@@ -2327,6 +2327,9 @@ pub(crate) fn dispatch<'a>(
                 {
                     return Ok(Datum::Text(name));
                 }
+                if crate::storage::NamedTypeKind::from_oid(o).is_some() {
+                    return Ok(Datum::Text("???"));
+                }
                 let Some(coltype) = exec::coltype_of_oid(o) else {
                     return Ok(Datum::Text("???"));
                 };

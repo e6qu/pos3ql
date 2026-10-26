@@ -70,13 +70,13 @@ jobs:
       - name: Verify compact identity layouts
         shell: bash
         run: |
-          cargo test --lib --locked -- named_type_creation_layout_stays_within_startup_reservations type_creation_identity_roundtrips_without_allocation type_identity_index_replaces_at_capacity_and_isolates_databases_without_allocation cached_array_descriptors_preserve_maximum_creation_identities_without_allocation --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/layout.log"
-          grep -Eq 'test result: ok\. 4 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/layout.log"
+          cargo test --lib --locked -- named_type_creation_layout_stays_within_startup_reservations named_type_oid_ranges type_creation_identity_roundtrips_without_allocation type_identity_index_replaces_at_capacity_and_isolates_databases_without_allocation cached_array_descriptors_preserve_maximum_creation_identities_without_allocation --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/layout.log"
+          grep -Eq 'test result: ok\. 5 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/layout.log"
       - name: Diagnose new cold-recovery and privilege regressions
         shell: bash
         run: |
-          python3 tools/test_command.py cargo test --lib --locked -- named_type_cached_defaults numeric_object_privileges type_recovery_installs_saved_birth restored_type_identity_rejects tablespace_identity_bounds catalog_oid_inputs type_creation_lookup_preserves declared_type_bindings_reject --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/new-type-regressions.log"
-          grep -Eq 'test result: ok\. 9 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/new-type-regressions.log"
+          python3 tools/test_command.py cargo test --lib --locked -- named_type_cached_defaults numeric_object_privileges type_recovery_installs_saved_birth restored_type_identity_rejects tablespace_identity_bounds catalog_oid_inputs named_type_public_identifiers type_creation_lookup_preserves declared_type_bindings_reject --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/new-type-regressions.log"
+          grep -Eq 'test result: ok\. 11 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/new-type-regressions.log"
       - name: Enum label identities, corruption and replay lock regression
         shell: bash
         run: |

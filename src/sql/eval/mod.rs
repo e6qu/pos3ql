@@ -7145,7 +7145,9 @@ fn regtype_of_oid_with_catalog<'a>(
         name
     } else if let Some(name) = regtype_builtin_name(referenced_oid) {
         name
-    } else if let Some(ctype) = crate::sql::exec::coltype_of_oid_pub(referenced_oid) {
+    } else if let Some(ctype) = crate::sql::exec::coltype_of_oid_pub(referenced_oid)
+        && crate::storage::NamedTypeKind::from_oid(referenced_oid).is_none()
+    {
         ctype.name()
     } else {
         return arena

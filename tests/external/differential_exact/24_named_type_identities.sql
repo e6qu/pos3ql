@@ -34,6 +34,10 @@ CREATE ROLE type_identity_reader;
 SELECT count(*) = 0 FROM saved_type_identities WHERE has_type_privilege('type_identity_reader', identity, 'USAGE') IS NOT NULL;
 DROP ROLE type_identity_reader;
 SELECT count(*) = 0 FROM saved_type_identities WHERE pg_type_is_visible(identity) IS NOT NULL;
+SELECT count(*) = 3 FROM saved_type_identities
+ WHERE format_type(identity, NULL) = '???' AND format_type(array_identity, NULL) = '???';
+SELECT count(*) = 3 FROM saved_type_identities WHERE identity::regtype::text = identity::text;
+
 SELECT count(*) = 0 FROM saved_type_identities s JOIN pg_class c ON c.oid = s.relation WHERE s.relation <> 0;
 CREATE TABLE current_type_identity AS SELECT 'type_identity_scope.status'::regtype::oid AS identity;
 BEGIN;

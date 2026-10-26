@@ -12962,7 +12962,7 @@ mod tests {
                 name: "mood_ops",
             },
             WalOp::SetCollation {
-                slot: crate::storage::TypeCreation::parse(7).unwrap(),
+                slot: 7,
                 created_at: 14,
                 definition: collation,
             },
@@ -13005,7 +13005,7 @@ mod tests {
         // Kind 111 encoded one-byte slots. Keep it readable after widening
         // newly written records so existing journals remain recoverable.
         let operation = WalOp::SetTextSearch {
-            slot: crate::storage::TypeCreation::parse(7).unwrap(),
+            slot: 7,
             created_at: 18,
             definition: text_search,
         };
@@ -13016,7 +13016,7 @@ mod tests {
         legacy[1..payload.len() - 1].copy_from_slice(&payload[2..]);
         assert!(matches!(
             decode_op(KIND_SET_TEXT_SEARCH, &legacy[..payload.len() - 1]),
-            Some(WalOp::SetTextSearch { slot: crate::storage::TypeCreation::parse(7).unwrap(), .. })
+            Some(WalOp::SetTextSearch { slot: 7, .. })
         ));
     }
 
@@ -13068,7 +13068,7 @@ mod tests {
                     Some(Some(value))
                 );
                 assert_eq!(at, length);
-                let prefix = if member.is_some() { 15 } else { 11 };
+                let prefix = if member.is_some() { 17 } else { 13 };
                 encoded[prefix] = 64;
                 encoded[length] = b'x';
                 at = 0;
@@ -15145,7 +15145,7 @@ mod tests {
             ddl_state: crate::storage::CatalogDdlState::Absent,
         };
         let op = WalOp::CreateComposite {
-            slot: crate::storage::TypeCreation::parse(7).unwrap(),
+            slot: 7,
             definition: &definition,
         };
         let mut budget = Budget::new(4096);

@@ -1332,6 +1332,64 @@ fn numeric_object_privileges_match_postgresql_before_lookup() {
 }
 
 #[test]
+fn named_type_public_identifiers_survive_edits_replacement_and_savepoint_rollback() {
+    for mode in [crate::config::TransactionMode::Mvcc, crate::config::TransactionMode::Locking] {
+        let mut config = test_config(&format!("named-type-public-identifiers-{mode:?}"));
+        config.transaction_mode = mode;
+        config.max_ddl_per_transaction = 32;
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        assert_eq!(data_rows(&session.success(&mut engine,
+            include_str!("../../tests/external/differential_exact/24_named_type_identities.sql"), true)), ["t"; 14]);
+    }
+}
+
+#[test]
+fn named_type_public_identifiers_survive_journal_and_checkpoint_recovery() {
+    let fixture = include_str!("../../tests/external/differential_exact/24_named_type_identities.sql");
+    let (setup, _) = fixture.split_once(
+        "DROP TYPE type_identity_scope.order_item, type_identity_scope.payment_status;"
+    ).unwrap();
+    let remaining = &fixture[setup.len()..];
+    const QUERIES: &str = "SELECT count(*) = 3 FROM saved_type_identities s JOIN pg_type t ON t.oid = s.identity;
+        SELECT count(*) = 3 FROM saved_type_identities s JOIN pg_type t ON t.oid = s.array_identity;
+        SELECT count(*) = 2 FROM saved_enum_identities s JOIN pg_enum e ON e.oid = s.identity";
+    for checkpoint in [false, true] {
+        for mode in [crate::config::TransactionMode::Mvcc, crate::config::TransactionMode::Locking] {
+            let name = format!("named-type-public-cold-{checkpoint}-{mode:?}");
+            let mut config = test_config(&name);
+            config.transaction_mode = mode;
+            config.max_ddl_per_transaction = 32;
+            config.object_store_on = true;
+            config.object_store_sim = true;
+            config.wal_upload = true;
+            config.wal_upload_sync = true;
+            config.object_store_bucket = format!("{name}-{}", std::process::id());
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+            {
+                let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+                let mut engine = Engine::new(&config, &mut budget).unwrap();
+                let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+                assert_eq!(data_rows(&session.success(&mut engine, setup, false)), ["t"; 4]);
+                if checkpoint { assert!(engine.checkpoint().unwrap()); }
+                engine.commit_wal().unwrap();
+            }
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+            {
+                let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+                let mut engine = Engine::new(&config, &mut budget).unwrap();
+                let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+                assert_eq!(data_rows(&session.success(&mut engine, QUERIES, true)), ["t"; 3]);
+                assert_eq!(data_rows(&session.success(&mut engine, remaining, false)), ["t"; 10]);
+            }
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        }
+    }
+}
+
+#[test]
 fn enum_label_identities_preserve_saved_identifiers_through_edits_and_slot_reuse() {
     for mode in [
         crate::config::TransactionMode::Mvcc,

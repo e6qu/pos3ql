@@ -73,7 +73,7 @@ mod type_identities;
 mod type_names;
 mod type_reference_moves;
 #[cfg(test)]
-pub(crate) use type_identities::TypeCreation;
+pub(crate) use type_identities::{CachedArrayElement, TypeCreation};
 mod type_references;
 use crate::mem::mutex::{Mutex, MutexGuard};
 use enum_images::{EnumImageRead, EnumImageReservation, EnumMemberImages};

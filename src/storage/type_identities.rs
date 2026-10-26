@@ -202,8 +202,147 @@ impl TypeIdentityIndex {
 }
 
 #[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArrayElementIdentity {
+    Builtin(u8),
+    Enum(TypeCreation),
+    Composite(TypeCreation),
+    DomainBuiltin { domain: TypeCreation, base_code: u8 },
+    DomainEnum { domain: TypeCreation, base: TypeCreation },
+    DomainComposite { domain: TypeCreation, base: TypeCreation },
+}
+
+/// A checked six-byte descriptor for inline cached array defaults.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CachedArrayElement([u8; 6]);
+
+#[cfg(test)]
+impl CachedArrayElement {
+    const ENUM: u64 = 256;
+    const COMPOSITE: u64 = Self::ENUM + MAX_TYPE_CREATION;
+    const DOMAIN_BUILTIN: u64 = Self::COMPOSITE + MAX_TYPE_CREATION;
+    const DOMAIN_ENUM: u64 = Self::DOMAIN_BUILTIN + MAX_TYPE_CREATION * 256;
+    const DOMAIN_COMPOSITE: u64 = Self::DOMAIN_ENUM + MAX_TYPE_CREATION * MAX_TYPE_CREATION;
+    const END: u64 = Self::DOMAIN_COMPOSITE + MAX_TYPE_CREATION * MAX_TYPE_CREATION;
+
+    fn builtin(code: u8) -> bool {
+        crate::sql::types::ArrElem::from_code(code)
+            .is_some_and(|element| element.user_type_slot().is_none())
+    }
+
+    fn builtin_base(code: u8) -> bool {
+        use crate::sql::types::ColType;
+        crate::sql::types::ColType::from_code(code).is_some_and(|base| match base {
+            ColType::Enum(_) | ColType::Composite(_) => false,
+            ColType::Array(element) => element.user_type_slot().is_none(),
+            _ => true,
+        })
+    }
+
+    fn from_identity(identity: ArrayElementIdentity) -> Option<Self> {
+        use ArrayElementIdentity::*;
+        let value = match identity {
+            Builtin(code) if Self::builtin(code) => u64::from(code),
+            Enum(creation) => Self::ENUM + creation.created_at() - 1,
+            Composite(creation) => Self::COMPOSITE + creation.created_at() - 1,
+            DomainBuiltin { domain, base_code } if Self::builtin_base(base_code) =>
+                Self::DOMAIN_BUILTIN + (domain.created_at() - 1) * 256 + u64::from(base_code),
+            DomainEnum { domain, base } => Self::DOMAIN_ENUM
+                + (domain.created_at() - 1) * MAX_TYPE_CREATION + base.created_at() - 1,
+            DomainComposite { domain, base } => Self::DOMAIN_COMPOSITE
+                + (domain.created_at() - 1) * MAX_TYPE_CREATION + base.created_at() - 1,
+            _ => return None,
+        };
+        let bytes = value.to_le_bytes();
+        Some(Self([bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5]]))
+    }
+
+    fn value(self) -> u64 {
+        let [a,b,c,d,e,f] = self.0;
+        u64::from_le_bytes([a,b,c,d,e,f,0,0])
+    }
+
+    fn decode(value: u64) -> Option<ArrayElementIdentity> {
+        use ArrayElementIdentity::*;
+        if value < Self::ENUM {
+            return Self::builtin(value as u8).then_some(Builtin(value as u8));
+        }
+        if value < Self::COMPOSITE {
+            return TypeCreation::parse(value - Self::ENUM + 1).map(Enum);
+        }
+        if value < Self::DOMAIN_BUILTIN {
+            return TypeCreation::parse(value - Self::COMPOSITE + 1).map(Composite);
+        }
+        if value < Self::DOMAIN_ENUM {
+            let offset = value - Self::DOMAIN_BUILTIN;
+            let base_code = (offset % 256) as u8;
+            return Self::builtin_base(base_code).then(|| DomainBuiltin {
+                domain: TypeCreation::parse(offset / 256 + 1).expect("bounded domain identity"),
+                base_code,
+            });
+        }
+        let (start, composite) = if value < Self::DOMAIN_COMPOSITE {
+            (Self::DOMAIN_ENUM, false)
+        } else if value < Self::END {
+            (Self::DOMAIN_COMPOSITE, true)
+        } else { return None; };
+        let offset = value - start;
+        let domain = TypeCreation::parse(offset / MAX_TYPE_CREATION + 1)?;
+        let base = TypeCreation::parse(offset % MAX_TYPE_CREATION + 1)?;
+        Some(if composite { DomainComposite { domain, base } } else { DomainEnum { domain, base } })
+    }
+
+    fn from_bytes(bytes: [u8; 6]) -> Option<Self> {
+        let encoded = Self(bytes);
+        Self::decode(encoded.value())?;
+        Some(encoded)
+    }
+
+    fn identity(self) -> ArrayElementIdentity {
+        Self::decode(self.value()).expect("cached array descriptor was checked")
+    }
+}
+
+#[cfg(test)]
+const _: [(); 6] = [(); core::mem::size_of::<CachedArrayElement>()];
+#[cfg(test)]
+const _: () = assert!(CachedArrayElement::END <= 1 << 48);
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cached_array_descriptors_preserve_maximum_creation_identities_without_allocation() {
+        fn check(identity: ArrayElementIdentity) {
+            let encoded = CachedArrayElement::from_identity(identity).unwrap();
+            assert_eq!(encoded.identity(), identity);
+            assert_eq!(CachedArrayElement::from_bytes(encoded.0).unwrap().identity(), identity);
+        }
+        crate::mem::guard::forbid_alloc(|| {
+            for element in crate::sql::types::ArrElem::BUILTIN {
+                check(ArrayElementIdentity::Builtin(element.code()));
+            }
+            for domain in [1, 255, 256, 65_535, MAX_TYPE_CREATION] {
+                let domain = TypeCreation::parse(domain).unwrap();
+                check(ArrayElementIdentity::Enum(domain));
+                check(ArrayElementIdentity::Composite(domain));
+                for base in [1, 255, 256, 65_535, MAX_TYPE_CREATION] {
+                    let base = TypeCreation::parse(base).unwrap();
+                    check(ArrayElementIdentity::DomainEnum { domain, base });
+                    check(ArrayElementIdentity::DomainComposite { domain, base });
+                }
+                for base in [crate::sql::types::ColType::Bool, crate::sql::types::ColType::Text,
+                    crate::sql::types::ColType::Array(crate::sql::types::ArrElem::Int4)] {
+                    check(ArrayElementIdentity::DomainBuiltin { domain, base_code: base.code() });
+                }
+            }
+            assert!(CachedArrayElement::from_bytes([255; 6]).is_none());
+            let invalid_builtin = crate::sql::types::ArrElem::Enum(0).code();
+            assert!(CachedArrayElement::from_identity(ArrayElementIdentity::Builtin(invalid_builtin)).is_none());
+        });
+    }
 
     #[test]
     fn type_identity_index_replaces_at_capacity_and_isolates_databases_without_allocation() {

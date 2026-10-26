@@ -29,8 +29,8 @@ jobs:
       - name: Verify compact identity layouts
         shell: bash
         run: |
-          cargo test --lib --locked -- named_type_creation_code_layout_probe type_creation_identity_roundtrips_without_allocation type_identity_index_replaces_at_capacity_and_isolates_databases_without_allocation --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/layout.log"
-          grep -Eq 'test result: ok\. 3 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/layout.log"
+          cargo test --lib --locked -- named_type_creation_code_layout_probe type_creation_identity_roundtrips_without_allocation type_identity_index_replaces_at_capacity_and_isolates_databases_without_allocation cached_array_descriptors_preserve_maximum_creation_identities_without_allocation --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/layout.log"
+          grep -Eq 'test result: ok\. 4 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/layout.log"
       - name: Named type lifecycle, recovery and startup accounting
         shell: bash
         run: |

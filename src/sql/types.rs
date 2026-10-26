@@ -6253,7 +6253,7 @@ mod named_type_layout_probe {
             bytes: [u8; crate::storage::MAX_DEFAULT_TEXT],
         },
         Array {
-            element: ProjectedArrElem,
+            element: crate::storage::CachedArrayElement,
             len: u8,
             bytes: [u8; crate::storage::MAX_DEFAULT_TEXT],
         },

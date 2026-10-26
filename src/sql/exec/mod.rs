@@ -67575,6 +67575,12 @@ fn alter_table_relation(
                     } else {
                         new_def.columns[i].not_null.drop_local()
                     };
+                if !new_def.columns[i].not_null.is_required() {
+                    let attribute = usize::from(new_def.attribute_number(i) - 1);
+                    new_def.not_null_identities[attribute] = None;
+                    new_def.not_null_names[i] = None;
+                    new_def.not_null_name_edits.insert(i);
+                }
             }
             AlterAction::SetStatistics { column, target } => {
                 let Some(i) = new_def.column_index(column) else {

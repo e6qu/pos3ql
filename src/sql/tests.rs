@@ -1361,7 +1361,7 @@ fn constraint_public_identifiers_survive_edits_replacement_and_savepoint_rollbac
             }
             observations += rows.len();
         }
-        assert_eq!(observations, 13);
+        assert_eq!(observations, 14);
     }
 }
 
@@ -1420,7 +1420,7 @@ fn constraint_public_identifiers_survive_journal_and_checkpoint_recovery() {
                 let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
                 let mut engine = Engine::new(&config, &mut budget).unwrap();
                 let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
-                for (statements, guarded, expected) in [(QUERIES, true, 2), (remaining, false, 8)] {
+                for (statements, guarded, expected) in [(QUERIES, true, 2), (remaining, false, 9)] {
                     let mut observations = 0;
                     for statement in statements
                         .split(';')

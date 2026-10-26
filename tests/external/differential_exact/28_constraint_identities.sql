@@ -39,6 +39,8 @@ ALTER TABLE constraint_rules DROP CONSTRAINT constraint_survives;
 ALTER TABLE constraint_rules ADD CONSTRAINT constraint_survives CHECK (b > 0);
 SELECT count(*) = 1 FROM pg_constraint c JOIN saved_constraint_identities s ON s.name = 'table_keep'
  WHERE c.conrelid = 'constraint_rules'::regclass AND c.conname = 'constraint_survives' AND c.oid <> s.identity;
+ALTER TABLE constraint_rules ALTER COLUMN b DROP NOT NULL, ALTER COLUMN b SET NOT NULL;
+SELECT count(*) = 0 FROM pg_constraint c JOIN saved_constraint_identities s ON c.oid = s.identity WHERE s.name = 'rules_nn';
 ROLLBACK TO SAVEPOINT before_constraint;
 SELECT count(*) = 1 FROM pg_constraint c JOIN saved_constraint_identities s ON c.oid = s.identity
  WHERE s.name = 'table_keep' AND c.conname = 'constraint_survives';

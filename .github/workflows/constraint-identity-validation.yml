@@ -40,7 +40,7 @@ jobs:
         run: |
           set -euo pipefail
           docker exec "$POSTGRES_CONTAINER" psql -U postgres -X -At -c 'SELECT version()'
-          for specification in 28_constraint_identities:13 29_wide_domain_constraints:1 31_domain_constraint_declarations:8; do
+          for specification in 28_constraint_identities:14 29_wide_domain_constraints:1 31_domain_constraint_declarations:8; do
             database=${specification%:*}
             expected=${specification##*:}
             docker exec "$POSTGRES_CONTAINER" createdb -U postgres "$database"

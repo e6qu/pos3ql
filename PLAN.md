@@ -49,7 +49,8 @@ Complete these remaining cases:
   also need exact duplicate counts.
 - Give replacement tables, indexes, sequences and other remaining objects fresh
   SQL object identifiers, independently of reused storage slots. A cached
-  identifier for a dropped table must not name its replacement. Check shared
+  identifier for a dropped table must not name its replacement. Removing an
+  earlier constraint must also preserve the identifiers of surviving indexes. Check shared
   catalogs across databases as well.
 - Keep old row, index and backup data until their readers finish. Pace history
   pruning, file replacement and deletion without holding unrelated owners.

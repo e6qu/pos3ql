@@ -1497,9 +1497,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
         };
         let mut columns = ArenaList::new(arena);
         if (oid::FIRST_TABLE_COMPOSITE..oid::FIRST_VIEW_COMPOSITE).contains(&type_oid) {
-            let slot = usize::try_from(type_oid - oid::FIRST_TABLE_COMPOSITE)
-                .ok()
-                .filter(|slot| *slot < self.storage.table_count())
+            let slot = super::catalog::table_slot_by_row_type_oid(self.storage, self.txid, type_oid, false)
                 .ok_or_else(|| {
                     sql_err!(sqlstate::INTERNAL_ERROR, "table rowtype OID is not a table")
                 })?;
@@ -1518,9 +1516,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
             }
             return Ok(columns.as_slice());
         }
-        let slot = usize::try_from(type_oid - oid::FIRST_VIEW_COMPOSITE)
-            .ok()
-            .filter(|slot| *slot < self.storage.view_count())
+        let slot = super::catalog::view_slot_by_row_type_oid(self.storage, self.txid, type_oid, false)
             .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "view rowtype OID is not a view"))?;
         let view = self.storage.view(slot);
         let count = view.columns_for(self.txid).names().len();
@@ -2065,7 +2061,7 @@ fn brin_index_slot(storage: &Storage, txid: u32, oid: i32) -> Result<usize, SqlE
         return Ok(slot);
     }
     for slot in 0..storage.table_count() {
-        if storage.table_slot_visible_to(slot, txid) && super::catalog::user_table_oid(slot) == oid
+        if storage.table_slot_visible_to(slot, txid) && super::catalog::user_table_oid(self.storage, slot) == oid
         {
             return Err(sql_err!(
                 sqlstate::WRONG_OBJECT_TYPE,
@@ -2617,7 +2613,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         arena: &'a Arena,
     ) -> Result<Option<&'a [super::types::RecordField<'a>]>, SqlError> {
         use super::types::oid;
-        if (oid::FIRST_TABLE_COMPOSITE..oid::FIRST_DOMAIN_ARRAY).contains(&type_oid) {
+        if (oid::FIRST_TABLE_COMPOSITE..oid::FIRST_VIEW_COMPOSITE).contains(&type_oid) {
             return self.rowtype_fields(type_oid, arena).map(Some);
         }
         let Ok(slot) = usize::try_from(type_oid - super::types::oid::FIRST_COMPOSITE) else {
@@ -2669,7 +2665,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             return Some(type_oid);
         }
         // Table/view rowtypes and named composites are their own base type.
-        if (oid::FIRST_TABLE_COMPOSITE..oid::FIRST_DOMAIN_ARRAY).contains(&type_oid)
+        if (oid::FIRST_TABLE_COMPOSITE..oid::FIRST_VIEW_COMPOSITE).contains(&type_oid)
             || (oid::FIRST_COMPOSITE..oid::FIRST_COMPOSITE_ARRAY).contains(&type_oid)
         {
             return Some(type_oid);
@@ -2693,7 +2689,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
     fn composite_field_type_mod(&self, type_oid: i32, field: usize) -> Option<i32> {
         use super::types::oid;
         if (oid::FIRST_TABLE_COMPOSITE..oid::FIRST_VIEW_COMPOSITE).contains(&type_oid) {
-            let slot = usize::try_from(type_oid - oid::FIRST_TABLE_COMPOSITE).ok()?;
+            let slot = super::catalog::table_slot_by_row_type_oid(self.storage, self.txid, type_oid, false)?;
             if slot >= self.storage.table_count() {
                 return None;
             }
@@ -3619,13 +3615,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             None => return Ok(None),
         };
         let oid = privilege_relation_oid(self.storage, self.txid, sequence)?;
-        let slot = oid
-            .checked_sub(super::catalog::sequence_oid(0))
-            .and_then(|slot| usize::try_from(slot).ok())
-            .filter(|slot| {
-                *slot < self.storage.sequence_count()
-                    && self.storage.sequence_slot_visible_to(*slot, self.txid)
-            });
+        let slot = super::catalog::sequence_slot_by_oid(self.storage, self.txid, oid);
         let Some(slot) = slot else {
             if super::catalog::relation_oid_visibility(self.storage, self.txid, oid).is_some() {
                 return Err(sql_err!(
@@ -3816,35 +3806,11 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             .map(Some);
         }
         let owner = {
-            let row_type = [
-                (
-                    super::catalog::FIRST_TABLE_COMPOSITE_TYPE_OID,
-                    self.storage.table_count(),
-                    AccessClass::Table,
-                ),
-                (
-                    super::catalog::FIRST_TABLE_COMPOSITE_ARRAY_TYPE_OID,
-                    self.storage.table_count(),
-                    AccessClass::Table,
-                ),
-                (
-                    super::catalog::FIRST_VIEW_COMPOSITE_TYPE_OID,
-                    self.storage.view_count(),
-                    AccessClass::View,
-                ),
-                (
-                    super::catalog::FIRST_VIEW_COMPOSITE_ARRAY_TYPE_OID,
-                    self.storage.view_count(),
-                    AccessClass::View,
-                ),
-            ]
-            .into_iter()
-            .find_map(|(first, count, class)| {
-                let slot = usize::try_from(type_oid.checked_sub(first)?).ok()?;
-                (slot < count).then_some(AccessObject {
-                    class,
-                    slot: slot as u16,
-                })
+            let row_type = [false, true].into_iter().find_map(|array| {
+                super::catalog::table_slot_by_row_type_oid(self.storage, self.txid, type_oid, array)
+                    .map(|slot| AccessObject { class: AccessClass::Table, slot: slot as u16 })
+                    .or_else(|| super::catalog::view_slot_by_row_type_oid(self.storage, self.txid, type_oid, array)
+                        .map(|slot| AccessObject { class: AccessClass::View, slot: slot as u16 }))
             });
             if let Some(object) = row_type {
                 let slot = usize::from(object.slot);
@@ -4522,21 +4488,10 @@ pub(super) fn privilege_relation(
     if super::catalog::catalog_relation_oid_by_oid(oid) {
         return Ok(Some(crate::storage::ResolvedRelation::Catalog));
     }
-    if let Some(slot) = oid
-        .checked_sub(super::catalog::user_table_oid(0))
-        .and_then(|slot| usize::try_from(slot).ok())
-        .filter(|slot| {
-            *slot < storage.table_count() && storage.table_slot_visible_to(*slot, transaction)
-        })
-    {
+    if let Some(slot) = super::catalog::table_slot_by_oid(storage, transaction, oid) {
         return Ok(Some(crate::storage::ResolvedRelation::Table(slot)));
     }
-    let resolved = oid
-        .checked_sub(super::catalog::view_oid(0))
-        .and_then(|slot| usize::try_from(slot).ok())
-        .filter(|slot| {
-            *slot < storage.view_count() && storage.view_slot_visible_to(*slot, transaction)
-        })
+    let resolved = super::catalog::view_slot_by_oid(storage, transaction, oid)
         .map(crate::storage::ResolvedRelation::View);
     if resolved.is_none() && matches!(relation, PrivilegeRelation::Name(_)) {
         return Err(sql_err!(

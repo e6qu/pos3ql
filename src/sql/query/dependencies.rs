@@ -2843,7 +2843,7 @@ fn collect_sequence(
             crate::sql::identifiers::ObjectReference::Oid(oid) => {
                 let slot = (0..storage.sequence_count()).find(|slot| {
                     storage.sequence_slot_visible_to(*slot, txid)
-                        && crate::sql::catalog::sequence_oid(*slot) as u32 == oid
+                        && crate::sql::catalog::sequence_oid(storage, *slot) as u32 == oid
                 });
                 (
                     slot,

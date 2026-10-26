@@ -209,7 +209,7 @@ fn parse_writer_fence(bytes: &[u8]) -> Result<(&str, WriterToken), &'static str>
     Ok((state, token))
 }
 
-const MANIFEST_HEADER: &str = "pos3ql-manifest-v27";
+const MANIFEST_HEADER: &str = "pos3ql-manifest-v28";
 
 struct ManifestMetadata {
     lsn: u64,
@@ -287,12 +287,11 @@ fn parse_manifest_metadata(text: &str) -> Result<ManifestMetadata, &'static str>
                 if catalog_sequence.is_some() {
                     return Err("duplicate catalog identity allocator");
                 }
-                catalog_sequence = Some(
-                    words
-                        .next()
-                        .and_then(|word| word.parse().ok())
-                        .ok_or("invalid catalog identity allocator")?,
-                );
+                let sequence: u64 = words.next().and_then(|word| word.parse().ok()).ok_or("invalid catalog identity allocator")?;
+                if sequence > crate::storage::MAX_RELATION_GENERATION {
+                    return Err("invalid catalog identity allocator");
+                }
+                catalog_sequence = Some(sequence);
                 true
             }
             Some("role_sequence") => {
@@ -4193,6 +4192,7 @@ impl Checkpointer {
                         not_null_inheritable: not_null_inheritable != 0,
                         unique: not_null & 4 != 0,
                         primary: not_null & 8 != 0,
+                        index_identity: None,
                         auto_increment: not_null & 16 != 0,
                         default,
                         is_identity: not_null & 64 != 0,
@@ -18817,6 +18817,7 @@ fn empty_column() -> ColumnMeta {
         not_null_inheritable: true,
         unique: false,
         primary: false,
+        index_identity: None,
         auto_increment: false,
         default: ColumnDefault::NONE,
         is_identity: false,

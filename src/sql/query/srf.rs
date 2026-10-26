@@ -664,7 +664,7 @@ fn publication_table_rows<'a>(
         rows[row_count] = crate::sql::exec::encode_projected_pub(
             &[
                 Datum::Oid(crate::sql::catalog::publication_oid(info.publication_slot) as u32),
-                Datum::Oid(crate::sql::catalog::user_table_oid(info.relation_slot) as u32),
+                Datum::Oid(crate::sql::catalog::user_table_oid(storage, info.relation_slot) as u32),
                 publication_int2vector(column_mask, &table, arena)?,
                 qual,
             ],
@@ -2137,6 +2137,7 @@ pub(crate) fn describe_derived_definition<'a>(
         not_null_inheritable: true,
         unique: false,
         primary: false,
+        index_identity: None,
         auto_increment: false,
         default: crate::storage::ColumnDefault::NONE,
         is_identity: false,
@@ -2458,9 +2459,7 @@ fn populate_record_append_columns<'a, C: ColumnLookup<'a>>(
     }
     // A table or view rowtype contributes its own columns.
     if (oid::FIRST_TABLE_COMPOSITE..oid::FIRST_VIEW_COMPOSITE).contains(&composite_oid) {
-        let slot = usize::try_from(composite_oid - oid::FIRST_TABLE_COMPOSITE)
-            .ok()
-            .filter(|slot| *slot < storage.table_count())
+        let slot = crate::sql::catalog::table_slot_by_row_type_oid(storage, txid, composite_oid, false)
             .ok_or_else(|| {
                 sql_err!(sqlstate::INTERNAL_ERROR, "table rowtype OID is not a table")
             })?;
@@ -2475,10 +2474,8 @@ fn populate_record_append_columns<'a, C: ColumnLookup<'a>>(
         }
         return Ok(count);
     }
-    if (oid::FIRST_VIEW_COMPOSITE..oid::FIRST_DOMAIN_ARRAY).contains(&composite_oid) {
-        let slot = usize::try_from(composite_oid - oid::FIRST_VIEW_COMPOSITE)
-            .ok()
-            .filter(|slot| *slot < storage.view_count())
+    if (oid::FIRST_VIEW_COMPOSITE..oid::FIRST_TABLE_COMPOSITE_ARRAY).contains(&composite_oid) {
+        let slot = crate::sql::catalog::view_slot_by_row_type_oid(storage, txid, composite_oid, false)
             .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "view rowtype OID is not a view"))?;
         let view = storage.view(slot);
         let width = view.columns_for(txid).names().len();

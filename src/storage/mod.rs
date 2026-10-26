@@ -58,6 +58,8 @@ pub(crate) use type_edits::{
     TypeDdlUndo, TypeEditTarget,
 };
 mod domain_validation;
+mod relation_identities;
+pub(crate) use relation_identities::{RelationIdentity, MAX_RELATION_GENERATION};
 mod table_creation;
 mod table_definitions;
 mod table_edits;
@@ -1379,6 +1381,7 @@ pub struct ColumnMeta {
     pub not_null_inheritable: bool,
     pub unique: bool,
     pub primary: bool,
+    pub(crate) index_identity: Option<RelationIdentity>,
     /// `serial`/`bigserial`/`smallserial` or GENERATED AS IDENTITY: when the
     /// column is omitted (or DEFAULT) on INSERT, it is assigned one past the
     /// column's current maximum.
@@ -1592,6 +1595,7 @@ impl ColumnMeta {
         not_null_inheritable: true,
         unique: false,
         primary: false,
+        index_identity: None,
         auto_increment: false,
         default: ColumnDefault::NONE,
         is_identity: false,
@@ -1760,6 +1764,7 @@ impl UniqueKeyKind {
 /// Named, multi-column, deferred or NULLS NOT DISTINCT key constraint.
 #[derive(Debug, Clone, Copy)]
 pub struct UniqueKey {
+    pub(crate) index_identity: Option<RelationIdentity>,
     pub name: SqlName,
     pub columns: [u16; MAX_INDEX_COLS],
     pub n_cols: usize,
@@ -1769,6 +1774,7 @@ pub struct UniqueKey {
 
 impl UniqueKey {
     pub const EMPTY: Self = UniqueKey {
+        index_identity: None,
         name: SqlName::EMPTY,
         columns: [0u16; MAX_INDEX_COLS],
         n_cols: 0,
@@ -1817,6 +1823,7 @@ impl ExclusionOperator {
 
 #[derive(Debug, Clone, Copy)]
 pub struct ExclusionConstraint {
+    pub(crate) index_identity: Option<RelationIdentity>,
     pub name: SqlName,
     pub columns: [u16; MAX_INDEX_COLS],
     pub operators: [ExclusionOperator; MAX_INDEX_COLS],
@@ -1827,6 +1834,7 @@ pub struct ExclusionConstraint {
 
 impl ExclusionConstraint {
     pub const EMPTY: Self = Self {
+        index_identity: None,
         name: SqlName::EMPTY,
         columns: [0; MAX_INDEX_COLS],
         operators: [ExclusionOperator::Equal; MAX_INDEX_COLS],
@@ -6513,21 +6521,17 @@ impl MatviewDef {
 pub(crate) const MAX_DOMAIN_CATALOG_SLOTS: usize =
     (crate::sql::types::oid::FIRST_ENUM - crate::sql::types::oid::FIRST_DOMAIN) as usize;
 /// Physical table row types occupy the band before view row types.
-pub(crate) const MAX_TABLE_TYPE_OID_SLOTS: usize = (crate::sql::types::oid::FIRST_VIEW_COMPOSITE
-    - crate::sql::types::oid::FIRST_TABLE_COMPOSITE)
-    as usize;
+pub(crate) const MAX_TABLE_TYPE_OID_SLOTS: usize = 10_000;
 /// View row types occupy the band before synthesized domain arrays.
-pub(crate) const MAX_VIEW_TYPE_OID_SLOTS: usize = (crate::sql::types::oid::FIRST_DOMAIN_ARRAY
-    - crate::sql::types::oid::FIRST_VIEW_COMPOSITE)
-    as usize;
+pub(crate) const MAX_VIEW_TYPE_OID_SLOTS: usize = 10_000;
 
-pub(crate) const FIRST_IMPLICIT_INDEX_OID: i32 = 120_000_000;
+pub(crate) const FIRST_IMPLICIT_INDEX_OID: i32 = relation_identities::FIRST_RELATION_OID;
 pub(crate) const INDEX_CONSTRAINT_OID_OFFSET: i32 =
     (MAX_TABLE_TYPE_OID_SLOTS * MAX_VALUE_ENFORCERS) as i32;
 pub(crate) const FIRST_EXPLICIT_INDEX_OID: i32 = 300_000_000;
 pub(crate) const FIRST_PARTITION_TRIGGER_OID: i32 = 1_000_000_000;
 pub(crate) const TRIGGER_CONSTRAINT_OID_OFFSET: i32 = 500_000;
-pub(crate) const MAX_INDEX_OID_GENERATION: u64 = INDEX_CONSTRAINT_OID_OFFSET as u64 - 1;
+pub(crate) const MAX_INDEX_OID_GENERATION: u64 = relation_identities::MAX_RELATION_GENERATION;
 // Reserve complete table-slot strides and the derived constraint OID at the
 // top of the signed OID space. Validate before installation, not catalog reads.
 pub(crate) const MAX_TRIGGER_OID_GENERATION: u64 = (i32::MAX as u64
@@ -9714,8 +9718,7 @@ pub(crate) struct DomainSpec {
 
 /// Enum scalar slots fit before table row types; their array OIDs have a
 /// wider band, so the scalar identity is the limiting representation.
-pub(crate) const MAX_ENUM_CATALOG_SLOTS: usize =
-    (crate::sql::types::oid::FIRST_TABLE_COMPOSITE - crate::sql::types::oid::FIRST_ENUM) as usize;
+pub(crate) const MAX_ENUM_CATALOG_SLOTS: usize = 10_000;
 /// Composite slots fit between their synthesized scalar and array OID bands.
 pub(crate) const MAX_COMPOSITE_CATALOG_SLOTS: usize = (crate::sql::types::oid::FIRST_COMPOSITE_ARRAY
     - crate::sql::types::oid::FIRST_COMPOSITE)
@@ -14133,10 +14136,11 @@ impl CatalogSequence {
     }
 
     fn next(&self) -> Result<u64, SqlError> {
-        self.next_bounded(u64::MAX, "catalog sequence")
+        self.next_bounded(relation_identities::MAX_RELATION_GENERATION, "catalog sequence")
     }
 
     fn next_bounded(&self, maximum: u64, object: &str) -> Result<u64, SqlError> {
+        let maximum = maximum.min(relation_identities::MAX_RELATION_GENERATION);
         let mut current = self.0.load(std::sync::atomic::Ordering::Relaxed);
         loop {
             let next =
@@ -16809,13 +16813,12 @@ impl Storage {
     }
 
     fn reset_implicit_index_statistics(&self, table: usize) {
-        let first = crate::sql::catalog::index_oid(table, 0);
-        let end = crate::sql::catalog::index_oid(table, 64);
+        let definition = self.tables[table].definition();
         let mut cumulative = self.cumulative_statistics();
         let statistics = &mut cumulative.indexes;
         let mut position = 0usize;
         while position < statistics.len() {
-            if (first..end).contains(&statistics[position].oid) {
+            if definition.implicit_index_identities().flatten().any(|identity| identity.oid() == statistics[position].oid) {
                 statistics.swap_remove(position);
             } else {
                 position += 1;
@@ -47512,6 +47515,7 @@ impl Storage {
         revision: TableDefinitionRevision,
         rewrites_rows: bool,
     ) -> Result<(), SqlError> {
+        self.validate_implicit_index_identities(&definition)?;
         let state = self.tables[index].definition.read();
         let source = self.catalog_object_identity(
             catalog_sources::CatalogObjectSlot::Table(index),
@@ -56735,6 +56739,7 @@ mod tests {
                 not_null_inheritable: true,
                 unique: false,
                 primary: false,
+                index_identity: None,
                 auto_increment: false,
                 default: ColumnDefault::NONE,
                 is_identity: false,

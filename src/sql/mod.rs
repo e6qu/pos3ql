@@ -15092,7 +15092,7 @@ impl Engine {
         if let Some((slot, reason)) = table_rewrite_target(statement, &self.storage, txn.txid)
             && let Err(error) = self.fire_event_triggers(
                 EventTriggerInvocation::TableRewrite {
-                    relation_oid: catalog::user_table_oid(slot),
+                    relation_oid: catalog::user_table_oid(&self.storage, slot),
                     reason,
                 },
                 EventTriggerExecution {
@@ -15405,7 +15405,7 @@ impl Engine {
         if let Some((slot, reason)) = table_rewrite_target(statement, &self.storage, txn.txid)
             && let Err(error) = self.fire_event_triggers(
                 EventTriggerInvocation::TableRewrite {
-                    relation_oid: catalog::user_table_oid(slot),
+                    relation_oid: catalog::user_table_oid(&self.storage, slot),
                     reason,
                 },
                 EventTriggerExecution {

@@ -1064,7 +1064,7 @@ fn create_table_kind(
                     lsn,
                     &WalOp::CreateTable {
                         identity: storage.table_position(slot),
-                        definition: &def,
+                        definition: &storage.table_def(slot, txn.txid),
                     },
                 )
             };
@@ -15852,10 +15852,10 @@ impl<'a> TriggerInvocation<'a> {
                 .map_err(|_| super::query::arena_full_pub())?,
             relid: match relation.target {
                 crate::storage::TriggerTarget::Table(slot) => {
-                    crate::sql::catalog::user_table_oid(usize::from(slot))
+                    crate::sql::catalog::user_table_oid(storage, usize::from(slot))
                 }
                 crate::storage::TriggerTarget::View(slot) => {
-                    crate::sql::catalog::view_oid(usize::from(slot))
+                    crate::sql::catalog::view_oid(storage, usize::from(slot))
                 }
             },
             routine_oid: crate::storage::routine_oid(routine),
@@ -39424,6 +39424,7 @@ pub fn create_table_as(
             not_null_inheritable: true,
             unique: false,
             primary: false,
+            index_identity: None,
             auto_increment: false,
             default: crate::storage::ColumnDefault::NONE,
             is_identity: false,
@@ -39449,7 +39450,7 @@ pub fn create_table_as(
                     lsn,
                     &WalOp::CreateTable {
                         identity: storage.table_position(slot),
-                        definition: &def,
+                        definition: &storage.table_def(slot, txn.txid),
                     },
                 )
             };
@@ -40547,6 +40548,9 @@ fn rewrite_sequence_default_references(
                 column_mapping: wal_mapping,
             },
         )?;
+        if let Err(error) = storage.reserve_implicit_index_identities(&mut altered) {
+            return Err(error);
+        }
         let lsn = storage.bump_lsn();
         wal.stage_reserved(
             txn.txid,
@@ -46784,7 +46788,7 @@ fn rewrite_composite_dependent_tables(
                 lsn,
                 &WalOp::CreateTable {
                     identity: storage.table_position(table_slot),
-                    definition: &altered,
+                    definition: &storage.table_def(table_slot, txn.txid),
                 },
             )?;
         }
@@ -50255,7 +50259,7 @@ fn stage_table_definition(
     txn: &mut TxnState,
     edit_target: crate::storage::TableDefinitionTarget,
     previous: TableDef,
-    next: TableDef,
+    mut next: TableDef,
 ) -> Result<(), SqlError> {
     let table = edit_target.table();
     let mut mapping = [None; MAX_COLUMNS];
@@ -50276,6 +50280,9 @@ fn stage_table_definition(
                 column_mapping: wal_mapping,
             },
         )?;
+        if let Err(error) = storage.reserve_implicit_index_identities(&mut next) {
+            return Err(error);
+        }
         let lsn = storage.bump_lsn();
         wal.stage_reserved(
             txn.txid,
@@ -59211,6 +59218,7 @@ pub(crate) fn view_trigger_definition(
             not_null_inheritable: true,
             unique: false,
             primary: false,
+            index_identity: None,
             auto_increment: false,
             default: crate::storage::ColumnDefault::NONE,
             is_identity: false,
@@ -63732,6 +63740,9 @@ fn rename_attached_index_constraint(
             column_mapping: wal_mapping,
         },
     )?;
+    if let Err(error) = storage.reserve_implicit_index_identities(&mut altered) {
+        return Err(error);
+    }
     let lsn = storage.bump_lsn();
     wal.stage_reserved(
         txn.txid,
@@ -63813,6 +63824,9 @@ fn drop_dependent_foreign_keys(
                 column_mapping: wal_mapping,
             },
         )?;
+        if let Err(error) = storage.reserve_implicit_index_identities(&mut altered) {
+            return Err(error);
+        }
         let lsn = storage.bump_lsn();
         wal.stage_reserved(
             txn.txid,
@@ -65057,6 +65071,9 @@ fn alter_table_inheritance(
     ) {
         return sql_fail(error);
     }
+    if let Err(error) = storage.reserve_implicit_index_identities(&mut updated) {
+        return sql_fail(error);
+    }
     let lsn = storage.bump_lsn();
     if let Err(error) = wal.stage_reserved(
         txn.txid,
@@ -65486,6 +65503,9 @@ fn alter_partition_attachment(
     ) {
         return sql_fail(error);
     }
+    if let Err(error) = storage.reserve_implicit_index_identities(&mut new_def) {
+        return sql_fail(error);
+    }
     let lsn = storage.bump_lsn();
     if let Err(error) = wal.stage_reserved(
         txn.txid,
@@ -65541,6 +65561,9 @@ fn alter_partition_attachment(
                         column_mapping: wal_mapping,
                     },
                 ) {
+                    return sql_fail(error);
+                }
+                if let Err(error) = storage.reserve_implicit_index_identities(&mut dependent) {
                     return sql_fail(error);
                 }
                 let lsn = storage.bump_lsn();
@@ -66631,6 +66654,9 @@ fn alter_table_relation(
                     column_mapping: wal_mapping,
                 },
             ) {
+                return sql_fail(error);
+            }
+            if let Err(error) = storage.reserve_implicit_index_identities(&mut new_def) {
                 return sql_fail(error);
             }
             let lsn = storage.bump_lsn();
@@ -68320,6 +68346,9 @@ fn alter_table_relation(
         ) {
             return sql_fail(e);
         }
+        if let Err(error) = storage.reserve_implicit_index_identities(&mut new_def) {
+            return sql_fail(error);
+        }
         let lsn = storage.bump_lsn();
         if let Err(e) = wal.stage_reserved(
             txn.txid,
@@ -68819,6 +68848,9 @@ fn alter_table_relation(
                     ) {
                         return sql_fail(error);
                     }
+                    if let Err(error) = storage.reserve_implicit_index_identities(&mut dependent) {
+                        return sql_fail(error);
+                    }
                     let lsn = storage.bump_lsn();
                     if let Err(error) = wal.stage_reserved(
                         txn.txid,
@@ -69203,6 +69235,9 @@ fn alter_table_replica_identity(
                 column_mapping: wal_mapping,
             },
         ) {
+            return sql_fail(error);
+        }
+        if let Err(error) = storage.reserve_implicit_index_identities(&mut next) {
             return sql_fail(error);
         }
         let lsn = storage.bump_lsn();
@@ -70642,6 +70677,7 @@ fn coerce_composite_value_inner<'a>(
             not_null_inheritable: true,
             unique: false,
             primary: false,
+            index_identity: None,
             auto_increment: false,
             default: crate::storage::ColumnDefault::NONE,
             is_identity: false,

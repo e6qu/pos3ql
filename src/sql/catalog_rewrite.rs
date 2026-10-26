@@ -31,7 +31,7 @@ fn rule_row<'a>(
     let definition = rule.definition_for(transaction);
     let relation = match definition.target {
         crate::storage::RuleTarget::Table(slot) => super::table_oid(storage, usize::from(slot)),
-        crate::storage::RuleTarget::View(slot) => super::view_oid(usize::from(slot)),
+        crate::storage::RuleTarget::View(slot) => super::view_oid(storage, usize::from(slot)),
     };
     let view = if bodies && definition.name.as_str() == "_RETURN" {
         match definition.target {
@@ -227,14 +227,8 @@ pub(super) fn view_definition<'a>(
     oid: i32,
     arena: &'a Arena,
 ) -> Result<Option<&'a str>, SqlError> {
-    let Some(slot) = oid
-        .checked_sub(super::view_oid(0))
-        .and_then(|slot| usize::try_from(slot).ok())
-        .filter(|slot| *slot < storage.view_count())
-    else {
-        return Ok(None);
-    };
-    if !storage.view_slot_visible_to(slot, transaction) {
+    let slot = super::view_slot_by_oid(storage, transaction, oid);
+    if slot.is_none() {
         let retained = super::select_catalog_rows(
             storage,
             Some("pg_catalog"),
@@ -262,7 +256,7 @@ pub(super) fn view_definition<'a>(
             )),
         };
     }
-    let rule_slot = storage.view_return_rule(slot);
+    let rule_slot = storage.view_return_rule(slot.expect("visible view was resolved"));
     if rule_slot >= storage.rule_count() {
         return Ok(None);
     }

@@ -26,7 +26,7 @@ use crc32c::crc32c;
 
 /// On-disk record header length shared by recovery and logical decoding.
 pub(crate) const HEADER_LEN: usize = 24;
-pub(crate) const RECORD_VERSION: u8 = 15;
+pub(crate) const RECORD_VERSION: u8 = 16;
 
 /// One contiguous, committed journal range ready for immutable publication.
 /// Construction is private to the journal, so callers cannot pair an LSN with
@@ -252,7 +252,7 @@ wal_record_kinds! {
 /// A table definition is an independently versioned payload inside the
 /// object-native logical WAL. Replays reject a definition from an incompatible
 /// schema instead of assigning later bytes to a different column property.
-const TABLE_DEF_PAYLOAD_VERSION: u8 = 9;
+const TABLE_DEF_PAYLOAD_VERSION: u8 = 10;
 const DOMAIN_PAYLOAD_VERSION: u8 = u8::MAX - 2;
 const NO_DOMAIN_BASE_SLOT: u16 = u16::MAX;
 
@@ -2994,6 +2994,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             };
             n += 1;
             n += 3;
+            n += def.implicit_index_identities().count() * 8;
             n
         }
         WalOp::BeginTableRewrite {
@@ -4734,6 +4735,9 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 u8::from(def.row_level_security.forced),
                 def.replica_identity.code(),
             ]);
+            for identity in def.implicit_index_identities() {
+                ok &= identity.is_some() && buffer.append(&identity.map_or(0, |identity| identity.created_at()).to_le_bytes());
+            }
             ok
         }
         WalOp::BeginTableRewrite {
@@ -7770,6 +7774,7 @@ fn decode_op_inner<'a>(
                     not_null_inheritable,
                     unique: meta[1] & 2 != 0,
                     primary: meta[1] & 4 != 0,
+                    index_identity: None,
                     auto_increment: meta[1] & 8 != 0,
                     default,
                     is_identity: meta[1] & 32 != 0,
@@ -7972,6 +7977,16 @@ fn decode_op_inner<'a>(
             def.replica_identity =
                 crate::storage::ReplicaIdentityMode::from_code(*payload.get(at)?)?;
             at += 1;
+            for identity in def.implicit_index_identities_mut() {
+                let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
+                at += 8;
+                *identity = Some(crate::storage::RelationIdentity::parse(created_at)?);
+            }
+            for (position, identity) in def.implicit_index_identities().enumerate() {
+                if def.implicit_index_identities().take(position).any(|earlier| earlier == identity) {
+                    return None;
+                }
+            }
             if at != payload.len() {
                 return None;
             }
@@ -14460,6 +14475,7 @@ mod tests {
             not_null_inheritable: true,
             unique: true,
             primary: true,
+            index_identity: None,
             auto_increment: false,
             default: ColumnDefault::NONE,
             is_identity: false,
@@ -14480,6 +14496,7 @@ mod tests {
             not_null_inheritable: true,
             unique: false,
             primary: false,
+            index_identity: None,
             auto_increment: false,
             default: ColumnDefault::Constant {
                 value: OwnedDatum::Int4(7),

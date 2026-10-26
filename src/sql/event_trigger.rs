@@ -409,7 +409,7 @@ impl EventObjectRef {
                 let table_slot = usize::from(table);
                 let table = storage.table_def(table_slot, txid);
                 index_object(
-                    catalog::index_oid(table_slot, usize::from(position)),
+                    catalog::index_oid(&table, usize::from(position)),
                     name.as_str(),
                     &table,
                 )?
@@ -419,7 +419,7 @@ impl EventObjectRef {
                 let table = storage.table_def(slot, txid);
                 base_object(
                     catalog::PG_TYPE_OID,
-                    catalog::FIRST_TABLE_COMPOSITE_TYPE_OID + slot as i32,
+                    catalog::table_row_type_oid(storage, slot, false),
                     "type",
                     Some(table.schema.as_str()),
                     Some(table.name.as_str()),
@@ -433,12 +433,12 @@ impl EventObjectRef {
                 array_type_object(
                     table.schema.as_str(),
                     table.name.as_str(),
-                    catalog::FIRST_TABLE_COMPOSITE_ARRAY_TYPE_OID + slot as i32,
+                    catalog::table_row_type_oid(storage, slot, true),
                 )?
             }
             Self::ToastRelation(slot) | Self::ToastIndex(slot) => {
                 let slot = usize::from(slot);
-                let table_oid = catalog::user_table_oid(slot);
+                let table_oid = catalog::user_table_oid(storage, slot);
                 let toast_name = crate::stack_format!(64, "pg_toast_{}", table_oid);
                 let is_index = matches!(self, Self::ToastIndex(_));
                 let name = if is_index {
@@ -449,9 +449,9 @@ impl EventObjectRef {
                 base_object(
                     catalog::PG_CLASS_OID,
                     if is_index {
-                        catalog::toast_index_oid(slot)
+                        catalog::toast_index_oid(storage, slot)
                     } else {
-                        catalog::toast_relation_oid(slot)
+                        catalog::toast_relation_oid(storage, slot)
                     },
                     if is_index { "index" } else { "toast table" },
                     Some("pg_toast"),
@@ -470,7 +470,7 @@ impl EventObjectRef {
                 let view = storage.view(slot);
                 base_object(
                     catalog::PG_TYPE_OID,
-                    catalog::FIRST_VIEW_COMPOSITE_TYPE_OID + slot as i32,
+                    catalog::view_row_type_oid(storage, slot, false),
                     "type",
                     Some(view.schema.as_str()),
                     Some(view.name.as_str()),
@@ -484,7 +484,7 @@ impl EventObjectRef {
                 array_type_object(
                     view.schema.as_str(),
                     view.name.as_str(),
-                    catalog::FIRST_VIEW_COMPOSITE_ARRAY_TYPE_OID + slot as i32,
+                    catalog::view_row_type_oid(storage, slot, true),
                 )?
             }
             Self::ViewRule(slot) => {
@@ -565,7 +565,7 @@ impl EventObjectRef {
                 let composite = storage.composite_for(slot, txid);
                 base_object(
                     catalog::PG_CLASS_OID,
-                    catalog::named_composite_relation_oid(slot),
+                    catalog::named_composite_relation_oid(storage, slot),
                     "composite type",
                     Some(composite.schema.as_str()),
                     Some(composite.name.as_str()),
@@ -1587,7 +1587,7 @@ fn primary_object(
             let table = storage.table_def(slot, txid);
             base_object(
                 catalog::PG_CLASS_OID,
-                catalog::user_table_oid(slot),
+                catalog::user_table_oid(storage, slot),
                 "table",
                 Some(table.schema.as_str()),
                 Some(table.name.as_str()),
@@ -1601,7 +1601,7 @@ fn primary_object(
             let name = view.name_for(txid);
             base_object(
                 catalog::PG_CLASS_OID,
-                catalog::view_oid(slot),
+                catalog::view_oid(storage, slot),
                 "view",
                 Some(schema.as_str()),
                 Some(name.as_str()),
@@ -1614,7 +1614,7 @@ fn primary_object(
             let sequence = storage.sequence_for(slot, txid);
             base_object(
                 catalog::PG_CLASS_OID,
-                catalog::sequence_oid(slot),
+                catalog::sequence_oid(storage, slot),
                 "sequence",
                 Some(sequence.schema.as_str()),
                 Some(sequence.name.as_str()),
@@ -1690,7 +1690,7 @@ fn primary_object(
             let table = storage.table_def(table_slot, txid);
             base_object(
                 catalog::PG_CLASS_OID,
-                catalog::user_table_oid(table_slot),
+                catalog::user_table_oid(storage, table_slot),
                 "materialized view",
                 Some(table.schema.as_str()),
                 Some(table.name.as_str()),
@@ -2164,7 +2164,7 @@ pub(crate) fn catalog_object_address(
         if !storage.table_slot_visible_to(slot, txid) {
             continue;
         }
-        let relation = relation_object_ref(storage, txid, catalog::user_table_oid(slot))
+        let relation = relation_object_ref(storage, txid, catalog::user_table_oid(storage, slot))
             .expect("visible tables have relation objects");
         consider!(relation);
         let table = storage.table_def(slot, txid);
@@ -2371,7 +2371,7 @@ pub(crate) fn catalog_object_address(
 
 fn relation_object_ref(storage: &Storage, txid: u32, object_id: i32) -> Option<EventObjectRef> {
     for slot in 0..storage.table_count() {
-        if storage.table_slot_visible_to(slot, txid) && catalog::user_table_oid(slot) == object_id {
+        if storage.table_slot_visible_to(slot, txid) && catalog::user_table_oid(storage, slot) == object_id {
             return Some(EventObjectRef::Primary(
                 storage
                     .matview_slot_for_table(slot, txid)
@@ -2380,18 +2380,18 @@ fn relation_object_ref(storage: &Storage, txid: u32, object_id: i32) -> Option<E
         }
     }
     for slot in 0..storage.view_count() {
-        if storage.view_slot_visible_to(slot, txid) && catalog::view_oid(slot) == object_id {
+        if storage.view_slot_visible_to(slot, txid) && catalog::view_oid(storage, slot) == object_id {
             return Some(EventObjectRef::Primary(ObjectRef::View(slot)));
         }
     }
     for slot in 0..storage.sequence_count() {
-        if storage.sequence_slot_visible_to(slot, txid) && catalog::sequence_oid(slot) == object_id
+        if storage.sequence_slot_visible_to(slot, txid) && catalog::sequence_oid(storage, slot) == object_id
         {
             return Some(EventObjectRef::Primary(ObjectRef::Sequence(slot)));
         }
     }
     for (slot, _) in storage.composites_with_slots_visible_to(txid) {
-        if catalog::named_composite_relation_oid(slot) == object_id {
+        if catalog::named_composite_relation_oid(storage, slot) == object_id {
             return Some(EventObjectRef::CompositeRelation(slot as u16));
         }
     }
@@ -2473,30 +2473,16 @@ fn type_object_ref(storage: &Storage, txid: u32, object_id: i32) -> Option<Event
     {
         return Some(EventObjectRef::CompositeArray(slot as u16));
     }
-    if let Some(slot) = slot_in(
-        catalog::FIRST_TABLE_COMPOSITE_TYPE_OID,
-        storage.table_count(),
-    ) && storage.table_slot_visible_to(slot, txid)
-    {
+    if let Some(slot) = catalog::table_slot_by_row_type_oid(storage, txid, object_id, false) {
         return Some(EventObjectRef::TableRowType(slot as u16));
     }
-    if let Some(slot) = slot_in(
-        catalog::FIRST_TABLE_COMPOSITE_ARRAY_TYPE_OID,
-        storage.table_count(),
-    ) && storage.table_slot_visible_to(slot, txid)
-    {
+    if let Some(slot) = catalog::table_slot_by_row_type_oid(storage, txid, object_id, true) {
         return Some(EventObjectRef::TableArrayType(slot as u16));
     }
-    if let Some(slot) = slot_in(catalog::FIRST_VIEW_COMPOSITE_TYPE_OID, storage.view_count())
-        && storage.view_slot_visible_to(slot, txid)
-    {
+    if let Some(slot) = catalog::view_slot_by_row_type_oid(storage, txid, object_id, false) {
         return Some(EventObjectRef::ViewRowType(slot as u16));
     }
-    if let Some(slot) = slot_in(
-        catalog::FIRST_VIEW_COMPOSITE_ARRAY_TYPE_OID,
-        storage.view_count(),
-    ) && storage.view_slot_visible_to(slot, txid)
-    {
+    if let Some(slot) = catalog::view_slot_by_row_type_oid(storage, txid, object_id, true) {
         return Some(EventObjectRef::ViewArrayType(slot as u16));
     }
     let column_type = crate::sql::types::ColType::from_oid(object_id)?;
@@ -3237,7 +3223,7 @@ fn push_alter_table_drops(
         return Ok(());
     };
     let new = storage.table_def(slot, txid);
-    let table_oid = catalog::user_table_oid(slot);
+    let table_oid = catalog::user_table_oid(storage, slot);
     let (inline_positions, named_start) = table_index_positions(old);
 
     let constraint_removed = |name: &str| {
@@ -3334,7 +3320,7 @@ fn push_alter_table_drops(
                     .iter()
                     .position(|constraint| constraint.name.as_str() == *name)
                 {
-                    let index_oid = catalog::index_oid(slot, named_start + index);
+                    let index_oid = catalog::index_oid(old, named_start + index);
                     push_drop_once(
                         output,
                         count,
@@ -3359,7 +3345,7 @@ fn push_alter_table_drops(
                     .position(|constraint| constraint.name.as_str() == *name)
                 {
                     let index_oid =
-                        catalog::index_oid(slot, named_start + old.uniques().len() + index);
+                        catalog::index_oid(old, named_start + old.uniques().len() + index);
                     push_drop_once(
                         output,
                         count,
@@ -3394,8 +3380,7 @@ fn push_alter_table_drops(
                             .is_some_and(|generated| generated.as_str() == *name)
                         {
                             if column.primary || column.unique {
-                                let index_oid = catalog::index_oid(
-                                    slot,
+                                let index_oid = catalog::index_oid(old,
                                     usize::from(
                                         inline_positions[column_index].ok_or_else(graph_full)?,
                                     ),
@@ -3508,8 +3493,7 @@ fn push_alter_table_drops(
             } else {
                 inline_unique_name(old, column)
             };
-            let index_oid = catalog::index_oid(
-                slot,
+            let index_oid = catalog::index_oid(old,
                 usize::from(inline_positions[column_index].ok_or_else(graph_full)?),
             );
             push_drop_once(
@@ -3538,7 +3522,7 @@ fn push_alter_table_drops(
             .iter()
             .any(|candidate| candidate.name == unique.name)
         {
-            let index_oid = catalog::index_oid(slot, named_start + index);
+            let index_oid = catalog::index_oid(old, named_start + index);
             push_drop_once(
                 output,
                 count,
@@ -3565,7 +3549,7 @@ fn push_alter_table_drops(
             .iter()
             .any(|candidate| candidate.name == exclusion.name)
         {
-            let index_oid = catalog::index_oid(slot, named_start + old.uniques().len() + index);
+            let index_oid = catalog::index_oid(old, named_start + old.uniques().len() + index);
             push_drop_once(
                 output,
                 count,
@@ -3750,7 +3734,7 @@ fn push_table_drop_dependents(
             None
         };
         if let Some(name) = name {
-            let index_oid = catalog::index_oid(slot, position);
+            let index_oid = catalog::index_oid(&table, position);
             push_drop(
                 output,
                 count,
@@ -3777,7 +3761,7 @@ fn push_table_drop_dependents(
         }
     }
     for unique in table.uniques() {
-        let index_oid = catalog::index_oid(slot, position);
+        let index_oid = catalog::index_oid(&table, position);
         push_drop(
             output,
             count,
@@ -3803,7 +3787,7 @@ fn push_table_drop_dependents(
         position += 1;
     }
     for exclusion in table.exclusions() {
-        let index_oid = catalog::index_oid(slot, position);
+        let index_oid = catalog::index_oid(&table, position);
         push_drop(
             output,
             count,

@@ -42755,13 +42755,7 @@ fn build_composite_spec(
             let ctype = if array {
                 ColType::Array(
                     ArrElem::domain(
-                        storage
-                            .domain_identity_slot(
-                                domain.schema.as_str(),
-                                domain.name.as_str(),
-                                txid,
-                            )
-                            .expect("visible domain has slot") as u16,
+                        domain.creation(),
                         domain.base,
                     )
                     .ok_or_else(|| {
@@ -54473,6 +54467,70 @@ pub(crate) fn resolve_parameter_input_type(
     let ctype = ColType::from_oid(oid).ok_or_else(|| sql_err!(sqlstate::FEATURE_NOT_SUPPORTED,
         "binary format for parameter type OID {} is not implemented", oid))?;
     Ok(ParameterInputType::Builtin(ctype))
+}
+
+pub(crate) fn decode_binary_input<'a>(
+    storage: &Storage,
+    oid: i32,
+    bytes: &'a [u8],
+    arena: &'a Arena,
+    txid: u32,
+) -> Result<Datum<'a>, SqlError> {
+    if oid == crate::sql::types::oid::REGTYPE {
+        let bytes: [u8; 4] = bytes.try_into().map_err(|_| {
+            sql_err!(
+                sqlstate::INVALID_BINARY_REPRESENTATION,
+                "invalid binary representation for parameter type OID {}",
+                oid
+            )
+        })?;
+        return crate::sql::eval::regtype_of_oid(i64::from(i32::from_be_bytes(bytes)), arena);
+    }
+    let decoded = match resolve_parameter_input_type(storage, oid, txid)? {
+        ParameterInputType::Builtin(ctype) => {
+            decode_binary_field_with_catalog(ctype, bytes, arena, storage, txid)
+        }
+        ParameterInputType::Domain { target: slot, base } => {
+            let value = decode_binary_field_with_catalog(base, bytes, arena, storage, txid)?;
+            coerce_domain_value(
+                storage,
+                slot,
+                value,
+                txid,
+                arena,
+                crate::sql::eval::NO_PARAMS,
+            )
+        }
+        ParameterInputType::DomainArray(element) => {
+            decode_binary_field_with_catalog(ColType::Array(element), bytes, arena, storage, txid)
+        }
+    };
+    // COPY framing errors are 22P04, but a Bind value is an individual type's
+    // binary input and PostgreSQL reports malformed bytes as 22P03. Keep the
+    // codec shared while preserving the protocol boundary in its error type.
+    decoded.map_err(|error| {
+        if error.sqlstate == sqlstate::BAD_COPY_FILE_FORMAT {
+            sql_err!(
+                sqlstate::INVALID_BINARY_REPRESENTATION,
+                "invalid binary representation for parameter type OID {}",
+                oid
+            )
+        } else {
+            error
+        }
+    })
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BinaryOutputCapability {
+    Supported,
+    /// The result type itself has no send function, so PostgreSQL fails while
+    /// initializing binary output even when the result contains no rows.
+    MissingAclItemSend,
+    /// `array_send` exists, but fails only for a non-NULL array because its
+    /// aclitem element type has no send function.
+    MissingAclItemElementSend,
+    Unsupported,
 }
 
 /// Resolves binary output capability at the catalog OID boundary. Keeping the

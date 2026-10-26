@@ -5475,7 +5475,7 @@ mod tests {
     fn btree_operator_classes_are_closed_and_match_postgres_catalogs() {
         let cases = [
             (ColType::Array(ArrElem::Int4), BtreeOperatorClass::Array),
-            (ColType::Enum(0), BtreeOperatorClass::Enum),
+            (ColType::Enum(None), BtreeOperatorClass::Enum),
             (
                 ColType::Multirange(RangeKind::Int4),
                 BtreeOperatorClass::Multirange,
@@ -5499,7 +5499,7 @@ mod tests {
             (ColType::Name, BtreeOperatorClass::Name),
             (ColType::Numeric, BtreeOperatorClass::Numeric),
             (ColType::Regclass, BtreeOperatorClass::Oid),
-            (ColType::Composite(0), BtreeOperatorClass::Record),
+            (ColType::Composite(None), BtreeOperatorClass::Record),
             (ColType::Varchar, BtreeOperatorClass::Text),
             (ColType::Time, BtreeOperatorClass::Time),
             (ColType::Timestamp, BtreeOperatorClass::Timestamp),
@@ -5898,13 +5898,13 @@ mod code_roundtrip_tests {
         );
         assert_ne!(
             ColType::Array(ArrElem::Record).code(),
-            ColType::Array(ArrElem::Composite(
-                crate::storage::MAX_COMPOSITE_CATALOG_SLOTS as u16 - 1
-            ))
+            ColType::Array(ArrElem::Composite(Some(
+                crate::storage::TypeCreation::parse(9_999_999).unwrap()
+            )))
             .code()
         );
         assert_eq!(
-            ColType::from_code(ColType::Enum(0).code()),
+            ColType::from_code(ColType::Enum(None).code()),
             Some(ColType::Enum(None))
         );
     }

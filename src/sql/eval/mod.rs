@@ -3829,14 +3829,21 @@ fn effective_quantified_collations<'a>(
     Ok(output)
 }
 
-fn typed_field_value<'a>(field: &super::types::RecordField<'a>) -> Datum<'a> {
-    if field.value.is_null() {
-        ColType::from_oid(field.type_oid)
-            .map(super::query::type_witness)
-            .unwrap_or(Datum::Null)
-    } else {
-        field.value
-    }
+fn typed_field_value<'a>(
+    field: &super::types::RecordField<'a>,
+    catalog: Option<&dyn CatalogAccess>,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    if !field.value.is_null() { return Ok(field.value); }
+    if field.type_oid == super::types::oid::UNKNOWN { return Ok(Datum::Null); }
+    if let Some(ctype) = ColType::from_oid(field.type_oid)
+        .or_else(|| catalog.and_then(|catalog| catalog.domain_base_type(field.type_oid)))
+    { return super::query::type_witness(ctype); }
+    if let Some(catalog) = catalog
+        && let Some(fields) = catalog.null_composite_fields(field.type_oid, arena)?
+    { return Ok(Datum::Record(fields)); }
+    Err(sql_err!(sqlstate::FEATURE_NOT_SUPPORTED,
+        "record field type OID {} is not supported", field.type_oid))
 }
 
 fn quantified_scalar<'a>(
@@ -3905,8 +3912,8 @@ pub(crate) fn quantified_comparison<'a>(
             for (index, (left, right)) in left.iter().zip(right).enumerate() {
                 let _ = quantified_scalar(
                     operator,
-                    typed_field_value(left),
-                    typed_field_value(right),
+                    typed_field_value(left, catalog, arena)?,
+                    typed_field_value(right, catalog, arena)?,
                     collations[index],
                     catalog,
                     arena,

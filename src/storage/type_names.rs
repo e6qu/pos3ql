@@ -692,3 +692,39 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod oid_identity_tests {
+    use super::*;
+    use crate::sql::types::{ArrElem, ColType, oid};
+
+    #[test]
+    fn named_type_oid_ranges_preserve_creation_stamps_beyond_catalog_capacity() {
+        crate::mem::guard::forbid_alloc(|| {
+            for birth in [1, 254, 255, 256, 65_535, 65_536, 9_999_999] {
+                let creation = super::super::TypeCreation::parse(birth).unwrap();
+                for (kind, scalar, array) in [
+                    (NamedTypeKind::Domain, oid::domain_oid(creation), oid::domain_array_oid(creation)),
+                    (NamedTypeKind::Enum, oid::enum_oid(creation), oid::enum_array_oid(creation)),
+                    (NamedTypeKind::Composite, oid::composite_oid(creation), oid::composite_array_oid(creation)),
+                ] {
+                    assert_eq!(NamedTypeKind::from_oid(scalar), Some((kind, creation, false)));
+                    assert_eq!(NamedTypeKind::from_oid(array), Some((kind, creation, true)));
+                }
+                for scalar in [ColType::Enum(Some(creation)), ColType::Composite(Some(creation))] {
+                    assert_eq!(ColType::from_oid(scalar.oid()), Some(scalar));
+                    let array = ColType::Array(ArrElem::from_coltype(scalar).unwrap());
+                    assert_eq!(ColType::from_oid(array.oid()), Some(array));
+                }
+            }
+            for first in [oid::FIRST_DOMAIN, oid::FIRST_ENUM, oid::FIRST_COMPOSITE,
+                oid::FIRST_DOMAIN_ARRAY, oid::FIRST_ENUM_ARRAY, oid::FIRST_COMPOSITE_ARRAY] {
+                assert!(NamedTypeKind::from_oid(first).is_none());
+                assert!(NamedTypeKind::from_oid(first + 10_000_000).is_none());
+            }
+            assert_eq!(ColType::Enum(None).try_oid(), None);
+            assert_eq!(ColType::Composite(None).try_oid(), None);
+            assert_eq!(ColType::Array(ArrElem::Enum(None)).try_oid(), None);
+        });
+    }
+}

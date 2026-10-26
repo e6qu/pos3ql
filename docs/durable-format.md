@@ -322,8 +322,13 @@ before its cached label. A clear high bit retains the legacy decoder. Composite
 physical-field counts use bit 15 to mark records whose enum leaves contain member
 ordinals. The remaining bits retain the physical attribute count. The marker
 covers nested records and arrays; ordinary text fields retain their original text.
-Frozen enum defaults use journal/default tag 42 for a member identity; tag 12
-remains readable.
+Frozen enum defaults use tag 201 with a member identity or tag 202 with an
+explicit label binding. Both store a four-byte type creation stamp. Previous
+slot-based tags 12/42 are rejected. Cached array defaults use tag 200 and a
+checked six-byte element descriptor, including a domain's own creation and its
+named base creation. Previous array-default tags 21/41 are rejected. The same
+compact descriptor identifies arrays in schema-less spill rows; named scalar
+spill values carry a four-byte creation stamp.
 Their labels obey the [PostgreSQL 18 limit of 63 bytes](https://www.postgresql.org/docs/18/datatype-enum.html#DATATYPE-ENUM-IMPLEMENTATION-DETAILS).
 Object-reference defaults such as `'orders'::regclass` retain the full type and
 target OIDs in the encoded record. Their memory cache uses a closed type tag;
@@ -378,6 +383,13 @@ Built-in tablespaces keep OIDs 1663 and 1664. Custom tablespace OIDs are
 publication. No conversion saturates or substitutes an identifier.
 
 Named-type source references admit creation stamps from 1 through 9,999,999.
+SQL type identifiers add that stamp to disjoint bases: domains 180,000,000,
+enums 200,000,000 and named composites 220,000,000; their arrays use
+240,000,000, 260,000,000 and 280,000,000 respectively. These ranges are
+independent of configured catalog positions. Dropping and recreating a type
+reserves a different stamp even when its position and SQL name are reused.
+Runtime declarations explicitly lack a creation until binding resolves the
+source; values and emitted identifiers require a checked creation.
 Their checked three-byte runtime representation cannot contain zero or an
 out-of-range value. Fresh creation returns `54000` when the shared catalog
 sequence reaches this limit. Unsupported stored stamps are rejected before
@@ -424,7 +436,7 @@ including objects deleted before checkpoint. Restore never assigns
 a fresh lifetime to a saved type. Slots are checked against configured capacity;
 zero creation identities, mismatched lifetimes and unavailable slots are errors.
 
-The manifest writes `dom5`, `enm2` and `cmp2` records before a required
+The manifest writes `dom5`, `enm3` and `cmp2` records before a required
 `types_end` record. At that boundary, recovery resolves domain chains and
 composite fields in each database before loading dependent definitions. Missing
 or duplicate boundaries and later type records are rejected.

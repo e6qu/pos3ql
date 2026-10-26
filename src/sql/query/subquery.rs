@@ -276,7 +276,7 @@ fn scope_record_witness<'a>(
     if let Expr::Cast { type_name, .. } = expression
         && let Some(slot) = storage.resolve_composite_slot(type_name, txid)
     {
-        return composite_slot_witness(storage, txid, slot, arena).map(Some);
+        return composite_slot_witness(storage, txid, storage.composite_for(slot, txid).creation(), arena).map(Some);
     }
     let Some(scope) = scope else {
         return Ok(None);

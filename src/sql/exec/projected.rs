@@ -178,7 +178,7 @@ pub fn projected_value_len(v: &Datum) -> usize {
         Datum::Json { text, .. } => 5 + text.len(),
         Datum::JsonPath(text) => 4 + text.len(),
         Datum::Snapshot { value, .. } => 5 + value.raw().len(),
-        // element code + user-type slot + domain base code/slot + byte length
+        // Compact element descriptor plus byte length.
         Datum::Array { raw, .. } => 10 + raw.len(),
         Datum::Int2Vector { raw, .. } | Datum::OidVector { raw, .. } => 8 + raw.len(),
         Datum::Bytea(b) => 4 + b.len(),
@@ -187,8 +187,7 @@ pub fn projected_value_len(v: &Datum) -> usize {
         Datum::Bit { bits, .. } => 5 + bits.len(),
         Datum::Multirange { text, .. } => 5 + text.len(),
         Datum::Geometry { text, .. } => 5 + text.len(),
-        // Projected values are schema-less, so an enum carries its slot too:
-        // slot(2) + sort(8) + 4-byte label length + label bytes.
+        // Schema-less enums retain creation(4), sort(8), member(4) and label length(4).
         Datum::Enum { label, .. } => 20 + label.len(),
         // A record stores its rendered text (the arena-free decode returns
         // that, keeping comparators and output unchanged) followed by a
@@ -1250,26 +1249,26 @@ mod tests {
     }
 
     #[test]
-    fn user_type_array_slots_round_trip_through_schema_less_spill_rows() {
+    fn user_type_array_creations_round_trip_through_schema_less_spill_rows() {
         use crate::sql::types::{ArrElem, ColType};
 
         let mut budget = Budget::new(4096);
         let arena = Arena::new(&mut budget, "user array projected row", 2048).unwrap();
         let values = [
             Datum::Array {
-                element: ArrElem::Enum(513),
+                element: ArrElem::Enum(Some(crate::storage::TypeCreation::parse(9_999_997).unwrap())),
                 raw: b"enum",
             },
             Datum::Array {
                 element: ArrElem::Domain {
-                    identity: 769,
-                    base_code: ColType::Composite(1025).code(),
-                    base_identity: 1025,
+                    identity: Some(crate::storage::TypeCreation::parse(9_999_998).unwrap()),
+                    base_code: ColType::Composite(None).code(),
+                    base_identity: Some(crate::storage::TypeCreation::parse(9_999_999).unwrap()),
                 },
                 raw: b"domain",
             },
             Datum::Array {
-                element: ArrElem::Composite(1281),
+                element: ArrElem::Composite(Some(crate::storage::TypeCreation::parse(9_999_999).unwrap())),
                 raw: b"composite",
             },
         ];

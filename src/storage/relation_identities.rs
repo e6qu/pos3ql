@@ -188,7 +188,8 @@ impl Storage {
         let views = self.view_rule_catalog();
         let sequences = self.sequence_catalog();
         for (_, database) in self.databases_visible_to(0) {
-            for first in (1..=saved_sequence.min(MAX_RELATION_GENERATION)).step_by(WIDTH as usize) {
+            // Inspect one range even when a corrupt manifest claims no reservations.
+            for first in (1..=saved_sequence.clamp(1, MAX_RELATION_GENERATION)).step_by(WIDTH as usize) {
                 let mut seen = [0u64; WORDS];
                 let mut check = |created_at: u64| -> Result<(), SqlError> {
                     if RelationIdentity::parse(created_at).is_none() || created_at > saved_sequence

@@ -58153,6 +58153,7 @@ mod tests {
         let config = test_config();
         let mut budget = test_budget(&config);
         let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
+        storage.validate_restored_relation_identities(0).unwrap();
         let mut definition = make_def("identity_orders", &[("id", ColType::Int4, true)]);
         definition.columns[0].primary = true;
         let slot = storage.create_table(definition).unwrap();
@@ -58160,6 +58161,15 @@ mod tests {
         storage
             .validate_restored_relation_identities(sequence)
             .unwrap();
+        for saved_sequence in [0, storage.table(slot).created_at()] {
+            let error = crate::mem::guard::forbid_alloc(|| {
+                storage.validate_restored_relation_identities(saved_sequence)
+            })
+            .unwrap_err();
+            assert_eq!(error.sqlstate, sqlstate::DATA_EXCEPTION);
+            assert!(error.message.as_str().contains("invalid"));
+            assert_eq!(storage.catalog_identity_sequence(), sequence);
+        }
         let table_identity = storage.table(slot).created_at();
         let revision = storage.reserve_table_definition_revision().unwrap();
         storage.tables[slot]

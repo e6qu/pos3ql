@@ -392,7 +392,8 @@ fn collect_stored_query_composite_field_rename_select<'a>(
         outer_scope: outer_scope.map(|scope| scope.current),
         storage: rename.storage,
         txid: rename.txid,
-    });
+    arena: rename.arena,
+});
     let columns: &dyn super::exec::ColTypeResolver = match (&catalog_columns, outer_scope) {
         (Some(columns), _) => columns,
         (None, Some(scope)) => &ScopeCols(scope.current),
@@ -4883,7 +4884,7 @@ fn patch_subquery_column_types<'a>(
     txid: u32,
     arena: &'a Arena,
     columns: &mut [ColDesc],
-) {
+) -> Result<(), SqlError> {
     let mut slot = 0usize;
     for item in items {
         match item {
@@ -4894,7 +4895,7 @@ fn patch_subquery_column_types<'a>(
                     .unwrap_or(0);
             }
             SelectItem::RecordStar(base) => {
-                slot += scope.map_or(0, |s| record_star_width(base, s));
+                slot += scope.map(|s| record_star_width(base, s)).transpose()?.unwrap_or(0);
             }
             SelectItem::Expr { expression, .. } => {
                 if slot < columns.len()
@@ -4959,6 +4960,7 @@ fn patch_subquery_column_types<'a>(
             }
         }
     }
+    Ok(())
 }
 
 type CorrelatedScalarScratch<'a> = [(*const Expr<'a>, Datum<'a>, Datum<'a>)];
@@ -5153,7 +5155,7 @@ fn resolve_group_ordinals<'a>(
                 None => 0,
             },
             SelectItem::RecordStar(expression) => {
-                scope.map_or(0, |scope| record_star_width(expression, scope))
+                scope.map(|scope| record_star_width(expression, scope)).transpose()?.unwrap_or(0)
             }
             SelectItem::Expr { .. } => 1,
         };
@@ -5268,7 +5270,7 @@ pub(super) fn resolve_sort_key<'a>(
                 SelectItem::TableWildcard(qualifier) => {
                     index += scope.qualified_star_columns(qualifier)?;
                 }
-                SelectItem::RecordStar(base) => index += record_star_width(base, scope),
+                SelectItem::RecordStar(base) => index += record_star_width(base, scope)?,
             }
         }
         if let Some(index) = named_output.or(equal_output) {
@@ -5357,7 +5359,7 @@ fn resolve_position_target<'a>(
                 let Some(scope) = scope else {
                     return Err(position_error());
                 };
-                let width = record_star_width(base, scope);
+                let width = record_star_width(base, scope)?;
                 if remaining < width {
                     let target = remaining;
                     let mut result = None;
@@ -5375,7 +5377,7 @@ fn resolve_position_target<'a>(
                                 ));
                         }
                         index += 1;
-                    });
+                    })?;
                     return result.unwrap_or_else(|| Err(position_error()));
                 }
                 remaining -= width;
@@ -6611,7 +6613,8 @@ pub(crate) fn select_query_resumable<'a, 'statement>(
             outer_scope: None,
             storage,
             txid,
-        };
+        arena: arena,
+};
         let check = |e: &Expr| -> Result<(), SqlError> {
             if user_type_expression_description(e, "", storage, txid).is_some() {
                 Ok(())
@@ -6682,7 +6685,7 @@ pub(crate) fn select_query_resumable<'a, 'statement>(
     ) {
         return sql_fail(e);
     }
-    patch_subquery_column_types(
+    if let Err(error) = patch_subquery_column_types(
         statement.items,
         Some(&scope),
         &outer_subs.base,
@@ -6691,7 +6694,7 @@ pub(crate) fn select_query_resumable<'a, 'statement>(
         txid,
         arena,
         &mut columns[..n_cols],
-    );
+    ) { return sql_fail(error); }
     responder.row_description(&columns[..n_cols])?;
 
     let limit = match super::exec::eval_limit_pub(statement.limit, arena, params) {
@@ -7170,7 +7173,7 @@ pub(crate) fn constant_select_resumable<'a, 'statement>(
     ) {
         return sql_fail(e);
     }
-    patch_subquery_column_types(
+    if let Err(error) = patch_subquery_column_types(
         statement.items,
         None,
         &subs,
@@ -7179,7 +7182,7 @@ pub(crate) fn constant_select_resumable<'a, 'statement>(
         txid,
         arena,
         &mut columns[..n],
-    );
+    ) { return sql_fail(error); }
     let catalog = StorageCatalog {
         storage,
         routine_workspace: arena,
@@ -8654,7 +8657,8 @@ pub fn describe_scope_items<'q>(
                     outer_scope,
                     storage,
                     txid,
-                };
+                arena: arena,
+};
                 let user_type = user_type_expression_description(expression, name, storage, txid);
                 let (mut oid, mut typlen) = match user_type {
                     Some(description) => (description.type_oid, description.typlen),
@@ -8826,7 +8830,7 @@ pub fn describe_select_items<'q>(
                 }
             }
             SelectItem::RecordStar(base) => {
-                column += scope.map_or(0, |scope| record_star_width(base, scope));
+                column += scope.map(|scope| record_star_width(base, scope)).transpose()?.unwrap_or(0);
             }
             SelectItem::Expr { expression, .. } => {
                 if let Some(description) =
@@ -8867,7 +8871,7 @@ fn patch_array_subquery_field_types<'q>(
                 }
             }
             SelectItem::RecordStar(base) => {
-                column += outer_scope.map_or(0, |scope| record_star_width(base, scope));
+                column += outer_scope.map(|scope| record_star_width(base, scope)).transpose()?.unwrap_or(0);
             }
             SelectItem::Expr { expression, .. } => {
                 if let Some((ctype, type_mod)) =
@@ -9470,7 +9474,8 @@ fn describe_scope_record_star<'q>(
         outer_scope: None,
         storage,
         txid,
-    };
+    arena: arena,
+};
     match base {
         Expr::Call { name, .. } if name.eq_ignore_ascii_case("row") => {
             super::exec::check_row_field_types(base, &resolver)?;
@@ -9485,7 +9490,7 @@ fn describe_scope_record_star<'q>(
                     .err();
                 }
                 index += 1;
-            })
+            })?
             .ok_or_else(|| super::exec::could_not_identify("*"))?;
             if let Some(error) = error {
                 return Err(error);
@@ -9731,6 +9736,7 @@ pub(crate) struct CatalogScopeCols<'scope, 'definition, 'storage> {
     pub(crate) outer_scope: Option<&'scope QueryScope<'definition>>,
     pub(crate) storage: &'storage Storage,
     pub(crate) txid: u32,
+    pub(crate) arena: &'storage Arena,
 }
 
 impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_> {
@@ -10014,38 +10020,8 @@ impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_> {
         &self,
         type_name: &str,
         index: usize,
-    ) -> Option<(crate::util::StackStr<64>, super::exec::StaticTypeMeta)> {
-        if let Some(column) =
-            super::catalog::table_rowtype_field(self.storage, self.txid, type_name, index)
-        {
-            return Some((
-                crate::util::StackStr::from_str(column.name.as_str()),
-                super::exec::StaticTypeMeta {
-                    ctype: column.ctype,
-                    type_oid: self.storage.routine_type_oid(
-                        column.ctype,
-                        column.user_type,
-                        self.txid,
-                    )?,
-                    type_mod: column.type_mod,
-                    collation: column.collation,
-                },
-            ));
-        }
-        let slot = self.storage.resolve_composite_slot(type_name, self.txid)?;
-        let definition = self.storage.composite_for(slot, self.txid);
-        let field = definition.active_field(index)?;
-        Some((
-            crate::util::StackStr::from_str(field.name.as_str()),
-            super::exec::StaticTypeMeta {
-                ctype: field.ctype,
-                type_oid: self
-                    .storage
-                    .routine_type_oid(field.ctype, field.user_type, self.txid)?,
-                type_mod: field.type_mod,
-                collation: field.collation,
-            },
-        ))
+    ) -> Result<Option<(crate::util::StackStr<64>, crate::sql::exec::StaticTypeMeta)>, SqlError> {
+        crate::sql::exec::catalog_rowtype_field(self.storage, self.txid, type_name, index, self.arena)
     }
 
     fn is_whole_row(&self, name: &str) -> bool {
@@ -10167,8 +10143,8 @@ fn scope_column_type_mod<'a>(
 
 /// The number of columns a `(base).*` record expansion contributes, or 0 when
 /// its shape is not statically known (surfaced loudly at projection time).
-pub(super) fn record_star_width(base: &Expr, scope: &QueryScope) -> usize {
-    super::exec::record_shape(base, &ScopeCols(scope), |_, _| {}).unwrap_or(0)
+pub(super) fn record_star_width(base: &Expr, scope: &QueryScope) -> Result<usize, SqlError> {
+    Ok(super::exec::record_shape(base, &ScopeCols(scope), |_, _| {})?.unwrap_or(0))
 }
 
 fn infer_scope_type(expression: &Expr, scope: &QueryScope) -> Result<(i32, i16), SqlError> {

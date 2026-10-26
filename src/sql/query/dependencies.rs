@@ -474,7 +474,7 @@ fn collect_statement(
                 $excluded.map(|(_, definition)| definition),
                 dependencies,
                 context,
-            )
+arena,)
         }};
     }
     match statement {
@@ -781,7 +781,7 @@ fn collect_dml_routine_calls<'a>(
     excluded: Option<&crate::storage::TableDef>,
     dependencies: &mut StoredQueryDependencies,
     context: CollectionContext<'a>,
-) -> Result<(), SqlError> {
+arena: &Arena,) -> Result<(), SqlError> {
     collect_dml_routine_calls_with_output(
         expression,
         storage,
@@ -791,7 +791,7 @@ fn collect_dml_routine_calls<'a>(
         dependencies,
         context,
         None,
-    )
+arena,)
 }
 
 #[expect(
@@ -807,7 +807,7 @@ fn collect_dml_routine_calls_with_output<'a>(
     dependencies: &mut StoredQueryDependencies,
     context: CollectionContext<'a>,
     returning_output: Option<(&crate::storage::TableDef, [&'a str; 2])>,
-) -> Result<(), SqlError> {
+arena: &Arena,) -> Result<(), SqlError> {
     let resolver = DependencyTypes {
         scope,
         excluded,
@@ -815,7 +815,8 @@ fn collect_dml_routine_calls_with_output<'a>(
         txid,
         returning_output,
         transition: context.transition,
-    };
+    arena: arena,
+};
     let mut needs_scope = false;
     fn visit(
         expression: &Expr<'_>,
@@ -923,7 +924,7 @@ fn collect_returning_expression<'a>(
         dependencies,
         context,
         Some((target, aliases)),
-    )
+arena,)
 }
 
 fn record_dml_column_references(
@@ -1242,6 +1243,7 @@ struct DependencyTypes<'scope, 'definition, 'storage> {
     storage: &'storage Storage,
     txid: u32,
     returning_output: Option<(&'storage crate::storage::TableDef, [&'definition str; 2])>,
+    arena: &'storage Arena,
 }
 
 impl ColTypeResolver for DependencyTypes<'_, '_, '_> {
@@ -1328,7 +1330,8 @@ impl ColTypeResolver for DependencyTypes<'_, '_, '_> {
                 outer_scope: None,
                 storage: self.storage,
                 txid: self.txid,
-            },
+            arena: self.arena,
+},
             qualifier,
             name,
         )
@@ -1420,21 +1423,8 @@ impl ColTypeResolver for DependencyTypes<'_, '_, '_> {
         &self,
         type_name: &str,
         index: usize,
-    ) -> Option<(crate::util::StackStr<64>, StaticTypeMeta)> {
-        let slot = self.storage.resolve_composite_slot(type_name, self.txid)?;
-        let definition = self.storage.composite_for(slot, self.txid);
-        let field = definition.active_field(index)?;
-        Some((
-            crate::util::StackStr::from_str(field.name.as_str()),
-            StaticTypeMeta {
-                ctype: field.ctype,
-                type_oid: self
-                    .storage
-                    .routine_type_oid(field.ctype, field.user_type, self.txid)?,
-                type_mod: field.type_mod,
-                collation: field.collation,
-            },
-        ))
+    ) -> Result<Option<(crate::util::StackStr<64>, crate::sql::exec::StaticTypeMeta)>, SqlError> {
+        crate::sql::exec::catalog_rowtype_field(self.storage, self.txid, type_name, index, self.arena)
     }
 
     fn is_whole_row(&self, name: &str) -> bool {
@@ -1510,7 +1500,8 @@ fn collect_routine_dependencies(
         storage,
         txid,
         returning_output: None,
-    };
+    arena: arena,
+};
     let needs_scope =
         collect_routine_dependencies_with_resolver(select, storage, txid, dependencies, &resolver)?;
     if needs_scope {
@@ -1531,7 +1522,8 @@ fn collect_routine_dependencies(
                 storage,
                 txid,
                 returning_output: None,
-            };
+            arena: arena,
+};
             if collect_routine_dependencies_with_resolver(
                 select,
                 storage,
@@ -1588,7 +1580,8 @@ pub(super) fn stored_routine_dependency_for_call(
         storage,
         txid,
         returning_output: None,
-    };
+    arena: arena,
+};
     let mut argument_oids = [0_i32; crate::storage::MAX_ROUTINE_ARGUMENTS];
     for (output, argument) in argument_oids.iter_mut().zip(args.iter().copied()) {
         *output = match crate::sql::exec::infer_routine_argument_oid(argument, &resolver) {
@@ -1678,7 +1671,8 @@ pub(super) fn stored_operator_dependency_for_call(
         storage,
         txid,
         returning_output: None,
-    };
+    arena: arena,
+};
     let mut argument_oids = [0_i32; 2];
     for (output, argument) in argument_oids.iter_mut().zip(args.iter().copied()) {
         *output = match crate::sql::exec::infer_routine_argument_oid(argument, &resolver) {

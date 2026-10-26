@@ -10980,8 +10980,6 @@ const fn foreign_key_action_routine(action: crate::storage::FkAction, update: bo
         (FkAction::NoAction, true) => 1655,
     }
 }
-/// PostgreSQL gives every named composite a backing `pg_class` relation whose
-/// OID links `pg_type.typrelid` and its `pg_attribute` rows.
 const FIRST_EXTENDED_STATISTICS_OID: i32 = 300_000;
 const FIRST_EXTENSION_OID: i32 = 500_000;
 
@@ -11821,8 +11819,8 @@ pub fn relname_text<'a>(
                 .map_err(|_| arena_full());
         }
     }
-    // Startup validates disjoint relation bands. Only index identities need
-    // the synthesized-index walk, and its owned name needs no catalog rows.
+    // Other relation families were resolved above. Index names are copied
+    // directly, without constructing catalog rows.
     if oid >= crate::storage::FIRST_IMPLICIT_INDEX_OID
         && let Some((_, name)) = index_identity_by_oid(storage, txid, oid)
     {
@@ -12222,26 +12220,6 @@ pub(crate) fn type_oid_visibility(storage: &Storage, txid: u32, oid: i32) -> Opt
         }
     }
     None
-}
-
-/// Resolves the exact OID for a visible user-defined type spelling, including
-/// the automatically-created array type.  Call sites that dispatch routines
-/// use this instead of reducing a domain to its storage representation.
-pub(crate) fn table_rowtype_field(
-    storage: &Storage,
-    txid: u32,
-    type_name: &str,
-    index: usize,
-) -> Option<crate::storage::ColumnMeta> {
-    let (qualifier, bare) = type_name
-        .split_once('.')
-        .map_or((None, type_name), |(schema, name)| (Some(schema), name));
-    let crate::storage::ResolvedRelation::Table(slot) =
-        storage.resolve_relation(qualifier, bare, txid)?
-    else {
-        return None;
-    };
-    storage.table_def(slot, txid).columns().get(index).copied()
 }
 
 pub(crate) fn user_type_oid(storage: &Storage, txid: u32, type_name: &str) -> Option<i32> {
@@ -22418,7 +22396,7 @@ fn index_operator_classes<'a>(
                 .expect("expression index has source");
             let expression = crate::sql::parser::parse_expr(source.as_str(), arena)?;
             let (oid, _) =
-                super::exec::infer_type_catalog(expression, Some(&table), storage, txid)?;
+                super::exec::infer_type_catalog(expression, Some(&table), storage, txid, arena)?;
             super::exec::catalog_column_type(storage, txid, oid)
                 .map(|(ctype, _)| ctype)
                 .and_then(crate::sql::types::BtreeOperatorClass::for_type)
@@ -22879,7 +22857,7 @@ fn pg_attribute<'a>(
                 let source = arena.alloc_str(source.as_str()).map_err(|_| arena_full())?;
                 let expression = crate::sql::parser::parse_expr(source, arena)?;
                 let (type_oid, type_mod) =
-                    super::exec::infer_type_catalog(expression, Some(&table), storage, txid)?;
+                    super::exec::infer_type_catalog(expression, Some(&table), storage, txid, arena)?;
                 let (ctype, user_type) = super::exec::catalog_column_type(storage, txid, type_oid)
                     .ok_or_else(|| {
                         sql_err!(

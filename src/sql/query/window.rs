@@ -1732,7 +1732,7 @@ fn projected_width<'a>(
         width += match item {
             SelectItem::Wildcard => scope.star_columns(),
             SelectItem::TableWildcard(qualifier) => scope.qualified_star_columns(qualifier)?,
-            SelectItem::RecordStar(base) => record_star_width(base, scope),
+            SelectItem::RecordStar(base) => record_star_width(base, scope)?,
             SelectItem::Expr { .. } => 1,
         };
     }

@@ -11,7 +11,7 @@ pub(crate) fn infer<'a>(
     arena: &'a Arena,
     oids: &mut [i32],
 ) {
-    infer_declared(storage, statement, txid, oids, None);
+    infer_declared(storage, statement, txid, oids, None, arena);
     infer_resolved(storage, statement, txid, arena, oids);
 }
 
@@ -21,10 +21,12 @@ pub(crate) fn infer_declared(
     txid: u32,
     oids: &mut [i32],
     captured_types: Option<CapturedTypeResolver<'_>>,
+    arena: &Arena,
 ) {
     ParameterInference {
         storage,
         captured_types,
+        arena,
     }
     .infer_stmt_params(statement, txid, oids);
 }
@@ -39,6 +41,7 @@ pub(crate) fn infer_resolved<'a>(
     ParameterInference {
         storage,
         captured_types: None,
+        arena,
     }
     .infer_resolved_stmt_params(statement, txid, arena, oids);
 }
@@ -46,6 +49,7 @@ pub(crate) fn infer_resolved<'a>(
 struct ParameterInference<'a> {
     storage: &'a Storage,
     captured_types: Option<CapturedTypeResolver<'a>>,
+    arena: &'a Arena,
 }
 
 impl ParameterInference<'_> {
@@ -92,7 +96,7 @@ impl ParameterInference<'_> {
                     return;
                 }
                 for (index, argument) in arguments.iter().copied().enumerate() {
-                    actual[index] = exec::infer_type_catalog(argument, None, self.storage, txid)
+                    actual[index] = exec::infer_type_catalog(argument, None, self.storage, txid, self.arena)
                         .map_or(types::oid::UNKNOWN, |inferred| inferred.0);
                 }
                 let qualified = match name.schema {
@@ -173,11 +177,12 @@ impl ParameterInference<'_> {
             outer_scope: None,
             storage: self.storage,
             txid,
-        });
+        arena: self.arena,
+});
         let infer = |expression: &Expr<'a>| {
             let inferred = match &resolver {
                 Some(resolver) => exec::infer_type_res(expression, resolver),
-                None => exec::infer_type_catalog(expression, None, self.storage, txid),
+                None => exec::infer_type_catalog(expression, None, self.storage, txid, self.arena),
             }
             .ok()?
             .0;

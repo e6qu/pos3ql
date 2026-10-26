@@ -2760,9 +2760,9 @@ fn prepare_recursive_decoration<'a>(
             CteCycleMark::Boolean => (Datum::Bool(true), Datum::Bool(false), ColType::Bool),
             CteCycleMark::Custom { value, default } => {
                 let value_type =
-                    crate::sql::exec::infer_type_catalog(value, None, storage, txid)?.0;
+                    crate::sql::exec::infer_type_catalog(value, None, storage, txid, arena)?.0;
                 let default_type =
-                    crate::sql::exec::infer_type_catalog(default, None, storage, txid)?.0;
+                    crate::sql::exec::infer_type_catalog(default, None, storage, txid, arena)?.0;
                 let value_type = (value_type != crate::sql::types::oid::UNKNOWN)
                     .then(|| crate::sql::exec::catalog_column_type(storage, txid, value_type))
                     .flatten()

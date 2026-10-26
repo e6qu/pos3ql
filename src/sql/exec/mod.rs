@@ -13945,7 +13945,7 @@ pub fn create_publication(
         ));
     }
     let (members, table_column_masks, table_include_descendants, table_filter_sql, table_count) =
-        match publication_members(storage, txn.txid, tables, publish.update || publish.delete) {
+        match publication_members(storage, txn.txid, tables, publish.update || publish.delete, arena) {
             Ok(members) => members,
             Err(error) => return sql_fail(error),
         };
@@ -15018,7 +15018,7 @@ pub fn alter_publication(
                 txn.txid,
                 tables,
                 definition.publish_update || definition.publish_delete,
-            ) {
+arena,) {
                 Ok(members) => members,
                 Err(error) => return sql_fail(error),
             };
@@ -15050,7 +15050,7 @@ pub fn alter_publication(
                 txn.txid,
                 tables,
                 definition.publish_update || definition.publish_delete,
-            ) {
+arena,) {
                 Ok(members) => members,
                 Err(error) => return sql_fail(error),
             };
@@ -15124,7 +15124,7 @@ pub fn alter_publication(
                 ));
             }
             let (members, _, _, _, count) =
-                match publication_members(storage, txn.txid, tables, false) {
+                match publication_members(storage, txn.txid, tables, false, arena) {
                     Ok(members) => members,
                     Err(error) => return sql_fail(error),
                 };
@@ -15302,6 +15302,7 @@ fn publication_members(
     txid: u32,
     tables: &[PublicationTarget],
     require_replica_identity: bool,
+    arena: &Arena,
 ) -> Result<PublicationMembers, SqlError> {
     let mut members = [u16::MAX; crate::storage::MAX_PUBLICATION_TABLES];
     let mut masks = [ColumnSet::EMPTY; crate::storage::MAX_PUBLICATION_TABLES];
@@ -15366,7 +15367,7 @@ fn publication_members(
             }
             let referenced = crate::sql::exec::ddl::check_referenced_columns(filter, &definition)?;
             let (type_oid, _) =
-                describe::infer_type_catalog(filter, Some(&definition), storage, txid)?;
+                describe::infer_type_catalog(filter, Some(&definition), storage, txid, arena)?;
             if type_oid != ColType::Bool.oid() {
                 return Err(sql_err!(
                     sqlstate::DATATYPE_MISMATCH,
@@ -47754,7 +47755,7 @@ pub fn create_statistics(
                     Some(&table_definition),
                     storage,
                     txn.txid,
-                ) {
+arena,) {
                     return sql_fail(error);
                 }
                 match crate::storage::extended_statistics_expression(expression.source) {
@@ -48555,7 +48556,7 @@ pub fn create_index(
     }
     if let Some(predicate_expression) = command.predicate {
         let (type_oid, _) =
-            match infer_type_catalog(predicate_expression, Some(&tdef), storage, txn.txid) {
+            match infer_type_catalog(predicate_expression, Some(&tdef), storage, txn.txid, arena) {
                 Ok(value) => value,
                 Err(error) => return sql_fail(error),
             };
@@ -48792,7 +48793,7 @@ pub fn create_index(
             )
         } else {
             let (type_oid, _) =
-                match infer_type_catalog(index_column.expression, Some(&tdef), storage, txn.txid) {
+                match infer_type_catalog(index_column.expression, Some(&tdef), storage, txn.txid, arena) {
                     Ok(result) => result,
                     Err(error) => return sql_fail(error),
                 };

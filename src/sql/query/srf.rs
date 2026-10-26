@@ -1856,7 +1856,7 @@ fn preserve_projection_type_identities(
                 };
             }
             SelectItem::RecordStar(base) => {
-                output += scope.map_or(1, |scope| record_star_width(base, scope));
+                output += scope.map(|scope| record_star_width(base, scope)).transpose()?.unwrap_or(1);
             }
             SelectItem::Expr { expression, .. } => {
                 let semantic = crate::sql::exec::infer_routine_argument_oid(expression, resolver)?;
@@ -1934,7 +1934,7 @@ pub(crate) fn describe_derived_definition<'a>(
                         SelectItem::TableWildcard(q) => {
                             slot += ss.qualified_star_columns(q)?;
                         }
-                        SelectItem::RecordStar(base) => slot += record_star_width(base, &ss),
+                        SelectItem::RecordStar(base) => slot += record_star_width(base, &ss)?,
                         SelectItem::Expr { expression, .. } => {
                             // A record-valued item registers its field shape;
                             // the column's type_mod carries the handle so
@@ -1948,9 +1948,10 @@ pub(crate) fn describe_derived_definition<'a>(
                                         outer_scope: outer,
                                         storage,
                                         txid,
-                                    },
+                                    arena: arena,
+},
                                     arena,
-                                )
+                                )?
                             {
                                 descriptors[slot].type_mod = handle;
                             }
@@ -2000,7 +2001,7 @@ pub(crate) fn describe_derived_definition<'a>(
                             }
                         }
                         SelectItem::RecordStar(base) => {
-                            slot += record_star_width(base, &ss);
+                            slot += record_star_width(base, &ss)?;
                         }
                         SelectItem::Expr { expression, .. } => {
                             output_collations[slot] = ss.expression_collation(expression)?;
@@ -2016,7 +2017,8 @@ pub(crate) fn describe_derived_definition<'a>(
                         outer_scope: outer,
                         storage,
                         txid,
-                    },
+                    arena: arena,
+},
                     &descriptors[..n],
                     &mut type_oids[..n],
                 )?;
@@ -2043,7 +2045,8 @@ pub(crate) fn describe_derived_definition<'a>(
                         outer_scope: None,
                         storage,
                         txid,
-                    },
+                    arena: arena,
+},
                     &descriptors[..n],
                     &mut type_oids[..n],
                 )?;
@@ -2071,9 +2074,10 @@ pub(crate) fn describe_derived_definition<'a>(
                                     output_aliases: &[],
                                     storage,
                                     txid,
-                                },
+                                arena: arena,
+},
                                 arena,
-                            )
+                            )?
                         {
                             descriptors[slot].type_mod = handle;
                         }
@@ -2089,7 +2093,8 @@ pub(crate) fn describe_derived_definition<'a>(
                         output_aliases: &[],
                         storage,
                         txid,
-                    },
+                    arena: arena,
+},
                     &descriptors[..n],
                     &mut type_oids[..n],
                 )?;

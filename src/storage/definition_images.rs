@@ -1,4 +1,4 @@
-//! Statement-owned immutable table definitions from a startup-sized pool.
+//! Statement-owned table and synthetic execution schemas in one fixed startup pool.
 
 use core::cell::{Cell, UnsafeCell};
 use core::mem::{MaybeUninit, size_of};
@@ -47,7 +47,7 @@ enum ImageSource {
     Relation { width: usize },
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct DefinitionImageId(usize);
 
 struct Image {
@@ -117,8 +117,8 @@ impl TableDefinitionImagePool {
     }
 }
 
-/// A statement retains each (table, transaction) image once. Nested statements
-/// get independent owners. The owner keeps the pool alive even after Storage
+/// A statement retains each (table, transaction) image and synthetic shape once.
+/// Nested statements get independent owners. The owner keeps the pool alive even after Storage
 /// drops, without allocating or retaining a borrow of mutable storage.
 pub(crate) struct TableDefinitionImages {
     pool: Arc<TableDefinitionImagePool>,
@@ -204,19 +204,20 @@ impl TableDefinitionImages {
                     self.pool.cells.len()
                 )
             })?;
-        let mut definition = TableDef::empty();
-        definition.schema = relation.schema;
-        definition.name = relation.name;
-        definition.n_columns = relation.n_columns;
-        definition.columns[..width].copy_from_slice(relation.columns);
+        const EMPTY_RELATION: TableDef = TableDef::empty();
         let target = self.pool.cells[index].image.get().cast::<Image>();
         // SAFETY: the allocation lock exclusively owns this unoccupied cell.
+        // Copy the constant directly into its destination, avoiding a wide stack
+        // image. Every field is initialized before occupancy becomes visible.
         unsafe {
-            target.write(Image {
-                next: self.head.get(),
-                source: ImageSource::Relation { width },
-                definition,
-            });
+            core::ptr::addr_of_mut!((*target).next).write(self.head.get());
+            core::ptr::addr_of_mut!((*target).source).write(ImageSource::Relation { width });
+            let destination = core::ptr::addr_of_mut!((*target).definition);
+            core::ptr::copy_nonoverlapping(&EMPTY_RELATION, destination, 1);
+            (*destination).schema = relation.schema;
+            (*destination).name = relation.name;
+            (*destination).n_columns = relation.n_columns;
+            (&mut (*destination).columns)[..width].copy_from_slice(relation.columns);
         }
         self.pool.occupied[index].store(true, Ordering::Release);
         self.head.set(Some(index));
@@ -391,6 +392,88 @@ impl Drop for TableDefinitionImages {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn catalog_lifetime_schemas_share_bounded_images_and_release_after_errors() {
+        use crate::storage::tests::{make_def, test_budget, test_config};
+        use crate::storage::{ColType, ColumnMeta, SqlName};
+        let mut config = test_config();
+        config.max_tables = 1;
+        config.max_catalog_versions_per_object = 1;
+        config.query_workspace_slots = 1;
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
+        let table = storage
+            .create_table(make_def("ordinary", &[("value", ColType::Int4, false)]))
+            .unwrap();
+        let images = storage.table_definition_images();
+        let mut columns = [ColumnMeta::EMPTY; 2];
+        columns[0].name = SqlName::parse("value").unwrap();
+        columns[0].ctype = ColType::Int4;
+        columns[1].name = SqlName::parse("tableoid").unwrap();
+        columns[1].ctype = ColType::Oid;
+        let schema = RelationDefinition {
+            schema: SqlName::parse("pg_catalog").unwrap(),
+            name: SqlName::parse("sample").unwrap(),
+            n_columns: 1,
+            columns: &columns,
+        };
+        crate::mem::guard::forbid_alloc(|| {
+            images.definition(&storage, table, 0).unwrap();
+            let original = images.retain_relation(&schema).unwrap();
+            assert_eq!(images.retain_relation(&schema).unwrap().0, original.0);
+            assert_eq!(
+                images.iter().count(),
+                1,
+                "catalog shapes cannot become stored table targets"
+            );
+            for index in 2..images.pool.cells.len() {
+                let name = crate::stack_format!(63, "catalog_{}", index);
+                images
+                    .retain_relation(&RelationDefinition {
+                        name: SqlName::parse(name.as_str()).unwrap(),
+                        ..schema
+                    })
+                    .unwrap();
+            }
+            let extra = RelationDefinition {
+                name: SqlName::parse("overflow").unwrap(),
+                ..schema
+            };
+            assert_eq!(
+                images.retain_relation(&extra).unwrap_err().sqlstate,
+                sqlstate::PROGRAM_LIMIT_EXCEEDED
+            );
+            let retained = images.retained_relation(original).unwrap();
+            assert_eq!(retained.n_columns, 1);
+            assert_eq!(retained.columns[1].name.as_str(), "tableoid");
+            assert_eq!(retained.columns[1].ctype, ColType::Oid);
+            assert_eq!(
+                images.retained_definition(table, 0).unwrap().name.as_str(),
+                "ordinary"
+            );
+        });
+        drop(storage);
+        assert_eq!(images.iter().count(), 1);
+        let pool = Arc::clone(&images.pool);
+        drop(images);
+        crate::mem::guard::forbid_alloc(|| {
+            assert!(
+                pool.occupied
+                    .iter()
+                    .all(|flag| !flag.load(Ordering::Acquire))
+            );
+            let reused = TableDefinitionImages::new(&pool);
+            let identity = reused.retain_relation(&schema).unwrap();
+            assert_eq!(
+                reused.retained_relation(identity).unwrap().columns[0]
+                    .name
+                    .as_str(),
+                "value"
+            );
+            assert_eq!(reused.iter().count(), 0);
+        });
+    }
 
     #[test]
     fn table_definition_images_charge_exact_startup_capacity() {

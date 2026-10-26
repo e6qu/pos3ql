@@ -2027,7 +2027,7 @@ fn catalog_lifetime_public_identifiers_survive_empty_disk_recovery() {
                 let mut engine = Engine::new(&config, &mut budget).unwrap();
                 let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
                 assert_eq!(data_rows(&session.success(&mut engine,
-                    "SELECT count(*) = 7 FROM saved_catalog_lifetimes s JOIN lifetime_catalog c ON c.kind = s.kind AND c.identity = s.identity", true)), ["t"]);
+                    "SELECT count(*) = 7 FROM saved_catalog_lifetimes s JOIN lifetime_catalog c ON c.kind = s.kind AND c.identity = s.identity", false)), ["t"]);
                 session.success(&mut engine, "DROP EXTENSION pos3ql_base", false);
                 for statement in remaining
                     .split(';')

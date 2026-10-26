@@ -3836,7 +3836,6 @@ impl Engine {
             wal.commit();
             storage.observe_lsn(commit_lsn);
         }
-        storage.reconcile_serials();
         // Replay's row installs bypass the per-row value-index maintenance, so
         // rebuild every table's uniqueness indexes from the recovered committed
         // rows before serving queries.

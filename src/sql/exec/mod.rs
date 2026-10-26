@@ -4351,8 +4351,8 @@ fn copy_comment_if_present(
 /// The next value of a serial/identity column: a real sequence, as PostgreSQL
 /// has it. Explicit inserts do not advance it, deletes and TRUNCATE do not
 /// rewind it, and the advance survives a rollback (a consumed number stays
-/// consumed). The counter is journaled at commit and floored against the
-/// stored rows at startup.
+/// consumed). Recovery restores saved generator positions without inferring
+/// them from stored row values.
 fn next_auto_value<'x>(
     storage: &mut Storage,
     table_index: usize,

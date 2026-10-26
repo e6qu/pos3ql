@@ -204,10 +204,10 @@ impl TableDefinitionImages {
                     self.pool.cells.len()
                 )
             })?;
-        const EMPTY_RELATION: TableDef = TableDef::empty();
+        static EMPTY_RELATION: TableDef = TableDef::empty();
         let target = self.pool.cells[index].image.get().cast::<Image>();
         // SAFETY: the allocation lock exclusively owns this unoccupied cell.
-        // Copy the constant directly into its destination, avoiding a wide stack
+        // Copy the static definition directly into its destination, avoiding a wide stack
         // image. Every field is initialized before occupancy becomes visible.
         unsafe {
             core::ptr::addr_of_mut!((*target).next).write(self.head.get());

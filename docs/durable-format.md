@@ -561,6 +561,10 @@ when an aborted creation leaves a gap in either catalog.
 
 ## Catalog identities and sequence restarts
 
+Recovery restores saved generator positions; it does not scan row values to
+infer them. For example, explicitly inserting serial value 100 does not make
+the next automatically generated value 101, either before or after recovery.
+
 **User example:** one connection creates a materialized report inside a transaction
 and later rolls it back. Another connection creates a different report and commits.
 After loss of the local disk, the committed report keeps its catalog identity,

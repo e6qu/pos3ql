@@ -32733,6 +32733,77 @@ fn serial_auto_increment() {
 }
 
 #[test]
+fn serial_recovery_keeps_saved_counters_independent_of_rows() {
+    for checkpoint in [false, true] {
+        for mode in [
+            crate::config::TransactionMode::Mvcc,
+            crate::config::TransactionMode::Locking,
+        ] {
+            let name = format!("serial-recovery-{checkpoint}-{mode:?}");
+            let mut config = catalog_lifetime_config(&name, mode);
+            config.object_store_on = true;
+            config.object_store_sim = true;
+            config.wal_upload = true;
+            config.wal_upload_sync = true;
+            config.object_store_bucket = format!("{name}-{}", std::process::id());
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+            {
+                let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+                let mut engine = Engine::new(&config, &mut budget).unwrap();
+                let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+                session.success(&mut engine, "CREATE TABLE serial_saved (id serial)", false);
+                let table = engine.storage.find_table("public", "serial_saved").unwrap();
+                // Both saved counter layers are independent of explicitly inserted values.
+                engine.storage.set_table_serial_value(table, 0, 21);
+                session.success(&mut engine, "INSERT INTO serial_saved VALUES (100)", false);
+                assert_eq!(
+                    data_rows(&session.success(
+                        &mut engine,
+                        "INSERT INTO serial_saved DEFAULT VALUES RETURNING id",
+                        false
+                    )),
+                    ["1"]
+                );
+                if checkpoint {
+                    assert!(engine.checkpoint().unwrap());
+                }
+                engine.commit_wal().unwrap();
+            }
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+            {
+                let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+                let mut engine = Engine::new(&config, &mut budget).unwrap();
+                let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+                let table = engine.storage.find_table("public", "serial_saved").unwrap();
+                assert_eq!(
+                    engine.storage.table_serial_value(table, 0),
+                    21,
+                    "checkpoint={checkpoint}, mode={mode:?}"
+                );
+                assert_eq!(
+                    data_rows(&session.success(
+                        &mut engine,
+                        "INSERT INTO serial_saved DEFAULT VALUES RETURNING id",
+                        false
+                    )),
+                    ["2"]
+                );
+                assert_eq!(
+                    data_rows(&session.success(
+                        &mut engine,
+                        "SELECT id FROM serial_saved ORDER BY id",
+                        false
+                    )),
+                    ["1", "2", "100"]
+                );
+            }
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        }
+    }
+}
+
+#[test]
 fn table_serial_state_wal_recovery_rejects_unknown_positions() {
     let (mut engine, mut budget) = test_engine();
     run_with(

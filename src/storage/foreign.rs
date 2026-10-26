@@ -1279,24 +1279,6 @@ impl ForeignCatalog {
             .filter(move |(_, entry)| entry.database == database && entry.visible_to(txid))
     }
 
-    pub(crate) fn checkpoint_wrappers(
-        &self,
-    ) -> impl Iterator<Item = (usize, &ForeignCatalogEntry<ForeignDataWrapperDefinition>)> {
-        self.wrappers
-            .iter()
-            .enumerate()
-            .filter(|(_, entry)| entry.ddl_state.committed_exists())
-    }
-
-    pub(crate) fn checkpoint_servers(
-        &self,
-    ) -> impl Iterator<Item = (usize, &ForeignCatalogEntry<ForeignServerDefinition>)> {
-        self.servers
-            .iter()
-            .enumerate()
-            .filter(|(_, entry)| entry.ddl_state.committed_exists())
-    }
-
     pub(crate) fn checkpoint_wrapper(
         &self,
         slot: usize,

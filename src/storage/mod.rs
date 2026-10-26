@@ -1397,9 +1397,8 @@ pub struct ColumnMeta {
     pub not_null_inheritable: bool,
     pub unique: bool,
     pub primary: bool,
-    /// `serial`/`bigserial`/`smallserial` or GENERATED AS IDENTITY: when the
-    /// column is omitted (or DEFAULT) on INSERT, it is assigned one past the
-    /// column's current maximum.
+    /// `serial`/`bigserial`/`smallserial` or GENERATED AS IDENTITY: an omitted
+    /// or DEFAULT value advances its generator, independently of stored rows.
     pub auto_increment: bool,
     /// DEFAULT or `GENERATED ALWAYS AS (...) STORED`, including its source for
     /// catalog rendering and replay.
@@ -22800,7 +22799,7 @@ impl Storage {
             .cloned_access_object(source_object, source, target)
             .ok_or_else(invalid)?;
         Ok(Some(if encoded_target {
-            u32::from(copied.slot) + 1 | (subid & (1 << 31))
+            (u32::from(copied.slot) + 1) | (subid & (1 << 31))
         } else {
             u32::from(copied.slot)
         }))
@@ -30996,77 +30995,6 @@ impl Storage {
                 && table.database() == current_database()
                 && table.live()
         })
-    }
-
-    /// Floors every serial column's sequence at the maximum value stored in
-    /// its rows. Run once after recovery: a journal or checkpoint written
-    /// before sequences were journaled carries no positions, and handing out
-    /// a value at or below an existing row's would violate the key.
-    pub fn reconcile_serials(&mut self) {
-        for i in 0..self.tables.len() {
-            if !self.tables[i].live() {
-                continue;
-            }
-            let n_columns = {
-                let definition = self.tables[i].definition();
-                definition.n_columns
-            };
-            let mut auto = [false; MAX_COLUMNS];
-            let mut any = false;
-            for (c, slot) in auto.iter_mut().enumerate().take(n_columns) {
-                *slot = self.tables[i].definition().columns()[c].auto_increment;
-                any |= *slot;
-            }
-            if !any {
-                continue;
-            }
-            let mut schema = [crate::sql::types::ColType::Bool; MAX_COLUMNS];
-            self.tables[i].definition().schema(&mut schema);
-            let mut max = [0i64; MAX_COLUMNS];
-            let mut rowids: Vec<(u64, RowHome)> = Vec::new();
-            for (rowid, state) in self.resident_rows(i).iter() {
-                if let Some(home) = state.visible_at(0, SNAPSHOT_ALL, u64::MAX).flatten() {
-                    rowids.push((rowid, home));
-                }
-            }
-            for (rowid, home) in rowids {
-                let mut vals = [0i64; MAX_COLUMNS];
-                let mut have = [false; MAX_COLUMNS];
-                self.with_row_bytes(i, rowid, home, |bytes| {
-                    let mut row = [crate::sql::types::Datum::Null; MAX_COLUMNS];
-                    if rowenc::decode(bytes, &schema[..n_columns], &mut row).is_err() {
-                        return Ok(());
-                    }
-                    for c in 0..n_columns {
-                        if !auto[c] {
-                            continue;
-                        }
-                        let v = match row[c] {
-                            crate::sql::types::Datum::Int2(x) => i64::from(x),
-                            crate::sql::types::Datum::Int4(x) => i64::from(x),
-                            crate::sql::types::Datum::Int8(x) => x,
-                            _ => continue,
-                        };
-                        vals[c] = v;
-                        have[c] = true;
-                    }
-                    Ok(())
-                })
-                .unwrap_or(());
-                for c in 0..n_columns {
-                    if have[c] {
-                        max[c] = max[c].max(vals[c]);
-                    }
-                }
-            }
-            for c in 0..n_columns {
-                if auto[c] {
-                    let prior = self.table_serial_value(i, c);
-                    self.replay_table_serial_value(i, c, prior.max(max[c]), 0)
-                        .expect("recovered serial column exists");
-                }
-            }
-        }
     }
 
     /// Attaches the spilled-row read path. The local temporary store is always

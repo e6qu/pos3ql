@@ -1059,17 +1059,35 @@ fn describe_record_star<'q>(
             if let Expr::Cast { type_name, .. } = base {
                 let mut error = None;
                 let fields = visit_catalog_rowtype_fields(
-                    storage.expect("checked"), txid, type_name, arena, &mut |name, metadata| {
-                        if error.is_some() { return; }
-                        error = arena.alloc_str(name)
-                            .map_err(|_| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                                "record description exceeds the statement arena"))
-                            .and_then(|name| push(ColDesc::new(name, metadata.type_oid, metadata.ctype.typlen())
-                                .with_type_mod(metadata.type_mod).with_collation(metadata.collation)))
+                    storage.expect("checked"),
+                    txid,
+                    type_name,
+                    arena,
+                    &mut |name, metadata| {
+                        if error.is_some() {
+                            return;
+                        }
+                        error = arena
+                            .alloc_str(name)
+                            .map_err(|_| {
+                                sql_err!(
+                                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                    "record description exceeds the statement arena"
+                                )
+                            })
+                            .and_then(|name| {
+                                push(
+                                    ColDesc::of_type(name, metadata.ctype)
+                                        .with_type_mod(metadata.type_mod)
+                                        .with_collation(metadata.collation),
+                                )
+                            })
                             .err();
                     },
                 )?;
-                if fields.is_some() { return error.map_or(Ok(()), Err); }
+                if fields.is_some() {
+                    return error.map_or(Ok(()), Err);
+                }
             }
 
             let resolver: &dyn ColTypeResolver = match def {

@@ -2681,17 +2681,6 @@ pub fn record_field_metadata(
                 if name.eq_ignore_ascii_case(field) { found = Some(metadata); }
             })?;
             found
-        } => {
-            let mut index = 0usize;
-            let mut found = None;
-            while let Some((name, meta)) = columns.named_composite_field(type_name, index)? {
-                if name.as_str().eq_ignore_ascii_case(field) {
-                    found = Some(meta);
-                    break;
-                }
-                index += 1;
-            }
-            found
         }
         _ => None,
     };

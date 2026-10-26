@@ -1475,8 +1475,13 @@ fn constraint_declaration_names_and_rejections_match_postgresql() {
                 ("declaration_table_duplicate_nn", "relation"),
             ] {
                 if statement.contains(object) {
-                    let expected = format!("constraint \"repeated_name\" for {kind} \"{object}\" already exists");
-                    assert!(String::from_utf8_lossy(&output).contains(&expected), "{statement}: expected {expected}; {output:?}");
+                    let expected = format!(
+                        "constraint \"repeated_name\" for {kind} \"{object}\" already exists"
+                    );
+                    assert!(
+                        String::from_utf8_lossy(&output).contains(&expected),
+                        "{statement}: expected {expected}; {output:?}"
+                    );
                 }
             }
             states.extend(error_sqlstates(&output).into_iter().map(str::to_owned));
@@ -1484,8 +1489,8 @@ fn constraint_declaration_names_and_rejections_match_postgresql() {
         assert_eq!(
             states,
             [
-                "42P17", "42601", "42601", "42P17", "42P17", "42601", "42710", "42710",
-                "42710", "42710", "42710"
+                "42P17", "42601", "42601", "42P17", "42P17", "42601", "42710", "42710", "42710",
+                "42710", "42710"
             ]
         );
         assert_eq!(

@@ -22313,16 +22313,9 @@ impl Storage {
                     .extended_statistics_catalog
                     .lock()
                     .expect("extended-statistics catalog lock poisoned");
-                let target_slot = statistics_catalog
-                    .definitions
-                    .iter()
-                    .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
-                    .ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                            "statistics catalog is full"
-                        )
-                    })?;
+                let target_slot = allocation.select(DatabaseCloneKind::Statistics, definition.created_at,
+                    statistics_catalog.definitions.iter().enumerate().filter_map(|(slot, candidate)|
+                        (candidate.ddl_state == CatalogDdlState::Absent).then_some(slot)))?;
                 definition.database = target;
                 definition.ownership = definition.ownership.committed();
                 definition.pending_definition = None;
@@ -22386,15 +22379,9 @@ impl Storage {
                     .publications
                     .lock()
                     .expect("publication catalog lock poisoned");
-                let target_slot = publications
-                    .iter()
-                    .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
-                    .ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                            "publication catalog is full"
-                        )
-                    })?;
+                let target_slot = allocation.select(DatabaseCloneKind::Publication, definition.created_at,
+                    publications.iter().enumerate().filter_map(|(slot, candidate)|
+                        (candidate.ddl_state == CatalogDdlState::Absent).then_some(slot)))?;
                 definition.database = target;
                 definition.pending_name = None;
                 definition.pending_definition = None;
@@ -22403,11 +22390,24 @@ impl Storage {
                 publications[target_slot] = definition;
             }
 
-            self.foreign_catalog().clone_database(source, target, allocation, txid, |table| {
-                self.cloned_access_object(AccessObject { class: AccessClass::Table, slot: table }, source, target)
+            self.foreign_catalog()
+                .clone_database(source, target, allocation, txid, |table| {
+                    self.cloned_access_object(
+                        AccessObject {
+                            class: AccessClass::Table,
+                            slot: table,
+                        },
+                        source,
+                        target,
+                    )
                     .map(|object| object.slot)
-                    .ok_or_else(|| sql_err!(sqlstate::DATA_EXCEPTION, "template foreign table was not cloned"))
-            })?;
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::DATA_EXCEPTION,
+                            "template foreign table was not cloned"
+                        )
+                    })
+                })?;
 
             for (_, mut definition) in (ExtensionIter {
                 catalog: &self.extension_catalog,
@@ -22434,16 +22434,9 @@ impl Storage {
                     })?
                     .slot;
                 let mut catalog = self.extension_catalog();
-                let target_slot = catalog
-                    .definitions
-                    .iter()
-                    .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
-                    .ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                            "extension catalog is full"
-                        )
-                    })?;
+                let target_slot = allocation.select(DatabaseCloneKind::Extension, definition.created_at,
+                    catalog.definitions.iter().enumerate().filter_map(|(slot, candidate)|
+                        (candidate.ddl_state == CatalogDdlState::Absent).then_some(slot)))?;
                 definition.database = target;
                 definition.ownership = definition.ownership.committed();
                 definition.pending = None;
@@ -22636,11 +22629,20 @@ impl Storage {
                 {
                     continue;
                 }
-                let Some(subid) = self.cloned_comment_subid(entry.class, entry.subid, source, target)? else { continue; };
+                let Some(subid) =
+                    self.cloned_comment_subid(entry.class, entry.subid, source, target)?
+                else {
+                    continue;
+                };
                 entry.subid = subid;
                 let mut comments = self.comment_catalog();
-                let target_slot = comments.entries.iter().position(|candidate| !candidate.used)
-                    .ok_or_else(|| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "comment catalog is full"))?;
+                let target_slot = comments
+                    .entries
+                    .iter()
+                    .position(|candidate| !candidate.used)
+                    .ok_or_else(|| {
+                        sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "comment catalog is full")
+                    })?;
                 entry.database = Some(target);
                 entry.pending = None;
                 entry.pending_identity = None;
@@ -22694,19 +22696,43 @@ impl Storage {
     }
 
     fn cloned_comment_subid(
-        &self, class: CommentClass, subid: u32, source: DatabaseOid, target: DatabaseOid,
+        &self,
+        class: CommentClass,
+        subid: u32,
+        source: DatabaseOid,
+        target: DatabaseOid,
     ) -> Result<Option<u32>, SqlError> {
-        let invalid = || sql_err!(sqlstate::DATA_EXCEPTION, "template comment source was not cloned");
-        if class == CommentClass::Subscription { return Ok(None); }
+        let invalid = || {
+            sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "template comment source was not cloned"
+            )
+        };
+        if class == CommentClass::Subscription {
+            return Ok(None);
+        }
         if class == CommentClass::Publication {
             let source_slot = usize::try_from(subid).map_err(|_| invalid())?;
-            let catalog = self.publications.lock().expect("publication catalog lock poisoned");
-            let source_definition = catalog.get(source_slot)
-                .filter(|publication| publication.database == source && publication.ddl_state == CatalogDdlState::Present)
+            let catalog = self
+                .publications
+                .lock()
+                .expect("publication catalog lock poisoned");
+            let source_definition = catalog
+                .get(source_slot)
+                .filter(|publication| {
+                    publication.database == source
+                        && publication.ddl_state == CatalogDdlState::Present
+                })
                 .ok_or_else(invalid)?;
-            return catalog.iter().position(|publication| publication.database == target
-                    && publication.ddl_state != CatalogDdlState::Absent && publication.created_at == source_definition.created_at)
-                .map(|slot| Some(slot as u32)).ok_or_else(invalid);
+            return catalog
+                .iter()
+                .position(|publication| {
+                    publication.database == target
+                        && publication.ddl_state != CatalogDdlState::Absent
+                        && publication.created_at == source_definition.created_at
+                })
+                .map(|slot| Some(slot as u32))
+                .ok_or_else(invalid);
         }
         let object_class = match class {
             CommentClass::Constraint => AccessClass::Table,
@@ -22714,12 +22740,20 @@ impl Storage {
             CommentClass::ForeignServer => AccessClass::ForeignServer,
             CommentClass::ForeignDataWrapper => AccessClass::ForeignDataWrapper,
             CommentClass::Trigger | CommentClass::Rule => {
-                if subid & (1 << 31) == 0 { AccessClass::Table } else { AccessClass::View }
+                if subid & (1 << 31) == 0 {
+                    AccessClass::Table
+                } else {
+                    AccessClass::View
+                }
             }
             _ => return Ok(Some(subid)),
         };
         let encoded_target = matches!(class, CommentClass::Trigger | CommentClass::Rule);
-        let slot = if encoded_target { (subid & !(1 << 31)).checked_sub(1).ok_or_else(invalid)? } else { subid };
+        let slot = if encoded_target {
+            (subid & !(1 << 31)).checked_sub(1).ok_or_else(invalid)?
+        } else {
+            subid
+        };
         let slot = u16::try_from(slot).map_err(|_| invalid())?;
         let capacity = match object_class {
             AccessClass::Table => self.tables.len(),
@@ -22729,11 +22763,24 @@ impl Storage {
             AccessClass::ForeignServer => self.foreign_catalog().server_capacity(),
             _ => unreachable!("comment class selects a slot catalog"),
         };
-        if usize::from(slot) >= capacity { return Err(invalid()); }
-        let source_object = AccessObject { class: object_class, slot };
-        if self.access_object_is_temporary(source_object, 0) { return Ok(None); }
-        let copied = self.cloned_access_object(source_object, source, target).ok_or_else(invalid)?;
-        Ok(Some(if encoded_target { u32::from(copied.slot) + 1 | (subid & (1 << 31)) } else { u32::from(copied.slot) }))
+        if usize::from(slot) >= capacity {
+            return Err(invalid());
+        }
+        let source_object = AccessObject {
+            class: object_class,
+            slot,
+        };
+        if self.access_object_is_temporary(source_object, 0) {
+            return Ok(None);
+        }
+        let copied = self
+            .cloned_access_object(source_object, source, target)
+            .ok_or_else(invalid)?;
+        Ok(Some(if encoded_target {
+            u32::from(copied.slot) + 1 | (subid & (1 << 31))
+        } else {
+            u32::from(copied.slot)
+        }))
     }
 
     fn clear_database_catalog(&mut self, database: DatabaseOid) {
@@ -23206,7 +23253,8 @@ impl Storage {
             .ddl_state
             .pending_txid()
             .expect("database create owns its catalog clone");
-        self.foreign_catalog().commit_database_create(database, txid);
+        self.foreign_catalog()
+            .commit_database_create(database, txid);
         for schema in self
             .schemas
             .lock()
@@ -24550,7 +24598,8 @@ impl Storage {
                 let created_at = catalog.entry_wrapper(source_slot).created_at;
                 (0..catalog.wrapper_capacity()).find(|slot| {
                     let candidate = catalog.entry_wrapper(*slot);
-                    candidate.database == target_database && candidate.created_at == created_at
+                    candidate.database == target_database
+                        && candidate.created_at == created_at
                         && candidate.ddl_state != CatalogDdlState::Absent
                 })?
             }
@@ -24559,7 +24608,8 @@ impl Storage {
                 let created_at = catalog.entry_server(source_slot).created_at;
                 (0..catalog.server_capacity()).find(|slot| {
                     let candidate = catalog.entry_server(*slot);
-                    candidate.database == target_database && candidate.created_at == created_at
+                    candidate.database == target_database
+                        && candidate.created_at == created_at
                         && candidate.ddl_state != CatalogDdlState::Absent
                 })?
             }

@@ -21,6 +21,9 @@ pub(crate) enum DatabaseCloneKind {
     ForeignServer = 10,
     UserMapping = 11,
     ForeignTable = 12,
+    Statistics = 13,
+    Publication = 14,
+    Extension = 15,
 }
 
 impl DatabaseCloneKind {
@@ -39,6 +42,9 @@ impl DatabaseCloneKind {
             10 => Self::ForeignServer,
             11 => Self::UserMapping,
             12 => Self::ForeignTable,
+            13 => Self::Statistics,
+            14 => Self::Publication,
+            15 => Self::Extension,
             _ => return None,
         })
     }
@@ -319,19 +325,53 @@ impl Storage {
         let catalog = self.foreign_catalog();
         for slot in 0..catalog.wrapper_capacity() {
             let entry = catalog.entry_wrapper(slot);
-            object(DatabaseCloneKind::ForeignWrapper, slot, entry.created_at, entry.database, entry.ddl_state);
+            object(
+                DatabaseCloneKind::ForeignWrapper,
+                slot,
+                entry.created_at,
+                entry.database,
+                entry.ddl_state,
+            );
         }
         for slot in 0..catalog.server_capacity() {
             let entry = catalog.entry_server(slot);
-            object(DatabaseCloneKind::ForeignServer, slot, entry.created_at, entry.database, entry.ddl_state);
+            object(
+                DatabaseCloneKind::ForeignServer,
+                slot,
+                entry.created_at,
+                entry.database,
+                entry.ddl_state,
+            );
         }
         for slot in 0..catalog.mapping_capacity() {
             let entry = catalog.entry_mapping(slot);
-            object(DatabaseCloneKind::UserMapping, slot, entry.created_at, entry.database, entry.ddl_state);
+            object(
+                DatabaseCloneKind::UserMapping,
+                slot,
+                entry.created_at,
+                entry.database,
+                entry.ddl_state,
+            );
         }
         for slot in 0..catalog.table_capacity() {
             let entry = catalog.entry_table(slot);
-            object(DatabaseCloneKind::ForeignTable, slot, entry.created_at, entry.database, entry.ddl_state);
+            object(
+                DatabaseCloneKind::ForeignTable,
+                slot,
+                entry.created_at,
+                entry.database,
+                entry.ddl_state,
+            );
+        }
+        drop(catalog);
+        for (slot, definition) in self.extended_statistics_catalog.lock().expect("statistics catalog lock poisoned").definitions.iter().enumerate() {
+            object(DatabaseCloneKind::Statistics, slot, definition.created_at, definition.database, definition.ddl_state);
+        }
+        for (slot, definition) in self.publications.lock().expect("publication catalog lock poisoned").iter().enumerate() {
+            object(DatabaseCloneKind::Publication, slot, definition.created_at, definition.database, definition.ddl_state);
+        }
+        for (slot, definition) in self.extension_catalog().definitions.iter().enumerate() {
+            object(DatabaseCloneKind::Extension, slot, definition.created_at, definition.database, definition.ddl_state);
         }
     }
 }

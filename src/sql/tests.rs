@@ -1941,6 +1941,8 @@ fn catalog_lifetime_template_copies_preserve_local_identifiers_and_statistics() 
                 engine
                     .select_database(crate::storage::DatabaseOid::POSTGRES)
                     .unwrap();
+                let mut discarded = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+                discarded.success(&mut engine, "BEGIN; CREATE FOREIGN DATA WRAPPER discarded_wrapper NO HANDLER NO VALIDATOR; CREATE SERVER discarded_server FOREIGN DATA WRAPPER discarded_wrapper; CREATE USER MAPPING FOR PUBLIC SERVER discarded_server; CREATE PUBLICATION discarded_publication", false);
                 session.success(
                     &mut engine,
                     "CREATE DATABASE catalog_copy TEMPLATE template1",
@@ -1950,13 +1952,25 @@ fn catalog_lifetime_template_copies_preserve_local_identifiers_and_statistics() 
                     .storage
                     .database(engine.storage.database_slot("catalog_copy", 0).unwrap())
                     .oid;
+                discarded.success(&mut engine, "ROLLBACK", false);
                 engine.select_database(copied).unwrap();
                 assert_eq!(
                     data_rows(&session.success(&mut engine, CHECK, false)),
                     ["t"]
                 );
-                assert_eq!(data_rows(&session.success(&mut engine, FOREIGN_LINKS, false)), ["t"]);
-                assert_eq!(data_rows(&session.success(&mut engine, COMMENTS, false)), ["wrapper comment", "server comment", "statistics comment", "publication comment"]);
+                assert_eq!(
+                    data_rows(&session.success(&mut engine, FOREIGN_LINKS, false)),
+                    ["t"]
+                );
+                assert_eq!(
+                    data_rows(&session.success(&mut engine, COMMENTS, false)),
+                    [
+                        "wrapper comment",
+                        "server comment",
+                        "statistics comment",
+                        "publication comment"
+                    ]
+                );
                 session.success(
                     &mut engine,
                     "ALTER STATISTICS lifetime_statistics SET STATISTICS 43",
@@ -1981,8 +1995,19 @@ fn catalog_lifetime_template_copies_preserve_local_identifiers_and_statistics() 
                         ["t"]
                     );
                     assert_eq!(data_rows(&session.success(&mut engine, &format!("SELECT stxstattarget = {target} FROM pg_statistic_ext WHERE stxname = 'lifetime_statistics'"), false)), ["t"]);
-                    assert_eq!(data_rows(&session.success(&mut engine, FOREIGN_LINKS, false)), ["t"]);
-                    assert_eq!(data_rows(&session.success(&mut engine, COMMENTS, false)), ["wrapper comment", "server comment", "statistics comment", "publication comment"]);
+                    assert_eq!(
+                        data_rows(&session.success(&mut engine, FOREIGN_LINKS, false)),
+                        ["t"]
+                    );
+                    assert_eq!(
+                        data_rows(&session.success(&mut engine, COMMENTS, false)),
+                        [
+                            "wrapper comment",
+                            "server comment",
+                            "statistics comment",
+                            "publication comment"
+                        ]
+                    );
                 }
             }
             std::fs::remove_dir_all(&config.data_dir).unwrap();

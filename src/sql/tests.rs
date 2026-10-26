@@ -1468,19 +1468,31 @@ fn constraint_declaration_names_and_rejections_match_postgresql() {
         .filter(|statement| !statement.is_empty())
         {
             let output = session.execute(&mut engine, statement, true);
-            for (object, kind) in [
-                ("declaration_check_name", "domain"),
-                ("declaration_nn_name", "domain"),
-                ("declaration_table_check_name", "relation"),
-                ("declaration_table_nn_name", "relation"),
-                ("declaration_table_duplicate_nn", "relation"),
+            for (object, expected) in [
+                (
+                    "declaration_check_name",
+                    "constraint \"repeated_name\" for domain \"declaration_check_name\" already exists",
+                ),
+                (
+                    "declaration_nn_name",
+                    "constraint \"repeated_name\" for domain \"declaration_nn_name\" already exists",
+                ),
+                (
+                    "declaration_table_check_name",
+                    "duplicate key value violates unique constraint \"pg_constraint_conrelid_contypid_conname_index\"",
+                ),
+                (
+                    "declaration_table_nn_name",
+                    "duplicate key value violates unique constraint \"pg_constraint_conrelid_contypid_conname_index\"",
+                ),
+                (
+                    "declaration_table_duplicate_nn",
+                    "constraint \"repeated_name\" for relation \"declaration_table_duplicate_nn\" already exists",
+                ),
             ] {
                 if statement.contains(object) {
-                    let expected = format!(
-                        "constraint \"repeated_name\" for {kind} \"{object}\" already exists"
-                    );
                     assert!(
-                        String::from_utf8_lossy(&output).contains(&expected),
+                        String::from_utf8_lossy(&output).contains(expected),
                         "{statement}: expected {expected}; {output:?}"
                     );
                 }
@@ -1490,8 +1502,8 @@ fn constraint_declaration_names_and_rejections_match_postgresql() {
         assert_eq!(
             states,
             [
-                "42P17", "42601", "42601", "42P17", "42P17", "42601", "42710", "42710", "42710",
-                "42710", "42710"
+                "42P17", "42601", "42601", "42P17", "42P17", "42601", "42710", "42710", "23505",
+                "23505", "42710"
             ]
         );
         assert_eq!(

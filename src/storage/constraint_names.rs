@@ -134,6 +134,13 @@ pub(crate) fn table(definition: &mut TableDef) -> Result<(), SqlError> {
                     .any(|constraint| constraint.name == name)
                 || definition.not_null_names[..position].contains(&Some(name)))
         {
+            if definition.checks().iter().any(|check| check.name == name) {
+                // PostgreSQL reports this mixed collision through its catalog index.
+                return Err(sql_err!(
+                    sqlstate::UNIQUE_VIOLATION,
+                    "duplicate key value violates unique constraint \"pg_constraint_conrelid_contypid_conname_index\""
+                ));
+            }
             return Err(sql_err!(
                 sqlstate::DUPLICATE_OBJECT,
                 "constraint \"{}\" for relation \"{}\" already exists",

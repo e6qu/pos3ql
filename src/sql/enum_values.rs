@@ -32,7 +32,9 @@ pub(crate) fn resolve<'a>(
     let definition = storage
         .read_enum_definition(
             crate::storage::TypeDefinitionTarget::by_creation(
-                storage, crate::storage::NamedTypeKind::Enum, slot,
+                storage,
+                crate::storage::NamedTypeKind::Enum,
+                slot,
             )?,
             txid,
         )?
@@ -92,7 +94,9 @@ pub(crate) fn sort(value: Datum<'_>, storage: &Storage, txid: u32) -> Result<f64
     let definition = storage
         .read_enum_definition(
             crate::storage::TypeDefinitionTarget::by_creation(
-                storage, crate::storage::NamedTypeKind::Enum, slot,
+                storage,
+                crate::storage::NamedTypeKind::Enum,
+                slot,
             )?,
             txid,
         )?
@@ -251,14 +255,26 @@ pub(crate) fn bind_query<const N: usize>(
             if let Some((crate::storage::NamedTypeKind::Enum, creation, false)) =
                 crate::storage::NamedTypeKind::from_oid(oid)
             {
-                let result = storage.routine_result_for_oid(oid, txid)
-                    .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "enum type does not exist"))?;
-                let reference = crate::storage::TypeReference::from_bound_name(result.user_type
-                    .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "enum type has no source identity"))?)?;
+                let result = storage.routine_result_for_oid(oid, txid).ok_or_else(|| {
+                    sql_err!(sqlstate::UNDEFINED_OBJECT, "enum type does not exist")
+                })?;
+                let reference = crate::storage::TypeReference::from_bound_name(
+                    result.user_type.ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::UNDEFINED_OBJECT,
+                            "enum type has no source identity"
+                        )
+                    })?,
+                )?;
                 let slot = usize::from(reference.catalog_slot());
-                let definition = storage.read_enum_definition(
-                    crate::storage::TypeDefinitionTarget::Bound(reference), txid,
-                )?.ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "enum type does not exist"))?;
+                let definition = storage
+                    .read_enum_definition(
+                        crate::storage::TypeDefinitionTarget::Bound(reference),
+                        txid,
+                    )?
+                    .ok_or_else(|| {
+                        sql_err!(sqlstate::UNDEFINED_OBJECT, "enum type does not exist")
+                    })?;
                 let member = definition
                     .members()
                     .position(|member| {
@@ -281,7 +297,8 @@ pub(crate) fn bind_query<const N: usize>(
                 }
                 let dependency = dependencies.view().entries().iter().position(|dependency| {
                     dependency.class == DependencyClass::Enum
-                        && dependency.identity == crate::storage::StoredDependencyIdentity::Type(reference)
+                        && dependency.identity
+                            == crate::storage::StoredDependencyIdentity::Type(reference)
                 });
                 let dependency = match dependency {
                     Some(index) => index,
@@ -454,7 +471,9 @@ pub(crate) fn legacy_identity(
     storage
         .read_enum_definition(
             crate::storage::TypeDefinitionTarget::by_creation(
-                storage, crate::storage::NamedTypeKind::Enum, slot,
+                storage,
+                crate::storage::NamedTypeKind::Enum,
+                slot,
             )?,
             txid,
         )?

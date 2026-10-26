@@ -117,10 +117,7 @@ pub(crate) fn coerce_domain_value<'a>(
     params: &[Datum<'a>],
 ) -> Result<Datum<'a>, SqlError> {
     let domain = storage
-        .read_domain_definition(
-            target,
-            txid,
-        )?
+        .read_domain_definition(target, txid)?
         .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "domain type does not exist"))?;
     coerce_selected_domain_value(storage, &domain, value, txid, arena, params)
 }
@@ -153,9 +150,15 @@ fn coerce_selected_domain_value<'a>(
             }
             crate::sql::types::ColType::Composite(slot) => match value {
                 value @ Datum::CompositeText { slot: actual, .. } if Some(actual) == slot => value,
-                Datum::Text(text) | Datum::Bpchar(text) => {
-                    super::decode_composite_text(text, slot.ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "composite type has no identity"))?, storage, txid, arena)?
-                }
+                Datum::Text(text) | Datum::Bpchar(text) => super::decode_composite_text(
+                    text,
+                    slot.ok_or_else(|| {
+                        sql_err!(sqlstate::UNDEFINED_OBJECT, "composite type has no identity")
+                    })?,
+                    storage,
+                    txid,
+                    arena,
+                )?,
                 value => super::coerce_composite_value(value, slot, storage, txid, arena)?,
             },
             crate::sql::types::ColType::Array(
@@ -251,17 +254,26 @@ pub(crate) fn validate_domain_check<'a>(
 
 pub(crate) fn column_domain_target(
     storage: &Storage,
-    column: &crate::storage::ColumnMeta,
+    column: &ColumnMeta,
     txid: u32,
 ) -> Result<Option<crate::storage::TypeDefinitionTarget>, SqlError> {
-    let bound = storage.bind_routine_result(crate::storage::RoutineResult {
-        ctype: column.ctype, user_type: column.user_type,
-    }, txid)?;
-    let Some(identity) = bound.user_type else { return Ok(None); };
+    let bound = storage.bind_routine_result(
+        crate::storage::RoutineResult {
+            ctype: column.ctype,
+            user_type: column.user_type,
+        },
+        txid,
+    )?;
+    let Some(identity) = bound.user_type else {
+        return Ok(None);
+    };
     let reference = crate::storage::TypeReference::from_bound_name(identity)?;
     if reference.kind() != crate::storage::NamedTypeKind::Domain
         || matches!(bound.ctype, ColType::Array(crate::sql::types::ArrElem::Domain { identity, .. })
-            if identity == Some(reference.creation())) { return Ok(None); }
+            if identity == Some(reference.creation()))
+    {
+        return Ok(None);
+    }
     Ok(Some(crate::storage::TypeDefinitionTarget::Bound(reference)))
 }
 

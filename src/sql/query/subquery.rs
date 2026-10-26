@@ -164,8 +164,13 @@ fn spooled_column_witness<'a>(
         if let Some((ColType::Composite(slot), _)) =
             crate::sql::exec::catalog_column_type(storage, txid, columns[0].type_oid)
         {
-            return composite_slot_witness(storage, txid, crate::storage::TypeCreation::require(slot)?, arena)
-                .map(|(witness, _)| witness);
+            return composite_slot_witness(
+                storage,
+                txid,
+                crate::storage::TypeCreation::require(slot)?,
+                arena,
+            )
+            .map(|(witness, _)| witness);
         }
         return catalog_type_witness(storage, txid, columns[0].type_oid);
     }
@@ -198,9 +203,7 @@ fn spooled_column_witness<'a>(
                     "subquery must return only one column"
                 ));
             }
-            type_witness(
-                scope.output_type(scope.qualified_star_entry(qualifier, 0)?),
-            )
+            type_witness(scope.output_type(scope.qualified_star_entry(qualifier, 0)?))
         }
         _ => {
             if let Some((witness, _)) = scope_record_witness(item, scope, storage, txid, arena)? {
@@ -218,10 +221,19 @@ fn composite_slot_witness<'a>(
     slot: crate::storage::TypeCreation,
     arena: &'a Arena,
 ) -> Result<(Datum<'a>, &'a [Collation]), SqlError> {
-    let target = crate::storage::TypeDefinitionTarget::by_creation(storage,
-        crate::storage::NamedTypeKind::Composite, slot)?;
-    let definition = storage.read_composite_definition(target, txid)?
-        .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "composite type no longer exists"))?;
+    let target = crate::storage::TypeDefinitionTarget::by_creation(
+        storage,
+        crate::storage::NamedTypeKind::Composite,
+        slot,
+    )?;
+    let definition = storage
+        .read_composite_definition(target, txid)?
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "composite type no longer exists"
+            )
+        })?;
     let mut fields = [RecordField {
         name: "",
         type_oid: 0,
@@ -276,7 +288,13 @@ fn scope_record_witness<'a>(
     if let Expr::Cast { type_name, .. } = expression
         && let Some(slot) = storage.resolve_composite_slot(type_name, txid)
     {
-        return composite_slot_witness(storage, txid, storage.composite_for(slot, txid).creation(), arena).map(Some);
+        return composite_slot_witness(
+            storage,
+            txid,
+            storage.composite_for(slot, txid).creation(),
+            arena,
+        )
+        .map(Some);
     }
     let Some(scope) = scope else {
         return Ok(None);
@@ -975,8 +993,13 @@ fn subquery_collations<'a>(
             && let Some((ColType::Composite(slot), _)) =
                 crate::sql::exec::catalog_column_type(storage, txid, columns[0].type_oid)
         {
-            return composite_slot_witness(storage, txid, crate::storage::TypeCreation::require(slot)?, arena)
-                .map(|(_, collations)| collations);
+            return composite_slot_witness(
+                storage,
+                txid,
+                crate::storage::TypeCreation::require(slot)?,
+                arena,
+            )
+            .map(|(_, collations)| collations);
         }
         for (slot, column) in output.iter_mut().zip(&columns[..count]) {
             *slot = column.collation;
@@ -2095,7 +2118,10 @@ pub(crate) fn type_witness(ct: ColType) -> Result<Datum<'static>, SqlError> {
         // A named composite is not an anonymous record: even an empty
         // subquery must retain the catalog slot so ARRAY(subquery) chooses
         // the named composite array OID.
-        ColType::Composite(slot) => Datum::Composite { slot: crate::storage::TypeCreation::require(slot)?, fields: &[] },
+        ColType::Composite(slot) => Datum::Composite {
+            slot: crate::storage::TypeCreation::require(slot)?,
+            fields: &[],
+        },
         ColType::Bool => Datum::Bool(false),
         ColType::Int2 | ColType::Int4 => Datum::Int4(0),
         ColType::PgNodeTree => Datum::PgNodeTree(crate::sql::catalog_node::CatalogNode::NULL),
@@ -2329,7 +2355,8 @@ fn catalog_type_witness(
                 "subquery result type (oid {}) is not supported",
                 type_oid
             )
-        }).and_then(|(ctype, _)| type_witness(ctype))
+        })
+        .and_then(|(ctype, _)| type_witness(ctype))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2948,7 +2975,15 @@ fn run_set_subquery<'a>(
         *slot = v;
     }
     let witness = match target[0] {
-        ColType::Composite(slot) => composite_slot_witness(storage, txid, crate::storage::TypeCreation::require(slot)?, arena)?.0,
+        ColType::Composite(slot) => {
+            composite_slot_witness(
+                storage,
+                txid,
+                crate::storage::TypeCreation::require(slot)?,
+                arena,
+            )?
+            .0
+        }
         ctype => type_witness(ctype)?,
     };
     Ok((&*out, saw_null, witness))

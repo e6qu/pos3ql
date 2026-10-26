@@ -807,9 +807,17 @@ pub fn decode_projected_value(bytes: &[u8], tag: u8, at: usize) -> (Datum<'_>, u
         200 => {
             let element = crate::storage::CachedArrayElement::from_bytes(
                 bytes[at..at + 6].try_into().unwrap(),
-            ).expect("projected array descriptor was checked").element();
+            )
+            .expect("projected array descriptor was checked")
+            .element();
             let len = u32::from_le_bytes(bytes[at + 6..at + 10].try_into().unwrap()) as usize;
-            (Datum::Array { element, raw: &bytes[at + 10..at + 10 + len] }, 10 + len)
+            (
+                Datum::Array {
+                    element,
+                    raw: &bytes[at + 10..at + 10 + len],
+                },
+                10 + len,
+            )
         }
         16 => {
             let kind = crate::sql::types::RangeKind::from_code(bytes[at])
@@ -934,7 +942,9 @@ pub fn decode_projected_value(bytes: &[u8], tag: u8, at: usize) -> (Datum<'_>, u
         26 => (Datum::Macaddr(bytes[at..at + 6].try_into().unwrap()), 6),
         27 => (Datum::Macaddr8(bytes[at..at + 8].try_into().unwrap()), 8),
         201 => {
-            let slot = crate::storage::TypeCreation::from_le_bytes(bytes[at..at + 4].try_into().unwrap()).expect("projected enum creation");
+            let slot =
+                crate::storage::TypeCreation::from_le_bytes(bytes[at..at + 4].try_into().unwrap())
+                    .expect("projected enum creation");
             let sort = f64::from_le_bytes(bytes[at + 4..at + 12].try_into().unwrap());
             let identity = u32::from_le_bytes(bytes[at + 12..at + 16].try_into().unwrap());
             let member = crate::sql::types::EnumMemberId::from_ordinal(identity);
@@ -981,7 +991,9 @@ pub fn decode_projected_value(bytes: &[u8], tag: u8, at: usize) -> (Datum<'_>, u
             )
         }
         203 => {
-            let slot = crate::storage::TypeCreation::from_le_bytes(bytes[at..at + 4].try_into().unwrap()).expect("projected composite creation");
+            let slot =
+                crate::storage::TypeCreation::from_le_bytes(bytes[at..at + 4].try_into().unwrap())
+                    .expect("projected composite creation");
             let (physical_fields, prefix) =
                 decode_physical_field_count(&bytes[at + 4..]).expect("projected composite prefix");
             let length_at = at + 4 + prefix;
@@ -1115,7 +1127,10 @@ pub fn decode_projected_col_record<'a>(
                 return decode_record_tail(bytes, at + 4 + text_len, arena);
             }
             if tag == 202 {
-                let slot = crate::storage::TypeCreation::from_le_bytes(bytes[at..at + 4].try_into().unwrap()).expect("projected composite creation");
+                let slot = crate::storage::TypeCreation::from_le_bytes(
+                    bytes[at..at + 4].try_into().unwrap(),
+                )
+                .expect("projected composite creation");
                 let text_len =
                     u32::from_le_bytes(bytes[at + 4..at + 8].try_into().unwrap()) as usize;
                 let Datum::Record(fields) = decode_record_tail(bytes, at + 8 + text_len, arena)?
@@ -1169,7 +1184,10 @@ fn decode_record_tail<'a>(
             f.value = decode_record_tail(bytes, cursor + 4 + text_len, arena)?;
             cursor += decode_projected_value(bytes, tag, cursor).1;
         } else if tag == 202 {
-            let slot = crate::storage::TypeCreation::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()).expect("projected composite creation");
+            let slot = crate::storage::TypeCreation::from_le_bytes(
+                bytes[cursor..cursor + 4].try_into().unwrap(),
+            )
+            .expect("projected composite creation");
             let text_len =
                 u32::from_le_bytes(bytes[cursor + 4..cursor + 8].try_into().unwrap()) as usize;
             let Datum::Record(fields) = decode_record_tail(bytes, cursor + 8 + text_len, arena)?
@@ -1256,7 +1274,9 @@ mod tests {
         let arena = Arena::new(&mut budget, "user array projected row", 2048).unwrap();
         let values = [
             Datum::Array {
-                element: ArrElem::Enum(Some(crate::storage::TypeCreation::parse(9_999_997).unwrap())),
+                element: ArrElem::Enum(Some(
+                    crate::storage::TypeCreation::parse(9_999_997).unwrap(),
+                )),
                 raw: b"enum",
             },
             Datum::Array {
@@ -1268,7 +1288,9 @@ mod tests {
                 raw: b"domain",
             },
             Datum::Array {
-                element: ArrElem::Composite(Some(crate::storage::TypeCreation::parse(9_999_999).unwrap())),
+                element: ArrElem::Composite(Some(
+                    crate::storage::TypeCreation::parse(9_999_999).unwrap(),
+                )),
                 raw: b"composite",
             },
         ];

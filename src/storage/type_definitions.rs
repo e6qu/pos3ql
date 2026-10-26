@@ -40,11 +40,18 @@ impl TypeDefinitionTarget {
         kind: super::NamedTypeKind,
         creation: super::TypeCreation,
     ) -> Result<Self, SqlError> {
-        storage.type_catalog.lock().expect("type catalog lock poisoned")
+        storage
+            .type_catalog
+            .lock()
+            .expect("type catalog lock poisoned")
             .source_reference_by_creation(kind, creation, super::current_database())
             .map(Self::Bound)
-            .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT,
-                "named type creation no longer exists"))
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "named type creation no longer exists"
+                )
+            })
     }
 
     pub(super) fn slot(self) -> NamedTypeSlot {
@@ -1011,8 +1018,10 @@ mod tests {
                     selected
                 };
                 assert_retained(&retained);
-                assert_eq!(capture(&images, &storage, selected).err().unwrap().sqlstate,
-                    sqlstate::UNDEFINED_OBJECT);
+                assert_eq!(
+                    capture(&images, &storage, selected).err().unwrap().sqlstate,
+                    sqlstate::UNDEFINED_OBJECT
+                );
                 drop(images);
                 assert_eq!(create(&mut storage, source).unwrap(), source.index());
                 let catalog = storage.type_catalog.lock().unwrap();
@@ -1315,7 +1324,7 @@ mod tests {
             assert!(!selected.label_is_uncommitted("before"));
             assert!(selected.label_is_uncommitted("after"));
             let value = |member, label| Datum::Enum {
-                slot: 0,
+                slot: selected.creation(),
                 member: Some(EnumMemberId::from_ordinal(member).unwrap()),
                 sort: 0.0,
                 label,
@@ -1333,7 +1342,7 @@ mod tests {
             );
             let identified = value(0, "before");
             let legacy = Datum::Enum {
-                slot: 0,
+                slot: selected.creation(),
                 member: None,
                 sort: 0.0,
                 label: "before",
@@ -1434,7 +1443,7 @@ mod tests {
                         schema,
                         SqlName::parse("reader_source").unwrap(),
                     )),
-                    base: ColType::Enum(0),
+                    base: ColType::Enum(Some(storage.enum_for(0, 0).creation())),
                     base_type_mod: -1,
                     not_null: false,
                     not_null_name: None,
@@ -1450,7 +1459,7 @@ mod tests {
         fields[0] = CompositeFieldDef {
             name: SqlName::parse("status").unwrap(),
             attribute_number: 1,
-            ctype: ColType::Enum(0),
+            ctype: ColType::Enum(Some(storage.enum_for(0, 0).creation())),
             dropped: false,
             user_type: Some(super::super::UserTypeName::declaration(
                 schema,

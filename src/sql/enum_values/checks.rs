@@ -87,9 +87,13 @@ fn bind_expression<const N: usize>(
         return Ok(StackStr::from_str(source));
     };
     let target = crate::storage::TypeDefinitionTarget::by_creation(
-        storage, crate::storage::NamedTypeKind::Enum, slot,
+        storage,
+        crate::storage::NamedTypeKind::Enum,
+        slot,
     )?;
-    let definition = storage.read_enum_definition(target, txid)?.ok_or_else(corrupt)?;
+    let definition = storage
+        .read_enum_definition(target, txid)?
+        .ok_or_else(corrupt)?;
     let tokens = query_tokens(source, arena)?;
     let count = tokens
         .iter()
@@ -160,7 +164,8 @@ fn bind_expression<const N: usize>(
                 Some(schema) => storage.enum_slot(schema, bare, txid),
                 None => storage.resolve_enum_slot(bare, txid),
             };
-            if selected.is_some_and(|selected| storage.enum_for(selected, txid).creation() == slot) {
+            if selected.is_some_and(|selected| storage.enum_for(selected, txid).creation() == slot)
+            {
                 let _ = write!(output, "/*p3t:{width}*/");
                 for selected in &tokens[index..index + width] {
                     let _ = write!(output, "{} ", &source[selected.start..selected.end]);
@@ -356,9 +361,13 @@ fn resolve_expression<'a>(
         body
     };
     let target = crate::storage::TypeDefinitionTarget::by_creation(
-        storage, crate::storage::NamedTypeKind::Enum, slot,
+        storage,
+        crate::storage::NamedTypeKind::Enum,
+        slot,
     )?;
-    let definition = storage.read_enum_definition(target, txid)?.ok_or_else(corrupt)?;
+    let definition = storage
+        .read_enum_definition(target, txid)?
+        .ok_or_else(corrupt)?;
     let mut name = StackStr::<260>::new();
     if display_names {
         let display_name =

@@ -14,8 +14,12 @@ pub struct TypeCreation {
 
 impl TypeCreation {
     pub(crate) fn require(creation: Option<Self>) -> Result<Self, SqlError> {
-        creation.ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT,
-            "named type declaration has no bound identity"))
+        creation.ok_or_else(|| {
+            sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "named type declaration has no bound identity"
+            )
+        })
     }
 
     /// Rejects zero and stamps outside the named-type identifier range.
@@ -49,10 +53,14 @@ impl TypeCreation {
 }
 
 impl PartialOrd for TypeCreation {
-    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> { Some(self.cmp(other)) }
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }
 impl Ord for TypeCreation {
-    fn cmp(&self, other: &Self) -> core::cmp::Ordering { self.created_at().cmp(&other.created_at()) }
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        self.created_at().cmp(&other.created_at())
+    }
 }
 
 const _: [(); 3] = [(); core::mem::size_of::<TypeCreation>()];
@@ -349,16 +357,30 @@ impl CachedArrayElement {
     pub(crate) fn from_element(element: crate::sql::types::ArrElem) -> Result<Self, SqlError> {
         use crate::sql::types::{ArrElem, ColType};
         use ArrayElementIdentity::*;
-        let invalid = || sql_err!(sqlstate::UNDEFINED_OBJECT,
-            "array element has no bound type identity");
+        let invalid = || {
+            sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "array element has no bound type identity"
+            )
+        };
         let identity = match element {
             ArrElem::Enum(creation) => Enum(creation.ok_or_else(invalid)?),
             ArrElem::Composite(creation) => Composite(creation.ok_or_else(invalid)?),
-            ArrElem::Domain { identity, base_code, base_identity } => {
+            ArrElem::Domain {
+                identity,
+                base_code,
+                base_identity,
+            } => {
                 let domain = identity.ok_or_else(invalid)?;
                 match ColType::from_code(base_code).ok_or_else(invalid)? {
-                    ColType::Enum(_) => DomainEnum { domain, base: base_identity.ok_or_else(invalid)? },
-                    ColType::Composite(_) => DomainComposite { domain, base: base_identity.ok_or_else(invalid)? },
+                    ColType::Enum(_) => DomainEnum {
+                        domain,
+                        base: base_identity.ok_or_else(invalid)?,
+                    },
+                    ColType::Composite(_) => DomainComposite {
+                        domain,
+                        base: base_identity.ok_or_else(invalid)?,
+                    },
                     _ if base_identity.is_none() => DomainBuiltin { domain, base_code },
                     _ => return Err(invalid()),
                 }
@@ -376,18 +398,26 @@ impl CachedArrayElement {
             Enum(creation) => ArrElem::Enum(Some(creation)),
             Composite(creation) => ArrElem::Composite(Some(creation)),
             DomainBuiltin { domain, base_code } => ArrElem::Domain {
-                identity: Some(domain), base_code, base_identity: None,
+                identity: Some(domain),
+                base_code,
+                base_identity: None,
             },
             DomainEnum { domain, base } => ArrElem::Domain {
-                identity: Some(domain), base_code: ColType::Enum(None).code(), base_identity: Some(base),
+                identity: Some(domain),
+                base_code: ColType::Enum(None).code(),
+                base_identity: Some(base),
             },
             DomainComposite { domain, base } => ArrElem::Domain {
-                identity: Some(domain), base_code: ColType::Composite(None).code(), base_identity: Some(base),
+                identity: Some(domain),
+                base_code: ColType::Composite(None).code(),
+                base_identity: Some(base),
             },
         }
     }
 
-    pub(crate) fn bytes(self) -> [u8; 6] { self.0 }
+    pub(crate) fn bytes(self) -> [u8; 6] {
+        self.0
+    }
 
     const ENUM: u64 = 256;
     const COMPOSITE: u64 = Self::ENUM + MAX_TYPE_CREATION;
@@ -409,8 +439,13 @@ impl CachedArrayElement {
     fn builtin_base(code: u8) -> bool {
         use crate::sql::types::ColType;
         crate::sql::types::ColType::from_code(code).is_some_and(|base| match base {
-            ColType::Enum(_) | ColType::Composite(_) | ColType::Record | ColType::Void
-                | ColType::Internal | ColType::PgDdlCommand | ColType::AnyArray => false,
+            ColType::Enum(_)
+            | ColType::Composite(_)
+            | ColType::Record
+            | ColType::Void
+            | ColType::Internal
+            | ColType::PgDdlCommand
+            | ColType::AnyArray => false,
             ColType::Array(element) => !matches!(
                 element,
                 crate::sql::types::ArrElem::Enum(_)
@@ -513,7 +548,10 @@ mod tests {
     fn cached_array_descriptors_preserve_maximum_creation_identities_without_allocation() {
         fn check(identity: ArrayElementIdentity) {
             let encoded = CachedArrayElement::from_identity(identity).unwrap();
-            assert_eq!(CachedArrayElement::from_element(encoded.element()).unwrap(), encoded);
+            assert_eq!(
+                CachedArrayElement::from_element(encoded.element()).unwrap(),
+                encoded
+            );
             assert_eq!(encoded.identity(), identity);
             assert_eq!(
                 CachedArrayElement::from_bytes(encoded.0)

@@ -1008,7 +1008,7 @@ mod tests {
         );
         let mut definition = make_def(
             "enum_reader",
-            &[("state", ColType::Enum(slot as u16), false)],
+            &[("state", ColType::Enum(Some(storage.enum_for(slot, 0).creation())), false)],
         );
         definition.columns[0].user_type = Some(identity);
         let table = storage.create_table(definition).unwrap();
@@ -1081,7 +1081,7 @@ mod tests {
         let after = UserTypeName::declaration(before.schema, SqlName::parse("moved").unwrap());
         let mut definition = make_def(
             "enum_reference",
-            &[("state", ColType::Enum(slot as u16), false)],
+            &[("state", ColType::Enum(Some(storage.enum_for(slot, 0).creation())), false)],
         );
         definition.columns[0].user_type = Some(before);
         let table = storage.create_table(definition).unwrap();
@@ -1126,7 +1126,7 @@ mod tests {
                     .declared_column_type(&storage.table_def(table, 0).columns()[0], 0)
                     .unwrap()
                     .catalog_oid(),
-                crate::sql::types::oid::enum_oid(slot as u16)
+                crate::sql::types::oid::enum_oid(storage.enum_for(slot, 0).creation())
             );
         });
     }

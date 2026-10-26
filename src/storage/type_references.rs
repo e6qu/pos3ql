@@ -201,9 +201,13 @@ enum ReferenceIdentity {
 pub struct TypeReference(ReferenceIdentity);
 
 impl TypeReference {
-    pub(crate) fn creation(self) -> TypeCreation { self.stored().created_at }
+    pub(crate) fn creation(self) -> TypeCreation {
+        self.stored().created_at
+    }
 
-    pub(crate) fn kind(self) -> super::NamedTypeKind { self.slot().kind() }
+    pub(crate) fn kind(self) -> super::NamedTypeKind {
+        self.slot().kind()
+    }
 
     pub(crate) fn catalog_slot(self) -> u16 {
         u16::try_from(self.slot().index()).expect("captured type catalog slot fits")

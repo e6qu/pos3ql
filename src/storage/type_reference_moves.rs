@@ -1069,7 +1069,7 @@ mod tests {
                 (
                     slot,
                     ColType::Int4,
-                    ColType::Array(ArrElem::domain(slot as u16, ColType::Int4).unwrap()),
+                    ColType::Array(ArrElem::domain(storage.domain_for(slot, 0).creation(), ColType::Int4).unwrap()),
                 )
             }
             TypeReferenceKind::Enum => {
@@ -1091,8 +1091,8 @@ mod tests {
                     .slot();
                 (
                     slot,
-                    ColType::Enum(slot as u16),
-                    ColType::Array(ArrElem::Enum(slot as u16)),
+                    ColType::Enum(Some(storage.enum_for(slot, 0).creation())),
+                    ColType::Array(ArrElem::Enum(Some(storage.enum_for(slot, 0).creation()))),
                 )
             }
             TypeReferenceKind::Composite => {
@@ -1118,8 +1118,8 @@ mod tests {
                     .slot();
                 (
                     slot,
-                    ColType::Composite(slot as u16),
-                    ColType::Array(ArrElem::Composite(slot as u16)),
+                    ColType::Composite(Some(storage.composite_for(slot, 0).creation())),
+                    ColType::Array(ArrElem::Composite(Some(storage.composite_for(slot, 0).creation()))),
                 )
             }
         }
@@ -3006,32 +3006,23 @@ mod tests {
         let current = identity("current");
         let outer = identity("outer");
         for (kind, ctype) in [
-            (TypeReferenceKind::Enum, ColType::Enum(0)),
-            (TypeReferenceKind::Enum, ColType::Array(ArrElem::Enum(0))),
-            (
-                TypeReferenceKind::Enum,
-                ColType::Enum(None),
-            ),
-            (
-                TypeReferenceKind::Enum,
-                ColType::Array(ArrElem::Enum(None)),
-            ),
-            (TypeReferenceKind::Composite, ColType::Composite(0)),
+            (TypeReferenceKind::Enum, ColType::Enum(Some(super::super::TypeCreation::parse(1).unwrap()))),
+            (TypeReferenceKind::Enum, ColType::Array(ArrElem::Enum(Some(super::super::TypeCreation::parse(1).unwrap())))),
+            (TypeReferenceKind::Enum, ColType::Enum(None)),
+            (TypeReferenceKind::Enum, ColType::Array(ArrElem::Enum(None))),
+            (TypeReferenceKind::Composite, ColType::Composite(Some(super::super::TypeCreation::parse(1).unwrap()))),
             (
                 TypeReferenceKind::Composite,
-                ColType::Array(ArrElem::Composite(0)),
+                ColType::Array(ArrElem::Composite(Some(super::super::TypeCreation::parse(1).unwrap()))),
             ),
-            (
-                TypeReferenceKind::Composite,
-                ColType::Composite(None),
-            ),
+            (TypeReferenceKind::Composite, ColType::Composite(None)),
             (
                 TypeReferenceKind::Composite,
                 ColType::Array(ArrElem::Composite(None)),
             ),
             (
                 TypeReferenceKind::Domain,
-                ColType::Array(ArrElem::domain(0, ColType::Enum(0)).unwrap()),
+                ColType::Array(ArrElem::domain(super::super::TypeCreation::parse(1).unwrap(), ColType::Enum(Some(super::super::TypeCreation::parse(2).unwrap()))).unwrap()),
             ),
         ] {
             let movement = TypeReferenceMove::new(
@@ -3064,12 +3055,12 @@ mod tests {
             assert_eq!(base, None);
         }
         for (kind, ctype) in [
-            (TypeReferenceKind::Enum, ColType::Enum(1)),
-            (TypeReferenceKind::Enum, ColType::Array(ArrElem::Enum(1))),
-            (TypeReferenceKind::Composite, ColType::Composite(1)),
+            (TypeReferenceKind::Enum, ColType::Enum(Some(super::super::TypeCreation::parse(2).unwrap()))),
+            (TypeReferenceKind::Enum, ColType::Array(ArrElem::Enum(Some(super::super::TypeCreation::parse(2).unwrap())))),
+            (TypeReferenceKind::Composite, ColType::Composite(Some(super::super::TypeCreation::parse(2).unwrap()))),
             (
                 TypeReferenceKind::Composite,
-                ColType::Array(ArrElem::Composite(1)),
+                ColType::Array(ArrElem::Composite(Some(super::super::TypeCreation::parse(2).unwrap()))),
             ),
         ] {
             let movement = TypeReferenceMove::new(

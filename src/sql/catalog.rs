@@ -12119,7 +12119,12 @@ pub(crate) fn type_oid_visibility(storage: &Storage, txid: u32, oid: i32) -> Opt
     if let Some((_, _, array)) = crate::storage::NamedTypeKind::from_oid(oid) {
         let source = storage.routine_result_for_oid(oid, txid)?;
         let name = source.user_type?;
-        let written = stack_format!(160, "{}{}", name.name.as_str(), if array { "[]" } else { "" });
+        let written = stack_format!(
+            160,
+            "{}{}",
+            name.name.as_str(),
+            if array { "[]" } else { "" }
+        );
         return Some(user_type_oid(storage, txid, written.as_str()) == Some(oid));
     }
     for slot in 0..storage.table_count() {
@@ -14564,10 +14569,14 @@ fn type_oid_of(storage: &Storage, schema: &str, name: &str, txid: u32) -> Option
         return Some(domain_oid(storage, slot, txid));
     }
     if let Some(slot) = storage.enum_slot(schema, name, txid) {
-        return Some(crate::sql::types::oid::enum_oid(storage.enum_for(slot, txid).creation()));
+        return Some(crate::sql::types::oid::enum_oid(
+            storage.enum_for(slot, txid).creation(),
+        ));
     }
     if let Some(slot) = storage.composite_slot(schema, name, txid) {
-        return Some(crate::sql::types::oid::composite_oid(storage.composite_for(slot, txid).creation()));
+        return Some(crate::sql::types::oid::composite_oid(
+            storage.composite_for(slot, txid).creation(),
+        ));
     }
     if let Some(oid) = composite_type_oid(storage, schema, name, txid) {
         return Some(oid);
@@ -14587,9 +14596,15 @@ pub fn user_type_name_text<'a>(
     oid: i32,
     arena: &'a Arena,
 ) -> Result<Option<&'a str>, SqlError> {
-    let Some((_, _, array)) = crate::storage::NamedTypeKind::from_oid(oid) else { return Ok(None); };
-    let Some(source) = storage.routine_result_for_oid(oid, txid) else { return Ok(None); };
-    let Some(identity) = source.user_type else { return Ok(None); };
+    let Some((_, _, array)) = crate::storage::NamedTypeKind::from_oid(oid) else {
+        return Ok(None);
+    };
+    let Some(source) = storage.routine_result_for_oid(oid, txid) else {
+        return Ok(None);
+    };
+    let Some(identity) = source.user_type else {
+        return Ok(None);
+    };
     let (schema, name) = (identity.schema, identity.name);
     let written = stack_format!(160, "{}{}", name.as_str(), if array { "[]" } else { "" });
     let unqualified_visible = user_type_oid(storage, txid, written.as_str()) == Some(oid);
@@ -19515,7 +19530,11 @@ fn pg_class<'a>(
                     table_def
                         .type_membership
                         .composite_slot()
-                        .map_or(0, |slot| crate::sql::types::oid::composite_oid(storage.composite_for(slot, txid).creation())),
+                        .map_or(0, |slot| {
+                            crate::sql::types::oid::composite_oid(
+                                storage.composite_for(slot, txid).creation(),
+                            )
+                        }),
                 ),
                 Datum::Int4(if table_def.has_toast {
                     toast_relation_oid(storage, slot)
@@ -19692,7 +19711,9 @@ fn pg_class<'a>(
                 text("p", arena)?,
                 text("n", arena)?,
                 Datum::Int4(PG_CLASS_OID),
-                Datum::Int4(crate::sql::types::oid::composite_oid(storage.composite_for(slot, txid).creation())),
+                Datum::Int4(crate::sql::types::oid::composite_oid(
+                    storage.composite_for(slot, txid).creation(),
+                )),
                 acl(storage, object, txid, arena)?,
                 Datum::Int4(0),
                 Datum::Int4(0),
@@ -21099,10 +21120,19 @@ fn extension_dependency_catalog_identity(
         }
         AccessClass::Sequence => (PG_CLASS_OID, sequence_oid(storage, slot)),
         AccessClass::Domain => (PG_TYPE_OID, domain_oid(storage, slot, txid)),
-        AccessClass::Enum => (PG_TYPE_OID, crate::sql::types::oid::enum_oid(storage.enum_for(usize::from(object.slot), txid).creation())),
+        AccessClass::Enum => (
+            PG_TYPE_OID,
+            crate::sql::types::oid::enum_oid(
+                storage.enum_for(usize::from(object.slot), txid).creation(),
+            ),
+        ),
         AccessClass::Composite => (
             PG_TYPE_OID,
-            crate::sql::types::oid::composite_oid(storage.composite_for(usize::from(object.slot), txid).creation()),
+            crate::sql::types::oid::composite_oid(
+                storage
+                    .composite_for(usize::from(object.slot), txid)
+                    .creation(),
+            ),
         ),
         AccessClass::Routine => (
             PG_PROC_OID,
@@ -21332,7 +21362,11 @@ fn pg_depend<'a>(
                 .and_then(|base| {
                     storage
                         .enum_slot(base.schema.as_str(), base.name.as_str(), txid)
-                        .map(|slot| crate::sql::types::oid::enum_oid(storage.enum_for(slot, txid).creation()))
+                        .map(|slot| {
+                            crate::sql::types::oid::enum_oid(
+                                storage.enum_for(slot, txid).creation(),
+                            )
+                        })
                         .or_else(|| {
                             composite_type_oid(
                                 storage,
@@ -21610,16 +21644,25 @@ fn pg_depend<'a>(
             PG_CLASS_OID,
             sequence_oid(storage, dependency.slot as usize),
         )),
-        crate::storage::DependencyClass::Domain => {
-            Some((PG_TYPE_OID, domain_oid(storage, dependency.slot as usize, txid)))
-        }
+        crate::storage::DependencyClass::Domain => Some((
+            PG_TYPE_OID,
+            domain_oid(storage, dependency.slot as usize, txid),
+        )),
         crate::storage::DependencyClass::Enum => Some((
             PG_TYPE_OID,
-            crate::sql::types::oid::enum_oid(storage.enum_for(usize::from(dependency.slot), txid).creation()),
+            crate::sql::types::oid::enum_oid(
+                storage
+                    .enum_for(usize::from(dependency.slot), txid)
+                    .creation(),
+            ),
         )),
         crate::storage::DependencyClass::Composite => Some((
             PG_TYPE_OID,
-            crate::sql::types::oid::composite_oid(storage.composite_for(usize::from(dependency.slot), txid).creation()),
+            crate::sql::types::oid::composite_oid(
+                storage
+                    .composite_for(usize::from(dependency.slot), txid)
+                    .creation(),
+            ),
         )),
         crate::storage::DependencyClass::Routine => Some((
             PG_PROC_OID,
@@ -29732,7 +29775,8 @@ fn pg_type<'a>(
                 .expect("visible domain retains its parent identity"),
             None => d.base.oid(),
         };
-        let array_oid = crate::sql::types::oid::domain_array_oid(storage.domain_for(slot, txid).creation());
+        let array_oid =
+            crate::sql::types::oid::domain_array_oid(storage.domain_for(slot, txid).creation());
         out[n] = row(
             &[
                 Datum::Int4(domain_oid(storage, slot, txid)),
@@ -29842,7 +29886,8 @@ fn pg_type<'a>(
             continue;
         }
         let enum_oid = crate::sql::types::oid::enum_oid(storage.enum_for(slot, txid).creation());
-        let array_oid = crate::sql::types::oid::enum_array_oid(storage.enum_for(slot, txid).creation());
+        let array_oid =
+            crate::sql::types::oid::enum_array_oid(storage.enum_for(slot, txid).creation());
         out[n] = row(
             &[
                 Datum::Int4(enum_oid),
@@ -29931,8 +29976,11 @@ fn pg_type<'a>(
     // and automatically-created array type. Attribute rows are synthesized
     // separately from the same bounded `CompositeDef` field list.
     for (slot, composite) in storage.composites_with_slots_visible_to(txid) {
-        let composite_oid = crate::sql::types::oid::composite_oid(storage.composite_for(slot, txid).creation());
-        let array_oid = crate::sql::types::oid::composite_array_oid(storage.composite_for(slot, txid).creation());
+        let composite_oid =
+            crate::sql::types::oid::composite_oid(storage.composite_for(slot, txid).creation());
+        let array_oid = crate::sql::types::oid::composite_array_oid(
+            storage.composite_for(slot, txid).creation(),
+        );
         out[n] = row(
             &[
                 Datum::Int4(composite_oid),
@@ -31602,7 +31650,9 @@ fn information_schema_usage_type(
     let domain = match crate::storage::NamedTypeKind::from_oid(declared_oid) {
         Some((crate::storage::NamedTypeKind::Domain, creation, false)) => {
             let target = crate::storage::TypeDefinitionTarget::by_creation(
-                storage, crate::storage::NamedTypeKind::Domain, creation,
+                storage,
+                crate::storage::NamedTypeKind::Domain,
+                creation,
             )?;
             storage.read_domain_definition(target, txid)?
         }

@@ -288,7 +288,8 @@ fn domain_base_creation(def: &crate::storage::DomainDef) -> Option<u32> {
         (Some(_), ColType::Enum(creation) | ColType::Composite(creation)) => {
             creation.map(|creation| creation.created_at() as u32)
         }
-        (Some(_), ColType::Array(element)) => element.user_type_identity()
+        (Some(_), ColType::Array(element)) => element
+            .user_type_identity()
             .map(|creation| creation.created_at() as u32),
         (None, _) => Some(NO_DOMAIN_BASE_CREATION),
         (Some(_), _) => None,
@@ -5691,7 +5692,8 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                         .unwrap_or(""),
                 )
                 && buffer.append(&[def.base.code()])
-                && domain_base_creation(def).is_some_and(|creation| buffer.append(&creation.to_le_bytes()))
+                && domain_base_creation(def)
+                    .is_some_and(|creation| buffer.append(&creation.to_le_bytes()))
                 && buffer.append(&def.base_type_mod.to_le_bytes())
                 && buffer.append(&[u8::from(def.not_null)])
                 && name_bytes(
@@ -9819,15 +9821,29 @@ fn decode_op_inner<'a>(
             let raw_creation = u32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
             at += 4;
             let base = match (base_user_type, base, raw_creation) {
-                (Some(_), ColType::Enum(_), value) => ColType::Enum(Some(crate::storage::TypeCreation::parse(u64::from(value))?)),
-                (Some(_), ColType::Composite(_), value) => ColType::Composite(Some(crate::storage::TypeCreation::parse(u64::from(value))?)),
+                (Some(_), ColType::Enum(_), value) => {
+                    ColType::Enum(Some(crate::storage::TypeCreation::parse(u64::from(value))?))
+                }
+                (Some(_), ColType::Composite(_), value) => {
+                    ColType::Composite(Some(crate::storage::TypeCreation::parse(u64::from(value))?))
+                }
                 (Some(_), ColType::Array(element), value) => {
                     let creation = crate::storage::TypeCreation::parse(u64::from(value))?;
                     ColType::Array(match element {
-                        crate::sql::types::ArrElem::Enum(_) => crate::sql::types::ArrElem::Enum(Some(creation)),
-                        crate::sql::types::ArrElem::Composite(_) => crate::sql::types::ArrElem::Composite(Some(creation)),
-                        crate::sql::types::ArrElem::Domain { base_code, base_identity, .. } => crate::sql::types::ArrElem::Domain {
-                            identity: Some(creation), base_code, base_identity,
+                        crate::sql::types::ArrElem::Enum(_) => {
+                            crate::sql::types::ArrElem::Enum(Some(creation))
+                        }
+                        crate::sql::types::ArrElem::Composite(_) => {
+                            crate::sql::types::ArrElem::Composite(Some(creation))
+                        }
+                        crate::sql::types::ArrElem::Domain {
+                            base_code,
+                            base_identity,
+                            ..
+                        } => crate::sql::types::ArrElem::Domain {
+                            identity: Some(creation),
+                            base_code,
+                            base_identity,
                         },
                         _ => return None,
                     })
@@ -12113,7 +12129,11 @@ pub(crate) fn encode_default_bytes(d: &Option<OwnedDatum>, out: &mut [u8]) -> us
             out[3..3 + *len as usize].copy_from_slice(&bytes[..*len as usize]);
             3 + *len as usize
         }
-        Some(OwnedDatum::Array { element, len, bytes }) => {
+        Some(OwnedDatum::Array {
+            element,
+            len,
+            bytes,
+        }) => {
             out[0] = 200;
             out[1..7].copy_from_slice(&element.bytes());
             out[7] = *len;
@@ -12346,7 +12366,9 @@ pub(crate) fn decode_default(payload: &[u8], at: &mut usize) -> Option<Option<Ow
             Some(OwnedDatum::Macaddr8(b.try_into().unwrap()))
         }
         201 | 202 => {
-            let slot = crate::storage::TypeCreation::from_le_bytes(payload.get(*at..*at + 4)?.try_into().ok()?)?;
+            let slot = crate::storage::TypeCreation::from_le_bytes(
+                payload.get(*at..*at + 4)?.try_into().ok()?,
+            )?;
             let sort = f64::from_le_bytes(payload.get(*at + 4..*at + 12)?.try_into().unwrap());
             *at += 12;
             let member = if tag == 201 {
@@ -12436,7 +12458,11 @@ pub(crate) fn decode_default(payload: &[u8], at: &mut usize) -> Option<Option<Ow
             let len = *payload.get(*at + 6)? as usize;
             *at += 7;
             let bytes = decode_bounded_default_bytes(payload, at, len)?;
-            Some(OwnedDatum::Array { element, len: len as u8, bytes })
+            Some(OwnedDatum::Array {
+                element,
+                len: len as u8,
+                bytes,
+            })
         }
         22 => {
             let kind = crate::sql::types::RangeKind::from_code(*payload.get(*at)?)?;
@@ -12794,7 +12820,7 @@ mod tests {
     fn cast_and_operator_catalog_payloads_round_trip_strictly() {
         let public = SqlName::parse("public").unwrap();
         let custom = crate::storage::RoutineResult {
-            ctype: ColType::Enum(7),
+            ctype: ColType::Enum(Some(crate::storage::TypeCreation::parse(7).unwrap())),
             user_type: Some(crate::storage::UserTypeName::declaration(
                 public,
                 SqlName::parse("mood").unwrap(),
@@ -12936,7 +12962,7 @@ mod tests {
                 name: "mood_ops",
             },
             WalOp::SetCollation {
-                slot: 7,
+                slot: crate::storage::TypeCreation::parse(7).unwrap(),
                 created_at: 14,
                 definition: collation,
             },
@@ -12979,7 +13005,7 @@ mod tests {
         // Kind 111 encoded one-byte slots. Keep it readable after widening
         // newly written records so existing journals remain recoverable.
         let operation = WalOp::SetTextSearch {
-            slot: 7,
+            slot: crate::storage::TypeCreation::parse(7).unwrap(),
             created_at: 18,
             definition: text_search,
         };
@@ -12990,7 +13016,7 @@ mod tests {
         legacy[1..payload.len() - 1].copy_from_slice(&payload[2..]);
         assert!(matches!(
             decode_op(KIND_SET_TEXT_SEARCH, &legacy[..payload.len() - 1]),
-            Some(WalOp::SetTextSearch { slot: 7, .. })
+            Some(WalOp::SetTextSearch { slot: crate::storage::TypeCreation::parse(7).unwrap(), .. })
         ));
     }
 
@@ -13028,7 +13054,7 @@ mod tests {
         crate::mem::guard::forbid_alloc(|| {
             for member in [None, crate::sql::types::EnumMemberId::from_ordinal(7)] {
                 let value = OwnedDatum::from_datum(&Datum::Enum {
-                    slot: 7,
+                    slot: crate::storage::TypeCreation::parse(7).unwrap(),
                     member,
                     sort: 1.0,
                     label: &label,
@@ -13050,7 +13076,7 @@ mod tests {
             }
             assert!(
                 OwnedDatum::from_datum(&Datum::Enum {
-                    slot: 7,
+                    slot: crate::storage::TypeCreation::parse(7).unwrap(),
                     member: None,
                     sort: 1.0,
                     label: &too_long,
@@ -13143,26 +13169,26 @@ mod tests {
                 bytes: text,
             }),
             Some(OwnedDatum::Array {
-                element: crate::sql::types::ArrElem::Int4,
+                element: crate::storage::CachedArrayElement::from_element(crate::sql::types::ArrElem::Int4).unwrap(),
                 len: 3,
                 bytes: text,
             }),
             Some(OwnedDatum::Array {
-                element: crate::sql::types::ArrElem::Enum(513),
+                element: crate::storage::CachedArrayElement::from_element(crate::sql::types::ArrElem::Enum(Some(crate::storage::TypeCreation::parse(513).unwrap()))).unwrap(),
                 len: 3,
                 bytes: text,
             }),
             Some(OwnedDatum::Array {
-                element: crate::sql::types::ArrElem::Domain {
-                    identity: 769,
-                    base_code: crate::sql::types::ColType::Composite(1025).code(),
-                    base_identity: 1025,
-                },
+                element: crate::storage::CachedArrayElement::from_element(crate::sql::types::ArrElem::Domain {
+                    identity: Some(crate::storage::TypeCreation::parse(769).unwrap()),
+                    base_code: crate::sql::types::ColType::Composite(Some(crate::storage::TypeCreation::parse(1025).unwrap())).code(),
+                    base_identity: Some(crate::storage::TypeCreation::parse(1025).unwrap()),
+                }).unwrap(),
                 len: 3,
                 bytes: text,
             }),
             Some(OwnedDatum::Array {
-                element: crate::sql::types::ArrElem::Composite(1281),
+                element: crate::storage::CachedArrayElement::from_element(crate::sql::types::ArrElem::Composite(Some(crate::storage::TypeCreation::parse(1281).unwrap()))).unwrap(),
                 len: 3,
                 bytes: text,
             }),
@@ -13635,7 +13661,7 @@ mod tests {
         };
         domain.schema = SqlName::parse("public").unwrap();
         domain.name = SqlName::parse("guarded_state").unwrap();
-        domain.base = ColType::Enum(0);
+        domain.base = ColType::Enum(Some(crate::storage::TypeCreation::parse(1).unwrap()));
         domain.base_user_type = Some(crate::storage::UserTypeName::declaration(
             domain.schema,
             SqlName::parse("state").unwrap(),
@@ -13659,7 +13685,7 @@ mod tests {
         let mut payload = FixedBuf::new(&mut budget, "enum journal versions", 16384).unwrap();
         let mut reencoded = FixedBuf::new(&mut budget, "enum journal replay", 16384).unwrap();
         let mut table = sample_def();
-        table.columns[0].ctype = ColType::Enum(0);
+        table.columns[0].ctype = ColType::Enum(Some(crate::storage::TypeCreation::parse(1).unwrap()));
         table.columns[0].user_type = domain.base_user_type;
         table.columns[0].default = crate::storage::ColumnDefault::Expression(StackStr::from_str(
             "pos3ql-enum-check-v1\n/*p3c:0*/'old'",
@@ -13777,9 +13803,9 @@ mod tests {
         });
         domain.n_checks = 0;
         for element in [
-            crate::sql::types::ArrElem::Enum(7),
-            crate::sql::types::ArrElem::Composite(9),
-            crate::sql::types::ArrElem::domain(11, ColType::Enum(7)).unwrap(),
+            crate::sql::types::ArrElem::Enum(Some(crate::storage::TypeCreation::parse(7).unwrap())),
+            crate::sql::types::ArrElem::Composite(Some(crate::storage::TypeCreation::parse(9).unwrap())),
+            crate::sql::types::ArrElem::domain(crate::storage::TypeCreation::parse(11).unwrap(), ColType::Enum(Some(crate::storage::TypeCreation::parse(7).unwrap()))).unwrap(),
         ] {
             domain.base = ColType::Array(element);
             let operation = WalOp::CreateDomain(0, &domain);
@@ -13806,7 +13832,7 @@ mod tests {
                 }
             });
         }
-        domain.base = ColType::Enum(0);
+        domain.base = ColType::Enum(Some(crate::storage::TypeCreation::parse(1).unwrap()));
         domain.default_expr = Some(StackStr::from_str("pos3ql-enum-check-v1\n/*p3c:0*/'old'"));
         crate::mem::guard::forbid_alloc(|| {
             payload.clear();
@@ -15087,7 +15113,7 @@ mod tests {
         fields[0] = crate::storage::CompositeFieldDef {
             attribute_number: 1,
             name: crate::storage::SqlName::parse("retained").unwrap(),
-            ctype: ColType::Composite(3),
+            ctype: ColType::Composite(Some(crate::storage::TypeCreation::parse(3).unwrap())),
             type_mod: -1,
             collation: crate::sql::ast::Collation::None,
             user_type: Some(crate::storage::UserTypeName::declaration(
@@ -15119,7 +15145,7 @@ mod tests {
             ddl_state: crate::storage::CatalogDdlState::Absent,
         };
         let op = WalOp::CreateComposite {
-            slot: 7,
+            slot: crate::storage::TypeCreation::parse(7).unwrap(),
             definition: &definition,
         };
         let mut budget = Budget::new(4096);

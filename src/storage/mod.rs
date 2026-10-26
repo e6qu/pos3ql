@@ -6888,7 +6888,9 @@ fn polymorphic_element_oid(kind: PolymorphicType, actual_oid: i32) -> Option<i32
                 .then_some(actual_oid)
         }
         PolymorphicType::Array | PolymorphicType::CompatibleArray => {
-            if let Some((NamedTypeKind::Domain, creation, true)) = NamedTypeKind::from_oid(actual_oid) {
+            if let Some((NamedTypeKind::Domain, creation, true)) =
+                NamedTypeKind::from_oid(actual_oid)
+            {
                 Some(oid::domain_oid(creation))
             } else {
                 match actual? {
@@ -40273,45 +40275,75 @@ impl Storage {
             .type_catalog
             .lock()
             .expect("type catalog lock poisoned");
-        let mut state = self.domain_graph_scratch.lock()
+        let mut state = self
+            .domain_graph_scratch
+            .lock()
             .expect("domain graph scratch lock poisoned");
         let mut remaining = 0usize;
         for (slot, marker) in state.iter_mut().enumerate() {
             let domain = catalog.domains[slot].definition_for(txid);
             if domain.database == current_database && domain.visible_to(txid) {
-                for identity in [domain.base_domain, domain.base_user_type].into_iter().flatten() {
-                    catalog.resolve_type_reference(identity, current_database, txid)?
-                        .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT,
-                            "domain base type no longer exists"))?;
+                for identity in [domain.base_domain, domain.base_user_type]
+                    .into_iter()
+                    .flatten()
+                {
+                    catalog
+                        .resolve_type_reference(identity, current_database, txid)?
+                        .ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::UNDEFINED_OBJECT,
+                                "domain base type no longer exists"
+                            )
+                        })?;
                 }
                 *marker = 0;
                 remaining += 1;
-            } else { *marker = 2; }
+            } else {
+                *marker = 2;
+            }
         }
         while remaining != 0 {
             let before = remaining;
             for slot in 0..catalog.domains.len() {
-                if state[slot] != 0 { continue; }
+                if state[slot] != 0 {
+                    continue;
+                }
                 let domain = catalog.domains[slot].definition_for(txid);
                 let rebound = if let Some(identity) = domain.base_domain.or(domain.base_user_type) {
-                    let source = catalog.resolve_type_reference(identity, current_database, txid)?
-                        .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT,
-                            "domain base type no longer exists"))?;
-                    if domain.base_domain.is_some() && !matches!(source.identity.slot(), NamedTypeSlot::Domain(_)) {
-                        return Err(sql_err!(sqlstate::DATATYPE_MISMATCH,
-                            "domain parent does not identify a domain"));
+                    let source = catalog
+                        .resolve_type_reference(identity, current_database, txid)?
+                        .ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::UNDEFINED_OBJECT,
+                                "domain base type no longer exists"
+                            )
+                        })?;
+                    if domain.base_domain.is_some()
+                        && !matches!(source.identity.slot(), NamedTypeSlot::Domain(_))
+                    {
+                        return Err(sql_err!(
+                            sqlstate::DATATYPE_MISMATCH,
+                            "domain parent does not identify a domain"
+                        ));
                     }
                     if let NamedTypeSlot::Domain(parent) = source.identity.slot()
-                        && state[parent] == 0 { continue; }
+                        && state[parent] == 0
+                    {
+                        continue;
+                    }
                     source.representation(domain.base)?
-                } else { domain.base };
+                } else {
+                    domain.base
+                };
                 catalog.domains[slot].base = rebound;
                 state[slot] = 2;
                 remaining -= 1;
             }
             if remaining == before {
-                return Err(sql_err!(sqlstate::PROTOCOL_VIOLATION,
-                    "recovered domain base chain contains a cycle"));
+                return Err(sql_err!(
+                    sqlstate::PROTOCOL_VIOLATION,
+                    "recovered domain base chain contains a cycle"
+                ));
             }
         }
         for slot in 0..catalog.domains.len() {
@@ -43270,17 +43302,27 @@ impl Storage {
         let Some((kind, creation, array)) = NamedTypeKind::from_oid(type_oid) else {
             return ColType::from_oid(type_oid).map(RoutineResult::builtin);
         };
-        let catalog = self.type_catalog.lock().expect("type catalog lock poisoned");
+        let catalog = self
+            .type_catalog
+            .lock()
+            .expect("type catalog lock poisoned");
         let reference = catalog.source_reference_by_creation(kind, creation, current_database())?;
-        let snapshot = catalog.resolve_source_reference(reference, current_database(), txid).ok()??;
+        let snapshot = catalog
+            .resolve_source_reference(reference, current_database(), txid)
+            .ok()??;
         let ctype = if array {
             match kind {
                 NamedTypeKind::Domain => ColType::Array(ArrElem::domain(creation, snapshot.base)?),
                 NamedTypeKind::Enum => ColType::Array(ArrElem::Enum(Some(creation))),
                 NamedTypeKind::Composite => ColType::Array(ArrElem::Composite(Some(creation))),
             }
-        } else { snapshot.base };
-        Some(RoutineResult { ctype, user_type: Some(snapshot.name) })
+        } else {
+            snapshot.base
+        };
+        Some(RoutineResult {
+            ctype,
+            user_type: Some(snapshot.name),
+        })
     }
 
     /// Whether PostgreSQL permits `actual_oid` to enter a routine parameter
@@ -43368,9 +43410,13 @@ impl Storage {
 
     pub(crate) fn domain_base_type_for_oid(&self, type_oid: i32, txid: u32) -> Option<ColType> {
         let (kind, creation, array) = NamedTypeKind::from_oid(type_oid)?;
-        if kind != NamedTypeKind::Domain || array { return None; }
+        if kind != NamedTypeKind::Domain || array {
+            return None;
+        }
         let target = TypeDefinitionTarget::by_creation(self, kind, creation).ok()?;
-        self.read_domain_definition(target, txid).ok()?.map(|definition| definition.base)
+        self.read_domain_definition(target, txid)
+            .ok()?
+            .map(|definition| definition.base)
     }
 
     pub(crate) fn user_type_identity_oid(
@@ -62043,7 +62089,7 @@ mod tests {
         let mut budget = test_budget(&config);
         let storage = Storage::new(&config, &mut budget, 0).unwrap();
         let mut column = ColumnMeta::EMPTY;
-        column.ctype = ColType::Enum(0);
+        column.ctype = ColType::Enum(None);
         assert_eq!(
             storage
                 .declared_column_type(&column, 0)

@@ -2569,7 +2569,9 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
     ) -> Result<Option<super::types::EnumMemberId>, SqlError> {
         let Some(definition) = self.storage.read_enum_definition(
             crate::storage::TypeDefinitionTarget::by_creation(
-                self.storage, crate::storage::NamedTypeKind::Enum, slot,
+                self.storage,
+                crate::storage::NamedTypeKind::Enum,
+                slot,
             )?,
             self.txid,
         )?
@@ -2627,10 +2629,18 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             return self.rowtype_fields(type_oid, arena).map(Some);
         }
         let Some((crate::storage::NamedTypeKind::Composite, creation, false)) =
-            crate::storage::NamedTypeKind::from_oid(type_oid) else { return Ok(None); };
-        let target = crate::storage::TypeDefinitionTarget::by_creation(self.storage,
-            crate::storage::NamedTypeKind::Composite, creation)?;
-        let Some(definition) = self.storage.read_composite_definition(target, self.txid)? else { return Ok(None); };
+            crate::storage::NamedTypeKind::from_oid(type_oid)
+        else {
+            return Ok(None);
+        };
+        let target = crate::storage::TypeDefinitionTarget::by_creation(
+            self.storage,
+            crate::storage::NamedTypeKind::Composite,
+            creation,
+        )?;
+        let Some(definition) = self.storage.read_composite_definition(target, self.txid)? else {
+            return Ok(None);
+        };
         let fields = arena
             .alloc_slice_with(definition.active_field_count(), |_| {
                 super::types::RecordField {
@@ -2665,9 +2675,13 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
     }
 
     fn composite_base_type_oid(&self, type_oid: i32) -> Option<i32> {
-        if super::catalog::table_slot_by_row_type_oid(self.storage, self.txid, type_oid, false).is_some()
-            || super::catalog::view_slot_by_row_type_oid(self.storage, self.txid, type_oid, false).is_some()
-        { return Some(type_oid); }
+        if super::catalog::table_slot_by_row_type_oid(self.storage, self.txid, type_oid, false)
+            .is_some()
+            || super::catalog::view_slot_by_row_type_oid(self.storage, self.txid, type_oid, false)
+                .is_some()
+        {
+            return Some(type_oid);
+        }
         let result = self.storage.routine_result_for_oid(type_oid, self.txid)?;
         match result.ctype {
             ColType::Composite(Some(creation)) => Some(super::types::oid::composite_oid(creation)),
@@ -2680,7 +2694,6 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         type_oid: i32,
         arena: &'a Arena,
     ) -> Result<Option<&'a [i32]>, SqlError> {
-        use super::types::oid;
         if let Some(slot) =
             super::catalog::table_slot_by_row_type_oid(self.storage, self.txid, type_oid, false)
         {
@@ -2717,10 +2730,18 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             return Ok(Some(&modifiers[..result?]));
         }
         let Some((crate::storage::NamedTypeKind::Composite, creation, false)) =
-            crate::storage::NamedTypeKind::from_oid(type_oid) else { return Ok(None); };
-        let target = crate::storage::TypeDefinitionTarget::by_creation(self.storage,
-            crate::storage::NamedTypeKind::Composite, creation)?;
-        let Some(definition) = self.storage.read_composite_definition(target, self.txid)? else { return Ok(None); };
+            crate::storage::NamedTypeKind::from_oid(type_oid)
+        else {
+            return Ok(None);
+        };
+        let target = crate::storage::TypeDefinitionTarget::by_creation(
+            self.storage,
+            crate::storage::NamedTypeKind::Composite,
+            creation,
+        )?;
+        let Some(definition) = self.storage.read_composite_definition(target, self.txid)? else {
+            return Ok(None);
+        };
         let modifiers = arena
             .alloc_slice_with(definition.active_field_count(), |_| -1)
             .map_err(|_| arena_full())?;
@@ -3764,13 +3785,17 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         }
         let named = crate::storage::NamedTypeKind::from_oid(type_oid).and_then(|(kind, _, _)| {
             let result = self.storage.routine_result_for_oid(type_oid, self.txid)?;
-            let reference = crate::storage::TypeReference::from_bound_name(result.user_type?).ok()?;
+            let reference =
+                crate::storage::TypeReference::from_bound_name(result.user_type?).ok()?;
             let class = match kind {
                 crate::storage::NamedTypeKind::Domain => AccessClass::Domain,
                 crate::storage::NamedTypeKind::Enum => AccessClass::Enum,
                 crate::storage::NamedTypeKind::Composite => AccessClass::Composite,
             };
-            Some(AccessObject { class, slot: reference.catalog_slot() })
+            Some(AccessObject {
+                class,
+                slot: reference.catalog_slot(),
+            })
         });
         if let Some(object) = named {
             let slot = usize::from(object.slot);
@@ -4057,10 +4082,16 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         super::catalog::database_size(self.storage, self.txid)
     }
 
-    fn enum_name<'a>(&self, slot: crate::storage::TypeCreation, arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
+    fn enum_name<'a>(
+        &self,
+        slot: crate::storage::TypeCreation,
+        arena: &'a Arena,
+    ) -> Result<Option<&'a str>, SqlError> {
         let Some(def) = self.storage.read_enum_definition(
             crate::storage::TypeDefinitionTarget::by_creation(
-                self.storage, crate::storage::NamedTypeKind::Enum, slot,
+                self.storage,
+                crate::storage::NamedTypeKind::Enum,
+                slot,
             )?,
             self.txid,
         )?
@@ -4077,10 +4108,16 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         ))
     }
 
-    fn enum_label_sort(&self, slot: crate::storage::TypeCreation, label: &str) -> Result<Option<f64>, SqlError> {
+    fn enum_label_sort(
+        &self,
+        slot: crate::storage::TypeCreation,
+        label: &str,
+    ) -> Result<Option<f64>, SqlError> {
         let Some(def) = self.storage.read_enum_definition(
             crate::storage::TypeDefinitionTarget::by_creation(
-                self.storage, crate::storage::NamedTypeKind::Enum, slot,
+                self.storage,
+                crate::storage::NamedTypeKind::Enum,
+                slot,
             )?,
             self.txid,
         )?
@@ -4094,7 +4131,11 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         Ok(def.sort_of(label))
     }
 
-    fn ensure_enum_label_safe(&self, slot: crate::storage::TypeCreation, label: &str) -> Result<(), SqlError> {
+    fn ensure_enum_label_safe(
+        &self,
+        slot: crate::storage::TypeCreation,
+        label: &str,
+    ) -> Result<(), SqlError> {
         super::exec::ensure_enum_value_is_safe(self.storage, slot, label, self.txid)
     }
 
@@ -4105,7 +4146,9 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
     ) -> Result<Option<&'a [Datum<'a>]>, SqlError> {
         let Some(def) = self.storage.read_enum_definition(
             crate::storage::TypeDefinitionTarget::by_creation(
-                self.storage, crate::storage::NamedTypeKind::Enum, slot,
+                self.storage,
+                crate::storage::NamedTypeKind::Enum,
+                slot,
             )?,
             self.txid,
         )?
@@ -4137,7 +4180,12 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
     fn enum_creation_of_name(&self, type_name: &str) -> Option<crate::storage::TypeCreation> {
         self.storage
             .resolve_enum_slot(type_name, self.txid)
-            .map(|slot| crate::storage::TypeCreation::parse(self.storage.enum_for(slot, self.txid).created_at).expect("admitted enum birth"))
+            .map(|slot| {
+                crate::storage::TypeCreation::parse(
+                    self.storage.enum_for(slot, self.txid).created_at,
+                )
+                .expect("admitted enum birth")
+            })
     }
 
     fn cast_user_type<'a>(
@@ -4150,7 +4198,9 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             if let Some(slot) = self.storage.resolve_enum_slot(element_name, self.txid) {
                 return super::exec::coerce_user_type_array(
                     value,
-                    super::types::ArrElem::Enum(Some(self.storage.enum_for(slot, self.txid).creation())),
+                    super::types::ArrElem::Enum(Some(
+                        self.storage.enum_for(slot, self.txid).creation(),
+                    )),
                     self.storage,
                     self.txid,
                     arena,
@@ -4159,7 +4209,8 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             }
             if let Some(slot) = self.storage.resolve_domain_slot(element_name, self.txid) {
                 let domain = self.storage.domain(slot);
-                let Some(element) = super::types::ArrElem::domain(domain.creation(), domain.base) else {
+                let Some(element) = super::types::ArrElem::domain(domain.creation(), domain.base)
+                else {
                     return Err(sql_err!(
                         sqlstate::FEATURE_NOT_SUPPORTED,
                         "arrays of domain {} require a scalar base type",
@@ -4178,7 +4229,9 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             if let Some(slot) = self.storage.resolve_composite_slot(element_name, self.txid) {
                 return super::exec::coerce_user_type_array(
                     value,
-                    super::types::ArrElem::Composite(Some(self.storage.composite_for(slot, self.txid).creation())),
+                    super::types::ArrElem::Composite(Some(
+                        self.storage.composite_for(slot, self.txid).creation(),
+                    )),
                     self.storage,
                     self.txid,
                     arena,
@@ -4190,7 +4243,9 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         if let Some(slot) = self.storage.resolve_domain_slot(type_name, self.txid) {
             return super::exec::coerce_domain_value(
                 self.storage,
-                crate::storage::TypeDefinitionTarget::Slot(crate::storage::NamedTypeSlot::Domain(slot)),
+                crate::storage::TypeDefinitionTarget::Slot(crate::storage::NamedTypeSlot::Domain(
+                    slot,
+                )),
                 value,
                 self.txid,
                 arena,
@@ -4240,7 +4295,14 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             }
             return Ok(None);
         };
-        super::exec::coerce_enum_value(value, Some(self.storage.enum_for(slot, self.txid).creation()), self.storage, self.txid, arena).map(Some)
+        super::exec::coerce_enum_value(
+            value,
+            Some(self.storage.enum_for(slot, self.txid).creation()),
+            self.storage,
+            self.txid,
+            arena,
+        )
+        .map(Some)
     }
 
     fn array_domain_element(&self, type_name: &str) -> Option<super::types::ArrElem> {
@@ -8868,11 +8930,23 @@ fn array_subquery_field_type_inner<'q>(
     }
     let oid = element[0].type_oid;
     let Some((crate::storage::NamedTypeKind::Composite, creation, false)) =
-        crate::storage::NamedTypeKind::from_oid(oid) else { return Ok(None); };
-    let target = crate::storage::TypeDefinitionTarget::by_creation(storage,
-        crate::storage::NamedTypeKind::Composite, creation)?;
-    let composite = storage.read_composite_definition(target, txid)?
-        .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "composite type no longer exists"))?;
+        crate::storage::NamedTypeKind::from_oid(oid)
+    else {
+        return Ok(None);
+    };
+    let target = crate::storage::TypeDefinitionTarget::by_creation(
+        storage,
+        crate::storage::NamedTypeKind::Composite,
+        creation,
+    )?;
+    let composite = storage
+        .read_composite_definition(target, txid)?
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "composite type no longer exists"
+            )
+        })?;
     Ok(composite
         .active_fields()
         .find(|candidate| candidate.name.as_str().eq_ignore_ascii_case(field))
@@ -8960,14 +9034,24 @@ fn subquery_result_type_inner<'a>(
         Some(scalar) => {
             super::types::ArrElem::from_coltype(scalar).map(|element| element.array_oid())
         }
-        None => crate::storage::NamedTypeKind::from_oid(element_oid).and_then(|(kind, creation, array)| {
-            if array { return None; }
-            Some(match kind {
-                crate::storage::NamedTypeKind::Domain => super::types::oid::domain_array_oid(creation),
-                crate::storage::NamedTypeKind::Enum => super::types::oid::enum_array_oid(creation),
-                crate::storage::NamedTypeKind::Composite => super::types::oid::composite_array_oid(creation),
-            })
-        }),
+        None => crate::storage::NamedTypeKind::from_oid(element_oid).and_then(
+            |(kind, creation, array)| {
+                if array {
+                    return None;
+                }
+                Some(match kind {
+                    crate::storage::NamedTypeKind::Domain => {
+                        super::types::oid::domain_array_oid(creation)
+                    }
+                    crate::storage::NamedTypeKind::Enum => {
+                        super::types::oid::enum_array_oid(creation)
+                    }
+                    crate::storage::NamedTypeKind::Composite => {
+                        super::types::oid::composite_array_oid(creation)
+                    }
+                })
+            },
+        ),
     };
     array_oid
         .ok_or_else(|| {
@@ -9001,27 +9085,45 @@ fn user_type_cast_description<'q>(
     if let Some(slot) = storage.resolve_domain_slot(base_name, txid) {
         let domain = storage.domain(slot);
         return Some(if array {
-            ColDesc::new(name, super::types::oid::domain_array_oid(storage.domain_for(slot, txid).creation()), -1)
+            ColDesc::new(
+                name,
+                super::types::oid::domain_array_oid(storage.domain_for(slot, txid).creation()),
+                -1,
+            )
         } else {
             ColDesc::of_type(name, domain.base).with_type_mod(domain.base_type_mod)
         });
     }
     if let Some(slot) = storage.resolve_enum_slot(base_name, txid) {
         return Some(if array {
-            ColDesc::new(name, super::types::oid::enum_array_oid(storage.enum_for(slot, txid).creation()), -1)
+            ColDesc::new(
+                name,
+                super::types::oid::enum_array_oid(storage.enum_for(slot, txid).creation()),
+                -1,
+            )
         } else {
-            ColDesc::new(name, super::types::oid::enum_oid(storage.enum_for(slot, txid).creation()), 4)
+            ColDesc::new(
+                name,
+                super::types::oid::enum_oid(storage.enum_for(slot, txid).creation()),
+                4,
+            )
         });
     }
     storage.resolve_composite_slot(base_name, txid).map(|slot| {
         if array {
             ColDesc::new(
                 name,
-                super::types::oid::composite_array_oid(storage.composite_for(slot, txid).creation()),
+                super::types::oid::composite_array_oid(
+                    storage.composite_for(slot, txid).creation(),
+                ),
                 -1,
             )
         } else {
-            ColDesc::new(name, super::types::oid::composite_oid(storage.composite_for(slot, txid).creation()), -1)
+            ColDesc::new(
+                name,
+                super::types::oid::composite_oid(storage.composite_for(slot, txid).creation()),
+                -1,
+            )
         }
     })
 }
@@ -9182,13 +9284,21 @@ fn user_type_expression_description<'q>(
                 && let Some((ColType::Composite(Some(creation)), _)) =
                     super::exec::catalog_column_type(storage, txid, base.type_oid)
             {
-                let target = crate::storage::TypeDefinitionTarget::by_creation(storage,
-                    crate::storage::NamedTypeKind::Composite, creation).ok()?;
+                let target = crate::storage::TypeDefinitionTarget::by_creation(
+                    storage,
+                    crate::storage::NamedTypeKind::Composite,
+                    creation,
+                )
+                .ok()?;
                 let definition = storage.read_composite_definition(target, txid).ok()??;
-                let field = definition.active_fields().find(|candidate|
-                    candidate.name.as_str().eq_ignore_ascii_case(field))?;
-                return Some(ColDesc::of_type(name, field.ctype)
-                    .with_type_mod(field.type_mod).with_collation(field.collation));
+                let field = definition
+                    .active_fields()
+                    .find(|candidate| candidate.name.as_str().eq_ignore_ascii_case(field))?;
+                return Some(
+                    ColDesc::of_type(name, field.ctype)
+                        .with_type_mod(field.type_mod)
+                        .with_collation(field.collation),
+                );
             }
         }
         _ => {}
@@ -9222,14 +9332,16 @@ fn catalog_array_element_description<'q>(
         super::types::ColType::Array(super::types::ArrElem::Enum(Some(slot))) => {
             Some(ColDesc::new(name, super::types::oid::enum_oid(slot), 4))
         }
-        super::types::ColType::Array(super::types::ArrElem::Composite(Some(slot))) => Some(ColDesc::new(
-            name,
-            super::types::oid::composite_oid(slot),
-            -1,
-        )),
+        super::types::ColType::Array(super::types::ArrElem::Composite(Some(slot))) => Some(
+            ColDesc::new(name, super::types::oid::composite_oid(slot), -1),
+        ),
         super::types::ColType::Array(super::types::ArrElem::Domain { identity: slot, .. }) => {
-            let target = crate::storage::TypeDefinitionTarget::by_creation(storage,
-                crate::storage::NamedTypeKind::Domain, slot?).ok()?;
+            let target = crate::storage::TypeDefinitionTarget::by_creation(
+                storage,
+                crate::storage::NamedTypeKind::Domain,
+                slot?,
+            )
+            .ok()?;
             let domain = storage.read_domain_definition(target, txid).ok()??;
             Some(ColDesc::of_type(name, domain.base).with_type_mod(domain.base_type_mod))
         }
@@ -9262,10 +9374,9 @@ fn catalog_array_operation_description<'q>(
             super::types::ArrElem::Enum(Some(slot)) => {
                 value.type_oid == super::types::oid::enum_oid(slot)
             }
-            super::types::ArrElem::Domain { identity: slot, .. } => {
-                storage.domain_base_type_for_oid(super::types::oid::domain_oid(slot?), txid)
-                    .is_some_and(|base| value.type_oid == base.oid())
-            }
+            super::types::ArrElem::Domain { identity: slot, .. } => storage
+                .domain_base_type_for_oid(super::types::oid::domain_oid(slot?), txid)
+                .is_some_and(|base| value.type_oid == base.oid()),
             _ => false,
         };
         if !matches {
@@ -9517,10 +9628,19 @@ fn describe_scope_record_star<'q>(
                 _ => None,
             };
             if let Some(slot) = slot {
-                let target = crate::storage::TypeDefinitionTarget::by_creation(storage,
-                    crate::storage::NamedTypeKind::Composite, slot)?;
-                let definition = storage.read_composite_definition(target, txid)?
-                    .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "composite type no longer exists"))?;
+                let target = crate::storage::TypeDefinitionTarget::by_creation(
+                    storage,
+                    crate::storage::NamedTypeKind::Composite,
+                    slot,
+                )?;
+                let definition = storage
+                    .read_composite_definition(target, txid)?
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::UNDEFINED_OBJECT,
+                            "composite type no longer exists"
+                        )
+                    })?;
                 for field in definition.active_fields() {
                     let name = arena
                         .alloc_str(field.name.as_str())
@@ -9909,7 +10029,11 @@ impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_> {
         ))
     }
 
-    fn composite_field(&self, slot: Option<crate::storage::TypeCreation>, field: &str) -> Option<super::exec::StaticTypeMeta> {
+    fn composite_field(
+        &self,
+        slot: Option<crate::storage::TypeCreation>,
+        field: &str,
+    ) -> Option<super::exec::StaticTypeMeta> {
         super::exec::catalog_composite_field(self.storage, self.txid, slot, field)
     }
 

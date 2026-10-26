@@ -1542,16 +1542,28 @@ pub trait CatalogAccess {
     }
     /// The name of the enum type in catalog `slot`, for `pg_typeof` on an enum
     /// value. `None` if the slot holds no live enum.
-    fn enum_name<'a>(&self, _slot: crate::storage::TypeCreation, _arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
+    fn enum_name<'a>(
+        &self,
+        _slot: crate::storage::TypeCreation,
+        _arena: &'a Arena,
+    ) -> Result<Option<&'a str>, SqlError> {
         Ok(None)
     }
     /// The sort key of `label` in the enum type at `slot`, resolving a text
     /// literal against an enum in a comparison. `None` if the slot holds no
     /// live enum or the label is not a member.
-    fn enum_label_sort(&self, _slot: crate::storage::TypeCreation, _label: &str) -> Result<Option<f64>, SqlError> {
+    fn enum_label_sort(
+        &self,
+        _slot: crate::storage::TypeCreation,
+        _label: &str,
+    ) -> Result<Option<f64>, SqlError> {
         Ok(None)
     }
-    fn ensure_enum_label_safe(&self, _slot: crate::storage::TypeCreation, _label: &str) -> Result<(), SqlError> {
+    fn ensure_enum_label_safe(
+        &self,
+        _slot: crate::storage::TypeCreation,
+        _label: &str,
+    ) -> Result<(), SqlError> {
         Ok(())
     }
     /// Ordered members of a visible enum, materialized into the statement
@@ -3834,16 +3846,27 @@ fn typed_field_value<'a>(
     catalog: Option<&dyn CatalogAccess>,
     arena: &'a Arena,
 ) -> Result<Datum<'a>, SqlError> {
-    if !field.value.is_null() { return Ok(field.value); }
-    if field.type_oid == super::types::oid::UNKNOWN { return Ok(Datum::Null); }
+    if !field.value.is_null() {
+        return Ok(field.value);
+    }
+    if field.type_oid == super::types::oid::UNKNOWN {
+        return Ok(Datum::Null);
+    }
     if let Some(ctype) = ColType::from_oid(field.type_oid)
         .or_else(|| catalog.and_then(|catalog| catalog.domain_base_type(field.type_oid)))
-    { return super::query::type_witness(ctype); }
+    {
+        return super::query::type_witness(ctype);
+    }
     if let Some(catalog) = catalog
         && let Some(fields) = catalog.null_composite_fields(field.type_oid, arena)?
-    { return Ok(Datum::Record(fields)); }
-    Err(sql_err!(sqlstate::FEATURE_NOT_SUPPORTED,
-        "record field type OID {} is not supported", field.type_oid))
+    {
+        return Ok(Datum::Record(fields));
+    }
+    Err(sql_err!(
+        sqlstate::FEATURE_NOT_SUPPORTED,
+        "record field type OID {} is not supported",
+        field.type_oid
+    ))
 }
 
 fn quantified_scalar<'a>(
@@ -7597,33 +7620,34 @@ fn coerce_enum_literal<'a>(
     hooks: &EvalHooks<'_, 'a>,
     arena: &'a Arena,
 ) -> Result<(Datum<'a>, Datum<'a>), SqlError> {
-    let resolve = |slot: crate::storage::TypeCreation, text: Datum<'a>| -> Result<Datum<'a>, SqlError> {
-        let label = match text {
-            Datum::Text(s) => s,
-            Datum::Bpchar(s) => s.trim_end_matches(' '),
-            _ => return Ok(text),
+    let resolve =
+        |slot: crate::storage::TypeCreation, text: Datum<'a>| -> Result<Datum<'a>, SqlError> {
+            let label = match text {
+                Datum::Text(s) => s,
+                Datum::Bpchar(s) => s.trim_end_matches(' '),
+                _ => return Ok(text),
+            };
+            let cat = hooks.catalog.ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INVALID_TEXT_REPRESENTATION,
+                    "invalid input value for enum: \"{}\"",
+                    label
+                )
+            })?;
+            let Some(sort) = cat.enum_label_sort(slot, label)? else {
+                return Err(sql_err!(
+                    sqlstate::INVALID_TEXT_REPRESENTATION,
+                    "invalid input value for enum: \"{}\"",
+                    label
+                ));
+            };
+            Ok(Datum::Enum {
+                slot,
+                member: cat.enum_member_identity(slot, label)?,
+                sort,
+                label: arena.alloc_str(label).map_err(|_| arena_full())?,
+            })
         };
-        let cat = hooks.catalog.ok_or_else(|| {
-            sql_err!(
-                sqlstate::INVALID_TEXT_REPRESENTATION,
-                "invalid input value for enum: \"{}\"",
-                label
-            )
-        })?;
-        let Some(sort) = cat.enum_label_sort(slot, label)? else {
-            return Err(sql_err!(
-                sqlstate::INVALID_TEXT_REPRESENTATION,
-                "invalid input value for enum: \"{}\"",
-                label
-            ));
-        };
-        Ok(Datum::Enum {
-            slot,
-            member: cat.enum_member_identity(slot, label)?,
-            sort,
-            label: arena.alloc_str(label).map_err(|_| arena_full())?,
-        })
-    };
     match (l, r) {
         (Datum::Enum { slot, .. }, _) if r_unknown => Ok((l, resolve(slot, r)?)),
         (_, Datum::Enum { slot, .. }) if l_unknown => Ok((resolve(slot, l)?, r)),

@@ -5037,7 +5037,11 @@ fn subst_frame_bound<'a>(
 fn stored_type_reference(
     type_name: &str,
     dependencies: crate::storage::StoredQueryDependencyView<'_>,
-) -> Option<(crate::storage::DependencyClass, crate::storage::TypeReference, bool)> {
+) -> Option<(
+    crate::storage::DependencyClass,
+    crate::storage::TypeReference,
+    bool,
+)> {
     let (bare, array) = type_name
         .strip_suffix("[]")
         .map_or((type_name, false), |bare| (bare, true));
@@ -5055,7 +5059,9 @@ fn stored_type_reference(
                 && dependency.referenced_name.as_str() == referenced_name
         })
         .and_then(|dependency| match dependency.identity {
-            crate::storage::StoredDependencyIdentity::Type(reference) => Some((dependency.class, reference, array)),
+            crate::storage::StoredDependencyIdentity::Type(reference) => {
+                Some((dependency.class, reference, array))
+            }
             _ => None,
         })
 }
@@ -5093,21 +5099,48 @@ fn rewrite_stored_type_name<'a>(
     };
     let (schema, name) = match class {
         crate::storage::DependencyClass::Domain => {
-            let definition = context.storage.read_domain_definition(
-                crate::storage::TypeDefinitionTarget::Bound(reference), context.txid,
-            )?.ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "captured type source no longer exists"))?;
+            let definition = context
+                .storage
+                .read_domain_definition(
+                    crate::storage::TypeDefinitionTarget::Bound(reference),
+                    context.txid,
+                )?
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "captured type source no longer exists"
+                    )
+                })?;
             (definition.schema, definition.name)
         }
         crate::storage::DependencyClass::Enum => {
-            let definition = context.storage.read_enum_definition(
-                crate::storage::TypeDefinitionTarget::Bound(reference), context.txid,
-            )?.ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "captured type source no longer exists"))?;
+            let definition = context
+                .storage
+                .read_enum_definition(
+                    crate::storage::TypeDefinitionTarget::Bound(reference),
+                    context.txid,
+                )?
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "captured type source no longer exists"
+                    )
+                })?;
             (definition.schema, definition.name)
         }
         crate::storage::DependencyClass::Composite => {
-            let definition = context.storage.read_composite_definition(
-                crate::storage::TypeDefinitionTarget::Bound(reference), context.txid,
-            )?.ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "captured type source no longer exists"))?;
+            let definition = context
+                .storage
+                .read_composite_definition(
+                    crate::storage::TypeDefinitionTarget::Bound(reference),
+                    context.txid,
+                )?
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "captured type source no longer exists"
+                    )
+                })?;
             (definition.schema, definition.name)
         }
         _ => unreachable!("stored type-name rewriting records only type dependencies"),

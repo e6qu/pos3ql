@@ -852,7 +852,11 @@ impl ColTypeResolver for CatalogCols<'_> {
         .record_column_handle(qualifier, name)
     }
 
-    fn composite_field(&self, slot: Option<crate::storage::TypeCreation>, field: &str) -> Option<StaticTypeMeta> {
+    fn composite_field(
+        &self,
+        slot: Option<crate::storage::TypeCreation>,
+        field: &str,
+    ) -> Option<StaticTypeMeta> {
         catalog_composite_field(self.storage, self.txid, slot, field)
     }
 
@@ -1110,15 +1114,29 @@ fn describe_record_star<'q>(
                 Expr::Cast { type_name, .. } => storage
                     .expect("checked")
                     .resolve_composite_slot(type_name, txid)
-                    .map(|slot| storage.expect("checked").composite_for(slot, txid).creation()),
+                    .map(|slot| {
+                        storage
+                            .expect("checked")
+                            .composite_for(slot, txid)
+                            .creation()
+                    }),
                 _ => None,
             };
             if let Some(slot) = slot {
                 let storage = storage.expect("checked");
-                let target = crate::storage::TypeDefinitionTarget::by_creation(storage,
-                    crate::storage::NamedTypeKind::Composite, slot)?;
-                let composite = storage.read_composite_definition(target, txid)?
-                    .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "composite type no longer exists"))?;
+                let target = crate::storage::TypeDefinitionTarget::by_creation(
+                    storage,
+                    crate::storage::NamedTypeKind::Composite,
+                    slot,
+                )?;
+                let composite = storage
+                    .read_composite_definition(target, txid)?
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::UNDEFINED_OBJECT,
+                            "composite type no longer exists"
+                        )
+                    })?;
                 for field in composite.active_fields_for(txid) {
                     let name = arena.alloc_str(field.name.as_str()).map_err(|_| {
                         sql_err!(
@@ -1617,7 +1635,11 @@ pub trait ColTypeResolver {
 
     /// One field of a named composite already resolved to its catalog slot.
     /// Catalog-free resolvers may still use the statement-scoped shape copy.
-    fn composite_field(&self, slot: Option<crate::storage::TypeCreation>, field: &str) -> Option<StaticTypeMeta> {
+    fn composite_field(
+        &self,
+        slot: Option<crate::storage::TypeCreation>,
+        field: &str,
+    ) -> Option<StaticTypeMeta> {
         let mut found = None;
         self.visit_composite_fields(slot, &mut |name, metadata| {
             if name.eq_ignore_ascii_case(field) {
@@ -1931,8 +1953,11 @@ pub(crate) fn catalog_composite_field(
     name: &str,
 ) -> Option<StaticTypeMeta> {
     let target = crate::storage::TypeDefinitionTarget::by_creation(
-        storage, crate::storage::NamedTypeKind::Composite, slot?,
-    ).ok()?;
+        storage,
+        crate::storage::NamedTypeKind::Composite,
+        slot?,
+    )
+    .ok()?;
     let definition = storage.read_composite_definition(target, txid).ok()??;
     let field = definition
         .active_fields()
@@ -1947,8 +1972,11 @@ pub(crate) fn visit_catalog_composite_fields(
     visit: &mut dyn FnMut(&str, StaticTypeMeta),
 ) -> Option<usize> {
     let target = crate::storage::TypeDefinitionTarget::by_creation(
-        storage, crate::storage::NamedTypeKind::Composite, slot?,
-    ).ok()?;
+        storage,
+        crate::storage::NamedTypeKind::Composite,
+        slot?,
+    )
+    .ok()?;
     let definition = storage.read_composite_definition(target, txid).ok()??;
     let mut count = 0;
     for field in definition.active_fields() {

@@ -2454,9 +2454,12 @@ fn populate_record_append_columns<'a, C: ColumnLookup<'a>>(
     use crate::sql::types::oid;
     if let Some(ColType::Composite(Some(creation))) = ColType::from_oid(composite_oid) {
         let target = crate::storage::TypeDefinitionTarget::by_creation(
-            storage, crate::storage::NamedTypeKind::Composite, creation,
+            storage,
+            crate::storage::NamedTypeKind::Composite,
+            creation,
         )?;
-        let definition = storage.read_composite_definition(target, txid)?
+        let definition = storage
+            .read_composite_definition(target, txid)?
             .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "composite type does not exist"))?;
         for field in definition.active_fields() {
             push(table_function_column(

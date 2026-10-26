@@ -1070,13 +1070,13 @@ mod tests {
             for member in [None, Some(7)] {
                 let values = [
                     Datum::Enum {
-                        slot: 0,
+                        slot: crate::storage::TypeCreation::parse(1).unwrap(),
                         member: member.map(|ordinal| EnumMemberId::from_ordinal(ordinal).unwrap()),
                         sort: 2.0,
                         label: "old",
                     },
                     Datum::CompositeText {
-                        slot: 1,
+                        slot: crate::storage::TypeCreation::parse(2).unwrap(),
                         physical_fields: fields,
                         text: &text,
                     },
@@ -1084,8 +1084,8 @@ mod tests {
                     Datum::Text("after"),
                 ];
                 let schema = [
-                    ColType::Enum(0),
-                    ColType::Composite(1),
+                    ColType::Enum(Some(crate::storage::TypeCreation::parse(1).unwrap())),
+                    ColType::Composite(Some(crate::storage::TypeCreation::parse(2).unwrap())),
                     ColType::Int4,
                     ColType::Text,
                 ];
@@ -1110,7 +1110,7 @@ mod tests {
         let mut reference = [0u8; 17];
         reference[8..12].copy_from_slice(&0x8000_0001u32.to_le_bytes());
         assert!(encoded_value_len(&reference, ColType::Regclass).is_err());
-        assert_eq!(encoded_value_len(&reference, ColType::Enum(0)).unwrap(), 17);
+        assert_eq!(encoded_value_len(&reference, ColType::Enum(Some(crate::storage::TypeCreation::parse(1).unwrap()))).unwrap(), 17);
         assert!(decode_physical_field_count(&[255, 255, 127]).is_none());
     }
 

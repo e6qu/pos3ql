@@ -22,7 +22,7 @@ SPEC.loader.exec_module(DIAGNOSTICS)
 class DifferentialDiagnosticsTests(unittest.TestCase):
     def render_transcript(self, stdout, stderr, diagnostics):
         output = io.BytesIO()
-        DIAGNOSTICS.write_transcript(io.BytesIO(stdout), len(stdout), stderr, diagnostics, output)
+        DIAGNOSTICS.write_transcript(io.BytesIO(stdout), len(stdout), stderr, diagnostics, {}, output)
         return output.getvalue()
 
     def test_stdout_streams_with_bounded_reads_and_rejects_a_changed_length(self):
@@ -35,14 +35,14 @@ class DifferentialDiagnosticsTests(unittest.TestCase):
         payload = b"x" * (128 * 1024 + 1)
         output = io.BytesIO()
         DIAGNOSTICS.write_transcript(
-            BoundedReader(payload), len(payload), "", "verbose", output
+            BoundedReader(payload), len(payload), "", "verbose", {}, output
         )
         self.assertEqual(
             output.getvalue(), f"STDOUT {len(payload)} bytes\n".encode() + payload
             + b"\nDIAGNOSTICS\n",
         )
         with self.assertRaises(ValueError):
-            DIAGNOSTICS.write_transcript(io.BytesIO(b"x"), 2, "", "verbose", io.BytesIO())
+            DIAGNOSTICS.write_transcript(io.BytesIO(b"x"), 2, "", "verbose", {}, io.BytesIO())
 
     def test_diagnostic_lookalikes_in_rows_are_preserved_verbatim(self):
         stdout = (
@@ -58,7 +58,7 @@ class DifferentialDiagnosticsTests(unittest.TestCase):
         self.assertTrue(result.startswith(
             f"STDOUT {len(stdout)} bytes\n".encode() + stdout + b"\nDIAGNOSTICS\n"
         ))
-        self.assertEqual(DIAGNOSTICS.normalize_diagnostics(stderr, "sqlstate"), [{
+        self.assertEqual(DIAGNOSTICS.normalize_diagnostics(stderr, "sqlstate", {}), [{
             "source": "corpus.sql", "line": 54, "severity": "ERROR", "sqlstate": "2BP01",
         }])
 
@@ -79,12 +79,14 @@ class DifferentialDiagnosticsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as work:
             stdout = pathlib.Path(work, "stdout")
             stderr = pathlib.Path(work, "stderr")
+            source = pathlib.Path(work, "corpus.sql")
+            source.write_text("SELECT 1;\n")
             stdout.write_bytes(b"\xff\x00\r\n")
             stderr.write_bytes(b"psql:corpus.sql:8: ERROR:  23505: value \xff\rretained\n")
             completed = subprocess.run(
                 [
                     sys.executable, str(ROOT / "tests/external/differential_diagnostics.py"),
-                    "--stdout", str(stdout), "--stderr", str(stderr),
+                    "--source", str(source), "--stdout", str(stdout), "--stderr", str(stderr),
                     "--diagnostics", "verbose",
                 ],
                 capture_output=True, check=True,
@@ -111,7 +113,7 @@ class DifferentialDiagnosticsTests(unittest.TestCase):
             "psql:corpus.sql:30: ERROR:  P0001:   first primary line\n"
             "second primary line\nCONTEXT:  function example()\n"
         )
-        records = DIAGNOSTICS.normalize_diagnostics(stderr, "verbose")
+        records = DIAGNOSTICS.normalize_diagnostics(stderr, "verbose", {})
         self.assertEqual([record["line"] for record in records], [20, 30])
         self.assertEqual([record["message"] for record in records], [
             "cannot drop type child", "  first primary line\nsecond primary line",
@@ -142,7 +144,7 @@ class DifferentialDiagnosticsTests(unittest.TestCase):
 
     def test_client_failures_and_malformed_diagnostics_cannot_disappear(self):
         stderr = "psql: error: connection failed\nserver closed the connection\n"
-        self.assertEqual(DIAGNOSTICS.normalize_diagnostics(stderr, "verbose"), [
+        self.assertEqual(DIAGNOSTICS.normalize_diagnostics(stderr, "verbose", {}), [
             {"client": "psql: error: connection failed"},
             {"client": "server closed the connection"},
         ])
@@ -152,7 +154,28 @@ class DifferentialDiagnosticsTests(unittest.TestCase):
             ("unknown", ""),
         ):
             with self.subTest(style=style), self.assertRaises(ValueError):
-                DIAGNOSTICS.normalize_diagnostics(stderr, style)
+                DIAGNOSTICS.normalize_diagnostics(stderr, style, {})
+
+    def test_copy_errors_keep_the_command_position_while_input_is_drained(self):
+        source = "SELECT 1;\nCOPY t\nFROM STDIN WITH (FORMAT csv); -- payload follows\n'not SQL\n\\.\n\nSELECT 2;\n"
+        positions = DIAGNOSTICS.copy_line_positions(source, "corpus.sql")
+        self.assertEqual(positions, {("corpus.sql", line): 3 for line in (3, 4, 5)})
+        early = "psql:corpus.sql:3: ERROR:  42809\n"
+        late = "psql:corpus.sql:5: ERROR:  42809\n"
+        self.assertEqual(
+            DIAGNOSTICS.normalize_diagnostics(early, "sqlstate", positions),
+            DIAGNOSTICS.normalize_diagnostics(late, "sqlstate", positions),
+        )
+        for unrelated in (
+            "psql:corpus.sql:7: ERROR:  42809\n",
+            "psql:another.sql:5: ERROR:  42809\n",
+        ):
+            self.assertNotEqual(
+                DIAGNOSTICS.normalize_diagnostics(early, "sqlstate", positions),
+                DIAGNOSTICS.normalize_diagnostics(unrelated, "sqlstate", positions),
+            )
+        with self.assertRaisesRegex(ValueError, "unterminated COPY data"):
+            DIAGNOSTICS.copy_line_positions("COPY t FROM STDIN;\n", "corpus.sql")
 
     def run_harness(self, harness, diagnostics, reference, client_status):
         source = (ROOT / "tests/external" / harness).read_text()
@@ -162,6 +185,7 @@ class DifferentialDiagnosticsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="corpus settings ") as work:
             port = "55432" if reference else "65432"
             input_path = work + "/input.sql"
+            pathlib.Path(input_path).write_text("SELECT 1;\n")
             if harness == "ci_diff.sh":
                 arguments = ["127.0.0.1", port, work + "/output", input_path, diagnostics]
             else:

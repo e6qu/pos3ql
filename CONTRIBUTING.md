@@ -112,7 +112,10 @@ SQLSTATEs, types, result shape, and values. SQLSTATE-only and exact-message
 corpora share the same reference connection settings, including UTC and the
 test extension directory; diagnostic style must not change fixture availability.
 Corpus comparisons echo each sent SQL command and retain its results and command
-tags in stdout. This follows [psql's query echo and status output](https://github.com/postgres/postgres/blob/REL_18_6/src/bin/psql/common.c#L1088),
+tags in stdout. COPY errors retain their command's source position even when
+psql drains input before reporting the error; other diagnostic positions stay
+exact. The shared SQL lexer recognizes input boundaries, including COPY options,
+without treating quoted text or COPY data as SQL. This follows [psql's query echo and status output](https://github.com/postgres/postgres/blob/REL_18_6/src/bin/psql/common.c#L1088),
 and preserves ordering even for repeated commands on one input line. They retain
 stdout bytes verbatim and compare stderr diagnostics separately with their source
 file and SQL line number. This preserves which

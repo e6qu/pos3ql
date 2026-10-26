@@ -1251,11 +1251,7 @@ fn event_trigger_tag(statement: &Stmt<'_>) -> Option<&'static str> {
         Stmt::DropRule(_) => "DROP RULE",
         Stmt::RefreshMaterializedView { .. } => "REFRESH MATERIALIZED VIEW",
         Stmt::DropMaterializedView { .. } => "DROP MATERIALIZED VIEW",
-        Stmt::CreateTableAs { kind, .. } => match kind {
-            ast::CreateTableAsKind::Table => "CREATE TABLE AS",
-            ast::CreateTableAsKind::MaterializedView => "CREATE MATERIALIZED VIEW",
-            ast::CreateTableAsKind::SelectInto => "SELECT INTO",
-        },
+        Stmt::CreateTableAs { kind, .. } => kind.ddl_tag(),
         Stmt::CreateRoutine(routine) => match routine.kind {
             ast::RoutineCreateKind::Procedure => "CREATE PROCEDURE",
             ast::RoutineCreateKind::Function { .. }
@@ -9261,16 +9257,41 @@ impl Engine {
         Ok(Ok(()))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn execute_discard_statement(
         &mut self,
         target: ast::DiscardTarget,
+        txn: &mut TxnState,
+        arena: &Arena,
         sqlprep: &mut SqlPreparedPool,
         cursors: &mut cursor::CursorPool,
         guc: &GucState,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
+        if matches!(
+            target,
+            ast::DiscardTarget::All | ast::DiscardTarget::Temporary
+        ) {
+            let outcome = responder.without_command_complete(|responder| {
+                exec::drop_schema(
+                    &mut self.storage,
+                    &mut self.wal,
+                    txn,
+                    &mut self.dml_scratch,
+                    exec::SchemaDropTarget::TemporaryObjects,
+                    arena,
+                    guc.seq_session(),
+                    responder,
+                )
+            })?;
+            if outcome.is_err() {
+                return Ok(outcome);
+            }
+        }
         match target {
             ast::DiscardTarget::All => {
+                self.storage
+                    .release_connection_advisory_locks(self.work.connection_id());
                 sqlprep.clear();
                 cursors.close_all();
                 guc.discard_all();
@@ -9288,9 +9309,15 @@ impl Engine {
                 self.protocol_reset = ProtocolReset::All;
             }
             ast::DiscardTarget::Sequences => guc.seq_session().discard(),
+            // Plans are rebuilt at execution; temporary drops were staged above.
             ast::DiscardTarget::Plans | ast::DiscardTarget::Temporary => {}
         }
-        responder.command_complete("DISCARD")?;
+        responder.command_complete(match target {
+            ast::DiscardTarget::All => "DISCARD ALL",
+            ast::DiscardTarget::Plans => "DISCARD PLANS",
+            ast::DiscardTarget::Sequences => "DISCARD SEQUENCES",
+            ast::DiscardTarget::Temporary => "DISCARD TEMP",
+        })?;
         Ok(Ok(()))
     }
 
@@ -12052,18 +12079,20 @@ impl Engine {
         let mut capture = capture;
         let mut original_rows = 0u64;
         if insert_event && !suppress_original {
-            let outcome = Self::execute_data_modification_unrewritten(
-                storage,
-                scratch,
-                arena,
-                original_statement,
-                authorization,
-                txn,
-                params,
-                guc,
-                responder,
-                capture.take(),
-            )?;
+            let outcome = responder.without_command_complete(|responder| {
+                Self::execute_data_modification_unrewritten(
+                    storage,
+                    scratch,
+                    arena,
+                    original_statement,
+                    authorization,
+                    txn,
+                    params,
+                    guc,
+                    responder,
+                    capture.take(),
+                )
+            })?;
             if outcome.is_err() {
                 return Ok(outcome);
             }
@@ -12215,18 +12244,20 @@ impl Engine {
         }
 
         if !insert_event && !suppress_original {
-            let outcome = Self::execute_data_modification_unrewritten(
-                storage,
-                scratch,
-                arena,
-                original_statement,
-                authorization,
-                txn,
-                params,
-                guc,
-                responder,
-                capture.take(),
-            )?;
+            let outcome = responder.without_command_complete(|responder| {
+                Self::execute_data_modification_unrewritten(
+                    storage,
+                    scratch,
+                    arena,
+                    original_statement,
+                    authorization,
+                    txn,
+                    params,
+                    guc,
+                    responder,
+                    capture.take(),
+                )
+            })?;
             if outcome.is_err() {
                 return Ok(outcome);
             }
@@ -16430,7 +16461,7 @@ impl Engine {
                 sql,
                 *with_data,
                 *if_not_exists,
-                *kind == ast::CreateTableAsKind::MaterializedView,
+                *kind,
                 *options,
                 *persistence,
                 guc.search_path().as_str(),
@@ -16893,115 +16924,121 @@ impl Engine {
                 if_not_exists,
                 elements,
             } => {
-                let resolved = match resolve_create_schema(
-                    *name,
-                    *authorization,
-                    eval::funcs::system::current_identity(),
-                    eval::funcs::system::session_identity(),
-                ) {
-                    Ok(resolved) => resolved,
-                    Err(error) => return Ok(Err(error)),
-                };
-                let name = resolved.name.as_str();
-                let out = exec::create_schema(
-                    &mut self.storage,
-                    &mut self.wal,
-                    txn,
-                    name,
-                    resolved.authorization.as_ref().map(|role| role.as_str()),
-                    *if_not_exists,
-                    responder,
-                )?;
-                if let Err(e) = out {
-                    return Ok(Err(e));
-                }
-                let prior_role = guc.current_identity();
-                let prior_user = eval::funcs::system::current_identity();
-                if let Some(owner) = resolved.authorization.as_ref() {
-                    let owner = match self.storage.capture_role(owner.as_str(), txn.txid) {
-                        Ok(role) => crate::storage::SessionIdentity::bound(role),
+                let outcome = responder.without_command_complete(|responder| {
+                    let resolved = match resolve_create_schema(
+                        *name,
+                        *authorization,
+                        eval::funcs::system::current_identity(),
+                        eval::funcs::system::session_identity(),
+                    ) {
+                        Ok(resolved) => resolved,
                         Err(error) => return Ok(Err(error)),
                     };
-                    guc.set_role(owner, true);
-                    eval::funcs::system::set_current_user(owner);
-                }
-                // Schema elements run with the new schema as their creation
-                // target; an element naming a different schema is refused, as
-                // PostgreSQL has it (42P15).
-                let elements_result = (|| {
-                    for element in *elements {
-                        let requalified = match requalify_schema_element(element, name, arena) {
-                            Ok(r) => r,
-                            Err(e) => return Ok(Err(e)),
+                    let name = resolved.name.as_str();
+                    let out = exec::create_schema(
+                        &mut self.storage,
+                        &mut self.wal,
+                        txn,
+                        name,
+                        resolved.authorization.as_ref().map(|role| role.as_str()),
+                        *if_not_exists,
+                        responder,
+                    )?;
+                    if let Err(e) = out {
+                        return Ok(Err(e));
+                    }
+                    let prior_role = guc.current_identity();
+                    let prior_user = eval::funcs::system::current_identity();
+                    if let Some(owner) = resolved.authorization.as_ref() {
+                        let owner = match self.storage.capture_role(owner.as_str(), txn.txid) {
+                            Ok(role) => crate::storage::SessionIdentity::bound(role),
+                            Err(error) => return Ok(Err(error)),
                         };
-                        let result = if let Stmt::CreateView {
-                            name,
-                            persistence,
-                            columns,
-                            or_replace,
-                            security,
-                            security_barrier,
-                            check_option,
-                            sql,
-                        } = requalified
-                        {
-                            let schema = name
-                                .schema
-                                .expect("CREATE SCHEMA requalification assigns a schema");
-                            let schema_path = match eval::quote_ident_str(schema, arena) {
-                                Ok(path) => path,
+                        guc.set_role(owner, true);
+                        eval::funcs::system::set_current_user(owner);
+                    }
+                    // Schema elements run with the new schema as their creation
+                    // target; an element naming a different schema is refused, as
+                    // PostgreSQL has it (42P15).
+                    let elements_result = (|| {
+                        for element in *elements {
+                            let requalified = match requalify_schema_element(element, name, arena) {
+                                Ok(r) => r,
                                 Err(e) => return Ok(Err(e)),
                             };
-                            let role = guc.current_role();
-                            let path =
-                                self.storage
-                                    .compute_path(schema_path, role.as_str(), txn.txid);
-                            let old_path = self.storage.swap_path(path);
-                            let result = exec::create_view(
-                                &mut self.storage,
-                                &mut self.wal,
-                                txn,
-                                exec::CreateViewCommand {
-                                    name,
-                                    persistence: *persistence,
-                                    columns,
-                                    or_replace: *or_replace,
-                                    security: *security,
-                                    security_barrier: *security_barrier,
-                                    check_option: *check_option,
-                                    sql,
-                                    raw_path: schema_path,
-                                },
-                                arena,
-                                responder,
-                            );
-                            self.storage.swap_path(old_path);
-                            result
-                        } else {
-                            self.execute_stmt(
-                                requalified,
-                                arena,
-                                params,
-                                txn,
-                                sqlprep,
-                                cursors,
-                                guc,
-                                exec::PlpgsqlTransactionContext::Atomic,
-                                responder,
-                            )
-                        };
-                        let result = result?;
-                        if let Err(e) = result {
-                            return Ok(Err(e));
+                            let result = if let Stmt::CreateView {
+                                name,
+                                persistence,
+                                columns,
+                                or_replace,
+                                security,
+                                security_barrier,
+                                check_option,
+                                sql,
+                            } = requalified
+                            {
+                                let schema = name
+                                    .schema
+                                    .expect("CREATE SCHEMA requalification assigns a schema");
+                                let schema_path = match eval::quote_ident_str(schema, arena) {
+                                    Ok(path) => path,
+                                    Err(e) => return Ok(Err(e)),
+                                };
+                                let role = guc.current_role();
+                                let path =
+                                    self.storage
+                                        .compute_path(schema_path, role.as_str(), txn.txid);
+                                let old_path = self.storage.swap_path(path);
+                                let result = exec::create_view(
+                                    &mut self.storage,
+                                    &mut self.wal,
+                                    txn,
+                                    exec::CreateViewCommand {
+                                        name,
+                                        persistence: *persistence,
+                                        columns,
+                                        or_replace: *or_replace,
+                                        security: *security,
+                                        security_barrier: *security_barrier,
+                                        check_option: *check_option,
+                                        sql,
+                                        raw_path: schema_path,
+                                    },
+                                    arena,
+                                    responder,
+                                );
+                                self.storage.swap_path(old_path);
+                                result
+                            } else {
+                                self.execute_stmt(
+                                    requalified,
+                                    arena,
+                                    params,
+                                    txn,
+                                    sqlprep,
+                                    cursors,
+                                    guc,
+                                    exec::PlpgsqlTransactionContext::Atomic,
+                                    responder,
+                                )
+                            };
+                            let result = result?;
+                            if let Err(e) = result {
+                                return Ok(Err(e));
+                            }
                         }
+                        Ok(Ok(()))
+                    })();
+                    if resolved.authorization.is_some() {
+                        guc.set_role(prior_role, true);
+                        eval::funcs::system::set_current_user(prior_user);
                     }
-                    Ok(Ok(()))
-                })();
-                if resolved.authorization.is_some() {
-                    guc.set_role(prior_role, true);
-                    eval::funcs::system::set_current_user(prior_user);
+                    elements_result
+                })?;
+                if outcome.is_ok() {
+                    responder.command_complete("CREATE SCHEMA")?;
                 }
-                elements_result
+                Ok(outcome)
             }
             Stmt::DropSchema {
                 names,
@@ -17012,9 +17049,11 @@ impl Engine {
                 &mut self.wal,
                 txn,
                 &mut self.dml_scratch,
-                names,
-                *if_exists,
-                *cascade,
+                exec::SchemaDropTarget::Named {
+                    names,
+                    if_exists: *if_exists,
+                    cascade: *cascade,
+                },
                 arena,
                 guc.seq_session(),
                 responder,
@@ -17116,6 +17155,7 @@ impl Engine {
                 )
             }
             Stmt::GrantRole {
+                syntax,
                 roles,
                 members,
                 options,
@@ -17125,6 +17165,7 @@ impl Engine {
                 &mut self.wal,
                 txn,
                 exec::GrantRoleRequest {
+                    syntax: *syntax,
                     roles,
                     members,
                     options: *options,
@@ -17134,6 +17175,7 @@ impl Engine {
                 responder,
             ),
             Stmt::RevokeRole {
+                syntax,
                 roles,
                 members,
                 option,
@@ -17144,6 +17186,7 @@ impl Engine {
                 &mut self.wal,
                 txn,
                 exec::RevokeRoleRequest {
+                    syntax: *syntax,
                     roles,
                     members,
                     option: *option,
@@ -17517,9 +17560,8 @@ impl Engine {
             }
             Stmt::Show(name) => self.show(name, guc, txn, responder),
             Stmt::ShowAll => self.show_all(guc, txn, responder),
-            Stmt::Discard(target) => {
-                self.execute_discard_statement(*target, sqlprep, cursors, guc, responder)
-            }
+            Stmt::Discard(target) => self
+                .execute_discard_statement(*target, txn, arena, sqlprep, cursors, guc, responder),
             Stmt::Copy(c) => {
                 // COPY (query) TO STDOUT streams a query's rows, not a table's.
                 if let Some(sql) = c.query {
@@ -19470,7 +19512,11 @@ impl Engine {
                     Some(_) => {}
                     None => cursors.close_all(),
                 }
-                responder.command_complete("CLOSE CURSOR")?;
+                responder.command_complete(if name.is_some() {
+                    "CLOSE CURSOR"
+                } else {
+                    "CLOSE CURSOR ALL"
+                })?;
                 Ok(Ok(()))
             }
             _ => unreachable!("cursor executor requires a cursor statement"),

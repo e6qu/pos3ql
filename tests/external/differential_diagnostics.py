@@ -7,6 +7,9 @@ from pathlib import Path
 import re
 import sys
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from sql_script import split_sql
+
 
 START = re.compile(
     r"^(?:psql:(.+?):([0-9]+): )?(ERROR|WARNING|NOTICE|INFO|LOG|FATAL|PANIC|DEBUG[0-9]*):[ \t]*(.*)$"
@@ -17,7 +20,17 @@ AUXILIARY = re.compile(
 )
 
 
-def normalize_diagnostics(stderr, diagnostics):
+def copy_line_positions(source, filename):
+    # psql can report a COPY error before or after draining its input. Associate
+    # either position with this command, retaining every other source position.
+    return {
+        (str(filename), line): span.command_end_line
+        for span in split_sql(source).copy_inputs
+        for line in range(span.command_end_line, span.data_end_line + 1)
+    }
+
+
+def normalize_diagnostics(stderr, diagnostics, copy_positions):
     if diagnostics not in ("sqlstate", "verbose"):
         raise ValueError(f"unknown corpus diagnostics {diagnostics}")
     result = []
@@ -53,7 +66,8 @@ def normalize_diagnostics(stderr, diagnostics):
                 raise ValueError(f"malformed {diagnostics} diagnostic: {line}")
             current = {
                 "source": source,
-                "line": int(number) if number is not None else None,
+                "line": (copy_positions.get((source, int(number)), int(number))
+                         if number is not None else None),
                 "severity": severity,
                 "sqlstate": None if state is None else state[1],
                 "message": message,
@@ -74,8 +88,8 @@ def normalize_diagnostics(stderr, diagnostics):
     return result
 
 
-def write_transcript(stdout, byte_count, stderr, diagnostics, output):
-    records = normalize_diagnostics(stderr, diagnostics)
+def write_transcript(stdout, byte_count, stderr, diagnostics, copy_positions, output):
+    records = normalize_diagnostics(stderr, diagnostics, copy_positions)
     # Length framing keeps data that resembles these markers unambiguous.
     output.write(f"STDOUT {byte_count} bytes\n".encode())
     copied = 0
@@ -91,6 +105,7 @@ def write_transcript(stdout, byte_count, stderr, diagnostics, output):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--source", type=Path, required=True)
     parser.add_argument("--stdout", type=Path, required=True)
     parser.add_argument("--stderr", type=Path, required=True)
     parser.add_argument("--diagnostics", choices=("sqlstate", "verbose"), required=True)
@@ -102,6 +117,10 @@ def main():
                 arguments.stdout.stat().st_size,
                 arguments.stderr.read_bytes().decode("utf-8", errors="surrogateescape"),
                 arguments.diagnostics,
+                copy_line_positions(
+                    arguments.source.read_bytes().decode("utf-8", errors="surrogateescape"),
+                    arguments.source,
+                ),
                 sys.stdout.buffer,
             )
     except (OSError, ValueError) as error:

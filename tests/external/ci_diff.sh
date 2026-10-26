@@ -1461,7 +1461,7 @@ run_corpus() { # host port outfile file diagnostics
     cat "$3.stderr" >&2
     return 1
   fi
-  python3 "$EXT/differential_diagnostics.py" --stdout "$3.stdout" \
+  python3 "$EXT/differential_diagnostics.py" --source "$4" --stdout "$3.stdout" \
     --stderr "$3.stderr" --diagnostics "$diagnostics" > "$3" || return 1
 }
 reset_user_extensions() { # host port

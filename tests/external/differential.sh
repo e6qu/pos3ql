@@ -272,7 +272,7 @@ run_corpus() { # port name file diagnostics
     cat "$WORK/$2.stderr" >&2
     return 1
   fi
-  python3 "$EXT/differential_diagnostics.py" --stdout "$WORK/$2.stdout" \
+  python3 "$EXT/differential_diagnostics.py" --source "$3" --stdout "$WORK/$2.stdout" \
     --stderr "$WORK/$2.stderr" --diagnostics "$diagnostics" > "$WORK/$2" || return 1
 }
 reset_user_extensions() { # port

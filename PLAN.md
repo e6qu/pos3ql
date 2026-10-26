@@ -90,7 +90,9 @@ are not acceptance evidence.
 
 Fix encountered defects in the same complete PR unless an actual blocker
 prevents repair. Diagnose failures and timeouts; do not extend limits to hide
-them. Match supported PostgreSQL SQL, types, errors, catalogs and wire behavior.
+them. Match supported PostgreSQL SQL, types, errors, catalogs and wire behavior,
+including one correct command-completion response per statement and transactional
+cleanup of temporary objects.
 Reject unsupported behavior and stored formats explicitly. Earlier pos3ql
 versions are not compatibility targets.
 

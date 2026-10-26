@@ -1237,12 +1237,14 @@ pub enum Stmt<'a> {
         if_exists: bool,
     },
     GrantRole {
+        syntax: RoleMembershipSyntax,
         roles: &'a [&'a str],
         members: &'a [&'a str],
         options: RoleMembershipPatch,
         grantor: Option<&'a str>,
     },
     RevokeRole {
+        syntax: RoleMembershipSyntax,
         roles: &'a [&'a str],
         members: &'a [&'a str],
         option: Option<RoleMembershipOption>,
@@ -1360,6 +1362,16 @@ pub enum CreateTableAsKind {
     Table,
     MaterializedView,
     SelectInto,
+}
+
+impl CreateTableAsKind {
+    pub(crate) fn ddl_tag(self) -> &'static str {
+        match self {
+            Self::Table => "CREATE TABLE AS",
+            Self::MaterializedView => "CREATE MATERIALIZED VIEW",
+            Self::SelectInto => "SELECT INTO",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2400,6 +2412,28 @@ impl RoutineTargetKind {
             Self::Procedure => "procedure",
             Self::Aggregate => "aggregate",
             Self::Either => "routine",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoleMembershipSyntax {
+    GrantRevoke,
+    AlterGroup,
+}
+
+impl RoleMembershipSyntax {
+    pub(crate) fn grant_tag(self) -> &'static str {
+        match self {
+            Self::GrantRevoke => "GRANT ROLE",
+            Self::AlterGroup => "ALTER ROLE",
+        }
+    }
+
+    pub(crate) fn revoke_tag(self) -> &'static str {
+        match self {
+            Self::GrantRevoke => "REVOKE ROLE",
+            Self::AlterGroup => "ALTER ROLE",
         }
     }
 }

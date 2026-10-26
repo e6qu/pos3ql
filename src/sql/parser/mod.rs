@@ -4257,6 +4257,7 @@ impl<'a> Parser<'a> {
             None
         };
         Ok(Stmt::GrantRole {
+            syntax: crate::sql::ast::RoleMembershipSyntax::GrantRevoke,
             roles,
             members,
             options,
@@ -4646,6 +4647,7 @@ impl<'a> Parser<'a> {
             false
         };
         Ok(Stmt::RevokeRole {
+            syntax: crate::sql::ast::RoleMembershipSyntax::GrantRevoke,
             roles,
             members,
             option,
@@ -9968,6 +9970,7 @@ mod tests {
              ALTER GROUP parent RENAME TO renamed",
             |parser| {
                 let Some(Stmt::GrantRole {
+                    syntax,
                     roles,
                     members,
                     options,
@@ -9976,12 +9979,14 @@ mod tests {
                 else {
                     panic!("ALTER GROUP ADD USER did not parse")
                 };
+                assert_eq!(syntax, crate::sql::ast::RoleMembershipSyntax::AlterGroup);
                 assert_eq!(roles, ["parent"]);
                 assert_eq!(members, ["child", "other"]);
                 assert_eq!(options, crate::sql::ast::RoleMembershipPatch::EMPTY);
                 assert_eq!(grantor, None);
 
                 let Some(Stmt::RevokeRole {
+                    syntax,
                     roles,
                     members,
                     option,
@@ -9991,6 +9996,7 @@ mod tests {
                 else {
                     panic!("ALTER GROUP DROP USER did not parse")
                 };
+                assert_eq!(syntax, crate::sql::ast::RoleMembershipSyntax::AlterGroup);
                 assert_eq!(roles, ["parent"]);
                 assert_eq!(members, ["child"]);
                 assert_eq!(option, None);

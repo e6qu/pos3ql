@@ -31803,7 +31803,19 @@ fn info_collation_character_set_applicability<'a>(
     finish(definition, &output[..count], arena)
 }
 
+#[track_caller]
 fn arena_full() -> SqlError {
+    #[cfg(test)]
+    {
+        let caller = core::panic::Location::caller();
+        return sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "catalog relation exceeds the statement arena ({}:{})",
+            caller.file(),
+            caller.line()
+        );
+    }
+    #[cfg(not(test))]
     sql_err!(
         sqlstate::PROGRAM_LIMIT_EXCEEDED,
         "catalog relation exceeds the statement arena"

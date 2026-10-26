@@ -1827,7 +1827,16 @@ fn catalog_lifetime_shared_subscriptions_keep_database_and_identity_through_reco
                 let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
                 let mut engine = Engine::new(&config, &mut budget).unwrap();
                 let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
-                session.success(&mut engine, "CREATE DATABASE catalog_first TEMPLATE template0; CREATE DATABASE catalog_second TEMPLATE template0", false);
+                session.success(
+                    &mut engine,
+                    "CREATE DATABASE catalog_first TEMPLATE template0",
+                    false,
+                );
+                session.success(
+                    &mut engine,
+                    "CREATE DATABASE catalog_second TEMPLATE template0",
+                    false,
+                );
                 databases = ["catalog_first", "catalog_second"].map(|name| {
                     let slot = engine.storage.database_slot(name, 0).unwrap();
                     engine.storage.database(slot).oid

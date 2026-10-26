@@ -106,9 +106,9 @@ amortizes that work but does not remove ordered root publication.
 **Calculated example:** assume the two independent uploads overlap and each
 phase, including the later root update, takes 20 ms; assume no overlap between
 successive batches and negligible transfer/CPU costs. That is at least 40 ms
-per batch, at most 25 batches/s. With `commit_queue_slots` at least eight and log bytes fitting their reserved
-buffers, eight transactions in each batch would give an optimistic 200 committed
-transactions/s under those assumptions. One
+per batch, at most 25 batches/s. With `commit_queue_slots` at least eight and
+log bytes fitting their reserved buffers, eight transactions per batch would
+give an optimistic 200 committed transactions/s under those assumptions. One
 transaction per batch would give 25. Real batch occupancy, bytes, network
 latency and CPU must be measured; the server does not promise these rates or
 promise eight transactions per batch.

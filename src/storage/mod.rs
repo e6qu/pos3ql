@@ -17910,7 +17910,6 @@ impl Storage {
         definition: foreign::ForeignDataWrapperDefinition,
         owner: u16,
     ) -> Result<(), SqlError> {
-        CatalogIdentity::require(created_at)?;
         self.foreign_catalog().restore_wrapper(
             slot,
             current_database(),
@@ -17929,7 +17928,6 @@ impl Storage {
         definition: foreign::ForeignServerDefinition,
         owner: u16,
     ) -> Result<(), SqlError> {
-        CatalogIdentity::require(created_at)?;
         self.foreign_catalog().restore_server(
             slot,
             current_database(),
@@ -17947,7 +17945,6 @@ impl Storage {
         created_at: u64,
         definition: foreign::UserMappingDefinition,
     ) -> Result<(), SqlError> {
-        CatalogIdentity::require(created_at)?;
         self.foreign_catalog()
             .restore_mapping(slot, current_database(), created_at, definition)?;
         self.catalog_sequence.observe(created_at);

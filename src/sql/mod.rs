@@ -23010,6 +23010,7 @@ fn apply_wal_op(
                 base_type_mod: def.base_type_mod,
                 not_null: def.not_null,
                 not_null_name: def.not_null_name,
+                not_null_identity: def.not_null_identity,
                 default_expr: def.default_expr,
                 checks: def.checks,
                 n_checks: def.n_checks,

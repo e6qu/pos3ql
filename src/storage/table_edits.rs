@@ -229,7 +229,7 @@ impl<'storage> TableDefinitionEdit<'storage> {
         )?;
         super::constraint_names::remap_table(current, &mut definition, column_mapping)?;
         self.storage
-            .reserve_implicit_index_identities(&mut definition)?;
+            .reserve_table_catalog_identities(&mut definition)?;
         // Column-only edits replace pg_attribute rows. Keep track of edits
         // that also fork pg_class, including a rename followed by renaming back.
         let class_tuple_private = prior

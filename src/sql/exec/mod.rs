@@ -3140,6 +3140,7 @@ fn inherit_table_checks(
             ));
         }
         child.checks[child.n_checks] = *inherited;
+        child.checks[child.n_checks].identity = None;
         child.n_checks += 1;
     }
     Ok(())
@@ -3831,6 +3832,7 @@ fn copy_like_constraints(
                     ));
                 }
                 let mut copied = *check;
+                copied.identity = None;
                 // The name is regenerated from the new table, as PostgreSQL
                 // does, so the two tables' constraints stay distinguishable.
                 copied.name = auto_key_name(def, &[], "check", false)?;
@@ -41178,6 +41180,7 @@ fn build_domain_spec(
             ));
         }
         checks[n] = crate::storage::CheckConstraint {
+            identity: None,
             name,
             expression: super::enum_values::checks::bind::<{ crate::storage::CHECK_SQL_MAX }>(
                 domain_text::<{ crate::storage::CHECK_SQL_MAX }>(c.expression)?.as_str(),
@@ -41209,6 +41212,7 @@ fn build_domain_spec(
         base_type_mod,
         not_null,
         not_null_name: None,
+        not_null_identity: None,
         default_expr,
         checks,
         n_checks: n,
@@ -42137,6 +42141,7 @@ pub fn alter_domain(
         base_type_mod: current.base_type_mod,
         not_null: current.not_null,
         not_null_name: current.not_null_name,
+        not_null_identity: current.not_null_identity,
         default_expr: current.default_expr,
         checks: current.checks,
         n_checks: current.n_checks,
@@ -42233,6 +42238,7 @@ pub fn alter_domain(
                 Err(e) => return sql_fail(e),
             };
             spec.checks[spec.n_checks] = crate::storage::CheckConstraint {
+                identity: None,
                 name: cname,
                 expression,
                 validation: match check.validation {
@@ -46714,6 +46720,7 @@ fn rewrite_composite_dependent_domains(
             base_type_mod: current.base_type_mod,
             not_null: current.not_null,
             not_null_name: current.not_null_name,
+            not_null_identity: current.not_null_identity,
             default_expr: current.default_expr,
             checks: current.checks,
             n_checks: current.n_checks,
@@ -50380,7 +50387,7 @@ fn stage_table_definition(
                 column_mapping: wal_mapping,
             },
         )?;
-        storage.reserve_implicit_index_identities(&mut next)?;
+        storage.reserve_table_catalog_identities(&mut next)?;
         let lsn = storage.bump_lsn();
         wal.stage_reserved(
             txn.txid,
@@ -63831,7 +63838,7 @@ fn rename_attached_index_constraint(
             column_mapping: wal_mapping,
         },
     )?;
-    storage.reserve_implicit_index_identities(&mut altered)?;
+    storage.reserve_table_catalog_identities(&mut altered)?;
     let lsn = storage.bump_lsn();
     wal.stage_reserved(
         txn.txid,
@@ -63913,7 +63920,7 @@ fn drop_dependent_foreign_keys(
                 column_mapping: wal_mapping,
             },
         )?;
-        storage.reserve_implicit_index_identities(&mut altered)?;
+        storage.reserve_table_catalog_identities(&mut altered)?;
         let lsn = storage.bump_lsn();
         wal.stage_reserved(
             txn.txid,
@@ -64729,6 +64736,7 @@ fn inherit_partition_constraints(
             ));
         }
         child.checks[child.n_checks] = *constraint;
+        child.checks[child.n_checks].identity = None;
         child.n_checks += 1;
     }
     for constraint in parent.fkeys() {
@@ -65160,7 +65168,7 @@ fn alter_table_inheritance(
     ) {
         return sql_fail(error);
     }
-    if let Err(error) = storage.reserve_implicit_index_identities(&mut updated) {
+    if let Err(error) = storage.reserve_table_catalog_identities(&mut updated) {
         return sql_fail(error);
     }
     let lsn = storage.bump_lsn();
@@ -65450,6 +65458,7 @@ fn alter_partition_attachment(
             definition.partition.detached_bound = retain_bound
                 .then(|| {
                     generated_constraint_name.map(|name| crate::storage::DetachedPartitionBound {
+                        identity: None,
                         name,
                         scheme,
                         bound: attachment.bound,
@@ -65532,6 +65541,7 @@ fn alter_partition_attachment(
                     });
                     new_def.partition.detached_bound = generated_constraint_name.map(|name| {
                         crate::storage::DetachedPartitionBound {
+                            identity: None,
                             name,
                             scheme,
                             bound: attachment.bound,
@@ -65592,7 +65602,7 @@ fn alter_partition_attachment(
     ) {
         return sql_fail(error);
     }
-    if let Err(error) = storage.reserve_implicit_index_identities(&mut new_def) {
+    if let Err(error) = storage.reserve_table_catalog_identities(&mut new_def) {
         return sql_fail(error);
     }
     let lsn = storage.bump_lsn();
@@ -65652,7 +65662,7 @@ fn alter_partition_attachment(
                 ) {
                     return sql_fail(error);
                 }
-                if let Err(error) = storage.reserve_implicit_index_identities(&mut dependent) {
+                if let Err(error) = storage.reserve_table_catalog_identities(&mut dependent) {
                     return sql_fail(error);
                 }
                 let lsn = storage.bump_lsn();
@@ -66745,7 +66755,7 @@ fn alter_table_relation(
             ) {
                 return sql_fail(error);
             }
-            if let Err(error) = storage.reserve_implicit_index_identities(&mut new_def) {
+            if let Err(error) = storage.reserve_table_catalog_identities(&mut new_def) {
                 return sql_fail(error);
             }
             let lsn = storage.bump_lsn();
@@ -68435,7 +68445,7 @@ fn alter_table_relation(
         ) {
             return sql_fail(e);
         }
-        if let Err(error) = storage.reserve_implicit_index_identities(&mut new_def) {
+        if let Err(error) = storage.reserve_table_catalog_identities(&mut new_def) {
             return sql_fail(error);
         }
         let lsn = storage.bump_lsn();
@@ -68937,7 +68947,7 @@ fn alter_table_relation(
                     ) {
                         return sql_fail(error);
                     }
-                    if let Err(error) = storage.reserve_implicit_index_identities(&mut dependent) {
+                    if let Err(error) = storage.reserve_table_catalog_identities(&mut dependent) {
                         return sql_fail(error);
                     }
                     let lsn = storage.bump_lsn();
@@ -69326,7 +69336,7 @@ fn alter_table_replica_identity(
         ) {
             return sql_fail(error);
         }
-        if let Err(error) = storage.reserve_implicit_index_identities(&mut next) {
+        if let Err(error) = storage.reserve_table_catalog_identities(&mut next) {
             return sql_fail(error);
         }
         let lsn = storage.bump_lsn();

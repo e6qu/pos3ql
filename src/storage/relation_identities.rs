@@ -108,10 +108,11 @@ impl TableDef {
 }
 
 impl Storage {
-    pub(crate) fn reserve_implicit_index_identities(
+    pub(crate) fn reserve_table_catalog_identities(
         &self,
         definition: &mut TableDef,
     ) -> Result<(), SqlError> {
+        self.reserve_constraint_identities(definition)?;
         for (identity, slot) in definition
             .inline_index_identities
             .iter_mut()
@@ -142,10 +143,11 @@ impl Storage {
         Ok(())
     }
 
-    pub(super) fn validate_implicit_index_identities(
+    pub(super) fn validate_table_catalog_identities(
         &self,
         definition: &TableDef,
     ) -> Result<(), SqlError> {
+        super::validate_constraint_identities(definition.constraint_identities())?;
         for (position, identity) in definition.implicit_index_identities().enumerate() {
             let identity = identity.ok_or_else(|| {
                 sql_err!(
@@ -165,6 +167,9 @@ impl Storage {
             }
         }
         for identity in definition.implicit_index_identities().flatten() {
+            self.catalog_sequence.observe(identity.created_at());
+        }
+        for identity in definition.constraint_identities().flatten() {
             self.catalog_sequence.observe(identity.created_at());
         }
         Ok(())

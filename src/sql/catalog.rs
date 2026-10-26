@@ -10941,7 +10941,6 @@ pub(crate) const FIRST_VIEW_COMPOSITE_ARRAY_TYPE_OID: i32 =
     super::types::oid::FIRST_VIEW_COMPOSITE_ARRAY;
 pub(crate) const FIRST_TOAST_RELATION_OID: i32 = 320_000_000;
 pub(crate) const FIRST_TOAST_INDEX_OID: i32 = 340_000_000;
-pub(crate) const FIRST_FOREIGN_KEY_TRIGGER_OID: i32 = 1_700_000;
 
 pub(crate) fn toast_relation_oid(storage: &Storage, slot: usize) -> i32 {
     crate::storage::RelationIdentity::parse(storage.table(slot).created_at())
@@ -10953,15 +10952,6 @@ pub(crate) fn toast_index_oid(storage: &Storage, slot: usize) -> i32 {
     crate::storage::RelationIdentity::parse(storage.table(slot).created_at())
         .expect("admitted table has a durable identity")
         .companion_oid(FIRST_TOAST_INDEX_OID)
-}
-
-pub(crate) const fn foreign_key_trigger_oid(
-    table_slot: usize,
-    foreign_key: usize,
-    ordinal: usize,
-) -> i32 {
-    FIRST_FOREIGN_KEY_TRIGGER_OID
-        + (table_slot * crate::storage::MAX_FKEYS * 4 + foreign_key * 4 + ordinal) as i32
 }
 
 const fn foreign_key_action_routine(action: crate::storage::FkAction, update: bool) -> i32 {
@@ -15213,37 +15203,7 @@ struct FkInfo {
     name: StackStr<64>,
 }
 
-pub(crate) const FIRST_FK_OID: i32 = 10_000_000;
-pub(crate) const FIRST_CHECK_OID: i32 = 20_000_000;
-pub(crate) const FIRST_DOMAIN_CHECK_OID: i32 = 30_000_000;
-pub(crate) const FIRST_NOT_NULL_OID: i32 = 40_000_000;
-pub(crate) const FIRST_DETACHED_PARTITION_CHECK_OID: i32 = 110_000_000;
-pub(crate) const FIRST_DOMAIN_NOT_NULL_OID: i32 = 130_000_000;
-
-/// Constraint positions are durable catalog identities. Keep their OID
-/// arithmetic here so catalog rows, event triggers, and comments cannot drift
-/// to a different per-object stride.
-pub(crate) const fn foreign_key_constraint_oid(table_slot: usize, index: usize) -> i32 {
-    FIRST_FK_OID + (table_slot * crate::storage::MAX_FKEYS + index) as i32
-}
-
-pub(crate) const fn check_constraint_oid(table_slot: usize, index: usize) -> i32 {
-    FIRST_CHECK_OID + (table_slot * crate::storage::MAX_CHECKS + index) as i32
-}
-
-pub(crate) const fn domain_check_constraint_oid(domain_slot: usize, index: usize) -> i32 {
-    FIRST_DOMAIN_CHECK_OID + (domain_slot * crate::storage::MAX_DOMAIN_CHECKS + index) as i32
-}
-
-pub(crate) const fn not_null_constraint_oid(table_slot: usize, column_index: usize) -> i32 {
-    FIRST_NOT_NULL_OID
-        + table_slot as i32 * crate::storage::MAX_RELATION_COLUMNS as i32
-        + column_index as i32
-}
-
-/// The current catalog OID of a named table constraint. Constraint comments
-/// retain the table-slot/name identity because index and check positions are
-/// presentation-derived and can change after an unrelated DROP CONSTRAINT.
+/// Resolve the current name to its admitted constraint lifetime.
 pub(crate) fn table_constraint_oid(
     storage: &Storage,
     txid: u32,
@@ -15263,46 +15223,23 @@ pub(crate) fn table_constraint_oid(
         return index_constraint;
     }
     let table = storage.table_def(table_slot, txid);
-    if table
-        .partition
-        .detached_bound
-        .is_some_and(|constraint| constraint.name.as_str() == name)
+    if let Some(constraint) = table.partition.detached_bound
+        && constraint.name.as_str() == name
     {
-        return Some(FIRST_DETACHED_PARTITION_CHECK_OID + table_slot as i32);
+        return Some(constraint.oid());
     }
-    if let Some((index, _)) = table
-        .checks()
-        .iter()
-        .enumerate()
-        .find(|(_, constraint)| constraint.name.as_str() == name)
-    {
-        return Some(check_constraint_oid(table_slot, index));
+    if let Some(constraint) = table.checks().iter().find(|constraint| constraint.name.as_str() == name) {
+        return Some(constraint.oid());
     }
-    if let Some((index, _)) = table
-        .fkeys()
-        .iter()
-        .enumerate()
-        .find(|(_, constraint)| constraint.name.as_str() == name)
-    {
-        return Some(foreign_key_constraint_oid(table_slot, index));
+    if let Some(constraint) = table.fkeys().iter().find(|constraint| constraint.name.as_str() == name) {
+        return Some(constraint.oid());
     }
-    table
-        .columns()
-        .iter()
-        .enumerate()
-        .find(|(_, column)| {
-            column.not_null.is_required()
-                && not_null_constraint_name(&table, column).as_str() == name
-        })
-        .map(|(index, _)| {
-            not_null_constraint_oid(table_slot, usize::from(table.attribute_number(index) - 1))
-        })
+    table.columns().iter().enumerate().find(|(_, column)| {
+        column.not_null.is_required() && not_null_constraint_name(&table, column).as_str() == name
+    }).map(|(column, _)| table.not_null_constraint_oid(column))
 }
 
-/// Resolve a table constraint OID back to its stable table/name identity.
-/// The forward and reverse paths deliberately meet at `table_constraint_oid`
-/// because generated NOT NULL and index-backed constraint positions can move
-/// after unrelated catalog edits.
+/// Resolve a constraint lifetime to its current table and name.
 pub(crate) fn table_constraint_identity_by_oid(
     storage: &Storage,
     txid: u32,
@@ -15375,7 +15312,7 @@ fn visit_fkeys(storage: &Storage, txid: u32, mut visit: impl FnMut(FkInfo)) {
                 continue;
             };
             visit(FkInfo {
-                oid: foreign_key_constraint_oid(slot, i),
+                oid: fk.oid(),
                 conrelid,
                 confrelid: user_table_oid(storage, pslot),
                 child_slot: slot,
@@ -15431,7 +15368,7 @@ fn inherited_foreign_key_parent_oid(
         .table_def(parent_slot, txid)
         .fkeys()
         .iter()
-        .position(|parent| {
+        .find(|parent| {
             parent.name == child.name
                 && parent.columns() == child.columns()
                 && parent.parent_schema == child.parent_schema
@@ -15440,7 +15377,7 @@ fn inherited_foreign_key_parent_oid(
                 && parent.on_delete == child.on_delete
                 && parent.on_update == child.on_update
         })
-        .map_or(0, |index| foreign_key_constraint_oid(parent_slot, index))
+        .map_or(0, |constraint| constraint.oid())
 }
 
 fn check_inheritance_count(
@@ -15554,7 +15491,7 @@ pub fn constraint_def_text<'a>(
             continue;
         }
         for (check_index, check) in storage.table_def(slot, txid).checks().iter().enumerate() {
-            let check_oid = check_constraint_oid(slot, check_index);
+            let check_oid = check.oid();
             if check_oid != oid {
                 continue;
             }
@@ -15574,7 +15511,7 @@ pub fn constraint_def_text<'a>(
         }
         let table = storage.table_def(slot, txid);
         if let Some(constraint) = table.partition.detached_bound
-            && oid == FIRST_DETACHED_PARTITION_CHECK_OID + slot as i32
+            && oid == constraint.oid()
         {
             return Ok(Some(detached_partition_constraint_def_text(
                 &table, constraint, arena,
@@ -15587,7 +15524,7 @@ pub fn constraint_def_text<'a>(
             continue;
         }
         for (check_index, check) in domain.checks().iter().enumerate() {
-            let check_oid = domain_check_constraint_oid(slot, check_index);
+            let check_oid = check.oid();
             if check_oid != oid {
                 continue;
             }
@@ -20632,7 +20569,7 @@ fn pg_constraint_values<'a>(
             }
             out[n] = row(
                 &[
-                    Datum::Int4(check_constraint_oid(slot, check_index)),
+                    Datum::Int4(check.oid()),
                     text(check.name.as_str(), arena)?,
                     Datum::Int4(user_table_oid(storage, slot)),
                     Datum::Int4(0),
@@ -20698,7 +20635,7 @@ fn pg_constraint_values<'a>(
             })?;
         out[n] = row(
             &[
-                Datum::Int4(FIRST_DETACHED_PARTITION_CHECK_OID + slot as i32),
+                Datum::Int4(constraint.oid()),
                 text(constraint.name.as_str(), arena)?,
                 Datum::Int4(user_table_oid(storage, slot)),
                 Datum::Int4(0),
@@ -20753,10 +20690,7 @@ fn pg_constraint_values<'a>(
             let constraint_name = not_null_constraint_name(&table, column);
             out[n] = row(
                 &[
-                    Datum::Int4(not_null_constraint_oid(
-                        slot,
-                        usize::from(table.attribute_number(column_index) - 1),
-                    )),
+                    Datum::Int4(table.not_null_constraint_oid(column_index)),
                     text(constraint_name.as_str(), arena)?,
                     Datum::Int4(user_table_oid(storage, slot)),
                     Datum::Int4(0),
@@ -20803,7 +20737,7 @@ fn pg_constraint_values<'a>(
             }
             out[n] = row(
                 &[
-                    Datum::Int4(domain_check_constraint_oid(slot, check_index)),
+                    Datum::Int4(check.oid()),
                     text(check.name.as_str(), arena)?,
                     Datum::Int4(0),
                     Datum::Int4(domain_oid(storage, slot, txid)),
@@ -20855,7 +20789,7 @@ fn pg_constraint_values<'a>(
                 .expect("stored domain NOT NULL constraint has a name");
             out[n] = row(
                 &[
-                    Datum::Int4(FIRST_DOMAIN_NOT_NULL_OID + slot as i32),
+                    Datum::Int4(domain.not_null_constraint_oid()),
                     text(name.as_str(), arena)?,
                     Datum::Int4(0),
                     Datum::Int4(domain_oid(storage, slot, txid)),
@@ -26023,7 +25957,7 @@ fn pg_trigger<'a>(
             continue;
         }
         let child = storage.table_def(child_slot, txid);
-        for (foreign_key_index, foreign_key) in child.fkeys().iter().enumerate() {
+        for foreign_key in child.fkeys() {
             let Some(parent_slot) = storage.find_visible(
                 foreign_key.parent_schema.as_str(),
                 foreign_key.parent.as_str(),
@@ -26041,29 +25975,29 @@ fn pg_trigger<'a>(
                         && index.columns[..index.n_cols] == *foreign_key.parent_cols()
                 })
                 .map_or(0, |index| index.oid);
-            let constraint_oid = foreign_key_constraint_oid(child_slot, foreign_key_index);
-            for ordinal in 0..4 {
+            let constraint_oid = foreign_key.oid();
+            for trigger in crate::storage::ForeignKeyTrigger::ALL {
                 if count == rows.len() {
                     return Err(catalog_capacity_exceeded("pg_trigger"));
                 }
-                let oid = foreign_key_trigger_oid(child_slot, foreign_key_index, ordinal);
-                let side = if ordinal < 2 { "a" } else { "c" };
+                let oid = foreign_key.trigger_oid(trigger);
+                let side = if trigger.ordinal() < 2 { "a" } else { "c" };
                 let name = crate::stack_format!(64, "RI_ConstraintTrigger_{}_{}", side, oid);
-                let (relation, function, trigger_type, constrained_relation) = match ordinal {
-                    0 => (
+                let (relation, function, trigger_type, constrained_relation) = match trigger {
+                    crate::storage::ForeignKeyTrigger::ActionDelete => (
                         parent_oid,
                         foreign_key_action_routine(foreign_key.on_delete, false),
                         9,
                         child_oid,
                     ),
-                    1 => (
+                    crate::storage::ForeignKeyTrigger::ActionUpdate => (
                         parent_oid,
                         foreign_key_action_routine(foreign_key.on_update, true),
                         17,
                         child_oid,
                     ),
-                    2 => (child_oid, 1644, 5, parent_oid),
-                    _ => (child_oid, 1645, 17, parent_oid),
+                    crate::storage::ForeignKeyTrigger::CheckInsert => (child_oid, 1644, 5, parent_oid),
+                    crate::storage::ForeignKeyTrigger::CheckUpdate => (child_oid, 1645, 17, parent_oid),
                 };
                 rows[count] = row(
                     &[

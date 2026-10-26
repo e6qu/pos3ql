@@ -185,14 +185,18 @@ pub(super) fn allocate(
         };
         match allocation {
             super::CatalogAllocation::New => {
+                def.not_null_identities.fill(None);
+                for identity in def.constraint_identities_mut() {
+                    *identity = None;
+                }
                 def.inline_index_identities.fill(None);
                 for identity in def.implicit_index_identities_mut() {
                     *identity = None;
                 }
-                storage.reserve_implicit_index_identities(&mut def)?;
+                storage.reserve_table_catalog_identities(&mut def)?;
             }
             super::CatalogAllocation::Restore(_) => {
-                storage.validate_implicit_index_identities(&def)?
+                storage.validate_table_catalog_identities(&def)?
             }
         }
         state.install(

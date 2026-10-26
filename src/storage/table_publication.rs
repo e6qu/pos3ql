@@ -495,6 +495,7 @@ mod tests {
         let mut child = make_def("publication_child", &[("id", ColType::Int4, false)]);
         child.n_fkeys = 1;
         child.fkeys[0] = ForeignKey {
+            identity: None,
             parent_schema: SqlName::parse("public").unwrap(),
             parent: SqlName::parse("publication_parent").unwrap(),
             n_cols: 1,
@@ -784,6 +785,7 @@ mod tests {
                         let (target, mut definition) = storage.select_table_definition(other, 9);
                         definition.n_fkeys = 1;
                         definition.fkeys[0] = ForeignKey {
+                            identity: None,
                             parent_schema: SqlName::parse("public").unwrap(),
                             parent: SqlName::parse("publication_parent").unwrap(),
                             n_cols: 1,
@@ -944,6 +946,7 @@ mod tests {
             let (target, mut definition) = storage.select_table_definition(child, 8);
             definition.n_fkeys = 1;
             definition.fkeys[0] = ForeignKey {
+                identity: None,
                 name: SqlName::parse("publication_parent_link").unwrap(),
                 parent_schema: parent_definition.schema,
                 parent: parent_definition.name,

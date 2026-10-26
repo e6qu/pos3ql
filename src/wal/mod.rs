@@ -26,7 +26,7 @@ use crc32c::crc32c;
 
 /// On-disk record header length shared by recovery and logical decoding.
 pub(crate) const HEADER_LEN: usize = 24;
-pub(crate) const RECORD_VERSION: u8 = 17;
+pub(crate) const RECORD_VERSION: u8 = 18;
 
 /// One contiguous, committed journal range ready for immutable publication.
 /// Construction is private to the journal, so callers cannot pair an LSN with
@@ -252,8 +252,8 @@ wal_record_kinds! {
 /// A table definition is an independently versioned payload inside the
 /// object-native logical WAL. Replays reject a definition from an incompatible
 /// schema instead of assigning later bytes to a different column property.
-const TABLE_DEF_PAYLOAD_VERSION: u8 = 11;
-const DOMAIN_PAYLOAD_VERSION: u8 = u8::MAX - 2;
+const TABLE_DEF_PAYLOAD_VERSION: u8 = 12;
+const DOMAIN_PAYLOAD_VERSION: u8 = u8::MAX - 3;
 const NO_DOMAIN_BASE_CREATION: u32 = 0;
 
 fn access_class_has_oid(class: u8) -> bool {
@@ -2967,6 +2967,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             n += 1;
             n += 3;
             n += def.implicit_index_identities().count() * 8;
+            n += def.constraint_identities().count() * crate::storage::ConstraintIdentity::ENCODED_BYTES;
             n
         }
         WalOp::BeginTableRewrite {
@@ -3537,6 +3538,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             for c in def.checks() {
                 n += 1 + c.name.as_str().len() + 2 + c.expression.as_str().len() + 1;
             }
+            n += def.constraint_identities().count() * crate::storage::ConstraintIdentity::ENCODED_BYTES;
             n
         }
         WalOp::RestoreDomain(payload)
@@ -4716,6 +4718,10 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                             .to_le_bytes(),
                     );
             }
+            for identity in def.constraint_identities() {
+                let Some(identity) = identity else { return false; };
+                ok &= buffer.append(&identity.to_le_bytes());
+            }
             ok
         }
         WalOp::BeginTableRewrite {
@@ -5708,6 +5714,10 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                     && buffer.append(&(c.expression.as_str().len() as u16).to_le_bytes())
                     && buffer.append(c.expression.as_str().as_bytes())
                     && buffer.append(&[c.validation.code()]);
+            }
+            for identity in def.constraint_identities() {
+                let Some(identity) = identity else { return false; };
+                ok &= buffer.append(&identity.to_le_bytes());
             }
             ok
         }
@@ -7964,6 +7974,12 @@ fn decode_op_inner<'a>(
                 at += 8;
                 *identity = Some(crate::storage::RelationIdentity::parse(created_at)?);
             }
+            for identity in def.constraint_identities_mut() {
+                let bytes = payload.get(at..at + crate::storage::ConstraintIdentity::ENCODED_BYTES)?;
+                at += crate::storage::ConstraintIdentity::ENCODED_BYTES;
+                *identity = Some(crate::storage::ConstraintIdentity::from_le_bytes(bytes.try_into().ok()?)?);
+            }
+            crate::storage::validate_constraint_identities(def.constraint_identities()).ok()?;
             for (position, identity) in def.implicit_index_identities().enumerate() {
                 if def
                     .implicit_index_identities()
@@ -9891,11 +9907,22 @@ fn decode_op_inner<'a>(
                     crate::storage::ConstraintValidation::from_code(*payload.get(at)?)?;
                 at += 1;
                 *check = crate::storage::CheckConstraint {
+                    identity: None,
                     name: SqlName::parse(cname).ok()?,
                     expression: bounded_wal_text(expr)?,
                     validation,
                 };
             }
+            for check in checks.iter_mut().take(n_checks) {
+                let bytes = payload.get(at..at + crate::storage::ConstraintIdentity::ENCODED_BYTES)?;
+                at += crate::storage::ConstraintIdentity::ENCODED_BYTES;
+                check.identity = Some(crate::storage::ConstraintIdentity::from_le_bytes(bytes.try_into().ok()?)?);
+            }
+            let not_null_identity = if not_null {
+                let bytes = payload.get(at..at + crate::storage::ConstraintIdentity::ENCODED_BYTES)?;
+                at += crate::storage::ConstraintIdentity::ENCODED_BYTES;
+                Some(crate::storage::ConstraintIdentity::from_le_bytes(bytes.try_into().ok()?)?)
+            } else { None };
             if at != payload.len() {
                 return None;
             }
@@ -9911,12 +9938,14 @@ fn decode_op_inner<'a>(
                 base_type_mod,
                 not_null,
                 not_null_name,
+                not_null_identity,
                 default_expr,
                 checks,
                 n_checks,
                 pending_definition: None,
                 ddl_state: crate::storage::CatalogDdlState::Absent,
             };
+            crate::storage::validate_constraint_identities(definition.constraint_identities()).ok()?;
             if decoded_domain.is_none()
                 && (kind == KIND_CREATE_DOMAIN_TYPED) != domain_needs_typed_journal(&definition)
             {
@@ -12657,6 +12686,7 @@ fn decode_partition(payload: &[u8], at: &mut usize) -> Option<PartitionDef> {
             *at += 2;
         }
         Some(crate::storage::DetachedPartitionBound {
+            identity: None,
             name,
             scheme: crate::storage::PartitionScheme {
                 strategy,
@@ -14657,6 +14687,7 @@ mod tests {
         definition.partition.attachment.as_mut().unwrap().state =
             crate::storage::PartitionAttachmentState::DetachPending;
         definition.partition.detached_bound = Some(crate::storage::DetachedPartitionBound {
+            identity: None,
             name: SqlName::parse("detached_bound_check").unwrap(),
             scheme: crate::storage::PartitionScheme {
                 strategy: PartitionStrategy::Range,
@@ -14706,6 +14737,7 @@ mod tests {
         assert!(matches!(
             restored.partition.detached_bound,
             Some(crate::storage::DetachedPartitionBound {
+                identity: None,
                 name,
                 scheme: crate::storage::PartitionScheme {
                     strategy: PartitionStrategy::Range,

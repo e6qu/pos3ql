@@ -125,7 +125,7 @@ pub(crate) fn capture_before<'a>(
             }
             let reference = detached_constraint(
                 child,
-                catalog::foreign_key_constraint_oid(child_slot, foreign_key_index),
+                foreign_key.oid(),
                 foreign_key.name.as_str(),
             );
             if dependent_drops
@@ -138,14 +138,8 @@ pub(crate) fn capture_before<'a>(
             dependent_drops
                 .push((reference, true))
                 .map_err(|_| graph_full())?;
-            for ordinal in 0..4 {
-                let reference = foreign_key_trigger_reference(
-                    child,
-                    child_slot,
-                    foreign_key_index,
-                    foreign_key,
-                    ordinal,
-                );
+            for trigger in crate::storage::ForeignKeyTrigger::ALL {
+                let reference = foreign_key_trigger_reference(child, foreign_key, trigger);
                 dependent_drops
                     .push((reference, false))
                     .map_err(|_| graph_full())?;
@@ -352,7 +346,7 @@ enum EventObjectRef {
     DomainArray(u16),
     DomainConstraint {
         domain: u16,
-        constraint: u16,
+        constraint: crate::storage::ConstraintIdentity,
     },
     EnumArray(u16),
     CompositeRelation(u16),
@@ -525,9 +519,9 @@ impl EventObjectRef {
             }
             Self::DomainConstraint { domain, constraint } => {
                 let domain_slot = usize::from(domain);
-                let constraint_slot = usize::from(constraint);
                 let domain = storage.domain_for(domain_slot, txid);
-                let check = &domain.checks()[constraint_slot];
+                let check = domain.checks().iter().find(|check| check.identity == Some(constraint))
+                    .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "domain constraint no longer exists"))?;
                 let mut identity = EventIdentity::new();
                 write!(
                     identity,
@@ -538,7 +532,7 @@ impl EventObjectRef {
                 .map_err(|_| graph_full())?;
                 let mut object = base_object(
                     catalog::PG_CONSTRAINT_OID,
-                    catalog::domain_check_constraint_oid(domain_slot, constraint_slot),
+                    check.oid(),
                     "domain constraint",
                     Some(domain.schema.as_str()),
                     None,
@@ -2230,10 +2224,10 @@ pub(crate) fn catalog_object_address(
         }
         consider!(EventObjectRef::Primary(ObjectRef::Domain(slot)));
         consider!(EventObjectRef::DomainArray(slot as u16));
-        for constraint in 0..storage.domain_for(slot, txid).checks().len() {
+        for constraint in storage.domain_for(slot, txid).checks() {
             consider!(EventObjectRef::DomainConstraint {
                 domain: slot as u16,
-                constraint: constraint as u16,
+                constraint: constraint.identity.expect("admitted domain CHECK has an identity"),
             });
         }
     }
@@ -2600,16 +2594,15 @@ fn existing_catalog_object(
                         .domain_for(domain, txid)
                         .checks()
                         .iter()
-                        .enumerate()
-                        .find_map(|(constraint, _)| {
-                            (catalog::domain_check_constraint_oid(domain, constraint) == object_id)
-                                .then_some((domain, constraint))
+                        .find_map(|check| {
+                            check.identity.filter(|identity| identity.oid() == object_id)
+                                .map(|identity| (domain, identity))
                         })
                 })
             {
                 EventObjectRef::DomainConstraint {
                     domain: domain as u16,
-                    constraint: constraint as u16,
+                    constraint,
                 }
             } else {
                 return Err(catalog_lookup_failed(class_id, object_id));
@@ -3135,12 +3128,11 @@ fn detached_index(
 
 fn foreign_key_trigger_reference(
     child: &crate::storage::TableDef,
-    child_slot: usize,
-    foreign_key_index: usize,
     foreign_key: &crate::storage::ForeignKey,
-    ordinal: usize,
+    trigger: crate::storage::ForeignKeyTrigger,
 ) -> EventObjectRef {
-    let oid = catalog::foreign_key_trigger_oid(child_slot, foreign_key_index, ordinal);
+    let oid = foreign_key.trigger_oid(trigger);
+    let ordinal = trigger.ordinal();
     let side = if ordinal < 2 { "a" } else { "c" };
     EventObjectRef::DetachedTrigger {
         oid,
@@ -3160,23 +3152,15 @@ fn foreign_key_trigger_reference(
 
 fn push_foreign_key_trigger_drops(
     child: &crate::storage::TableDef,
-    child_slot: usize,
-    foreign_key_index: usize,
     foreign_key: &crate::storage::ForeignKey,
     output: &mut ArenaList<'_, DroppedObject>,
     count: &mut usize,
 ) -> Result<(), SqlError> {
-    for ordinal in 0..4 {
+    for trigger in crate::storage::ForeignKeyTrigger::ALL {
         push_drop_once(
             output,
             count,
-            foreign_key_trigger_reference(
-                child,
-                child_slot,
-                foreign_key_index,
-                foreign_key,
-                ordinal,
-            ),
+            foreign_key_trigger_reference(child, foreign_key, trigger),
             false,
             false,
         )?;
@@ -3268,10 +3252,7 @@ fn push_alter_table_drops(
                         count,
                         detached_constraint(
                             old,
-                            catalog::not_null_constraint_oid(
-                                slot,
-                                usize::from(old.attribute_number(column_index) - 1),
-                            ),
+                            old.not_null_constraint_oid(column_index),
                             name.as_str(),
                         ),
                         true,
@@ -3288,7 +3269,7 @@ fn push_alter_table_drops(
                     push_drop_once(
                         output,
                         count,
-                        detached_constraint(old, catalog::check_constraint_oid(slot, index), *name),
+                        detached_constraint(old, old.checks()[index].oid(), *name),
                         true,
                         false,
                     )?;
@@ -3302,7 +3283,7 @@ fn push_alter_table_drops(
                         count,
                         detached_constraint(
                             old,
-                            catalog::foreign_key_constraint_oid(slot, index),
+                            old.fkeys()[index].oid(),
                             *name,
                         ),
                         true,
@@ -3400,10 +3381,7 @@ fn push_alter_table_drops(
                                     count,
                                     detached_constraint(
                                         old,
-                                        catalog::not_null_constraint_oid(
-                                            slot,
-                                            usize::from(old.attribute_number(column_index) - 1),
-                                        ),
+                                        old.not_null_constraint_oid(column_index),
                                         *name,
                                     ),
                                     true,
@@ -3426,7 +3404,7 @@ fn push_alter_table_drops(
                 count,
                 detached_constraint(
                     old,
-                    catalog::check_constraint_oid(slot, index),
+                    old.checks()[index].oid(),
                     check.name.as_str(),
                 ),
                 false,
@@ -3441,13 +3419,13 @@ fn push_alter_table_drops(
                 count,
                 detached_constraint(
                     old,
-                    catalog::foreign_key_constraint_oid(slot, index),
+                    old.fkeys()[index].oid(),
                     foreign_key.name.as_str(),
                 ),
                 false,
                 true,
             )?;
-            push_foreign_key_trigger_drops(old, slot, index, foreign_key, output, count)?;
+            push_foreign_key_trigger_drops(old, foreign_key, output, count)?;
         }
     }
     for (column_index, column) in old.columns().iter().enumerate() {
@@ -3464,10 +3442,7 @@ fn push_alter_table_drops(
                 count,
                 detached_constraint(
                     old,
-                    catalog::not_null_constraint_oid(
-                        slot,
-                        usize::from(old.attribute_number(column_index) - 1),
-                    ),
+                    old.not_null_constraint_oid(column_index),
                     name.as_str(),
                 ),
                 false,
@@ -3658,7 +3633,7 @@ fn push_table_drop_dependents(
             count,
             EventObjectRef::TableConstraint {
                 table: table_ref,
-                oid: catalog::check_constraint_oid(slot, index),
+                oid: check.oid(),
                 name: StackStr::from_str(check.name.as_str()),
             },
             false,
@@ -3673,10 +3648,7 @@ fn push_table_drop_dependents(
                 count,
                 EventObjectRef::TableConstraint {
                     table: table_ref,
-                    oid: catalog::not_null_constraint_oid(
-                        slot,
-                        usize::from(table.attribute_number(index) - 1),
-                    ),
+                    oid: table.not_null_constraint_oid(index),
                     name,
                 },
                 false,
@@ -3690,13 +3662,13 @@ fn push_table_drop_dependents(
             count,
             EventObjectRef::TableConstraint {
                 table: table_ref,
-                oid: catalog::foreign_key_constraint_oid(slot, index),
+                oid: foreign_key.oid(),
                 name: StackStr::from_str(foreign_key.name.as_str()),
             },
             false,
             true,
         )?;
-        push_foreign_key_trigger_drops(&table, slot, index, foreign_key, output, count)?;
+        push_foreign_key_trigger_drops(&table, foreign_key, output, count)?;
     }
     if table.has_toast {
         push_drop(
@@ -3855,13 +3827,13 @@ fn push_type_drop_dependents(
                 false,
                 false,
             )?;
-            for index in 0..domain.checks().len() {
+            for constraint in domain.checks() {
                 push_drop(
                     output,
                     count,
                     EventObjectRef::DomainConstraint {
                         domain: domain_ref,
-                        constraint: u16::try_from(index).map_err(|_| graph_full())?,
+                        constraint: constraint.identity.expect("admitted domain CHECK has an identity"),
                     },
                     false,
                     false,

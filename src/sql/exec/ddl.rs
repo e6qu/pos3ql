@@ -859,6 +859,7 @@ pub(super) fn attach_constraints(
                     ));
                 }
                 let mut c = CheckConstraint {
+                    identity: None,
                     name: constraint_name,
                     expression: crate::util::StackStr::new(),
                     validation: storage_validation(*validation),

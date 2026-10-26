@@ -1354,7 +1354,7 @@ fn constraint_public_identifiers_survive_edits_replacement_and_savepoint_rollbac
         {
             let output = session.success(&mut engine, statement, true);
             let rows = data_rows(&output);
-            assert!(rows.iter().all(|row| row == "t"), "{statement}: {rows:?}");
+            assert!(rows.iter().all(|row| row == "t"), "after {observations} checks; {statement}: {rows:?}");
             observations += rows.len();
         }
         assert_eq!(observations, 12);
@@ -1399,7 +1399,7 @@ fn constraint_public_identifiers_survive_journal_and_checkpoint_recovery() {
                 {
                     let output = session.success(&mut engine, statement, false);
                     let rows = data_rows(&output);
-                    assert!(rows.iter().all(|row| row == "t"), "{statement}: {rows:?}");
+                    assert!(rows.iter().all(|row| row == "t"), "after {observations} checks; {statement}: {rows:?}");
                     observations += rows.len();
                 }
                 assert_eq!(observations, 4);
@@ -1422,7 +1422,7 @@ fn constraint_public_identifiers_survive_journal_and_checkpoint_recovery() {
                     {
                         let output = session.success(&mut engine, statement, guarded);
                         let rows = data_rows(&output);
-                        assert!(rows.iter().all(|row| row == "t"), "{statement}: {rows:?}");
+                        assert!(rows.iter().all(|row| row == "t"), "after {observations} checks; {statement}: {rows:?}");
                         observations += rows.len();
                     }
                     assert_eq!(observations, expected);
@@ -5329,88 +5329,30 @@ fn relation_identity_view_rowtype_json_preserves_field_limits() {
 }
 
 #[test]
-fn wide_schema_catalog_oid_bands_are_disjoint_at_declared_capacities() {
-    use crate::storage::MAX_TABLE_CATALOG_SLOTS;
+fn catalog_constraint_identity_ranges_reject_overflow_and_keep_triggers_disjoint() {
+    use crate::storage::{ConstraintIdentity, ForeignKeyTrigger, MAX_TABLE_CATALOG_SLOTS};
     crate::mem::guard::forbid_alloc(|| {
-        assert_eq!(
-            catalog::foreign_key_constraint_oid(0, 0),
-            catalog::FIRST_FK_OID
-        );
-        assert_eq!(
-            catalog::check_constraint_oid(0, 0),
-            catalog::FIRST_CHECK_OID
-        );
-        assert_eq!(
-            catalog::domain_check_constraint_oid(0, 0),
-            catalog::FIRST_DOMAIN_CHECK_OID
-        );
-        assert_eq!(
-            catalog::foreign_key_constraint_oid(1, 0),
-            catalog::foreign_key_constraint_oid(0, crate::storage::MAX_FKEYS - 1) + 1
-        );
-        assert_eq!(
-            catalog::check_constraint_oid(1, 0),
-            catalog::check_constraint_oid(0, crate::storage::MAX_CHECKS - 1) + 1
-        );
-        assert_eq!(
-            catalog::domain_check_constraint_oid(1, 0),
-            catalog::domain_check_constraint_oid(0, crate::storage::MAX_DOMAIN_CHECKS - 1) + 1
-        );
-        assert_eq!(
-            catalog::not_null_constraint_oid(0, 0),
-            catalog::FIRST_NOT_NULL_OID
-        );
-        assert_eq!(
-            catalog::not_null_constraint_oid(
-                MAX_TABLE_CATALOG_SLOTS - 1,
-                crate::storage::MAX_RELATION_COLUMNS - 1,
-            ),
-            catalog::FIRST_NOT_NULL_OID
-                + (MAX_TABLE_CATALOG_SLOTS * crate::storage::MAX_RELATION_COLUMNS) as i32
-                - 1,
-        );
-        let ranges = [
-            (
-                catalog::FIRST_FK_OID,
-                MAX_TABLE_CATALOG_SLOTS * crate::storage::MAX_FKEYS,
-            ),
-            (
-                catalog::FIRST_CHECK_OID,
-                MAX_TABLE_CATALOG_SLOTS * crate::storage::MAX_CHECKS,
-            ),
-            (
-                catalog::FIRST_DOMAIN_CHECK_OID,
-                crate::storage::MAX_DOMAIN_CATALOG_SLOTS * crate::storage::MAX_DOMAIN_CHECKS,
-            ),
-            (
-                catalog::FIRST_NOT_NULL_OID,
-                MAX_TABLE_CATALOG_SLOTS * crate::storage::MAX_RELATION_COLUMNS,
-            ),
-            (
-                catalog::FIRST_DETACHED_PARTITION_CHECK_OID,
-                MAX_TABLE_CATALOG_SLOTS,
-            ),
-        ];
-        for pair in ranges.windows(2) {
-            assert!(pair[0].0 + pair[0].1 as i32 <= pair[1].0);
-        }
+        assert!(ConstraintIdentity::parse(0).is_none());
+        assert!(ConstraintIdentity::parse(10_000_000).is_none());
+        assert!(ConstraintIdentity::parse(u64::MAX).is_none());
+        let first = ConstraintIdentity::parse(1).unwrap();
+        let last = ConstraintIdentity::parse(9_999_999).unwrap();
+        assert!(first.oid() < last.oid());
         assert!(
             crate::storage::FIRST_EXPLICIT_INDEX_OID as u64
                 + crate::storage::MAX_INDEX_OID_GENERATION
-                + (crate::storage::INDEX_CONSTRAINT_OID_OFFSET as u64)
-                < crate::storage::FIRST_PARTITION_TRIGGER_OID as u64
+                + crate::storage::INDEX_CONSTRAINT_OID_OFFSET as u64
+                < first.oid() as u64
         );
-        assert!(
-            crate::storage::TRIGGER_OID_BASE as u64 + crate::storage::MAX_TRIGGER_OID_GENERATION
-                < catalog::FIRST_FOREIGN_KEY_TRIGGER_OID as u64
-        );
-        assert!(
-            catalog::foreign_key_trigger_oid(
-                MAX_TABLE_CATALOG_SLOTS - 1,
-                crate::storage::MAX_FKEYS - 1,
-                3
-            ) < crate::storage::FIRST_PARTITION_TRIGGER_OID
-        );
+        for trigger in ForeignKeyTrigger::ALL {
+            assert!(last.oid() < first.foreign_key_trigger_oid(trigger));
+            assert!(first.foreign_key_trigger_oid(trigger) < last.foreign_key_trigger_oid(trigger));
+            assert!(last.foreign_key_trigger_oid(trigger) < crate::storage::FIRST_PARTITION_TRIGGER_OID);
+            assert!(
+                crate::storage::TRIGGER_OID_BASE as u64 + crate::storage::MAX_TRIGGER_OID_GENERATION
+                    < first.foreign_key_trigger_oid(trigger) as u64
+            );
+        }
         assert!(
             crate::storage::FIRST_PARTITION_TRIGGER_OID as u64
                 + crate::storage::MAX_TRIGGER_OID_GENERATION * MAX_TABLE_CATALOG_SLOTS as u64

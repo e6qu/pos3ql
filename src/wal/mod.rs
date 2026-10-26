@@ -7779,7 +7779,6 @@ fn decode_op_inner<'a>(
                     not_null_inheritable,
                     unique: meta[1] & 2 != 0,
                     primary: meta[1] & 4 != 0,
-                    index_identity: None,
                     auto_increment: meta[1] & 8 != 0,
                     default,
                     is_identity: meta[1] & 32 != 0,
@@ -14484,7 +14483,6 @@ mod tests {
             not_null_inheritable: true,
             unique: true,
             primary: true,
-            index_identity: None,
             auto_increment: false,
             default: ColumnDefault::NONE,
             is_identity: false,
@@ -14505,7 +14503,6 @@ mod tests {
             not_null_inheritable: true,
             unique: false,
             primary: false,
-            index_identity: None,
             auto_increment: false,
             default: ColumnDefault::Constant {
                 value: OwnedDatum::Int4(7),
@@ -14600,10 +14597,13 @@ mod tests {
         let definition = sample_def();
         let mut budget = Budget::new(1 << 20);
         let mut payload = FixedBuf::new(&mut budget, "relation identity payload", 32768).unwrap();
-        assert!(append_payload(&mut payload, &WalOp::CreateTable {
-            identity: crate::storage::CatalogPosition::new(0, 50).unwrap(),
-            definition: &definition,
-        }));
+        assert!(append_payload(
+            &mut payload,
+            &WalOp::CreateTable {
+                identity: crate::storage::CatalogPosition::new(0, 50).unwrap(),
+                definition: &definition,
+            }
+        ));
         let bytes = payload.readable();
         assert!(decode_table_payload(bytes).is_some());
         assert!(decode_table_payload(&bytes[..bytes.len() - 1]).is_none());
@@ -14611,7 +14611,10 @@ mod tests {
             let mut corrupt = bytes.to_vec();
             let end = corrupt.len();
             corrupt[end - 8..].copy_from_slice(&invalid.to_le_bytes());
-            assert!(decode_table_payload(&corrupt).is_none(), "accepted index creation stamp {invalid}");
+            assert!(
+                decode_table_payload(&corrupt).is_none(),
+                "accepted index creation stamp {invalid}"
+            );
         }
     }
 

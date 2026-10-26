@@ -75,11 +75,14 @@ constraint-created indexes share the 300,000,001–309,999,999 relation band.
 TOAST relations and indexes use creation-stamp companions starting at
 320,000,000 and 340,000,000. Table and view row types start at 130,000,000 and
 140,000,000; their arrays start at 150,000,000 and 160,000,000. These bands depend
-on creation stamps, not configured catalog capacities. New relation or index creation returns `54000` when the shared creation
-sequence would exceed 9,999,999; other catalog changes keep their own limits.
+on creation stamps, not configured catalog capacities. New relation or index
+creation returns `54000` when the shared creation sequence would exceed
+9,999,999; other catalog changes keep their own limits.
 The sequence retains reservations for dropped and rolled-back objects.
 
-Each constraint-created index owns a separate creation stamp. Renaming its
+Each constraint-created index owns a separate creation stamp. Inline-column
+keys keep their stamps beside stable attribute numbers in the table definition;
+the shared column metadata stays within its existing 512-byte recovery bound. Renaming its
 constraint, dropping an earlier constraint, or moving its column preserves
 that identity. Replacing the index reserves a fresh stamp. Manifest
 `implicit_index POSITION CREATED_AT` records and table payload v10 store the
@@ -271,14 +274,13 @@ Retained `pg_rewrite` images have nine typed fields: the six public fields,
 `tableoid`, a private text field for the view definition, and a private text
 array containing the rule condition followed by its actions. A missing
 condition is NULL. SQL reads expose only the six public fields and the hidden
-system column; the two body fields exist only in catalog history. Journal v14
-rejects earlier framing before reading these images.
+system column; the two body fields exist only in catalog history. The journal reader rejects older framing before reading these images.
 
 Unique keys retain an explicit mode: tag `0` means NULLs are distinct, tag `1`
 means primary key, and tag `2` means `NULLS NOT DISTINCT`. Other tags are rejected.
 The checkpoint `ukey` record starts with this tag. Table-definition payload v10
 stores the tag, key-column count and timing as three bytes before the column
-positions. Manifest v26 and journal v14 reject earlier format identities.
+positions. Older format identities are rejected before these records are read.
 
 Table constraints are fixed at 64 entries per modeled kind and
 domain checks at 64 entries. Their journal counts are unsigned bytes, while

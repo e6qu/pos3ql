@@ -2137,7 +2137,6 @@ pub(crate) fn describe_derived_definition<'a>(
         not_null_inheritable: true,
         unique: false,
         primary: false,
-        index_identity: None,
         auto_increment: false,
         default: crate::storage::ColumnDefault::NONE,
         is_identity: false,

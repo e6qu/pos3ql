@@ -476,6 +476,32 @@ same fixed pool.
 reading the replacement orders table through the reused internal slot. Bytes
 it already selected stay readable; a later admission fails explicitly.
 
+SQL identifiers for tables, views, sequences and indexes follow the object's
+lifetime. Renaming an object keeps its identifier; dropping it and creating
+another object gives the replacement a fresh identifier, even when storage
+reuses the same slot. Tables and views also keep separate identifiers for their
+row types and arrays. Journal and checkpoint recovery preserve these values.
+
+**User example:** an application can save a table's identifier before replacing
+it. The old value cannot give permission to read the replacement:
+
+```sql
+CREATE TABLE orders(id integer);
+CREATE TABLE saved_table_id AS SELECT 'orders'::regclass::oid AS oid;
+DROP TABLE orders;
+CREATE TABLE orders(id integer);
+SELECT has_table_privilege(oid, 'SELECT') IS NULL FROM saved_table_id;
+-- true
+```
+
+An index created by a constraint keeps its identifier when an earlier
+constraint is removed, its own constraint is renamed, or a column moves.
+`ADD CONSTRAINT ... USING INDEX` keeps the existing index's identifier.
+Drop and recreate reserve a fresh one. Identifier exhaustion returns `54000`
+without installing a replacement; existing data and recovery remain usable.
+The [format guide](durable-format.md) specifies the bounds. Remaining identifier
+families stay in [PLAN.md](../PLAN.md).
+
 ALTER TABLE rewrites retain the source before choosing any input row identity.
 The chosen versions and their later reads therefore share one source through
 row changes, rollback, and maintenance. An ALTER that changes only a definition

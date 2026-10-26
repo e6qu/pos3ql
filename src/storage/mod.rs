@@ -1381,7 +1381,6 @@ pub struct ColumnMeta {
     pub not_null_inheritable: bool,
     pub unique: bool,
     pub primary: bool,
-    pub(crate) index_identity: Option<RelationIdentity>,
     /// `serial`/`bigserial`/`smallserial` or GENERATED AS IDENTITY: when the
     /// column is omitted (or DEFAULT) on INSERT, it is assigned one past the
     /// column's current maximum.
@@ -1595,7 +1594,6 @@ impl ColumnMeta {
         not_null_inheritable: true,
         unique: false,
         primary: false,
-        index_identity: None,
         auto_increment: false,
         default: ColumnDefault::NONE,
         is_identity: false,
@@ -1926,6 +1924,7 @@ pub struct TableDef {
     pub n_columns: usize,
     pub(crate) not_null_names: [Option<SqlName>; MAX_COLUMNS],
     pub(crate) attributes: column_attributes::ColumnAttributes,
+    pub(crate) inline_index_identities: [Option<RelationIdentity>; MAX_RELATION_COLUMNS],
     pub uniques: [UniqueKey; MAX_UNIQUES],
     pub n_uniques: usize,
     pub checks: [CheckConstraint; MAX_CHECKS],
@@ -2345,6 +2344,7 @@ impl TableDef {
             n_columns: 0,
             not_null_names: [None; MAX_COLUMNS],
             attributes: column_attributes::ColumnAttributes::EMPTY,
+            inline_index_identities: [None; MAX_RELATION_COLUMNS],
             uniques: [UniqueKey::EMPTY; MAX_UNIQUES],
             n_uniques: 0,
             checks: [CheckConstraint::EMPTY; MAX_CHECKS],
@@ -6520,13 +6520,13 @@ impl MatviewDef {
 pub(crate) const MAX_DOMAIN_CATALOG_SLOTS: usize =
     (crate::sql::types::oid::FIRST_ENUM - crate::sql::types::oid::FIRST_DOMAIN) as usize;
 /// Startup table capacity is independent of durable relation identities.
-pub(crate) const MAX_TABLE_TYPE_OID_SLOTS: usize = 10_000;
+pub(crate) const MAX_TABLE_CATALOG_SLOTS: usize = 10_000;
 /// Startup view capacity is independent of durable relation identities.
-pub(crate) const MAX_VIEW_TYPE_OID_SLOTS: usize = 10_000;
+pub(crate) const MAX_VIEW_CATALOG_SLOTS: usize = 10_000;
 
 pub(crate) const FIRST_IMPLICIT_INDEX_OID: i32 = relation_identities::FIRST_RELATION_OID;
 pub(crate) const INDEX_CONSTRAINT_OID_OFFSET: i32 =
-    (MAX_TABLE_TYPE_OID_SLOTS * MAX_VALUE_ENFORCERS) as i32;
+    (MAX_TABLE_CATALOG_SLOTS * MAX_VALUE_ENFORCERS) as i32;
 pub(crate) const FIRST_EXPLICIT_INDEX_OID: i32 = 300_000_000;
 pub(crate) const FIRST_PARTITION_TRIGGER_OID: i32 = 1_000_000_000;
 pub(crate) const TRIGGER_CONSTRAINT_OID_OFFSET: i32 = 500_000;
@@ -6536,8 +6536,8 @@ pub(crate) const MAX_INDEX_OID_GENERATION: u64 = relation_identities::MAX_RELATI
 pub(crate) const MAX_TRIGGER_OID_GENERATION: u64 = (i32::MAX as u64
     - FIRST_PARTITION_TRIGGER_OID as u64
     - TRIGGER_CONSTRAINT_OID_OFFSET as u64
-    - (MAX_TABLE_TYPE_OID_SLOTS as u64 - 1))
-    / MAX_TABLE_TYPE_OID_SLOTS as u64;
+    - (MAX_TABLE_CATALOG_SLOTS as u64 - 1))
+    / MAX_TABLE_CATALOG_SLOTS as u64;
 
 fn bounded_catalog_generation(value: u64, maximum: u64, object: &str) -> Result<u64, SqlError> {
     if value == 0 || value > maximum {
@@ -41691,7 +41691,8 @@ impl Storage {
         let created_at = if defer_manifest_binding {
             self.catalog_sequence.next()?
         } else {
-            self.catalog_sequence.next_bounded(MAX_RELATION_GENERATION, "relation")?
+            self.catalog_sequence
+                .next_bounded(MAX_RELATION_GENERATION, "relation")?
         };
         let (mut permissions, mut catalog) = self.type_creation_catalogs();
         if !defer_manifest_binding {
@@ -41885,7 +41886,9 @@ impl Storage {
             let undo = self.replace_view_in(&mut owners, target, definition, txid)?;
             return Ok(ViewPublication::Altered(undo));
         }
-        let created_at = self.catalog_sequence.next_bounded(MAX_RELATION_GENERATION, "relation")?;
+        let created_at = self
+            .catalog_sequence
+            .next_bounded(MAX_RELATION_GENERATION, "relation")?;
         // Reserve and populate the return rule before changing either view.
         // Capacity and identity errors preserve an existing replacement target.
         let rule = self.create_new_rule_in(
@@ -56744,7 +56747,6 @@ mod tests {
                 not_null_inheritable: true,
                 unique: false,
                 primary: false,
-                index_identity: None,
                 auto_increment: false,
                 default: ColumnDefault::NONE,
                 is_identity: false,
@@ -57781,12 +57783,18 @@ mod tests {
         definition.columns[0].primary = true;
         let slot = storage.create_table(definition).unwrap();
         let sequence = storage.catalog_identity_sequence();
-        storage.validate_restored_relation_identities(sequence).unwrap();
+        storage
+            .validate_restored_relation_identities(sequence)
+            .unwrap();
         let table_identity = storage.table(slot).created_at();
         let revision = storage.reserve_table_definition_revision().unwrap();
-        storage.tables[slot].definition_mut(revision).columns[0].index_identity = RelationIdentity::parse(table_identity);
+        storage.tables[slot].definition_mut(revision).inline_index_identities[0] =
+            RelationIdentity::parse(table_identity);
         let before = storage.catalog_identity_sequence();
-        let error = crate::mem::guard::forbid_alloc(|| storage.validate_restored_relation_identities(before)).unwrap_err();
+        let error = crate::mem::guard::forbid_alloc(|| {
+            storage.validate_restored_relation_identities(before)
+        })
+        .unwrap_err();
         assert_eq!(error.sqlstate, sqlstate::DATA_EXCEPTION);
         assert!(error.message.as_str().contains("duplicated"));
         assert_eq!(storage.catalog_identity_sequence(), before);

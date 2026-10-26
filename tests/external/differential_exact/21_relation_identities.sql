@@ -40,6 +40,8 @@ ALTER TABLE identity_keys DROP CONSTRAINT identity_keys_a_key;
 SELECT oid = 'identity_keys_b_key'::regclass FROM identity_key_saved;
 ALTER TABLE identity_keys RENAME CONSTRAINT identity_keys_b_key TO identity_kept_key;
 SELECT oid = 'identity_kept_key'::regclass FROM identity_key_saved;
+ALTER TABLE identity_keys DROP COLUMN a;
+SELECT oid = 'identity_kept_key'::regclass FROM identity_key_saved;
 BEGIN;
 SAVEPOINT keep_index;
 ALTER TABLE identity_keys DROP CONSTRAINT identity_kept_key;

@@ -4192,7 +4192,6 @@ impl Checkpointer {
                         not_null_inheritable: not_null_inheritable != 0,
                         unique: not_null & 4 != 0,
                         primary: not_null & 8 != 0,
-                        index_identity: None,
                         auto_increment: not_null & 16 != 0,
                         default,
                         is_identity: not_null & 64 != 0,
@@ -5567,6 +5566,9 @@ impl Checkpointer {
                         .ok_or(CheckpointSetupError::Corrupt(
                             "invalid implicit index creation identity",
                         ))?;
+                    if !definition.attributes.validate(definition.n_columns) {
+                        return Err(CheckpointSetupError::Corrupt("implicit index requires valid column attributes"));
+                    }
                     let target = definition
                         .implicit_index_identities_mut()
                         .nth(position)
@@ -8833,8 +8835,14 @@ impl Checkpointer {
                     error.message.as_str()
                 ))
             })?;
-        storage.validate_restored_relation_identities(metadata.catalog_sequence)
-            .map_err(|error| CheckpointSetupError::ObjectStore(format!("manifest relation identities rejected: {}", error.message.as_str())))?;
+        storage
+            .validate_restored_relation_identities(metadata.catalog_sequence)
+            .map_err(|error| {
+                CheckpointSetupError::ObjectStore(format!(
+                    "manifest relation identities rejected: {}",
+                    error.message.as_str()
+                ))
+            })?;
         // Block SSTs load in list order. Versioned reads choose the greatest
         // admissible commit LSN across every member.
         bssts.sort_by_key(|(mindex, idx, ..)| (*mindex, *idx));
@@ -18858,7 +18866,6 @@ fn empty_column() -> ColumnMeta {
         not_null_inheritable: true,
         unique: false,
         primary: false,
-        index_identity: None,
         auto_increment: false,
         default: ColumnDefault::NONE,
         is_identity: false,

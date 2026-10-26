@@ -1311,7 +1311,7 @@ fn relation_identity_replacement_and_constraint_edits_match_postgresql() {
         assert_eq!(
             data_rows(&output),
             [
-                "t", "t", "t", "t", "t", "t", "t", "81", "t", "t", "t", "t", "t", "t", "t"
+                "t", "t", "t", "t", "t", "t", "t", "81", "t", "t", "t", "t", "t", "t", "t", "t"
             ]
         );
     }
@@ -1343,7 +1343,7 @@ fn relation_identity_cold_recovery_preserves_replacements_and_surviving_indexes(
                 .find_table("public", "identity_cold")
                 .unwrap();
             let original = catalog::user_table_oid(&engine.storage, slot);
-            session.success(&mut engine, "ALTER TABLE identity_cold DROP CONSTRAINT identity_cold_first_value_key; ALTER TABLE identity_cold RENAME CONSTRAINT identity_cold_second_value_key TO identity_cold_kept; CREATE VIEW identity_cold_view AS SELECT id FROM identity_cold; CREATE SEQUENCE identity_cold_sequence START WITH 101", false);
+            session.success(&mut engine, "ALTER TABLE identity_cold DROP CONSTRAINT identity_cold_first_value_key; ALTER TABLE identity_cold DROP COLUMN first_value; ALTER TABLE identity_cold RENAME CONSTRAINT identity_cold_second_value_key TO identity_cold_kept; CREATE UNIQUE INDEX identity_cold_label ON identity_cold(label); ALTER TABLE identity_cold ADD CONSTRAINT identity_cold_label UNIQUE USING INDEX identity_cold_label; CREATE VIEW identity_cold_view AS SELECT id FROM identity_cold; CREATE SEQUENCE identity_cold_sequence START WITH 101", false);
             assert_eq!(
                 data_rows(&session.success(
                     &mut engine,
@@ -1363,8 +1363,16 @@ fn relation_identity_cold_recovery_preserves_replacements_and_surviving_indexes(
             let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
             let mut session = ConfiguredTransactionSession::new(&config, &mut cold_budget);
             assert_eq!(data_rows(&session.success(&mut cold, "SELECT 'identity_cold'::regclass::oid, 'identity_cold'::regtype::oid, 'identity_cold[]'::regtype::oid, 'identity_cold_kept'::regclass::oid, 'identity_cold_view'::regclass::oid, 'identity_cold_view'::regtype::oid, 'identity_cold_sequence'::regclass::oid", false)), before);
-            session.success(&mut cold, "DROP VIEW identity_cold_view; DROP TABLE identity_cold", false);
-            session.success(&mut cold, "CREATE TABLE identity_cold(id integer PRIMARY KEY, label text)", false);
+            session.success(
+                &mut cold,
+                "DROP VIEW identity_cold_view; DROP TABLE identity_cold",
+                false,
+            );
+            session.success(
+                &mut cold,
+                "CREATE TABLE identity_cold(id integer PRIMARY KEY, label text)",
+                false,
+            );
             let new_slot = cold.storage.find_table("public", "identity_cold").unwrap();
             assert_eq!(new_slot, slot);
             assert_ne!(catalog::user_table_oid(&cold.storage, new_slot), original);
@@ -1389,15 +1397,29 @@ fn relation_identity_exhaustion_keeps_existing_data_and_cold_recovery_usable() {
         let mut engine = Engine::new(&config, &mut budget).unwrap();
         let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
         session.success(&mut engine, "CREATE DOMAIN identity_limit_domain AS integer; CREATE TYPE identity_limit_enum AS ENUM ('ready'); CREATE TYPE identity_limit_composite AS (value integer)", false);
-        engine.storage.replace_catalog_sequence_for_test(crate::storage::MAX_RELATION_GENERATION - 2);
+        engine
+            .storage
+            .replace_catalog_sequence_for_test(crate::storage::MAX_RELATION_GENERATION - 2);
         session.success(&mut engine, "CREATE TABLE identity_limit_orders(id integer PRIMARY KEY); INSERT INTO identity_limit_orders VALUES (7)", false);
-        for sql in ["CREATE TABLE identity_limit_rejected(id integer)", "CREATE INDEX identity_limit_rejected ON identity_limit_orders(id)", "CREATE SEQUENCE identity_limit_rejected", "CREATE VIEW identity_limit_rejected AS SELECT 1 AS value", "CREATE TYPE identity_limit_rejected AS (value integer)"] {
-            assert_eq!(error_sqlstates(&session.execute(&mut engine, sql, false)), ["54000"], "{sql}");
+        for sql in [
+            "CREATE TABLE identity_limit_rejected(id integer)",
+            "CREATE INDEX identity_limit_rejected ON identity_limit_orders(id)",
+            "CREATE SEQUENCE identity_limit_rejected",
+            "CREATE VIEW identity_limit_rejected AS SELECT 1 AS value",
+            "CREATE TYPE identity_limit_rejected AS (value integer)",
+        ] {
+            assert_eq!(
+                error_sqlstates(&session.execute(&mut engine, sql, false)),
+                ["54000"],
+                "{sql}"
+            );
         }
         session.success(&mut engine, "ALTER TABLE identity_limit_orders SET (fillfactor = 80); INSERT INTO identity_limit_orders VALUES (8)", false);
         let before = data_rows(&session.success(&mut engine, "SELECT 'identity_limit_orders'::regclass::oid, 'identity_limit_orders'::regtype::oid, 'identity_limit_orders_pkey'::regclass::oid; SELECT to_regclass('identity_limit_rejected') IS NULL", false));
         assert_eq!(before[1], "t");
-        if checkpoint { assert!(engine.checkpoint().unwrap()); }
+        if checkpoint {
+            assert!(engine.checkpoint().unwrap());
+        }
         drop(session);
         drop(engine);
         std::fs::remove_dir_all(&config.data_dir).unwrap();
@@ -1406,7 +1428,14 @@ fn relation_identity_exhaustion_keeps_existing_data_and_cold_recovery_usable() {
         let mut session = ConfiguredTransactionSession::new(&config, &mut cold_budget);
         assert_eq!(data_rows(&session.success(&mut cold, "SELECT 'identity_limit_orders'::regclass::oid, 'identity_limit_orders'::regtype::oid, 'identity_limit_orders_pkey'::regclass::oid; SELECT to_regclass('identity_limit_rejected') IS NULL", false)), before);
         assert_eq!(data_rows(&session.success(&mut cold, "SELECT id FROM identity_limit_orders ORDER BY id; SELECT (NULL::identity_limit_composite).value IS NULL", false)), ["7", "8", "t"]);
-        assert_eq!(error_sqlstates(&session.execute(&mut cold, "CREATE TABLE identity_limit_rejected(id integer)", false)), ["54000"]);
+        assert_eq!(
+            error_sqlstates(&session.execute(
+                &mut cold,
+                "CREATE TABLE identity_limit_rejected(id integer)",
+                false
+            )),
+            ["54000"]
+        );
     }
 }
 
@@ -4793,7 +4822,7 @@ fn json_populate_record_uses_table_rowtype_fields() {
 
 #[test]
 fn wide_schema_catalog_oid_bands_are_disjoint_at_declared_capacities() {
-    use crate::storage::MAX_TABLE_TYPE_OID_SLOTS;
+    use crate::storage::MAX_TABLE_CATALOG_SLOTS;
     crate::mem::guard::forbid_alloc(|| {
         assert_eq!(
             catalog::foreign_key_constraint_oid(0, 0),
@@ -4825,21 +4854,21 @@ fn wide_schema_catalog_oid_bands_are_disjoint_at_declared_capacities() {
         );
         assert_eq!(
             catalog::not_null_constraint_oid(
-                MAX_TABLE_TYPE_OID_SLOTS - 1,
+                MAX_TABLE_CATALOG_SLOTS - 1,
                 crate::storage::MAX_RELATION_COLUMNS - 1,
             ),
             catalog::FIRST_NOT_NULL_OID
-                + (MAX_TABLE_TYPE_OID_SLOTS * crate::storage::MAX_RELATION_COLUMNS) as i32
+                + (MAX_TABLE_CATALOG_SLOTS * crate::storage::MAX_RELATION_COLUMNS) as i32
                 - 1,
         );
         let ranges = [
             (
                 catalog::FIRST_FK_OID,
-                MAX_TABLE_TYPE_OID_SLOTS * crate::storage::MAX_FKEYS,
+                MAX_TABLE_CATALOG_SLOTS * crate::storage::MAX_FKEYS,
             ),
             (
                 catalog::FIRST_CHECK_OID,
-                MAX_TABLE_TYPE_OID_SLOTS * crate::storage::MAX_CHECKS,
+                MAX_TABLE_CATALOG_SLOTS * crate::storage::MAX_CHECKS,
             ),
             (
                 catalog::FIRST_DOMAIN_CHECK_OID,
@@ -4847,11 +4876,11 @@ fn wide_schema_catalog_oid_bands_are_disjoint_at_declared_capacities() {
             ),
             (
                 catalog::FIRST_NOT_NULL_OID,
-                MAX_TABLE_TYPE_OID_SLOTS * crate::storage::MAX_RELATION_COLUMNS,
+                MAX_TABLE_CATALOG_SLOTS * crate::storage::MAX_RELATION_COLUMNS,
             ),
             (
                 catalog::FIRST_DETACHED_PARTITION_CHECK_OID,
-                MAX_TABLE_TYPE_OID_SLOTS,
+                MAX_TABLE_CATALOG_SLOTS,
             ),
         ];
         for pair in ranges.windows(2) {
@@ -4869,15 +4898,15 @@ fn wide_schema_catalog_oid_bands_are_disjoint_at_declared_capacities() {
         );
         assert!(
             catalog::foreign_key_trigger_oid(
-                MAX_TABLE_TYPE_OID_SLOTS - 1,
+                MAX_TABLE_CATALOG_SLOTS - 1,
                 crate::storage::MAX_FKEYS - 1,
                 3
             ) < crate::storage::FIRST_PARTITION_TRIGGER_OID
         );
         assert!(
             crate::storage::FIRST_PARTITION_TRIGGER_OID as u64
-                + crate::storage::MAX_TRIGGER_OID_GENERATION * MAX_TABLE_TYPE_OID_SLOTS as u64
-                + MAX_TABLE_TYPE_OID_SLOTS as u64
+                + crate::storage::MAX_TRIGGER_OID_GENERATION * MAX_TABLE_CATALOG_SLOTS as u64
+                + MAX_TABLE_CATALOG_SLOTS as u64
                 - 1
                 + crate::storage::TRIGGER_CONSTRAINT_OID_OFFSET as u64
                 <= i32::MAX as u64
@@ -28502,11 +28531,12 @@ fn partitioned_catalog_relations_expose_parent_and_leaf_identity() {
         )),
         ["RANGE (id)|NULL"]
     );
+    let partition_oid = catalog::reloid_of_name(&engine.storage, 0, "catalog_partition_parent").unwrap().unwrap();
     assert_eq!(
         data_rows(&run_with(
             &mut engine,
             &mut budget,
-            "SELECT pg_get_partkeydef('16384')",
+            &format!("SELECT pg_get_partkeydef('{partition_oid}')"),
         )),
         ["RANGE (id)"],
         "pg_dump passes relation OIDs as unknown string literals"
@@ -64798,12 +64828,12 @@ fn wide_schema_objects_cover_full_definition_bounds_and_object_cold_recovery() {
 
     for (query, expected) in [
         (
-            "SELECT typrelid FROM pg_type WHERE typname = 'wide_composite'",
-            "180000",
+            "SELECT typrelid = 'wide_composite'::regclass FROM pg_type WHERE typname = 'wide_composite'",
+            "t",
         ),
         (
             "SELECT count(*) FROM pg_attribute \
-               WHERE attrelid = 180000 \
+               WHERE attrelid = 'wide_composite'::regclass \
                  AND attnum > 0 AND NOT attisdropped",
             "64",
         ),

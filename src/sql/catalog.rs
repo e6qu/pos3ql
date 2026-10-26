@@ -11326,7 +11326,7 @@ fn visit_indexes(
             if col.primary {
                 let name = stack_str_64(stack_format!(64, "{}_pkey", table_name).as_str());
                 visit(mk(
-                    col.index_identity
+                    def.column_index_identity(ci)
                         .expect("admitted inline index has an identity")
                         .oid(),
                     &[ci as u16],
@@ -11348,7 +11348,7 @@ fn visit_indexes(
                     stack_format!(64, "{}_{}_key", table_name, col.name.as_str()).as_str(),
                 );
                 visit(mk(
-                    col.index_identity
+                    def.column_index_identity(ci)
                         .expect("admitted inline index has an identity")
                         .oid(),
                     &[ci as u16],
@@ -22783,7 +22783,6 @@ fn pg_attribute<'a>(
                 not_null_inheritable: true,
                 unique: false,
                 primary: false,
-                index_identity: None,
                 auto_increment: false,
                 default: crate::storage::ColumnDefault::NONE,
                 is_identity: false,
@@ -26114,7 +26113,7 @@ fn partition_trigger_oid(
 ) -> Result<i32, SqlError> {
     let ordinal = trigger
         .created_at
-        .checked_mul(crate::storage::MAX_TABLE_TYPE_OID_SLOTS as u64)
+        .checked_mul(crate::storage::MAX_TABLE_CATALOG_SLOTS as u64)
         .and_then(|value| value.checked_add(table as u64))
         .and_then(|value| i32::try_from(value).ok())
         .and_then(|value| crate::storage::FIRST_PARTITION_TRIGGER_OID.checked_add(value))
@@ -31747,7 +31746,6 @@ fn info_column_type_usage<'a>(
                 not_null_inheritable: true,
                 unique: false,
                 primary: false,
-                index_identity: None,
                 auto_increment: false,
                 default: crate::storage::ColumnDefault::NONE,
                 is_identity: false,

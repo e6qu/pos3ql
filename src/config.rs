@@ -1702,18 +1702,18 @@ impl Config {
             (
                 "max_tables",
                 config.max_tables,
-                crate::storage::MAX_TABLE_TYPE_OID_SLOTS,
+                crate::storage::MAX_TABLE_CATALOG_SLOTS,
             ),
             (
                 "max_views",
                 config.max_views,
-                crate::storage::MAX_VIEW_TYPE_OID_SLOTS,
+                crate::storage::MAX_VIEW_CATALOG_SLOTS,
             ),
         ] {
             if capacity > maximum {
                 return Err(ConfigError::at(
                     0,
-                    format!("{name} exceeds the {maximum}-slot row-type OID range"),
+                    format!("{name} exceeds the {maximum}-slot catalog limit"),
                 ));
             }
         }
@@ -2703,8 +2703,8 @@ sql_arena_bytes = 4096
             .unwrap();
         }
         for (name, maximum) in [
-            ("max_tables", crate::storage::MAX_TABLE_TYPE_OID_SLOTS),
-            ("max_views", crate::storage::MAX_VIEW_TYPE_OID_SLOTS),
+            ("max_tables", crate::storage::MAX_TABLE_CATALOG_SLOTS),
+            ("max_views", crate::storage::MAX_VIEW_CATALOG_SLOTS),
         ] {
             let error = Config::parse(&format!(
                 "{name} = {}\n\ntransaction_mode = mvcc\ncatalog_history_bytes = 16MiB\n",
@@ -2714,7 +2714,7 @@ sql_arena_bytes = 4096
             assert!(
                 error
                     .message
-                    .contains(&format!("{maximum}-slot row-type OID range")),
+                    .contains(&format!("{maximum}-slot catalog limit")),
                 "{name}: {error}"
             );
             Config::parse(&format!(

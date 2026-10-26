@@ -39427,7 +39427,6 @@ pub fn create_table_as(
             not_null_inheritable: true,
             unique: false,
             primary: false,
-            index_identity: None,
             auto_increment: false,
             default: crate::storage::ColumnDefault::NONE,
             is_identity: false,
@@ -59216,7 +59215,6 @@ pub(crate) fn view_trigger_definition(
             not_null_inheritable: true,
             unique: false,
             primary: false,
-            index_identity: None,
             auto_increment: false,
             default: crate::storage::ColumnDefault::NONE,
             is_identity: false,
@@ -63460,11 +63458,11 @@ fn drop_named_constraint(def: &mut TableDef, name: &str) -> bool {
     // A single-column primary key is a column flag named "<table>_pkey".
     let pkey = crate::stack_format!(96, "{}_pkey", def.name.as_str());
     if name == pkey.as_str()
-        && let Some(c) = def.columns[..def.n_columns].iter_mut().find(|c| c.primary)
+        && let Some(column) = def.columns().iter().position(|column| column.primary)
     {
-        c.index_identity = None;
-        c.primary = false;
-        c.unique = false;
+        def.take_column_index_identity(column);
+        def.columns[column].primary = false;
+        def.columns[column].unique = false;
         return true;
     }
     // A single-column UNIQUE is "<table>_<column>_key".
@@ -63477,7 +63475,7 @@ fn drop_named_constraint(def: &mut TableDef, name: &str) -> bool {
                 def.columns[i].name.as_str()
             );
             if name == key.as_str() {
-                def.columns[i].index_identity = None;
+                def.take_column_index_identity(i);
                 def.columns[i].unique = false;
                 return true;
             }
@@ -69286,8 +69284,7 @@ fn materialize_flag_key_names(def: &mut TableDef) -> Result<(), SqlError> {
             },
             crate::sql::ast::ConstraintTiming::NotDeferrable,
         )?;
-        def.uniques[def.n_uniques - 1].index_identity = metadata.index_identity;
-        def.columns[column].index_identity = None;
+        def.uniques[def.n_uniques - 1].index_identity = def.take_column_index_identity(column);
         def.columns[column].primary = false;
         def.columns[column].unique = false;
     }
@@ -69336,8 +69333,7 @@ fn rename_flag_key(def: &mut TableDef, from: &str, new_name: SqlName) -> Result<
                 },
                 crate::sql::ast::ConstraintTiming::NotDeferrable,
             )?;
-            def.uniques[def.n_uniques - 1].index_identity = col.index_identity;
-            def.columns[i].index_identity = None;
+            def.uniques[def.n_uniques - 1].index_identity = def.take_column_index_identity(i);
             return Ok(true);
         }
     }
@@ -70683,7 +70679,6 @@ fn coerce_composite_value_inner<'a>(
             not_null_inheritable: true,
             unique: false,
             primary: false,
-            index_identity: None,
             auto_increment: false,
             default: crate::storage::ColumnDefault::NONE,
             is_identity: false,

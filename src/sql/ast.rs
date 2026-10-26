@@ -3862,10 +3862,6 @@ impl ColumnStatisticsOptionNames {
 /// name its single column.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TableConstraint<'a> {
-    NamedNotNull {
-        name: &'a str,
-        column: &'a str,
-    },
     PrimaryKey {
         name: Option<&'a str>,
         columns: &'a [&'a str],
@@ -4482,6 +4478,7 @@ pub struct ColumnDef<'a> {
     /// explicit algorithm in `pg_attribute.attcompression`.
     pub compression: ColumnCompression,
     pub not_null: bool,
+    pub not_null_name: Option<&'a str>,
     /// `NOT NULL NO INHERIT` is a distinct constraint state, not a later
     /// executor-side exception to ordinary table inheritance.
     pub not_null_inheritable: bool,

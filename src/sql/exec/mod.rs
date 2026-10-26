@@ -3782,6 +3782,9 @@ fn build_def_with_likes(
                 &mut n,
                 build_column(column, storage, txid, arena)?,
             )?;
+            if let Some(name) = column.not_null_name {
+                def.set_not_null_constraint_name(n - 1, SqlName::parse(name)?);
+            }
         }
     }
     def.n_columns = n;
@@ -67142,6 +67145,13 @@ fn alter_table_relation(
                 let index = new_def.n_columns;
                 new_def.columns[index] = meta;
                 new_def.n_columns += 1;
+                if let Some(name) = c.not_null_name {
+                    let name = match SqlName::parse(name) {
+                        Ok(name) => name,
+                        Err(error) => return sql_fail(error),
+                    };
+                    new_def.set_not_null_constraint_name(index, name);
+                }
                 source[index] = ColSource::FillDefault(index);
                 added_any = true;
             }

@@ -6195,6 +6195,8 @@ impl<'a> Parser<'a> {
                 crate::sql::ast::ParsedCollation::DEFAULT
             };
             let mut not_null = false;
+            let mut not_null_name = None;
+            let mut null_clause = None;
             let mut not_null_inheritable = true;
             let mut unique = false;
             let mut default = None;
@@ -6202,14 +6204,36 @@ impl<'a> Parser<'a> {
             let mut generated_text = None;
             let mut identity = None;
             loop {
+                let constraint_name = if self.eat_ident("constraint")? {
+                    Some(self.col_ident("constraint name")?)
+                } else {
+                    None
+                };
+                if constraint_name.is_some() && !matches!(self.peeked, Tok::Ident("not")) {
+                    return Err(self.err_here("ADD COLUMN supports a named NOT NULL clause here"));
+                }
                 if self.eat_ident("not")? {
                     self.expect_ident("null")?;
+                    if null_clause == Some(false) {
+                        return Err(self.err_here("conflicting NULL/NOT NULL declarations"));
+                    }
+                    null_clause = Some(true);
                     not_null = true;
+                    if let Some(name) = constraint_name {
+                        if not_null_name.is_some_and(|previous| previous != name) {
+                            return Err(self.err_here("conflicting not-null constraint names"));
+                        }
+                        not_null_name = Some(name);
+                    }
                     if self.eat_ident("no")? {
                         self.expect_ident("inherit")?;
                         not_null_inheritable = false;
                     }
                 } else if self.eat_ident("null")? {
+                    if null_clause == Some(true) {
+                        return Err(self.err_here("conflicting NULL/NOT NULL declarations"));
+                    }
+                    null_clause = Some(false);
                     not_null = false;
                 } else if self.eat_ident("default")? {
                     let start = self.peek_at;
@@ -6236,6 +6260,7 @@ impl<'a> Parser<'a> {
                     storage,
                     compression,
                     not_null,
+                    not_null_name,
                     not_null_inheritable,
                     unique,
                     primary: false,

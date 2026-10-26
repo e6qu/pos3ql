@@ -33,7 +33,7 @@ reduce work, not a guaranteed request count or a measured query rate.
 
 GiST point, box, polygon, and circle classes and SP-GiST quad-point, k-d point,
 box, and polygon classes use bounding-box summaries. GIN array, `tsvector`,
-`jsonb_ops`, and `jsonb_path_ops` classes use exact lossy-token posting trees;
+`jsonb_ops`, and `jsonb_path_ops` classes use hashed-token posting trees;
 GiST `tsvector` uses token signatures. GiST range, multirange, and network
 classes and SP-GiST range and network classes use ordered interval envelopes.
 These are object-native formats, not PostgreSQL page storage or a native

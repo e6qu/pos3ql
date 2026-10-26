@@ -110,6 +110,45 @@ jobs:
           assert rows == ['t'] * 8, rows
           print('PostgreSQL: eight shared subscription observations match')
           PYCODE
+      - name: PostgreSQL catalog template-copy oracle
+        env:
+          POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PYCODE' > "$RUNNER_TEMP/catalog-template.sql"
+          from pathlib import Path
+          fixture = Path('tests/external/differential_exact/32_catalog_lifetimes.sql').read_text()
+          print(fixture.split('DROP EXTENSION pos3ql_base;', 1)[0])
+          print("DROP SUBSCRIPTION lifetime_subscription; DELETE FROM saved_catalog_lifetimes WHERE kind = 'subscription';")
+          print("CREATE FOREIGN TABLE copied_foreign(a integer) SERVER lifetime_server;")
+          print("COMMENT ON FOREIGN DATA WRAPPER lifetime_wrapper IS 'wrapper comment'; COMMENT ON SERVER lifetime_server IS 'server comment'; COMMENT ON STATISTICS lifetime_statistics IS 'statistics comment'; COMMENT ON PUBLICATION lifetime_publication IS 'publication comment';")
+          PYCODE
+          reference() {
+            docker exec -i --env PGOPTIONS='-c extension_control_path=/tmp/pos3ql-extensions' "$POSTGRES_CONTAINER" psql -X -qAt -v ON_ERROR_STOP=1 -U postgres -d "$1"
+          }
+          reference template1 < "$RUNNER_TEMP/catalog-template.sql" > "$RUNNER_TEMP/catalog-copy-pg.txt"
+          reference postgres <<'SQL'
+          CREATE DATABASE catalog_template_copy TEMPLATE template1;
+          SQL
+          reference catalog_template_copy <<'SQL' >> "$RUNNER_TEMP/catalog-copy-pg.txt"
+          SELECT count(*) = 6 FROM saved_catalog_lifetimes s JOIN lifetime_catalog c ON c.kind = s.kind AND c.identity = s.identity;
+          SELECT count(*) = 1 FROM pg_foreign_table f JOIN pg_class c ON c.oid = f.ftrelid JOIN pg_foreign_server s ON s.oid = f.ftserver JOIN pg_foreign_data_wrapper w ON w.oid = s.srvfdw WHERE c.relname = 'copied_foreign' AND s.srvname = 'lifetime_server' AND w.fdwname = 'lifetime_wrapper';
+          SELECT obj_description(oid, 'pg_foreign_data_wrapper') = 'wrapper comment' FROM pg_foreign_data_wrapper WHERE fdwname = 'lifetime_wrapper';
+          SELECT obj_description(oid, 'pg_foreign_server') = 'server comment' FROM pg_foreign_server WHERE srvname = 'lifetime_server';
+          SELECT obj_description(oid, 'pg_statistic_ext') = 'statistics comment' FROM pg_statistic_ext WHERE stxname = 'lifetime_statistics';
+          SELECT obj_description(oid, 'pg_publication') = 'publication comment' FROM pg_publication WHERE pubname = 'lifetime_publication';
+          ALTER STATISTICS lifetime_statistics SET STATISTICS 43;
+          SELECT stxstattarget = 43 FROM pg_statistic_ext WHERE stxname = 'lifetime_statistics';
+          SQL
+          reference template1 <<'SQL' >> "$RUNNER_TEMP/catalog-copy-pg.txt"
+          SELECT stxstattarget = 42 FROM pg_statistic_ext WHERE stxname = 'lifetime_statistics';
+          SQL
+          python3 - "$RUNNER_TEMP/catalog-copy-pg.txt" <<'PYCODE'
+          import pathlib, sys
+          rows = pathlib.Path(sys.argv[1]).read_text().splitlines()
+          assert rows == ['t'] * 12, rows
+          print('PostgreSQL: twelve template-copy observations match')
+          PYCODE
       - name: Focused lifetime and recovery regressions
         run: cargo test --lib --locked -- public_identifiers catalog_lifetime metadata_database_copy every_exposed_catalog catalog_row_keys table_definition_images --test-threads=1
       - name: All-target lint

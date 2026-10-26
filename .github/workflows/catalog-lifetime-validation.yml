@@ -45,6 +45,48 @@ jobs:
           assert rows == ['t'] * 8, rows
           print('PostgreSQL: eight lifetime observations match')
           PYCODE
+      - name: PostgreSQL shared subscription oracle
+        env:
+          POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
+        run: |
+          set -euo pipefail
+          reference() {
+            docker exec -i "$POSTGRES_CONTAINER" psql -X -qAt -v ON_ERROR_STOP=1 -U postgres -d "$1"
+          }
+          reference postgres <<'SQL'
+          CREATE DATABASE catalog_first TEMPLATE template0;
+          CREATE DATABASE catalog_second TEMPLATE template0;
+          SQL
+          for database in catalog_first catalog_second; do
+            reference "$database" <<'SQL'
+          CREATE SUBSCRIPTION shared_catalog_sub CONNECTION 'host=127.0.0.1 port=5432 user=repl dbname=publisher sslmode=disable' PUBLICATION orders WITH (connect = false, slot_name = NONE);
+          CREATE TABLE saved_shared_subscription AS SELECT oid AS identity, subdbid AS database_identity FROM pg_subscription WHERE subname = 'shared_catalog_sub' AND subdbid = (SELECT oid FROM pg_database WHERE datname = current_database());
+          SQL
+          done
+          for database in catalog_first catalog_second; do
+            reference "$database" <<'SQL' >> "$RUNNER_TEMP/shared-subscriptions-pg.txt"
+          SELECT count(*) = 2 AND count(DISTINCT oid) = 2 AND count(DISTINCT subdbid) = 2 FROM pg_subscription WHERE subname = 'shared_catalog_sub';
+          SELECT count(*) = 1 FROM saved_shared_subscription s JOIN pg_subscription c ON c.oid = s.identity AND c.subdbid = s.database_identity;
+          BEGIN;
+          ALTER SUBSCRIPTION shared_catalog_sub RENAME TO shared_catalog_temporary;
+          SELECT count(*) = 1 FROM pg_subscription WHERE subname = 'shared_catalog_temporary' AND subdbid = (SELECT oid FROM pg_database WHERE datname = current_database());
+          ROLLBACK;
+          SQL
+          done
+          reference catalog_first <<'SQL' >> "$RUNNER_TEMP/shared-subscriptions-pg.txt"
+          DROP SUBSCRIPTION shared_catalog_sub;
+          CREATE SUBSCRIPTION shared_catalog_sub CONNECTION 'host=127.0.0.1 port=5432 user=repl dbname=publisher sslmode=disable' PUBLICATION orders WITH (connect = false, slot_name = NONE);
+          SELECT count(*) = 0 FROM saved_shared_subscription s JOIN pg_subscription c ON c.oid = s.identity;
+          SQL
+          reference catalog_second <<'SQL' >> "$RUNNER_TEMP/shared-subscriptions-pg.txt"
+          SELECT count(*) = 1 FROM saved_shared_subscription s JOIN pg_subscription c ON c.oid = s.identity AND c.subdbid = s.database_identity;
+          SQL
+          python3 - "$RUNNER_TEMP/shared-subscriptions-pg.txt" <<'PYCODE'
+          import pathlib, sys
+          rows = pathlib.Path(sys.argv[1]).read_text().splitlines()
+          assert rows == ['t'] * 8, rows
+          print('PostgreSQL: eight shared subscription observations match')
+          PYCODE
       - name: Focused lifetime and recovery regressions
         run: cargo test --lib --locked -- public_identifiers catalog_lifetime metadata_database_copy --test-threads=1
       - name: All-target lint

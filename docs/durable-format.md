@@ -691,7 +691,9 @@ Creation reserves from the shared catalog sequence and returns `54000` when its
 representable range is exhausted. The failed reservation installs no object.
 Recovery rejects zero, out-of-range, duplicate or unreserved stamps before writer
 promotion. The check includes prepared catalog changes and uses a fixed bitmap
-rather than memory proportional to catalog churn.
+rather than memory proportional to catalog churn. Database-template copies may
+preserve numeric identifiers in database-local catalogs; shared subscription
+identifiers must remain unique across databases.
 
 Manifest `pub` records place the creation stamp after the owner and before the
 flags. Journal publication-creation records place the eight-byte little-endian

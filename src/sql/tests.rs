@@ -1806,6 +1806,176 @@ fn catalog_lifetime_public_identifiers_preserve_edits_and_reject_replacements() 
 }
 
 #[test]
+fn catalog_lifetime_shared_subscriptions_keep_database_and_identity_through_recovery() {
+    const CREATE: &str = "CREATE SUBSCRIPTION shared_catalog_sub CONNECTION 'host=127.0.0.1 port=5432 user=repl dbname=publisher sslmode=disable' PUBLICATION orders WITH (connect = false, slot_name = NONE)";
+    const CHECK: &str = "SELECT count(*) = 2 AND count(DISTINCT oid) = 2 AND count(DISTINCT subdbid) = 2 FROM pg_subscription WHERE subname = 'shared_catalog_sub'; SELECT count(*) = 1 FROM saved_shared_subscription s JOIN pg_subscription c ON c.oid = s.identity AND c.subdbid = s.database_identity";
+    for checkpoint in [false, true] {
+        for mode in [
+            crate::config::TransactionMode::Mvcc,
+            crate::config::TransactionMode::Locking,
+        ] {
+            let name = format!("catalog-lifetime-shared-{checkpoint}-{mode:?}");
+            let mut config = catalog_lifetime_config(&name, mode);
+            config.object_store_on = true;
+            config.object_store_sim = true;
+            config.wal_upload = true;
+            config.wal_upload_sync = true;
+            config.object_store_bucket = format!("{name}-{}", std::process::id());
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+            let databases;
+            {
+                let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+                let mut engine = Engine::new(&config, &mut budget).unwrap();
+                let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+                session.success(&mut engine, "CREATE DATABASE catalog_first TEMPLATE template0; CREATE DATABASE catalog_second TEMPLATE template0", false);
+                databases = ["catalog_first", "catalog_second"].map(|name| {
+                    let slot = engine.storage.database_slot(name, 0).unwrap();
+                    engine.storage.database(slot).oid
+                });
+                for database in databases {
+                    engine.select_database(database).unwrap();
+                    session.success(&mut engine, CREATE, false);
+                    session.success(&mut engine, "CREATE TABLE saved_shared_subscription AS SELECT oid AS identity, subdbid AS database_identity FROM pg_subscription WHERE subname = 'shared_catalog_sub' AND subdbid = (SELECT oid FROM pg_database WHERE datname = current_database())", false);
+                }
+                for database in databases {
+                    engine.select_database(database).unwrap();
+                    assert_eq!(
+                        data_rows(&session.success(&mut engine, CHECK, false)),
+                        ["t", "t"]
+                    );
+                    assert_eq!(data_rows(&session.success(&mut engine,
+                        "BEGIN; ALTER SUBSCRIPTION shared_catalog_sub RENAME TO shared_catalog_temporary; SELECT count(*) = 1 FROM pg_subscription WHERE subname = 'shared_catalog_temporary' AND subdbid = (SELECT oid FROM pg_database WHERE datname = current_database()); ROLLBACK", false)), ["t"]);
+                }
+                if checkpoint {
+                    assert!(engine.checkpoint().unwrap());
+                }
+                engine.commit_wal().unwrap();
+            }
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+            {
+                let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+                let mut engine = Engine::new(&config, &mut budget).unwrap();
+                let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+                for database in databases {
+                    engine.select_database(database).unwrap();
+                    assert_eq!(
+                        data_rows(&session.success(&mut engine, CHECK, false)),
+                        ["t", "t"]
+                    );
+                }
+                engine.select_database(databases[0]).unwrap();
+                session.success(&mut engine, "DROP SUBSCRIPTION shared_catalog_sub", false);
+                session.success(&mut engine, CREATE, false);
+                assert_eq!(data_rows(&session.success(&mut engine, "SELECT count(*) = 0 FROM saved_shared_subscription s JOIN pg_subscription c ON c.oid = s.identity", false)), ["t"]);
+                engine.select_database(databases[1]).unwrap();
+                assert_eq!(
+                    data_rows(&session.success(&mut engine, CHECK, false)),
+                    ["t", "t"]
+                );
+            }
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        }
+    }
+}
+
+#[test]
+fn catalog_lifetime_template_copies_preserve_local_identifiers_and_statistics() {
+    let fixture = include_str!("../../tests/external/differential_exact/32_catalog_lifetimes.sql");
+    let setup = fixture.split_once("DROP EXTENSION pos3ql_base;").unwrap().0;
+    const CHECK: &str = "SELECT count(*) = 6 FROM saved_catalog_lifetimes s JOIN lifetime_catalog c ON c.kind = s.kind AND c.identity = s.identity";
+    for checkpoint in [false, true] {
+        for mode in [
+            crate::config::TransactionMode::Mvcc,
+            crate::config::TransactionMode::Locking,
+        ] {
+            let name = format!("catalog-lifetime-copy-{checkpoint}-{mode:?}");
+            let mut config = catalog_lifetime_config(&name, mode);
+            config.max_foreign_data_wrappers = 4;
+            config.max_foreign_servers = 4;
+            config.max_user_mappings = 4;
+            config.max_publications = 4;
+            config.set_extended_statistics_capacity(4);
+            config.object_store_on = true;
+            config.object_store_sim = true;
+            config.wal_upload = true;
+            config.wal_upload_sync = true;
+            config.object_store_bucket = format!("{name}-{}", std::process::id());
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+            let copied;
+            {
+                let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+                let mut engine = Engine::new(&config, &mut budget).unwrap();
+                let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+                engine
+                    .select_database(crate::storage::DatabaseOid::TEMPLATE1)
+                    .unwrap();
+                for statement in setup
+                    .split(';')
+                    .map(str::trim)
+                    .filter(|statement| !statement.is_empty())
+                {
+                    let output = session.success(&mut engine, statement, false);
+                    assert!(
+                        data_rows(&output).iter().all(|row| row == "t"),
+                        "{statement}"
+                    );
+                }
+                session.success(&mut engine, "DROP SUBSCRIPTION lifetime_subscription; DELETE FROM saved_catalog_lifetimes WHERE kind = 'subscription'", false);
+                assert_eq!(
+                    data_rows(&session.success(&mut engine, CHECK, false)),
+                    ["t"]
+                );
+                engine
+                    .select_database(crate::storage::DatabaseOid::POSTGRES)
+                    .unwrap();
+                session.success(
+                    &mut engine,
+                    "CREATE DATABASE catalog_copy TEMPLATE template1",
+                    false,
+                );
+                copied = engine
+                    .storage
+                    .database(engine.storage.database_slot("catalog_copy", 0).unwrap())
+                    .oid;
+                engine.select_database(copied).unwrap();
+                assert_eq!(
+                    data_rows(&session.success(&mut engine, CHECK, false)),
+                    ["t"]
+                );
+                session.success(
+                    &mut engine,
+                    "ALTER STATISTICS lifetime_statistics SET STATISTICS 43",
+                    false,
+                );
+                if checkpoint {
+                    assert!(engine.checkpoint().unwrap());
+                }
+                engine.commit_wal().unwrap();
+            }
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+            {
+                let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+                let mut engine = Engine::new(&config, &mut budget).unwrap();
+                let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+                for (database, target) in
+                    [(crate::storage::DatabaseOid::TEMPLATE1, 42), (copied, 43)]
+                {
+                    engine.select_database(database).unwrap();
+                    assert_eq!(
+                        data_rows(&session.success(&mut engine, CHECK, false)),
+                        ["t"]
+                    );
+                    assert_eq!(data_rows(&session.success(&mut engine, &format!("SELECT stxstattarget = {target} FROM pg_statistic_ext WHERE stxname = 'lifetime_statistics'"), false)), ["t"]);
+                }
+            }
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        }
+    }
+}
+
+#[test]
 fn catalog_lifetime_public_identifiers_survive_empty_disk_recovery() {
     let fixture = include_str!("../../tests/external/differential_exact/32_catalog_lifetimes.sql");
     let (setup, remaining) = fixture.split_once("DROP EXTENSION pos3ql_base;").unwrap();

@@ -2685,7 +2685,7 @@ impl Engine {
 
     pub(crate) fn subscription_runtime(&self, slot: usize) -> Option<SubscriptionRuntime> {
         self.storage
-            .subscriptions_with_slots_visible_to(0)
+            .subscriptions_with_slots_visible_to(Some(self.storage.current_database_oid()), 0)
             .find(|(index, _subscription)| *index == slot)
             .filter(|(_, subscription)| {
                 (subscription.failure.is_none()
@@ -2877,7 +2877,7 @@ impl Engine {
     ) -> Result<crate::storage::SessionIdentity, SqlError> {
         let subscription = self
             .storage
-            .subscriptions_with_slots_visible_to(txid)
+            .subscriptions_with_slots_visible_to(Some(self.storage.current_database_oid()), txid)
             .find(|(slot, subscription)| {
                 *slot == stream.slot()
                     && subscription.created_at == stream.created_at()
@@ -3317,7 +3317,7 @@ impl Engine {
     ) -> Result<crate::storage::SessionIdentity, SqlError> {
         let subscription = self
             .storage
-            .subscriptions_with_slots_visible_to(txid)
+            .subscriptions_with_slots_visible_to(Some(self.storage.current_database_oid()), txid)
             .find(|(slot, subscription)| {
                 *slot == stream.slot()
                     && subscription.created_at == stream.created_at()
@@ -4420,7 +4420,10 @@ impl Engine {
     pub(crate) fn reset_subscription_statistics(&mut self, oid: Option<i32>, txid: u32) {
         let slot = oid.and_then(|oid| {
             self.storage
-                .subscriptions_with_slots_visible_to(txid)
+                .subscriptions_with_slots_visible_to(
+                    Some(self.storage.current_database_oid()),
+                    txid,
+                )
                 .find_map(|(slot, subscription)| (subscription.oid() == oid).then_some(slot))
         });
         if oid.is_none() || slot.is_some() {

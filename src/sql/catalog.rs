@@ -14298,7 +14298,7 @@ fn pg_description<'a>(
             }
             crate::storage::CommentClass::Subscription => {
                 let Some((_, subscription)) = storage
-                    .subscriptions_with_slots_visible_to(txid)
+                    .subscriptions_with_slots_visible_to(Some(storage.current_database_oid()), txid)
                     .find(|(_, subscription)| subscription.created_at as u32 == subid)
                 else {
                     continue;
@@ -15134,11 +15134,14 @@ fn visit_comments_for_object(
                 class == crate::storage::CommentClass::Subscription
                     && subid == 0
                     && signed_oid.is_some_and(|oid| {
-                        storage.subscriptions_with_slots_visible_to(txid).any(
-                            |(_, subscription)| {
+                        storage
+                            .subscriptions_with_slots_visible_to(
+                                Some(storage.current_database_oid()),
+                                txid,
+                            )
+                            .any(|(_, subscription)| {
                                 subscription.oid() == oid && csub == subscription.created_at as u32
-                            },
-                        )
+                            })
                     })
             }
             "pg_extension" => {
@@ -18752,12 +18755,16 @@ fn pg_replication_origin<'a>(
     let definition = schema::require("pg_replication_origin", false);
     let rows = arena
         .alloc_slice_with(
-            storage.subscriptions_with_slots_visible_to(txid).count(),
+            storage
+                .subscriptions_with_slots_visible_to(Some(storage.current_database_oid()), txid)
+                .count(),
             |_| &[] as &[Datum],
         )
         .map_err(|_| arena_full())?;
     let mut count = 0usize;
-    for (slot, subscription) in storage.subscriptions_with_slots_visible_to(txid) {
+    for (slot, subscription) in
+        storage.subscriptions_with_slots_visible_to(Some(storage.current_database_oid()), txid)
+    {
         if count == rows.len() {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -18782,12 +18789,16 @@ fn pg_replication_origin_status<'a>(
     let definition = schema::require("pg_replication_origin_status", false);
     let rows = arena
         .alloc_slice_with(
-            storage.subscriptions_with_slots_visible_to(txid).count(),
+            storage
+                .subscriptions_with_slots_visible_to(Some(storage.current_database_oid()), txid)
+                .count(),
             |_| &[] as &[Datum],
         )
         .map_err(|_| arena_full())?;
     let mut count = 0usize;
-    for (slot, subscription) in storage.subscriptions_with_slots_visible_to(txid) {
+    for (slot, subscription) in
+        storage.subscriptions_with_slots_visible_to(Some(storage.current_database_oid()), txid)
+    {
         if count == rows.len() {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -18906,10 +18917,12 @@ fn pg_subscription<'a>(
     let definition = schema::require("pg_subscription", false);
     let rows = catalog_rows(
         arena,
-        storage.subscriptions_with_slots_visible_to(txid).count(),
+        storage
+            .subscriptions_with_slots_visible_to(None, txid)
+            .count(),
     )?;
     let mut count = 0;
-    for (_slot, subscription) in storage.subscriptions_with_slots_visible_to(txid) {
+    for (_slot, subscription) in storage.subscriptions_with_slots_visible_to(None, txid) {
         if count == rows.len() {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -18937,9 +18950,9 @@ fn pg_subscription<'a>(
             &[
                 Datum::Int4(PG_SUBSCRIPTION_OID),
                 Datum::Int4(subscription.oid()),
-                Datum::Int4(storage.current_database_oid().get()),
+                Datum::Int4(subscription.database.get()),
                 skip_lsn,
-                text(subscription.name.as_str(), arena)?,
+                text(subscription.name_for(txid).as_str(), arena)?,
                 Datum::Int4(storage.role_oid(subscription.ownership.owner_to(txid) as usize)),
                 Datum::Bool(subscription.enabled_to(txid)),
                 Datum::Bool(definition.behavior.binary),
@@ -18986,7 +18999,7 @@ fn pg_subscription_rel<'a>(
 ) -> Result<SynthTable<'a>, SqlError> {
     let definition = schema::require("pg_subscription_rel", false);
     let count = storage
-        .subscriptions_with_slots_visible_to(txid)
+        .subscriptions_with_slots_visible_to(Some(storage.current_database_oid()), txid)
         .map(|(_, subscription)| {
             storage
                 .subscription_relations_visible_to(&subscription, txid)
@@ -18997,7 +19010,9 @@ fn pg_subscription_rel<'a>(
         .alloc_slice_with(count, |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
     let mut index = 0;
-    for (_, subscription) in storage.subscriptions_with_slots_visible_to(txid) {
+    for (_, subscription) in
+        storage.subscriptions_with_slots_visible_to(Some(storage.current_database_oid()), txid)
+    {
         for relation in storage.subscription_relations_visible_to(&subscription, txid) {
             if index == rows.len() {
                 return Err(sql_err!(
@@ -19035,13 +19050,13 @@ fn pg_stat_subscription<'a>(
     let rows = catalog_rows(
         arena,
         storage
-            .subscriptions_with_slots_visible_to(txid)
+            .subscriptions_with_slots_visible_to(Some(storage.current_database_oid()), txid)
             .filter(|(_, subscription)| subscription.enabled_to(txid))
             .count(),
     )?;
     let mut count = 0;
     for (_, subscription) in storage
-        .subscriptions_with_slots_visible_to(txid)
+        .subscriptions_with_slots_visible_to(Some(storage.current_database_oid()), txid)
         .filter(|(_, subscription)| subscription.enabled_to(txid))
     {
         if count == rows.len() {
@@ -19085,10 +19100,14 @@ fn pg_stat_subscription_stats<'a>(
     let definition = schema::require("pg_stat_subscription_stats", false);
     let rows = catalog_rows(
         arena,
-        storage.subscriptions_with_slots_visible_to(txid).count(),
+        storage
+            .subscriptions_with_slots_visible_to(Some(storage.current_database_oid()), txid)
+            .count(),
     )?;
     let mut count = 0;
-    for (_, subscription) in storage.subscriptions_with_slots_visible_to(txid) {
+    for (_, subscription) in
+        storage.subscriptions_with_slots_visible_to(Some(storage.current_database_oid()), txid)
+    {
         if count == rows.len() {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,

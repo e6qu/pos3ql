@@ -1247,7 +1247,7 @@ fn comment_reference(
         )),
         CommentClass::Subscription => EventObjectRef::Primary(ObjectRef::Subscription(
             storage
-                .subscriptions_with_slots_visible_to(txid)
+                .subscriptions_with_slots_visible_to(Some(storage.current_database_oid()), txid)
                 .find_map(|(slot, subscription)| {
                     (subscription.created_at as u32 == subid).then_some(slot)
                 })
@@ -2289,7 +2289,9 @@ pub(crate) fn catalog_object_address(
     for (slot, _) in storage.publications_with_slots_visible_to(txid) {
         consider!(EventObjectRef::Primary(ObjectRef::Publication(slot)));
     }
-    for (slot, _) in storage.subscriptions_with_slots_visible_to(txid) {
+    for (slot, _) in
+        storage.subscriptions_with_slots_visible_to(Some(storage.current_database_oid()), txid)
+    {
         consider!(EventObjectRef::Primary(ObjectRef::Subscription(slot)));
     }
     for (slot, _) in storage.extensions_visible_to(txid) {
@@ -2724,7 +2726,7 @@ fn existing_catalog_object(
         )),
         catalog::PG_SUBSCRIPTION_OID => EventObjectRef::Primary(ObjectRef::Subscription(
             storage
-                .subscriptions_with_slots_visible_to(txid)
+                .subscriptions_with_slots_visible_to(None, txid)
                 .find_map(|(slot, subscription)| (subscription.oid() == object_id).then_some(slot))
                 .ok_or_else(|| catalog_lookup_failed(class_id, object_id))?,
         )),

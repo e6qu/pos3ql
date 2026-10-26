@@ -111,6 +111,12 @@ entries, or about 104 MiB across the default 16 subscription workers. Reducing
 Selected UPDATE and DELETE rows retain their original bytes and schema through
 triggers; selection copies matching rows without copying every row scanned.
 
+The [subscription catalog](https://www.postgresql.org/docs/18/catalog-pg-subscription.html)
+is shared across SQL databases. `pg_subscription.subdbid` identifies each
+subscription's owning database; reading that catalog from another database does
+not change ownership or start another worker. Subscription names are local to
+their database, while their object identifiers are shared and remain unique.
+
 ## SQL and monitoring
 
 The SQL control surface includes `pg_create_logical_replication_slot`, `pg_copy_logical_replication_slot`, `pg_drop_replication_slot`, and `pg_replication_slot_advance`. Only `pgoutput` logical slots are accepted. Temporary slots and two-phase decoding reject atomically; failover is retained as typed slot state. Slot operations require a superuser or a role with `REPLICATION`.

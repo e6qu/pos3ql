@@ -38035,6 +38035,7 @@ impl Storage {
 
     pub(crate) fn subscriptions_with_slots_visible_to(
         &self,
+        database: Option<DatabaseOid>,
         txid: u32,
     ) -> impl Iterator<Item = (usize, SubscriptionDef)> + '_ {
         SubscriptionIter {
@@ -38042,7 +38043,8 @@ impl Storage {
             next_slot: 0,
         }
         .filter(move |(_, subscription)| {
-            subscription.database == current_database() && subscription.visible_to(txid)
+            database.is_none_or(|database| subscription.database == database)
+                && subscription.visible_to(txid)
         })
     }
 
@@ -38090,7 +38092,7 @@ impl Storage {
     }
 
     pub(crate) fn subscription(&self, name: &str, txid: u32) -> Option<(usize, SubscriptionDef)> {
-        self.subscriptions_with_slots_visible_to(txid)
+        self.subscriptions_with_slots_visible_to(Some(current_database()), txid)
             .find(|(_, subscription)| subscription.name_for(txid).as_str() == name)
     }
 
@@ -59544,10 +59546,14 @@ mod tests {
             assert_eq!(catalog.relations.capacity(), WORKERS);
         }
         assert_eq!(
-            storage.subscriptions_with_slots_visible_to(0).count(),
+            storage
+                .subscriptions_with_slots_visible_to(Some(storage.current_database_oid()), 0)
+                .count(),
             WORKERS
         );
-        for (slot, definition) in storage.subscriptions_with_slots_visible_to(0) {
+        for (slot, definition) in
+            storage.subscriptions_with_slots_visible_to(Some(storage.current_database_oid()), 0)
+        {
             let nested = storage
                 .subscription(definition.name.as_str(), 0)
                 .expect("copied iterator releases the catalog lock");

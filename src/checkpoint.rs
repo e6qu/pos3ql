@@ -18385,7 +18385,7 @@ fn load_subscription_relation(
         ));
     }
     let slot = storage
-        .subscriptions_with_slots_visible_to(0)
+        .subscriptions_with_slots_visible_to(Some(storage.current_database_oid()), 0)
         .find(|(_, subscription)| {
             subscription.created_at == created_at
                 && subscription.definition_generation == definition_generation

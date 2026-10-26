@@ -982,7 +982,7 @@ mod tests {
                             .is_none()
                     );
                 }
-                retain(&images, &storage, reference).unwrap();
+                let retained = capture(&images, &storage, reference).unwrap();
                 retire(&mut storage, source);
                 let selected = {
                     let catalog = storage.type_catalog.lock().unwrap();
@@ -998,7 +998,9 @@ mod tests {
                     );
                     selected
                 };
-                assert_retained(&capture(&images, &storage, selected).unwrap());
+                assert_retained(&retained);
+                assert_eq!(capture(&images, &storage, selected).err().unwrap().sqlstate,
+                    sqlstate::UNDEFINED_OBJECT);
                 drop(images);
                 assert_eq!(create(&mut storage, source).unwrap(), source.index());
                 let catalog = storage.type_catalog.lock().unwrap();

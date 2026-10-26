@@ -3488,7 +3488,7 @@ fn execute_row_trigger_body<'a>(
         .then(|| super::guc::enter_active_routine_configs(routine.configs()))
         .transpose()?;
     let invocation = TriggerInvocation::new(
-        storage,
+        context.storage(),
         trigger,
         TriggerRelationIdentity {
             target,
@@ -27164,7 +27164,7 @@ fn fire_statement_triggers_with_rows<'a>(
             .then(|| super::guc::enter_active_routine_configs(routine.configs()))
             .transpose()?;
         let invocation = TriggerInvocation::new(
-        storage,
+        context.storage(),
             &trigger,
             TriggerRelationIdentity {
                 target,
@@ -50280,9 +50280,7 @@ fn stage_table_definition(
                 column_mapping: wal_mapping,
             },
         )?;
-        if let Err(error) = storage.reserve_implicit_index_identities(&mut next) {
-            return Err(error);
-        }
+        storage.reserve_implicit_index_identities(&mut next)?;
         let lsn = storage.bump_lsn();
         wal.stage_reserved(
             txn.txid,
@@ -63685,6 +63683,8 @@ fn attach_constraint_using_index(
         },
         timing,
     )?;
+    new_definition.uniques[new_definition.n_uniques - 1].index_identity =
+        Some(crate::storage::RelationIdentity::parse(index.created_at).expect("admitted explicit index has an identity"));
     stage_index_rename(storage, wal, txn, slot, constraint_name)
 }
 
@@ -63742,9 +63742,7 @@ fn rename_attached_index_constraint(
             column_mapping: wal_mapping,
         },
     )?;
-    if let Err(error) = storage.reserve_implicit_index_identities(&mut altered) {
-        return Err(error);
-    }
+    storage.reserve_implicit_index_identities(&mut altered)?;
     let lsn = storage.bump_lsn();
     wal.stage_reserved(
         txn.txid,
@@ -63826,9 +63824,7 @@ fn drop_dependent_foreign_keys(
                 column_mapping: wal_mapping,
             },
         )?;
-        if let Err(error) = storage.reserve_implicit_index_identities(&mut altered) {
-            return Err(error);
-        }
+        storage.reserve_implicit_index_identities(&mut altered)?;
         let lsn = storage.bump_lsn();
         wal.stage_reserved(
             txn.txid,
@@ -64675,7 +64671,6 @@ fn inherit_partition_constraints(
             ));
         }
         let mut inherited = *constraint;
-        inherited.index_identity = None;
         inherited.columns = columns;
         child.fkeys[child.n_fkeys] = inherited;
         child.n_fkeys += 1;

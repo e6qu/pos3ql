@@ -27,7 +27,8 @@ impl CatalogPosition {
 
     pub(crate) fn new(slot: usize, created_at: u64) -> Result<Self, SqlError> {
         let slot = u16::try_from(slot).ok();
-        let created_at = NonZeroU64::new(created_at).filter(|value| value.get() <= super::MAX_RELATION_GENERATION);
+        let created_at = NonZeroU64::new(created_at)
+            .filter(|value| value.get() <= super::MAX_RELATION_GENERATION);
         match (slot, created_at) {
             (Some(slot), Some(created_at)) => Ok(Self { slot, created_at }),
             _ => Err(sql_err!(

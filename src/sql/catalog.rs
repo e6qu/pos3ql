@@ -11269,8 +11269,8 @@ fn visit_indexes(
         }
         let table_name = def.name.as_str();
         let toid = user_table_oid(storage, slot);
-        let mut pos = 0usize;
-        let mut mk = |columns: &[u16],
+        let mk = |oid: i32,
+                  columns: &[u16],
                       expression_keys: [bool; crate::storage::MAX_INDEX_COLS],
                       include_columns: &[u16],
                       descending: [bool; crate::storage::MAX_INDEX_COLS],
@@ -11288,7 +11288,7 @@ fn visit_indexes(
             let mut included = [0u16; crate::storage::MAX_INDEX_COLS];
             included[..include_columns.len()].copy_from_slice(include_columns);
             let mut info = IdxInfo {
-                oid: index_oid(&def, pos),
+                oid,
                 table_oid: toid,
                 table_slot: slot,
                 name,
@@ -11319,7 +11319,6 @@ fn visit_indexes(
             if is_constraint {
                 info.constraint_parent_oid = parent_constraint_oid(storage, txid, slot, &info);
             }
-            pos += 1;
             info
         };
         // Single-column PK / UNIQUE carried as column flags.
@@ -11327,6 +11326,7 @@ fn visit_indexes(
             if col.primary {
                 let name = stack_str_64(stack_format!(64, "{}_pkey", table_name).as_str());
                 visit(mk(
+                    col.index_identity.expect("admitted inline index has an identity").oid(),
                     &[ci as u16],
                     [false; crate::storage::MAX_INDEX_COLS],
                     &[],
@@ -11346,6 +11346,7 @@ fn visit_indexes(
                     stack_format!(64, "{}_{}_key", table_name, col.name.as_str()).as_str(),
                 );
                 visit(mk(
+                    col.index_identity.expect("admitted inline index has an identity").oid(),
                     &[ci as u16],
                     [false; crate::storage::MAX_INDEX_COLS],
                     &[],
@@ -11382,6 +11383,7 @@ fn visit_indexes(
                 continue;
             }
             visit(mk(
+                uk.index_identity.expect("admitted unique index has an identity").oid(),
                 uk.columns(),
                 [false; crate::storage::MAX_INDEX_COLS],
                 &[],
@@ -11399,6 +11401,7 @@ fn visit_indexes(
         }
         for exclusion in def.exclusions() {
             visit(mk(
+                exclusion.index_identity.expect("admitted exclusion index has an identity").oid(),
                 exclusion.columns(),
                 [false; crate::storage::MAX_INDEX_COLS],
                 &[],
@@ -11427,6 +11430,7 @@ fn visit_indexes(
                         .all(Option::is_none)
             });
             let mut info = mk(
+                explicit_index_oid(&index),
                 &index.columns[..index.n_cols],
                 index.expressions.map(|expression| expression.is_some()),
                 &index.include_columns[..index.n_include_cols],
@@ -11443,7 +11447,6 @@ fn visit_indexes(
                 }),
                 stack_str_64(index.name_for(txid).as_str()),
             );
-            info.oid = explicit_index_oid(&index);
             info.method = index.method;
             info.collations = index.collations;
             info.explicit_collations = index.explicit_collations;
@@ -12066,6 +12069,12 @@ pub fn type_oid_is_visible(storage: &Storage, txid: u32, oid: i32) -> bool {
             26 | 2249 | 2202 | 2203 | 2204 | 2205 | 2206 | 3115 | 4096 | 4097
         )
     {
+        return true;
+    }
+    if [false, true].into_iter().any(|array| {
+        table_slot_by_row_type_oid(storage, txid, oid, array).is_some()
+            || view_slot_by_row_type_oid(storage, txid, oid, array).is_some()
+    }) {
         return true;
     }
     use super::types::oid as type_oid;

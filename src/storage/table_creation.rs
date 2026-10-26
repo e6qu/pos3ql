@@ -168,15 +168,6 @@ pub(super) fn allocate(
             None,
         )?;
         source.bind_table_definition(&mut def, transaction)?;
-        match allocation {
-            super::CatalogAllocation::New => {
-                for identity in def.implicit_index_identities_mut() { *identity = None; }
-                storage.reserve_implicit_index_identities(&mut def)?;
-            },
-            super::CatalogAllocation::Restore(_) => {
-                storage.validate_implicit_index_identities(&def)?
-            }
-        }
         let created_at = match allocation {
             super::CatalogAllocation::New => storage.catalog_sequence.next()?,
             super::CatalogAllocation::Restore(position) => {
@@ -190,6 +181,17 @@ pub(super) fn allocate(
                 position.created_at()
             }
         };
+        match allocation {
+            super::CatalogAllocation::New => {
+                for identity in def.implicit_index_identities_mut() {
+                    *identity = None;
+                }
+                storage.reserve_implicit_index_identities(&mut def)?;
+            }
+            super::CatalogAllocation::Restore(_) => {
+                storage.validate_implicit_index_identities(&def)?
+            }
+        }
         state.install(
             def,
             table_definitions::TableIdentity {

@@ -1330,7 +1330,7 @@ impl super::Storage {
         target: NamedTypeSlot,
         created_at: u64,
     ) -> Result<(), SqlError> {
-        if created_at == 0 {
+        if created_at == 0 || created_at > super::MAX_RELATION_GENERATION {
             return Err(sql_err!(
                 sqlstate::DATA_EXCEPTION,
                 "stored type creation identity is invalid"

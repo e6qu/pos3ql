@@ -5559,17 +5559,27 @@ impl Checkpointer {
                 }
                 Some("implicit_index") => {
                     let Some((_, _, definition, _, _)) = pending_def.as_mut() else {
-                        return Err(CheckpointSetupError::Corrupt("implicit index outside table"));
+                        return Err(CheckpointSetupError::Corrupt(
+                            "implicit index outside table",
+                        ));
                     };
                     let position: usize = parse_field(words.next(), "implicit index position")?;
                     let created_at: u64 = parse_field(words.next(), "implicit index creation")?;
                     let identity = crate::storage::RelationIdentity::parse(created_at)
                         .filter(|_| created_at <= metadata.catalog_sequence)
-                        .ok_or(CheckpointSetupError::Corrupt("invalid implicit index creation identity"))?;
-                    let target = definition.implicit_index_identities_mut().nth(position)
-                        .ok_or(CheckpointSetupError::Corrupt("invalid implicit index position"))?;
+                        .ok_or(CheckpointSetupError::Corrupt(
+                            "invalid implicit index creation identity",
+                        ))?;
+                    let target = definition
+                        .implicit_index_identities_mut()
+                        .nth(position)
+                        .ok_or(CheckpointSetupError::Corrupt(
+                            "invalid implicit index position",
+                        ))?;
                     if target.is_some() || words.next().is_some() {
-                        return Err(CheckpointSetupError::Corrupt("duplicate or malformed implicit index identity"));
+                        return Err(CheckpointSetupError::Corrupt(
+                            "duplicate or malformed implicit index identity",
+                        ));
                     }
                     *target = Some(identity);
                 }
@@ -10392,8 +10402,16 @@ impl Checkpointer {
             }
 
             for (position, identity) in definition.implicit_index_identities().enumerate() {
-                let identity = identity.ok_or_else(|| sql_err!(sqlstate::DATA_EXCEPTION, "checkpoint implicit index has no creation identity"))?;
-                write_manifest(&mut self.manifest_output, format_args!("implicit_index {position} {}", identity.created_at()))?;
+                let identity = identity.ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::DATA_EXCEPTION,
+                        "checkpoint implicit index has no creation identity"
+                    )
+                })?;
+                write_manifest(
+                    &mut self.manifest_output,
+                    format_args!("implicit_index {position} {}", identity.created_at()),
+                )?;
             }
 
             // A slot not sliced this sweep carries its published list

@@ -30,7 +30,7 @@ fn rule_row<'a>(
 ) -> Result<&'a [Datum<'a>], SqlError> {
     let definition = rule.definition_for(transaction);
     let relation = match definition.target {
-        crate::storage::RuleTarget::Table(slot) => super::table_oid(storage, usize::from(slot)),
+        crate::storage::RuleTarget::Table(slot) => super::user_table_oid(storage, usize::from(slot)),
         crate::storage::RuleTarget::View(slot) => super::view_oid(storage, usize::from(slot)),
     };
     let view = if bodies && definition.name.as_str() == "_RETURN" {

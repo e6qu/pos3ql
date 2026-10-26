@@ -4194,8 +4194,7 @@ pub(crate) const MAX_RULE_ACTIONS: usize = MAX_DEFINITION_ITEMS;
 /// may reserve any smaller per-image capacity.
 pub(crate) const MAX_STORED_QUERY_DEPENDENCIES: usize = u8::MAX as usize;
 
-/// Sequence relation OIDs occupy `[95_000, 100_000)`, immediately below the
-/// view relation range. The startup parser rejects capacities beyond it.
+/// Startup sequence capacity; durable OIDs use the shared creation allocator.
 pub(crate) const MAX_SEQUENCE_CATALOG_SLOTS: usize = 5_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -6520,9 +6519,9 @@ impl MatviewDef {
 /// configured catalog may use any prefix of this representable range.
 pub(crate) const MAX_DOMAIN_CATALOG_SLOTS: usize =
     (crate::sql::types::oid::FIRST_ENUM - crate::sql::types::oid::FIRST_DOMAIN) as usize;
-/// Physical table row types occupy the band before view row types.
+/// Startup table capacity is independent of durable relation identities.
 pub(crate) const MAX_TABLE_TYPE_OID_SLOTS: usize = 10_000;
-/// View row types occupy the band before synthesized domain arrays.
+/// Startup view capacity is independent of durable relation identities.
 pub(crate) const MAX_VIEW_TYPE_OID_SLOTS: usize = 10_000;
 
 pub(crate) const FIRST_IMPLICIT_INDEX_OID: i32 = relation_identities::FIRST_RELATION_OID;
@@ -9716,8 +9715,7 @@ pub(crate) struct DomainSpec {
     pub n_checks: usize,
 }
 
-/// Enum scalar slots fit before table row types; their array OIDs have a
-/// wider band, so the scalar identity is the limiting representation.
+/// Named enum slots retain their bounded scalar and array representation.
 pub(crate) const MAX_ENUM_CATALOG_SLOTS: usize = 10_000;
 /// Composite slots fit between their synthesized scalar and array OID bands.
 pub(crate) const MAX_COMPOSITE_CATALOG_SLOTS: usize = (crate::sql::types::oid::FIRST_COMPOSITE_ARRAY

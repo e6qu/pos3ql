@@ -160,12 +160,12 @@ impl TypeReferenceMove {
         // Recovery declarations have names before their runtime slots bind.
         match self.identity.slot() {
             NamedTypeSlot::Domain(_) => true,
-            NamedTypeSlot::Enum(expected) => matches!(ctype,
+            NamedTypeSlot::Enum(_) => matches!(ctype,
                 ColType::Enum(slot) | ColType::Array(ArrElem::Enum(slot))
-                    if usize::from(slot) == expected || slot == ColType::ENUM_SLOT_UNRESOLVED),
-            NamedTypeSlot::Composite(expected) => matches!(ctype,
+                    if slot.is_none_or(|creation| creation.created_at() == self.identity.created_at())),
+            NamedTypeSlot::Composite(_) => matches!(ctype,
                 ColType::Composite(slot) | ColType::Array(ArrElem::Composite(slot))
-                    if usize::from(slot) == expected || slot == ColType::COMPOSITE_SLOT_UNRESOLVED),
+                    if slot.is_none_or(|creation| creation.created_at() == self.identity.created_at())),
         }
     }
 
@@ -3010,11 +3010,11 @@ mod tests {
             (TypeReferenceKind::Enum, ColType::Array(ArrElem::Enum(0))),
             (
                 TypeReferenceKind::Enum,
-                ColType::Enum(ColType::ENUM_SLOT_UNRESOLVED),
+                ColType::Enum(None),
             ),
             (
                 TypeReferenceKind::Enum,
-                ColType::Array(ArrElem::Enum(ColType::ENUM_SLOT_UNRESOLVED)),
+                ColType::Array(ArrElem::Enum(None)),
             ),
             (TypeReferenceKind::Composite, ColType::Composite(0)),
             (
@@ -3023,11 +3023,11 @@ mod tests {
             ),
             (
                 TypeReferenceKind::Composite,
-                ColType::Composite(ColType::COMPOSITE_SLOT_UNRESOLVED),
+                ColType::Composite(None),
             ),
             (
                 TypeReferenceKind::Composite,
-                ColType::Array(ArrElem::Composite(ColType::COMPOSITE_SLOT_UNRESOLVED)),
+                ColType::Array(ArrElem::Composite(None)),
             ),
             (
                 TypeReferenceKind::Domain,

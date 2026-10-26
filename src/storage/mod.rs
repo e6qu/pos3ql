@@ -75,8 +75,7 @@ mod type_identities;
 mod type_names;
 mod type_reference_moves;
 pub(crate) use type_identities::EnumLabelIdentity;
-#[cfg(test)]
-pub(crate) use type_identities::{CachedArrayElement, TypeCreation};
+pub use type_identities::{CachedArrayElement, TypeCreation};
 mod type_references;
 use crate::mem::mutex::{Mutex, MutexGuard};
 use enum_images::{EnumImageRead, EnumImageReservation, EnumMemberImages};
@@ -795,7 +794,7 @@ pub enum OwnedDatum {
         bytes: [u8; MAX_DEFAULT_TEXT],
     },
     Array {
-        element: crate::sql::types::ArrElem,
+        element: CachedArrayElement,
         len: u8,
         bytes: [u8; MAX_DEFAULT_TEXT],
     },
@@ -830,7 +829,7 @@ pub enum OwnedDatum {
     Macaddr([u8; 6]),
     Macaddr8([u8; 8]),
     Enum {
-        slot: u16,
+        slot: TypeCreation,
         member: Option<crate::sql::types::EnumMemberId>,
         sort: f64,
         label: SqlName,
@@ -1248,7 +1247,7 @@ impl OwnedDatum {
                 len,
                 bytes,
             } => Datum::Array {
-                element: *element,
+                element: element.element(),
                 raw: &bytes[..*len as usize],
             },
             Self::Int2Vector {
@@ -1331,7 +1330,7 @@ impl OwnedDatum {
     fn array(element: crate::sql::types::ArrElem, raw: &[u8]) -> Result<Self, SqlError> {
         let (len, bytes) = Self::bytes(raw, "array")?;
         Ok(Self::Array {
-            element,
+            element: CachedArrayElement::from_element(element)?,
             len,
             bytes,
         })
@@ -6523,8 +6522,7 @@ impl MatviewDef {
 
 /// Domain slots fit between the synthesized domain and enum OID bands. The
 /// configured catalog may use any prefix of this representable range.
-pub(crate) const MAX_DOMAIN_CATALOG_SLOTS: usize =
-    (crate::sql::types::oid::FIRST_ENUM - crate::sql::types::oid::FIRST_DOMAIN) as usize;
+pub(crate) const MAX_DOMAIN_CATALOG_SLOTS: usize = 10_000;
 /// Startup table capacity is independent of durable relation identities.
 pub(crate) const MAX_TABLE_CATALOG_SLOTS: usize = 10_000;
 /// Startup view capacity is independent of durable relation identities.
@@ -6952,7 +6950,7 @@ impl RoutineResult {
     fn requires_type_catalog(self) -> bool {
         self.user_type.is_some()
             || matches!(self.ctype, ColType::Enum(_) | ColType::Composite(_))
-            || matches!(self.ctype, ColType::Array(element) if element.user_type_slot().is_some())
+            || matches!(self.ctype, ColType::Array(element) if element.is_named())
     }
 
     pub(crate) const TEXT: Self = Self {
@@ -9725,9 +9723,7 @@ pub(crate) struct DomainSpec {
 /// Named enum slots retain their bounded scalar and array representation.
 pub(crate) const MAX_ENUM_CATALOG_SLOTS: usize = 10_000;
 /// Composite slots fit between their synthesized scalar and array OID bands.
-pub(crate) const MAX_COMPOSITE_CATALOG_SLOTS: usize = (crate::sql::types::oid::FIRST_COMPOSITE_ARRAY
-    - crate::sql::types::oid::FIRST_COMPOSITE)
-    as usize;
+pub(crate) const MAX_COMPOSITE_CATALOG_SLOTS: usize = 10_000;
 /// Named composites share the durable row-format column boundary. This avoids
 /// accepting a table shape that the corresponding named record cannot model.
 pub(crate) const MAX_COMPOSITE_FIELDS: usize = MAX_RELATION_COLUMNS;
@@ -40032,7 +40028,7 @@ impl Storage {
     ) -> Result<DeclaredColumnType, SqlError> {
         let Some(identity) = column.user_type else {
             if matches!(column.ctype, ColType::Enum(_) | ColType::Composite(_))
-                || matches!(column.ctype, ColType::Array(element) if element.user_type_slot().is_some())
+                || matches!(column.ctype, ColType::Array(element) if element.is_named())
             {
                 return Err(sql_err!(
                     sqlstate::PROTOCOL_VIOLATION,
@@ -43342,7 +43338,7 @@ impl Storage {
         }
         let Some(identity) = user_type else {
             return (!matches!(ctype, ColType::Enum(_) | ColType::Composite(_))
-                && !matches!(ctype, ColType::Array(element) if element.user_type_slot().is_some()))
+                && !matches!(ctype, ColType::Array(element) if element.is_named()))
             .then(|| ctype.oid());
         };
         let catalog = self
@@ -43376,61 +43372,20 @@ impl Storage {
     }
 
     pub(crate) fn routine_result_for_oid(&self, type_oid: i32, txid: u32) -> Option<RoutineResult> {
-        use crate::sql::types::oid;
-        let catalog = self
-            .type_catalog
-            .lock()
-            .expect("type catalog lock poisoned");
-        let sources = [
-            (oid::FIRST_DOMAIN, catalog.domains.len(), false, 0u8),
-            (oid::FIRST_DOMAIN_ARRAY, catalog.domains.len(), true, 0u8),
-            (oid::FIRST_ENUM, catalog.enums.len(), false, 1u8),
-            (oid::FIRST_ENUM_ARRAY, catalog.enums.len(), true, 1u8),
-            (oid::FIRST_COMPOSITE, catalog.composites.len(), false, 2u8),
-            (
-                oid::FIRST_COMPOSITE_ARRAY,
-                catalog.composites.len(),
-                true,
-                2u8,
-            ),
-        ];
-        for (first, count, array, kind) in sources {
-            let Some(index) = type_oid
-                .checked_sub(first)
-                .and_then(|index| usize::try_from(index).ok())
-                .filter(|index| *index < count)
-            else {
-                continue;
-            };
-            let slot = match kind {
-                0 => NamedTypeSlot::Domain(index),
-                1 => NamedTypeSlot::Enum(index),
-                _ => NamedTypeSlot::Composite(index),
-            };
-            let snapshot = catalog.type_snapshot(slot, txid).ok()??;
-            if snapshot.identity.database() != current_database() {
-                return None;
+        let Some((kind, creation, array)) = NamedTypeKind::from_oid(type_oid) else {
+            return ColType::from_oid(type_oid).map(RoutineResult::builtin);
+        };
+        let catalog = self.type_catalog.lock().expect("type catalog lock poisoned");
+        let reference = catalog.source_reference_by_creation(kind, creation, current_database())?;
+        let snapshot = catalog.resolve_source_reference(reference, current_database(), txid).ok()??;
+        let ctype = if array {
+            match kind {
+                NamedTypeKind::Domain => ColType::Array(ArrElem::domain(creation, snapshot.base)?),
+                NamedTypeKind::Enum => ColType::Array(ArrElem::Enum(Some(creation))),
+                NamedTypeKind::Composite => ColType::Array(ArrElem::Composite(Some(creation))),
             }
-            let ctype = if array && matches!(slot, NamedTypeSlot::Domain(_)) {
-                ColType::Array(ArrElem::domain(u16::try_from(index).ok()?, snapshot.base)?)
-            } else if array {
-                match snapshot.base {
-                    ColType::Enum(slot) => ColType::Array(ArrElem::Enum(slot)),
-                    ColType::Composite(slot) => ColType::Array(ArrElem::Composite(slot)),
-                    _ if matches!(slot, NamedTypeSlot::Domain(_)) => {
-                        ColType::Array(ArrElem::domain(u16::try_from(index).ok()?, snapshot.base)?)
-                    }
-                    _ => return None,
-                }
-            } else {
-                snapshot.base
-            };
-            return Some(RoutineResult {
-                ctype,
-                user_type: Some(snapshot.name),
-            });
-        }
-        ColType::from_oid(type_oid).map(RoutineResult::builtin)
+        } else { snapshot.base };
+        Some(RoutineResult { ctype, user_type: Some(snapshot.name) })
     }
 
     /// Whether PostgreSQL permits `actual_oid` to enter a routine parameter
@@ -43517,12 +43472,10 @@ impl Storage {
     }
 
     pub(crate) fn domain_base_type_for_oid(&self, type_oid: i32, txid: u32) -> Option<ColType> {
-        let slot =
-            usize::try_from(type_oid.checked_sub(crate::sql::types::oid::FIRST_DOMAIN)?).ok()?;
-        if slot >= self.domain_count() || !self.domain_slot_visible_to(slot, txid) {
-            return None;
-        }
-        Some(self.domain_for(slot, txid).base)
+        let (kind, creation, array) = NamedTypeKind::from_oid(type_oid)?;
+        if kind != NamedTypeKind::Domain || array { return None; }
+        let target = TypeDefinitionTarget::by_creation(self, kind, creation).ok()?;
+        self.read_domain_definition(target, txid).ok()?.map(|definition| definition.base)
     }
 
     pub(crate) fn user_type_identity_oid(

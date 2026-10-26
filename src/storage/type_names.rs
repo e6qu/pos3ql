@@ -13,6 +13,25 @@ pub(crate) enum NamedTypeKind {
     Composite,
 }
 
+impl NamedTypeKind {
+    pub(crate) fn from_oid(type_oid: i32) -> Option<(Self, super::TypeCreation, bool)> {
+        use crate::sql::types::oid;
+        for (kind, first, array) in [
+            (Self::Domain, oid::FIRST_DOMAIN, false),
+            (Self::Domain, oid::FIRST_DOMAIN_ARRAY, true),
+            (Self::Enum, oid::FIRST_ENUM, false),
+            (Self::Enum, oid::FIRST_ENUM_ARRAY, true),
+            (Self::Composite, oid::FIRST_COMPOSITE, false),
+            (Self::Composite, oid::FIRST_COMPOSITE_ARRAY, true),
+        ] {
+            if let Some(creation) = type_oid.checked_sub(first)
+                .and_then(|value| u64::try_from(value).ok()).and_then(super::TypeCreation::parse)
+            { return Some((kind, creation, array)); }
+        }
+        None
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum NamedTypeSlot {
     Domain(usize),

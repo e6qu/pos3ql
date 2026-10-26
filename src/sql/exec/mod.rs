@@ -55126,7 +55126,7 @@ fn decode_binary_array<'a>(
             decode_binary_field_with_context(element_type, field, arena, context)?
         };
         *slot = match element {
-            crate::sql::types::ArrElem::Domain { slot, .. } => {
+            crate::sql::types::ArrElem::Domain { identity: slot, .. } => {
                 let BinaryDecodeContext::Catalog { storage, txid } = context else {
                     return Err(sql_err!(
                         sqlstate::FEATURE_NOT_SUPPORTED,
@@ -70563,14 +70563,14 @@ pub(crate) fn enum_array_member_text<'a>(
 
 pub(crate) fn enum_array_from_legacy_labels<'a>(
     text: &'a str,
-    slot: u16,
+    slot: crate::storage::TypeCreation,
     storage: &Storage,
     txid: u32,
     arena: &'a Arena,
 ) -> Result<Datum<'a>, SqlError> {
     decode_composite_stored_field(
         Datum::Text(text),
-        ColType::Array(crate::sql::types::ArrElem::Enum(slot)),
+        ColType::Array(crate::sql::types::ArrElem::Enum(Some(slot))),
         CompositeEncoding::Legacy,
         storage,
         txid,
@@ -70580,14 +70580,14 @@ pub(crate) fn enum_array_from_legacy_labels<'a>(
 
 pub(crate) fn enum_array_from_members<'a>(
     text: &'a str,
-    slot: u16,
+    slot: crate::storage::TypeCreation,
     storage: &Storage,
     txid: u32,
     arena: &'a Arena,
 ) -> Result<Datum<'a>, SqlError> {
     decode_composite_stored_field(
         Datum::Text(text),
-        ColType::Array(crate::sql::types::ArrElem::Enum(slot)),
+        ColType::Array(crate::sql::types::ArrElem::Enum(Some(slot))),
         CompositeEncoding::Members,
         storage,
         txid,
@@ -70600,7 +70600,7 @@ pub(crate) fn enum_array_from_members<'a>(
 /// dropped slots as NULL so a later attribute change cannot shift old data.
 fn composite_storage_text<'a>(
     value: Datum<'a>,
-    slot: u16,
+    slot: crate::storage::TypeCreation,
     storage: &Storage,
     txid: u32,
     arena: &'a Arena,
@@ -70613,9 +70613,9 @@ fn composite_storage_text<'a>(
     };
     let definition = storage
         .read_composite_definition(
-            crate::storage::TypeDefinitionTarget::Slot(crate::storage::NamedTypeSlot::Composite(
-                slot as usize,
-            )),
+            crate::storage::TypeDefinitionTarget::by_creation(
+                storage, crate::storage::NamedTypeKind::Composite, slot,
+            )?,
             txid,
         )?
         .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "composite type does not exist"))?;
@@ -70670,17 +70670,19 @@ fn composite_storage_text<'a>(
 /// concrete type are established once, before a `Datum::Composite` exists.
 pub(crate) fn coerce_composite_value<'a>(
     value: Datum<'a>,
-    slot: u16,
+    slot: Option<crate::storage::TypeCreation>,
     storage: &Storage,
     txid: u32,
     arena: &'a Arena,
 ) -> Result<Datum<'a>, SqlError> {
+    let slot = slot.ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT,
+        "named type declaration has no bound identity"))?;
     coerce_composite_value_inner(value, slot, CompositeEncoding::Input, storage, txid, arena)
 }
 
 fn coerce_composite_value_inner<'a>(
     value: Datum<'a>,
-    slot: u16,
+    slot: crate::storage::TypeCreation,
     encoding: CompositeEncoding,
     storage: &Storage,
     txid: u32,
@@ -70707,9 +70709,9 @@ fn coerce_composite_value_inner<'a>(
     };
     let definition = storage
         .read_composite_definition(
-            crate::storage::TypeDefinitionTarget::Slot(crate::storage::NamedTypeSlot::Composite(
-                slot as usize,
-            )),
+            crate::storage::TypeDefinitionTarget::by_creation(
+                storage, crate::storage::NamedTypeKind::Composite, slot,
+            )?,
             txid,
         )?
         .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "composite type does not exist"))?;
@@ -70814,7 +70816,7 @@ fn coerce_composite_value_inner<'a>(
 /// leak into type coercion as separate attributes.
 pub(crate) fn decode_composite_text<'a>(
     text: &'a str,
-    slot: u16,
+    slot: crate::storage::TypeCreation,
     storage: &Storage,
     txid: u32,
     arena: &'a Arena,
@@ -70826,7 +70828,7 @@ pub(crate) fn decode_composite_text<'a>(
 /// durable datum so an old layout remains unambiguous after ALTER TYPE.
 pub(crate) fn decode_stored_composite_text<'a>(
     text: &'a str,
-    slot: u16,
+    slot: crate::storage::TypeCreation,
     physical_fields: u16,
     storage: &Storage,
     txid: u32,
@@ -70844,7 +70846,7 @@ pub(crate) fn decode_stored_composite_text<'a>(
 
 fn decode_composite_text_inner<'a>(
     text: &'a str,
-    slot: u16,
+    slot: crate::storage::TypeCreation,
     stored_physical_fields: Option<usize>,
     storage: &Storage,
     txid: u32,
@@ -70870,9 +70872,9 @@ fn decode_composite_text_inner<'a>(
         })?;
     let definition = storage
         .read_composite_definition(
-            crate::storage::TypeDefinitionTarget::Slot(crate::storage::NamedTypeSlot::Composite(
-                slot as usize,
-            )),
+            crate::storage::TypeDefinitionTarget::by_creation(
+                storage, crate::storage::NamedTypeKind::Composite, slot,
+            )?,
             txid,
         )?
         .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "composite type does not exist"))?;
@@ -71074,10 +71076,10 @@ pub(crate) fn coerce_user_type_array_element<'a>(
     arena: &'a Arena,
 ) -> Result<Datum<'a>, SqlError> {
     Ok(match target {
-        crate::sql::types::ArrElem::Enum(slot) => {
+        crate::sql::types::ArrElem::Enum(Some(slot)) => {
             coerce_enum_value(value, slot, storage, txid, arena)?
         }
-        crate::sql::types::ArrElem::Domain { slot, .. } => constraints::coerce_domain_value(
+        crate::sql::types::ArrElem::Domain { identity: slot, .. } => constraints::coerce_domain_value(
             storage,
             slot as usize,
             value,
@@ -71127,11 +71129,13 @@ pub(crate) fn coerce_user_type_array_element<'a>(
 /// PostgreSQL's 22P02 `invalid input value for enum <type>: "..."`.
 pub(crate) fn coerce_enum_value<'a>(
     v: Datum<'a>,
-    slot: u16,
+    slot: Option<crate::storage::TypeCreation>,
     storage: &Storage,
     txid: u32,
     arena: &'a Arena,
 ) -> Result<Datum<'a>, SqlError> {
+    let slot = slot.ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT,
+        "named type declaration has no bound identity"))?;
     if v.is_null() {
         return Ok(Datum::Null);
     }
@@ -71144,9 +71148,9 @@ pub(crate) fn coerce_enum_value<'a>(
     }
     let def = storage
         .read_enum_definition(
-            crate::storage::TypeDefinitionTarget::Slot(crate::storage::NamedTypeSlot::Enum(
-                slot as usize,
-            )),
+            crate::storage::TypeDefinitionTarget::by_creation(
+                storage, crate::storage::NamedTypeKind::Enum, slot,
+            )?,
             txid,
         )?
         .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "enum type does not exist"))?;
@@ -71192,15 +71196,15 @@ pub(crate) fn coerce_enum_value<'a>(
 
 pub(crate) fn ensure_enum_value_is_safe(
     storage: &Storage,
-    slot: u16,
+    slot: crate::storage::TypeCreation,
     label: &str,
     txid: u32,
 ) -> Result<(), SqlError> {
     let definition = storage
         .read_enum_definition(
-            crate::storage::TypeDefinitionTarget::Slot(crate::storage::NamedTypeSlot::Enum(
-                slot as usize,
-            )),
+            crate::storage::TypeDefinitionTarget::by_creation(
+                storage, crate::storage::NamedTypeKind::Enum, slot,
+            )?,
             txid,
         )?
         .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "enum type does not exist"))?;

@@ -29,14 +29,11 @@ pub(crate) fn resolve<'a>(
             "stored enum member has no catalog identity"
         )
     };
-    if usize::from(slot) >= storage.enum_count() {
-        return Err(corrupt());
-    }
     let definition = storage
         .read_enum_definition(
-            crate::storage::TypeDefinitionTarget::Slot(crate::storage::NamedTypeSlot::Enum(
-                usize::from(slot),
-            )),
+            crate::storage::TypeDefinitionTarget::by_creation(
+                storage, crate::storage::NamedTypeKind::Enum, slot,
+            )?,
             txid,
         )?
         .ok_or_else(corrupt)?;
@@ -92,14 +89,11 @@ pub(crate) fn sort(value: Datum<'_>, storage: &Storage, txid: u32) -> Result<f64
             "stored enum member has no catalog identity"
         )
     };
-    if usize::from(slot) >= storage.enum_count() {
-        return Err(corrupt());
-    }
     let definition = storage
         .read_enum_definition(
-            crate::storage::TypeDefinitionTarget::Slot(crate::storage::NamedTypeSlot::Enum(
-                usize::from(slot),
-            )),
+            crate::storage::TypeDefinitionTarget::by_creation(
+                storage, crate::storage::NamedTypeKind::Enum, slot,
+            )?,
             txid,
         )?
         .ok_or_else(corrupt)?;
@@ -454,7 +448,7 @@ pub(crate) fn resolve_query<const N: usize>(
 }
 
 pub(crate) fn legacy_identity(
-    slot: u16,
+    slot: crate::storage::TypeCreation,
     label: &str,
     storage: &Storage,
     txid: u32,
@@ -465,14 +459,11 @@ pub(crate) fn legacy_identity(
             "stored enum member has no catalog identity"
         )
     };
-    if usize::from(slot) >= storage.enum_count() {
-        return Err(corrupt());
-    }
     storage
         .read_enum_definition(
-            crate::storage::TypeDefinitionTarget::Slot(crate::storage::NamedTypeSlot::Enum(
-                usize::from(slot),
-            )),
+            crate::storage::TypeDefinitionTarget::by_creation(
+                storage, crate::storage::NamedTypeKind::Enum, slot,
+            )?,
             txid,
         )?
         .ok_or_else(corrupt)?

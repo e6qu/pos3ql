@@ -997,7 +997,7 @@ pub trait CatalogAccess {
 
     fn enum_member_identity(
         &self,
-        _slot: u16,
+        _slot: crate::storage::TypeCreation,
         _label: &str,
     ) -> Result<Option<super::types::EnumMemberId>, SqlError> {
         Ok(None)
@@ -1008,7 +1008,7 @@ pub trait CatalogAccess {
     /// never treated as an anonymous record.
     fn materialize_composite<'a>(
         &self,
-        _slot: u16,
+        _slot: crate::storage::TypeCreation,
         _physical_fields: u16,
         _text: &'a str,
         _arena: &'a Arena,
@@ -1023,7 +1023,7 @@ pub trait CatalogAccess {
     fn composite_array_element<'a>(
         &self,
         _value: Datum<'a>,
-        _slot: u16,
+        _slot: crate::storage::TypeCreation,
         _arena: &'a Arena,
     ) -> Result<Datum<'a>, SqlError> {
         Err(sql_err!(
@@ -1542,23 +1542,23 @@ pub trait CatalogAccess {
     }
     /// The name of the enum type in catalog `slot`, for `pg_typeof` on an enum
     /// value. `None` if the slot holds no live enum.
-    fn enum_name<'a>(&self, _slot: u16, _arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
+    fn enum_name<'a>(&self, _slot: crate::storage::TypeCreation, _arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
         Ok(None)
     }
     /// The sort key of `label` in the enum type at `slot`, resolving a text
     /// literal against an enum in a comparison. `None` if the slot holds no
     /// live enum or the label is not a member.
-    fn enum_label_sort(&self, _slot: u16, _label: &str) -> Result<Option<f64>, SqlError> {
+    fn enum_label_sort(&self, _slot: crate::storage::TypeCreation, _label: &str) -> Result<Option<f64>, SqlError> {
         Ok(None)
     }
-    fn ensure_enum_label_safe(&self, _slot: u16, _label: &str) -> Result<(), SqlError> {
+    fn ensure_enum_label_safe(&self, _slot: crate::storage::TypeCreation, _label: &str) -> Result<(), SqlError> {
         Ok(())
     }
     /// Ordered members of a visible enum, materialized into the statement
     /// arena for `enum_first`/`enum_last`/`enum_range`.
     fn enum_values<'a>(
         &self,
-        _slot: u16,
+        _slot: crate::storage::TypeCreation,
         _arena: &'a Arena,
     ) -> Result<Option<&'a [Datum<'a>]>, SqlError> {
         Ok(None)
@@ -1566,7 +1566,7 @@ pub trait CatalogAccess {
     /// The catalog slot of the (possibly schema-qualified) enum type named
     /// `type_name`, or `None` if no such live enum is visible — used to
     /// resolve `value::enumtype` casts, which base-type name lookup cannot.
-    fn enum_slot_of_name(&self, _type_name: &str) -> Option<u16> {
+    fn enum_creation_of_name(&self, _type_name: &str) -> Option<crate::storage::TypeCreation> {
         None
     }
     /// Casts to a catalog-defined domain, enum, or its automatically-created
@@ -6907,7 +6907,7 @@ pub(crate) fn input_error<'a>(
             Ok(None) => None,
             Err(error) => {
                 let message = if error.message.is_truncated()
-                    && catalog.enum_slot_of_name(base_name).is_some()
+                    && catalog.enum_creation_of_name(base_name).is_some()
                 {
                     arena.alloc_str_display(format_args!(
                         "invalid input value for enum {}: \"{}\"",
@@ -7590,7 +7590,7 @@ fn coerce_enum_literal<'a>(
     hooks: &EvalHooks<'_, 'a>,
     arena: &'a Arena,
 ) -> Result<(Datum<'a>, Datum<'a>), SqlError> {
-    let resolve = |slot: u16, text: Datum<'a>| -> Result<Datum<'a>, SqlError> {
+    let resolve = |slot: crate::storage::TypeCreation, text: Datum<'a>| -> Result<Datum<'a>, SqlError> {
         let label = match text {
             Datum::Text(s) => s,
             Datum::Bpchar(s) => s.trim_end_matches(' '),

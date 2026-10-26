@@ -189,7 +189,7 @@ pub fn projected_value_len(v: &Datum) -> usize {
         Datum::Geometry { text, .. } => 5 + text.len(),
         // Projected values are schema-less, so an enum carries its slot too:
         // slot(2) + sort(8) + 4-byte label length + label bytes.
-        Datum::Enum { label, .. } => 18 + label.len(),
+        Datum::Enum { label, .. } => 20 + label.len(),
         // A record stores its rendered text (the arena-free decode returns
         // that, keeping comparators and output unchanged) followed by a
         // structural tail — field names, OIDs, nested tagged values — that
@@ -203,7 +203,7 @@ pub fn projected_value_len(v: &Datum) -> usize {
             n
         }
         Datum::Composite { fields, .. } => {
-            let mut n = 2 + 4 + record_text_len(v) + 1;
+            let mut n = 4 + 4 + record_text_len(v) + 1;
             for f in *fields {
                 n += 1 + f.name.len() + 4 + projected_value_len(&f.value);
             }
@@ -213,7 +213,7 @@ pub fn projected_value_len(v: &Datum) -> usize {
             physical_fields,
             text,
             ..
-        } => 2 + physical_field_count_len(*physical_fields) + 4 + text.len(),
+        } => 4 + physical_field_count_len(*physical_fields) + 4 + text.len(),
     }
 }
 
@@ -430,28 +430,10 @@ fn write_projected_value(v: &Datum, out: &mut [u8]) -> usize {
             5 + text.len()
         }
         Datum::Array { element, raw } => {
-            out[0] = 15;
-            out[1] = element.code();
-            let (element_slot, base_code, base_user_slot) = match element {
-                crate::sql::types::ArrElem::Enum(slot)
-                | crate::sql::types::ArrElem::Composite(slot) => {
-                    (*slot, 0, crate::sql::types::ColType::ENUM_SLOT_UNRESOLVED)
-                }
-                crate::sql::types::ArrElem::Domain {
-                    slot,
-                    base_code,
-                    base_user_slot,
-                    ..
-                } => (*slot, *base_code, *base_user_slot),
-                _ => (
-                    crate::sql::types::ColType::ENUM_SLOT_UNRESOLVED,
-                    0,
-                    crate::sql::types::ColType::ENUM_SLOT_UNRESOLVED,
-                ),
-            };
-            out[2..4].copy_from_slice(&element_slot.to_le_bytes());
-            out[4] = base_code;
-            out[5..7].copy_from_slice(&base_user_slot.to_le_bytes());
+            out[0] = 200;
+            let descriptor = crate::storage::CachedArrayElement::from_element(*element)
+                .expect("projected array type was bound");
+            out[1..7].copy_from_slice(&descriptor.bytes());
             out[7..11].copy_from_slice(&(raw.len() as u32).to_le_bytes());
             out[11..11 + raw.len()].copy_from_slice(raw);
             11 + raw.len()
@@ -547,17 +529,17 @@ fn write_projected_value(v: &Datum, out: &mut [u8]) -> usize {
             sort,
             label,
         } => {
-            out[0] = 28;
-            out[1..3].copy_from_slice(&slot.to_le_bytes());
-            out[3..11].copy_from_slice(&sort.to_le_bytes());
-            out[11..15].copy_from_slice(
+            out[0] = 201;
+            out[1..5].copy_from_slice(&slot.to_le_bytes());
+            out[5..13].copy_from_slice(&sort.to_le_bytes());
+            out[13..17].copy_from_slice(
                 &member
                     .map_or(u32::MAX, crate::sql::types::EnumMemberId::ordinal)
                     .to_le_bytes(),
             );
-            out[15..19].copy_from_slice(&(label.len() as u32).to_le_bytes());
-            out[19..19 + label.len()].copy_from_slice(label.as_bytes());
-            19 + label.len()
+            out[17..21].copy_from_slice(&(label.len() as u32).to_le_bytes());
+            out[21..21 + label.len()].copy_from_slice(label.as_bytes());
+            21 + label.len()
         }
         Datum::Record(fields) => {
             use core::fmt::Write as _;
@@ -608,13 +590,13 @@ fn write_projected_value(v: &Datum, out: &mut [u8]) -> usize {
                     Ok(())
                 }
             }
-            out[0] = 32;
-            out[1..3].copy_from_slice(&slot.to_le_bytes());
-            let mut w = SliceWriter { buf: out, at: 7 };
+            out[0] = 202;
+            out[1..5].copy_from_slice(&slot.to_le_bytes());
+            let mut w = SliceWriter { buf: out, at: 9 };
             let _ = write!(w, "{v}");
-            let text_len = w.at - 7;
-            out[3..7].copy_from_slice(&(text_len as u32).to_le_bytes());
-            let mut at = 7 + text_len;
+            let text_len = w.at - 9;
+            out[5..9].copy_from_slice(&(text_len as u32).to_le_bytes());
+            let mut at = 9 + text_len;
             out[at] = fields.len() as u8;
             at += 1;
             for f in *fields {
@@ -633,12 +615,12 @@ fn write_projected_value(v: &Datum, out: &mut [u8]) -> usize {
             physical_fields,
             text,
         } => {
-            out[0] = 33;
-            out[1..3].copy_from_slice(&slot.to_le_bytes());
-            let prefix = encode_physical_field_count(*physical_fields, &mut out[3..]);
-            out[3 + prefix..7 + prefix].copy_from_slice(&(text.len() as u32).to_le_bytes());
-            out[7 + prefix..7 + prefix + text.len()].copy_from_slice(text.as_bytes());
-            7 + prefix + text.len()
+            out[0] = 203;
+            out[1..5].copy_from_slice(&slot.to_le_bytes());
+            let prefix = encode_physical_field_count(*physical_fields, &mut out[5..]);
+            out[5 + prefix..9 + prefix].copy_from_slice(&(text.len() as u32).to_le_bytes());
+            out[9 + prefix..9 + prefix + text.len()].copy_from_slice(text.as_bytes());
+            9 + prefix + text.len()
         }
     }
 }
@@ -823,30 +805,12 @@ pub fn decode_projected_value(bytes: &[u8], tag: u8, at: usize) -> (Datum<'_>, u
                 4 + len,
             )
         }
-        15 => {
-            let mut element = crate::sql::types::ArrElem::from_code(bytes[at])
-                .expect("projected array carries a valid element code");
-            let slot = u16::from_le_bytes(bytes[at + 1..at + 3].try_into().unwrap());
-            element = match element {
-                crate::sql::types::ArrElem::Enum(_) => crate::sql::types::ArrElem::Enum(slot),
-                crate::sql::types::ArrElem::Composite(_) => {
-                    crate::sql::types::ArrElem::Composite(slot)
-                }
-                crate::sql::types::ArrElem::Domain { .. } => crate::sql::types::ArrElem::Domain {
-                    slot,
-                    base_code: bytes[at + 3],
-                    base_user_slot: u16::from_le_bytes(bytes[at + 4..at + 6].try_into().unwrap()),
-                },
-                builtin => builtin,
-            };
+        200 => {
+            let element = crate::storage::CachedArrayElement::from_bytes(
+                bytes[at..at + 6].try_into().unwrap(),
+            ).expect("projected array descriptor was checked").element();
             let len = u32::from_le_bytes(bytes[at + 6..at + 10].try_into().unwrap()) as usize;
-            (
-                Datum::Array {
-                    element,
-                    raw: &bytes[at + 10..at + 10 + len],
-                },
-                10 + len,
-            )
+            (Datum::Array { element, raw: &bytes[at + 10..at + 10 + len] }, 10 + len)
         }
         16 => {
             let kind = crate::sql::types::RangeKind::from_code(bytes[at])
@@ -970,13 +934,13 @@ pub fn decode_projected_value(bytes: &[u8], tag: u8, at: usize) -> (Datum<'_>, u
         }
         26 => (Datum::Macaddr(bytes[at..at + 6].try_into().unwrap()), 6),
         27 => (Datum::Macaddr8(bytes[at..at + 8].try_into().unwrap()), 8),
-        28 => {
-            let slot = u16::from_le_bytes(bytes[at..at + 2].try_into().unwrap());
-            let sort = f64::from_le_bytes(bytes[at + 2..at + 10].try_into().unwrap());
-            let identity = u32::from_le_bytes(bytes[at + 10..at + 14].try_into().unwrap());
+        201 => {
+            let slot = crate::storage::TypeCreation::from_le_bytes(bytes[at..at + 4].try_into().unwrap()).expect("projected enum creation");
+            let sort = f64::from_le_bytes(bytes[at + 4..at + 12].try_into().unwrap());
+            let identity = u32::from_le_bytes(bytes[at + 12..at + 16].try_into().unwrap());
             let member = crate::sql::types::EnumMemberId::from_ordinal(identity);
-            let len = u32::from_le_bytes(bytes[at + 14..at + 18].try_into().unwrap()) as usize;
-            let label = core::str::from_utf8(&bytes[at + 18..at + 18 + len])
+            let len = u32::from_le_bytes(bytes[at + 16..at + 20].try_into().unwrap()) as usize;
+            let label = core::str::from_utf8(&bytes[at + 20..at + 20 + len])
                 .expect("projected enum label is valid UTF-8");
             (
                 Datum::Enum {
@@ -985,7 +949,7 @@ pub fn decode_projected_value(bytes: &[u8], tag: u8, at: usize) -> (Datum<'_>, u
                     sort,
                     label,
                 },
-                18 + len,
+                20 + len,
             )
         }
         29 => {
@@ -1008,20 +972,20 @@ pub fn decode_projected_value(bytes: &[u8], tag: u8, at: usize) -> (Datum<'_>, u
                 8 + len,
             )
         }
-        32 => {
-            let len = u32::from_le_bytes(bytes[at + 2..at + 6].try_into().unwrap()) as usize;
-            let s = core::str::from_utf8(&bytes[at + 6..at + 6 + len])
+        202 => {
+            let len = u32::from_le_bytes(bytes[at + 4..at + 8].try_into().unwrap()) as usize;
+            let s = core::str::from_utf8(&bytes[at + 8..at + 8 + len])
                 .expect("projected composite text was encoded from valid UTF-8");
             (
                 Datum::Text(s),
-                6 + len + record_tail_len(bytes, at + 6 + len),
+                8 + len + record_tail_len(bytes, at + 8 + len),
             )
         }
-        33 => {
-            let slot = u16::from_le_bytes(bytes[at..at + 2].try_into().unwrap());
+        203 => {
+            let slot = crate::storage::TypeCreation::from_le_bytes(bytes[at..at + 4].try_into().unwrap()).expect("projected composite creation");
             let (physical_fields, prefix) =
-                decode_physical_field_count(&bytes[at + 2..]).expect("projected composite prefix");
-            let length_at = at + 2 + prefix;
+                decode_physical_field_count(&bytes[at + 4..]).expect("projected composite prefix");
+            let length_at = at + 4 + prefix;
             let len =
                 u32::from_le_bytes(bytes[length_at..length_at + 4].try_into().unwrap()) as usize;
             let text = core::str::from_utf8(&bytes[length_at + 4..length_at + 4 + len])
@@ -1032,7 +996,7 @@ pub fn decode_projected_value(bytes: &[u8], tag: u8, at: usize) -> (Datum<'_>, u
                     physical_fields,
                     text,
                 },
-                2 + prefix + 4 + len,
+                4 + prefix + 4 + len,
             )
         }
         _ => unreachable!("tags are exhaustive"),
@@ -1151,11 +1115,11 @@ pub fn decode_projected_col_record<'a>(
                 let text_len = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
                 return decode_record_tail(bytes, at + 4 + text_len, arena);
             }
-            if tag == 32 {
-                let slot = u16::from_le_bytes(bytes[at..at + 2].try_into().unwrap());
+            if tag == 202 {
+                let slot = crate::storage::TypeCreation::from_le_bytes(bytes[at..at + 4].try_into().unwrap()).expect("projected composite creation");
                 let text_len =
-                    u32::from_le_bytes(bytes[at + 2..at + 6].try_into().unwrap()) as usize;
-                let Datum::Record(fields) = decode_record_tail(bytes, at + 6 + text_len, arena)?
+                    u32::from_le_bytes(bytes[at + 4..at + 8].try_into().unwrap()) as usize;
+                let Datum::Record(fields) = decode_record_tail(bytes, at + 8 + text_len, arena)?
                 else {
                     unreachable!()
                 };
@@ -1205,11 +1169,11 @@ fn decode_record_tail<'a>(
                 u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
             f.value = decode_record_tail(bytes, cursor + 4 + text_len, arena)?;
             cursor += decode_projected_value(bytes, tag, cursor).1;
-        } else if tag == 32 {
-            let slot = u16::from_le_bytes(bytes[cursor..cursor + 2].try_into().unwrap());
+        } else if tag == 202 {
+            let slot = crate::storage::TypeCreation::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()).expect("projected composite creation");
             let text_len =
-                u32::from_le_bytes(bytes[cursor + 2..cursor + 6].try_into().unwrap()) as usize;
-            let Datum::Record(fields) = decode_record_tail(bytes, cursor + 6 + text_len, arena)?
+                u32::from_le_bytes(bytes[cursor + 4..cursor + 8].try_into().unwrap()) as usize;
+            let Datum::Record(fields) = decode_record_tail(bytes, cursor + 8 + text_len, arena)?
             else {
                 unreachable!()
             };
@@ -1298,9 +1262,9 @@ mod tests {
             },
             Datum::Array {
                 element: ArrElem::Domain {
-                    slot: 769,
+                    identity: 769,
                     base_code: ColType::Composite(1025).code(),
-                    base_user_slot: 1025,
+                    base_identity: 1025,
                 },
                 raw: b"domain",
             },

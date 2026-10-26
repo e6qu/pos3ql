@@ -2642,7 +2642,7 @@ pub(crate) fn dispatch<'a>(
                     return Ok(regtype(crate::sql::types::oid::enum_oid(slot), name));
                 }
                 if let Datum::Array { element, .. } = v
-                    && element.user_type_slot().is_some()
+                    && element.is_named()
                     && let Some(cat) = hooks.catalog
                     && let Some(name) = cat.user_array_name(element, arena)?
                 {

@@ -64,6 +64,9 @@ jobs:
         run: |
           cargo fmt
           git diff --binary > "$RUNNER_TEMP/formatting.patch"
+      - name: Compile runtime type bindings
+        shell: bash
+        run: cargo check --lib --locked --message-format short 2>&1 | tee "$RUNNER_TEMP/type-check.log"
       - name: Verify compact identity layouts
         shell: bash
         run: |
@@ -95,6 +98,7 @@ jobs:
             ${{ runner.temp }}/formatting.patch
             ${{ runner.temp }}/*.reference
             ${{ runner.temp }}/wide-enum.sql
+            ${{ runner.temp }}/type-check.log
             ${{ runner.temp }}/layout.log
             ${{ runner.temp }}/type-lifetimes.log
             ${{ runner.temp }}/new-type-regressions.log

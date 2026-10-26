@@ -161,7 +161,7 @@ pub(crate) fn dispatch<'a>(
                         args.iter().find_map(|expression| match expression {
                             Expr::Cast { type_name, .. } => hooks
                                 .catalog
-                                .and_then(|catalog| catalog.enum_slot_of_name(type_name)),
+                                .and_then(|catalog| catalog.enum_creation_of_name(type_name)),
                             _ => None,
                         })
                     })
@@ -220,7 +220,7 @@ pub(crate) fn dispatch<'a>(
                     }
                 }
                 Ok(Datum::Array {
-                    element: crate::sql::types::ArrElem::Enum(slot),
+                    element: crate::sql::types::ArrElem::Enum(Some(slot)),
                     raw: crate::sql::array::build(&selected[..count], arena)?,
                 })
             }

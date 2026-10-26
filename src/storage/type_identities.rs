@@ -7,7 +7,7 @@ pub(crate) const MAX_TYPE_CREATION: u64 = 9_999_999;
 /// A nonzero stamp with a three-byte optional representation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(C)]
-pub(crate) struct TypeCreation {
+pub struct TypeCreation {
     low: NonZeroU8,
     upper: [u8; 2],
 }
@@ -28,6 +28,14 @@ impl TypeCreation {
             low,
             upper: ((ordinal / 255) as u16).to_le_bytes(),
         })
+    }
+
+    pub(crate) const fn to_le_bytes(self) -> [u8; 4] {
+        (self.created_at() as u32).to_le_bytes()
+    }
+
+    pub(crate) const fn from_le_bytes(bytes: [u8; 4]) -> Option<Self> {
+        Self::parse(u32::from_le_bytes(bytes) as u64)
     }
 
     pub(crate) const fn created_at(self) -> u64 {
@@ -302,7 +310,6 @@ impl TypeIdentityIndex {
     }
 }
 
-#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ArrayElementIdentity {
     Builtin(u8),
@@ -323,12 +330,53 @@ enum ArrayElementIdentity {
 }
 
 /// A checked six-byte descriptor for inline cached array defaults.
-#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct CachedArrayElement([u8; 6]);
+pub struct CachedArrayElement([u8; 6]);
 
-#[cfg(test)]
 impl CachedArrayElement {
+    pub(crate) fn from_element(element: crate::sql::types::ArrElem) -> Result<Self, SqlError> {
+        use crate::sql::types::{ArrElem, ColType};
+        use ArrayElementIdentity::*;
+        let invalid = || sql_err!(sqlstate::UNDEFINED_OBJECT,
+            "array element has no bound type identity");
+        let identity = match element {
+            ArrElem::Enum(creation) => Enum(creation.ok_or_else(invalid)?),
+            ArrElem::Composite(creation) => Composite(creation.ok_or_else(invalid)?),
+            ArrElem::Domain { identity, base_code, base_identity } => {
+                let domain = identity.ok_or_else(invalid)?;
+                match ColType::from_code(base_code).ok_or_else(invalid)? {
+                    ColType::Enum(_) => DomainEnum { domain, base: base_identity.ok_or_else(invalid)? },
+                    ColType::Composite(_) => DomainComposite { domain, base: base_identity.ok_or_else(invalid)? },
+                    _ if base_identity.is_none() => DomainBuiltin { domain, base_code },
+                    _ => return Err(invalid()),
+                }
+            }
+            _ => Builtin(element.code()),
+        };
+        Self::from_identity(identity).ok_or_else(invalid)
+    }
+
+    pub(crate) fn element(self) -> crate::sql::types::ArrElem {
+        use crate::sql::types::{ArrElem, ColType};
+        use ArrayElementIdentity::*;
+        match self.identity() {
+            Builtin(code) => ArrElem::from_code(code).expect("checked builtin array element"),
+            Enum(creation) => ArrElem::Enum(Some(creation)),
+            Composite(creation) => ArrElem::Composite(Some(creation)),
+            DomainBuiltin { domain, base_code } => ArrElem::Domain {
+                identity: Some(domain), base_code, base_identity: None,
+            },
+            DomainEnum { domain, base } => ArrElem::Domain {
+                identity: Some(domain), base_code: ColType::Enum(None).code(), base_identity: Some(base),
+            },
+            DomainComposite { domain, base } => ArrElem::Domain {
+                identity: Some(domain), base_code: ColType::Composite(None).code(), base_identity: Some(base),
+            },
+        }
+    }
+
+    pub(crate) fn bytes(self) -> [u8; 6] { self.0 }
+
     const ENUM: u64 = 256;
     const COMPOSITE: u64 = Self::ENUM + MAX_TYPE_CREATION;
     const DOMAIN_BUILTIN: u64 = Self::COMPOSITE + MAX_TYPE_CREATION;
@@ -430,7 +478,7 @@ impl CachedArrayElement {
         })
     }
 
-    fn from_bytes(bytes: [u8; 6]) -> Option<Self> {
+    pub(crate) fn from_bytes(bytes: [u8; 6]) -> Option<Self> {
         let encoded = Self(bytes);
         Self::decode(encoded.value())?;
         Some(encoded)
@@ -441,9 +489,7 @@ impl CachedArrayElement {
     }
 }
 
-#[cfg(test)]
 const _: [(); 6] = [(); core::mem::size_of::<CachedArrayElement>()];
-#[cfg(test)]
 const _: () = assert!(CachedArrayElement::END <= 1 << 48);
 
 #[cfg(test)]

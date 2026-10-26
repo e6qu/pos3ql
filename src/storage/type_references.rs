@@ -546,8 +546,7 @@ pub(super) struct TypeSnapshot {
 impl TypeSnapshot {
     pub(super) fn oid(&self, array: bool) -> i32 {
         use crate::sql::types::oid;
-        let slot = u16::try_from(self.identity.slot().index())
-            .expect("admitted type slot fits its catalog representation");
+        let slot = self.identity.created_at;
         match (self.identity.slot(), array) {
             (NamedTypeSlot::Domain(_), false) => oid::domain_oid(slot),
             (NamedTypeSlot::Domain(_), true) => oid::domain_array_oid(slot),
@@ -580,17 +579,11 @@ impl TypeSnapshot {
 
     pub(super) fn representation(&self, declared: ColType) -> Result<ColType, SqlError> {
         match self.identity.slot() {
-            NamedTypeSlot::Domain(slot)
+            NamedTypeSlot::Domain(_)
                 if matches!(declared, ColType::Array(ArrElem::Domain { .. }))
                     && !matches!(self.base, ColType::Array(ArrElem::Domain { .. })) =>
             {
-                let slot = u16::try_from(slot).map_err(|_| {
-                    sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "domain representation slot space exhausted"
-                    )
-                })?;
-                ArrElem::domain(slot, self.base)
+                ArrElem::domain(self.identity.created_at, self.base)
                     .map(ColType::Array)
                     .ok_or_else(|| {
                         sql_err!(
@@ -894,18 +887,14 @@ impl TypeCatalog {
                     .map_or((definition.schema, definition.name), |pending| {
                         (pending.schema, pending.name)
                     });
-                let index = u16::try_from(index).map_err(|_| {
-                    sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "enum representation slot space exhausted"
-                    )
-                })?;
+                let creation = TypeCreation::parse(definition.created_at)
+                    .expect("catalog type creation was admitted");
                 (
                     definition.database,
                     definition.created_at,
                     schema,
                     name,
-                    ColType::Enum(index),
+                    ColType::Enum(Some(creation)),
                 )
             }
             NamedTypeSlot::Composite(index) => {
@@ -924,18 +913,14 @@ impl TypeCatalog {
                     .map_or((definition.schema, definition.name), |pending| {
                         (pending.schema, pending.name)
                     });
-                let index = u16::try_from(index).map_err(|_| {
-                    sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "composite representation slot space exhausted"
-                    )
-                })?;
+                let creation = TypeCreation::parse(definition.created_at)
+                    .expect("catalog type creation was admitted");
                 (
                     definition.database,
                     definition.created_at,
                     schema,
                     name,
-                    ColType::Composite(index),
+                    ColType::Composite(Some(creation)),
                 )
             }
         };
@@ -979,7 +964,7 @@ impl TypeCatalog {
     ) -> Result<RoutineResult, SqlError> {
         let Some(identity) = result.user_type else {
             if matches!(result.ctype, ColType::Enum(_) | ColType::Composite(_))
-                || matches!(result.ctype, ColType::Array(element) if element.user_type_slot().is_some())
+                || matches!(result.ctype, ColType::Array(element) if element.is_named())
             {
                 return Err(sql_err!(
                     sqlstate::UNDEFINED_OBJECT,

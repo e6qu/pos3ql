@@ -2564,13 +2564,13 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
 
     fn enum_member_identity(
         &self,
-        slot: u16,
+        slot: crate::storage::TypeCreation,
         label: &str,
     ) -> Result<Option<super::types::EnumMemberId>, SqlError> {
         let Some(definition) = self.storage.read_enum_definition(
-            crate::storage::TypeDefinitionTarget::Slot(crate::storage::NamedTypeSlot::Enum(
-                usize::from(slot),
-            )),
+            crate::storage::TypeDefinitionTarget::by_creation(
+                self.storage, crate::storage::NamedTypeKind::Enum, slot,
+            )?,
             self.txid,
         )?
         else {
@@ -2587,7 +2587,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
 
     fn materialize_composite<'a>(
         &self,
-        slot: u16,
+        slot: crate::storage::TypeCreation,
         physical_fields: u16,
         text: &'a str,
         arena: &'a Arena,
@@ -2605,12 +2605,12 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
     fn composite_array_element<'a>(
         &self,
         value: Datum<'a>,
-        slot: u16,
+        slot: crate::storage::TypeCreation,
         arena: &'a Arena,
     ) -> Result<Datum<'a>, SqlError> {
         super::exec::coerce_user_type_array_element(
             value,
-            super::types::ArrElem::Composite(slot),
+            super::types::ArrElem::Composite(Some(slot)),
             self.storage,
             self.txid,
             arena,
@@ -4116,11 +4116,11 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         super::catalog::database_size(self.storage, self.txid)
     }
 
-    fn enum_name<'a>(&self, slot: u16, arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
+    fn enum_name<'a>(&self, slot: crate::storage::TypeCreation, arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
         let Some(def) = self.storage.read_enum_definition(
-            crate::storage::TypeDefinitionTarget::Slot(crate::storage::NamedTypeSlot::Enum(
-                usize::from(slot),
-            )),
+            crate::storage::TypeDefinitionTarget::by_creation(
+                self.storage, crate::storage::NamedTypeKind::Enum, slot,
+            )?,
             self.txid,
         )?
         else {
@@ -4136,11 +4136,11 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         ))
     }
 
-    fn enum_label_sort(&self, slot: u16, label: &str) -> Result<Option<f64>, SqlError> {
+    fn enum_label_sort(&self, slot: crate::storage::TypeCreation, label: &str) -> Result<Option<f64>, SqlError> {
         let Some(def) = self.storage.read_enum_definition(
-            crate::storage::TypeDefinitionTarget::Slot(crate::storage::NamedTypeSlot::Enum(
-                usize::from(slot),
-            )),
+            crate::storage::TypeDefinitionTarget::by_creation(
+                self.storage, crate::storage::NamedTypeKind::Enum, slot,
+            )?,
             self.txid,
         )?
         else {
@@ -4153,19 +4153,19 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         Ok(def.sort_of(label))
     }
 
-    fn ensure_enum_label_safe(&self, slot: u16, label: &str) -> Result<(), SqlError> {
+    fn ensure_enum_label_safe(&self, slot: crate::storage::TypeCreation, label: &str) -> Result<(), SqlError> {
         super::exec::ensure_enum_value_is_safe(self.storage, slot, label, self.txid)
     }
 
     fn enum_values<'a>(
         &self,
-        slot: u16,
+        slot: crate::storage::TypeCreation,
         arena: &'a Arena,
     ) -> Result<Option<&'a [Datum<'a>]>, SqlError> {
         let Some(def) = self.storage.read_enum_definition(
-            crate::storage::TypeDefinitionTarget::Slot(crate::storage::NamedTypeSlot::Enum(
-                usize::from(slot),
-            )),
+            crate::storage::TypeDefinitionTarget::by_creation(
+                self.storage, crate::storage::NamedTypeKind::Enum, slot,
+            )?,
             self.txid,
         )?
         else {
@@ -4193,10 +4193,10 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         Ok(Some(values))
     }
 
-    fn enum_slot_of_name(&self, type_name: &str) -> Option<u16> {
+    fn enum_creation_of_name(&self, type_name: &str) -> Option<crate::storage::TypeCreation> {
         self.storage
             .resolve_enum_slot(type_name, self.txid)
-            .map(|s| s as u16)
+            .map(|slot| crate::storage::TypeCreation::parse(self.storage.enum_for(slot, self.txid).created_at).expect("admitted enum birth"))
     }
 
     fn cast_user_type<'a>(
@@ -9307,7 +9307,7 @@ fn catalog_array_element_description<'q>(
             super::types::oid::composite_oid(slot),
             -1,
         )),
-        super::types::ColType::Array(super::types::ArrElem::Domain { slot, .. }) => {
+        super::types::ColType::Array(super::types::ArrElem::Domain { identity: slot, .. }) => {
             let domain = storage.domain(slot as usize);
             Some(ColDesc::of_type(name, domain.base).with_type_mod(domain.base_type_mod))
         }
@@ -9340,7 +9340,7 @@ fn catalog_array_operation_description<'q>(
             super::types::ArrElem::Enum(slot) => {
                 value.type_oid == super::types::oid::enum_oid(slot)
             }
-            super::types::ArrElem::Domain { slot, .. } => {
+            super::types::ArrElem::Domain { identity: slot, .. } => {
                 value.type_oid == storage.domain(slot as usize).base.oid()
             }
             _ => false,
@@ -9982,13 +9982,13 @@ impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_> {
         ))
     }
 
-    fn composite_field(&self, slot: u16, field: &str) -> Option<super::exec::StaticTypeMeta> {
+    fn composite_field(&self, slot: Option<crate::storage::TypeCreation>, field: &str) -> Option<super::exec::StaticTypeMeta> {
         super::exec::catalog_composite_field(self.storage, self.txid, slot, field)
     }
 
     fn visit_composite_fields(
         &self,
-        slot: u16,
+        slot: Option<crate::storage::TypeCreation>,
         visit: &mut dyn FnMut(&str, super::exec::StaticTypeMeta),
     ) -> Option<usize> {
         super::exec::visit_catalog_composite_fields(self.storage, self.txid, slot, visit)

@@ -35,6 +35,18 @@ pub(crate) enum TypeDefinitionTarget {
 }
 
 impl TypeDefinitionTarget {
+    pub(crate) fn by_creation(
+        storage: &Storage,
+        kind: super::NamedTypeKind,
+        creation: super::TypeCreation,
+    ) -> Result<Self, SqlError> {
+        storage.type_catalog.lock().expect("type catalog lock poisoned")
+            .source_reference_by_creation(kind, creation, super::current_database())
+            .map(Self::Bound)
+            .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT,
+                "named type creation no longer exists"))
+    }
+
     pub(super) fn slot(self) -> NamedTypeSlot {
         match self {
             Self::Slot(slot) => slot,

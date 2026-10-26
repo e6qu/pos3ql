@@ -257,7 +257,7 @@ pub(crate) fn column_domain_slot(
     let identity = column.user_type?;
     let slot =
         storage.domain_identity_slot(identity.schema.as_str(), identity.name.as_str(), txid)?;
-    if matches!(column.ctype, ColType::Array(crate::sql::types::ArrElem::Domain { slot: element_slot, .. }) if usize::from(element_slot) == slot)
+    if matches!(column.ctype, ColType::Array(crate::sql::types::ArrElem::Domain { identity: element_slot, .. }) if usize::from(element_slot) == slot)
     {
         None
     } else {

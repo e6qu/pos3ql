@@ -6202,23 +6202,47 @@ mod named_type_layout_probe {
         },
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq)]
+struct ProjectedColumnMeta {
+    pub name: crate::storage::SqlName,
+    pub ctype: ProjectedColType,
+    pub type_mod: i32,
+    pub collation: crate::sql::ast::Collation,
+    pub storage: crate::sql::ast::ColumnStorage,
+    pub compression: crate::sql::ast::ColumnCompression,
+    pub not_null: crate::storage::NotNullOrigin,
+    pub not_null_inheritable: bool,
+    pub unique: bool,
+    pub primary: bool,
+    pub auto_increment: bool,
+    pub default: crate::storage::ColumnDefault,
+    pub is_identity: bool,
+    pub identity_always: bool,
+    pub auto_increment_step: i64,
+    pub user_type: Option<crate::storage::UserTypeName>,
+    pub statistics_target: i16,
+    pub statistics_options: crate::sql::ast::ColumnStatisticsOptions,
+}
+
     #[test]
     fn named_type_creation_code_layout_probe() {
         use core::mem::{align_of, size_of};
         println!(
-            "layout current/projected: ColType {}/{}, ArrElem {}/{}, Datum {}/{}, ColumnMeta {}",
+            "layout current/projected: ColType {}/{}, ArrElem {}/{}, Datum {}/{}, ColumnMeta {}/{}",
             size_of::<ColType>(),
             size_of::<ProjectedColType>(),
             size_of::<ArrElem>(),
             size_of::<ProjectedArrElem>(),
             size_of::<Datum<'_>>(),
             size_of::<ProjectedDatum<'_>>(),
-            size_of::<crate::storage::ColumnMeta>()
+            size_of::<crate::storage::ColumnMeta>(),
+            size_of::<ProjectedColumnMeta>()
         );
         assert_eq!(size_of::<ProposedCreation>(), 3);
         assert_eq!(size_of::<Option<ProposedCreation>>(), 3);
         assert_eq!(align_of::<ProposedCreation>(), 1);
-        assert!(size_of::<ProjectedColType>() <= size_of::<ColType>());
+        assert!(size_of::<ProjectedColType>() <= 7);
+        assert!(size_of::<ProjectedColumnMeta>() <= 512);
         assert!(align_of::<ProjectedColType>() <= align_of::<ColType>());
         assert!(size_of::<ProjectedArrElem>() <= 7);
         assert!(align_of::<ProjectedArrElem>() <= align_of::<ArrElem>());
@@ -6233,6 +6257,5 @@ mod named_type_layout_probe {
         for created_at in [0, 10_000_000, u64::MAX] {
             assert!(ProposedCreation::parse(created_at).is_none());
         }
-
     }
 }

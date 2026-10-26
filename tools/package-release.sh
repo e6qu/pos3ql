@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Host filesystem metadata is not part of a release archive.
+export COPYFILE_DISABLE=1
+
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 OUTPUT=${1:-"$ROOT/dist"}
 BINARY=${POS3QL_RELEASE_BINARY:-"$ROOT/target/release/pos3ql"}

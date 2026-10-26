@@ -14276,16 +14276,13 @@ fn pg_description<'a>(
                 (crate::storage::policy_oid(&policy), PG_POLICY_OID)
             }
             crate::storage::CommentClass::Statistics => {
-                let Some((slot, _)) = storage
+                let Some((_, statistics)) = storage
                     .extended_statistics_visible(txid)
-                    .find(|(slot, _)| storage.extended_statistics(*slot).creation().get() == subid)
+                    .find(|(_, statistics)| statistics.creation().get() == subid)
                 else {
                     continue;
                 };
-                (
-                    storage.extended_statistics(slot).oid(),
-                    PG_STATISTIC_EXT_OID,
-                )
+                (statistics.oid(), PG_STATISTIC_EXT_OID)
             }
             crate::storage::CommentClass::Publication => {
                 let Some((_, publication)) = storage
@@ -15112,10 +15109,11 @@ fn visit_comments_for_object(
                 class == crate::storage::CommentClass::Statistics
                     && subid == 0
                     && signed_oid.is_some_and(|oid| {
-                        storage.extended_statistics_visible(txid).any(|(slot, _)| {
-                            storage.extended_statistics(slot).oid() == oid
-                                && csub == storage.extended_statistics(slot).creation().get()
-                        })
+                        storage
+                            .extended_statistics_visible(txid)
+                            .any(|(_, statistics)| {
+                                statistics.oid() == oid && csub == statistics.creation().get()
+                            })
                     })
             }
             "pg_publication" => {

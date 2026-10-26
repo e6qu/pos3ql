@@ -1242,8 +1242,8 @@ fn comment_reference(
         CommentClass::Statistics => EventObjectRef::Primary(ObjectRef::Statistics(
             storage
                 .extended_statistics_visible(txid)
-                .find_map(|(slot, _)| {
-                    (storage.extended_statistics(slot).creation().get() == subid).then_some(slot)
+                .find_map(|(slot, statistics)| {
+                    (statistics.creation().get() == subid).then_some(slot)
                 })
                 .ok_or_else(graph_full)?,
         )),

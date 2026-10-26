@@ -5949,7 +5949,7 @@ mod named_type_layout_probe {
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProjectedColType {
+enum ProjectedColType {
     Void,
     Internal,
     PgDdlCommand,
@@ -6026,7 +6026,7 @@ pub enum ProjectedColType {
 }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProjectedArrElem {
+enum ProjectedArrElem {
     Bool,
     Char,
     Int4,
@@ -6095,7 +6095,7 @@ pub enum ProjectedArrElem {
 }
 
     #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum ProjectedDatum<'a> {
+enum ProjectedDatum<'a> {
     Null,
     PgDdlCommand,
     Bool(bool),

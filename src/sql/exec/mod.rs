@@ -41131,8 +41131,11 @@ fn build_domain_spec(
         ));
     }
     let (not_null, not_null_name) = match nullability {
-        crate::sql::ast::DomainNullability::Unspecified | crate::sql::ast::DomainNullability::Nullable => (false, None),
-        crate::sql::ast::DomainNullability::NotNull { name } => (true, name.map(SqlName::parse).transpose()?),
+        crate::sql::ast::DomainNullability::Unspecified
+        | crate::sql::ast::DomainNullability::Nullable => (false, None),
+        crate::sql::ast::DomainNullability::NotNull { name } => {
+            (true, name.map(SqlName::parse).transpose()?)
+        }
     };
     let resolved = resolve_routine_type(storage, txid, base_type)?;
     let (base_domain, base_user_type, inherited_default) =
@@ -67248,10 +67251,19 @@ fn alter_table_relation(
                         n_owned_sequences_to_drop += 1;
                     }
                 }
+                let mut name_edits = ColumnSet::EMPTY;
+                for column in 0..new_def.n_columns {
+                    if column != i && new_def.not_null_name_edits.contains(column) {
+                        name_edits.insert(if column > i { column - 1 } else { column });
+                    }
+                }
                 for j in i..new_def.n_columns - 1 {
                     new_def.columns[j] = new_def.columns[j + 1];
+                    new_def.not_null_names[j] = new_def.not_null_names[j + 1];
                     source[j] = source[j + 1];
                 }
+                new_def.not_null_names[new_def.n_columns - 1] = None;
+                new_def.not_null_name_edits = name_edits;
                 new_def.n_columns -= 1;
                 dropped_any = true;
             }

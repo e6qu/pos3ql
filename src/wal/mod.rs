@@ -7975,6 +7975,8 @@ fn decode_op_inner<'a>(
             def.replica_identity =
                 crate::storage::ReplicaIdentityMode::from_code(*payload.get(at)?)?;
             at += 1;
+            // Stored names are authoritative during later column remapping.
+            def.not_null_name_edits = crate::storage::ColumnSet::all(n_cols);
             for identity in def.implicit_index_identities_mut() {
                 let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
                 at += 8;
@@ -7988,7 +7990,11 @@ fn decode_op_inner<'a>(
                     bytes.try_into().ok()?,
                 )?);
             }
-            crate::storage::validate_constraint_lifetimes(def.constraint_identities(), identity.created_at()).ok()?;
+            crate::storage::validate_constraint_lifetimes(
+                def.constraint_identities(),
+                identity.created_at(),
+            )
+            .ok()?;
             for (position, identity) in def.implicit_index_identities().enumerate() {
                 if def
                     .implicit_index_identities()
@@ -9962,7 +9968,11 @@ fn decode_op_inner<'a>(
                 pending_definition: None,
                 ddl_state: crate::storage::CatalogDdlState::Absent,
             };
-            crate::storage::validate_constraint_lifetimes(definition.constraint_identities(), definition.created_at).ok()?;
+            crate::storage::validate_constraint_lifetimes(
+                definition.constraint_identities(),
+                definition.created_at,
+            )
+            .ok()?;
             if decoded_domain.is_none()
                 && (kind == KIND_CREATE_DOMAIN_TYPED) != domain_needs_typed_journal(&definition)
             {

@@ -66,8 +66,8 @@ jobs:
       - name: Verify constraint lifetimes and cold recovery
         shell: bash
         run: |
-          python3 tools/test_command.py cargo test --lib --locked -- constraint_public_identifiers constraint_manifest_wide constraint_declaration_names --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/constraint-lifetimes.log"
-          grep -Eq 'test result: ok\. 4 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/constraint-lifetimes.log"
+          python3 tools/test_command.py cargo test --lib --locked -- constraint_public_identifiers constraint_manifest_wide constraint_declaration_names constraint_identity_ --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/constraint-lifetimes.log"
+          grep -Eq 'test result: ok\. 7 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/constraint-lifetimes.log"
       - name: Build every target and lint
         run: cargo clippy --all-targets --locked -- -D warnings
       - name: Retain constraint and formatting evidence

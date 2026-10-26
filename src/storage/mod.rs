@@ -43,7 +43,8 @@ pub(crate) use catalog_sources::{
 };
 mod constraint_identities;
 pub(crate) use constraint_identities::{
-    ConstraintIdentity, ForeignKeyTrigger, validate_constraint_identities, validate_constraint_lifetimes,
+    ConstraintIdentity, ForeignKeyTrigger, validate_constraint_identities,
+    validate_constraint_lifetimes,
 };
 mod column_maps;
 pub(crate) use column_maps::{RelationColumnMap, RelationRowDecoder};
@@ -1936,6 +1937,7 @@ pub struct TableDef {
     pub columns: [ColumnMeta; MAX_COLUMNS],
     pub n_columns: usize,
     pub(crate) not_null_names: [Option<SqlName>; MAX_COLUMNS],
+    pub(crate) not_null_name_edits: ColumnSet,
     pub(crate) not_null_identities: [Option<ConstraintIdentity>; MAX_RELATION_COLUMNS],
     pub(crate) attributes: column_attributes::ColumnAttributes,
     pub(crate) inline_index_identities: [Option<RelationIdentity>; MAX_RELATION_COLUMNS],
@@ -2358,6 +2360,7 @@ impl TableDef {
             columns: [ColumnMeta::EMPTY; MAX_COLUMNS],
             n_columns: 0,
             not_null_names: [None; MAX_COLUMNS],
+            not_null_name_edits: ColumnSet::EMPTY,
             not_null_identities: [None; MAX_RELATION_COLUMNS],
             attributes: column_attributes::ColumnAttributes::EMPTY,
             inline_index_identities: [None; MAX_RELATION_COLUMNS],

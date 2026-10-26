@@ -1354,10 +1354,11 @@ fn constraint_public_identifiers_survive_edits_replacement_and_savepoint_rollbac
         {
             let output = session.success(&mut engine, statement, true);
             let rows = data_rows(&output);
-            assert!(
-                rows.iter().all(|row| row == "t"),
-                "after {observations} checks; {statement}: {rows:?}"
-            );
+            if rows.iter().any(|row| row != "t") {
+                let actual = data_rows(&session.success(&mut engine,
+                    "SELECT conname, oid, contype, conrelid, contypid FROM pg_constraint WHERE conrelid = 'constraint_rules'::regclass OR contypid = 'constraint_domain'::regtype; SELECT name, identity FROM saved_constraint_identities ORDER BY name", false));
+                panic!("after {observations} checks; {statement}: {rows:?}; catalog and saved rows: {actual:?}");
+            }
             observations += rows.len();
         }
         assert_eq!(observations, 13);
@@ -1457,18 +1458,36 @@ fn constraint_declaration_names_and_rejections_match_postgresql() {
         let mut engine = Engine::new(&config, &mut budget).unwrap();
         let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
         let mut states = Vec::new();
-        for statement in include_str!("../../tests/external/differential_exact/30_domain_constraint_errors.sql")
-            .split(';').map(str::trim).filter(|statement| !statement.is_empty())
+        for statement in
+            include_str!("../../tests/external/differential_exact/30_domain_constraint_errors.sql")
+                .split(';')
+                .map(str::trim)
+                .filter(|statement| !statement.is_empty())
         {
             let output = session.execute(&mut engine, statement, true);
             states.extend(error_sqlstates(&output).into_iter().map(str::to_owned));
         }
-        assert_eq!(states, ["42P17", "42601", "42601", "42P17", "42P17", "42601", "42710", "42710"]);
-        assert_eq!(data_rows(&session.success(&mut engine,
-            "SELECT count(*) = 0 FROM pg_type WHERE typname LIKE 'declaration_%'", true)), ["t"]);
+        assert_eq!(
+            states,
+            [
+                "42P17", "42601", "42601", "42P17", "42P17", "42601", "42710", "42710"
+            ]
+        );
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "SELECT count(*) = 0 FROM pg_type WHERE typname LIKE 'declaration_%'",
+                true
+            )),
+            ["t"]
+        );
         let mut observations = 0;
-        for statement in include_str!("../../tests/external/differential_exact/31_domain_constraint_declarations.sql")
-            .split(';').map(str::trim).filter(|statement| !statement.is_empty())
+        for statement in include_str!(
+            "../../tests/external/differential_exact/31_domain_constraint_declarations.sql"
+        )
+        .split(';')
+        .map(str::trim)
+        .filter(|statement| !statement.is_empty())
         {
             let output = session.success(&mut engine, statement, true);
             let rows = data_rows(&output);
@@ -1503,7 +1522,9 @@ fn constraint_manifest_wide_domains_survive_journal_and_checkpoint_recovery() {
                 assert_eq!(
                     data_rows(&session.success(
                         &mut engine,
-                        include_str!("../../tests/external/differential_exact/29_wide_domain_constraints.sql"),
+                        include_str!(
+                            "../../tests/external/differential_exact/29_wide_domain_constraints.sql"
+                        ),
                         false
                     )),
                     ["t"]
@@ -1527,7 +1548,11 @@ fn constraint_manifest_wide_domains_survive_journal_and_checkpoint_recovery() {
                     ["t"]
                 );
                 assert_eq!(
-                    error_sqlstates(&session.execute(&mut engine, "SELECT (-1)::wide_constraint_domain", true)),
+                    error_sqlstates(&session.execute(
+                        &mut engine,
+                        "SELECT (-1)::wide_constraint_domain",
+                        true
+                    )),
                     ["23514"]
                 );
             }

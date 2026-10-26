@@ -5590,8 +5590,13 @@ impl Checkpointer {
                             "constraint identity outside table",
                         ));
                     };
-                    if storage.is_large_object_page_relation(definition.schema.as_str(), definition.name.as_str()) {
-                        return Err(CheckpointSetupError::Corrupt("internal storage table has no SQL constraint identities"));
+                    if storage.is_large_object_page_relation(
+                        definition.schema.as_str(),
+                        definition.name.as_str(),
+                    ) {
+                        return Err(CheckpointSetupError::Corrupt(
+                            "internal storage table has no SQL constraint identities",
+                        ));
                     }
                     let position: usize = parse_field(words.next(), "constraint position")?;
                     let created_at: u64 = parse_field(words.next(), "constraint creation")?;
@@ -9970,25 +9975,39 @@ impl Checkpointer {
             use core::fmt::Write;
             write!(&mut self.manifest_output, "enm3 {} {} ", slot, e.created_at)
                 .map_err(|_| manifest_full())?;
-            write!(&mut self.manifest_output, "{}", ManifestZeroName(e.schema.as_str()))
-                .map_err(|_| manifest_full())?;
+            write!(
+                &mut self.manifest_output,
+                "{}",
+                ManifestZeroName(e.schema.as_str())
+            )
+            .map_err(|_| manifest_full())?;
             write!(&mut self.manifest_output, " ").map_err(|_| manifest_full())?;
-            write!(&mut self.manifest_output, "{}", ManifestZeroName(e.name.as_str()))
-                .map_err(|_| manifest_full())?;
+            write!(
+                &mut self.manifest_output,
+                "{}",
+                ManifestZeroName(e.name.as_str())
+            )
+            .map_err(|_| manifest_full())?;
             write!(&mut self.manifest_output, " {}", definition.members().len())
                 .map_err(|_| manifest_full())?;
             for m in definition.members() {
                 write!(&mut self.manifest_output, " ").map_err(|_| manifest_full())?;
-                write!(&mut self.manifest_output, "{}", ManifestZeroName(m.label.as_str()))
-                    .map_err(|_| manifest_full())?;
+                write!(
+                    &mut self.manifest_output,
+                    "{}",
+                    ManifestZeroName(m.label.as_str())
+                )
+                .map_err(|_| manifest_full())?;
                 write!(&mut self.manifest_output, " {}", m.sort.to_bits())
                     .map_err(|_| manifest_full())?;
                 write!(&mut self.manifest_output, " ").map_err(|_| manifest_full())?;
                 match m.legacy_label {
-                    Some(label) => {
-                        write!(&mut self.manifest_output, "{}", ManifestZeroName(label.as_str()))
-                            .map_err(|_| manifest_full())?
-                    }
+                    Some(label) => write!(
+                        &mut self.manifest_output,
+                        "{}",
+                        ManifestZeroName(label.as_str())
+                    )
+                    .map_err(|_| manifest_full())?,
                     None => write!(&mut self.manifest_output, "-").map_err(|_| manifest_full())?,
                 }
                 let identity = m.identity.ok_or_else(|| {

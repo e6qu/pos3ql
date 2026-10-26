@@ -518,7 +518,10 @@ impl EventObjectRef {
                 let domain_slot = usize::from(domain);
                 let domain = storage.domain_for(domain_slot, txid);
                 let name = domain.constraint_name(constraint).ok_or_else(|| {
-                    sql_err!(sqlstate::UNDEFINED_OBJECT, "domain constraint no longer exists")
+                    sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "domain constraint no longer exists"
+                    )
                 })?;
                 let mut identity = EventIdentity::new();
                 write!(
@@ -2592,7 +2595,8 @@ fn existing_catalog_object(
                         .domain_for(domain, txid)
                         .constraint_identities()
                         .find_map(|identity| {
-                            identity.filter(|identity| identity.oid() == object_id)
+                            identity
+                                .filter(|identity| identity.oid() == object_id)
                                 .map(|identity| (domain, identity))
                         })
                 })

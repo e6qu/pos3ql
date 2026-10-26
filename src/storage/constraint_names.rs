@@ -74,6 +74,13 @@ fn choose(
     ))
 }
 
+impl TableDef {
+    pub(crate) fn set_not_null_constraint_name(&mut self, column: usize, name: SqlName) {
+        self.not_null_names[column] = Some(name);
+        self.not_null_name_edits.insert(column);
+    }
+}
+
 pub(crate) fn table(definition: &mut TableDef) -> Result<(), SqlError> {
     for position in 0..definition.n_columns {
         let column = definition.columns[position];
@@ -134,6 +141,7 @@ pub(crate) fn table(definition: &mut TableDef) -> Result<(), SqlError> {
             ));
         }
     }
+    definition.not_null_name_edits = super::ColumnSet::EMPTY;
     Ok(())
 }
 
@@ -154,6 +162,11 @@ pub(crate) fn remap_table(
                     )
                 })?;
             names[target] = previous.not_null_names[column];
+        }
+    }
+    for (column, name) in names[..definition.n_columns].iter_mut().enumerate() {
+        if definition.not_null_name_edits.contains(column) {
+            *name = definition.not_null_names[column];
         }
     }
     definition.not_null_names = names;

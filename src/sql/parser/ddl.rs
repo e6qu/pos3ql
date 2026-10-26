@@ -4484,19 +4484,26 @@ impl<'a> Parser<'a> {
             if self.eat_ident("not")? {
                 self.expect_ident("null")?;
                 match nullability {
-                    DomainNullability::Nullable => return Err(self.err_here("conflicting NULL/NOT NULL constraints")),
-                    DomainNullability::NotNull { .. } => return Err(ParseError {
-                        at: self.peek_at,
-                        message: stack_format!(96, "redundant NOT NULL constraint definition"),
-                        sqlstate: sqlstate::INVALID_OBJECT_DEFINITION,
-                    }),
+                    DomainNullability::Nullable => {
+                        return Err(self.err_here("conflicting NULL/NOT NULL constraints"));
+                    }
+                    DomainNullability::NotNull { .. } => {
+                        return Err(ParseError {
+                            at: self.peek_at,
+                            message: stack_format!(96, "redundant NOT NULL constraint definition"),
+                            sqlstate: sqlstate::INVALID_OBJECT_DEFINITION,
+                        });
+                    }
                     DomainNullability::Unspecified => {}
                 }
                 if self.eat_ident("no")? {
                     self.expect_ident("inherit")?;
                     return Err(ParseError {
                         at: self.peek_at,
-                        message: stack_format!(96, "not-null constraints for domains cannot be marked NO INHERIT"),
+                        message: stack_format!(
+                            96,
+                            "not-null constraints for domains cannot be marked NO INHERIT"
+                        ),
                         sqlstate: sqlstate::INVALID_OBJECT_DEFINITION,
                     });
                 }
@@ -4516,7 +4523,10 @@ impl<'a> Parser<'a> {
                     self.expect_ident("inherit")?;
                     return Err(ParseError {
                         at: self.peek_at,
-                        message: stack_format!(96, "check constraints for domains cannot be marked NO INHERIT"),
+                        message: stack_format!(
+                            96,
+                            "check constraints for domains cannot be marked NO INHERIT"
+                        ),
                         sqlstate: sqlstate::INVALID_OBJECT_DEFINITION,
                     });
                 }
@@ -7979,6 +7989,7 @@ impl<'a> Parser<'a> {
                 self.warn(again)?;
             }
             let mut not_null = false;
+            let mut null_clause = None;
             let mut unique = false;
             let mut primary = false;
             let mut not_null_inheritable = true;
@@ -7995,12 +8006,23 @@ impl<'a> Parser<'a> {
                 };
                 if self.eat_ident("not")? {
                     self.expect_ident("null")?;
+                    if null_clause == Some(false) {
+                        return Err(self.err_here("conflicting NULL/NOT NULL declarations"));
+                    }
+                    null_clause = Some(true);
                     not_null = true;
                     if self.eat_ident("no")? {
                         self.expect_ident("inherit")?;
                         not_null_inheritable = false;
                     }
+                    if let Some(name) = col_cons_name {
+                        self.push(&mut cons, TableConstraint::NamedNotNull { name, column: col_name })?;
+                    }
                 } else if self.eat_ident("null")? {
+                    if null_clause == Some(true) {
+                        return Err(self.err_here("conflicting NULL/NOT NULL declarations"));
+                    }
+                    null_clause = Some(false);
                     not_null = false;
                 } else if self.eat_ident("default")? {
                     let start = self.peek_at;

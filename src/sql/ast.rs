@@ -3862,6 +3862,10 @@ impl ColumnStatisticsOptionNames {
 /// name its single column.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TableConstraint<'a> {
+    NamedNotNull {
+        name: &'a str,
+        column: &'a str,
+    },
     PrimaryKey {
         name: Option<&'a str>,
         columns: &'a [&'a str],

@@ -15514,7 +15514,11 @@ pub fn constraint_def_text<'a>(
                 if !column.not_null_inheritable {
                     let _ = rendered.write_str(" NO INHERIT");
                 }
-                return Ok(Some(alloc_rendered(&rendered, "NOT NULL definition is too long", arena)?));
+                return Ok(Some(alloc_rendered(
+                    &rendered,
+                    "NOT NULL definition is too long",
+                    arena,
+                )?));
             }
         }
         for check in table.checks() {

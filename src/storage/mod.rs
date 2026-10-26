@@ -40039,17 +40039,34 @@ impl Storage {
                     "named column type lacks its durable identity"
                 ));
             }
-            return Ok(DeclaredColumnType::Builtin { oid: column.ctype.oid() });
+            return Ok(DeclaredColumnType::Builtin {
+                oid: column.ctype.oid(),
+            });
         };
-        let catalog = self.type_catalog.lock().expect("type catalog lock poisoned");
+        let catalog = self
+            .type_catalog
+            .lock()
+            .expect("type catalog lock poisoned");
         let bound = catalog.bind_type_reference(
-            RoutineResult { ctype: column.ctype, user_type: Some(identity) },
-            current_database(), txid,
+            RoutineResult {
+                ctype: column.ctype,
+                user_type: Some(identity),
+            },
+            current_database(),
+            txid,
         )?;
-        let source = catalog.resolve_type_reference(
-            bound.user_type.expect("named column type was bound"), current_database(), txid,
-        )?.ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT,
-            "declared column type no longer exists"))?;
+        let source = catalog
+            .resolve_type_reference(
+                bound.user_type.expect("named column type was bound"),
+                current_database(),
+                txid,
+            )?
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "declared column type no longer exists"
+                )
+            })?;
         Ok(source.declared_type(bound.ctype))
     }
 
@@ -40778,29 +40795,6 @@ impl Storage {
                 .then_some(slot)
         })
     }
-    /// Resolves a durable declaration while its owner transaction moves the
-    /// public name. SQL lookup continues to use enum_slot.
-    pub(crate) fn enum_identity_slot(&self, schema: &str, name: &str, txid: u32) -> Option<usize> {
-        self.enum_slot(schema, name, txid).or_else(|| {
-            EnumIter {
-                catalog: &self.type_catalog,
-                next_slot: 0,
-            }
-            .find_map(|(slot, definition)| {
-                (definition.database == current_database()
-                    && definition.visible_to(txid)
-                    && definition.schema.as_str() == schema
-                    && definition.name.as_str() == name
-                    && definition.pending_definition.is_some_and(|pending| {
-                        pending.txid == txid
-                            && (pending.schema != definition.schema
-                                || pending.name != definition.name)
-                    }))
-                .then_some(slot)
-            })
-        })
-    }
-
     pub(crate) fn enum_for(&self, slot: usize, txid: u32) -> EnumDefinition {
         let (definition, image, safe_member_count) = {
             let catalog = self
@@ -41505,46 +41499,6 @@ impl Storage {
             visible_schema.as_str() == schema && visible_name.as_str() == name
         })
     }
-    /// Resolves a durable declaration while its owner transaction moves the
-    /// public name. SQL lookup continues to use composite_slot.
-    pub(crate) fn composite_identity_slot(
-        &self,
-        schema: &str,
-        name: &str,
-        txid: u32,
-    ) -> Option<usize> {
-        let catalog = self
-            .type_catalog
-            .lock()
-            .expect("type catalog lock poisoned");
-        catalog
-            .composites
-            .iter()
-            .position(|definition| {
-                if definition.database != current_database() || !definition.visible_to(txid) {
-                    return false;
-                }
-                let (visible_schema, visible_name) = definition.names_for(txid);
-                visible_schema.as_str() == schema && visible_name.as_str() == name
-            })
-            .or_else(|| {
-                catalog.composites.iter().position(|definition| {
-                    definition.database == current_database()
-                        && definition.visible_to(txid)
-                        && definition.schema.as_str() == schema
-                        && definition.name.as_str() == name
-                        && definition
-                            .pending_definition
-                            .as_ref()
-                            .is_some_and(|pending| {
-                                pending.txid == txid
-                                    && (pending.schema != definition.schema
-                                        || pending.name != definition.name)
-                            })
-                })
-            })
-    }
-
     /// Resolve the closed PostgreSQL `ALTER TYPE ... OWNER` target set.
     ///
     /// Search-path resolution is performed once across the shared named-type

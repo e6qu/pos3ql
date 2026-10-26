@@ -795,9 +795,9 @@ impl TypeCatalog {
         if slot.kind() != kind {
             return None;
         }
-        Some(TypeReference(ReferenceIdentity::Captured(TypeIdentity::new(
-            self.origin, database, slot, creation.created_at(),
-        ))))
+        Some(TypeReference(ReferenceIdentity::Captured(
+            TypeIdentity::new(self.origin, database, slot, creation.created_at()),
+        )))
     }
 
     pub(super) fn resolve_source_reference(
@@ -815,12 +815,14 @@ impl TypeCatalog {
             ));
         }
         let key = reference.stored();
-        let Some(bound) = self.source_reference_by_creation(
-            key.slot().kind(), key.created_at, database,
-        ).filter(|bound| bound.slot() == key.slot()) else {
+        let Some(bound) = self
+            .source_reference_by_creation(key.slot().kind(), key.created_at, database)
+            .filter(|bound| bound.slot() == key.slot())
+        else {
             return Ok(None);
         };
-        Ok(self.type_snapshot(bound.slot(), transaction)?
+        Ok(self
+            .type_snapshot(bound.slot(), transaction)?
             .filter(|snapshot| reference.refers_to(snapshot.identity, database)))
     }
 

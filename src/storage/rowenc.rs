@@ -989,7 +989,7 @@ pub(crate) fn decode<'a>(
                 at += len;
                 let label = core::str::from_utf8(raw).map_err(|_| corrupt())?;
                 out[i] = Datum::Enum {
-                    slot,
+                    slot: slot.ok_or_else(corrupt)?,
                     member,
                     sort,
                     label,
@@ -1007,7 +1007,7 @@ pub(crate) fn decode<'a>(
                 at += len;
                 let text = core::str::from_utf8(raw).map_err(|_| corrupt())?;
                 out[i] = Datum::CompositeText {
-                    slot,
+                    slot: slot.ok_or_else(corrupt)?,
                     physical_fields,
                     text,
                 };

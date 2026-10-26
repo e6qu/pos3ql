@@ -9655,6 +9655,10 @@ pub(crate) struct PendingDomainIdentity {
 }
 
 impl DomainDef {
+    pub(crate) fn creation(&self) -> TypeCreation {
+        TypeCreation::parse(self.created_at).expect("catalog type creation was admitted")
+    }
+
     pub(crate) const EMPTY: Self = DomainDef {
         database: DatabaseOid::POSTGRES,
         created_at: 0,
@@ -9811,6 +9815,10 @@ pub struct EnumDefinition {
 }
 
 impl EnumDefinition {
+    pub(crate) fn creation(&self) -> TypeCreation {
+        TypeCreation::parse(self.created_at).expect("catalog type creation was admitted")
+    }
+
     pub(crate) fn label_is_uncommitted(&self, label: &str) -> bool {
         self.members()
             .position(|member| member.label.as_str() == label)
@@ -9993,6 +10001,10 @@ pub(crate) struct PendingCompositeDefinition {
 }
 
 impl CompositeDef {
+    pub(crate) fn creation(&self) -> TypeCreation {
+        TypeCreation::parse(self.created_at).expect("catalog type creation was admitted")
+    }
+
     pub(crate) const EMPTY: Self = Self {
         database: DatabaseOid::POSTGRES,
         created_at: 0,
@@ -40269,155 +40281,45 @@ impl Storage {
             .type_catalog
             .lock()
             .expect("type catalog lock poisoned");
-        let TypeCatalog {
-            domains,
-            enums,
-            composites,
-            ..
-        } = &mut *catalog;
-        let mut state = self
-            .domain_graph_scratch
-            .lock()
+        let mut state = self.domain_graph_scratch.lock()
             .expect("domain graph scratch lock poisoned");
         let mut remaining = 0usize;
         for (slot, marker) in state.iter_mut().enumerate() {
-            let domain = domains[slot];
+            let domain = catalog.domains[slot].definition_for(txid);
             if domain.database == current_database && domain.visible_to(txid) {
+                for identity in [domain.base_domain, domain.base_user_type].into_iter().flatten() {
+                    catalog.resolve_type_reference(identity, current_database, txid)?
+                        .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT,
+                            "domain base type no longer exists"))?;
+                }
                 *marker = 0;
                 remaining += 1;
-            } else {
-                *marker = 2;
-            }
+            } else { *marker = 2; }
         }
-
         while remaining != 0 {
             let before = remaining;
-            for slot in 0..domains.len() {
-                if state[slot] != 0 {
-                    continue;
-                }
-                let domain = domains[slot].definition_for(txid);
-                let rebound = if let Some(parent) = domain.base_domain {
-                    let parent_slot = domains
-                        .iter()
-                        .position(|candidate| {
-                            let candidate = candidate.definition_for(txid);
-                            candidate.database == current_database
-                                && candidate.visible_to(txid)
-                                && candidate.schema == parent.schema
-                                && candidate.name == parent.name
-                        })
-                        .ok_or_else(|| {
-                            sql_err!(
-                                sqlstate::UNDEFINED_OBJECT,
-                                "domain base \"{}.{}\" does not exist",
-                                parent.schema.as_str(),
-                                parent.name.as_str()
-                            )
-                        })?;
-                    if state[parent_slot] == 0 {
-                        continue;
+            for slot in 0..catalog.domains.len() {
+                if state[slot] != 0 { continue; }
+                let domain = catalog.domains[slot].definition_for(txid);
+                let rebound = if let Some(identity) = domain.base_domain.or(domain.base_user_type) {
+                    let source = catalog.resolve_type_reference(identity, current_database, txid)?
+                        .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT,
+                            "domain base type no longer exists"))?;
+                    if domain.base_domain.is_some() && !matches!(source.identity.slot(), NamedTypeSlot::Domain(_)) {
+                        return Err(sql_err!(sqlstate::DATATYPE_MISMATCH,
+                            "domain parent does not identify a domain"));
                     }
-                    domains[parent_slot].definition_for(txid).base
-                } else if let Some(identity) = domain.base_user_type {
-                    match domain.base {
-                        ColType::Enum(_) | ColType::Array(ArrElem::Enum(_)) => {
-                            let slot = enums
-                                .iter()
-                                .position(|candidate| {
-                                    let candidate = candidate.definition_for(txid);
-                                    candidate.database == current_database
-                                        && candidate.visible_to(txid)
-                                        && candidate.schema == identity.schema
-                                        && candidate.name == identity.name
-                                })
-                                .ok_or_else(|| {
-                                    sql_err!(
-                                        sqlstate::UNDEFINED_OBJECT,
-                                        "domain base enum \"{}.{}\" does not exist",
-                                        identity.schema.as_str(),
-                                        identity.name.as_str()
-                                    )
-                                })? as u16;
-                            match domain.base {
-                                ColType::Array(_) => ColType::Array(ArrElem::Enum(slot)),
-                                _ => ColType::Enum(slot),
-                            }
-                        }
-                        ColType::Composite(_) | ColType::Array(ArrElem::Composite(_)) => {
-                            let slot = composites
-                                .iter()
-                                .position(|candidate| {
-                                    let candidate = candidate.definition_for(txid);
-                                    candidate.database == current_database
-                                        && candidate.visible_to(txid)
-                                        && candidate.schema == identity.schema
-                                        && candidate.name == identity.name
-                                })
-                                .ok_or_else(|| {
-                                    sql_err!(
-                                        sqlstate::UNDEFINED_OBJECT,
-                                        "domain base composite \"{}.{}\" does not exist",
-                                        identity.schema.as_str(),
-                                        identity.name.as_str()
-                                    )
-                                })? as u16;
-                            match domain.base {
-                                ColType::Array(_) => ColType::Array(ArrElem::Composite(slot)),
-                                _ => ColType::Composite(slot),
-                            }
-                        }
-                        ColType::Array(ArrElem::Domain { .. }) => {
-                            let element_slot = domains
-                                .iter()
-                                .position(|candidate| {
-                                    let candidate = candidate.definition_for(txid);
-                                    candidate.database == current_database
-                                        && candidate.visible_to(txid)
-                                        && candidate.schema == identity.schema
-                                        && candidate.name == identity.name
-                                })
-                                .ok_or_else(|| {
-                                    sql_err!(
-                                        sqlstate::UNDEFINED_OBJECT,
-                                        "domain array element does not exist"
-                                    )
-                                })?;
-                            if state[element_slot] == 0 {
-                                continue;
-                            }
-                            ColType::Array(
-                                ArrElem::domain(
-                                    element_slot as u16,
-                                    domains[element_slot].definition_for(txid).base,
-                                )
-                                .ok_or_else(|| {
-                                    sql_err!(
-                                        sqlstate::DATATYPE_MISMATCH,
-                                        "domain base cannot be an array element"
-                                    )
-                                })?,
-                            )
-                        }
-                        _ => {
-                            return Err(sql_err!(
-                                sqlstate::PROTOCOL_VIOLATION,
-                                "domain base identity names a non-user-defined type"
-                            ));
-                        }
-                    }
-                } else {
-                    domain.base
-                };
-                domains[slot].base = rebound;
+                    if let NamedTypeSlot::Domain(parent) = source.identity.slot()
+                        && state[parent] == 0 { continue; }
+                    source.representation(domain.base)?
+                } else { domain.base };
+                catalog.domains[slot].base = rebound;
                 state[slot] = 2;
                 remaining -= 1;
             }
             if remaining == before {
-                return Err(sql_err!(
-                    sqlstate::PROTOCOL_VIOLATION,
-                    "recovered domain base chain contains a cycle"
-                ));
+                return Err(sql_err!(sqlstate::PROTOCOL_VIOLATION,
+                    "recovered domain base chain contains a cycle"));
             }
         }
         for slot in 0..catalog.domains.len() {
@@ -40865,6 +40767,7 @@ impl Storage {
     /// Whether any table column (in any table) is declared with this enum —
     /// the dependency that makes `DROP TYPE ... RESTRICT` fail.
     pub fn enum_in_use(&self, slot: usize) -> Option<(SqlName, SqlName)> {
+        let creation = self.enum_for(slot, 0).creation();
         for table in self
             .tables
             .iter()
@@ -40872,10 +40775,10 @@ impl Storage {
         {
             let definition = table.definition();
             for col in definition.columns() {
-                if matches!(col.ctype, ColType::Enum(s) if s as usize == slot)
+                if matches!(col.ctype, ColType::Enum(s) if s == Some(creation))
                     || matches!(
                         col.ctype,
-                        ColType::Array(ArrElem::Enum(s)) if s as usize == slot
+                        ColType::Array(ArrElem::Enum(s)) if s == Some(creation)
                     )
                 {
                     return Some((definition.name, col.name));

@@ -518,7 +518,7 @@ impl EventObjectRef {
                 array_type_object(
                     domain.schema.as_str(),
                     domain.name.as_str(),
-                    crate::sql::types::oid::domain_array_oid(slot as u16),
+                    crate::sql::types::oid::domain_array_oid(storage.domain_for(slot, txid).creation()),
                 )?
             }
             Self::DomainConstraint { domain, constraint } => {
@@ -557,7 +557,7 @@ impl EventObjectRef {
                 array_type_object(
                     enumeration.schema.as_str(),
                     enumeration.name.as_str(),
-                    crate::sql::types::oid::enum_array_oid(slot as u16),
+                    crate::sql::types::oid::enum_array_oid(storage.enum_for(slot, txid).creation()),
                 )?
             }
             Self::CompositeRelation(slot) => {
@@ -579,7 +579,7 @@ impl EventObjectRef {
                 array_type_object(
                     composite.schema.as_str(),
                     composite.name.as_str(),
-                    crate::sql::types::oid::composite_array_oid(slot as u16),
+                    crate::sql::types::oid::composite_array_oid(storage.composite_for(slot, txid).creation()),
                 )?
             }
             Self::NamedType { oid, schema, name } => {
@@ -1626,7 +1626,7 @@ fn primary_object(
             let domain = storage.domain_for(slot, txid);
             base_object(
                 catalog::PG_TYPE_OID,
-                catalog::domain_oid(slot),
+                catalog::domain_oid(storage, slot, txid),
                 "type",
                 Some(domain.schema.as_str()),
                 Some(domain.name.as_str()),
@@ -1638,7 +1638,7 @@ fn primary_object(
             let enumeration = storage.enum_for(slot, txid);
             base_object(
                 catalog::PG_TYPE_OID,
-                crate::sql::types::oid::enum_oid(slot as u16),
+                crate::sql::types::oid::enum_oid(storage.enum_for(slot, txid).creation()),
                 "type",
                 Some(enumeration.schema.as_str()),
                 Some(enumeration.name.as_str()),
@@ -1650,7 +1650,7 @@ fn primary_object(
             let composite = storage.composite_for(slot, txid);
             base_object(
                 catalog::PG_TYPE_OID,
-                crate::sql::types::oid::composite_oid(slot as u16),
+                crate::sql::types::oid::composite_oid(storage.composite_for(slot, txid).creation()),
                 "type",
                 Some(composite.schema.as_str()),
                 Some(composite.name.as_str()),

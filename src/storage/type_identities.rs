@@ -13,6 +13,11 @@ pub struct TypeCreation {
 }
 
 impl TypeCreation {
+    pub(crate) fn require(creation: Option<Self>) -> Result<Self, SqlError> {
+        creation.ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT,
+            "named type declaration has no bound identity"))
+    }
+
     /// Rejects zero and stamps outside the named-type identifier range.
     pub(crate) const fn parse(created_at: u64) -> Option<Self> {
         if created_at == 0 || created_at > MAX_TYPE_CREATION {
@@ -41,6 +46,13 @@ impl TypeCreation {
     pub(crate) const fn created_at(self) -> u64 {
         self.low.get() as u64 + 255 * u16::from_le_bytes(self.upper) as u64
     }
+}
+
+impl PartialOrd for TypeCreation {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> { Some(self.cmp(other)) }
+}
+impl Ord for TypeCreation {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering { self.created_at().cmp(&other.created_at()) }
 }
 
 const _: [(); 3] = [(); core::mem::size_of::<TypeCreation>()];

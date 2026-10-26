@@ -3317,14 +3317,14 @@ fn eval_full_inner<'a>(
                         // A bpchar element keeps its padding in the array
                         // value, as PostgreSQL's array_out shows it.
                         Datum::Bpchar(s) => Datum::Text(s),
-                        Datum::Composite { slot, .. } if matches!(element, super::types::ArrElem::Composite(expected) if expected == slot) => {
+                        Datum::Composite { slot, .. } if matches!(element, super::types::ArrElem::Composite(expected) if expected == Some(slot)) => {
                             Datum::CompositeText {
                                 slot,
                                 physical_fields: 0,
                                 text: arena.alloc_str_display(*v).map_err(|_| arena_full())?,
                             }
                         }
-                        value @ Datum::CompositeText { slot, .. } if matches!(element, super::types::ArrElem::Composite(expected) if expected == slot) => {
+                        value @ Datum::CompositeText { slot, .. } if matches!(element, super::types::ArrElem::Composite(expected) if expected == Some(slot)) => {
                             value
                         }
                         other => cast_to(other, ct, arena)?,

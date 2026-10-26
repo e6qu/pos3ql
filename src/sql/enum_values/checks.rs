@@ -86,7 +86,10 @@ fn bind_expression<const N: usize>(
     let Some(slot) = enum_slot(base) else {
         return Ok(StackStr::from_str(source));
     };
-    let definition = storage.enum_for(usize::from(slot), txid);
+    let target = crate::storage::TypeDefinitionTarget::by_creation(
+        storage, crate::storage::NamedTypeKind::Enum, slot,
+    )?;
+    let definition = storage.read_enum_definition(target, txid)?.ok_or_else(corrupt)?;
     let tokens = query_tokens(source, arena)?;
     let count = tokens
         .iter()
@@ -98,8 +101,8 @@ fn bind_expression<const N: usize>(
     write_name(&mut name, definition.name.as_str());
     let context_base = if default_target {
         match base {
-            ColType::Array(_) => ColType::Array(crate::sql::types::ArrElem::Enum(slot)),
-            _ => ColType::Enum(slot),
+            ColType::Array(_) => ColType::Array(crate::sql::types::ArrElem::Enum(Some(slot))),
+            _ => ColType::Enum(Some(slot)),
         }
     } else {
         base
@@ -157,7 +160,7 @@ fn bind_expression<const N: usize>(
                 Some(schema) => storage.enum_slot(schema, bare, txid),
                 None => storage.resolve_enum_slot(bare, txid),
             };
-            if selected == Some(usize::from(slot)) {
+            if selected.is_some_and(|selected| storage.enum_for(selected, txid).creation() == slot) {
                 let _ = write!(output, "/*p3t:{width}*/");
                 for selected in &tokens[index..index + width] {
                     let _ = write!(output, "{} ", &source[selected.start..selected.end]);
@@ -352,7 +355,10 @@ fn resolve_expression<'a>(
         };
         body
     };
-    let definition = storage.enum_for(usize::from(slot), txid);
+    let target = crate::storage::TypeDefinitionTarget::by_creation(
+        storage, crate::storage::NamedTypeKind::Enum, slot,
+    )?;
+    let definition = storage.read_enum_definition(target, txid)?.ok_or_else(corrupt)?;
     let mut name = StackStr::<260>::new();
     if display_names {
         let display_name =
@@ -586,11 +592,11 @@ fn corrupt() -> SqlError {
     )
 }
 
-fn enum_slot(base: ColType) -> Option<u16> {
+fn enum_slot(base: ColType) -> Option<crate::storage::TypeCreation> {
     match base {
-        ColType::Enum(slot) => Some(slot),
+        ColType::Enum(slot) => slot,
         ColType::Array(element) => match element.to_coltype() {
-            ColType::Enum(slot) => Some(slot),
+            ColType::Enum(slot) => slot,
             _ => None,
         },
         _ => None,

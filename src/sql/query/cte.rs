@@ -5037,7 +5037,7 @@ fn subst_frame_bound<'a>(
 fn stored_type_reference(
     type_name: &str,
     dependencies: crate::storage::StoredQueryDependencyView<'_>,
-) -> Option<(crate::storage::DependencyClass, u16, bool)> {
+) -> Option<(crate::storage::DependencyClass, crate::storage::TypeReference, bool)> {
     let (bare, array) = type_name
         .strip_suffix("[]")
         .map_or((type_name, false), |bare| (bare, true));
@@ -5054,7 +5054,10 @@ fn stored_type_reference(
             ) && dependency.referenced_schema.as_str() == referenced_schema
                 && dependency.referenced_name.as_str() == referenced_name
         })
-        .map(|dependency| (dependency.class, dependency.slot, array))
+        .and_then(|dependency| match dependency.identity {
+            crate::storage::StoredDependencyIdentity::Type(reference) => Some((dependency.class, reference, array)),
+            _ => None,
+        })
 }
 
 /// Resolved dependency slots retain the identity of the original SQL spelling,
@@ -5064,7 +5067,8 @@ pub(crate) fn captured_type_oid(
     dependencies: crate::storage::StoredQueryDependencyView<'_>,
 ) -> Option<i32> {
     use crate::sql::types::oid;
-    let (class, slot, array) = stored_type_reference(type_name, dependencies)?;
+    let (class, reference, array) = stored_type_reference(type_name, dependencies)?;
+    let slot = reference.creation();
     Some(match (class, array) {
         (crate::storage::DependencyClass::Domain, false) => oid::domain_oid(slot),
         (crate::storage::DependencyClass::Domain, true) => oid::domain_array_oid(slot),
@@ -5084,20 +5088,26 @@ fn rewrite_stored_type_name<'a>(
     let Some(dependencies) = context.dependencies else {
         return Ok(type_name);
     };
-    let Some((class, slot, array)) = stored_type_reference(type_name, dependencies) else {
+    let Some((class, reference, array)) = stored_type_reference(type_name, dependencies) else {
         return Ok(type_name);
     };
     let (schema, name) = match class {
         crate::storage::DependencyClass::Domain => {
-            let definition = context.storage.domain_for(slot as usize, context.txid);
+            let definition = context.storage.read_domain_definition(
+                crate::storage::TypeDefinitionTarget::Bound(reference), context.txid,
+            )?.ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "captured type source no longer exists"))?;
             (definition.schema, definition.name)
         }
         crate::storage::DependencyClass::Enum => {
-            let definition = context.storage.enum_for(slot as usize, context.txid);
+            let definition = context.storage.read_enum_definition(
+                crate::storage::TypeDefinitionTarget::Bound(reference), context.txid,
+            )?.ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "captured type source no longer exists"))?;
             (definition.schema, definition.name)
         }
         crate::storage::DependencyClass::Composite => {
-            let definition = context.storage.composite_for(slot as usize, context.txid);
+            let definition = context.storage.read_composite_definition(
+                crate::storage::TypeDefinitionTarget::Bound(reference), context.txid,
+            )?.ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "captured type source no longer exists"))?;
             (definition.schema, definition.name)
         }
         _ => unreachable!("stored type-name rewriting records only type dependencies"),

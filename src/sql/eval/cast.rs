@@ -264,7 +264,7 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
         ColType::Composite(slot) => match v {
             value @ Datum::Composite { slot: actual, .. }
             | value @ Datum::CompositeText { slot: actual, .. }
-                if actual == slot =>
+                if Some(actual) == slot =>
             {
                 value
             }

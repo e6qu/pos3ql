@@ -321,7 +321,7 @@ pub(crate) fn populate_record_from_json<'a>(
             super::super::ExpressionTypeIdentity::Known(type_oid) => Some(type_oid),
             super::super::ExpressionTypeIdentity::Unresolved => None,
         };
-    let (slot, base_fields, base_type_oid): (Option<u16>, _, i32) = match base {
+    let (slot, base_fields, base_type_oid): (Option<crate::storage::TypeCreation>, _, i32) = match base {
         Datum::Composite { slot, fields } => (
             Some(slot),
             fields,
@@ -457,7 +457,7 @@ pub(crate) fn json_value_to_type<'a>(
             "JSON conversion requires catalog access"
         )
     })?;
-    if let Some(crate::sql::types::ColType::Composite(slot)) =
+    if let Some(crate::sql::types::ColType::Composite(Some(slot))) =
         crate::sql::types::ColType::from_oid(type_oid)
     {
         let json::Json::Object(members) = value else {
@@ -609,7 +609,7 @@ fn json_value_to_array<'a>(
             json_value_to_type(*item, element.element_oid(), -1, Datum::Null, arena, hooks)?
         };
         *slot = match (element, value) {
-            (crate::sql::types::ArrElem::Composite(composite_slot), value) if !value.is_null() => {
+            (crate::sql::types::ArrElem::Composite(Some(composite_slot)), value) if !value.is_null() => {
                 hooks
                     .catalog
                     .ok_or_else(|| {

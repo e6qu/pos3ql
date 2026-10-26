@@ -110,7 +110,7 @@ impl<'v> ColumnLookup<'v> for ValueLookup<'v> {
 /// path shared by explicit casts, domain-array elements, and table writes.
 pub(crate) fn coerce_domain_value<'a>(
     storage: &Storage,
-    slot: usize,
+    target: crate::storage::TypeDefinitionTarget,
     value: Datum<'a>,
     txid: u32,
     arena: &'a Arena,
@@ -118,7 +118,7 @@ pub(crate) fn coerce_domain_value<'a>(
 ) -> Result<Datum<'a>, SqlError> {
     let domain = storage
         .read_domain_definition(
-            crate::storage::TypeDefinitionTarget::Slot(crate::storage::NamedTypeSlot::Domain(slot)),
+            target,
             txid,
         )?
         .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "domain type does not exist"))?;
@@ -152,9 +152,9 @@ fn coerce_selected_domain_value<'a>(
                 super::coerce_enum_value(value, slot, storage, txid, arena)?
             }
             crate::sql::types::ColType::Composite(slot) => match value {
-                value @ Datum::CompositeText { slot: actual, .. } if actual == slot => value,
+                value @ Datum::CompositeText { slot: actual, .. } if Some(actual) == slot => value,
                 Datum::Text(text) | Datum::Bpchar(text) => {
-                    super::decode_composite_text(text, slot, storage, txid, arena)?
+                    super::decode_composite_text(text, slot.ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "composite type has no identity"))?, storage, txid, arena)?
                 }
                 value => super::coerce_composite_value(value, slot, storage, txid, arena)?,
             },
@@ -249,20 +249,20 @@ pub(crate) fn validate_domain_check<'a>(
     Ok(())
 }
 
-pub(crate) fn column_domain_slot(
+pub(crate) fn column_domain_target(
     storage: &Storage,
-    column: &ColumnMeta,
+    column: &crate::storage::ColumnMeta,
     txid: u32,
-) -> Option<usize> {
-    let identity = column.user_type?;
-    let slot =
-        storage.domain_identity_slot(identity.schema.as_str(), identity.name.as_str(), txid)?;
-    if matches!(column.ctype, ColType::Array(crate::sql::types::ArrElem::Domain { identity: element_slot, .. }) if usize::from(element_slot) == slot)
-    {
-        None
-    } else {
-        Some(slot)
-    }
+) -> Result<Option<crate::storage::TypeDefinitionTarget>, SqlError> {
+    let bound = storage.bind_routine_result(crate::storage::RoutineResult {
+        ctype: column.ctype, user_type: column.user_type,
+    }, txid)?;
+    let Some(identity) = bound.user_type else { return Ok(None); };
+    let reference = crate::storage::TypeReference::from_bound_name(identity)?;
+    if reference.kind() != crate::storage::NamedTypeKind::Domain
+        || matches!(bound.ctype, ColType::Array(crate::sql::types::ArrElem::Domain { identity, .. })
+            if identity == Some(reference.creation())) { return Ok(None); }
+    Ok(Some(crate::storage::TypeDefinitionTarget::Bound(reference)))
 }
 
 /// Enforces every domain-typed column's NOT NULL and CHECK constraints against a
@@ -277,7 +277,7 @@ pub(crate) fn check_domain_constraints(
     params: &[Datum],
 ) -> Result<(), SqlError> {
     for (i, col) in def.columns().iter().enumerate() {
-        let Some(slot) = column_domain_slot(storage, col, txid) else {
+        let Some(slot) = column_domain_target(storage, col, txid)? else {
             continue;
         };
         let value = values.get(i).copied().unwrap_or(Datum::Null);

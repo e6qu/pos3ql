@@ -4209,7 +4209,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             if let Some(slot) = self.storage.resolve_enum_slot(element_name, self.txid) {
                 return super::exec::coerce_user_type_array(
                     value,
-                    super::types::ArrElem::Enum(slot as u16),
+                    super::types::ArrElem::Enum(Some(self.storage.enum_for(slot, self.txid).creation())),
                     self.storage,
                     self.txid,
                     arena,
@@ -4218,7 +4218,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             }
             if let Some(slot) = self.storage.resolve_domain_slot(element_name, self.txid) {
                 let domain = self.storage.domain(slot);
-                let Some(element) = super::types::ArrElem::domain(slot as u16, domain.base) else {
+                let Some(element) = super::types::ArrElem::domain(domain.creation(), domain.base) else {
                     return Err(sql_err!(
                         sqlstate::FEATURE_NOT_SUPPORTED,
                         "arrays of domain {} require a scalar base type",
@@ -4237,7 +4237,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             if let Some(slot) = self.storage.resolve_composite_slot(element_name, self.txid) {
                 return super::exec::coerce_user_type_array(
                     value,
-                    super::types::ArrElem::Composite(slot as u16),
+                    super::types::ArrElem::Composite(Some(self.storage.composite_for(slot, self.txid).creation())),
                     self.storage,
                     self.txid,
                     arena,
@@ -4249,7 +4249,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         if let Some(slot) = self.storage.resolve_domain_slot(type_name, self.txid) {
             return super::exec::coerce_domain_value(
                 self.storage,
-                slot,
+                crate::storage::TypeDefinitionTarget::Slot(crate::storage::NamedTypeSlot::Domain(slot)),
                 value,
                 self.txid,
                 arena,
@@ -4306,7 +4306,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         let slot = self.storage.resolve_domain_slot(type_name, self.txid)?;
         let domain = self.storage.domain(slot);
         matches!(domain.base, super::types::ColType::Array(_))
-            .then(|| super::types::ArrElem::domain(slot as u16, domain.base))?
+            .then(|| super::types::ArrElem::domain(domain.creation(), domain.base))?
     }
 
     fn user_array_name<'a>(

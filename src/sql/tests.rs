@@ -1301,24 +1301,9 @@ fn numeric_type_schema_and_function_privileges_match_postgresql_before_lookup() 
         let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
         assert_eq!(data_rows(&session.success(&mut engine,
             include_str!("../../tests/external/differential_exact/25_numeric_privileges.sql"), true)), ["t", "t", "t"]);
-        session.success(&mut engine, "CREATE ROLE numeric_privilege_reader", true);
-        for query in [
-            "SELECT has_type_privilege(2147483647::oid, 'USAGE, SELECT')",
-            "SELECT has_type_privilege('numeric_privilege_reader', 2147483647::oid, 'USAGE, SELECT')",
-            "SELECT has_schema_privilege(2147483647::oid, 'USAGE, SELECT')",
-            "SELECT has_schema_privilege('numeric_privilege_reader', 2147483647::oid, 'USAGE, SELECT')",
-            "SELECT has_function_privilege(2147483647::oid, 'EXECUTE, SELECT')",
-            "SELECT has_function_privilege('numeric_privilege_reader', 2147483647::oid, 'EXECUTE, SELECT')",
-        ] {
-            assert_eq!(error_sqlstates(&session.execute(&mut engine, query, true)), ["22023"], "{query}");
-        }
-        for (query, state) in [
-            ("SELECT has_type_privilege('numeric_missing_type', 'USAGE')", "42704"),
-            ("SELECT has_schema_privilege('numeric_missing_schema', 'USAGE')", "3F000"),
-            ("SELECT has_function_privilege('numeric_missing_function()', 'EXECUTE')", "42883"),
-        ] {
-            assert_eq!(error_sqlstates(&session.execute(&mut engine, query, true)), [state], "{query}");
-        }
+        assert_eq!(error_sqlstates(&session.execute(&mut engine,
+            include_str!("../../tests/external/differential_exact/26_numeric_privilege_errors.sql"), true)),
+            ["22023", "22023", "22023", "22023", "22023", "22023", "42704", "3F000", "42883"]);
     }
 }
 

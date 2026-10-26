@@ -70,7 +70,8 @@ pub(super) struct TypeIdentityIndex {
 
 impl core::fmt::Debug for TypeIdentityIndex {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        formatter.debug_struct("TypeIdentityIndex")
+        formatter
+            .debug_struct("TypeIdentityIndex")
             .field("assigned", &self.by_lifetime.len())
             .field("capacity", &self.by_slot.len())
             .field("domains", &self.domains)
@@ -82,8 +83,9 @@ impl core::fmt::Debug for TypeIdentityIndex {
 impl TypeIdentityIndex {
     pub(super) fn budget_bytes(domains: usize, enums: usize, composites: usize) -> usize {
         let capacity = domains.saturating_add(enums).saturating_add(composites);
-        FixedMap::<TypeLifetimeKey, NamedTypeSlot>::budget_bytes(capacity)
-            .saturating_add(capacity.saturating_mul(core::mem::size_of::<Option<TypeLifetimeKey>>()))
+        FixedMap::<TypeLifetimeKey, NamedTypeSlot>::budget_bytes(capacity).saturating_add(
+            capacity.saturating_mul(core::mem::size_of::<Option<TypeLifetimeKey>>()),
+        )
     }
 
     pub(super) fn new(
@@ -96,9 +98,16 @@ impl TypeIdentityIndex {
         let by_lifetime = FixedMap::new(budget, "type_creation_index", capacity)?;
         let mut by_slot = FixedVec::new(budget, "type_creation_slots", capacity)?;
         for _ in 0..capacity {
-            by_slot.push(None).expect("sized to named type catalog slots");
+            by_slot
+                .push(None)
+                .expect("sized to named type catalog slots");
         }
-        Ok(Self { by_lifetime, by_slot, domains, enums })
+        Ok(Self {
+            by_lifetime,
+            by_slot,
+            domains,
+            enums,
+        })
     }
 
     fn position(&self, slot: NamedTypeSlot) -> Result<usize, SqlError> {
@@ -112,21 +121,29 @@ impl TypeIdentityIndex {
             }
             _ => None,
         };
-        position.ok_or_else(|| sql_err!(sqlstate::DATA_EXCEPTION,
-            "named type identity slot is outside its startup reservation"))
+        position.ok_or_else(|| {
+            sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "named type identity slot is outside its startup reservation"
+            )
+        })
     }
 
     fn validate_slot(&self, slot: NamedTypeSlot, position: usize) -> Result<(), SqlError> {
         if self.by_slot[position].is_some_and(|key| self.by_lifetime.get(&key) != Some(&slot)) {
-            return Err(sql_err!(sqlstate::DATA_EXCEPTION,
-                "named type identity index does not match its slot"));
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "named type identity index does not match its slot"
+            ));
         }
         Ok(())
     }
 
     pub(super) fn lookup(&self, database: DatabaseOid, created_at: u64) -> Option<NamedTypeSlot> {
         let creation = NonZeroU64::new(created_at)?;
-        self.by_lifetime.get(&TypeLifetimeKey { database, creation }).copied()
+        self.by_lifetime
+            .get(&TypeLifetimeKey { database, creation })
+            .copied()
     }
 
     /// The catalog owner has already validated that this slot can be replaced.
@@ -139,24 +156,38 @@ impl TypeIdentityIndex {
         let position = self.position(slot)?;
         self.validate_slot(slot, position)?;
         let old = self.by_slot[position];
-        let creation = NonZeroU64::new(created_at).ok_or_else(|| sql_err!(sqlstate::DATA_EXCEPTION,
-            "named type creation identity is zero"))?;
+        let creation = NonZeroU64::new(created_at).ok_or_else(|| {
+            sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "named type creation identity is zero"
+            )
+        })?;
         let key = TypeLifetimeKey { database, creation };
         if let Some(owner) = self.by_lifetime.get(&key)
             && (*owner != slot || old != Some(key))
         {
-            return Err(sql_err!(sqlstate::DATA_EXCEPTION,
-                "named type creation identity is duplicated"));
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "named type creation identity is duplicated"
+            ));
         }
-        if old == Some(key) { return Ok(()); }
+        if old == Some(key) {
+            return Ok(());
+        }
         if old.is_none() && self.by_lifetime.len() == self.by_slot.len() {
-            return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "named type identity capacity exhausted"));
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "named type identity capacity exhausted"
+            ));
         }
         if let Some(old) = old {
-            self.by_lifetime.remove(&old).expect("slot membership was checked");
+            self.by_lifetime
+                .remove(&old)
+                .expect("slot membership was checked");
         }
-        self.by_lifetime.insert(key, slot).expect("a catalog slot reserves one identity entry");
+        self.by_lifetime
+            .insert(key, slot)
+            .expect("a catalog slot reserves one identity entry");
         self.by_slot[position] = Some(key);
         Ok(())
     }
@@ -170,31 +201,51 @@ impl TypeIdentityIndex {
         created_at: u64,
     ) -> Result<(), SqlError> {
         if allocated.kind() != target.kind() {
-            return Err(sql_err!(sqlstate::DATA_EXCEPTION,
-                "stored type identity changes its catalog family"));
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "stored type identity changes its catalog family"
+            ));
         }
-        if allocated == target { return self.replace(target, database, created_at); }
+        if allocated == target {
+            return self.replace(target, database, created_at);
+        }
         let old_position = self.position(allocated)?;
         let new_position = self.position(target)?;
         self.validate_slot(allocated, old_position)?;
         self.validate_slot(target, new_position)?;
-        let old = self.by_slot[old_position].ok_or_else(|| sql_err!(sqlstate::DATA_EXCEPTION,
-            "restored type source has no creation identity"))?;
+        let old = self.by_slot[old_position].ok_or_else(|| {
+            sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "restored type source has no creation identity"
+            )
+        })?;
         let destination = self.by_slot[new_position];
-        let creation = NonZeroU64::new(created_at).ok_or_else(|| sql_err!(sqlstate::DATA_EXCEPTION,
-            "named type creation identity is zero"))?;
+        let creation = NonZeroU64::new(created_at).ok_or_else(|| {
+            sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "named type creation identity is zero"
+            )
+        })?;
         let key = TypeLifetimeKey { database, creation };
         if let Some(owner) = self.by_lifetime.get(&key)
             && (*owner != allocated || old != key)
         {
-            return Err(sql_err!(sqlstate::DATA_EXCEPTION,
-                "named type creation identity is duplicated"));
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "named type creation identity is duplicated"
+            ));
         }
-        self.by_lifetime.remove(&old).expect("source membership was checked");
+        self.by_lifetime
+            .remove(&old)
+            .expect("source membership was checked");
         if let Some(destination) = destination {
-            self.by_lifetime.remove(&destination).expect("destination membership was checked");
+            self.by_lifetime
+                .remove(&destination)
+                .expect("destination membership was checked");
         }
-        self.by_lifetime.insert(key, target).expect("relocation retains a reserved identity entry");
+        self.by_lifetime
+            .insert(key, target)
+            .expect("relocation retains a reserved identity entry");
         self.by_slot[old_position] = None;
         self.by_slot[new_position] = Some(key);
         Ok(())
@@ -207,9 +258,18 @@ enum ArrayElementIdentity {
     Builtin(u8),
     Enum(TypeCreation),
     Composite(TypeCreation),
-    DomainBuiltin { domain: TypeCreation, base_code: u8 },
-    DomainEnum { domain: TypeCreation, base: TypeCreation },
-    DomainComposite { domain: TypeCreation, base: TypeCreation },
+    DomainBuiltin {
+        domain: TypeCreation,
+        base_code: u8,
+    },
+    DomainEnum {
+        domain: TypeCreation,
+        base: TypeCreation,
+    },
+    DomainComposite {
+        domain: TypeCreation,
+        base: TypeCreation,
+    },
 }
 
 /// A checked six-byte descriptor for inline cached array defaults.
@@ -246,21 +306,32 @@ impl CachedArrayElement {
             Builtin(code) if Self::builtin(code) => u64::from(code),
             Enum(creation) => Self::ENUM + creation.created_at() - 1,
             Composite(creation) => Self::COMPOSITE + creation.created_at() - 1,
-            DomainBuiltin { domain, base_code } if Self::builtin_base(base_code) =>
-                Self::DOMAIN_BUILTIN + (domain.created_at() - 1) * 256 + u64::from(base_code),
-            DomainEnum { domain, base } => Self::DOMAIN_ENUM
-                + (domain.created_at() - 1) * MAX_TYPE_CREATION + base.created_at() - 1,
-            DomainComposite { domain, base } => Self::DOMAIN_COMPOSITE
-                + (domain.created_at() - 1) * MAX_TYPE_CREATION + base.created_at() - 1,
+            DomainBuiltin { domain, base_code } if Self::builtin_base(base_code) => {
+                Self::DOMAIN_BUILTIN + (domain.created_at() - 1) * 256 + u64::from(base_code)
+            }
+            DomainEnum { domain, base } => {
+                Self::DOMAIN_ENUM
+                    + (domain.created_at() - 1) * MAX_TYPE_CREATION
+                    + base.created_at()
+                    - 1
+            }
+            DomainComposite { domain, base } => {
+                Self::DOMAIN_COMPOSITE
+                    + (domain.created_at() - 1) * MAX_TYPE_CREATION
+                    + base.created_at()
+                    - 1
+            }
             _ => return None,
         };
         let bytes = value.to_le_bytes();
-        Some(Self([bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5]]))
+        Some(Self([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5],
+        ]))
     }
 
     fn value(self) -> u64 {
-        let [a,b,c,d,e,f] = self.0;
-        u64::from_le_bytes([a,b,c,d,e,f,0,0])
+        let [a, b, c, d, e, f] = self.0;
+        u64::from_le_bytes([a, b, c, d, e, f, 0, 0])
     }
 
     fn decode(value: u64) -> Option<ArrayElementIdentity> {
@@ -286,11 +357,17 @@ impl CachedArrayElement {
             (Self::DOMAIN_ENUM, false)
         } else if value < Self::END {
             (Self::DOMAIN_COMPOSITE, true)
-        } else { return None; };
+        } else {
+            return None;
+        };
         let offset = value - start;
         let domain = TypeCreation::parse(offset / MAX_TYPE_CREATION + 1)?;
         let base = TypeCreation::parse(offset % MAX_TYPE_CREATION + 1)?;
-        Some(if composite { DomainComposite { domain, base } } else { DomainEnum { domain, base } })
+        Some(if composite {
+            DomainComposite { domain, base }
+        } else {
+            DomainEnum { domain, base }
+        })
     }
 
     fn from_bytes(bytes: [u8; 6]) -> Option<Self> {
@@ -318,7 +395,12 @@ mod tests {
         fn check(identity: ArrayElementIdentity) {
             let encoded = CachedArrayElement::from_identity(identity).unwrap();
             assert_eq!(encoded.identity(), identity);
-            assert_eq!(CachedArrayElement::from_bytes(encoded.0).unwrap().identity(), identity);
+            assert_eq!(
+                CachedArrayElement::from_bytes(encoded.0)
+                    .unwrap()
+                    .identity(),
+                identity
+            );
         }
         crate::mem::guard::forbid_alloc(|| {
             for element in crate::sql::types::ArrElem::BUILTIN {
@@ -333,20 +415,31 @@ mod tests {
                     check(ArrayElementIdentity::DomainEnum { domain, base });
                     check(ArrayElementIdentity::DomainComposite { domain, base });
                 }
-                for base in [crate::sql::types::ColType::Bool, crate::sql::types::ColType::Text,
-                    crate::sql::types::ColType::Array(crate::sql::types::ArrElem::Int4)] {
-                    check(ArrayElementIdentity::DomainBuiltin { domain, base_code: base.code() });
+                for base in [
+                    crate::sql::types::ColType::Bool,
+                    crate::sql::types::ColType::Text,
+                    crate::sql::types::ColType::Array(crate::sql::types::ArrElem::Int4),
+                ] {
+                    check(ArrayElementIdentity::DomainBuiltin {
+                        domain,
+                        base_code: base.code(),
+                    });
                 }
             }
             assert!(CachedArrayElement::from_bytes([255; 6]).is_none());
             let invalid_builtin = crate::sql::types::ArrElem::Enum(0).code();
-            assert!(CachedArrayElement::from_identity(ArrayElementIdentity::Builtin(invalid_builtin)).is_none());
+            assert!(
+                CachedArrayElement::from_identity(ArrayElementIdentity::Builtin(invalid_builtin))
+                    .is_none()
+            );
         });
     }
 
     #[test]
     fn type_identity_index_replaces_at_capacity_and_isolates_databases_without_allocation() {
-        fn creation(value: u64) -> u64 { TypeCreation::parse(value).unwrap().created_at() }
+        fn creation(value: u64) -> u64 {
+            TypeCreation::parse(value).unwrap().created_at()
+        }
         let bytes = TypeIdentityIndex::budget_bytes(2, 1, 1);
         let mut budget = Budget::new(bytes);
         let mut index = TypeIdentityIndex::new(&mut budget, 2, 1, 1).unwrap();
@@ -354,34 +447,90 @@ mod tests {
         let database = DatabaseOid::POSTGRES;
         let other = DatabaseOid::TEMPLATE1;
         crate::mem::guard::forbid_alloc(|| {
-            index.replace(NamedTypeSlot::Domain(0), database, creation(1)).unwrap();
-            index.replace(NamedTypeSlot::Domain(1), other, creation(1)).unwrap();
-            index.replace(NamedTypeSlot::Enum(0), database, creation(2)).unwrap();
-            index.replace(NamedTypeSlot::Composite(0), database, creation(3)).unwrap();
+            index
+                .replace(NamedTypeSlot::Domain(0), database, creation(1))
+                .unwrap();
+            index
+                .replace(NamedTypeSlot::Domain(1), other, creation(1))
+                .unwrap();
+            index
+                .replace(NamedTypeSlot::Enum(0), database, creation(2))
+                .unwrap();
+            index
+                .replace(NamedTypeSlot::Composite(0), database, creation(3))
+                .unwrap();
             let mut old = creation(1);
             for value in 4..1_004 {
-                index.replace(NamedTypeSlot::Domain(0), database, creation(value)).unwrap();
+                index
+                    .replace(NamedTypeSlot::Domain(0), database, creation(value))
+                    .unwrap();
                 assert_eq!(index.lookup(database, old), None);
-                assert_eq!(index.lookup(other, creation(1)), Some(NamedTypeSlot::Domain(1)));
+                assert_eq!(
+                    index.lookup(other, creation(1)),
+                    Some(NamedTypeSlot::Domain(1))
+                );
                 assert_eq!(index.by_lifetime.len(), 4);
                 old = creation(value);
             }
-            let duplicate = index.replace(NamedTypeSlot::Enum(0), database, old).unwrap_err();
+            let duplicate = index
+                .replace(NamedTypeSlot::Enum(0), database, old)
+                .unwrap_err();
             assert_eq!(duplicate.sqlstate, sqlstate::DATA_EXCEPTION);
-            assert_eq!(index.lookup(database, creation(2)), Some(NamedTypeSlot::Enum(0)));
+            assert_eq!(
+                index.lookup(database, creation(2)),
+                Some(NamedTypeSlot::Enum(0))
+            );
             assert_eq!(index.lookup(database, old), Some(NamedTypeSlot::Domain(0)));
-            index.relocate(NamedTypeSlot::Domain(0), NamedTypeSlot::Domain(1), database, creation(1_500)).unwrap();
+            index
+                .relocate(
+                    NamedTypeSlot::Domain(0),
+                    NamedTypeSlot::Domain(1),
+                    database,
+                    creation(1_500),
+                )
+                .unwrap();
             assert_eq!(index.lookup(database, old), None);
             assert_eq!(index.lookup(other, creation(1)), None);
-            assert_eq!(index.lookup(database, creation(1_500)), Some(NamedTypeSlot::Domain(1)));
-            index.replace(NamedTypeSlot::Domain(0), other, creation(1_500)).unwrap();
-            assert_eq!(index.lookup(other, creation(1_500)), Some(NamedTypeSlot::Domain(0)));
-            let duplicate = index.relocate(NamedTypeSlot::Domain(1), NamedTypeSlot::Domain(0), database, creation(2)).unwrap_err();
+            assert_eq!(
+                index.lookup(database, creation(1_500)),
+                Some(NamedTypeSlot::Domain(1))
+            );
+            index
+                .replace(NamedTypeSlot::Domain(0), other, creation(1_500))
+                .unwrap();
+            assert_eq!(
+                index.lookup(other, creation(1_500)),
+                Some(NamedTypeSlot::Domain(0))
+            );
+            let duplicate = index
+                .relocate(
+                    NamedTypeSlot::Domain(1),
+                    NamedTypeSlot::Domain(0),
+                    database,
+                    creation(2),
+                )
+                .unwrap_err();
             assert_eq!(duplicate.sqlstate, sqlstate::DATA_EXCEPTION);
-            assert_eq!(index.lookup(database, creation(1_500)), Some(NamedTypeSlot::Domain(1)));
-            assert_eq!(index.lookup(other, creation(1_500)), Some(NamedTypeSlot::Domain(0)));
-            assert_eq!(index.lookup(database, creation(2)), Some(NamedTypeSlot::Enum(0)));
-            let wrong_family = index.relocate(NamedTypeSlot::Domain(0), NamedTypeSlot::Enum(0), other, creation(1_600)).unwrap_err();
+            assert_eq!(
+                index.lookup(database, creation(1_500)),
+                Some(NamedTypeSlot::Domain(1))
+            );
+            assert_eq!(
+                index.lookup(other, creation(1_500)),
+                Some(NamedTypeSlot::Domain(0))
+            );
+            assert_eq!(
+                index.lookup(database, creation(2)),
+                Some(NamedTypeSlot::Enum(0))
+            );
+            let wrong_family = index
+                .relocate(
+                    NamedTypeSlot::Domain(0),
+                    NamedTypeSlot::Enum(0),
+                    other,
+                    creation(1_600),
+                )
+                .unwrap_err();
             assert_eq!(wrong_family.sqlstate, sqlstate::DATA_EXCEPTION);
             assert_eq!(index.by_lifetime.len(), 4);
         });

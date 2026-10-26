@@ -1340,6 +1340,72 @@ mod tests {
     }
 
     #[test]
+    fn restored_type_identity_rejects_unpublished_retired_and_mismatched_sources_atomically() {
+        for source in SOURCES {
+            let mut storage = fixture(1);
+            create(&mut storage, source).unwrap();
+            let original = reference(&storage, source);
+            let (database, created_at, version) = {
+                let catalog = storage.type_catalog.lock().unwrap();
+                let selected = catalog.type_snapshot(source, 0).unwrap().unwrap();
+                (selected.identity.database(), selected.identity.created_at(), catalog.versions.get(source))
+            };
+            let sequence = storage.catalog_identity_sequence();
+            crate::mem::guard::forbid_alloc(|| {
+                let bad_family = match source {
+                    NamedTypeSlot::Domain(_) => NamedTypeSlot::Enum(0),
+                    _ => NamedTypeSlot::Domain(0),
+                };
+                let out_of_bounds = match source {
+                    NamedTypeSlot::Domain(_) => NamedTypeSlot::Domain(1),
+                    NamedTypeSlot::Enum(_) => NamedTypeSlot::Enum(1),
+                    NamedTypeSlot::Composite(_) => NamedTypeSlot::Composite(1),
+                };
+                for (target, stamp) in [(source, 0), (bad_family, created_at), (out_of_bounds, created_at)] {
+                    assert_eq!(storage.restore_type_identity(source, target, stamp).unwrap_err().sqlstate,
+                        sqlstate::DATA_EXCEPTION);
+                    assert_eq!(reference(&storage, source), original);
+                    let catalog = storage.type_catalog.lock().unwrap();
+                    assert_eq!(catalog.identities.lookup(database, created_at), Some(source));
+                    assert_eq!(catalog.versions.get(source), version);
+                    assert_eq!(storage.catalog_identity_sequence(), sequence);
+                }
+                storage.select_database_for_recovery(super::super::DatabaseOid::TEMPLATE1).unwrap();
+                assert_eq!(storage.restore_type_identity(source, source, created_at + 100).unwrap_err().sqlstate,
+                    sqlstate::DATA_EXCEPTION);
+                storage.select_database_for_recovery(database).unwrap();
+                assert_eq!(reference(&storage, source), original);
+                {
+                    let mut catalog = storage.type_catalog.lock().unwrap();
+                    match source {
+                        NamedTypeSlot::Domain(slot) => catalog.domains[slot].ddl_state = super::super::CatalogDdlState::PendingCreate { txid: 77 },
+                        NamedTypeSlot::Enum(slot) => catalog.enums[slot].ddl_state = super::super::CatalogDdlState::PendingCreate { txid: 77 },
+                        NamedTypeSlot::Composite(slot) => catalog.composites[slot].ddl_state = super::super::CatalogDdlState::PendingCreate { txid: 77 },
+                    }
+                }
+                assert_eq!(storage.restore_type_identity(source, source, created_at + 100).unwrap_err().sqlstate,
+                    sqlstate::DATA_EXCEPTION);
+                {
+                    let mut catalog = storage.type_catalog.lock().unwrap();
+                    match source {
+                        NamedTypeSlot::Domain(slot) => catalog.domains[slot].ddl_state = super::super::CatalogDdlState::Present,
+                        NamedTypeSlot::Enum(slot) => catalog.enums[slot].ddl_state = super::super::CatalogDdlState::Present,
+                        NamedTypeSlot::Composite(slot) => catalog.composites[slot].ddl_state = super::super::CatalogDdlState::Present,
+                    }
+                }
+                assert_eq!(reference(&storage, source), original);
+                retire(&mut storage, source);
+                assert_eq!(storage.restore_type_identity(source, source, created_at + 100).unwrap_err().sqlstate,
+                    sqlstate::DATA_EXCEPTION);
+                let catalog = storage.type_catalog.lock().unwrap();
+                assert_eq!(catalog.identities.lookup(database, created_at), Some(source));
+                assert_eq!(catalog.identities.lookup(database, created_at + 100), None);
+                assert_eq!(storage.catalog_identity_sequence(), sequence);
+            });
+        }
+    }
+
+    #[test]
     fn retained_type_identity_allows_exact_replay_and_rejects_reassignment() {
         for source in SOURCES {
             let mut storage = fixture(1);

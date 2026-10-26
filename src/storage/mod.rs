@@ -18940,7 +18940,9 @@ impl Storage {
             + type_reference_moves::DefinitionPublication::budget_bytes(config)
             + type_edits::TypeRevisions::budget_bytes(config)
             + type_identities::TypeIdentityIndex::budget_bytes(
-                config.max_domains, config.max_enums, config.max_composites,
+                config.max_domains,
+                config.max_enums,
+                config.max_composites,
             )
             + Self::type_definition_image_budget_bytes(config)
             + size_of::<type_references::CatalogOrigin>()
@@ -19477,7 +19479,10 @@ impl Storage {
                 .expect("sized to max_sequences");
         }
         let type_identities = type_identities::TypeIdentityIndex::new(
-            budget, config.max_domains, config.max_enums, config.max_composites,
+            budget,
+            config.max_domains,
+            config.max_enums,
+            config.max_composites,
         )?;
         let mut domains = FixedVec::new(budget, "domains", config.max_domains)?;
         for _ in 0..config.max_domains {
@@ -21400,7 +21405,9 @@ impl Storage {
                 definition.pending_definition = None;
                 definition.ddl_state = CatalogDdlState::PendingCreate { txid };
                 type_catalog.identities.replace(
-                    NamedTypeSlot::Domain(target_slot), target, definition.created_at,
+                    NamedTypeSlot::Domain(target_slot),
+                    target,
+                    definition.created_at,
                 )?;
                 type_catalog
                     .versions
@@ -21438,7 +21445,9 @@ impl Storage {
                 })?;
                 let image = EnumImageReservation::copy(&self.enum_member_images, source, count)?;
                 type_catalog.identities.replace(
-                    NamedTypeSlot::Enum(target_slot), target, definition.created_at,
+                    NamedTypeSlot::Enum(target_slot),
+                    target,
+                    definition.created_at,
                 )?;
                 definition.member_image = Some(image.publish());
                 type_catalog
@@ -21483,7 +21492,9 @@ impl Storage {
                     }
                 }
                 type_catalog.identities.replace(
-                    NamedTypeSlot::Composite(target_slot), target, definition.created_at,
+                    NamedTypeSlot::Composite(target_slot),
+                    target,
+                    definition.created_at,
                 )?;
                 type_catalog
                     .versions
@@ -40305,7 +40316,9 @@ impl Storage {
                 catalog.domains.len()
             ));
         };
-        catalog.identities.replace(NamedTypeSlot::Domain(new), current_database(), created_at)?;
+        catalog
+            .identities
+            .replace(NamedTypeSlot::Domain(new), current_database(), created_at)?;
         Self::clear_object_acl_entries_locked(
             &mut permissions,
             AccessObject {
@@ -41097,7 +41110,9 @@ impl Storage {
         };
         let image = EnumImageReservation::write(&self.enum_member_images, spec.members)?;
         let member_count = image.count();
-        catalog.identities.replace(NamedTypeSlot::Enum(new), current_database(), created_at)?;
+        catalog
+            .identities
+            .replace(NamedTypeSlot::Enum(new), current_database(), created_at)?;
         Self::clear_object_acl_entries_locked(
             &mut permissions,
             AccessObject {
@@ -41826,7 +41841,11 @@ impl Storage {
                 catalog.composites.len()
             ));
         };
-        catalog.identities.replace(NamedTypeSlot::Composite(slot), current_database(), created_at)?;
+        catalog.identities.replace(
+            NamedTypeSlot::Composite(slot),
+            current_database(),
+            created_at,
+        )?;
         Self::clear_object_acl_entries_locked(
             &mut permissions,
             AccessObject {
@@ -41890,7 +41909,11 @@ impl Storage {
             ));
         }
         self.require_named_type_name(&catalog, schema, name, txid, None)?;
-        catalog.identities.replace(NamedTypeSlot::Composite(slot), current_database(), created_at)?;
+        catalog.identities.replace(
+            NamedTypeSlot::Composite(slot),
+            current_database(),
+            created_at,
+        )?;
         Self::clear_object_acl_entries_locked(
             &mut permissions,
             AccessObject {

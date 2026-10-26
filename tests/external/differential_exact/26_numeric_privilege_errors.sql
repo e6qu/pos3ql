@@ -1,0 +1,11 @@
+CREATE ROLE numeric_privilege_reader;
+SELECT has_type_privilege(2147483647::oid, 'USAGE, SELECT');
+SELECT has_type_privilege('numeric_privilege_reader', 2147483647::oid, 'USAGE, SELECT');
+SELECT has_schema_privilege(2147483647::oid, 'USAGE, SELECT');
+SELECT has_schema_privilege('numeric_privilege_reader', 2147483647::oid, 'USAGE, SELECT');
+SELECT has_function_privilege(2147483647::oid, 'EXECUTE, SELECT');
+SELECT has_function_privilege('numeric_privilege_reader', 2147483647::oid, 'EXECUTE, SELECT');
+SELECT has_type_privilege('numeric_missing_type', 'USAGE');
+SELECT has_schema_privilege('numeric_missing_schema', 'USAGE');
+SELECT has_function_privilege('numeric_missing_function()', 'EXECUTE');
+DROP ROLE numeric_privilege_reader;

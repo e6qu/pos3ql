@@ -771,10 +771,12 @@ impl TypeCatalog {
                 if self.identities.lookup(database, key.created_at()) != Some(key.slot()) {
                     return Ok(None);
                 }
-                Ok(self.type_snapshot(key.slot(), transaction)?.filter(|snapshot| {
-                    snapshot.identity.database() == database
-                        && snapshot.identity.created_at() == key.created_at()
-                }))
+                Ok(self
+                    .type_snapshot(key.slot(), transaction)?
+                    .filter(|snapshot| {
+                        snapshot.identity.database() == database
+                            && snapshot.identity.created_at() == key.created_at()
+                    }))
             }
         }
     }
@@ -1340,44 +1342,89 @@ impl super::Storage {
             || matches!(target, NamedTypeSlot::Composite(_))
                 && created_at > super::MAX_RELATION_GENERATION
         {
-            return Err(sql_err!(sqlstate::DATA_EXCEPTION,
-                "stored type creation identity is invalid"));
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "stored type creation identity is invalid"
+            ));
         }
-        let invalid = || sql_err!(sqlstate::DATA_EXCEPTION,
-            "stored type catalog slot is unavailable");
-        let mut catalog = self.type_catalog.lock().expect("type catalog lock poisoned");
+        let invalid = || {
+            sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "stored type catalog slot is unavailable"
+            )
+        };
+        let mut catalog = self
+            .type_catalog
+            .lock()
+            .expect("type catalog lock poisoned");
         let old = allocated.index();
         let new = target.index();
-        let (database, old_creation) = match (allocated, target) {
+        let (database, old_creation, state) = match (allocated, target) {
             (NamedTypeSlot::Domain(_), NamedTypeSlot::Domain(_)) => {
-                if new >= catalog.domains.len() || old >= catalog.domains.len()
-                    || old != new && catalog.domains[new].ddl_state != super::CatalogDdlState::Absent
-                { return Err(invalid()); }
-                (catalog.domains[old].database, catalog.domains[old].created_at)
+                if new >= catalog.domains.len()
+                    || old >= catalog.domains.len()
+                    || old != new
+                        && catalog.domains[new].ddl_state != super::CatalogDdlState::Absent
+                {
+                    return Err(invalid());
+                }
+                (
+                    catalog.domains[old].database,
+                    catalog.domains[old].created_at,
+                    catalog.domains[old].ddl_state,
+                )
             }
             (NamedTypeSlot::Enum(_), NamedTypeSlot::Enum(_)) => {
-                if new >= catalog.enums.len() || old >= catalog.enums.len()
+                if new >= catalog.enums.len()
+                    || old >= catalog.enums.len()
                     || old != new && catalog.enums[new].ddl_state != super::CatalogDdlState::Absent
-                { return Err(invalid()); }
-                (catalog.enums[old].database, catalog.enums[old].created_at)
+                {
+                    return Err(invalid());
+                }
+                (
+                    catalog.enums[old].database,
+                    catalog.enums[old].created_at,
+                    catalog.enums[old].ddl_state,
+                )
             }
             (NamedTypeSlot::Composite(_), NamedTypeSlot::Composite(_)) => {
-                if new >= catalog.composites.len() || old >= catalog.composites.len()
-                    || old != new && catalog.composites[new].ddl_state != super::CatalogDdlState::Absent
-                { return Err(invalid()); }
-                (catalog.composites[old].database, catalog.composites[old].created_at)
+                if new >= catalog.composites.len()
+                    || old >= catalog.composites.len()
+                    || old != new
+                        && catalog.composites[new].ddl_state != super::CatalogDdlState::Absent
+                {
+                    return Err(invalid());
+                }
+                (
+                    catalog.composites[old].database,
+                    catalog.composites[old].created_at,
+                    catalog.composites[old].ddl_state,
+                )
             }
             _ => return Err(invalid()),
         };
+        if database != super::current_database()
+            || state != super::CatalogDdlState::Present
+            || catalog.identities.lookup(database, old_creation) != Some(allocated)
+        {
+            return Err(sql_err!(sqlstate::DATA_EXCEPTION,
+                "stored type source is not a committed identity in the selected database"));
+        }
         if (self.type_definition_images.retains(allocated)
             || self.type_definition_images.retains(target))
             && (old != new || old_creation != created_at)
         {
-            return Err(sql_err!(sqlstate::OBJECT_IN_USE,
-                "stored type catalog slot is retained by an executing statement"));
+            return Err(sql_err!(
+                sqlstate::OBJECT_IN_USE,
+                "stored type catalog slot is retained by an executing statement"
+            ));
         }
-        catalog.identities.relocate(allocated, target, database, created_at)?;
-        if old_creation != created_at { catalog.versions.initialize(allocated, created_at); }
+        catalog
+            .identities
+            .relocate(allocated, target, database, created_at)?;
+        if old_creation != created_at {
+            catalog.versions.initialize(allocated, created_at);
+        }
         catalog.versions.swap(allocated, target);
         match target {
             NamedTypeSlot::Domain(_) => {

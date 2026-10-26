@@ -50,6 +50,11 @@ jobs:
             fi
             cat "$RUNNER_TEMP/$database.reference"
           done
+          docker exec "$POSTGRES_CONTAINER" createdb -U postgres numeric_privilege_errors
+          docker exec -i "$POSTGRES_CONTAINER" psql -U postgres -d numeric_privilege_errors -X -Atq -v VERBOSITY=verbose < tests/external/differential_exact/26_numeric_privilege_errors.sql > "$RUNNER_TEMP/26_numeric_privilege_errors.reference" 2>&1
+          sed -nE 's/^ERROR:  ([0-9A-Z]{5}):.*/\1/p' "$RUNNER_TEMP/26_numeric_privilege_errors.reference" > "$RUNNER_TEMP/privilege-states"
+          printf '%s\n' 22023 22023 22023 22023 22023 22023 42704 3F000 42883 > "$RUNNER_TEMP/expected-privilege-states"
+          diff -u "$RUNNER_TEMP/expected-privilege-states" "$RUNNER_TEMP/privilege-states"
       - name: Format and retain correction
         run: |
           cargo fmt

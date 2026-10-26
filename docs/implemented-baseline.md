@@ -472,10 +472,6 @@ Already bound portals keep their original statements until closed; replacement
 names cannot redirect their execution. Repeated client cache resets reuse the
 same fixed pool.
 
-**User example:** a storage check started for an old orders table cannot start
-reading the replacement orders table through the reused internal slot. Bytes
-it already selected stay readable; a later admission fails explicitly.
-
 SQL identifiers for tables, views, sequences and indexes follow the object's
 lifetime. Renaming an object keeps its identifier; dropping it and creating
 another object gives the replacement a fresh identifier, even when storage
@@ -497,8 +493,9 @@ SELECT has_table_privilege(oid, 'SELECT') IS NULL FROM saved_table_id;
 An index created by a constraint keeps its identifier when an earlier
 constraint is removed, its own constraint is renamed, or a column moves.
 `ADD CONSTRAINT ... USING INDEX` keeps the existing index's identifier.
-Drop and recreate reserve a fresh one. Committing an index drop also releases
-its statistics entry; repeated replacements reuse the fixed statistics pool.
+Drop and recreate reserve a fresh one. Committing an index drop or rolling back its creation also releases its
+statistics entry; repeated replacements reuse the fixed statistics pool.
+Savepoints keep counters for indexes they can still restore.
 Counters remain separate across databases, including cloned databases with the
 same numeric identifiers. Identifier exhaustion returns `54000`
 without installing a replacement; existing data and recovery remain usable.

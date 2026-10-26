@@ -267,13 +267,11 @@ impl DefinitionPublication {
                 })?;
             }
             let selected = &owners.slots[table].as_ref().unwrap().definition;
-            let mut retired_index_identities = [None; super::MAX_VALUE_ENFORCERS];
-            let mut retired_index_count = 0usize;
-            for identity in selected.committed().implicit_index_identities().flatten() {
-                if !definition.implicit_index_identities().any(|candidate| candidate == Some(identity)) {
-                    retired_index_identities[retired_index_count] = Some(identity);
-                    retired_index_count += 1;
-                }
+            let mut live_index_identities = [None; super::MAX_VALUE_ENFORCERS];
+            let mut live_index_count = 0usize;
+            for identity in definition.implicit_index_identities().flatten() {
+                live_index_identities[live_index_count] = Some(identity);
+                live_index_count += 1;
             }
             if let Some(transaction) = transaction {
                 storage.promote_private_index_bindings_locked(
@@ -465,9 +463,7 @@ impl DefinitionPublication {
             drop(indexes);
             drop(sequences);
             drop(dependencies);
-            for identity in retired_index_identities[..retired_index_count].iter().flatten() {
-                storage.reset_index_statistics(movement.database, identity.oid());
-            }
+            storage.retain_implicit_index_statistics(movement.database, table, &live_index_identities[..live_index_count]);
             return Ok(Some(rewrites_rows));
         }
     }

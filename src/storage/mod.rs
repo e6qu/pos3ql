@@ -14037,8 +14037,21 @@ impl RelationTransactionStatistics {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IndexStatisticsOwner {
+    Implicit(u16),
+    Explicit(u16),
+}
+
+impl IndexStatisticsOwner {
+    fn table(self) -> u16 {
+        match self { Self::Implicit(table) | Self::Explicit(table) => table }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct IndexCumulativeStatistics {
+    owner: Option<IndexStatisticsOwner>,
     pub(crate) oid: i32,
     database: DatabaseOid,
     pub(crate) idx_scan: u64,
@@ -14049,6 +14062,7 @@ pub(crate) struct IndexCumulativeStatistics {
 
 impl IndexCumulativeStatistics {
     const EMPTY: Self = Self {
+        owner: None,
         oid: 0,
         database: DatabaseOid::POSTGRES,
         idx_scan: 0,
@@ -16139,30 +16153,30 @@ impl Storage {
         })?;
         if let Some(oid) = index_oid {
             let database = self.tables[table].database();
-            let mut cumulative = self.cumulative_statistics();
-            let indexes = &mut cumulative.indexes;
-            let position = if let Some(position) = indexes.iter().position(|entry| entry.database == database && entry.oid == oid)
-            {
-                position
-            } else {
-                indexes
-                    .push(IndexCumulativeStatistics {
-                        oid,
-                        database,
-                        ..IndexCumulativeStatistics::EMPTY
-                    })
-                    .map_err(|_| {
-                        sql_err!(
-                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                            "index statistics capacity exhausted"
-                        )
-                    })?;
-                indexes.len() - 1
-            };
-            let statistics = &mut indexes[position];
-            statistics.idx_scan = statistics.idx_scan.saturating_add(1);
-            statistics.last_idx_scan = Some(now);
-            statistics.idx_tup_read = statistics.idx_tup_read.saturating_add(index_entries as u64);
+            let mut selected_owner = None;
+            loop {
+                let mut cumulative = self.cumulative_statistics();
+                let indexes = &mut cumulative.indexes;
+                let position = if let Some(position) = indexes.iter().position(|entry| entry.database == database && entry.oid == oid) {
+                    if indexes[position].owner.is_none_or(|owner| usize::from(owner.table()) != table) {
+                        return Err(sql_err!(sqlstate::SERIALIZATION_FAILURE, "index statistics source changed"));
+                    }
+                    position
+                } else if let Some(owner) = selected_owner {
+                    indexes.push(IndexCumulativeStatistics { owner: Some(owner), oid, database, ..IndexCumulativeStatistics::EMPTY })
+                        .map_err(|_| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "index statistics capacity exhausted"))?;
+                    indexes.len() - 1
+                } else {
+                    drop(cumulative);
+                    selected_owner = Some(self.index_statistics_owner(table, txid, oid)?);
+                    continue;
+                };
+                let statistics = &mut indexes[position];
+                statistics.idx_scan = statistics.idx_scan.saturating_add(1);
+                statistics.last_idx_scan = Some(now);
+                statistics.idx_tup_read = statistics.idx_tup_read.saturating_add(index_entries as u64);
+                break;
+            }
         }
         Ok(())
     }
@@ -16810,22 +16824,48 @@ impl Storage {
         }
     }
 
+    fn index_statistics_owner(&self, table: usize, transaction: u32, oid: i32) -> Result<IndexStatisticsOwner, SqlError> {
+        let (implicit, schema, name) = {
+            let definition = self.table_def(table, transaction);
+            let implicit = definition.implicit_index_identities().flatten().any(|identity| identity.oid() == oid);
+            (implicit, definition.schema, definition.name)
+        };
+        let slot = u16::try_from(table).expect("startup table capacity is representable");
+        // Explicit adopted indexes also appear in the constraint definition.
+        if self.indexes_for(schema.as_str(), name.as_str(), transaction).any(|index| crate::sql::catalog::explicit_index_oid(&index) == oid) {
+            return Ok(IndexStatisticsOwner::Explicit(slot));
+        }
+        if implicit { return Ok(IndexStatisticsOwner::Implicit(slot)); }
+        Err(sql_err!(sqlstate::SERIALIZATION_FAILURE, "index statistics source changed"))
+    }
+
     fn reset_implicit_index_statistics(&self, table: usize) {
-        let definition = self.tables[table].definition();
-        let database = definition.identity().database;
+        let database = self.tables[table].database();
+        self.retain_implicit_index_statistics(database, table, &[]);
+    }
+
+    pub(super) fn retain_implicit_index_statistics(&self, database: DatabaseOid, table: usize, live: &[Option<RelationIdentity>]) {
         let mut cumulative = self.cumulative_statistics();
         let statistics = &mut cumulative.indexes;
         let mut position = 0usize;
         while position < statistics.len() {
-            if statistics[position].database == database && definition
-                .implicit_index_identities()
-                .flatten()
-                .any(|identity| identity.oid() == statistics[position].oid)
-            {
-                statistics.swap_remove(position);
-            } else {
-                position += 1;
-            }
+            let entry = &statistics[position];
+            if entry.database == database && entry.owner == Some(IndexStatisticsOwner::Implicit(table as u16))
+                && !live.iter().flatten().any(|identity| identity.oid() == entry.oid)
+            { statistics.swap_remove(position); } else { position += 1; }
+        }
+    }
+
+    pub(super) fn retire_implicit_index_statistics(&self, database: DatabaseOid, table: usize, retired: &[Option<RelationIdentity>]) {
+        if retired.iter().all(Option::is_none) { return; }
+        let mut cumulative = self.cumulative_statistics();
+        let statistics = &mut cumulative.indexes;
+        let mut position = 0usize;
+        while position < statistics.len() {
+            let entry = &statistics[position];
+            if entry.database == database && entry.owner == Some(IndexStatisticsOwner::Implicit(table as u16))
+                && retired.iter().flatten().any(|identity| identity.oid() == entry.oid)
+            { statistics.swap_remove(position); } else { position += 1; }
         }
     }
 
@@ -37102,6 +37142,7 @@ impl Storage {
             state.identity.existence = CatalogDdlState::Absent;
         }
         self.release_enforcers(index);
+        self.reset_implicit_index_statistics(index);
         self.clear_pending_table_defs(index);
         self.clear_pending_table_statistics(index);
         self.clear_table_rows(index);
@@ -46624,7 +46665,6 @@ impl Storage {
     pub fn commit_index_drop(&mut self, slot: usize) {
         let index = self.index(slot);
         let table = self.index_table_slot(slot);
-        self.reset_index_statistics(index.database, crate::sql::catalog::explicit_index_oid(&index));
         self.drop_object_comments(
             CommentClass::Relation,
             index.schema.as_str(),
@@ -46646,6 +46686,8 @@ impl Storage {
             slot: slot as u16,
         });
         let mut catalog = self.index_catalog();
+        let database = catalog[slot].database;
+        let identity = RelationIdentity::parse(catalog[slot].created_at);
         if rollback_create {
             catalog[slot].ddl_state.rollback_create();
         } else {
@@ -46660,6 +46702,9 @@ impl Storage {
         *state = BrinMaintenanceState::EMPTY;
         ranges.fill(0);
         catalog[slot] = IndexDef::EMPTY;
+        drop(maintenance);
+        drop(catalog);
+        if let Some(identity) = identity { self.reset_index_statistics(database, identity.oid()); }
     }
 
     /// The committed table named by a retained index definition.
@@ -57837,6 +57882,58 @@ mod tests {
             assert_eq!(storage.cumulative_statistics().indexes.len(), capacity);
             assert_eq!(storage.index_cumulative_statistics(database, replacement).idx_scan, 1);
             storage.reset_index_statistics(database, replacement);
+            assert_eq!(storage.index_cumulative_statistics(other_database, original).idx_scan, 11);
+            // The scanned index exists only in a discarded private version.
+            let (target, mut next) = storage.select_table_definition(table, 4);
+            next.take_column_index_identity(0);
+            next.columns[0].primary = false;
+            next.columns[0].unique = true;
+            storage.write_table_def(target, next, &mapping, false).unwrap();
+            let transient = storage.table_def(table, 4).column_index_identity(0).unwrap().oid();
+            storage.record_relation_scan(4, table, Some(transient), 1).unwrap();
+            let (target, mut next) = storage.select_table_definition(table, 4);
+            next.columns[0].unique = false;
+            let change = storage.write_table_def(target, next, &mapping, false).unwrap();
+            storage.commit_table_def(change).unwrap();
+            assert_eq!(storage.cumulative_statistics().indexes.len(), capacity - 1);
+            assert_eq!(storage.index_cumulative_statistics(database, transient).idx_scan, 0);
+            // A hidden older savepoint keeps its index counter until discarded.
+            let (target, mut next) = storage.select_table_definition(table, 5);
+            next.columns[0].unique = true;
+            let first = storage.write_table_def(target, next, &mapping, false).unwrap();
+            let saved = storage.table_def(table, 5).column_index_identity(0).unwrap().oid();
+            storage.record_relation_scan(5, table, Some(saved), 1).unwrap();
+            {
+                let mut cumulative = storage.cumulative_statistics();
+                let dummy = cumulative.indexes.iter().position(|entry| entry.database == other_database && entry.oid != original).unwrap();
+                cumulative.indexes.swap_remove(dummy);
+            }
+            let (target, mut next) = storage.select_table_definition(table, 5);
+            next.columns[0].unique = false;
+            let second = storage.write_table_def(target, next, &mapping, false).unwrap();
+            let (target, mut next) = storage.select_table_definition(table, 5);
+            next.columns[0].unique = true;
+            let third = storage.write_table_def(target, next, &mapping, false).unwrap();
+            let discarded = storage.table_def(table, 5).column_index_identity(0).unwrap().oid();
+            storage.record_relation_scan(5, table, Some(discarded), 1).unwrap();
+            assert_eq!(storage.cumulative_statistics().indexes.len(), capacity);
+            storage.rollback_table_def(third);
+            assert_eq!(storage.index_cumulative_statistics(database, discarded).idx_scan, 0);
+            assert_eq!(storage.index_cumulative_statistics(database, saved).idx_scan, 1);
+            storage.rollback_table_def(second);
+            assert_eq!(storage.index_cumulative_statistics(database, saved).idx_scan, 1);
+            storage.rollback_table_def(first);
+            assert_eq!(storage.index_cumulative_statistics(database, saved).idx_scan, 0);
+            assert_eq!(storage.cumulative_statistics().indexes.len(), capacity - 2);
+            let mut explicit = test_index_definition("statistics_explicit");
+            explicit.table = SqlName::parse("identity_statistics").unwrap();
+            let slot = storage.create_index(explicit, 6).unwrap();
+            let oid = crate::sql::catalog::explicit_index_oid(&storage.index(slot));
+            storage.record_relation_scan(6, table, Some(oid), 1).unwrap();
+            assert_eq!(storage.index_cumulative_statistics(database, oid).idx_scan, 1);
+            storage.rollback_index_create(slot);
+            assert_eq!(storage.index_cumulative_statistics(database, oid).idx_scan, 0);
+            assert_eq!(storage.cumulative_statistics().indexes.len(), capacity - 2);
             assert_eq!(storage.index_cumulative_statistics(other_database, original).idx_scan, 11);
         });
     }

@@ -13879,7 +13879,9 @@ pub fn function_result_text<'a>(
 }
 
 pub(crate) fn intrinsic_type_name(oid: i32) -> Option<&'static str> {
-    if crate::storage::NamedTypeKind::from_oid(oid).is_some() { return None; }
+    if crate::storage::NamedTypeKind::from_oid(oid).is_some() {
+        return None;
+    }
     ColType::from_oid(oid).map(ColType::name).or_else(|| {
         Some(match oid {
             2276 => "\"any\"",

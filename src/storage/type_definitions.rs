@@ -1632,32 +1632,16 @@ mod tests {
                     assert_eq!(reference(&storage, source), original);
                     assert_eq!(storage.catalog_identity_sequence(), maximum);
                 }
-                storage
-                    .restore_type_identity(source, source, maximum)
-                    .unwrap();
-                let captured = reference(&storage, source);
-                assert_ne!(captured, original);
+                assert_eq!(storage.restore_type_identity(source, source, maximum)
+                    .unwrap_err().sqlstate, sqlstate::DATA_EXCEPTION);
+                assert_eq!(reference(&storage, source), original);
                 let catalog = storage.type_catalog.lock().unwrap();
                 let selected = catalog.type_snapshot(source, 0).unwrap().unwrap();
-                assert_eq!(selected.identity.created_at(), maximum);
-                assert_eq!(
-                    catalog
-                        .identities
-                        .lookup(selected.identity.database(), maximum),
-                    Some(source)
-                );
-                assert!(
-                    catalog
-                        .resolve_source_reference(original, selected.identity.database(), 0)
-                        .unwrap()
-                        .is_none()
-                );
-                assert!(
-                    catalog
-                        .resolve_source_reference(captured, selected.identity.database(), 0)
-                        .unwrap()
-                        .is_some()
-                );
+                assert_eq!(selected.identity.created_at(), original.creation().created_at());
+                assert_eq!(catalog.identities.lookup(selected.identity.database(), maximum), None);
+                assert!(catalog.resolve_source_reference(original, selected.identity.database(), 0)
+                    .unwrap().is_some());
+
             });
         }
     }
@@ -1903,16 +1887,10 @@ mod tests {
                 );
                 retain(&images, &storage, reference).unwrap();
                 drop(images);
-                storage
-                    .restore_type_identity(source, source, created_at + 1)
-                    .unwrap();
+                assert_eq!(storage.restore_type_identity(source, source, created_at + 1)
+                    .unwrap_err().sqlstate, sqlstate::DATA_EXCEPTION);
                 let replacement = storage.type_definition_images();
-                assert_eq!(
-                    retain(&replacement, &storage, reference)
-                        .unwrap_err()
-                        .sqlstate,
-                    sqlstate::UNDEFINED_OBJECT
-                );
+                retain(&replacement, &storage, reference).unwrap();
             });
         }
     }

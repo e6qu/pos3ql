@@ -1333,30 +1333,46 @@ fn numeric_object_privileges_match_postgresql_before_lookup() {
 
 #[test]
 fn named_type_public_identifiers_survive_edits_replacement_and_savepoint_rollback() {
-    for mode in [crate::config::TransactionMode::Mvcc, crate::config::TransactionMode::Locking] {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
         let mut config = test_config(&format!("named-type-public-identifiers-{mode:?}"));
         config.transaction_mode = mode;
         config.max_ddl_per_transaction = 32;
         let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
         let mut engine = Engine::new(&config, &mut budget).unwrap();
         let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
-        assert_eq!(data_rows(&session.success(&mut engine,
-            include_str!("../../tests/external/differential_exact/24_named_type_identities.sql"), true)), ["t"; 14]);
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                include_str!(
+                    "../../tests/external/differential_exact/24_named_type_identities.sql"
+                ),
+                true
+            )),
+            ["t"; 14]
+        );
     }
 }
 
 #[test]
 fn named_type_public_identifiers_survive_journal_and_checkpoint_recovery() {
-    let fixture = include_str!("../../tests/external/differential_exact/24_named_type_identities.sql");
-    let (setup, _) = fixture.split_once(
-        "DROP TYPE type_identity_scope.order_item, type_identity_scope.payment_status;"
-    ).unwrap();
+    let fixture =
+        include_str!("../../tests/external/differential_exact/24_named_type_identities.sql");
+    let (setup, _) = fixture
+        .split_once("DROP TYPE type_identity_scope.order_item, type_identity_scope.payment_status;")
+        .unwrap();
     let remaining = &fixture[setup.len()..];
-    const QUERIES: &str = "SELECT count(*) = 3 FROM saved_type_identities s JOIN pg_type t ON t.oid = s.identity;
+    const QUERIES: &str =
+        "SELECT count(*) = 3 FROM saved_type_identities s JOIN pg_type t ON t.oid = s.identity;
         SELECT count(*) = 3 FROM saved_type_identities s JOIN pg_type t ON t.oid = s.array_identity;
         SELECT count(*) = 2 FROM saved_enum_identities s JOIN pg_enum e ON e.oid = s.identity";
     for checkpoint in [false, true] {
-        for mode in [crate::config::TransactionMode::Mvcc, crate::config::TransactionMode::Locking] {
+        for mode in [
+            crate::config::TransactionMode::Mvcc,
+            crate::config::TransactionMode::Locking,
+        ] {
             let name = format!("named-type-public-cold-{checkpoint}-{mode:?}");
             let mut config = test_config(&name);
             config.transaction_mode = mode;
@@ -1371,8 +1387,13 @@ fn named_type_public_identifiers_survive_journal_and_checkpoint_recovery() {
                 let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
                 let mut engine = Engine::new(&config, &mut budget).unwrap();
                 let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
-                assert_eq!(data_rows(&session.success(&mut engine, setup, false)), ["t"; 4]);
-                if checkpoint { assert!(engine.checkpoint().unwrap()); }
+                assert_eq!(
+                    data_rows(&session.success(&mut engine, setup, false)),
+                    ["t"; 4]
+                );
+                if checkpoint {
+                    assert!(engine.checkpoint().unwrap());
+                }
                 engine.commit_wal().unwrap();
             }
             std::fs::remove_dir_all(&config.data_dir).unwrap();
@@ -1380,8 +1401,14 @@ fn named_type_public_identifiers_survive_journal_and_checkpoint_recovery() {
                 let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
                 let mut engine = Engine::new(&config, &mut budget).unwrap();
                 let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
-                assert_eq!(data_rows(&session.success(&mut engine, QUERIES, true)), ["t"; 3]);
-                assert_eq!(data_rows(&session.success(&mut engine, remaining, false)), ["t"; 10]);
+                assert_eq!(
+                    data_rows(&session.success(&mut engine, QUERIES, true)),
+                    ["t"; 3]
+                );
+                assert_eq!(
+                    data_rows(&session.success(&mut engine, remaining, false)),
+                    ["t"; 10]
+                );
             }
             std::fs::remove_dir_all(&config.data_dir).unwrap();
             crate::object_store::sim::drop_namespace(&config.object_store_bucket);
@@ -25385,14 +25412,30 @@ fn declared_user_types_survive_protocol_description_and_parameter_inference() {
          CREATE PROCEDURE protocol_output(IN value integer, OUT doubled integer) \
            LANGUAGE SQL AS 'SELECT value * 2'",
     );
-    let enum_oid = crate::sql::types::oid::enum_oid(engine.storage.enum_for(engine
+    let enum_oid = crate::sql::types::oid::enum_oid(
+        engine
             .storage
-            .enum_slot("public", "protocol_state", 0)
-            .unwrap(), 0).creation());
-    let domain_oid = crate::sql::types::oid::domain_oid(engine.storage.domain_for(engine
+            .enum_for(
+                engine
+                    .storage
+                    .enum_slot("public", "protocol_state", 0)
+                    .unwrap(),
+                0,
+            )
+            .creation(),
+    );
+    let domain_oid = crate::sql::types::oid::domain_oid(
+        engine
             .storage
-            .domain_slot("public", "protocol_count", 0)
-            .unwrap(), 0).creation());
+            .domain_for(
+                engine
+                    .storage
+                    .domain_slot("public", "protocol_count", 0)
+                    .unwrap(),
+                0,
+            )
+            .creation(),
+    );
 
     for query in [
         "SELECT state, count FROM protocol_types",
@@ -25780,22 +25823,54 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
          CREATE TYPE binary_coordinate AS (x integer, y integer); \
          CREATE DOMAIN binary_coordinate_domain AS binary_coordinate",
     );
-    let enum_oid = crate::sql::types::oid::enum_oid(engine.storage.enum_for(engine
+    let enum_oid = crate::sql::types::oid::enum_oid(
+        engine
             .storage
-            .enum_slot("public", "binary_state", 0)
-            .unwrap(), 0).creation());
-    let domain_oid = crate::sql::types::oid::domain_oid(engine.storage.domain_for(engine
+            .enum_for(
+                engine
+                    .storage
+                    .enum_slot("public", "binary_state", 0)
+                    .unwrap(),
+                0,
+            )
+            .creation(),
+    );
+    let domain_oid = crate::sql::types::oid::domain_oid(
+        engine
             .storage
-            .domain_slot("public", "binary_positive", 0)
-            .unwrap(), 0).creation());
-    let composite_oid = crate::sql::types::oid::composite_oid(engine.storage.composite_for(engine
+            .domain_for(
+                engine
+                    .storage
+                    .domain_slot("public", "binary_positive", 0)
+                    .unwrap(),
+                0,
+            )
+            .creation(),
+    );
+    let composite_oid = crate::sql::types::oid::composite_oid(
+        engine
             .storage
-            .composite_slot("public", "binary_coordinate", 0)
-            .unwrap(), 0).creation());
-    let composite_domain_oid = crate::sql::types::oid::domain_oid(engine.storage.domain_for(engine
+            .composite_for(
+                engine
+                    .storage
+                    .composite_slot("public", "binary_coordinate", 0)
+                    .unwrap(),
+                0,
+            )
+            .creation(),
+    );
+    let composite_domain_oid = crate::sql::types::oid::domain_oid(
+        engine
             .storage
-            .domain_slot("public", "binary_coordinate_domain", 0)
-            .unwrap(), 0).creation());
+            .domain_for(
+                engine
+                    .storage
+                    .domain_slot("public", "binary_coordinate_domain", 0)
+                    .unwrap(),
+                0,
+            )
+            .creation(),
+    );
     let mut transaction = TxnState::new(&mut budget, 64).unwrap();
     let arena = Arena::new(&mut budget, "binary parameter", 1 << 18).unwrap();
 
@@ -25837,10 +25912,18 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
             .to_string(),
         "(4,8)"
     );
-    let composite_array_oid = crate::sql::types::oid::composite_array_oid(engine.storage.composite_for(engine
+    let composite_array_oid = crate::sql::types::oid::composite_array_oid(
+        engine
             .storage
-            .composite_slot("public", "binary_coordinate", 0)
-            .unwrap(), 0).creation());
+            .composite_for(
+                engine
+                    .storage
+                    .composite_slot("public", "binary_coordinate", 0)
+                    .unwrap(),
+                0,
+            )
+            .creation(),
+    );
     let mut composite_array_binary = Vec::new();
     composite_array_binary.extend_from_slice(&1_i32.to_be_bytes());
     composite_array_binary.extend_from_slice(&0_i32.to_be_bytes());
@@ -25908,10 +25991,18 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
     engine.commit_txn(&mut transaction, &guc).unwrap();
     let mut composite_domain_array_binary = composite_array_binary.clone();
     composite_domain_array_binary[8..12].copy_from_slice(&composite_domain_oid.to_be_bytes());
-    let composite_domain_array_oid = crate::sql::types::oid::domain_array_oid(engine.storage.domain_for(engine
+    let composite_domain_array_oid = crate::sql::types::oid::domain_array_oid(
+        engine
             .storage
-            .domain_slot("public", "binary_coordinate_domain", 0)
-            .unwrap(), 0).creation());
+            .domain_for(
+                engine
+                    .storage
+                    .domain_slot("public", "binary_coordinate_domain", 0)
+                    .unwrap(),
+                0,
+            )
+            .creation(),
+    );
     assert_eq!(
         engine
             .decode_binary_parameter(
@@ -26021,19 +26112,35 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
             .unwrap_err();
         assert_eq!(error.sqlstate, sqlstate::INVALID_TEXT_REPRESENTATION);
     }
-    let required_domain_oid = crate::sql::types::oid::domain_oid(engine.storage.domain_for(engine
+    let required_domain_oid = crate::sql::types::oid::domain_oid(
+        engine
             .storage
-            .domain_slot("public", "binary_required", 0)
-            .unwrap(), 0).creation());
+            .domain_for(
+                engine
+                    .storage
+                    .domain_slot("public", "binary_required", 0)
+                    .unwrap(),
+                0,
+            )
+            .creation(),
+    );
     let null_domain = engine
         .coerce_parameter_null(required_domain_oid, &arena, 0)
         .unwrap_err();
     assert_eq!(null_domain.sqlstate, sqlstate::NOT_NULL_VIOLATION);
 
-    let required_domain_array_oid = crate::sql::types::oid::domain_array_oid(engine.storage.domain_for(engine
+    let required_domain_array_oid = crate::sql::types::oid::domain_array_oid(
+        engine
             .storage
-            .domain_slot("public", "binary_required", 0)
-            .unwrap(), 0).creation());
+            .domain_for(
+                engine
+                    .storage
+                    .domain_slot("public", "binary_required", 0)
+                    .unwrap(),
+                0,
+            )
+            .creation(),
+    );
     let required_domain_array = [
         0,
         0,
@@ -26078,10 +26185,18 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
     assert_eq!(
         engine
             .decode_binary_parameter(
-                crate::sql::types::oid::enum_array_oid(engine.storage.enum_for(engine
+                crate::sql::types::oid::enum_array_oid(
+                    engine
                         .storage
-                        .enum_slot("public", "binary_state", 0)
-                        .unwrap(), 0).creation()),
+                        .enum_for(
+                            engine
+                                .storage
+                                .enum_slot("public", "binary_state", 0)
+                                .unwrap(),
+                            0
+                        )
+                        .creation()
+                ),
                 &enum_array,
                 &arena,
                 0,
@@ -26093,10 +26208,18 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
     assert_eq!(
         engine
             .decode_text_parameter(
-                crate::sql::types::oid::enum_array_oid(engine.storage.enum_for(engine
+                crate::sql::types::oid::enum_array_oid(
+                    engine
                         .storage
-                        .enum_slot("public", "binary_state", 0)
-                        .unwrap(), 0).creation()),
+                        .enum_for(
+                            engine
+                                .storage
+                                .enum_slot("public", "binary_state", 0)
+                                .unwrap(),
+                            0
+                        )
+                        .creation()
+                ),
                 b"{ready,blocked}",
                 &arena,
                 0,
@@ -26119,10 +26242,18 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
     assert_eq!(
         engine
             .decode_binary_parameter(
-                crate::sql::types::oid::domain_array_oid(engine.storage.domain_for(engine
+                crate::sql::types::oid::domain_array_oid(
+                    engine
                         .storage
-                        .domain_slot("public", "binary_positive", 0)
-                        .unwrap(), 0).creation()),
+                        .domain_for(
+                            engine
+                                .storage
+                                .domain_slot("public", "binary_positive", 0)
+                                .unwrap(),
+                            0
+                        )
+                        .creation()
+                ),
                 &domain_array,
                 &arena,
                 0,
@@ -26134,10 +26265,18 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
     assert_eq!(
         engine
             .decode_text_parameter(
-                crate::sql::types::oid::domain_array_oid(engine.storage.domain_for(engine
+                crate::sql::types::oid::domain_array_oid(
+                    engine
                         .storage
-                        .domain_slot("public", "binary_positive", 0)
-                        .unwrap(), 0).creation()),
+                        .domain_for(
+                            engine
+                                .storage
+                                .domain_slot("public", "binary_positive", 0)
+                                .unwrap(),
+                            0
+                        )
+                        .creation()
+                ),
                 b"{3,5}",
                 &arena,
                 0,
@@ -26148,10 +26287,18 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
     );
     let invalid_text_domain_array = engine
         .decode_text_parameter(
-            crate::sql::types::oid::domain_array_oid(engine.storage.domain_for(engine
+            crate::sql::types::oid::domain_array_oid(
+                engine
                     .storage
-                    .domain_slot("public", "binary_positive", 0)
-                    .unwrap(), 0).creation()),
+                    .domain_for(
+                        engine
+                            .storage
+                            .domain_slot("public", "binary_positive", 0)
+                            .unwrap(),
+                        0,
+                    )
+                    .creation(),
+            ),
             b"{3,-1}",
             &arena,
             0,
@@ -26193,10 +26340,18 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
     domain_array[8..12].copy_from_slice(&crate::sql::types::oid::INT4.to_be_bytes());
     let wrong_element_oid = engine
         .decode_binary_parameter(
-            crate::sql::types::oid::domain_array_oid(engine.storage.domain_for(engine
+            crate::sql::types::oid::domain_array_oid(
+                engine
                     .storage
-                    .domain_slot("public", "binary_positive", 0)
-                    .unwrap(), 0).creation()),
+                    .domain_for(
+                        engine
+                            .storage
+                            .domain_slot("public", "binary_positive", 0)
+                            .unwrap(),
+                        0,
+                    )
+                    .creation(),
+            ),
             &domain_array,
             &arena,
             0,
@@ -26257,10 +26412,18 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
         (enum_oid, b"ready".as_slice()),
         (domain_oid, &7_i32.to_be_bytes()),
         (
-            crate::sql::types::oid::domain_array_oid(engine.storage.domain_for(engine
+            crate::sql::types::oid::domain_array_oid(
+                engine
                     .storage
-                    .domain_slot("public", "binary_positive", 0)
-                    .unwrap(), 0).creation()),
+                    .domain_for(
+                        engine
+                            .storage
+                            .domain_slot("public", "binary_positive", 0)
+                            .unwrap(),
+                        0,
+                    )
+                    .creation(),
+            ),
             domain_array.as_slice(),
         ),
         (crate::sql::types::oid::UNKNOWN, b"wire text".as_slice()),
@@ -26332,7 +26495,12 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
         .unwrap_err();
     assert_eq!(invalid_record.sqlstate, sqlstate::CHECK_VIOLATION);
     let missing_type = engine
-        .decode_binary_parameter(crate::sql::types::oid::enum_oid(crate::storage::TypeCreation::parse(31).unwrap()), b"ready", &arena, 0)
+        .decode_binary_parameter(
+            crate::sql::types::oid::enum_oid(crate::storage::TypeCreation::parse(31).unwrap()),
+            b"ready",
+            &arena,
+            0,
+        )
         .unwrap_err();
     assert_eq!(missing_type.sqlstate, sqlstate::UNDEFINED_OBJECT);
 }
@@ -32270,10 +32438,18 @@ fn array_subquery_preserves_named_composite_identity_over_empty_and_nonempty_set
         "{}",
         String::from_utf8_lossy(&setup)
     );
-    let type_oid = crate::sql::types::oid::composite_array_oid(engine.storage.composite_for(engine
+    let type_oid = crate::sql::types::oid::composite_array_oid(
+        engine
             .storage
-            .resolve_composite_slot("array_subquery_pair", 0)
-            .unwrap(), 0).creation());
+            .composite_for(
+                engine
+                    .storage
+                    .resolve_composite_slot("array_subquery_pair", 0)
+                    .unwrap(),
+                0,
+            )
+            .creation(),
+    );
     let nonempty = run_with(
         &mut engine,
         &mut budget,
@@ -44678,7 +44854,12 @@ fn routines_retain_catalog_defined_signature_and_result_types() {
         captured,
         engine
             .storage
-            .routine_result_for_oid(crate::sql::types::oid::domain_oid(engine.storage.domain_for(moved_domain, 0).creation()), 0)
+            .routine_result_for_oid(
+                crate::sql::types::oid::domain_oid(
+                    engine.storage.domain_for(moved_domain, 0).creation()
+                ),
+                0
+            )
             .unwrap()
             .user_type
     );
@@ -44692,7 +44873,9 @@ fn routines_retain_catalog_defined_signature_and_result_types() {
             engine.storage.routine(echo_count).arguments()[0].user_type,
             0,
         ),
-        Some(crate::sql::types::oid::domain_oid(engine.storage.domain_for(moved_domain, 0).creation()))
+        Some(crate::sql::types::oid::domain_oid(
+            engine.storage.domain_for(moved_domain, 0).creation()
+        ))
     );
     let echo_count_result = match engine.storage.routine(echo_count).kind {
         crate::storage::RoutineKind::Function { result } => result,
@@ -44702,7 +44885,9 @@ fn routines_retain_catalog_defined_signature_and_result_types() {
         engine
             .storage
             .routine_type_oid(echo_count_result.ctype, echo_count_result.user_type, 0,),
-        Some(crate::sql::types::oid::domain_oid(engine.storage.domain_for(moved_domain, 0).creation()))
+        Some(crate::sql::types::oid::domain_oid(
+            engine.storage.domain_for(moved_domain, 0).creation()
+        ))
     );
     let moved_catalog = run_with(
         &mut engine,
@@ -54101,7 +54286,11 @@ fn named_composite_type_is_transactional_and_catalog_visible() {
         "SELECT pg_typeof(values), pg_typeof(values[1]) FROM address_arrays",
     );
     assert_eq!(data_rows(&bytes), ["address[]|address"]);
-    let address_oid = crate::sql::types::oid::composite_oid(e.storage.composite_for(e.storage.composite_slot("public", "address", 0).unwrap(), 0).creation());
+    let address_oid = crate::sql::types::oid::composite_oid(
+        e.storage
+            .composite_for(e.storage.composite_slot("public", "address", 0).unwrap(), 0)
+            .creation(),
+    );
     let copy_array_binary = run_with(
         &mut e,
         &mut b,
@@ -55825,7 +56014,12 @@ fn composite_domain_arrays_keep_the_domain_binary_boundary() {
         .storage
         .domain_slot("public", "binary_domain_point_value", 0)
         .unwrap() as u16;
-    let domain_oid = crate::sql::types::oid::domain_oid(engine.storage.domain_for(usize::from(domain_slot), 0).creation());
+    let domain_oid = crate::sql::types::oid::domain_oid(
+        engine
+            .storage
+            .domain_for(usize::from(domain_slot), 0)
+            .creation(),
+    );
     let copy = run_with(
         &mut engine,
         &mut budget,
@@ -56173,7 +56367,12 @@ fn anonymous_record_field_preserves_catalog_cast_type() {
         .unwrap() as u16;
     assert_eq!(
         row_description_type_oids(&enum_output),
-        [crate::sql::types::oid::enum_oid(engine.storage.enum_for(usize::from(enum_slot), 0).creation())]
+        [crate::sql::types::oid::enum_oid(
+            engine
+                .storage
+                .enum_for(usize::from(enum_slot), 0)
+                .creation()
+        )]
     );
     let expansion_in_scalar = run_with(&mut engine, &mut budget, "SELECT (ROW(1,2)).* + 1");
     assert!(
@@ -56198,10 +56397,18 @@ fn expression_index_attributes_preserve_catalog_type_identity() {
         "{}",
         String::from_utf8_lossy(&setup)
     );
-    let domain_oid = crate::sql::types::oid::domain_oid(engine.storage.domain_for(engine
+    let domain_oid = crate::sql::types::oid::domain_oid(
+        engine
             .storage
-            .domain_slot("public", "expression_index_domain", 0)
-            .unwrap(), 0).creation());
+            .domain_for(
+                engine
+                    .storage
+                    .domain_slot("public", "expression_index_domain", 0)
+                    .unwrap(),
+                0,
+            )
+            .creation(),
+    );
     assert_eq!(
         data_rows(&run_with(
             &mut engine,
@@ -56255,7 +56462,12 @@ fn catalog_casts_preserve_type_through_expression_descriptions() {
         .unwrap() as u16;
     assert_eq!(
         row_description_type_oids(&enum_output),
-        [crate::sql::types::oid::enum_oid(engine.storage.enum_for(usize::from(enum_slot), 0).creation())]
+        [crate::sql::types::oid::enum_oid(
+            engine
+                .storage
+                .enum_for(usize::from(enum_slot), 0)
+                .creation()
+        )]
     );
     let case_output = run_with(
         &mut engine,
@@ -56265,7 +56477,12 @@ fn catalog_casts_preserve_type_through_expression_descriptions() {
     assert_eq!(data_rows(&case_output), ["ready"], "{case_output:?}");
     assert_eq!(
         row_description_type_oids(&case_output),
-        [crate::sql::types::oid::enum_oid(engine.storage.enum_for(usize::from(enum_slot), 0).creation())]
+        [crate::sql::types::oid::enum_oid(
+            engine
+                .storage
+                .enum_for(usize::from(enum_slot), 0)
+                .creation()
+        )]
     );
     let nullable_case_output = run_with(
         &mut engine,
@@ -56279,7 +56496,12 @@ fn catalog_casts_preserve_type_through_expression_descriptions() {
     );
     assert_eq!(
         row_description_type_oids(&nullable_case_output),
-        [crate::sql::types::oid::enum_oid(engine.storage.enum_for(usize::from(enum_slot), 0).creation())]
+        [crate::sql::types::oid::enum_oid(
+            engine
+                .storage
+                .enum_for(usize::from(enum_slot), 0)
+                .creation()
+        )]
     );
     let array_output = run_with(
         &mut engine,
@@ -56289,7 +56511,12 @@ fn catalog_casts_preserve_type_through_expression_descriptions() {
     assert_eq!(data_rows(&array_output), ["{ready}"], "{array_output:?}");
     assert_eq!(
         row_description_type_oids(&array_output),
-        [crate::sql::types::oid::enum_array_oid(engine.storage.enum_for(usize::from(enum_slot), 0).creation())]
+        [crate::sql::types::oid::enum_array_oid(
+            engine
+                .storage
+                .enum_for(usize::from(enum_slot), 0)
+                .creation()
+        )]
     );
     let filled_array = run_with(
         &mut engine,
@@ -56303,7 +56530,12 @@ fn catalog_casts_preserve_type_through_expression_descriptions() {
     );
     assert_eq!(
         row_description_type_oids(&filled_array),
-        [crate::sql::types::oid::enum_array_oid(engine.storage.enum_for(usize::from(enum_slot), 0).creation())]
+        [crate::sql::types::oid::enum_array_oid(
+            engine
+                .storage
+                .enum_for(usize::from(enum_slot), 0)
+                .creation()
+        )]
     );
     let domain_array = run_with(
         &mut engine,
@@ -56317,7 +56549,12 @@ fn catalog_casts_preserve_type_through_expression_descriptions() {
         .unwrap() as u16;
     assert_eq!(
         row_description_type_oids(&domain_array),
-        [crate::sql::types::oid::domain_array_oid(engine.storage.domain_for(usize::from(domain_slot), 0).creation())]
+        [crate::sql::types::oid::domain_array_oid(
+            engine
+                .storage
+                .domain_for(usize::from(domain_slot), 0)
+                .creation()
+        )]
     );
     let enum_element = run_with(
         &mut engine,
@@ -56327,7 +56564,12 @@ fn catalog_casts_preserve_type_through_expression_descriptions() {
     assert_eq!(data_rows(&enum_element), ["ready"], "{enum_element:?}");
     assert_eq!(
         row_description_type_oids(&enum_element),
-        [crate::sql::types::oid::enum_oid(engine.storage.enum_for(usize::from(enum_slot), 0).creation())]
+        [crate::sql::types::oid::enum_oid(
+            engine
+                .storage
+                .enum_for(usize::from(enum_slot), 0)
+                .creation()
+        )]
     );
     let enum_slice = run_with(
         &mut engine,
@@ -56337,7 +56579,12 @@ fn catalog_casts_preserve_type_through_expression_descriptions() {
     assert_eq!(data_rows(&enum_slice), ["{ready}"], "{enum_slice:?}");
     assert_eq!(
         row_description_type_oids(&enum_slice),
-        [crate::sql::types::oid::enum_array_oid(engine.storage.enum_for(usize::from(enum_slot), 0).creation())]
+        [crate::sql::types::oid::enum_array_oid(
+            engine
+                .storage
+                .enum_for(usize::from(enum_slot), 0)
+                .creation()
+        )]
     );
     let appended = run_with(
         &mut engine,
@@ -56347,7 +56594,12 @@ fn catalog_casts_preserve_type_through_expression_descriptions() {
     assert_eq!(data_rows(&appended), ["{ready,blocked}"], "{appended:?}");
     assert_eq!(
         row_description_type_oids(&appended),
-        [crate::sql::types::oid::enum_array_oid(engine.storage.enum_for(usize::from(enum_slot), 0).creation())]
+        [crate::sql::types::oid::enum_array_oid(
+            engine
+                .storage
+                .enum_for(usize::from(enum_slot), 0)
+                .creation()
+        )]
     );
     let concatenated = run_with(
         &mut engine,
@@ -56361,7 +56613,12 @@ fn catalog_casts_preserve_type_through_expression_descriptions() {
     );
     assert_eq!(
         row_description_type_oids(&concatenated),
-        [crate::sql::types::oid::enum_array_oid(engine.storage.enum_for(usize::from(enum_slot), 0).creation())]
+        [crate::sql::types::oid::enum_array_oid(
+            engine
+                .storage
+                .enum_for(usize::from(enum_slot), 0)
+                .creation()
+        )]
     );
     let unnested = run_with(
         &mut engine,
@@ -56371,7 +56628,12 @@ fn catalog_casts_preserve_type_through_expression_descriptions() {
     assert_eq!(data_rows(&unnested), ["ready"], "{unnested:?}");
     assert_eq!(
         row_description_type_oids(&unnested),
-        [crate::sql::types::oid::enum_oid(engine.storage.enum_for(usize::from(enum_slot), 0).creation())]
+        [crate::sql::types::oid::enum_oid(
+            engine
+                .storage
+                .enum_for(usize::from(enum_slot), 0)
+                .creation()
+        )]
     );
     let lagged = run_with(
         &mut engine,
@@ -56381,7 +56643,12 @@ fn catalog_casts_preserve_type_through_expression_descriptions() {
     assert_eq!(data_rows(&lagged), ["NULL"], "{lagged:?}");
     assert_eq!(
         row_description_type_oids(&lagged),
-        [crate::sql::types::oid::enum_oid(engine.storage.enum_for(usize::from(enum_slot), 0).creation())]
+        [crate::sql::types::oid::enum_oid(
+            engine
+                .storage
+                .enum_for(usize::from(enum_slot), 0)
+                .creation()
+        )]
     );
     let aggregated = run_with(
         &mut engine,
@@ -56391,7 +56658,12 @@ fn catalog_casts_preserve_type_through_expression_descriptions() {
     assert_eq!(data_rows(&aggregated), ["{ready}"], "{aggregated:?}");
     assert_eq!(
         row_description_type_oids(&aggregated),
-        [crate::sql::types::oid::enum_array_oid(engine.storage.enum_for(usize::from(enum_slot), 0).creation())]
+        [crate::sql::types::oid::enum_array_oid(
+            engine
+                .storage
+                .enum_for(usize::from(enum_slot), 0)
+                .creation()
+        )]
     );
 }
 
@@ -57761,7 +58033,10 @@ fn enum_value_identity_legacy_rows_arrays_and_records_keep_original_members() {
         .storage
         .composite_slot("public", "enum_legacy_detail", 0)
         .unwrap() as u16;
-    let composite_slot = engine.storage.composite_for(usize::from(composite_slot), 0).creation();
+    let composite_slot = engine
+        .storage
+        .composite_for(usize::from(composite_slot), 0)
+        .creation();
     let record = crate::mem::guard::forbid_alloc(|| {
         crate::sql::exec::decode_stored_composite_text(
             "(old,old)",
@@ -57864,8 +58139,13 @@ fn enum_value_identity_compact_ids_preserve_value_size() {
     );
     assert!(EnumMemberId::from_ordinal(u32::MAX).is_none());
     assert!(
-        crate::sql::types::ArrElem::domain(crate::storage::TypeCreation::parse(1).unwrap(), ColType::Array(crate::sql::types::ArrElem::Enum(Some(crate::storage::TypeCreation::parse(2).unwrap()))))
-            .is_none()
+        crate::sql::types::ArrElem::domain(
+            crate::storage::TypeCreation::parse(1).unwrap(),
+            ColType::Array(crate::sql::types::ArrElem::Enum(Some(
+                crate::storage::TypeCreation::parse(2).unwrap()
+            )))
+        )
+        .is_none()
     );
 }
 
@@ -57943,7 +58223,11 @@ fn enum_value_identity_private_markers_and_invalid_bindings_are_checked() {
     );
     for (source, base, expected) in [
         ("pos3ql-enum-check-v99\n'old'", ColType::Text, "0A000"),
-        ("pos3ql-enum-check-v99\n'old'", ColType::Enum(Some(slot)), "0A000"),
+        (
+            "pos3ql-enum-check-v99\n'old'",
+            ColType::Enum(Some(slot)),
+            "0A000",
+        ),
         (
             "pos3ql-enum-check-v1\n/*p3c:0*/'old'",
             ColType::Text,
@@ -84110,7 +84394,14 @@ fn derived_tables() {
          CREATE TABLE typed_source (state derived_state, count derived_count); \
          INSERT INTO typed_source VALUES ('ready', 7)",
     );
-    let enum_oid = crate::sql::types::oid::enum_oid(e.storage.enum_for(e.storage.enum_slot("public", "derived_state", 0).unwrap(), 0).creation());
+    let enum_oid = crate::sql::types::oid::enum_oid(
+        e.storage
+            .enum_for(
+                e.storage.enum_slot("public", "derived_state", 0).unwrap(),
+                0,
+            )
+            .creation(),
+    );
     let query = "SELECT d.state, d.count FROM (SELECT state, count FROM typed_source) d";
     assert_eq!(data_rows(&run_with(&mut e, &mut b, query)), ["ready|7"]);
     assert_eq!(
@@ -85647,7 +85938,9 @@ fn arrays_of_array_domains_preserve_the_domain_element_identity() {
         .storage
         .domain_slot("public", "integer_vector", 0)
         .unwrap() as u16;
-    let domain_oid = crate::sql::types::oid::domain_oid(engine.storage.domain_for(usize::from(slot), 0).creation());
+    let domain_oid = crate::sql::types::oid::domain_oid(
+        engine.storage.domain_for(usize::from(slot), 0).creation(),
+    );
     let mut inner = Vec::new();
     inner.extend_from_slice(&1_i32.to_be_bytes());
     inner.extend_from_slice(&0_i32.to_be_bytes());
@@ -85670,7 +85963,9 @@ fn arrays_of_array_domains_preserve_the_domain_element_identity() {
     assert_eq!(
         engine
             .decode_binary_parameter(
-                crate::sql::types::oid::domain_array_oid(engine.storage.domain_for(usize::from(slot), 0).creation()),
+                crate::sql::types::oid::domain_array_oid(
+                    engine.storage.domain_for(usize::from(slot), 0).creation()
+                ),
                 &outer,
                 &arena,
                 0,
@@ -86119,10 +86414,18 @@ fn binary_copy_enforces_not_null_domain_array_elements() {
         "CREATE DOMAIN binary_copy_required AS integer NOT NULL; \
          CREATE TABLE binary_copy_required_values (values binary_copy_required[])",
     );
-    let domain_oid = crate::sql::types::oid::domain_oid(engine.storage.domain_for(engine
+    let domain_oid = crate::sql::types::oid::domain_oid(
+        engine
             .storage
-            .domain_slot("public", "binary_copy_required", 0)
-            .unwrap(), 0).creation());
+            .domain_for(
+                engine
+                    .storage
+                    .domain_slot("public", "binary_copy_required", 0)
+                    .unwrap(),
+                0,
+            )
+            .creation(),
+    );
     let mut send =
         crate::mem::FixedBuf::new(&mut budget, "binary copy domain send", 1 << 18).unwrap();
     let arena = Arena::new(&mut budget, "binary copy domain sql", 1 << 18).unwrap();
@@ -86293,10 +86596,18 @@ fn copy_query_to_stdout() {
         &mut budget,
         "COPY (SELECT value, values, state FROM cq_domain) TO STDOUT (FORMAT binary)",
     );
-    let domain_oid = crate::sql::types::oid::domain_oid(engine.storage.domain_for(engine
+    let domain_oid = crate::sql::types::oid::domain_oid(
+        engine
             .storage
-            .domain_slot("public", "cq_positive", 0)
-            .unwrap(), 0).creation());
+            .domain_for(
+                engine
+                    .storage
+                    .domain_slot("public", "cq_positive", 0)
+                    .unwrap(),
+                0,
+            )
+            .creation(),
+    );
     assert!(
         !message_types(&out).contains(&b'E')
             && out.windows(4).any(|bytes| bytes == 7_i32.to_be_bytes())

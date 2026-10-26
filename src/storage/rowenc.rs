@@ -1110,7 +1110,14 @@ mod tests {
         let mut reference = [0u8; 17];
         reference[8..12].copy_from_slice(&0x8000_0001u32.to_le_bytes());
         assert!(encoded_value_len(&reference, ColType::Regclass).is_err());
-        assert_eq!(encoded_value_len(&reference, ColType::Enum(Some(crate::storage::TypeCreation::parse(1).unwrap()))).unwrap(), 17);
+        assert_eq!(
+            encoded_value_len(
+                &reference,
+                ColType::Enum(Some(crate::storage::TypeCreation::parse(1).unwrap()))
+            )
+            .unwrap(),
+            17
+        );
         assert!(decode_physical_field_count(&[255, 255, 127]).is_none());
     }
 

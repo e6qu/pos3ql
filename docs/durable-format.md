@@ -400,8 +400,9 @@ reserve a temporary stamp and overwrite it later. An exhausted creation sequence
 therefore cannot prevent loading an existing domain, enum or composite. The
 startup-reserved identity index keys each source by database and creation stamp.
 Retired entries remain bounded by catalog capacity and are replaced on slot reuse.
-Reassignment rejects an uncommitted, retired, wrong-database or retained source
-before changing its definition, version or identity entry.
+Recovery may move a source to its saved physical position, but cannot change
+an admitted creation stamp. It rejects an uncommitted, retired, wrong-database
+or retained source before changing its definition, version or identity entry.
 
 Journal routine type references identify their saved source lifetime. Replay
 refreshes the SQL spelling from that source; a missing lifetime cannot select a

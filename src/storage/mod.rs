@@ -75,7 +75,7 @@ mod type_identities;
 mod type_names;
 mod type_reference_moves;
 pub(crate) use type_identities::EnumLabelIdentity;
-pub use type_identities::{CachedArrayElement, TypeCreation};
+pub(crate) use type_identities::{CachedArrayElement, TypeCreation};
 mod type_references;
 use crate::mem::mutex::{Mutex, MutexGuard};
 use enum_images::{EnumImageRead, EnumImageReservation, EnumMemberImages};
@@ -6520,8 +6520,7 @@ impl MatviewDef {
     }
 }
 
-/// Domain slots fit between the synthesized domain and enum OID bands. The
-/// configured catalog may use any prefix of this representable range.
+/// Startup domain capacity is independent of public type creation ranges.
 pub(crate) const MAX_DOMAIN_CATALOG_SLOTS: usize = 10_000;
 /// Startup table capacity is independent of durable relation identities.
 pub(crate) const MAX_TABLE_CATALOG_SLOTS: usize = 10_000;
@@ -6931,9 +6930,8 @@ impl RoutineArgumentDef {
     }
 }
 
-/// A scalar routine result keeps its executor representation and its durable
-/// catalog identity together.  A bare `ColType::Enum(slot)` cannot survive a
-/// catalog rebuild because slots are allocation details, not identities.
+/// A routine result retains its declared source alongside its runtime type.
+/// Domains execute as their base type but retain their own SQL identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RoutineResult {
     pub ctype: ColType,
@@ -9720,7 +9718,7 @@ pub(crate) struct DomainSpec {
 
 /// Named enum slots retain their bounded scalar and array representation.
 pub(crate) const MAX_ENUM_CATALOG_SLOTS: usize = 10_000;
-/// Composite slots fit between their synthesized scalar and array OID bands.
+/// Startup composite capacity is independent of public type creation ranges.
 pub(crate) const MAX_COMPOSITE_CATALOG_SLOTS: usize = 10_000;
 /// Named composites share the durable row-format column boundary. This avoids
 /// accepting a table shape that the corresponding named record cannot model.

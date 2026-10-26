@@ -3528,7 +3528,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                 + 1
                 + base_schema
                 + 1
-                + 2
+                + 4
                 + 4
                 + 1
                 + 2
@@ -13169,26 +13169,45 @@ mod tests {
                 bytes: text,
             }),
             Some(OwnedDatum::Array {
-                element: crate::storage::CachedArrayElement::from_element(crate::sql::types::ArrElem::Int4).unwrap(),
+                element: crate::storage::CachedArrayElement::from_element(
+                    crate::sql::types::ArrElem::Int4,
+                )
+                .unwrap(),
                 len: 3,
                 bytes: text,
             }),
             Some(OwnedDatum::Array {
-                element: crate::storage::CachedArrayElement::from_element(crate::sql::types::ArrElem::Enum(Some(crate::storage::TypeCreation::parse(513).unwrap()))).unwrap(),
+                element: crate::storage::CachedArrayElement::from_element(
+                    crate::sql::types::ArrElem::Enum(Some(
+                        crate::storage::TypeCreation::parse(513).unwrap(),
+                    )),
+                )
+                .unwrap(),
                 len: 3,
                 bytes: text,
             }),
             Some(OwnedDatum::Array {
-                element: crate::storage::CachedArrayElement::from_element(crate::sql::types::ArrElem::Domain {
-                    identity: Some(crate::storage::TypeCreation::parse(769).unwrap()),
-                    base_code: crate::sql::types::ColType::Composite(Some(crate::storage::TypeCreation::parse(1025).unwrap())).code(),
-                    base_identity: Some(crate::storage::TypeCreation::parse(1025).unwrap()),
-                }).unwrap(),
+                element: crate::storage::CachedArrayElement::from_element(
+                    crate::sql::types::ArrElem::Domain {
+                        identity: Some(crate::storage::TypeCreation::parse(769).unwrap()),
+                        base_code: crate::sql::types::ColType::Composite(Some(
+                            crate::storage::TypeCreation::parse(1025).unwrap(),
+                        ))
+                        .code(),
+                        base_identity: Some(crate::storage::TypeCreation::parse(1025).unwrap()),
+                    },
+                )
+                .unwrap(),
                 len: 3,
                 bytes: text,
             }),
             Some(OwnedDatum::Array {
-                element: crate::storage::CachedArrayElement::from_element(crate::sql::types::ArrElem::Composite(Some(crate::storage::TypeCreation::parse(1281).unwrap()))).unwrap(),
+                element: crate::storage::CachedArrayElement::from_element(
+                    crate::sql::types::ArrElem::Composite(Some(
+                        crate::storage::TypeCreation::parse(1281).unwrap(),
+                    )),
+                )
+                .unwrap(),
                 len: 3,
                 bytes: text,
             }),
@@ -13685,7 +13704,8 @@ mod tests {
         let mut payload = FixedBuf::new(&mut budget, "enum journal versions", 16384).unwrap();
         let mut reencoded = FixedBuf::new(&mut budget, "enum journal replay", 16384).unwrap();
         let mut table = sample_def();
-        table.columns[0].ctype = ColType::Enum(Some(crate::storage::TypeCreation::parse(1).unwrap()));
+        table.columns[0].ctype =
+            ColType::Enum(Some(crate::storage::TypeCreation::parse(1).unwrap()));
         table.columns[0].user_type = domain.base_user_type;
         table.columns[0].default = crate::storage::ColumnDefault::Expression(StackStr::from_str(
             "pos3ql-enum-check-v1\n/*p3c:0*/'old'",
@@ -13804,8 +13824,14 @@ mod tests {
         domain.n_checks = 0;
         for element in [
             crate::sql::types::ArrElem::Enum(Some(crate::storage::TypeCreation::parse(7).unwrap())),
-            crate::sql::types::ArrElem::Composite(Some(crate::storage::TypeCreation::parse(9).unwrap())),
-            crate::sql::types::ArrElem::domain(crate::storage::TypeCreation::parse(11).unwrap(), ColType::Enum(Some(crate::storage::TypeCreation::parse(7).unwrap()))).unwrap(),
+            crate::sql::types::ArrElem::Composite(Some(
+                crate::storage::TypeCreation::parse(9).unwrap(),
+            )),
+            crate::sql::types::ArrElem::domain(
+                crate::storage::TypeCreation::parse(11).unwrap(),
+                ColType::Enum(Some(crate::storage::TypeCreation::parse(7).unwrap())),
+            )
+            .unwrap(),
         ] {
             domain.base = ColType::Array(element);
             let operation = WalOp::CreateDomain(0, &domain);

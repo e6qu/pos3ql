@@ -96,7 +96,7 @@ impl TypeIdentity {
         slot: NamedTypeSlot,
         created_at: u64,
     ) -> Self {
-        // Configuration caps each catalog within its PostgreSQL OID band.
+        // Configuration caps positions to the stored reference width.
         let index = u16::try_from(slot.index())
             .expect("configured type slot is representable")
             .to_le_bytes();
@@ -1460,25 +1460,21 @@ impl super::Storage {
                 "stored type catalog slot is retained by an executing statement"
             ));
         }
-        catalog
-            .identities
-            .relocate(allocated, target, database, created_at)?;
         if old_creation != created_at {
-            catalog.versions.initialize(allocated, created_at);
+            return Err(sql_err!(sqlstate::DATA_EXCEPTION,
+                "stored type creation does not match its admitted source"));
         }
+        catalog.identities.relocate(allocated, target, database, created_at)?;
         catalog.versions.swap(allocated, target);
         match target {
             NamedTypeSlot::Domain(_) => {
                 catalog.domains.swap(old, new);
-                catalog.domains[new].created_at = created_at;
             }
             NamedTypeSlot::Enum(_) => {
                 catalog.enums.swap(old, new);
-                catalog.enums[new].created_at = created_at;
             }
             NamedTypeSlot::Composite(_) => {
                 catalog.composites.swap(old, new);
-                catalog.composites[new].created_at = created_at;
             }
         }
         self.catalog_sequence.observe(created_at);

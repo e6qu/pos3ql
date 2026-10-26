@@ -284,9 +284,6 @@ impl TypeIdentityIndex {
                 "stored type identity changes its catalog family"
             ));
         }
-        if allocated == target {
-            return self.replace(target, database, created_at);
-        }
         let old_position = self.position(allocated)?;
         let new_position = self.position(target)?;
         self.validate_slot(allocated, old_position)?;
@@ -305,6 +302,11 @@ impl TypeIdentityIndex {
             )
         })?;
         let key = TypeLifetimeKey { database, creation };
+        if old != key {
+            return Err(sql_err!(sqlstate::DATA_EXCEPTION,
+                "restored type creation does not match its admitted source"));
+        }
+        if allocated == target { return Ok(()); }
         if let Some(owner) = self.by_lifetime.get(&key)
             && (*owner != allocated || old != key)
         {
@@ -657,20 +659,20 @@ mod tests {
                     NamedTypeSlot::Domain(0),
                     NamedTypeSlot::Domain(1),
                     database,
-                    creation(1_500),
+                    old,
                 )
                 .unwrap();
-            assert_eq!(index.lookup(database, old), None);
+            assert_eq!(index.lookup(database, old), Some(NamedTypeSlot::Domain(1)));
             assert_eq!(index.lookup(other, creation(1)), None);
             assert_eq!(
-                index.lookup(database, creation(1_500)),
+                index.lookup(database, old),
                 Some(NamedTypeSlot::Domain(1))
             );
             index
-                .replace(NamedTypeSlot::Domain(0), other, creation(1_500))
+                .replace(NamedTypeSlot::Domain(0), other, old)
                 .unwrap();
             assert_eq!(
-                index.lookup(other, creation(1_500)),
+                index.lookup(other, old),
                 Some(NamedTypeSlot::Domain(0))
             );
             let duplicate = index
@@ -683,11 +685,11 @@ mod tests {
                 .unwrap_err();
             assert_eq!(duplicate.sqlstate, sqlstate::DATA_EXCEPTION);
             assert_eq!(
-                index.lookup(database, creation(1_500)),
+                index.lookup(database, old),
                 Some(NamedTypeSlot::Domain(1))
             );
             assert_eq!(
-                index.lookup(other, creation(1_500)),
+                index.lookup(other, old),
                 Some(NamedTypeSlot::Domain(0))
             );
             assert_eq!(

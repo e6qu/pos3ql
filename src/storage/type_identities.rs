@@ -53,12 +53,22 @@ struct TypeLifetimeKey {
 }
 
 /// Both directions share one startup reservation; slot replacement cannot grow it.
-#[derive(Debug)]
 pub(super) struct TypeIdentityIndex {
     by_lifetime: FixedMap<TypeLifetimeKey, NamedTypeSlot>,
     by_slot: FixedVec<Option<TypeLifetimeKey>>,
     domains: usize,
     enums: usize,
+}
+
+impl core::fmt::Debug for TypeIdentityIndex {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.debug_struct("TypeIdentityIndex")
+            .field("assigned", &self.by_lifetime.len())
+            .field("capacity", &self.by_slot.len())
+            .field("domains", &self.domains)
+            .field("enums", &self.enums)
+            .finish()
+    }
 }
 
 impl TypeIdentityIndex {

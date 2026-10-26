@@ -21581,9 +21581,11 @@ impl Storage {
                 let target_slot = allocation.select(
                     DatabaseCloneKind::Table,
                     created_at,
-                    self.tables.iter().take(self.table_count()).enumerate().filter_map(
-                        |(slot, table)| table.is_free().then_some(slot),
-                    ),
+                    self.tables
+                        .iter()
+                        .take(self.table_count())
+                        .enumerate()
+                        .filter_map(|(slot, table)| table.is_free().then_some(slot)),
                 )?;
                 let target_slot = table_creation::allocate(
                     self,

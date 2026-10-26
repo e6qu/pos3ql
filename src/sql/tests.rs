@@ -2316,6 +2316,7 @@ fn metadata_database_copy_recovers_exact_positions_after_other_transaction_rollb
         bytes.readable().to_vec()
     }
     fn identities(engine: &mut Engine, session: &mut ConfiguredTransactionSession) -> Vec<String> {
+        engine.commit_wal().unwrap();
         let mut rows = data_rows(&session.success(engine,
             "SELECT relname, oid FROM pg_class WHERE relname IN ('orders', 'orders_pkey', 'order_report', 'order_counter', 'copied_counter', 'saved_report'); SELECT conname, oid FROM pg_constraint WHERE conrelid = 'orders'::regclass OR contypid = 'code'::regtype; SELECT typname, oid FROM pg_type WHERE typname IN ('code', 'state', 'payload', 'orders')", true));
         rows.sort_unstable();

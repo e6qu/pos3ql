@@ -16267,7 +16267,7 @@ impl Engine {
                 *publish_via_partition_root,
                 *publish_generated_columns,
                 responder,
-            ),
+arena,),
             Stmt::AlterPublication { name, action } => exec::alter_publication(
                 &mut self.storage,
                 &mut self.wal,
@@ -16275,7 +16275,7 @@ impl Engine {
                 name,
                 *action,
                 responder,
-            ),
+arena,),
             Stmt::DropPublication { names, if_exists } => exec::drop_publication(
                 &mut self.storage,
                 &mut self.wal,

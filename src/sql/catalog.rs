@@ -22856,8 +22856,13 @@ fn pg_attribute<'a>(
             let (name, ctype, type_oid, type_mod, collation) = if let Some(source) = expression {
                 let source = arena.alloc_str(source.as_str()).map_err(|_| arena_full())?;
                 let expression = crate::sql::parser::parse_expr(source, arena)?;
-                let (type_oid, type_mod) =
-                    super::exec::infer_type_catalog(expression, Some(&table), storage, txid, arena)?;
+                let (type_oid, type_mod) = super::exec::infer_type_catalog(
+                    expression,
+                    Some(&table),
+                    storage,
+                    txid,
+                    arena,
+                )?;
                 let (ctype, user_type) = super::exec::catalog_column_type(storage, txid, type_oid)
                     .ok_or_else(|| {
                         sql_err!(

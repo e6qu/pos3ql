@@ -4570,7 +4570,7 @@ fn subst_tableref<'a>(
                 context.storage,
                 context.txid,
                 dependencies,
-            )?,
+arena,)?,
             None => None,
         };
         let Some(dependency) = dependency else {
@@ -5349,7 +5349,7 @@ fn rewrite_stored_routine_name<'a>(
         context.storage,
         context.txid,
         dependencies,
-    )?
+arena,)?
     else {
         return Ok(name);
     };
@@ -5388,7 +5388,7 @@ fn rewrite_stored_operator_name<'a>(
         context.storage,
         context.txid,
         dependencies,
-    )?
+arena,)?
     else {
         return Ok(name);
     };

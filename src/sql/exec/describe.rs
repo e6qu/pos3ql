@@ -233,8 +233,8 @@ fn describe_items_with_output_aliases<'q>(
                             output_aliases,
                             storage,
                             txid,
-                        arena: context.arena,
-};
+                            arena: context.arena,
+                        };
                         &catalog_resolver
                     }
                     None => match def {
@@ -518,31 +518,51 @@ pub(crate) fn catalog_rowtype_field(
         .map_or((None, type_name), |(schema, name)| (Some(schema), name));
     match storage.resolve_relation(qualifier, bare, txid) {
         Some(crate::storage::ResolvedRelation::Table(slot)) => {
-            return Ok(storage.table_def(slot, txid).columns().get(index).and_then(|column| {
-                static_meta_for_column(storage, column, txid)
-                    .map(|metadata| (crate::util::StackStr::from_str(column.name.as_str()), metadata))
-            }));
+            return Ok(storage
+                .table_def(slot, txid)
+                .columns()
+                .get(index)
+                .and_then(|column| {
+                    static_meta_for_column(storage, column, txid).map(|metadata| {
+                        (
+                            crate::util::StackStr::from_str(column.name.as_str()),
+                            metadata,
+                        )
+                    })
+                }));
         }
         Some(crate::storage::ResolvedRelation::View(slot)) => {
             let mark = arena.mark();
             let result = (|| {
                 let view = storage.view(slot);
                 let columns = arena
-                    .alloc_slice_with(view.columns_for(txid).names().len(), |_| ColDesc::new("", 0, 0))
-                    .map_err(|_| arena_full())?;
-                let count = crate::sql::catalog::describe_view(storage, txid, &view, arena, columns)?;
+                    .alloc_slice_with(view.columns_for(txid).names().len(), |_| {
+                        ColDesc::new("", 0, 0)
+                    })
+                    .map_err(|_| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "view description exceeds the statement arena"))?;
+                let count =
+                    crate::sql::catalog::describe_view(storage, txid, &view, arena, columns)?;
                 let Some(column) = columns[..count].get(index) else {
                     return Ok(None);
                 };
-                let (ctype, _) = crate::sql::exec::catalog_column_type(storage, txid, column.type_oid)
-                    .ok_or_else(|| sql_err!(sqlstate::FEATURE_NOT_SUPPORTED,
-                        "view rowtype field has unsupported type OID {}", column.type_oid))?;
-                Ok(Some((crate::util::StackStr::from_str(column.name), StaticTypeMeta {
-                    ctype,
-                    type_oid: column.type_oid,
-                    type_mod: column.type_mod,
-                    collation: column.collation,
-                })))
+                let (ctype, _) =
+                    crate::sql::exec::catalog_column_type(storage, txid, column.type_oid)
+                        .ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::FEATURE_NOT_SUPPORTED,
+                                "view rowtype field has unsupported type OID {}",
+                                column.type_oid
+                            )
+                        })?;
+                Ok(Some((
+                    crate::util::StackStr::from_str(column.name),
+                    StaticTypeMeta {
+                        ctype,
+                        type_oid: column.type_oid,
+                        type_mod: column.type_mod,
+                        collation: column.collation,
+                    },
+                )))
             })();
             // Only copied field metadata or an owned error leaves the description.
             unsafe { arena.rewind_to(mark) };
@@ -557,15 +577,23 @@ pub(crate) fn catalog_rowtype_field(
     let Some(field) = definition.active_field(index) else {
         return Ok(None);
     };
-    let type_oid = storage.routine_type_oid(field.ctype, field.user_type, txid)
-        .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT,
-            "composite field type identity is unavailable"))?;
-    Ok(Some((crate::util::StackStr::from_str(field.name.as_str()), StaticTypeMeta {
-        ctype: field.ctype,
-        type_oid,
-        type_mod: field.type_mod,
-        collation: field.collation,
-    })))
+    let type_oid = storage
+        .routine_type_oid(field.ctype, field.user_type, txid)
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "composite field type identity is unavailable"
+            )
+        })?;
+    Ok(Some((
+        crate::util::StackStr::from_str(field.name.as_str()),
+        StaticTypeMeta {
+            ctype: field.ctype,
+            type_oid,
+            type_mod: field.type_mod,
+            collation: field.collation,
+        },
+    )))
 }
 
 impl ColTypeResolver for CatalogCols<'_> {
@@ -827,8 +855,15 @@ impl ColTypeResolver for CatalogCols<'_> {
         &self,
         type_name: &str,
         index: usize,
-    ) -> Result<Option<(crate::util::StackStr<64>, crate::sql::exec::StaticTypeMeta)>, SqlError> {
-        crate::sql::exec::catalog_rowtype_field(self.storage, self.txid, type_name, index, self.arena)
+    ) -> Result<Option<(crate::util::StackStr<64>, crate::sql::exec::StaticTypeMeta)>, SqlError>
+    {
+        crate::sql::exec::catalog_rowtype_field(
+            self.storage,
+            self.txid,
+            type_name,
+            index,
+            self.arena,
+        )
     }
 }
 
@@ -859,8 +894,8 @@ fn describe_record_star<'q>(
                         output_aliases,
                         storage,
                         txid,
-                    arena: arena,
-};
+                        arena: arena,
+                    };
                     &catalog_resolver
                 }
                 (Some(definition), None) => {
@@ -952,8 +987,8 @@ fn describe_record_star<'q>(
                 output_aliases,
                 storage,
                 txid,
-            arena: arena,
-};
+                arena: arena,
+            };
             let mut argument_oids = [oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
             if args.len() > argument_oids.len() {
                 return Err(sql_err!(
@@ -2096,7 +2131,8 @@ pub fn register_shape_for(
                     };
                     n += 1;
                 }
-            })?.ok_or_else(|| could_not_identify("*"))?;
+            })?
+            .ok_or_else(|| could_not_identify("*"))?;
         }
         Expr::Call { name, args, .. } if name.eq_ignore_ascii_case("_pg_expandarray") => {
             let Some(element) = expand_array_element_metadata(args, columns) else {
@@ -2402,7 +2438,9 @@ fn record_shape_metadata_dyn(
                     | "jsonb_populate_recordset"
             ) =>
         {
-            let Some(argument) = args.first() else { return Ok(None); };
+            let Some(argument) = args.first() else {
+                return Ok(None);
+            };
             record_shape_metadata_dyn(argument, columns, visit)
         }
         Expr::Call {
@@ -2481,7 +2519,9 @@ fn record_shape_metadata_dyn(
         // shape exposes its fields for selection and star expansion.
         Expr::Column { .. } | Expr::Field { .. } if expr_record_handle(base, columns).is_some() => {
             Ok(visit_record_shape_metadata(
-                expr_record_handle(base, columns).expect("record shape was selected"), visit))
+                expr_record_handle(base, columns).expect("record shape was selected"),
+                visit,
+            ))
         }
         Expr::Column {
             qualifier: None,
@@ -3104,8 +3144,8 @@ pub(crate) fn infer_type_catalog(
             output_aliases: &[],
             storage,
             txid,
-        arena: arena,
-},
+            arena: arena,
+        },
     )
 }
 

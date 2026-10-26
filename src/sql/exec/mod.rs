@@ -696,7 +696,7 @@ pub(crate) use copy_transition::CopyTransitionRows;
 pub(super) use schema::rename as stage_schema_rename;
 
 mod describe;
-pub(crate) use describe::{CatalogCols, catalog_composite_field, visit_catalog_composite_fields};
+pub(crate) use describe::{CatalogCols, catalog_composite_field, catalog_rowtype_field, visit_catalog_composite_fields};
 pub use describe::{
     ColTypeResolver, DefCols, NoCols, RECORD_FIELD_NAMES, check_row_field_types,
     could_not_identify, derived_name, describe_items, expr_record_handle as expr_record_handle_pub,
@@ -13862,7 +13862,7 @@ fn remove_schema_from_publications(
             .copy_within(index + 1..definition.schema_count, index);
         definition.schema_count -= 1;
         definition.schemas[definition.schema_count] = u8::MAX;
-        let (slot, prior) = storage.alter_publication(name.as_str(), definition, txn.txid)?;
+        let (slot, prior) = storage.alter_publication(name.as_str(), definition, txn.txid, arena)?;
         let lsn = storage.bump_lsn();
         if let Err(error) = wal.stage_reserved(
             txn.txid,
@@ -13918,7 +13918,7 @@ pub fn create_publication(
     publish_via_partition_root: bool,
     publish_generated_columns: crate::sql::ast::PublishGeneratedColumns,
     responder: &mut Responder,
-) -> Outcome {
+arena: &Arena,) -> Outcome {
     if all_tables && (!tables.is_empty() || !schemas.is_empty()) {
         return sql_fail(sql_err!(
             sqlstate::SYNTAX_ERROR,
@@ -13945,7 +13945,13 @@ pub fn create_publication(
         ));
     }
     let (members, table_column_masks, table_include_descendants, table_filter_sql, table_count) =
-        match publication_members(storage, txn.txid, tables, publish.update || publish.delete, arena) {
+        match publication_members(
+            storage,
+            txn.txid,
+            tables,
+            publish.update || publish.delete,
+            arena,
+        ) {
             Ok(members) => members,
             Err(error) => return sql_fail(error),
         };
@@ -13990,7 +13996,7 @@ pub fn create_publication(
             publish_generated_columns: publish_generated_columns.into(),
         },
         txn.txid,
-    ) {
+arena,) {
         Ok(slot) => {
             let owner = storage.publication_owner(slot, txn.txid);
             let lsn = storage.bump_lsn();
@@ -14875,7 +14881,7 @@ pub fn alter_publication(
     name: &str,
     action: crate::sql::ast::AlterPublicationAction<'_>,
     responder: &mut Responder,
-) -> Outcome {
+arena: &Arena,) -> Outcome {
     let Some((slot, current)) = storage.publication_definition(name, txn.txid) else {
         return sql_fail(sql_err!(
             sqlstate::UNDEFINED_OBJECT,
@@ -15018,7 +15024,8 @@ pub fn alter_publication(
                 txn.txid,
                 tables,
                 definition.publish_update || definition.publish_delete,
-arena,) {
+                arena,
+            ) {
                 Ok(members) => members,
                 Err(error) => return sql_fail(error),
             };
@@ -15050,7 +15057,8 @@ arena,) {
                 txn.txid,
                 tables,
                 definition.publish_update || definition.publish_delete,
-arena,) {
+                arena,
+            ) {
                 Ok(members) => members,
                 Err(error) => return sql_fail(error),
             };
@@ -15197,7 +15205,7 @@ arena,) {
     if let Err(error) = validate_publication_replica_identity(storage, &definition, txn.txid) {
         return sql_fail(error);
     }
-    let (slot, prior) = match storage.alter_publication(name, definition, txn.txid) {
+    let (slot, prior) = match storage.alter_publication(name, definition, txn.txid, arena) {
         Ok(result) => result,
         Err(error) => return sql_fail(error),
     };
@@ -22496,7 +22504,7 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                     *publish_via_partition_root,
                     *publish_generated_columns,
                     responder,
-                ),
+arena,),
                 Stmt::AlterPublication { name, action } => super::exec::alter_publication(
                     &mut engine.storage,
                     &mut engine.wal,
@@ -22504,7 +22512,7 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                     name,
                     *action,
                     responder,
-                ),
+arena,),
                 Stmt::DropPublication { names, if_exists } => super::exec::drop_publication(
                     &mut engine.storage,
                     &mut engine.wal,
@@ -44419,7 +44427,7 @@ fn stage_publication_column_drop_dependencies(
         definition.table_filters =
             crate::storage::PublicationFilters::from_sql(&filters[..definition.table_count])?;
         let (altered_slot, prior) =
-            storage.alter_publication(name.as_str(), definition, txn.txid)?;
+            storage.alter_publication(name.as_str(), definition, txn.txid, arena)?;
         let lsn = storage.bump_lsn();
         if let Err(error) = wal.stage_reserved(
             txn.txid,
@@ -46318,7 +46326,7 @@ fn remap_publication_column_projections(
             .materialize_sql(definition.table_count);
         let name = publication.name_for(txn.txid);
         let (altered_slot, prior) =
-            storage.alter_publication(name.as_str(), definition, txn.txid)?;
+            storage.alter_publication(name.as_str(), definition, txn.txid, arena)?;
         let lsn = storage.bump_lsn();
         if let Err(error) = wal.stage_reserved(
             txn.txid,
@@ -46410,7 +46418,7 @@ fn rewrite_table_publication_column_references(
         validate_publication_replica_identity(storage, &definition, txn.txid)?;
         let name = publication.name_for(txn.txid);
         let (altered_slot, prior) =
-            storage.alter_publication(name.as_str(), definition, txn.txid)?;
+            storage.alter_publication(name.as_str(), definition, txn.txid, arena)?;
         let lsn = storage.bump_lsn();
         if let Err(error) = wal.stage_reserved(
             txn.txid,
@@ -47631,7 +47639,7 @@ pub fn create_statistics(
     wal: &mut Wal,
     txn: &mut TxnState,
     command: &crate::sql::ast::CreateStatistics<'_>,
-    _arena: &Arena,
+    arena: &Arena,
     responder: &mut Responder,
 ) -> Outcome {
     use crate::sql::ast::{StatisticsKey, StatisticsKeys, StatisticsName};
@@ -47755,7 +47763,8 @@ pub fn create_statistics(
                     Some(&table_definition),
                     storage,
                     txn.txid,
-arena,) {
+                    arena,
+                ) {
                     return sql_fail(error);
                 }
                 match crate::storage::extended_statistics_expression(expression.source) {
@@ -48792,11 +48801,16 @@ pub fn create_index(
                 type_oid,
             )
         } else {
-            let (type_oid, _) =
-                match infer_type_catalog(index_column.expression, Some(&tdef), storage, txn.txid, arena) {
-                    Ok(result) => result,
-                    Err(error) => return sql_fail(error),
-                };
+            let (type_oid, _) = match infer_type_catalog(
+                index_column.expression,
+                Some(&tdef),
+                storage,
+                txn.txid,
+                arena,
+            ) {
+                Ok(result) => result,
+                Err(error) => return sql_fail(error),
+            };
             expressions[i] =
                 match crate::storage::index_expression_stackstr(index_column.expression_text) {
                     Ok(expression) => Some(expression),

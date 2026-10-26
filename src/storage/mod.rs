@@ -36259,7 +36259,7 @@ impl Storage {
                                 Some(table_definition),
                                 self,
                                 txid.unwrap_or(0),
-                            )?;
+&arena,)?;
                             self.routine_result_for_oid(type_oid, txid.unwrap_or(0))
                                 .map(|result| result.ctype)
                                 .ok_or_else(|| {

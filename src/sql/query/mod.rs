@@ -392,8 +392,8 @@ fn collect_stored_query_composite_field_rename_select<'a>(
         outer_scope: outer_scope.map(|scope| scope.current),
         storage: rename.storage,
         txid: rename.txid,
-    arena: rename.arena,
-});
+        arena: rename.arena,
+    });
     let columns: &dyn super::exec::ColTypeResolver = match (&catalog_columns, outer_scope) {
         (Some(columns), _) => columns,
         (None, Some(scope)) => &ScopeCols(scope.current),
@@ -2703,12 +2703,9 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         arena: &Arena,
     ) -> Result<Option<i32>, SqlError> {
         use super::types::oid;
-        if let Some(slot) = super::catalog::table_slot_by_row_type_oid(
-            self.storage,
-            self.txid,
-            type_oid,
-            false,
-        ) {
+        if let Some(slot) =
+            super::catalog::table_slot_by_row_type_oid(self.storage, self.txid, type_oid, false)
+        {
             return Ok(self
                 .storage
                 .table_def(slot, self.txid)
@@ -2716,12 +2713,9 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                 .get(field)
                 .map(|column| column.type_mod));
         }
-        if let Some(slot) = super::catalog::view_slot_by_row_type_oid(
-            self.storage,
-            self.txid,
-            type_oid,
-            false,
-        ) {
+        if let Some(slot) =
+            super::catalog::view_slot_by_row_type_oid(self.storage, self.txid, type_oid, false)
+        {
             let mark = arena.mark();
             let result = (|| {
                 let view = self.storage.view(slot);
@@ -2730,13 +2724,8 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                         super::types::ColDesc::new("", 0, 0)
                     })
                     .map_err(|_| arena_full())?;
-                let count = super::catalog::describe_view(
-                    self.storage,
-                    self.txid,
-                    &view,
-                    arena,
-                    columns,
-                )?;
+                let count =
+                    super::catalog::describe_view(self.storage, self.txid, &view, arena, columns)?;
                 Ok(columns[..count].get(field).map(|column| column.type_mod))
             })();
             // Only an owned modifier or error escapes the temporary description.
@@ -4895,7 +4884,10 @@ fn patch_subquery_column_types<'a>(
                     .unwrap_or(0);
             }
             SelectItem::RecordStar(base) => {
-                slot += scope.map(|s| record_star_width(base, s)).transpose()?.unwrap_or(0);
+                slot += scope
+                    .map(|s| record_star_width(base, s))
+                    .transpose()?
+                    .unwrap_or(0);
             }
             SelectItem::Expr { expression, .. } => {
                 if slot < columns.len()
@@ -5154,9 +5146,10 @@ fn resolve_group_ordinals<'a>(
                 Some(scope) => scope.qualified_star_columns(qualifier)?,
                 None => 0,
             },
-            SelectItem::RecordStar(expression) => {
-                scope.map(|scope| record_star_width(expression, scope)).transpose()?.unwrap_or(0)
-            }
+            SelectItem::RecordStar(expression) => scope
+                .map(|scope| record_star_width(expression, scope))
+                .transpose()?
+                .unwrap_or(0),
             SelectItem::Expr { .. } => 1,
         };
     }
@@ -6613,8 +6606,8 @@ pub(crate) fn select_query_resumable<'a, 'statement>(
             outer_scope: None,
             storage,
             txid,
-        arena: arena,
-};
+            arena: arena,
+        };
         let check = |e: &Expr| -> Result<(), SqlError> {
             if user_type_expression_description(e, "", storage, txid).is_some() {
                 Ok(())
@@ -6694,7 +6687,9 @@ pub(crate) fn select_query_resumable<'a, 'statement>(
         txid,
         arena,
         &mut columns[..n_cols],
-    ) { return sql_fail(error); }
+    ) {
+        return sql_fail(error);
+    }
     responder.row_description(&columns[..n_cols])?;
 
     let limit = match super::exec::eval_limit_pub(statement.limit, arena, params) {
@@ -7182,7 +7177,9 @@ pub(crate) fn constant_select_resumable<'a, 'statement>(
         txid,
         arena,
         &mut columns[..n],
-    ) { return sql_fail(error); }
+    ) {
+        return sql_fail(error);
+    }
     let catalog = StorageCatalog {
         storage,
         routine_workspace: arena,
@@ -8657,8 +8654,8 @@ pub fn describe_scope_items<'q>(
                     outer_scope,
                     storage,
                     txid,
-                arena: arena,
-};
+                    arena: arena,
+                };
                 let user_type = user_type_expression_description(expression, name, storage, txid);
                 let (mut oid, mut typlen) = match user_type {
                     Some(description) => (description.type_oid, description.typlen),
@@ -8830,7 +8827,10 @@ pub fn describe_select_items<'q>(
                 }
             }
             SelectItem::RecordStar(base) => {
-                column += scope.map(|scope| record_star_width(base, scope)).transpose()?.unwrap_or(0);
+                column += scope
+                    .map(|scope| record_star_width(base, scope))
+                    .transpose()?
+                    .unwrap_or(0);
             }
             SelectItem::Expr { expression, .. } => {
                 if let Some(description) =
@@ -8871,7 +8871,10 @@ fn patch_array_subquery_field_types<'q>(
                 }
             }
             SelectItem::RecordStar(base) => {
-                column += outer_scope.map(|scope| record_star_width(base, scope)).transpose()?.unwrap_or(0);
+                column += outer_scope
+                    .map(|scope| record_star_width(base, scope))
+                    .transpose()?
+                    .unwrap_or(0);
             }
             SelectItem::Expr { expression, .. } => {
                 if let Some((ctype, type_mod)) =
@@ -9474,8 +9477,8 @@ fn describe_scope_record_star<'q>(
         outer_scope: None,
         storage,
         txid,
-    arena: arena,
-};
+        arena: arena,
+    };
     match base {
         Expr::Call { name, .. } if name.eq_ignore_ascii_case("row") => {
             super::exec::check_row_field_types(base, &resolver)?;
@@ -10020,8 +10023,15 @@ impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_> {
         &self,
         type_name: &str,
         index: usize,
-    ) -> Result<Option<(crate::util::StackStr<64>, crate::sql::exec::StaticTypeMeta)>, SqlError> {
-        crate::sql::exec::catalog_rowtype_field(self.storage, self.txid, type_name, index, self.arena)
+    ) -> Result<Option<(crate::util::StackStr<64>, crate::sql::exec::StaticTypeMeta)>, SqlError>
+    {
+        crate::sql::exec::catalog_rowtype_field(
+            self.storage,
+            self.txid,
+            type_name,
+            index,
+            self.arena,
+        )
     }
 
     fn is_whole_row(&self, name: &str) -> bool {

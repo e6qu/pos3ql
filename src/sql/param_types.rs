@@ -96,8 +96,9 @@ impl ParameterInference<'_> {
                     return;
                 }
                 for (index, argument) in arguments.iter().copied().enumerate() {
-                    actual[index] = exec::infer_type_catalog(argument, None, self.storage, txid, self.arena)
-                        .map_or(types::oid::UNKNOWN, |inferred| inferred.0);
+                    actual[index] =
+                        exec::infer_type_catalog(argument, None, self.storage, txid, self.arena)
+                            .map_or(types::oid::UNKNOWN, |inferred| inferred.0);
                 }
                 let qualified = match name.schema {
                     Some(schema) => stack_format!(260, "{}.{}", schema, name.name),
@@ -177,8 +178,8 @@ impl ParameterInference<'_> {
             outer_scope: None,
             storage: self.storage,
             txid,
-        arena: self.arena,
-});
+            arena: self.arena,
+        });
         let infer = |expression: &Expr<'a>| {
             let inferred = match &resolver {
                 Some(resolver) => exec::infer_type_res(expression, resolver),

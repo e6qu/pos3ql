@@ -1856,7 +1856,10 @@ fn preserve_projection_type_identities(
                 };
             }
             SelectItem::RecordStar(base) => {
-                output += scope.map(|scope| record_star_width(base, scope)).transpose()?.unwrap_or(1);
+                output += scope
+                    .map(|scope| record_star_width(base, scope))
+                    .transpose()?
+                    .unwrap_or(1);
             }
             SelectItem::Expr { expression, .. } => {
                 let semantic = crate::sql::exec::infer_routine_argument_oid(expression, resolver)?;
@@ -1948,8 +1951,8 @@ pub(crate) fn describe_derived_definition<'a>(
                                         outer_scope: outer,
                                         storage,
                                         txid,
-                                    arena: arena,
-},
+                                        arena: arena,
+                                    },
                                     arena,
                                 )?
                             {
@@ -2017,8 +2020,8 @@ pub(crate) fn describe_derived_definition<'a>(
                         outer_scope: outer,
                         storage,
                         txid,
-                    arena: arena,
-},
+                        arena: arena,
+                    },
                     &descriptors[..n],
                     &mut type_oids[..n],
                 )?;
@@ -2045,8 +2048,8 @@ pub(crate) fn describe_derived_definition<'a>(
                         outer_scope: None,
                         storage,
                         txid,
-                    arena: arena,
-},
+                        arena: arena,
+                    },
                     &descriptors[..n],
                     &mut type_oids[..n],
                 )?;
@@ -2074,8 +2077,8 @@ pub(crate) fn describe_derived_definition<'a>(
                                     output_aliases: &[],
                                     storage,
                                     txid,
-                                arena: arena,
-},
+                                    arena: arena,
+                                },
                                 arena,
                             )?
                         {
@@ -2093,8 +2096,8 @@ pub(crate) fn describe_derived_definition<'a>(
                         output_aliases: &[],
                         storage,
                         txid,
-                    arena: arena,
-},
+                        arena: arena,
+                    },
                     &descriptors[..n],
                     &mut type_oids[..n],
                 )?;

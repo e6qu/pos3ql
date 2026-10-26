@@ -1340,6 +1340,61 @@ mod tests {
     }
 
     #[test]
+    fn type_recovery_installs_saved_birth_when_the_catalog_sequence_is_exhausted() {
+        for manifest in [false, true] {
+            for source in SOURCES {
+                let mut storage = fixture(1);
+                let schema = SqlName::parse("public").unwrap();
+                let name = SqlName::parse("reader_source").unwrap();
+                storage.restore_catalog_identity_sequence(u64::MAX);
+                let created_at = 41;
+                crate::mem::guard::forbid_alloc(|| {
+                    let slot = match source {
+                        NamedTypeSlot::Domain(_) => {
+                            let spec = DomainSpec {
+                                base_domain: None, base_user_type: None, base: ColType::Int4,
+                                base_type_mod: -1, not_null: false, not_null_name: None,
+                                default_expr: None, checks: [CheckConstraint::EMPTY; MAX_DOMAIN_CHECKS], n_checks: 0,
+                            };
+                            if manifest { storage.create_domain_from_manifest(schema, name, spec, created_at) }
+                            else { storage.create_domain_from_journal(schema, name, spec, created_at) }.unwrap()
+                        }
+                        NamedTypeSlot::Enum(_) => {
+                            storage.enum_replay_members(1).unwrap()[0] = EnumMember {
+                                label: SqlName::parse("before").unwrap(), legacy_label: None, sort: 1.0,
+                            };
+                            storage.finish_enum_replay(schema, name, 1, created_at).unwrap()
+                        }
+                        NamedTypeSlot::Composite(_) => {
+                            let mut fields = [CompositeFieldDef::EMPTY; MAX_COMPOSITE_FIELDS];
+                            fields[0] = CompositeFieldDef {
+                                name: SqlName::parse("before").unwrap(), attribute_number: 1,
+                                ctype: ColType::Int4, ..CompositeFieldDef::EMPTY
+                            };
+                            let spec = CompositeSpec { fields, n_fields: 1 };
+                            if manifest { storage.create_composite_from_manifest(schema, name, spec, created_at) }
+                            else { storage.create_composite_at(0, schema, name, spec, created_at) }.unwrap()
+                        }
+                    };
+                    assert_eq!(slot, source.index());
+                    let captured = reference(&storage, source);
+                    let catalog = storage.type_catalog.lock().unwrap();
+                    let selected = catalog.type_snapshot(source, 0).unwrap().unwrap();
+                    assert_eq!(selected.identity.created_at(), created_at);
+                    assert_eq!(catalog.identities.lookup(selected.identity.database(), created_at), Some(source));
+                    assert!(catalog.versions.get(source) >= created_at);
+                    assert!(catalog.resolve_source_reference(captured, selected.identity.database(), 0).unwrap().is_some());
+                    assert_eq!(storage.catalog_identity_sequence(), u64::MAX);
+                    drop(catalog);
+                    assert_eq!(create(&mut storage, source).unwrap_err().sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+                    assert_eq!(reference(&storage, source), captured);
+                    assert_eq!(storage.catalog_identity_sequence(), u64::MAX);
+                });
+            }
+        }
+    }
+
+    #[test]
     fn restored_type_identity_rejects_unpublished_retired_and_mismatched_sources_atomically() {
         for source in SOURCES {
             let mut storage = fixture(1);

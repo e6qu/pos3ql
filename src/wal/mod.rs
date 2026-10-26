@@ -880,7 +880,7 @@ pub(crate) fn apply_enum_payload(
         ));
     }
     drop(members);
-    let allocated = storage.finish_enum_replay(schema, name, count)?;
+    let allocated = storage.finish_enum_replay(schema, name, count, created_at)?;
     storage.restore_type_identity(
         crate::storage::NamedTypeSlot::Enum(allocated),
         crate::storage::NamedTypeSlot::Enum(usize::from(slot)),

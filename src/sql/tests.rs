@@ -1301,8 +1301,13 @@ fn numeric_type_schema_and_function_privileges_match_postgresql_before_lookup() 
         let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
         assert_eq!(data_rows(&session.success(&mut engine,
             include_str!("../../tests/external/differential_exact/25_numeric_privileges.sql"), true)), ["t", "t", "t"]);
-        assert_eq!(error_sqlstates(&session.execute(&mut engine,
-            include_str!("../../tests/external/differential_exact/26_numeric_privilege_errors.sql"), true)),
+        let mut states = Vec::new();
+        for statement in include_str!("../../tests/external/differential_exact/26_numeric_privilege_errors.sql")
+            .split(';').map(str::trim).filter(|statement| !statement.is_empty())
+        {
+            states.extend(error_sqlstates(&session.execute(&mut engine, statement, true)));
+        }
+        assert_eq!(states,
             ["22023", "22023", "22023", "22023", "22023", "22023", "42704", "3F000", "42883"]);
     }
 }

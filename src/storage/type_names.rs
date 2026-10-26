@@ -630,7 +630,7 @@ mod tests {
                                 fields: [CompositeFieldDef::EMPTY; MAX_COMPOSITE_FIELDS],
                                 n_fields: 0,
                             },
-                            0,
+                            42,
                         )
                         .unwrap_err()
                         .sqlstate,

@@ -54,6 +54,30 @@ use crate::mem::{FixedMap, FixedVec};
 use crate::sql::eval::{SqlError, sqlstate};
 use crate::sql_err;
 
+#[derive(Clone, Copy)]
+pub(super) enum TypeCreationAdmission {
+    Fresh,
+    Restored(NonZeroU64),
+}
+
+impl TypeCreationAdmission {
+    pub(super) fn restored(created_at: u64) -> Result<Self, SqlError> {
+        NonZeroU64::new(created_at).map(Self::Restored).ok_or_else(||
+            sql_err!(sqlstate::DATA_EXCEPTION, "stored type creation identity is zero"))
+    }
+
+    pub(super) fn stamp(self, sequence: &super::CatalogSequence, maximum: u64, family: &str) -> Result<u64, SqlError> {
+        match self {
+            Self::Fresh => sequence.next_bounded(maximum, family),
+            Self::Restored(creation) => super::bounded_catalog_generation(creation.get(), maximum, family),
+        }
+    }
+
+    pub(super) fn installed(self, sequence: &super::CatalogSequence, created_at: u64) {
+        if matches!(self, Self::Restored(_)) { sequence.observe(created_at); }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct TypeLifetimeKey {
     database: DatabaseOid,

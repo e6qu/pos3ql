@@ -857,6 +857,7 @@ mod tests {
         crate::mem::guard::forbid_alloc(|| {
             let slot = create(&mut storage, "state");
             let before = storage.enum_for(slot, 0);
+            let created_at = before.created_at;
             storage
                 .enum_replay_members(2)
                 .unwrap()
@@ -866,6 +867,7 @@ mod tests {
                     SqlName::parse("public").unwrap(),
                     SqlName::parse("state").unwrap(),
                     2,
+                    created_at,
                 )
                 .unwrap();
             assert_eq!(before.members().len(), 1);
@@ -876,6 +878,7 @@ mod tests {
                     SqlName::parse("public").unwrap(),
                     SqlName::parse("state").unwrap(),
                     1,
+                    created_at,
                 )
                 .unwrap_err();
             assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
@@ -886,6 +889,7 @@ mod tests {
                     SqlName::parse("public").unwrap(),
                     SqlName::parse("state").unwrap(),
                     1,
+                    created_at,
                 )
                 .unwrap();
             assert_eq!(current.sort_of("paid"), Some(2.0));

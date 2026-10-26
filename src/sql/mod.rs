@@ -21472,7 +21472,7 @@ fn apply_composite_wal_definition(
         let prior = storage.stage_composite_alter(edit_target, definition, 0)?;
         storage.commit_composite_alter(prior.target())?;
     } else {
-        storage.create_composite_at(slot, def.schema, def.name, spec, 0)?;
+        storage.create_composite_at(slot, def.schema, def.name, spec, def.created_at)?;
         storage.restore_type_identity(
             crate::storage::NamedTypeSlot::Composite(slot),
             crate::storage::NamedTypeSlot::Composite(slot),
@@ -23031,7 +23031,7 @@ fn apply_wal_op(
                 let prior = storage.stage_domain_alter(edit_target, spec, 0)?;
                 storage.commit_domain_alter(prior.target())?;
             } else {
-                let allocated = storage.create_domain(def.schema, def.name, spec, 0)?.slot();
+                let allocated = storage.create_domain_from_journal(def.schema, def.name, spec, def.created_at)?;
                 storage.restore_type_identity(
                     crate::storage::NamedTypeSlot::Domain(allocated),
                     crate::storage::NamedTypeSlot::Domain(slot),
@@ -23107,6 +23107,7 @@ fn apply_wal_op(
                 crate::storage::SqlName::parse(schema)?,
                 crate::storage::SqlName::parse(name)?,
                 members.len(),
+                created_at,
             )?;
             storage.restore_type_identity(
                 crate::storage::NamedTypeSlot::Enum(allocated),

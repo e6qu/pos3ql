@@ -547,7 +547,7 @@ keeps its supplied name when earlier columns are removed and after restart.
 `pg_get_constraintdef` describes that table rule as `NOT NULL amount`; a domain's
 NOT NULL rule is described as `NOT NULL`, matching
 [PostgreSQL 18.6](https://github.com/postgres/postgres/blob/REL_18_6/src/backend/utils/adt/ruleutils.c).
-The [shared SQL comparisons](../tests/external/differential_exact/28_constraint_identities.sql)
+The [shared SQL comparisons](https://github.com/e6qu/pos3ql/blob/4cdd4a9fea583303d31966ba82e54df87b84fc1c/tests/external/differential_exact/28_constraint_identities.sql)
 exercise the identifier behavior against PostgreSQL.
 
 ALTER TABLE rewrites retain the source before choosing any input row identity.

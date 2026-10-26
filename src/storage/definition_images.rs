@@ -12,12 +12,47 @@ use crate::mem::budget::{Budget, BudgetError};
 use crate::sql::eval::{SqlError, sqlstate};
 use crate::sql_err;
 
-struct Image {
-    next: Option<usize>,
+/// Only column metadata is needed to describe a synthetic relation.
+#[derive(Clone, Copy)]
+pub(crate) struct RelationDefinition<'a> {
+    pub(crate) schema: super::SqlName,
+    pub(crate) name: super::SqlName,
+    pub(crate) n_columns: usize,
+    pub(crate) columns: &'a [super::ColumnMeta],
+}
+
+impl RelationDefinition<'_> {
+    pub(crate) fn columns(&self) -> &[super::ColumnMeta] {
+        &self.columns[..self.n_columns]
+    }
+
+    pub(crate) fn column_index(&self, name: &str) -> Option<usize> {
+        self.columns()
+            .iter()
+            .position(|column| column.name.as_str() == name)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct TableSource {
     table: usize,
     transaction: u32,
     identity: TableIdentity,
     target: super::TableDefinitionTarget,
+}
+
+#[derive(Clone, Copy)]
+enum ImageSource {
+    Table(TableSource),
+    Relation { width: usize },
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct DefinitionImageId(usize);
+
+struct Image {
+    next: Option<usize>,
+    source: ImageSource,
     definition: TableDef,
 }
 
@@ -115,13 +150,90 @@ impl TableDefinitionImages {
     pub(crate) fn iter(&self) -> impl Iterator<Item = (super::TableDefinitionTarget, &TableDef)> {
         let mut slot = self.head.get();
         core::iter::from_fn(move || {
-            let index = slot?;
-            // SAFETY: the borrowed owner pins this immutable chain. A later
-            // capture prepends a head without changing existing images.
-            let image = unsafe { (*self.pool.cells[index].image.get()).assume_init_ref() };
-            slot = image.next;
-            Some((image.target, &image.definition))
+            loop {
+                let index = slot?;
+                // SAFETY: the borrowed owner pins every immutable image in this chain.
+                let image = unsafe { (*self.pool.cells[index].image.get()).assume_init_ref() };
+                slot = image.next;
+                if let ImageSource::Table(source) = image.source {
+                    return Some((source.target, &image.definition));
+                }
+            }
         })
+    }
+
+    pub(crate) fn retain_relation(
+        &self,
+        relation: &RelationDefinition<'_>,
+    ) -> Result<DefinitionImageId, SqlError> {
+        let width = relation.columns.len();
+        if relation.n_columns > width || width > super::MAX_COLUMNS {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "invalid synthetic relation width"
+            ));
+        }
+        let mut slot = self.head.get();
+        while let Some(index) = slot {
+            // SAFETY: this owner pins the chain, including any previously retained schema.
+            let image = unsafe { (*self.pool.cells[index].image.get()).assume_init_ref() };
+            if matches!(image.source, ImageSource::Relation { width: saved } if saved == width)
+                && image.definition.schema == relation.schema
+                && image.definition.name == relation.name
+                && image.definition.n_columns == relation.n_columns
+                && image.definition.columns[..width] == *relation.columns
+            {
+                return Ok(DefinitionImageId(index));
+            }
+            slot = image.next;
+        }
+        let _allocation = self
+            .pool
+            .allocation
+            .lock()
+            .expect("table definition image lock poisoned");
+        let index = self
+            .pool
+            .occupied
+            .iter()
+            .position(|flag| !flag.load(Ordering::Acquire))
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "table definition image pool is exhausted (capacity {})",
+                    self.pool.cells.len()
+                )
+            })?;
+        let mut definition = TableDef::empty();
+        definition.schema = relation.schema;
+        definition.name = relation.name;
+        definition.n_columns = relation.n_columns;
+        definition.columns[..width].copy_from_slice(relation.columns);
+        let target = self.pool.cells[index].image.get().cast::<Image>();
+        // SAFETY: the allocation lock exclusively owns this unoccupied cell.
+        unsafe {
+            target.write(Image {
+                next: self.head.get(),
+                source: ImageSource::Relation { width },
+                definition,
+            });
+        }
+        self.pool.occupied[index].store(true, Ordering::Release);
+        self.head.set(Some(index));
+        Ok(DefinitionImageId(index))
+    }
+
+    pub(crate) fn retained_relation(&self, identity: DefinitionImageId) -> Option<&TableDef> {
+        let mut slot = self.head.get();
+        while let Some(index) = slot {
+            // SAFETY: references borrow the owner that keeps this entire chain occupied.
+            let image = unsafe { (*self.pool.cells[index].image.get()).assume_init_ref() };
+            if index == identity.0 && matches!(image.source, ImageSource::Relation { .. }) {
+                return Some(&image.definition);
+            }
+            slot = image.next;
+        }
+        None
     }
 
     /// Read a captured image without reacquiring the live table identity.
@@ -130,7 +242,10 @@ impl TableDefinitionImages {
         while let Some(index) = slot {
             // SAFETY: this owner's immutable chain remains occupied until Drop.
             let image = unsafe { (*self.pool.cells[index].image.get()).assume_init_ref() };
-            if image.table == table && image.transaction == transaction {
+            if let ImageSource::Table(source) = image.source
+                && source.table == table
+                && source.transaction == transaction
+            {
                 return Some(&image.definition);
             }
             slot = image.next;
@@ -147,8 +262,11 @@ impl TableDefinitionImages {
         while let Some(index) = slot {
             // SAFETY: the owner retains this immutable image until Drop.
             let image = unsafe { (*self.pool.cells[index].image.get()).assume_init_ref() };
-            if image.table == table && image.transaction == transaction {
-                return Some(image.identity);
+            if let ImageSource::Table(source) = image.source
+                && source.table == table
+                && source.transaction == transaction
+            {
+                return Some(source.identity);
             }
             slot = image.next;
         }
@@ -166,8 +284,11 @@ impl TableDefinitionImages {
         while let Some(index) = slot {
             // SAFETY: this owner's immutable chain remains occupied until Drop.
             let image = unsafe { (*self.pool.cells[index].image.get()).assume_init_ref() };
-            if image.table == table && image.transaction == transaction {
-                return Ok((image.target, definition));
+            if let ImageSource::Table(source) = image.source
+                && source.table == table
+                && source.transaction == transaction
+            {
+                return Ok((source.target, definition));
             }
             slot = image.next;
         }
@@ -186,15 +307,18 @@ impl TableDefinitionImages {
                 "table definition reader belongs to different storage"
             ));
         }
-        let source = storage.table(table).identity();
+        let selected = storage.table(table).identity();
         let mut slot = self.head.get();
         while let Some(index) = slot {
             // SAFETY: this owner retains every cell in its immutable chain.
             // Adding a new head never modifies a previously captured image.
             let image = unsafe { (*self.pool.cells[index].image.get()).assume_init_ref() };
-            if image.table == table && image.transaction == transaction {
-                if image.identity.database != source.database
-                    || image.identity.created_at != source.created_at
+            if let ImageSource::Table(source) = image.source
+                && source.table == table
+                && source.transaction == transaction
+            {
+                if source.identity.database != selected.database
+                    || source.identity.created_at != selected.created_at
                 {
                     return Err(sql_err!(
                         sqlstate::SERIALIZATION_FAILURE,
@@ -231,14 +355,12 @@ impl TableDefinitionImages {
         // Copy directly into the reserved slot instead of a wide stack image.
         unsafe {
             core::ptr::addr_of_mut!((*target).next).write(self.head.get());
-            core::ptr::addr_of_mut!((*target).table).write(table);
-            core::ptr::addr_of_mut!((*target).transaction).write(transaction);
-            core::ptr::addr_of_mut!((*target).identity).write(identity);
-            core::ptr::addr_of_mut!((*target).target).write(storage.table_definition_target(
+            core::ptr::addr_of_mut!((*target).source).write(ImageSource::Table(TableSource {
                 table,
                 transaction,
-                &definition,
-            ));
+                identity,
+                target: storage.table_definition_target(table, transaction, &definition),
+            }));
             core::ptr::copy_nonoverlapping(
                 &*definition,
                 core::ptr::addr_of_mut!((*target).definition),

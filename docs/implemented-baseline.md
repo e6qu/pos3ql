@@ -266,6 +266,11 @@ repeated references and require the applicable ownership role. Their full
 result shapes and definitions follow the pinned PostgreSQL 18.6
 [information schema](https://github.com/postgres/postgres/blob/REL_18_6/src/backend/catalog/information_schema.sql).
 
+Catalog descriptions retain only their actual column metadata in statement
+memory; full execution definitions use the existing fixed schema-image pool.
+Joining several small catalogs does not reserve a full wide table and all its
+constraint arrays for each description. Pool exhaustion is still a named error.
+
 Catalog type properties describe PostgreSQL's interface, independently of the
 object-store layout. Hidden `tableoid` must be named explicitly. Index vectors
 start at subscript zero and preserve that bound when cast to ordinary arrays;

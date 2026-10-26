@@ -29,7 +29,9 @@ flowchart LR
 ```
 
 Connection input, parsed SQL, statement workspaces, transaction undo, locks,
-object requests and output have separate fixed reservations. After startup,
+object requests and output have separate fixed reservations. Catalog descriptions
+retain their actual columns, rather than full 1,600-column table definitions,
+in statement memory. Execution schemas share the existing startup image pool. After startup,
 ordinary runtime work cannot grow a heap, pool or sort allocation. The isolated
 TLS transport uses its separately budgeted pool. The memory plan describes
 these reservations; it is not the entire operating-system RSS, kernel socket

@@ -1682,9 +1682,7 @@ mod tests {
 
     #[test]
     fn every_exposed_catalog_has_a_bounded_shared_definition() {
-        let bytes = core::mem::size_of::<
-            crate::mem::arena::InternedValue<(crate::storage::TableDef, usize)>,
-        >();
+        let bytes = 64 * 1024;
         let mut budget = crate::mem::budget::Budget::new(bytes);
         let arena =
             crate::mem::arena::Arena::new(&mut budget, "schema definition only", bytes).unwrap();
@@ -1700,7 +1698,7 @@ mod tests {
             crate::mem::guard::forbid_alloc(|| {
                 let table =
                     super::super::synthesize_definition(Some("pg_catalog"), name, &arena).unwrap();
-                assert_eq!(arena.used(), bytes);
+                assert!(arena.used() < core::mem::size_of::<crate::storage::TableDef>() / 4);
                 assert!(table.rows.is_empty());
                 if definition.relation.is_some() {
                     assert_eq!(table.hidden_columns, 1);

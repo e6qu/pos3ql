@@ -50,8 +50,8 @@ mod type_io;
 
 /// A materialized catalog relation: its shape plus rows in the arena.
 #[derive(Clone, Copy)]
-pub struct SynthTable<'a> {
-    pub def: &'a TableDef,
+pub(crate) struct SynthTable<'a> {
+    pub def: &'a crate::storage::RelationDefinition<'a>,
     pub rows: &'a [&'a [Datum<'a>]],
     /// Addressable system columns encoded after `def.n_columns`, and therefore
     /// omitted from star expansion and the relation's positive attributes.
@@ -16492,26 +16492,24 @@ fn materialize_with_hidden(
     Ok((definition, count))
 }
 
-fn allocate_definition(
+fn allocate_definition<'a>(
     definition: TableDef,
     hidden_columns: usize,
-    arena: &Arena,
-) -> Result<&TableDef, SqlError> {
-    let def = arena
-        .alloc_interned(
-            (definition, hidden_columns),
-            |(left, left_hidden), (right, right_hidden)| {
-                // These definitions come only from materialize_with_hidden: all other
-                // TableDef fields have its fixed empty values.
-                left_hidden == right_hidden
-                    && left.name == right.name
-                    && left.n_columns == right.n_columns
-                    && left.columns[..left.n_columns + left_hidden]
-                        == right.columns[..right.n_columns + right_hidden]
-            },
-        )
+    arena: &'a Arena,
+) -> Result<&'a crate::storage::RelationDefinition<'a>, SqlError> {
+    let width = definition.n_columns + hidden_columns;
+    let columns = arena
+        .alloc_slice_copy(&definition.columns[..width])
         .map_err(|_| arena_full())?;
-    Ok(&def.0)
+    arena
+        .alloc(crate::storage::RelationDefinition {
+            schema: definition.schema,
+            name: definition.name,
+            n_columns: definition.n_columns,
+            columns,
+        })
+        .map(|definition| &*definition)
+        .map_err(|_| arena_full())
 }
 
 fn finish_with_hidden<'a>(
@@ -31803,19 +31801,7 @@ fn info_collation_character_set_applicability<'a>(
     finish(definition, &output[..count], arena)
 }
 
-#[track_caller]
 fn arena_full() -> SqlError {
-    #[cfg(test)]
-    {
-        let caller = core::panic::Location::caller();
-        return sql_err!(
-            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "catalog relation exceeds the statement arena ({}:{})",
-            caller.file(),
-            caller.line()
-        );
-    }
-    #[cfg(not(test))]
     sql_err!(
         sqlstate::PROGRAM_LIMIT_EXCEEDED,
         "catalog relation exceeds the statement arena"

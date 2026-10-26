@@ -237,7 +237,14 @@ pub(super) fn retain_query_definition(
 #[derive(Clone, Copy)]
 enum ScopeDefinition<'a> {
     Arena(&'a TableDef),
-    Retained { table: usize, names: &'a [&'a str] },
+    Relation {
+        image: crate::storage::DefinitionImageId,
+        names: &'a [&'a str],
+    },
+    Retained {
+        table: usize,
+        names: &'a [&'a str],
+    },
 }
 
 // Definition references borrow this owner; escaped names borrow the arena.
@@ -251,6 +258,11 @@ impl<'a> QueryDefinitions<'a> {
     pub(crate) fn get(&self, index: usize) -> Option<&TableDef> {
         match self.sources.get(index).copied().flatten()? {
             ScopeDefinition::Arena(definition) => Some(definition),
+            ScopeDefinition::Relation { image, .. } => Some(
+                self.images
+                    .retained_relation(image)
+                    .expect("scope retains its catalog definition"),
+            ),
             ScopeDefinition::Retained { table, .. } => Some(
                 self.images
                     .retained_definition(table, self.transaction)
@@ -270,7 +282,9 @@ impl<'a> QueryDefinitions<'a> {
     pub(crate) fn column_name(&self, index: usize, column: usize) -> &'a str {
         match self.sources[index].expect("source is resolved") {
             ScopeDefinition::Arena(definition) => definition.columns[column].name.as_str(),
-            ScopeDefinition::Retained { names, .. } => names[column],
+            ScopeDefinition::Retained { names, .. } | ScopeDefinition::Relation { names, .. } => {
+                names[column]
+            }
         }
     }
 }
@@ -983,24 +997,30 @@ impl<'d> QueryScope<'d> {
                 exposed
             ));
         }
-        let def_reference = if let Some(aliases) = tref.col_alias {
-            if aliases.len() > synth.def.n_columns {
+        let mut definition = *synth.def;
+        if let Some(aliases) = tref.col_alias {
+            if aliases.len() > definition.n_columns {
                 return Err(sql_err!(
                     sqlstate::INVALID_COLUMN_REFERENCE,
-                    "table \"{}\" has {} columns available but {} columns specified",
+                    r#"table "{}" has {} columns available but {} columns specified"#,
                     exposed,
-                    synth.def.n_columns,
+                    definition.n_columns,
                     aliases.len()
                 ));
             }
-            let mut renamed = *synth.def;
-            for (column, alias) in renamed.columns.iter_mut().zip(aliases) {
+            let columns = arena
+                .alloc_slice_copy(definition.columns)
+                .map_err(|_| arena_full())?;
+            for (column, alias) in columns.iter_mut().zip(aliases) {
                 column.name = SqlName::parse(alias)?;
             }
-            &*arena.alloc(renamed).map_err(|_| arena_full())?
-        } else {
-            synth.def
-        };
+            definition.columns = columns;
+        }
+        let columns = definition.columns;
+        let names = arena
+            .alloc_slice_with(columns.len(), |column| columns[column].name.as_str())
+            .map_err(|_| arena_full())?;
+        let image = self.defs.images.retain_relation(&definition)?;
         let rows: &'a [&'a [u8]] = if materialize {
             const EMPTY: &[u8] = &[];
             let encoded = arena
@@ -1028,7 +1048,7 @@ impl<'d> QueryScope<'d> {
             &[]
         };
         self.names[self.n] = exposed;
-        self.defs.set_arena(self.n, def_reference);
+        self.defs.sources[self.n] = Some(ScopeDefinition::Relation { image, names });
         self.derived[self.n] = Some(rows);
         self.slots[self.n] = usize::MAX;
         self.hidden_columns[self.n] = synth.hidden_columns;

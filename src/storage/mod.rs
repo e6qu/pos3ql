@@ -54,6 +54,7 @@ pub(crate) use constraint_identities::{
 mod column_maps;
 pub(crate) use column_maps::{RelationColumnMap, RelationRowDecoder};
 mod definition_images;
+pub(crate) use definition_images::{DefinitionImageId, RelationDefinition};
 mod definition_pool;
 mod index_bindings;
 mod key_preparation;

@@ -15,8 +15,8 @@ mod cast;
 pub mod funcs;
 pub use cast::{cast, cast_to, fit_bits, int_to_bits};
 pub(crate) use cast::{
-    cast_to_text, parse_bytea, parse_int_bounded, parse_int_literal, parse_oid, parse_uuid, validate_bits,
-    validate_catalog_reference_cast,
+    cast_to_text, parse_bytea, parse_int_bounded, parse_int_literal, parse_oid, parse_uuid,
+    validate_bits, validate_catalog_reference_cast,
 };
 
 mod args;
@@ -1501,8 +1501,6 @@ pub trait CatalogAccess {
         Ok(None)
     }
 
-
-
     fn has_parameter_privilege(
         &self,
         _role: Option<&str>,
@@ -1511,7 +1509,6 @@ pub trait CatalogAccess {
     ) -> Result<Option<bool>, SqlError> {
         Ok(None)
     }
-
 
     /// The comment text on the object with this OID and column `subid` (0 for
     /// the object itself), or `None`. `catalog_name` selects the owning

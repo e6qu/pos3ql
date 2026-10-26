@@ -15064,10 +15064,12 @@ fn visit_comments_for_object(
             "pg_tablespace" => {
                 class == crate::storage::CommentClass::Tablespace
                     && subid == 0
-                    && storage.tablespaces_visible_to(txid).any(|(slot, tablespace)| {
-                        tablespace.name_for(txid).as_str() == name
-                            && Some(tablespace_oid(slot, tablespace)) == signed_oid
-                    })
+                    && storage
+                        .tablespaces_visible_to(txid)
+                        .any(|(slot, tablespace)| {
+                            tablespace.name_for(txid).as_str() == name
+                                && Some(tablespace_oid(slot, tablespace)) == signed_oid
+                        })
             }
             "pg_database" => {
                 class == crate::storage::CommentClass::Database
@@ -20251,7 +20253,8 @@ pub(crate) fn tablespace_oid(slot: usize, tablespace: crate::storage::Tablespace
         0 => 1663,
         1 => 1664,
         _ => crate::storage::TablespaceIdentity::parse(tablespace.created_at)
-            .expect("admitted tablespace creation stamp").oid(),
+            .expect("admitted tablespace creation stamp")
+            .oid(),
     }
 }
 
@@ -20263,8 +20266,9 @@ fn catalog_tablespace_oid(storage: &Storage, id: u16, txid: u32) -> i32 {
         // relations.
         0 => 0,
         1 => 1664,
-        _ => storage.tablespace_by_id(id, txid).map_or(0, |definition|
-            tablespace_oid(usize::from(id) - 2, definition)),
+        _ => storage.tablespace_by_id(id, txid).map_or(0, |definition| {
+            tablespace_oid(usize::from(id) - 2, definition)
+        }),
     }
 }
 
@@ -20358,8 +20362,6 @@ pub(crate) fn tablespace_location_by_oid<'a>(
     }
     Ok(None)
 }
-
-
 
 fn index_reloptions<'a>(
     definition: Option<crate::storage::IndexMutableDefinition>,
@@ -28013,8 +28015,16 @@ fn pg_enum<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
         for m in e.members() {
             out[n] = row(
                 &[
-                    Datum::Int4(m.identity.ok_or_else(|| sql_err!(sqlstate::DATA_EXCEPTION,
-                        "enum member has no catalog identity"))?.oid()),
+                    Datum::Int4(
+                        m.identity
+                            .ok_or_else(|| {
+                                sql_err!(
+                                    sqlstate::DATA_EXCEPTION,
+                                    "enum member has no catalog identity"
+                                )
+                            })?
+                            .oid(),
+                    ),
                     Datum::Int4(typid),
                     Datum::Float8(m.sort),
                     text(

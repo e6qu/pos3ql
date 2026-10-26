@@ -3904,14 +3904,21 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
     }
 
     fn has_language_privilege(
-        &self, role: Option<&str>, target: super::eval::PrivilegeObject<'_>, privileges: &str,
+        &self,
+        role: Option<&str>,
+        target: super::eval::PrivilegeObject<'_>,
+        privileges: &str,
     ) -> Result<Option<bool>, SqlError> {
-        object_privilege_query(self.storage, self.txid, role,
-            crate::storage::AccessClass::Language, target,
-            crate::storage::PrivilegeSet::USAGE, privileges)
+        object_privilege_query(
+            self.storage,
+            self.txid,
+            role,
+            crate::storage::AccessClass::Language,
+            target,
+            crate::storage::PrivilegeSet::USAGE,
+            privileges,
+        )
     }
-
-
 
     fn has_function_privilege(
         &self,
@@ -3968,52 +3975,89 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
     }
 
     fn has_database_privilege(
-        &self, role: Option<&str>, target: super::eval::PrivilegeObject<'_>, privileges: &str,
+        &self,
+        role: Option<&str>,
+        target: super::eval::PrivilegeObject<'_>,
+        privileges: &str,
     ) -> Result<Option<bool>, SqlError> {
-        object_privilege_query(self.storage, self.txid, role,
-            crate::storage::AccessClass::Database, target,
-            crate::storage::PrivilegeSet::DATABASE_ALL, privileges)
+        object_privilege_query(
+            self.storage,
+            self.txid,
+            role,
+            crate::storage::AccessClass::Database,
+            target,
+            crate::storage::PrivilegeSet::DATABASE_ALL,
+            privileges,
+        )
     }
 
-
-
     fn has_tablespace_privilege(
-        &self, role: Option<&str>, target: super::eval::PrivilegeObject<'_>, privileges: &str,
+        &self,
+        role: Option<&str>,
+        target: super::eval::PrivilegeObject<'_>,
+        privileges: &str,
     ) -> Result<Option<bool>, SqlError> {
-        object_privilege_query(self.storage, self.txid, role,
-            crate::storage::AccessClass::Tablespace, target,
-            crate::storage::PrivilegeSet::CREATE, privileges)
+        object_privilege_query(
+            self.storage,
+            self.txid,
+            role,
+            crate::storage::AccessClass::Tablespace,
+            target,
+            crate::storage::PrivilegeSet::CREATE,
+            privileges,
+        )
     }
 
     fn has_foreign_data_wrapper_privilege(
-        &self, role: Option<&str>, target: super::eval::PrivilegeObject<'_>, privileges: &str,
+        &self,
+        role: Option<&str>,
+        target: super::eval::PrivilegeObject<'_>,
+        privileges: &str,
     ) -> Result<Option<bool>, SqlError> {
-        object_privilege_query(self.storage, self.txid, role,
-            crate::storage::AccessClass::ForeignDataWrapper, target,
-            crate::storage::PrivilegeSet::USAGE, privileges)
+        object_privilege_query(
+            self.storage,
+            self.txid,
+            role,
+            crate::storage::AccessClass::ForeignDataWrapper,
+            target,
+            crate::storage::PrivilegeSet::USAGE,
+            privileges,
+        )
     }
 
     fn has_server_privilege(
-        &self, role: Option<&str>, target: super::eval::PrivilegeObject<'_>, privileges: &str,
+        &self,
+        role: Option<&str>,
+        target: super::eval::PrivilegeObject<'_>,
+        privileges: &str,
     ) -> Result<Option<bool>, SqlError> {
-        object_privilege_query(self.storage, self.txid, role,
-            crate::storage::AccessClass::ForeignServer, target,
-            crate::storage::PrivilegeSet::USAGE, privileges)
+        object_privilege_query(
+            self.storage,
+            self.txid,
+            role,
+            crate::storage::AccessClass::ForeignServer,
+            target,
+            crate::storage::PrivilegeSet::USAGE,
+            privileges,
+        )
     }
 
     fn has_largeobject_privilege(
-        &self, role: Option<&str>, target: super::eval::PrivilegeObject<'_>, privileges: &str,
+        &self,
+        role: Option<&str>,
+        target: super::eval::PrivilegeObject<'_>,
+        privileges: &str,
     ) -> Result<Option<bool>, SqlError> {
-        object_privilege_query(self.storage, self.txid, role,
-            crate::storage::AccessClass::LargeObject, target,
-            crate::storage::PrivilegeSet::LARGE_OBJECT_ALL, privileges)
+        object_privilege_query(
+            self.storage,
+            self.txid,
+            role,
+            crate::storage::AccessClass::LargeObject,
+            target,
+            crate::storage::PrivilegeSet::LARGE_OBJECT_ALL,
+            privileges,
+        )
     }
-
-
-
-
-
-
 
     fn has_parameter_privilege(
         &self,
@@ -4042,8 +4086,6 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         )
         .map(Some)
     }
-
-
 
     fn comment<'a>(
         &self,
@@ -4507,27 +4549,37 @@ fn object_privilege_query(
 ) -> Result<Option<bool>, SqlError> {
     use super::eval::PrivilegeObject;
     use crate::storage::{AccessClass, AccessObject, LargeObjectOid};
-    enum Lookup { Named(AccessObject), Numeric(i32) }
-    let Some(role) = privilege_role(storage, role, txid) else { return Ok(None); };
+    enum Lookup {
+        Named(AccessObject),
+        Numeric(i32),
+    }
+    let Some(role) = privilege_role(storage, role, txid) else {
+        return Ok(None);
+    };
     let target = match target {
         PrivilegeObject::Name(value) if class == AccessClass::LargeObject => {
             let oid = super::eval::parse_oid(value)?;
             Lookup::Numeric(oid as i32)
         }
         PrivilegeObject::Name(name) => {
-            let object = storage.resolve_access_object(class, "", name, txid).ok_or_else(|| {
-                let label = match class {
-                    AccessClass::Database => "database",
-                    AccessClass::Tablespace => "tablespace",
-                    AccessClass::Language => "language",
-                    AccessClass::ForeignDataWrapper => "foreign-data wrapper",
-                    AccessClass::ForeignServer => "server",
-                    _ => unreachable!("object privilege class was classified"),
-                };
-                let state = if class == AccessClass::Database { sqlstate::INVALID_CATALOG_NAME }
-                    else { sqlstate::UNDEFINED_OBJECT };
-                sql_err!(state, r#"{} "{}" does not exist"#, label, name)
-            })?;
+            let object = storage
+                .resolve_access_object(class, "", name, txid)
+                .ok_or_else(|| {
+                    let label = match class {
+                        AccessClass::Database => "database",
+                        AccessClass::Tablespace => "tablespace",
+                        AccessClass::Language => "language",
+                        AccessClass::ForeignDataWrapper => "foreign-data wrapper",
+                        AccessClass::ForeignServer => "server",
+                        _ => unreachable!("object privilege class was classified"),
+                    };
+                    let state = if class == AccessClass::Database {
+                        sqlstate::INVALID_CATALOG_NAME
+                    } else {
+                        sqlstate::UNDEFINED_OBJECT
+                    };
+                    sql_err!(state, r#"{} "{}" does not exist"#, label, name)
+                })?;
             Lookup::Named(object)
         }
         PrivilegeObject::Oid(oid) => Lookup::Numeric(oid),
@@ -4542,27 +4594,43 @@ fn object_privilege_query(
             let slot = match class {
                 AccessClass::Database => crate::storage::DatabaseOid::parse(oid)
                     .and_then(|oid| storage.database_slot_by_oid(oid, txid)),
-                AccessClass::Tablespace => storage.tablespaces_visible_to(txid).find_map(|(slot, definition)| {
-                    let actual = super::catalog::tablespace_oid(slot, definition);
-                    (actual == oid).then_some(slot)
-                }),
+                AccessClass::Tablespace => {
+                    storage
+                        .tablespaces_visible_to(txid)
+                        .find_map(|(slot, definition)| {
+                            let actual = super::catalog::tablespace_oid(slot, definition);
+                            (actual == oid).then_some(slot)
+                        })
+                }
                 AccessClass::Language => super::catalog::procedural_language_name(oid)
-                    .and_then(|_| u16::try_from(oid).ok()).map(usize::from),
-                AccessClass::ForeignDataWrapper => storage.foreign_wrappers(txid)
-                    .find_map(|(slot, _)| (super::catalog::foreign_data_wrapper_oid(slot) == oid).then_some(slot)),
-                AccessClass::ForeignServer => storage.foreign_servers(txid)
-                    .find_map(|(slot, _)| (super::catalog::foreign_server_oid(slot) == oid).then_some(slot)),
+                    .and_then(|_| u16::try_from(oid).ok())
+                    .map(usize::from),
+                AccessClass::ForeignDataWrapper => {
+                    storage.foreign_wrappers(txid).find_map(|(slot, _)| {
+                        (super::catalog::foreign_data_wrapper_oid(slot) == oid).then_some(slot)
+                    })
+                }
+                AccessClass::ForeignServer => {
+                    storage.foreign_servers(txid).find_map(|(slot, _)| {
+                        (super::catalog::foreign_server_oid(slot) == oid).then_some(slot)
+                    })
+                }
                 AccessClass::LargeObject => LargeObjectOid::parse(oid as u32)
                     .and_then(|oid| storage.large_object_slot(oid, txid)),
                 _ => unreachable!("object privilege class was classified"),
             };
-            slot.and_then(|slot| u16::try_from(slot).ok()).map(|slot| AccessObject { class, slot })
+            slot.and_then(|slot| u16::try_from(slot).ok())
+                .map(|slot| AccessObject { class, slot })
         }
     };
-    let Some(object) = object else { return Ok(None); };
-    Ok(Some(requested.allows(crate::storage::PrivilegeSet::NONE,
+    let Some(object) = object else {
+        return Ok(None);
+    };
+    Ok(Some(requested.allows(
+        crate::storage::PrivilegeSet::NONE,
         |privilege| storage.has_object_privilege(object, role, privilege, txid),
-        |privilege| storage.has_object_grant_option(object, role, privilege, txid))))
+        |privilege| storage.has_object_grant_option(object, role, privilege, txid),
+    )))
 }
 
 fn parameter_privilege_query(

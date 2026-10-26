@@ -772,7 +772,7 @@ mod tests {
                 EnumSpec {
                     members: &[EnumMember {
                         identity: None,
-label: SqlName::parse("before").unwrap(),
+                        label: SqlName::parse("before").unwrap(),
                         legacy_label: None,
                         sort: 1.0,
                     }],
@@ -1113,13 +1113,13 @@ label: SqlName::parse("before").unwrap(),
         let members = [
             EnumMember {
                 identity: None,
-label: SqlName::parse("before").unwrap(),
+                label: SqlName::parse("before").unwrap(),
                 legacy_label: Some(SqlName::parse("before").unwrap()),
                 sort: 1.0,
             },
             EnumMember {
                 identity: None,
-label: SqlName::parse("after").unwrap(),
+                label: SqlName::parse("after").unwrap(),
                 legacy_label: None,
                 sort: 2.0,
             },
@@ -1372,7 +1372,7 @@ label: SqlName::parse("after").unwrap(),
                 .get(NamedTypeSlot::Domain(0));
             storage.enum_replay_members(1).unwrap()[0] = EnumMember {
                 identity: super::super::EnumLabelIdentity::parse(43),
-label: SqlName::parse("saved").unwrap(),
+                label: SqlName::parse("saved").unwrap(),
                 legacy_label: None,
                 sort: 1.0,
             };
@@ -1512,7 +1512,7 @@ label: SqlName::parse("saved").unwrap(),
                         NamedTypeSlot::Enum(_) => {
                             storage.enum_replay_members(1).unwrap()[0] = EnumMember {
                                 identity: super::super::EnumLabelIdentity::parse(42),
-label: SqlName::parse("before").unwrap(),
+                                label: SqlName::parse("before").unwrap(),
                                 legacy_label: None,
                                 sort: 1.0,
                             };
@@ -1782,7 +1782,7 @@ label: SqlName::parse("before").unwrap(),
                                 SqlName::parse("reader_source").unwrap(),
                                 &[EnumMember {
                                     identity: None,
-label: SqlName::parse("pending").unwrap(),
+                                    label: SqlName::parse("pending").unwrap(),
                                     legacy_label: None,
                                     sort: 1.0,
                                 }],
@@ -1975,7 +1975,7 @@ label: SqlName::parse("pending").unwrap(),
                     SqlName::parse("reader_source").unwrap(),
                     &[EnumMember {
                         identity: None,
-label: SqlName::parse(marker).unwrap(),
+                        label: SqlName::parse(marker).unwrap(),
                         legacy_label: None,
                         sort: 1.0,
                     }],

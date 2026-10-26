@@ -8860,8 +8860,14 @@ impl Checkpointer {
                     error.message.as_str()
                 ))
             })?;
-        storage.validate_restored_enum_label_identities(metadata.catalog_sequence).map_err(|error|
-            CheckpointSetupError::ObjectStore(format!("manifest enum identities rejected: {}", error.message.as_str())))?;
+        storage
+            .validate_restored_enum_label_identities(metadata.catalog_sequence)
+            .map_err(|error| {
+                CheckpointSetupError::ObjectStore(format!(
+                    "manifest enum identities rejected: {}",
+                    error.message.as_str()
+                ))
+            })?;
         // Block SSTs load in list order. Versioned reads choose the greatest
         // admissible commit LSN across every member.
         bssts.sort_by_key(|(mindex, idx, ..)| (*mindex, *idx));
@@ -9941,8 +9947,14 @@ impl Checkpointer {
                         .map_err(|_| manifest_full())?,
                     None => write!(&mut self.manifest_output, "-").map_err(|_| manifest_full())?,
                 }
-                let identity = m.identity.ok_or_else(|| sql_err!(sqlstate::DATA_EXCEPTION, "enum member has no catalog identity"))?;
-                write!(&mut self.manifest_output, " {}", identity.created_at()).map_err(|_| manifest_full())?;
+                let identity = m.identity.ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::DATA_EXCEPTION,
+                        "enum member has no catalog identity"
+                    )
+                })?;
+                write!(&mut self.manifest_output, " {}", identity.created_at())
+                    .map_err(|_| manifest_full())?;
             }
             writeln!(&mut self.manifest_output).map_err(|_| manifest_full())?;
         }

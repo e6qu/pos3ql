@@ -12,20 +12,43 @@ use crate::sql_err;
 fn validate_members(members: &mut [EnumMember]) -> Result<(), SqlError> {
     let mut previous = 0;
     for member in members.iter() {
-        let creation = member.identity.ok_or_else(|| sql_err!(sqlstate::DATA_EXCEPTION,
-            "enum member has no creation identity"))?.created_at();
-        if creation <= previous || !member.sort.is_finite() || f64::from(member.sort as f32) != member.sort {
-            return Err(sql_err!(sqlstate::DATA_EXCEPTION, "enum member identity or sort position is invalid"));
+        let creation = member
+            .identity
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::DATA_EXCEPTION,
+                    "enum member has no creation identity"
+                )
+            })?
+            .created_at();
+        if creation <= previous
+            || !member.sort.is_finite()
+            || f64::from(member.sort as f32) != member.sort
+        {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "enum member identity or sort position is invalid"
+            ));
         }
         previous = creation;
     }
     members.sort_unstable_by(|left, right| left.label.as_str().cmp(right.label.as_str()));
-    let duplicate_label = members.windows(2).any(|pair| pair[0].label == pair[1].label);
+    let duplicate_label = members
+        .windows(2)
+        .any(|pair| pair[0].label == pair[1].label);
     members.sort_unstable_by(|left, right| left.sort.total_cmp(&right.sort));
     let duplicate_sort = members.windows(2).any(|pair| pair[0].sort == pair[1].sort);
-    members.sort_unstable_by_key(|member| member.identity.expect("checked member identity").created_at());
+    members.sort_unstable_by_key(|member| {
+        member
+            .identity
+            .expect("checked member identity")
+            .created_at()
+    });
     if duplicate_label || duplicate_sort {
-        return Err(sql_err!(sqlstate::DATA_EXCEPTION, "enum labels or sort positions are duplicated"));
+        return Err(sql_err!(
+            sqlstate::DATA_EXCEPTION,
+            "enum labels or sort positions are duplicated"
+        ));
     }
     Ok(())
 }
@@ -171,11 +194,17 @@ impl EnumMemberImages {
         let count = self.validate_count(count)?;
         let mut previous = 0;
         for member in self.replay_members(count as usize) {
-            let identity = member.identity.ok_or_else(|| sql_err!(sqlstate::DATA_EXCEPTION,
-                "stored enum member has no creation identity"))?;
+            let identity = member.identity.ok_or_else(|| {
+                sql_err!(
+                    sqlstate::DATA_EXCEPTION,
+                    "stored enum member has no creation identity"
+                )
+            })?;
             if identity.created_at() <= previous {
-                return Err(sql_err!(sqlstate::DATA_EXCEPTION,
-                    "stored enum member creation identities are not increasing"));
+                return Err(sql_err!(
+                    sqlstate::DATA_EXCEPTION,
+                    "stored enum member creation identities are not increasing"
+                ));
             }
             previous = identity.created_at();
         }
@@ -233,27 +262,51 @@ impl EnumImageReservation {
     ) -> Result<Self, SqlError> {
         let mut state = images.lock().expect("enum member-image lock poisoned");
         let count = state.validate_count(members.len())?;
-        if previous.is_some_and(|(image, count)| count > state.width || state.slots.get(image as usize)
-            .is_none_or(|slot| !slot.owned && slot.readers == 0)) {
-            return Err(sql_err!(sqlstate::DATA_EXCEPTION, "enum member source image is unavailable"));
+        if previous.is_some_and(|(image, count)| {
+            count > state.width
+                || state
+                    .slots
+                    .get(image as usize)
+                    .is_none_or(|slot| !slot.owned && slot.readers == 0)
+        }) {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "enum member source image is unavailable"
+            ));
         }
         let image = state.reserve()?;
         let start = image as usize * state.width;
         for (index, member) in members.iter().enumerate() {
-            let old = previous.filter(|(_, count)| index < *count)
+            let old = previous
+                .filter(|(_, count)| index < *count)
                 .map(|(source, _)| state.members[source as usize * state.width + index].identity);
             let identity = match old {
-                Some(Some(identity)) if member.identity.is_none_or(|supplied| supplied == identity) => Ok(identity),
+                Some(Some(identity))
+                    if member.identity.is_none_or(|supplied| supplied == identity) =>
+                {
+                    Ok(identity)
+                }
                 None if member.identity.is_none() => super::EnumLabelIdentity::reserve(sequence),
-                _ => Err(sql_err!(sqlstate::DATA_EXCEPTION, "enum member identity does not match its source")),
+                _ => Err(sql_err!(
+                    sqlstate::DATA_EXCEPTION,
+                    "enum member identity does not match its source"
+                )),
             };
             let identity = match identity {
                 Ok(identity) => identity,
-                Err(error) => { state.release(image); return Err(error); }
+                Err(error) => {
+                    state.release(image);
+                    return Err(error);
+                }
             };
-            state.members[start + index] = EnumMember { identity: Some(identity), ..*member };
+            state.members[start + index] = EnumMember {
+                identity: Some(identity),
+                ..*member
+            };
         }
-        if let Err(error) = validate_members(&mut state.members.as_mut_slice()[start..start + members.len()]) {
+        if let Err(error) =
+            validate_members(&mut state.members.as_mut_slice()[start..start + members.len()])
+        {
             state.release(image);
             return Err(error);
         }
@@ -372,39 +425,70 @@ impl Drop for EnumImageRead {
 }
 
 impl super::Storage {
-    pub(crate) fn validate_restored_enum_label_identities(&self, saved_sequence: u64) -> Result<(), SqlError> {
+    pub(crate) fn validate_restored_enum_label_identities(
+        &self,
+        saved_sequence: u64,
+    ) -> Result<(), SqlError> {
         const WORDS: usize = 1024;
         const WIDTH: u64 = (WORDS * u64::BITS as usize) as u64;
-        let catalog = self.type_catalog.lock().expect("type catalog lock poisoned");
-        let images = self.enum_member_images.lock().expect("enum member-image lock poisoned");
+        let catalog = self
+            .type_catalog
+            .lock()
+            .expect("type catalog lock poisoned");
+        let images = self
+            .enum_member_images
+            .lock()
+            .expect("enum member-image lock poisoned");
         for (_, database) in self.databases_visible_to(0) {
             let last = saved_sequence.clamp(1, super::type_identities::MAX_TYPE_CREATION);
             for first in (1..=last).step_by(WIDTH as usize) {
                 let mut seen = [0u64; WORDS];
-                for definition in catalog.enums.iter().filter(|definition|
-                    definition.database == database.oid && definition.ddl_state != super::CatalogDdlState::Absent)
-                {
+                for definition in catalog.enums.iter().filter(|definition| {
+                    definition.database == database.oid
+                        && definition.ddl_state != super::CatalogDdlState::Absent
+                }) {
                     let (image, count) = definition.pending_definition.map_or(
                         (definition.member_image, definition.member_count as usize),
-                        |pending| (Some(pending.image), pending.member_count as usize));
+                        |pending| (Some(pending.image), pending.member_count as usize),
+                    );
                     let Some(image) = image else {
-                        if count == 0 { continue; }
-                        return Err(sql_err!(sqlstate::DATA_EXCEPTION, "stored enum member image is missing"));
+                        if count == 0 {
+                            continue;
+                        }
+                        return Err(sql_err!(
+                            sqlstate::DATA_EXCEPTION,
+                            "stored enum member image is missing"
+                        ));
                     };
                     let mut previous = definition.created_at;
                     for member in images.image_members(image, count) {
-                        let creation = member.identity.ok_or_else(|| sql_err!(sqlstate::DATA_EXCEPTION,
-                            "stored enum member has no creation identity"))?.created_at();
+                        let creation = member
+                            .identity
+                            .ok_or_else(|| {
+                                sql_err!(
+                                    sqlstate::DATA_EXCEPTION,
+                                    "stored enum member has no creation identity"
+                                )
+                            })?
+                            .created_at();
                         if creation <= previous || creation > saved_sequence {
-                            return Err(sql_err!(sqlstate::DATA_EXCEPTION, "stored enum member creation identity is invalid"));
+                            return Err(sql_err!(
+                                sqlstate::DATA_EXCEPTION,
+                                "stored enum member creation identity is invalid"
+                            ));
                         }
                         previous = creation;
-                        if !(first..first + WIDTH).contains(&creation) { continue; }
+                        if !(first..first + WIDTH).contains(&creation) {
+                            continue;
+                        }
                         let offset = (creation - first) as usize;
                         let bit = 1u64 << (offset % u64::BITS as usize);
                         let word = &mut seen[offset / u64::BITS as usize];
                         if *word & bit != 0 {
-                            return Err(sql_err!(sqlstate::DATA_EXCEPTION, "stored enum member creation identity is duplicated"));
+                            return Err(sql_err!(
+                                sqlstate::DATA_EXCEPTION,
+                                "stored enum member creation identity is duplicated"
+                            ));
                         }
                         *word |= bit;
                     }
@@ -464,7 +548,7 @@ mod tests {
     fn member(label: &str, sort: f64) -> EnumMember {
         EnumMember {
             identity: None,
-label: SqlName::parse(label).unwrap(),
+            label: SqlName::parse(label).unwrap(),
             legacy_label: None,
             sort,
         }
@@ -483,14 +567,24 @@ label: SqlName::parse(label).unwrap(),
         let old = member("new", 1.0);
         let replacement = member("paid", 2.0);
         crate::mem::guard::forbid_alloc(|| {
-            let image = EnumImageReservation::write(&images, &[old], &super::super::CatalogSequence::new(0), None)
-                .unwrap()
-                .publish();
+            let image = EnumImageReservation::write(
+                &images,
+                &[old],
+                &super::super::CatalogSequence::new(0),
+                None,
+            )
+            .unwrap()
+            .publish();
             let selected = EnumImageRead::capture(&images, Some(image));
             images.lock().unwrap().release(image);
-            let new_image = EnumImageReservation::write(&images, &[replacement], &super::super::CatalogSequence::new(0), None)
-                .unwrap()
-                .publish();
+            let new_image = EnumImageReservation::write(
+                &images,
+                &[replacement],
+                &super::super::CatalogSequence::new(0),
+                None,
+            )
+            .unwrap()
+            .publish();
             assert_ne!(new_image, image);
             let retained = selected.clone();
             drop(selected);
@@ -506,32 +600,66 @@ label: SqlName::parse(label).unwrap(),
         let images = images(3, 2);
         let label = member("old", 1.0);
         crate::mem::guard::forbid_alloc(|| {
-            let first = EnumImageReservation::write(&images, &[label], &super::super::CatalogSequence::new(0), None)
-                .unwrap()
-                .publish();
+            let first = EnumImageReservation::write(
+                &images,
+                &[label],
+                &super::super::CatalogSequence::new(0),
+                None,
+            )
+            .unwrap()
+            .publish();
             let selected = EnumImageRead::capture(&images, Some(first));
             let retained = selected.clone();
             images.lock().unwrap().release(first);
-            let second = EnumImageReservation::write(&images, &[label], &super::super::CatalogSequence::new(0), None)
-                .unwrap()
-                .publish();
-            let error = EnumImageReservation::write(&images, &[label], &super::super::CatalogSequence::new(0), None)
-                .err()
-                .unwrap();
+            let second = EnumImageReservation::write(
+                &images,
+                &[label],
+                &super::super::CatalogSequence::new(0),
+                None,
+            )
+            .unwrap()
+            .publish();
+            let error = EnumImageReservation::write(
+                &images,
+                &[label],
+                &super::super::CatalogSequence::new(0),
+                None,
+            )
+            .err()
+            .unwrap();
             assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
             assert_eq!(
                 error.message.as_str(),
                 "enum member-image pool is exhausted"
             );
             drop(selected);
-            assert!(EnumImageReservation::write(&images, &[label], &super::super::CatalogSequence::new(0), None).is_err());
+            assert!(
+                EnumImageReservation::write(
+                    &images,
+                    &[label],
+                    &super::super::CatalogSequence::new(0),
+                    None
+                )
+                .is_err()
+            );
             assert_eq!(retained.member(0).label, label.label);
             drop(retained);
-            let reservation = EnumImageReservation::write(&images, &[label], &super::super::CatalogSequence::new(0), None).unwrap();
+            let reservation = EnumImageReservation::write(
+                &images,
+                &[label],
+                &super::super::CatalogSequence::new(0),
+                None,
+            )
+            .unwrap();
             drop(reservation);
-            let third = EnumImageReservation::write(&images, &[label], &super::super::CatalogSequence::new(0), None)
-                .unwrap()
-                .publish();
+            let third = EnumImageReservation::write(
+                &images,
+                &[label],
+                &super::super::CatalogSequence::new(0),
+                None,
+            )
+            .unwrap()
+            .publish();
             assert_eq!(third, first);
             images.lock().unwrap().release(second);
             images.lock().unwrap().release(third);
@@ -543,12 +671,22 @@ label: SqlName::parse(label).unwrap(),
         let images = images(3, 2);
         let label = member("source", 1.0);
         crate::mem::guard::forbid_alloc(|| {
-            let source = EnumImageReservation::write(&images, &[label], &super::super::CatalogSequence::new(0), None)
-                .unwrap()
-                .publish();
-            let invalid = EnumImageReservation::write(&images, &[label, label, label], &super::super::CatalogSequence::new(0), None)
-                .err()
-                .unwrap();
+            let source = EnumImageReservation::write(
+                &images,
+                &[label],
+                &super::super::CatalogSequence::new(0),
+                None,
+            )
+            .unwrap()
+            .publish();
+            let invalid = EnumImageReservation::write(
+                &images,
+                &[label, label, label],
+                &super::super::CatalogSequence::new(0),
+                None,
+            )
+            .err()
+            .unwrap();
             assert_eq!(invalid.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
             let invalid = EnumImageReservation::copy(&images, u32::MAX, 1)
                 .err()
@@ -560,9 +698,14 @@ label: SqlName::parse(label).unwrap(),
             let selected = EnumImageRead::capture(&images, Some(copy));
             images.lock().unwrap().release(source);
             images.lock().unwrap().release(copy);
-            let reused = EnumImageReservation::write(&images, &[member("changed", 2.0)], &super::super::CatalogSequence::new(0), None)
-                .unwrap()
-                .publish();
+            let reused = EnumImageReservation::write(
+                &images,
+                &[member("changed", 2.0)],
+                &super::super::CatalogSequence::new(0),
+                None,
+            )
+            .unwrap()
+            .publish();
             assert_eq!(reused, source);
             assert_eq!(selected.member(0).label, label.label);
             images.lock().unwrap().release(reused);
@@ -574,8 +717,14 @@ label: SqlName::parse(label).unwrap(),
         crate::mem::guard::forbid_alloc(|| {
             for case in 0..6 {
                 let mut values = [
-                    EnumMember { identity: super::super::EnumLabelIdentity::parse(1), ..member("later", 2.0) },
-                    EnumMember { identity: super::super::EnumLabelIdentity::parse(2), ..member("earlier", 1.0) },
+                    EnumMember {
+                        identity: super::super::EnumLabelIdentity::parse(1),
+                        ..member("later", 2.0)
+                    },
+                    EnumMember {
+                        identity: super::super::EnumLabelIdentity::parse(2),
+                        ..member("earlier", 1.0)
+                    },
                 ];
                 match case {
                     0 => values[1].label = values[0].label,
@@ -587,7 +736,10 @@ label: SqlName::parse(label).unwrap(),
                     _ => unreachable!(),
                 }
                 let before = values;
-                assert_eq!(validate_members(&mut values).unwrap_err().sqlstate, sqlstate::DATA_EXCEPTION);
+                assert_eq!(
+                    validate_members(&mut values).unwrap_err().sqlstate,
+                    sqlstate::DATA_EXCEPTION
+                );
                 for (value, saved) in values.iter().zip(before) {
                     assert_eq!(value.label, saved.label);
                     assert_eq!(value.identity, saved.identity);
@@ -603,18 +755,28 @@ label: SqlName::parse(label).unwrap(),
         assert_eq!(size_of::<Option<super::super::EnumLabelIdentity>>(), 3);
         assert!(size_of::<EnumMember>() <= 144);
         let images = images(2, 2);
-        let sequence = super::super::CatalogSequence::new(super::super::type_identities::MAX_TYPE_CREATION - 1);
+        let sequence = super::super::CatalogSequence::new(
+            super::super::type_identities::MAX_TYPE_CREATION - 1,
+        );
         crate::mem::guard::forbid_alloc(|| {
             for _ in 0..8 {
-                let error = EnumImageReservation::write(&images,
-                    &[member("one", 1.0), member("two", 2.0)], &sequence, None).err().unwrap();
+                let error = EnumImageReservation::write(
+                    &images,
+                    &[member("one", 1.0), member("two", 2.0)],
+                    &sequence,
+                    None,
+                )
+                .err()
+                .unwrap();
                 assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
                 let state = images.lock().unwrap();
                 assert!(!state.slots[0].owned);
                 assert_eq!(state.slots[0].readers, 0);
             }
             let fresh = super::super::CatalogSequence::new(10);
-            let source = EnumImageReservation::write(&images, &[member("one", 1.0)], &fresh, None).unwrap().publish();
+            let source = EnumImageReservation::write(&images, &[member("one", 1.0)], &fresh, None)
+                .unwrap()
+                .publish();
             let selected = EnumImageRead::capture(&images, Some(source));
             assert_eq!(selected.member(0).identity.unwrap().created_at(), 11);
             assert_eq!(selected.member(0).identity.unwrap().oid(), 360_000_011);
@@ -629,7 +791,9 @@ label: SqlName::parse(label).unwrap(),
         crate::mem::guard::forbid_alloc(|| {
             let first = create(&mut storage, "first");
             let second = create(&mut storage, "second");
-            storage.validate_restored_enum_label_identities(storage.catalog_identity_sequence()).unwrap();
+            storage
+                .validate_restored_enum_label_identities(storage.catalog_identity_sequence())
+                .unwrap();
             let before_first = storage.enum_for(first, 0);
             let before_second = storage.enum_for(second, 0);
             let first_creation = before_first.members().next().unwrap().identity.unwrap();
@@ -638,16 +802,27 @@ label: SqlName::parse(label).unwrap(),
             drop(before_second);
             let (first_image, second_image) = {
                 let catalog = storage.type_catalog.lock().unwrap();
-                (catalog.enums[first].member_image.unwrap(), catalog.enums[second].member_image.unwrap())
+                (
+                    catalog.enums[first].member_image.unwrap(),
+                    catalog.enums[second].member_image.unwrap(),
+                )
             };
             storage.restore_catalog_identity_sequence(100);
             {
                 let mut images = storage.enum_member_images.lock().unwrap();
                 let width = images.width;
-                images.members[first_image as usize * width].identity = super::super::EnumLabelIdentity::parse(100);
-                images.members[second_image as usize * width].identity = super::super::EnumLabelIdentity::parse(100);
+                images.members[first_image as usize * width].identity =
+                    super::super::EnumLabelIdentity::parse(100);
+                images.members[second_image as usize * width].identity =
+                    super::super::EnumLabelIdentity::parse(100);
             }
-            assert_eq!(storage.validate_restored_enum_label_identities(100).unwrap_err().sqlstate, sqlstate::DATA_EXCEPTION);
+            assert_eq!(
+                storage
+                    .validate_restored_enum_label_identities(100)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::DATA_EXCEPTION
+            );
             assert_eq!(storage.catalog_identity_sequence(), 100);
             {
                 let mut images = storage.enum_member_images.lock().unwrap();
@@ -655,10 +830,34 @@ label: SqlName::parse(label).unwrap(),
                 images.members[first_image as usize * width].identity = Some(first_creation);
                 images.members[second_image as usize * width].identity = Some(second_creation);
             }
-            storage.validate_restored_enum_label_identities(100).unwrap();
-            assert_eq!(storage.validate_restored_enum_label_identities(0).unwrap_err().sqlstate, sqlstate::DATA_EXCEPTION);
-            assert_eq!(storage.enum_for(first, 0).members().next().unwrap().identity, Some(first_creation));
-            assert_eq!(storage.enum_for(second, 0).members().next().unwrap().identity, Some(second_creation));
+            storage
+                .validate_restored_enum_label_identities(100)
+                .unwrap();
+            assert_eq!(
+                storage
+                    .validate_restored_enum_label_identities(0)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::DATA_EXCEPTION
+            );
+            assert_eq!(
+                storage
+                    .enum_for(first, 0)
+                    .members()
+                    .next()
+                    .unwrap()
+                    .identity,
+                Some(first_creation)
+            );
+            assert_eq!(
+                storage
+                    .enum_for(second, 0)
+                    .members()
+                    .next()
+                    .unwrap()
+                    .identity,
+                Some(second_creation)
+            );
         });
     }
 
@@ -666,11 +865,19 @@ label: SqlName::parse(label).unwrap(),
     fn enum_image_ownership_pool_replay_reuses_only_unretained_images() {
         let images = images(2, 1);
         let original = member("old", 1.0);
-        let changed = EnumMember { identity: super::super::EnumLabelIdentity::parse(2), ..member("new", 2.0) };
+        let changed = EnumMember {
+            identity: super::super::EnumLabelIdentity::parse(2),
+            ..member("new", 2.0)
+        };
         crate::mem::guard::forbid_alloc(|| {
-            let source = EnumImageReservation::write(&images, &[original], &super::super::CatalogSequence::new(0), None)
-                .unwrap()
-                .publish();
+            let source = EnumImageReservation::write(
+                &images,
+                &[original],
+                &super::super::CatalogSequence::new(0),
+                None,
+            )
+            .unwrap()
+            .publish();
             images.lock().unwrap().replay_members_mut(1)[0] = changed;
             let retained = EnumImageRead::capture(&images, Some(source));
             let error = images
@@ -1057,13 +1264,16 @@ label: SqlName::parse(label).unwrap(),
             let slot = create(&mut storage, "state");
             let before = storage.enum_for(slot, 0);
             let created_at = before.created_at;
-            storage
-                .enum_replay_members(2)
-                .unwrap()
-                .copy_from_slice(&[
-                    EnumMember { identity: super::super::EnumLabelIdentity::parse(2), ..member("new", 1.0) },
-                    EnumMember { identity: super::super::EnumLabelIdentity::parse(3), ..member("paid", 2.0) },
-                ]);
+            storage.enum_replay_members(2).unwrap().copy_from_slice(&[
+                EnumMember {
+                    identity: super::super::EnumLabelIdentity::parse(2),
+                    ..member("new", 1.0)
+                },
+                EnumMember {
+                    identity: super::super::EnumLabelIdentity::parse(3),
+                    ..member("paid", 2.0)
+                },
+            ]);
             storage
                 .finish_enum_replay(
                     SqlName::parse("public").unwrap(),
@@ -1075,8 +1285,14 @@ label: SqlName::parse(label).unwrap(),
             assert_eq!(before.members().len(), 1);
             let current = storage.enum_for(slot, 0);
             storage.enum_replay_members(2).unwrap().copy_from_slice(&[
-                EnumMember { identity: super::super::EnumLabelIdentity::parse(2), ..member("later", 4.0) },
-                EnumMember { identity: super::super::EnumLabelIdentity::parse(3), ..member("paid", 2.0) },
+                EnumMember {
+                    identity: super::super::EnumLabelIdentity::parse(2),
+                    ..member("later", 4.0)
+                },
+                EnumMember {
+                    identity: super::super::EnumLabelIdentity::parse(3),
+                    ..member("paid", 2.0)
+                },
             ]);
             let error = storage
                 .finish_enum_replay(

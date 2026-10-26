@@ -815,7 +815,12 @@ pub(crate) fn apply_enum_payload(
     {
         return Err(invalid());
     }
-    let count = u32::from_le_bytes(payload.get(at..at + 4).and_then(|bytes| bytes.try_into().ok()).ok_or_else(invalid)?) as usize;
+    let count = u32::from_le_bytes(
+        payload
+            .get(at..at + 4)
+            .and_then(|bytes| bytes.try_into().ok())
+            .ok_or_else(invalid)?,
+    ) as usize;
     at += 4;
     let mut members = storage.enum_replay_members(count)?;
     for member in members.iter_mut() {
@@ -830,13 +835,25 @@ pub(crate) fn apply_enum_payload(
         );
         at += 8;
         let legacy_label = match *payload.get(at).ok_or_else(invalid)? {
-            0 => { at += 1; None }
-            1 => { at += 1; Some(crate::storage::SqlName::parse(take_name(&mut at)?)?) }
+            0 => {
+                at += 1;
+                None
+            }
+            1 => {
+                at += 1;
+                Some(crate::storage::SqlName::parse(take_name(&mut at)?)?)
+            }
             _ => return Err(invalid()),
         };
-        let identity = u32::from_le_bytes(payload.get(at..at + 4).and_then(|bytes| bytes.try_into().ok()).ok_or_else(invalid)?);
+        let identity = u32::from_le_bytes(
+            payload
+                .get(at..at + 4)
+                .and_then(|bytes| bytes.try_into().ok())
+                .ok_or_else(invalid)?,
+        );
         at += 4;
-        let identity = crate::storage::EnumLabelIdentity::parse(u64::from(identity)).ok_or_else(invalid)?;
+        let identity =
+            crate::storage::EnumLabelIdentity::parse(u64::from(identity)).ok_or_else(invalid)?;
         *member = crate::storage::EnumMember {
             identity: Some(identity),
             label,
@@ -1491,7 +1508,9 @@ pub(crate) enum WalOp<'a> {
         members: &'a [crate::storage::EnumMember],
     },
     /// A validated current enum image, materialized only in recovery scratch.
-    RestoreEnum { payload: &'a [u8] },
+    RestoreEnum {
+        payload: &'a [u8],
+    },
     DropEnum {
         schema: &'a str,
         name: &'a str,
@@ -5720,7 +5739,9 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 if let Some(label) = m.legacy_label {
                     ok &= name_bytes(buffer, label.as_str());
                 }
-                let Some(identity) = m.identity else { return false; };
+                let Some(identity) = m.identity else {
+                    return false;
+                };
                 ok &= buffer.append(&(identity.created_at() as u32).to_le_bytes());
             }
             ok
@@ -9937,8 +9958,13 @@ fn decode_op_inner<'a>(
                 let _sort = f64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
                 at += 8;
                 match *payload.get(at)? {
-                    0 => { at += 1; }
-                    1 => { at += 1; SqlName::parse(take_name(&mut at)?).ok()?; }
+                    0 => {
+                        at += 1;
+                    }
+                    1 => {
+                        at += 1;
+                        SqlName::parse(take_name(&mut at)?).ok()?;
+                    }
                     _ => return None,
                 }
                 let identity = u32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
@@ -13631,13 +13657,13 @@ mod tests {
         let members = [
             crate::storage::EnumMember {
                 identity: crate::storage::EnumLabelIdentity::parse(2),
-label: crate::storage::SqlName::parse("first").unwrap(),
+                label: crate::storage::SqlName::parse("first").unwrap(),
                 legacy_label: None,
                 sort: 1.0,
             },
             crate::storage::EnumMember {
                 identity: crate::storage::EnumLabelIdentity::parse(3),
-label: crate::storage::SqlName::parse("second").unwrap(),
+                label: crate::storage::SqlName::parse("second").unwrap(),
                 legacy_label: None,
                 sort: 2.0,
             },

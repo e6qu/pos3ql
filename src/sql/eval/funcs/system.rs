@@ -46,8 +46,7 @@ impl CatalogOid {
             // String literals are represented as text in the AST, so perform
             // that parse at this identity boundary and carry only CatalogOid
             // afterward.
-            Datum::Text(raw) => super::super::parse_oid(raw)
-                .map(|oid| Some(Self(oid as i32))),
+            Datum::Text(raw) => super::super::parse_oid(raw).map(|oid| Some(Self(oid as i32))),
             _ => Ok(None),
         }
     }
@@ -1671,9 +1670,15 @@ pub(crate) fn dispatch<'a>(
                 }
                 if matches!(
                     name,
-                    "has_type_privilege" | "has_schema_privilege" | "has_function_privilege"
-                        | "has_language_privilege" | "has_database_privilege" | "has_tablespace_privilege"
-                        | "has_foreign_data_wrapper_privilege" | "has_server_privilege" | "has_largeobject_privilege"
+                    "has_type_privilege"
+                        | "has_schema_privilege"
+                        | "has_function_privilege"
+                        | "has_language_privilege"
+                        | "has_database_privilege"
+                        | "has_tablespace_privilege"
+                        | "has_foreign_data_wrapper_privilege"
+                        | "has_server_privilege"
+                        | "has_largeobject_privilege"
                 ) {
                     let target = match object {
                         Datum::Text(name) => super::super::PrivilegeObject::Name(name),
@@ -1691,19 +1696,33 @@ pub(crate) fn dispatch<'a>(
                         "has_function_privilege" => {
                             cat.has_function_privilege(role, target, privilege)?
                         }
-                        "has_language_privilege" => cat.has_language_privilege(role, target, privilege)?,
-                        "has_database_privilege" => cat.has_database_privilege(role, target, privilege)?,
-                        "has_tablespace_privilege" => cat.has_tablespace_privilege(role, target, privilege)?,
-                        "has_foreign_data_wrapper_privilege" => cat.has_foreign_data_wrapper_privilege(role, target, privilege)?,
-                        "has_server_privilege" => cat.has_server_privilege(role, target, privilege)?,
-                        "has_largeobject_privilege" => cat.has_largeobject_privilege(role, target, privilege)?,
+                        "has_language_privilege" => {
+                            cat.has_language_privilege(role, target, privilege)?
+                        }
+                        "has_database_privilege" => {
+                            cat.has_database_privilege(role, target, privilege)?
+                        }
+                        "has_tablespace_privilege" => {
+                            cat.has_tablespace_privilege(role, target, privilege)?
+                        }
+                        "has_foreign_data_wrapper_privilege" => {
+                            cat.has_foreign_data_wrapper_privilege(role, target, privilege)?
+                        }
+                        "has_server_privilege" => {
+                            cat.has_server_privilege(role, target, privilege)?
+                        }
+                        "has_largeobject_privilege" => {
+                            cat.has_largeobject_privilege(role, target, privilege)?
+                        }
                         _ => unreachable!("typed object privilege function was classified"),
                     };
                     return Ok(answer.map_or(Datum::Null, Datum::Bool));
                 }
                 let Datum::Text(parameter) = object else {
-                    return Err(sql_err!(sqlstate::DATATYPE_MISMATCH,
-                        "has_parameter_privilege() requires a text parameter name"));
+                    return Err(sql_err!(
+                        sqlstate::DATATYPE_MISMATCH,
+                        "has_parameter_privilege() requires a text parameter name"
+                    ));
                 };
                 let answer = cat.has_parameter_privilege(role, parameter, privilege)?;
                 Ok(answer.map_or(Datum::Null, Datum::Bool))

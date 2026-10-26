@@ -1322,35 +1322,56 @@ fn numeric_object_privileges_match_postgresql_before_lookup() {
         }
         assert_eq!(
             states,
-            ["22023", "22023", "22023", "22023", "22023", "22023", "22023", "22023", "22023", "22023", "22023", "22023", "22023", "22023", "22023", "22023", "22023", "22023", "42704", "3F000", "42883", "42704", "3D000", "42704", "42704", "42704", "22P02"]
+            [
+                "22023", "22023", "22023", "22023", "22023", "22023", "22023", "22023", "22023",
+                "22023", "22023", "22023", "22023", "22023", "22023", "22023", "22023", "22023",
+                "42704", "3F000", "42883", "42704", "3D000", "42704", "42704", "42704", "22P02"
+            ]
         );
     }
 }
 
 #[test]
 fn enum_label_identities_preserve_saved_identifiers_through_edits_and_slot_reuse() {
-    for mode in [crate::config::TransactionMode::Mvcc, crate::config::TransactionMode::Locking] {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
         let mut config = test_config(&format!("enum-label-identities-{mode:?}"));
         config.transaction_mode = mode;
         config.max_ddl_per_transaction = 32;
         let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
         let mut engine = Engine::new(&config, &mut budget).unwrap();
         let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
-        assert_eq!(data_rows(&session.success(&mut engine,
-            include_str!("../../tests/external/differential_exact/27_enum_label_identities.sql"), true)),
-            ["t", "t", "t", "t", "t", "t"]);
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                include_str!(
+                    "../../tests/external/differential_exact/27_enum_label_identities.sql"
+                ),
+                true
+            )),
+            ["t", "t", "t", "t", "t", "t"]
+        );
     }
 }
 
 #[test]
 fn enum_label_identities_survive_empty_cache_recovery_and_keep_replacements_distinct() {
-    let fixture = include_str!("../../tests/external/differential_exact/27_enum_label_identities.sql");
-    let (setup, _) = fixture.split_once("DROP TYPE enum_identity_scope.order_status;").unwrap();
-    const QUERIES: &str = "SELECT count(*) = 4 FROM saved_label_identities s JOIN pg_enum e ON e.oid = s.identity;
+    let fixture =
+        include_str!("../../tests/external/differential_exact/27_enum_label_identities.sql");
+    let (setup, _) = fixture
+        .split_once("DROP TYPE enum_identity_scope.order_status;")
+        .unwrap();
+    const QUERIES: &str =
+        "SELECT count(*) = 4 FROM saved_label_identities s JOIN pg_enum e ON e.oid = s.identity;
         SELECT count(*) = 1 FROM saved_label_identities s JOIN pg_enum e ON e.oid = s.identity
         WHERE s.label = 'new' AND e.enumlabel = 'pending'";
     for checkpoint in [false, true] {
-        for mode in [crate::config::TransactionMode::Mvcc, crate::config::TransactionMode::Locking] {
+        for mode in [
+            crate::config::TransactionMode::Mvcc,
+            crate::config::TransactionMode::Locking,
+        ] {
             let name = format!("enum-label-cold-{checkpoint}-{mode:?}");
             let mut config = test_config(&name);
             config.transaction_mode = mode;
@@ -1366,8 +1387,13 @@ fn enum_label_identities_survive_empty_cache_recovery_and_keep_replacements_dist
                 let mut engine = Engine::new(&config, &mut budget).unwrap();
                 let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
                 // Uploads grow the simulator's fixture map; queries retain the allocation guard.
-                assert_eq!(data_rows(&session.success(&mut engine, setup, false)), ["t", "t", "t", "t", "t"]);
-                if checkpoint { assert!(engine.checkpoint().unwrap()); }
+                assert_eq!(
+                    data_rows(&session.success(&mut engine, setup, false)),
+                    ["t", "t", "t", "t", "t"]
+                );
+                if checkpoint {
+                    assert!(engine.checkpoint().unwrap());
+                }
                 engine.commit_wal().unwrap();
             }
             std::fs::remove_dir_all(&config.data_dir).unwrap();
@@ -1375,7 +1401,10 @@ fn enum_label_identities_survive_empty_cache_recovery_and_keep_replacements_dist
                 let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
                 let mut engine = Engine::new(&config, &mut budget).unwrap();
                 let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
-                assert_eq!(data_rows(&session.success(&mut engine, QUERIES, true)), ["t", "t"]);
+                assert_eq!(
+                    data_rows(&session.success(&mut engine, QUERIES, true)),
+                    ["t", "t"]
+                );
                 session.success(&mut engine,
                     "DROP TYPE enum_identity_scope.order_status; CREATE TYPE enum_identity_scope.order_status AS ENUM ('new', 'paid')", false);
                 assert_eq!(data_rows(&session.success(&mut engine,
@@ -1389,8 +1418,13 @@ fn enum_label_identities_survive_empty_cache_recovery_and_keep_replacements_dist
 
 #[test]
 fn enum_label_identities_do_not_overlap_for_more_than_one_thousand_members() {
-    let labels = (0..1025).map(|index| format!("'label_{index}'")).collect::<Vec<_>>().join(",");
-    let sql = format!("CREATE TYPE wide_labels AS ENUM ({labels}); CREATE TYPE next_labels AS ENUM ('only');");
+    let labels = (0..1025)
+        .map(|index| format!("'label_{index}'"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "CREATE TYPE wide_labels AS ENUM ({labels}); CREATE TYPE next_labels AS ENUM ('only');"
+    );
     let mut config = test_config("wide-enum-label-identities");
     config.max_enums = 2;
     config.max_enum_labels_per_type = 1025;
@@ -1398,8 +1432,14 @@ fn enum_label_identities_do_not_overlap_for_more_than_one_thousand_members() {
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
     session.success(&mut engine, &sql, true);
-    assert_eq!(data_rows(&session.success(&mut engine,
-        "SELECT count(*) = 1026 AND count(DISTINCT oid) = 1026 FROM pg_enum", true)), ["t"]);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT count(*) = 1026 AND count(DISTINCT oid) = 1026 FROM pg_enum",
+            true
+        )),
+        ["t"]
+    );
 }
 
 #[test]
@@ -21177,12 +21217,11 @@ fn column_privileges_enforce_dml_dependencies_catalogs_and_cold_recovery() {
             "SELECT acldefault('r', oid), acldefault('f', oid), \
                     acldefault(CASE WHEN true THEN 's'::\"char\" \
                                     ELSE 'r'::\"char\" END, oid), \
-                    has_database_privilege('postgres', 'postgres', 'CONNECT'), \
-                    has_database_privilege('postgres', 'missing', 'CONNECT') IS NULL \
+                    has_database_privilege('postgres', 'postgres', 'CONNECT') \
                FROM pg_roles WHERE rolname = 'postgres'"
         )),
         [
-            "{postgres=arwdDxtm/postgres}|{=X/postgres,postgres=X/postgres}|{postgres=rwU/postgres}|t|t"
+            "{postgres=arwdDxtm/postgres}|{=X/postgres,postgres=X/postgres}|{postgres=rwU/postgres}|t"
         ]
     );
     assert_eq!(
@@ -21207,6 +21246,16 @@ fn column_privileges_enforce_dml_dependencies_catalogs_and_cold_recovery() {
             "{postgres=sA/postgres}|{postgres=arwdDxtm/postgres}|",
             "{postgres=rwU/postgres}|{postgres=C/postgres}"
         )]
+    );
+    let missing_database = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT has_database_privilege('postgres', 'missing', 'CONNECT')",
+    );
+    assert!(
+        String::from_utf8_lossy(&missing_database).contains("3D000"),
+        "{}",
+        String::from_utf8_lossy(&missing_database)
     );
     let sql_character_is_not_internal_char = run_with(
         &mut engine,
@@ -57572,13 +57621,13 @@ fn enum_value_identity_hashes_are_selective_and_bind_legacy_labels() {
     let members = [
         crate::storage::EnumMember {
             identity: None,
-label: crate::storage::SqlName::parse("new").unwrap(),
+            label: crate::storage::SqlName::parse("new").unwrap(),
             legacy_label: Some(crate::storage::SqlName::parse("old").unwrap()),
             sort: 1.0,
         },
         crate::storage::EnumMember {
             identity: None,
-label: crate::storage::SqlName::parse("ready").unwrap(),
+            label: crate::storage::SqlName::parse("ready").unwrap(),
             legacy_label: Some(crate::storage::SqlName::parse("ready").unwrap()),
             sort: 2.0,
         },
@@ -57624,13 +57673,13 @@ fn enum_value_identity_legacy_rows_arrays_and_records_keep_original_members() {
     let members = [
         crate::storage::EnumMember {
             identity: None,
-label: crate::storage::SqlName::parse("old").unwrap(),
+            label: crate::storage::SqlName::parse("old").unwrap(),
             legacy_label: Some(crate::storage::SqlName::parse("old").unwrap()),
             sort: 1.0,
         },
         crate::storage::EnumMember {
             identity: None,
-label: crate::storage::SqlName::parse("ready").unwrap(),
+            label: crate::storage::SqlName::parse("ready").unwrap(),
             legacy_label: Some(crate::storage::SqlName::parse("ready").unwrap()),
             sort: 2.0,
         },

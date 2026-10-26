@@ -42596,23 +42596,42 @@ fn build_enum_spec<'a>(
     for (index, &label) in labels.iter().enumerate() {
         let label = match SqlName::parse(label) {
             Ok(label) => label,
-            Err(error) => { parse_error = Some(error); break; }
+            Err(error) => {
+                parse_error = Some(error);
+                break;
+            }
         };
         members[index] = crate::storage::EnumMember {
-            identity: None, label, legacy_label: None, sort: (index + 1) as f64,
+            identity: None,
+            label,
+            legacy_label: None,
+            sort: (index + 1) as f64,
         };
         parsed += 1;
     }
     let completed = &mut members[..parsed];
-    completed.sort_unstable_by(|left, right| left.label.as_str().cmp(right.label.as_str())
-        .then_with(|| left.sort.total_cmp(&right.sort)));
-    let duplicate = completed.windows(2).filter(|pair| pair[0].label == pair[1].label)
-        .min_by(|left, right| left[1].sort.total_cmp(&right[1].sort)).map(|pair| pair[1].label);
+    completed.sort_unstable_by(|left, right| {
+        left.label
+            .as_str()
+            .cmp(right.label.as_str())
+            .then_with(|| left.sort.total_cmp(&right.sort))
+    });
+    let duplicate = completed
+        .windows(2)
+        .filter(|pair| pair[0].label == pair[1].label)
+        .min_by(|left, right| left[1].sort.total_cmp(&right[1].sort))
+        .map(|pair| pair[1].label);
     completed.sort_unstable_by(|left, right| left.sort.total_cmp(&right.sort));
     if let Some(label) = duplicate {
-        return Err(sql_err!(sqlstate::DUPLICATE_OBJECT, r#"enum label "{}" specified more than once"#, label.as_str()));
+        return Err(sql_err!(
+            sqlstate::DUPLICATE_OBJECT,
+            r#"enum label "{}" specified more than once"#,
+            label.as_str()
+        ));
     }
-    if let Some(error) = parse_error { return Err(error); }
+    if let Some(error) = parse_error {
+        return Err(error);
+    }
     Ok(members)
 }
 
@@ -42654,14 +42673,21 @@ pub fn create_enum(
         Ok(n) => n,
         Err(e) => return sql_fail(e),
     };
-    let created = match storage.create_enum(schema, sqlname, crate::storage::EnumSpec { members }, txn.txid) {
+    let created = match storage.create_enum(
+        schema,
+        sqlname,
+        crate::storage::EnumSpec { members },
+        txn.txid,
+    ) {
         Ok(slot) => slot,
         Err(e) => return sql_fail(e),
     };
     let slot = created.slot();
     let lsn = storage.bump_lsn();
     let definition = storage.enum_for(slot, txn.txid);
-    for (target, source) in members.iter_mut().zip(definition.members()) { *target = source; }
+    for (target, source) in members.iter_mut().zip(definition.members()) {
+        *target = source;
+    }
     if let Err(e) = wal.stage_reserved(
         txn.txid,
         lsn,
@@ -45532,7 +45558,7 @@ pub fn alter_type(
             };
             altered[current.members().len()] = crate::storage::EnumMember {
                 identity: None,
-label: new_label,
+                label: new_label,
                 legacy_label: None,
                 sort,
             };
@@ -45551,7 +45577,9 @@ label: new_label,
                 return sql_fail(error);
             }
             let admitted = storage.enum_for(slot, txn.txid);
-            for (target, source) in altered.iter_mut().zip(admitted.members()) { *target = source; }
+            for (target, source) in altered.iter_mut().zip(admitted.members()) {
+                *target = source;
+            }
             let lsn = storage.bump_lsn();
             if let Err(e) = wal.stage_reserved(
                 txn.txid,
@@ -45771,7 +45799,9 @@ label: new_label,
                 Err(error) => return sql_fail(error),
             };
             let admitted = storage.enum_for(slot, txn.txid);
-            for (target, source) in altered.iter_mut().zip(admitted.members()) { *target = source; }
+            for (target, source) in altered.iter_mut().zip(admitted.members()) {
+                *target = source;
+            }
             let lsn = storage.bump_lsn();
             if let Err(e) = wal.stage_reserved(
                 txn.txid,
@@ -47351,12 +47381,22 @@ fn compute_add_value_sort(
         }
 
         if members.iter().any(|member| member.identity.is_none()) {
-            return Err(sql_err!(sqlstate::DATA_EXCEPTION, "enum sort renumbering has an unbound member"));
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "enum sort renumbering has an unbound member"
+            ));
         }
         members.sort_unstable_by(|left, right| left.sort.total_cmp(&right.sort));
-        for (index, member) in members.iter_mut().enumerate() { member.sort = (index + 1) as f64; }
+        for (index, member) in members.iter_mut().enumerate() {
+            member.sort = (index + 1) as f64;
+        }
         // Public label births preserve original member ordinals after sorting by value.
-        members.sort_unstable_by_key(|member| member.identity.expect("checked member identity").created_at());
+        members.sort_unstable_by_key(|member| {
+            member
+                .identity
+                .expect("checked member identity")
+                .created_at()
+        });
         renumbered = true;
     }
 }
@@ -51203,7 +51243,14 @@ pub fn create_tablespace(
         Err(error) => return sql_fail(error),
     };
     let options = stored_tablespace_options(options);
-    let slot = match storage.create_tablespace(crate::storage::TablespaceCreation::Fresh, name, location, options, owner as u16, txn.txid) {
+    let slot = match storage.create_tablespace(
+        crate::storage::TablespaceCreation::Fresh,
+        name,
+        location,
+        options,
+        owner as u16,
+        txn.txid,
+    ) {
         Ok(slot) => slot,
         Err(error) => return sql_fail(error),
     };

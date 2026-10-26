@@ -23121,7 +23121,9 @@ fn apply_wal_op(
                 created_at,
             )?;
         }
-        WalOp::RestoreEnum { payload } => { crate::wal::apply_enum_payload(storage, payload)?; }
+        WalOp::RestoreEnum { payload } => {
+            crate::wal::apply_enum_payload(storage, payload)?;
+        }
         WalOp::CreateComposite {
             slot,
             definition: def,

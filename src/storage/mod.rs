@@ -74,9 +74,9 @@ pub(crate) use tablespace_identities::{TablespaceCreation, TablespaceIdentity};
 mod type_identities;
 mod type_names;
 mod type_reference_moves;
+pub(crate) use type_identities::EnumLabelIdentity;
 #[cfg(test)]
 pub(crate) use type_identities::{CachedArrayElement, TypeCreation};
-pub(crate) use type_identities::EnumLabelIdentity;
 mod type_references;
 use crate::mem::mutex::{Mutex, MutexGuard};
 use enum_images::{EnumImageRead, EnumImageReservation, EnumMemberImages};
@@ -9749,7 +9749,7 @@ pub struct EnumMember {
 impl EnumMember {
     pub(crate) const EMPTY: Self = EnumMember {
         identity: None,
-label: SqlName::EMPTY,
+        label: SqlName::EMPTY,
         legacy_label: None,
         sort: 0.0,
     };
@@ -41097,16 +41097,25 @@ impl Storage {
         }
         let creation = type_identities::TypeCreationAdmission::restored(created_at)?;
         let maximum_label_creation = {
-            let mut images = self.enum_member_images.lock().expect("enum member-image lock poisoned");
+            let mut images = self
+                .enum_member_images
+                .lock()
+                .expect("enum member-image lock poisoned");
             images.validate_replay(count)?;
             let replay = images.replay_members(count);
             let mut previous = created_at;
             for member in replay.iter() {
-                let identity = member.identity.ok_or_else(|| sql_err!(sqlstate::DATA_EXCEPTION,
-                    "stored enum member has no creation identity"))?;
+                let identity = member.identity.ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::DATA_EXCEPTION,
+                        "stored enum member has no creation identity"
+                    )
+                })?;
                 if identity.created_at() <= previous {
-                    return Err(sql_err!(sqlstate::DATA_EXCEPTION,
-                        "stored enum member creation identities are not increasing"));
+                    return Err(sql_err!(
+                        sqlstate::DATA_EXCEPTION,
+                        "stored enum member creation identities are not increasing"
+                    ));
                 }
                 previous = identity.created_at();
             }
@@ -41121,19 +41130,40 @@ impl Storage {
                 ));
             }
             {
-                let catalog = self.type_catalog.lock().expect("type catalog lock poisoned");
+                let catalog = self
+                    .type_catalog
+                    .lock()
+                    .expect("type catalog lock poisoned");
                 let definition = catalog.enums[slot];
-                let (image, old_count) = definition.pending_definition.filter(|pending| pending.txid == 0)
-                    .map_or((definition.member_image, definition.member_count as usize),
-                        |pending| (Some(pending.image), pending.member_count as usize));
-                let image = image.ok_or_else(|| sql_err!(sqlstate::DATA_EXCEPTION, "stored enum source image is missing"))?;
-                let images = self.enum_member_images.lock().expect("enum member-image lock poisoned");
+                let (image, old_count) = definition
+                    .pending_definition
+                    .filter(|pending| pending.txid == 0)
+                    .map_or(
+                        (definition.member_image, definition.member_count as usize),
+                        |pending| (Some(pending.image), pending.member_count as usize),
+                    );
+                let image = image.ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::DATA_EXCEPTION,
+                        "stored enum source image is missing"
+                    )
+                })?;
+                let images = self
+                    .enum_member_images
+                    .lock()
+                    .expect("enum member-image lock poisoned");
                 let existing = images.image_members(image, old_count);
                 let replay = images.replay_members(count);
-                if count < old_count || existing.iter().zip(replay.iter())
-                    .any(|(old, restored)| old.identity != restored.identity)
+                if count < old_count
+                    || existing
+                        .iter()
+                        .zip(replay.iter())
+                        .any(|(old, restored)| old.identity != restored.identity)
                 {
-                    return Err(sql_err!(sqlstate::DATA_EXCEPTION, "stored enum member identities changed an existing prefix"));
+                    return Err(sql_err!(
+                        sqlstate::DATA_EXCEPTION,
+                        "stored enum member identities changed an existing prefix"
+                    ));
                 }
             }
             let version = self
@@ -41215,7 +41245,12 @@ impl Storage {
                 catalog.enums.len()
             ));
         };
-        let image = EnumImageReservation::write(&self.enum_member_images, spec.members, &self.catalog_sequence, None)?;
+        let image = EnumImageReservation::write(
+            &self.enum_member_images,
+            spec.members,
+            &self.catalog_sequence,
+            None,
+        )?;
         let member_count = image.count();
         catalog
             .identities
@@ -41310,9 +41345,22 @@ impl Storage {
             catalog.pending_enum_members[previous as usize].depth + 1
         });
         let version = catalog.versions.next()?;
-        let image = EnumImageReservation::write(&self.enum_member_images, members, &self.catalog_sequence,
-            Some((prior.map_or(catalog.enums[slot].member_image.expect("live enum owns members"), |pending| pending.image),
-                prior.map_or(catalog.enums[slot].member_count as usize, |pending| pending.member_count as usize))))?;
+        let image = EnumImageReservation::write(
+            &self.enum_member_images,
+            members,
+            &self.catalog_sequence,
+            Some((
+                prior.map_or(
+                    catalog.enums[slot]
+                        .member_image
+                        .expect("live enum owns members"),
+                    |pending| pending.image,
+                ),
+                prior.map_or(catalog.enums[slot].member_count as usize, |pending| {
+                    pending.member_count as usize
+                }),
+            )),
+        )?;
         let member_count = image.count();
         let image = image.publish();
         catalog.pending_enum_members[member_slot] = PendingEnumMemberSlot {
@@ -47356,10 +47404,19 @@ impl Storage {
                 )
             })?;
         let created_at = creation.value(&self.catalog_sequence)?;
-        if tablespaces.iter().enumerate().skip(2).any(|(_, definition)|
-            definition.ddl_state != CatalogDdlState::Absent && definition.created_at == created_at)
+        if tablespaces
+            .iter()
+            .enumerate()
+            .skip(2)
+            .any(|(_, definition)| {
+                definition.ddl_state != CatalogDdlState::Absent
+                    && definition.created_at == created_at
+            })
         {
-            return Err(sql_err!(sqlstate::DATA_EXCEPTION, "tablespace creation identity is duplicated"));
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "tablespace creation identity is duplicated"
+            ));
         }
         let definition = self.tablespace_definition(
             TablespaceImage {
@@ -47451,10 +47508,20 @@ impl Storage {
                 slot
             ));
         }
-        if tablespaces.iter().enumerate().skip(2).any(|(other, definition)| other != slot
-            && definition.ddl_state != CatalogDdlState::Absent && definition.created_at == created_at)
+        if tablespaces
+            .iter()
+            .enumerate()
+            .skip(2)
+            .any(|(other, definition)| {
+                other != slot
+                    && definition.ddl_state != CatalogDdlState::Absent
+                    && definition.created_at == created_at
+            })
         {
-            return Err(sql_err!(sqlstate::DATA_EXCEPTION, "tablespace creation identity is duplicated"));
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "tablespace creation identity is duplicated"
+            ));
         }
         let mut definition = self.tablespace_definition(
             TablespaceImage {
@@ -47506,8 +47573,12 @@ impl Storage {
         image: TablespaceImage,
         txid: u32,
     ) -> Result<TablespaceDef, SqlError> {
-        let identity = TablespaceIdentity::parse(image.created_at).ok_or_else(||
-            sql_err!(sqlstate::DATA_EXCEPTION, "stored tablespace creation identity is outside its OID range"))?;
+        let identity = TablespaceIdentity::parse(image.created_at).ok_or_else(|| {
+            sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "stored tablespace creation identity is outside its OID range"
+            )
+        })?;
         let created_at = identity.created_at();
         self.catalog_sequence.observe(created_at);
         Ok(TablespaceDef {
@@ -58719,12 +58790,17 @@ mod tests {
                     enumeration.ddl_state = CatalogDdlState::Present;
                     let member = EnumMember {
                         identity: None,
-label: SqlName::parse(label.as_str()).unwrap(),
+                        label: SqlName::parse(label.as_str()).unwrap(),
                         legacy_label: None,
                         sort: worker as f64 + 1.0,
                     };
-                    let image = EnumImageReservation::write(&storage.enum_member_images, &[member], &storage.catalog_sequence, None)
-                        .unwrap();
+                    let image = EnumImageReservation::write(
+                        &storage.enum_member_images,
+                        &[member],
+                        &storage.catalog_sequence,
+                        None,
+                    )
+                    .unwrap();
                     enumeration.member_image = Some(image.publish());
                     catalog.enums[worker] = enumeration;
 

@@ -50,9 +50,15 @@ use crate::sql_err;
 pub(crate) struct EnumLabelIdentity(TypeCreation);
 
 impl EnumLabelIdentity {
-    pub(crate) fn parse(created_at: u64) -> Option<Self> { TypeCreation::parse(created_at).map(Self) }
-    pub(crate) fn created_at(self) -> u64 { self.0.created_at() }
-    pub(crate) fn oid(self) -> i32 { 360_000_000 + self.created_at() as i32 }
+    pub(crate) fn parse(created_at: u64) -> Option<Self> {
+        TypeCreation::parse(created_at).map(Self)
+    }
+    pub(crate) fn created_at(self) -> u64 {
+        self.0.created_at()
+    }
+    pub(crate) fn oid(self) -> i32 {
+        360_000_000 + self.created_at() as i32
+    }
     pub(super) fn reserve(sequence: &super::CatalogSequence) -> Result<Self, SqlError> {
         let created_at = sequence.next_bounded(MAX_TYPE_CREATION, "enum label")?;
         Ok(Self::parse(created_at).expect("bounded enum label reservation"))
@@ -332,19 +338,24 @@ impl CachedArrayElement {
 
     fn builtin(code: u8) -> bool {
         use crate::sql::types::ArrElem;
-        ArrElem::from_code(code).is_some_and(|element| !matches!(
-            element, ArrElem::Enum(_) | ArrElem::Composite(_) | ArrElem::Domain { .. }
-        ))
+        ArrElem::from_code(code).is_some_and(|element| {
+            !matches!(
+                element,
+                ArrElem::Enum(_) | ArrElem::Composite(_) | ArrElem::Domain { .. }
+            )
+        })
     }
 
     fn builtin_base(code: u8) -> bool {
         use crate::sql::types::ColType;
         crate::sql::types::ColType::from_code(code).is_some_and(|base| match base {
             ColType::Enum(_) | ColType::Composite(_) => false,
-            ColType::Array(element) => !matches!(element,
+            ColType::Array(element) => !matches!(
+                element,
                 crate::sql::types::ArrElem::Enum(_)
-                | crate::sql::types::ArrElem::Composite(_)
-                | crate::sql::types::ArrElem::Domain { .. }),
+                    | crate::sql::types::ArrElem::Composite(_)
+                    | crate::sql::types::ArrElem::Domain { .. }
+            ),
             _ => true,
         })
     }
@@ -456,10 +467,13 @@ mod tests {
                 check(ArrayElementIdentity::Builtin(element.code()));
             }
             for code in u8::MIN..=u8::MAX {
-                let encoded = CachedArrayElement::from_identity(ArrayElementIdentity::Builtin(code));
+                let encoded =
+                    CachedArrayElement::from_identity(ArrayElementIdentity::Builtin(code));
                 // Anonymous records also have a transient array representation.
                 let builtin = code == crate::sql::types::ArrElem::Record.code()
-                    || crate::sql::types::ArrElem::BUILTIN.iter().any(|element| element.code() == code);
+                    || crate::sql::types::ArrElem::BUILTIN
+                        .iter()
+                        .any(|element| element.code() == code);
                 assert_eq!(encoded.is_some(), builtin, "array opcode {code}");
                 if let Some(encoded) = encoded {
                     assert_eq!(encoded.identity(), ArrayElementIdentity::Builtin(code));

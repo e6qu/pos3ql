@@ -1,0 +1,8 @@
+CREATE DOMAIN declaration_duplicate_nn AS integer NOT NULL NOT NULL;
+CREATE DOMAIN declaration_null_then_nn AS integer NULL NOT NULL;
+CREATE DOMAIN declaration_nn_then_null AS integer NOT NULL NULL;
+CREATE DOMAIN declaration_nn_inheritance AS integer NOT NULL NO INHERIT;
+CREATE DOMAIN declaration_check_inheritance AS integer CHECK (VALUE > 0) NO INHERIT;
+CREATE DOMAIN declaration_duplicate_default AS integer DEFAULT 1 DEFAULT 2;
+CREATE DOMAIN declaration_check_name AS integer CONSTRAINT repeated_name CHECK (VALUE > 0) CONSTRAINT repeated_name NOT NULL;
+CREATE DOMAIN declaration_nn_name AS integer CONSTRAINT repeated_name NOT NULL CONSTRAINT repeated_name CHECK (VALUE > 0);

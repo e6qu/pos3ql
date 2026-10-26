@@ -15504,7 +15504,20 @@ pub fn constraint_def_text<'a>(
         if !storage.table_slot_visible_to(slot, txid) {
             continue;
         }
-        for check in storage.table_def(slot, txid).checks() {
+        let table = storage.table_def(slot, txid);
+        for (column_index, column) in table.columns().iter().enumerate() {
+            if column.not_null.is_required() && table.not_null_constraint_oid(column_index) == oid {
+                let mut rendered = StackStr::<256>::new();
+                use core::fmt::Write as _;
+                let _ = rendered.write_str("NOT NULL ");
+                write_identifier(&mut rendered, column.name.as_str());
+                if !column.not_null_inheritable {
+                    let _ = rendered.write_str(" NO INHERIT");
+                }
+                return Ok(Some(alloc_rendered(&rendered, "NOT NULL definition is too long", arena)?));
+            }
+        }
+        for check in table.checks() {
             let check_oid = check.oid();
             if check_oid != oid {
                 continue;
@@ -15523,7 +15536,6 @@ pub fn constraint_def_text<'a>(
                 arena,
             )?));
         }
-        let table = storage.table_def(slot, txid);
         if let Some(constraint) = table.partition.detached_bound
             && oid == constraint.oid()
         {
@@ -15536,6 +15548,9 @@ pub fn constraint_def_text<'a>(
         let domain = storage.domain_for(slot, txid);
         if !storage.domain_slot_visible_to(slot, txid) {
             continue;
+        }
+        if domain.not_null && domain.not_null_constraint_oid() == oid {
+            return Ok(Some("NOT NULL"));
         }
         for check in domain.checks() {
             let check_oid = check.oid();

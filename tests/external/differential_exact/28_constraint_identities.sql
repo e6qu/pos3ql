@@ -19,6 +19,9 @@ CREATE TABLE saved_constraint_triggers AS SELECT tgname AS name, oid AS identity
  FROM pg_trigger WHERE tgconstraint = (SELECT identity FROM saved_constraint_identities WHERE name = 'table_fk_keep');
 SELECT count(*) = 5 FROM saved_constraint_identities s JOIN pg_constraint c ON c.oid = s.identity;
 SELECT count(*) = 4 FROM saved_constraint_triggers s JOIN pg_trigger t ON t.oid = s.identity AND t.tgconstraint = s.parent;
+SELECT count(*) = 2 FROM saved_constraint_identities s JOIN pg_constraint c ON c.oid = s.identity
+ WHERE (s.name = 'rules_nn' AND pg_get_constraintdef(c.oid) = 'NOT NULL b')
+    OR (s.name = 'domain_nn' AND pg_get_constraintdef(c.oid) = 'NOT NULL');
 ALTER TABLE constraint_rules DROP CONSTRAINT table_first;
 ALTER TABLE constraint_rules DROP CONSTRAINT table_fk_first;
 ALTER DOMAIN constraint_domain DROP CONSTRAINT domain_first;

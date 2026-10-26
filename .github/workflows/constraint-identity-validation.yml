@@ -40,7 +40,7 @@ jobs:
         run: |
           set -euo pipefail
           docker exec "$POSTGRES_CONTAINER" psql -U postgres -X -At -c 'SELECT version()'
-          for specification in 28_constraint_identities:12 29_wide_domain_constraints:1; do
+          for specification in 28_constraint_identities:13 29_wide_domain_constraints:1 31_domain_constraint_declarations:6; do
             database=${specification%:*}
             expected=${specification##*:}
             docker exec "$POSTGRES_CONTAINER" createdb -U postgres "$database"
@@ -51,6 +51,11 @@ jobs:
             fi
             cat "$RUNNER_TEMP/$database.reference"
           done
+          docker exec "$POSTGRES_CONTAINER" createdb -U postgres domain_constraint_errors
+          docker exec -i "$POSTGRES_CONTAINER" psql -U postgres -d domain_constraint_errors -X -Atq -v VERBOSITY=verbose < tests/external/differential_exact/30_domain_constraint_errors.sql > "$RUNNER_TEMP/domain-constraint-errors.reference" 2>&1
+          sed -nE 's/^ERROR:  ([0-9A-Z]{5}):.*/\1/p' "$RUNNER_TEMP/domain-constraint-errors.reference" > "$RUNNER_TEMP/domain-constraint-states"
+          printf '%s\n' 42P17 42601 42601 42P17 42P17 42601 42710 42710 > "$RUNNER_TEMP/expected-domain-constraint-states"
+          diff -u "$RUNNER_TEMP/expected-domain-constraint-states" "$RUNNER_TEMP/domain-constraint-states"
       - name: Format and retain correction
         run: |
           cargo fmt
@@ -61,8 +66,8 @@ jobs:
       - name: Verify constraint lifetimes and cold recovery
         shell: bash
         run: |
-          python3 tools/test_command.py cargo test --lib --locked -- constraint_public_identifiers constraint_manifest_wide --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/constraint-lifetimes.log"
-          grep -Eq 'test result: ok\. 3 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/constraint-lifetimes.log"
+          python3 tools/test_command.py cargo test --lib --locked -- constraint_public_identifiers constraint_manifest_wide constraint_declaration_names --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/constraint-lifetimes.log"
+          grep -Eq 'test result: ok\. 4 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/constraint-lifetimes.log"
       - name: Build every target and lint
         run: cargo clippy --all-targets --locked -- -D warnings
       - name: Retain constraint and formatting evidence

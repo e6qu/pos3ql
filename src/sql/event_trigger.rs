@@ -517,27 +517,20 @@ impl EventObjectRef {
             Self::DomainConstraint { domain, constraint } => {
                 let domain_slot = usize::from(domain);
                 let domain = storage.domain_for(domain_slot, txid);
-                let check = domain
-                    .checks()
-                    .iter()
-                    .find(|check| check.identity == Some(constraint))
-                    .ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::UNDEFINED_OBJECT,
-                            "domain constraint no longer exists"
-                        )
-                    })?;
+                let name = domain.constraint_name(constraint).ok_or_else(|| {
+                    sql_err!(sqlstate::UNDEFINED_OBJECT, "domain constraint no longer exists")
+                })?;
                 let mut identity = EventIdentity::new();
                 write!(
                     identity,
                     "{} on {}",
-                    identifier(check.name.as_str()).as_str(),
+                    identifier(name.as_str()).as_str(),
                     qualified(domain.schema.as_str(), domain.name.as_str())?.as_str()
                 )
                 .map_err(|_| graph_full())?;
                 let mut object = base_object(
                     catalog::PG_CONSTRAINT_OID,
-                    check.oid(),
+                    constraint.oid(),
                     "domain constraint",
                     Some(domain.schema.as_str()),
                     None,
@@ -548,7 +541,7 @@ impl EventObjectRef {
                     qualified(domain.schema.as_str(), domain.name.as_str())?.as_str(),
                 );
                 object.address_name_count = 1;
-                object.address_args[0] = StackStr::from_str(check.name.as_str());
+                object.address_args[0] = StackStr::from_str(name.as_str());
                 object.address_arg_count = 1;
                 object
             }
@@ -2229,12 +2222,10 @@ pub(crate) fn catalog_object_address(
         }
         consider!(EventObjectRef::Primary(ObjectRef::Domain(slot)));
         consider!(EventObjectRef::DomainArray(slot as u16));
-        for constraint in storage.domain_for(slot, txid).checks() {
+        for constraint in storage.domain_for(slot, txid).constraint_identities() {
             consider!(EventObjectRef::DomainConstraint {
                 domain: slot as u16,
-                constraint: constraint
-                    .identity
-                    .expect("admitted domain CHECK has an identity"),
+                constraint: constraint.expect("admitted domain constraint has an identity"),
             });
         }
     }
@@ -2599,12 +2590,9 @@ fn existing_catalog_object(
                     }
                     storage
                         .domain_for(domain, txid)
-                        .checks()
-                        .iter()
-                        .find_map(|check| {
-                            check
-                                .identity
-                                .filter(|identity| identity.oid() == object_id)
+                        .constraint_identities()
+                        .find_map(|identity| {
+                            identity.filter(|identity| identity.oid() == object_id)
                                 .map(|identity| (domain, identity))
                         })
                 })
@@ -3824,15 +3812,13 @@ fn push_type_drop_dependents(
                 false,
                 false,
             )?;
-            for constraint in domain.checks() {
+            for constraint in domain.constraint_identities() {
                 push_drop(
                     output,
                     count,
                     EventObjectRef::DomainConstraint {
                         domain: domain_ref,
-                        constraint: constraint
-                            .identity
-                            .expect("admitted domain CHECK has an identity"),
+                        constraint: constraint.expect("admitted domain constraint has an identity"),
                     },
                     false,
                     false,

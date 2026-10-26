@@ -41118,7 +41118,7 @@ fn build_domain_spec(
     domain: &str,
     base_type: &str,
     base_type_mod: i32,
-    not_null: bool,
+    nullability: crate::sql::ast::DomainNullability<'_>,
     default_text: Option<&str>,
     ast_checks: &[crate::sql::ast::DomainCheck],
     arena: &Arena,
@@ -41130,6 +41130,10 @@ fn build_domain_spec(
             base_type
         ));
     }
+    let (not_null, not_null_name) = match nullability {
+        crate::sql::ast::DomainNullability::Unspecified | crate::sql::ast::DomainNullability::Nullable => (false, None),
+        crate::sql::ast::DomainNullability::NotNull { name } => (true, name.map(SqlName::parse).transpose()?),
+    };
     let resolved = resolve_routine_type(storage, txid, base_type)?;
     let (base_domain, base_user_type, inherited_default) =
         if let Some(parent) = storage.find_domain(base_type, txid) {
@@ -41211,7 +41215,7 @@ fn build_domain_spec(
         base,
         base_type_mod,
         not_null,
-        not_null_name: None,
+        not_null_name,
         not_null_identity: None,
         default_expr,
         checks,
@@ -41278,7 +41282,7 @@ pub fn create_domain(
         d.name.name,
         d.base_type,
         d.base_type_mod,
-        d.not_null,
+        d.nullability,
         d.default_text,
         d.checks,
         arena,

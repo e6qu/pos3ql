@@ -180,6 +180,13 @@ impl TableDef {
 }
 
 impl DomainDef {
+    pub(crate) fn constraint_name(&self, identity: ConstraintIdentity) -> Option<super::SqlName> {
+        if self.not_null && self.not_null_identity == Some(identity) {
+            return self.not_null_name;
+        }
+        self.checks().iter().find(|check| check.identity == Some(identity)).map(|check| check.name)
+    }
+
     pub(crate) fn not_null_constraint_oid(&self) -> i32 {
         self.not_null_identity
             .expect("admitted domain NOT NULL has a creation identity")

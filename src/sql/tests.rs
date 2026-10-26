@@ -1360,7 +1360,7 @@ fn constraint_public_identifiers_survive_edits_replacement_and_savepoint_rollbac
             );
             observations += rows.len();
         }
-        assert_eq!(observations, 12);
+        assert_eq!(observations, 13);
     }
 }
 
@@ -1408,7 +1408,7 @@ fn constraint_public_identifiers_survive_journal_and_checkpoint_recovery() {
                     );
                     observations += rows.len();
                 }
-                assert_eq!(observations, 4);
+                assert_eq!(observations, 5);
                 if checkpoint {
                     assert!(engine.checkpoint().unwrap());
                 }
@@ -1440,6 +1440,42 @@ fn constraint_public_identifiers_survive_journal_and_checkpoint_recovery() {
             std::fs::remove_dir_all(&config.data_dir).unwrap();
             crate::object_store::sim::drop_namespace(&config.object_store_bucket);
         }
+    }
+}
+
+#[test]
+fn constraint_declaration_names_and_rejections_match_postgresql() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("constraint-declarations-{mode:?}"));
+        config.transaction_mode = mode;
+        config.max_tables = 1;
+        config.max_domains = 4;
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        let mut states = Vec::new();
+        for statement in include_str!("../../tests/external/differential_exact/30_domain_constraint_errors.sql")
+            .split(';').map(str::trim).filter(|statement| !statement.is_empty())
+        {
+            let output = session.execute(&mut engine, statement, true);
+            states.extend(error_sqlstates(&output).into_iter().map(str::to_owned));
+        }
+        assert_eq!(states, ["42P17", "42601", "42601", "42P17", "42P17", "42601", "42710", "42710"]);
+        assert_eq!(data_rows(&session.success(&mut engine,
+            "SELECT count(*) = 0 FROM pg_type WHERE typname LIKE 'declaration_%'", true)), ["t"]);
+        let mut observations = 0;
+        for statement in include_str!("../../tests/external/differential_exact/31_domain_constraint_declarations.sql")
+            .split(';').map(str::trim).filter(|statement| !statement.is_empty())
+        {
+            let output = session.success(&mut engine, statement, true);
+            let rows = data_rows(&output);
+            assert!(rows.iter().all(|row| row == "t"), "{statement}: {rows:?}");
+            observations += rows.len();
+        }
+        assert_eq!(observations, 6);
     }
 }
 

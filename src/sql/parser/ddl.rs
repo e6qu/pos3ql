@@ -4471,7 +4471,8 @@ impl<'a> Parser<'a> {
         let name = self.qual_name("domain name")?;
         let _ = self.eat_ident("as")?;
         let (base_type, base_type_mod) = self.type_name_mod()?;
-        let mut not_null = false;
+        use crate::sql::ast::DomainNullability;
+        let mut nullability = DomainNullability::Unspecified;
         let mut default_text = None;
         let mut checks = ArenaList::new(self.arena);
         loop {
@@ -4482,17 +4483,48 @@ impl<'a> Parser<'a> {
             };
             if self.eat_ident("not")? {
                 self.expect_ident("null")?;
-                not_null = true;
+                match nullability {
+                    DomainNullability::Nullable => return Err(self.err_here("conflicting NULL/NOT NULL constraints")),
+                    DomainNullability::NotNull { .. } => return Err(ParseError {
+                        at: self.peek_at,
+                        message: stack_format!(96, "redundant NOT NULL constraint definition"),
+                        sqlstate: sqlstate::INVALID_OBJECT_DEFINITION,
+                    }),
+                    DomainNullability::Unspecified => {}
+                }
+                if self.eat_ident("no")? {
+                    self.expect_ident("inherit")?;
+                    return Err(ParseError {
+                        at: self.peek_at,
+                        message: stack_format!(96, "not-null constraints for domains cannot be marked NO INHERIT"),
+                        sqlstate: sqlstate::INVALID_OBJECT_DEFINITION,
+                    });
+                }
+                nullability = DomainNullability::NotNull { name: cname };
             } else if self.eat_ident("null")? {
-                not_null = false;
+                if matches!(nullability, DomainNullability::NotNull { .. }) {
+                    return Err(self.err_here("conflicting NULL/NOT NULL constraints"));
+                }
+                nullability = DomainNullability::Nullable;
             } else if self.eat_ident("check")? {
                 let check = DomainCheck {
                     name: cname,
                     expression: self.check_text()?,
                     validation: ConstraintValidation::EnforcedValidated,
                 };
+                if self.eat_ident("no")? {
+                    self.expect_ident("inherit")?;
+                    return Err(ParseError {
+                        at: self.peek_at,
+                        message: stack_format!(96, "check constraints for domains cannot be marked NO INHERIT"),
+                        sqlstate: sqlstate::INVALID_OBJECT_DEFINITION,
+                    });
+                }
                 self.push(&mut checks, check)?;
-            } else if cname.is_none() && self.eat_ident("default")? {
+            } else if self.eat_ident("default")? {
+                if default_text.is_some() {
+                    return Err(self.err_here("multiple default expressions"));
+                }
                 let start = self.peek_at;
                 let _ = self.column_default_expression()?;
                 default_text = Some(self.arena_str(self.text[start..self.peek_at].trim_end())?);
@@ -4507,7 +4539,7 @@ impl<'a> Parser<'a> {
             name,
             base_type,
             base_type_mod,
-            not_null,
+            nullability,
             default_text,
             checks,
         }))

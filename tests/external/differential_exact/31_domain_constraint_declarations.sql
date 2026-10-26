@@ -1,0 +1,13 @@
+CREATE DOMAIN declaration_named_nn AS integer CONSTRAINT required_value NOT NULL;
+SELECT count(*) = 1 FROM pg_constraint WHERE contypid = 'declaration_named_nn'::regtype AND conname = 'required_value';
+SELECT pg_get_constraintdef(oid) = 'NOT NULL' FROM pg_constraint WHERE contypid = 'declaration_named_nn'::regtype;
+CREATE DOMAIN declaration_nullable AS integer NULL NULL;
+SELECT NOT typnotnull FROM pg_type WHERE typname = 'declaration_nullable';
+CREATE DOMAIN declaration_default AS integer CONSTRAINT default_label DEFAULT 7;
+SELECT typdefault = '7' FROM pg_type WHERE typname = 'declaration_default';
+CREATE DOMAIN declaration_named_null AS integer CONSTRAINT no_row NULL;
+SELECT count(*) = 0 FROM pg_constraint WHERE contypid = 'declaration_named_null'::regtype;
+CREATE TABLE constraint_quoted_nn ("a b" integer NOT NULL NO INHERIT);
+SELECT pg_get_constraintdef(oid) = 'NOT NULL "a b" NO INHERIT' FROM pg_constraint WHERE conrelid = 'constraint_quoted_nn'::regclass AND contype = 'n';
+DROP TABLE constraint_quoted_nn;
+DROP DOMAIN declaration_named_nn, declaration_nullable, declaration_default, declaration_named_null;

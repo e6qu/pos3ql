@@ -5590,6 +5590,9 @@ impl Checkpointer {
                             "constraint identity outside table",
                         ));
                     };
+                    if storage.is_large_object_page_relation(definition.schema.as_str(), definition.name.as_str()) {
+                        return Err(CheckpointSetupError::Corrupt("internal storage table has no SQL constraint identities"));
+                    }
                     let position: usize = parse_field(words.next(), "constraint position")?;
                     let created_at: u64 = parse_field(words.next(), "constraint creation")?;
                     let identity = crate::storage::ConstraintIdentity::parse(created_at)
@@ -9933,13 +9936,13 @@ impl Checkpointer {
                     .map_or("", |expression| expression.as_str()),
             ] {
                 write!(&mut self.manifest_output, " ").map_err(|_| manifest_full())?;
-                write_manifest_hex_value(&mut self.manifest_output, value)
+                write!(&mut self.manifest_output, "{}", ManifestZeroName(value))
                     .map_err(|_| manifest_full())?;
             }
             for check in d.checks() {
                 for value in [check.name.as_str(), check.expression.as_str()] {
                     write!(&mut self.manifest_output, " ").map_err(|_| manifest_full())?;
-                    write_manifest_hex_value(&mut self.manifest_output, value)
+                    write!(&mut self.manifest_output, "{}", ManifestZeroName(value))
                         .map_err(|_| manifest_full())?;
                 }
                 write!(&mut self.manifest_output, " {}", check.validation.code())
@@ -9967,23 +9970,23 @@ impl Checkpointer {
             use core::fmt::Write;
             write!(&mut self.manifest_output, "enm3 {} {} ", slot, e.created_at)
                 .map_err(|_| manifest_full())?;
-            write_manifest_hex_value(&mut self.manifest_output, e.schema.as_str())
+            write!(&mut self.manifest_output, "{}", ManifestZeroName(e.schema.as_str()))
                 .map_err(|_| manifest_full())?;
             write!(&mut self.manifest_output, " ").map_err(|_| manifest_full())?;
-            write_manifest_hex_value(&mut self.manifest_output, e.name.as_str())
+            write!(&mut self.manifest_output, "{}", ManifestZeroName(e.name.as_str()))
                 .map_err(|_| manifest_full())?;
             write!(&mut self.manifest_output, " {}", definition.members().len())
                 .map_err(|_| manifest_full())?;
             for m in definition.members() {
                 write!(&mut self.manifest_output, " ").map_err(|_| manifest_full())?;
-                write_manifest_hex_value(&mut self.manifest_output, m.label.as_str())
+                write!(&mut self.manifest_output, "{}", ManifestZeroName(m.label.as_str()))
                     .map_err(|_| manifest_full())?;
                 write!(&mut self.manifest_output, " {}", m.sort.to_bits())
                     .map_err(|_| manifest_full())?;
                 write!(&mut self.manifest_output, " ").map_err(|_| manifest_full())?;
                 match m.legacy_label {
                     Some(label) => {
-                        write_manifest_hex_value(&mut self.manifest_output, label.as_str())
+                        write!(&mut self.manifest_output, "{}", ManifestZeroName(label.as_str()))
                             .map_err(|_| manifest_full())?
                     }
                     None => write!(&mut self.manifest_output, "-").map_err(|_| manifest_full())?,
@@ -10495,17 +10498,19 @@ impl Checkpointer {
                 )?;
             }
 
-            for (position, identity) in definition.constraint_identities().enumerate() {
-                let identity = identity.ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::DATA_EXCEPTION,
-                        "checkpoint constraint has no creation identity"
-                    )
-                })?;
-                write_manifest(
-                    &mut self.manifest_output,
-                    format_args!("constraint_identity {position} {}", identity.created_at()),
-                )?;
+            if slot != storage.large_object_page_table() {
+                for (position, identity) in definition.constraint_identities().enumerate() {
+                    let identity = identity.ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::DATA_EXCEPTION,
+                            "checkpoint constraint has no creation identity"
+                        )
+                    })?;
+                    write_manifest(
+                        &mut self.manifest_output,
+                        format_args!("constraint_identity {position} {}", identity.created_at()),
+                    )?;
+                }
             }
 
             // A slot not sliced this sweep carries its published list
@@ -15556,18 +15561,6 @@ fn temporary_store_to_sql(error: crate::store::StoreError) -> SqlError {
 
 fn value_index_to_sql(error: impl core::fmt::Debug) -> SqlError {
     sql_err!(SQLSTATE_IO, "persistent value-index write: {:?}", error)
-}
-
-fn write_manifest_hex_value(output: &mut FixedBuf, value: &str) -> core::fmt::Result {
-    use core::fmt::Write;
-    if value.is_empty() {
-        write!(output, "0")?;
-    } else {
-        for byte in value.as_bytes() {
-            write!(output, "{byte:02x}")?;
-        }
-    }
-    Ok(())
 }
 
 fn manifest_full() -> SqlError {

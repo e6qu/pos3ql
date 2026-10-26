@@ -247,6 +247,12 @@ mod tests {
             Storage::validate_not_null_names(&replacement).unwrap();
             assert_eq!(original.not_null_names[0], None);
             assert_eq!(original.not_null_names[1], retained_name);
+            let explicit = SqlName::parse("explicit_added_name").unwrap();
+            replacement.set_not_null_constraint_name(1, explicit);
+            remap_table(&original, &mut replacement, &mapping).unwrap();
+            assert_eq!(replacement.not_null_names[0], retained_name);
+            assert_eq!(replacement.not_null_names[1], Some(explicit));
+            assert_eq!(replacement.not_null_name_edits, super::super::ColumnSet::EMPTY);
         });
     }
 }

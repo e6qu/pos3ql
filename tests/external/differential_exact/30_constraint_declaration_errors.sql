@@ -6,3 +6,6 @@ CREATE DOMAIN declaration_check_inheritance AS integer CHECK (VALUE > 0) NO INHE
 CREATE DOMAIN declaration_duplicate_default AS integer DEFAULT 1 DEFAULT 2;
 CREATE DOMAIN declaration_check_name AS integer CONSTRAINT repeated_name CHECK (VALUE > 0) CONSTRAINT repeated_name NOT NULL;
 CREATE DOMAIN declaration_nn_name AS integer CONSTRAINT repeated_name NOT NULL CONSTRAINT repeated_name CHECK (VALUE > 0);
+CREATE TABLE declaration_table_check_name (id integer CONSTRAINT repeated_name NOT NULL, CONSTRAINT repeated_name CHECK (id > 0));
+CREATE TABLE declaration_table_nn_name (id integer CONSTRAINT repeated_name CHECK (id > 0) CONSTRAINT repeated_name NOT NULL);
+CREATE TABLE declaration_table_duplicate_nn (a integer CONSTRAINT repeated_name NOT NULL, b integer CONSTRAINT repeated_name NOT NULL);

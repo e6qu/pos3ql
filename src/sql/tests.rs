@@ -1461,18 +1461,31 @@ fn constraint_declaration_names_and_rejections_match_postgresql() {
         let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
         let mut states = Vec::new();
         for statement in
-            include_str!("../../tests/external/differential_exact/30_domain_constraint_errors.sql")
+            include_str!("../../tests/external/differential_exact/30_constraint_declaration_errors.sql")
                 .split(';')
                 .map(str::trim)
                 .filter(|statement| !statement.is_empty())
         {
             let output = session.execute(&mut engine, statement, true);
+            for (object, kind) in [
+                ("declaration_check_name", "domain"),
+                ("declaration_nn_name", "domain"),
+                ("declaration_table_check_name", "relation"),
+                ("declaration_table_nn_name", "relation"),
+                ("declaration_table_duplicate_nn", "relation"),
+            ] {
+                if statement.contains(object) {
+                    let expected = format!("constraint \"repeated_name\" for {kind} \"{object}\" already exists");
+                    assert!(String::from_utf8_lossy(&output).contains(&expected), "{statement}: expected {expected}; {output:?}");
+                }
+            }
             states.extend(error_sqlstates(&output).into_iter().map(str::to_owned));
         }
         assert_eq!(
             states,
             [
-                "42P17", "42601", "42601", "42P17", "42P17", "42601", "42710", "42710"
+                "42P17", "42601", "42601", "42P17", "42P17", "42601", "42710", "42710",
+                "42710", "42710", "42710"
             ]
         );
         assert_eq!(

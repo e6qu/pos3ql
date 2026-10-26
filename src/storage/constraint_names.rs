@@ -136,8 +136,9 @@ pub(crate) fn table(definition: &mut TableDef) -> Result<(), SqlError> {
         {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_OBJECT,
-                "constraint \"{}\" already exists",
-                name.as_str()
+                "constraint \"{}\" for relation \"{}\" already exists",
+                name.as_str(),
+                definition.name.as_str()
             ));
         }
     }

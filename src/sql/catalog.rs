@@ -28031,11 +28031,11 @@ fn pg_enum<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
             continue;
         }
         let typid = crate::sql::types::oid::enum_oid(slot as u16);
-        for (i, m) in e.members().enumerate() {
+        for m in e.members() {
             out[n] = row(
                 &[
-                    // A stable, unique synthetic OID per member.
-                    Datum::Int4(typid * 1000 + i as i32),
+                    Datum::Int4(m.identity.ok_or_else(|| sql_err!(sqlstate::DATA_EXCEPTION,
+                        "enum member has no catalog identity"))?.oid()),
                     Datum::Int4(typid),
                     Datum::Float8(m.sort),
                     text(

@@ -42575,7 +42575,7 @@ fn build_enum_spec<'a>(
     labels: &[&str],
     capacity: usize,
     arena: &'a Arena,
-) -> Result<crate::storage::EnumSpec<'a>, SqlError> {
+) -> Result<&'a mut [crate::storage::EnumMember], SqlError> {
     if labels.len() > capacity {
         return Err(sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -42600,12 +42600,13 @@ fn build_enum_spec<'a>(
             ));
         }
         members[i] = crate::storage::EnumMember {
-            label: SqlName::parse(label)?,
+            identity: None,
+label: SqlName::parse(label)?,
             legacy_label: None,
             sort: (i + 1) as f64,
         };
     }
-    Ok(crate::storage::EnumSpec { members })
+    Ok(members)
 }
 
 pub fn create_enum(
@@ -42638,7 +42639,7 @@ pub fn create_enum(
             name.name
         ));
     }
-    let spec = match build_enum_spec(labels, storage.enum_label_capacity(), arena) {
+    let members = match build_enum_spec(labels, storage.enum_label_capacity(), arena) {
         Ok(s) => s,
         Err(e) => return sql_fail(e),
     };
@@ -42646,13 +42647,14 @@ pub fn create_enum(
         Ok(n) => n,
         Err(e) => return sql_fail(e),
     };
-    let created = match storage.create_enum(schema, sqlname, spec, txn.txid) {
+    let created = match storage.create_enum(schema, sqlname, crate::storage::EnumSpec { members }, txn.txid) {
         Ok(slot) => slot,
         Err(e) => return sql_fail(e),
     };
     let slot = created.slot();
     let lsn = storage.bump_lsn();
     let definition = storage.enum_for(slot, txn.txid);
+    for (target, source) in members.iter_mut().zip(definition.members()) { *target = source; }
     if let Err(e) = wal.stage_reserved(
         txn.txid,
         lsn,
@@ -42661,7 +42663,7 @@ pub fn create_enum(
             created_at: storage.enum_for(slot, txn.txid).created_at,
             schema: definition.schema.as_str(),
             name: definition.name.as_str(),
-            members: spec.members,
+            members,
         },
     ) {
         storage.finish_type_ddl(created, crate::storage::TypeDdlDecision::Rollback);
@@ -45522,7 +45524,8 @@ pub fn alter_type(
                 Err(e) => return sql_fail(e),
             };
             altered[current.members().len()] = crate::storage::EnumMember {
-                label: new_label,
+                identity: None,
+label: new_label,
                 legacy_label: None,
                 sort,
             };
@@ -45540,6 +45543,8 @@ pub fn alter_type(
                 storage.rollback_enum_alter(prior);
                 return sql_fail(error);
             }
+            let admitted = storage.enum_for(slot, txn.txid);
+            for (target, source) in altered.iter_mut().zip(admitted.members()) { *target = source; }
             let lsn = storage.bump_lsn();
             if let Err(e) = wal.stage_reserved(
                 txn.txid,
@@ -45758,6 +45763,8 @@ pub fn alter_type(
                 Ok(prior) => prior,
                 Err(error) => return sql_fail(error),
             };
+            let admitted = storage.enum_for(slot, txn.txid);
+            for (target, source) in altered.iter_mut().zip(admitted.members()) { *target = source; }
             let lsn = storage.bump_lsn();
             if let Err(e) = wal.stage_reserved(
                 txn.txid,

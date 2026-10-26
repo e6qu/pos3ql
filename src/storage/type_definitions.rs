@@ -771,7 +771,8 @@ mod tests {
                 name,
                 EnumSpec {
                     members: &[EnumMember {
-                        label: SqlName::parse("before").unwrap(),
+                        identity: None,
+label: SqlName::parse("before").unwrap(),
                         legacy_label: None,
                         sort: 1.0,
                     }],
@@ -1111,12 +1112,14 @@ mod tests {
         create(&mut storage, NamedTypeSlot::Enum(0)).unwrap();
         let members = [
             EnumMember {
-                label: SqlName::parse("before").unwrap(),
+                identity: None,
+label: SqlName::parse("before").unwrap(),
                 legacy_label: Some(SqlName::parse("before").unwrap()),
                 sort: 1.0,
             },
             EnumMember {
-                label: SqlName::parse("after").unwrap(),
+                identity: None,
+label: SqlName::parse("after").unwrap(),
                 legacy_label: None,
                 sort: 2.0,
             },
@@ -1368,7 +1371,8 @@ mod tests {
                 .versions
                 .get(NamedTypeSlot::Domain(0));
             storage.enum_replay_members(1).unwrap()[0] = EnumMember {
-                label: SqlName::parse("saved").unwrap(),
+                identity: super::super::EnumLabelIdentity::parse(43),
+label: SqlName::parse("saved").unwrap(),
                 legacy_label: None,
                 sort: 1.0,
             };
@@ -1402,7 +1406,7 @@ mod tests {
                 0
             );
             assert_eq!(storage.enum_for(0, 0).sort_of("saved"), Some(1.0));
-            assert_eq!(storage.catalog_identity_sequence(), 42);
+            assert_eq!(storage.catalog_identity_sequence(), 43);
             let catalog = storage.type_catalog.lock().unwrap();
             assert_eq!(
                 catalog
@@ -1507,7 +1511,8 @@ mod tests {
                         }
                         NamedTypeSlot::Enum(_) => {
                             storage.enum_replay_members(1).unwrap()[0] = EnumMember {
-                                label: SqlName::parse("before").unwrap(),
+                                identity: super::super::EnumLabelIdentity::parse(42),
+label: SqlName::parse("before").unwrap(),
                                 legacy_label: None,
                                 sort: 1.0,
                             };
@@ -1776,7 +1781,8 @@ mod tests {
                                 SqlName::parse("public").unwrap(),
                                 SqlName::parse("reader_source").unwrap(),
                                 &[EnumMember {
-                                    label: SqlName::parse("pending").unwrap(),
+                                    identity: None,
+label: SqlName::parse("pending").unwrap(),
                                     legacy_label: None,
                                     sort: 1.0,
                                 }],
@@ -1968,7 +1974,8 @@ mod tests {
                     SqlName::parse("public").unwrap(),
                     SqlName::parse("reader_source").unwrap(),
                     &[EnumMember {
-                        label: SqlName::parse(marker).unwrap(),
+                        identity: None,
+label: SqlName::parse(marker).unwrap(),
                         legacy_label: None,
                         sort: 1.0,
                     }],

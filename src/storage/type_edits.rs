@@ -930,7 +930,8 @@ mod tests {
                     name,
                     EnumSpec {
                         members: &[EnumMember {
-                            label: SqlName::parse("ready").unwrap(),
+                            identity: None,
+label: SqlName::parse("ready").unwrap(),
                             legacy_label: None,
                             sort: 1.0,
                         }],

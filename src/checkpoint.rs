@@ -354,7 +354,7 @@ fn parse_manifest_metadata(text: &str) -> Result<ManifestMetadata, &'static str>
                 types_finished = true;
                 true
             }
-            Some("dom5" | "enm2" | "cmp2") if types_finished => {
+            Some("dom5" | "enm3" | "cmp2") if types_finished => {
                 return Err("type source follows its catalog boundary");
             }
             Some("end") => {
@@ -7565,7 +7565,7 @@ impl Checkpointer {
                             CheckpointSetupError::Corrupt("invalid restored domain identity")
                         })?;
                 }
-                Some("enm2") => {
+                Some("enm3") => {
                     let source_slot: usize = parse_field(words.next(), "enm source slot")?;
                     if source_slot >= storage.enum_count() {
                         return Err(CheckpointSetupError::Corrupt(
@@ -7610,7 +7610,11 @@ impl Checkpointer {
                                 ));
                             }
                         };
+                        let label_creation: u64 = parse_field(words.next(), "enm label creation")?;
+                        let identity = crate::storage::EnumLabelIdentity::parse(label_creation)
+                            .ok_or(CheckpointSetupError::Corrupt("invalid enum label creation"))?;
                         *member = crate::storage::EnumMember {
+                            identity: Some(identity),
                             label,
                             legacy_label,
                             sort: f64::from_bits(sort_bits),
@@ -8856,6 +8860,8 @@ impl Checkpointer {
                     error.message.as_str()
                 ))
             })?;
+        storage.validate_restored_enum_label_identities(metadata.catalog_sequence).map_err(|error|
+            CheckpointSetupError::ObjectStore(format!("manifest enum identities rejected: {}", error.message.as_str())))?;
         // Block SSTs load in list order. Versioned reads choose the greatest
         // admissible commit LSN across every member.
         bssts.sort_by_key(|(mindex, idx, ..)| (*mindex, *idx));
@@ -9917,7 +9923,7 @@ impl Checkpointer {
                 }
                 Ok(())
             };
-            write!(&mut self.manifest_output, "enm2 {} {} ", slot, e.created_at)
+            write!(&mut self.manifest_output, "enm3 {} {} ", slot, e.created_at)
                 .map_err(|_| manifest_full())?;
             hex(&mut self.manifest_output, e.schema.as_str()).map_err(|_| manifest_full())?;
             write!(&mut self.manifest_output, " ").map_err(|_| manifest_full())?;
@@ -9935,6 +9941,8 @@ impl Checkpointer {
                         .map_err(|_| manifest_full())?,
                     None => write!(&mut self.manifest_output, "-").map_err(|_| manifest_full())?,
                 }
+                let identity = m.identity.ok_or_else(|| sql_err!(sqlstate::DATA_EXCEPTION, "enum member has no catalog identity"))?;
+                write!(&mut self.manifest_output, " {}", identity.created_at()).map_err(|_| manifest_full())?;
             }
             writeln!(&mut self.manifest_output).map_err(|_| manifest_full())?;
         }

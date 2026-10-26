@@ -57498,12 +57498,14 @@ fn enum_value_identity_hashes_are_selective_and_bind_legacy_labels() {
     let engine = Engine::new(&config, &mut budget).unwrap();
     let members = [
         crate::storage::EnumMember {
-            label: crate::storage::SqlName::parse("new").unwrap(),
+            identity: None,
+label: crate::storage::SqlName::parse("new").unwrap(),
             legacy_label: Some(crate::storage::SqlName::parse("old").unwrap()),
             sort: 1.0,
         },
         crate::storage::EnumMember {
-            label: crate::storage::SqlName::parse("ready").unwrap(),
+            identity: None,
+label: crate::storage::SqlName::parse("ready").unwrap(),
             legacy_label: Some(crate::storage::SqlName::parse("ready").unwrap()),
             sort: 2.0,
         },
@@ -57548,12 +57550,14 @@ fn enum_value_identity_legacy_rows_arrays_and_records_keep_original_members() {
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let members = [
         crate::storage::EnumMember {
-            label: crate::storage::SqlName::parse("old").unwrap(),
+            identity: None,
+label: crate::storage::SqlName::parse("old").unwrap(),
             legacy_label: Some(crate::storage::SqlName::parse("old").unwrap()),
             sort: 1.0,
         },
         crate::storage::EnumMember {
-            label: crate::storage::SqlName::parse("ready").unwrap(),
+            identity: None,
+label: crate::storage::SqlName::parse("ready").unwrap(),
             legacy_label: Some(crate::storage::SqlName::parse("ready").unwrap()),
             sort: 2.0,
         },

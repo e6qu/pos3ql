@@ -46,6 +46,19 @@ use crate::mem::{FixedMap, FixedVec};
 use crate::sql::eval::{SqlError, sqlstate};
 use crate::sql_err;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct EnumLabelIdentity(TypeCreation);
+
+impl EnumLabelIdentity {
+    pub(crate) fn parse(created_at: u64) -> Option<Self> { TypeCreation::parse(created_at).map(Self) }
+    pub(crate) fn created_at(self) -> u64 { self.0.created_at() }
+    pub(crate) fn oid(self) -> i32 { 360_000_000 + self.created_at() as i32 }
+    pub(super) fn reserve(sequence: &super::CatalogSequence) -> Result<Self, SqlError> {
+        let created_at = sequence.next_bounded(MAX_TYPE_CREATION, "enum label")?;
+        Ok(Self::parse(created_at).expect("bounded enum label reservation"))
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(super) enum TypeCreationAdmission {
     Fresh,

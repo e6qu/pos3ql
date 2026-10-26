@@ -3792,6 +3792,7 @@ impl Engine {
         storage.select_database(crate::storage::DatabaseOid::POSTGRES)?;
         wal.select_database(crate::storage::DatabaseOid::POSTGRES);
         storage.validate_restored_relation_identities(storage.catalog_identity_sequence())?;
+        storage.validate_restored_enum_label_identities(storage.catalog_identity_sequence())?;
         // Startup reconciliation makes every recovered commit durable in the
         // configured object store before the server admits any connection.
         if config.wal_upload
@@ -23120,13 +23121,7 @@ fn apply_wal_op(
                 created_at,
             )?;
         }
-        WalOp::RestoreEnum {
-            payload,
-            wide_count,
-            stable_members,
-        } => {
-            crate::wal::apply_enum_payload(storage, payload, wide_count, stable_members)?;
-        }
+        WalOp::RestoreEnum { payload } => { crate::wal::apply_enum_payload(storage, payload)?; }
         WalOp::CreateComposite {
             slot,
             definition: def,

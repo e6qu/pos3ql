@@ -74,6 +74,7 @@ mod type_names;
 mod type_reference_moves;
 #[cfg(test)]
 pub(crate) use type_identities::{CachedArrayElement, TypeCreation};
+pub(crate) use type_identities::EnumLabelIdentity;
 mod type_references;
 use crate::mem::mutex::{Mutex, MutexGuard};
 use enum_images::{EnumImageRead, EnumImageReservation, EnumMemberImages};
@@ -9736,6 +9737,7 @@ pub(crate) const MAX_COMPOSITE_FIELDS: usize = MAX_RELATION_COLUMNS;
 /// when no distinct midpoint remains.
 #[derive(Debug, Clone, Copy)]
 pub struct EnumMember {
+    pub(crate) identity: Option<EnumLabelIdentity>,
     pub label: SqlName,
     /// The label used by legacy rows before stable member identities.
     pub legacy_label: Option<SqlName>,
@@ -9744,7 +9746,8 @@ pub struct EnumMember {
 
 impl EnumMember {
     pub(crate) const EMPTY: Self = EnumMember {
-        label: SqlName::EMPTY,
+        identity: None,
+label: SqlName::EMPTY,
         legacy_label: None,
         sort: 0.0,
     };
@@ -41091,6 +41094,20 @@ impl Storage {
             ));
         }
         let creation = type_identities::TypeCreationAdmission::restored(created_at)?;
+        let maximum_label_creation = {
+            let replay = self.enum_replay_members(count)?;
+            let mut previous = created_at;
+            for member in replay.iter() {
+                let identity = member.identity.ok_or_else(|| sql_err!(sqlstate::DATA_EXCEPTION,
+                    "stored enum member has no creation identity"))?;
+                if identity.created_at() <= previous {
+                    return Err(sql_err!(sqlstate::DATA_EXCEPTION,
+                        "stored enum member creation identities are not increasing"));
+                }
+                previous = identity.created_at();
+            }
+            previous
+        };
         let (slot, version) = if let Some(slot) = self.enum_slot(schema.as_str(), name.as_str(), 0)
         {
             if self.enum_for(slot, 0).created_at != created_at {
@@ -41130,6 +41147,7 @@ impl Storage {
         catalog.enums[slot].member_image = Some(image);
         catalog.enums[slot].member_count = count;
         catalog.versions.set(NamedTypeSlot::Enum(slot), version);
+        self.catalog_sequence.observe(maximum_label_creation);
         Ok(slot)
     }
 
@@ -41177,7 +41195,7 @@ impl Storage {
                 catalog.enums.len()
             ));
         };
-        let image = EnumImageReservation::write(&self.enum_member_images, spec.members)?;
+        let image = EnumImageReservation::write(&self.enum_member_images, spec.members, &self.catalog_sequence, None)?;
         let member_count = image.count();
         catalog
             .identities
@@ -41272,7 +41290,9 @@ impl Storage {
             catalog.pending_enum_members[previous as usize].depth + 1
         });
         let version = catalog.versions.next()?;
-        let image = EnumImageReservation::write(&self.enum_member_images, members)?;
+        let image = EnumImageReservation::write(&self.enum_member_images, members, &self.catalog_sequence,
+            Some((prior.map_or(catalog.enums[slot].member_image.expect("live enum owns members"), |pending| pending.image),
+                prior.map_or(catalog.enums[slot].member_count as usize, |pending| pending.member_count as usize))))?;
         let member_count = image.count();
         let image = image.publish();
         catalog.pending_enum_members[member_slot] = PendingEnumMemberSlot {
@@ -58669,11 +58689,12 @@ mod tests {
                     enumeration.member_count = 1;
                     enumeration.ddl_state = CatalogDdlState::Present;
                     let member = EnumMember {
-                        label: SqlName::parse(label.as_str()).unwrap(),
+                        identity: None,
+label: SqlName::parse(label.as_str()).unwrap(),
                         legacy_label: None,
                         sort: worker as f64 + 1.0,
                     };
-                    let image = EnumImageReservation::write(&storage.enum_member_images, &[member])
+                    let image = EnumImageReservation::write(&storage.enum_member_images, &[member], &storage.catalog_sequence, None)
                         .unwrap();
                     enumeration.member_image = Some(image.publish());
                     catalog.enums[worker] = enumeration;

@@ -4153,7 +4153,7 @@ fn copy_like_statistics(
             )?;
             let slot = storage.create_extended_statistics(
                 ExtendedStatisticsSpec {
-                    created_at: 0,
+                    creation: crate::storage::CatalogCreation::New,
                     schema: target.schema,
                     name,
                     table: target_slot as u16,
@@ -47887,7 +47887,7 @@ pub fn create_statistics(
     }
     let slot = match storage.create_extended_statistics(
         ExtendedStatisticsSpec {
-            created_at: 0,
+            creation: crate::storage::CatalogCreation::New,
             schema,
             name,
             table: table as u16,

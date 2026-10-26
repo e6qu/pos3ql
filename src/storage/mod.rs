@@ -3717,7 +3717,7 @@ pub(crate) struct ExtendedStatisticsDef {
 
 #[derive(Clone, Copy)]
 pub(crate) struct ExtendedStatisticsSpec {
-    pub(crate) created_at: u64,
+    pub(crate) creation: CatalogCreation,
     pub(crate) schema: SqlName,
     pub(crate) name: SqlName,
     pub(crate) table: u16,
@@ -30018,6 +30018,17 @@ impl Storage {
     ) -> Result<usize, SqlError> {
         CatalogIdentity::require(created_at)?;
         let mut catalog = self.extension_catalog();
+        if catalog.definitions.iter().any(|extension| {
+            extension.database == current_database()
+                && extension.ddl_state != CatalogDdlState::Absent
+                && extension.created_at == created_at
+                && extension.name != name
+        }) {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "extension creation identity is duplicated"
+            ));
+        }
         let definition = ExtensionDef {
             database: current_database(),
             created_at,
@@ -38282,7 +38293,7 @@ impl Storage {
         definition_generation: u64,
     ) -> Result<(), SqlError> {
         CatalogIdentity::require(created_at)?;
-        if created_at == 0 || definition_generation == 0 {
+        if definition_generation == 0 {
             return Err(sql_err!(
                 sqlstate::INVALID_PARAMETER_VALUE,
                 "subscription stream identity must be nonzero"
@@ -38292,7 +38303,27 @@ impl Storage {
             .subscription_catalog
             .lock()
             .expect("subscription catalog lock poisoned");
-        let subscription = &mut catalog.definitions[slot];
+        if catalog
+            .definitions
+            .iter()
+            .enumerate()
+            .any(|(other, subscription)| {
+                other != slot
+                    && subscription.ddl_state != CatalogDdlState::Absent
+                    && subscription.created_at == created_at
+            })
+        {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "subscription creation identity is duplicated"
+            ));
+        }
+        let subscription = catalog.definitions.get_mut(slot).ok_or_else(|| {
+            sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "subscription source slot is out of range"
+            )
+        })?;
         subscription.created_at = created_at;
         subscription.definition_generation = definition_generation;
         self.catalog_sequence.observe(created_at);
@@ -39295,9 +39326,20 @@ impl Storage {
                 publications.len()
             ));
         };
+        let created_at = spec.creation.resolve(&self.catalog_sequence)?;
+        if publications.iter().any(|publication| {
+            publication.database == current_database()
+                && publication.ddl_state != CatalogDdlState::Absent
+                && publication.created_at == created_at
+        }) {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "publication creation identity is duplicated"
+            ));
+        }
         publications[slot] = PublicationDef {
             database: current_database(),
-            created_at: spec.creation.resolve(&self.catalog_sequence)?,
+            created_at,
             name: spec.name,
             pending_name: None,
             all_tables: spec.all_tables,
@@ -39318,6 +39360,7 @@ impl Storage {
             ownership,
             ddl_state: CatalogDdlState::PendingCreate { txid },
         };
+        self.catalog_sequence.observe(created_at);
         Ok(slot)
     }
 
@@ -45268,14 +45311,17 @@ impl Storage {
                 catalog.definitions.len()
             ));
         };
-        let created_at = if spec.created_at == 0 {
-            self.catalog_sequence
-                .next_bounded(MAX_CATALOG_CREATION, "catalog object")?
-        } else {
-            CatalogIdentity::require(spec.created_at)?;
-            self.catalog_sequence.observe(spec.created_at);
-            spec.created_at
-        };
+        let created_at = spec.creation.resolve(&self.catalog_sequence)?;
+        if catalog.definitions.iter().any(|statistics| {
+            statistics.database == current_database()
+                && statistics.ddl_state != CatalogDdlState::Absent
+                && statistics.created_at == created_at
+        }) {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "statistics creation identity is duplicated"
+            ));
+        }
         catalog.definitions[slot] = ExtendedStatisticsDef {
             database: current_database(),
             created_at,
@@ -45297,6 +45343,7 @@ impl Storage {
             pending_data_txid: None,
             ddl_state: CatalogDdlState::PendingCreate { txid },
         };
+        self.catalog_sequence.observe(created_at);
         Ok(slot)
     }
 
@@ -45730,14 +45777,22 @@ impl Storage {
         &mut self,
         spec: ExtendedStatisticsSpec,
     ) -> Result<usize, SqlError> {
+        let CatalogCreation::Restore(identity) = spec.creation else {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "statistics replay requires a restored identity"
+            ));
+        };
+        let created_at = identity.created_at();
         {
             let mut catalog = self
                 .extended_statistics_catalog
                 .lock()
                 .expect("extended-statistics catalog lock poisoned");
             if let Some(slot) = catalog.definitions.iter().position(|statistics| {
-                statistics.ddl_state != CatalogDdlState::Absent
-                    && statistics.created_at == spec.created_at
+                statistics.database == current_database()
+                    && statistics.ddl_state != CatalogDdlState::Absent
+                    && statistics.created_at == created_at
             }) {
                 if catalog
                     .definitions
@@ -45745,6 +45800,7 @@ impl Storage {
                     .enumerate()
                     .any(|(other, statistics)| {
                         other != slot
+                            && statistics.database == current_database()
                             && statistics.ddl_state != CatalogDdlState::Absent
                             && statistics.mutable.schema == spec.schema
                             && statistics.mutable.name == spec.name
@@ -59150,7 +59206,7 @@ mod tests {
         }
 
         let full = ExtendedStatisticsSpec {
-            created_at: 0,
+            creation: CatalogCreation::New,
             schema: SqlName::parse("public").unwrap(),
             name: SqlName::parse("statistics_full").unwrap(),
             table: table as u16,

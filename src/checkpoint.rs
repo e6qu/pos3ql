@@ -9096,7 +9096,15 @@ impl Checkpointer {
             }
             let slot = storage
                 .replay_extended_statistics(crate::storage::ExtendedStatisticsSpec {
-                    created_at: statistics.created_at,
+                    creation: crate::storage::CatalogCreation::Restore(
+                        crate::storage::CatalogIdentity::require(statistics.created_at).map_err(
+                            |_| {
+                                CheckpointSetupError::Corrupt(
+                                    "invalid statistics creation identity",
+                                )
+                            },
+                        )?,
+                    ),
                     schema: statistics.schema,
                     name: statistics.name,
                     table: table as u16,

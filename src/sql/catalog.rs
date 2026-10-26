@@ -9868,7 +9868,7 @@ fn pg_user_mapping<'a>(
     let rows = arena
         .alloc_slice_with(count, |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
-    for (index, (slot, entry)) in storage.foreign_user_mappings(txid).enumerate() {
+    for (index, (_, entry)) in storage.foreign_user_mappings(txid).enumerate() {
         let mapping = entry.definition_for(txid);
         let user = match mapping.user {
             crate::storage::foreign::ForeignMappingUser::Public => 0,
@@ -9903,7 +9903,7 @@ fn pg_user_mappings<'a>(
     let rows = arena
         .alloc_slice_with(count, |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
-    for (index, (slot, entry)) in storage.foreign_user_mappings(txid).enumerate() {
+    for (index, (_, entry)) in storage.foreign_user_mappings(txid).enumerate() {
         let mapping = entry.definition_for(txid);
         let server = storage
             .foreign_server_by_slot(mapping.server as usize, txid)
@@ -9922,7 +9922,7 @@ fn pg_user_mappings<'a>(
         };
         rows[index] = row(
             &[
-                Datum::Int4(storage.foreign_mapping_entry(slot).oid()),
+                Datum::Int4(entry.oid()),
                 Datum::Int4(storage.foreign_server_entry(mapping.server as usize).oid()),
                 text(server.name.as_str(), arena)?,
                 Datum::Int4(user),

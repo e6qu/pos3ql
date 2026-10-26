@@ -22103,7 +22103,9 @@ fn apply_wal_op(
                 };
             }
             storage.replay_extended_statistics(crate::storage::ExtendedStatisticsSpec {
-                created_at,
+                creation: crate::storage::CatalogCreation::Restore(
+                    crate::storage::CatalogIdentity::require(created_at)?,
+                ),
                 schema: crate::storage::SqlName::parse(schema)?,
                 name: crate::storage::SqlName::parse(name)?,
                 table: table_slot as u16,

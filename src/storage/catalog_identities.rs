@@ -17,6 +17,10 @@ impl CatalogIdentity {
         NonZeroU32::new(u32::try_from(created_at).ok()?).map(Self)
     }
 
+    pub(crate) fn created_at(self) -> u64 {
+        u64::from(self.0.get())
+    }
+
     pub(crate) fn require(created_at: u64) -> Result<Self, SqlError> {
         Self::parse(created_at).ok_or_else(|| {
             sql_err!(
@@ -108,11 +112,7 @@ impl CatalogCreation {
     pub(super) fn resolve(self, sequence: &CatalogSequence) -> Result<u64, SqlError> {
         match self {
             Self::New => sequence.next_bounded(MAX_CATALOG_CREATION, "catalog object"),
-            Self::Restore(identity) => {
-                let created_at = u64::from(identity.0.get());
-                sequence.observe(created_at);
-                Ok(created_at)
-            }
+            Self::Restore(identity) => Ok(identity.created_at()),
         }
     }
 }

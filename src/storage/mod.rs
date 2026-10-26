@@ -41116,6 +41116,15 @@ impl Storage {
                     "stored enum lifetime does not match its source"
                 ));
             }
+            {
+                let existing = self.enum_for(slot, 0);
+                let replay = self.enum_replay_members(count)?;
+                if count < existing.members().len() || existing.members().zip(replay.iter())
+                    .any(|(old, restored)| old.identity != restored.identity)
+                {
+                    return Err(sql_err!(sqlstate::DATA_EXCEPTION, "stored enum member identities changed an existing prefix"));
+                }
+            }
             let version = self
                 .type_catalog
                 .lock()

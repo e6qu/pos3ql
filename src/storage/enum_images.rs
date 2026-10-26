@@ -949,12 +949,15 @@ label: SqlName::parse(label).unwrap(),
                 .unwrap();
             assert_eq!(before.members().len(), 1);
             let current = storage.enum_for(slot, 0);
-            storage.enum_replay_members(1).unwrap()[0] = EnumMember { identity: super::super::EnumLabelIdentity::parse(2), ..member("later", 4.0) };
+            storage.enum_replay_members(2).unwrap().copy_from_slice(&[
+                EnumMember { identity: super::super::EnumLabelIdentity::parse(2), ..member("later", 4.0) },
+                EnumMember { identity: super::super::EnumLabelIdentity::parse(3), ..member("paid", 2.0) },
+            ]);
             let error = storage
                 .finish_enum_replay(
                     SqlName::parse("public").unwrap(),
                     SqlName::parse("state").unwrap(),
-                    1,
+                    2,
                     created_at,
                 )
                 .unwrap_err();
@@ -965,7 +968,7 @@ label: SqlName::parse(label).unwrap(),
                 .finish_enum_replay(
                     SqlName::parse("public").unwrap(),
                     SqlName::parse("state").unwrap(),
-                    1,
+                    2,
                     created_at,
                 )
                 .unwrap();

@@ -1330,6 +1330,36 @@ fn numeric_type_schema_and_function_privileges_match_postgresql_before_lookup() 
 }
 
 #[test]
+fn enum_label_identities_preserve_saved_identifiers_through_edits_and_slot_reuse() {
+    for mode in [crate::config::TransactionMode::Mvcc, crate::config::TransactionMode::Locking] {
+        let mut config = test_config(&format!("enum-label-identities-{mode:?}"));
+        config.transaction_mode = mode;
+        config.max_ddl_per_transaction = 32;
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        assert_eq!(data_rows(&session.success(&mut engine,
+            include_str!("../../tests/external/differential_exact/27_enum_label_identities.sql"), true)),
+            ["t", "t", "t", "t", "t", "t"]);
+    }
+}
+
+#[test]
+fn enum_label_identities_do_not_overlap_for_more_than_one_thousand_members() {
+    let labels = (0..1025).map(|index| format!("'label_{index}'")).collect::<Vec<_>>().join(",");
+    let sql = format!("CREATE TYPE wide_labels AS ENUM ({labels}); CREATE TYPE next_labels AS ENUM ('only');");
+    let mut config = test_config("wide-enum-label-identities");
+    config.max_enums = 2;
+    config.max_enum_labels_per_type = 1025;
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(&mut engine, &sql, true);
+    assert_eq!(data_rows(&session.success(&mut engine,
+        "SELECT count(*) = 1026 AND count(DISTINCT oid) = 1026 FROM pg_enum", true)), ["t"]);
+}
+
+#[test]
 fn named_type_default_arrays_preserve_declared_types_without_allocation() {
     for mode in [
         crate::config::TransactionMode::Mvcc,

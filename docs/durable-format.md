@@ -300,11 +300,19 @@ BEFORE another member. Renaming or renumbering never changes an existing member'
 identity. Row values keep this identity separately from their cached label and
 sort position. Catalog-aware reads select the current label and sort position.
 
-Enum manifest records include an optional legacy label after each member's sort bits.
-The retained enum payload readers for kinds 23/147 initialize this binding from their
-labels. Journal kind 149 writes the current label, sort bits, and an optional
-legacy label for each member; it retains the u32 member count. Existing legacy
-bindings survive later label changes. No missing identity is guessed.
+Public `pg_enum.oid` values use an independent creation stamp, starting at
+360,000,001 and ending at 369,999,999. They are distinct from the stable ordinal
+stored in row values. Renaming, changing sort position and adding labels preserve
+existing stamps; replacing a type reserves new ones. Each stamp fits in three
+runtime bytes without increasing the enum-member image size.
+
+The `enm3` manifest record writes each label's creation stamp after its sort bits
+and optional legacy label. Journal kind 149 writes the same facts, with a u32
+creation stamp after each optional legacy binding and a u32 member count. Enum
+journal kinds 23/147 are rejected. Recovery checks increasing member stamps,
+unchanged existing prefixes and uniqueness across types within each database;
+a fixed 8 KiB bitmap scans the admitted stamp ranges before writer promotion.
+No missing identity is guessed.
 
 A row enum's u32 label-length high bit marks an additional u32 member identity
 before its cached label. A clear high bit retains the legacy decoder. Composite

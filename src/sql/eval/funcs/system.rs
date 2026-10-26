@@ -26,19 +26,16 @@ use super::super::{
 struct CatalogOid(i32);
 
 impl CatalogOid {
-    /// Parse the SQL identity boundary once: wide SQL integers and unsigned
-    /// wire OIDs must not wrap into a different internal catalog object.
+    /// Keep all four OID bytes in the legacy signed catalog interface; wider
+    /// integers are rejected before their bits can name a different object.
     fn parse(value: Datum<'_>) -> Result<Option<Self>, SqlError> {
         match value {
             Datum::Null => Ok(None),
             Datum::Int2(oid) => Ok(Some(Self(i32::from(oid)))),
             Datum::Int4(oid) => Ok(Some(Self(oid))),
-            Datum::Oid(oid) => i32::try_from(oid)
-                .map(Self)
-                .map(Some)
-                .map_err(|_| sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "OID out of range")),
-            Datum::Int8(oid) => i32::try_from(oid)
-                .map(Self)
+            Datum::Oid(oid) => Ok(Some(Self(oid as i32))),
+            Datum::Int8(oid) => u32::try_from(oid)
+                .map(|oid| Self(oid as i32))
                 .map(Some)
                 .map_err(|_| sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "OID out of range")),
             Datum::Regtype { referenced_oid, .. } | Datum::RegObject { referenced_oid, .. } => {
@@ -49,13 +46,8 @@ impl CatalogOid {
             // String literals are represented as text in the AST, so perform
             // that parse at this identity boundary and carry only CatalogOid
             // afterward.
-            Datum::Text(raw) => raw.parse::<i32>().map(Self).map(Some).map_err(|_| {
-                sql_err!(
-                    sqlstate::INVALID_TEXT_REPRESENTATION,
-                    "invalid input syntax for type oid: \"{}\"",
-                    raw
-                )
-            }),
+            Datum::Text(raw) => super::super::cast::parse_oid(raw)
+                .map(|oid| Some(Self(oid as i32))),
             _ => Ok(None),
         }
     }
@@ -73,10 +65,7 @@ impl ObjectOid {
                 .map(Self)
                 .map(Some)
                 .map_err(|_| sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "OID out of range")),
-            Datum::Regtype { referenced_oid, .. } => u32::try_from(referenced_oid)
-                .map(Self)
-                .map(Some)
-                .map_err(|_| sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "OID must be nonnegative")),
+            Datum::Regtype { referenced_oid, .. } => Ok(Some(Self(referenced_oid as u32))),
             Datum::Int4(oid) => u32::try_from(oid)
                 .map(Self)
                 .map(Some)
@@ -85,17 +74,8 @@ impl ObjectOid {
                 .map(Self)
                 .map(Some)
                 .map_err(|_| sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "OID out of range")),
-            Datum::RegObject { referenced_oid, .. } => u32::try_from(referenced_oid)
-                .map(Self)
-                .map(Some)
-                .map_err(|_| sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "OID out of range")),
-            Datum::Text(raw) => raw.parse::<u32>().map(Self).map(Some).map_err(|_| {
-                sql_err!(
-                    sqlstate::INVALID_TEXT_REPRESENTATION,
-                    "invalid input syntax for type oid: \"{}\"",
-                    raw
-                )
-            }),
+            Datum::RegObject { referenced_oid, .. } => Ok(Some(Self(referenced_oid as u32))),
+            Datum::Text(raw) => super::super::cast::parse_oid(raw).map(|oid| Some(Self(oid))),
             _ => Err(sql_err!(
                 sqlstate::DATATYPE_MISMATCH,
                 "object identity must be oid"

@@ -164,7 +164,7 @@ fn spooled_column_witness<'a>(
         if let Some((ColType::Composite(slot), _)) =
             crate::sql::exec::catalog_column_type(storage, txid, columns[0].type_oid)
         {
-            return composite_slot_witness(storage, txid, slot as usize, arena)
+            return composite_slot_witness(storage, txid, crate::storage::TypeCreation::require(slot)?, arena)
                 .map(|(witness, _)| witness);
         }
         return catalog_type_witness(storage, txid, columns[0].type_oid);
@@ -183,7 +183,7 @@ fn spooled_column_witness<'a>(
                     "subquery must return only one column"
                 ));
             }
-            Ok(type_witness(scope.output_type(scope.star_entry(0))))
+            type_witness(scope.output_type(scope.star_entry(0)))
         }
         Some(SelectItem::TableWildcard(qualifier)) => {
             let scope = scope.ok_or_else(|| {
@@ -198,9 +198,9 @@ fn spooled_column_witness<'a>(
                     "subquery must return only one column"
                 ));
             }
-            Ok(type_witness(
+            type_witness(
                 scope.output_type(scope.qualified_star_entry(qualifier, 0)?),
-            ))
+            )
         }
         _ => {
             if let Some((witness, _)) = scope_record_witness(item, scope, storage, txid, arena)? {
@@ -215,10 +215,13 @@ fn spooled_column_witness<'a>(
 fn composite_slot_witness<'a>(
     storage: &'a Storage,
     txid: u32,
-    slot: usize,
+    slot: crate::storage::TypeCreation,
     arena: &'a Arena,
 ) -> Result<(Datum<'a>, &'a [Collation]), SqlError> {
-    let definition = storage.composite_for(slot, txid);
+    let target = crate::storage::TypeDefinitionTarget::by_creation(storage,
+        crate::storage::NamedTypeKind::Composite, slot)?;
+    let definition = storage.read_composite_definition(target, txid)?
+        .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "composite type no longer exists"))?;
     let mut fields = [RecordField {
         name: "",
         type_oid: 0,
@@ -239,7 +242,7 @@ fn composite_slot_witness<'a>(
                         "composite field type is absent from the catalog"
                     )
                 })?,
-            value: type_witness(field.ctype),
+            value: type_witness(field.ctype)?,
         };
         collations[count] = if field.ctype.is_collatable() {
             Collation::Default
@@ -256,7 +259,7 @@ fn composite_slot_witness<'a>(
         .map_err(|_| arena_full())?;
     Ok((
         Datum::Composite {
-            slot: slot as u16,
+            slot,
             fields: &*fields,
         },
         &*collations,
@@ -309,7 +312,7 @@ fn scope_record_witness<'a>(
                             "whole-row field type is absent from the catalog"
                         )
                     })?,
-                value: type_witness(column.ctype),
+                value: type_witness(column.ctype)?,
             };
             collations[index] = column.collation;
         }
@@ -972,7 +975,7 @@ fn subquery_collations<'a>(
             && let Some((ColType::Composite(slot), _)) =
                 crate::sql::exec::catalog_column_type(storage, txid, columns[0].type_oid)
         {
-            return composite_slot_witness(storage, txid, slot as usize, arena)
+            return composite_slot_witness(storage, txid, crate::storage::TypeCreation::require(slot)?, arena)
                 .map(|(_, collations)| collations);
         }
         for (slot, column) in output.iter_mut().zip(&columns[..count]) {
@@ -2082,8 +2085,8 @@ pub(super) fn correlated_where_passes<'a>(
 /// to the subquery's result type even over an empty or all-NULL set. Text /
 /// bytea / numeric use a text witness, which `coerce_unknown` leaves untouched
 /// (no spurious error), matching that these accept an unknown literal as-is.
-pub(crate) fn type_witness(ct: ColType) -> Datum<'static> {
-    match ct {
+pub(crate) fn type_witness(ct: ColType) -> Result<Datum<'static>, SqlError> {
+    Ok(match ct {
         ColType::Void | ColType::Internal => Datum::Null,
         ColType::PgDdlCommand => Datum::PgDdlCommand,
         ColType::AnyArray => Datum::Null,
@@ -2092,7 +2095,7 @@ pub(crate) fn type_witness(ct: ColType) -> Datum<'static> {
         // A named composite is not an anonymous record: even an empty
         // subquery must retain the catalog slot so ARRAY(subquery) chooses
         // the named composite array OID.
-        ColType::Composite(slot) => Datum::Composite { slot, fields: &[] },
+        ColType::Composite(slot) => Datum::Composite { slot: crate::storage::TypeCreation::require(slot)?, fields: &[] },
         ColType::Bool => Datum::Bool(false),
         ColType::Int2 | ColType::Int4 => Datum::Int4(0),
         ColType::PgNodeTree => Datum::PgNodeTree(crate::sql::catalog_node::CatalogNode::NULL),
@@ -2203,12 +2206,12 @@ pub(crate) fn type_witness(ct: ColType) -> Datum<'static> {
         // A witness carries only the type; the empty label is never compared or
         // output (an empty/all-NULL set produces no rows).
         ColType::Enum(slot) => Datum::Enum {
-            slot,
+            slot: crate::storage::TypeCreation::require(slot)?,
             member: None,
             sort: 0.0,
             label: "",
         },
-    }
+    })
 }
 
 /// The type witness for a subquery's single result column, inferred from its
@@ -2247,7 +2250,7 @@ fn subquery_witness_with_outer<'scope, 'definition, 'outer, 'row>(
         },
     }?;
     if inferred.0 == crate::sql::types::oid::UNKNOWN {
-        return Ok(type_witness(ColType::Text));
+        return type_witness(ColType::Text);
     }
     catalog_type_witness(storage, txid, inferred.0)
 }
@@ -2320,14 +2323,13 @@ fn catalog_type_witness(
     type_oid: i32,
 ) -> Result<Datum<'static>, SqlError> {
     crate::sql::exec::catalog_column_type(storage, txid, type_oid)
-        .map(|(ctype, _)| type_witness(ctype))
         .ok_or_else(|| {
             sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
                 "subquery result type (oid {}) is not supported",
                 type_oid
             )
-        })
+        }).and_then(|(ctype, _)| type_witness(ctype))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2946,8 +2948,8 @@ fn run_set_subquery<'a>(
         *slot = v;
     }
     let witness = match target[0] {
-        ColType::Composite(slot) => composite_slot_witness(storage, txid, slot as usize, arena)?.0,
-        ctype => type_witness(ctype),
+        ColType::Composite(slot) => composite_slot_witness(storage, txid, crate::storage::TypeCreation::require(slot)?, arena)?.0,
+        ctype => type_witness(ctype)?,
     };
     Ok((&*out, saw_null, witness))
 }
@@ -2994,7 +2996,7 @@ fn set_record_rows<'a>(
     }
     // The witness types the IN operand before any comparison, so it is built
     // from the column types rather than from a row that may not exist.
-    let witness = record(&mut |column| Ok(type_witness(target[column])))?;
+    let witness = record(&mut |column| type_witness(target[column]))?;
     // A record itself is never null here; a null *field* makes an individual
     // membership comparison unknown, which `membership_eq` decides.
     Ok((&*out, false, witness))

@@ -12125,6 +12125,19 @@ pub(crate) fn drop_schema(
                 == schema
         })
     };
+    let enum_uses_listed_schema = |storage: &Storage, base: ColType, txid: u32| -> Result<bool, SqlError> {
+        let creation = match base {
+            ColType::Enum(creation) | ColType::Array(super::types::ArrElem::Enum(creation)) =>
+                crate::storage::TypeCreation::require(creation)?,
+            _ => return Ok(false),
+        };
+        let target = crate::storage::TypeDefinitionTarget::by_creation(storage,
+            crate::storage::NamedTypeKind::Enum, creation)?;
+        let definition = storage.read_enum_definition(target, txid)?
+            .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "enum type no longer exists"))?;
+        Ok(in_listed(storage, definition.schema.as_str()))
+    };
+
     let objects = match arena.alloc_slice_with(storage.schema_drop_object_count(txn.txid), |_| None)
     {
         Ok(objects) => objects,
@@ -12297,15 +12310,10 @@ pub(crate) fn drop_schema(
                     Ok(parent) => parent.is_some(),
                     Err(error) => return sql_fail(error),
                 };
-            let enum_in_schema = match domain.base {
-                ColType::Enum(slot) | ColType::Array(super::types::ArrElem::Enum(slot)) => {
-                    in_listed(
-                        storage,
-                        storage.enum_for(slot as usize, txn.txid).schema.as_str(),
-                    )
-                }
-                _ => false,
-            };
+            let enum_in_schema = match enum_uses_listed_schema(storage, domain.base, txn.txid) {
+                        Ok(selected) => selected,
+                        Err(error) => return sql_fail(error),
+                    };
             if (parent_in_schema || enum_in_schema)
                 && let Err(error) = push(SchemaObject::Domain(domain_slot), &mut n_objects)
             {
@@ -12355,14 +12363,9 @@ pub(crate) fn drop_schema(
                         Ok(parent) => parent.is_some(),
                         Err(error) => return sql_fail(error),
                     };
-                    let enum_in_schema = match storage.domain_for(domain_slot, txn.txid).base {
-                        ColType::Enum(slot) | ColType::Array(super::types::ArrElem::Enum(slot)) => {
-                            in_listed(
-                                storage,
-                                storage.enum_for(slot as usize, txn.txid).schema.as_str(),
-                            )
-                        }
-                        _ => false,
+                    let enum_in_schema = match enum_uses_listed_schema(storage, storage.domain_for(domain_slot, txn.txid).base, txn.txid) {
+                        Ok(selected) => selected,
+                        Err(error) => return sql_fail(error),
                     };
                     if parent_in_schema || enum_in_schema {
                         uses_schema_type = true;
@@ -12414,14 +12417,9 @@ pub(crate) fn drop_schema(
                         Ok(parent) => parent.is_some(),
                         Err(error) => return sql_fail(error),
                     };
-                    let enum_in_schema = match storage.domain_for(domain_slot, txn.txid).base {
-                        ColType::Enum(slot) | ColType::Array(super::types::ArrElem::Enum(slot)) => {
-                            in_listed(
-                                storage,
-                                storage.enum_for(slot as usize, txn.txid).schema.as_str(),
-                            )
-                        }
-                        _ => false,
+                    let enum_in_schema = match enum_uses_listed_schema(storage, storage.domain_for(domain_slot, txn.txid).base, txn.txid) {
+                        Ok(selected) => selected,
+                        Err(error) => return sql_fail(error),
                     };
                     parent_in_schema || enum_in_schema
                 } else {
@@ -42997,6 +42995,7 @@ pub(crate) fn drop_type(
             let e = storage.enum_for(slot, txn.txid);
             (e.schema, e.name)
         };
+        let creation = storage.enum_for(slot, txn.txid).creation();
         while let Some((table_schema, table, _)) = enum_column_in_use(storage, slot, txn.txid) {
             if cascade {
                 let table_slot = storage
@@ -43010,7 +43009,7 @@ pub(crate) fn drop_type(
                         column.ctype,
                         ColType::Enum(enum_slot)
                             | ColType::Array(super::types::ArrElem::Enum(enum_slot))
-                            if enum_slot as usize == slot
+                            if enum_slot == Some(creation)
                     ) {
                         columns[column_count] = column.name;
                         column_count += 1;
@@ -43053,7 +43052,7 @@ pub(crate) fn drop_type(
                         field.ctype,
                         ColType::Enum(candidate)
                             | ColType::Array(super::types::ArrElem::Enum(candidate))
-                            if candidate as usize == slot
+                            if candidate == Some(creation)
                     ))
                 })
             {
@@ -43075,7 +43074,7 @@ pub(crate) fn drop_type(
                     domain.base,
                     ColType::Enum(enum_slot)
                         | ColType::Array(super::types::ArrElem::Enum(enum_slot))
-                        if enum_slot as usize == slot
+                        if enum_slot == Some(creation)
                 )
             {
                 *is_dependent = true;
@@ -43136,6 +43135,7 @@ pub(crate) fn drop_type(
 }
 
 fn composite_field_uses_enum(storage: &Storage, enum_slot: usize, txid: u32) -> Option<usize> {
+    let creation = storage.enum_for(enum_slot, txid).creation();
     (0..storage.composite_count()).find(|&composite_slot| {
         storage.composite_slot_visible_to(composite_slot, txid)
             && storage
@@ -43146,7 +43146,7 @@ fn composite_field_uses_enum(storage: &Storage, enum_slot: usize, txid: u32) -> 
                         field.ctype,
                         ColType::Enum(candidate)
                             | ColType::Array(super::types::ArrElem::Enum(candidate))
-                            if candidate as usize == enum_slot
+                            if candidate == Some(creation)
                     )
                 })
     })
@@ -43186,6 +43186,7 @@ fn drop_composite_type(
     seq_session: &crate::sql::guc::SeqSession,
     responder: &mut Responder,
 ) -> Result<(), SqlError> {
+    let creation = storage.composite_for(slot, txn.txid).creation();
     let definition = storage.composite_for(slot, txn.txid);
     storage.require_owner(
         crate::storage::AccessObject {
@@ -43252,7 +43253,7 @@ fn drop_composite_type(
     {
         let domain = storage.domain_for(domain_slot, txn.txid);
         *selected = domain.visible_to(txn.txid)
-            && matches!(domain.base, ColType::Composite(candidate) if candidate as usize == slot)
+            && matches!(domain.base, ColType::Composite(candidate) if candidate == Some(creation))
             && domain
                 .base_user_type
                 .is_some_and(|identity| identity.is_named(definition.schema, definition.name));
@@ -43349,7 +43350,7 @@ fn drop_composite_type(
                 column.ctype,
                 ColType::Composite(candidate)
                     | ColType::Array(super::types::ArrElem::Composite(candidate))
-                    if candidate as usize == slot
+                    if candidate == Some(creation)
             ) {
                 columns[count] = column.name;
                 count += 1;
@@ -43464,6 +43465,7 @@ fn report_composite_type_dependents(
     cascade: bool,
     responder: &mut Responder,
 ) -> Result<bool, SqlError> {
+    let creation = storage.composite_for(root.slot, txid).creation();
     use core::fmt::Write as _;
     let CompositeTypeDependencyRoot {
         slot,
@@ -43488,7 +43490,7 @@ fn report_composite_type_dependents(
                 || !matches!(
                     field.ctype,
                     ColType::Composite(candidate) | ColType::Array(ArrElem::Composite(candidate))
-                        if candidate as usize == slot
+                        if candidate == Some(creation)
                 )
             {
                 continue;
@@ -43531,7 +43533,7 @@ fn report_composite_type_dependents(
             }
         }
         for column in definition.columns() {
-            if matches!(column.ctype, ColType::Composite(found) if found as usize == slot) {
+            if matches!(column.ctype, ColType::Composite(found) if found == Some(creation)) {
                 let line = stack_format!(
                     192,
                     "column {} of table {}{}",
@@ -43620,6 +43622,7 @@ fn composite_field_uses_composite(
     root: CompositeTypeDependencyRoot,
     txid: u32,
 ) -> Result<Option<(usize, u16)>, SqlError> {
+    let creation = storage.composite_for(root.slot, txid).creation();
     for (candidate, definition) in storage.composites_with_slots_visible_to(txid) {
         if candidate == root.slot {
             continue;
@@ -43629,7 +43632,7 @@ fn composite_field_uses_composite(
                 && matches!(
                     field.ctype,
                     ColType::Composite(candidate) | ColType::Array(ArrElem::Composite(candidate))
-                        if candidate as usize == root.slot
+                        if candidate == Some(creation)
                 )
             {
                 return Ok(Some((candidate, field.attribute_number)));
@@ -43691,6 +43694,7 @@ fn composite_column_in_use(
     composite_slot: usize,
     txid: u32,
 ) -> Option<(SqlName, SqlName, SqlName)> {
+    let creation = storage.composite_for(composite_slot, txid).creation();
     for table_slot in 0..storage.table_count() {
         if !storage.table_slot_visible_to(table_slot, txid) {
             continue;
@@ -43701,7 +43705,7 @@ fn composite_column_in_use(
                 column.ctype,
                 ColType::Composite(slot)
                     | ColType::Array(super::types::ArrElem::Composite(slot))
-                    if slot as usize == composite_slot
+                    if slot == Some(creation)
             )
         }) {
             return Some((definition.schema, definition.name, column.name));
@@ -43727,7 +43731,7 @@ fn reject_composite_attribute_type_with_dependents(
     let nested_field = composite_field_uses_composite(storage, root, txid)?.is_some();
     let domain = (0..storage.domain_count()).any(|slot| {
         storage.domain_slot_visible_to(slot, txid)
-            && domain_composite_base(storage, slot, txid) == Some(composite_slot as u16)
+            && domain_composite_base(storage, slot, txid) == Some(storage.composite_for(composite_slot, txid).creation())
     });
     let StoredDependencyClosure {
         views,
@@ -45417,17 +45421,18 @@ fn enum_column_in_use(
     enum_slot: usize,
     txid: u32,
 ) -> Option<(SqlName, SqlName, SqlName)> {
+    let creation = storage.enum_for(enum_slot, txid).creation();
     for table_index in 0..storage.table_count() {
         if !storage.table_slot_visible_to(table_index, txid) {
             continue;
         }
         let def = storage.table_def(table_index, txid);
         for column in def.columns() {
-            if matches!(column.ctype, ColType::Enum(slot) if slot as usize == enum_slot)
+            if matches!(column.ctype, ColType::Enum(slot) if slot == Some(creation))
                 || matches!(
                     column.ctype,
                     ColType::Array(super::types::ArrElem::Enum(slot))
-                        if slot as usize == enum_slot
+                        if slot == Some(creation)
                 )
             {
                 return Some((def.schema, def.name, column.name));
@@ -46097,7 +46102,7 @@ fn alter_composite_type(
     }
     if let Some(rename) = renamed_attribute
         && let Err(error) =
-            rewrite_composite_dependents(storage, wal, txn, slot as u16, rename, arena)
+            rewrite_composite_dependents(storage, wal, txn, altered.creation(), rename, arena)
     {
         return sql_fail(error);
     }
@@ -46670,7 +46675,7 @@ fn rewrite_composite_dependent_domains(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
-    composite_slot: u16,
+    composite_slot: crate::storage::TypeCreation,
     rename: CompositeFieldRename,
     arena: &Arena,
 ) -> Result<(), SqlError> {
@@ -46742,7 +46747,7 @@ fn rewrite_composite_dependents(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
-    composite_slot: u16,
+    composite_slot: crate::storage::TypeCreation,
     rename: CompositeFieldRename,
     arena: &Arena,
 ) -> Result<(), SqlError> {
@@ -46756,7 +46761,7 @@ fn rewrite_composite_dependent_tables(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
-    composite_slot: u16,
+    composite_slot: crate::storage::TypeCreation,
     rename: CompositeFieldRename,
     arena: &Arena,
 ) -> Result<(), SqlError> {
@@ -46862,7 +46867,7 @@ fn rewrite_composite_dependent_views(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
-    composite_slot: u16,
+    composite_slot: crate::storage::TypeCreation,
     rename: CompositeFieldRename,
     arena: &Arena,
 ) -> Result<(), SqlError> {
@@ -46975,7 +46980,7 @@ fn rewrite_composite_dependent_indexes(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
-    composite_slot: u16,
+    composite_slot: crate::storage::TypeCreation,
     rename: CompositeFieldRename,
     arena: &Arena,
 ) -> Result<(), SqlError> {
@@ -47102,12 +47107,12 @@ fn rewrite_composite_dependent_indexes(
     Ok(())
 }
 
-fn domain_composite_base(storage: &Storage, mut slot: usize, txid: u32) -> Option<u16> {
+fn domain_composite_base(storage: &Storage, mut slot: usize, txid: u32) -> Option<crate::storage::TypeCreation> {
     for _ in 0..storage.domain_count() {
         let domain = storage.domain_for(slot, txid);
         let Some(parent) = domain.base_domain else {
             return match domain.base {
-                ColType::Composite(slot) => Some(slot),
+                ColType::Composite(slot) => slot,
                 _ => None,
             };
         };
@@ -47116,12 +47121,12 @@ fn domain_composite_base(storage: &Storage, mut slot: usize, txid: u32) -> Optio
     None
 }
 
-struct DomainValueCols(u16);
+struct DomainValueCols(crate::storage::TypeCreation);
 
 impl ColTypeResolver for DomainValueCols {
     fn resolve(&self, qualifier: Option<&str>, name: &str) -> Result<ColType, SqlError> {
         if qualifier.is_none() && name.eq_ignore_ascii_case("value") {
-            Ok(ColType::Composite(self.0))
+            Ok(ColType::Composite(Some(self.0)))
         } else {
             Err(sql_err!(
                 sqlstate::UNDEFINED_COLUMN,
@@ -47135,7 +47140,7 @@ impl ColTypeResolver for DomainValueCols {
 pub(crate) fn collect_composite_field_rename_sites(
     expression: &Expr<'_>,
     columns: &dyn ColTypeResolver,
-    composite_slot: u16,
+    composite_slot: crate::storage::TypeCreation,
     from: &str,
     sites: &mut [bool],
     count: &mut usize,
@@ -47149,7 +47154,7 @@ pub(crate) fn collect_composite_field_rename_sites(
 pub(crate) fn collect_composite_field_rename_site(
     expression: &Expr<'_>,
     columns: &dyn ColTypeResolver,
-    composite_slot: u16,
+    composite_slot: crate::storage::TypeCreation,
     from: &str,
     sites: &mut [bool],
     count: &mut usize,
@@ -47167,7 +47172,7 @@ pub(crate) fn collect_composite_field_rename_site(
         && infer_type_res(base, columns)
             .ok()
             .and_then(|(type_oid, _)| coltype_of_oid(type_oid))
-            == Some(ColType::Composite(composite_slot));
+            == Some(ColType::Composite(Some(composite_slot)));
     *count += 1;
     Ok(())
 }
@@ -47175,7 +47180,7 @@ pub(crate) fn collect_composite_field_rename_site(
 fn rewrite_typed_composite_field_selectors<const N: usize>(
     text: &str,
     columns: &dyn ColTypeResolver,
-    composite_slot: u16,
+    composite_slot: crate::storage::TypeCreation,
     rename: CompositeFieldRename,
     arena: &Arena,
 ) -> Result<crate::util::StackStr<N>, SqlError> {

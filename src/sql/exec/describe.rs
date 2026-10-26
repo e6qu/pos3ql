@@ -1100,21 +1100,25 @@ fn describe_record_star<'q>(
             };
             let slot = match base {
                 Expr::Column { qualifier, name } => match resolver.resolve(*qualifier, name)? {
-                    ColType::Composite(slot) => Some(slot),
+                    ColType::Composite(slot) => slot,
                     _ => None,
                 },
                 Expr::Field { base, field } => match record_field_type(base, field, resolver)? {
-                    ColType::Composite(slot) => Some(slot),
+                    ColType::Composite(slot) => slot,
                     _ => None,
                 },
                 Expr::Cast { type_name, .. } => storage
                     .expect("checked")
                     .resolve_composite_slot(type_name, txid)
-                    .map(|slot| slot as u16),
+                    .map(|slot| storage.expect("checked").composite_for(slot, txid).creation()),
                 _ => None,
             };
             if let Some(slot) = slot {
-                let composite = storage.expect("checked").composite(slot as usize);
+                let storage = storage.expect("checked");
+                let target = crate::storage::TypeDefinitionTarget::by_creation(storage,
+                    crate::storage::NamedTypeKind::Composite, slot)?;
+                let composite = storage.read_composite_definition(target, txid)?
+                    .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "composite type no longer exists"))?;
                 for field in composite.active_fields_for(txid) {
                     let name = arena.alloc_str(field.name.as_str()).map_err(|_| {
                         sql_err!(

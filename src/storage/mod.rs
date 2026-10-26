@@ -16138,16 +16138,17 @@ impl Storage {
             }
         })?;
         if let Some(oid) = index_oid {
+            let database = self.tables[table].database();
             let mut cumulative = self.cumulative_statistics();
             let indexes = &mut cumulative.indexes;
-            let position = if let Some(position) = indexes.iter().position(|entry| entry.oid == oid)
+            let position = if let Some(position) = indexes.iter().position(|entry| entry.database == database && entry.oid == oid)
             {
                 position
             } else {
                 indexes
                     .push(IndexCumulativeStatistics {
                         oid,
-                        database: self.tables[table].database(),
+                        database,
                         ..IndexCumulativeStatistics::EMPTY
                     })
                     .map_err(|_| {
@@ -16179,14 +16180,13 @@ impl Storage {
                 statistics.seq_tup_read = statistics.seq_tup_read.saturating_add(1);
             }
         })?;
-        if let Some(oid) = index_oid
-            && let Some(statistics) = self
-                .cumulative_statistics()
-                .indexes
-                .iter_mut()
-                .find(|statistics| statistics.oid == oid)
-        {
-            statistics.idx_tup_fetch = statistics.idx_tup_fetch.saturating_add(1);
+        if let Some(oid) = index_oid {
+            let database = self.tables[table].database();
+            if let Some(statistics) = self.cumulative_statistics().indexes.iter_mut()
+                .find(|statistics| statistics.database == database && statistics.oid == oid)
+            {
+                statistics.idx_tup_fetch = statistics.idx_tup_fetch.saturating_add(1);
+            }
         }
         Ok(())
     }
@@ -16735,13 +16735,14 @@ impl Storage {
         total
     }
 
-    pub(crate) fn index_cumulative_statistics(&self, oid: i32) -> IndexCumulativeStatistics {
+    pub(crate) fn index_cumulative_statistics(&self, database: DatabaseOid, oid: i32) -> IndexCumulativeStatistics {
         self.cumulative_statistics()
             .indexes
             .iter()
-            .find(|statistics| statistics.oid == oid)
+            .find(|statistics| statistics.database == database && statistics.oid == oid)
             .copied()
             .unwrap_or(IndexCumulativeStatistics {
+                database,
                 oid,
                 ..IndexCumulativeStatistics::EMPTY
             })
@@ -16801,21 +16802,22 @@ impl Storage {
         }
     }
 
-    pub(crate) fn reset_index_statistics(&self, oid: i32) {
+    pub(crate) fn reset_index_statistics(&self, database: DatabaseOid, oid: i32) {
         let mut cumulative = self.cumulative_statistics();
         let statistics = &mut cumulative.indexes;
-        if let Some(position) = statistics.iter().position(|entry| entry.oid == oid) {
+        if let Some(position) = statistics.iter().position(|entry| entry.database == database && entry.oid == oid) {
             statistics.swap_remove(position);
         }
     }
 
     fn reset_implicit_index_statistics(&self, table: usize) {
         let definition = self.tables[table].definition();
+        let database = definition.identity().database;
         let mut cumulative = self.cumulative_statistics();
         let statistics = &mut cumulative.indexes;
         let mut position = 0usize;
         while position < statistics.len() {
-            if definition
+            if statistics[position].database == database && definition
                 .implicit_index_identities()
                 .flatten()
                 .any(|identity| identity.oid() == statistics[position].oid)
@@ -46622,7 +46624,7 @@ impl Storage {
     pub fn commit_index_drop(&mut self, slot: usize) {
         let index = self.index(slot);
         let table = self.index_table_slot(slot);
-        self.reset_index_statistics(crate::sql::catalog::explicit_index_oid(&index));
+        self.reset_index_statistics(index.database, crate::sql::catalog::explicit_index_oid(&index));
         self.drop_object_comments(
             CommentClass::Relation,
             index.schema.as_str(),
@@ -57775,6 +57777,71 @@ mod tests {
     }
 
     #[test]
+    fn relation_identity_statistics_retire_without_growth_or_cross_database_reset() {
+        let config = test_config();
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
+        let mut definition = make_def("identity_statistics", &[("id", ColType::Int4, true)]);
+        definition.columns[0].primary = true;
+        let table = storage.create_table(definition).unwrap();
+        let database = storage.table(table).database();
+        let other_database = DatabaseOid::parse(USER_DATABASE_OID_BASE + 1).unwrap();
+        let original = storage.table_def(table, 0).column_index_identity(0).unwrap().oid();
+        storage.record_relation_scan(1, table, Some(original), 1).unwrap();
+        storage.record_relation_tuple_read(1, table, Some(original)).unwrap();
+        storage.cumulative_statistics().indexes.push(IndexCumulativeStatistics {
+            database: other_database, oid: original, idx_scan: 11,
+            ..IndexCumulativeStatistics::EMPTY
+        }).unwrap();
+        storage.reset_index_statistics(database, original);
+        assert_eq!(storage.index_cumulative_statistics(other_database, original).idx_scan, 11);
+        storage.record_relation_scan(1, table, Some(original), 1).unwrap();
+        storage.record_relation_tuple_read(1, table, Some(original)).unwrap();
+        let capacity = {
+            let mut cumulative = storage.cumulative_statistics();
+            let capacity = cumulative.indexes.capacity();
+            while cumulative.indexes.len() < capacity {
+                let oid = i32::MAX - cumulative.indexes.len() as i32;
+                cumulative.indexes.push(IndexCumulativeStatistics { database: other_database, oid, ..IndexCumulativeStatistics::EMPTY }).unwrap();
+            }
+            capacity
+        };
+        crate::mem::guard::forbid_alloc(|| {
+            storage.record_relation_scan(1, table, Some(original), 1).unwrap();
+            assert_eq!(storage.index_cumulative_statistics(database, original).idx_scan, 2);
+            assert_eq!(storage.index_cumulative_statistics(database, original).idx_tup_fetch, 1);
+            assert_eq!(storage.index_cumulative_statistics(other_database, original).idx_tup_fetch, 0);
+            assert_eq!(storage.index_cumulative_statistics(other_database, original).idx_scan, 11);
+            let mut mapping = [None; MAX_COLUMNS];
+            mapping[0] = Some(SqlName::parse("id").unwrap());
+            let (target, mut next) = storage.select_table_definition(table, 1);
+            next.columns[0].primary = false;
+            let change = storage.write_table_def(target, next, &mapping, false).unwrap();
+            assert_eq!(storage.index_cumulative_statistics(database, original).idx_scan, 2);
+            storage.rollback_table_def(change);
+            assert_eq!(storage.index_cumulative_statistics(database, original).idx_scan, 2);
+            let (target, mut next) = storage.select_table_definition(table, 2);
+            next.columns[0].primary = false;
+            let change = storage.write_table_def(target, next, &mapping, false).unwrap();
+            assert_eq!(storage.commit_table_def(change).unwrap(), Some(false));
+            assert_eq!(storage.cumulative_statistics().indexes.len(), capacity - 1);
+            assert_eq!(storage.index_cumulative_statistics(database, original).idx_scan, 0);
+            assert_eq!(storage.index_cumulative_statistics(other_database, original).idx_scan, 11);
+            let (target, mut next) = storage.select_table_definition(table, 3);
+            next.columns[0].primary = true;
+            let change = storage.write_table_def(target, next, &mapping, false).unwrap();
+            storage.commit_table_def(change).unwrap();
+            let replacement = storage.table_def(table, 0).column_index_identity(0).unwrap().oid();
+            assert_ne!(replacement, original);
+            storage.record_relation_scan(3, table, Some(replacement), 1).unwrap();
+            assert_eq!(storage.cumulative_statistics().indexes.len(), capacity);
+            assert_eq!(storage.index_cumulative_statistics(database, replacement).idx_scan, 1);
+            storage.reset_index_statistics(database, replacement);
+            assert_eq!(storage.index_cumulative_statistics(other_database, original).idx_scan, 11);
+        });
+    }
+
+    #[test]
     fn relation_identity_recovery_rejects_cross_catalog_aliases_without_mutation() {
         let config = test_config();
         let mut budget = test_budget(&config);
@@ -57788,8 +57855,9 @@ mod tests {
             .unwrap();
         let table_identity = storage.table(slot).created_at();
         let revision = storage.reserve_table_definition_revision().unwrap();
-        storage.tables[slot].definition_mut(revision).inline_index_identities[0] =
-            RelationIdentity::parse(table_identity);
+        storage.tables[slot]
+            .definition_mut(revision)
+            .inline_index_identities[0] = RelationIdentity::parse(table_identity);
         let before = storage.catalog_identity_sequence();
         let error = crate::mem::guard::forbid_alloc(|| {
             storage.validate_restored_relation_identities(before)

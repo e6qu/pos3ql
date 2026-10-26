@@ -78,7 +78,9 @@ TOAST relations and indexes use creation-stamp companions starting at
 on creation stamps, not configured catalog capacities. New relation or index
 creation returns `54000` when the shared creation sequence would exceed
 9,999,999; other catalog changes keep their own limits.
-The sequence retains reservations for dropped and rolled-back objects.
+Reservations are not reused while the server runs. Checkpoints retain the
+highest reservation they capture; journal replay observes committed creation
+stamps, including objects later dropped.
 
 Each constraint-created index owns a separate creation stamp. Inline-column
 keys keep their stamps beside stable attribute numbers in the table definition;

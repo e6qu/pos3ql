@@ -497,7 +497,10 @@ SELECT has_table_privilege(oid, 'SELECT') IS NULL FROM saved_table_id;
 An index created by a constraint keeps its identifier when an earlier
 constraint is removed, its own constraint is renamed, or a column moves.
 `ADD CONSTRAINT ... USING INDEX` keeps the existing index's identifier.
-Drop and recreate reserve a fresh one. Identifier exhaustion returns `54000`
+Drop and recreate reserve a fresh one. Committing an index drop also releases
+its statistics entry; repeated replacements reuse the fixed statistics pool.
+Counters remain separate across databases, including cloned databases with the
+same numeric identifiers. Identifier exhaustion returns `54000`
 without installing a replacement; existing data and recovery remain usable.
 The [format guide](durable-format.md) specifies the bounds. Remaining identifier
 families stay in [PLAN.md](../PLAN.md).

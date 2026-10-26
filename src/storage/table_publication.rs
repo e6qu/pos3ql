@@ -267,6 +267,14 @@ impl DefinitionPublication {
                 })?;
             }
             let selected = &owners.slots[table].as_ref().unwrap().definition;
+            let mut retired_index_identities = [None; super::MAX_VALUE_ENFORCERS];
+            let mut retired_index_count = 0usize;
+            for identity in selected.committed().implicit_index_identities().flatten() {
+                if !definition.implicit_index_identities().any(|candidate| candidate == Some(identity)) {
+                    retired_index_identities[retired_index_count] = Some(identity);
+                    retired_index_count += 1;
+                }
+            }
             if let Some(transaction) = transaction {
                 storage.promote_private_index_bindings_locked(
                     &mut indexes,
@@ -450,6 +458,16 @@ impl DefinitionPublication {
                 .unwrap()
                 .definition
                 .publish_names();
+            // A statistics reader may own its counters while reading a definition.
+            drop(owners);
+            drop(_types);
+            drop(comments);
+            drop(indexes);
+            drop(sequences);
+            drop(dependencies);
+            for identity in retired_index_identities[..retired_index_count].iter().flatten() {
+                storage.reset_index_statistics(movement.database, identity.oid());
+            }
             return Ok(Some(rewrites_rows));
         }
     }

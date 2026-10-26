@@ -28531,7 +28531,9 @@ fn partitioned_catalog_relations_expose_parent_and_leaf_identity() {
         )),
         ["RANGE (id)|NULL"]
     );
-    let partition_oid = catalog::reloid_of_name(&engine.storage, 0, "catalog_partition_parent").unwrap().unwrap();
+    let partition_oid = catalog::reloid_of_name(&engine.storage, 0, "catalog_partition_parent")
+        .unwrap()
+        .unwrap();
     assert_eq!(
         data_rows(&run_with(
             &mut engine,

@@ -10867,11 +10867,6 @@ pub(crate) fn role_oid_by_written(storage: &Storage, txid: u32, written: &str) -
     })
 }
 
-/// Implicit indexes retain their own identities when presentation positions move.
-pub(crate) fn index_oid(definition: &crate::storage::TableDef, position: usize) -> i32 {
-    definition.implicit_index_oid(position)
-}
-
 pub(crate) fn explicit_index_oid(index: &crate::storage::IndexDef) -> i32 {
     assert!((1..=crate::storage::MAX_INDEX_OID_GENERATION).contains(&index.created_at));
     crate::storage::FIRST_EXPLICIT_INDEX_OID + index.created_at as i32
@@ -11201,7 +11196,7 @@ fn parent_constraint_oid(storage: &Storage, txid: u32, child_slot: usize, index:
                 && index.timing == crate::storage::ConstraintTiming::NotDeferrable
                 && columns == [column as u16]
             {
-                return index_oid(&parent, position) + crate::storage::INDEX_CONSTRAINT_OID_OFFSET;
+                return parent.implicit_index_oid(position) + crate::storage::INDEX_CONSTRAINT_OID_OFFSET;
             }
             position += 1;
         } else if metadata.unique {
@@ -11211,7 +11206,7 @@ fn parent_constraint_oid(storage: &Storage, txid: u32, child_slot: usize, index:
                 && index.timing == crate::storage::ConstraintTiming::NotDeferrable
                 && columns == [column as u16]
             {
-                return index_oid(&parent, position) + crate::storage::INDEX_CONSTRAINT_OID_OFFSET;
+                return parent.implicit_index_oid(position) + crate::storage::INDEX_CONSTRAINT_OID_OFFSET;
             }
             position += 1;
         }
@@ -11223,7 +11218,7 @@ fn parent_constraint_oid(storage: &Storage, txid: u32, child_slot: usize, index:
             && unique.timing == index.timing
             && unique.columns() == columns
         {
-            return index_oid(&parent, position) + crate::storage::INDEX_CONSTRAINT_OID_OFFSET;
+            return parent.implicit_index_oid(position) + crate::storage::INDEX_CONSTRAINT_OID_OFFSET;
         }
         position += 1;
     }
@@ -11242,7 +11237,7 @@ fn parent_constraint_oid(storage: &Storage, txid: u32, child_slot: usize, index:
                     == child_exclusion.operators[..child_exclusion.n_cols]
                 && exclusion.predicate == child_exclusion.predicate
             {
-                return index_oid(&parent, position) + crate::storage::INDEX_CONSTRAINT_OID_OFFSET;
+                return parent.implicit_index_oid(position) + crate::storage::INDEX_CONSTRAINT_OID_OFFSET;
             }
             position += 1;
         }
@@ -11598,7 +11593,7 @@ pub(crate) fn reset_relation_statistics_by_oid(storage: &Storage, txid: u32, oid
         is_index |= index.oid == oid;
     });
     if is_index {
-        storage.reset_index_statistics(oid);
+        storage.reset_index_statistics(storage.current_database_oid(), oid);
     }
 }
 
@@ -28407,7 +28402,7 @@ fn pg_stat_tables<'a>(
                 .iter()
                 .filter(|index| index.table_slot == table_slot)
             {
-                let index_statistics = storage.index_cumulative_statistics(index.oid);
+                let index_statistics = storage.index_cumulative_statistics(storage.current_database_oid(), index.oid);
                 idx_scan = idx_scan.saturating_add(index_statistics.idx_scan);
                 idx_tup_fetch = idx_tup_fetch.saturating_add(index_statistics.idx_tup_fetch);
                 last_idx_scan = match (last_idx_scan, index_statistics.last_idx_scan) {
@@ -28484,7 +28479,7 @@ fn pg_stat_indexes<'a>(
         {
             continue;
         }
-        let statistics = storage.index_cumulative_statistics(index.oid);
+        let statistics = storage.index_cumulative_statistics(storage.current_database_oid(), index.oid);
         rows[count] = row(
             &[
                 Datum::Oid(index.table_oid as u32),

@@ -5567,7 +5567,9 @@ impl Checkpointer {
                             "invalid implicit index creation identity",
                         ))?;
                     if !definition.attributes.validate(definition.n_columns) {
-                        return Err(CheckpointSetupError::Corrupt("implicit index requires valid column attributes"));
+                        return Err(CheckpointSetupError::Corrupt(
+                            "implicit index requires valid column attributes",
+                        ));
                     }
                     let target = definition
                         .implicit_index_identities_mut()

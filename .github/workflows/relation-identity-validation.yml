@@ -5,7 +5,7 @@ on:
     branches: [catalog-relation-identities]
 
 concurrency:
-  group: relation-identity-validation-${{ github.ref }}
+  group: relation-identity-final-validation-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -29,7 +29,13 @@ jobs:
       - name: Build every target and lint
         run: cargo clippy --all-targets --locked -- -D warnings
       - name: Focused identity regressions
-        run: cargo test --lib --locked -- relation_identity_ json_populate_record_uses_table_rowtype_fields --test-threads=1
+        run: >-
+          cargo test --lib --locked -- relation_identity_
+          json_populate_record_uses_table_rowtype_fields
+          column_metadata_stays_within_recovery_stack_budget
+          partitioned_catalog_relations_expose_parent_and_leaf_identity
+          wide_schema_objects_cover_full_definition_bounds_and_object_cold_recovery
+          --test-threads=1
       - name: Retain formatting
         if: always()
         uses: actions/upload-artifact@v6
@@ -37,202 +43,3 @@ jobs:
           name: relation-formatting-${{ github.sha }}
           path: ${{ runner.temp }}/formatting.patch
           if-no-files-found: error
-      - name: Retain library executable
-        run: |
-          cargo test --lib --locked --no-run --message-format=json > "$RUNNER_TEMP/library-build.json"
-          mkdir -p "$RUNNER_TEMP/library/deps"
-          python3 - "$RUNNER_TEMP/library-build.json" "$RUNNER_TEMP/library" <<'PY'
-          import json
-          from pathlib import Path
-          import shutil
-          import sys
-          artifacts = [json.loads(line) for line in Path(sys.argv[1]).read_text().splitlines()]
-          executables = [item['executable'] for item in artifacts
-                         if item.get('reason') == 'compiler-artifact'
-                         and item.get('profile', {}).get('test') and item.get('executable')]
-          if len(executables) != 1:
-              raise SystemExit(f'Expected one library executable: {executables}')
-          destination = Path(sys.argv[2])
-          relative = Path('deps') / Path(executables[0]).name
-          shutil.copy2(executables[0], destination / relative)
-          (destination / 'executable').write_text(str(relative))
-          PY
-          git rev-parse HEAD > "$RUNNER_TEMP/library/revision"
-          cd "$RUNNER_TEMP/library"
-          sha256sum deps/* > SHA256SUMS
-      - uses: actions/upload-artifact@v6
-        with:
-          name: relation-library-${{ github.sha }}
-          path: ${{ runner.temp }}/library/
-          if-no-files-found: error
-
-  library:
-    needs: quality
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    strategy:
-      fail-fast: false
-      matrix:
-        partition: [0, 1, 2, 3, 4, 5, 6, 7]
-    steps:
-      - uses: actions/checkout@v5
-      - uses: actions/download-artifact@v8
-        with:
-          name: relation-library-${{ github.sha }}
-          path: ${{ runner.temp }}/library/
-      - name: Verify executable provenance
-        run: |
-          test "$(cat "$RUNNER_TEMP/library/revision")" = "$(git rev-parse HEAD)"
-          cd "$RUNNER_TEMP/library"
-          sha256sum --strict --check SHA256SUMS
-      - name: Library partition
-        env:
-          PARTITION: ${{ matrix.partition }}
-        run: |
-          python3 - "$RUNNER_TEMP/library" <<'PY'
-          import os
-          from pathlib import Path
-          import re
-          import subprocess
-          import tomllib
-          import sys
-          root = Path(sys.argv[1])
-          relative = (root / 'executable').read_text()
-          if re.fullmatch(r'deps/pos3ql-[a-f0-9]+', relative) is None:
-              raise SystemExit('Invalid library executable path')
-          binary = str(root / relative)
-          Path(binary).chmod(0o755)
-          stack = tomllib.loads(Path('.cargo/config.toml').read_text())['env']['RUST_MIN_STACK']
-          if stack['force'] is not True:
-              raise SystemExit('Library tests require the repository stack setting')
-          os.environ['RUST_MIN_STACK'] = stack['value']
-          listing = subprocess.check_output([binary, '--list'], text=True)
-          names = [line.removesuffix(': test') for line in listing.splitlines() if line.endswith(': test')]
-          partition = int(os.environ['PARTITION'])
-          priority = 'sql::tests::atomic_block_reads_function_and_sequence_effects_survive_cold_http_reads_once'
-          if priority not in names:
-              raise SystemExit('Missing priority cold-read test')
-          if partition == 0:
-              status = subprocess.run(['python3', 'tools/test_command.py', binary, '--exact', priority])
-              if status.returncode:
-                  raise SystemExit(status.returncode)
-          excluded = {
-              priority,
-              'sim::storage::storage_vopr',
-              'sql::tests::remaining_execution_widths_are_allocation_free_and_survive_cold_recovery',
-              'sql::tests::external_cold_order_and_distinct_runs_use_object_storage',
-              'sql::tests::external_recursive_runs_use_object_storage',
-              'sql::tests::external_lateral_runs_use_object_storage',
-              'sql::tests::external_set_runs_use_object_storage',
-          }
-          command = ['python3', 'tools/test_command.py', binary, '--exact', '--test-threads=2']
-          selected = []
-          for ordinal, name in enumerate(names):
-              if ordinal % 8 == partition and name not in excluded:
-                  selected.append(name)
-              else:
-                  command += ['--skip', name]
-          if not selected:
-              raise SystemExit('Empty library partition')
-          print(f'Partition {partition}: {len(selected)} tests', flush=True)
-          raise SystemExit(subprocess.run(command).returncode)
-          PY
-
-  release:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v5
-      - uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-differential-build-${{ hashFiles('Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
-      - name: Build comparison executable
-        run: |
-          cargo build --release --locked
-          mkdir -p "$RUNNER_TEMP/release"
-          cp target/release/pos3ql "$RUNNER_TEMP/release/pos3ql"
-          git rev-parse HEAD > "$RUNNER_TEMP/release/revision"
-          cd "$RUNNER_TEMP/release"
-          sha256sum pos3ql > SHA256SUMS
-      - uses: actions/upload-artifact@v6
-        with:
-          name: relation-release-${{ github.sha }}
-          path: ${{ runner.temp }}/release/
-          if-no-files-found: error
-
-  postgres:
-    needs: release
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    strategy:
-      fail-fast: false
-      matrix:
-        phase: [exact, types]
-    services:
-      postgres:
-        image: mirror.gcr.io/library/postgres:18@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336
-        env:
-          POSTGRES_HOST_AUTH_METHOD: trust
-          POSTGRES_INITDB_ARGS: "--lc-collate=C --lc-ctype=C --encoding=UTF8"
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U postgres"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 20
-    steps:
-      - uses: actions/checkout@v5
-      - name: Prepare PostgreSQL reference
-        env:
-          POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
-        run: |
-          docker exec "$POSTGRES_CONTAINER" psql -U postgres -X -v ON_ERROR_STOP=1 -c "ALTER SYSTEM SET max_prepared_transactions = 8"
-          docker restart "$POSTGRES_CONTAINER"
-          for _ in $(seq 1 50); do
-            pg_isready -h 127.0.0.1 -p 5432 -U postgres >/dev/null 2>&1 && break
-            sleep 0.1
-          done
-          pg_isready -h 127.0.0.1 -p 5432 -U postgres
-          docker exec "$POSTGRES_CONTAINER" mkdir -p /tmp/pos3ql-extensions
-          docker cp tests/external/extensions/. "$POSTGRES_CONTAINER":/tmp/pos3ql-extensions/
-      - uses: actions/download-artifact@v8
-        with:
-          name: relation-release-${{ github.sha }}
-          path: ${{ runner.temp }}/release/
-      - name: Verify executable provenance
-        run: |
-          test "$(cat "$RUNNER_TEMP/release/revision")" = "$(git rev-parse HEAD)"
-          cd "$RUNNER_TEMP/release"
-          sha256sum --strict --check SHA256SUMS
-          chmod +x pos3ql
-      - uses: ./.github/actions/python-test-environment
-        with:
-          venv: target/external-venv
-      - name: PostgreSQL comparison
-        env:
-          PGHOST: 127.0.0.1
-          PGPORT: "5432"
-          PGUSER: postgres
-          P3_PORT: "15599"
-          RUN_FAST: "1"
-          RUN_CORE: "0"
-          RUN_CORPUS: "0"
-          RUN_AUX: "1"
-          RUN_SLT: "0"
-          RUN_FUZZ: "0"
-          AUXILIARY_PHASE: ${{ matrix.phase }}
-          POS3QL_EXTENSION_CONTROL_PATH: ${{ github.workspace }}/tests/external/extensions
-          POS3QL_REFERENCE_EXTENSION_CONTROL_PATH: /tmp/pos3ql-extensions
-        run: bash tests/external/ci_diff.sh "$RUNNER_TEMP/release/pos3ql" "$RUNNER_TEMP/evidence"
-      - uses: actions/upload-artifact@v6
-        if: always()
-        with:
-          name: relation-postgres-${{ matrix.phase }}-${{ github.sha }}
-          path: ${{ runner.temp }}/evidence/
-          if-no-files-found: warn

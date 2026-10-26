@@ -409,7 +409,7 @@ impl EventObjectRef {
                 let table_slot = usize::from(table);
                 let table = storage.table_def(table_slot, txid);
                 index_object(
-                    catalog::index_oid(&table, usize::from(position)),
+                    table.implicit_index_oid(usize::from(position)),
                     name.as_str(),
                     &table,
                 )?
@@ -3324,7 +3324,7 @@ fn push_alter_table_drops(
                     .iter()
                     .position(|constraint| constraint.name.as_str() == *name)
                 {
-                    let index_oid = catalog::index_oid(old, named_start + index);
+                    let index_oid = old.implicit_index_oid(named_start + index);
                     push_drop_once(
                         output,
                         count,
@@ -3349,7 +3349,7 @@ fn push_alter_table_drops(
                     .position(|constraint| constraint.name.as_str() == *name)
                 {
                     let index_oid =
-                        catalog::index_oid(old, named_start + old.uniques().len() + index);
+                        old.implicit_index_oid(named_start + old.uniques().len() + index);
                     push_drop_once(
                         output,
                         count,
@@ -3384,9 +3384,7 @@ fn push_alter_table_drops(
                             .is_some_and(|generated| generated.as_str() == *name)
                         {
                             if column.primary || column.unique {
-                                let index_oid = catalog::index_oid(
-                                    old,
-                                    usize::from(
+                                let index_oid = old.implicit_index_oid(usize::from(
                                         inline_positions[column_index].ok_or_else(graph_full)?,
                                     ),
                                 );
@@ -3498,9 +3496,7 @@ fn push_alter_table_drops(
             } else {
                 inline_unique_name(old, column)
             };
-            let index_oid = catalog::index_oid(
-                old,
-                usize::from(inline_positions[column_index].ok_or_else(graph_full)?),
+            let index_oid = old.implicit_index_oid(usize::from(inline_positions[column_index].ok_or_else(graph_full)?),
             );
             push_drop_once(
                 output,
@@ -3528,7 +3524,7 @@ fn push_alter_table_drops(
             .iter()
             .any(|candidate| candidate.name == unique.name)
         {
-            let index_oid = catalog::index_oid(old, named_start + index);
+            let index_oid = old.implicit_index_oid(named_start + index);
             push_drop_once(
                 output,
                 count,
@@ -3555,7 +3551,7 @@ fn push_alter_table_drops(
             .iter()
             .any(|candidate| candidate.name == exclusion.name)
         {
-            let index_oid = catalog::index_oid(old, named_start + old.uniques().len() + index);
+            let index_oid = old.implicit_index_oid(named_start + old.uniques().len() + index);
             push_drop_once(
                 output,
                 count,
@@ -3740,7 +3736,7 @@ fn push_table_drop_dependents(
             None
         };
         if let Some(name) = name {
-            let index_oid = catalog::index_oid(&table, position);
+            let index_oid = table.implicit_index_oid(position);
             push_drop(
                 output,
                 count,
@@ -3767,7 +3763,7 @@ fn push_table_drop_dependents(
         }
     }
     for unique in table.uniques() {
-        let index_oid = catalog::index_oid(&table, position);
+        let index_oid = table.implicit_index_oid(position);
         push_drop(
             output,
             count,
@@ -3793,7 +3789,7 @@ fn push_table_drop_dependents(
         position += 1;
     }
     for exclusion in table.exclusions() {
-        let index_oid = catalog::index_oid(&table, position);
+        let index_oid = table.implicit_index_oid(position);
         push_drop(
             output,
             count,

@@ -44,38 +44,66 @@ impl TableDef {
         self.inline_index_identities[attribute].take()
     }
 
-    pub(crate) fn implicit_index_identities(&self) -> impl Iterator<Item = Option<RelationIdentity>> + '_ {
-        self.inline_index_identities[..usize::from(self.attributes.count)].iter()
+    pub(crate) fn implicit_index_identities(
+        &self,
+    ) -> impl Iterator<Item = Option<RelationIdentity>> + '_ {
+        self.inline_index_identities[..usize::from(self.attributes.count)]
+            .iter()
             .zip(&self.attributes.slots)
             .filter_map(|(identity, slot)| match *slot {
                 super::column_attributes::AttributeSlot::Live(column)
-                    if self.columns[usize::from(column)].primary || self.columns[usize::from(column)].unique => Some(*identity),
+                    if self.columns[usize::from(column)].primary
+                        || self.columns[usize::from(column)].unique =>
+                {
+                    Some(*identity)
+                }
                 _ => None,
             })
             .chain(self.uniques().iter().map(|key| key.index_identity))
             .chain(self.exclusions().iter().map(|key| key.index_identity))
     }
 
-    pub(crate) fn implicit_index_identities_mut(&mut self) -> impl Iterator<Item = &mut Option<RelationIdentity>> {
+    pub(crate) fn implicit_index_identities_mut(
+        &mut self,
+    ) -> impl Iterator<Item = &mut Option<RelationIdentity>> {
         let columns = &self.columns;
-        self.inline_index_identities[..usize::from(self.attributes.count)].iter_mut()
+        self.inline_index_identities[..usize::from(self.attributes.count)]
+            .iter_mut()
             .zip(&self.attributes.slots)
             .filter_map(move |(identity, slot)| match *slot {
                 super::column_attributes::AttributeSlot::Live(column)
-                    if columns[usize::from(column)].primary || columns[usize::from(column)].unique => Some(identity),
+                    if columns[usize::from(column)].primary
+                        || columns[usize::from(column)].unique =>
+                {
+                    Some(identity)
+                }
                 _ => None,
             })
-            .chain(self.uniques[..self.n_uniques].iter_mut().map(|key| &mut key.index_identity))
-            .chain(self.exclusions[..self.n_exclusions].iter_mut().map(|key| &mut key.index_identity))
+            .chain(
+                self.uniques[..self.n_uniques]
+                    .iter_mut()
+                    .map(|key| &mut key.index_identity),
+            )
+            .chain(
+                self.exclusions[..self.n_exclusions]
+                    .iter_mut()
+                    .map(|key| &mut key.index_identity),
+            )
     }
 
     /// Event positions follow live columns; the durable array follows attribute numbers.
     pub(crate) fn implicit_index_oid(&self, position: usize) -> i32 {
-        self.columns().iter().enumerate().filter(|(_, column)| column.primary || column.unique)
+        self.columns()
+            .iter()
+            .enumerate()
+            .filter(|(_, column)| column.primary || column.unique)
             .map(|(column, _)| self.column_index_identity(column))
             .chain(self.uniques().iter().map(|key| key.index_identity))
             .chain(self.exclusions().iter().map(|key| key.index_identity))
-            .nth(position).flatten().expect("admitted implicit index has a durable identity").oid()
+            .nth(position)
+            .flatten()
+            .expect("admitted implicit index has a durable identity")
+            .oid()
     }
 }
 
@@ -84,14 +112,21 @@ impl Storage {
         &self,
         definition: &mut TableDef,
     ) -> Result<(), SqlError> {
-        for (identity, slot) in definition.inline_index_identities.iter_mut().zip(&definition.attributes.slots) {
+        for (identity, slot) in definition
+            .inline_index_identities
+            .iter_mut()
+            .zip(&definition.attributes.slots)
+        {
             let active = match *slot {
                 super::column_attributes::AttributeSlot::Live(column) => {
-                    definition.columns[usize::from(column)].primary || definition.columns[usize::from(column)].unique
+                    definition.columns[usize::from(column)].primary
+                        || definition.columns[usize::from(column)].unique
                 }
                 _ => false,
             };
-            if !active { *identity = None; }
+            if !active {
+                *identity = None;
+            }
         }
         for identity in definition.implicit_index_identities_mut() {
             if identity.is_none() {
@@ -188,8 +223,23 @@ impl Storage {
                     }
                     check(identity.created_at)?;
                     let definition = table.definition();
-                    for (column, _) in definition.columns().iter().enumerate().filter(|(_, column)| column.primary || column.unique) {
-                        check(definition.column_index_identity(column).ok_or_else(|| sql_err!(sqlstate::DATA_EXCEPTION, "restored inline index has no identity"))?.created_at())?;
+                    for (column, _) in definition
+                        .columns()
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, column)| column.primary || column.unique)
+                    {
+                        check(
+                            definition
+                                .column_index_identity(column)
+                                .ok_or_else(|| {
+                                    sql_err!(
+                                        sqlstate::DATA_EXCEPTION,
+                                        "restored inline index has no identity"
+                                    )
+                                })?
+                                .created_at(),
+                        )?;
                     }
                     for key in definition.uniques() {
                         let identity = key.index_identity.ok_or_else(|| {

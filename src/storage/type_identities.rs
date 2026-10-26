@@ -409,7 +409,8 @@ impl CachedArrayElement {
     fn builtin_base(code: u8) -> bool {
         use crate::sql::types::ColType;
         crate::sql::types::ColType::from_code(code).is_some_and(|base| match base {
-            ColType::Enum(_) | ColType::Composite(_) => false,
+            ColType::Enum(_) | ColType::Composite(_) | ColType::Record | ColType::Void
+                | ColType::Internal | ColType::PgDdlCommand | ColType::AnyArray => false,
             ColType::Array(element) => !matches!(
                 element,
                 crate::sql::types::ArrElem::Enum(_)
@@ -512,6 +513,7 @@ mod tests {
     fn cached_array_descriptors_preserve_maximum_creation_identities_without_allocation() {
         fn check(identity: ArrayElementIdentity) {
             let encoded = CachedArrayElement::from_identity(identity).unwrap();
+            assert_eq!(CachedArrayElement::from_element(encoded.element()).unwrap(), encoded);
             assert_eq!(encoded.identity(), identity);
             assert_eq!(
                 CachedArrayElement::from_bytes(encoded.0)
@@ -558,7 +560,7 @@ mod tests {
                 }
             }
             assert!(CachedArrayElement::from_bytes([255; 6]).is_none());
-            let invalid_builtin = crate::sql::types::ArrElem::Enum(0).code();
+            let invalid_builtin = crate::sql::types::ArrElem::Enum(None).code();
             assert!(
                 CachedArrayElement::from_identity(ArrayElementIdentity::Builtin(invalid_builtin))
                     .is_none()

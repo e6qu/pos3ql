@@ -6844,18 +6844,12 @@ fn compatible_type_oid(left: i32, right: i32) -> Option<i32> {
 
 fn array_oid_for_element(element_oid: i32) -> Option<i32> {
     use crate::sql::types::{ArrElem, oid};
-    if (oid::FIRST_DOMAIN..oid::FIRST_DOMAIN + MAX_DOMAIN_CATALOG_SLOTS as i32)
-        .contains(&element_oid)
-    {
-        return Some(oid::FIRST_DOMAIN_ARRAY + element_oid - oid::FIRST_DOMAIN);
-    }
-    if (oid::FIRST_ENUM..oid::FIRST_ENUM + MAX_ENUM_CATALOG_SLOTS as i32).contains(&element_oid) {
-        return Some(oid::FIRST_ENUM_ARRAY + element_oid - oid::FIRST_ENUM);
-    }
-    if (oid::FIRST_COMPOSITE..oid::FIRST_COMPOSITE + MAX_COMPOSITE_CATALOG_SLOTS as i32)
-        .contains(&element_oid)
-    {
-        return Some(oid::FIRST_COMPOSITE_ARRAY + element_oid - oid::FIRST_COMPOSITE);
+    if let Some((kind, creation, false)) = NamedTypeKind::from_oid(element_oid) {
+        return Some(match kind {
+            NamedTypeKind::Domain => oid::domain_array_oid(creation),
+            NamedTypeKind::Enum => oid::enum_array_oid(creation),
+            NamedTypeKind::Composite => oid::composite_array_oid(creation),
+        });
     }
     ArrElem::from_coltype(ColType::from_oid(element_oid)?).map(ArrElem::array_oid)
 }
@@ -6894,10 +6888,8 @@ fn polymorphic_element_oid(kind: PolymorphicType, actual_oid: i32) -> Option<i32
                 .then_some(actual_oid)
         }
         PolymorphicType::Array | PolymorphicType::CompatibleArray => {
-            if (oid::FIRST_DOMAIN_ARRAY..oid::FIRST_DOMAIN_ARRAY + MAX_DOMAIN_CATALOG_SLOTS as i32)
-                .contains(&actual_oid)
-            {
-                Some(oid::FIRST_DOMAIN + actual_oid - oid::FIRST_DOMAIN_ARRAY)
+            if let Some((NamedTypeKind::Domain, creation, true)) = NamedTypeKind::from_oid(actual_oid) {
+                Some(oid::domain_oid(creation))
             } else {
                 match actual? {
                     ColType::Array(element) => Some(element.element_oid()),

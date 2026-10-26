@@ -361,9 +361,10 @@ pub(crate) fn populate_record_from_json<'a>(
                     )
                 })?;
             // Table/view rowtypes have no named-composite slot.
-            let slot = usize::try_from(composite_oid - crate::sql::types::oid::FIRST_COMPOSITE)
-                .ok()
-                .and_then(|slot| u16::try_from(slot).ok());
+            let slot = match crate::storage::NamedTypeKind::from_oid(composite_oid) {
+                Some((crate::storage::NamedTypeKind::Composite, creation, false)) => Some(creation),
+                _ => None,
+            };
             (slot, fields, composite_oid)
         }
         other => {

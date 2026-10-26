@@ -87,7 +87,7 @@ keys keep their stamps beside stable attribute numbers in the table definition;
 the shared column metadata stays within its existing 512-byte recovery bound.
 Renaming its constraint, dropping an earlier constraint, or moving its column preserves
 that identity. Replacing the index reserves a fresh stamp. Manifest
-`implicit_index POSITION CREATED_AT` records and table payload v10 store the
+`implicit_index POSITION CREATED_AT` records and table payload v11 store the
 complete set; missing, duplicate, out-of-range or truncated identities are
 rejected before installation. Recovery also checks relation identities across
 catalog families within each database before durable startup publication. A
@@ -436,7 +436,7 @@ PostgreSQL polymorphic type. The schema is stored separately and database scope
 comes from the enclosing record. The SQL name after the prefix retains its
 original colons and Unicode bytes. Manifests hex-encode these fields. Tables,
 composites, routine signatures/results, aggregate types, casts and operator
-contracts share this encoding. Table definition payloads use version 10.
+contracts share this encoding. Table definition payloads use version 11.
 
 Bit and varbit modifiers store the bit count directly: `bit(6)` stores `6`.
 Character modifiers include their four-byte header: `varchar(7)` stores `11`.

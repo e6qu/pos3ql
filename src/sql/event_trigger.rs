@@ -2441,41 +2441,18 @@ fn relation_column_ref(
 }
 
 fn type_object_ref(storage: &Storage, txid: u32, object_id: i32) -> Option<EventObjectRef> {
-    use crate::sql::types::oid;
-    let slot_in = |first: i32, count: usize| {
-        (first..first + count as i32)
-            .contains(&object_id)
-            .then_some((object_id - first) as usize)
-    };
-    if let Some(slot) = slot_in(oid::FIRST_DOMAIN, storage.domain_count())
-        && storage.domain_slot_visible_to(slot, txid)
-    {
-        return Some(EventObjectRef::Primary(ObjectRef::Domain(slot)));
-    }
-    if let Some(slot) = slot_in(oid::FIRST_DOMAIN_ARRAY, storage.domain_count())
-        && storage.domain_slot_visible_to(slot, txid)
-    {
-        return Some(EventObjectRef::DomainArray(slot as u16));
-    }
-    if let Some(slot) = slot_in(oid::FIRST_ENUM, storage.enum_count())
-        && storage.enum_slot_visible_to(slot, txid)
-    {
-        return Some(EventObjectRef::Primary(ObjectRef::Enum(slot)));
-    }
-    if let Some(slot) = slot_in(oid::FIRST_ENUM_ARRAY, storage.enum_count())
-        && storage.enum_slot_visible_to(slot, txid)
-    {
-        return Some(EventObjectRef::EnumArray(slot as u16));
-    }
-    if let Some(slot) = slot_in(oid::FIRST_COMPOSITE, storage.composite_count())
-        && storage.composite_slot_visible_to(slot, txid)
-    {
-        return Some(EventObjectRef::Primary(ObjectRef::Composite(slot)));
-    }
-    if let Some(slot) = slot_in(oid::FIRST_COMPOSITE_ARRAY, storage.composite_count())
-        && storage.composite_slot_visible_to(slot, txid)
-    {
-        return Some(EventObjectRef::CompositeArray(slot as u16));
+    if let Some((kind, _, array)) = crate::storage::NamedTypeKind::from_oid(object_id) {
+        let result = storage.routine_result_for_oid(object_id, txid)?;
+        let reference = crate::storage::TypeReference::from_bound_name(result.user_type?).ok()?;
+        let slot = reference.catalog_slot();
+        return Some(match (kind, array) {
+            (crate::storage::NamedTypeKind::Domain, false) => EventObjectRef::Primary(ObjectRef::Domain(usize::from(slot))),
+            (crate::storage::NamedTypeKind::Enum, false) => EventObjectRef::Primary(ObjectRef::Enum(usize::from(slot))),
+            (crate::storage::NamedTypeKind::Composite, false) => EventObjectRef::Primary(ObjectRef::Composite(usize::from(slot))),
+            (crate::storage::NamedTypeKind::Domain, true) => EventObjectRef::DomainArray(slot),
+            (crate::storage::NamedTypeKind::Enum, true) => EventObjectRef::EnumArray(slot),
+            (crate::storage::NamedTypeKind::Composite, true) => EventObjectRef::CompositeArray(slot),
+        });
     }
     if let Some(slot) = catalog::table_slot_by_row_type_oid(storage, txid, object_id, false) {
         return Some(EventObjectRef::TableRowType(slot as u16));

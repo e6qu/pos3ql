@@ -95,15 +95,6 @@ pub(crate) enum DatabaseCloneAllocation<'bytes> {
 }
 
 impl DatabaseCloneAllocation<'_> {
-    pub(super) fn table(self, created_at: u64) -> Result<CatalogAllocation, SqlError> {
-        match self {
-            Self::New => Ok(CatalogAllocation::New),
-            Self::Restore(positions) => Ok(CatalogAllocation::Restore(
-                positions.position(DatabaseCloneKind::Table, created_at)?,
-            )),
-        }
-    }
-
     pub(super) fn select(
         self,
         kind: DatabaseCloneKind,

@@ -93,6 +93,13 @@ rejected before installation. Recovery also checks relation identities across
 catalog families within each database before durable startup publication. A
 constraint that adopts an explicit index still denotes one relation.
 
+Database template copies preserve table, index and constraint identities in the
+new database's separate namespace, matching PostgreSQL. The copy selects its
+saved table lifetime at admission; it never creates temporary index or constraint
+identities and then overwrites the table's creation number. Replay therefore
+restores the same inventory, even when another transaction's rolled-back
+creations changed which physical slots were available.
+
 CHECK, foreign-key and NOT NULL constraints on tables, detached partition
 CHECKs, and domain CHECK and NOT NULL constraints have their own creation
 identities. Public identifiers are 380,000,000 plus that identity. The four

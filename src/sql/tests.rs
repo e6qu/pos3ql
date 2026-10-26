@@ -2315,7 +2315,13 @@ fn metadata_database_copy_recovers_exact_positions_after_other_transaction_rollb
         crate::mem::guard::forbid_alloc(|| assert!(image.append(&mut bytes)));
         bytes.readable().to_vec()
     }
-    const DEFINITION: &str = "CREATE DOMAIN code AS integer; CREATE TYPE state AS ENUM ('ready'); CREATE TYPE payload AS (id code); CREATE TABLE orders(id code PRIMARY KEY, state state); INSERT INTO orders VALUES (7, 'ready'); COMMENT ON CONSTRAINT orders_pkey ON orders IS 'primary key'; CREATE VIEW order_report AS SELECT id FROM orders; CREATE SEQUENCE order_counter START 10; CREATE FUNCTION order_body() RETURNS integer LANGUAGE SQL AS 'SELECT 1'; CREATE MATERIALIZED VIEW saved_report AS SELECT id FROM orders";
+    fn identities(engine: &mut Engine, session: &mut ConfiguredTransactionSession) -> Vec<String> {
+        let mut rows = data_rows(&session.success(engine,
+            "SELECT relname, oid FROM pg_class WHERE relname IN ('orders', 'orders_pkey', 'order_report', 'order_counter', 'copied_counter', 'saved_report'); SELECT conname, oid FROM pg_constraint WHERE conrelid = 'orders'::regclass OR contypid = 'code'::regtype; SELECT typname, oid FROM pg_type WHERE typname IN ('code', 'state', 'payload', 'orders')", true));
+        rows.sort_unstable();
+        rows
+    }
+    const DEFINITION: &str = "CREATE DOMAIN code AS integer CONSTRAINT code_positive CHECK (VALUE > 0) CONSTRAINT code_nn NOT NULL; CREATE TYPE state AS ENUM ('ready'); CREATE TYPE payload AS (id code); CREATE TABLE orders(id code PRIMARY KEY, state state); INSERT INTO orders VALUES (7, 'ready'); COMMENT ON CONSTRAINT orders_pkey ON orders IS 'primary key'; CREATE VIEW order_report AS SELECT id FROM orders; CREATE SEQUENCE order_counter START 10; CREATE FUNCTION order_body() RETURNS integer LANGUAGE SQL AS 'SELECT 1'; CREATE MATERIALIZED VIEW saved_report AS SELECT id FROM orders";
     for checkpoint in [false, true] {
         for mode in [
             crate::config::TransactionMode::Mvcc,
@@ -2339,6 +2345,7 @@ fn metadata_database_copy_recovers_exact_positions_after_other_transaction_rollb
             let mut retained =
                 ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
             retained.success(&mut engine, DEFINITION, false);
+            let template_identities = identities(&mut engine, &mut retained);
             engine
                 .select_database(crate::storage::DatabaseOid::POSTGRES)
                 .unwrap();
@@ -2358,6 +2365,7 @@ fn metadata_database_copy_recovers_exact_positions_after_other_transaction_rollb
                 .unwrap();
             engine.select_database(copied).unwrap();
             let original = positions(&engine);
+            assert_eq!(identities(&mut engine, &mut retained), template_identities);
             retained.success(&mut engine, "ALTER SEQUENCE order_counter RENAME TO copied_counter; CREATE OR REPLACE FUNCTION order_body() RETURNS integer LANGUAGE SQL AS 'SELECT 2'; REFRESH MATERIALIZED VIEW saved_report", false);
             if checkpoint {
                 assert!(engine.checkpoint().unwrap());
@@ -2375,6 +2383,15 @@ fn metadata_database_copy_recovers_exact_positions_after_other_transaction_rollb
                 "checkpoint={checkpoint}, mode={mode:?}"
             );
             let mut session = ConfiguredTransactionSession::new(&config, &mut cold_budget);
+            // The sequence rename is the only identifier inventory name change.
+            let mut expected = template_identities.clone();
+            for row in &mut expected {
+                if row.starts_with("order_counter|") {
+                    *row = row.replacen("order_counter|", "copied_counter|", 1);
+                }
+            }
+            expected.sort_unstable();
+            assert_eq!(identities(&mut cold, &mut session), expected);
             assert_eq!(data_rows(&session.success(&mut cold, "SELECT nextval('copied_counter'); SELECT order_body(); SELECT id FROM saved_report; SELECT id FROM order_report; SELECT obj_description(oid, 'pg_constraint') FROM pg_constraint WHERE conrelid = 'orders'::regclass AND contype = 'p'", false)), ["10", "2", "7", "7", "primary key"]);
         }
     }

@@ -21578,15 +21578,21 @@ impl Storage {
                 let has_index =
                     self.relation_has_index(CatalogPosition::new(source_slot, created_at)?, 0);
                 let serial_values = self.table_serial_values(source_slot);
+                let target_slot = allocation.select(
+                    DatabaseCloneKind::Table,
+                    created_at,
+                    self.tables.iter().take(self.table_count()).enumerate().filter_map(
+                        |(slot, table)| table.is_free().then_some(slot),
+                    ),
+                )?;
                 let target_slot = table_creation::allocate(
                     self,
                     definition,
-                    allocation.table(created_at)?,
+                    CatalogAllocation::Restore(CatalogPosition::new(target_slot, created_at)?),
                     TableCreation::Pending(txid),
                 )?;
                 {
                     let target_table = &mut self.tables[target_slot];
-                    target_table.identity_mut().created_at = created_at;
                     target_table.identity_mut().ownership = ownership;
                     target_table.statistics.set_image(statistics, None, false);
                     target_table

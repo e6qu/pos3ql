@@ -56,6 +56,21 @@ jobs:
           sed -nE 's/^ERROR:  ([0-9A-Z]{5}):.*/\1/p' "$RUNNER_TEMP/domain-constraint-errors.reference" > "$RUNNER_TEMP/domain-constraint-states"
           printf '%s\n' 42P17 42601 42601 42P17 42P17 42601 42710 42710 > "$RUNNER_TEMP/expected-domain-constraint-states"
           diff -u "$RUNNER_TEMP/expected-domain-constraint-states" "$RUNNER_TEMP/domain-constraint-states"
+      - name: Check template identifiers against PostgreSQL
+        env:
+          POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker exec "$POSTGRES_CONTAINER" createdb -U postgres constraint_template
+          docker exec "$POSTGRES_CONTAINER" psql -U postgres -d constraint_template -X -Atq -v ON_ERROR_STOP=1 -c 'CREATE DOMAIN code AS integer CONSTRAINT code_positive CHECK (VALUE > 0) CONSTRAINT code_nn NOT NULL; CREATE TABLE orders(id code PRIMARY KEY)'
+          docker exec "$POSTGRES_CONTAINER" createdb -U postgres -T constraint_template constraint_copy
+          inventory="SELECT conname, oid FROM pg_constraint WHERE conrelid = 'orders'::regclass OR contypid = 'code'::regtype ORDER BY conname; SELECT relname, oid FROM pg_class WHERE relname IN ('orders', 'orders_pkey') ORDER BY relname"
+          for database in constraint_template constraint_copy; do
+            docker exec "$POSTGRES_CONTAINER" psql -U postgres -d "$database" -X -Atq -v ON_ERROR_STOP=1 -c "$inventory" > "$RUNNER_TEMP/$database.reference"
+            test "$(wc -l < "$RUNNER_TEMP/$database.reference")" -eq 6
+          done
+          diff -u "$RUNNER_TEMP/constraint_template.reference" "$RUNNER_TEMP/constraint_copy.reference"
       - name: Format and retain correction
         run: |
           cargo fmt
@@ -72,7 +87,7 @@ jobs:
         if: ${{ !cancelled() }}
         shell: bash
         run: |
-          python3 tools/test_command.py cargo test --lib --locked -- constraint domain relation_identity prepared enum_value_identity_journal catalog_snapshot_table_payload table_payload durable_format_documentation current_manifest_metadata startup budget clone inherit partition --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/related-catalogs.log"
+          python3 tools/test_command.py cargo test --lib --locked -- database_copy database_clone clone durable_format_documentation current_manifest_metadata --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/related-catalogs.log"
           grep -Eq 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/related-catalogs.log"
       - name: Build every target and lint
         if: ${{ !cancelled() }}

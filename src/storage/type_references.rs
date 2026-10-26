@@ -1,6 +1,7 @@
 //! Captured references identify a type's lifetime independently of its name.
 
 use super::type_names::NamedTypeSlot;
+use super::type_identities::TypeCreation;
 use super::{
     ArrElem, ColType, DatabaseOid, PolymorphicType, RoutineResult, SqlName, TypeCatalog,
     UserTypeName,
@@ -84,7 +85,7 @@ pub(super) struct TypeIdentity {
     // column or routine parameter to eight-byte alignment.
     origin: [u8; 8],
     database: [u8; 4],
-    created_at: [u8; 8],
+    created_at: TypeCreation,
     source: CapturedTypeSlot,
 }
 
@@ -107,7 +108,7 @@ impl TypeIdentity {
         Self {
             origin: origin.0.to_le_bytes(),
             database: database.get().to_le_bytes(),
-            created_at: created_at.to_le_bytes(),
+            created_at: TypeCreation::parse(created_at).expect("named type birth was admitted"),
             source,
         }
     }
@@ -121,7 +122,7 @@ impl TypeIdentity {
     }
 
     pub(super) fn created_at(self) -> u64 {
-        u64::from_le_bytes(self.created_at)
+        self.created_at.created_at()
     }
 
     pub(super) fn slot(self) -> NamedTypeSlot {
@@ -142,12 +143,12 @@ impl TypeIdentity {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct StoredTypeIdentity {
     source: CapturedTypeSlot,
-    created_at: [u8; 8],
+    created_at: TypeCreation,
 }
 
 impl StoredTypeIdentity {
     pub(super) fn created_at(self) -> u64 {
-        u64::from_le_bytes(self.created_at)
+        self.created_at.created_at()
     }
 
     pub(super) fn slot(self) -> NamedTypeSlot {
@@ -182,16 +183,11 @@ impl StoredTypeIdentity {
                 ));
             }
         };
-        if created_at == 0 {
-            return Err(sql_err!(
-                sqlstate::PROTOCOL_VIOLATION,
-                "invalid stored type identity"
-            ));
-        }
-        Ok(Self {
-            source,
-            created_at: created_at.to_le_bytes(),
-        })
+        let created_at = TypeCreation::parse(created_at).ok_or_else(|| sql_err!(
+            sqlstate::PROTOCOL_VIOLATION,
+            "invalid stored type identity"
+        ))?;
+        Ok(Self { source, created_at })
     }
 }
 
@@ -394,10 +390,10 @@ mod tests {
     fn captured_type_reference_layout_keeps_slots_in_their_oid_width() {
         use core::mem::size_of;
         assert_eq!(size_of::<CapturedTypeSlot>(), 3);
-        assert_eq!(size_of::<TypeIdentity>(), 23);
-        assert!(size_of::<TypeBinding>() <= 24);
-        assert!(size_of::<TypeReference>() <= 24);
-        assert!(size_of::<Option<UserTypeName>>() <= 152);
+        assert_eq!(size_of::<TypeIdentity>(), 18);
+        assert!(size_of::<TypeBinding>() <= 19);
+        assert!(size_of::<TypeReference>() <= 19);
+        assert!(size_of::<Option<UserTypeName>>() <= 147);
         for source in [
             NamedTypeSlot::Domain(0),
             NamedTypeSlot::Enum(65535),
@@ -405,18 +401,18 @@ mod tests {
         ] {
             let origin = CatalogOrigin(u64::MAX);
             let database = DatabaseOid::parse(i32::MAX).unwrap();
-            let identity = TypeIdentity::new(origin, database, source, u64::MAX);
+            let identity = TypeIdentity::new(origin, database, source, super::super::type_identities::MAX_TYPE_CREATION);
             assert_eq!(identity.slot(), source);
             assert_eq!(identity.origin(), origin);
             assert_eq!(identity.database(), database);
-            assert_eq!(identity.created_at(), u64::MAX);
+            assert_eq!(identity.created_at(), super::super::type_identities::MAX_TYPE_CREATION);
         }
     }
 
     #[test]
     fn source_reference_codec_preserves_lifetimes_without_names() {
         crate::mem::guard::forbid_alloc(|| {
-            for encoded in ["d:0:1", "e:0:18446744073709551615", "c:1600:41"] {
+            for encoded in ["d:0:1", "e:0:9999999", "c:1600:41"] {
                 let reference = TypeReference::from_storage(encoded).unwrap();
                 assert_eq!(reference.storage_key().as_str(), encoded);
             }
@@ -424,6 +420,8 @@ mod tests {
                 "",
                 "c:0",
                 "c:0:0",
+                "e:0:10000000",
+                "e:0:18446744073709551615",
                 "c:0:1:extra",
                 "x:0:1",
                 "d:65536:1",
@@ -1338,10 +1336,7 @@ impl super::Storage {
         target: NamedTypeSlot,
         created_at: u64,
     ) -> Result<(), SqlError> {
-        if created_at == 0
-            || matches!(target, NamedTypeSlot::Composite(_))
-                && created_at > super::MAX_RELATION_GENERATION
-        {
+        if TypeCreation::parse(created_at).is_none() {
             return Err(sql_err!(
                 sqlstate::DATA_EXCEPTION,
                 "stored type creation identity is invalid"

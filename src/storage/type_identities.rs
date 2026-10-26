@@ -1,14 +1,10 @@
 //! Checked creation stamps for named SQL type lifetimes.
 
-#[cfg(test)]
 use core::num::NonZeroU8;
-use core::num::NonZeroU64;
 
-#[cfg(test)]
 pub(crate) const MAX_TYPE_CREATION: u64 = 9_999_999;
 
 /// A nonzero stamp with a three-byte optional representation.
-#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(C)]
 pub(crate) struct TypeCreation {
@@ -16,7 +12,6 @@ pub(crate) struct TypeCreation {
     upper: [u8; 2],
 }
 
-#[cfg(test)]
 impl TypeCreation {
     /// Rejects zero and stamps outside the named-type identifier range.
     pub(crate) const fn parse(created_at: u64) -> Option<Self> {
@@ -40,11 +35,8 @@ impl TypeCreation {
     }
 }
 
-#[cfg(test)]
 const _: [(); 3] = [(); core::mem::size_of::<TypeCreation>()];
-#[cfg(test)]
 const _: [(); 3] = [(); core::mem::size_of::<Option<TypeCreation>>()];
-#[cfg(test)]
 const _: [(); 1] = [(); core::mem::align_of::<TypeCreation>()];
 
 use super::DatabaseOid;
@@ -57,17 +49,17 @@ use crate::sql_err;
 #[derive(Clone, Copy)]
 pub(super) enum TypeCreationAdmission {
     Fresh,
-    Restored(NonZeroU64),
+    Restored(TypeCreation),
 }
 
 impl TypeCreationAdmission {
     pub(super) fn restored(created_at: u64) -> Result<Self, SqlError> {
-        NonZeroU64::new(created_at)
+        TypeCreation::parse(created_at)
             .map(Self::Restored)
             .ok_or_else(|| {
                 sql_err!(
                     sqlstate::DATA_EXCEPTION,
-                    "stored type creation identity is zero"
+                    "stored type creation identity is outside 1..=9999999"
                 )
             })
     }
@@ -79,9 +71,9 @@ impl TypeCreationAdmission {
         family: &str,
     ) -> Result<u64, SqlError> {
         match self {
-            Self::Fresh => sequence.next_bounded(maximum, family),
+            Self::Fresh => sequence.next_bounded(maximum.min(MAX_TYPE_CREATION), family),
             Self::Restored(creation) => {
-                super::bounded_catalog_generation(creation.get(), maximum, family)
+                super::bounded_catalog_generation(creation.created_at(), maximum, family)
             }
         }
     }
@@ -96,7 +88,7 @@ impl TypeCreationAdmission {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct TypeLifetimeKey {
     database: DatabaseOid,
-    creation: NonZeroU64,
+    creation: TypeCreation,
 }
 
 /// Both directions share one startup reservation; slot replacement cannot grow it.
@@ -179,7 +171,7 @@ impl TypeIdentityIndex {
     }
 
     pub(super) fn lookup(&self, database: DatabaseOid, created_at: u64) -> Option<NamedTypeSlot> {
-        let creation = NonZeroU64::new(created_at)?;
+        let creation = TypeCreation::parse(created_at)?;
         self.by_lifetime
             .get(&TypeLifetimeKey { database, creation })
             .copied()
@@ -195,10 +187,10 @@ impl TypeIdentityIndex {
         let position = self.position(slot)?;
         self.validate_slot(slot, position)?;
         let old = self.by_slot[position];
-        let creation = NonZeroU64::new(created_at).ok_or_else(|| {
+        let creation = TypeCreation::parse(created_at).ok_or_else(|| {
             sql_err!(
                 sqlstate::DATA_EXCEPTION,
-                "named type creation identity is zero"
+                "named type creation identity is outside 1..=9999999"
             )
         })?;
         let key = TypeLifetimeKey { database, creation };
@@ -259,10 +251,10 @@ impl TypeIdentityIndex {
             )
         })?;
         let destination = self.by_slot[new_position];
-        let creation = NonZeroU64::new(created_at).ok_or_else(|| {
+        let creation = TypeCreation::parse(created_at).ok_or_else(|| {
             sql_err!(
                 sqlstate::DATA_EXCEPTION,
-                "named type creation identity is zero"
+                "named type creation identity is outside 1..=9999999"
             )
         })?;
         let key = TypeLifetimeKey { database, creation };

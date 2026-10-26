@@ -1346,34 +1346,109 @@ mod tests {
         let name = SqlName::parse("original_domain").unwrap();
         let enumeration = SqlName::parse("restored_enum").unwrap();
         let spec = DomainSpec {
-            base_domain: None, base_user_type: None, base: ColType::Int4,
-            base_type_mod: -1, not_null: false, not_null_name: None,
-            default_expr: None, checks: [CheckConstraint::EMPTY; MAX_DOMAIN_CHECKS], n_checks: 0,
+            base_domain: None,
+            base_user_type: None,
+            base: ColType::Int4,
+            base_type_mod: -1,
+            not_null: false,
+            not_null_name: None,
+            default_expr: None,
+            checks: [CheckConstraint::EMPTY; MAX_DOMAIN_CHECKS],
+            n_checks: 0,
         };
         crate::mem::guard::forbid_alloc(|| {
-            storage.create_domain_from_manifest(schema, name, spec, 41).unwrap();
+            storage
+                .create_domain_from_manifest(schema, name, spec, 41)
+                .unwrap();
             let original = reference(&storage, NamedTypeSlot::Domain(0));
-            let version = storage.type_catalog.lock().unwrap().versions.get(NamedTypeSlot::Domain(0));
+            let version = storage
+                .type_catalog
+                .lock()
+                .unwrap()
+                .versions
+                .get(NamedTypeSlot::Domain(0));
             storage.enum_replay_members(1).unwrap()[0] = EnumMember {
-                label: SqlName::parse("saved").unwrap(), legacy_label: None, sort: 1.0,
+                label: SqlName::parse("saved").unwrap(),
+                legacy_label: None,
+                sort: 1.0,
             };
             for _ in 0..32 {
-                assert_eq!(storage.finish_enum_replay(schema, enumeration, 1, 41).unwrap_err().sqlstate,
-                    sqlstate::DATA_EXCEPTION);
+                assert_eq!(
+                    storage
+                        .finish_enum_replay(schema, enumeration, 1, 41)
+                        .unwrap_err()
+                        .sqlstate,
+                    sqlstate::DATA_EXCEPTION
+                );
                 assert_eq!(storage.catalog_identity_sequence(), 41);
                 assert_eq!(reference(&storage, NamedTypeSlot::Domain(0)), original);
                 let catalog = storage.type_catalog.lock().unwrap();
                 assert_eq!(catalog.versions.get(NamedTypeSlot::Domain(0)), version);
-                assert_eq!(catalog.enums[0].ddl_state, super::super::CatalogDdlState::Absent);
-                assert_eq!(catalog.identities.lookup(super::super::current_database(), 41), Some(NamedTypeSlot::Domain(0)));
+                assert_eq!(
+                    catalog.enums[0].ddl_state,
+                    super::super::CatalogDdlState::Absent
+                );
+                assert_eq!(
+                    catalog
+                        .identities
+                        .lookup(super::super::current_database(), 41),
+                    Some(NamedTypeSlot::Domain(0))
+                );
             }
-            assert_eq!(storage.finish_enum_replay(schema, enumeration, 1, 42).unwrap(), 0);
+            assert_eq!(
+                storage
+                    .finish_enum_replay(schema, enumeration, 1, 42)
+                    .unwrap(),
+                0
+            );
             assert_eq!(storage.enum_for(0, 0).sort_of("saved"), Some(1.0));
             assert_eq!(storage.catalog_identity_sequence(), 42);
             let catalog = storage.type_catalog.lock().unwrap();
-            assert_eq!(catalog.identities.lookup(super::super::current_database(), 41), Some(NamedTypeSlot::Domain(0)));
-            assert_eq!(catalog.identities.lookup(super::super::current_database(), 42), Some(NamedTypeSlot::Enum(0)));
+            assert_eq!(
+                catalog
+                    .identities
+                    .lookup(super::super::current_database(), 41),
+                Some(NamedTypeSlot::Domain(0))
+            );
+            assert_eq!(
+                catalog
+                    .identities
+                    .lookup(super::super::current_database(), 42),
+                Some(NamedTypeSlot::Enum(0))
+            );
         });
+    }
+
+    #[test]
+    fn type_creation_range_exhaustion_and_invalid_restore_preserve_existing_sources() {
+        let maximum = super::super::type_identities::MAX_TYPE_CREATION;
+        for source in SOURCES {
+            let mut storage = fixture(1);
+            create(&mut storage, source).unwrap();
+            let original = reference(&storage, source);
+            storage.restore_catalog_identity_sequence(maximum);
+            crate::mem::guard::forbid_alloc(|| {
+                assert_eq!(create(&mut storage, source).unwrap_err().sqlstate,
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED);
+                assert_eq!(reference(&storage, source), original);
+                assert_eq!(storage.catalog_identity_sequence(), maximum);
+                for rejected in [0, maximum + 1, u64::MAX] {
+                    assert_eq!(storage.restore_type_identity(source, source, rejected).unwrap_err().sqlstate,
+                        sqlstate::DATA_EXCEPTION);
+                    assert_eq!(reference(&storage, source), original);
+                    assert_eq!(storage.catalog_identity_sequence(), maximum);
+                }
+                storage.restore_type_identity(source, source, maximum).unwrap();
+                let captured = reference(&storage, source);
+                assert_ne!(captured, original);
+                let catalog = storage.type_catalog.lock().unwrap();
+                let selected = catalog.type_snapshot(source, 0).unwrap().unwrap();
+                assert_eq!(selected.identity.created_at(), maximum);
+                assert_eq!(catalog.identities.lookup(selected.identity.database(), maximum), Some(source));
+                assert!(catalog.resolve_source_reference(original, selected.identity.database(), 0).unwrap().is_none());
+                assert!(catalog.resolve_source_reference(captured, selected.identity.database(), 0).unwrap().is_some());
+            });
+        }
     }
 
     #[test]

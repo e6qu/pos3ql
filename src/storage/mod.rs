@@ -40272,7 +40272,14 @@ impl Storage {
         spec: DomainSpec,
         txid: u32,
     ) -> Result<TypeDdlUndo, SqlError> {
-        self.create_domain_with_binding(schema, name, spec, txid, type_identities::TypeCreationAdmission::Fresh, false)
+        self.create_domain_with_binding(
+            schema,
+            name,
+            spec,
+            txid,
+            type_identities::TypeCreationAdmission::Fresh,
+            false,
+        )
     }
 
     /// Manifest loading is the sole phase allowed to defer a named base-type
@@ -40284,15 +40291,33 @@ impl Storage {
         spec: DomainSpec,
         created_at: u64,
     ) -> Result<usize, SqlError> {
-        self.create_domain_with_binding(schema, name, spec, 0, type_identities::TypeCreationAdmission::restored(created_at)?, true)
-            .map(TypeDdlUndo::slot)
+        self.create_domain_with_binding(
+            schema,
+            name,
+            spec,
+            0,
+            type_identities::TypeCreationAdmission::restored(created_at)?,
+            true,
+        )
+        .map(TypeDdlUndo::slot)
     }
 
     pub(crate) fn create_domain_from_journal(
-        &mut self, schema: SqlName, name: SqlName, spec: DomainSpec, created_at: u64,
+        &mut self,
+        schema: SqlName,
+        name: SqlName,
+        spec: DomainSpec,
+        created_at: u64,
     ) -> Result<usize, SqlError> {
-        self.create_domain_with_binding(schema, name, spec, 0,
-            type_identities::TypeCreationAdmission::restored(created_at)?, false).map(TypeDdlUndo::slot)
+        self.create_domain_with_binding(
+            schema,
+            name,
+            spec,
+            0,
+            type_identities::TypeCreationAdmission::restored(created_at)?,
+            false,
+        )
+        .map(TypeDdlUndo::slot)
     }
 
     fn create_domain_with_binding(
@@ -41066,15 +41091,31 @@ impl Storage {
             ));
         }
         let creation = type_identities::TypeCreationAdmission::restored(created_at)?;
-        let (slot, version) = if let Some(slot) = self.enum_slot(schema.as_str(), name.as_str(), 0) {
+        let (slot, version) = if let Some(slot) = self.enum_slot(schema.as_str(), name.as_str(), 0)
+        {
             if self.enum_for(slot, 0).created_at != created_at {
-                return Err(sql_err!(sqlstate::DATA_EXCEPTION, "stored enum lifetime does not match its source"));
+                return Err(sql_err!(
+                    sqlstate::DATA_EXCEPTION,
+                    "stored enum lifetime does not match its source"
+                ));
             }
-            let version = self.type_catalog.lock().expect("type catalog lock poisoned").versions.next()?;
+            let version = self
+                .type_catalog
+                .lock()
+                .expect("type catalog lock poisoned")
+                .versions
+                .next()?;
             (slot, version)
         } else {
-            let slot = self.create_enum_with_creation(schema, name, EnumSpec { members: &[] }, 0, creation)?.slot();
-            let version = self.type_catalog.lock().expect("type catalog lock poisoned").versions.get(NamedTypeSlot::Enum(slot));
+            let slot = self
+                .create_enum_with_creation(schema, name, EnumSpec { members: &[] }, 0, creation)?
+                .slot();
+            let version = self
+                .type_catalog
+                .lock()
+                .expect("type catalog lock poisoned")
+                .versions
+                .get(NamedTypeSlot::Enum(slot));
             (slot, version)
         };
         let mut catalog = self
@@ -41102,11 +41143,21 @@ impl Storage {
         spec: EnumSpec<'_>,
         txid: u32,
     ) -> Result<TypeDdlUndo, SqlError> {
-        self.create_enum_with_creation(schema, name, spec, txid, type_identities::TypeCreationAdmission::Fresh)
+        self.create_enum_with_creation(
+            schema,
+            name,
+            spec,
+            txid,
+            type_identities::TypeCreationAdmission::Fresh,
+        )
     }
 
     fn create_enum_with_creation(
-        &self, schema: SqlName, name: SqlName, spec: EnumSpec<'_>, txid: u32,
+        &self,
+        schema: SqlName,
+        name: SqlName,
+        spec: EnumSpec<'_>,
+        txid: u32,
         creation: type_identities::TypeCreationAdmission,
     ) -> Result<TypeDdlUndo, SqlError> {
         self.require_schema_create(schema.as_str(), txid)?;
@@ -41809,7 +41860,14 @@ impl Storage {
         spec: CompositeSpec,
         txid: u32,
     ) -> Result<TypeDdlUndo, SqlError> {
-        self.create_composite_with_binding(schema, name, spec, txid, type_identities::TypeCreationAdmission::Fresh, false)
+        self.create_composite_with_binding(
+            schema,
+            name,
+            spec,
+            txid,
+            type_identities::TypeCreationAdmission::Fresh,
+            false,
+        )
     }
 
     pub(crate) fn create_composite_from_manifest(
@@ -41819,8 +41877,15 @@ impl Storage {
         spec: CompositeSpec,
         created_at: u64,
     ) -> Result<usize, SqlError> {
-        self.create_composite_with_binding(schema, name, spec, 0, type_identities::TypeCreationAdmission::restored(created_at)?, true)
-            .map(TypeDdlUndo::slot)
+        self.create_composite_with_binding(
+            schema,
+            name,
+            spec,
+            0,
+            type_identities::TypeCreationAdmission::restored(created_at)?,
+            true,
+        )
+        .map(TypeDdlUndo::slot)
     }
 
     fn create_composite_with_binding(
@@ -41834,7 +41899,8 @@ impl Storage {
     ) -> Result<TypeDdlUndo, SqlError> {
         self.require_schema_create(schema.as_str(), txid)?;
         let ownership = self.initial_ownership(txid)?;
-        let created_at = creation.stamp(&self.catalog_sequence, MAX_RELATION_GENERATION, "relation")?;
+        let created_at =
+            creation.stamp(&self.catalog_sequence, MAX_RELATION_GENERATION, "relation")?;
         let (mut permissions, mut catalog) = self.type_creation_catalogs();
         if !defer_manifest_binding {
             catalog.bind_composite_fields(&mut spec.fields[..spec.n_fields], txid)?;
@@ -41913,7 +41979,8 @@ impl Storage {
         let txid = 0;
         let ownership = self.initial_ownership(txid)?;
         let creation = type_identities::TypeCreationAdmission::restored(created_at)?;
-        let created_at = creation.stamp(&self.catalog_sequence, MAX_RELATION_GENERATION, "relation")?;
+        let created_at =
+            creation.stamp(&self.catalog_sequence, MAX_RELATION_GENERATION, "relation")?;
         let (mut permissions, mut catalog) = self.type_creation_catalogs();
         catalog.bind_composite_fields(&mut spec.fields[..spec.n_fields], txid)?;
         if slot >= catalog.composites.len()

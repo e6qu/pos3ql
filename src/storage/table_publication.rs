@@ -463,7 +463,11 @@ impl DefinitionPublication {
             drop(indexes);
             drop(sequences);
             drop(dependencies);
-            storage.retain_implicit_index_statistics(movement.database, table, &live_index_identities[..live_index_count]);
+            storage.retain_implicit_index_statistics(
+                movement.database,
+                table,
+                &live_index_identities[..live_index_count],
+            );
             return Ok(Some(rewrites_rows));
         }
     }

@@ -11196,7 +11196,8 @@ fn parent_constraint_oid(storage: &Storage, txid: u32, child_slot: usize, index:
                 && index.timing == crate::storage::ConstraintTiming::NotDeferrable
                 && columns == [column as u16]
             {
-                return parent.implicit_index_oid(position) + crate::storage::INDEX_CONSTRAINT_OID_OFFSET;
+                return parent.implicit_index_oid(position)
+                    + crate::storage::INDEX_CONSTRAINT_OID_OFFSET;
             }
             position += 1;
         } else if metadata.unique {
@@ -11206,7 +11207,8 @@ fn parent_constraint_oid(storage: &Storage, txid: u32, child_slot: usize, index:
                 && index.timing == crate::storage::ConstraintTiming::NotDeferrable
                 && columns == [column as u16]
             {
-                return parent.implicit_index_oid(position) + crate::storage::INDEX_CONSTRAINT_OID_OFFSET;
+                return parent.implicit_index_oid(position)
+                    + crate::storage::INDEX_CONSTRAINT_OID_OFFSET;
             }
             position += 1;
         }
@@ -11218,7 +11220,8 @@ fn parent_constraint_oid(storage: &Storage, txid: u32, child_slot: usize, index:
             && unique.timing == index.timing
             && unique.columns() == columns
         {
-            return parent.implicit_index_oid(position) + crate::storage::INDEX_CONSTRAINT_OID_OFFSET;
+            return parent.implicit_index_oid(position)
+                + crate::storage::INDEX_CONSTRAINT_OID_OFFSET;
         }
         position += 1;
     }
@@ -11237,7 +11240,8 @@ fn parent_constraint_oid(storage: &Storage, txid: u32, child_slot: usize, index:
                     == child_exclusion.operators[..child_exclusion.n_cols]
                 && exclusion.predicate == child_exclusion.predicate
             {
-                return parent.implicit_index_oid(position) + crate::storage::INDEX_CONSTRAINT_OID_OFFSET;
+                return parent.implicit_index_oid(position)
+                    + crate::storage::INDEX_CONSTRAINT_OID_OFFSET;
             }
             position += 1;
         }
@@ -11464,11 +11468,16 @@ fn visit_indexes(
 }
 
 /// Counters belong to the index's table, which may be a scanned child partition.
-pub(crate) fn index_statistics_owner(storage: &Storage, transaction: u32, oid: i32) -> Option<crate::storage::IndexStatisticsOwner> {
+pub(crate) fn index_statistics_owner(
+    storage: &Storage,
+    transaction: u32,
+    oid: i32,
+) -> Option<crate::storage::IndexStatisticsOwner> {
     let mut owner = None;
     visit_indexes(storage, transaction, None, |index| {
         if index.oid == oid {
-            let table = u16::try_from(index.table_slot).expect("startup table capacity is representable");
+            let table =
+                u16::try_from(index.table_slot).expect("startup table capacity is representable");
             owner = Some(if index.explicit_definition.is_some() {
                 crate::storage::IndexStatisticsOwner::Explicit(table)
             } else {
@@ -28418,7 +28427,8 @@ fn pg_stat_tables<'a>(
                 .iter()
                 .filter(|index| index.table_slot == table_slot)
             {
-                let index_statistics = storage.index_cumulative_statistics(storage.current_database_oid(), index.oid);
+                let index_statistics =
+                    storage.index_cumulative_statistics(storage.current_database_oid(), index.oid);
                 idx_scan = idx_scan.saturating_add(index_statistics.idx_scan);
                 idx_tup_fetch = idx_tup_fetch.saturating_add(index_statistics.idx_tup_fetch);
                 last_idx_scan = match (last_idx_scan, index_statistics.last_idx_scan) {
@@ -28495,7 +28505,8 @@ fn pg_stat_indexes<'a>(
         {
             continue;
         }
-        let statistics = storage.index_cumulative_statistics(storage.current_database_oid(), index.oid);
+        let statistics =
+            storage.index_cumulative_statistics(storage.current_database_oid(), index.oid);
         rows[count] = row(
             &[
                 Datum::Oid(index.table_oid as u32),

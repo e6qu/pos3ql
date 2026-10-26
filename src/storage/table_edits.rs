@@ -383,7 +383,10 @@ impl<'storage> TableDefinitionEdit<'storage> {
             }
         };
         let mut discarded = [None; super::MAX_VALUE_ENFORCERS];
-        let discarded_count = self.storage.pending_table_defs.latest_index_identities(&self.definition, &mut discarded);
+        let discarded_count = self
+            .storage
+            .pending_table_defs
+            .latest_index_identities(&self.definition, &mut discarded);
         if !self
             .storage
             .pending_table_defs
@@ -420,7 +423,13 @@ impl<'storage> TableDefinitionEdit<'storage> {
         );
         identity.apply(&mut comments);
         for candidate in &mut discarded[..discarded_count] {
-            if candidate.is_some_and(|identity| self.storage.pending_table_defs.contains_index_identity(&self.definition, identity)) { *candidate = None; }
+            if candidate.is_some_and(|identity| {
+                self.storage
+                    .pending_table_defs
+                    .contains_index_identity(&self.definition, identity)
+            }) {
+                *candidate = None;
+            }
         }
         let storage = self.storage;
         let table = self.table;

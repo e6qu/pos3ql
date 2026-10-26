@@ -3385,9 +3385,8 @@ fn push_alter_table_drops(
                         {
                             if column.primary || column.unique {
                                 let index_oid = old.implicit_index_oid(usize::from(
-                                        inline_positions[column_index].ok_or_else(graph_full)?,
-                                    ),
-                                );
+                                    inline_positions[column_index].ok_or_else(graph_full)?,
+                                ));
                                 push_drop_once(
                                     output,
                                     count,
@@ -3496,8 +3495,9 @@ fn push_alter_table_drops(
             } else {
                 inline_unique_name(old, column)
             };
-            let index_oid = old.implicit_index_oid(usize::from(inline_positions[column_index].ok_or_else(graph_full)?),
-            );
+            let index_oid = old.implicit_index_oid(usize::from(
+                inline_positions[column_index].ok_or_else(graph_full)?,
+            ));
             push_drop_once(
                 output,
                 count,

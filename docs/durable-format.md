@@ -84,8 +84,8 @@ stamps, including objects later dropped.
 
 Each constraint-created index owns a separate creation stamp. Inline-column
 keys keep their stamps beside stable attribute numbers in the table definition;
-the shared column metadata stays within its existing 512-byte recovery bound. Renaming its
-constraint, dropping an earlier constraint, or moving its column preserves
+the shared column metadata stays within its existing 512-byte recovery bound.
+Renaming its constraint, dropping an earlier constraint, or moving its column preserves
 that identity. Replacing the index reserves a fresh stamp. Manifest
 `implicit_index POSITION CREATED_AT` records and table payload v10 store the
 complete set; missing, duplicate, out-of-range or truncated identities are

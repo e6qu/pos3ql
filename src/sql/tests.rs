@@ -1991,7 +1991,7 @@ fn relation_identity_exhaustion_keeps_existing_data_and_cold_recovery_usable() {
         session.success(&mut engine, "CREATE DOMAIN identity_limit_domain AS integer; CREATE TYPE identity_limit_enum AS ENUM ('ready'); CREATE TYPE identity_limit_composite AS (value integer)", false);
         engine
             .storage
-            .replace_catalog_sequence_for_test(crate::storage::MAX_RELATION_GENERATION - 2);
+            .replace_catalog_sequence_for_test(crate::storage::MAX_RELATION_GENERATION - 3);
         session.success(&mut engine, "CREATE TABLE identity_limit_orders(id integer PRIMARY KEY); INSERT INTO identity_limit_orders VALUES (7)", false);
         for sql in [
             "CREATE TABLE identity_limit_rejected(id integer)",

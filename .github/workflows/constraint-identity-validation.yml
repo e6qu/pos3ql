@@ -67,7 +67,12 @@ jobs:
         shell: bash
         run: |
           python3 tools/test_command.py cargo test --lib --locked -- constraint_public_identifiers constraint_manifest_wide constraint_declaration_names constraint_identity_ --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/constraint-lifetimes.log"
-          grep -Eq 'test result: ok\. 7 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/constraint-lifetimes.log"
+          grep -Eq 'test result: ok\. 8 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/constraint-lifetimes.log"
+      - name: Verify related catalog and recovery behavior
+        shell: bash
+        run: |
+          python3 tools/test_command.py cargo test --lib --locked -- constraint domain relation_identity prepared enum_value_identity_journal catalog_snapshot_table_payload table_payload --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/related-catalogs.log"
+          grep -Eq 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/related-catalogs.log"
       - name: Build every target and lint
         run: cargo clippy --all-targets --locked -- -D warnings
       - name: Retain constraint and formatting evidence
@@ -80,4 +85,5 @@ jobs:
             ${{ runner.temp }}/*.reference
             ${{ runner.temp }}/constraint-check.log
             ${{ runner.temp }}/constraint-lifetimes.log
+            ${{ runner.temp }}/related-catalogs.log
           if-no-files-found: error

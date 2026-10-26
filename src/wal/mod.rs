@@ -13747,6 +13747,7 @@ mod tests {
             SqlName::parse("state").unwrap(),
         ));
         domain.n_checks = 1;
+        domain.checks[0].identity = crate::storage::ConstraintIdentity::parse(2);
         domain.checks[0].name = SqlName::parse("allowed").unwrap();
         domain.checks[0].expression =
             StackStr::from_str("pos3ql-enum-check-v1\nVALUE = /*p3c:0*/'old'");
@@ -14532,6 +14533,9 @@ mod tests {
         for (position, identity) in def.implicit_index_identities_mut().enumerate() {
             *identity = crate::storage::RelationIdentity::parse(position as u64 + 100);
         }
+        for (position, identity) in def.constraint_identities_mut().enumerate() {
+            *identity = crate::storage::ConstraintIdentity::parse(position as u64 + 200);
+        }
         def
     }
 
@@ -14585,8 +14589,10 @@ mod tests {
         assert!(decode_table_payload(&bytes[..bytes.len() - 1]).is_none());
         for invalid in [0, crate::storage::MAX_RELATION_GENERATION + 1, 101] {
             let mut corrupt = bytes.to_vec();
-            let end = corrupt.len();
-            corrupt[end - 8..].copy_from_slice(&invalid.to_le_bytes());
+            let end = corrupt.len()
+                - definition.constraint_identities().count()
+                    * crate::storage::ConstraintIdentity::ENCODED_BYTES;
+            corrupt[end - 8..end].copy_from_slice(&invalid.to_le_bytes());
             assert!(
                 decode_table_payload(&corrupt).is_none(),
                 "accepted index creation stamp {invalid}"
@@ -14714,7 +14720,7 @@ mod tests {
         definition.partition.attachment.as_mut().unwrap().state =
             crate::storage::PartitionAttachmentState::DetachPending;
         definition.partition.detached_bound = Some(crate::storage::DetachedPartitionBound {
-            identity: None,
+            identity: crate::storage::ConstraintIdentity::parse(300),
             name: SqlName::parse("detached_bound_check").unwrap(),
             scheme: crate::storage::PartitionScheme {
                 strategy: PartitionStrategy::Range,
@@ -14764,7 +14770,7 @@ mod tests {
         assert!(matches!(
             restored.partition.detached_bound,
             Some(crate::storage::DetachedPartitionBound {
-                identity: None,
+                identity: Some(identity),
                 name,
                 scheme: crate::storage::PartitionScheme {
                     strategy: PartitionStrategy::Range,
@@ -14773,7 +14779,7 @@ mod tests {
                 },
                 bound: PartitionBound::Range { n_keys: 1, .. },
                 ..
-            }) if name.as_str() == "detached_bound_check"
+            }) if name.as_str() == "detached_bound_check" && identity.created_at() == 300
         ));
         assert_eq!(
             restored.columns[0].not_null,
@@ -16164,6 +16170,7 @@ mod tests {
         definition.default_expr = Some(StackStr::from_str("64"));
         definition.n_checks = crate::storage::MAX_DOMAIN_CHECKS;
         for (index, check) in definition.checks.iter_mut().enumerate() {
+            check.identity = crate::storage::ConstraintIdentity::parse(index as u64 + 2);
             check.name = SqlName::parse(&format!("wide_check_{index}")).unwrap();
             check.expression = StackStr::from_str("VALUE >= 0");
             check.validation = crate::storage::ConstraintValidation::NotEnforced;
@@ -16218,6 +16225,10 @@ mod tests {
             bytes.extend_from_slice(&(expression.len() as u16).to_le_bytes());
             bytes.extend_from_slice(expression.as_bytes());
             bytes.push(crate::storage::ConstraintValidation::EnforcedValidated.code());
+            bytes.extend_from_slice(&2u32.to_le_bytes());
+            if not_null == 1 {
+                bytes.extend_from_slice(&3u32.to_le_bytes());
+            }
             bytes
         }
         let valid = payload("7", "VALUE > 0", 1, "bounded_domain_not_null");

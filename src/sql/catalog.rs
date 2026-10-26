@@ -9687,22 +9687,6 @@ pub(crate) fn view_slot_by_row_type_oid(
     })
 }
 
-const FIRST_FOREIGN_DATA_WRAPPER_OID: i32 = 510_000;
-const FIRST_FOREIGN_SERVER_OID: i32 = 520_000;
-const FIRST_USER_MAPPING_OID: i32 = 530_000;
-
-pub(crate) const fn foreign_data_wrapper_oid(slot: usize) -> i32 {
-    FIRST_FOREIGN_DATA_WRAPPER_OID + slot as i32
-}
-
-pub(crate) const fn foreign_server_oid(slot: usize) -> i32 {
-    FIRST_FOREIGN_SERVER_OID + slot as i32
-}
-
-const fn user_mapping_oid(slot: usize) -> i32 {
-    FIRST_USER_MAPPING_OID + slot as i32
-}
-
 fn foreign_options_datum<'a>(
     options: &crate::storage::foreign::ForeignOptions,
     arena: &'a Arena,
@@ -9774,7 +9758,7 @@ fn pg_foreign_data_wrapper<'a>(
         rows[index] = row(
             &[
                 Datum::Int4(2328),
-                Datum::Int4(foreign_data_wrapper_oid(slot)),
+                Datum::Int4(storage.foreign_wrapper_entry(slot).oid()),
                 text(wrapper.name.as_str(), arena)?,
                 Datum::Int4(storage.role_oid(entry.ownership.owner_to(txid) as usize)),
                 Datum::Int4(match wrapper.handler {
@@ -9821,10 +9805,10 @@ fn pg_foreign_server<'a>(
         rows[index] = row(
             &[
                 Datum::Int4(1417),
-                Datum::Int4(foreign_server_oid(slot)),
+                Datum::Int4(storage.foreign_server_entry(slot).oid()),
                 text(server.name.as_str(), arena)?,
                 Datum::Int4(storage.role_oid(entry.ownership.owner_to(txid) as usize)),
-                Datum::Int4(foreign_data_wrapper_oid(server.wrapper as usize)),
+                Datum::Int4(storage.foreign_wrapper_entry(server.wrapper as usize).oid()),
                 match server.server_type {
                     Some(value) => text(value.as_str(), arena)?,
                     None => Datum::Null,
@@ -9865,7 +9849,7 @@ fn pg_foreign_table<'a>(
         rows[index] = row(
             &[
                 Datum::Int4(user_table_oid(storage, table.table as usize)),
-                Datum::Int4(foreign_server_oid(table.server as usize)),
+                Datum::Int4(storage.foreign_server_entry(table.server as usize).oid()),
                 foreign_options_datum(&table.options, arena)?,
             ],
             arena,
@@ -9894,9 +9878,9 @@ fn pg_user_mapping<'a>(
         };
         rows[index] = row(
             &[
-                Datum::Int4(user_mapping_oid(slot)),
+                Datum::Int4(storage.foreign_mapping_entry(slot).oid()),
                 Datum::Int4(user),
-                Datum::Int4(foreign_server_oid(mapping.server as usize)),
+                Datum::Int4(storage.foreign_server_entry(mapping.server as usize).oid()),
                 if foreign_mapping_options_visible(storage, mapping, txid) {
                     foreign_options_datum(&mapping.options, arena)?
                 } else {
@@ -9938,8 +9922,8 @@ fn pg_user_mappings<'a>(
         };
         rows[index] = row(
             &[
-                Datum::Int4(user_mapping_oid(slot)),
-                Datum::Int4(foreign_server_oid(mapping.server as usize)),
+                Datum::Int4(storage.foreign_mapping_entry(slot).oid()),
+                Datum::Int4(storage.foreign_server_entry(mapping.server as usize).oid()),
                 text(server.name.as_str(), arena)?,
                 Datum::Int4(user),
                 user_name,
@@ -10970,16 +10954,6 @@ const fn foreign_key_action_routine(action: crate::storage::FkAction, update: bo
         (FkAction::NoAction, true) => 1655,
     }
 }
-const FIRST_EXTENDED_STATISTICS_OID: i32 = 300_000;
-const FIRST_EXTENSION_OID: i32 = 500_000;
-
-pub(crate) fn extension_oid(slot: usize) -> i32 {
-    FIRST_EXTENSION_OID + slot as i32
-}
-
-pub(crate) fn extended_statistics_oid(slot: usize) -> i32 {
-    FIRST_EXTENDED_STATISTICS_OID + slot as i32
-}
 
 pub(crate) fn extended_statistics_columns_by_oid<'a>(
     storage: &Storage,
@@ -10990,7 +10964,7 @@ pub(crate) fn extended_statistics_columns_by_oid<'a>(
     use core::fmt::Write as _;
     let Some((_, statistics)) = storage
         .extended_statistics_visible(txid)
-        .find(|(slot, _)| extended_statistics_oid(*slot) == oid)
+        .find(|(slot, _)| storage.extended_statistics(*slot).oid() == oid)
     else {
         return Ok(None);
     };
@@ -11026,7 +11000,7 @@ pub(crate) fn extended_statistics_definition_by_oid<'a>(
     use core::fmt::Write as _;
     let Some((_, statistics)) = storage
         .extended_statistics_visible(txid)
-        .find(|(slot, _)| extended_statistics_oid(*slot) == oid)
+        .find(|(slot, _)| storage.extended_statistics(*slot).oid() == oid)
     else {
         return Ok(None);
     };
@@ -11094,7 +11068,7 @@ pub(crate) fn extended_statistics_expressions_by_oid<'a>(
 ) -> Result<Option<Datum<'a>>, SqlError> {
     let Some((_, statistics)) = storage
         .extended_statistics_visible(txid)
-        .find(|(slot, _)| extended_statistics_oid(*slot) == oid)
+        .find(|(slot, _)| storage.extended_statistics(*slot).oid() == oid)
     else {
         return Ok(None);
     };
@@ -12413,7 +12387,7 @@ pub(crate) fn conversion_oid_visibility(storage: &Storage, txid: u32, oid: i32) 
 pub(crate) fn statistics_oid_visibility(storage: &Storage, txid: u32, oid: i32) -> Option<bool> {
     let (slot, statistics) = storage
         .extended_statistics_visible(txid)
-        .find(|(slot, _)| extended_statistics_oid(*slot) == oid)?;
+        .find(|(slot, _)| storage.extended_statistics(*slot).oid() == oid)?;
     let definition = statistics.definition_for(txid);
     Some(
         storage.extended_statistics_slot_on_path(None, definition.name.as_str(), txid)
@@ -14148,7 +14122,7 @@ fn pg_description<'a>(
                 let Some(_) = storage.foreign_server_by_slot(slot, txid) else {
                     continue;
                 };
-                (foreign_server_oid(slot), 1417)
+                (storage.foreign_server_entry(slot).oid(), 1417)
             }
             crate::storage::CommentClass::ForeignDataWrapper => {
                 let Ok(slot) = usize::try_from(subid) else {
@@ -14157,7 +14131,7 @@ fn pg_description<'a>(
                 let Some(_) = storage.foreign_wrapper_by_slot(slot, txid) else {
                     continue;
                 };
-                (foreign_data_wrapper_oid(slot), 2328)
+                (storage.foreign_wrapper_entry(slot).oid(), 2328)
             }
             crate::storage::CommentClass::AccessMethod => {
                 let Ok(oid) = i32::try_from(subid) else {
@@ -14234,7 +14208,7 @@ fn pg_description<'a>(
                 let Some(slot) = storage.extension_slot(name, txid) else {
                     continue;
                 };
-                (extension_oid(slot), 3079)
+                (storage.extension(slot).oid(), 3079)
             }
             crate::storage::CommentClass::Trigger => {
                 let trigger = storage
@@ -14308,7 +14282,10 @@ fn pg_description<'a>(
                 else {
                     continue;
                 };
-                (extended_statistics_oid(slot), PG_STATISTIC_EXT_OID)
+                (
+                    storage.extended_statistics(slot).oid(),
+                    PG_STATISTIC_EXT_OID,
+                )
             }
             crate::storage::CommentClass::Publication => {
                 let Some((slot, _)) = storage
@@ -14317,7 +14294,10 @@ fn pg_description<'a>(
                 else {
                     continue;
                 };
-                (publication_oid(slot), PG_PUBLICATION_OID)
+                (
+                    storage.publication_for_event_trigger(slot).oid(),
+                    PG_PUBLICATION_OID,
+                )
             }
             crate::storage::CommentClass::Subscription => {
                 let Some((_, subscription)) = storage
@@ -14326,7 +14306,7 @@ fn pg_description<'a>(
                 else {
                     continue;
                 };
-                (subscription_oid(&subscription), PG_SUBSCRIPTION_OID)
+                (subscription.oid(), PG_SUBSCRIPTION_OID)
             }
             crate::storage::CommentClass::Rule => {
                 let rule = storage
@@ -14931,7 +14911,7 @@ fn visit_comments_for_object(
                     && subid == 0
                     && signed_oid.is_some_and(|server_oid| {
                         usize::try_from(csub).ok().is_some_and(|slot| {
-                            foreign_server_oid(slot) == server_oid
+                            storage.foreign_server_entry(slot).oid() == server_oid
                                 && storage.foreign_server_by_slot(slot, txid).is_some()
                         })
                     })
@@ -14941,7 +14921,7 @@ fn visit_comments_for_object(
                     && subid == 0
                     && signed_oid.is_some_and(|wrapper_oid| {
                         usize::try_from(csub).ok().is_some_and(|slot| {
-                            foreign_data_wrapper_oid(slot) == wrapper_oid
+                            storage.foreign_wrapper_entry(slot).oid() == wrapper_oid
                                 && storage.foreign_wrapper_by_slot(slot, txid).is_some()
                         })
                     })
@@ -15138,7 +15118,7 @@ fn visit_comments_for_object(
                     && subid == 0
                     && signed_oid.is_some_and(|oid| {
                         storage.extended_statistics_visible(txid).any(|(slot, _)| {
-                            extended_statistics_oid(slot) == oid && csub == slot as u32
+                            storage.extended_statistics(slot).oid() == oid && csub == slot as u32
                         })
                     })
             }
@@ -15148,7 +15128,10 @@ fn visit_comments_for_object(
                     && signed_oid.is_some_and(|oid| {
                         storage
                             .publications_with_slots_visible_to(txid)
-                            .any(|(slot, _)| publication_oid(slot) == oid && csub == slot as u32)
+                            .any(|(slot, _)| {
+                                storage.publication_for_event_trigger(slot).oid() == oid
+                                    && csub == slot as u32
+                            })
                     })
             }
             "pg_subscription" => {
@@ -15157,8 +15140,7 @@ fn visit_comments_for_object(
                     && signed_oid.is_some_and(|oid| {
                         storage.subscriptions_with_slots_visible_to(txid).any(
                             |(_, subscription)| {
-                                subscription_oid(&subscription) == oid
-                                    && csub == subscription.created_at as u32
+                                subscription.oid() == oid && csub == subscription.created_at as u32
                             },
                         )
                     })
@@ -15168,7 +15150,7 @@ fn visit_comments_for_object(
                     && subid == 0
                     && storage
                         .extension_slot(name, txid)
-                        .is_some_and(|slot| Some(extension_oid(slot)) == signed_oid)
+                        .is_some_and(|slot| Some(storage.extension(slot).oid()) == signed_oid)
             }
             "pg_class" => {
                 class == crate::storage::CommentClass::Relation
@@ -16784,14 +16766,6 @@ fn pg_stats<'a>(
     finish(def, &rows[..count], arena)
 }
 
-pub(crate) fn publication_oid(slot: usize) -> i32 {
-    FIRST_USER_OID + 80_000 + slot as i32
-}
-
-pub(crate) fn subscription_oid(subscription: &crate::storage::SubscriptionDef) -> i32 {
-    FIRST_USER_OID + 95_000 + subscription.created_at as i32
-}
-
 fn policy_command_name(command: PolicyCommandKind) -> &'static str {
     match command {
         PolicyCommandKind::All => "ALL",
@@ -16948,7 +16922,7 @@ fn pg_statistic_ext<'a>(
         rows[count] = row(
             &[
                 Datum::Int4(3381),
-                Datum::Int4(extended_statistics_oid(slot)),
+                Datum::Int4(storage.extended_statistics(slot).oid()),
                 Datum::Int4(user_table_oid(storage, usize::from(statistics.table))),
                 text(mutable.name.as_str(), arena)?,
                 Datum::Int4(namespace_oid(storage, mutable.schema.as_str(), txid)),
@@ -17258,7 +17232,7 @@ fn pg_statistic_ext_data<'a>(
         rows[count] = row(
             &[
                 Datum::Int4(3429),
-                Datum::Int4(extended_statistics_oid(slot)),
+                Datum::Int4(storage.extended_statistics(slot).oid()),
                 Datum::Bool(data.inherited),
                 if statistics.kinds.ndistinct() {
                     text(ndistinct.as_str(), arena)?
@@ -17663,7 +17637,7 @@ fn pg_publication<'a>(
         rows[count] = row(
             &[
                 Datum::Int4(6104),
-                Datum::Int4(publication_oid(slot)),
+                Datum::Int4(storage.publication_for_event_trigger(slot).oid()),
                 text(publication.name_for(txid).as_str(), arena)?,
                 Datum::Int4(storage.role_oid(publication.ownership.owner_to(txid) as usize)),
                 Datum::Bool(definition.all_tables),
@@ -17713,7 +17687,11 @@ fn pg_publication_namespace<'a>(
                             .get(),
                     ),
                     Datum::Int4(FIRST_USER_OID + 85_000 + count as i32),
-                    Datum::Int4(publication_oid(publication_slot)),
+                    Datum::Int4(
+                        storage
+                            .publication_for_event_trigger(publication_slot)
+                            .oid(),
+                    ),
                     Datum::Int4(namespace_oid(storage, schema.name.as_str(), txid)),
                 ],
                 arena,
@@ -17788,7 +17766,11 @@ fn pg_publication_rel<'a>(
                 &[
                     Datum::Int4(6106),
                     Datum::Int4(FIRST_USER_OID + 90_000 + count as i32),
-                    Datum::Int4(publication_oid(publication_slot)),
+                    Datum::Int4(
+                        storage
+                            .publication_for_event_trigger(publication_slot)
+                            .oid(),
+                    ),
                     Datum::Int4(user_table_oid(storage, *member as usize)),
                     prqual,
                     prattrs,
@@ -18794,7 +18776,7 @@ fn pg_replication_origin<'a>(
                 "pg_replication_origin changed while it was being read"
             ));
         }
-        let name = stack_format!(64, "pg_{}", subscription_oid(&subscription));
+        let name = stack_format!(64, "pg_{}", subscription.oid());
         rows[count] = row(
             &[Datum::Oid(slot as u32 + 1), text(name.as_str(), arena)?],
             arena,
@@ -18824,7 +18806,7 @@ fn pg_replication_origin_status<'a>(
                 "pg_replication_origin_status changed while it was being read"
             ));
         }
-        let name = stack_format!(64, "pg_{}", subscription_oid(&subscription));
+        let name = stack_format!(64, "pg_{}", subscription.oid());
         rows[count] = row(
             &[
                 Datum::Oid(slot as u32 + 1),
@@ -18966,7 +18948,7 @@ fn pg_subscription<'a>(
         rows[count] = row(
             &[
                 Datum::Int4(PG_SUBSCRIPTION_OID),
-                Datum::Int4(subscription_oid(&subscription)),
+                Datum::Int4(subscription.oid()),
                 Datum::Int4(storage.current_database_oid().get()),
                 skip_lsn,
                 text(subscription.name.as_str(), arena)?,
@@ -19039,7 +19021,7 @@ fn pg_subscription_rel<'a>(
             let rendered_lsn = stack_format!(32, "0/{lsn:X}");
             rows[index] = row(
                 &[
-                    Datum::Int4(subscription_oid(&subscription)),
+                    Datum::Int4(subscription.oid()),
                     Datum::Int4(user_table_oid(storage, relation.table_slot())),
                     text(relation.state().pg_code(), arena)?,
                     if lsn == 0 {
@@ -19088,7 +19070,7 @@ fn pg_stat_subscription<'a>(
         };
         rows[count] = row(
             &[
-                Datum::Oid(subscription_oid(&subscription) as u32),
+                Datum::Oid(subscription.oid() as u32),
                 text(subscription.name_for(txid).as_str(), arena)?,
                 text("apply", arena)?,
                 Datum::Null,
@@ -19128,7 +19110,7 @@ fn pg_stat_subscription_stats<'a>(
         }
         rows[count] = row(
             &[
-                Datum::Oid(subscription_oid(&subscription) as u32),
+                Datum::Oid(subscription.oid() as u32),
                 text(subscription.name_for(txid).as_str(), arena)?,
                 Datum::Int8(subscription.apply_error_count),
                 Datum::Int8(subscription.sync_error_count),
@@ -21044,7 +21026,7 @@ fn pg_extension<'a>(
         out[index] = row(
             &[
                 Datum::Int4(3079),
-                Datum::Int4(extension_oid(slot)),
+                Datum::Int4(storage.extension(slot).oid()),
                 text(extension.name.as_str(), arena)?,
                 Datum::Int4(owner_oid(
                     storage,
@@ -21120,9 +21102,9 @@ fn extension_dependency_catalog_identity(
                 txid,
             ),
         ),
-        AccessClass::Statistics => (3381, extended_statistics_oid(slot)),
+        AccessClass::Statistics => (3381, storage.extended_statistics(slot).oid()),
         AccessClass::Tablespace => return None,
-        AccessClass::Extension => (3079, extension_oid(slot)),
+        AccessClass::Extension => (3079, storage.extension(slot).oid()),
         AccessClass::Trigger => (2620, crate::storage::trigger_oid(&storage.trigger(slot))),
         AccessClass::EventTrigger => (3466, storage.event_trigger(slot).oid()),
         AccessClass::Database => (1262, 5),
@@ -21133,8 +21115,8 @@ fn extension_dependency_catalog_identity(
                 .find_map(|(candidate, object)| (candidate == slot).then_some(object.oid.get()))?
                 as i32,
         ),
-        AccessClass::ForeignDataWrapper => (2328, foreign_data_wrapper_oid(slot)),
-        AccessClass::ForeignServer => (1417, foreign_server_oid(slot)),
+        AccessClass::ForeignDataWrapper => (2328, storage.foreign_wrapper_entry(slot).oid()),
+        AccessClass::ForeignServer => (1417, storage.foreign_server_entry(slot).oid()),
         AccessClass::Language => (PG_LANGUAGE_OID, object.slot.into()),
     })
 }
@@ -21933,7 +21915,7 @@ fn pg_depend<'a>(
             class,
             object,
             3079,
-            extension_oid(dependency.extension as usize),
+            storage.extension(dependency.extension as usize).oid(),
             0,
             match dependency.kind {
                 crate::storage::ExtensionDependencyKind::Member => "e",

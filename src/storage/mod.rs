@@ -10,7 +10,10 @@ pub(crate) use catalog_history::{
     CatalogHistory, CatalogHistoryBatch, CatalogPublication, CatalogRelationIdentity,
     CatalogRowImage, HistoricalCatalogRow,
 };
+mod catalog_identities;
 mod catalog_sources;
+use catalog_identities::MAX_CATALOG_CREATION;
+pub(crate) use catalog_identities::{CatalogCreation, CatalogIdentity};
 mod parameter_acls;
 use parameter_acls::ParameterAclGrantIdentity;
 use parameter_acls::ParameterAclRows;
@@ -5593,6 +5596,7 @@ pub(crate) enum PublicationAlteration {
 /// and manifests) on the same semantic boundary.
 #[derive(Clone, Copy)]
 pub struct PublicationSpec<'a> {
+    pub(crate) creation: CatalogCreation,
     pub name: SqlName,
     pub all_tables: bool,
     pub tables: &'a [u16],
@@ -17906,6 +17910,7 @@ impl Storage {
         definition: foreign::ForeignDataWrapperDefinition,
         owner: u16,
     ) -> Result<(), SqlError> {
+        CatalogIdentity::require(created_at)?;
         self.catalog_sequence.observe(created_at);
         self.foreign_catalog().restore_wrapper(
             slot,
@@ -17923,6 +17928,7 @@ impl Storage {
         definition: foreign::ForeignServerDefinition,
         owner: u16,
     ) -> Result<(), SqlError> {
+        CatalogIdentity::require(created_at)?;
         self.catalog_sequence.observe(created_at);
         self.foreign_catalog().restore_server(
             slot,
@@ -17939,6 +17945,7 @@ impl Storage {
         created_at: u64,
         definition: foreign::UserMappingDefinition,
     ) -> Result<(), SqlError> {
+        CatalogIdentity::require(created_at)?;
         self.catalog_sequence.observe(created_at);
         self.foreign_catalog()
             .restore_mapping(slot, current_database(), created_at, definition)
@@ -18049,7 +18056,9 @@ impl Storage {
         txid: u32,
     ) -> Result<usize, SqlError> {
         let ownership = self.initial_ownership(txid)?;
-        let created_at = self.catalog_sequence.next()?;
+        let created_at = self
+            .catalog_sequence
+            .next_bounded(MAX_CATALOG_CREATION, "catalog object")?;
         let slot = self.foreign_catalog().create_wrapper(
             current_database(),
             created_at,
@@ -18070,7 +18079,9 @@ impl Storage {
         txid: u32,
     ) -> Result<usize, SqlError> {
         let ownership = self.initial_ownership(txid)?;
-        let created_at = self.catalog_sequence.next()?;
+        let created_at = self
+            .catalog_sequence
+            .next_bounded(MAX_CATALOG_CREATION, "catalog object")?;
         let slot = self.foreign_catalog().create_server(
             current_database(),
             created_at,
@@ -18093,7 +18104,9 @@ impl Storage {
         if let foreign::ForeignMappingUser::Role(role) = definition.user {
             self.role_reference_ready(usize::from(role), txid)?;
         }
-        let created_at = self.catalog_sequence.next()?;
+        let created_at = self
+            .catalog_sequence
+            .next_bounded(MAX_CATALOG_CREATION, "catalog object")?;
         self.foreign_catalog()
             .create_mapping(current_database(), created_at, definition, txid)
     }
@@ -29959,7 +29972,9 @@ impl Storage {
                     catalog.definitions.len()
                 )
             })?;
-        let created_at = self.catalog_sequence.next()?;
+        let created_at = self
+            .catalog_sequence
+            .next_bounded(MAX_CATALOG_CREATION, "catalog object")?;
         catalog.definitions[slot] = ExtensionDef {
             database: current_database(),
             created_at,
@@ -29983,6 +29998,7 @@ impl Storage {
         owner: usize,
         created_at: u64,
     ) -> Result<usize, SqlError> {
+        CatalogIdentity::require(created_at)?;
         let mut catalog = self.extension_catalog();
         let definition = ExtensionDef {
             database: current_database(),
@@ -38140,7 +38156,9 @@ impl Storage {
         };
         let mut publications = [SqlName::EMPTY; MAX_SUBSCRIPTION_PUBLICATIONS];
         publications[..spec.publications.len()].copy_from_slice(spec.publications);
-        let created_at = self.catalog_sequence.next()?;
+        let created_at = self
+            .catalog_sequence
+            .next_bounded(MAX_CATALOG_CREATION, "catalog object")?;
         catalog.definitions[slot] = SubscriptionDef {
             database: current_database(),
             created_at,
@@ -38245,6 +38263,7 @@ impl Storage {
         created_at: u64,
         definition_generation: u64,
     ) -> Result<(), SqlError> {
+        CatalogIdentity::require(created_at)?;
         if created_at == 0 || definition_generation == 0 {
             return Err(sql_err!(
                 sqlstate::INVALID_PARAMETER_VALUE,
@@ -39260,7 +39279,7 @@ impl Storage {
         };
         publications[slot] = PublicationDef {
             database: current_database(),
-            created_at: self.catalog_sequence.next()?,
+            created_at: spec.creation.resolve(&self.catalog_sequence)?,
             name: spec.name,
             pending_name: None,
             all_tables: spec.all_tables,
@@ -45232,8 +45251,10 @@ impl Storage {
             ));
         };
         let created_at = if spec.created_at == 0 {
-            self.catalog_sequence.next()?
+            self.catalog_sequence
+                .next_bounded(MAX_CATALOG_CREATION, "catalog object")?
         } else {
+            CatalogIdentity::require(spec.created_at)?;
             self.catalog_sequence.observe(spec.created_at);
             spec.created_at
         };
@@ -59231,6 +59252,7 @@ mod tests {
         let empty_descendants: [bool; 0] = [];
         let empty_filters: [StackStr<PUBLICATION_FILTER_SQL_MAX>; 0] = [];
         let full = PublicationSpec {
+            creation: CatalogCreation::New,
             name: SqlName::parse("publication_full").unwrap(),
             all_tables: true,
             tables: &[],
@@ -59254,6 +59276,7 @@ mod tests {
             storage
                 .create_publication(
                     PublicationSpec {
+                        creation: CatalogCreation::New,
                         name: pending_name,
                         ..full
                     },

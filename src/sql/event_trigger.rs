@@ -1908,7 +1908,7 @@ fn primary_object(
             let definition = statistics.definition_for(txid);
             base_object(
                 catalog::PG_STATISTIC_EXT_OID,
-                catalog::extended_statistics_oid(slot),
+                storage.extended_statistics(slot).oid(),
                 "statistics object",
                 Some(definition.schema.as_str()),
                 Some(definition.name.as_str()),
@@ -1921,7 +1921,7 @@ fn primary_object(
             let name = publication.name_for(txid);
             base_object(
                 catalog::PG_PUBLICATION_OID,
-                catalog::publication_oid(slot),
+                storage.publication_for_event_trigger(slot).oid(),
                 "publication",
                 None,
                 Some(name.as_str()),
@@ -1934,7 +1934,7 @@ fn primary_object(
             let name = subscription.name_for(txid);
             base_object(
                 catalog::PG_SUBSCRIPTION_OID,
-                catalog::subscription_oid(&subscription),
+                subscription.oid(),
                 "subscription",
                 None,
                 Some(name.as_str()),
@@ -1946,7 +1946,7 @@ fn primary_object(
             let extension = storage.extension(slot);
             base_object(
                 catalog::PG_EXTENSION_OID,
-                catalog::extension_oid(slot),
+                storage.extension(slot).oid(),
                 "extension",
                 None,
                 Some(extension.name.as_str()),
@@ -1973,7 +1973,7 @@ fn primary_object(
                 .ok_or_else(graph_full)?;
             base_object(
                 1417,
-                catalog::foreign_server_oid(slot),
+                storage.foreign_server_entry(slot).oid(),
                 "foreign server",
                 None,
                 Some(server.name.as_str()),
@@ -1987,7 +1987,7 @@ fn primary_object(
                 .ok_or_else(graph_full)?;
             base_object(
                 2328,
-                catalog::foreign_data_wrapper_oid(slot),
+                storage.foreign_wrapper_entry(slot).oid(),
                 "foreign data wrapper",
                 None,
                 Some(wrapper.name.as_str()),
@@ -2648,7 +2648,7 @@ fn existing_catalog_object(
             storage
                 .extended_statistics_visible(txid)
                 .find_map(|(slot, _)| {
-                    (catalog::extended_statistics_oid(slot) == object_id).then_some(slot)
+                    (storage.extended_statistics(slot).oid() == object_id).then_some(slot)
                 })
                 .ok_or_else(|| catalog_lookup_failed(class_id, object_id))?,
         )),
@@ -2717,21 +2717,21 @@ fn existing_catalog_object(
         catalog::PG_PUBLICATION_OID => EventObjectRef::Primary(ObjectRef::Publication(
             storage
                 .publications_with_slots_visible_to(txid)
-                .find_map(|(slot, _)| (catalog::publication_oid(slot) == object_id).then_some(slot))
+                .find_map(|(slot, _)| {
+                    (storage.publication_for_event_trigger(slot).oid() == object_id).then_some(slot)
+                })
                 .ok_or_else(|| catalog_lookup_failed(class_id, object_id))?,
         )),
         catalog::PG_SUBSCRIPTION_OID => EventObjectRef::Primary(ObjectRef::Subscription(
             storage
                 .subscriptions_with_slots_visible_to(txid)
-                .find_map(|(slot, subscription)| {
-                    (catalog::subscription_oid(&subscription) == object_id).then_some(slot)
-                })
+                .find_map(|(slot, subscription)| (subscription.oid() == object_id).then_some(slot))
                 .ok_or_else(|| catalog_lookup_failed(class_id, object_id))?,
         )),
         catalog::PG_EXTENSION_OID => EventObjectRef::Primary(ObjectRef::Extension(
             storage
                 .extensions_visible_to(txid)
-                .find_map(|(slot, _)| (catalog::extension_oid(slot) == object_id).then_some(slot))
+                .find_map(|(slot, _)| (storage.extension(slot).oid() == object_id).then_some(slot))
                 .ok_or_else(|| catalog_lookup_failed(class_id, object_id))?,
         )),
         catalog::PG_LARGEOBJECT_OID => EventObjectRef::Primary(ObjectRef::LargeObject(

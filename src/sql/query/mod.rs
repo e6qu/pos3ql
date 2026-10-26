@@ -4610,12 +4610,12 @@ fn object_privilege_query(
                     .map(usize::from),
                 AccessClass::ForeignDataWrapper => {
                     storage.foreign_wrappers(txid).find_map(|(slot, _)| {
-                        (super::catalog::foreign_data_wrapper_oid(slot) == oid).then_some(slot)
+                        (storage.foreign_wrapper_entry(slot).oid() == oid).then_some(slot)
                     })
                 }
                 AccessClass::ForeignServer => {
                     storage.foreign_servers(txid).find_map(|(slot, _)| {
-                        (super::catalog::foreign_server_oid(slot) == oid).then_some(slot)
+                        (storage.foreign_server_entry(slot).oid() == oid).then_some(slot)
                     })
                 }
                 AccessClass::LargeObject => LargeObjectOid::parse(oid as u32)

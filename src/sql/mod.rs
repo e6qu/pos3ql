@@ -4420,9 +4420,7 @@ impl Engine {
         let slot = oid.and_then(|oid| {
             self.storage
                 .subscriptions_with_slots_visible_to(txid)
-                .find_map(|(slot, subscription)| {
-                    (catalog::subscription_oid(&subscription) == oid).then_some(slot)
-                })
+                .find_map(|(slot, subscription)| (subscription.oid() == oid).then_some(slot))
         });
         if oid.is_none() || slot.is_some() {
             self.storage.reset_subscription_statistics(
@@ -22456,6 +22454,7 @@ fn apply_wal_op(
             }
         }
         WalOp::CreatePublication {
+            created_at,
             name,
             owner,
             all_tables,
@@ -22482,6 +22481,9 @@ fn apply_wal_op(
                 })?;
             let slot = storage.create_publication(
                 crate::storage::PublicationSpec {
+                    creation: crate::storage::CatalogCreation::Restore(
+                        crate::storage::CatalogIdentity::require(created_at)?,
+                    ),
                     name: crate::storage::SqlName::parse(name)?,
                     all_tables,
                     tables: &tables[..table_count],

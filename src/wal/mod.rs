@@ -26,7 +26,7 @@ use crc32c::crc32c;
 
 /// On-disk record header length shared by recovery and logical decoding.
 pub(crate) const HEADER_LEN: usize = 24;
-pub(crate) const RECORD_VERSION: u8 = 18;
+pub(crate) const RECORD_VERSION: u8 = 19;
 
 /// One contiguous, committed journal range ready for immutable publication.
 /// Construction is private to the journal, so callers cannot pair an LSN with
@@ -1047,6 +1047,7 @@ pub(crate) enum WalOp<'a> {
         name: &'a str,
     },
     CreatePublication {
+        created_at: u64,
         name: &'a str,
         owner: u16,
         all_tables: bool,
@@ -3085,7 +3086,8 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             table_filter_sql,
             ..
         } => {
-            1 + name.len()
+            8 + 1
+                + name.len()
                 + 2
                 + 1
                 + 1
@@ -4932,6 +4934,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 && name_bytes(buffer, name)
         }
         WalOp::CreatePublication {
+            created_at,
             name,
             owner,
             all_tables,
@@ -4960,7 +4963,8 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                     publish_generated_columns,
                     crate::storage::PublishGeneratedColumns::Stored
                 )) << 6);
-            let mut ok = name_bytes(buffer, name)
+            let mut ok = buffer.append(&created_at.to_le_bytes())
+                && name_bytes(buffer, name)
                 && buffer.append(&owner.to_le_bytes())
                 && buffer.append(&[flags, *table_count as u8, *schema_count as u8]);
             for table in &tables[..*table_count] {
@@ -8471,6 +8475,9 @@ fn decode_op_inner<'a>(
         }),
         KIND_CREATE_PUBLICATION_V2 | KIND_CREATE_PUBLICATION_V3 => decode_large_op(|| {
             let wide_columns = kind == KIND_CREATE_PUBLICATION_V3;
+            let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
+            at += 8;
+            crate::storage::CatalogIdentity::parse(created_at)?;
             let name = take_name(&mut at)?;
             let owner = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
             at += 2;
@@ -8530,6 +8537,7 @@ fn decode_op_inner<'a>(
             schemas[..schema_count].copy_from_slice(payload.get(at..at + schema_count)?);
             at += schema_count;
             (at == payload.len()).then_some(WalOp::CreatePublication {
+                created_at,
                 name,
                 owner,
                 all_tables: flags & 1 != 0,
@@ -15460,6 +15468,7 @@ mod tests {
             wal.append_committed(
                 13,
                 &WalOp::CreatePublication {
+                    created_at: 17,
                     name: "changes",
                     owner: 7,
                     all_tables: false,

@@ -209,7 +209,7 @@ fn parse_writer_fence(bytes: &[u8]) -> Result<(&str, WriterToken), &'static str>
     Ok((state, token))
 }
 
-pub(crate) const MANIFEST_HEADER: &str = "pos3ql-manifest-v30";
+pub(crate) const MANIFEST_HEADER: &str = "pos3ql-manifest-v31";
 
 struct ManifestMetadata {
     lsn: u64,
@@ -10991,9 +10991,10 @@ impl Checkpointer {
                 )) << 6);
             write!(
                 &mut self.manifest_output,
-                "pub {} {} {} {} {}",
+                "pub {} {} {} {} {} {}",
                 name.as_str(),
                 publication.ownership.owner,
+                publication.created_at,
                 flags,
                 publication.table_count,
                 publication.schema_count
@@ -17549,6 +17550,9 @@ fn load_publication(storage: &mut Storage, line: &str) -> Result<(), CheckpointS
         .ok_or(CheckpointSetupError::Corrupt("pub name"))
         .and_then(decode_hex_name)?;
     let owner: u16 = parse_field(words.next(), "pub owner")?;
+    let created_at = parse_field(words.next(), "pub creation stamp")?;
+    let creation = crate::storage::CatalogIdentity::require(created_at)
+        .map_err(|_| CheckpointSetupError::Corrupt("invalid publication creation identity"))?;
     let flags: u8 = parse_field(words.next(), "pub flags")?;
     let count: usize = parse_field(words.next(), "pub table count")?;
     let schema_count: usize = parse_field(words.next(), "pub schema count")?;
@@ -17600,6 +17604,7 @@ fn load_publication(storage: &mut Storage, line: &str) -> Result<(), CheckpointS
     let slot = storage
         .create_publication(
             crate::storage::PublicationSpec {
+                creation: crate::storage::CatalogCreation::Restore(creation),
                 name: sql_name(&name)?,
                 all_tables: flags & 1 != 0,
                 tables: &tables[..count],

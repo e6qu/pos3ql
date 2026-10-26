@@ -14002,6 +14002,7 @@ pub fn create_publication(
     };
     match storage.create_publication(
         crate::storage::PublicationSpec {
+            creation: crate::storage::CatalogCreation::New,
             name,
             all_tables,
             tables: &members[..table_count],
@@ -14025,6 +14026,7 @@ pub fn create_publication(
                 txn.txid,
                 lsn,
                 &WalOp::CreatePublication {
+                    created_at: storage.publication_for_event_trigger(slot).created_at,
                     name: name.as_str(),
                     owner,
                     all_tables,

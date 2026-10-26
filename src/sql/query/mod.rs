@@ -3722,6 +3722,10 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                 )?
             }
         };
+        let requested = PrivilegeRequirements::parse(privileges, PrivilegeSet::SCHEMA_ALL)?;
+        if self.storage.role(role).attributes_to(self.txid).superuser {
+            return Ok(Some(true));
+        }
         let Some(schema) = super::catalog::schema_name_by_oid(self.storage, self.txid, oid) else {
             return Ok(None);
         };
@@ -3731,14 +3735,11 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         ) {
             let owner = self.storage.role_has_privileges_of(role, 0, self.txid);
             let public = schema.as_str() != "pg_toast";
-            return privilege_query(
-                privileges,
-                PrivilegeSet::NONE,
-                PrivilegeSet::SCHEMA_ALL,
-                |privilege| owner || (public && privilege == PrivilegeSet::USAGE),
-                |_| owner,
-            )
-            .map(Some);
+            return Ok(Some(requested.allows(
+PrivilegeSet::NONE,
+|privilege| owner || (public && privilege == PrivilegeSet::USAGE),
+|_| owner
+)));
         }
         let Some(slot) = self.storage.find_schema_visible(schema.as_str(), self.txid) else {
             return Ok(None);
@@ -3747,20 +3748,17 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             class: crate::storage::AccessClass::Schema,
             slot: slot as u16,
         };
-        privilege_query(
-            privileges,
-            crate::storage::PrivilegeSet::NONE,
-            crate::storage::PrivilegeSet::SCHEMA_ALL,
-            |privilege| {
+        Ok(Some(requested.allows(
+crate::storage::PrivilegeSet::NONE,
+|privilege| {
                 self.storage
                     .has_object_privilege(object, role, privilege, self.txid)
             },
-            |privilege| {
+|privilege| {
                 self.storage
                     .has_object_grant_option(object, role, privilege, self.txid)
-            },
-        )
-        .map(Some)
+            }
+)))
     }
 
     fn has_type_privilege(
@@ -3789,6 +3787,10 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                 referenced_oid
             }
         };
+        let requested = PrivilegeRequirements::parse(privileges, PrivilegeSet::TYPE_ALL)?;
+        if self.storage.role(role).attributes_to(self.txid).superuser {
+            return Ok(Some(true));
+        }
         let named = [
             (
                 oid::FIRST_DOMAIN,
@@ -3840,20 +3842,17 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             if !visible {
                 return Ok(None);
             }
-            return privilege_query(
-                privileges,
-                PrivilegeSet::NONE,
-                PrivilegeSet::TYPE_ALL,
-                |privilege| {
+            return Ok(Some(requested.allows(
+PrivilegeSet::NONE,
+|privilege| {
                     self.storage
                         .has_object_privilege(object, role, privilege, self.txid)
                 },
-                |privilege| {
+|privilege| {
                     self.storage
                         .has_object_grant_option(object, role, privilege, self.txid)
-                },
-            )
-            .map(Some);
+                }
+)));
         }
         let owner = {
             let row_type = [false, true].into_iter().find_map(|array| {
@@ -3897,14 +3896,11 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             }
         };
         let owned = self.storage.role_has_privileges_of(role, owner, self.txid);
-        privilege_query(
-            privileges,
-            PrivilegeSet::USAGE,
-            PrivilegeSet::TYPE_ALL,
-            |_| owned,
-            |_| owned,
-        )
-        .map(Some)
+        Ok(Some(requested.allows(
+PrivilegeSet::USAGE,
+|_| owned,
+|_| owned
+)))
     }
 
     fn has_language_privilege(
@@ -3976,35 +3972,33 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                     })?
             }
         };
+        let requested = PrivilegeRequirements::parse(privileges, PrivilegeSet::FUNCTION_ALL)?;
+        if self.storage.role(role).attributes_to(self.txid).superuser {
+            return Ok(Some(true));
+        }
         if let Some(public) = super::catalog::intrinsic_routine_public_execute(oid) {
             let owner = self.storage.role_has_privileges_of(role, 0, self.txid);
-            return privilege_query(
-                privileges,
-                PrivilegeSet::NONE,
-                PrivilegeSet::FUNCTION_ALL,
-                |_| owner || public,
-                |_| owner,
-            )
-            .map(Some);
+            return Ok(Some(requested.allows(
+PrivilegeSet::NONE,
+|_| owner || public,
+|_| owner
+)));
         }
         let Some(slot) = self.storage.routine_slot_by_oid(oid, self.txid) else {
             return Ok(None);
         };
         let object = crate::storage::Storage::routine_access_object(slot);
-        privilege_query(
-            privileges,
-            crate::storage::PrivilegeSet::NONE,
-            crate::storage::PrivilegeSet::FUNCTION_ALL,
-            |privilege| {
+        Ok(Some(requested.allows(
+crate::storage::PrivilegeSet::NONE,
+|privilege| {
                 self.storage
                     .has_object_privilege(object, role, privilege, self.txid)
             },
-            |privilege| {
+|privilege| {
                 self.storage
                     .has_object_grant_option(object, role, privilege, self.txid)
-            },
-        )
-        .map(Some)
+            }
+)))
     }
 
     fn has_database_privilege(
@@ -4572,14 +4566,18 @@ fn privilege_role(storage: &Storage, role: Option<&str>, txid: u32) -> Option<us
     }
 }
 
-fn privilege_query(
-    written: &str,
-    catalog_default: crate::storage::PrivilegeSet,
-    all: crate::storage::PrivilegeSet,
-    has_privilege: impl Fn(crate::storage::PrivilegeSet) -> bool,
-    has_grant_option: impl Fn(crate::storage::PrivilegeSet) -> bool,
-) -> Result<bool, SqlError> {
-    let mut answer = false;
+/// A complete privilege request, checked before a missing-object result.
+struct PrivilegeRequirements {
+    ordinary: crate::storage::PrivilegeSet,
+    grant_option: crate::storage::PrivilegeSet,
+}
+
+impl PrivilegeRequirements {
+    fn parse(written: &str, all: crate::storage::PrivilegeSet) -> Result<Self, SqlError> {
+        let mut requested = Self {
+            ordinary: crate::storage::PrivilegeSet::NONE,
+            grant_option: crate::storage::PrivilegeSet::NONE,
+        };
     for item in written.split(',') {
         let item = item.trim();
         const GRANT_OPTION: &str = " WITH GRANT OPTION";
@@ -4631,14 +4629,46 @@ fn privilege_query(
                 name
             ));
         }
-        let allowed = if grant_option {
-            has_grant_option(privilege)
+        if grant_option {
+            requested.grant_option = requested.grant_option.union(privilege);
         } else {
-            catalog_default.contains(privilege) || has_privilege(privilege)
-        };
-        answer |= allowed;
+            requested.ordinary = requested.ordinary.union(privilege);
+        }
     }
-    Ok(answer)
+    Ok(requested)
+    }
+
+    fn allows(
+        &self,
+        catalog_default: crate::storage::PrivilegeSet,
+        has_privilege: impl Fn(crate::storage::PrivilegeSet) -> bool,
+        has_grant_option: impl Fn(crate::storage::PrivilegeSet) -> bool,
+    ) -> bool {
+        for bit in 0..u16::BITS {
+            let privilege = crate::storage::PrivilegeSet(1 << bit);
+            if self.ordinary.contains(privilege)
+                && (catalog_default.contains(privilege) || has_privilege(privilege))
+                || self.grant_option.contains(privilege) && has_grant_option(privilege)
+            {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+fn privilege_query(
+    written: &str,
+    catalog_default: crate::storage::PrivilegeSet,
+    all: crate::storage::PrivilegeSet,
+    has_privilege: impl Fn(crate::storage::PrivilegeSet) -> bool,
+    has_grant_option: impl Fn(crate::storage::PrivilegeSet) -> bool,
+) -> Result<bool, SqlError> {
+    Ok(PrivilegeRequirements::parse(written, all)?.allows(
+        catalog_default,
+        has_privilege,
+        has_grant_option,
+    ))
 }
 
 fn object_privilege_query(

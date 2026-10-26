@@ -40,7 +40,7 @@ jobs:
         run: |
           set -euo pipefail
           docker exec "$POSTGRES_CONTAINER" psql -U postgres -X -At -c 'SELECT version()'
-          for fixture in tests/external/differential_exact/{23_named_type_defaults,24_named_type_identities}.sql; do
+          for fixture in tests/external/differential_exact/{23_named_type_defaults,24_named_type_identities,25_numeric_privileges}.sql; do
             database=$(basename "$fixture" .sql)
             docker exec "$POSTGRES_CONTAINER" createdb -U postgres "$database"
             docker exec -i "$POSTGRES_CONTAINER" psql -U postgres -d "$database" -X -Atq -v ON_ERROR_STOP=1 < "$fixture" > "$RUNNER_TEMP/$database.reference"

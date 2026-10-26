@@ -774,7 +774,10 @@ fn collect_statement(
     }
 }
 
-#[expect(clippy::too_many_arguments, reason = "stored query analysis keeps its arena and captured identities explicit")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "stored query analysis keeps its arena and captured identities explicit"
+)]
 fn collect_dml_routine_calls<'a>(
     expression: &Expr<'a>,
     storage: &Storage,
@@ -1430,7 +1433,13 @@ impl ColTypeResolver for DependencyTypes<'_, '_, '_> {
         type_name: &str,
         visit: &mut dyn FnMut(&str, crate::sql::exec::StaticTypeMeta),
     ) -> Result<Option<usize>, SqlError> {
-        crate::sql::exec::visit_catalog_rowtype_fields(self.storage, self.txid, type_name, self.arena, visit)
+        crate::sql::exec::visit_catalog_rowtype_fields(
+            self.storage,
+            self.txid,
+            type_name,
+            self.arena,
+            visit,
+        )
     }
 
     fn is_whole_row(&self, name: &str) -> bool {
@@ -1552,7 +1561,10 @@ fn collect_routine_dependencies(
     Ok(())
 }
 
-#[expect(clippy::too_many_arguments, reason = "stored query analysis keeps its arena and captured identities explicit")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "stored query analysis keeps its arena and captured identities explicit"
+)]
 pub(super) fn stored_routine_dependency_for_call(
     name: &str,
     args: &[&Expr<'_>],
@@ -1561,7 +1573,8 @@ pub(super) fn stored_routine_dependency_for_call(
     storage: &Storage,
     txid: u32,
     dependencies: crate::storage::StoredQueryDependencyView<'_>,
-arena: &Arena,) -> Result<Option<StoredQueryDependency>, SqlError> {
+    arena: &Arena,
+) -> Result<Option<StoredQueryDependency>, SqlError> {
     let (referenced_schema, referenced_name) = name.split_once('.').unwrap_or(("", name));
     let mut candidates = dependencies.entries().iter().copied().filter(|dependency| {
         dependency.class == DependencyClass::Routine
@@ -1650,7 +1663,8 @@ pub(super) fn stored_operator_dependency_for_call(
     storage: &Storage,
     txid: u32,
     dependencies: crate::storage::StoredQueryDependencyView<'_>,
-arena: &Arena,) -> Result<Option<StoredQueryDependency>, SqlError> {
+    arena: &Arena,
+) -> Result<Option<StoredQueryDependency>, SqlError> {
     let Some((schema, operator_name)) = crate::sql::ast::catalog_operator_call(name) else {
         return Ok(None);
     };

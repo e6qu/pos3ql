@@ -696,7 +696,10 @@ pub(crate) use copy_transition::CopyTransitionRows;
 pub(super) use schema::rename as stage_schema_rename;
 
 mod describe;
-pub(crate) use describe::{CatalogCols, catalog_composite_field, visit_catalog_rowtype_fields, visit_catalog_composite_fields};
+pub(crate) use describe::{
+    CatalogCols, catalog_composite_field, visit_catalog_composite_fields,
+    visit_catalog_rowtype_fields,
+};
 pub use describe::{
     ColTypeResolver, DefCols, NoCols, RECORD_FIELD_NAMES, check_row_field_types,
     could_not_identify, derived_name, describe_items, expr_record_handle as expr_record_handle_pub,
@@ -13918,7 +13921,8 @@ pub fn create_publication(
     publish_via_partition_root: bool,
     publish_generated_columns: crate::sql::ast::PublishGeneratedColumns,
     responder: &mut Responder,
-arena: &Arena,) -> Outcome {
+    arena: &Arena,
+) -> Outcome {
     if all_tables && (!tables.is_empty() || !schemas.is_empty()) {
         return sql_fail(sql_err!(
             sqlstate::SYNTAX_ERROR,
@@ -13995,7 +13999,8 @@ arena: &Arena,) -> Outcome {
             publish_via_partition_root,
             publish_generated_columns: publish_generated_columns.into(),
         },
-        txn.txid) {
+        txn.txid,
+    ) {
         Ok(slot) => {
             let owner = storage.publication_owner(slot, txn.txid);
             let lsn = storage.bump_lsn();
@@ -14880,7 +14885,8 @@ pub fn alter_publication(
     name: &str,
     action: crate::sql::ast::AlterPublicationAction<'_>,
     responder: &mut Responder,
-arena: &Arena,) -> Outcome {
+    arena: &Arena,
+) -> Outcome {
     let Some((slot, current)) = storage.publication_definition(name, txn.txid) else {
         return sql_fail(sql_err!(
             sqlstate::UNDEFINED_OBJECT,

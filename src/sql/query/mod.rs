@@ -2707,7 +2707,9 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         {
             let definition = self.storage.table_def(slot, self.txid);
             return arena
-                .alloc_slice_with(definition.n_columns, |index| definition.columns()[index].type_mod)
+                .alloc_slice_with(definition.n_columns, |index| {
+                    definition.columns()[index].type_mod
+                })
                 .map(|modifiers| Some(&*modifiers))
                 .map_err(|_| arena_full());
         }
@@ -2716,7 +2718,9 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         {
             let view = self.storage.view(slot);
             let width = view.columns_for(self.txid).names().len();
-            let modifiers = arena.alloc_slice_with(width, |_| -1).map_err(|_| arena_full())?;
+            let modifiers = arena
+                .alloc_slice_with(width, |_| -1)
+                .map_err(|_| arena_full())?;
             let mark = arena.mark();
             let result: Result<usize, SqlError> = (|| {
                 let columns = arena
@@ -2739,12 +2743,15 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         else {
             return Ok(None);
         };
-        let Some(definition) = self.storage.composites_with_slots_visible_to(self.txid)
+        let Some(definition) = self
+            .storage
+            .composites_with_slots_visible_to(self.txid)
             .find_map(|(candidate, definition)| (candidate == slot).then_some(definition))
         else {
             return Ok(None);
         };
-        let modifiers = arena.alloc_slice_with(definition.active_field_count(), |_| -1)
+        let modifiers = arena
+            .alloc_slice_with(definition.active_field_count(), |_| -1)
             .map_err(|_| arena_full())?;
         for (modifier, field) in modifiers.iter_mut().zip(definition.active_fields()) {
             *modifier = field.type_mod;
@@ -10026,7 +10033,13 @@ impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_> {
         type_name: &str,
         visit: &mut dyn FnMut(&str, crate::sql::exec::StaticTypeMeta),
     ) -> Result<Option<usize>, SqlError> {
-        crate::sql::exec::visit_catalog_rowtype_fields(self.storage, self.txid, type_name, self.arena, visit)
+        crate::sql::exec::visit_catalog_rowtype_fields(
+            self.storage,
+            self.txid,
+            type_name,
+            self.arena,
+            visit,
+        )
     }
 
     fn is_whole_row(&self, name: &str) -> bool {

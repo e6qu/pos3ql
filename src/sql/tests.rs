@@ -4839,7 +4839,9 @@ fn relation_identity_view_rowtype_json_preserves_field_limits() {
         r#"SELECT (jsonb_populate_record(NULL::json_identity_view,
                   '{"id":9,"label":"hi"}'::jsonb)).id,
                   (jsonb_populate_record(NULL::json_identity_view,
-                  '{"id":9,"label":"hi"}'::jsonb)).label"#,
+                  '{"id":9,"label":"hi"}'::jsonb)).label;
+           SELECT (jsonb_populate_record(NULL::json_identity_view,
+                  '{"id":10,"label":"yo"}'::jsonb)).*"#,
         4 << 20,
     );
     assert!(
@@ -4847,7 +4849,7 @@ fn relation_identity_view_rowtype_json_preserves_field_limits() {
         "{}",
         String::from_utf8_lossy(&output)
     );
-    assert_eq!(data_rows(&output), ["9|hi"]);
+    assert_eq!(data_rows(&output), ["9|hi", "10|yo"]);
     let rejected = run_with_fixed_memory(
         &mut engine,
         &budget,

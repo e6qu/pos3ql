@@ -6347,7 +6347,7 @@ mod named_type_layout_probe {
         assert_eq!(size_of::<ProposedCreation>(), 3);
         assert_eq!(size_of::<Option<ProposedCreation>>(), 3);
         assert_eq!(align_of::<ProposedCreation>(), 1);
-        assert!(size_of::<ProjectedColType>() <= 9);
+        assert!(size_of::<ProjectedColType>() <= 8);
         assert!(size_of::<ProjectedColumnMeta>() <= 512);
         assert!(align_of::<ProjectedColType>() <= align_of::<ColType>());
         assert!(size_of::<ProjectedArrElem>() <= 8);

@@ -444,7 +444,9 @@ mod tests {
             }
             for code in u8::MIN..=u8::MAX {
                 let encoded = CachedArrayElement::from_identity(ArrayElementIdentity::Builtin(code));
-                let builtin = crate::sql::types::ArrElem::BUILTIN.iter().any(|element| element.code() == code);
+                // Anonymous records also have a transient array representation.
+                let builtin = code == crate::sql::types::ArrElem::Record.code()
+                    || crate::sql::types::ArrElem::BUILTIN.iter().any(|element| element.code() == code);
                 assert_eq!(encoded.is_some(), builtin, "array opcode {code}");
                 if let Some(encoded) = encoded {
                     assert_eq!(encoded.identity(), ArrayElementIdentity::Builtin(code));

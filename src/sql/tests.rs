@@ -1292,6 +1292,27 @@ fn private_index_bindings_survive_table_changes_savepoints_and_cold_recovery() {
 }
 
 #[test]
+fn named_type_default_arrays_preserve_declared_types_without_allocation() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("named-type-default-arrays-{mode:?}"));
+        config.transaction_mode = mode;
+        config.max_ddl_per_transaction = 32;
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        let output = session.success(
+            &mut engine,
+            include_str!("../../tests/external/differential_exact/23_named_type_defaults.sql"),
+            true,
+        );
+        assert_eq!(data_rows(&output), ["t", "t"]);
+    }
+}
+
+#[test]
 fn relation_identity_replacement_and_constraint_edits_match_postgresql() {
     for mode in [
         crate::config::TransactionMode::Mvcc,

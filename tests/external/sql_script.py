@@ -73,7 +73,7 @@ def split_sql(source):
                 statement = "".join(buffer).strip()
                 if has_code:
                     copy_data = None
-                    if (len(words) > 1 and words[0] == "COPY" and words[1] != "("
+                    if (words and words[0] == "COPY"
                             and any(pair == ["FROM", "STDIN"]
                                     for pair in (words[i:i + 2] for i in range(len(words) - 1)))):
                         command_end_line = line

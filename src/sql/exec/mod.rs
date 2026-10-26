@@ -10094,9 +10094,11 @@ pub(crate) fn drop_owned(
                         wal,
                         txn,
                         scratch,
-                        &[schema.as_str()],
-                        false,
-                        true,
+                        SchemaDropTarget::Named {
+                            names: &[schema.as_str()],
+                            if_exists: false,
+                            cascade: true,
+                        },
                         arena,
                         seq_session,
                         responder,
@@ -10462,9 +10464,11 @@ pub(crate) fn drop_owned(
                         wal,
                         txn,
                         scratch,
-                        &[schema.as_str()],
-                        false,
-                        false,
+                        SchemaDropTarget::Named {
+                            names: &[schema.as_str()],
+                            if_exists: false,
+                            cascade: false,
+                        },
                         arena,
                         seq_session,
                         responder,
@@ -23308,7 +23312,7 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                     engine.execute_deallocate_statement(*name, sqlprep, responder)
                 }
                 Stmt::Discard(target) => engine.execute_discard_statement(
-                    *target, sqlprep, cursors, guc, responder,
+                    *target, txn, arena, sqlprep, cursors, guc, responder,
                 ),
                 Stmt::Show(name) => engine.show(name, guc, txn, responder),
                 Stmt::ShowAll => engine.show_all(guc, txn, responder),

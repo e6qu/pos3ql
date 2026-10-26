@@ -42,11 +42,17 @@ CREATE FUNCTION f() RETURNS text AS $$ BEGIN RETURN ';'; END $$ LANGUAGE plpgsql
         self.assertEqual(parsed.statements[1], (7, "SELECT 2;", None))
 
     def test_copy_lookalikes_inside_queries_and_quoted_bodies_are_not_input(self):
-        source = "COPY (SELECT id FROM t) FROM STDIN; COPY (SELECT 'FROM stdin') TO STDOUT; SELECT E'can\\\'t; split'; SELECT $$ COPY t FROM STDIN; $$; SELECT name$part;"
+        source = "COPY (SELECT 'FROM stdin') TO STDOUT; SELECT E'can\\\'t; split'; SELECT $$ COPY t FROM STDIN; $$; SELECT name$part;"
         parsed = MODULE.split_sql(source)
-        self.assertEqual(len(parsed.statements), 5)
+        self.assertEqual(len(parsed.statements), 4)
         self.assertEqual(parsed.copy_inputs, ())
         self.assertTrue(all(statement[2] is None for statement in parsed.statements))
+
+    def test_invalid_query_copy_from_still_drains_psql_input(self):
+        parsed = MODULE.split_sql("COPY (SELECT 1) FROM STDIN;\n\\.\nSELECT 43;\n")
+        self.assertEqual(parsed.copy_inputs, ((1, 2),))
+        self.assertEqual(parsed.statements[0][2], "")
+        self.assertEqual(parsed.statements[1], (3, "SELECT 43;", None))
 
     def test_copy_header_cannot_swallow_a_second_command(self):
         with self.assertRaisesRegex(ValueError, "COPY input must start on a new line"):

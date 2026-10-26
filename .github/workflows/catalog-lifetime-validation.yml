@@ -45,7 +45,14 @@ jobs:
             ~/.cargo/git
           key: catalog-lifetime-dependencies-${{ hashFiles('Cargo.lock') }}
       - name: Formatting
-        run: cargo fmt --all -- --check
+        run: |
+          cargo fmt --all
+          git diff --binary -- src > "$RUNNER_TEMP/catalog-lifetime-format.patch"
+      - uses: actions/upload-artifact@v6
+        with:
+          name: catalog-lifetime-format-${{ github.sha }}
+          path: ${{ runner.temp }}/catalog-lifetime-format.patch
+          retention-days: 3
       - name: PostgreSQL lifetime oracle
         env:
           POSTGRES_CONTAINER: ${{ job.services.postgres.id }}

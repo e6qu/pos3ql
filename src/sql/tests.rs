@@ -1893,6 +1893,8 @@ fn catalog_lifetime_template_copies_preserve_local_identifiers_and_statistics() 
     let fixture = include_str!("../../tests/external/differential_exact/32_catalog_lifetimes.sql");
     let setup = fixture.split_once("DROP EXTENSION pos3ql_base;").unwrap().0;
     const CHECK: &str = "SELECT count(*) = 6 FROM saved_catalog_lifetimes s JOIN lifetime_catalog c ON c.kind = s.kind AND c.identity = s.identity";
+    const FOREIGN_LINKS: &str = "SELECT count(*) = 1 FROM pg_foreign_table f JOIN pg_class c ON c.oid = f.ftrelid JOIN pg_foreign_server s ON s.oid = f.ftserver JOIN pg_foreign_data_wrapper w ON w.oid = s.srvfdw WHERE c.relname = 'copied_foreign' AND s.srvname = 'lifetime_server' AND w.fdwname = 'lifetime_wrapper'";
+    const COMMENTS: &str = "SELECT obj_description(oid, 'pg_foreign_data_wrapper') FROM pg_foreign_data_wrapper WHERE fdwname = 'lifetime_wrapper'; SELECT obj_description(oid, 'pg_foreign_server') FROM pg_foreign_server WHERE srvname = 'lifetime_server'; SELECT obj_description(oid, 'pg_statistic_ext') FROM pg_statistic_ext WHERE stxname = 'lifetime_statistics'; SELECT obj_description(oid, 'pg_publication') FROM pg_publication WHERE pubname = 'lifetime_publication'";
     for checkpoint in [false, true] {
         for mode in [
             crate::config::TransactionMode::Mvcc,
@@ -1931,6 +1933,7 @@ fn catalog_lifetime_template_copies_preserve_local_identifiers_and_statistics() 
                     );
                 }
                 session.success(&mut engine, "DROP SUBSCRIPTION lifetime_subscription; DELETE FROM saved_catalog_lifetimes WHERE kind = 'subscription'", false);
+                session.success(&mut engine, "CREATE FOREIGN TABLE copied_foreign(a integer) SERVER lifetime_server; COMMENT ON FOREIGN DATA WRAPPER lifetime_wrapper IS 'wrapper comment'; COMMENT ON SERVER lifetime_server IS 'server comment'; COMMENT ON STATISTICS lifetime_statistics IS 'statistics comment'; COMMENT ON PUBLICATION lifetime_publication IS 'publication comment'", false);
                 assert_eq!(
                     data_rows(&session.success(&mut engine, CHECK, false)),
                     ["t"]
@@ -1952,6 +1955,8 @@ fn catalog_lifetime_template_copies_preserve_local_identifiers_and_statistics() 
                     data_rows(&session.success(&mut engine, CHECK, false)),
                     ["t"]
                 );
+                assert_eq!(data_rows(&session.success(&mut engine, FOREIGN_LINKS, false)), ["t"]);
+                assert_eq!(data_rows(&session.success(&mut engine, COMMENTS, false)), ["wrapper comment", "server comment", "statistics comment", "publication comment"]);
                 session.success(
                     &mut engine,
                     "ALTER STATISTICS lifetime_statistics SET STATISTICS 43",
@@ -1976,6 +1981,8 @@ fn catalog_lifetime_template_copies_preserve_local_identifiers_and_statistics() 
                         ["t"]
                     );
                     assert_eq!(data_rows(&session.success(&mut engine, &format!("SELECT stxstattarget = {target} FROM pg_statistic_ext WHERE stxname = 'lifetime_statistics'"), false)), ["t"]);
+                    assert_eq!(data_rows(&session.success(&mut engine, FOREIGN_LINKS, false)), ["t"]);
+                    assert_eq!(data_rows(&session.success(&mut engine, COMMENTS, false)), ["wrapper comment", "server comment", "statistics comment", "publication comment"]);
                 }
             }
             std::fs::remove_dir_all(&config.data_dir).unwrap();

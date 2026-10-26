@@ -670,6 +670,12 @@ value across recovery. Journal and saved-file observations advance the counter
 with saturating arithmetic, including legacy maximum identities. Row key and
 manifest encodings are unchanged; the allocator adds no startup reservation.
 
+Database-copy journal inventories also retain exact foreign-wrapper, foreign-server,
+user-mapping and foreign-table-binding positions and creation stamps. Copies
+remap wrapper/server/table parents to the destination and preserve database-local
+SQL identifiers. Source-slot comment keys are rebound to copied objects; shared
+subscriptions and their comments are not copied into a new SQL database.
+
 ## Catalog object identifiers
 
 Statistics, extensions, foreign-data wrappers, foreign servers, user mappings,

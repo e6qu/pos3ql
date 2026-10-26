@@ -183,7 +183,10 @@ foreign-key and NOT NULL constraints, statistics, extensions, foreign-data
 wrappers, servers, user mappings, publications and subscriptions. Removing an
 earlier column or rule does not renumber survivors. Foreign-key triggers retain
 their constraint links. `ADD CONSTRAINT ... USING INDEX` preserves the existing
-index identifier. Remaining identifier families are tracked in the plan.
+index identifier. Database-template copies preserve database-local identifiers, foreign-wrapper,
+server, mapping and table links, and their copied comments. Shared subscriptions
+remain owned by their original database. Remaining identifier families are
+tracked in the plan.
 
 ```sql
 CREATE TABLE orders(id integer);

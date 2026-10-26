@@ -17,6 +17,10 @@ pub(crate) enum DatabaseCloneKind {
     Rule = 6,
     MaterializedView = 7,
     Routine = 8,
+    ForeignWrapper = 9,
+    ForeignServer = 10,
+    UserMapping = 11,
+    ForeignTable = 12,
 }
 
 impl DatabaseCloneKind {
@@ -31,6 +35,10 @@ impl DatabaseCloneKind {
             6 => Self::Rule,
             7 => Self::MaterializedView,
             8 => Self::Routine,
+            9 => Self::ForeignWrapper,
+            10 => Self::ForeignServer,
+            11 => Self::UserMapping,
+            12 => Self::ForeignTable,
             _ => return None,
         })
     }
@@ -307,6 +315,23 @@ impl Storage {
                 definition.database,
                 definition.ddl_state,
             );
+        }
+        let catalog = self.foreign_catalog();
+        for slot in 0..catalog.wrapper_capacity() {
+            let entry = catalog.entry_wrapper(slot);
+            object(DatabaseCloneKind::ForeignWrapper, slot, entry.created_at, entry.database, entry.ddl_state);
+        }
+        for slot in 0..catalog.server_capacity() {
+            let entry = catalog.entry_server(slot);
+            object(DatabaseCloneKind::ForeignServer, slot, entry.created_at, entry.database, entry.ddl_state);
+        }
+        for slot in 0..catalog.mapping_capacity() {
+            let entry = catalog.entry_mapping(slot);
+            object(DatabaseCloneKind::UserMapping, slot, entry.created_at, entry.database, entry.ddl_state);
+        }
+        for slot in 0..catalog.table_capacity() {
+            let entry = catalog.entry_table(slot);
+            object(DatabaseCloneKind::ForeignTable, slot, entry.created_at, entry.database, entry.ddl_state);
         }
     }
 }

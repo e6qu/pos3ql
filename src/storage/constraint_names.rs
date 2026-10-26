@@ -185,14 +185,16 @@ pub(super) fn domain(name: SqlName, spec: &mut DomainSpec) -> Result<(), SqlErro
                 .any(|constraint| constraint.name == name)
         })?);
     }
-    if spec.not_null_name.is_some_and(|name| {
-        spec.checks[..spec.n_checks]
+    if let Some(constraint) = spec.not_null_name
+        && spec.checks[..spec.n_checks]
             .iter()
-            .any(|constraint| constraint.name == name)
-    }) {
+            .any(|check| check.name == constraint)
+    {
         return Err(sql_err!(
             sqlstate::DUPLICATE_OBJECT,
-            "domain constraint name already exists"
+            "constraint \"{}\" for domain \"{}\" already exists",
+            constraint.as_str(),
+            name.as_str()
         ));
     }
     Ok(())

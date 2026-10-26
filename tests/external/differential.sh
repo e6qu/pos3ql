@@ -22,6 +22,11 @@ REFERENCE_HOST=${POS3QL_REFERENCE_PG_HOST:-}
 REFERENCE_PORT=${POS3QL_REFERENCE_PG_PORT:-}
 REFERENCE_DATABASE=${POS3QL_REFERENCE_PG_DATABASE:-postgres}
 if [[ -n "$REFERENCE_HOST" ]]; then
+  # Auxiliary oracles address both servers by loopback port, not by host name.
+  if [[ "$REFERENCE_HOST" != 127.0.0.1 ]]; then
+    printf '%s\n' 'FAIL: this corpus harness requires POS3QL_REFERENCE_PG_HOST=127.0.0.1; forward a remote reference to a loopback port' >&2
+    exit 1
+  fi
   if [[ -z "$REFERENCE_PORT" || -z "${POS3QL_REFERENCE_PSQL:-}" ]]; then
     printf '%s\n' 'FAIL: an external PostgreSQL reference requires both POS3QL_REFERENCE_PG_PORT and POS3QL_REFERENCE_PSQL'
     exit 1
@@ -246,16 +251,22 @@ normalize() {
     -e '/^(psql:[^:]*:[0-9]+: )?(NOTICE|WARNING):/d'
 }
 
-run_corpus() { # port name file
+run_corpus() { # port name file diagnostics
+  local diagnostics=$4 normalizer
+  case "$diagnostics" in
+    sqlstate) normalizer=normalize ;;
+    verbose) normalizer=normalize_exact ;;
+    *) printf 'FAIL: unknown corpus diagnostics %s\n' "$diagnostics" >&2; return 1 ;;
+  esac
   printf 'RUN: differential: %s\n' "$2"
   if [[ "$1" == "$PG_PORT" ]]; then
     PGOPTIONS="-c timezone=UTC -c extension_control_path=$REFERENCE_EXTENSION_CONTROL_ROOT" \
       stdbuf -o0 -e0 "$PSQL" -h 127.0.0.1 -p "$1" -U postgres -d "$REFERENCE_DATABASE" -X -a -q -P pager=off \
-        -v VERBOSITY=sqlstate -f "$3" 2>&1
+        -v VERBOSITY="$diagnostics" -f "$3" 2>&1
   else
     stdbuf -o0 -e0 "$PSQL" -h 127.0.0.1 -p "$1" -U postgres -X -a -q -P pager=off \
-      -v VERBOSITY=sqlstate -f "$3" 2>&1
-  fi | normalize > "$WORK/$2"
+      -v VERBOSITY="$diagnostics" -f "$3" 2>&1
+  fi | "$normalizer" > "$WORK/$2"
   if [[ "$1" == "$P3_PORT" ]] && ! server_alive "$P3_PID"; then
     bad "pos3ql exited during $(basename "$3")"
     printf '%s\n' 'Last client transcript:'
@@ -338,8 +349,8 @@ if [[ "$CORPUS_SHARD_MODE" != none ]]; then
       continue
     fi
     name=$(basename "$f" .sql)
-    run_corpus "$PG_PORT" "$name.pg" "$f"
-    run_corpus "$P3_PORT" "$name.p3" "$f"
+    run_corpus "$PG_PORT" "$name.pg" "$f" sqlstate
+    run_corpus "$P3_PORT" "$name.p3" "$f" sqlstate
     if diff -u "$WORK/$name.pg" "$WORK/$name.p3" > "$WORK/$name.diff"; then
       ok "differential: $name"
     else
@@ -386,19 +397,13 @@ normalize_exact() {
     -e '/^(HINT|DETAIL|LOCATION|CONTEXT|SCHEMA NAME|TABLE NAME|COLUMN NAME|CONSTRAINT NAME|DATATYPE NAME|NOTICE|WARNING):/d'
 }
 
-run_exact() { # port name file
-  local database=postgres
-  [[ "$1" == "$PG_PORT" ]] && database=$REFERENCE_DATABASE
-  stdbuf -o0 -e0 "$PSQL" -h 127.0.0.1 -p "$1" -U postgres -d "$database" -X -a -q -P pager=off \
-    -v VERBOSITY=verbose -f "$3" 2>&1 | normalize_exact > "$WORK/$2"
-}
 
 printf '%s\n' '' '=== exact-error corpora (message wording must match) ==='
 restart_pos3ql_clean
 for f in $EXT/differential_exact/*.sql; do
   name=$(basename "$f" .sql)
-  run_exact "$PG_PORT" "$name.pg" "$f"
-  run_exact "$P3_PORT" "$name.p3" "$f"
+  run_corpus "$PG_PORT" "$name.pg" "$f" verbose
+  run_corpus "$P3_PORT" "$name.p3" "$f" verbose
   if diff -u "$WORK/$name.pg" "$WORK/$name.p3" > "$WORK/$name.diff"; then
     ok "exact errors: $name"
   else

@@ -108,7 +108,11 @@ Verify the invariant or external contract, not a test that merely restates the
 implementation. Boundary changes generally need accepted/rejected capacity,
 rollback, failure cleanup, WAL/checkpoint, and empty-cache recovery coverage.
 SQL and wire behavior needs comparison with actual PostgreSQL, including
-SQLSTATEs, types, result shape, and values.
+SQLSTATEs, types, result shape, and values. SQLSTATE-only and exact-message
+corpora share the same reference connection settings, including UTC and the
+test extension directory; diagnostic style must not change fixture availability.
+The port-based corpus harness requires an external reference at `127.0.0.1`;
+forward a remote reference explicitly instead of supplying a host it cannot use.
 Synchronize concurrent catalog changes before comparing current permission
 lookups. For example, after another connection grants access to `orders`,
 `LOCK TABLE orders IN ACCESS SHARE MODE` acquires a new relation lock and makes

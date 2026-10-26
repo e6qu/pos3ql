@@ -1443,15 +1443,21 @@ normalize() {
     -e 's/^ERROR:  ([0-9A-Z]{5})$/ERROR \1/' \
     -e '/^(psql:[^:]*:[0-9]+: )?(NOTICE|WARNING):/d'
 }
-run_corpus() { # host port outfile file
+run_corpus() { # host port outfile file diagnostics
+  local diagnostics=$5 normalizer
+  case "$diagnostics" in
+    sqlstate) normalizer=normalize ;;
+    verbose) normalizer=normalize_exact ;;
+    *) printf 'FAIL: unknown corpus diagnostics %s\n' "$diagnostics" >&2; return 1 ;;
+  esac
   if [[ "$1" == "$PGHOST" && "$2" == "$PGPORT" ]]; then
     PGOPTIONS="-c timezone=UTC -c extension_control_path=$REFERENCE_EXTENSION_CONTROL_ROOT" \
       psql -h "$1" -p "$2" -U "$PGUSER" -d postgres -X -a -q -P pager=off \
-        -v VERBOSITY=sqlstate -f "$4" 2>&1
+        -v VERBOSITY="$diagnostics" -f "$4" 2>&1
   else
     psql -h "$1" -p "$2" -U "$PGUSER" -d postgres -X -a -q -P pager=off \
-      -v VERBOSITY=sqlstate -f "$4" 2>&1
-  fi | normalize > "$3"
+      -v VERBOSITY="$diagnostics" -f "$4" 2>&1
+  fi | "$normalizer" > "$3"
   if [[ "$2" == "$P3_PORT" ]] && ! server_alive "$P3_PID"; then
     echo "pos3ql exited while running $(basename "$4")"
     tail -80 "$WORK/p3.log"
@@ -1512,8 +1518,8 @@ for f in "$EXT"/differential/*.sql; do
     corpus_ordinal=$((corpus_ordinal + 1))
     continue
   fi
-  run_corpus "$PGHOST" "$PGPORT" "$WORK/$n.pg" "$f"
-  run_corpus 127.0.0.1 "$P3_PORT" "$WORK/$n.p3" "$f"
+  run_corpus "$PGHOST" "$PGPORT" "$WORK/$n.pg" "$f" sqlstate
+  run_corpus 127.0.0.1 "$P3_PORT" "$WORK/$n.p3" "$f" sqlstate
   if diff -u "$WORK/$n.pg" "$WORK/$n.p3" > "$WORK/$n.diff"; then ok "corpus: $n"
   else bad "corpus: $n"; head -40 "$WORK/$n.diff"; fi
   reset_corpus_pair
@@ -1558,13 +1564,10 @@ normalize_exact() {
     -e '/^psql:[^:]*:[0-9]+: (HINT|DETAIL|LOCATION|CONTEXT|SCHEMA NAME|TABLE NAME|COLUMN NAME|CONSTRAINT NAME|DATATYPE NAME|NOTICE|WARNING):/d' \
     -e '/^(HINT|DETAIL|LOCATION|CONTEXT|SCHEMA NAME|TABLE NAME|COLUMN NAME|CONSTRAINT NAME|DATATYPE NAME|NOTICE|WARNING):/d'
 }
-run_exact() { # host port outfile file
-  psql -h "$1" -p "$2" -U "$PGUSER" -d postgres -X -a -q -P pager=off -v VERBOSITY=verbose -f "$4" 2>&1 | normalize_exact > "$3"
-}
 for f in "$EXT"/differential_exact/*.sql; do
   n=$(basename "$f" .sql)
-  run_exact "$PGHOST" "$PGPORT" "$WORK/$n.pg" "$f"
-  run_exact 127.0.0.1 "$P3_PORT" "$WORK/$n.p3" "$f"
+  run_corpus "$PGHOST" "$PGPORT" "$WORK/$n.pg" "$f" verbose
+  run_corpus 127.0.0.1 "$P3_PORT" "$WORK/$n.p3" "$f" verbose
   if diff -u "$WORK/$n.pg" "$WORK/$n.p3" > "$WORK/$n.diff"; then ok "exact errors: $n"
   else bad "exact errors: $n"; head -40 "$WORK/$n.diff"; fi
 done

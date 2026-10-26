@@ -50,6 +50,11 @@ jobs:
             fi
             cat "$RUNNER_TEMP/$database.reference"
           done
+          python3 -c 'labels = ",".join(chr(39) + "label_" + str(i) + chr(39) for i in range(1025)); print("CREATE TYPE wide_labels AS ENUM (" + labels + "); CREATE TYPE next_labels AS ENUM (" + chr(39) + "only" + chr(39) + "); SELECT count(*) = 1026 AND count(DISTINCT oid) = 1026 FROM pg_enum;")' > "$RUNNER_TEMP/wide-enum.sql"
+          docker exec "$POSTGRES_CONTAINER" createdb -U postgres wide_enum
+          docker exec -i "$POSTGRES_CONTAINER" psql -U postgres -d wide_enum -X -Atq -v ON_ERROR_STOP=1 < "$RUNNER_TEMP/wide-enum.sql" > "$RUNNER_TEMP/wide-enum.reference"
+          printf 't\n' > "$RUNNER_TEMP/wide-enum.expected"
+          diff -u "$RUNNER_TEMP/wide-enum.expected" "$RUNNER_TEMP/wide-enum.reference"
           docker exec "$POSTGRES_CONTAINER" createdb -U postgres numeric_privilege_errors
           docker exec -i "$POSTGRES_CONTAINER" psql -U postgres -d numeric_privilege_errors -X -Atq -v VERBOSITY=verbose < tests/external/differential_exact/26_numeric_privilege_errors.sql > "$RUNNER_TEMP/26_numeric_privilege_errors.reference" 2>&1
           sed -nE 's/^ERROR:  ([0-9A-Z]{5}):.*/\1/p' "$RUNNER_TEMP/26_numeric_privilege_errors.reference" > "$RUNNER_TEMP/privilege-states"
@@ -69,6 +74,11 @@ jobs:
         run: |
           python3 tools/test_command.py cargo test --lib --locked -- named_type_cached_defaults numeric_type_schema type_recovery_installs_saved_birth restored_type_identity_rejects --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/new-type-regressions.log"
           grep -Eq 'test result: ok\. 5 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/new-type-regressions.log"
+      - name: Enum label identities, corruption and replay lock regression
+        shell: bash
+        run: |
+          timeout 90s python3 tools/test_command.py cargo test --lib --locked -- enum_label_identities enum_label_identity_ enum_label_validation_ enum_image_ownership_replay_preserves enum_image_ownership_pool_replay_reuses enum_codec_preserves_label_identities --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/enum-label-regressions.log"
+          grep -Eq 'test result: ok\. 9 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/enum-label-regressions.log"
       - name: Named type lifecycle, recovery and startup accounting
         shell: bash
         run: |
@@ -84,7 +94,9 @@ jobs:
           path: |
             ${{ runner.temp }}/formatting.patch
             ${{ runner.temp }}/*.reference
+            ${{ runner.temp }}/wide-enum.sql
             ${{ runner.temp }}/layout.log
             ${{ runner.temp }}/type-lifetimes.log
             ${{ runner.temp }}/new-type-regressions.log
+            ${{ runner.temp }}/enum-label-regressions.log
           if-no-files-found: error

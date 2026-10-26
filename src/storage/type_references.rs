@@ -1407,8 +1407,10 @@ impl super::Storage {
             || state != super::CatalogDdlState::Present
             || catalog.identities.lookup(database, old_creation) != Some(allocated)
         {
-            return Err(sql_err!(sqlstate::DATA_EXCEPTION,
-                "stored type source is not a committed identity in the selected database"));
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "stored type source is not a committed identity in the selected database"
+            ));
         }
         if (self.type_definition_images.retains(allocated)
             || self.type_definition_images.retains(target))

@@ -23031,7 +23031,12 @@ fn apply_wal_op(
                 let prior = storage.stage_domain_alter(edit_target, spec, 0)?;
                 storage.commit_domain_alter(prior.target())?;
             } else {
-                let allocated = storage.create_domain_from_journal(def.schema, def.name, spec, def.created_at)?;
+                let allocated = storage.create_domain_from_journal(
+                    def.schema,
+                    def.name,
+                    spec,
+                    def.created_at,
+                )?;
                 storage.restore_type_identity(
                     crate::storage::NamedTypeSlot::Domain(allocated),
                     crate::storage::NamedTypeSlot::Domain(slot),

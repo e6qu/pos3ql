@@ -3736,10 +3736,10 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             let owner = self.storage.role_has_privileges_of(role, 0, self.txid);
             let public = schema.as_str() != "pg_toast";
             return Ok(Some(requested.allows(
-PrivilegeSet::NONE,
-|privilege| owner || (public && privilege == PrivilegeSet::USAGE),
-|_| owner
-)));
+                PrivilegeSet::NONE,
+                |privilege| owner || (public && privilege == PrivilegeSet::USAGE),
+                |_| owner,
+            )));
         }
         let Some(slot) = self.storage.find_schema_visible(schema.as_str(), self.txid) else {
             return Ok(None);
@@ -3749,16 +3749,16 @@ PrivilegeSet::NONE,
             slot: slot as u16,
         };
         Ok(Some(requested.allows(
-crate::storage::PrivilegeSet::NONE,
-|privilege| {
+            crate::storage::PrivilegeSet::NONE,
+            |privilege| {
                 self.storage
                     .has_object_privilege(object, role, privilege, self.txid)
             },
-|privilege| {
+            |privilege| {
                 self.storage
                     .has_object_grant_option(object, role, privilege, self.txid)
-            }
-)))
+            },
+        )))
     }
 
     fn has_type_privilege(
@@ -3843,16 +3843,16 @@ crate::storage::PrivilegeSet::NONE,
                 return Ok(None);
             }
             return Ok(Some(requested.allows(
-PrivilegeSet::NONE,
-|privilege| {
+                PrivilegeSet::NONE,
+                |privilege| {
                     self.storage
                         .has_object_privilege(object, role, privilege, self.txid)
                 },
-|privilege| {
+                |privilege| {
                     self.storage
                         .has_object_grant_option(object, role, privilege, self.txid)
-                }
-)));
+                },
+            )));
         }
         let owner = {
             let row_type = [false, true].into_iter().find_map(|array| {
@@ -3897,10 +3897,10 @@ PrivilegeSet::NONE,
         };
         let owned = self.storage.role_has_privileges_of(role, owner, self.txid);
         Ok(Some(requested.allows(
-PrivilegeSet::USAGE,
-|_| owned,
-|_| owned
-)))
+            PrivilegeSet::USAGE,
+            |_| owned,
+            |_| owned,
+        )))
     }
 
     fn has_language_privilege(
@@ -3979,26 +3979,26 @@ PrivilegeSet::USAGE,
         if let Some(public) = super::catalog::intrinsic_routine_public_execute(oid) {
             let owner = self.storage.role_has_privileges_of(role, 0, self.txid);
             return Ok(Some(requested.allows(
-PrivilegeSet::NONE,
-|_| owner || public,
-|_| owner
-)));
+                PrivilegeSet::NONE,
+                |_| owner || public,
+                |_| owner,
+            )));
         }
         let Some(slot) = self.storage.routine_slot_by_oid(oid, self.txid) else {
             return Ok(None);
         };
         let object = crate::storage::Storage::routine_access_object(slot);
         Ok(Some(requested.allows(
-crate::storage::PrivilegeSet::NONE,
-|privilege| {
+            crate::storage::PrivilegeSet::NONE,
+            |privilege| {
                 self.storage
                     .has_object_privilege(object, role, privilege, self.txid)
             },
-|privilege| {
+            |privilege| {
                 self.storage
                     .has_object_grant_option(object, role, privilege, self.txid)
-            }
-)))
+            },
+        )))
     }
 
     fn has_database_privilege(
@@ -4578,64 +4578,64 @@ impl PrivilegeRequirements {
             ordinary: crate::storage::PrivilegeSet::NONE,
             grant_option: crate::storage::PrivilegeSet::NONE,
         };
-    for item in written.split(',') {
-        let item = item.trim();
-        const GRANT_OPTION: &str = " WITH GRANT OPTION";
-        let (name, grant_option) = if item
-            .get(item.len().saturating_sub(GRANT_OPTION.len())..)
-            .is_some_and(|suffix| suffix.eq_ignore_ascii_case(GRANT_OPTION))
-        {
-            (item[..item.len() - GRANT_OPTION.len()].trim_end(), true)
-        } else {
-            (item, false)
-        };
-        let privilege = if name.eq_ignore_ascii_case("select") {
-            crate::storage::PrivilegeSet::SELECT
-        } else if name.eq_ignore_ascii_case("insert") {
-            crate::storage::PrivilegeSet::INSERT
-        } else if name.eq_ignore_ascii_case("update") {
-            crate::storage::PrivilegeSet::UPDATE
-        } else if name.eq_ignore_ascii_case("delete") {
-            crate::storage::PrivilegeSet::DELETE
-        } else if name.eq_ignore_ascii_case("truncate") {
-            crate::storage::PrivilegeSet::TRUNCATE
-        } else if name.eq_ignore_ascii_case("references") {
-            crate::storage::PrivilegeSet::REFERENCES
-        } else if name.eq_ignore_ascii_case("trigger") {
-            crate::storage::PrivilegeSet::TRIGGER
-        } else if name.eq_ignore_ascii_case("usage") {
-            crate::storage::PrivilegeSet::USAGE
-        } else if name.eq_ignore_ascii_case("create") {
-            crate::storage::PrivilegeSet::CREATE
-        } else if name.eq_ignore_ascii_case("execute") {
-            crate::storage::PrivilegeSet::EXECUTE
-        } else if name.eq_ignore_ascii_case("maintain") {
-            crate::storage::PrivilegeSet::MAINTAIN
-        } else if name.eq_ignore_ascii_case("connect") {
-            crate::storage::PrivilegeSet::CONNECT
-        } else if name.eq_ignore_ascii_case("temporary") || name.eq_ignore_ascii_case("temp") {
-            crate::storage::PrivilegeSet::TEMPORARY
-        } else {
-            return Err(sql_err!(
-                sqlstate::INVALID_PARAMETER_VALUE,
-                "unrecognized privilege type: \"{}\"",
-                name
-            ));
-        };
-        if !all.contains(privilege) {
-            return Err(sql_err!(
-                sqlstate::INVALID_PARAMETER_VALUE,
-                "unrecognized privilege type: \"{}\"",
-                name
-            ));
+        for item in written.split(',') {
+            let item = item.trim();
+            const GRANT_OPTION: &str = " WITH GRANT OPTION";
+            let (name, grant_option) = if item
+                .get(item.len().saturating_sub(GRANT_OPTION.len())..)
+                .is_some_and(|suffix| suffix.eq_ignore_ascii_case(GRANT_OPTION))
+            {
+                (item[..item.len() - GRANT_OPTION.len()].trim_end(), true)
+            } else {
+                (item, false)
+            };
+            let privilege = if name.eq_ignore_ascii_case("select") {
+                crate::storage::PrivilegeSet::SELECT
+            } else if name.eq_ignore_ascii_case("insert") {
+                crate::storage::PrivilegeSet::INSERT
+            } else if name.eq_ignore_ascii_case("update") {
+                crate::storage::PrivilegeSet::UPDATE
+            } else if name.eq_ignore_ascii_case("delete") {
+                crate::storage::PrivilegeSet::DELETE
+            } else if name.eq_ignore_ascii_case("truncate") {
+                crate::storage::PrivilegeSet::TRUNCATE
+            } else if name.eq_ignore_ascii_case("references") {
+                crate::storage::PrivilegeSet::REFERENCES
+            } else if name.eq_ignore_ascii_case("trigger") {
+                crate::storage::PrivilegeSet::TRIGGER
+            } else if name.eq_ignore_ascii_case("usage") {
+                crate::storage::PrivilegeSet::USAGE
+            } else if name.eq_ignore_ascii_case("create") {
+                crate::storage::PrivilegeSet::CREATE
+            } else if name.eq_ignore_ascii_case("execute") {
+                crate::storage::PrivilegeSet::EXECUTE
+            } else if name.eq_ignore_ascii_case("maintain") {
+                crate::storage::PrivilegeSet::MAINTAIN
+            } else if name.eq_ignore_ascii_case("connect") {
+                crate::storage::PrivilegeSet::CONNECT
+            } else if name.eq_ignore_ascii_case("temporary") || name.eq_ignore_ascii_case("temp") {
+                crate::storage::PrivilegeSet::TEMPORARY
+            } else {
+                return Err(sql_err!(
+                    sqlstate::INVALID_PARAMETER_VALUE,
+                    "unrecognized privilege type: \"{}\"",
+                    name
+                ));
+            };
+            if !all.contains(privilege) {
+                return Err(sql_err!(
+                    sqlstate::INVALID_PARAMETER_VALUE,
+                    "unrecognized privilege type: \"{}\"",
+                    name
+                ));
+            }
+            if grant_option {
+                requested.grant_option = requested.grant_option.union(privilege);
+            } else {
+                requested.ordinary = requested.ordinary.union(privilege);
+            }
         }
-        if grant_option {
-            requested.grant_option = requested.grant_option.union(privilege);
-        } else {
-            requested.ordinary = requested.ordinary.union(privilege);
-        }
-    }
-    Ok(requested)
+        Ok(requested)
     }
 
     fn allows(

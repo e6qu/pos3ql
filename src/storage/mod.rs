@@ -40289,7 +40289,7 @@ impl Storage {
     }
 
     pub(crate) fn create_domain_from_journal(
-        &self, schema: SqlName, name: SqlName, spec: DomainSpec, created_at: u64,
+        &mut self, schema: SqlName, name: SqlName, spec: DomainSpec, created_at: u64,
     ) -> Result<usize, SqlError> {
         self.create_domain_with_binding(schema, name, spec, 0,
             type_identities::TypeCreationAdmission::restored(created_at)?, false).map(TypeDdlUndo::slot)
@@ -41903,7 +41903,7 @@ impl Storage {
     /// slot explicitly, so restart cannot rebind existing rows to whichever
     /// free slot happens to be allocated first.
     pub(crate) fn create_composite_at(
-        &self,
+        &mut self,
         slot: usize,
         schema: SqlName,
         name: SqlName,

@@ -360,6 +360,14 @@ readable. Enum-dependent most-common-value hash summaries from older manifests
 or journal kind 77 are retired while their counts and dependency estimates remain
 valid. ANALYZE recreates these cached summaries. New summaries use journal kind 150. Label edits and sort renumbering do not rewrite table rows. The current manifest and journal framing reject incompatible recovery candidates before they can interpret these records.
 
+Named-type recovery installs each saved creation stamp directly; it does not
+reserve a temporary stamp and overwrite it later. An exhausted creation sequence
+therefore cannot prevent loading an existing domain, enum or composite. The
+startup-reserved identity index keys each source by database and creation stamp.
+Retired entries remain bounded by catalog capacity and are replaced on slot reuse.
+Reassignment rejects an uncommitted, retired, wrong-database or retained source
+before changing its definition, version or identity entry.
+
 Journal routine type references identify their saved source lifetime. Replay
 refreshes the SQL spelling from that source; a missing lifetime cannot select a
 replacement with the same name.

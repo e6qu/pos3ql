@@ -7543,7 +7543,12 @@ impl Checkpointer {
                         n_checks,
                     };
                     let allocated = storage
-                        .create_domain_from_manifest(sql_name(&schema)?, sql_name(&name)?, spec, created_at)
+                        .create_domain_from_manifest(
+                            sql_name(&schema)?,
+                            sql_name(&name)?,
+                            spec,
+                            created_at,
+                        )
                         .map_err(|e| {
                             CheckpointSetupError::ObjectStore(format!(
                                 "manifest domain rejected: {}",
@@ -7613,7 +7618,12 @@ impl Checkpointer {
                     }
                     drop(members);
                     let allocated = storage
-                        .finish_enum_replay(sql_name(&schema)?, sql_name(&name)?, n_members, created_at)
+                        .finish_enum_replay(
+                            sql_name(&schema)?,
+                            sql_name(&name)?,
+                            n_members,
+                            created_at,
+                        )
                         .map_err(|e| {
                             CheckpointSetupError::ObjectStore(format!(
                                 "manifest enum rejected: {}",

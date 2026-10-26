@@ -1293,22 +1293,39 @@ fn private_index_bindings_survive_table_changes_savepoints_and_cold_recovery() {
 
 #[test]
 fn numeric_type_schema_and_function_privileges_match_postgresql_before_lookup() {
-    for mode in [crate::config::TransactionMode::Mvcc, crate::config::TransactionMode::Locking] {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
         let mut config = test_config(&format!("numeric-privileges-{mode:?}"));
         config.transaction_mode = mode;
         let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
         let mut engine = Engine::new(&config, &mut budget).unwrap();
         let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
-        assert_eq!(data_rows(&session.success(&mut engine,
-            include_str!("../../tests/external/differential_exact/25_numeric_privileges.sql"), true)), ["t", "t", "t"]);
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                include_str!("../../tests/external/differential_exact/25_numeric_privileges.sql"),
+                true
+            )),
+            ["t", "t", "t"]
+        );
         let mut states = Vec::new();
-        for statement in include_str!("../../tests/external/differential_exact/26_numeric_privilege_errors.sql")
-            .split(';').map(str::trim).filter(|statement| !statement.is_empty())
+        for statement in
+            include_str!("../../tests/external/differential_exact/26_numeric_privilege_errors.sql")
+                .split(';')
+                .map(str::trim)
+                .filter(|statement| !statement.is_empty())
         {
-            states.extend(error_sqlstates(&session.execute(&mut engine, statement, true)));
+            let output = session.execute(&mut engine, statement, true);
+            states.extend(error_sqlstates(&output).into_iter().map(str::to_owned));
         }
-        assert_eq!(states,
-            ["22023", "22023", "22023", "22023", "22023", "22023", "42704", "3F000", "42883"]);
+        assert_eq!(
+            states,
+            [
+                "22023", "22023", "22023", "22023", "22023", "22023", "42704", "3F000", "42883"
+            ]
+        );
     }
 }
 
@@ -1335,11 +1352,14 @@ fn named_type_default_arrays_preserve_declared_types_without_allocation() {
 
 #[test]
 fn named_type_cached_defaults_survive_empty_cache_wal_and_checkpoint_recovery() {
-    let fixture = include_str!("../../tests/external/differential_exact/23_named_type_defaults.sql");
+    let fixture =
+        include_str!("../../tests/external/differential_exact/23_named_type_defaults.sql");
     let (setup, remainder) = fixture
         .split_once("INSERT INTO type_default_scope.orders DEFAULT VALUES;")
         .unwrap();
-    let (queries, _) = remainder.split_once("DROP TABLE type_default_scope.orders;").unwrap();
+    let (queries, _) = remainder
+        .split_once("DROP TABLE type_default_scope.orders;")
+        .unwrap();
     for checkpoint in [false, true] {
         for mode in [
             crate::config::TransactionMode::Mvcc,
@@ -1360,9 +1380,18 @@ fn named_type_cached_defaults_survive_empty_cache_wal_and_checkpoint_recovery() 
                 let mut engine = Engine::new(&config, &mut budget).unwrap();
                 let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
                 session.success(&mut engine, setup, true);
-                session.success(&mut engine, "INSERT INTO type_default_scope.orders DEFAULT VALUES", true);
-                assert_eq!(data_rows(&session.success(&mut engine, queries, true)), ["t", "t"]);
-                if checkpoint { assert!(engine.checkpoint().unwrap()); }
+                session.success(
+                    &mut engine,
+                    "INSERT INTO type_default_scope.orders DEFAULT VALUES",
+                    true,
+                );
+                assert_eq!(
+                    data_rows(&session.success(&mut engine, queries, true)),
+                    ["t", "t"]
+                );
+                if checkpoint {
+                    assert!(engine.checkpoint().unwrap());
+                }
                 engine.commit_wal().unwrap();
             }
             std::fs::remove_dir_all(&config.data_dir).unwrap();
@@ -1370,9 +1399,19 @@ fn named_type_cached_defaults_survive_empty_cache_wal_and_checkpoint_recovery() 
                 let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
                 let mut engine = Engine::new(&config, &mut budget).unwrap();
                 let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
-                assert_eq!(data_rows(&session.success(&mut engine, queries, true)), ["t", "t"]);
-                session.success(&mut engine, "INSERT INTO type_default_scope.orders DEFAULT VALUES", true);
-                assert_eq!(data_rows(&session.success(&mut engine, queries, true)), ["t", "t", "t", "t"]);
+                assert_eq!(
+                    data_rows(&session.success(&mut engine, queries, true)),
+                    ["t", "t"]
+                );
+                session.success(
+                    &mut engine,
+                    "INSERT INTO type_default_scope.orders DEFAULT VALUES",
+                    true,
+                );
+                assert_eq!(
+                    data_rows(&session.success(&mut engine, queries, true)),
+                    ["t", "t", "t", "t"]
+                );
             }
             std::fs::remove_dir_all(&config.data_dir).unwrap();
             crate::object_store::sim::drop_namespace(&config.object_store_bucket);

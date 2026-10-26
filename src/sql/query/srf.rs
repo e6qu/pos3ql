@@ -664,7 +664,7 @@ fn publication_table_rows<'a>(
         rows[row_count] = crate::sql::exec::encode_projected_pub(
             &[
                 Datum::Oid(crate::sql::catalog::publication_oid(info.publication_slot) as u32),
-                Datum::Oid(crate::sql::catalog::user_table_oid(info.relation_slot) as u32),
+                Datum::Oid(crate::sql::catalog::user_table_oid(storage, info.relation_slot) as u32),
                 publication_int2vector(column_mask, &table, arena)?,
                 qual,
             ],
@@ -1856,7 +1856,10 @@ fn preserve_projection_type_identities(
                 };
             }
             SelectItem::RecordStar(base) => {
-                output += scope.map_or(1, |scope| record_star_width(base, scope));
+                output += scope
+                    .map(|scope| record_star_width(base, scope))
+                    .transpose()?
+                    .unwrap_or(1);
             }
             SelectItem::Expr { expression, .. } => {
                 let semantic = crate::sql::exec::infer_routine_argument_oid(expression, resolver)?;
@@ -1934,7 +1937,7 @@ pub(crate) fn describe_derived_definition<'a>(
                         SelectItem::TableWildcard(q) => {
                             slot += ss.qualified_star_columns(q)?;
                         }
-                        SelectItem::RecordStar(base) => slot += record_star_width(base, &ss),
+                        SelectItem::RecordStar(base) => slot += record_star_width(base, &ss)?,
                         SelectItem::Expr { expression, .. } => {
                             // A record-valued item registers its field shape;
                             // the column's type_mod carries the handle so
@@ -1948,9 +1951,10 @@ pub(crate) fn describe_derived_definition<'a>(
                                         outer_scope: outer,
                                         storage,
                                         txid,
+                                        arena,
                                     },
                                     arena,
-                                )
+                                )?
                             {
                                 descriptors[slot].type_mod = handle;
                             }
@@ -2000,7 +2004,7 @@ pub(crate) fn describe_derived_definition<'a>(
                             }
                         }
                         SelectItem::RecordStar(base) => {
-                            slot += record_star_width(base, &ss);
+                            slot += record_star_width(base, &ss)?;
                         }
                         SelectItem::Expr { expression, .. } => {
                             output_collations[slot] = ss.expression_collation(expression)?;
@@ -2016,6 +2020,7 @@ pub(crate) fn describe_derived_definition<'a>(
                         outer_scope: outer,
                         storage,
                         txid,
+                        arena,
                     },
                     &descriptors[..n],
                     &mut type_oids[..n],
@@ -2043,6 +2048,7 @@ pub(crate) fn describe_derived_definition<'a>(
                         outer_scope: None,
                         storage,
                         txid,
+                        arena,
                     },
                     &descriptors[..n],
                     &mut type_oids[..n],
@@ -2071,9 +2077,10 @@ pub(crate) fn describe_derived_definition<'a>(
                                     output_aliases: &[],
                                     storage,
                                     txid,
+                                    arena,
                                 },
                                 arena,
-                            )
+                            )?
                         {
                             descriptors[slot].type_mod = handle;
                         }
@@ -2089,6 +2096,7 @@ pub(crate) fn describe_derived_definition<'a>(
                         output_aliases: &[],
                         storage,
                         txid,
+                        arena,
                     },
                     &descriptors[..n],
                     &mut type_oids[..n],
@@ -2458,12 +2466,11 @@ fn populate_record_append_columns<'a, C: ColumnLookup<'a>>(
     }
     // A table or view rowtype contributes its own columns.
     if (oid::FIRST_TABLE_COMPOSITE..oid::FIRST_VIEW_COMPOSITE).contains(&composite_oid) {
-        let slot = usize::try_from(composite_oid - oid::FIRST_TABLE_COMPOSITE)
-            .ok()
-            .filter(|slot| *slot < storage.table_count())
-            .ok_or_else(|| {
-                sql_err!(sqlstate::INTERNAL_ERROR, "table rowtype OID is not a table")
-            })?;
+        let slot =
+            crate::sql::catalog::table_slot_by_row_type_oid(storage, txid, composite_oid, false)
+                .ok_or_else(|| {
+                    sql_err!(sqlstate::INTERNAL_ERROR, "table rowtype OID is not a table")
+                })?;
         for column in storage.table_def(slot, txid).columns() {
             push(table_function_column(
                 column.name,
@@ -2475,11 +2482,12 @@ fn populate_record_append_columns<'a, C: ColumnLookup<'a>>(
         }
         return Ok(count);
     }
-    if (oid::FIRST_VIEW_COMPOSITE..oid::FIRST_DOMAIN_ARRAY).contains(&composite_oid) {
-        let slot = usize::try_from(composite_oid - oid::FIRST_VIEW_COMPOSITE)
-            .ok()
-            .filter(|slot| *slot < storage.view_count())
-            .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "view rowtype OID is not a view"))?;
+    if (oid::FIRST_VIEW_COMPOSITE..oid::FIRST_TABLE_COMPOSITE_ARRAY).contains(&composite_oid) {
+        let slot =
+            crate::sql::catalog::view_slot_by_row_type_oid(storage, txid, composite_oid, false)
+                .ok_or_else(|| {
+                    sql_err!(sqlstate::INTERNAL_ERROR, "view rowtype OID is not a view")
+                })?;
         let view = storage.view(slot);
         let width = view.columns_for(txid).names().len();
         let described = arena

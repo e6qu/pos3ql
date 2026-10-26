@@ -474,6 +474,7 @@ fn collect_statement(
                 $excluded.map(|(_, definition)| definition),
                 dependencies,
                 context,
+                arena,
             )
         }};
     }
@@ -773,6 +774,10 @@ fn collect_statement(
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "stored query analysis keeps its arena and captured identities explicit"
+)]
 fn collect_dml_routine_calls<'a>(
     expression: &Expr<'a>,
     storage: &Storage,
@@ -781,6 +786,7 @@ fn collect_dml_routine_calls<'a>(
     excluded: Option<&crate::storage::TableDef>,
     dependencies: &mut StoredQueryDependencies,
     context: CollectionContext<'a>,
+    arena: &Arena,
 ) -> Result<(), SqlError> {
     collect_dml_routine_calls_with_output(
         expression,
@@ -791,6 +797,7 @@ fn collect_dml_routine_calls<'a>(
         dependencies,
         context,
         None,
+        arena,
     )
 }
 
@@ -807,6 +814,7 @@ fn collect_dml_routine_calls_with_output<'a>(
     dependencies: &mut StoredQueryDependencies,
     context: CollectionContext<'a>,
     returning_output: Option<(&crate::storage::TableDef, [&'a str; 2])>,
+    arena: &Arena,
 ) -> Result<(), SqlError> {
     let resolver = DependencyTypes {
         scope,
@@ -815,6 +823,7 @@ fn collect_dml_routine_calls_with_output<'a>(
         txid,
         returning_output,
         transition: context.transition,
+        arena,
     };
     let mut needs_scope = false;
     fn visit(
@@ -923,6 +932,7 @@ fn collect_returning_expression<'a>(
         dependencies,
         context,
         Some((target, aliases)),
+        arena,
     )
 }
 
@@ -1242,6 +1252,7 @@ struct DependencyTypes<'scope, 'definition, 'storage> {
     storage: &'storage Storage,
     txid: u32,
     returning_output: Option<(&'storage crate::storage::TableDef, [&'definition str; 2])>,
+    arena: &'storage Arena,
 }
 
 impl ColTypeResolver for DependencyTypes<'_, '_, '_> {
@@ -1328,6 +1339,7 @@ impl ColTypeResolver for DependencyTypes<'_, '_, '_> {
                 outer_scope: None,
                 storage: self.storage,
                 txid: self.txid,
+                arena: self.arena,
             },
             qualifier,
             name,
@@ -1416,25 +1428,18 @@ impl ColTypeResolver for DependencyTypes<'_, '_, '_> {
         ))
     }
 
-    fn named_composite_field(
+    fn visit_named_composite_fields(
         &self,
         type_name: &str,
-        index: usize,
-    ) -> Option<(crate::util::StackStr<64>, StaticTypeMeta)> {
-        let slot = self.storage.resolve_composite_slot(type_name, self.txid)?;
-        let definition = self.storage.composite_for(slot, self.txid);
-        let field = definition.active_field(index)?;
-        Some((
-            crate::util::StackStr::from_str(field.name.as_str()),
-            StaticTypeMeta {
-                ctype: field.ctype,
-                type_oid: self
-                    .storage
-                    .routine_type_oid(field.ctype, field.user_type, self.txid)?,
-                type_mod: field.type_mod,
-                collation: field.collation,
-            },
-        ))
+        visit: &mut dyn FnMut(&str, crate::sql::exec::StaticTypeMeta),
+    ) -> Result<Option<usize>, SqlError> {
+        crate::sql::exec::visit_catalog_rowtype_fields(
+            self.storage,
+            self.txid,
+            type_name,
+            self.arena,
+            visit,
+        )
     }
 
     fn is_whole_row(&self, name: &str) -> bool {
@@ -1510,6 +1515,7 @@ fn collect_routine_dependencies(
         storage,
         txid,
         returning_output: None,
+        arena,
     };
     let needs_scope =
         collect_routine_dependencies_with_resolver(select, storage, txid, dependencies, &resolver)?;
@@ -1531,6 +1537,7 @@ fn collect_routine_dependencies(
                 storage,
                 txid,
                 returning_output: None,
+                arena,
             };
             if collect_routine_dependencies_with_resolver(
                 select,
@@ -1554,6 +1561,10 @@ fn collect_routine_dependencies(
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "stored query analysis keeps its arena and captured identities explicit"
+)]
 pub(super) fn stored_routine_dependency_for_call(
     name: &str,
     args: &[&Expr<'_>],
@@ -1562,6 +1573,7 @@ pub(super) fn stored_routine_dependency_for_call(
     storage: &Storage,
     txid: u32,
     dependencies: crate::storage::StoredQueryDependencyView<'_>,
+    arena: &Arena,
 ) -> Result<Option<StoredQueryDependency>, SqlError> {
     let (referenced_schema, referenced_name) = name.split_once('.').unwrap_or(("", name));
     let mut candidates = dependencies.entries().iter().copied().filter(|dependency| {
@@ -1588,6 +1600,7 @@ pub(super) fn stored_routine_dependency_for_call(
         storage,
         txid,
         returning_output: None,
+        arena,
     };
     let mut argument_oids = [0_i32; crate::storage::MAX_ROUTINE_ARGUMENTS];
     for (output, argument) in argument_oids.iter_mut().zip(args.iter().copied()) {
@@ -1650,6 +1663,7 @@ pub(super) fn stored_operator_dependency_for_call(
     storage: &Storage,
     txid: u32,
     dependencies: crate::storage::StoredQueryDependencyView<'_>,
+    arena: &Arena,
 ) -> Result<Option<StoredQueryDependency>, SqlError> {
     let Some((schema, operator_name)) = crate::sql::ast::catalog_operator_call(name) else {
         return Ok(None);
@@ -1678,6 +1692,7 @@ pub(super) fn stored_operator_dependency_for_call(
         storage,
         txid,
         returning_output: None,
+        arena,
     };
     let mut argument_oids = [0_i32; 2];
     for (output, argument) in argument_oids.iter_mut().zip(args.iter().copied()) {
@@ -2843,7 +2858,7 @@ fn collect_sequence(
             crate::sql::identifiers::ObjectReference::Oid(oid) => {
                 let slot = (0..storage.sequence_count()).find(|slot| {
                     storage.sequence_slot_visible_to(*slot, txid)
-                        && crate::sql::catalog::sequence_oid(*slot) as u32 == oid
+                        && crate::sql::catalog::sequence_oid(storage, *slot) as u32 == oid
                 });
                 (
                     slot,

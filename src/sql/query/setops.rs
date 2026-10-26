@@ -1193,7 +1193,10 @@ fn register_record_shapes_inner(
                     .unwrap_or(0);
             }
             SelectItem::RecordStar(base) => {
-                slot += scope.map_or(0, |scope| super::record_star_width(base, scope));
+                slot += scope
+                    .map(|scope| super::record_star_width(base, scope))
+                    .transpose()?
+                    .unwrap_or(0);
             }
             SelectItem::Expr { expression, .. } => {
                 if slot < count && columns[slot].type_oid == crate::sql::types::oid::RECORD {
@@ -1205,9 +1208,10 @@ fn register_record_shapes_inner(
                                 outer_scope: None,
                                 storage,
                                 txid,
+                                arena,
                             },
                             arena,
-                        ),
+                        )?,
                         None => crate::sql::exec::register_shape_for(
                             expression,
                             &crate::sql::exec::CatalogCols {
@@ -1216,9 +1220,10 @@ fn register_record_shapes_inner(
                                 output_aliases: &[],
                                 storage,
                                 txid,
+                                arena,
                             },
                             arena,
-                        ),
+                        )?,
                     };
                     if let Some(handle) = handle {
                         columns[slot].type_mod = handle;

@@ -484,6 +484,51 @@ impl DefinitionVersions {
             .map(|head| self.read(head.tail as usize).version)
     }
 
+    pub(super) fn latest_index_identities(
+        &self,
+        state: &DefinitionState,
+        output: &mut [Option<super::RelationIdentity>; super::MAX_VALUE_ENFORCERS],
+    ) -> usize {
+        let Some(head) = state.pending else {
+            return 0;
+        };
+        let entry = self.read(head.tail as usize);
+        let mut count = 0usize;
+        for identity in entry.version.def.implicit_index_identities().flatten() {
+            output[count] = Some(identity);
+            count += 1;
+        }
+        count
+    }
+
+    pub(super) fn contains_index_identity(
+        &self,
+        state: &DefinitionState,
+        identity: super::RelationIdentity,
+    ) -> bool {
+        if state
+            .committed()
+            .implicit_index_identities()
+            .any(|candidate| candidate == Some(identity))
+        {
+            return true;
+        }
+        let mut tail = state.pending.map(|head| head.tail);
+        while let Some(slot) = tail {
+            let entry = self.read(slot as usize);
+            if entry
+                .version
+                .def
+                .implicit_index_identities()
+                .any(|candidate| candidate == Some(identity))
+            {
+                return true;
+            }
+            tail = entry.previous;
+        }
+        false
+    }
+
     pub(super) fn selected_revision(&self, state: &DefinitionState, transaction: u32) -> u64 {
         state
             .pending

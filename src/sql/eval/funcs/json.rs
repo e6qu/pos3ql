@@ -382,18 +382,19 @@ pub(crate) fn populate_record_from_json<'a>(
     let fields = arena
         .alloc_slice_copy(base_fields)
         .map_err(|_| arena_full())?;
-    for (index, field) in fields.iter_mut().enumerate() {
+    let modifiers = catalog
+        .composite_field_type_mods(base_type_oid, arena)?
+        .filter(|modifiers| modifiers.len() == fields.len())
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::DATATYPE_MISMATCH,
+                "composite field modifiers are unavailable"
+            )
+        })?;
+    for (field, &type_mod) in fields.iter_mut().zip(modifiers) {
         if let Some((_, value)) = members.iter().find(|(name, _)| *name == field.name) {
-            field.value = json_value_to_type(
-                *value,
-                field.type_oid,
-                catalog
-                    .composite_field_type_mod(base_type_oid, index)
-                    .unwrap_or(-1),
-                field.value,
-                arena,
-                hooks,
-            )?;
+            field.value =
+                json_value_to_type(*value, field.type_oid, type_mod, field.value, arena, hooks)?;
         }
     }
     // A rowtype base yields an anonymous record carrying the declared
@@ -489,14 +490,21 @@ pub(crate) fn json_value_to_type<'a>(
         let fields = arena
             .alloc_slice_copy(base_fields)
             .map_err(|_| arena_full())?;
-        for (index, field) in fields.iter_mut().enumerate() {
+        let modifiers = catalog
+            .composite_field_type_mods(type_oid, arena)?
+            .filter(|modifiers| modifiers.len() == fields.len())
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::DATATYPE_MISMATCH,
+                    "composite field modifiers are unavailable"
+                )
+            })?;
+        for (field, &type_mod) in fields.iter_mut().zip(modifiers) {
             if let Some((_, child)) = members.iter().find(|(name, _)| *name == field.name) {
                 field.value = json_value_to_type(
                     *child,
                     field.type_oid,
-                    catalog
-                        .composite_field_type_mod(type_oid, index)
-                        .unwrap_or(-1),
+                    type_mod,
                     field.value,
                     arena,
                     hooks,

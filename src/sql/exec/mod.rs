@@ -696,7 +696,10 @@ pub(crate) use copy_transition::CopyTransitionRows;
 pub(super) use schema::rename as stage_schema_rename;
 
 mod describe;
-pub(crate) use describe::{CatalogCols, catalog_composite_field, visit_catalog_composite_fields};
+pub(crate) use describe::{
+    CatalogCols, catalog_composite_field, visit_catalog_composite_fields,
+    visit_catalog_rowtype_fields,
+};
 pub use describe::{
     ColTypeResolver, DefCols, NoCols, RECORD_FIELD_NAMES, check_row_field_types,
     could_not_identify, derived_name, describe_items, expr_record_handle as expr_record_handle_pub,
@@ -1064,7 +1067,7 @@ fn create_table_kind(
                     lsn,
                     &WalOp::CreateTable {
                         identity: storage.table_position(slot),
-                        definition: &def,
+                        definition: &storage.table_def(slot, txn.txid),
                     },
                 )
             };
@@ -3488,6 +3491,7 @@ fn execute_row_trigger_body<'a>(
         .then(|| super::guc::enter_active_routine_configs(routine.configs()))
         .transpose()?;
     let invocation = TriggerInvocation::new(
+        context.storage(),
         trigger,
         TriggerRelationIdentity {
             target,
@@ -13917,6 +13921,7 @@ pub fn create_publication(
     publish_via_partition_root: bool,
     publish_generated_columns: crate::sql::ast::PublishGeneratedColumns,
     responder: &mut Responder,
+    arena: &Arena,
 ) -> Outcome {
     if all_tables && (!tables.is_empty() || !schemas.is_empty()) {
         return sql_fail(sql_err!(
@@ -13944,7 +13949,13 @@ pub fn create_publication(
         ));
     }
     let (members, table_column_masks, table_include_descendants, table_filter_sql, table_count) =
-        match publication_members(storage, txn.txid, tables, publish.update || publish.delete) {
+        match publication_members(
+            storage,
+            txn.txid,
+            tables,
+            publish.update || publish.delete,
+            arena,
+        ) {
             Ok(members) => members,
             Err(error) => return sql_fail(error),
         };
@@ -14874,6 +14885,7 @@ pub fn alter_publication(
     name: &str,
     action: crate::sql::ast::AlterPublicationAction<'_>,
     responder: &mut Responder,
+    arena: &Arena,
 ) -> Outcome {
     let Some((slot, current)) = storage.publication_definition(name, txn.txid) else {
         return sql_fail(sql_err!(
@@ -15017,6 +15029,7 @@ pub fn alter_publication(
                 txn.txid,
                 tables,
                 definition.publish_update || definition.publish_delete,
+                arena,
             ) {
                 Ok(members) => members,
                 Err(error) => return sql_fail(error),
@@ -15049,6 +15062,7 @@ pub fn alter_publication(
                 txn.txid,
                 tables,
                 definition.publish_update || definition.publish_delete,
+                arena,
             ) {
                 Ok(members) => members,
                 Err(error) => return sql_fail(error),
@@ -15123,7 +15137,7 @@ pub fn alter_publication(
                 ));
             }
             let (members, _, _, _, count) =
-                match publication_members(storage, txn.txid, tables, false) {
+                match publication_members(storage, txn.txid, tables, false, arena) {
                     Ok(members) => members,
                     Err(error) => return sql_fail(error),
                 };
@@ -15301,6 +15315,7 @@ fn publication_members(
     txid: u32,
     tables: &[PublicationTarget],
     require_replica_identity: bool,
+    arena: &Arena,
 ) -> Result<PublicationMembers, SqlError> {
     let mut members = [u16::MAX; crate::storage::MAX_PUBLICATION_TABLES];
     let mut masks = [ColumnSet::EMPTY; crate::storage::MAX_PUBLICATION_TABLES];
@@ -15365,7 +15380,7 @@ fn publication_members(
             }
             let referenced = crate::sql::exec::ddl::check_referenced_columns(filter, &definition)?;
             let (type_oid, _) =
-                describe::infer_type_catalog(filter, Some(&definition), storage, txid)?;
+                describe::infer_type_catalog(filter, Some(&definition), storage, txid, arena)?;
             if type_oid != ColType::Bool.oid() {
                 return Err(sql_err!(
                     sqlstate::DATATYPE_MISMATCH,
@@ -15797,6 +15812,7 @@ fn plpgsql_context_field(kind: PlpgsqlProgramKind, name: &str) -> Option<Trigger
 
 impl<'a> TriggerInvocation<'a> {
     fn new(
+        storage: &Storage,
         trigger: &crate::storage::TriggerDef,
         relation: TriggerRelationIdentity,
         event: u8,
@@ -15852,10 +15868,10 @@ impl<'a> TriggerInvocation<'a> {
                 .map_err(|_| super::query::arena_full_pub())?,
             relid: match relation.target {
                 crate::storage::TriggerTarget::Table(slot) => {
-                    crate::sql::catalog::user_table_oid(usize::from(slot))
+                    crate::sql::catalog::user_table_oid(storage, usize::from(slot))
                 }
                 crate::storage::TriggerTarget::View(slot) => {
-                    crate::sql::catalog::view_oid(usize::from(slot))
+                    crate::sql::catalog::view_oid(storage, usize::from(slot))
                 }
             },
             routine_oid: crate::storage::routine_oid(routine),
@@ -22493,6 +22509,7 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                     *publish_via_partition_root,
                     *publish_generated_columns,
                     responder,
+                    context.arena,
                 ),
                 Stmt::AlterPublication { name, action } => super::exec::alter_publication(
                     &mut engine.storage,
@@ -22501,6 +22518,7 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                     name,
                     *action,
                     responder,
+                    context.arena,
                 ),
                 Stmt::DropPublication { names, if_exists } => super::exec::drop_publication(
                     &mut engine.storage,
@@ -27162,6 +27180,7 @@ fn fire_statement_triggers_with_rows<'a>(
             .then(|| super::guc::enter_active_routine_configs(routine.configs()))
             .transpose()?;
         let invocation = TriggerInvocation::new(
+            context.storage(),
             &trigger,
             TriggerRelationIdentity {
                 target,
@@ -39449,7 +39468,7 @@ pub fn create_table_as(
                     lsn,
                     &WalOp::CreateTable {
                         identity: storage.table_position(slot),
-                        definition: &def,
+                        definition: &storage.table_def(slot, txn.txid),
                     },
                 )
             };
@@ -40553,7 +40572,7 @@ fn rewrite_sequence_default_references(
             lsn,
             &WalOp::CreateTable {
                 identity: storage.table_position(table_slot),
-                definition: &altered,
+                definition: &storage.table_def(table_slot, txn.txid),
             },
         )?;
     }
@@ -46784,7 +46803,7 @@ fn rewrite_composite_dependent_tables(
                 lsn,
                 &WalOp::CreateTable {
                     identity: storage.table_position(table_slot),
-                    definition: &altered,
+                    definition: &storage.table_def(table_slot, txn.txid),
                 },
             )?;
         }
@@ -47627,7 +47646,7 @@ pub fn create_statistics(
     wal: &mut Wal,
     txn: &mut TxnState,
     command: &crate::sql::ast::CreateStatistics<'_>,
-    _arena: &Arena,
+    arena: &Arena,
     responder: &mut Responder,
 ) -> Outcome {
     use crate::sql::ast::{StatisticsKey, StatisticsKeys, StatisticsName};
@@ -47751,6 +47770,7 @@ pub fn create_statistics(
                     Some(&table_definition),
                     storage,
                     txn.txid,
+                    arena,
                 ) {
                     return sql_fail(error);
                 }
@@ -48552,7 +48572,7 @@ pub fn create_index(
     }
     if let Some(predicate_expression) = command.predicate {
         let (type_oid, _) =
-            match infer_type_catalog(predicate_expression, Some(&tdef), storage, txn.txid) {
+            match infer_type_catalog(predicate_expression, Some(&tdef), storage, txn.txid, arena) {
                 Ok(value) => value,
                 Err(error) => return sql_fail(error),
             };
@@ -48788,11 +48808,16 @@ pub fn create_index(
                 type_oid,
             )
         } else {
-            let (type_oid, _) =
-                match infer_type_catalog(index_column.expression, Some(&tdef), storage, txn.txid) {
-                    Ok(result) => result,
-                    Err(error) => return sql_fail(error),
-                };
+            let (type_oid, _) = match infer_type_catalog(
+                index_column.expression,
+                Some(&tdef),
+                storage,
+                txn.txid,
+                arena,
+            ) {
+                Ok(result) => result,
+                Err(error) => return sql_fail(error),
+            };
             expressions[i] =
                 match crate::storage::index_expression_stackstr(index_column.expression_text) {
                     Ok(expression) => Some(expression),
@@ -50255,7 +50280,7 @@ fn stage_table_definition(
     txn: &mut TxnState,
     edit_target: crate::storage::TableDefinitionTarget,
     previous: TableDef,
-    next: TableDef,
+    mut next: TableDef,
 ) -> Result<(), SqlError> {
     let table = edit_target.table();
     let mut mapping = [None; MAX_COLUMNS];
@@ -50276,6 +50301,7 @@ fn stage_table_definition(
                 column_mapping: wal_mapping,
             },
         )?;
+        storage.reserve_implicit_index_identities(&mut next)?;
         let lsn = storage.bump_lsn();
         wal.stage_reserved(
             txn.txid,
@@ -63454,10 +63480,11 @@ fn drop_named_constraint(def: &mut TableDef, name: &str) -> bool {
     // A single-column primary key is a column flag named "<table>_pkey".
     let pkey = crate::stack_format!(96, "{}_pkey", def.name.as_str());
     if name == pkey.as_str()
-        && let Some(c) = def.columns[..def.n_columns].iter_mut().find(|c| c.primary)
+        && let Some(column) = def.columns().iter().position(|column| column.primary)
     {
-        c.primary = false;
-        c.unique = false;
+        def.take_column_index_identity(column);
+        def.columns[column].primary = false;
+        def.columns[column].unique = false;
         return true;
     }
     // A single-column UNIQUE is "<table>_<column>_key".
@@ -63470,6 +63497,7 @@ fn drop_named_constraint(def: &mut TableDef, name: &str) -> bool {
                 def.columns[i].name.as_str()
             );
             if name == key.as_str() {
+                def.take_column_index_identity(i);
                 def.columns[i].unique = false;
                 return true;
             }
@@ -63675,6 +63703,10 @@ fn attach_constraint_using_index(
         },
         timing,
     )?;
+    new_definition.uniques[new_definition.n_uniques - 1].index_identity = Some(
+        crate::storage::RelationIdentity::parse(index.created_at)
+            .expect("admitted explicit index has an identity"),
+    );
     stage_index_rename(storage, wal, txn, slot, constraint_name)
 }
 
@@ -63732,6 +63764,7 @@ fn rename_attached_index_constraint(
             column_mapping: wal_mapping,
         },
     )?;
+    storage.reserve_implicit_index_identities(&mut altered)?;
     let lsn = storage.bump_lsn();
     wal.stage_reserved(
         txn.txid,
@@ -63813,6 +63846,7 @@ fn drop_dependent_foreign_keys(
                 column_mapping: wal_mapping,
             },
         )?;
+        storage.reserve_implicit_index_identities(&mut altered)?;
         let lsn = storage.bump_lsn();
         wal.stage_reserved(
             txn.txid,
@@ -64580,6 +64614,7 @@ fn inherit_partition_constraints(
             ));
         }
         let mut inherited = *constraint;
+        inherited.index_identity = None;
         inherited.columns = columns;
         inherited.name = auto_key_name(
             child,
@@ -64679,6 +64714,7 @@ fn inherit_partition_constraints(
             ));
         }
         let mut inherited = *constraint;
+        inherited.index_identity = None;
         inherited.columns = columns;
         inherited.name = auto_key_name(child, &columns[..constraint.n_cols], "excl", true)?;
         child.exclusions[child.n_exclusions] = inherited;
@@ -65055,6 +65091,9 @@ fn alter_table_inheritance(
             column_mapping: wal_mapping,
         },
     ) {
+        return sql_fail(error);
+    }
+    if let Err(error) = storage.reserve_implicit_index_identities(&mut updated) {
         return sql_fail(error);
     }
     let lsn = storage.bump_lsn();
@@ -65486,6 +65525,9 @@ fn alter_partition_attachment(
     ) {
         return sql_fail(error);
     }
+    if let Err(error) = storage.reserve_implicit_index_identities(&mut new_def) {
+        return sql_fail(error);
+    }
     let lsn = storage.bump_lsn();
     if let Err(error) = wal.stage_reserved(
         txn.txid,
@@ -65541,6 +65583,9 @@ fn alter_partition_attachment(
                         column_mapping: wal_mapping,
                     },
                 ) {
+                    return sql_fail(error);
+                }
+                if let Err(error) = storage.reserve_implicit_index_identities(&mut dependent) {
                     return sql_fail(error);
                 }
                 let lsn = storage.bump_lsn();
@@ -66631,6 +66676,9 @@ fn alter_table_relation(
                     column_mapping: wal_mapping,
                 },
             ) {
+                return sql_fail(error);
+            }
+            if let Err(error) = storage.reserve_implicit_index_identities(&mut new_def) {
                 return sql_fail(error);
             }
             let lsn = storage.bump_lsn();
@@ -68320,6 +68368,9 @@ fn alter_table_relation(
         ) {
             return sql_fail(e);
         }
+        if let Err(error) = storage.reserve_implicit_index_identities(&mut new_def) {
+            return sql_fail(error);
+        }
         let lsn = storage.bump_lsn();
         if let Err(e) = wal.stage_reserved(
             txn.txid,
@@ -68819,6 +68870,9 @@ fn alter_table_relation(
                     ) {
                         return sql_fail(error);
                     }
+                    if let Err(error) = storage.reserve_implicit_index_identities(&mut dependent) {
+                        return sql_fail(error);
+                    }
                     let lsn = storage.bump_lsn();
                     if let Err(error) = wal.stage_reserved(
                         txn.txid,
@@ -69205,6 +69259,9 @@ fn alter_table_replica_identity(
         ) {
             return sql_fail(error);
         }
+        if let Err(error) = storage.reserve_implicit_index_identities(&mut next) {
+            return sql_fail(error);
+        }
         let lsn = storage.bump_lsn();
         if let Err(error) = wal.stage_reserved(
             txn.txid,
@@ -69249,6 +69306,7 @@ fn materialize_flag_key_names(def: &mut TableDef) -> Result<(), SqlError> {
             },
             crate::sql::ast::ConstraintTiming::NotDeferrable,
         )?;
+        def.uniques[def.n_uniques - 1].index_identity = def.take_column_index_identity(column);
         def.columns[column].primary = false;
         def.columns[column].unique = false;
     }
@@ -69297,6 +69355,7 @@ fn rename_flag_key(def: &mut TableDef, from: &str, new_name: SqlName) -> Result<
                 },
                 crate::sql::ast::ConstraintTiming::NotDeferrable,
             )?;
+            def.uniques[def.n_uniques - 1].index_identity = def.take_column_index_identity(i);
             return Ok(true);
         }
     }

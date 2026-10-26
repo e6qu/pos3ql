@@ -107,7 +107,7 @@ pub(super) fn current<'a>(
                 .unwrap_or(0);
             let slot = (0..storage.table_count()).find(|&slot| {
                 storage.table_slot_visible_to(slot, transaction)
-                    && super::table_oid(storage, slot) == relation
+                    && super::user_table_oid(storage, slot) == relation
             });
             row[position] = Datum::PgNodeTree(if let Some(slot) = slot {
                 let definition = storage.table_def(slot, transaction);
@@ -433,7 +433,7 @@ pub(super) fn deparse<'a>(
     }
     let slot = (0..storage.table_count()).find(|&slot| {
         storage.table_slot_visible_to(slot, transaction)
-            && super::table_oid(storage, slot) == relation
+            && super::user_table_oid(storage, slot) == relation
     });
     let mut output = ArenaString::new(arena);
     let mut copied = 0;

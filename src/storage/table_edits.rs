@@ -228,6 +228,8 @@ impl<'storage> TableDefinitionEdit<'storage> {
             column_mapping,
         )?;
         super::constraint_names::remap_table(current, &mut definition, column_mapping)?;
+        self.storage
+            .reserve_implicit_index_identities(&mut definition)?;
         // Column-only edits replace pg_attribute rows. Keep track of edits
         // that also fork pg_class, including a rename followed by renaming back.
         let class_tuple_private = prior
@@ -380,6 +382,11 @@ impl<'storage> TableDefinitionEdit<'storage> {
                 }
             }
         };
+        let mut discarded = [None; super::MAX_VALUE_ENFORCERS];
+        let discarded_count = self
+            .storage
+            .pending_table_defs
+            .latest_index_identities(&self.definition, &mut discarded);
         if !self
             .storage
             .pending_table_defs
@@ -415,6 +422,22 @@ impl<'storage> TableDefinitionEdit<'storage> {
             transaction,
         );
         identity.apply(&mut comments);
+        for candidate in &mut discarded[..discarded_count] {
+            if candidate.is_some_and(|identity| {
+                self.storage
+                    .pending_table_defs
+                    .contains_index_identity(&self.definition, identity)
+            }) {
+                *candidate = None;
+            }
+        }
+        let storage = self.storage;
+        let table = self.table;
+        let database = self.definition.identity.database;
+        drop(indexes);
+        drop(comments);
+        drop(self);
+        storage.retire_implicit_index_statistics(database, table, &discarded[..discarded_count]);
     }
 }
 

@@ -47,10 +47,11 @@ Complete these remaining cases:
   catalog families. Cover edits after another connection replaced a catalog
   tuple. Listings and direct lookups can expose different rows; dependency rows
   also need exact duplicate counts.
-- Give replacement tables, indexes, sequences and other remaining objects fresh
-  SQL object identifiers, independently of reused storage slots. A cached
-  identifier for a dropped table must not name its replacement. Check shared
-  catalogs across databases as well.
+- Finish lifetime-based SQL identifiers in the remaining catalog families,
+  including named types and constraints without an index. The
+  [behavior guide](docs/implemented-baseline.md) owns the implemented relation,
+  table/view row-type and index guarantees. Check shared catalogs across
+  databases as well.
 - Keep old row, index and backup data until their readers finish. Pace history
   pruning, file replacement and deletion without holding unrelated owners.
 - Replace remaining synchronous metadata and maintenance reads with bounded

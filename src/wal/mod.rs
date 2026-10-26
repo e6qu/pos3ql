@@ -26,7 +26,7 @@ use crc32c::crc32c;
 
 /// On-disk record header length shared by recovery and logical decoding.
 pub(crate) const HEADER_LEN: usize = 24;
-pub(crate) const RECORD_VERSION: u8 = 15;
+pub(crate) const RECORD_VERSION: u8 = 16;
 
 /// One contiguous, committed journal range ready for immutable publication.
 /// Construction is private to the journal, so callers cannot pair an LSN with
@@ -252,7 +252,7 @@ wal_record_kinds! {
 /// A table definition is an independently versioned payload inside the
 /// object-native logical WAL. Replays reject a definition from an incompatible
 /// schema instead of assigning later bytes to a different column property.
-const TABLE_DEF_PAYLOAD_VERSION: u8 = 9;
+const TABLE_DEF_PAYLOAD_VERSION: u8 = 10;
 const DOMAIN_PAYLOAD_VERSION: u8 = u8::MAX - 2;
 const NO_DOMAIN_BASE_SLOT: u16 = u16::MAX;
 
@@ -2994,6 +2994,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             };
             n += 1;
             n += 3;
+            n += def.implicit_index_identities().count() * 8;
             n
         }
         WalOp::BeginTableRewrite {
@@ -4734,6 +4735,14 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 u8::from(def.row_level_security.forced),
                 def.replica_identity.code(),
             ]);
+            for identity in def.implicit_index_identities() {
+                ok &= identity.is_some()
+                    && buffer.append(
+                        &identity
+                            .map_or(0, |identity| identity.created_at())
+                            .to_le_bytes(),
+                    );
+            }
             ok
         }
         WalOp::BeginTableRewrite {
@@ -7972,6 +7981,20 @@ fn decode_op_inner<'a>(
             def.replica_identity =
                 crate::storage::ReplicaIdentityMode::from_code(*payload.get(at)?)?;
             at += 1;
+            for identity in def.implicit_index_identities_mut() {
+                let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
+                at += 8;
+                *identity = Some(crate::storage::RelationIdentity::parse(created_at)?);
+            }
+            for (position, identity) in def.implicit_index_identities().enumerate() {
+                if def
+                    .implicit_index_identities()
+                    .take(position)
+                    .any(|earlier| earlier == identity)
+                {
+                    return None;
+                }
+            }
             if at != payload.len() {
                 return None;
             }
@@ -14530,6 +14553,9 @@ mod tests {
         def.n_exclusions = 1;
         def.attributes.initialize(def.n_columns).unwrap();
         crate::storage::constraint_names::table(&mut def).unwrap();
+        for (position, identity) in def.implicit_index_identities_mut().enumerate() {
+            *identity = crate::storage::RelationIdentity::parse(position as u64 + 100);
+        }
         def
     }
 
@@ -14564,6 +14590,32 @@ mod tests {
             .into_iter()
             .filter(|record| !record.contains(":Commit {"))
             .collect()
+    }
+
+    #[test]
+    fn relation_identity_table_payload_rejects_missing_duplicate_and_invalid_index_stamps() {
+        let definition = sample_def();
+        let mut budget = Budget::new(1 << 20);
+        let mut payload = FixedBuf::new(&mut budget, "relation identity payload", 32768).unwrap();
+        assert!(append_payload(
+            &mut payload,
+            &WalOp::CreateTable {
+                identity: crate::storage::CatalogPosition::new(0, 50).unwrap(),
+                definition: &definition,
+            }
+        ));
+        let bytes = payload.readable();
+        assert!(decode_table_payload(bytes).is_some());
+        assert!(decode_table_payload(&bytes[..bytes.len() - 1]).is_none());
+        for invalid in [0, crate::storage::MAX_RELATION_GENERATION + 1, 101] {
+            let mut corrupt = bytes.to_vec();
+            let end = corrupt.len();
+            corrupt[end - 8..].copy_from_slice(&invalid.to_le_bytes());
+            assert!(
+                decode_table_payload(&corrupt).is_none(),
+                "accepted index creation stamp {invalid}"
+            );
+        }
     }
 
     #[test]

@@ -1188,6 +1188,7 @@ fn expand_grouped_stars<'a>(
                     outer_scope: None,
                     storage,
                     txid,
+                    arena,
                 };
                 let expanded = crate::sql::exec::record_shape(base, &resolver, |name, _| {
                     if error.is_some() {
@@ -1209,7 +1210,7 @@ fn expand_grouped_stars<'a>(
                     if let Err(e) = result {
                         error = Some(e);
                     }
-                });
+                })?;
                 if let Some(error) = error {
                     return Err(error);
                 }

@@ -3791,6 +3791,7 @@ impl Engine {
         }
         storage.select_database(crate::storage::DatabaseOid::POSTGRES)?;
         wal.select_database(crate::storage::DatabaseOid::POSTGRES);
+        storage.validate_restored_relation_identities(storage.catalog_identity_sequence())?;
         // Startup reconciliation makes every recovered commit durable in the
         // configured object store before the server admits any connection.
         if config.wal_upload
@@ -15092,7 +15093,7 @@ impl Engine {
         if let Some((slot, reason)) = table_rewrite_target(statement, &self.storage, txn.txid)
             && let Err(error) = self.fire_event_triggers(
                 EventTriggerInvocation::TableRewrite {
-                    relation_oid: catalog::user_table_oid(slot),
+                    relation_oid: catalog::user_table_oid(&self.storage, slot),
                     reason,
                 },
                 EventTriggerExecution {
@@ -15405,7 +15406,7 @@ impl Engine {
         if let Some((slot, reason)) = table_rewrite_target(statement, &self.storage, txn.txid)
             && let Err(error) = self.fire_event_triggers(
                 EventTriggerInvocation::TableRewrite {
-                    relation_oid: catalog::user_table_oid(slot),
+                    relation_oid: catalog::user_table_oid(&self.storage, slot),
                     reason,
                 },
                 EventTriggerExecution {
@@ -16266,6 +16267,7 @@ impl Engine {
                 *publish_via_partition_root,
                 *publish_generated_columns,
                 responder,
+                arena,
             ),
             Stmt::AlterPublication { name, action } => exec::alter_publication(
                 &mut self.storage,
@@ -16274,6 +16276,7 @@ impl Engine {
                 name,
                 *action,
                 responder,
+                arena,
             ),
             Stmt::DropPublication { names, if_exists } => exec::drop_publication(
                 &mut self.storage,

@@ -370,7 +370,7 @@ where
             SelectItem::TableWildcard(q) => {
                 slot += scope.qualified_star_columns(q)?;
             }
-            SelectItem::RecordStar(base) => slot += record_star_width(base, scope),
+            SelectItem::RecordStar(base) => slot += record_star_width(base, scope)?,
             SelectItem::Expr { expression, .. } => {
                 if d.postponed[i] {
                     out[slot] = eval_full(expression, arena, params, &raw_row, hooks)?;
@@ -572,7 +572,7 @@ fn prepare_materialization<'a>(
         width += match item {
             SelectItem::Wildcard => scope.star_columns(),
             SelectItem::TableWildcard(qualifier) => scope.qualified_star_columns(qualifier)?,
-            SelectItem::RecordStar(base) => record_star_width(base, scope),
+            SelectItem::RecordStar(base) => record_star_width(base, scope)?,
             SelectItem::Expr { .. } => 1,
         };
     }

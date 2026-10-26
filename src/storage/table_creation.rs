@@ -169,12 +169,32 @@ pub(super) fn allocate(
         )?;
         source.bind_table_definition(&mut def, transaction)?;
         let created_at = match allocation {
-            super::CatalogAllocation::New => storage.catalog_sequence.next()?,
+            super::CatalogAllocation::New => storage
+                .catalog_sequence
+                .next_bounded(super::MAX_RELATION_GENERATION, "relation")?,
             super::CatalogAllocation::Restore(position) => {
+                super::RelationIdentity::parse(position.created_at()).ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::DATA_EXCEPTION,
+                        "saved table has an invalid creation identity"
+                    )
+                })?;
                 storage.catalog_sequence.observe(position.created_at());
                 position.created_at()
             }
         };
+        match allocation {
+            super::CatalogAllocation::New => {
+                def.inline_index_identities.fill(None);
+                for identity in def.implicit_index_identities_mut() {
+                    *identity = None;
+                }
+                storage.reserve_implicit_index_identities(&mut def)?;
+            }
+            super::CatalogAllocation::Restore(_) => {
+                storage.validate_implicit_index_identities(&def)?
+            }
+        }
         state.install(
             def,
             table_definitions::TableIdentity {

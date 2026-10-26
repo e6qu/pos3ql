@@ -311,7 +311,7 @@ impl<'a> SeqEval<'a> {
             crate::sql::identifiers::ObjectReference::Oid(oid) => {
                 let slot = (0..self.storage.sequence_count()).find(|slot| {
                     self.storage.sequence_slot_visible_to(*slot, self.txid)
-                        && crate::sql::catalog::sequence_oid(*slot) as u32 == oid
+                        && crate::sql::catalog::sequence_oid(self.storage, *slot) as u32 == oid
                 });
                 if let Some(slot) = slot {
                     return Ok(slot);

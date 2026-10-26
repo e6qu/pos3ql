@@ -9608,12 +9608,6 @@ pub(crate) fn synthesize_current<'a>(
     )
 }
 
-/// Deterministic oid for a live table: slot index offset into the user
-/// range (stable for a running process).
-fn table_oid(_storage: &Storage, slot: usize) -> i32 {
-    user_table_oid(slot)
-}
-
 pub(crate) fn expression_def_text<'a>(
     storage: &Storage,
     transaction: u32,
@@ -9625,8 +9619,72 @@ pub(crate) fn expression_def_text<'a>(
     expressions::deparse(storage, transaction, node, relation, pretty, arena)
 }
 
-pub(crate) fn user_table_oid(slot: usize) -> i32 {
-    FIRST_USER_OID + slot as i32
+pub(crate) fn user_table_oid(storage: &Storage, slot: usize) -> i32 {
+    crate::storage::RelationIdentity::parse(storage.table(slot).created_at())
+        .expect("admitted table has a durable relation identity")
+        .oid()
+}
+
+pub(crate) fn table_row_type_oid(storage: &Storage, slot: usize, array: bool) -> i32 {
+    crate::storage::RelationIdentity::parse(storage.table(slot).created_at())
+        .expect("admitted table has a durable relation identity")
+        .companion_oid(if array {
+            FIRST_TABLE_COMPOSITE_ARRAY_TYPE_OID
+        } else {
+            FIRST_TABLE_COMPOSITE_TYPE_OID
+        })
+}
+
+pub(crate) fn view_row_type_oid(storage: &Storage, slot: usize, array: bool) -> i32 {
+    crate::storage::RelationIdentity::parse(storage.view(slot).created_at)
+        .expect("admitted view has a durable relation identity")
+        .companion_oid(if array {
+            FIRST_VIEW_COMPOSITE_ARRAY_TYPE_OID
+        } else {
+            FIRST_VIEW_COMPOSITE_TYPE_OID
+        })
+}
+
+pub(crate) fn table_slot_by_oid(storage: &Storage, transaction: u32, oid: i32) -> Option<usize> {
+    (0..storage.table_count()).find(|slot| {
+        storage.table_slot_visible_to(*slot, transaction) && user_table_oid(storage, *slot) == oid
+    })
+}
+
+pub(crate) fn view_slot_by_oid(storage: &Storage, transaction: u32, oid: i32) -> Option<usize> {
+    (0..storage.view_count()).find(|slot| {
+        storage.view_slot_visible_to(*slot, transaction) && view_oid(storage, *slot) == oid
+    })
+}
+
+pub(crate) fn sequence_slot_by_oid(storage: &Storage, transaction: u32, oid: i32) -> Option<usize> {
+    (0..storage.sequence_count()).find(|slot| {
+        storage.sequence_slot_visible_to(*slot, transaction) && sequence_oid(storage, *slot) == oid
+    })
+}
+
+pub(crate) fn table_slot_by_row_type_oid(
+    storage: &Storage,
+    transaction: u32,
+    oid: i32,
+    array: bool,
+) -> Option<usize> {
+    (0..storage.table_count()).find(|slot| {
+        storage.table_slot_visible_to(*slot, transaction)
+            && table_row_type_oid(storage, *slot, array) == oid
+    })
+}
+
+pub(crate) fn view_slot_by_row_type_oid(
+    storage: &Storage,
+    transaction: u32,
+    oid: i32,
+    array: bool,
+) -> Option<usize> {
+    (0..storage.view_count()).find(|slot| {
+        storage.view_slot_visible_to(*slot, transaction)
+            && view_row_type_oid(storage, *slot, array) == oid
+    })
 }
 
 const FIRST_FOREIGN_DATA_WRAPPER_OID: i32 = 510_000;
@@ -9806,7 +9864,7 @@ fn pg_foreign_table<'a>(
         let table = entry.definition_for(txid);
         rows[index] = row(
             &[
-                Datum::Int4(user_table_oid(table.table as usize)),
+                Datum::Int4(user_table_oid(storage, table.table as usize)),
                 Datum::Int4(foreign_server_oid(table.server as usize)),
                 foreign_options_datum(&table.options, arena)?,
             ],
@@ -10809,32 +10867,29 @@ pub(crate) fn role_oid_by_written(storage: &Storage, txid: u32, written: &str) -
     })
 }
 
-/// Index relations get OIDs from a separate range so they never collide with
-/// table OIDs; `pos` is the index's position within its table's index list.
-pub(crate) fn index_oid(slot: usize, pos: usize) -> i32 {
-    assert!(slot < crate::storage::MAX_TABLE_TYPE_OID_SLOTS);
-    assert!(pos < crate::storage::MAX_VALUE_ENFORCERS);
-    crate::storage::FIRST_IMPLICIT_INDEX_OID
-        + (slot * crate::storage::MAX_VALUE_ENFORCERS + pos) as i32
-}
-
 pub(crate) fn explicit_index_oid(index: &crate::storage::IndexDef) -> i32 {
     assert!((1..=crate::storage::MAX_INDEX_OID_GENERATION).contains(&index.created_at));
     crate::storage::FIRST_EXPLICIT_INDEX_OID + index.created_at as i32
 }
 
-/// Sequence relation OIDs occupy their startup-validated band below views.
-const FIRST_SEQUENCE_OID: i32 = 95_000;
-pub(crate) fn sequence_oid(slot: usize) -> i32 {
-    FIRST_SEQUENCE_OID + slot as i32
+/// A sequence keeps its relation identity independently of its resident slot.
+pub(crate) fn sequence_oid(storage: &Storage, slot: usize) -> i32 {
+    crate::storage::RelationIdentity::parse(storage.sequence_for(slot, 0).created_at)
+        .expect("admitted relation has a durable identity")
+        .oid()
 }
 
 pub(crate) fn extension_config_relation_oid(
+    storage: &Storage,
     relation: crate::storage::ExtensionConfigRelation,
 ) -> i32 {
     match relation {
-        crate::storage::ExtensionConfigRelation::Table(slot) => user_table_oid(slot as usize),
-        crate::storage::ExtensionConfigRelation::Sequence(slot) => sequence_oid(slot as usize),
+        crate::storage::ExtensionConfigRelation::Table(slot) => {
+            user_table_oid(storage, slot as usize)
+        }
+        crate::storage::ExtensionConfigRelation::Sequence(slot) => {
+            sequence_oid(storage, slot as usize)
+        }
     }
 }
 
@@ -10844,14 +10899,14 @@ pub(crate) fn extension_config_relation_by_oid(
     oid: i32,
 ) -> Option<crate::storage::ExtensionConfigRelation> {
     for slot in 0..storage.table_count() {
-        if storage.table_slot_visible_to(slot, txid) && user_table_oid(slot) == oid {
+        if storage.table_slot_visible_to(slot, txid) && user_table_oid(storage, slot) == oid {
             return u16::try_from(slot)
                 .ok()
                 .map(crate::storage::ExtensionConfigRelation::Table);
         }
     }
     for slot in 0..storage.sequence_count() {
-        if storage.sequence_slot_visible_to(slot, txid) && sequence_oid(slot) == oid {
+        if storage.sequence_slot_visible_to(slot, txid) && sequence_oid(storage, slot) == oid {
             return u16::try_from(slot)
                 .ok()
                 .map(crate::storage::ExtensionConfigRelation::Sequence);
@@ -10861,18 +10916,15 @@ pub(crate) fn extension_config_relation_by_oid(
 }
 
 pub(crate) fn sequence_state_by_oid(storage: &Storage, oid: i32, txid: u32) -> Option<(i64, bool)> {
-    let slot = usize::try_from(oid.checked_sub(FIRST_SEQUENCE_OID)?).ok()?;
-    if slot >= storage.sequence_count() || !storage.sequence_slot_visible_to(slot, txid) {
-        return None;
-    }
+    let slot = sequence_slot_by_oid(storage, txid, oid)?;
     Some(storage.sequence_value_for(slot, txid))
 }
 
-/// Plain views get OIDs from their own range so `'view'::regclass` resolves and
-/// their comments surface, even though a view is not yet a full `pg_class` row.
-const FIRST_VIEW_OID: i32 = 100_000;
-pub(crate) fn view_oid(slot: usize) -> i32 {
-    FIRST_VIEW_OID + slot as i32
+/// A view replacement preserves identity; drop and create reserve a new one.
+pub(crate) fn view_oid(storage: &Storage, slot: usize) -> i32 {
+    crate::storage::RelationIdentity::parse(storage.view(slot).created_at)
+        .expect("admitted relation has a durable identity")
+        .oid()
 }
 
 pub(crate) fn domain_oid(slot: usize) -> i32 {
@@ -10887,16 +10939,20 @@ pub(crate) const FIRST_TABLE_COMPOSITE_ARRAY_TYPE_OID: i32 =
     super::types::oid::FIRST_TABLE_COMPOSITE_ARRAY;
 pub(crate) const FIRST_VIEW_COMPOSITE_ARRAY_TYPE_OID: i32 =
     super::types::oid::FIRST_VIEW_COMPOSITE_ARRAY;
-pub(crate) const FIRST_TOAST_RELATION_OID: i32 = 1_500_000;
-pub(crate) const FIRST_TOAST_INDEX_OID: i32 = 1_600_000;
+pub(crate) const FIRST_TOAST_RELATION_OID: i32 = 320_000_000;
+pub(crate) const FIRST_TOAST_INDEX_OID: i32 = 340_000_000;
 pub(crate) const FIRST_FOREIGN_KEY_TRIGGER_OID: i32 = 1_700_000;
 
-pub(crate) const fn toast_relation_oid(slot: usize) -> i32 {
-    FIRST_TOAST_RELATION_OID + slot as i32
+pub(crate) fn toast_relation_oid(storage: &Storage, slot: usize) -> i32 {
+    crate::storage::RelationIdentity::parse(storage.table(slot).created_at())
+        .expect("admitted table has a durable identity")
+        .companion_oid(FIRST_TOAST_RELATION_OID)
 }
 
-pub(crate) const fn toast_index_oid(slot: usize) -> i32 {
-    FIRST_TOAST_INDEX_OID + slot as i32
+pub(crate) fn toast_index_oid(storage: &Storage, slot: usize) -> i32 {
+    crate::storage::RelationIdentity::parse(storage.table(slot).created_at())
+        .expect("admitted table has a durable identity")
+        .companion_oid(FIRST_TOAST_INDEX_OID)
 }
 
 pub(crate) const fn foreign_key_trigger_oid(
@@ -10924,9 +10980,6 @@ const fn foreign_key_action_routine(action: crate::storage::FkAction, update: bo
         (FkAction::NoAction, true) => 1655,
     }
 }
-/// PostgreSQL gives every named composite a backing `pg_class` relation whose
-/// OID links `pg_type.typrelid` and its `pg_attribute` rows.
-const FIRST_NAMED_COMPOSITE_RELATION_OID: i32 = 180_000;
 const FIRST_EXTENDED_STATISTICS_OID: i32 = 300_000;
 const FIRST_EXTENSION_OID: i32 = 500_000;
 
@@ -11072,17 +11125,19 @@ pub(crate) fn extended_statistics_expressions_by_oid<'a>(
     }))
 }
 
-pub(crate) fn named_composite_relation_oid(slot: usize) -> i32 {
-    FIRST_NAMED_COMPOSITE_RELATION_OID + slot as i32
+pub(crate) fn named_composite_relation_oid(storage: &Storage, slot: usize) -> i32 {
+    crate::storage::RelationIdentity::parse(storage.composite(slot).created_at)
+        .expect("admitted relation has a durable identity")
+        .oid()
 }
 
 fn composite_type_oid(storage: &Storage, schema: &str, name: &str, txid: u32) -> Option<i32> {
     match storage.resolve_relation(Some(schema), name, txid)? {
         crate::storage::ResolvedRelation::Table(slot) => {
-            Some(FIRST_TABLE_COMPOSITE_TYPE_OID + slot as i32)
+            Some(table_row_type_oid(storage, slot, false))
         }
         crate::storage::ResolvedRelation::View(slot) => {
-            Some(FIRST_VIEW_COMPOSITE_TYPE_OID + slot as i32)
+            Some(view_row_type_oid(storage, slot, false))
         }
         crate::storage::ResolvedRelation::Catalog => None,
     }
@@ -11139,7 +11194,7 @@ fn parent_constraint_oid(storage: &Storage, txid: u32, child_slot: usize, index:
                 && index.timing == crate::storage::ConstraintTiming::NotDeferrable
                 && columns == [column as u16]
             {
-                return index_oid(parent_slot, position)
+                return parent.implicit_index_oid(position)
                     + crate::storage::INDEX_CONSTRAINT_OID_OFFSET;
             }
             position += 1;
@@ -11150,7 +11205,7 @@ fn parent_constraint_oid(storage: &Storage, txid: u32, child_slot: usize, index:
                 && index.timing == crate::storage::ConstraintTiming::NotDeferrable
                 && columns == [column as u16]
             {
-                return index_oid(parent_slot, position)
+                return parent.implicit_index_oid(position)
                     + crate::storage::INDEX_CONSTRAINT_OID_OFFSET;
             }
             position += 1;
@@ -11163,7 +11218,8 @@ fn parent_constraint_oid(storage: &Storage, txid: u32, child_slot: usize, index:
             && unique.timing == index.timing
             && unique.columns() == columns
         {
-            return index_oid(parent_slot, position) + crate::storage::INDEX_CONSTRAINT_OID_OFFSET;
+            return parent.implicit_index_oid(position)
+                + crate::storage::INDEX_CONSTRAINT_OID_OFFSET;
         }
         position += 1;
     }
@@ -11182,7 +11238,7 @@ fn parent_constraint_oid(storage: &Storage, txid: u32, child_slot: usize, index:
                     == child_exclusion.operators[..child_exclusion.n_cols]
                 && exclusion.predicate == child_exclusion.predicate
             {
-                return index_oid(parent_slot, position)
+                return parent.implicit_index_oid(position)
                     + crate::storage::INDEX_CONSTRAINT_OID_OFFSET;
             }
             position += 1;
@@ -11193,8 +11249,7 @@ fn parent_constraint_oid(storage: &Storage, txid: u32, child_slot: usize, index:
 
 /// Enumerates every index relation psql `\d` would show: a single-column PK or
 /// UNIQUE (from column flags), a multi-column PK/UNIQUE (from `uniques`), and
-/// explicit `CREATE INDEX`es. OIDs are assigned by table slot + position so the
-/// same index resolves identically here and in `pg_get_indexdef`.
+/// explicit `CREATE INDEX`es. Each admitted key owns a durable index identity.
 fn visit_indexes(
     storage: &Storage,
     txid: u32,
@@ -11210,27 +11265,27 @@ fn visit_indexes(
             continue;
         }
         let table_name = def.name.as_str();
-        let toid = table_oid(storage, slot);
-        let mut pos = 0usize;
-        let mut mk = |columns: &[u16],
-                      expression_keys: [bool; crate::storage::MAX_INDEX_COLS],
-                      include_columns: &[u16],
-                      descending: [bool; crate::storage::MAX_INDEX_COLS],
-                      nulls_first: [bool; crate::storage::MAX_INDEX_COLS],
-                      predicate: Option<StackStr<{ crate::storage::INDEX_PREDICATE_MAX }>>,
-                      nulls_not_distinct: bool,
-                      is_primary: bool,
-                      is_unique: bool,
-                      is_constraint: bool,
-                      is_exclusion: bool,
-                      timing: crate::storage::ConstraintTiming,
-                      name: StackStr<64>| {
+        let toid = user_table_oid(storage, slot);
+        let mk = |oid: i32,
+                  columns: &[u16],
+                  expression_keys: [bool; crate::storage::MAX_INDEX_COLS],
+                  include_columns: &[u16],
+                  descending: [bool; crate::storage::MAX_INDEX_COLS],
+                  nulls_first: [bool; crate::storage::MAX_INDEX_COLS],
+                  predicate: Option<StackStr<{ crate::storage::INDEX_PREDICATE_MAX }>>,
+                  nulls_not_distinct: bool,
+                  is_primary: bool,
+                  is_unique: bool,
+                  is_constraint: bool,
+                  is_exclusion: bool,
+                  timing: crate::storage::ConstraintTiming,
+                  name: StackStr<64>| {
             let mut c = [0u16; crate::storage::MAX_INDEX_COLS];
             c[..columns.len()].copy_from_slice(columns);
             let mut included = [0u16; crate::storage::MAX_INDEX_COLS];
             included[..include_columns.len()].copy_from_slice(include_columns);
             let mut info = IdxInfo {
-                oid: index_oid(slot, pos),
+                oid,
                 table_oid: toid,
                 table_slot: slot,
                 name,
@@ -11261,7 +11316,6 @@ fn visit_indexes(
             if is_constraint {
                 info.constraint_parent_oid = parent_constraint_oid(storage, txid, slot, &info);
             }
-            pos += 1;
             info
         };
         // Single-column PK / UNIQUE carried as column flags.
@@ -11269,6 +11323,9 @@ fn visit_indexes(
             if col.primary {
                 let name = stack_str_64(stack_format!(64, "{}_pkey", table_name).as_str());
                 visit(mk(
+                    def.column_index_identity(ci)
+                        .expect("admitted inline index has an identity")
+                        .oid(),
                     &[ci as u16],
                     [false; crate::storage::MAX_INDEX_COLS],
                     &[],
@@ -11288,6 +11345,9 @@ fn visit_indexes(
                     stack_format!(64, "{}_{}_key", table_name, col.name.as_str()).as_str(),
                 );
                 visit(mk(
+                    def.column_index_identity(ci)
+                        .expect("admitted inline index has an identity")
+                        .oid(),
                     &[ci as u16],
                     [false; crate::storage::MAX_INDEX_COLS],
                     &[],
@@ -11324,6 +11384,9 @@ fn visit_indexes(
                 continue;
             }
             visit(mk(
+                uk.index_identity
+                    .expect("admitted unique index has an identity")
+                    .oid(),
                 uk.columns(),
                 [false; crate::storage::MAX_INDEX_COLS],
                 &[],
@@ -11341,6 +11404,10 @@ fn visit_indexes(
         }
         for exclusion in def.exclusions() {
             visit(mk(
+                exclusion
+                    .index_identity
+                    .expect("admitted exclusion index has an identity")
+                    .oid(),
                 exclusion.columns(),
                 [false; crate::storage::MAX_INDEX_COLS],
                 &[],
@@ -11369,6 +11436,7 @@ fn visit_indexes(
                         .all(Option::is_none)
             });
             let mut info = mk(
+                explicit_index_oid(&index),
                 &index.columns[..index.n_cols],
                 index.expressions.map(|expression| expression.is_some()),
                 &index.include_columns[..index.n_include_cols],
@@ -11385,7 +11453,6 @@ fn visit_indexes(
                 }),
                 stack_str_64(index.name_for(txid).as_str()),
             );
-            info.oid = explicit_index_oid(&index);
             info.method = index.method;
             info.collations = index.collations;
             info.explicit_collations = index.explicit_collations;
@@ -11396,6 +11463,27 @@ fn visit_indexes(
             visit(info);
         }
     }
+}
+
+/// Counters belong to the index's table, which may be a scanned child partition.
+pub(crate) fn index_statistics_owner(
+    storage: &Storage,
+    transaction: u32,
+    oid: i32,
+) -> Option<crate::storage::IndexStatisticsOwner> {
+    let mut owner = None;
+    visit_indexes(storage, transaction, None, |index| {
+        if index.oid == oid {
+            let table =
+                u16::try_from(index.table_slot).expect("startup table capacity is representable");
+            owner = Some(if index.explicit_definition.is_some() {
+                crate::storage::IndexStatisticsOwner::Explicit(table)
+            } else {
+                crate::storage::IndexStatisticsOwner::Implicit(table)
+            });
+        }
+    });
+    owner
 }
 
 /// Resolves the catalog identity of the plain-column value index selected by
@@ -11517,9 +11605,9 @@ pub(crate) fn ordered_value_index_identity(
 }
 
 pub(crate) fn reset_relation_statistics_by_oid(storage: &Storage, txid: u32, oid: i32) {
-    if let Some(table) = (0..storage.table_count())
-        .find(|slot| storage.table_slot_visible_to(*slot, txid) && user_table_oid(*slot) == oid)
-    {
+    if let Some(table) = (0..storage.table_count()).find(|slot| {
+        storage.table_slot_visible_to(*slot, txid) && user_table_oid(storage, *slot) == oid
+    }) {
         storage.reset_relation_statistics(table);
         return;
     }
@@ -11528,7 +11616,7 @@ pub(crate) fn reset_relation_statistics_by_oid(storage: &Storage, txid: u32, oid
         is_index |= index.oid == oid;
     });
     if is_index {
-        storage.reset_index_statistics(oid);
+        storage.reset_index_statistics(storage.current_database_oid(), oid);
     }
 }
 
@@ -11538,7 +11626,7 @@ pub(crate) fn replica_identity_index_oid(
     relation_oid: i32,
 ) -> Option<i32> {
     let table_slot = (0..storage.table_count()).find(|slot| {
-        storage.table_slot_visible_to(*slot, txid) && user_table_oid(*slot) == relation_oid
+        storage.table_slot_visible_to(*slot, txid) && user_table_oid(storage, *slot) == relation_oid
     })?;
     let mode = storage.table_def(table_slot, txid).replica_identity;
     let mut selected = None;
@@ -11705,45 +11793,34 @@ pub fn relname_text<'a>(
     if let Some(name) = catalog_relation_name(oid) {
         return arena.alloc_str(name).map(Some).map_err(|_| arena_full());
     }
-    let slot_in = |first: i32, count: usize| {
-        usize::try_from(oid.checked_sub(first)?)
-            .ok()
-            .filter(|slot| *slot < count)
-    };
-    if let Some(slot) = slot_in(user_table_oid(0), storage.table_count())
-        && storage.table_slot_visible_to(slot, txid)
-    {
+    if let Some(slot) = table_slot_by_oid(storage, txid, oid) {
         return arena
             .alloc_str(storage.table_def(slot, txid).name.as_str())
             .map(Some)
             .map_err(|_| arena_full());
     }
-    if let Some(slot) = slot_in(FIRST_SEQUENCE_OID, storage.sequence_count())
-        && storage.sequence_slot_visible_to(slot, txid)
-    {
+    if let Some(slot) = sequence_slot_by_oid(storage, txid, oid) {
         return arena
             .alloc_str(storage.sequence_for(slot, txid).name.as_str())
             .map(Some)
             .map_err(|_| arena_full());
     }
-    if let Some(slot) = slot_in(FIRST_VIEW_OID, storage.view_count())
-        && storage.view_slot_visible_to(slot, txid)
-    {
+    if let Some(slot) = view_slot_by_oid(storage, txid, oid) {
         return arena
             .alloc_str(storage.view(slot).name_for(txid).as_str())
             .map(Some)
             .map_err(|_| arena_full());
     }
     for (slot, composite) in storage.composites_with_slots_visible_to(txid) {
-        if named_composite_relation_oid(slot) == oid {
+        if named_composite_relation_oid(storage, slot) == oid {
             return arena
                 .alloc_str(composite.name.as_str())
                 .map(Some)
                 .map_err(|_| arena_full());
         }
     }
-    // Startup validates disjoint relation bands. Only index identities need
-    // the synthesized-index walk, and its owned name needs no catalog rows.
+    // Other relation families were resolved above. Index names are copied
+    // directly, without constructing catalog rows.
     if oid >= crate::storage::FIRST_IMPLICIT_INDEX_OID
         && let Some((_, name)) = index_identity_by_oid(storage, txid, oid)
     {
@@ -11844,20 +11921,20 @@ fn relation_oid_in_schema(
     }
     match storage.resolve_relation(Some(schema), relation, txid) {
         Some(crate::storage::ResolvedRelation::Table(slot)) => {
-            return Some(table_oid(storage, slot));
+            return Some(user_table_oid(storage, slot));
         }
-        Some(crate::storage::ResolvedRelation::View(slot)) => return Some(view_oid(slot)),
+        Some(crate::storage::ResolvedRelation::View(slot)) => return Some(view_oid(storage, slot)),
         Some(crate::storage::ResolvedRelation::Catalog) | None => {}
     }
     if let Some(oid) = index_oid_by_name(storage, txid, Some(schema), relation) {
         return Some(oid);
     }
     if let Some(slot) = storage.sequence_slot(schema, relation, txid) {
-        return Some(sequence_oid(slot));
+        return Some(sequence_oid(storage, slot));
     }
     storage
         .composite_slot(schema, relation, txid)
-        .map(named_composite_relation_oid)
+        .map(|slot| named_composite_relation_oid(storage, slot))
 }
 
 fn table_slot_by_written_name(storage: &Storage, txid: u32, written: &str) -> Option<usize> {
@@ -11950,16 +12027,17 @@ pub(crate) fn serial_sequence_name<'a>(
 pub fn relation_oid_is_visible(storage: &Storage, txid: u32, oid: i32) -> bool {
     catalog_relation_oid_by_oid(oid)
         || (0..storage.table_count()).any(|slot| {
-            storage.table_slot_visible_to(slot, txid) && table_oid(storage, slot) == oid
+            storage.table_slot_visible_to(slot, txid) && user_table_oid(storage, slot) == oid
         })
         || has_index_oid(storage, txid, oid)
-        || (0..storage.sequence_count())
-            .any(|slot| storage.sequence_slot_visible_to(slot, txid) && sequence_oid(slot) == oid)
+        || (0..storage.sequence_count()).any(|slot| {
+            storage.sequence_slot_visible_to(slot, txid) && sequence_oid(storage, slot) == oid
+        })
         || (0..storage.view_count())
-            .any(|slot| storage.view_slot_visible_to(slot, txid) && view_oid(slot) == oid)
+            .any(|slot| storage.view_slot_visible_to(slot, txid) && view_oid(storage, slot) == oid)
         || storage
             .composites_with_slots_visible_to(txid)
-            .any(|(slot, _)| named_composite_relation_oid(slot) == oid)
+            .any(|(slot, _)| named_composite_relation_oid(storage, slot) == oid)
 }
 
 pub(crate) fn relation_oid_visibility(storage: &Storage, txid: u32, oid: i32) -> Option<bool> {
@@ -11967,7 +12045,7 @@ pub(crate) fn relation_oid_visibility(storage: &Storage, txid: u32, oid: i32) ->
         return Some(relation_oid_for_name(storage, txid, None, name) == Some(oid));
     }
     for slot in 0..storage.table_count() {
-        if storage.table_slot_visible_to(slot, txid) && table_oid(storage, slot) == oid {
+        if storage.table_slot_visible_to(slot, txid) && user_table_oid(storage, slot) == oid {
             let table = storage.table_def(slot, txid);
             return Some(
                 relation_oid_for_name(storage, txid, None, table.name.as_str()) == Some(oid),
@@ -11978,7 +12056,7 @@ pub(crate) fn relation_oid_visibility(storage: &Storage, txid: u32, oid: i32) ->
         return Some(index_oid_by_name(storage, txid, None, name.as_str()) == Some(oid));
     }
     for slot in 0..storage.sequence_count() {
-        if storage.sequence_slot_visible_to(slot, txid) && sequence_oid(slot) == oid {
+        if storage.sequence_slot_visible_to(slot, txid) && sequence_oid(storage, slot) == oid {
             let sequence = storage.sequence_for(slot, txid);
             return Some(
                 relation_oid_for_name(storage, txid, None, sequence.name.as_str()) == Some(oid),
@@ -11986,7 +12064,7 @@ pub(crate) fn relation_oid_visibility(storage: &Storage, txid: u32, oid: i32) ->
         }
     }
     for slot in 0..storage.view_count() {
-        if storage.view_slot_visible_to(slot, txid) && view_oid(slot) == oid {
+        if storage.view_slot_visible_to(slot, txid) && view_oid(storage, slot) == oid {
             return Some(
                 relation_oid_for_name(
                     storage,
@@ -11998,7 +12076,7 @@ pub(crate) fn relation_oid_visibility(storage: &Storage, txid: u32, oid: i32) ->
         }
     }
     for (slot, composite) in storage.composites_with_slots_visible_to(txid) {
-        if named_composite_relation_oid(slot) == oid {
+        if named_composite_relation_oid(storage, slot) == oid {
             return Some(
                 relation_oid_for_name(storage, txid, None, composite.name.as_str()) == Some(oid),
             );
@@ -12018,6 +12096,12 @@ pub fn type_oid_is_visible(storage: &Storage, txid: u32, oid: i32) -> bool {
             26 | 2249 | 2202 | 2203 | 2204 | 2205 | 2206 | 3115 | 4096 | 4097
         )
     {
+        return true;
+    }
+    if [false, true].into_iter().any(|array| {
+        table_slot_by_row_type_oid(storage, txid, oid, array).is_some()
+            || view_slot_by_row_type_oid(storage, txid, oid, array).is_some()
+    }) {
         return true;
     }
     use super::types::oid as type_oid;
@@ -12109,12 +12193,12 @@ pub(crate) fn type_oid_visibility(storage: &Storage, txid: u32, oid: i32) -> Opt
             continue;
         }
         let table = storage.table_def(slot, txid);
-        if oid == FIRST_TABLE_COMPOSITE_TYPE_OID + slot as i32
-            || oid == FIRST_TABLE_COMPOSITE_ARRAY_TYPE_OID + slot as i32
+        if oid == table_row_type_oid(storage, slot, false)
+            || oid == table_row_type_oid(storage, slot, true)
         {
             return Some(
                 relation_oid_for_name(storage, txid, None, table.name.as_str())
-                    == Some(table_oid(storage, slot)),
+                    == Some(user_table_oid(storage, slot)),
             );
         }
     }
@@ -12122,8 +12206,8 @@ pub(crate) fn type_oid_visibility(storage: &Storage, txid: u32, oid: i32) -> Opt
         if !storage.view_slot_visible_to(slot, txid) {
             continue;
         }
-        if oid == FIRST_VIEW_COMPOSITE_TYPE_OID + slot as i32
-            || oid == FIRST_VIEW_COMPOSITE_ARRAY_TYPE_OID + slot as i32
+        if oid == view_row_type_oid(storage, slot, false)
+            || oid == view_row_type_oid(storage, slot, true)
         {
             return Some(
                 relation_oid_for_name(
@@ -12131,31 +12215,11 @@ pub(crate) fn type_oid_visibility(storage: &Storage, txid: u32, oid: i32) -> Opt
                     txid,
                     None,
                     storage.view(slot).name_for(txid).as_str(),
-                ) == Some(view_oid(slot)),
+                ) == Some(view_oid(storage, slot)),
             );
         }
     }
     None
-}
-
-/// Resolves the exact OID for a visible user-defined type spelling, including
-/// the automatically-created array type.  Call sites that dispatch routines
-/// use this instead of reducing a domain to its storage representation.
-pub(crate) fn table_rowtype_field(
-    storage: &Storage,
-    txid: u32,
-    type_name: &str,
-    index: usize,
-) -> Option<crate::storage::ColumnMeta> {
-    let (qualifier, bare) = type_name
-        .split_once('.')
-        .map_or((None, type_name), |(schema, name)| (Some(schema), name));
-    let crate::storage::ResolvedRelation::Table(slot) =
-        storage.resolve_relation(qualifier, bare, txid)?
-    else {
-        return None;
-    };
-    storage.table_def(slot, txid).columns().get(index).copied()
 }
 
 pub(crate) fn user_type_oid(storage: &Storage, txid: u32, type_name: &str) -> Option<i32> {
@@ -12190,14 +12254,14 @@ pub(crate) fn user_type_oid(storage: &Storage, txid: u32, type_name: &str) -> Op
         .map_or((None, base), |(schema, name)| (Some(schema), name));
     match storage.resolve_relation(qualifier, name, txid)? {
         crate::storage::ResolvedRelation::Table(slot) => Some(if array {
-            FIRST_TABLE_COMPOSITE_ARRAY_TYPE_OID + slot as i32
+            table_row_type_oid(storage, slot, true)
         } else {
-            FIRST_TABLE_COMPOSITE_TYPE_OID + slot as i32
+            table_row_type_oid(storage, slot, false)
         }),
         crate::storage::ResolvedRelation::View(slot) => Some(if array {
-            FIRST_VIEW_COMPOSITE_ARRAY_TYPE_OID + slot as i32
+            view_row_type_oid(storage, slot, true)
         } else {
-            FIRST_VIEW_COMPOSITE_TYPE_OID + slot as i32
+            view_row_type_oid(storage, slot, false)
         }),
         crate::storage::ResolvedRelation::Catalog => None,
     }
@@ -13999,7 +14063,7 @@ pub fn relation_oid_is_publishable(storage: &Storage, txid: u32, oid: i32) -> bo
         storage.table_slot_visible_to(slot, txid)
             && storage.table_def(slot, txid).persistence
                 == crate::storage::RelationPersistence::Permanent
-            && table_oid(storage, slot) == oid
+            && user_table_oid(storage, slot) == oid
     })
 }
 
@@ -14019,7 +14083,7 @@ pub fn view_def_text<'a>(
         if !storage.table_slot_visible_to(slot, txid) {
             continue;
         }
-        if table_oid(storage, slot) != oid {
+        if user_table_oid(storage, slot) != oid {
             continue;
         }
         let (schema, name) = {
@@ -14054,14 +14118,14 @@ pub fn relation_size(storage: &Storage, txid: u32, oid: i32) -> Result<Option<i6
         if !storage.table_slot_visible_to(slot, txid) {
             continue;
         }
-        if table_oid(storage, slot) != oid {
+        if user_table_oid(storage, slot) != oid {
             continue;
         }
         return table_size(storage, txid, slot).map(Some);
     }
     if storage
         .views_visible_to(txid)
-        .any(|(slot, _)| view_oid(slot) == oid)
+        .any(|(slot, _)| view_oid(storage, slot) == oid)
     {
         return Ok(Some(0));
     }
@@ -14492,10 +14556,10 @@ fn pg_shdescription<'a>(
 /// index.
 fn relation_oid_of(storage: &Storage, txid: u32, schema: &str, name: &str) -> Option<i32> {
     if let Some(slot) = storage.find_visible(schema, name, txid) {
-        return Some(table_oid(storage, slot));
+        return Some(user_table_oid(storage, slot));
     }
     if let Some(slot) = storage.sequence_slot(schema, name, txid) {
-        return Some(sequence_oid(slot));
+        return Some(sequence_oid(storage, slot));
     }
     for slot in 0..storage.view_count() {
         let view = storage.view(slot);
@@ -14503,7 +14567,7 @@ fn relation_oid_of(storage: &Storage, txid: u32, schema: &str, name: &str) -> Op
             && view.schema_for(txid).as_str() == schema
             && view.name_for(txid).as_str() == name
         {
-            return Some(view_oid(slot));
+            return Some(view_oid(storage, slot));
         }
     }
     index_oid_by_name(storage, txid, Some(schema), name)
@@ -15451,7 +15515,7 @@ fn visit_fkeys(storage: &Storage, txid: u32, mut visit: impl FnMut(FkInfo)) {
             continue;
         }
         let def = storage.table_def(slot, txid);
-        let conrelid = table_oid(storage, slot);
+        let conrelid = user_table_oid(storage, slot);
         for (i, fk) in def.fkeys().iter().enumerate() {
             let Some(pslot) =
                 storage.find_visible(fk.parent_schema.as_str(), fk.parent.as_str(), txid)
@@ -15461,7 +15525,7 @@ fn visit_fkeys(storage: &Storage, txid: u32, mut visit: impl FnMut(FkInfo)) {
             visit(FkInfo {
                 oid: foreign_key_constraint_oid(slot, i),
                 conrelid,
-                confrelid: table_oid(storage, pslot),
+                confrelid: user_table_oid(storage, pslot),
                 child_slot: slot,
                 parent_slot: pslot,
                 fk_index: i,
@@ -15774,11 +15838,7 @@ pub fn partition_key_def_text<'a>(
     oid: i32,
     arena: &'a Arena,
 ) -> Result<Option<&'a str>, SqlError> {
-    let Some(slot) = oid
-        .checked_sub(FIRST_USER_OID)
-        .and_then(|slot| usize::try_from(slot).ok())
-        .filter(|slot| *slot < storage.table_count())
-    else {
+    let Some(slot) = table_slot_by_oid(storage, txid, oid) else {
         return Ok(None);
     };
     if !storage.table_slot_visible_to(slot, txid) {
@@ -17067,7 +17127,7 @@ fn pg_statistic_ext<'a>(
             &[
                 Datum::Int4(3381),
                 Datum::Int4(extended_statistics_oid(slot)),
-                Datum::Int4(table_oid(storage, usize::from(statistics.table))),
+                Datum::Int4(user_table_oid(storage, usize::from(statistics.table))),
                 text(mutable.name.as_str(), arena)?,
                 Datum::Int4(namespace_oid(storage, mutable.schema.as_str(), txid)),
                 Datum::Int4(owner_oid(
@@ -17694,7 +17754,7 @@ fn pg_policy<'a>(
                 Datum::Int4(3256),
                 Datum::Int4(crate::storage::policy_oid(&policy)),
                 text(policy.name.as_str(), arena)?,
-                Datum::Int4(table_oid(storage, usize::from(policy.table))),
+                Datum::Int4(user_table_oid(storage, usize::from(policy.table))),
                 text(
                     core::str::from_utf8(&[policy.command.code()]).unwrap_or("*"),
                     arena,
@@ -17907,7 +17967,7 @@ fn pg_publication_rel<'a>(
                     Datum::Int4(6106),
                     Datum::Int4(FIRST_USER_OID + 90_000 + count as i32),
                     Datum::Int4(publication_oid(publication_slot)),
-                    Datum::Int4(table_oid(storage, *member as usize)),
+                    Datum::Int4(user_table_oid(storage, *member as usize)),
                     prqual,
                     prattrs,
                 ],
@@ -19158,7 +19218,7 @@ fn pg_subscription_rel<'a>(
             rows[index] = row(
                 &[
                     Datum::Int4(subscription_oid(&subscription)),
-                    Datum::Int4(table_oid(storage, relation.table_slot())),
+                    Datum::Int4(user_table_oid(storage, relation.table_slot())),
                     text(relation.state().pg_code(), arena)?,
                     if lsn == 0 {
                         Datum::Null
@@ -19300,8 +19360,8 @@ fn pg_inherits<'a>(
         for (position, parent) in definition.inheritance.parents_ref().iter().enumerate() {
             rows[n] = row(
                 &[
-                    Datum::Int4(table_oid(storage, child)),
-                    Datum::Int4(table_oid(storage, usize::from(*parent))),
+                    Datum::Int4(user_table_oid(storage, child)),
+                    Datum::Int4(user_table_oid(storage, usize::from(*parent))),
                     Datum::Int4((position + 1) as i32),
                     Datum::Bool(false),
                 ],
@@ -19314,8 +19374,8 @@ fn pg_inherits<'a>(
         {
             rows[n] = row(
                 &[
-                    Datum::Int4(table_oid(storage, child)),
-                    Datum::Int4(table_oid(storage, usize::from(parent))),
+                    Datum::Int4(user_table_oid(storage, child)),
+                    Datum::Int4(user_table_oid(storage, usize::from(parent))),
                     Datum::Int4(1),
                     Datum::Bool(matches!(
                         state,
@@ -19422,10 +19482,10 @@ fn pg_partitioned_table<'a>(
                                 )
                         })
             })
-            .map_or(0, |child| table_oid(storage, child));
+            .map_or(0, |child| user_table_oid(storage, child));
         rows[n] = row(
             &[
-                Datum::Int4(table_oid(storage, slot)),
+                Datum::Int4(user_table_oid(storage, slot)),
                 Datum::Char(strategy_code),
                 Datum::Int2(i16::from(n_keys)),
                 Datum::Int4(default_partition),
@@ -19530,7 +19590,7 @@ fn pg_class<'a>(
         if n == out.len() {
             return Err(catalog_capacity_exceeded("pg_class"));
         }
-        let toid = table_oid(storage, slot);
+        let toid = user_table_oid(storage, slot);
         let has_index = storage.relation_has_index(
             crate::storage::CatalogPosition::new(slot, table_def.identity().created_at)?,
             txid,
@@ -19624,7 +19684,7 @@ fn pg_class<'a>(
                         .map_or(0, |slot| crate::sql::types::oid::composite_oid(slot as u16)),
                 ),
                 Datum::Int4(if table_def.has_toast {
-                    toast_relation_oid(slot)
+                    toast_relation_oid(storage, slot)
                 } else {
                     0
                 }),
@@ -19643,7 +19703,7 @@ fn pg_class<'a>(
                     arena,
                 )?,
                 Datum::Int4(PG_CLASS_OID),
-                Datum::Int4(FIRST_TABLE_COMPOSITE_TYPE_OID + slot as i32),
+                Datum::Int4(table_row_type_oid(storage, slot, false)),
                 acl(storage, relation_object, txid, arena)?,
                 Datum::Int4(0),
                 Datum::Int4(0),
@@ -19670,7 +19730,7 @@ fn pg_class<'a>(
         if n + 2 > out.len() {
             return Err(catalog_capacity_exceeded("pg_class"));
         }
-        let table_oid = table_oid(storage, slot);
+        let table_oid = user_table_oid(storage, slot);
         let toast_name = crate::stack_format!(64, "pg_toast_{}", table_oid);
         let toast_index_name = crate::stack_format!(72, "{}_index", toast_name.as_str());
         let owner = storage.role_oid(storage.object_owner(
@@ -19682,7 +19742,7 @@ fn pg_class<'a>(
         ));
         out[n] = row(
             &[
-                Datum::Int4(toast_relation_oid(slot)),
+                Datum::Int4(toast_relation_oid(storage, slot)),
                 text(toast_name.as_str(), arena)?,
                 Datum::Int4(PG_TOAST_NS_OID),
                 text("t", arena)?,
@@ -19723,7 +19783,7 @@ fn pg_class<'a>(
         n += 1;
         out[n] = row(
             &[
-                Datum::Int4(toast_index_oid(slot)),
+                Datum::Int4(toast_index_oid(storage, slot)),
                 text(toast_index_name.as_str(), arena)?,
                 Datum::Int4(PG_TOAST_NS_OID),
                 text("i", arena)?,
@@ -19776,7 +19836,7 @@ fn pg_class<'a>(
         };
         out[n] = row(
             &[
-                Datum::Int4(named_composite_relation_oid(slot)),
+                Datum::Int4(named_composite_relation_oid(storage, slot)),
                 text(composite.name.as_str(), arena)?,
                 Datum::Int4(namespace_oid(storage, composite.schema.as_str(), txid)),
                 text("c", arena)?,
@@ -19907,7 +19967,7 @@ fn pg_class<'a>(
         }
         out[n] = row(
             &[
-                Datum::Int4(sequence_oid(slot)),
+                Datum::Int4(sequence_oid(storage, slot)),
                 text(seq.name.as_str(), arena)?,
                 Datum::Int4(namespace_oid(storage, seq.schema.as_str(), txid)),
                 text("S", arena)?, // relkind: sequence
@@ -20007,7 +20067,7 @@ fn pg_class<'a>(
         };
         out[n] = row(
             &[
-                Datum::Int4(view_oid(slot)),
+                Datum::Int4(view_oid(storage, slot)),
                 text(view.name_for(txid).as_str(), arena)?,
                 Datum::Int4(namespace_oid(storage, view.schema_for(txid).as_str(), txid)),
                 text("v", arena)?,
@@ -20037,7 +20097,7 @@ fn pg_class<'a>(
                 )?,
                 text("n", arena)?,
                 Datum::Int4(PG_CLASS_OID),
-                Datum::Int4(FIRST_VIEW_COMPOSITE_TYPE_OID + slot as i32),
+                Datum::Int4(view_row_type_oid(storage, slot, false)),
                 acl(
                     storage,
                     crate::storage::AccessObject {
@@ -20645,7 +20705,7 @@ fn pg_constraint_values<'a>(
                         + crate::storage::TRIGGER_CONSTRAINT_OID_OFFSET,
                 ),
                 text(trigger.name_to(txid).as_str(), arena)?,
-                Datum::Int4(table_oid(storage, table)),
+                Datum::Int4(user_table_oid(storage, table)),
                 Datum::Int4(0),
                 text("t", arena)?,
                 Datum::Int4(0),
@@ -20698,7 +20758,7 @@ fn pg_constraint_values<'a>(
                 partition_trigger_oid(&trigger, child)?
                     + crate::storage::TRIGGER_CONSTRAINT_OID_OFFSET,
             );
-            clone[2] = Datum::Int4(table_oid(storage, child));
+            clone[2] = Datum::Int4(user_table_oid(storage, child));
             clone[18] = Datum::Int4(namespace_oid(
                 storage,
                 storage.table_def(child, txid).schema.as_str(),
@@ -20737,7 +20797,7 @@ fn pg_constraint_values<'a>(
                 &[
                     Datum::Int4(check_constraint_oid(slot, check_index)),
                     text(check.name.as_str(), arena)?,
-                    Datum::Int4(table_oid(storage, slot)),
+                    Datum::Int4(user_table_oid(storage, slot)),
                     Datum::Int4(0),
                     text("c", arena)?,
                     Datum::Int4(0),
@@ -20803,7 +20863,7 @@ fn pg_constraint_values<'a>(
             &[
                 Datum::Int4(FIRST_DETACHED_PARTITION_CHECK_OID + slot as i32),
                 text(constraint.name.as_str(), arena)?,
-                Datum::Int4(table_oid(storage, slot)),
+                Datum::Int4(user_table_oid(storage, slot)),
                 Datum::Int4(0),
                 text("c", arena)?,
                 Datum::Int4(0),
@@ -20861,7 +20921,7 @@ fn pg_constraint_values<'a>(
                         usize::from(table.attribute_number(column_index) - 1),
                     )),
                     text(constraint_name.as_str(), arena)?,
-                    Datum::Int4(table_oid(storage, slot)),
+                    Datum::Int4(user_table_oid(storage, slot)),
                     Datum::Int4(0),
                     text("n", arena)?,
                     Datum::Int4(0),
@@ -21157,7 +21217,7 @@ fn pg_extension<'a>(
         }
         for (index, config) in configs[..config_count].iter().enumerate() {
             let config = config.expect("sorted extension configuration slot");
-            let oid = extension_config_relation_oid(config.relation);
+            let oid = extension_config_relation_oid(storage, config.relation);
             config_oids[index] = Datum::Oid(oid as u32);
             config_conditions[index] = text(config.condition_to(txid).as_str(), arena)?;
         }
@@ -21215,16 +21275,16 @@ fn extension_dependency_catalog_identity(
     use crate::storage::AccessClass;
     let slot = object.slot as usize;
     Some(match object.class {
-        AccessClass::Table => (PG_CLASS_OID, table_oid(storage, slot)),
-        AccessClass::View => (PG_CLASS_OID, view_oid(slot)),
+        AccessClass::Table => (PG_CLASS_OID, user_table_oid(storage, slot)),
+        AccessClass::View => (PG_CLASS_OID, view_oid(storage, slot)),
         AccessClass::MaterializedView => {
             let table = storage.matview_table(slot);
             if !storage.table_slot_visible_to(table, txid) {
                 return None;
             }
-            (PG_CLASS_OID, table_oid(storage, table))
+            (PG_CLASS_OID, user_table_oid(storage, table))
         }
-        AccessClass::Sequence => (PG_CLASS_OID, sequence_oid(slot)),
+        AccessClass::Sequence => (PG_CLASS_OID, sequence_oid(storage, slot)),
         AccessClass::Domain => (PG_TYPE_OID, domain_oid(slot)),
         AccessClass::Enum => (PG_TYPE_OID, crate::sql::types::oid::enum_oid(object.slot)),
         AccessClass::Composite => (
@@ -21425,9 +21485,9 @@ fn pg_depend<'a>(
         };
         push(
             PG_CLASS_OID,
-            sequence_oid(sequence_slot),
+            sequence_oid(storage, sequence_slot),
             PG_CLASS_OID,
-            table_oid(storage, table_slot),
+            user_table_oid(storage, table_slot),
             i32::from(table.attribute_number(column)),
             if table.columns()[column].is_identity {
                 "i"
@@ -21726,15 +21786,17 @@ fn pg_depend<'a>(
 
     let referenced_oid = |dependency: &crate::storage::StoredQueryDependency| match dependency.class
     {
-        crate::storage::DependencyClass::Table => {
-            Some((PG_CLASS_OID, table_oid(storage, dependency.slot as usize)))
-        }
+        crate::storage::DependencyClass::Table => Some((
+            PG_CLASS_OID,
+            user_table_oid(storage, dependency.slot as usize),
+        )),
         crate::storage::DependencyClass::View => {
-            Some((PG_CLASS_OID, view_oid(dependency.slot as usize)))
+            Some((PG_CLASS_OID, view_oid(storage, dependency.slot as usize)))
         }
-        crate::storage::DependencyClass::Sequence => {
-            Some((PG_CLASS_OID, sequence_oid(dependency.slot as usize)))
-        }
+        crate::storage::DependencyClass::Sequence => Some((
+            PG_CLASS_OID,
+            sequence_oid(storage, dependency.slot as usize),
+        )),
         crate::storage::DependencyClass::Domain => {
             Some((PG_TYPE_OID, domain_oid(dependency.slot as usize)))
         }
@@ -21789,7 +21851,14 @@ fn pg_depend<'a>(
     };
     for (view_slot, _) in storage.views_visible_to(txid) {
         let rewrite_oid = storage.rule(storage.view_return_rule(view_slot)).oid();
-        push(2618, rewrite_oid, PG_CLASS_OID, view_oid(view_slot), 0, "i")?;
+        push(
+            2618,
+            rewrite_oid,
+            PG_CLASS_OID,
+            view_oid(storage, view_slot),
+            0,
+            "i",
+        )?;
         for dependency in storage
             .snapshot_view_dependencies(view_slot, txid, arena)?
             .entries()
@@ -21828,8 +21897,8 @@ fn pg_depend<'a>(
             continue;
         }
         let relation_oid = match definition.target {
-            crate::storage::RuleTarget::Table(slot) => table_oid(storage, usize::from(slot)),
-            crate::storage::RuleTarget::View(slot) => view_oid(usize::from(slot)),
+            crate::storage::RuleTarget::Table(slot) => user_table_oid(storage, usize::from(slot)),
+            crate::storage::RuleTarget::View(slot) => view_oid(storage, usize::from(slot)),
         };
         push(2618, rule.oid(), PG_CLASS_OID, relation_oid, 0, "i")?;
         for dependency in storage
@@ -21875,7 +21944,7 @@ fn pg_depend<'a>(
             };
             push(
                 PG_CLASS_OID,
-                table_oid(storage, table_slot),
+                user_table_oid(storage, table_slot),
                 referenced_class,
                 referenced_object,
                 0,
@@ -21886,8 +21955,10 @@ fn pg_depend<'a>(
     for (_, trigger) in storage.triggers_with_slots_visible_to(txid) {
         let trigger_oid = crate::storage::trigger_oid(&trigger);
         let relation_oid = match trigger.target {
-            crate::storage::TriggerTarget::Table(table) => table_oid(storage, usize::from(table)),
-            crate::storage::TriggerTarget::View(view) => view_oid(usize::from(view)),
+            crate::storage::TriggerTarget::Table(table) => {
+                user_table_oid(storage, usize::from(table))
+            }
+            crate::storage::TriggerTarget::View(view) => view_oid(storage, usize::from(view)),
         };
         push(
             2620,
@@ -21907,7 +21978,7 @@ fn pg_depend<'a>(
                     2620,
                     trigger_oid,
                     PG_CLASS_OID,
-                    table_oid(storage, usize::from(referenced)),
+                    user_table_oid(storage, usize::from(referenced)),
                     0,
                     "a",
                 )?;
@@ -21955,7 +22026,7 @@ fn pg_depend<'a>(
                 continue;
             }
             let clone_oid = partition_trigger_oid(&trigger, child)?;
-            let child_relation_oid = table_oid(storage, child);
+            let child_relation_oid = user_table_oid(storage, child);
             push(
                 2620,
                 clone_oid,
@@ -21976,7 +22047,7 @@ fn pg_depend<'a>(
                         2620,
                         clone_oid,
                         PG_CLASS_OID,
-                        table_oid(storage, usize::from(referenced)),
+                        user_table_oid(storage, usize::from(referenced)),
                         0,
                         "a",
                     )?;
@@ -22191,8 +22262,8 @@ fn pg_index<'a>(
         let operator_classes = [1981_i32, 1978];
         out[n] = row(
             &[
-                Datum::Int4(toast_index_oid(slot)),
-                Datum::Int4(toast_relation_oid(slot)),
+                Datum::Int4(toast_index_oid(storage, slot)),
+                Datum::Int4(toast_relation_oid(storage, slot)),
                 Datum::Bool(true),
                 Datum::Bool(true),
                 Datum::Bool(false),
@@ -22325,7 +22396,7 @@ fn index_operator_classes<'a>(
                 .expect("expression index has source");
             let expression = crate::sql::parser::parse_expr(source.as_str(), arena)?;
             let (oid, _) =
-                super::exec::infer_type_catalog(expression, Some(&table), storage, txid)?;
+                super::exec::infer_type_catalog(expression, Some(&table), storage, txid, arena)?;
             super::exec::catalog_column_type(storage, txid, oid)
                 .map(|(ctype, _)| ctype)
                 .and_then(crate::sql::types::BtreeOperatorClass::for_type)
@@ -22579,7 +22650,7 @@ fn pg_attribute<'a>(
                 };
             out[n] = row(
                 &[
-                    Datum::Int4(table_oid(storage, slot)),
+                    Datum::Int4(user_table_oid(storage, slot)),
                     text(c.name.as_str(), arena)?,
                     Datum::Int4(catalog_column_type_oid(storage, c, txid)?),
                     Datum::Int4(i32::from(table_definition.attribute_number(i))),
@@ -22652,8 +22723,8 @@ fn pg_attribute<'a>(
             ("chunk_data", 17, -1),
         ];
         for (relation_oid, count) in [
-            (toast_relation_oid(slot), attributes.len()),
-            (toast_index_oid(slot), 2),
+            (toast_relation_oid(storage, slot), attributes.len()),
+            (toast_index_oid(storage, slot), 2),
         ] {
             for (attribute, (name, type_oid, type_length)) in attributes[..count].iter().enumerate()
             {
@@ -22721,7 +22792,7 @@ fn pg_attribute<'a>(
             };
             out[n] = row(
                 &[
-                    Datum::Int4(named_composite_relation_oid(slot)),
+                    Datum::Int4(named_composite_relation_oid(storage, slot)),
                     text(field.name.as_str(), arena)?,
                     if field.dropped {
                         Datum::Int4(0)
@@ -22785,8 +22856,13 @@ fn pg_attribute<'a>(
             let (name, ctype, type_oid, type_mod, collation) = if let Some(source) = expression {
                 let source = arena.alloc_str(source.as_str()).map_err(|_| arena_full())?;
                 let expression = crate::sql::parser::parse_expr(source, arena)?;
-                let (type_oid, type_mod) =
-                    super::exec::infer_type_catalog(expression, Some(&table), storage, txid)?;
+                let (type_oid, type_mod) = super::exec::infer_type_catalog(
+                    expression,
+                    Some(&table),
+                    storage,
+                    txid,
+                    arena,
+                )?;
                 let (ctype, user_type) = super::exec::catalog_column_type(storage, txid, type_oid)
                     .ok_or_else(|| {
                         sql_err!(
@@ -22870,7 +22946,7 @@ fn pg_attribute<'a>(
             let (ctype, user_type) = view_column_catalog_type(storage, txid, column.type_oid)?;
             out[n] = row(
                 &[
-                    Datum::Int4(view_oid(slot)),
+                    Datum::Int4(view_oid(storage, slot)),
                     text(column.name, arena)?,
                     Datum::Int4(column.type_oid),
                     Datum::Int4(attribute as i32 + 1),
@@ -23051,7 +23127,7 @@ fn pg_attribute<'a>(
             let number = attribute as i16 + 1;
             out[n] = row(
                 &[
-                    Datum::Oid(table_oid(storage, slot) as u32),
+                    Datum::Oid(user_table_oid(storage, slot) as u32),
                     text(
                         stack_format!(64, "........pg.dropped.{number}........").as_str(),
                         arena,
@@ -23128,7 +23204,7 @@ fn pg_attrdef<'a>(
             continue;
         }
         let table = storage.table_def(slot, txid);
-        let relid = table_oid(storage, slot);
+        let relid = user_table_oid(storage, slot);
         for (ci, c) in table.columns().iter().enumerate() {
             let Some(text_expr) = super::enum_values::default_expression(
                 &c.default,
@@ -23195,7 +23271,7 @@ fn pg_attrdef<'a>(
             if n == out.len() {
                 return Err(catalog_capacity_exceeded("pg_attrdef"));
             }
-            let relid = view_oid(slot);
+            let relid = view_oid(storage, slot);
             out[n] = row(
                 &[
                     Datum::Oid(
@@ -26040,7 +26116,7 @@ fn partition_trigger_oid(
 ) -> Result<i32, SqlError> {
     let ordinal = trigger
         .created_at
-        .checked_mul(crate::storage::MAX_TABLE_TYPE_OID_SLOTS as u64)
+        .checked_mul(crate::storage::MAX_TABLE_CATALOG_SLOTS as u64)
         .and_then(|value| value.checked_add(table as u64))
         .and_then(|value| i32::try_from(value).ok())
         .and_then(|value| crate::storage::FIRST_PARTITION_TRIGGER_OID.checked_add(value))
@@ -26096,8 +26172,8 @@ fn pg_trigger<'a>(
             ) else {
                 continue;
             };
-            let parent_oid = table_oid(storage, parent_slot);
-            let child_oid = table_oid(storage, child_slot);
+            let parent_oid = user_table_oid(storage, parent_slot);
+            let child_oid = user_table_oid(storage, child_slot);
             let parent_index = indexes
                 .iter()
                 .find(|index| {
@@ -26169,14 +26245,14 @@ fn pg_trigger<'a>(
                 if !storage.table_slot_visible_to(slot, txid) {
                     continue;
                 }
-                table_oid(storage, slot)
+                user_table_oid(storage, slot)
             }
             crate::storage::TriggerTarget::View(slot) => {
                 let slot = usize::from(slot);
                 if !storage.view_slot_visible_to(slot, txid) {
                     continue;
                 }
-                view_oid(slot)
+                view_oid(storage, slot)
             }
         };
         let function = storage.routine(usize::from(trigger.function));
@@ -26191,7 +26267,7 @@ fn pg_trigger<'a>(
                 crate::storage::trigger_oid(&trigger)
                     + crate::storage::TRIGGER_CONSTRAINT_OID_OFFSET,
                 timing,
-                referenced_table.map_or(0, |slot| table_oid(storage, usize::from(slot))),
+                referenced_table.map_or(0, |slot| user_table_oid(storage, usize::from(slot))),
             ),
         };
         let mut trigger_type = match trigger.level {
@@ -26351,7 +26427,7 @@ fn pg_trigger<'a>(
             }
             clone[15] = int2vector(&columns[..update_count], Some(&child_definition), arena)?;
             clone[1] = Datum::Int4(clone_oid);
-            clone[2] = Datum::Int4(table_oid(storage, child));
+            clone[2] = Datum::Int4(user_table_oid(storage, child));
             clone[3] = Datum::Int4(parent_oid);
             clone[7] = Datum::Bpchar(
                 match storage.partition_trigger_enabled_to(trigger_slot, child, txid) {
@@ -28063,7 +28139,7 @@ fn pg_locks<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, S
             crate::storage::ObjectLockTarget::Table(slot) => (
                 "relation",
                 Datum::Oid(storage.table(slot).database().get() as u32),
-                Datum::Oid(user_table_oid(slot) as u32),
+                Datum::Oid(user_table_oid(storage, slot) as u32),
                 Datum::Null,
                 Datum::Null,
                 Datum::Null,
@@ -28071,7 +28147,7 @@ fn pg_locks<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, S
             crate::storage::ObjectLockTarget::View(slot) => (
                 "relation",
                 Datum::Oid(storage.view(slot).database.get() as u32),
-                Datum::Oid(view_oid(slot) as u32),
+                Datum::Oid(view_oid(storage, slot) as u32),
                 Datum::Null,
                 Datum::Null,
                 Datum::Null,
@@ -28301,7 +28377,7 @@ fn pg_stat_tables<'a>(
             continue;
         }
         let identity = [
-            Datum::Oid(user_table_oid(table_slot) as u32),
+            Datum::Oid(user_table_oid(storage, table_slot) as u32),
             text(table.schema.as_str(), arena)?,
             text(table.name.as_str(), arena)?,
         ];
@@ -28334,7 +28410,8 @@ fn pg_stat_tables<'a>(
                 .iter()
                 .filter(|index| index.table_slot == table_slot)
             {
-                let index_statistics = storage.index_cumulative_statistics(index.oid);
+                let index_statistics =
+                    storage.index_cumulative_statistics(storage.current_database_oid(), index.oid);
                 idx_scan = idx_scan.saturating_add(index_statistics.idx_scan);
                 idx_tup_fetch = idx_tup_fetch.saturating_add(index_statistics.idx_tup_fetch);
                 last_idx_scan = match (last_idx_scan, index_statistics.last_idx_scan) {
@@ -28411,7 +28488,8 @@ fn pg_stat_indexes<'a>(
         {
             continue;
         }
-        let statistics = storage.index_cumulative_statistics(index.oid);
+        let statistics =
+            storage.index_cumulative_statistics(storage.current_database_oid(), index.oid);
         rows[count] = row(
             &[
                 Datum::Oid(index.table_oid as u32),
@@ -28467,7 +28545,7 @@ fn pg_statio_tables<'a>(
         let has_indexes = indexes.iter().any(|index| index.table_slot == slot);
         rows[count] = row(
             &[
-                Datum::Oid(user_table_oid(slot) as u32),
+                Datum::Oid(user_table_oid(storage, slot) as u32),
                 text(table.schema.as_str(), arena)?,
                 text(table.name.as_str(), arena)?,
                 Datum::Int8(0),
@@ -28570,7 +28648,7 @@ fn pg_statio_sequences<'a>(
         }
         rows[count] = row(
             &[
-                Datum::Oid(sequence_oid(slot) as u32),
+                Datum::Oid(sequence_oid(storage, slot) as u32),
                 text(sequence.schema.as_str(), arena)?,
                 text(sequence.name.as_str(), arena)?,
                 Datum::Int8(0),
@@ -29270,7 +29348,7 @@ fn pg_shdepend<'a>(
         let object_slot = storage.matview_slot_for_table(slot, txid).unwrap_or(slot);
         append(
             PG_CLASS_OID,
-            table_oid(storage, slot),
+            user_table_oid(storage, slot),
             crate::storage::AccessObject {
                 class,
                 slot: object_slot as u16,
@@ -29280,7 +29358,7 @@ fn pg_shdepend<'a>(
     for (slot, _) in storage.views_visible_to(txid) {
         append(
             PG_CLASS_OID,
-            view_oid(slot),
+            view_oid(storage, slot),
             crate::storage::AccessObject {
                 class: crate::storage::AccessClass::View,
                 slot: slot as u16,
@@ -29291,7 +29369,7 @@ fn pg_shdepend<'a>(
         if storage.sequence_slot_visible_to(slot, txid) {
             append(
                 PG_CLASS_OID,
-                sequence_oid(slot),
+                sequence_oid(storage, slot),
                 crate::storage::AccessObject {
                     class: crate::storage::AccessClass::Sequence,
                     slot: slot as u16,
@@ -30051,7 +30129,7 @@ fn pg_type<'a>(
                 Datum::Int4(0),
                 Datum::Int4(0),
                 Datum::Int4(array_oid),
-                Datum::Int4(named_composite_relation_oid(slot)),
+                Datum::Int4(named_composite_relation_oid(storage, slot)),
                 Datum::Int4(-1),
                 Datum::Bool(false),
                 Datum::Null,
@@ -30134,7 +30212,7 @@ fn pg_type<'a>(
         }
         out[n] = row(
             &[
-                Datum::Int4(FIRST_TABLE_COMPOSITE_TYPE_OID + slot as i32),
+                Datum::Int4(table_row_type_oid(storage, slot, false)),
                 text(name.as_str(), arena)?,
                 Datum::Int4(-1),
                 Datum::Int4(0),
@@ -30143,8 +30221,8 @@ fn pg_type<'a>(
                 text("C", arena)?,
                 Datum::Int4(0),
                 Datum::Int4(0),
-                Datum::Int4(FIRST_TABLE_COMPOSITE_ARRAY_TYPE_OID + slot as i32),
-                Datum::Int4(table_oid(storage, slot)),
+                Datum::Int4(table_row_type_oid(storage, slot, true)),
+                Datum::Int4(user_table_oid(storage, slot)),
                 Datum::Int4(-1),
                 Datum::Bool(false),
                 Datum::Null,
@@ -30189,7 +30267,7 @@ fn pg_type<'a>(
         let array_name = stack_format!(128, "_{}", name.as_str());
         out[n] = row(
             &[
-                Datum::Int4(FIRST_TABLE_COMPOSITE_ARRAY_TYPE_OID + slot as i32),
+                Datum::Int4(table_row_type_oid(storage, slot, true)),
                 text(array_name.as_str(), arena)?,
                 Datum::Int4(-1),
                 Datum::Int4(0),
@@ -30197,7 +30275,7 @@ fn pg_type<'a>(
                 text("b", arena)?,
                 text("A", arena)?,
                 Datum::Int4(0),
-                Datum::Int4(FIRST_TABLE_COMPOSITE_TYPE_OID + slot as i32),
+                Datum::Int4(table_row_type_oid(storage, slot, false)),
                 Datum::Int4(0),
                 Datum::Int4(0),
                 Datum::Int4(-1),
@@ -30227,7 +30305,7 @@ fn pg_type<'a>(
         }
         out[n] = row(
             &[
-                Datum::Int4(FIRST_VIEW_COMPOSITE_TYPE_OID + slot as i32),
+                Datum::Int4(view_row_type_oid(storage, slot, false)),
                 text(view.name_for(txid).as_str(), arena)?,
                 Datum::Int4(-1),
                 Datum::Int4(0),
@@ -30236,8 +30314,8 @@ fn pg_type<'a>(
                 text("C", arena)?,
                 Datum::Int4(0),
                 Datum::Int4(0),
-                Datum::Int4(FIRST_VIEW_COMPOSITE_ARRAY_TYPE_OID + slot as i32),
-                Datum::Int4(view_oid(slot)),
+                Datum::Int4(view_row_type_oid(storage, slot, true)),
+                Datum::Int4(view_oid(storage, slot)),
                 Datum::Int4(-1),
                 Datum::Bool(false),
                 Datum::Null,
@@ -30266,7 +30344,7 @@ fn pg_type<'a>(
         let array_name = stack_format!(128, "_{}", view.name_for(txid).as_str());
         out[n] = row(
             &[
-                Datum::Int4(FIRST_VIEW_COMPOSITE_ARRAY_TYPE_OID + slot as i32),
+                Datum::Int4(view_row_type_oid(storage, slot, true)),
                 text(array_name.as_str(), arena)?,
                 Datum::Int4(-1),
                 Datum::Int4(0),
@@ -30274,7 +30352,7 @@ fn pg_type<'a>(
                 text("b", arena)?,
                 text("A", arena)?,
                 Datum::Int4(0),
-                Datum::Int4(FIRST_VIEW_COMPOSITE_TYPE_OID + slot as i32),
+                Datum::Int4(view_row_type_oid(storage, slot, false)),
                 Datum::Int4(0),
                 Datum::Int4(0),
                 Datum::Int4(-1),
@@ -31006,7 +31084,7 @@ fn pg_sequence<'a>(
         }
         out[n] = row(
             &[
-                Datum::Int4(sequence_oid(slot)),
+                Datum::Int4(sequence_oid(storage, slot)),
                 Datum::Int4(seq.data_type.oid()),
                 Datum::Int8(seq.start_value),
                 Datum::Int8(seq.increment),

@@ -1,0 +1,10 @@
+CREATE VIEW identity_json_report AS SELECT 1 AS id, 'ok'::varchar(2) AS label;
+SELECT (jsonb_populate_record(NULL::identity_json_report, '{"id":9,"label":"hi"}'::jsonb)).id;
+SELECT (jsonb_populate_record(NULL::identity_json_report, '{"id":9,"label":"hi"}'::jsonb)).label;
+SELECT (jsonb_populate_record(NULL::identity_json_report, '{"id":10,"label":"yo"}'::jsonb)).*;
+SELECT (jsonb_populate_record(NULL::identity_json_report, '{"id":11,"label":"up"}'::jsonb)).id FROM (VALUES (1)) source(n);
+CREATE VIEW identity_json_projection AS SELECT (jsonb_populate_record(NULL::identity_json_report, '{"id":12,"label":"ok"}'::jsonb)).id AS id;
+SELECT id FROM identity_json_projection;
+DROP VIEW identity_json_projection;
+SELECT jsonb_populate_record(NULL::identity_json_report, '{"id":9,"label":"long"}'::jsonb);
+DROP VIEW identity_json_report;

@@ -82383,7 +82383,8 @@ fn current_manifest_cold_recovery_rejects_invalid_roots_without_publication_body
         .object_bytes(&manifest_key)
         .unwrap()
         .to_vec();
-    assert!(current.starts_with(b"pos3ql-manifest-v29\n"));
+    let current_header = crate::checkpoint::MANIFEST_HEADER.as_bytes();
+    assert_eq!(current.split(|byte| *byte == b'\n').next(), Some(current_header));
     assert!(
         current.windows(b" v4\n".len()).any(|part| part == b" v4\n"),
         "current checkpoint must retain its packed row layout"
@@ -82418,6 +82419,11 @@ fn current_manifest_cold_recovery_rejects_invalid_roots_without_publication_body
         "pos3ql-manifest-v22",
         "pos3ql-manifest-v23",
         "pos3ql-manifest-v24",
+        "pos3ql-manifest-v25",
+        "pos3ql-manifest-v26",
+        "pos3ql-manifest-v27",
+        "pos3ql-manifest-v28",
+        "pos3ql-manifest-v29",
     ] {
         rejected_roots.push((format!("{header}\n{body}"), "unsupported manifest format"));
     }
@@ -82598,7 +82604,9 @@ fn current_manifest_cold_recovery_rejects_invalid_roots_without_publication_body
         namespace
             .borrow()
             .object_bytes(&manifest_key)
-            .is_some_and(|bytes| bytes.starts_with(b"pos3ql-manifest-v29\n"))
+            .is_some_and(|bytes| {
+                bytes.split(|byte| *byte == b'\n').next() == Some(current_header)
+            })
     );
     drop(recovered);
 

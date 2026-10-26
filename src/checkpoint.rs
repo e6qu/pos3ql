@@ -209,7 +209,7 @@ fn parse_writer_fence(bytes: &[u8]) -> Result<(&str, WriterToken), &'static str>
     Ok((state, token))
 }
 
-const MANIFEST_HEADER: &str = "pos3ql-manifest-v30";
+pub(crate) const MANIFEST_HEADER: &str = "pos3ql-manifest-v30";
 
 struct ManifestMetadata {
     lsn: u64,

@@ -1183,10 +1183,16 @@ fn comment_reference(
                 .ok_or_else(graph_full)?,
         )),
         CommentClass::ForeignServer => EventObjectRef::Primary(ObjectRef::ForeignServer(
-            usize::try_from(subid).map_err(|_| graph_full())?,
+            storage
+                .foreign_servers(txid)
+                .find_map(|(slot, entry)| (entry.creation().get() == subid).then_some(slot))
+                .ok_or_else(graph_full)?,
         )),
         CommentClass::ForeignDataWrapper => EventObjectRef::Primary(ObjectRef::ForeignDataWrapper(
-            usize::try_from(subid).map_err(|_| graph_full())?,
+            storage
+                .foreign_wrappers(txid)
+                .find_map(|(slot, entry)| (entry.creation().get() == subid).then_some(slot))
+                .ok_or_else(graph_full)?,
         )),
         CommentClass::AccessMethod => {
             let oid = i32::try_from(subid).map_err(|_| graph_full())?;
@@ -1236,13 +1242,17 @@ fn comment_reference(
         CommentClass::Statistics => EventObjectRef::Primary(ObjectRef::Statistics(
             storage
                 .extended_statistics_visible(txid)
-                .find_map(|(slot, _)| (slot as u32 == subid).then_some(slot))
+                .find_map(|(slot, _)| {
+                    (storage.extended_statistics(slot).creation().get() == subid).then_some(slot)
+                })
                 .ok_or_else(graph_full)?,
         )),
         CommentClass::Publication => EventObjectRef::Primary(ObjectRef::Publication(
             storage
                 .publications_with_slots_visible_to(txid)
-                .find_map(|(slot, _)| (slot as u32 == subid).then_some(slot))
+                .find_map(|(slot, publication)| {
+                    (publication.creation().get() == subid).then_some(slot)
+                })
                 .ok_or_else(graph_full)?,
         )),
         CommentClass::Subscription => EventObjectRef::Primary(ObjectRef::Subscription(

@@ -17,6 +17,10 @@ impl CatalogIdentity {
         NonZeroU32::new(u32::try_from(created_at).ok()?).map(Self)
     }
 
+    pub(crate) fn get(self) -> u32 {
+        self.0.get()
+    }
+
     pub(crate) fn created_at(self) -> u64 {
         u64::from(self.0.get())
     }
@@ -32,6 +36,11 @@ impl CatalogIdentity {
 }
 
 impl ExtendedStatisticsDef {
+    pub(crate) fn creation(&self) -> CatalogIdentity {
+        CatalogIdentity::parse(self.created_at)
+            .expect("admitted catalog object has a checked creation identity")
+    }
+
     pub(crate) fn oid(&self) -> i32 {
         440_000_000
             + CatalogIdentity::parse(self.created_at)
@@ -48,6 +57,13 @@ impl ExtensionDef {
                 .expect("admitted Extension has a checked creation identity")
                 .0
                 .get() as i32
+    }
+}
+
+impl<D: Copy> foreign::ForeignCatalogEntry<D> {
+    pub(crate) fn creation(&self) -> CatalogIdentity {
+        CatalogIdentity::parse(self.created_at)
+            .expect("admitted foreign object has a checked creation identity")
     }
 }
 
@@ -82,6 +98,11 @@ impl foreign::ForeignCatalogEntry<foreign::UserMappingDefinition> {
 }
 
 impl PublicationDef {
+    pub(crate) fn creation(&self) -> CatalogIdentity {
+        CatalogIdentity::parse(self.created_at)
+            .expect("admitted catalog object has a checked creation identity")
+    }
+
     pub(crate) fn oid(&self) -> i32 {
         540_000_000
             + CatalogIdentity::parse(self.created_at)

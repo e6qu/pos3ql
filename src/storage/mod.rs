@@ -18218,6 +18218,17 @@ impl Storage {
         class: foreign::ForeignObjectClass,
         slot: usize,
     ) {
+        let comment = match class {
+            foreign::ForeignObjectClass::Wrapper => Some((
+                CommentClass::ForeignDataWrapper,
+                self.foreign_wrapper_entry(slot).creation(),
+            )),
+            foreign::ForeignObjectClass::Server => Some((
+                CommentClass::ForeignServer,
+                self.foreign_server_entry(slot).creation(),
+            )),
+            foreign::ForeignObjectClass::Mapping | foreign::ForeignObjectClass::Table => None,
+        };
         self.foreign_catalog().commit_drop(class, slot);
         let access = match class {
             foreign::ForeignObjectClass::Wrapper => Some(AccessClass::ForeignDataWrapper),
@@ -18232,11 +18243,8 @@ impl Storage {
             self.clear_object_acl_entries(object);
             self.clear_extension_dependencies_for_object(object);
         }
-        if class == foreign::ForeignObjectClass::Server {
-            self.drop_comments_by_subid(CommentClass::ForeignServer, slot as u32);
-        }
-        if class == foreign::ForeignObjectClass::Wrapper {
-            self.drop_comments_by_subid(CommentClass::ForeignDataWrapper, slot as u32);
+        if let Some((class, creation)) = comment {
+            self.drop_comments_by_subid(class, creation.get());
         }
     }
 
@@ -22313,9 +22321,17 @@ impl Storage {
                     .extended_statistics_catalog
                     .lock()
                     .expect("extended-statistics catalog lock poisoned");
-                let target_slot = allocation.select(DatabaseCloneKind::Statistics, definition.created_at,
-                    statistics_catalog.definitions.iter().enumerate().filter_map(|(slot, candidate)|
-                        (candidate.ddl_state == CatalogDdlState::Absent).then_some(slot)))?;
+                let target_slot = allocation.select(
+                    DatabaseCloneKind::Statistics,
+                    definition.created_at,
+                    statistics_catalog
+                        .definitions
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(slot, candidate)| {
+                            (candidate.ddl_state == CatalogDdlState::Absent).then_some(slot)
+                        }),
+                )?;
                 definition.database = target;
                 definition.ownership = definition.ownership.committed();
                 definition.pending_definition = None;
@@ -22379,9 +22395,16 @@ impl Storage {
                     .publications
                     .lock()
                     .expect("publication catalog lock poisoned");
-                let target_slot = allocation.select(DatabaseCloneKind::Publication, definition.created_at,
-                    publications.iter().enumerate().filter_map(|(slot, candidate)|
-                        (candidate.ddl_state == CatalogDdlState::Absent).then_some(slot)))?;
+                let target_slot = allocation.select(
+                    DatabaseCloneKind::Publication,
+                    definition.created_at,
+                    publications
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(slot, candidate)| {
+                            (candidate.ddl_state == CatalogDdlState::Absent).then_some(slot)
+                        }),
+                )?;
                 definition.database = target;
                 definition.pending_name = None;
                 definition.pending_definition = None;
@@ -22434,9 +22457,17 @@ impl Storage {
                     })?
                     .slot;
                 let mut catalog = self.extension_catalog();
-                let target_slot = allocation.select(DatabaseCloneKind::Extension, definition.created_at,
-                    catalog.definitions.iter().enumerate().filter_map(|(slot, candidate)|
-                        (candidate.ddl_state == CatalogDdlState::Absent).then_some(slot)))?;
+                let target_slot = allocation.select(
+                    DatabaseCloneKind::Extension,
+                    definition.created_at,
+                    catalog
+                        .definitions
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(slot, candidate)| {
+                            (candidate.ddl_state == CatalogDdlState::Absent).then_some(slot)
+                        }),
+                )?;
                 definition.database = target;
                 definition.ownership = definition.ownership.committed();
                 definition.pending = None;
@@ -22711,34 +22742,29 @@ impl Storage {
         if class == CommentClass::Subscription {
             return Ok(None);
         }
-        if class == CommentClass::Publication {
-            let source_slot = usize::try_from(subid).map_err(|_| invalid())?;
-            let catalog = self
-                .publications
-                .lock()
-                .expect("publication catalog lock poisoned");
-            let source_definition = catalog
-                .get(source_slot)
-                .filter(|publication| {
-                    publication.database == source
-                        && publication.ddl_state == CatalogDdlState::Present
+        if class == CommentClass::Statistics {
+            let statistics = {
+                let catalog = self
+                    .extended_statistics_catalog
+                    .lock()
+                    .expect("extended-statistics catalog lock poisoned");
+                catalog.definitions.iter().copied().find(|statistics| {
+                    statistics.database == source
+                        && statistics.ddl_state == CatalogDdlState::Present
+                        && statistics.creation().get() == subid
                 })
-                .ok_or_else(invalid)?;
-            return catalog
-                .iter()
-                .position(|publication| {
-                    publication.database == target
-                        && publication.ddl_state != CatalogDdlState::Absent
-                        && publication.created_at == source_definition.created_at
-                })
-                .map(|slot| Some(slot as u32))
-                .ok_or_else(invalid);
+            }
+            .ok_or_else(invalid)?;
+            if self.table_def(usize::from(statistics.table), 0).persistence
+                == RelationPersistence::Temporary
+            {
+                return Ok(None);
+            }
+            return Ok(Some(subid));
         }
+        // Database-local birth keys survive copying and recovery slot changes.
         let object_class = match class {
             CommentClass::Constraint => AccessClass::Table,
-            CommentClass::Statistics => AccessClass::Statistics,
-            CommentClass::ForeignServer => AccessClass::ForeignServer,
-            CommentClass::ForeignDataWrapper => AccessClass::ForeignDataWrapper,
             CommentClass::Trigger | CommentClass::Rule => {
                 if subid & (1 << 31) == 0 {
                     AccessClass::Table
@@ -22758,9 +22784,6 @@ impl Storage {
         let capacity = match object_class {
             AccessClass::Table => self.tables.len(),
             AccessClass::View => self.view_count(),
-            AccessClass::Statistics => self.extended_statistics_count(),
-            AccessClass::ForeignDataWrapper => self.foreign_catalog().wrapper_capacity(),
-            AccessClass::ForeignServer => self.foreign_catalog().server_capacity(),
             _ => unreachable!("comment class selects a slot catalog"),
         };
         if usize::from(slot) >= capacity {
@@ -39477,11 +39500,12 @@ impl Storage {
             .publications
             .lock()
             .expect("publication catalog lock poisoned");
+        let creation = publications[slot].creation();
         if publications[slot].ddl_state.commit_drop() == CatalogDdlState::Absent {
             publications[slot] = PublicationDef::EMPTY;
         }
         drop(publications);
-        self.drop_comments_by_subid(CommentClass::Publication, slot as u32);
+        self.drop_comments_by_subid(CommentClass::Publication, creation.get());
     }
 
     pub(crate) fn alter_publication(
@@ -45589,15 +45613,17 @@ impl Storage {
     }
 
     fn retire_extended_statistics(&self, slot: usize) {
-        {
+        let creation = {
             let mut catalog = self
                 .extended_statistics_catalog
                 .lock()
                 .expect("extended-statistics catalog lock poisoned");
+            let creation = catalog.definitions[slot].creation();
             Self::clear_pending_extended_statistics_data(&mut catalog, slot);
             catalog.definitions[slot] = ExtendedStatisticsDef::EMPTY;
-        }
-        self.drop_comments_by_subid(CommentClass::Statistics, slot as u32);
+            creation
+        };
+        self.drop_comments_by_subid(CommentClass::Statistics, creation.get());
     }
 
     fn commit_extended_statistics_for_table(&self, table: usize) {

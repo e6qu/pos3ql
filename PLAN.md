@@ -36,7 +36,8 @@ A waiting schema edit must never attach itself to a new object that reused a nam
   Finish source-lifetime checks and private edits for remaining catalog families.
 - Finish lifetime SQL identifiers beyond the families guaranteed in the
   [behavior guide](docs/implemented-baseline.md#schema-changes-and-object-identity).
-  Check shared catalogs and database-template copies, including recovery.
+  Check shared catalogs and database-template copies, including recovery and
+  comments that must stay attached when physical catalog slots change.
 - Complete reader-safe row/index history and backup retention. Pace pruning,
   replacement and deletion without holding unrelated owners.
 - Make remaining synchronous metadata and maintenance storage reads yield with

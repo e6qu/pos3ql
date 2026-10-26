@@ -588,12 +588,17 @@ Ordinary `nextval` advances remain nontransactional.
 
 Database creation journal records also retain a copy inventory: a four-byte
 count followed by eleven bytes per copied table, named type, sequence, view,
-rewrite rule, materialized view or routine. Each entry has a one-byte kind and
+rewrite rule, materialized view, routine, statistics object, publication,
+extension, foreign wrapper, foreign server, user mapping or foreign-table binding.
+Each entry has a one-byte kind and
 the ten-byte catalog position. Entries are ordered by kind and slot; unknown
 kinds, duplicate slots, missing source lifetimes, unavailable positions and
 unused entries are errors. The source lifetime selects each copied object,
 so unrelated rolled-back creations cannot change its recovered slot. Encoding
 uses the existing fixed journal buffers and adds no startup allocation.
+Copies remap wrapper/server/table parents to the destination and preserve
+local SQL identifiers. Table and view comment references are rebound to copied
+objects. Shared subscriptions and their comments are not copied.
 `max_rules`, like other catalog slot capacities, cannot exceed 65,535.
 
 The added binary positions are included in the common journal size calculation;
@@ -670,13 +675,6 @@ value across recovery. Journal and saved-file observations advance the counter
 with saturating arithmetic, including legacy maximum identities. Row key and
 manifest encodings are unchanged; the allocator adds no startup reservation.
 
-Database-copy journal inventories also retain exact statistics, publication,
-extension, foreign-wrapper, foreign-server, user-mapping and foreign-table-binding
-positions and creation stamps. Copies
-remap wrapper/server/table parents to the destination and preserve database-local
-SQL identifiers. Source-slot comment keys are rebound to copied objects; shared
-subscriptions and their comments are not copied into a new SQL database.
-
 ## Catalog object identifiers
 
 Statistics, extensions, foreign-data wrappers, foreign servers, user mappings,
@@ -701,6 +699,12 @@ promotion. The check includes prepared catalog changes and uses a fixed bitmap
 rather than memory proportional to catalog churn. Database-template copies may
 preserve numeric identifiers in database-local catalogs; shared subscription
 identifiers must remain unique across databases.
+
+Comments on statistics, publications, foreign wrappers and foreign servers use
+the database and creation stamp as their internal object key. They survive
+checkpoint recovery even when catalog slots change. Copying a database preserves
+these keys within the new database; dropping a copied object clears only its
+own comments. This internal key does not change PostgreSQL's exposed `objsubid`.
 
 Manifest `pub` records place the creation stamp after the owner and before the
 flags. Journal publication-creation records place the eight-byte little-endian

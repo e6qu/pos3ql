@@ -364,14 +364,45 @@ impl Storage {
             );
         }
         drop(catalog);
-        for (slot, definition) in self.extended_statistics_catalog.lock().expect("statistics catalog lock poisoned").definitions.iter().enumerate() {
-            object(DatabaseCloneKind::Statistics, slot, definition.created_at, definition.database, definition.ddl_state);
+        for (slot, definition) in self
+            .extended_statistics_catalog
+            .lock()
+            .expect("statistics catalog lock poisoned")
+            .definitions
+            .iter()
+            .enumerate()
+        {
+            object(
+                DatabaseCloneKind::Statistics,
+                slot,
+                definition.created_at,
+                definition.database,
+                definition.ddl_state,
+            );
         }
-        for (slot, definition) in self.publications.lock().expect("publication catalog lock poisoned").iter().enumerate() {
-            object(DatabaseCloneKind::Publication, slot, definition.created_at, definition.database, definition.ddl_state);
+        for (slot, definition) in self
+            .publications
+            .lock()
+            .expect("publication catalog lock poisoned")
+            .iter()
+            .enumerate()
+        {
+            object(
+                DatabaseCloneKind::Publication,
+                slot,
+                definition.created_at,
+                definition.database,
+                definition.ddl_state,
+            );
         }
         for (slot, definition) in self.extension_catalog().definitions.iter().enumerate() {
-            object(DatabaseCloneKind::Extension, slot, definition.created_at, definition.database, definition.ddl_state);
+            object(
+                DatabaseCloneKind::Extension,
+                slot,
+                definition.created_at,
+                definition.database,
+                definition.ddl_state,
+            );
         }
     }
 }
@@ -415,7 +446,7 @@ mod tests {
                 assert!(DatabaseClonePositions::decode(&bytes[..end]).is_none());
             }
             let mut invalid = bytes;
-            invalid[4] = 9;
+            invalid[4] = u8::MAX;
             assert!(DatabaseClonePositions::decode(&invalid).is_none());
             invalid = bytes;
             invalid[7..15].fill(0);

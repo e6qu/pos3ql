@@ -4183,13 +4183,16 @@ fn copy_like_statistics(
                         class: crate::storage::CommentClass::Statistics,
                         schema: definition.schema,
                         name: definition.name,
-                        subid: source_statistics_slot as u32,
+                        subid: storage
+                            .extended_statistics(source_statistics_slot)
+                            .creation()
+                            .get(),
                     },
                     CommentIdentity {
                         class: crate::storage::CommentClass::Statistics,
                         schema: target.schema,
                         name,
-                        subid: slot as u32,
+                        subid: storage.extended_statistics(slot).creation().get(),
                     },
                 )?;
             }
@@ -38720,7 +38723,7 @@ pub fn comment(
                 CommentClass::Statistics,
                 definition.schema,
                 definition.name,
-                slot as u32,
+                storage.extended_statistics(slot).creation().get(),
             )
         }
         CommentTarget::Role(role_name) => {
@@ -38989,7 +38992,7 @@ pub fn comment(
                 CommentClass::ForeignDataWrapper,
                 SqlName::EMPTY,
                 wrapper.name,
-                slot as u32,
+                storage.foreign_wrapper_entry(slot).creation().get(),
             )
         }
         CommentTarget::ForeignServer(server_name) => {
@@ -39011,7 +39014,7 @@ pub fn comment(
                 CommentClass::ForeignServer,
                 SqlName::EMPTY,
                 server.name,
-                slot as u32,
+                storage.foreign_server_entry(slot).creation().get(),
             )
         }
         CommentTarget::Publication(publication_name) => {
@@ -39030,7 +39033,7 @@ pub fn comment(
                 CommentClass::Publication,
                 SqlName::EMPTY,
                 publication.name_for(txid),
-                slot as u32,
+                publication.creation().get(),
             )
         }
         CommentTarget::Subscription(subscription_name) => {

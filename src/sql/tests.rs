@@ -1941,8 +1941,30 @@ fn catalog_lifetime_template_copies_preserve_local_identifiers_and_statistics() 
                 engine
                     .select_database(crate::storage::DatabaseOid::POSTGRES)
                     .unwrap();
-                let mut discarded = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+                let mut discarded =
+                    ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
                 discarded.success(&mut engine, "BEGIN; CREATE FOREIGN DATA WRAPPER discarded_wrapper NO HANDLER NO VALIDATOR; CREATE SERVER discarded_server FOREIGN DATA WRAPPER discarded_wrapper; CREATE USER MAPPING FOR PUBLIC SERVER discarded_server; CREATE PUBLICATION discarded_publication", false);
+                let mut blocker =
+                    ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(3);
+                blocker.success(&mut engine, "BEGIN; CREATE FOREIGN DATA WRAPPER blocking_wrapper NO HANDLER NO VALIDATOR; CREATE SERVER blocking_first FOREIGN DATA WRAPPER blocking_wrapper; CREATE SERVER blocking_second FOREIGN DATA WRAPPER blocking_wrapper", false);
+                assert_eq!(
+                    error_sqlstates(&session.execute(
+                        &mut engine,
+                        "CREATE DATABASE catalog_copy TEMPLATE template1",
+                        false
+                    )),
+                    ["54000"]
+                );
+                assert!(engine.storage.database_slot("catalog_copy", 0).is_none());
+                assert_eq!(
+                    (0..config.max_foreign_data_wrappers)
+                        .filter(|slot| engine.storage.foreign_wrapper_entry(*slot).ddl_state
+                            != crate::storage::CatalogDdlState::Absent)
+                        .count(),
+                    3,
+                    "failed cloning must release its partial foreign wrapper"
+                );
+                blocker.success(&mut engine, "ROLLBACK", false);
                 session.success(
                     &mut engine,
                     "CREATE DATABASE catalog_copy TEMPLATE template1",
@@ -2006,9 +2028,28 @@ fn catalog_lifetime_template_copies_preserve_local_identifiers_and_statistics() 
                             "server comment",
                             "statistics comment",
                             "publication comment"
-                        ]
+                        ],
+                        "cold comments: checkpoint={checkpoint}, mode={mode:?}, database={database:?}"
                     );
                 }
+                engine.select_database(copied).unwrap();
+                session.success(&mut engine, "DROP PUBLICATION lifetime_publication; CREATE PUBLICATION lifetime_publication FOR TABLE lifetime_rows; DROP STATISTICS lifetime_statistics; CREATE STATISTICS lifetime_statistics ON a, b FROM lifetime_rows; DROP FOREIGN DATA WRAPPER lifetime_wrapper CASCADE; CREATE FOREIGN DATA WRAPPER lifetime_wrapper NO HANDLER NO VALIDATOR; CREATE SERVER lifetime_server FOREIGN DATA WRAPPER lifetime_wrapper", false);
+                assert_eq!(
+                    data_rows(&session.success(&mut engine, COMMENTS, false)),
+                    ["NULL"; 4]
+                );
+                engine
+                    .select_database(crate::storage::DatabaseOid::TEMPLATE1)
+                    .unwrap();
+                assert_eq!(
+                    data_rows(&session.success(&mut engine, COMMENTS, false)),
+                    [
+                        "wrapper comment",
+                        "server comment",
+                        "statistics comment",
+                        "publication comment"
+                    ]
+                );
             }
             std::fs::remove_dir_all(&config.data_dir).unwrap();
             crate::object_store::sim::drop_namespace(&config.object_store_bucket);

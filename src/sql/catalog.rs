@@ -14116,22 +14116,22 @@ fn pg_description<'a>(
                 continue;
             }
             crate::storage::CommentClass::ForeignServer => {
-                let Ok(slot) = usize::try_from(subid) else {
+                let Some((_, entry)) = storage
+                    .foreign_servers(txid)
+                    .find(|(_, entry)| entry.creation().get() == subid)
+                else {
                     continue;
                 };
-                let Some(_) = storage.foreign_server_by_slot(slot, txid) else {
-                    continue;
-                };
-                (storage.foreign_server_entry(slot).oid(), 1417)
+                (entry.oid(), 1417)
             }
             crate::storage::CommentClass::ForeignDataWrapper => {
-                let Ok(slot) = usize::try_from(subid) else {
+                let Some((_, entry)) = storage
+                    .foreign_wrappers(txid)
+                    .find(|(_, entry)| entry.creation().get() == subid)
+                else {
                     continue;
                 };
-                let Some(_) = storage.foreign_wrapper_by_slot(slot, txid) else {
-                    continue;
-                };
-                (storage.foreign_wrapper_entry(slot).oid(), 2328)
+                (entry.oid(), 2328)
             }
             crate::storage::CommentClass::AccessMethod => {
                 let Ok(oid) = i32::try_from(subid) else {
@@ -14278,7 +14278,7 @@ fn pg_description<'a>(
             crate::storage::CommentClass::Statistics => {
                 let Some((slot, _)) = storage
                     .extended_statistics_visible(txid)
-                    .find(|(slot, _)| *slot as u32 == subid)
+                    .find(|(slot, _)| storage.extended_statistics(*slot).creation().get() == subid)
                 else {
                     continue;
                 };
@@ -14288,13 +14288,13 @@ fn pg_description<'a>(
                 )
             }
             crate::storage::CommentClass::Publication => {
-                let Some((slot, _)) = storage
+                let Some((_, publication)) = storage
                     .publications_with_slots_visible_to(txid)
-                    .find(|(slot, _)| *slot as u32 == subid)
+                    .find(|(_, publication)| publication.creation().get() == subid)
                 else {
                     continue;
                 };
-                (storage.publication_at(slot).oid(), PG_PUBLICATION_OID)
+                (publication.oid(), PG_PUBLICATION_OID)
             }
             crate::storage::CommentClass::Subscription => {
                 let Some((_, subscription)) = storage
@@ -14907,9 +14907,8 @@ fn visit_comments_for_object(
                 class == crate::storage::CommentClass::ForeignServer
                     && subid == 0
                     && signed_oid.is_some_and(|server_oid| {
-                        usize::try_from(csub).ok().is_some_and(|slot| {
-                            storage.foreign_server_entry(slot).oid() == server_oid
-                                && storage.foreign_server_by_slot(slot, txid).is_some()
+                        storage.foreign_servers(txid).any(|(_, entry)| {
+                            entry.creation().get() == csub && entry.oid() == server_oid
                         })
                     })
             }
@@ -14917,9 +14916,8 @@ fn visit_comments_for_object(
                 class == crate::storage::CommentClass::ForeignDataWrapper
                     && subid == 0
                     && signed_oid.is_some_and(|wrapper_oid| {
-                        usize::try_from(csub).ok().is_some_and(|slot| {
-                            storage.foreign_wrapper_entry(slot).oid() == wrapper_oid
-                                && storage.foreign_wrapper_by_slot(slot, txid).is_some()
+                        storage.foreign_wrappers(txid).any(|(_, entry)| {
+                            entry.creation().get() == csub && entry.oid() == wrapper_oid
                         })
                     })
             }
@@ -15115,7 +15113,8 @@ fn visit_comments_for_object(
                     && subid == 0
                     && signed_oid.is_some_and(|oid| {
                         storage.extended_statistics_visible(txid).any(|(slot, _)| {
-                            storage.extended_statistics(slot).oid() == oid && csub == slot as u32
+                            storage.extended_statistics(slot).oid() == oid
+                                && csub == storage.extended_statistics(slot).creation().get()
                         })
                     })
             }
@@ -15125,8 +15124,8 @@ fn visit_comments_for_object(
                     && signed_oid.is_some_and(|oid| {
                         storage
                             .publications_with_slots_visible_to(txid)
-                            .any(|(slot, _)| {
-                                storage.publication_at(slot).oid() == oid && csub == slot as u32
+                            .any(|(_, publication)| {
+                                publication.oid() == oid && csub == publication.creation().get()
                             })
                     })
             }

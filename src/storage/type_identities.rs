@@ -1,10 +1,14 @@
 //! Checked creation stamps for named SQL type lifetimes.
 
+#[cfg(test)]
 use core::num::NonZeroU8;
+use core::num::NonZeroU64;
 
+#[cfg(test)]
 pub(crate) const MAX_TYPE_CREATION: u64 = 9_999_999;
 
 /// A nonzero stamp with a three-byte optional representation.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(C)]
 pub(crate) struct TypeCreation {
@@ -12,6 +16,7 @@ pub(crate) struct TypeCreation {
     upper: [u8; 2],
 }
 
+#[cfg(test)]
 impl TypeCreation {
     /// Rejects zero and stamps outside the named-type identifier range.
     pub(crate) const fn parse(created_at: u64) -> Option<Self> {
@@ -35,8 +40,11 @@ impl TypeCreation {
     }
 }
 
+#[cfg(test)]
 const _: [(); 3] = [(); core::mem::size_of::<TypeCreation>()];
+#[cfg(test)]
 const _: [(); 3] = [(); core::mem::size_of::<Option<TypeCreation>>()];
+#[cfg(test)]
 const _: [(); 1] = [(); core::mem::align_of::<TypeCreation>()];
 
 use super::DatabaseOid;
@@ -49,7 +57,7 @@ use crate::sql_err;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct TypeLifetimeKey {
     database: DatabaseOid,
-    creation: TypeCreation,
+    creation: NonZeroU64,
 }
 
 /// Both directions share one startup reservation; slot replacement cannot grow it.
@@ -116,7 +124,8 @@ impl TypeIdentityIndex {
         Ok(())
     }
 
-    pub(super) fn lookup(&self, database: DatabaseOid, creation: TypeCreation) -> Option<NamedTypeSlot> {
+    pub(super) fn lookup(&self, database: DatabaseOid, created_at: u64) -> Option<NamedTypeSlot> {
+        let creation = NonZeroU64::new(created_at)?;
         self.by_lifetime.get(&TypeLifetimeKey { database, creation }).copied()
     }
 
@@ -125,11 +134,13 @@ impl TypeIdentityIndex {
         &mut self,
         slot: NamedTypeSlot,
         database: DatabaseOid,
-        creation: TypeCreation,
+        created_at: u64,
     ) -> Result<(), SqlError> {
         let position = self.position(slot)?;
         self.validate_slot(slot, position)?;
         let old = self.by_slot[position];
+        let creation = NonZeroU64::new(created_at).ok_or_else(|| sql_err!(sqlstate::DATA_EXCEPTION,
+            "named type creation identity is zero"))?;
         let key = TypeLifetimeKey { database, creation };
         if let Some(owner) = self.by_lifetime.get(&key)
             && (*owner != slot || old != Some(key))
@@ -156,13 +167,13 @@ impl TypeIdentityIndex {
         allocated: NamedTypeSlot,
         target: NamedTypeSlot,
         database: DatabaseOid,
-        creation: TypeCreation,
+        created_at: u64,
     ) -> Result<(), SqlError> {
         if allocated.kind() != target.kind() {
             return Err(sql_err!(sqlstate::DATA_EXCEPTION,
                 "stored type identity changes its catalog family"));
         }
-        if allocated == target { return self.replace(target, database, creation); }
+        if allocated == target { return self.replace(target, database, created_at); }
         let old_position = self.position(allocated)?;
         let new_position = self.position(target)?;
         self.validate_slot(allocated, old_position)?;
@@ -170,6 +181,8 @@ impl TypeIdentityIndex {
         let old = self.by_slot[old_position].ok_or_else(|| sql_err!(sqlstate::DATA_EXCEPTION,
             "restored type source has no creation identity"))?;
         let destination = self.by_slot[new_position];
+        let creation = NonZeroU64::new(created_at).ok_or_else(|| sql_err!(sqlstate::DATA_EXCEPTION,
+            "named type creation identity is zero"))?;
         let key = TypeLifetimeKey { database, creation };
         if let Some(owner) = self.by_lifetime.get(&key)
             && (*owner != allocated || old != key)
@@ -194,7 +207,7 @@ mod tests {
 
     #[test]
     fn type_identity_index_replaces_at_capacity_and_isolates_databases_without_allocation() {
-        fn creation(value: u64) -> TypeCreation { TypeCreation::parse(value).unwrap() }
+        fn creation(value: u64) -> u64 { TypeCreation::parse(value).unwrap().created_at() }
         let bytes = TypeIdentityIndex::budget_bytes(2, 1, 1);
         let mut budget = Budget::new(bytes);
         let mut index = TypeIdentityIndex::new(&mut budget, 2, 1, 1).unwrap();

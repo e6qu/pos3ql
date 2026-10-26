@@ -6179,132 +6179,132 @@ mod named_type_layout_probe {
     }
 
     #[derive(Debug, Clone, Copy, PartialEq)]
-enum ProjectedOwnedDatum {
-    Null,
-    Bool(bool),
-    Char(u8),
-    Int4(i32),
-    Oid(u32),
-    Tid(crate::sql::types::Tid),
-    Cid(u32),
-    Xid8(u64),
-    Snapshot {
-        legacy: bool,
-        len: u8,
-        bytes: [u8; crate::storage::MAX_DEFAULT_TEXT],
-    },
-    PgLsn(u64),
-    AclItem {
-        len: u8,
-        bytes: [u8; crate::storage::MAX_DEFAULT_TEXT],
-    },
-    Money(i64),
-    Int8(i64),
-    Regtype {
-        referenced_oid: i32,
-        len: u8,
-        bytes: [u8; crate::storage::MAX_DEFAULT_TEXT],
-    },
-    RegObject {
-        kind: crate::storage::RegObjectType,
-        referenced_oid: i32,
-        len: u8,
-        bytes: [u8; crate::storage::MAX_DEFAULT_TEXT],
-    },
-    Float8(f64),
-    Text {
-        len: u8,
-        bytes: [u8; crate::storage::MAX_DEFAULT_TEXT],
-    },
-    PgNodeTree {
-        len: u8,
-        bytes: [u8; crate::storage::MAX_DEFAULT_TEXT],
-    },
-    Geometry {
-        kind: crate::sql::types::GeometryKind,
-        len: u8,
-        bytes: [u8; crate::storage::MAX_DEFAULT_TEXT],
-    },
-    TextSearch {
-        query: bool,
-        len: u8,
-        bytes: [u8; crate::storage::MAX_DEFAULT_TEXT],
-    },
-    Numeric {
-        sign: u8,
-        weight: i16,
-        dscale: u16,
-        nbytes: u8,
-        digits: [u8; crate::storage::MAX_DEFAULT_TEXT],
-    },
-    Date(i32),
-    Timestamp(i64),
-    Timestamptz(i64),
-    Time(i64),
-    Timetz(i64, i32),
-    Interval(crate::sql::types::Interval),
-    Json {
-        jsonb: bool,
-        len: u8,
-        bytes: [u8; crate::storage::MAX_DEFAULT_TEXT],
-    },
-    JsonPath {
-        len: u8,
-        bytes: [u8; crate::storage::MAX_DEFAULT_TEXT],
-    },
-    Array {
-        element: ProjectedArrElem,
-        len: u8,
-        bytes: [u8; crate::storage::MAX_DEFAULT_TEXT],
-    },
-    Int2Vector {
-        lower_bound: i32,
-        len: u8,
-        bytes: [u8; crate::storage::MAX_DEFAULT_TEXT],
-    },
-    OidVector {
-        lower_bound: i32,
-        len: u8,
-        bytes: [u8; crate::storage::MAX_DEFAULT_TEXT],
-    },
-    Range {
-        kind: crate::sql::types::RangeKind,
-        multirange: bool,
-        len: u8,
-        bytes: [u8; crate::storage::MAX_DEFAULT_TEXT],
-    },
-    Bit {
-        varying: bool,
-        len: u8,
-        bytes: [u8; crate::storage::MAX_DEFAULT_TEXT],
-    },
-    Uuid([u8; 16]),
-    Bytea {
-        len: u8,
-        bytes: [u8; crate::storage::MAX_DEFAULT_TEXT],
-    },
-    Inet(crate::sql::net::NetAddr),
-    Cidr(crate::sql::net::NetAddr),
-    Macaddr([u8; 6]),
-    Macaddr8([u8; 8]),
-    Enum {
-        slot: ProposedCreation,
-        member: Option<crate::sql::types::EnumMemberId>,
-        sort: f64,
-        label: crate::storage::SqlName,
-    },
-}
+    enum ProjectedOwnedDatum {
+        Null,
+        Bool(bool),
+        Char(u8),
+        Int4(i32),
+        Oid(u32),
+        Tid(crate::sql::types::Tid),
+        Cid(u32),
+        Xid8(u64),
+        Snapshot {
+            legacy: bool,
+            len: u8,
+            bytes: [u8; crate::storage::MAX_DEFAULT_TEXT],
+        },
+        PgLsn(u64),
+        AclItem {
+            len: u8,
+            bytes: [u8; crate::storage::MAX_DEFAULT_TEXT],
+        },
+        Money(i64),
+        Int8(i64),
+        Regtype {
+            referenced_oid: i32,
+            len: u8,
+            bytes: [u8; crate::storage::MAX_DEFAULT_TEXT],
+        },
+        RegObject {
+            kind: crate::storage::RegObjectType,
+            referenced_oid: i32,
+            len: u8,
+            bytes: [u8; crate::storage::MAX_DEFAULT_TEXT],
+        },
+        Float8(f64),
+        Text {
+            len: u8,
+            bytes: [u8; crate::storage::MAX_DEFAULT_TEXT],
+        },
+        PgNodeTree {
+            len: u8,
+            bytes: [u8; crate::storage::MAX_DEFAULT_TEXT],
+        },
+        Geometry {
+            kind: crate::sql::types::GeometryKind,
+            len: u8,
+            bytes: [u8; crate::storage::MAX_DEFAULT_TEXT],
+        },
+        TextSearch {
+            query: bool,
+            len: u8,
+            bytes: [u8; crate::storage::MAX_DEFAULT_TEXT],
+        },
+        Numeric {
+            sign: u8,
+            weight: i16,
+            dscale: u16,
+            nbytes: u8,
+            digits: [u8; crate::storage::MAX_DEFAULT_TEXT],
+        },
+        Date(i32),
+        Timestamp(i64),
+        Timestamptz(i64),
+        Time(i64),
+        Timetz(i64, i32),
+        Interval(crate::sql::types::Interval),
+        Json {
+            jsonb: bool,
+            len: u8,
+            bytes: [u8; crate::storage::MAX_DEFAULT_TEXT],
+        },
+        JsonPath {
+            len: u8,
+            bytes: [u8; crate::storage::MAX_DEFAULT_TEXT],
+        },
+        Array {
+            element: ProjectedArrElem,
+            len: u8,
+            bytes: [u8; crate::storage::MAX_DEFAULT_TEXT],
+        },
+        Int2Vector {
+            lower_bound: i32,
+            len: u8,
+            bytes: [u8; crate::storage::MAX_DEFAULT_TEXT],
+        },
+        OidVector {
+            lower_bound: i32,
+            len: u8,
+            bytes: [u8; crate::storage::MAX_DEFAULT_TEXT],
+        },
+        Range {
+            kind: crate::sql::types::RangeKind,
+            multirange: bool,
+            len: u8,
+            bytes: [u8; crate::storage::MAX_DEFAULT_TEXT],
+        },
+        Bit {
+            varying: bool,
+            len: u8,
+            bytes: [u8; crate::storage::MAX_DEFAULT_TEXT],
+        },
+        Uuid([u8; 16]),
+        Bytea {
+            len: u8,
+            bytes: [u8; crate::storage::MAX_DEFAULT_TEXT],
+        },
+        Inet(crate::sql::net::NetAddr),
+        Cidr(crate::sql::net::NetAddr),
+        Macaddr([u8; 6]),
+        Macaddr8([u8; 8]),
+        Enum {
+            slot: ProposedCreation,
+            member: Option<crate::sql::types::EnumMemberId>,
+            sort: f64,
+            label: crate::storage::SqlName,
+        },
+    }
 
     #[derive(Debug, Clone, Copy, PartialEq)]
-enum ProjectedColumnDefault {
-    None,
-    Constant {
-        value: ProjectedOwnedDatum,
-        expression: crate::util::StackStr<crate::storage::DEFAULT_EXPR_MAX>,
-    },
-    Expression(crate::util::StackStr<crate::storage::DEFAULT_EXPR_MAX>),
-    Generated(crate::util::StackStr<crate::storage::DEFAULT_EXPR_MAX>),
-}
+    enum ProjectedColumnDefault {
+        None,
+        Constant {
+            value: ProjectedOwnedDatum,
+            expression: crate::util::StackStr<{ crate::storage::DEFAULT_EXPR_MAX }>,
+        },
+        Expression(crate::util::StackStr<{ crate::storage::DEFAULT_EXPR_MAX }>),
+        Generated(crate::util::StackStr<{ crate::storage::DEFAULT_EXPR_MAX }>),
+    }
 
     #[derive(Debug, Clone, Copy, PartialEq)]
     struct ProjectedColumnMeta {
@@ -6342,9 +6342,13 @@ enum ProjectedColumnDefault {
             size_of::<crate::storage::ColumnMeta>(),
             size_of::<ProjectedColumnMeta>()
         );
-        println!("nested layout current/projected: OwnedDatum {}/{}, ColumnDefault {}/{}",
-            size_of::<crate::storage::OwnedDatum>(), size_of::<ProjectedOwnedDatum>(),
-            size_of::<crate::storage::ColumnDefault>(), size_of::<ProjectedColumnDefault>());
+        println!(
+            "nested layout current/projected: OwnedDatum {}/{}, ColumnDefault {}/{}",
+            size_of::<crate::storage::OwnedDatum>(),
+            size_of::<ProjectedOwnedDatum>(),
+            size_of::<crate::storage::ColumnDefault>(),
+            size_of::<ProjectedColumnDefault>()
+        );
         assert!(size_of::<ProjectedOwnedDatum>() <= size_of::<crate::storage::OwnedDatum>());
         assert!(size_of::<ProjectedColumnDefault>() <= size_of::<crate::storage::ColumnDefault>());
         assert_eq!(size_of::<ProposedCreation>(), 3);

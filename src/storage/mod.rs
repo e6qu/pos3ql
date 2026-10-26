@@ -69,7 +69,6 @@ mod type_contracts;
 mod type_creation;
 mod type_definitions;
 pub(crate) use type_definitions::{TypeDefinitionImages, TypeDefinitionTarget};
-#[cfg(test)]
 mod type_identities;
 mod type_names;
 mod type_reference_moves;
@@ -7524,6 +7523,7 @@ struct OperatorClassIter<'a> {
 struct TypeCatalog {
     origin: type_references::CatalogOrigin,
     versions: type_edits::TypeRevisions,
+    identities: type_identities::TypeIdentityIndex,
     domains: FixedVec<DomainDef>,
     enums: FixedVec<EnumDef>,
     pending_enum_members: FixedVec<PendingEnumMemberSlot>,
@@ -18939,6 +18939,9 @@ impl Storage {
             + row_ownership::HeapRowOwnership::budget_bytes(config)
             + type_reference_moves::DefinitionPublication::budget_bytes(config)
             + type_edits::TypeRevisions::budget_bytes(config)
+            + type_identities::TypeIdentityIndex::budget_bytes(
+                config.max_domains, config.max_enums, config.max_composites,
+            )
             + Self::type_definition_image_budget_bytes(config)
             + size_of::<type_references::CatalogOrigin>()
             + size_of::<catalog_sources::CatalogSources>()
@@ -19473,6 +19476,9 @@ impl Storage {
                 .push(SequenceValues::initial(1))
                 .expect("sized to max_sequences");
         }
+        let type_identities = type_identities::TypeIdentityIndex::new(
+            budget, config.max_domains, config.max_enums, config.max_composites,
+        )?;
         let mut domains = FixedVec::new(budget, "domains", config.max_domains)?;
         for _ in 0..config.max_domains {
             domains
@@ -19941,6 +19947,7 @@ impl Storage {
             type_catalog: Mutex::new(TypeCatalog {
                 origin: catalog_origin,
                 versions: type_definition_versions,
+                identities: type_identities,
                 domains,
                 enums,
                 pending_enum_members,
@@ -21392,6 +21399,9 @@ impl Storage {
                 definition.ownership = definition.ownership.committed();
                 definition.pending_definition = None;
                 definition.ddl_state = CatalogDdlState::PendingCreate { txid };
+                type_catalog.identities.replace(
+                    NamedTypeSlot::Domain(target_slot), target, definition.created_at,
+                )?;
                 type_catalog
                     .versions
                     .initialize(NamedTypeSlot::Domain(target_slot), definition.created_at);
@@ -21427,6 +21437,9 @@ impl Storage {
                     sql_err!(sqlstate::INTERNAL_ERROR, "cloned enum has no member image")
                 })?;
                 let image = EnumImageReservation::copy(&self.enum_member_images, source, count)?;
+                type_catalog.identities.replace(
+                    NamedTypeSlot::Enum(target_slot), target, definition.created_at,
+                )?;
                 definition.member_image = Some(image.publish());
                 type_catalog
                     .versions
@@ -21469,6 +21482,9 @@ impl Storage {
                         field.collation = Collation::Catalog(target);
                     }
                 }
+                type_catalog.identities.replace(
+                    NamedTypeSlot::Composite(target_slot), target, definition.created_at,
+                )?;
                 type_catalog
                     .versions
                     .initialize(NamedTypeSlot::Composite(target_slot), definition.created_at);
@@ -40289,6 +40305,7 @@ impl Storage {
                 catalog.domains.len()
             ));
         };
+        catalog.identities.replace(NamedTypeSlot::Domain(new), current_database(), created_at)?;
         Self::clear_object_acl_entries_locked(
             &mut permissions,
             AccessObject {
@@ -41080,6 +41097,7 @@ impl Storage {
         };
         let image = EnumImageReservation::write(&self.enum_member_images, spec.members)?;
         let member_count = image.count();
+        catalog.identities.replace(NamedTypeSlot::Enum(new), current_database(), created_at)?;
         Self::clear_object_acl_entries_locked(
             &mut permissions,
             AccessObject {
@@ -41808,6 +41826,7 @@ impl Storage {
                 catalog.composites.len()
             ));
         };
+        catalog.identities.replace(NamedTypeSlot::Composite(slot), current_database(), created_at)?;
         Self::clear_object_acl_entries_locked(
             &mut permissions,
             AccessObject {
@@ -41871,6 +41890,7 @@ impl Storage {
             ));
         }
         self.require_named_type_name(&catalog, schema, name, txid, None)?;
+        catalog.identities.replace(NamedTypeSlot::Composite(slot), current_database(), created_at)?;
         Self::clear_object_acl_entries_locked(
             &mut permissions,
             AccessObject {

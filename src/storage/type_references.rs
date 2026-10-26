@@ -760,16 +760,22 @@ impl TypeCatalog {
                         "captured type reference belongs to a different catalog"
                     ));
                 }
+                if self.identities.lookup(database, key.created_at()) != Some(key.slot()) {
+                    return Ok(None);
+                }
                 Ok(self
                     .type_snapshot(key.slot(), transaction)?
                     .filter(|snapshot| snapshot.identity == key))
             }
-            ReferenceIdentity::Stored(key) => Ok(self
-                .type_snapshot(key.slot(), transaction)?
-                .filter(|snapshot| {
+            ReferenceIdentity::Stored(key) => {
+                if self.identities.lookup(database, key.created_at()) != Some(key.slot()) {
+                    return Ok(None);
+                }
+                Ok(self.type_snapshot(key.slot(), transaction)?.filter(|snapshot| {
                     snapshot.identity.database() == database
                         && snapshot.identity.created_at() == key.created_at()
-                })),
+                }))
+            }
         }
     }
 
@@ -1334,86 +1340,58 @@ impl super::Storage {
             || matches!(target, NamedTypeSlot::Composite(_))
                 && created_at > super::MAX_RELATION_GENERATION
         {
-            return Err(sql_err!(
-                sqlstate::DATA_EXCEPTION,
-                "stored type creation identity is invalid"
-            ));
+            return Err(sql_err!(sqlstate::DATA_EXCEPTION,
+                "stored type creation identity is invalid"));
         }
-        let invalid = || {
-            sql_err!(
-                sqlstate::DATA_EXCEPTION,
-                "stored type catalog slot is unavailable"
-            )
-        };
-        let mut catalog = self
-            .type_catalog
-            .lock()
-            .expect("type catalog lock poisoned");
+        let invalid = || sql_err!(sqlstate::DATA_EXCEPTION,
+            "stored type catalog slot is unavailable");
+        let mut catalog = self.type_catalog.lock().expect("type catalog lock poisoned");
         let old = allocated.index();
         let new = target.index();
-        let retained = self.type_definition_images.retains(allocated)
-            || self.type_definition_images.retains(target);
-        let retained_error = || {
-            sql_err!(
-                sqlstate::OBJECT_IN_USE,
-                "stored type catalog slot is retained by an executing statement"
-            )
-        };
-        match (allocated, target) {
+        let (database, old_creation) = match (allocated, target) {
             (NamedTypeSlot::Domain(_), NamedTypeSlot::Domain(_)) => {
-                if new >= catalog.domains.len()
-                    || old >= catalog.domains.len()
-                    || old != new
-                        && catalog.domains[new].ddl_state != super::CatalogDdlState::Absent
-                {
-                    return Err(invalid());
-                }
-                if retained && (old != new || catalog.domains[old].created_at != created_at) {
-                    return Err(retained_error());
-                }
-                if catalog.domains[old].created_at != created_at {
-                    catalog.versions.initialize(allocated, created_at);
-                }
-                catalog.versions.swap(allocated, target);
+                if new >= catalog.domains.len() || old >= catalog.domains.len()
+                    || old != new && catalog.domains[new].ddl_state != super::CatalogDdlState::Absent
+                { return Err(invalid()); }
+                (catalog.domains[old].database, catalog.domains[old].created_at)
+            }
+            (NamedTypeSlot::Enum(_), NamedTypeSlot::Enum(_)) => {
+                if new >= catalog.enums.len() || old >= catalog.enums.len()
+                    || old != new && catalog.enums[new].ddl_state != super::CatalogDdlState::Absent
+                { return Err(invalid()); }
+                (catalog.enums[old].database, catalog.enums[old].created_at)
+            }
+            (NamedTypeSlot::Composite(_), NamedTypeSlot::Composite(_)) => {
+                if new >= catalog.composites.len() || old >= catalog.composites.len()
+                    || old != new && catalog.composites[new].ddl_state != super::CatalogDdlState::Absent
+                { return Err(invalid()); }
+                (catalog.composites[old].database, catalog.composites[old].created_at)
+            }
+            _ => return Err(invalid()),
+        };
+        if (self.type_definition_images.retains(allocated)
+            || self.type_definition_images.retains(target))
+            && (old != new || old_creation != created_at)
+        {
+            return Err(sql_err!(sqlstate::OBJECT_IN_USE,
+                "stored type catalog slot is retained by an executing statement"));
+        }
+        catalog.identities.relocate(allocated, target, database, created_at)?;
+        if old_creation != created_at { catalog.versions.initialize(allocated, created_at); }
+        catalog.versions.swap(allocated, target);
+        match target {
+            NamedTypeSlot::Domain(_) => {
                 catalog.domains.swap(old, new);
                 catalog.domains[new].created_at = created_at;
             }
-            (NamedTypeSlot::Enum(_), NamedTypeSlot::Enum(_)) => {
-                if new >= catalog.enums.len()
-                    || old >= catalog.enums.len()
-                    || old != new && catalog.enums[new].ddl_state != super::CatalogDdlState::Absent
-                {
-                    return Err(invalid());
-                }
-                if retained && (old != new || catalog.enums[old].created_at != created_at) {
-                    return Err(retained_error());
-                }
-                if catalog.enums[old].created_at != created_at {
-                    catalog.versions.initialize(allocated, created_at);
-                }
-                catalog.versions.swap(allocated, target);
+            NamedTypeSlot::Enum(_) => {
                 catalog.enums.swap(old, new);
                 catalog.enums[new].created_at = created_at;
             }
-            (NamedTypeSlot::Composite(_), NamedTypeSlot::Composite(_)) => {
-                if new >= catalog.composites.len()
-                    || old >= catalog.composites.len()
-                    || old != new
-                        && catalog.composites[new].ddl_state != super::CatalogDdlState::Absent
-                {
-                    return Err(invalid());
-                }
-                if retained && (old != new || catalog.composites[old].created_at != created_at) {
-                    return Err(retained_error());
-                }
-                if catalog.composites[old].created_at != created_at {
-                    catalog.versions.initialize(allocated, created_at);
-                }
-                catalog.versions.swap(allocated, target);
+            NamedTypeSlot::Composite(_) => {
                 catalog.composites.swap(old, new);
                 catalog.composites[new].created_at = created_at;
             }
-            _ => return Err(invalid()),
         }
         self.catalog_sequence.observe(created_at);
         Ok(())

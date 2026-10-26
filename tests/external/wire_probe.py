@@ -3407,14 +3407,22 @@ def test_catalog_aware_binary_bind_parameters():
 
     enum_oid = int(first_text_row(simple_query(s, "SELECT oid FROM pg_type WHERE typname = 'wire_binary_state'")))
     domain_oid = int(first_text_row(simple_query(s, "SELECT oid FROM pg_type WHERE typname = 'wire_binary_positive'")))
-    enum_array_oid = 160000 + enum_oid - 120000
-    domain_array_oid = 150000 + domain_oid - 110000
+    enum_array_oid = int(
+        first_text_row(simple_query(s, f"SELECT typarray FROM pg_type WHERE oid = {enum_oid}"))
+    )
+    domain_array_oid = int(
+        first_text_row(simple_query(s, f"SELECT typarray FROM pg_type WHERE oid = {domain_oid}"))
+    )
     vector_oid = int(first_text_row(simple_query(s, "SELECT oid FROM pg_type WHERE typname = 'wire_binary_vector'")))
-    vector_array_oid = 150000 + vector_oid - 110000
+    vector_array_oid = int(
+        first_text_row(simple_query(s, f"SELECT typarray FROM pg_type WHERE oid = {vector_oid}"))
+    )
     required_domain_oid = int(
         first_text_row(simple_query(s, "SELECT oid FROM pg_type WHERE typname = 'wire_binary_required'"))
     )
-    required_domain_array_oid = 150000 + required_domain_oid - 110000
+    required_domain_array_oid = int(
+        first_text_row(simple_query(s, f"SELECT typarray FROM pg_type WHERE oid = {required_domain_oid}"))
+    )
     coordinate_domain_oid = int(
         first_text_row(
             simple_query(s, "SELECT oid FROM pg_type WHERE typname = 'wire_binary_coordinate_domain'")
@@ -3423,8 +3431,12 @@ def test_catalog_aware_binary_bind_parameters():
     coordinate_oid = int(
         first_text_row(simple_query(s, "SELECT oid FROM pg_type WHERE typname = 'wire_binary_coordinate'"))
     )
-    coordinate_array_oid = 240000 + coordinate_oid - 230000
-    coordinate_domain_array_oid = 150000 + coordinate_domain_oid - 110000
+    coordinate_array_oid = int(
+        first_text_row(simple_query(s, f"SELECT typarray FROM pg_type WHERE oid = {coordinate_oid}"))
+    )
+    coordinate_domain_array_oid = int(
+        first_text_row(simple_query(s, f"SELECT typarray FROM pg_type WHERE oid = {coordinate_domain_oid}"))
+    )
     coordinate = binary_record([(23, struct.pack("!i", 4)), (23, struct.pack("!i", 8))])
     typed_record = binary_record(
         [
@@ -4056,8 +4068,12 @@ def test_catalog_aware_text_bind_parameters():
     )
     enum_oid = int(first_text_row(simple_query(s, "SELECT oid FROM pg_type WHERE typname = 'wire_text_state'")))
     domain_oid = int(first_text_row(simple_query(s, "SELECT oid FROM pg_type WHERE typname = 'wire_text_positive'")))
-    enum_array_oid = 160000 + enum_oid - 120000
-    domain_array_oid = 150000 + domain_oid - 110000
+    enum_array_oid = int(
+        first_text_row(simple_query(s, f"SELECT typarray FROM pg_type WHERE oid = {enum_oid}"))
+    )
+    domain_array_oid = int(
+        first_text_row(simple_query(s, f"SELECT typarray FROM pg_type WHERE oid = {domain_oid}"))
+    )
     required_domain_oid = int(
         first_text_row(simple_query(s, "SELECT oid FROM pg_type WHERE typname = 'wire_text_required'"))
     )

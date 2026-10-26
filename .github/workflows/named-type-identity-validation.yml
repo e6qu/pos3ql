@@ -68,7 +68,7 @@ jobs:
         shell: bash
         run: |
           python3 tools/test_command.py cargo test --lib --locked -- named_type_cached_defaults numeric_type_schema type_recovery_installs_saved_birth restored_type_identity_rejects --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/new-type-regressions.log"
-          grep -Eq 'test result: ok\. 4 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/new-type-regressions.log"
+          grep -Eq 'test result: ok\. 5 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/new-type-regressions.log"
       - name: Named type lifecycle, recovery and startup accounting
         shell: bash
         run: |

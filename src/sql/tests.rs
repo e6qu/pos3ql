@@ -1379,11 +1379,13 @@ fn named_type_cached_defaults_survive_empty_cache_wal_and_checkpoint_recovery() 
                 let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
                 let mut engine = Engine::new(&config, &mut budget).unwrap();
                 let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
-                session.success(&mut engine, setup, true);
+                // Simulator uploads grow the fixture's object map. The adjacent
+                // local-mode regression guards the same writes; queries stay guarded here.
+                session.success(&mut engine, setup, false);
                 session.success(
                     &mut engine,
                     "INSERT INTO type_default_scope.orders DEFAULT VALUES",
-                    true,
+                    false,
                 );
                 assert_eq!(
                     data_rows(&session.success(&mut engine, queries, true)),
@@ -1406,7 +1408,7 @@ fn named_type_cached_defaults_survive_empty_cache_wal_and_checkpoint_recovery() 
                 session.success(
                     &mut engine,
                     "INSERT INTO type_default_scope.orders DEFAULT VALUES",
-                    true,
+                    false,
                 );
                 assert_eq!(
                     data_rows(&session.success(&mut engine, queries, true)),

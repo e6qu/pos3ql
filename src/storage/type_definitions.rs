@@ -1340,6 +1340,43 @@ mod tests {
     }
 
     #[test]
+    fn restored_type_identity_rejects_duplicate_births_without_leaking_images() {
+        let mut storage = fixture(1);
+        let schema = SqlName::parse("public").unwrap();
+        let name = SqlName::parse("original_domain").unwrap();
+        let enumeration = SqlName::parse("restored_enum").unwrap();
+        let spec = DomainSpec {
+            base_domain: None, base_user_type: None, base: ColType::Int4,
+            base_type_mod: -1, not_null: false, not_null_name: None,
+            default_expr: None, checks: [CheckConstraint::EMPTY; MAX_DOMAIN_CHECKS], n_checks: 0,
+        };
+        crate::mem::guard::forbid_alloc(|| {
+            storage.create_domain_from_manifest(schema, name, spec, 41).unwrap();
+            let original = reference(&storage, NamedTypeSlot::Domain(0));
+            let version = storage.type_catalog.lock().unwrap().versions.get(NamedTypeSlot::Domain(0));
+            storage.enum_replay_members(1).unwrap()[0] = EnumMember {
+                label: SqlName::parse("saved").unwrap(), legacy_label: None, sort: 1.0,
+            };
+            for _ in 0..32 {
+                assert_eq!(storage.finish_enum_replay(schema, enumeration, 1, 41).unwrap_err().sqlstate,
+                    sqlstate::DATA_EXCEPTION);
+                assert_eq!(storage.catalog_identity_sequence(), 41);
+                assert_eq!(reference(&storage, NamedTypeSlot::Domain(0)), original);
+                let catalog = storage.type_catalog.lock().unwrap();
+                assert_eq!(catalog.versions.get(NamedTypeSlot::Domain(0)), version);
+                assert_eq!(catalog.enums[0].ddl_state, super::super::CatalogDdlState::Absent);
+                assert_eq!(catalog.identities.lookup(super::super::current_database(), 41), Some(NamedTypeSlot::Domain(0)));
+            }
+            assert_eq!(storage.finish_enum_replay(schema, enumeration, 1, 42).unwrap(), 0);
+            assert_eq!(storage.enum_for(0, 0).sort_of("saved"), Some(1.0));
+            assert_eq!(storage.catalog_identity_sequence(), 42);
+            let catalog = storage.type_catalog.lock().unwrap();
+            assert_eq!(catalog.identities.lookup(super::super::current_database(), 41), Some(NamedTypeSlot::Domain(0)));
+            assert_eq!(catalog.identities.lookup(super::super::current_database(), 42), Some(NamedTypeSlot::Enum(0)));
+        });
+    }
+
+    #[test]
     fn type_recovery_installs_saved_birth_when_the_catalog_sequence_is_exhausted() {
         for manifest in [false, true] {
             for source in SOURCES {

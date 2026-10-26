@@ -14532,7 +14532,7 @@ fn pg_shdescription<'a>(
             count += 1;
             continue;
         }
-        let Some((_, tablespace)) = storage
+        let Some((slot, tablespace)) = storage
             .tablespaces_visible_to(txid)
             .find(|(_, tablespace)| tablespace.name_for(txid).as_str() == name)
         else {
@@ -14540,7 +14540,7 @@ fn pg_shdescription<'a>(
         };
         rows[count] = row(
             &[
-                Datum::Int4(tablespace_oid(tablespace)),
+                Datum::Int4(tablespace_oid(slot, tablespace)),
                 Datum::Int4(PG_TABLESPACE_OID),
                 text(description, arena)?,
             ],
@@ -15064,9 +15064,9 @@ fn visit_comments_for_object(
             "pg_tablespace" => {
                 class == crate::storage::CommentClass::Tablespace
                     && subid == 0
-                    && storage.tablespaces_visible_to(txid).any(|(_, tablespace)| {
+                    && storage.tablespaces_visible_to(txid).any(|(slot, tablespace)| {
                         tablespace.name_for(txid).as_str() == name
-                            && Some(tablespace_oid(tablespace)) == signed_oid
+                            && Some(tablespace_oid(slot, tablespace)) == signed_oid
                     })
             }
             "pg_database" => {
@@ -20246,8 +20246,13 @@ fn pg_class<'a>(
     )
 }
 
-pub(crate) fn tablespace_oid(tablespace: crate::storage::TablespaceDef) -> i32 {
-    210_000 + i32::try_from(tablespace.created_at).unwrap_or(i32::MAX - 210_000)
+pub(crate) fn tablespace_oid(slot: usize, tablespace: crate::storage::TablespaceDef) -> i32 {
+    match slot {
+        0 => 1663,
+        1 => 1664,
+        _ => crate::storage::TablespaceIdentity::parse(tablespace.created_at)
+            .expect("admitted tablespace creation stamp").oid(),
+    }
 }
 
 fn catalog_tablespace_oid(storage: &Storage, id: u16, txid: u32) -> i32 {
@@ -20258,7 +20263,8 @@ fn catalog_tablespace_oid(storage: &Storage, id: u16, txid: u32) -> i32 {
         // relations.
         0 => 0,
         1 => 1664,
-        _ => storage.tablespace_by_id(id, txid).map_or(0, tablespace_oid),
+        _ => storage.tablespace_by_id(id, txid).map_or(0, |definition|
+            tablespace_oid(usize::from(id) - 2, definition)),
     }
 }
 
@@ -20320,11 +20326,7 @@ fn pg_tablespace<'a>(
         rows[count] = row(
             &[
                 Datum::Int4(1213),
-                Datum::Int4(match tablespace.name_for(txid).as_str() {
-                    "pg_default" => 1663,
-                    "pg_global" => 1664,
-                    _ => tablespace_oid(tablespace),
-                }),
+                Datum::Int4(tablespace_oid(slot, tablespace)),
                 text(tablespace.name_for(txid).as_str(), arena)?,
                 Datum::Int4(storage.role_oid(storage.object_owner(object, txid))),
                 acl(storage, object, txid, arena)?,
@@ -20346,8 +20348,8 @@ pub(crate) fn tablespace_location_by_oid<'a>(
     if oid == 1663 || oid == 1664 {
         return Ok(Some(""));
     }
-    for (_, tablespace) in storage.tablespaces_visible_to(txid) {
-        if tablespace_oid(tablespace) == oid {
+    for (slot, tablespace) in storage.tablespaces_visible_to(txid) {
+        if tablespace_oid(slot, tablespace) == oid {
             return arena
                 .alloc_str(tablespace.location.as_str())
                 .map(Some)
@@ -20357,30 +20359,7 @@ pub(crate) fn tablespace_location_by_oid<'a>(
     Ok(None)
 }
 
-pub(crate) fn tablespace_name_by_oid<'a>(
-    storage: &Storage,
-    txid: u32,
-    oid: i32,
-    arena: &'a Arena,
-) -> Result<Option<&'a str>, SqlError> {
-    let builtin = match oid {
-        1663 => Some("pg_default"),
-        1664 => Some("pg_global"),
-        _ => None,
-    };
-    if let Some(name) = builtin {
-        return Ok(Some(name));
-    }
-    for (_, tablespace) in storage.tablespaces_visible_to(txid) {
-        if tablespace_oid(tablespace) == oid {
-            return arena
-                .alloc_str(tablespace.name_for(txid).as_str())
-                .map(Some)
-                .map_err(|_| arena_full());
-        }
-    }
-    Ok(None)
-}
+
 
 fn index_reloptions<'a>(
     definition: Option<crate::storage::IndexMutableDefinition>,
@@ -30802,7 +30781,7 @@ fn pg_database<'a>(
             id => storage
                 .tablespaces_visible_to(txid)
                 .find(|(slot, _)| *slot + 2 == usize::from(id))
-                .map_or(0, |(_, tablespace)| tablespace_oid(tablespace)),
+                .map_or(0, |(slot, tablespace)| tablespace_oid(slot, tablespace)),
         };
         output[count] = row(
             &[

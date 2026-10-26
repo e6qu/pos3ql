@@ -1292,7 +1292,7 @@ fn private_index_bindings_survive_table_changes_savepoints_and_cold_recovery() {
 }
 
 #[test]
-fn numeric_type_schema_and_function_privileges_match_postgresql_before_lookup() {
+fn numeric_object_privileges_match_postgresql_before_lookup() {
     for mode in [
         crate::config::TransactionMode::Mvcc,
         crate::config::TransactionMode::Locking,
@@ -1308,7 +1308,7 @@ fn numeric_type_schema_and_function_privileges_match_postgresql_before_lookup() 
                 include_str!("../../tests/external/differential_exact/25_numeric_privileges.sql"),
                 true
             )),
-            ["t", "t", "t"]
+            ["t"; 6]
         );
         let mut states = Vec::new();
         for statement in
@@ -1322,9 +1322,7 @@ fn numeric_type_schema_and_function_privileges_match_postgresql_before_lookup() 
         }
         assert_eq!(
             states,
-            [
-                "22023", "22023", "22023", "22023", "22023", "22023", "42704", "3F000", "42883"
-            ]
+            ["22023", "22023", "22023", "22023", "22023", "22023", "22023", "22023", "22023", "22023", "22023", "22023", "22023", "22023", "22023", "22023", "22023", "22023", "42704", "3F000", "42883", "42704", "3D000", "42704", "42704", "42704", "22P02"]
         );
     }
 }

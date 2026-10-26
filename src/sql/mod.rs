@@ -23372,7 +23372,7 @@ fn apply_wal_op(
                 ));
             }
             let slot = storage.create_tablespace(
-                created_at,
+                crate::storage::TablespaceCreation::restored(created_at)?,
                 crate::storage::SqlName::parse(name)?,
                 location,
                 options,

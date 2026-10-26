@@ -498,8 +498,9 @@ SELECT has_table_privilege(oid, 'SELECT') IS NULL FROM saved_table_id;
 ```
 
 Privilege checks by numeric identifier have PostgreSQL's role-dependent rules.
-For a missing type, schema or function identifier, a superuser receives `true`
-and an ordinary account receives `NULL`. Missing names still raise an error,
+For a missing type, schema, function, language, database, tablespace, foreign-data
+wrapper, server or large-object identifier, a superuser receives `true` and an
+ordinary account receives `NULL`. Missing names still raise an error,
 and invalid privilege names fail for either account. For example,
 `has_type_privilege(2147483647::oid, 'USAGE')` returns `true` for a superuser.
 A missing table or sequence identifier returns `NULL` for either account.

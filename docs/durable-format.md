@@ -371,6 +371,12 @@ readable. Enum-dependent most-common-value hash summaries from older manifests
 or journal kind 77 are retired while their counts and dependency estimates remain
 valid. ANALYZE recreates these cached summaries. New summaries use journal kind 150. Label edits and sort renumbering do not rewrite table rows. The current manifest and journal framing reject incompatible recovery candidates before they can interpret these records.
 
+Built-in tablespaces keep OIDs 1663 and 1664. Custom tablespace OIDs are
+210,000 plus their positive creation stamp, bounded by the largest signed
+32-bit OID. Fresh and restored creation are explicit choices. Exhaustion returns
+`54000`; a zero, out-of-range or duplicate stored stamp is rejected before
+publication. No conversion saturates or substitutes an identifier.
+
 Named-type source references admit creation stamps from 1 through 9,999,999.
 Their checked three-byte runtime representation cannot contain zero or an
 out-of-range value. Fresh creation returns `54000` when the shared catalog

@@ -1446,7 +1446,7 @@ pub trait CatalogAccess {
     fn has_language_privilege(
         &self,
         _role: Option<&str>,
-        _language: &str,
+        _language: PrivilegeObject<'_>,
         _privileges: &str,
     ) -> Result<Option<bool>, SqlError> {
         Ok(None)
@@ -1462,18 +1462,16 @@ pub trait CatalogAccess {
     fn has_database_privilege(
         &self,
         _role: Option<&str>,
-        _database: &str,
+        _database: PrivilegeObject<'_>,
         _privileges: &str,
     ) -> Result<Option<bool>, SqlError> {
         Ok(None)
     }
-    fn database_name<'a>(&self, _oid: i32, _arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
-        Ok(None)
-    }
+
     fn has_tablespace_privilege(
         &self,
         _role: Option<&str>,
-        _tablespace: &str,
+        _tablespace: PrivilegeObject<'_>,
         _privileges: &str,
     ) -> Result<Option<bool>, SqlError> {
         Ok(None)
@@ -1481,7 +1479,7 @@ pub trait CatalogAccess {
     fn has_foreign_data_wrapper_privilege(
         &self,
         _role: Option<&str>,
-        _wrapper: &str,
+        _wrapper: PrivilegeObject<'_>,
         _privileges: &str,
     ) -> Result<Option<bool>, SqlError> {
         Ok(None)
@@ -1489,7 +1487,7 @@ pub trait CatalogAccess {
     fn has_server_privilege(
         &self,
         _role: Option<&str>,
-        _server: &str,
+        _server: PrivilegeObject<'_>,
         _privileges: &str,
     ) -> Result<Option<bool>, SqlError> {
         Ok(None)
@@ -1497,32 +1495,14 @@ pub trait CatalogAccess {
     fn has_largeobject_privilege(
         &self,
         _role: Option<&str>,
-        _large_object: &str,
+        _large_object: PrivilegeObject<'_>,
         _privileges: &str,
     ) -> Result<Option<bool>, SqlError> {
         Ok(None)
     }
-    fn foreign_data_wrapper_name<'a>(
-        &self,
-        _oid: i32,
-        _arena: &'a Arena,
-    ) -> Result<Option<&'a str>, SqlError> {
-        Ok(None)
-    }
-    fn foreign_server_name<'a>(
-        &self,
-        _oid: i32,
-        _arena: &'a Arena,
-    ) -> Result<Option<&'a str>, SqlError> {
-        Ok(None)
-    }
-    fn large_object_name<'a>(
-        &self,
-        _oid: i32,
-        _arena: &'a Arena,
-    ) -> Result<Option<&'a str>, SqlError> {
-        Ok(None)
-    }
+
+
+
     fn has_parameter_privilege(
         &self,
         _role: Option<&str>,
@@ -1531,16 +1511,8 @@ pub trait CatalogAccess {
     ) -> Result<Option<bool>, SqlError> {
         Ok(None)
     }
-    fn tablespace_name<'a>(
-        &self,
-        _oid: i32,
-        _arena: &'a Arena,
-    ) -> Result<Option<&'a str>, SqlError> {
-        Ok(None)
-    }
-    fn language_name<'a>(&self, _oid: i32, _arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
-        Ok(None)
-    }
+
+
     /// The comment text on the object with this OID and column `subid` (0 for
     /// the object itself), or `None`. `catalog_name` selects the owning
     /// catalog (`pg_class`, `pg_namespace`, or `pg_type`). Backs

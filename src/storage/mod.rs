@@ -69,6 +69,8 @@ mod type_contracts;
 mod type_creation;
 mod type_definitions;
 pub(crate) use type_definitions::{TypeDefinitionImages, TypeDefinitionTarget};
+mod tablespace_identities;
+pub(crate) use tablespace_identities::{TablespaceCreation, TablespaceIdentity};
 mod type_identities;
 mod type_names;
 mod type_reference_moves;
@@ -47313,7 +47315,7 @@ impl Storage {
 
     pub(crate) fn create_tablespace(
         &self,
-        created_at: u64,
+        creation: TablespaceCreation,
         name: SqlName,
         location: StackStr<TABLESPACE_LOCATION_MAX>,
         options: TablespaceOptions,
@@ -47353,6 +47355,12 @@ impl Storage {
                     "tablespace catalog capacity exhausted"
                 )
             })?;
+        let created_at = creation.value(&self.catalog_sequence)?;
+        if tablespaces.iter().enumerate().skip(2).any(|(_, definition)|
+            definition.ddl_state != CatalogDdlState::Absent && definition.created_at == created_at)
+        {
+            return Err(sql_err!(sqlstate::DATA_EXCEPTION, "tablespace creation identity is duplicated"));
+        }
         let definition = self.tablespace_definition(
             TablespaceImage {
                 created_at,
@@ -47443,6 +47451,11 @@ impl Storage {
                 slot
             ));
         }
+        if tablespaces.iter().enumerate().skip(2).any(|(other, definition)| other != slot
+            && definition.ddl_state != CatalogDdlState::Absent && definition.created_at == created_at)
+        {
+            return Err(sql_err!(sqlstate::DATA_EXCEPTION, "tablespace creation identity is duplicated"));
+        }
         let mut definition = self.tablespace_definition(
             TablespaceImage {
                 created_at,
@@ -47493,12 +47506,10 @@ impl Storage {
         image: TablespaceImage,
         txid: u32,
     ) -> Result<TablespaceDef, SqlError> {
-        let created_at = if image.created_at == 0 {
-            self.catalog_sequence.next()?
-        } else {
-            self.catalog_sequence.observe(image.created_at);
-            image.created_at
-        };
+        let identity = TablespaceIdentity::parse(image.created_at).ok_or_else(||
+            sql_err!(sqlstate::DATA_EXCEPTION, "stored tablespace creation identity is outside its OID range"))?;
+        let created_at = identity.created_at();
+        self.catalog_sequence.observe(created_at);
         Ok(TablespaceDef {
             created_at,
             name: image.name,
@@ -61039,7 +61050,7 @@ label: SqlName::parse(label.as_str()).unwrap(),
                     let txid = worker as u32 + 1;
                     let slot = storage
                         .create_tablespace(
-                            0,
+                            TablespaceCreation::Fresh,
                             SqlName::parse(worker_name).unwrap(),
                             StackStr::from_str("/data"),
                             TablespaceOptions::DEFAULT,
@@ -61072,7 +61083,7 @@ label: SqlName::parse(label.as_str()).unwrap(),
         assert_eq!(
             storage
                 .create_tablespace(
-                    0,
+                    TablespaceCreation::Fresh,
                     SqlName::parse("space_full").unwrap(),
                     StackStr::from_str("/data"),
                     TablespaceOptions::DEFAULT,
@@ -61097,7 +61108,7 @@ label: SqlName::parse(label.as_str()).unwrap(),
 
         let reused = storage
             .create_tablespace(
-                0,
+                TablespaceCreation::Fresh,
                 SqlName::parse("space_reused").unwrap(),
                 StackStr::from_str("/reused"),
                 TablespaceOptions::DEFAULT,
@@ -61112,7 +61123,7 @@ label: SqlName::parse(label.as_str()).unwrap(),
 
         let pending = storage
             .create_tablespace(
-                0,
+                TablespaceCreation::Fresh,
                 SqlName::parse("space_pending").unwrap(),
                 StackStr::from_str("/pending"),
                 TablespaceOptions::DEFAULT,
@@ -61123,7 +61134,7 @@ label: SqlName::parse(label.as_str()).unwrap(),
         assert_eq!(
             storage
                 .create_tablespace(
-                    0,
+                    TablespaceCreation::Fresh,
                     SqlName::parse("space_pending").unwrap(),
                     StackStr::from_str("/other"),
                     TablespaceOptions::DEFAULT,

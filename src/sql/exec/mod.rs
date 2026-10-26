@@ -51203,7 +51203,7 @@ pub fn create_tablespace(
         Err(error) => return sql_fail(error),
     };
     let options = stored_tablespace_options(options);
-    let slot = match storage.create_tablespace(0, name, location, options, owner as u16, txn.txid) {
+    let slot = match storage.create_tablespace(crate::storage::TablespaceCreation::Fresh, name, location, options, owner as u16, txn.txid) {
         Ok(slot) => slot,
         Err(error) => return sql_fail(error),
     };

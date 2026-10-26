@@ -58,7 +58,7 @@ jobs:
           docker exec "$POSTGRES_CONTAINER" createdb -U postgres numeric_privilege_errors
           docker exec -i "$POSTGRES_CONTAINER" psql -U postgres -d numeric_privilege_errors -X -Atq -v VERBOSITY=verbose < tests/external/differential_exact/26_numeric_privilege_errors.sql > "$RUNNER_TEMP/26_numeric_privilege_errors.reference" 2>&1
           sed -nE 's/^ERROR:  ([0-9A-Z]{5}):.*/\1/p' "$RUNNER_TEMP/26_numeric_privilege_errors.reference" > "$RUNNER_TEMP/privilege-states"
-          printf '%s\n' 22023 22023 22023 22023 22023 22023 42704 3F000 42883 > "$RUNNER_TEMP/expected-privilege-states"
+          printf '%s\n' 22023 22023 22023 22023 22023 22023 22023 22023 22023 22023 22023 22023 22023 22023 22023 22023 22023 22023 42704 3F000 42883 42704 3D000 42704 42704 42704 22P02 > "$RUNNER_TEMP/expected-privilege-states"
           diff -u "$RUNNER_TEMP/expected-privilege-states" "$RUNNER_TEMP/privilege-states"
       - name: Format and retain correction
         run: |
@@ -72,8 +72,8 @@ jobs:
       - name: Diagnose new cold-recovery and privilege regressions
         shell: bash
         run: |
-          python3 tools/test_command.py cargo test --lib --locked -- named_type_cached_defaults numeric_type_schema type_recovery_installs_saved_birth restored_type_identity_rejects --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/new-type-regressions.log"
-          grep -Eq 'test result: ok\. 5 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/new-type-regressions.log"
+          python3 tools/test_command.py cargo test --lib --locked -- named_type_cached_defaults numeric_object_privileges type_recovery_installs_saved_birth restored_type_identity_rejects tablespace_identity_bounds --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/new-type-regressions.log"
+          grep -Eq 'test result: ok\. 6 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/new-type-regressions.log"
       - name: Enum label identities, corruption and replay lock regression
         shell: bash
         run: |
@@ -82,7 +82,7 @@ jobs:
       - name: Named type lifecycle, recovery and startup accounting
         shell: bash
         run: |
-          python3 tools/test_command.py cargo test --lib --locked -- type_ domain enum composite database_clone relation_identity_ budget startup --test-threads=1 2>&1 | tee "$RUNNER_TEMP/type-lifetimes.log"
+          python3 tools/test_command.py cargo test --lib --locked -- type_ domain enum composite database_clone relation_identity_ budget startup privilege tablespace foreign_wrapper foreign_server large_object language --test-threads=1 2>&1 | tee "$RUNNER_TEMP/type-lifetimes.log"
           grep -Eq 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/type-lifetimes.log"
       - name: Build every target and lint
         run: cargo clippy --all-targets --locked -- -D warnings

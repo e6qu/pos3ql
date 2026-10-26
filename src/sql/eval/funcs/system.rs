@@ -167,46 +167,6 @@ fn privilege_role_name<'a>(
     }
 }
 
-fn privilege_object_name<'a>(
-    value: Datum<'a>,
-    function: &str,
-    catalog: &dyn super::super::CatalogAccess,
-    arena: &'a crate::mem::arena::Arena,
-) -> Result<Option<&'a str>, SqlError> {
-    match value {
-        Datum::Text(object) => Ok(Some(object)),
-        value @ (Datum::Int4(_) | Datum::Oid(_) | Datum::Int8(_) | Datum::RegObject { .. }) => {
-            let oid = CatalogOid::parse(value)?
-                .expect("identity datum is non-null")
-                .0;
-            if function == "has_function_privilege" {
-                catalog.routine_name(oid, true, arena)
-            } else if function == "has_language_privilege" {
-                catalog.language_name(oid, arena)
-            } else if function == "has_schema_privilege" {
-                catalog.schema_name(oid, arena)
-            } else if function == "has_database_privilege" {
-                catalog.database_name(oid, arena)
-            } else if function == "has_tablespace_privilege" {
-                catalog.tablespace_name(oid, arena)
-            } else if function == "has_foreign_data_wrapper_privilege" {
-                catalog.foreign_data_wrapper_name(oid, arena)
-            } else if function == "has_server_privilege" {
-                catalog.foreign_server_name(oid, arena)
-            } else if function == "has_largeobject_privilege" {
-                catalog.large_object_name(oid, arena)
-            } else {
-                catalog.relname(oid, arena)
-            }
-        }
-        Datum::Null => Ok(None),
-        _ => Err(sql_err!(
-            sqlstate::DATATYPE_MISMATCH,
-            "object must be specified by name or oid"
-        )),
-    }
-}
-
 std::thread_local! {
     static SESSION_USER: core::cell::Cell<crate::storage::SessionIdentity> =
         core::cell::Cell::new(crate::storage::SessionIdentity::bootstrap());
@@ -1732,6 +1692,8 @@ pub(crate) fn dispatch<'a>(
                 if matches!(
                     name,
                     "has_type_privilege" | "has_schema_privilege" | "has_function_privilege"
+                        | "has_language_privilege" | "has_database_privilege" | "has_tablespace_privilege"
+                        | "has_foreign_data_wrapper_privilege" | "has_server_privilege" | "has_largeobject_privilege"
                 ) {
                     let target = match object {
                         Datum::Text(name) => super::super::PrivilegeObject::Name(name),
@@ -1749,49 +1711,22 @@ pub(crate) fn dispatch<'a>(
                         "has_function_privilege" => {
                             cat.has_function_privilege(role, target, privilege)?
                         }
+                        "has_language_privilege" => cat.has_language_privilege(role, target, privilege)?,
+                        "has_database_privilege" => cat.has_database_privilege(role, target, privilege)?,
+                        "has_tablespace_privilege" => cat.has_tablespace_privilege(role, target, privilege)?,
+                        "has_foreign_data_wrapper_privilege" => cat.has_foreign_data_wrapper_privilege(role, target, privilege)?,
+                        "has_server_privilege" => cat.has_server_privilege(role, target, privilege)?,
+                        "has_largeobject_privilege" => cat.has_largeobject_privilege(role, target, privilege)?,
                         _ => unreachable!("typed object privilege function was classified"),
                     };
                     return Ok(answer.map_or(Datum::Null, Datum::Bool));
                 }
-                let object = if name == "has_parameter_privilege" {
-                    match object {
-                        Datum::Text(parameter) => parameter,
-                        _ => {
-                            return Err(sql_err!(
-                                sqlstate::DATATYPE_MISMATCH,
-                                "has_parameter_privilege() requires a text parameter name"
-                            ));
-                        }
-                    }
-                } else {
-                    match privilege_object_name(object, name, cat, arena)? {
-                        Some(object) => object,
-                        None => return Ok(Datum::Null),
-                    }
+                let Datum::Text(parameter) = object else {
+                    return Err(sql_err!(sqlstate::DATATYPE_MISMATCH,
+                        "has_parameter_privilege() requires a text parameter name"));
                 };
-                let answer = match name {
-                    "has_language_privilege" => {
-                        cat.has_language_privilege(role, object, privilege)?
-                    }
-                    "has_database_privilege" => {
-                        cat.has_database_privilege(role, object, privilege)?
-                    }
-                    "has_tablespace_privilege" => {
-                        cat.has_tablespace_privilege(role, object, privilege)?
-                    }
-                    "has_foreign_data_wrapper_privilege" => {
-                        cat.has_foreign_data_wrapper_privilege(role, object, privilege)?
-                    }
-                    "has_server_privilege" => cat.has_server_privilege(role, object, privilege)?,
-                    "has_largeobject_privilege" => {
-                        cat.has_largeobject_privilege(role, object, privilege)?
-                    }
-                    "has_parameter_privilege" => {
-                        cat.has_parameter_privilege(role, object, privilege)?
-                    }
-                    _ => unreachable!(),
-                };
-                Ok(answer.map(Datum::Bool).unwrap_or(Datum::Null))
+                let answer = cat.has_parameter_privilege(role, parameter, privilege)?;
+                Ok(answer.map_or(Datum::Null, Datum::Bool))
             }
             _ if predicate == Some(CatalogPredicateKind::Object) => {
                 let name = name.strip_prefix("pg_catalog.").unwrap_or(name);

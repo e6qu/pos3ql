@@ -1313,6 +1313,53 @@ fn named_type_default_arrays_preserve_declared_types_without_allocation() {
 }
 
 #[test]
+fn named_type_cached_defaults_survive_empty_cache_wal_and_checkpoint_recovery() {
+    let fixture = include_str!("../../tests/external/differential_exact/23_named_type_defaults.sql");
+    let (setup, remainder) = fixture
+        .split_once("INSERT INTO type_default_scope.orders DEFAULT VALUES;")
+        .unwrap();
+    let (queries, _) = remainder.split_once("DROP TABLE type_default_scope.orders;").unwrap();
+    for checkpoint in [false, true] {
+        for mode in [
+            crate::config::TransactionMode::Mvcc,
+            crate::config::TransactionMode::Locking,
+        ] {
+            let name = format!("named-type-cached-defaults-{checkpoint}-{mode:?}");
+            let mut config = test_config(&name);
+            config.transaction_mode = mode;
+            config.max_ddl_per_transaction = 32;
+            config.object_store_on = true;
+            config.object_store_sim = true;
+            config.wal_upload = true;
+            config.wal_upload_sync = true;
+            config.object_store_bucket = format!("{name}-{}", std::process::id());
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+            {
+                let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+                let mut engine = Engine::new(&config, &mut budget).unwrap();
+                let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+                session.success(&mut engine, setup, true);
+                session.success(&mut engine, "INSERT INTO type_default_scope.orders DEFAULT VALUES", true);
+                assert_eq!(data_rows(&session.success(&mut engine, queries, true)), ["t", "t"]);
+                if checkpoint { assert!(engine.checkpoint().unwrap()); }
+                engine.commit_wal().unwrap();
+            }
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+            {
+                let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+                let mut engine = Engine::new(&config, &mut budget).unwrap();
+                let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+                assert_eq!(data_rows(&session.success(&mut engine, queries, true)), ["t", "t"]);
+                session.success(&mut engine, "INSERT INTO type_default_scope.orders DEFAULT VALUES", true);
+                assert_eq!(data_rows(&session.success(&mut engine, queries, true)), ["t", "t", "t", "t"]);
+            }
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        }
+    }
+}
+
+#[test]
 fn relation_identity_replacement_and_constraint_edits_match_postgresql() {
     for mode in [
         crate::config::TransactionMode::Mvcc,

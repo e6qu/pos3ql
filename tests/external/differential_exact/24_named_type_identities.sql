@@ -11,6 +11,8 @@ SELECT e.oid AS identity, e.enumlabel AS label
   FROM pg_enum e WHERE e.enumtypid = 'type_identity_scope.status'::regtype;
 ALTER TYPE type_identity_scope.status RENAME VALUE 'new' TO 'pending';
 ALTER TYPE type_identity_scope.status ADD VALUE 'refunded' BEFORE 'paid';
+SELECT count(*) = 1 FROM saved_enum_identities s JOIN pg_enum e ON e.oid = s.identity
+ WHERE s.label = 'new' AND e.enumlabel = 'pending';
 SELECT count(*) = 0 FROM saved_enum_identities s
   LEFT JOIN pg_enum e ON e.oid = s.identity WHERE e.oid IS NULL;
 ALTER DOMAIN type_identity_scope.quantity RENAME TO amount;
@@ -30,12 +32,16 @@ SELECT count(*) = 0 FROM pg_enum e JOIN saved_enum_identities s ON e.oid = s.ide
 SELECT count(*) = 0 FROM saved_type_identities WHERE has_type_privilege(identity, 'USAGE') IS NOT NULL;
 SELECT count(*) = 0 FROM saved_type_identities WHERE pg_type_is_visible(identity) IS NOT NULL;
 SELECT count(*) = 0 FROM saved_type_identities s JOIN pg_class c ON c.oid = s.relation WHERE s.relation <> 0;
+CREATE TABLE current_type_identity AS SELECT 'type_identity_scope.status'::regtype::oid AS identity;
 BEGIN;
 SAVEPOINT before_type;
-CREATE TYPE type_identity_scope.discarded AS ENUM ('one');
-CREATE TEMP TABLE discarded_type_identity AS SELECT 'type_identity_scope.discarded'::regtype::oid AS identity;
+DROP TYPE type_identity_scope.item, type_identity_scope.status;
+CREATE TYPE type_identity_scope.status AS ENUM ('one');
+SELECT identity <> 'type_identity_scope.status'::regtype::oid FROM current_type_identity;
 ROLLBACK TO SAVEPOINT before_type;
+SELECT identity = 'type_identity_scope.status'::regtype::oid FROM current_type_identity;
 COMMIT;
+DROP TABLE current_type_identity;
 DROP TYPE type_identity_scope.item, type_identity_scope.status;
 DROP DOMAIN type_identity_scope.quantity;
 DROP SCHEMA type_identity_scope;

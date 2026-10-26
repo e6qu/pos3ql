@@ -27349,7 +27349,7 @@ fn publication_via_partition_root_emits_root_relation_identity() {
 }
 
 #[test]
-fn publication_via_partition_root_covers_update_delete_and_truncate() {
+fn publication_via_partition_root_uses_catalog_identity_for_every_change() {
     let (mut engine, mut budget) = test_engine();
     let mut transaction = TxnState::new(&mut budget, 256).unwrap();
     run_txn(
@@ -27368,8 +27368,17 @@ fn publication_via_partition_root_covers_update_delete_and_truncate() {
     let mut send =
         crate::mem::FixedBuf::new(&mut budget, "root ops replication send", 1 << 16).unwrap();
     let publication = [crate::storage::SqlName::parse("root_ops").unwrap()];
+    let root_oids = data_rows(&run_with_txn_bytes(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        "SELECT 'publication_root_ops'::regclass::oid",
+    ));
+    assert_eq!(root_oids.len(), 1);
+    let root_oid: u32 = root_oids[0].parse().unwrap();
 
     for (statement, operation) in [
+        ("INSERT INTO publication_root_ops VALUES (3)", b'I'),
         ("UPDATE publication_root_ops SET id = 2 WHERE id = 1", b'U'),
         ("DELETE FROM publication_root_ops WHERE id = 2", b'D'),
         ("TRUNCATE publication_root_ops", b'T'),
@@ -27390,18 +27399,48 @@ fn publication_via_partition_root_covers_update_delete_and_truncate() {
             .unwrap()
             .expect("partition operation is retained");
         assert!(emitted);
-        assert!(send.readable().contains(&operation));
-        assert!(
-            send.readable()
-                .windows(b"publication_root_ops".len())
-                .any(|window| window == b"publication_root_ops")
-        );
-        assert!(
-            !send
-                .readable()
-                .windows(b"publication_root_ops_leaf".len())
-                .any(|window| window == b"publication_root_ops_leaf")
-        );
+        let mut at = 0;
+        let mut declarations = 0;
+        let mut changes = 0;
+        while at < send.len() {
+            let bytes = send.readable();
+            assert_eq!(bytes[at], b'd');
+            let length = u32::from_be_bytes(bytes[at + 1..at + 5].try_into().unwrap()) as usize;
+            let payload = &bytes[at + 5..at + 1 + length];
+            if let crate::pg::pginput::CopyData::XLogData { message, .. } =
+                crate::pg::pginput::copy_data(payload).unwrap()
+            {
+                use crate::pg::pginput::Message;
+                let row_change = match message {
+                    Message::Relation { relation, .. } => {
+                        assert_eq!(relation.id, root_oid);
+                        assert_eq!(relation.name, "publication_root_ops");
+                        declarations += 1;
+                        None
+                    }
+                    Message::Insert { relation_id, .. } => Some((b'I', relation_id)),
+                    Message::Update { relation_id, .. } => Some((b'U', relation_id)),
+                    Message::Delete { relation_id, .. } => Some((b'D', relation_id)),
+                    Message::Truncate { truncate, .. } => {
+                        assert_eq!(operation, b'T');
+                        assert_eq!(truncate.relation_ids().collect::<Vec<_>>(), [root_oid]);
+                        assert_eq!(declarations, 1);
+                        changes += 1;
+                        None
+                    }
+                    _ => None,
+                };
+                if let Some((tag, relation_id)) = row_change {
+                    assert_eq!(tag, operation);
+                    assert_eq!(relation_id, root_oid);
+                    assert_eq!(declarations, 1);
+                    changes += 1;
+                }
+            }
+            at += 1 + length;
+        }
+        assert_eq!(declarations, 1);
+        assert_eq!(changes, 1);
     }
 }
 

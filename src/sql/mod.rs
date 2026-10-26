@@ -2072,7 +2072,7 @@ fn emit_pending_truncates(
                 PublicationOperation::Truncate,
             )?;
             let definition = storage.table_def(output_slot, 0);
-            let relation_id = output_slot as u32 + 1;
+            let relation_id = catalog::user_table_oid(storage, output_slot) as u32;
             if relation_ids.contains(&relation_id) {
                 continue;
             }
@@ -5031,7 +5031,8 @@ impl Engine {
                                         table_slot,
                                         PublicationOperation::Update,
                                     )?;
-                                    let relation_id = output_slot as u32 + 1;
+                                    let relation_id =
+                                        catalog::user_table_oid(storage, output_slot) as u32;
                                     let replica_identity =
                                         logical_replica_identity(storage, output_slot)?;
                                     emit_replication_relation(
@@ -5101,7 +5102,8 @@ impl Engine {
                                         table_slot,
                                         PublicationOperation::Insert,
                                     )?;
-                                    let relation_id = output_slot as u32 + 1;
+                                    let relation_id =
+                                        catalog::user_table_oid(storage, output_slot) as u32;
                                     emit_replication_relation(
                                         storage,
                                         output_slot,
@@ -5214,7 +5216,8 @@ impl Engine {
                                     table_slot,
                                     PublicationOperation::Delete,
                                 )?;
-                                let relation_id = output_slot as u32 + 1;
+                                let relation_id =
+                                    catalog::user_table_oid(storage, output_slot) as u32;
                                 let replica_identity =
                                     logical_replica_identity(storage, output_slot)?;
                                 emit_replication_relation(

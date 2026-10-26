@@ -28,6 +28,12 @@ and logical decoding of prepared transactions are explicitly rejected.
 - Transactional message ordering uses the startup-sized work arena; there is no separate message-count ceiling. Work-memory exhaustion is a named error.
 - One complete emitted transaction must fit the startup-sized replication buffers. Exhaustion is a named error and cannot advance the slot.
 
+Relation declarations and row-change or truncate messages use the same table
+identifier as `SELECT 'orders'::regclass::oid`. With partition-root publication,
+that identifier belongs to the root table. Dropping and recreating a table gives
+its replacement a different identifier; a reused storage position cannot make
+the replacement look like the previous table.
+
 ### Keeping the initial copy consistent
 
 **User example:** an order changes while a subscriber copies the publisher's

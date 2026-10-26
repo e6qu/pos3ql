@@ -305,10 +305,14 @@ impl TypeIdentityIndex {
         })?;
         let key = TypeLifetimeKey { database, creation };
         if old != key {
-            return Err(sql_err!(sqlstate::DATA_EXCEPTION,
-                "restored type creation does not match its admitted source"));
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "restored type creation does not match its admitted source"
+            ));
         }
-        if allocated == target { return Ok(()); }
+        if allocated == target {
+            return Ok(());
+        }
         self.by_lifetime
             .remove(&old)
             .expect("source membership was checked");
@@ -596,15 +600,40 @@ mod tests {
             use crate::sql::types::{ArrElem, ColType};
             let creation = TypeCreation::parse(MAX_TYPE_CREATION).unwrap();
             for invalid in [
-                ArrElem::Enum(None), ArrElem::Composite(None),
-                ArrElem::Domain { identity: None, base_code: ColType::Int4.code(), base_identity: None },
-                ArrElem::Domain { identity: Some(creation), base_code: ColType::Enum(None).code(), base_identity: None },
-                ArrElem::Domain { identity: Some(creation), base_code: ColType::Composite(None).code(), base_identity: None },
-                ArrElem::Domain { identity: Some(creation), base_code: ColType::Int4.code(), base_identity: Some(creation) },
-                ArrElem::Domain { identity: Some(creation), base_code: ColType::Record.code(), base_identity: None },
+                ArrElem::Enum(None),
+                ArrElem::Composite(None),
+                ArrElem::Domain {
+                    identity: None,
+                    base_code: ColType::Int4.code(),
+                    base_identity: None,
+                },
+                ArrElem::Domain {
+                    identity: Some(creation),
+                    base_code: ColType::Enum(None).code(),
+                    base_identity: None,
+                },
+                ArrElem::Domain {
+                    identity: Some(creation),
+                    base_code: ColType::Composite(None).code(),
+                    base_identity: None,
+                },
+                ArrElem::Domain {
+                    identity: Some(creation),
+                    base_code: ColType::Int4.code(),
+                    base_identity: Some(creation),
+                },
+                ArrElem::Domain {
+                    identity: Some(creation),
+                    base_code: ColType::Record.code(),
+                    base_identity: None,
+                },
             ] {
-                assert_eq!(CachedArrayElement::from_element(invalid).unwrap_err().sqlstate,
-                    sqlstate::UNDEFINED_OBJECT);
+                assert_eq!(
+                    CachedArrayElement::from_element(invalid)
+                        .unwrap_err()
+                        .sqlstate,
+                    sqlstate::UNDEFINED_OBJECT
+                );
             }
             assert!(CachedArrayElement::from_bytes([255; 6]).is_none());
             let invalid_builtin = crate::sql::types::ArrElem::Enum(None).code();
@@ -671,17 +700,9 @@ mod tests {
                 .unwrap();
             assert_eq!(index.lookup(database, old), Some(NamedTypeSlot::Domain(1)));
             assert_eq!(index.lookup(other, creation(1)), None);
-            assert_eq!(
-                index.lookup(database, old),
-                Some(NamedTypeSlot::Domain(1))
-            );
-            index
-                .replace(NamedTypeSlot::Domain(0), other, old)
-                .unwrap();
-            assert_eq!(
-                index.lookup(other, old),
-                Some(NamedTypeSlot::Domain(0))
-            );
+            assert_eq!(index.lookup(database, old), Some(NamedTypeSlot::Domain(1)));
+            index.replace(NamedTypeSlot::Domain(0), other, old).unwrap();
+            assert_eq!(index.lookup(other, old), Some(NamedTypeSlot::Domain(0)));
             let duplicate = index
                 .relocate(
                     NamedTypeSlot::Domain(1),
@@ -691,14 +712,8 @@ mod tests {
                 )
                 .unwrap_err();
             assert_eq!(duplicate.sqlstate, sqlstate::DATA_EXCEPTION);
-            assert_eq!(
-                index.lookup(database, old),
-                Some(NamedTypeSlot::Domain(1))
-            );
-            assert_eq!(
-                index.lookup(other, old),
-                Some(NamedTypeSlot::Domain(0))
-            );
+            assert_eq!(index.lookup(database, old), Some(NamedTypeSlot::Domain(1)));
+            assert_eq!(index.lookup(other, old), Some(NamedTypeSlot::Domain(0)));
             assert_eq!(
                 index.lookup(database, creation(2)),
                 Some(NamedTypeSlot::Enum(0))

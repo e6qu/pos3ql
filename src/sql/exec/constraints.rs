@@ -264,6 +264,7 @@ pub(crate) fn column_domain_target(
         },
         txid,
     )?;
+    if bound.polymorphic_type().is_some() { return Ok(None); }
     let Some(identity) = bound.user_type else {
         return Ok(None);
     };

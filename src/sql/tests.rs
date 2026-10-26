@@ -1340,12 +1340,18 @@ fn named_type_public_identifiers_survive_edits_replacement_and_savepoint_rollbac
         let mut config = test_config(&format!("named-type-public-identifiers-{mode:?}"));
         config.transaction_mode = mode;
         config.max_ddl_per_transaction = 32;
+        config.max_domains = 1;
+        config.max_enums = 2;
+        config.max_composites = 1;
         let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
         let mut engine = Engine::new(&config, &mut budget).unwrap();
         let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
         let mut observations = 0;
-        for statement in include_str!("../../tests/external/differential_exact/24_named_type_identities.sql")
-            .split(';').map(str::trim).filter(|statement| !statement.is_empty())
+        for statement in
+            include_str!("../../tests/external/differential_exact/24_named_type_identities.sql")
+                .split(';')
+                .map(str::trim)
+                .filter(|statement| !statement.is_empty())
         {
             let output = session.success(&mut engine, statement, true);
             let rows = data_rows(&output);
@@ -1377,6 +1383,9 @@ fn named_type_public_identifiers_survive_journal_and_checkpoint_recovery() {
             let mut config = test_config(&name);
             config.transaction_mode = mode;
             config.max_ddl_per_transaction = 32;
+        config.max_domains = 1;
+        config.max_enums = 2;
+        config.max_composites = 1;
             config.object_store_on = true;
             config.object_store_sim = true;
             config.wal_upload = true;
@@ -1388,7 +1397,11 @@ fn named_type_public_identifiers_survive_journal_and_checkpoint_recovery() {
                 let mut engine = Engine::new(&config, &mut budget).unwrap();
                 let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
                 let mut observations = 0;
-                for statement in setup.split(';').map(str::trim).filter(|statement| !statement.is_empty()) {
+                for statement in setup
+                    .split(';')
+                    .map(str::trim)
+                    .filter(|statement| !statement.is_empty())
+                {
                     let output = session.success(&mut engine, statement, false);
                     let rows = data_rows(&output);
                     assert!(rows.iter().all(|row| row == "t"), "{statement}: {rows:?}");
@@ -1406,7 +1419,11 @@ fn named_type_public_identifiers_survive_journal_and_checkpoint_recovery() {
                 let mut engine = Engine::new(&config, &mut budget).unwrap();
                 let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
                 let mut observations = 0;
-                for statement in QUERIES.split(';').map(str::trim).filter(|statement| !statement.is_empty()) {
+                for statement in QUERIES
+                    .split(';')
+                    .map(str::trim)
+                    .filter(|statement| !statement.is_empty())
+                {
                     let output = session.success(&mut engine, statement, true);
                     let rows = data_rows(&output);
                     assert!(rows.iter().all(|row| row == "t"), "{statement}: {rows:?}");
@@ -1414,7 +1431,11 @@ fn named_type_public_identifiers_survive_journal_and_checkpoint_recovery() {
                 }
                 assert_eq!(observations, 3);
                 let mut observations = 0;
-                for statement in remaining.split(';').map(str::trim).filter(|statement| !statement.is_empty()) {
+                for statement in remaining
+                    .split(';')
+                    .map(str::trim)
+                    .filter(|statement| !statement.is_empty())
+                {
                     let output = session.success(&mut engine, statement, false);
                     let rows = data_rows(&output);
                     assert!(rows.iter().all(|row| row == "t"), "{statement}: {rows:?}");

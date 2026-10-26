@@ -85,7 +85,7 @@ jobs:
       - name: Named type lifecycle, recovery and startup accounting
         shell: bash
         run: |
-          python3 tools/test_command.py cargo test --lib --locked -- type_ domain enum composite database_clone relation_identity_ budget startup privilege tablespace foreign_wrapper foreign_server large_object language --test-threads=1 2>&1 | tee "$RUNNER_TEMP/type-lifetimes.log"
+          python3 tools/test_command.py cargo test --lib --locked -- type_ domain enum composite database_clone relation_identity_ budget startup privilege tablespace foreign_wrapper foreign_server large_object language polymorphic --test-threads=1 2>&1 | tee "$RUNNER_TEMP/type-lifetimes.log"
           grep -Eq 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/type-lifetimes.log"
       - name: Build every target and lint
         run: cargo clippy --all-targets --locked -- -D warnings

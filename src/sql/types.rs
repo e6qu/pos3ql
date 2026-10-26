@@ -3051,9 +3051,6 @@ impl ColType {
         }
     }
 
-    /// The catalog slot placed in [`ColType::Enum`] by [`from_code`](Self::from_code)
-    /// before the real slot is resolved from the persisted type name.
-
     /// Inverse of [`ColType::code`]; `None` for an unknown or corrupt code.
     pub fn from_code(code: u8) -> Option<Self> {
         Some(match code {

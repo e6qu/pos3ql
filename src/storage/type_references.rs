@@ -1461,10 +1461,14 @@ impl super::Storage {
             ));
         }
         if old_creation != created_at {
-            return Err(sql_err!(sqlstate::DATA_EXCEPTION,
-                "stored type creation does not match its admitted source"));
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "stored type creation does not match its admitted source"
+            ));
         }
-        catalog.identities.relocate(allocated, target, database, created_at)?;
+        catalog
+            .identities
+            .relocate(allocated, target, database, created_at)?;
         catalog.versions.swap(allocated, target);
         match target {
             NamedTypeSlot::Domain(_) => {

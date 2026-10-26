@@ -4511,7 +4511,7 @@ fn object_privilege_query(
     let Some(role) = privilege_role(storage, role, txid) else { return Ok(None); };
     let target = match target {
         PrivilegeObject::Name(value) if class == AccessClass::LargeObject => {
-            let oid = super::eval::cast::parse_oid(value)?;
+            let oid = super::eval::parse_oid(value)?;
             Lookup::Numeric(oid as i32)
         }
         PrivilegeObject::Name(name) => {

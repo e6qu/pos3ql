@@ -46,7 +46,7 @@ impl CatalogOid {
             // String literals are represented as text in the AST, so perform
             // that parse at this identity boundary and carry only CatalogOid
             // afterward.
-            Datum::Text(raw) => super::super::cast::parse_oid(raw)
+            Datum::Text(raw) => super::super::parse_oid(raw)
                 .map(|oid| Some(Self(oid as i32))),
             _ => Ok(None),
         }
@@ -75,7 +75,7 @@ impl ObjectOid {
                 .map(Some)
                 .map_err(|_| sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "OID out of range")),
             Datum::RegObject { referenced_oid, .. } => Ok(Some(Self(referenced_oid as u32))),
-            Datum::Text(raw) => super::super::cast::parse_oid(raw).map(|oid| Some(Self(oid))),
+            Datum::Text(raw) => super::super::parse_oid(raw).map(|oid| Some(Self(oid))),
             _ => Err(sql_err!(
                 sqlstate::DATATYPE_MISMATCH,
                 "object identity must be oid"

@@ -14038,16 +14038,11 @@ impl RelationTransactionStatistics {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum IndexStatisticsOwner {
+pub(crate) enum IndexStatisticsOwner {
     Implicit(u16),
     Explicit(u16),
 }
 
-impl IndexStatisticsOwner {
-    fn table(self) -> u16 {
-        match self { Self::Implicit(table) | Self::Explicit(table) => table }
-    }
-}
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct IndexCumulativeStatistics {
@@ -16158,7 +16153,7 @@ impl Storage {
                 let mut cumulative = self.cumulative_statistics();
                 let indexes = &mut cumulative.indexes;
                 let position = if let Some(position) = indexes.iter().position(|entry| entry.database == database && entry.oid == oid) {
-                    if indexes[position].owner.is_none_or(|owner| usize::from(owner.table()) != table) {
+                    if indexes[position].owner.is_none() {
                         return Err(sql_err!(sqlstate::SERIALIZATION_FAILURE, "index statistics source changed"));
                     }
                     position
@@ -16168,7 +16163,8 @@ impl Storage {
                     indexes.len() - 1
                 } else {
                     drop(cumulative);
-                    selected_owner = Some(self.index_statistics_owner(table, txid, oid)?);
+                    selected_owner = Some(crate::sql::catalog::index_statistics_owner(self, txid, oid)
+                        .ok_or_else(|| sql_err!(sqlstate::SERIALIZATION_FAILURE, "index statistics source changed"))?);
                     continue;
                 };
                 let statistics = &mut indexes[position];
@@ -16822,21 +16818,6 @@ impl Storage {
         if let Some(position) = statistics.iter().position(|entry| entry.database == database && entry.oid == oid) {
             statistics.swap_remove(position);
         }
-    }
-
-    fn index_statistics_owner(&self, table: usize, transaction: u32, oid: i32) -> Result<IndexStatisticsOwner, SqlError> {
-        let (implicit, schema, name) = {
-            let definition = self.table_def(table, transaction);
-            let implicit = definition.implicit_index_identities().flatten().any(|identity| identity.oid() == oid);
-            (implicit, definition.schema, definition.name)
-        };
-        let slot = u16::try_from(table).expect("startup table capacity is representable");
-        // Explicit adopted indexes also appear in the constraint definition.
-        if self.indexes_for(schema.as_str(), name.as_str(), transaction).any(|index| crate::sql::catalog::explicit_index_oid(&index) == oid) {
-            return Ok(IndexStatisticsOwner::Explicit(slot));
-        }
-        if implicit { return Ok(IndexStatisticsOwner::Implicit(slot)); }
-        Err(sql_err!(sqlstate::SERIALIZATION_FAILURE, "index statistics source changed"))
     }
 
     fn reset_implicit_index_statistics(&self, table: usize) {

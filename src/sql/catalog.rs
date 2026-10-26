@@ -11463,6 +11463,22 @@ fn visit_indexes(
     }
 }
 
+/// Counters belong to the index's table, which may be a scanned child partition.
+pub(crate) fn index_statistics_owner(storage: &Storage, transaction: u32, oid: i32) -> Option<crate::storage::IndexStatisticsOwner> {
+    let mut owner = None;
+    visit_indexes(storage, transaction, None, |index| {
+        if index.oid == oid {
+            let table = u16::try_from(index.table_slot).expect("startup table capacity is representable");
+            owner = Some(if index.explicit_definition.is_some() {
+                crate::storage::IndexStatisticsOwner::Explicit(table)
+            } else {
+                crate::storage::IndexStatisticsOwner::Implicit(table)
+            });
+        }
+    });
+    owner
+}
+
 /// Resolves the catalog identity of the plain-column value index selected by
 /// the storage probe path. Duplicate indexes must not all receive credit for
 /// one physical scan.

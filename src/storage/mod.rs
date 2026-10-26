@@ -71,6 +71,8 @@ mod type_definitions;
 pub(crate) use type_definitions::{TypeDefinitionImages, TypeDefinitionTarget};
 mod type_names;
 mod type_reference_moves;
+mod type_identities;
+pub use type_identities::TypeCreation;
 mod type_references;
 use crate::mem::mutex::{Mutex, MutexGuard};
 use enum_images::{EnumImageRead, EnumImageReservation, EnumMemberImages};

@@ -5924,31 +5924,7 @@ mod code_roundtrip_tests {
 #[allow(dead_code, reason = "temporary runner probe of candidate type layouts")]
 mod named_type_layout_probe {
     use super::*;
-    use core::num::NonZeroU8;
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    #[repr(C)]
-    struct ProposedCreation {
-        low: NonZeroU8,
-        upper: [u8; 2],
-    }
-
-    impl ProposedCreation {
-        fn parse(created_at: u64) -> Option<Self> {
-            if !(1..=9_999_999).contains(&created_at) {
-                return None;
-            }
-            let ordinal = u32::try_from(created_at - 1).ok()?;
-            Some(Self {
-                low: NonZeroU8::new((ordinal % 255 + 1) as u8)?,
-                upper: u16::try_from(ordinal / 255).ok()?.to_le_bytes(),
-            })
-        }
-
-        fn created_at(self) -> u64 {
-            u64::from(self.low.get() - 1) + 255 * u64::from(u16::from_le_bytes(self.upper))
-        }
-    }
+    use crate::storage::TypeCreation as ProposedCreation;
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum ProjectedColType {

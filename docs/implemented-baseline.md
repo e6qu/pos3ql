@@ -530,6 +530,26 @@ without installing a replacement; existing data and recovery remain usable.
 The [format guide](durable-format.md) specifies the bounds. Remaining identifier
 families stay in [PLAN.md](../PLAN.md).
 
+CHECK, foreign-key and NOT NULL constraints also keep independent identifiers.
+Removing an earlier rule or column does not renumber the surviving rules.
+Foreign-key triggers keep their identifiers and point to the same constraint.
+Dropping and recreating a rule gives it a new identifier, including when its name
+or catalog position is reused. These checks cover both transaction modes,
+savepoints, prepared transactions, and journal or checkpoint recovery after
+losing the local data directory.
+
+**User example:** an application saves the identifier of `amount_positive` from
+`pg_constraint`. Removing another CHECK on `orders` leaves that saved identifier
+valid. Dropping `amount_positive` and adding an identical CHECK makes the saved
+identifier disappear; it cannot accidentally select the replacement. A named
+NOT NULL clause such as `amount integer CONSTRAINT required_amount NOT NULL`
+keeps its supplied name when earlier columns are removed and after restart.
+`pg_get_constraintdef` describes that table rule as `NOT NULL amount`; a domain's
+NOT NULL rule is described as `NOT NULL`, matching
+[PostgreSQL 18.6](https://github.com/postgres/postgres/blob/REL_18_6/src/backend/utils/adt/ruleutils.c).
+The [shared SQL comparisons](../tests/external/differential_exact/28_constraint_identities.sql)
+exercise the identifier behavior against PostgreSQL.
+
 ALTER TABLE rewrites retain the source before choosing any input row identity.
 The chosen versions and their later reads therefore share one source through
 row changes, rollback, and maintenance. An ALTER that changes only a definition

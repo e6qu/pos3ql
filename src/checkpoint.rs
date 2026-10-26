@@ -20524,6 +20524,7 @@ mod stored_dependency_tests {
                 "pos3ql-manifest-v26",
                 "pos3ql-manifest-v27",
                 "pos3ql-manifest-v28",
+                "pos3ql-manifest-v29",
                 "pos3ql-manifest-v30 trailing",
             ] {
                 let rejected = stack_format!(512, "{header}\n{body}");
@@ -20994,6 +20995,9 @@ mod stored_dependency_tests {
             "pos3ql-manifest-v24",
             "pos3ql-manifest-v25",
             "pos3ql-manifest-v26",
+            "pos3ql-manifest-v27",
+            "pos3ql-manifest-v28",
+            "pos3ql-manifest-v29",
         ] {
             rejected.clear();
             rejected.append(format!("{header}\nlsn 7\nend\n").as_bytes());

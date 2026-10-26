@@ -1494,7 +1494,7 @@ fn constraint_declaration_names_and_rejections_match_postgresql() {
             assert!(rows.iter().all(|row| row == "t"), "{statement}: {rows:?}");
             observations += rows.len();
         }
-        assert_eq!(observations, 6);
+        assert_eq!(observations, 8);
     }
 }
 

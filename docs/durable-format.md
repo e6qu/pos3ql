@@ -31,8 +31,8 @@ they never select a guessed decoder.
 
 | Object | Identity | Read | Write | Migration |
 |---|---|---:|---:|---|
-| Checkpoint manifest | `pos3ql-manifest-v28` | yes | yes | Retains schema creation identities and database-owner roles, object-permission grant order, explicitly empty permission lists, index-presence hints, allocator counters, typed blocks, enum members, and exact table, view, rule, sequence, routine and materialized-view positions and creation stamps. |
-| Journal record | Version `16` at header byte 17; bytes 18–23 are zero | yes | yes | Schema create, drop and rename records retain creation identity. Catalog images retain declared types, hidden system-column positions, selected sources and permission grant order. Prepared comment roots rebind to restored sources. Parameter permissions retain complete replacement rows. Sequence restarts retain their transaction owner; materialized views retain the backing table identity. Older framing is rejected even when its checksum is valid. |
+| Checkpoint manifest | `pos3ql-manifest-v29` | yes | yes | Retains schema creation identities and database-owner roles, object-permission grant order, explicitly empty permission lists, index-presence hints, allocator counters, typed blocks, enum members, and exact table, view, rule, sequence, routine and materialized-view positions and creation stamps. |
+| Journal record | Version `17` at header byte 17; bytes 18–23 are zero | yes | yes | Schema create, drop and rename records retain creation identity. Catalog images retain declared types, hidden system-column positions, selected sources and permission grant order. Prepared comment roots rebind to restored sources. Parameter permissions retain complete replacement rows. Sequence restarts retain their transaction owner; materialized views retain the backing table identity. Older framing is rejected even when its checksum is valid. |
 | Immutable block | Header bytes 5–7: `01 00 00` | yes | yes | SHA-256 of `pos3ql:block:v1\0`, the one-byte block type, then payload; LSN is provenance, excluded from identity. |
 | Empty checkpoint root | `pos3ql-empty-manifest-v1` | yes | yes | Fences an as-yet unpublished manifest root. |
 | Commit head | `pos3ql-commit-head-v1` | yes | yes | Names the immutable commit chain and the publishing process incarnation. |
@@ -87,7 +87,7 @@ keys keep their stamps beside stable attribute numbers in the table definition;
 the shared column metadata stays within its existing 512-byte recovery bound.
 Renaming its constraint, dropping an earlier constraint, or moving its column preserves
 that identity. Replacing the index reserves a fresh stamp. Manifest
-`implicit_index POSITION CREATED_AT` records and table payload v10 store the
+`implicit_index POSITION CREATED_AT` records and table payload v11 store the
 complete set; missing, duplicate, out-of-range or truncated identities are
 rejected before installation. Recovery also checks relation identities across
 catalog families within each database before durable startup publication. A
@@ -127,7 +127,7 @@ filters and exact result checks can need more data.
 
 Catalog vectors retain their signed lower bounds in rows, projected values, and
 constant defaults. Each stored vector adds four bytes for this bound; writers
-and readers use manifest v28, journal v16, and table-definition payload v10.
+and readers use manifest v29, journal v17, and table-definition payload v10.
 The codec retains these bounds independently of SQL input conversion; SQL
 array-to-vector casts are rejected. Recovery tests cover text-created vectors,
 checkpointing, and recovery with empty local caches.
@@ -300,19 +300,35 @@ BEFORE another member. Renaming or renumbering never changes an existing member'
 identity. Row values keep this identity separately from their cached label and
 sort position. Catalog-aware reads select the current label and sort position.
 
-Enum manifest records include an optional legacy label after each member's sort bits.
-The retained enum payload readers for kinds 23/147 initialize this binding from their
-labels. Journal kind 149 writes the current label, sort bits, and an optional
-legacy label for each member; it retains the u32 member count. Existing legacy
-bindings survive later label changes. No missing identity is guessed.
+Public `pg_enum.oid` values use an independent creation stamp, starting at
+360,000,001 and ending at 369,999,999. They are distinct from the stable ordinal
+stored in row values. Renaming, changing sort position and adding labels preserve
+existing stamps; replacing a type reserves new ones. Each stamp fits in three
+runtime bytes without increasing the enum-member image size.
+
+The `enm3` manifest record writes each label's creation stamp after its sort bits
+and optional legacy label. Journal kind 149 writes the same facts, with a u32
+creation stamp after each optional legacy binding and a u32 member count. Enum
+journal kinds 23/147 are rejected. Recovery checks increasing member stamps,
+unchanged existing prefixes and uniqueness across types within each database;
+a fixed 8 KiB bitmap scans the admitted stamp ranges before writer promotion.
+No missing identity is guessed. Labels and sort positions must be unique; saved
+sort keys must be finite and exactly representable as PostgreSQL `float4`.
+Validation and sort renumbering use in-place sorts, then restore creation order
+so existing row-value ordinals cannot move.
 
 A row enum's u32 label-length high bit marks an additional u32 member identity
 before its cached label. A clear high bit retains the legacy decoder. Composite
 physical-field counts use bit 15 to mark records whose enum leaves contain member
 ordinals. The remaining bits retain the physical attribute count. The marker
 covers nested records and arrays; ordinary text fields retain their original text.
-Frozen enum defaults use journal/default tag 42 for a member identity; tag 12
-remains readable.
+Frozen enum defaults use tag 201 with a member identity or tag 202 with an
+explicit label binding. Both store a four-byte type creation stamp. Previous
+slot-based tags 12/42 are rejected. Cached array defaults use tag 200 and a
+checked six-byte element descriptor, including a domain's own creation and its
+named base creation. Previous array-default tags 21/41 are rejected. The same
+compact descriptor identifies arrays in schema-less spill rows; named scalar
+spill values carry a four-byte creation stamp.
 Their labels obey the [PostgreSQL 18 limit of 63 bytes](https://www.postgresql.org/docs/18/datatype-enum.html#DATATYPE-ENUM-IMPLEMENTATION-DETAILS).
 Object-reference defaults such as `'orders'::regclass` retain the full type and
 target OIDs in the encoded record. Their memory cache uses a closed type tag;
@@ -360,6 +376,34 @@ readable. Enum-dependent most-common-value hash summaries from older manifests
 or journal kind 77 are retired while their counts and dependency estimates remain
 valid. ANALYZE recreates these cached summaries. New summaries use journal kind 150. Label edits and sort renumbering do not rewrite table rows. The current manifest and journal framing reject incompatible recovery candidates before they can interpret these records.
 
+Built-in tablespaces keep OIDs 1663 and 1664. Custom tablespace OIDs are
+210,000 plus their positive creation stamp, bounded by the largest signed
+32-bit OID. Fresh and restored creation are explicit choices. Exhaustion returns
+`54000`; a zero, out-of-range or duplicate stored stamp is rejected before
+publication. No conversion saturates or substitutes an identifier.
+
+Named-type source references admit creation stamps from 1 through 9,999,999.
+SQL type identifiers add that stamp to disjoint bases: domains 180,000,000,
+enums 200,000,000 and named composites 220,000,000; their arrays use
+240,000,000, 260,000,000 and 280,000,000 respectively. These ranges are
+independent of configured catalog positions. Dropping and recreating a type
+reserves a different stamp even when its position and SQL name are reused.
+Runtime declarations explicitly lack a creation until binding resolves the
+source; values and emitted identifiers require a checked creation.
+Their checked three-byte runtime representation cannot contain zero or an
+out-of-range value. Fresh creation returns `54000` when the shared catalog
+sequence reaches this limit. Unsupported stored stamps are rejected before
+catalog publication; manifest v29 and journal v17 reject earlier framing.
+
+Named-type recovery installs each saved creation stamp directly; it does not
+reserve a temporary stamp and overwrite it later. An exhausted creation sequence
+therefore cannot prevent loading an existing domain, enum or composite. The
+startup-reserved identity index keys each source by database and creation stamp.
+Retired entries remain bounded by catalog capacity and are replaced on slot reuse.
+Recovery may move a source to its saved physical position, but cannot change
+an admitted creation stamp. It rejects an uncommitted, retired, wrong-database
+or retained source before changing its definition, version or identity entry.
+
 Journal routine type references identify their saved source lifetime. Replay
 refreshes the SQL spelling from that source; a missing lifetime cannot select a
 replacement with the same name.
@@ -393,7 +437,7 @@ including objects deleted before checkpoint. Restore never assigns
 a fresh lifetime to a saved type. Slots are checked against configured capacity;
 zero creation identities, mismatched lifetimes and unavailable slots are errors.
 
-The manifest writes `dom5`, `enm2` and `cmp2` records before a required
+The manifest writes `dom5`, `enm3` and `cmp2` records before a required
 `types_end` record. At that boundary, recovery resolves domain chains and
 composite fields in each database before loading dependent definitions. Missing
 or duplicate boundaries and later type records are rejected.
@@ -405,7 +449,7 @@ PostgreSQL polymorphic type. The schema is stored separately and database scope
 comes from the enclosing record. The SQL name after the prefix retains its
 original colons and Unicode bytes. Manifests hex-encode these fields. Tables,
 composites, routine signatures/results, aggregate types, casts and operator
-contracts share this encoding. Table definition payloads use version 10.
+contracts share this encoding. Table definition payloads use version 11.
 
 Bit and varbit modifiers store the bit count directly: `bit(6)` stores `6`.
 Character modifiers include their four-byte header: `varchar(7)` stores `11`.

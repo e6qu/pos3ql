@@ -26,19 +26,16 @@ use super::super::{
 struct CatalogOid(i32);
 
 impl CatalogOid {
-    /// Parse the SQL identity boundary once: wide SQL integers and unsigned
-    /// wire OIDs must not wrap into a different internal catalog object.
+    /// Keep all four OID bytes in the legacy signed catalog interface; wider
+    /// integers are rejected before their bits can name a different object.
     fn parse(value: Datum<'_>) -> Result<Option<Self>, SqlError> {
         match value {
             Datum::Null => Ok(None),
             Datum::Int2(oid) => Ok(Some(Self(i32::from(oid)))),
             Datum::Int4(oid) => Ok(Some(Self(oid))),
-            Datum::Oid(oid) => i32::try_from(oid)
-                .map(Self)
-                .map(Some)
-                .map_err(|_| sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "OID out of range")),
-            Datum::Int8(oid) => i32::try_from(oid)
-                .map(Self)
+            Datum::Oid(oid) => Ok(Some(Self(oid as i32))),
+            Datum::Int8(oid) => u32::try_from(oid)
+                .map(|oid| Self(oid as i32))
                 .map(Some)
                 .map_err(|_| sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "OID out of range")),
             Datum::Regtype { referenced_oid, .. } | Datum::RegObject { referenced_oid, .. } => {
@@ -49,13 +46,7 @@ impl CatalogOid {
             // String literals are represented as text in the AST, so perform
             // that parse at this identity boundary and carry only CatalogOid
             // afterward.
-            Datum::Text(raw) => raw.parse::<i32>().map(Self).map(Some).map_err(|_| {
-                sql_err!(
-                    sqlstate::INVALID_TEXT_REPRESENTATION,
-                    "invalid input syntax for type oid: \"{}\"",
-                    raw
-                )
-            }),
+            Datum::Text(raw) => super::super::parse_oid(raw).map(|oid| Some(Self(oid as i32))),
             _ => Ok(None),
         }
     }
@@ -73,10 +64,7 @@ impl ObjectOid {
                 .map(Self)
                 .map(Some)
                 .map_err(|_| sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "OID out of range")),
-            Datum::Regtype { referenced_oid, .. } => u32::try_from(referenced_oid)
-                .map(Self)
-                .map(Some)
-                .map_err(|_| sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "OID must be nonnegative")),
+            Datum::Regtype { referenced_oid, .. } => Ok(Some(Self(referenced_oid as u32))),
             Datum::Int4(oid) => u32::try_from(oid)
                 .map(Self)
                 .map(Some)
@@ -85,17 +73,8 @@ impl ObjectOid {
                 .map(Self)
                 .map(Some)
                 .map_err(|_| sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "OID out of range")),
-            Datum::RegObject { referenced_oid, .. } => u32::try_from(referenced_oid)
-                .map(Self)
-                .map(Some)
-                .map_err(|_| sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "OID out of range")),
-            Datum::Text(raw) => raw.parse::<u32>().map(Self).map(Some).map_err(|_| {
-                sql_err!(
-                    sqlstate::INVALID_TEXT_REPRESENTATION,
-                    "invalid input syntax for type oid: \"{}\"",
-                    raw
-                )
-            }),
+            Datum::RegObject { referenced_oid, .. } => Ok(Some(Self(referenced_oid as u32))),
+            Datum::Text(raw) => super::super::parse_oid(raw).map(|oid| Some(Self(oid))),
             _ => Err(sql_err!(
                 sqlstate::DATATYPE_MISMATCH,
                 "object identity must be oid"
@@ -163,46 +142,6 @@ fn privilege_role_name<'a>(
         _ => Err(sql_err!(
             sqlstate::DATATYPE_MISMATCH,
             "role must be specified by name or oid"
-        )),
-    }
-}
-
-fn privilege_object_name<'a>(
-    value: Datum<'a>,
-    function: &str,
-    catalog: &dyn super::super::CatalogAccess,
-    arena: &'a crate::mem::arena::Arena,
-) -> Result<Option<&'a str>, SqlError> {
-    match value {
-        Datum::Text(object) => Ok(Some(object)),
-        value @ (Datum::Int4(_) | Datum::Oid(_) | Datum::Int8(_) | Datum::RegObject { .. }) => {
-            let oid = CatalogOid::parse(value)?
-                .expect("identity datum is non-null")
-                .0;
-            if function == "has_function_privilege" {
-                catalog.routine_name(oid, true, arena)
-            } else if function == "has_language_privilege" {
-                catalog.language_name(oid, arena)
-            } else if function == "has_schema_privilege" {
-                catalog.schema_name(oid, arena)
-            } else if function == "has_database_privilege" {
-                catalog.database_name(oid, arena)
-            } else if function == "has_tablespace_privilege" {
-                catalog.tablespace_name(oid, arena)
-            } else if function == "has_foreign_data_wrapper_privilege" {
-                catalog.foreign_data_wrapper_name(oid, arena)
-            } else if function == "has_server_privilege" {
-                catalog.foreign_server_name(oid, arena)
-            } else if function == "has_largeobject_privilege" {
-                catalog.large_object_name(oid, arena)
-            } else {
-                catalog.relname(oid, arena)
-            }
-        }
-        Datum::Null => Ok(None),
-        _ => Err(sql_err!(
-            sqlstate::DATATYPE_MISMATCH,
-            "object must be specified by name or oid"
         )),
     }
 }
@@ -1731,7 +1670,15 @@ pub(crate) fn dispatch<'a>(
                 }
                 if matches!(
                     name,
-                    "has_type_privilege" | "has_schema_privilege" | "has_function_privilege"
+                    "has_type_privilege"
+                        | "has_schema_privilege"
+                        | "has_function_privilege"
+                        | "has_language_privilege"
+                        | "has_database_privilege"
+                        | "has_tablespace_privilege"
+                        | "has_foreign_data_wrapper_privilege"
+                        | "has_server_privilege"
+                        | "has_largeobject_privilege"
                 ) {
                     let target = match object {
                         Datum::Text(name) => super::super::PrivilegeObject::Name(name),
@@ -1749,49 +1696,36 @@ pub(crate) fn dispatch<'a>(
                         "has_function_privilege" => {
                             cat.has_function_privilege(role, target, privilege)?
                         }
+                        "has_language_privilege" => {
+                            cat.has_language_privilege(role, target, privilege)?
+                        }
+                        "has_database_privilege" => {
+                            cat.has_database_privilege(role, target, privilege)?
+                        }
+                        "has_tablespace_privilege" => {
+                            cat.has_tablespace_privilege(role, target, privilege)?
+                        }
+                        "has_foreign_data_wrapper_privilege" => {
+                            cat.has_foreign_data_wrapper_privilege(role, target, privilege)?
+                        }
+                        "has_server_privilege" => {
+                            cat.has_server_privilege(role, target, privilege)?
+                        }
+                        "has_largeobject_privilege" => {
+                            cat.has_largeobject_privilege(role, target, privilege)?
+                        }
                         _ => unreachable!("typed object privilege function was classified"),
                     };
                     return Ok(answer.map_or(Datum::Null, Datum::Bool));
                 }
-                let object = if name == "has_parameter_privilege" {
-                    match object {
-                        Datum::Text(parameter) => parameter,
-                        _ => {
-                            return Err(sql_err!(
-                                sqlstate::DATATYPE_MISMATCH,
-                                "has_parameter_privilege() requires a text parameter name"
-                            ));
-                        }
-                    }
-                } else {
-                    match privilege_object_name(object, name, cat, arena)? {
-                        Some(object) => object,
-                        None => return Ok(Datum::Null),
-                    }
+                let Datum::Text(parameter) = object else {
+                    return Err(sql_err!(
+                        sqlstate::DATATYPE_MISMATCH,
+                        "has_parameter_privilege() requires a text parameter name"
+                    ));
                 };
-                let answer = match name {
-                    "has_language_privilege" => {
-                        cat.has_language_privilege(role, object, privilege)?
-                    }
-                    "has_database_privilege" => {
-                        cat.has_database_privilege(role, object, privilege)?
-                    }
-                    "has_tablespace_privilege" => {
-                        cat.has_tablespace_privilege(role, object, privilege)?
-                    }
-                    "has_foreign_data_wrapper_privilege" => {
-                        cat.has_foreign_data_wrapper_privilege(role, object, privilege)?
-                    }
-                    "has_server_privilege" => cat.has_server_privilege(role, object, privilege)?,
-                    "has_largeobject_privilege" => {
-                        cat.has_largeobject_privilege(role, object, privilege)?
-                    }
-                    "has_parameter_privilege" => {
-                        cat.has_parameter_privilege(role, object, privilege)?
-                    }
-                    _ => unreachable!(),
-                };
-                Ok(answer.map(Datum::Bool).unwrap_or(Datum::Null))
+                let answer = cat.has_parameter_privilege(role, parameter, privilege)?;
+                Ok(answer.map_or(Datum::Null, Datum::Bool))
             }
             _ if predicate == Some(CatalogPredicateKind::Object) => {
                 let name = name.strip_prefix("pg_catalog.").unwrap_or(name);
@@ -2393,6 +2327,9 @@ pub(crate) fn dispatch<'a>(
                 {
                     return Ok(Datum::Text(name));
                 }
+                if crate::storage::NamedTypeKind::from_oid(o).is_some() {
+                    return Ok(Datum::Text("???"));
+                }
                 let Some(coltype) = exec::coltype_of_oid(o) else {
                     return Ok(Datum::Text("???"));
                 };
@@ -2708,7 +2645,7 @@ pub(crate) fn dispatch<'a>(
                     return Ok(regtype(crate::sql::types::oid::enum_oid(slot), name));
                 }
                 if let Datum::Array { element, .. } = v
-                    && element.user_type_slot().is_some()
+                    && element.is_named()
                     && let Some(cat) = hooks.catalog
                     && let Some(name) = cat.user_array_name(element, arena)?
                 {

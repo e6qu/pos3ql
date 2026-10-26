@@ -92,20 +92,13 @@ impl<'a> Reader<'a> {
                 self.take(length)?;
                 return Some(());
             }
-            (ColType::Array(expected), 15) => {
-                let element = ArrElem::from_code(self.byte()?)?;
+            (ColType::Array(expected), 200) => {
+                let element =
+                    crate::storage::CachedArrayElement::from_bytes(self.take(6)?.try_into().ok()?)?
+                        .element();
                 if element != expected
                     || !ArrElem::BUILTIN.contains(&element)
                     || element == ArrElem::Record
-                {
-                    return None;
-                }
-                let slot = u16::from_le_bytes(self.take(2)?.try_into().ok()?);
-                let base = self.byte()?;
-                let base_slot = u16::from_le_bytes(self.take(2)?.try_into().ok()?);
-                if slot != ColType::ENUM_SLOT_UNRESOLVED
-                    || base != 0
-                    || base_slot != ColType::ENUM_SLOT_UNRESOLVED
                 {
                     return None;
                 }

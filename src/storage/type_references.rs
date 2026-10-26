@@ -1,5 +1,6 @@
 //! Captured references identify a type's lifetime independently of its name.
 
+use super::type_identities::TypeCreation;
 use super::type_names::NamedTypeSlot;
 use super::{
     ArrElem, ColType, DatabaseOid, PolymorphicType, RoutineResult, SqlName, TypeCatalog,
@@ -84,7 +85,7 @@ pub(super) struct TypeIdentity {
     // column or routine parameter to eight-byte alignment.
     origin: [u8; 8],
     database: [u8; 4],
-    created_at: [u8; 8],
+    created_at: TypeCreation,
     source: CapturedTypeSlot,
 }
 
@@ -95,7 +96,7 @@ impl TypeIdentity {
         slot: NamedTypeSlot,
         created_at: u64,
     ) -> Self {
-        // Configuration caps each catalog within its PostgreSQL OID band.
+        // Configuration caps positions to the stored reference width.
         let index = u16::try_from(slot.index())
             .expect("configured type slot is representable")
             .to_le_bytes();
@@ -107,7 +108,7 @@ impl TypeIdentity {
         Self {
             origin: origin.0.to_le_bytes(),
             database: database.get().to_le_bytes(),
-            created_at: created_at.to_le_bytes(),
+            created_at: TypeCreation::parse(created_at).expect("named type birth was admitted"),
             source,
         }
     }
@@ -121,7 +122,7 @@ impl TypeIdentity {
     }
 
     pub(super) fn created_at(self) -> u64 {
-        u64::from_le_bytes(self.created_at)
+        self.created_at.created_at()
     }
 
     pub(super) fn slot(self) -> NamedTypeSlot {
@@ -142,12 +143,12 @@ impl TypeIdentity {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct StoredTypeIdentity {
     source: CapturedTypeSlot,
-    created_at: [u8; 8],
+    created_at: TypeCreation,
 }
 
 impl StoredTypeIdentity {
     pub(super) fn created_at(self) -> u64 {
-        u64::from_le_bytes(self.created_at)
+        self.created_at.created_at()
     }
 
     pub(super) fn slot(self) -> NamedTypeSlot {
@@ -182,16 +183,10 @@ impl StoredTypeIdentity {
                 ));
             }
         };
-        if created_at == 0 {
-            return Err(sql_err!(
-                sqlstate::PROTOCOL_VIOLATION,
-                "invalid stored type identity"
-            ));
-        }
-        Ok(Self {
-            source,
-            created_at: created_at.to_le_bytes(),
-        })
+        let created_at = TypeCreation::parse(created_at).ok_or_else(|| {
+            sql_err!(sqlstate::PROTOCOL_VIOLATION, "invalid stored type identity")
+        })?;
+        Ok(Self { source, created_at })
     }
 }
 
@@ -206,6 +201,18 @@ enum ReferenceIdentity {
 pub struct TypeReference(ReferenceIdentity);
 
 impl TypeReference {
+    pub(crate) fn creation(self) -> TypeCreation {
+        self.stored().created_at
+    }
+
+    pub(crate) fn kind(self) -> super::NamedTypeKind {
+        self.slot().kind()
+    }
+
+    pub(crate) fn catalog_slot(self) -> u16 {
+        u16::try_from(self.slot().index()).expect("captured type catalog slot fits")
+    }
+
     pub(super) fn refers_to(self, source: TypeIdentity, database: DatabaseOid) -> bool {
         source.database() == database
             && match self.0 {
@@ -394,10 +401,10 @@ mod tests {
     fn captured_type_reference_layout_keeps_slots_in_their_oid_width() {
         use core::mem::size_of;
         assert_eq!(size_of::<CapturedTypeSlot>(), 3);
-        assert_eq!(size_of::<TypeIdentity>(), 23);
-        assert!(size_of::<TypeBinding>() <= 24);
-        assert!(size_of::<TypeReference>() <= 24);
-        assert!(size_of::<Option<UserTypeName>>() <= 152);
+        assert_eq!(size_of::<TypeIdentity>(), 18);
+        assert!(size_of::<TypeBinding>() <= 19);
+        assert!(size_of::<TypeReference>() <= 19);
+        assert!(size_of::<Option<UserTypeName>>() <= 147);
         for source in [
             NamedTypeSlot::Domain(0),
             NamedTypeSlot::Enum(65535),
@@ -405,18 +412,26 @@ mod tests {
         ] {
             let origin = CatalogOrigin(u64::MAX);
             let database = DatabaseOid::parse(i32::MAX).unwrap();
-            let identity = TypeIdentity::new(origin, database, source, u64::MAX);
+            let identity = TypeIdentity::new(
+                origin,
+                database,
+                source,
+                super::super::type_identities::MAX_TYPE_CREATION,
+            );
             assert_eq!(identity.slot(), source);
             assert_eq!(identity.origin(), origin);
             assert_eq!(identity.database(), database);
-            assert_eq!(identity.created_at(), u64::MAX);
+            assert_eq!(
+                identity.created_at(),
+                super::super::type_identities::MAX_TYPE_CREATION
+            );
         }
     }
 
     #[test]
     fn source_reference_codec_preserves_lifetimes_without_names() {
         crate::mem::guard::forbid_alloc(|| {
-            for encoded in ["d:0:1", "e:0:18446744073709551615", "c:1600:41"] {
+            for encoded in ["d:0:1", "e:0:9999999", "c:1600:41"] {
                 let reference = TypeReference::from_storage(encoded).unwrap();
                 assert_eq!(reference.storage_key().as_str(), encoded);
             }
@@ -424,6 +439,8 @@ mod tests {
                 "",
                 "c:0",
                 "c:0:0",
+                "e:0:10000000",
+                "e:0:18446744073709551615",
                 "c:0:1:extra",
                 "x:0:1",
                 "d:65536:1",
@@ -539,19 +556,46 @@ pub(super) struct TypeSnapshot {
 }
 
 impl TypeSnapshot {
+    pub(super) fn oid(&self, array: bool) -> i32 {
+        use crate::sql::types::oid;
+        let slot = self.identity.created_at;
+        match (self.identity.slot(), array) {
+            (NamedTypeSlot::Domain(_), false) => oid::domain_oid(slot),
+            (NamedTypeSlot::Domain(_), true) => oid::domain_array_oid(slot),
+            (NamedTypeSlot::Enum(_), false) => oid::enum_oid(slot),
+            (NamedTypeSlot::Enum(_), true) => oid::enum_array_oid(slot),
+            (NamedTypeSlot::Composite(_), false) => oid::composite_oid(slot),
+            (NamedTypeSlot::Composite(_), true) => oid::composite_array_oid(slot),
+        }
+    }
+
+    pub(super) fn declared_type(&self, bound: ColType) -> super::DeclaredColumnType {
+        let array = match self.identity.slot() {
+            NamedTypeSlot::Domain(_) => {
+                matches!(bound, ColType::Array(ArrElem::Domain { .. }))
+                    && !matches!(self.base, ColType::Array(ArrElem::Domain { .. }))
+            }
+            _ => matches!(bound, ColType::Array(_)),
+        };
+        let oid = self.oid(array);
+        if array {
+            super::DeclaredColumnType::Builtin { oid }
+        } else {
+            super::DeclaredColumnType::UserDefined {
+                oid,
+                schema: self.name.schema,
+                name: self.name.name,
+            }
+        }
+    }
+
     pub(super) fn representation(&self, declared: ColType) -> Result<ColType, SqlError> {
         match self.identity.slot() {
-            NamedTypeSlot::Domain(slot)
+            NamedTypeSlot::Domain(_)
                 if matches!(declared, ColType::Array(ArrElem::Domain { .. }))
                     && !matches!(self.base, ColType::Array(ArrElem::Domain { .. })) =>
             {
-                let slot = u16::try_from(slot).map_err(|_| {
-                    sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "domain representation slot space exhausted"
-                    )
-                })?;
-                ArrElem::domain(slot, self.base)
+                ArrElem::domain(self.identity.created_at, self.base)
                     .map(ColType::Array)
                     .ok_or_else(|| {
                         sql_err!(
@@ -746,31 +790,45 @@ impl TypeCatalog {
         Ok(())
     }
 
+    pub(super) fn source_reference_by_creation(
+        &self,
+        kind: super::NamedTypeKind,
+        creation: TypeCreation,
+        database: DatabaseOid,
+    ) -> Option<TypeReference> {
+        let slot = self.identities.lookup(database, creation.created_at())?;
+        if slot.kind() != kind {
+            return None;
+        }
+        Some(TypeReference(ReferenceIdentity::Captured(
+            TypeIdentity::new(self.origin, database, slot, creation.created_at()),
+        )))
+    }
+
     pub(super) fn resolve_source_reference(
         &self,
         reference: TypeReference,
         database: DatabaseOid,
         transaction: u32,
     ) -> Result<Option<TypeSnapshot>, SqlError> {
-        match reference.0 {
-            ReferenceIdentity::Captured(key) => {
-                if key.origin() != self.origin || key.database() != database {
-                    return Err(sql_err!(
-                        sqlstate::UNDEFINED_OBJECT,
-                        "captured type reference belongs to a different catalog"
-                    ));
-                }
-                Ok(self
-                    .type_snapshot(key.slot(), transaction)?
-                    .filter(|snapshot| snapshot.identity == key))
-            }
-            ReferenceIdentity::Stored(key) => Ok(self
-                .type_snapshot(key.slot(), transaction)?
-                .filter(|snapshot| {
-                    snapshot.identity.database() == database
-                        && snapshot.identity.created_at() == key.created_at()
-                })),
+        if let ReferenceIdentity::Captured(key) = reference.0
+            && (key.origin() != self.origin || key.database() != database)
+        {
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "captured type reference belongs to a different catalog"
+            ));
         }
+        let key = reference.stored();
+        let Some(bound) = self
+            .source_reference_by_creation(key.slot().kind(), key.created_at, database)
+            .filter(|bound| bound.slot() == key.slot())
+        else {
+            return Ok(None);
+        };
+        Ok(self
+            .type_snapshot(bound.slot(), transaction)?
+            .filter(|snapshot| reference.refers_to(snapshot.identity, database)))
     }
 
     pub(super) fn resolve_type_reference(
@@ -841,18 +899,14 @@ impl TypeCatalog {
                     .map_or((definition.schema, definition.name), |pending| {
                         (pending.schema, pending.name)
                     });
-                let index = u16::try_from(index).map_err(|_| {
-                    sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "enum representation slot space exhausted"
-                    )
-                })?;
+                let creation = TypeCreation::parse(definition.created_at)
+                    .expect("catalog type creation was admitted");
                 (
                     definition.database,
                     definition.created_at,
                     schema,
                     name,
-                    ColType::Enum(index),
+                    ColType::Enum(Some(creation)),
                 )
             }
             NamedTypeSlot::Composite(index) => {
@@ -871,18 +925,14 @@ impl TypeCatalog {
                     .map_or((definition.schema, definition.name), |pending| {
                         (pending.schema, pending.name)
                     });
-                let index = u16::try_from(index).map_err(|_| {
-                    sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "composite representation slot space exhausted"
-                    )
-                })?;
+                let creation = TypeCreation::parse(definition.created_at)
+                    .expect("catalog type creation was admitted");
                 (
                     definition.database,
                     definition.created_at,
                     schema,
                     name,
-                    ColType::Composite(index),
+                    ColType::Composite(Some(creation)),
                 )
             }
         };
@@ -926,7 +976,7 @@ impl TypeCatalog {
     ) -> Result<RoutineResult, SqlError> {
         let Some(identity) = result.user_type else {
             if matches!(result.ctype, ColType::Enum(_) | ColType::Composite(_))
-                || matches!(result.ctype, ColType::Array(element) if element.user_type_slot().is_some())
+                || matches!(result.ctype, ColType::Array(element) if element.is_named())
             {
                 return Err(sql_err!(
                     sqlstate::UNDEFINED_OBJECT,
@@ -1330,10 +1380,7 @@ impl super::Storage {
         target: NamedTypeSlot,
         created_at: u64,
     ) -> Result<(), SqlError> {
-        if created_at == 0
-            || matches!(target, NamedTypeSlot::Composite(_))
-                && created_at > super::MAX_RELATION_GENERATION
-        {
+        if TypeCreation::parse(created_at).is_none() {
             return Err(sql_err!(
                 sqlstate::DATA_EXCEPTION,
                 "stored type creation identity is invalid"
@@ -1351,15 +1398,7 @@ impl super::Storage {
             .expect("type catalog lock poisoned");
         let old = allocated.index();
         let new = target.index();
-        let retained = self.type_definition_images.retains(allocated)
-            || self.type_definition_images.retains(target);
-        let retained_error = || {
-            sql_err!(
-                sqlstate::OBJECT_IN_USE,
-                "stored type catalog slot is retained by an executing statement"
-            )
-        };
-        match (allocated, target) {
+        let (database, old_creation, state) = match (allocated, target) {
             (NamedTypeSlot::Domain(_), NamedTypeSlot::Domain(_)) => {
                 if new >= catalog.domains.len()
                     || old >= catalog.domains.len()
@@ -1368,15 +1407,11 @@ impl super::Storage {
                 {
                     return Err(invalid());
                 }
-                if retained && (old != new || catalog.domains[old].created_at != created_at) {
-                    return Err(retained_error());
-                }
-                if catalog.domains[old].created_at != created_at {
-                    catalog.versions.initialize(allocated, created_at);
-                }
-                catalog.versions.swap(allocated, target);
-                catalog.domains.swap(old, new);
-                catalog.domains[new].created_at = created_at;
+                (
+                    catalog.domains[old].database,
+                    catalog.domains[old].created_at,
+                    catalog.domains[old].ddl_state,
+                )
             }
             (NamedTypeSlot::Enum(_), NamedTypeSlot::Enum(_)) => {
                 if new >= catalog.enums.len()
@@ -1385,15 +1420,11 @@ impl super::Storage {
                 {
                     return Err(invalid());
                 }
-                if retained && (old != new || catalog.enums[old].created_at != created_at) {
-                    return Err(retained_error());
-                }
-                if catalog.enums[old].created_at != created_at {
-                    catalog.versions.initialize(allocated, created_at);
-                }
-                catalog.versions.swap(allocated, target);
-                catalog.enums.swap(old, new);
-                catalog.enums[new].created_at = created_at;
+                (
+                    catalog.enums[old].database,
+                    catalog.enums[old].created_at,
+                    catalog.enums[old].ddl_state,
+                )
             }
             (NamedTypeSlot::Composite(_), NamedTypeSlot::Composite(_)) => {
                 if new >= catalog.composites.len()
@@ -1403,17 +1434,52 @@ impl super::Storage {
                 {
                     return Err(invalid());
                 }
-                if retained && (old != new || catalog.composites[old].created_at != created_at) {
-                    return Err(retained_error());
-                }
-                if catalog.composites[old].created_at != created_at {
-                    catalog.versions.initialize(allocated, created_at);
-                }
-                catalog.versions.swap(allocated, target);
-                catalog.composites.swap(old, new);
-                catalog.composites[new].created_at = created_at;
+                (
+                    catalog.composites[old].database,
+                    catalog.composites[old].created_at,
+                    catalog.composites[old].ddl_state,
+                )
             }
             _ => return Err(invalid()),
+        };
+        if database != super::current_database()
+            || state != super::CatalogDdlState::Present
+            || catalog.identities.lookup(database, old_creation) != Some(allocated)
+        {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "stored type source is not a committed identity in the selected database"
+            ));
+        }
+        if (self.type_definition_images.retains(allocated)
+            || self.type_definition_images.retains(target))
+            && (old != new || old_creation != created_at)
+        {
+            return Err(sql_err!(
+                sqlstate::OBJECT_IN_USE,
+                "stored type catalog slot is retained by an executing statement"
+            ));
+        }
+        if old_creation != created_at {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "stored type creation does not match its admitted source"
+            ));
+        }
+        catalog
+            .identities
+            .relocate(allocated, target, database, created_at)?;
+        catalog.versions.swap(allocated, target);
+        match target {
+            NamedTypeSlot::Domain(_) => {
+                catalog.domains.swap(old, new);
+            }
+            NamedTypeSlot::Enum(_) => {
+                catalog.enums.swap(old, new);
+            }
+            NamedTypeSlot::Composite(_) => {
+                catalog.composites.swap(old, new);
+            }
         }
         self.catalog_sequence.observe(created_at);
         Ok(())

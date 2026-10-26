@@ -134,7 +134,7 @@ pub(super) fn build_column(
             if let Some(element_name) = c.type_name.strip_suffix("[]") {
                 if let Some(slot) = storage.resolve_domain_slot(element_name, txid) {
                     let d = storage.domain(slot);
-                    let Some(element) = crate::sql::types::ArrElem::domain(slot as u16, d.base)
+                    let Some(element) = crate::sql::types::ArrElem::domain(d.creation(), d.base)
                     else {
                         return Err(sql_err!(
                             sqlstate::FEATURE_NOT_SUPPORTED,
@@ -151,7 +151,9 @@ pub(super) fn build_column(
                 } else if let Some(slot) = storage.resolve_enum_slot(element_name, txid) {
                     let definition = storage.enum_for(slot, txid);
                     (
-                        ColType::Array(crate::sql::types::ArrElem::Enum(slot as u16)),
+                        ColType::Array(crate::sql::types::ArrElem::Enum(Some(
+                            definition.creation(),
+                        ))),
                         -1,
                         Some(crate::storage::UserTypeName::declaration(
                             definition.schema,
@@ -162,7 +164,9 @@ pub(super) fn build_column(
                 } else if let Some(slot) = storage.resolve_composite_slot(element_name, txid) {
                     let definition = storage.composite_for(slot, txid);
                     (
-                        ColType::Array(crate::sql::types::ArrElem::Composite(slot as u16)),
+                        ColType::Array(crate::sql::types::ArrElem::Composite(Some(
+                            definition.creation(),
+                        ))),
                         -1,
                         Some(crate::storage::UserTypeName::declaration(
                             definition.schema,
@@ -189,7 +193,7 @@ pub(super) fn build_column(
                         Some(slot) => {
                             let definition = storage.enum_for(slot, txid);
                             (
-                                ColType::Enum(slot as u16),
+                                ColType::Enum(Some(definition.creation())),
                                 -1,
                                 Some(crate::storage::UserTypeName::declaration(
                                     definition.schema,
@@ -202,7 +206,7 @@ pub(super) fn build_column(
                             Some(slot) => {
                                 let definition = storage.composite_for(slot, txid);
                                 (
-                                    ColType::Composite(slot as u16),
+                                    ColType::Composite(Some(definition.creation())),
                                     -1,
                                     Some(crate::storage::UserTypeName::declaration(
                                         definition.schema,

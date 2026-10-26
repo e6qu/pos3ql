@@ -48,9 +48,9 @@ Complete these remaining cases:
   tuple. Listings and direct lookups can expose different rows; dependency rows
   also need exact duplicate counts.
 - Finish lifetime-based SQL identifiers in the remaining catalog families,
-  including named types and constraints without an index. The
+  including constraints without an index. The
   [behavior guide](docs/implemented-baseline.md) owns the implemented relation,
-  table/view row-type and index guarantees. Check shared catalogs across
+  named-type, enum-label and index guarantees. Check shared catalogs across
   databases as well.
 - Keep old row, index and backup data until their readers finish. Pace history
   pruning, file replacement and deletion without holding unrelated owners.

@@ -1292,6 +1292,367 @@ fn private_index_bindings_survive_table_changes_savepoints_and_cold_recovery() {
 }
 
 #[test]
+fn numeric_object_privileges_match_postgresql_before_lookup() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("numeric-privileges-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                include_str!("../../tests/external/differential_exact/25_numeric_privileges.sql"),
+                true
+            )),
+            ["t"; 6]
+        );
+        let mut states = Vec::new();
+        for statement in
+            include_str!("../../tests/external/differential_exact/26_numeric_privilege_errors.sql")
+                .split(';')
+                .map(str::trim)
+                .filter(|statement| !statement.is_empty())
+        {
+            let output = session.execute(&mut engine, statement, true);
+            states.extend(error_sqlstates(&output).into_iter().map(str::to_owned));
+        }
+        assert_eq!(
+            states,
+            [
+                "22023", "22023", "22023", "22023", "22023", "22023", "22023", "22023", "22023",
+                "22023", "22023", "22023", "22023", "22023", "22023", "22023", "22023", "22023",
+                "42704", "3F000", "42883", "42704", "3D000", "42704", "42704", "42704", "22P02"
+            ]
+        );
+    }
+}
+
+#[test]
+fn named_type_public_identifiers_survive_edits_replacement_and_savepoint_rollback() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("named-type-public-identifiers-{mode:?}"));
+        config.transaction_mode = mode;
+        config.max_ddl_per_transaction = 32;
+        config.max_domains = 1;
+        config.max_enums = 2;
+        config.max_composites = 1;
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        let mut observations = 0;
+        for statement in
+            include_str!("../../tests/external/differential_exact/24_named_type_identities.sql")
+                .split(';')
+                .map(str::trim)
+                .filter(|statement| !statement.is_empty())
+        {
+            let output = session.success(&mut engine, statement, true);
+            let rows = data_rows(&output);
+            assert!(rows.iter().all(|row| row == "t"), "{statement}: {rows:?}");
+            observations += rows.len();
+        }
+        assert_eq!(observations, 14);
+    }
+}
+
+#[test]
+fn named_type_public_identifiers_survive_journal_and_checkpoint_recovery() {
+    let fixture =
+        include_str!("../../tests/external/differential_exact/24_named_type_identities.sql");
+    let (setup, _) = fixture
+        .split_once("DROP TYPE type_identity_scope.order_item, type_identity_scope.payment_status;")
+        .unwrap();
+    let remaining = &fixture[setup.len()..];
+    const QUERIES: &str =
+        "SELECT count(*) = 3 FROM saved_type_identities s JOIN pg_type t ON t.oid = s.identity;
+        SELECT count(*) = 3 FROM saved_type_identities s JOIN pg_type t ON t.oid = s.array_identity;
+        SELECT count(*) = 2 FROM saved_enum_identities s JOIN pg_enum e ON e.oid = s.identity";
+    for checkpoint in [false, true] {
+        for mode in [
+            crate::config::TransactionMode::Mvcc,
+            crate::config::TransactionMode::Locking,
+        ] {
+            let name = format!("named-type-public-cold-{checkpoint}-{mode:?}");
+            let mut config = test_config(&name);
+            config.transaction_mode = mode;
+            config.max_ddl_per_transaction = 32;
+            config.max_domains = 1;
+            config.max_enums = 2;
+            config.max_composites = 1;
+            config.object_store_on = true;
+            config.object_store_sim = true;
+            config.wal_upload = true;
+            config.wal_upload_sync = true;
+            config.object_store_bucket = format!("{name}-{}", std::process::id());
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+            {
+                let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+                let mut engine = Engine::new(&config, &mut budget).unwrap();
+                let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+                let mut observations = 0;
+                for statement in setup
+                    .split(';')
+                    .map(str::trim)
+                    .filter(|statement| !statement.is_empty())
+                {
+                    let output = session.success(&mut engine, statement, false);
+                    let rows = data_rows(&output);
+                    assert!(rows.iter().all(|row| row == "t"), "{statement}: {rows:?}");
+                    observations += rows.len();
+                }
+                assert_eq!(observations, 4);
+                if checkpoint {
+                    assert!(engine.checkpoint().unwrap());
+                }
+                engine.commit_wal().unwrap();
+            }
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+            {
+                let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+                let mut engine = Engine::new(&config, &mut budget).unwrap();
+                let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+                let mut observations = 0;
+                for statement in QUERIES
+                    .split(';')
+                    .map(str::trim)
+                    .filter(|statement| !statement.is_empty())
+                {
+                    let output = session.success(&mut engine, statement, true);
+                    let rows = data_rows(&output);
+                    assert!(rows.iter().all(|row| row == "t"), "{statement}: {rows:?}");
+                    observations += rows.len();
+                }
+                assert_eq!(observations, 3);
+                let mut observations = 0;
+                for statement in remaining
+                    .split(';')
+                    .map(str::trim)
+                    .filter(|statement| !statement.is_empty())
+                {
+                    let output = session.success(&mut engine, statement, false);
+                    let rows = data_rows(&output);
+                    assert!(rows.iter().all(|row| row == "t"), "{statement}: {rows:?}");
+                    observations += rows.len();
+                }
+                assert_eq!(observations, 10);
+            }
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        }
+    }
+}
+
+#[test]
+fn enum_label_identities_preserve_saved_identifiers_through_edits_and_slot_reuse() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("enum-label-identities-{mode:?}"));
+        config.transaction_mode = mode;
+        config.max_ddl_per_transaction = 32;
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                include_str!(
+                    "../../tests/external/differential_exact/27_enum_label_identities.sql"
+                ),
+                true
+            )),
+            ["t", "t", "t", "t", "t", "t"]
+        );
+    }
+}
+
+#[test]
+fn enum_label_identities_survive_empty_cache_recovery_and_keep_replacements_distinct() {
+    let fixture =
+        include_str!("../../tests/external/differential_exact/27_enum_label_identities.sql");
+    let (setup, _) = fixture
+        .split_once("DROP TYPE enum_identity_scope.order_status;")
+        .unwrap();
+    const QUERIES: &str =
+        "SELECT count(*) = 4 FROM saved_label_identities s JOIN pg_enum e ON e.oid = s.identity;
+        SELECT count(*) = 1 FROM saved_label_identities s JOIN pg_enum e ON e.oid = s.identity
+        WHERE s.label = 'new' AND e.enumlabel = 'pending'";
+    for checkpoint in [false, true] {
+        for mode in [
+            crate::config::TransactionMode::Mvcc,
+            crate::config::TransactionMode::Locking,
+        ] {
+            let name = format!("enum-label-cold-{checkpoint}-{mode:?}");
+            let mut config = test_config(&name);
+            config.transaction_mode = mode;
+            config.max_ddl_per_transaction = 32;
+            config.object_store_on = true;
+            config.object_store_sim = true;
+            config.wal_upload = true;
+            config.wal_upload_sync = true;
+            config.object_store_bucket = format!("{name}-{}", std::process::id());
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+            {
+                let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+                let mut engine = Engine::new(&config, &mut budget).unwrap();
+                let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+                // Uploads grow the simulator's fixture map; queries retain the allocation guard.
+                assert_eq!(
+                    data_rows(&session.success(&mut engine, setup, false)),
+                    ["t", "t", "t", "t", "t"]
+                );
+                if checkpoint {
+                    assert!(engine.checkpoint().unwrap());
+                }
+                engine.commit_wal().unwrap();
+            }
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+            {
+                let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+                let mut engine = Engine::new(&config, &mut budget).unwrap();
+                let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+                assert_eq!(
+                    data_rows(&session.success(&mut engine, QUERIES, true)),
+                    ["t", "t"]
+                );
+                session.success(&mut engine,
+                    "DROP TYPE enum_identity_scope.order_status; CREATE TYPE enum_identity_scope.order_status AS ENUM ('new', 'paid')", false);
+                assert_eq!(data_rows(&session.success(&mut engine,
+                    "SELECT count(*) = 0 FROM saved_label_identities s JOIN pg_enum e ON e.oid = s.identity", true)), ["t"]);
+            }
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        }
+    }
+}
+
+#[test]
+fn enum_label_identities_do_not_overlap_for_more_than_one_thousand_members() {
+    let labels = (0..1025)
+        .map(|index| format!("'label_{index}'"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "CREATE TYPE wide_labels AS ENUM ({labels}); CREATE TYPE next_labels AS ENUM ('only');"
+    );
+    let mut config = test_config("wide-enum-label-identities");
+    config.max_enums = 2;
+    config.max_enum_labels_per_type = 1025;
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(&mut engine, &sql, true);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT count(*) = 1026 AND count(DISTINCT oid) = 1026 FROM pg_enum",
+            true
+        )),
+        ["t"]
+    );
+}
+
+#[test]
+fn named_type_default_arrays_preserve_declared_types_without_allocation() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("named-type-default-arrays-{mode:?}"));
+        config.transaction_mode = mode;
+        config.max_ddl_per_transaction = 32;
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        let output = session.success(
+            &mut engine,
+            include_str!("../../tests/external/differential_exact/23_named_type_defaults.sql"),
+            true,
+        );
+        assert_eq!(data_rows(&output), ["t", "t"]);
+    }
+}
+
+#[test]
+fn named_type_cached_defaults_survive_empty_cache_wal_and_checkpoint_recovery() {
+    let fixture =
+        include_str!("../../tests/external/differential_exact/23_named_type_defaults.sql");
+    let (setup, remainder) = fixture
+        .split_once("INSERT INTO type_default_scope.orders DEFAULT VALUES;")
+        .unwrap();
+    let (queries, _) = remainder
+        .split_once("DROP TABLE type_default_scope.orders;")
+        .unwrap();
+    for checkpoint in [false, true] {
+        for mode in [
+            crate::config::TransactionMode::Mvcc,
+            crate::config::TransactionMode::Locking,
+        ] {
+            let name = format!("named-type-cached-defaults-{checkpoint}-{mode:?}");
+            let mut config = test_config(&name);
+            config.transaction_mode = mode;
+            config.max_ddl_per_transaction = 32;
+            config.object_store_on = true;
+            config.object_store_sim = true;
+            config.wal_upload = true;
+            config.wal_upload_sync = true;
+            config.object_store_bucket = format!("{name}-{}", std::process::id());
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+            {
+                let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+                let mut engine = Engine::new(&config, &mut budget).unwrap();
+                let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+                // Simulator uploads grow the fixture's object map. The adjacent
+                // local-mode regression guards the same writes; queries stay guarded here.
+                session.success(&mut engine, setup, false);
+                session.success(
+                    &mut engine,
+                    "INSERT INTO type_default_scope.orders DEFAULT VALUES",
+                    false,
+                );
+                assert_eq!(
+                    data_rows(&session.success(&mut engine, queries, true)),
+                    ["t", "t"]
+                );
+                if checkpoint {
+                    assert!(engine.checkpoint().unwrap());
+                }
+                engine.commit_wal().unwrap();
+            }
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+            {
+                let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+                let mut engine = Engine::new(&config, &mut budget).unwrap();
+                let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+                assert_eq!(
+                    data_rows(&session.success(&mut engine, queries, true)),
+                    ["t", "t"]
+                );
+                session.success(
+                    &mut engine,
+                    "INSERT INTO type_default_scope.orders DEFAULT VALUES",
+                    false,
+                );
+                assert_eq!(
+                    data_rows(&session.success(&mut engine, queries, true)),
+                    ["t", "t", "t", "t"]
+                );
+            }
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        }
+    }
+}
+
+#[test]
 fn relation_identity_replacement_and_constraint_edits_match_postgresql() {
     for mode in [
         crate::config::TransactionMode::Mvcc,
@@ -20974,12 +21335,11 @@ fn column_privileges_enforce_dml_dependencies_catalogs_and_cold_recovery() {
             "SELECT acldefault('r', oid), acldefault('f', oid), \
                     acldefault(CASE WHEN true THEN 's'::\"char\" \
                                     ELSE 'r'::\"char\" END, oid), \
-                    has_database_privilege('postgres', 'postgres', 'CONNECT'), \
-                    has_database_privilege('postgres', 'missing', 'CONNECT') IS NULL \
+                    has_database_privilege('postgres', 'postgres', 'CONNECT') \
                FROM pg_roles WHERE rolname = 'postgres'"
         )),
         [
-            "{postgres=arwdDxtm/postgres}|{=X/postgres,postgres=X/postgres}|{postgres=rwU/postgres}|t|t"
+            "{postgres=arwdDxtm/postgres}|{=X/postgres,postgres=X/postgres}|{postgres=rwU/postgres}|t"
         ]
     );
     assert_eq!(
@@ -21004,6 +21364,16 @@ fn column_privileges_enforce_dml_dependencies_catalogs_and_cold_recovery() {
             "{postgres=sA/postgres}|{postgres=arwdDxtm/postgres}|",
             "{postgres=rwU/postgres}|{postgres=C/postgres}"
         )]
+    );
+    let missing_database = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT has_database_privilege('postgres', 'missing', 'CONNECT')",
+    );
+    assert!(
+        String::from_utf8_lossy(&missing_database).contains("3D000"),
+        "{}",
+        String::from_utf8_lossy(&missing_database)
     );
     let sql_character_is_not_internal_char = run_with(
         &mut engine,
@@ -25078,14 +25448,26 @@ fn declared_user_types_survive_protocol_description_and_parameter_inference() {
     let enum_oid = crate::sql::types::oid::enum_oid(
         engine
             .storage
-            .enum_slot("public", "protocol_state", 0)
-            .unwrap() as u16,
+            .enum_for(
+                engine
+                    .storage
+                    .enum_slot("public", "protocol_state", 0)
+                    .unwrap(),
+                0,
+            )
+            .creation(),
     );
     let domain_oid = crate::sql::types::oid::domain_oid(
         engine
             .storage
-            .domain_slot("public", "protocol_count", 0)
-            .unwrap() as u16,
+            .domain_for(
+                engine
+                    .storage
+                    .domain_slot("public", "protocol_count", 0)
+                    .unwrap(),
+                0,
+            )
+            .creation(),
     );
 
     for query in [
@@ -25477,26 +25859,50 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
     let enum_oid = crate::sql::types::oid::enum_oid(
         engine
             .storage
-            .enum_slot("public", "binary_state", 0)
-            .unwrap() as u16,
+            .enum_for(
+                engine
+                    .storage
+                    .enum_slot("public", "binary_state", 0)
+                    .unwrap(),
+                0,
+            )
+            .creation(),
     );
     let domain_oid = crate::sql::types::oid::domain_oid(
         engine
             .storage
-            .domain_slot("public", "binary_positive", 0)
-            .unwrap() as u16,
+            .domain_for(
+                engine
+                    .storage
+                    .domain_slot("public", "binary_positive", 0)
+                    .unwrap(),
+                0,
+            )
+            .creation(),
     );
     let composite_oid = crate::sql::types::oid::composite_oid(
         engine
             .storage
-            .composite_slot("public", "binary_coordinate", 0)
-            .unwrap() as u16,
+            .composite_for(
+                engine
+                    .storage
+                    .composite_slot("public", "binary_coordinate", 0)
+                    .unwrap(),
+                0,
+            )
+            .creation(),
     );
     let composite_domain_oid = crate::sql::types::oid::domain_oid(
         engine
             .storage
-            .domain_slot("public", "binary_coordinate_domain", 0)
-            .unwrap() as u16,
+            .domain_for(
+                engine
+                    .storage
+                    .domain_slot("public", "binary_coordinate_domain", 0)
+                    .unwrap(),
+                0,
+            )
+            .creation(),
     );
     let mut transaction = TxnState::new(&mut budget, 64).unwrap();
     let arena = Arena::new(&mut budget, "binary parameter", 1 << 18).unwrap();
@@ -25542,8 +25948,14 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
     let composite_array_oid = crate::sql::types::oid::composite_array_oid(
         engine
             .storage
-            .composite_slot("public", "binary_coordinate", 0)
-            .unwrap() as u16,
+            .composite_for(
+                engine
+                    .storage
+                    .composite_slot("public", "binary_coordinate", 0)
+                    .unwrap(),
+                0,
+            )
+            .creation(),
     );
     let mut composite_array_binary = Vec::new();
     composite_array_binary.extend_from_slice(&1_i32.to_be_bytes());
@@ -25615,8 +26027,14 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
     let composite_domain_array_oid = crate::sql::types::oid::domain_array_oid(
         engine
             .storage
-            .domain_slot("public", "binary_coordinate_domain", 0)
-            .unwrap() as u16,
+            .domain_for(
+                engine
+                    .storage
+                    .domain_slot("public", "binary_coordinate_domain", 0)
+                    .unwrap(),
+                0,
+            )
+            .creation(),
     );
     assert_eq!(
         engine
@@ -25730,8 +26148,14 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
     let required_domain_oid = crate::sql::types::oid::domain_oid(
         engine
             .storage
-            .domain_slot("public", "binary_required", 0)
-            .unwrap() as u16,
+            .domain_for(
+                engine
+                    .storage
+                    .domain_slot("public", "binary_required", 0)
+                    .unwrap(),
+                0,
+            )
+            .creation(),
     );
     let null_domain = engine
         .coerce_parameter_null(required_domain_oid, &arena, 0)
@@ -25741,8 +26165,14 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
     let required_domain_array_oid = crate::sql::types::oid::domain_array_oid(
         engine
             .storage
-            .domain_slot("public", "binary_required", 0)
-            .unwrap() as u16,
+            .domain_for(
+                engine
+                    .storage
+                    .domain_slot("public", "binary_required", 0)
+                    .unwrap(),
+                0,
+            )
+            .creation(),
     );
     let required_domain_array = [
         0,
@@ -25791,8 +26221,14 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
                 crate::sql::types::oid::enum_array_oid(
                     engine
                         .storage
-                        .enum_slot("public", "binary_state", 0)
-                        .unwrap() as u16,
+                        .enum_for(
+                            engine
+                                .storage
+                                .enum_slot("public", "binary_state", 0)
+                                .unwrap(),
+                            0
+                        )
+                        .creation()
                 ),
                 &enum_array,
                 &arena,
@@ -25808,8 +26244,14 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
                 crate::sql::types::oid::enum_array_oid(
                     engine
                         .storage
-                        .enum_slot("public", "binary_state", 0)
-                        .unwrap() as u16,
+                        .enum_for(
+                            engine
+                                .storage
+                                .enum_slot("public", "binary_state", 0)
+                                .unwrap(),
+                            0
+                        )
+                        .creation()
                 ),
                 b"{ready,blocked}",
                 &arena,
@@ -25836,8 +26278,14 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
                 crate::sql::types::oid::domain_array_oid(
                     engine
                         .storage
-                        .domain_slot("public", "binary_positive", 0)
-                        .unwrap() as u16,
+                        .domain_for(
+                            engine
+                                .storage
+                                .domain_slot("public", "binary_positive", 0)
+                                .unwrap(),
+                            0
+                        )
+                        .creation()
                 ),
                 &domain_array,
                 &arena,
@@ -25853,8 +26301,14 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
                 crate::sql::types::oid::domain_array_oid(
                     engine
                         .storage
-                        .domain_slot("public", "binary_positive", 0)
-                        .unwrap() as u16,
+                        .domain_for(
+                            engine
+                                .storage
+                                .domain_slot("public", "binary_positive", 0)
+                                .unwrap(),
+                            0
+                        )
+                        .creation()
                 ),
                 b"{3,5}",
                 &arena,
@@ -25869,8 +26323,14 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
             crate::sql::types::oid::domain_array_oid(
                 engine
                     .storage
-                    .domain_slot("public", "binary_positive", 0)
-                    .unwrap() as u16,
+                    .domain_for(
+                        engine
+                            .storage
+                            .domain_slot("public", "binary_positive", 0)
+                            .unwrap(),
+                        0,
+                    )
+                    .creation(),
             ),
             b"{3,-1}",
             &arena,
@@ -25916,8 +26376,14 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
             crate::sql::types::oid::domain_array_oid(
                 engine
                     .storage
-                    .domain_slot("public", "binary_positive", 0)
-                    .unwrap() as u16,
+                    .domain_for(
+                        engine
+                            .storage
+                            .domain_slot("public", "binary_positive", 0)
+                            .unwrap(),
+                        0,
+                    )
+                    .creation(),
             ),
             &domain_array,
             &arena,
@@ -25982,8 +26448,14 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
             crate::sql::types::oid::domain_array_oid(
                 engine
                     .storage
-                    .domain_slot("public", "binary_positive", 0)
-                    .unwrap() as u16,
+                    .domain_for(
+                        engine
+                            .storage
+                            .domain_slot("public", "binary_positive", 0)
+                            .unwrap(),
+                        0,
+                    )
+                    .creation(),
             ),
             domain_array.as_slice(),
         ),
@@ -26056,7 +26528,12 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
         .unwrap_err();
     assert_eq!(invalid_record.sqlstate, sqlstate::CHECK_VIOLATION);
     let missing_type = engine
-        .decode_binary_parameter(crate::sql::types::oid::enum_oid(31), b"ready", &arena, 0)
+        .decode_binary_parameter(
+            crate::sql::types::oid::enum_oid(crate::storage::TypeCreation::parse(31).unwrap()),
+            b"ready",
+            &arena,
+            0,
+        )
         .unwrap_err();
     assert_eq!(missing_type.sqlstate, sqlstate::UNDEFINED_OBJECT);
 }
@@ -26872,7 +27349,7 @@ fn publication_via_partition_root_emits_root_relation_identity() {
 }
 
 #[test]
-fn publication_via_partition_root_covers_update_delete_and_truncate() {
+fn publication_via_partition_root_uses_catalog_identity_for_every_change() {
     let (mut engine, mut budget) = test_engine();
     let mut transaction = TxnState::new(&mut budget, 256).unwrap();
     run_txn(
@@ -26891,8 +27368,17 @@ fn publication_via_partition_root_covers_update_delete_and_truncate() {
     let mut send =
         crate::mem::FixedBuf::new(&mut budget, "root ops replication send", 1 << 16).unwrap();
     let publication = [crate::storage::SqlName::parse("root_ops").unwrap()];
+    let root_oids = data_rows(&run_with_txn_bytes(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        "SELECT 'publication_root_ops'::regclass::oid",
+    ));
+    assert_eq!(root_oids.len(), 1);
+    let root_oid: u32 = root_oids[0].parse().unwrap();
 
     for (statement, operation) in [
+        ("INSERT INTO publication_root_ops VALUES (3)", b'I'),
         ("UPDATE publication_root_ops SET id = 2 WHERE id = 1", b'U'),
         ("DELETE FROM publication_root_ops WHERE id = 2", b'D'),
         ("TRUNCATE publication_root_ops", b'T'),
@@ -26913,18 +27399,48 @@ fn publication_via_partition_root_covers_update_delete_and_truncate() {
             .unwrap()
             .expect("partition operation is retained");
         assert!(emitted);
-        assert!(send.readable().contains(&operation));
-        assert!(
-            send.readable()
-                .windows(b"publication_root_ops".len())
-                .any(|window| window == b"publication_root_ops")
-        );
-        assert!(
-            !send
-                .readable()
-                .windows(b"publication_root_ops_leaf".len())
-                .any(|window| window == b"publication_root_ops_leaf")
-        );
+        let mut at = 0;
+        let mut declarations = 0;
+        let mut changes = 0;
+        while at < send.len() {
+            let bytes = send.readable();
+            assert_eq!(bytes[at], b'd');
+            let length = u32::from_be_bytes(bytes[at + 1..at + 5].try_into().unwrap()) as usize;
+            let payload = &bytes[at + 5..at + 1 + length];
+            if let crate::pg::pginput::CopyData::XLogData { message, .. } =
+                crate::pg::pginput::copy_data(payload).unwrap()
+            {
+                use crate::pg::pginput::Message;
+                let row_change = match message {
+                    Message::Relation { relation, .. } => {
+                        assert_eq!(relation.id, root_oid);
+                        assert_eq!(relation.name, "publication_root_ops");
+                        declarations += 1;
+                        None
+                    }
+                    Message::Insert { relation_id, .. } => Some((b'I', relation_id)),
+                    Message::Update { relation_id, .. } => Some((b'U', relation_id)),
+                    Message::Delete { relation_id, .. } => Some((b'D', relation_id)),
+                    Message::Truncate { truncate, .. } => {
+                        assert_eq!(operation, b'T');
+                        assert_eq!(truncate.relation_ids().collect::<Vec<_>>(), [root_oid]);
+                        assert_eq!(declarations, 1);
+                        changes += 1;
+                        None
+                    }
+                    _ => None,
+                };
+                if let Some((tag, relation_id)) = row_change {
+                    assert_eq!(tag, operation);
+                    assert_eq!(relation_id, root_oid);
+                    assert_eq!(declarations, 1);
+                    changes += 1;
+                }
+            }
+            at += 1 + length;
+        }
+        assert_eq!(declarations, 1);
+        assert_eq!(changes, 1);
     }
 }
 
@@ -27476,21 +27992,36 @@ fn logical_replication_declares_user_types_before_relations_on_sized_stack() {
         .unwrap()
         .expect("typed replication transaction is retained");
     assert!(emitted);
+    let identifiers = data_rows(&run_with_txn_bytes(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        "SELECT 'replication_state'::regtype::oid, \
+                'replication_count'::regtype::oid, 'typed_replication'::regclass::oid",
+    ));
+    assert_eq!(identifiers.len(), 1);
+    let identifiers: Vec<u32> = identifiers[0]
+        .split('|')
+        .map(|identifier| identifier.parse().unwrap())
+        .collect();
+    assert_eq!(identifiers.len(), 3);
     let bytes = send.readable();
-    let enum_type = b"Y\x00\x01\xd4\xc0public\x00replication_state\x00";
-    let domain_type = b"Y\x00\x01\xad\xb0public\x00replication_count\x00";
-    let enum_at = bytes
-        .windows(enum_type.len())
-        .position(|window| window == enum_type)
-        .expect("enum Type message must precede Relation");
-    let domain_at = bytes
-        .windows(domain_type.len())
-        .position(|window| window == domain_type)
-        .expect("domain Type message must precede Relation");
-    let relation_at = bytes
-        .iter()
-        .position(|byte| *byte == b'R')
-        .expect("Relation message follows type declarations");
+    let [enum_at, domain_at, relation_at] = [
+        (b'Y', identifiers[0], "replication_state"),
+        (b'Y', identifiers[1], "replication_count"),
+        (b'R', identifiers[2], "typed_replication"),
+    ]
+    .map(|(tag, identifier, name)| {
+        let mut expected = vec![tag];
+        expected.extend_from_slice(&identifier.to_be_bytes());
+        expected.extend_from_slice(b"public\0");
+        expected.extend_from_slice(name.as_bytes());
+        expected.push(0);
+        bytes
+            .windows(expected.len())
+            .position(|window| window == expected)
+            .unwrap_or_else(|| panic!("replication message for {name} is missing"))
+    });
     assert!(enum_at < relation_at && domain_at < relation_at);
 }
 
@@ -29677,11 +30208,17 @@ fn information_schema_columns_describes_views_from_their_bound_row_type() {
     let domain_dependencies = data_rows(&run_with(
         &mut engine,
         &mut budget,
-        "SELECT objid, refobjid FROM pg_depend WHERE refobjid = 230000",
+        "SELECT owner_type.typname, base_type.typname FROM pg_depend d \
+         JOIN pg_type owner_type ON owner_type.oid = d.objid \
+         JOIN pg_type base_type ON base_type.oid = d.refobjid \
+         WHERE owner_type.typname = 'view_column_coordinate_domain' \
+           AND base_type.typname = 'view_column_coordinate' \
+           AND d.classid = 'pg_type'::regclass AND d.refclassid = 'pg_type'::regclass \
+           AND d.deptype = 'n'",
     ));
     assert_eq!(
         domain_dependencies,
-        ["110001|230000"],
+        ["view_column_coordinate_domain|view_column_coordinate"],
         "domain type dependencies: {domain_dependencies:?}"
     );
     let mut owner = TxnState::new(&mut budget, 256).unwrap();
@@ -31997,8 +32534,14 @@ fn array_subquery_preserves_named_composite_identity_over_empty_and_nonempty_set
     let type_oid = crate::sql::types::oid::composite_array_oid(
         engine
             .storage
-            .resolve_composite_slot("array_subquery_pair", 0)
-            .unwrap() as u16,
+            .composite_for(
+                engine
+                    .storage
+                    .resolve_composite_slot("array_subquery_pair", 0)
+                    .unwrap(),
+                0,
+            )
+            .creation(),
     );
     let nonempty = run_with(
         &mut engine,
@@ -44404,7 +44947,12 @@ fn routines_retain_catalog_defined_signature_and_result_types() {
         captured,
         engine
             .storage
-            .routine_result_for_oid(crate::sql::types::oid::domain_oid(moved_domain as u16), 0)
+            .routine_result_for_oid(
+                crate::sql::types::oid::domain_oid(
+                    engine.storage.domain_for(moved_domain, 0).creation()
+                ),
+                0
+            )
             .unwrap()
             .user_type
     );
@@ -44418,7 +44966,9 @@ fn routines_retain_catalog_defined_signature_and_result_types() {
             engine.storage.routine(echo_count).arguments()[0].user_type,
             0,
         ),
-        Some(crate::sql::types::oid::domain_oid(moved_domain as u16))
+        Some(crate::sql::types::oid::domain_oid(
+            engine.storage.domain_for(moved_domain, 0).creation()
+        ))
     );
     let echo_count_result = match engine.storage.routine(echo_count).kind {
         crate::storage::RoutineKind::Function { result } => result,
@@ -44428,7 +44978,9 @@ fn routines_retain_catalog_defined_signature_and_result_types() {
         engine
             .storage
             .routine_type_oid(echo_count_result.ctype, echo_count_result.user_type, 0,),
-        Some(crate::sql::types::oid::domain_oid(moved_domain as u16))
+        Some(crate::sql::types::oid::domain_oid(
+            engine.storage.domain_for(moved_domain, 0).creation()
+        ))
     );
     let moved_catalog = run_with(
         &mut engine,
@@ -52495,7 +53047,7 @@ fn drop_composite_type_tracks_table_composite_and_view_dependencies() {
         .unwrap();
     assert!(matches!(
         engine.storage.composite_for(shipment_slot, 0).fields()[0].ctype,
-        ColType::Composite(slot) if slot as usize == address_slot
+        ColType::Composite(slot) if slot == Some(engine.storage.composite_for(address_slot, 0).creation())
     ));
     let restricted = run_with(&mut engine, &mut budget, "DROP TYPE address");
     assert!(
@@ -52713,7 +53265,7 @@ fn drop_composite_type_reports_dependencies_across_one_connection_lifetime() {
     let leaf_definition = engine.storage.composite_for(leaf, txn.txid);
     assert!(matches!(
         leaf_definition.fields()[0].ctype,
-        ColType::Composite(candidate) if candidate as usize == root
+        ColType::Composite(candidate) if candidate == Some(engine.storage.composite_for(root, txn.txid).creation())
     ));
     let result = execute(
         &mut engine,
@@ -53828,7 +54380,9 @@ fn named_composite_type_is_transactional_and_catalog_visible() {
     );
     assert_eq!(data_rows(&bytes), ["address[]|address"]);
     let address_oid = crate::sql::types::oid::composite_oid(
-        e.storage.composite_slot("public", "address", 0).unwrap() as u16,
+        e.storage
+            .composite_for(e.storage.composite_slot("public", "address", 0).unwrap(), 0)
+            .creation(),
     );
     let copy_array_binary = run_with(
         &mut e,
@@ -55553,7 +56107,12 @@ fn composite_domain_arrays_keep_the_domain_binary_boundary() {
         .storage
         .domain_slot("public", "binary_domain_point_value", 0)
         .unwrap() as u16;
-    let domain_oid = crate::sql::types::oid::domain_oid(domain_slot);
+    let domain_oid = crate::sql::types::oid::domain_oid(
+        engine
+            .storage
+            .domain_for(usize::from(domain_slot), 0)
+            .creation(),
+    );
     let copy = run_with(
         &mut engine,
         &mut budget,
@@ -55901,7 +56460,12 @@ fn anonymous_record_field_preserves_catalog_cast_type() {
         .unwrap() as u16;
     assert_eq!(
         row_description_type_oids(&enum_output),
-        [crate::sql::types::oid::enum_oid(enum_slot)]
+        [crate::sql::types::oid::enum_oid(
+            engine
+                .storage
+                .enum_for(usize::from(enum_slot), 0)
+                .creation()
+        )]
     );
     let expansion_in_scalar = run_with(&mut engine, &mut budget, "SELECT (ROW(1,2)).* + 1");
     assert!(
@@ -55929,8 +56493,14 @@ fn expression_index_attributes_preserve_catalog_type_identity() {
     let domain_oid = crate::sql::types::oid::domain_oid(
         engine
             .storage
-            .domain_slot("public", "expression_index_domain", 0)
-            .unwrap() as u16,
+            .domain_for(
+                engine
+                    .storage
+                    .domain_slot("public", "expression_index_domain", 0)
+                    .unwrap(),
+                0,
+            )
+            .creation(),
     );
     assert_eq!(
         data_rows(&run_with(
@@ -55985,7 +56555,12 @@ fn catalog_casts_preserve_type_through_expression_descriptions() {
         .unwrap() as u16;
     assert_eq!(
         row_description_type_oids(&enum_output),
-        [crate::sql::types::oid::enum_oid(enum_slot)]
+        [crate::sql::types::oid::enum_oid(
+            engine
+                .storage
+                .enum_for(usize::from(enum_slot), 0)
+                .creation()
+        )]
     );
     let case_output = run_with(
         &mut engine,
@@ -55995,7 +56570,12 @@ fn catalog_casts_preserve_type_through_expression_descriptions() {
     assert_eq!(data_rows(&case_output), ["ready"], "{case_output:?}");
     assert_eq!(
         row_description_type_oids(&case_output),
-        [crate::sql::types::oid::enum_oid(enum_slot)]
+        [crate::sql::types::oid::enum_oid(
+            engine
+                .storage
+                .enum_for(usize::from(enum_slot), 0)
+                .creation()
+        )]
     );
     let nullable_case_output = run_with(
         &mut engine,
@@ -56009,7 +56589,12 @@ fn catalog_casts_preserve_type_through_expression_descriptions() {
     );
     assert_eq!(
         row_description_type_oids(&nullable_case_output),
-        [crate::sql::types::oid::enum_oid(enum_slot)]
+        [crate::sql::types::oid::enum_oid(
+            engine
+                .storage
+                .enum_for(usize::from(enum_slot), 0)
+                .creation()
+        )]
     );
     let array_output = run_with(
         &mut engine,
@@ -56019,7 +56604,12 @@ fn catalog_casts_preserve_type_through_expression_descriptions() {
     assert_eq!(data_rows(&array_output), ["{ready}"], "{array_output:?}");
     assert_eq!(
         row_description_type_oids(&array_output),
-        [crate::sql::types::oid::enum_array_oid(enum_slot)]
+        [crate::sql::types::oid::enum_array_oid(
+            engine
+                .storage
+                .enum_for(usize::from(enum_slot), 0)
+                .creation()
+        )]
     );
     let filled_array = run_with(
         &mut engine,
@@ -56033,7 +56623,12 @@ fn catalog_casts_preserve_type_through_expression_descriptions() {
     );
     assert_eq!(
         row_description_type_oids(&filled_array),
-        [crate::sql::types::oid::enum_array_oid(enum_slot)]
+        [crate::sql::types::oid::enum_array_oid(
+            engine
+                .storage
+                .enum_for(usize::from(enum_slot), 0)
+                .creation()
+        )]
     );
     let domain_array = run_with(
         &mut engine,
@@ -56047,7 +56642,12 @@ fn catalog_casts_preserve_type_through_expression_descriptions() {
         .unwrap() as u16;
     assert_eq!(
         row_description_type_oids(&domain_array),
-        [crate::sql::types::oid::domain_array_oid(domain_slot)]
+        [crate::sql::types::oid::domain_array_oid(
+            engine
+                .storage
+                .domain_for(usize::from(domain_slot), 0)
+                .creation()
+        )]
     );
     let enum_element = run_with(
         &mut engine,
@@ -56057,7 +56657,12 @@ fn catalog_casts_preserve_type_through_expression_descriptions() {
     assert_eq!(data_rows(&enum_element), ["ready"], "{enum_element:?}");
     assert_eq!(
         row_description_type_oids(&enum_element),
-        [crate::sql::types::oid::enum_oid(enum_slot)]
+        [crate::sql::types::oid::enum_oid(
+            engine
+                .storage
+                .enum_for(usize::from(enum_slot), 0)
+                .creation()
+        )]
     );
     let enum_slice = run_with(
         &mut engine,
@@ -56067,7 +56672,12 @@ fn catalog_casts_preserve_type_through_expression_descriptions() {
     assert_eq!(data_rows(&enum_slice), ["{ready}"], "{enum_slice:?}");
     assert_eq!(
         row_description_type_oids(&enum_slice),
-        [crate::sql::types::oid::enum_array_oid(enum_slot)]
+        [crate::sql::types::oid::enum_array_oid(
+            engine
+                .storage
+                .enum_for(usize::from(enum_slot), 0)
+                .creation()
+        )]
     );
     let appended = run_with(
         &mut engine,
@@ -56077,7 +56687,12 @@ fn catalog_casts_preserve_type_through_expression_descriptions() {
     assert_eq!(data_rows(&appended), ["{ready,blocked}"], "{appended:?}");
     assert_eq!(
         row_description_type_oids(&appended),
-        [crate::sql::types::oid::enum_array_oid(enum_slot)]
+        [crate::sql::types::oid::enum_array_oid(
+            engine
+                .storage
+                .enum_for(usize::from(enum_slot), 0)
+                .creation()
+        )]
     );
     let concatenated = run_with(
         &mut engine,
@@ -56091,7 +56706,12 @@ fn catalog_casts_preserve_type_through_expression_descriptions() {
     );
     assert_eq!(
         row_description_type_oids(&concatenated),
-        [crate::sql::types::oid::enum_array_oid(enum_slot)]
+        [crate::sql::types::oid::enum_array_oid(
+            engine
+                .storage
+                .enum_for(usize::from(enum_slot), 0)
+                .creation()
+        )]
     );
     let unnested = run_with(
         &mut engine,
@@ -56101,7 +56721,12 @@ fn catalog_casts_preserve_type_through_expression_descriptions() {
     assert_eq!(data_rows(&unnested), ["ready"], "{unnested:?}");
     assert_eq!(
         row_description_type_oids(&unnested),
-        [crate::sql::types::oid::enum_oid(enum_slot)]
+        [crate::sql::types::oid::enum_oid(
+            engine
+                .storage
+                .enum_for(usize::from(enum_slot), 0)
+                .creation()
+        )]
     );
     let lagged = run_with(
         &mut engine,
@@ -56111,7 +56736,12 @@ fn catalog_casts_preserve_type_through_expression_descriptions() {
     assert_eq!(data_rows(&lagged), ["NULL"], "{lagged:?}");
     assert_eq!(
         row_description_type_oids(&lagged),
-        [crate::sql::types::oid::enum_oid(enum_slot)]
+        [crate::sql::types::oid::enum_oid(
+            engine
+                .storage
+                .enum_for(usize::from(enum_slot), 0)
+                .creation()
+        )]
     );
     let aggregated = run_with(
         &mut engine,
@@ -56121,7 +56751,12 @@ fn catalog_casts_preserve_type_through_expression_descriptions() {
     assert_eq!(data_rows(&aggregated), ["{ready}"], "{aggregated:?}");
     assert_eq!(
         row_description_type_oids(&aggregated),
-        [crate::sql::types::oid::enum_array_oid(enum_slot)]
+        [crate::sql::types::oid::enum_array_oid(
+            engine
+                .storage
+                .enum_for(usize::from(enum_slot), 0)
+                .creation()
+        )]
     );
 }
 
@@ -57368,11 +58003,13 @@ fn enum_value_identity_hashes_are_selective_and_bind_legacy_labels() {
     let engine = Engine::new(&config, &mut budget).unwrap();
     let members = [
         crate::storage::EnumMember {
+            identity: None,
             label: crate::storage::SqlName::parse("new").unwrap(),
             legacy_label: Some(crate::storage::SqlName::parse("old").unwrap()),
             sort: 1.0,
         },
         crate::storage::EnumMember {
+            identity: None,
             label: crate::storage::SqlName::parse("ready").unwrap(),
             legacy_label: Some(crate::storage::SqlName::parse("ready").unwrap()),
             sort: 2.0,
@@ -57388,6 +58025,7 @@ fn enum_value_identity_hashes_are_selective_and_bind_legacy_labels() {
         )
         .unwrap()
         .slot() as u16;
+    let slot = engine.storage.enum_for(usize::from(slot), 0).creation();
     let hash = |member: Option<u32>, sort, label| {
         crate::mem::guard::forbid_alloc(|| {
             crate::sql::eval::hash_key_catalog(
@@ -57418,11 +58056,13 @@ fn enum_value_identity_legacy_rows_arrays_and_records_keep_original_members() {
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let members = [
         crate::storage::EnumMember {
+            identity: None,
             label: crate::storage::SqlName::parse("old").unwrap(),
             legacy_label: Some(crate::storage::SqlName::parse("old").unwrap()),
             sort: 1.0,
         },
         crate::storage::EnumMember {
+            identity: None,
             label: crate::storage::SqlName::parse("ready").unwrap(),
             legacy_label: Some(crate::storage::SqlName::parse("ready").unwrap()),
             sort: 2.0,
@@ -57438,6 +58078,7 @@ fn enum_value_identity_legacy_rows_arrays_and_records_keep_original_members() {
         )
         .unwrap()
         .slot() as u16;
+    let slot = engine.storage.enum_for(usize::from(slot), 0).creation();
     let read_arena = Arena::new(&mut budget, "legacy enum reads", 1 << 20).unwrap();
     let legacy = Datum::Enum {
         slot,
@@ -57445,7 +58086,7 @@ fn enum_value_identity_legacy_rows_arrays_and_records_keep_original_members() {
         sort: 1.0,
         label: "old",
     };
-    let element = crate::sql::types::ArrElem::Enum(slot);
+    let element = crate::sql::types::ArrElem::Enum(Some(slot));
     let array = crate::sql::array::build_shaped(
         &[legacy, Datum::Null],
         crate::sql::array::Shape::one(2).unwrap(),
@@ -57469,7 +58110,7 @@ fn enum_value_identity_legacy_rows_arrays_and_records_keep_original_members() {
     crate::mem::guard::forbid_alloc(|| {
         crate::storage::rowenc::decode(
             &bytes[..length],
-            &[ColType::Enum(slot), ColType::Array(element)],
+            &[ColType::Enum(Some(slot)), ColType::Array(element)],
             &mut decoded,
         )
         .unwrap();
@@ -57485,6 +58126,10 @@ fn enum_value_identity_legacy_rows_arrays_and_records_keep_original_members() {
         .storage
         .composite_slot("public", "enum_legacy_detail", 0)
         .unwrap() as u16;
+    let composite_slot = engine
+        .storage
+        .composite_for(usize::from(composite_slot), 0)
+        .creation();
     let record = crate::mem::guard::forbid_alloc(|| {
         crate::sql::exec::decode_stored_composite_text(
             "(old,old)",
@@ -57587,8 +58232,13 @@ fn enum_value_identity_compact_ids_preserve_value_size() {
     );
     assert!(EnumMemberId::from_ordinal(u32::MAX).is_none());
     assert!(
-        crate::sql::types::ArrElem::domain(0, ColType::Array(crate::sql::types::ArrElem::Enum(0)))
-            .is_none()
+        crate::sql::types::ArrElem::domain(
+            crate::storage::TypeCreation::parse(1).unwrap(),
+            ColType::Array(crate::sql::types::ArrElem::Enum(Some(
+                crate::storage::TypeCreation::parse(2).unwrap()
+            )))
+        )
+        .is_none()
     );
 }
 
@@ -57635,6 +58285,7 @@ fn enum_value_identity_private_markers_and_invalid_bindings_are_checked() {
         .storage
         .enum_slot("public", "enum_private_state", 0)
         .unwrap() as u16;
+    let slot = engine.storage.enum_for(usize::from(slot), 0).creation();
     for (source, state) in [
         ("pos3ql-enum-check-v1\nVALUE=/*p3c:9999*/'old'", "XX000"),
         (
@@ -57646,7 +58297,7 @@ fn enum_value_identity_private_markers_and_invalid_bindings_are_checked() {
         let error = crate::mem::guard::forbid_alloc(|| {
             crate::sql::enum_values::checks::resolve(
                 source,
-                ColType::Enum(slot),
+                ColType::Enum(Some(slot)),
                 &engine.storage,
                 0,
                 &arena,
@@ -57665,7 +58316,11 @@ fn enum_value_identity_private_markers_and_invalid_bindings_are_checked() {
     );
     for (source, base, expected) in [
         ("pos3ql-enum-check-v99\n'old'", ColType::Text, "0A000"),
-        ("pos3ql-enum-check-v99\n'old'", ColType::Enum(slot), "0A000"),
+        (
+            "pos3ql-enum-check-v99\n'old'",
+            ColType::Enum(Some(slot)),
+            "0A000",
+        ),
         (
             "pos3ql-enum-check-v1\n/*p3c:0*/'old'",
             ColType::Text,
@@ -57673,12 +58328,12 @@ fn enum_value_identity_private_markers_and_invalid_bindings_are_checked() {
         ),
         (
             "pos3ql-enum-check-v1\n/*p3o:%ff*/\n/*p3c:0*/'old'",
-            ColType::Enum(slot),
+            ColType::Enum(Some(slot)),
             "XX000",
         ),
         (
             "pos3ql-enum-check-v1\n/*p3o:%0*/\n/*p3c:0*/'old'",
-            ColType::Enum(slot),
+            ColType::Enum(Some(slot)),
             "XX000",
         ),
     ] {
@@ -81341,7 +81996,7 @@ fn current_manifest_cold_recovery_rejects_invalid_roots_without_publication_body
         .object_bytes(&manifest_key)
         .unwrap()
         .to_vec();
-    assert!(current.starts_with(b"pos3ql-manifest-v28\n"));
+    assert!(current.starts_with(b"pos3ql-manifest-v29\n"));
     assert!(
         current.windows(b" v4\n".len()).any(|part| part == b" v4\n"),
         "current checkpoint must retain its packed row layout"
@@ -81556,7 +82211,7 @@ fn current_manifest_cold_recovery_rejects_invalid_roots_without_publication_body
         namespace
             .borrow()
             .object_bytes(&manifest_key)
-            .is_some_and(|bytes| bytes.starts_with(b"pos3ql-manifest-v28\n"))
+            .is_some_and(|bytes| bytes.starts_with(b"pos3ql-manifest-v29\n"))
     );
     drop(recovered);
 
@@ -83833,7 +84488,12 @@ fn derived_tables() {
          INSERT INTO typed_source VALUES ('ready', 7)",
     );
     let enum_oid = crate::sql::types::oid::enum_oid(
-        e.storage.enum_slot("public", "derived_state", 0).unwrap() as u16,
+        e.storage
+            .enum_for(
+                e.storage.enum_slot("public", "derived_state", 0).unwrap(),
+                0,
+            )
+            .creation(),
     );
     let query = "SELECT d.state, d.count FROM (SELECT state, count FROM typed_source) d";
     assert_eq!(data_rows(&run_with(&mut e, &mut b, query)), ["ready|7"]);
@@ -85371,7 +86031,9 @@ fn arrays_of_array_domains_preserve_the_domain_element_identity() {
         .storage
         .domain_slot("public", "integer_vector", 0)
         .unwrap() as u16;
-    let domain_oid = crate::sql::types::oid::domain_oid(slot);
+    let domain_oid = crate::sql::types::oid::domain_oid(
+        engine.storage.domain_for(usize::from(slot), 0).creation(),
+    );
     let mut inner = Vec::new();
     inner.extend_from_slice(&1_i32.to_be_bytes());
     inner.extend_from_slice(&0_i32.to_be_bytes());
@@ -85394,7 +86056,9 @@ fn arrays_of_array_domains_preserve_the_domain_element_identity() {
     assert_eq!(
         engine
             .decode_binary_parameter(
-                crate::sql::types::oid::domain_array_oid(slot),
+                crate::sql::types::oid::domain_array_oid(
+                    engine.storage.domain_for(usize::from(slot), 0).creation()
+                ),
                 &outer,
                 &arena,
                 0,
@@ -85846,8 +86510,14 @@ fn binary_copy_enforces_not_null_domain_array_elements() {
     let domain_oid = crate::sql::types::oid::domain_oid(
         engine
             .storage
-            .domain_slot("public", "binary_copy_required", 0)
-            .unwrap() as u16,
+            .domain_for(
+                engine
+                    .storage
+                    .domain_slot("public", "binary_copy_required", 0)
+                    .unwrap(),
+                0,
+            )
+            .creation(),
     );
     let mut send =
         crate::mem::FixedBuf::new(&mut budget, "binary copy domain send", 1 << 18).unwrap();
@@ -86022,8 +86692,14 @@ fn copy_query_to_stdout() {
     let domain_oid = crate::sql::types::oid::domain_oid(
         engine
             .storage
-            .domain_slot("public", "cq_positive", 0)
-            .unwrap() as u16,
+            .domain_for(
+                engine
+                    .storage
+                    .domain_slot("public", "cq_positive", 0)
+                    .unwrap(),
+                0,
+            )
+            .creation(),
     );
     assert!(
         !message_types(&out).contains(&b'E')

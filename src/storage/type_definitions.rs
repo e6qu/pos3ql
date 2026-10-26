@@ -35,6 +35,25 @@ pub(crate) enum TypeDefinitionTarget {
 }
 
 impl TypeDefinitionTarget {
+    pub(crate) fn by_creation(
+        storage: &Storage,
+        kind: super::NamedTypeKind,
+        creation: super::TypeCreation,
+    ) -> Result<Self, SqlError> {
+        storage
+            .type_catalog
+            .lock()
+            .expect("type catalog lock poisoned")
+            .source_reference_by_creation(kind, creation, super::current_database())
+            .map(Self::Bound)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "named type creation no longer exists"
+                )
+            })
+    }
+
     pub(super) fn slot(self) -> NamedTypeSlot {
         match self {
             Self::Slot(slot) => slot,
@@ -57,9 +76,14 @@ impl TypeDefinitionTarget {
         let snapshot = catalog
             .type_snapshot(self.slot(), transaction)?
             .filter(|snapshot| snapshot.identity.database() == super::current_database());
-        snapshot
-            .map(|snapshot| TypeReference::from_bound_name(snapshot.name))
-            .transpose()
+        Ok(snapshot.and_then(|snapshot| {
+            catalog.source_reference_by_creation(
+                snapshot.identity.slot().kind(),
+                super::type_identities::TypeCreation::parse(snapshot.identity.created_at())
+                    .expect("selected type birth was admitted"),
+                super::current_database(),
+            )
+        }))
     }
 
     pub(super) fn validate(
@@ -771,6 +795,7 @@ mod tests {
                 name,
                 EnumSpec {
                     members: &[EnumMember {
+                        identity: None,
                         label: SqlName::parse("before").unwrap(),
                         legacy_label: None,
                         sort: 1.0,
@@ -912,6 +937,165 @@ mod tests {
                 assert_eq!(definition.name.as_str(), "reader_source");
                 assert_eq!(definition.fields()[0].name.as_str(), "before");
             }
+        }
+    }
+
+    #[test]
+    fn type_creation_lookup_preserves_family_database_and_retained_definitions() {
+        use super::super::type_identities::TypeCreation;
+        use super::super::{DatabaseOid, NamedTypeKind};
+        for source in SOURCES {
+            let mut storage = fixture(1);
+            create(&mut storage, source).unwrap();
+            let reference = reference(&storage, source);
+            let birth = {
+                let catalog = storage.type_catalog.lock().unwrap();
+                TypeCreation::parse(
+                    catalog
+                        .type_snapshot(source, 0)
+                        .unwrap()
+                        .unwrap()
+                        .identity
+                        .created_at(),
+                )
+                .unwrap()
+            };
+            let database = super::super::current_database();
+            let images = storage.type_definition_images();
+            crate::mem::guard::forbid_alloc(|| {
+                {
+                    let catalog = storage.type_catalog.lock().unwrap();
+                    assert_eq!(
+                        catalog.source_reference_by_creation(source.kind(), birth, database),
+                        Some(reference)
+                    );
+                    for kind in [
+                        NamedTypeKind::Domain,
+                        NamedTypeKind::Enum,
+                        NamedTypeKind::Composite,
+                    ] {
+                        if kind != source.kind() {
+                            assert!(
+                                catalog
+                                    .source_reference_by_creation(kind, birth, database)
+                                    .is_none()
+                            );
+                        }
+                    }
+                    assert!(
+                        catalog
+                            .source_reference_by_creation(
+                                source.kind(),
+                                birth,
+                                DatabaseOid::TEMPLATE0
+                            )
+                            .is_none()
+                    );
+                    assert!(
+                        catalog
+                            .source_reference_by_creation(
+                                source.kind(),
+                                TypeCreation::parse(9_999_999).unwrap(),
+                                database
+                            )
+                            .is_none()
+                    );
+                }
+                let retained = capture(&images, &storage, reference).unwrap();
+                retire(&mut storage, source);
+                let selected = {
+                    let catalog = storage.type_catalog.lock().unwrap();
+                    let selected = catalog
+                        .source_reference_by_creation(source.kind(), birth, database)
+                        .unwrap();
+                    assert_eq!(selected, reference);
+                    assert!(
+                        catalog
+                            .resolve_source_reference(selected, database, 0)
+                            .unwrap()
+                            .is_none()
+                    );
+                    selected
+                };
+                assert_retained(&retained);
+                assert_eq!(
+                    capture(&images, &storage, selected).err().unwrap().sqlstate,
+                    sqlstate::UNDEFINED_OBJECT
+                );
+                drop(images);
+                assert_eq!(create(&mut storage, source).unwrap(), source.index());
+                let catalog = storage.type_catalog.lock().unwrap();
+                assert!(
+                    catalog
+                        .source_reference_by_creation(source.kind(), birth, database)
+                        .is_none()
+                );
+                assert!(
+                    catalog
+                        .resolve_source_reference(reference, database, 0)
+                        .unwrap()
+                        .is_none()
+                );
+                let new_birth = TypeCreation::parse(
+                    catalog
+                        .type_snapshot(source, 0)
+                        .unwrap()
+                        .unwrap()
+                        .identity
+                        .created_at(),
+                )
+                .unwrap();
+                assert_ne!(birth, new_birth);
+                assert!(
+                    catalog
+                        .source_reference_by_creation(source.kind(), new_birth, database)
+                        .is_some()
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn declared_type_bindings_reject_reused_sources_instead_of_resolving_names() {
+        use super::super::{ColumnMeta, UserTypeName};
+        for source in SOURCES {
+            let mut storage = fixture(1);
+            create(&mut storage, source).unwrap();
+            let (bound, stored) = {
+                let catalog = storage.type_catalog.lock().unwrap();
+                let snapshot = catalog.type_snapshot(source, 0).unwrap().unwrap();
+                let column = ColumnMeta {
+                    ctype: snapshot.base,
+                    user_type: Some(snapshot.name),
+                    ..ColumnMeta::EMPTY
+                };
+                let saved = snapshot.name.storage_name();
+                let restored = ColumnMeta {
+                    ctype: ColType::from_code(snapshot.base.code()).unwrap(),
+                    user_type: Some(
+                        UserTypeName::from_storage(snapshot.name.schema, saved.as_str()).unwrap(),
+                    ),
+                    ..column
+                };
+                (column, restored)
+            };
+            crate::mem::guard::forbid_alloc(|| {
+                assert_eq!(
+                    storage.declared_column_type(&bound, 0).unwrap(),
+                    storage.declared_column_type(&stored, 0).unwrap()
+                );
+                retire(&mut storage, source);
+                assert_eq!(create(&mut storage, source).unwrap(), source.index());
+                for column in [&bound, &stored] {
+                    assert_eq!(
+                        storage
+                            .declared_column_type(column, 0)
+                            .unwrap_err()
+                            .sqlstate,
+                        sqlstate::UNDEFINED_OBJECT
+                    );
+                }
+            });
         }
     }
 
@@ -1111,11 +1295,13 @@ mod tests {
         create(&mut storage, NamedTypeSlot::Enum(0)).unwrap();
         let members = [
             EnumMember {
+                identity: None,
                 label: SqlName::parse("before").unwrap(),
                 legacy_label: Some(SqlName::parse("before").unwrap()),
                 sort: 1.0,
             },
             EnumMember {
+                identity: None,
                 label: SqlName::parse("after").unwrap(),
                 legacy_label: None,
                 sort: 2.0,
@@ -1138,7 +1324,7 @@ mod tests {
             assert!(!selected.label_is_uncommitted("before"));
             assert!(selected.label_is_uncommitted("after"));
             let value = |member, label| Datum::Enum {
-                slot: 0,
+                slot: selected.creation(),
                 member: Some(EnumMemberId::from_ordinal(member).unwrap()),
                 sort: 0.0,
                 label,
@@ -1156,7 +1342,7 @@ mod tests {
             );
             let identified = value(0, "before");
             let legacy = Datum::Enum {
-                slot: 0,
+                slot: selected.creation(),
                 member: None,
                 sort: 0.0,
                 label: "before",
@@ -1257,7 +1443,7 @@ mod tests {
                         schema,
                         SqlName::parse("reader_source").unwrap(),
                     )),
-                    base: ColType::Enum(0),
+                    base: ColType::Enum(Some(storage.enum_for(0, 0).creation())),
                     base_type_mod: -1,
                     not_null: false,
                     not_null_name: None,
@@ -1273,7 +1459,7 @@ mod tests {
         fields[0] = CompositeFieldDef {
             name: SqlName::parse("status").unwrap(),
             attribute_number: 1,
-            ctype: ColType::Enum(0),
+            ctype: ColType::Enum(Some(storage.enum_for(0, 0).creation())),
             dropped: false,
             user_type: Some(super::super::UserTypeName::declaration(
                 schema,
@@ -1340,6 +1526,354 @@ mod tests {
     }
 
     #[test]
+    fn restored_type_identity_rejects_duplicate_births_without_leaking_images() {
+        let mut storage = fixture(1);
+        let schema = SqlName::parse("public").unwrap();
+        let name = SqlName::parse("original_domain").unwrap();
+        let enumeration = SqlName::parse("restored_enum").unwrap();
+        let spec = DomainSpec {
+            base_domain: None,
+            base_user_type: None,
+            base: ColType::Int4,
+            base_type_mod: -1,
+            not_null: false,
+            not_null_name: None,
+            default_expr: None,
+            checks: [CheckConstraint::EMPTY; MAX_DOMAIN_CHECKS],
+            n_checks: 0,
+        };
+        crate::mem::guard::forbid_alloc(|| {
+            storage
+                .create_domain_from_manifest(schema, name, spec, 41)
+                .unwrap();
+            let original = reference(&storage, NamedTypeSlot::Domain(0));
+            let version = storage
+                .type_catalog
+                .lock()
+                .unwrap()
+                .versions
+                .get(NamedTypeSlot::Domain(0));
+            storage.enum_replay_members(1).unwrap()[0] = EnumMember {
+                identity: super::super::EnumLabelIdentity::parse(43),
+                label: SqlName::parse("saved").unwrap(),
+                legacy_label: None,
+                sort: 1.0,
+            };
+            for _ in 0..32 {
+                assert_eq!(
+                    storage
+                        .finish_enum_replay(schema, enumeration, 1, 41)
+                        .unwrap_err()
+                        .sqlstate,
+                    sqlstate::DATA_EXCEPTION
+                );
+                assert_eq!(storage.catalog_identity_sequence(), 41);
+                assert_eq!(reference(&storage, NamedTypeSlot::Domain(0)), original);
+                let catalog = storage.type_catalog.lock().unwrap();
+                assert_eq!(catalog.versions.get(NamedTypeSlot::Domain(0)), version);
+                assert_eq!(
+                    catalog.enums[0].ddl_state,
+                    super::super::CatalogDdlState::Absent
+                );
+                assert_eq!(
+                    catalog
+                        .identities
+                        .lookup(super::super::current_database(), 41),
+                    Some(NamedTypeSlot::Domain(0))
+                );
+            }
+            assert_eq!(
+                storage
+                    .finish_enum_replay(schema, enumeration, 1, 42)
+                    .unwrap(),
+                0
+            );
+            assert_eq!(storage.enum_for(0, 0).sort_of("saved"), Some(1.0));
+            assert_eq!(storage.catalog_identity_sequence(), 43);
+            let catalog = storage.type_catalog.lock().unwrap();
+            assert_eq!(
+                catalog
+                    .identities
+                    .lookup(super::super::current_database(), 41),
+                Some(NamedTypeSlot::Domain(0))
+            );
+            assert_eq!(
+                catalog
+                    .identities
+                    .lookup(super::super::current_database(), 42),
+                Some(NamedTypeSlot::Enum(0))
+            );
+        });
+    }
+
+    #[test]
+    fn type_creation_range_exhaustion_and_invalid_restore_preserve_existing_sources() {
+        let maximum = super::super::type_identities::MAX_TYPE_CREATION;
+        for source in SOURCES {
+            let mut storage = fixture(1);
+            create(&mut storage, source).unwrap();
+            let original = reference(&storage, source);
+            storage.restore_catalog_identity_sequence(maximum);
+            crate::mem::guard::forbid_alloc(|| {
+                assert_eq!(
+                    create(&mut storage, source).unwrap_err().sqlstate,
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED
+                );
+                assert_eq!(reference(&storage, source), original);
+                assert_eq!(storage.catalog_identity_sequence(), maximum);
+                for rejected in [0, maximum + 1, u64::MAX] {
+                    assert_eq!(
+                        storage
+                            .restore_type_identity(source, source, rejected)
+                            .unwrap_err()
+                            .sqlstate,
+                        sqlstate::DATA_EXCEPTION
+                    );
+                    assert_eq!(reference(&storage, source), original);
+                    assert_eq!(storage.catalog_identity_sequence(), maximum);
+                }
+                assert_eq!(
+                    storage
+                        .restore_type_identity(source, source, maximum)
+                        .unwrap_err()
+                        .sqlstate,
+                    sqlstate::DATA_EXCEPTION
+                );
+                assert_eq!(reference(&storage, source), original);
+                let catalog = storage.type_catalog.lock().unwrap();
+                let selected = catalog.type_snapshot(source, 0).unwrap().unwrap();
+                assert_eq!(
+                    selected.identity.created_at(),
+                    original.creation().created_at()
+                );
+                assert_eq!(
+                    catalog
+                        .identities
+                        .lookup(selected.identity.database(), maximum),
+                    None
+                );
+                assert!(
+                    catalog
+                        .resolve_source_reference(original, selected.identity.database(), 0)
+                        .unwrap()
+                        .is_some()
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn type_recovery_installs_saved_birth_when_the_catalog_sequence_is_exhausted() {
+        for manifest in [false, true] {
+            for source in SOURCES {
+                let mut storage = fixture(1);
+                let schema = SqlName::parse("public").unwrap();
+                let name = SqlName::parse("reader_source").unwrap();
+                storage.restore_catalog_identity_sequence(u64::MAX);
+                let created_at = 41;
+                crate::mem::guard::forbid_alloc(|| {
+                    let slot = match source {
+                        NamedTypeSlot::Domain(_) => {
+                            let spec = DomainSpec {
+                                base_domain: None,
+                                base_user_type: None,
+                                base: ColType::Int4,
+                                base_type_mod: -1,
+                                not_null: false,
+                                not_null_name: None,
+                                default_expr: None,
+                                checks: [CheckConstraint::EMPTY; MAX_DOMAIN_CHECKS],
+                                n_checks: 0,
+                            };
+                            if manifest {
+                                storage.create_domain_from_manifest(schema, name, spec, created_at)
+                            } else {
+                                storage.create_domain_from_journal(schema, name, spec, created_at)
+                            }
+                            .unwrap()
+                        }
+                        NamedTypeSlot::Enum(_) => {
+                            storage.enum_replay_members(1).unwrap()[0] = EnumMember {
+                                identity: super::super::EnumLabelIdentity::parse(42),
+                                label: SqlName::parse("before").unwrap(),
+                                legacy_label: None,
+                                sort: 1.0,
+                            };
+                            storage
+                                .finish_enum_replay(schema, name, 1, created_at)
+                                .unwrap()
+                        }
+                        NamedTypeSlot::Composite(_) => {
+                            let mut fields = [CompositeFieldDef::EMPTY; MAX_COMPOSITE_FIELDS];
+                            fields[0] = CompositeFieldDef {
+                                name: SqlName::parse("before").unwrap(),
+                                attribute_number: 1,
+                                ctype: ColType::Int4,
+                                ..CompositeFieldDef::EMPTY
+                            };
+                            let spec = CompositeSpec {
+                                fields,
+                                n_fields: 1,
+                            };
+                            if manifest {
+                                storage
+                                    .create_composite_from_manifest(schema, name, spec, created_at)
+                            } else {
+                                storage.create_composite_at(0, schema, name, spec, created_at)
+                            }
+                            .unwrap()
+                        }
+                    };
+                    assert_eq!(slot, source.index());
+                    let captured = reference(&storage, source);
+                    let catalog = storage.type_catalog.lock().unwrap();
+                    let selected = catalog.type_snapshot(source, 0).unwrap().unwrap();
+                    assert_eq!(selected.identity.created_at(), created_at);
+                    assert_eq!(
+                        catalog
+                            .identities
+                            .lookup(selected.identity.database(), created_at),
+                        Some(source)
+                    );
+                    assert!(catalog.versions.get(source) >= created_at);
+                    assert!(
+                        catalog
+                            .resolve_source_reference(captured, selected.identity.database(), 0)
+                            .unwrap()
+                            .is_some()
+                    );
+                    assert_eq!(storage.catalog_identity_sequence(), u64::MAX);
+                    drop(catalog);
+                    assert_eq!(
+                        create(&mut storage, source).unwrap_err().sqlstate,
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED
+                    );
+                    assert_eq!(reference(&storage, source), captured);
+                    assert_eq!(storage.catalog_identity_sequence(), u64::MAX);
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn restored_type_identity_rejects_unpublished_retired_and_mismatched_sources_atomically() {
+        for source in SOURCES {
+            let mut storage = fixture(1);
+            create(&mut storage, source).unwrap();
+            let original = reference(&storage, source);
+            let (database, created_at, version) = {
+                let catalog = storage.type_catalog.lock().unwrap();
+                let selected = catalog.type_snapshot(source, 0).unwrap().unwrap();
+                (
+                    selected.identity.database(),
+                    selected.identity.created_at(),
+                    catalog.versions.get(source),
+                )
+            };
+            let sequence = storage.catalog_identity_sequence();
+            crate::mem::guard::forbid_alloc(|| {
+                let bad_family = match source {
+                    NamedTypeSlot::Domain(_) => NamedTypeSlot::Enum(0),
+                    _ => NamedTypeSlot::Domain(0),
+                };
+                let out_of_bounds = match source {
+                    NamedTypeSlot::Domain(_) => NamedTypeSlot::Domain(1),
+                    NamedTypeSlot::Enum(_) => NamedTypeSlot::Enum(1),
+                    NamedTypeSlot::Composite(_) => NamedTypeSlot::Composite(1),
+                };
+                for (target, stamp) in [
+                    (source, 0),
+                    (bad_family, created_at),
+                    (out_of_bounds, created_at),
+                ] {
+                    assert_eq!(
+                        storage
+                            .restore_type_identity(source, target, stamp)
+                            .unwrap_err()
+                            .sqlstate,
+                        sqlstate::DATA_EXCEPTION
+                    );
+                    assert_eq!(reference(&storage, source), original);
+                    let catalog = storage.type_catalog.lock().unwrap();
+                    assert_eq!(
+                        catalog.identities.lookup(database, created_at),
+                        Some(source)
+                    );
+                    assert_eq!(catalog.versions.get(source), version);
+                    assert_eq!(storage.catalog_identity_sequence(), sequence);
+                }
+                storage
+                    .select_database_for_recovery(super::super::DatabaseOid::TEMPLATE1)
+                    .unwrap();
+                assert_eq!(
+                    storage
+                        .restore_type_identity(source, source, created_at + 100)
+                        .unwrap_err()
+                        .sqlstate,
+                    sqlstate::DATA_EXCEPTION
+                );
+                storage.select_database_for_recovery(database).unwrap();
+                assert_eq!(reference(&storage, source), original);
+                {
+                    let mut catalog = storage.type_catalog.lock().unwrap();
+                    match source {
+                        NamedTypeSlot::Domain(slot) => {
+                            catalog.domains[slot].ddl_state =
+                                super::super::CatalogDdlState::PendingCreate { txid: 77 }
+                        }
+                        NamedTypeSlot::Enum(slot) => {
+                            catalog.enums[slot].ddl_state =
+                                super::super::CatalogDdlState::PendingCreate { txid: 77 }
+                        }
+                        NamedTypeSlot::Composite(slot) => {
+                            catalog.composites[slot].ddl_state =
+                                super::super::CatalogDdlState::PendingCreate { txid: 77 }
+                        }
+                    }
+                }
+                assert_eq!(
+                    storage
+                        .restore_type_identity(source, source, created_at + 100)
+                        .unwrap_err()
+                        .sqlstate,
+                    sqlstate::DATA_EXCEPTION
+                );
+                {
+                    let mut catalog = storage.type_catalog.lock().unwrap();
+                    match source {
+                        NamedTypeSlot::Domain(slot) => {
+                            catalog.domains[slot].ddl_state = super::super::CatalogDdlState::Present
+                        }
+                        NamedTypeSlot::Enum(slot) => {
+                            catalog.enums[slot].ddl_state = super::super::CatalogDdlState::Present
+                        }
+                        NamedTypeSlot::Composite(slot) => {
+                            catalog.composites[slot].ddl_state =
+                                super::super::CatalogDdlState::Present
+                        }
+                    }
+                }
+                assert_eq!(reference(&storage, source), original);
+                retire(&mut storage, source);
+                assert_eq!(
+                    storage
+                        .restore_type_identity(source, source, created_at + 100)
+                        .unwrap_err()
+                        .sqlstate,
+                    sqlstate::DATA_EXCEPTION
+                );
+                let catalog = storage.type_catalog.lock().unwrap();
+                assert_eq!(
+                    catalog.identities.lookup(database, created_at),
+                    Some(source)
+                );
+                assert_eq!(catalog.identities.lookup(database, created_at + 100), None);
+                assert_eq!(storage.catalog_identity_sequence(), sequence);
+            });
+        }
+    }
+
+    #[test]
     fn retained_type_identity_allows_exact_replay_and_rejects_reassignment() {
         for source in SOURCES {
             let mut storage = fixture(1);
@@ -1369,16 +1903,15 @@ mod tests {
                 );
                 retain(&images, &storage, reference).unwrap();
                 drop(images);
-                storage
-                    .restore_type_identity(source, source, created_at + 1)
-                    .unwrap();
-                let replacement = storage.type_definition_images();
                 assert_eq!(
-                    retain(&replacement, &storage, reference)
+                    storage
+                        .restore_type_identity(source, source, created_at + 1)
                         .unwrap_err()
                         .sqlstate,
-                    sqlstate::UNDEFINED_OBJECT
+                    sqlstate::DATA_EXCEPTION
                 );
+                let replacement = storage.type_definition_images();
+                retain(&replacement, &storage, reference).unwrap();
             });
         }
     }
@@ -1430,6 +1963,7 @@ mod tests {
                                 SqlName::parse("public").unwrap(),
                                 SqlName::parse("reader_source").unwrap(),
                                 &[EnumMember {
+                                    identity: None,
                                     label: SqlName::parse("pending").unwrap(),
                                     legacy_label: None,
                                     sort: 1.0,
@@ -1622,6 +2156,7 @@ mod tests {
                     SqlName::parse("public").unwrap(),
                     SqlName::parse("reader_source").unwrap(),
                     &[EnumMember {
+                        identity: None,
                         label: SqlName::parse(marker).unwrap(),
                         legacy_label: None,
                         sort: 1.0,

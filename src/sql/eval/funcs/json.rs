@@ -321,58 +321,62 @@ pub(crate) fn populate_record_from_json<'a>(
             super::super::ExpressionTypeIdentity::Known(type_oid) => Some(type_oid),
             super::super::ExpressionTypeIdentity::Unresolved => None,
         };
-    let (slot, base_fields, base_type_oid): (Option<u16>, _, i32) = match base {
-        Datum::Composite { slot, fields } => (
-            Some(slot),
-            fields,
-            crate::sql::types::oid::composite_oid(slot),
-        ),
-        Datum::CompositeText {
-            slot,
-            physical_fields,
-            text,
-        } => match catalog.materialize_composite(slot, physical_fields, text, arena)? {
-            Datum::Composite { fields, .. } => (
+    let (slot, base_fields, base_type_oid): (Option<crate::storage::TypeCreation>, _, i32) =
+        match base {
+            Datum::Composite { slot, fields } => (
                 Some(slot),
                 fields,
                 crate::sql::types::oid::composite_oid(slot),
             ),
-            _ => unreachable!("catalog materializes a named composite"),
-        },
-        Datum::Null => {
-            let Some(type_oid) = declared_type_oid else {
-                return Err(sql_err!(
-                    sqlstate::DATATYPE_MISMATCH,
-                    "record type has not been registered"
-                ));
-            };
-            let composite_oid = catalog.composite_base_type_oid(type_oid).ok_or_else(|| {
-                sql_err!(
-                    sqlstate::DATATYPE_MISMATCH,
-                    "first argument of populate_record must be a row type"
-                )
-            })?;
-            let fields = catalog
-                .null_composite_fields(composite_oid, arena)?
-                .ok_or_else(|| {
+            Datum::CompositeText {
+                slot,
+                physical_fields,
+                text,
+            } => match catalog.materialize_composite(slot, physical_fields, text, arena)? {
+                Datum::Composite { fields, .. } => (
+                    Some(slot),
+                    fields,
+                    crate::sql::types::oid::composite_oid(slot),
+                ),
+                _ => unreachable!("catalog materializes a named composite"),
+            },
+            Datum::Null => {
+                let Some(type_oid) = declared_type_oid else {
+                    return Err(sql_err!(
+                        sqlstate::DATATYPE_MISMATCH,
+                        "record type has not been registered"
+                    ));
+                };
+                let composite_oid = catalog.composite_base_type_oid(type_oid).ok_or_else(|| {
                     sql_err!(
                         sqlstate::DATATYPE_MISMATCH,
                         "first argument of populate_record must be a row type"
                     )
                 })?;
-            // Table/view rowtypes have no named-composite slot.
-            let slot = usize::try_from(composite_oid - crate::sql::types::oid::FIRST_COMPOSITE)
-                .ok()
-                .and_then(|slot| u16::try_from(slot).ok());
-            (slot, fields, composite_oid)
-        }
-        other => {
-            return Err(type_mismatch(
-                "first argument of populate_record must be a row type",
-                &other,
-            ));
-        }
-    };
+                let fields = catalog
+                    .null_composite_fields(composite_oid, arena)?
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::DATATYPE_MISMATCH,
+                            "first argument of populate_record must be a row type"
+                        )
+                    })?;
+                // Table/view rowtypes have no named-composite slot.
+                let slot = match crate::storage::NamedTypeKind::from_oid(composite_oid) {
+                    Some((crate::storage::NamedTypeKind::Composite, creation, false)) => {
+                        Some(creation)
+                    }
+                    _ => None,
+                };
+                (slot, fields, composite_oid)
+            }
+            other => {
+                return Err(type_mismatch(
+                    "first argument of populate_record must be a row type",
+                    &other,
+                ));
+            }
+        };
     let json::Json::Object(members) = source else {
         return Err(sql_err!(
             sqlstate::INVALID_PARAMETER_VALUE,
@@ -457,7 +461,7 @@ pub(crate) fn json_value_to_type<'a>(
             "JSON conversion requires catalog access"
         )
     })?;
-    if let Some(crate::sql::types::ColType::Composite(slot)) =
+    if let Some(crate::sql::types::ColType::Composite(Some(slot))) =
         crate::sql::types::ColType::from_oid(type_oid)
     {
         let json::Json::Object(members) = value else {
@@ -609,7 +613,9 @@ fn json_value_to_array<'a>(
             json_value_to_type(*item, element.element_oid(), -1, Datum::Null, arena, hooks)?
         };
         *slot = match (element, value) {
-            (crate::sql::types::ArrElem::Composite(composite_slot), value) if !value.is_null() => {
+            (crate::sql::types::ArrElem::Composite(Some(composite_slot)), value)
+                if !value.is_null() =>
+            {
                 hooks
                     .catalog
                     .ok_or_else(|| {

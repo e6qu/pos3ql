@@ -2072,7 +2072,7 @@ fn emit_pending_truncates(
                 PublicationOperation::Truncate,
             )?;
             let definition = storage.table_def(output_slot, 0);
-            let relation_id = output_slot as u32 + 1;
+            let relation_id = catalog::user_table_oid(storage, output_slot) as u32;
             if relation_ids.contains(&relation_id) {
                 continue;
             }
@@ -3792,6 +3792,7 @@ impl Engine {
         storage.select_database(crate::storage::DatabaseOid::POSTGRES)?;
         wal.select_database(crate::storage::DatabaseOid::POSTGRES);
         storage.validate_restored_relation_identities(storage.catalog_identity_sequence())?;
+        storage.validate_restored_enum_label_identities(storage.catalog_identity_sequence())?;
         // Startup reconciliation makes every recovered commit durable in the
         // configured object store before the server admits any connection.
         if config.wal_upload
@@ -5030,7 +5031,8 @@ impl Engine {
                                         table_slot,
                                         PublicationOperation::Update,
                                     )?;
-                                    let relation_id = output_slot as u32 + 1;
+                                    let relation_id =
+                                        catalog::user_table_oid(storage, output_slot) as u32;
                                     let replica_identity =
                                         logical_replica_identity(storage, output_slot)?;
                                     emit_replication_relation(
@@ -5100,7 +5102,8 @@ impl Engine {
                                         table_slot,
                                         PublicationOperation::Insert,
                                     )?;
-                                    let relation_id = output_slot as u32 + 1;
+                                    let relation_id =
+                                        catalog::user_table_oid(storage, output_slot) as u32;
                                     emit_replication_relation(
                                         storage,
                                         output_slot,
@@ -5213,7 +5216,8 @@ impl Engine {
                                     table_slot,
                                     PublicationOperation::Delete,
                                 )?;
-                                let relation_id = output_slot as u32 + 1;
+                                let relation_id =
+                                    catalog::user_table_oid(storage, output_slot) as u32;
                                 let replica_identity =
                                     logical_replica_identity(storage, output_slot)?;
                                 emit_replication_relation(
@@ -15231,9 +15235,9 @@ impl Engine {
         // execution context used by every name resolution below.
         let _ = eval::take_diagnostic();
         exec::reset_record_shapes();
-        for (slot, composite) in self.storage.composites_with_slots_visible_to(txn.txid) {
+        for (_, composite) in self.storage.composites_with_slots_visible_to(txn.txid) {
             if let Err(error) = exec::register_named_composite_shape(
-                slot as u16,
+                Some(composite.creation()),
                 composite.name.as_str(),
                 composite.fields(),
                 &self.storage,
@@ -21472,7 +21476,7 @@ fn apply_composite_wal_definition(
         let prior = storage.stage_composite_alter(edit_target, definition, 0)?;
         storage.commit_composite_alter(prior.target())?;
     } else {
-        storage.create_composite_at(slot, def.schema, def.name, spec, 0)?;
+        storage.create_composite_at(slot, def.schema, def.name, spec, def.created_at)?;
         storage.restore_type_identity(
             crate::storage::NamedTypeSlot::Composite(slot),
             crate::storage::NamedTypeSlot::Composite(slot),
@@ -23031,7 +23035,12 @@ fn apply_wal_op(
                 let prior = storage.stage_domain_alter(edit_target, spec, 0)?;
                 storage.commit_domain_alter(prior.target())?;
             } else {
-                let allocated = storage.create_domain(def.schema, def.name, spec, 0)?.slot();
+                let allocated = storage.create_domain_from_journal(
+                    def.schema,
+                    def.name,
+                    spec,
+                    def.created_at,
+                )?;
                 storage.restore_type_identity(
                     crate::storage::NamedTypeSlot::Domain(allocated),
                     crate::storage::NamedTypeSlot::Domain(slot),
@@ -23107,6 +23116,7 @@ fn apply_wal_op(
                 crate::storage::SqlName::parse(schema)?,
                 crate::storage::SqlName::parse(name)?,
                 members.len(),
+                created_at,
             )?;
             storage.restore_type_identity(
                 crate::storage::NamedTypeSlot::Enum(allocated),
@@ -23114,12 +23124,8 @@ fn apply_wal_op(
                 created_at,
             )?;
         }
-        WalOp::RestoreEnum {
-            payload,
-            wide_count,
-            stable_members,
-        } => {
-            crate::wal::apply_enum_payload(storage, payload, wide_count, stable_members)?;
+        WalOp::RestoreEnum { payload } => {
+            crate::wal::apply_enum_payload(storage, payload)?;
         }
         WalOp::CreateComposite {
             slot,
@@ -23371,7 +23377,7 @@ fn apply_wal_op(
                 ));
             }
             let slot = storage.create_tablespace(
-                created_at,
+                crate::storage::TablespaceCreation::restored(created_at)?,
                 crate::storage::SqlName::parse(name)?,
                 location,
                 options,

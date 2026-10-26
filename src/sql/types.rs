@@ -154,36 +154,36 @@ pub mod oid {
     pub const REGDICTIONARY_ARRAY: i32 = 3770;
     pub const REGCOLLATION_ARRAY: i32 = 4192;
     /// Base OIDs for user-defined domains, enums, composites, and the array types PostgreSQL
-    /// creates alongside each of them. Slots are catalog-local identities; the
-    /// bands are deliberately disjoint from relation/composite OIDs.
-    pub const FIRST_DOMAIN: i32 = 110_000;
-    pub const FIRST_ENUM: i32 = 120_000;
+    /// creates alongside each of them. Each identifier adds a checked creation
+    /// stamp; the bands are independent of configured catalog positions.
+    pub const FIRST_DOMAIN: i32 = 180_000_000;
+    pub const FIRST_ENUM: i32 = 200_000_000;
     pub const FIRST_TABLE_COMPOSITE: i32 = 130_000_000;
     pub const FIRST_VIEW_COMPOSITE: i32 = 140_000_000;
-    pub const FIRST_COMPOSITE: i32 = 230_000;
-    pub const FIRST_DOMAIN_ARRAY: i32 = 150_000;
-    pub const FIRST_ENUM_ARRAY: i32 = 160_000;
-    pub const FIRST_COMPOSITE_ARRAY: i32 = 240_000;
+    pub const FIRST_COMPOSITE: i32 = 220_000_000;
+    pub const FIRST_DOMAIN_ARRAY: i32 = 240_000_000;
+    pub const FIRST_ENUM_ARRAY: i32 = 260_000_000;
+    pub const FIRST_COMPOSITE_ARRAY: i32 = 280_000_000;
     pub const FIRST_TABLE_COMPOSITE_ARRAY: i32 = 150_000_000;
     pub const FIRST_VIEW_COMPOSITE_ARRAY: i32 = 160_000_000;
-    pub fn domain_oid(slot: u16) -> i32 {
-        FIRST_DOMAIN + slot as i32
+    pub fn domain_oid(creation: crate::storage::TypeCreation) -> i32 {
+        FIRST_DOMAIN + creation.created_at() as i32
     }
-    /// The synthesized OID of the enum type in catalog `slot`.
-    pub fn enum_oid(slot: u16) -> i32 {
-        FIRST_ENUM + slot as i32
+    /// The SQL identifier of one enum creation.
+    pub fn enum_oid(creation: crate::storage::TypeCreation) -> i32 {
+        FIRST_ENUM + creation.created_at() as i32
     }
-    pub fn domain_array_oid(slot: u16) -> i32 {
-        FIRST_DOMAIN_ARRAY + slot as i32
+    pub fn domain_array_oid(creation: crate::storage::TypeCreation) -> i32 {
+        FIRST_DOMAIN_ARRAY + creation.created_at() as i32
     }
-    pub fn enum_array_oid(slot: u16) -> i32 {
-        FIRST_ENUM_ARRAY + slot as i32
+    pub fn enum_array_oid(creation: crate::storage::TypeCreation) -> i32 {
+        FIRST_ENUM_ARRAY + creation.created_at() as i32
     }
-    pub fn composite_oid(slot: u16) -> i32 {
-        FIRST_COMPOSITE + slot as i32
+    pub fn composite_oid(creation: crate::storage::TypeCreation) -> i32 {
+        FIRST_COMPOSITE + creation.created_at() as i32
     }
-    pub fn composite_array_oid(slot: u16) -> i32 {
-        FIRST_COMPOSITE_ARRAY + slot as i32
+    pub fn composite_array_oid(creation: crate::storage::TypeCreation) -> i32 {
+        FIRST_COMPOSITE_ARRAY + creation.created_at() as i32
     }
 }
 
@@ -480,17 +480,13 @@ pub enum ColType {
     /// table column can never have this type (DDL refuses records), so it has
     /// no on-disk presence.
     Record,
-    /// A user-defined enum type (`CREATE TYPE ... AS ENUM`). The `u16` is the
-    /// slot of its [`crate::storage::EnumDef`] in the catalog — a runtime
-    /// identity only. A column of an enum type persists the enum's *name* (in
-    /// [`crate::storage::ColumnMeta::domain`], resolved back to a slot on load),
-    /// because slots are not stable across restart. A stored enum *value*
-    /// carries its own label and sort key inline, so [`from_code`](Self::from_code)
-    /// need not recover the slot to decode a row.
-    Enum(u16),
+    /// A user-defined enum type (`CREATE TYPE ... AS ENUM`). A bound declaration
+    /// carries its durable creation identity; `None` requires catalog binding
+    /// before use. Stored values retain their label and sort key inline.
+    Enum(Option<crate::storage::TypeCreation>),
     /// A named composite type (`CREATE TYPE ... AS (...)`). Unlike `Record`,
     /// this is durable and carries a catalog identity.
-    Composite(u16),
+    Composite(Option<crate::storage::TypeCreation>),
 }
 
 /// B-tree operator classes whose comparison semantics the executor implements.
@@ -2541,7 +2537,12 @@ impl ColType {
     }
 
     pub fn oid(self) -> i32 {
-        match self {
+        self.try_oid()
+            .expect("runtime type identity was bound before description")
+    }
+
+    pub fn try_oid(self) -> Option<i32> {
+        Some(match self {
             Self::Void => oid::VOID,
             Self::Internal => oid::INTERNAL,
             Self::PgDdlCommand => oid::PG_DDL_COMMAND,
@@ -2598,7 +2599,7 @@ impl ColType {
             Self::Jsonpath => oid::JSONPATH,
             Self::TsVector => oid::TSVECTOR,
             Self::TsQuery => oid::TSQUERY,
-            Self::Array(e) => e.array_oid(),
+            Self::Array(e) => e.try_array_oid()?,
             Self::Uuid => oid::UUID,
             Self::Bytea => oid::BYTEA,
             Self::Numeric => oid::NUMERIC,
@@ -2612,9 +2613,9 @@ impl ColType {
             Self::Macaddr8 => oid::MACADDR8,
             Self::Geometry(kind) => kind.oid(),
             Self::Record => oid::RECORD,
-            Self::Enum(slot) => oid::enum_oid(slot),
-            Self::Composite(slot) => oid::composite_oid(slot),
-        }
+            Self::Enum(slot) => oid::enum_oid(slot?),
+            Self::Composite(slot) => oid::composite_oid(slot?),
+        })
     }
     /// Inverse of [`ColType::oid`]: the column type a PostgreSQL type OID names,
     /// or `None` for an OID this engine does not model. Used to decode a
@@ -2720,31 +2721,24 @@ impl ColType {
                 return Some(Self::Array(element));
             }
         }
-        // User-defined enum types occupy a synthesized OID band.
-        if type_oid >= oid::FIRST_ENUM
-            && type_oid < oid::FIRST_ENUM + crate::storage::MAX_ENUM_CATALOG_SLOTS as i32
-        {
-            return Some(Self::Enum((type_oid - oid::FIRST_ENUM) as u16));
-        }
-        if type_oid >= oid::FIRST_ENUM_ARRAY
-            && type_oid < oid::FIRST_ENUM_ARRAY + crate::storage::MAX_ENUM_CATALOG_SLOTS as i32
-        {
-            return Some(Self::Array(ArrElem::Enum(
-                (type_oid - oid::FIRST_ENUM_ARRAY) as u16,
-            )));
-        }
-        if type_oid >= oid::FIRST_COMPOSITE
-            && type_oid < oid::FIRST_COMPOSITE + crate::storage::MAX_COMPOSITE_CATALOG_SLOTS as i32
-        {
-            return Some(Self::Composite((type_oid - oid::FIRST_COMPOSITE) as u16));
-        }
-        if type_oid >= oid::FIRST_COMPOSITE_ARRAY
-            && type_oid
-                < oid::FIRST_COMPOSITE_ARRAY + crate::storage::MAX_COMPOSITE_CATALOG_SLOTS as i32
-        {
-            return Some(Self::Array(ArrElem::Composite(
-                (type_oid - oid::FIRST_COMPOSITE_ARRAY) as u16,
-            )));
+        for (first, array, composite) in [
+            (oid::FIRST_ENUM, false, false),
+            (oid::FIRST_ENUM_ARRAY, true, false),
+            (oid::FIRST_COMPOSITE, false, true),
+            (oid::FIRST_COMPOSITE_ARRAY, true, true),
+        ] {
+            if let Some(creation) = type_oid
+                .checked_sub(first)
+                .and_then(|value| u64::try_from(value).ok())
+                .and_then(crate::storage::TypeCreation::parse)
+            {
+                return Some(match (array, composite) {
+                    (false, false) => Self::Enum(Some(creation)),
+                    (false, true) => Self::Composite(Some(creation)),
+                    (true, false) => Self::Array(ArrElem::Enum(Some(creation))),
+                    (true, true) => Self::Array(ArrElem::Composite(Some(creation))),
+                });
+            }
         }
         // Domain-array OIDs are catalog-owned and require their direct domain
         // identity, so catalog-aware paths resolve them separately.
@@ -2864,8 +2858,7 @@ impl ColType {
             Self::Macaddr8 => "macaddr8",
             Self::Geometry(kind) => kind.name(),
             Self::Record => "record",
-            // The real enum name is dynamic (per catalog slot); callers that
-            // must title a column after the enum resolve it via the catalog.
+            // Resolve the current name through the bound creation identity.
             Self::Enum(_) => "enum",
             Self::Composite(_) => "record",
         }
@@ -3053,11 +3046,6 @@ impl ColType {
         }
     }
 
-    /// The catalog slot placed in [`ColType::Enum`] by [`from_code`](Self::from_code)
-    /// before the real slot is resolved from the persisted type name.
-    pub const ENUM_SLOT_UNRESOLVED: u16 = u16::MAX;
-    pub const COMPOSITE_SLOT_UNRESOLVED: u16 = u16::MAX;
-
     /// Inverse of [`ColType::code`]; `None` for an unknown or corrupt code.
     pub fn from_code(code: u8) -> Option<Self> {
         Some(match code {
@@ -3132,10 +3120,9 @@ impl ColType {
             223 => Self::Geometry(GeometryKind::Polygon),
             224 => Self::Geometry(GeometryKind::Line),
             225 => Self::Geometry(GeometryKind::Circle),
-            // An enum column: the concrete slot is resolved from the persisted
-            // type name after decode (see the column codec's name handling).
-            54 => Self::Enum(Self::ENUM_SLOT_UNRESOLVED),
-            66 => Self::Composite(Self::COMPOSITE_SLOT_UNRESOLVED),
+            // Declarations acquire a creation only after their saved reference binds.
+            54 => Self::Enum(None),
+            66 => Self::Composite(None),
             c if (RANGE_CODE_BASE..RANGE_CODE_BASE + RANGE_KINDS).contains(&c) => {
                 Self::Range(RangeKind::from_code(c - RANGE_CODE_BASE)?)
             }
@@ -3224,20 +3211,20 @@ pub enum ArrElem {
     Range(RangeKind),
     /// One of PostgreSQL's six built-in multirange types.
     Multirange(RangeKind),
-    /// An enum array keeps the catalog slot as its runtime identity. Table
-    /// metadata also persists the type name and rebinds the slot on startup.
-    Enum(u16),
+    /// An enum array carries its element type's durable creation identity.
+    /// `None` requires catalog binding before use.
+    Enum(Option<crate::storage::TypeCreation>),
     /// An array of one named composite type.
-    Composite(u16),
+    Composite(Option<crate::storage::TypeCreation>),
     /// An array whose elements are values of a domain. Domain values use their
     /// ultimate base representation; `base_code` identifies that runtime
-    /// representation and `base_user_slot` completes it for an enum or named
+    /// representation and `base_identity` completes it for an enum or named
     /// composite base. Keeping both facts inline preserves allocation-free
     /// array decoding without reducing a user-defined base to an untyped tag.
     Domain {
-        slot: u16,
+        identity: Option<crate::storage::TypeCreation>,
         base_code: u8,
-        base_user_slot: u16,
+        base_identity: Option<crate::storage::TypeCreation>,
     },
 }
 
@@ -3601,9 +3588,9 @@ impl ArrElem {
             Datum::Record(_) => ArrElem::Record,
             Datum::Range { kind, .. } => ArrElem::Range(*kind),
             Datum::Multirange { kind, .. } => ArrElem::Multirange(*kind),
-            Datum::Enum { slot, .. } => ArrElem::Enum(*slot),
+            Datum::Enum { slot, .. } => ArrElem::Enum(Some(*slot)),
             Datum::Composite { slot, .. } | Datum::CompositeText { slot, .. } => {
-                ArrElem::Composite(*slot)
+                ArrElem::Composite(Some(*slot))
             }
             _ => return None,
         })
@@ -3750,13 +3737,13 @@ impl ArrElem {
             ArrElem::Composite(slot) => ColType::Composite(slot),
             ArrElem::Domain {
                 base_code,
-                base_user_slot,
+                base_identity,
                 ..
             } => {
                 match ColType::from_code(base_code).expect("domain array carries a valid base code")
                 {
-                    ColType::Enum(_) => ColType::Enum(base_user_slot),
-                    ColType::Composite(_) => ColType::Composite(base_user_slot),
+                    ColType::Enum(_) => ColType::Enum(base_identity),
+                    ColType::Composite(_) => ColType::Composite(base_identity),
                     base => base,
                 }
             }
@@ -3765,7 +3752,12 @@ impl ArrElem {
 
     /// The PostgreSQL array-type OID for this element type.
     pub fn array_oid(self) -> i32 {
-        match self {
+        self.try_array_oid()
+            .expect("runtime type identity was bound before description")
+    }
+
+    pub fn try_array_oid(self) -> Option<i32> {
+        Some(match self {
             ArrElem::Bool => 1000,
             ArrElem::Char => 1002,
             ArrElem::Int4 => 1007,
@@ -3824,10 +3816,10 @@ impl ArrElem {
             ArrElem::Record => oid::RECORD_ARRAY,
             ArrElem::Range(kind) => kind.array_oid(),
             ArrElem::Multirange(kind) => kind.multirange_array_oid(),
-            ArrElem::Enum(slot) => oid::enum_array_oid(slot),
-            ArrElem::Composite(slot) => oid::composite_array_oid(slot),
-            ArrElem::Domain { slot, .. } => oid::domain_array_oid(slot),
-        }
+            ArrElem::Enum(slot) => oid::enum_array_oid(slot?),
+            ArrElem::Composite(slot) => oid::composite_array_oid(slot?),
+            ArrElem::Domain { identity, .. } => oid::domain_array_oid(identity?),
+        })
     }
 
     /// The PostgreSQL element-type OID carried inside a binary array value.
@@ -3835,7 +3827,9 @@ impl ArrElem {
     /// values use the domain's base representation.
     pub fn element_oid(self) -> i32 {
         match self {
-            ArrElem::Domain { slot, .. } => oid::domain_oid(slot),
+            ArrElem::Domain { identity, .. } => {
+                oid::domain_oid(identity.expect("domain array type was bound"))
+            }
             ArrElem::Char => 18,
             ArrElem::AclItem => oid::ACLITEM,
             _ => self.to_coltype().oid(),
@@ -3908,9 +3902,8 @@ impl ArrElem {
             ArrElem::Record => 128,
             ArrElem::Range(kind) => 51 + kind.code(),
             ArrElem::Multirange(kind) => 57 + kind.code(),
-            // User-defined array slots are wider than this legacy byte code.
-            // Self-describing value codecs carry the u16 slot separately;
-            // schema codecs persist the type name and rebind it on recovery.
+            // Codes describe representation; checked descriptors and captured
+            // source references carry the separate creation identity.
             ArrElem::Enum(_) => Self::ENUM_CODE_BASE,
             ArrElem::Domain { .. } => Self::DOMAIN_CODE_BASE,
             ArrElem::Composite(_) => Self::COMPOSITE_CODE_BASE,
@@ -3983,48 +3976,51 @@ impl ArrElem {
             128 => ArrElem::Record,
             51..=56 => ArrElem::Range(RangeKind::from_code(c - 51)?),
             57..=62 => ArrElem::Multirange(RangeKind::from_code(c - 57)?),
-            c if (Self::ENUM_CODE_BASE..Self::ENUM_CODE_BASE + 32).contains(&c) => {
-                ArrElem::Enum((c - Self::ENUM_CODE_BASE) as u16)
-            }
-            c if (Self::DOMAIN_CODE_BASE..Self::DOMAIN_CODE_BASE + 32).contains(&c) => {
-                ArrElem::Domain {
-                    slot: (c - Self::DOMAIN_CODE_BASE) as u16,
-                    base_code: ColType::Text.code(),
-                    base_user_slot: ColType::ENUM_SLOT_UNRESOLVED,
-                }
-            }
-            c if (Self::COMPOSITE_CODE_BASE..Self::COMPOSITE_CODE_BASE + 32).contains(&c) => {
-                ArrElem::Composite((c - Self::COMPOSITE_CODE_BASE) as u16)
-            }
+            Self::ENUM_CODE_BASE => ArrElem::Enum(None),
+            Self::DOMAIN_CODE_BASE => ArrElem::Domain {
+                identity: None,
+                base_code: ColType::Text.code(),
+                base_identity: None,
+            },
+            Self::COMPOSITE_CODE_BASE => ArrElem::Composite(None),
             _ => return None,
         })
     }
 
     /// Rebuilds a domain-array element identity from the domain catalog.
-    pub fn domain(slot: u16, base: ColType) -> Option<Self> {
+    pub fn domain(identity: crate::storage::TypeCreation, base: ColType) -> Option<Self> {
         // Built-in array bases retain their complete element in the base code.
-        // Nested user-type slots are not represented by that code.
+        // Nested named creations are not represented by that code.
         if matches!(base, ColType::Record)
-            || matches!(base, ColType::Array(element) if element.user_type_slot().is_some())
+            || matches!(base, ColType::Array(element) if element.is_named())
         {
             return None;
         }
-        let base_user_slot = match base {
+        let base_identity = match base {
             ColType::Enum(slot) | ColType::Composite(slot) => slot,
-            _ => ColType::ENUM_SLOT_UNRESOLVED,
+            _ => None,
         };
         Some(Self::Domain {
-            slot,
+            identity: Some(identity),
             base_code: base.code(),
-            base_user_slot,
+            base_identity,
         })
     }
 
-    pub fn user_type_slot(self) -> Option<u16> {
+    pub fn user_type_identity(self) -> Option<crate::storage::TypeCreation> {
         match self {
-            Self::Enum(slot) | Self::Composite(slot) | Self::Domain { slot, .. } => Some(slot),
+            Self::Enum(identity) | Self::Composite(identity) | Self::Domain { identity, .. } => {
+                identity
+            }
             _ => None,
         }
+    }
+
+    pub fn is_named(self) -> bool {
+        matches!(
+            self,
+            Self::Enum(_) | Self::Composite(_) | Self::Domain { .. }
+        )
     }
 }
 
@@ -4711,14 +4707,14 @@ pub enum Datum<'a> {
     /// `Record` preserves the PostgreSQL type OID across expressions, Bind,
     /// Result and persistence; an anonymous row can never masquerade as it.
     Composite {
-        slot: u16,
+        slot: crate::storage::TypeCreation,
         fields: &'a [RecordField<'a>],
     },
     /// The durable row form of a named composite. It carries its immutable
-    /// catalog slot and PostgreSQL text input spelling; only catalog-aware
+    /// type creation and PostgreSQL text input spelling; only catalog-aware
     /// evaluation may materialize fields from it.
     CompositeText {
-        slot: u16,
+        slot: crate::storage::TypeCreation,
         /// Physical attribute count when the text was persisted. This is a
         /// layout version, not a display arity: dropped attributes retain
         /// their position and added attributes cannot be mistaken for old
@@ -4730,7 +4726,7 @@ pub enum Datum<'a> {
     /// cached label and sort position; catalog-aware materialization refreshes
     /// both before SQL evaluation. None identifies a legacy label-bound value.
     Enum {
-        slot: u16,
+        slot: crate::storage::TypeCreation,
         member: Option<EnumMemberId>,
         sort: f64,
         label: &'a str,
@@ -5485,7 +5481,7 @@ mod tests {
     fn btree_operator_classes_are_closed_and_match_postgres_catalogs() {
         let cases = [
             (ColType::Array(ArrElem::Int4), BtreeOperatorClass::Array),
-            (ColType::Enum(0), BtreeOperatorClass::Enum),
+            (ColType::Enum(None), BtreeOperatorClass::Enum),
             (
                 ColType::Multirange(RangeKind::Int4),
                 BtreeOperatorClass::Multirange,
@@ -5509,7 +5505,7 @@ mod tests {
             (ColType::Name, BtreeOperatorClass::Name),
             (ColType::Numeric, BtreeOperatorClass::Numeric),
             (ColType::Regclass, BtreeOperatorClass::Oid),
-            (ColType::Composite(0), BtreeOperatorClass::Record),
+            (ColType::Composite(None), BtreeOperatorClass::Record),
             (ColType::Varchar, BtreeOperatorClass::Text),
             (ColType::Time, BtreeOperatorClass::Time),
             (ColType::Timestamp, BtreeOperatorClass::Timestamp),
@@ -5908,14 +5904,37 @@ mod code_roundtrip_tests {
         );
         assert_ne!(
             ColType::Array(ArrElem::Record).code(),
-            ColType::Array(ArrElem::Composite(
-                crate::storage::MAX_COMPOSITE_CATALOG_SLOTS as u16 - 1
-            ))
+            ColType::Array(ArrElem::Composite(Some(
+                crate::storage::TypeCreation::parse(9_999_999).unwrap()
+            )))
             .code()
         );
         assert_eq!(
-            ColType::from_code(ColType::Enum(0).code()),
-            Some(ColType::Enum(ColType::ENUM_SLOT_UNRESOLVED))
+            ColType::from_code(ColType::Enum(None).code()),
+            Some(ColType::Enum(None))
         );
+    }
+}
+
+#[cfg(test)]
+mod named_type_layout_tests {
+    use super::*;
+    use core::mem::{align_of, size_of};
+
+    #[test]
+    fn named_type_creation_layout_stays_within_startup_reservations() {
+        use crate::storage::{
+            CachedArrayElement, ColumnDefault, ColumnMeta, OwnedDatum, TypeCreation,
+        };
+        assert_eq!(size_of::<TypeCreation>(), 3);
+        assert_eq!(size_of::<Option<TypeCreation>>(), 3);
+        assert_eq!(align_of::<TypeCreation>(), 1);
+        assert_eq!(size_of::<CachedArrayElement>(), 6);
+        assert!(size_of::<ColType>() <= 8);
+        assert!(size_of::<ArrElem>() <= 8);
+        assert!(size_of::<Datum<'_>>() <= 32);
+        assert!(size_of::<OwnedDatum>() <= 128);
+        assert!(size_of::<ColumnDefault>() <= 256);
+        assert!(size_of::<ColumnMeta>() <= 512);
     }
 }

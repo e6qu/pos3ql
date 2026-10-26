@@ -29,14 +29,13 @@ pub(crate) fn resolve<'a>(
             "stored enum member has no catalog identity"
         )
     };
-    if usize::from(slot) >= storage.enum_count() {
-        return Err(corrupt());
-    }
     let definition = storage
         .read_enum_definition(
-            crate::storage::TypeDefinitionTarget::Slot(crate::storage::NamedTypeSlot::Enum(
-                usize::from(slot),
-            )),
+            crate::storage::TypeDefinitionTarget::by_creation(
+                storage,
+                crate::storage::NamedTypeKind::Enum,
+                slot,
+            )?,
             txid,
         )?
         .ok_or_else(corrupt)?;
@@ -92,14 +91,13 @@ pub(crate) fn sort(value: Datum<'_>, storage: &Storage, txid: u32) -> Result<f64
             "stored enum member has no catalog identity"
         )
     };
-    if usize::from(slot) >= storage.enum_count() {
-        return Err(corrupt());
-    }
     let definition = storage
         .read_enum_definition(
-            crate::storage::TypeDefinitionTarget::Slot(crate::storage::NamedTypeSlot::Enum(
-                usize::from(slot),
-            )),
+            crate::storage::TypeDefinitionTarget::by_creation(
+                storage,
+                crate::storage::NamedTypeKind::Enum,
+                slot,
+            )?,
             txid,
         )?
         .ok_or_else(corrupt)?;
@@ -254,16 +252,24 @@ pub(crate) fn bind_query<const N: usize>(
         if let Tok::Str(label) = token.token {
             let oid = oids[parameter];
             parameter += 1;
-            if (super::types::oid::FIRST_ENUM
-                ..super::types::oid::FIRST_ENUM + storage.enum_count() as i32)
-                .contains(&oid)
+            if let Some((crate::storage::NamedTypeKind::Enum, creation, false)) =
+                crate::storage::NamedTypeKind::from_oid(oid)
             {
-                let slot = (oid - super::types::oid::FIRST_ENUM) as usize;
+                let result = storage.routine_result_for_oid(oid, txid).ok_or_else(|| {
+                    sql_err!(sqlstate::UNDEFINED_OBJECT, "enum type does not exist")
+                })?;
+                let reference = crate::storage::TypeReference::from_bound_name(
+                    result.user_type.ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::UNDEFINED_OBJECT,
+                            "enum type has no source identity"
+                        )
+                    })?,
+                )?;
+                let slot = usize::from(reference.catalog_slot());
                 let definition = storage
                     .read_enum_definition(
-                        crate::storage::TypeDefinitionTarget::Slot(
-                            crate::storage::NamedTypeSlot::Enum(slot),
-                        ),
+                        crate::storage::TypeDefinitionTarget::Bound(reference),
                         txid,
                     )?
                     .ok_or_else(|| {
@@ -287,11 +293,12 @@ pub(crate) fn bind_query<const N: usize>(
                         )
                     })?;
                 if !legacy {
-                    super::exec::ensure_enum_value_is_safe(storage, slot as u16, label, txid)?;
+                    super::exec::ensure_enum_value_is_safe(storage, creation, label, txid)?;
                 }
                 let dependency = dependencies.view().entries().iter().position(|dependency| {
                     dependency.class == DependencyClass::Enum
-                        && usize::from(dependency.slot) == slot
+                        && dependency.identity
+                            == crate::storage::StoredDependencyIdentity::Type(reference)
                 });
                 let dependency = match dependency {
                     Some(index) => index,
@@ -300,11 +307,7 @@ pub(crate) fn bind_query<const N: usize>(
                         dependencies.push(StoredQueryDependency {
                             class: DependencyClass::Enum,
                             slot: slot as u16,
-                            identity: storage.capture_type_dependency(
-                                DependencyClass::Enum,
-                                slot,
-                                txid,
-                            )?,
+                            identity: crate::storage::StoredDependencyIdentity::Type(reference),
                             referenced_columns: crate::storage::ColumnSet::EMPTY,
                             schema: definition.schema,
                             name: definition.name,
@@ -454,7 +457,7 @@ pub(crate) fn resolve_query<const N: usize>(
 }
 
 pub(crate) fn legacy_identity(
-    slot: u16,
+    slot: crate::storage::TypeCreation,
     label: &str,
     storage: &Storage,
     txid: u32,
@@ -465,14 +468,13 @@ pub(crate) fn legacy_identity(
             "stored enum member has no catalog identity"
         )
     };
-    if usize::from(slot) >= storage.enum_count() {
-        return Err(corrupt());
-    }
     storage
         .read_enum_definition(
-            crate::storage::TypeDefinitionTarget::Slot(crate::storage::NamedTypeSlot::Enum(
-                usize::from(slot),
-            )),
+            crate::storage::TypeDefinitionTarget::by_creation(
+                storage,
+                crate::storage::NamedTypeKind::Enum,
+                slot,
+            )?,
             txid,
         )?
         .ok_or_else(corrupt)?

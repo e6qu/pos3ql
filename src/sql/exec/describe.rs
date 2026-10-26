@@ -852,13 +852,17 @@ impl ColTypeResolver for CatalogCols<'_> {
         .record_column_handle(qualifier, name)
     }
 
-    fn composite_field(&self, slot: u16, field: &str) -> Option<StaticTypeMeta> {
+    fn composite_field(
+        &self,
+        slot: Option<crate::storage::TypeCreation>,
+        field: &str,
+    ) -> Option<StaticTypeMeta> {
         catalog_composite_field(self.storage, self.txid, slot, field)
     }
 
     fn visit_composite_fields(
         &self,
-        slot: u16,
+        slot: Option<crate::storage::TypeCreation>,
         visit: &mut dyn FnMut(&str, StaticTypeMeta),
     ) -> Option<usize> {
         visit_catalog_composite_fields(self.storage, self.txid, slot, visit)
@@ -1100,21 +1104,39 @@ fn describe_record_star<'q>(
             };
             let slot = match base {
                 Expr::Column { qualifier, name } => match resolver.resolve(*qualifier, name)? {
-                    ColType::Composite(slot) => Some(slot),
+                    ColType::Composite(slot) => slot,
                     _ => None,
                 },
                 Expr::Field { base, field } => match record_field_type(base, field, resolver)? {
-                    ColType::Composite(slot) => Some(slot),
+                    ColType::Composite(slot) => slot,
                     _ => None,
                 },
                 Expr::Cast { type_name, .. } => storage
                     .expect("checked")
                     .resolve_composite_slot(type_name, txid)
-                    .map(|slot| slot as u16),
+                    .map(|slot| {
+                        storage
+                            .expect("checked")
+                            .composite_for(slot, txid)
+                            .creation()
+                    }),
                 _ => None,
             };
             if let Some(slot) = slot {
-                let composite = storage.expect("checked").composite(slot as usize);
+                let storage = storage.expect("checked");
+                let target = crate::storage::TypeDefinitionTarget::by_creation(
+                    storage,
+                    crate::storage::NamedTypeKind::Composite,
+                    slot,
+                )?;
+                let composite = storage
+                    .read_composite_definition(target, txid)?
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::UNDEFINED_OBJECT,
+                            "composite type no longer exists"
+                        )
+                    })?;
                 for field in composite.active_fields_for(txid) {
                     let name = arena.alloc_str(field.name.as_str()).map_err(|_| {
                         sql_err!(
@@ -1613,7 +1635,11 @@ pub trait ColTypeResolver {
 
     /// One field of a named composite already resolved to its catalog slot.
     /// Catalog-free resolvers may still use the statement-scoped shape copy.
-    fn composite_field(&self, slot: u16, field: &str) -> Option<StaticTypeMeta> {
+    fn composite_field(
+        &self,
+        slot: Option<crate::storage::TypeCreation>,
+        field: &str,
+    ) -> Option<StaticTypeMeta> {
         let mut found = None;
         self.visit_composite_fields(slot, &mut |name, metadata| {
             if name.eq_ignore_ascii_case(field) {
@@ -1625,7 +1651,7 @@ pub trait ColTypeResolver {
 
     fn visit_composite_fields(
         &self,
-        slot: u16,
+        slot: Option<crate::storage::TypeCreation>,
         visit: &mut dyn FnMut(&str, StaticTypeMeta),
     ) -> Option<usize> {
         visit_registered_composite_fields(slot, visit)
@@ -1770,14 +1796,14 @@ struct NamedRecordShape {
     fields: [RecordShapeField; MAX_SHAPE_FIELDS],
     name: crate::util::StackStr<64>,
     len: u16,
-    slot: u16,
+    slot: Option<crate::storage::TypeCreation>,
 }
 
 static EMPTY_NAMED_RECORD_SHAPE: NamedRecordShape = NamedRecordShape {
     fields: [EMPTY_RECORD_SHAPE_FIELD; MAX_SHAPE_FIELDS],
     name: crate::util::StackStr::new(),
     len: 0,
-    slot: u16::MAX,
+    slot: None,
 };
 
 #[derive(Clone, Copy)]
@@ -1864,7 +1890,7 @@ pub fn reset_record_shapes() {
 /// Both the name and fields are copied into fixed storage, making planner
 /// access independent of runtime values and without post-startup allocation.
 pub fn register_named_composite_shape(
-    slot: u16,
+    slot: Option<crate::storage::TypeCreation>,
     name: &str,
     fields: &[crate::storage::CompositeFieldDef],
     storage: &crate::storage::Storage,
@@ -1923,13 +1949,16 @@ fn composite_field_metadata(
 pub(crate) fn catalog_composite_field(
     storage: &crate::storage::Storage,
     txid: u32,
-    slot: u16,
+    slot: Option<crate::storage::TypeCreation>,
     name: &str,
 ) -> Option<StaticTypeMeta> {
-    if !storage.composite_slot_visible_to(usize::from(slot), txid) {
-        return None;
-    }
-    let definition = storage.composite_for(usize::from(slot), txid);
+    let target = crate::storage::TypeDefinitionTarget::by_creation(
+        storage,
+        crate::storage::NamedTypeKind::Composite,
+        slot?,
+    )
+    .ok()?;
+    let definition = storage.read_composite_definition(target, txid).ok()??;
     let field = definition
         .active_fields()
         .find(|field| field.name.as_str().eq_ignore_ascii_case(name))?;
@@ -1939,13 +1968,16 @@ pub(crate) fn catalog_composite_field(
 pub(crate) fn visit_catalog_composite_fields(
     storage: &crate::storage::Storage,
     txid: u32,
-    slot: u16,
+    slot: Option<crate::storage::TypeCreation>,
     visit: &mut dyn FnMut(&str, StaticTypeMeta),
 ) -> Option<usize> {
-    if !storage.composite_slot_visible_to(usize::from(slot), txid) {
-        return None;
-    }
-    let definition = storage.composite_for(usize::from(slot), txid);
+    let target = crate::storage::TypeDefinitionTarget::by_creation(
+        storage,
+        crate::storage::NamedTypeKind::Composite,
+        slot?,
+    )
+    .ok()?;
+    let definition = storage.read_composite_definition(target, txid).ok()??;
     let mut count = 0;
     for field in definition.active_fields() {
         visit(
@@ -1958,7 +1990,7 @@ pub(crate) fn visit_catalog_composite_fields(
 }
 
 fn visit_registered_composite_fields(
-    slot: u16,
+    slot: Option<crate::storage::TypeCreation>,
     visit: &mut dyn FnMut(&str, StaticTypeMeta),
 ) -> Option<usize> {
     RECORD_SHAPES.with(|p| {

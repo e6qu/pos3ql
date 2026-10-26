@@ -1245,12 +1245,12 @@ pub(crate) fn coerce_set_value<'a>(
 ) -> Result<Datum<'a>, SqlError> {
     match (value, target) {
         (value @ Datum::Composite { slot, .. }, ColType::Composite(expected))
-            if slot == expected =>
+            if Some(slot) == expected =>
         {
             Ok(value)
         }
         (value @ Datum::CompositeText { slot, .. }, ColType::Composite(expected))
-            if slot == expected =>
+            if Some(slot) == expected =>
         {
             Ok(value)
         }

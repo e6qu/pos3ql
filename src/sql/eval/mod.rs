@@ -15,8 +15,8 @@ mod cast;
 pub mod funcs;
 pub use cast::{cast, cast_to, fit_bits, int_to_bits};
 pub(crate) use cast::{
-    cast_to_text, parse_bytea, parse_int_bounded, parse_int_literal, parse_uuid, validate_bits,
-    validate_catalog_reference_cast,
+    cast_to_text, parse_bytea, parse_int_bounded, parse_int_literal, parse_oid, parse_uuid,
+    validate_bits, validate_catalog_reference_cast,
 };
 
 mod args;
@@ -997,7 +997,7 @@ pub trait CatalogAccess {
 
     fn enum_member_identity(
         &self,
-        _slot: u16,
+        _slot: crate::storage::TypeCreation,
         _label: &str,
     ) -> Result<Option<super::types::EnumMemberId>, SqlError> {
         Ok(None)
@@ -1008,7 +1008,7 @@ pub trait CatalogAccess {
     /// never treated as an anonymous record.
     fn materialize_composite<'a>(
         &self,
-        _slot: u16,
+        _slot: crate::storage::TypeCreation,
         _physical_fields: u16,
         _text: &'a str,
         _arena: &'a Arena,
@@ -1023,7 +1023,7 @@ pub trait CatalogAccess {
     fn composite_array_element<'a>(
         &self,
         _value: Datum<'a>,
-        _slot: u16,
+        _slot: crate::storage::TypeCreation,
         _arena: &'a Arena,
     ) -> Result<Datum<'a>, SqlError> {
         Err(sql_err!(
@@ -1446,7 +1446,7 @@ pub trait CatalogAccess {
     fn has_language_privilege(
         &self,
         _role: Option<&str>,
-        _language: &str,
+        _language: PrivilegeObject<'_>,
         _privileges: &str,
     ) -> Result<Option<bool>, SqlError> {
         Ok(None)
@@ -1462,18 +1462,16 @@ pub trait CatalogAccess {
     fn has_database_privilege(
         &self,
         _role: Option<&str>,
-        _database: &str,
+        _database: PrivilegeObject<'_>,
         _privileges: &str,
     ) -> Result<Option<bool>, SqlError> {
         Ok(None)
     }
-    fn database_name<'a>(&self, _oid: i32, _arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
-        Ok(None)
-    }
+
     fn has_tablespace_privilege(
         &self,
         _role: Option<&str>,
-        _tablespace: &str,
+        _tablespace: PrivilegeObject<'_>,
         _privileges: &str,
     ) -> Result<Option<bool>, SqlError> {
         Ok(None)
@@ -1481,7 +1479,7 @@ pub trait CatalogAccess {
     fn has_foreign_data_wrapper_privilege(
         &self,
         _role: Option<&str>,
-        _wrapper: &str,
+        _wrapper: PrivilegeObject<'_>,
         _privileges: &str,
     ) -> Result<Option<bool>, SqlError> {
         Ok(None)
@@ -1489,7 +1487,7 @@ pub trait CatalogAccess {
     fn has_server_privilege(
         &self,
         _role: Option<&str>,
-        _server: &str,
+        _server: PrivilegeObject<'_>,
         _privileges: &str,
     ) -> Result<Option<bool>, SqlError> {
         Ok(None)
@@ -1497,32 +1495,12 @@ pub trait CatalogAccess {
     fn has_largeobject_privilege(
         &self,
         _role: Option<&str>,
-        _large_object: &str,
+        _large_object: PrivilegeObject<'_>,
         _privileges: &str,
     ) -> Result<Option<bool>, SqlError> {
         Ok(None)
     }
-    fn foreign_data_wrapper_name<'a>(
-        &self,
-        _oid: i32,
-        _arena: &'a Arena,
-    ) -> Result<Option<&'a str>, SqlError> {
-        Ok(None)
-    }
-    fn foreign_server_name<'a>(
-        &self,
-        _oid: i32,
-        _arena: &'a Arena,
-    ) -> Result<Option<&'a str>, SqlError> {
-        Ok(None)
-    }
-    fn large_object_name<'a>(
-        &self,
-        _oid: i32,
-        _arena: &'a Arena,
-    ) -> Result<Option<&'a str>, SqlError> {
-        Ok(None)
-    }
+
     fn has_parameter_privilege(
         &self,
         _role: Option<&str>,
@@ -1531,16 +1509,7 @@ pub trait CatalogAccess {
     ) -> Result<Option<bool>, SqlError> {
         Ok(None)
     }
-    fn tablespace_name<'a>(
-        &self,
-        _oid: i32,
-        _arena: &'a Arena,
-    ) -> Result<Option<&'a str>, SqlError> {
-        Ok(None)
-    }
-    fn language_name<'a>(&self, _oid: i32, _arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
-        Ok(None)
-    }
+
     /// The comment text on the object with this OID and column `subid` (0 for
     /// the object itself), or `None`. `catalog_name` selects the owning
     /// catalog (`pg_class`, `pg_namespace`, or `pg_type`). Backs
@@ -1573,23 +1542,35 @@ pub trait CatalogAccess {
     }
     /// The name of the enum type in catalog `slot`, for `pg_typeof` on an enum
     /// value. `None` if the slot holds no live enum.
-    fn enum_name<'a>(&self, _slot: u16, _arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
+    fn enum_name<'a>(
+        &self,
+        _slot: crate::storage::TypeCreation,
+        _arena: &'a Arena,
+    ) -> Result<Option<&'a str>, SqlError> {
         Ok(None)
     }
     /// The sort key of `label` in the enum type at `slot`, resolving a text
     /// literal against an enum in a comparison. `None` if the slot holds no
     /// live enum or the label is not a member.
-    fn enum_label_sort(&self, _slot: u16, _label: &str) -> Result<Option<f64>, SqlError> {
+    fn enum_label_sort(
+        &self,
+        _slot: crate::storage::TypeCreation,
+        _label: &str,
+    ) -> Result<Option<f64>, SqlError> {
         Ok(None)
     }
-    fn ensure_enum_label_safe(&self, _slot: u16, _label: &str) -> Result<(), SqlError> {
+    fn ensure_enum_label_safe(
+        &self,
+        _slot: crate::storage::TypeCreation,
+        _label: &str,
+    ) -> Result<(), SqlError> {
         Ok(())
     }
     /// Ordered members of a visible enum, materialized into the statement
     /// arena for `enum_first`/`enum_last`/`enum_range`.
     fn enum_values<'a>(
         &self,
-        _slot: u16,
+        _slot: crate::storage::TypeCreation,
         _arena: &'a Arena,
     ) -> Result<Option<&'a [Datum<'a>]>, SqlError> {
         Ok(None)
@@ -1597,7 +1578,7 @@ pub trait CatalogAccess {
     /// The catalog slot of the (possibly schema-qualified) enum type named
     /// `type_name`, or `None` if no such live enum is visible — used to
     /// resolve `value::enumtype` casts, which base-type name lookup cannot.
-    fn enum_slot_of_name(&self, _type_name: &str) -> Option<u16> {
+    fn enum_creation_of_name(&self, _type_name: &str) -> Option<crate::storage::TypeCreation> {
         None
     }
     /// Casts to a catalog-defined domain, enum, or its automatically-created
@@ -3348,14 +3329,14 @@ fn eval_full_inner<'a>(
                         // A bpchar element keeps its padding in the array
                         // value, as PostgreSQL's array_out shows it.
                         Datum::Bpchar(s) => Datum::Text(s),
-                        Datum::Composite { slot, .. } if matches!(element, super::types::ArrElem::Composite(expected) if expected == slot) => {
+                        Datum::Composite { slot, .. } if matches!(element, super::types::ArrElem::Composite(expected) if expected == Some(slot)) => {
                             Datum::CompositeText {
                                 slot,
                                 physical_fields: 0,
                                 text: arena.alloc_str_display(*v).map_err(|_| arena_full())?,
                             }
                         }
-                        value @ Datum::CompositeText { slot, .. } if matches!(element, super::types::ArrElem::Composite(expected) if expected == slot) => {
+                        value @ Datum::CompositeText { slot, .. } if matches!(element, super::types::ArrElem::Composite(expected) if expected == Some(slot)) => {
                             value
                         }
                         other => cast_to(other, ct, arena)?,
@@ -3860,14 +3841,32 @@ fn effective_quantified_collations<'a>(
     Ok(output)
 }
 
-fn typed_field_value<'a>(field: &super::types::RecordField<'a>) -> Datum<'a> {
-    if field.value.is_null() {
-        ColType::from_oid(field.type_oid)
-            .map(super::query::type_witness)
-            .unwrap_or(Datum::Null)
-    } else {
-        field.value
+fn typed_field_value<'a>(
+    field: &super::types::RecordField<'a>,
+    catalog: Option<&dyn CatalogAccess>,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    if !field.value.is_null() {
+        return Ok(field.value);
     }
+    if field.type_oid == super::types::oid::UNKNOWN {
+        return Ok(Datum::Null);
+    }
+    if let Some(ctype) = ColType::from_oid(field.type_oid)
+        .or_else(|| catalog.and_then(|catalog| catalog.domain_base_type(field.type_oid)))
+    {
+        return super::query::type_witness(ctype);
+    }
+    if let Some(catalog) = catalog
+        && let Some(fields) = catalog.null_composite_fields(field.type_oid, arena)?
+    {
+        return Ok(Datum::Record(fields));
+    }
+    Err(sql_err!(
+        sqlstate::FEATURE_NOT_SUPPORTED,
+        "record field type OID {} is not supported",
+        field.type_oid
+    ))
 }
 
 fn quantified_scalar<'a>(
@@ -3936,8 +3935,8 @@ pub(crate) fn quantified_comparison<'a>(
             for (index, (left, right)) in left.iter().zip(right).enumerate() {
                 let _ = quantified_scalar(
                     operator,
-                    typed_field_value(left),
-                    typed_field_value(right),
+                    typed_field_value(left, catalog, arena)?,
+                    typed_field_value(right, catalog, arena)?,
                     collations[index],
                     catalog,
                     arena,
@@ -6938,7 +6937,7 @@ pub(crate) fn input_error<'a>(
             Ok(None) => None,
             Err(error) => {
                 let message = if error.message.is_truncated()
-                    && catalog.enum_slot_of_name(base_name).is_some()
+                    && catalog.enum_creation_of_name(base_name).is_some()
                 {
                     arena.alloc_str_display(format_args!(
                         "invalid input value for enum {}: \"{}\"",
@@ -7146,7 +7145,9 @@ fn regtype_of_oid_with_catalog<'a>(
         name
     } else if let Some(name) = regtype_builtin_name(referenced_oid) {
         name
-    } else if let Some(ctype) = crate::sql::exec::coltype_of_oid_pub(referenced_oid) {
+    } else if let Some(ctype) = crate::sql::exec::coltype_of_oid_pub(referenced_oid)
+        && crate::storage::NamedTypeKind::from_oid(referenced_oid).is_none()
+    {
         ctype.name()
     } else {
         return arena
@@ -7621,33 +7622,34 @@ fn coerce_enum_literal<'a>(
     hooks: &EvalHooks<'_, 'a>,
     arena: &'a Arena,
 ) -> Result<(Datum<'a>, Datum<'a>), SqlError> {
-    let resolve = |slot: u16, text: Datum<'a>| -> Result<Datum<'a>, SqlError> {
-        let label = match text {
-            Datum::Text(s) => s,
-            Datum::Bpchar(s) => s.trim_end_matches(' '),
-            _ => return Ok(text),
+    let resolve =
+        |slot: crate::storage::TypeCreation, text: Datum<'a>| -> Result<Datum<'a>, SqlError> {
+            let label = match text {
+                Datum::Text(s) => s,
+                Datum::Bpchar(s) => s.trim_end_matches(' '),
+                _ => return Ok(text),
+            };
+            let cat = hooks.catalog.ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INVALID_TEXT_REPRESENTATION,
+                    "invalid input value for enum: \"{}\"",
+                    label
+                )
+            })?;
+            let Some(sort) = cat.enum_label_sort(slot, label)? else {
+                return Err(sql_err!(
+                    sqlstate::INVALID_TEXT_REPRESENTATION,
+                    "invalid input value for enum: \"{}\"",
+                    label
+                ));
+            };
+            Ok(Datum::Enum {
+                slot,
+                member: cat.enum_member_identity(slot, label)?,
+                sort,
+                label: arena.alloc_str(label).map_err(|_| arena_full())?,
+            })
         };
-        let cat = hooks.catalog.ok_or_else(|| {
-            sql_err!(
-                sqlstate::INVALID_TEXT_REPRESENTATION,
-                "invalid input value for enum: \"{}\"",
-                label
-            )
-        })?;
-        let Some(sort) = cat.enum_label_sort(slot, label)? else {
-            return Err(sql_err!(
-                sqlstate::INVALID_TEXT_REPRESENTATION,
-                "invalid input value for enum: \"{}\"",
-                label
-            ));
-        };
-        Ok(Datum::Enum {
-            slot,
-            member: cat.enum_member_identity(slot, label)?,
-            sort,
-            label: arena.alloc_str(label).map_err(|_| arena_full())?,
-        })
-    };
     match (l, r) {
         (Datum::Enum { slot, .. }, _) if r_unknown => Ok((l, resolve(slot, r)?)),
         (_, Datum::Enum { slot, .. }) if l_unknown => Ok((resolve(slot, l)?, r)),

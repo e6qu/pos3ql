@@ -420,6 +420,11 @@ type to take the name.
 Renaming to the existing name returns PostgreSQL's duplicate error; moving to
 the current schema succeeds without changing the object.
 
+Named types use the shared catalog creation counter. When its
+[fixed identifier range](durable-format.md) fills, creation returns `54000`;
+restarting does not reset that counter. Existing types and their recovery use
+the saved values without reserving new ones.
+
 Each type kind reserves `max_<kind> * (max_catalog_versions_per_object + 1) *
 query_workspace_slots` definition images at startup (`max_domains`, `max_enums`
 and `max_composites`). Statement selection maps and ownership controls are also
@@ -476,7 +481,13 @@ SQL identifiers for tables, views, sequences and indexes follow the object's
 lifetime. Renaming an object keeps its identifier; dropping it and creating
 another object gives the replacement a fresh identifier, even when storage
 reuses the same slot. Tables and views also keep separate identifiers for their
-row types and arrays. JSON-to-row conversion accepts table and view row types
+row types and arrays. Domains, enums and named composites retain their own
+creation identifiers through scalar and array values, cached defaults,
+savepoints, database cloning, and journal/checkpoint recovery. Enum labels have
+separate identifiers: renaming a label or inserting another label preserves
+existing identifiers. Recreating a type cannot make saved scalar, array or label
+identifiers refer to its replacement. JSON-to-row conversion accepts table and
+view row types
 and enforces their declared field limits. Journal and checkpoint recovery
 preserve these values.
 
@@ -491,6 +502,20 @@ CREATE TABLE orders(id integer);
 SELECT has_table_privilege(oid, 'SELECT') IS NULL FROM saved_table_id;
 -- true
 ```
+
+**User example:** an application saves the identifier of `order_status` and its
+array type from `pg_type`. After dropping and recreating `order_status`, looking
+up either saved identifier returns no type. Renaming the existing type keeps
+both identifiers. The same checks hold after losing the local data directory
+and recovering from object storage, with either transaction mode.
+
+Privilege checks by numeric identifier have PostgreSQL's role-dependent rules.
+For a missing type, schema, function, language, database, tablespace, foreign-data
+wrapper or server identifier, a superuser receives `true` and an ordinary account
+receives `NULL`. Missing names still raise an error,
+and invalid privilege names fail for either account. For example,
+`has_type_privilege(2147483647::oid, 'USAGE')` returns `true` for a superuser.
+A missing table, sequence or large-object identifier returns `NULL` for either account.
 
 An index created by a constraint keeps its identifier when an earlier
 constraint is removed, its own constraint is renamed, or a column moves.

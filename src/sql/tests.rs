@@ -1343,16 +1343,16 @@ fn named_type_public_identifiers_survive_edits_replacement_and_savepoint_rollbac
         let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
         let mut engine = Engine::new(&config, &mut budget).unwrap();
         let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
-        assert_eq!(
-            data_rows(&session.success(
-                &mut engine,
-                include_str!(
-                    "../../tests/external/differential_exact/24_named_type_identities.sql"
-                ),
-                true
-            )),
-            ["t"; 14]
-        );
+        let mut observations = 0;
+        for statement in include_str!("../../tests/external/differential_exact/24_named_type_identities.sql")
+            .split(';').map(str::trim).filter(|statement| !statement.is_empty())
+        {
+            let output = session.success(&mut engine, statement, true);
+            let rows = data_rows(&output);
+            assert!(rows.iter().all(|row| row == "t"), "{statement}: {rows:?}");
+            observations += rows.len();
+        }
+        assert_eq!(observations, 14);
     }
 }
 
@@ -1387,10 +1387,14 @@ fn named_type_public_identifiers_survive_journal_and_checkpoint_recovery() {
                 let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
                 let mut engine = Engine::new(&config, &mut budget).unwrap();
                 let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
-                assert_eq!(
-                    data_rows(&session.success(&mut engine, setup, false)),
-                    ["t"; 4]
-                );
+                let mut observations = 0;
+                for statement in setup.split(';').map(str::trim).filter(|statement| !statement.is_empty()) {
+                    let output = session.success(&mut engine, statement, false);
+                    let rows = data_rows(&output);
+                    assert!(rows.iter().all(|row| row == "t"), "{statement}: {rows:?}");
+                    observations += rows.len();
+                }
+                assert_eq!(observations, 4);
                 if checkpoint {
                     assert!(engine.checkpoint().unwrap());
                 }
@@ -1401,14 +1405,22 @@ fn named_type_public_identifiers_survive_journal_and_checkpoint_recovery() {
                 let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
                 let mut engine = Engine::new(&config, &mut budget).unwrap();
                 let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
-                assert_eq!(
-                    data_rows(&session.success(&mut engine, QUERIES, true)),
-                    ["t"; 3]
-                );
-                assert_eq!(
-                    data_rows(&session.success(&mut engine, remaining, false)),
-                    ["t"; 10]
-                );
+                let mut observations = 0;
+                for statement in QUERIES.split(';').map(str::trim).filter(|statement| !statement.is_empty()) {
+                    let output = session.success(&mut engine, statement, true);
+                    let rows = data_rows(&output);
+                    assert!(rows.iter().all(|row| row == "t"), "{statement}: {rows:?}");
+                    observations += rows.len();
+                }
+                assert_eq!(observations, 3);
+                let mut observations = 0;
+                for statement in remaining.split(';').map(str::trim).filter(|statement| !statement.is_empty()) {
+                    let output = session.success(&mut engine, statement, false);
+                    let rows = data_rows(&output);
+                    assert!(rows.iter().all(|row| row == "t"), "{statement}: {rows:?}");
+                    observations += rows.len();
+                }
+                assert_eq!(observations, 10);
             }
             std::fs::remove_dir_all(&config.data_dir).unwrap();
             crate::object_store::sim::drop_namespace(&config.object_store_bucket);

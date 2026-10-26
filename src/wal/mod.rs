@@ -3528,7 +3528,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                 + 1
                 + base_schema
                 + 1
-                + 4
+                + crate::storage::TypeCreation::ENCODED_BYTES
                 + 4
                 + 1
                 + 2
@@ -11734,7 +11734,8 @@ pub(crate) fn encoded_default_len(d: &Option<OwnedDatum>) -> usize {
         Some(OwnedDatum::Macaddr8(_)) => 8,
         // slot(2) + sort(8) + len(1) + label bytes.
         Some(OwnedDatum::Enum { label, member, .. }) => {
-            13 + usize::from(member.is_some()) * 4 + label.as_str().len()
+            crate::storage::TypeCreation::ENCODED_BYTES + 8 + 1
+                + usize::from(member.is_some()) * 4 + label.as_str().len()
         }
         Some(OwnedDatum::Json { len, .. }) | Some(OwnedDatum::Bit { len, .. }) => 2 + *len as usize,
         Some(OwnedDatum::Bytea { len, .. }) => 1 + *len as usize,

@@ -13,6 +13,8 @@ pub struct TypeCreation {
 }
 
 impl TypeCreation {
+    pub(crate) const ENCODED_BYTES: usize = core::mem::size_of::<u32>();
+
     pub(crate) fn require(creation: Option<Self>) -> Result<Self, SqlError> {
         creation.ok_or_else(|| {
             sql_err!(
@@ -307,14 +309,6 @@ impl TypeIdentityIndex {
                 "restored type creation does not match its admitted source"));
         }
         if allocated == target { return Ok(()); }
-        if let Some(owner) = self.by_lifetime.get(&key)
-            && (*owner != allocated || old != key)
-        {
-            return Err(sql_err!(
-                sqlstate::DATA_EXCEPTION,
-                "named type creation identity is duplicated"
-            ));
-        }
         self.by_lifetime
             .remove(&old)
             .expect("source membership was checked");
@@ -598,6 +592,19 @@ mod tests {
                         base_code: base.code(),
                     });
                 }
+            }
+            use crate::sql::types::{ArrElem, ColType};
+            let creation = TypeCreation::parse(MAX_TYPE_CREATION).unwrap();
+            for invalid in [
+                ArrElem::Enum(None), ArrElem::Composite(None),
+                ArrElem::Domain { identity: None, base_code: ColType::Int4.code(), base_identity: None },
+                ArrElem::Domain { identity: Some(creation), base_code: ColType::Enum(None).code(), base_identity: None },
+                ArrElem::Domain { identity: Some(creation), base_code: ColType::Composite(None).code(), base_identity: None },
+                ArrElem::Domain { identity: Some(creation), base_code: ColType::Int4.code(), base_identity: Some(creation) },
+                ArrElem::Domain { identity: Some(creation), base_code: ColType::Record.code(), base_identity: None },
+            ] {
+                assert_eq!(CachedArrayElement::from_element(invalid).unwrap_err().sqlstate,
+                    sqlstate::UNDEFINED_OBJECT);
             }
             assert!(CachedArrayElement::from_bytes([255; 6]).is_none());
             let invalid_builtin = crate::sql::types::ArrElem::Enum(None).code();

@@ -67576,7 +67576,9 @@ fn alter_table_relation(
                         new_def.columns[i].not_null.drop_local()
                     };
                 if !new_def.columns[i].not_null.is_required() {
-                    if let ColSource::Keep(original) | ColSource::Cast { orig: original, .. } = source[i] {
+                    if let ColSource::Keep(original) | ColSource::Cast { orig: original, .. } =
+                        source[i]
+                    {
                         let attribute = usize::from(def.attribute_number(original) - 1);
                         new_def.not_null_identities[attribute] = None;
                     }

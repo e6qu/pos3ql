@@ -310,17 +310,16 @@ system column; the two body fields exist only in catalog history. The journal re
 
 Unique keys retain an explicit mode: tag `0` means NULLs are distinct, tag `1`
 means primary key, and tag `2` means `NULLS NOT DISTINCT`. Other tags are rejected.
-The checkpoint `ukey` record starts with this tag. Table-definition payload v10
+The checkpoint `ukey` record starts with this tag. Table-definition payload v12
 stores the tag, key-column count and timing as three bytes before the column
 positions. Older format identities are rejected before these records are read.
 
-Table constraints are fixed at 64 entries per modeled kind and
-domain checks at 64 entries. Their journal counts are unsigned bytes, while
-their positions use a 64-entry stride in synthesized `pg_constraint` and
-referential-trigger OIDs. The 65th entry is rejected with SQLSTATE `54000`
-before catalog mutation. Raising this boundary would renumber durable catalog
-identities, so it requires an explicit format identity and a review of catalog
-OID ranges rather than only changing the constant.
+Table constraints are fixed at 64 entries per modeled kind and domain checks
+at 64 entries. Their journal counts are unsigned bytes. The 65th entry is
+rejected with SQLSTATE `54000` before catalog mutation. Public identifiers use
+creation identities independently of those capacities. Raising this boundary
+requires an explicit stored-format and memory-accounting change that preserves
+existing identities.
 
 ### Enum member identities
 
@@ -423,7 +422,7 @@ source; values and emitted identifiers require a checked creation.
 Their checked three-byte runtime representation cannot contain zero or an
 out-of-range value. Fresh creation returns `54000` when the shared catalog
 sequence reaches this limit. Unsupported stored stamps are rejected before
-catalog publication; manifest v29 and journal v17 reject earlier framing.
+catalog publication; manifest v30 and journal v18 reject earlier framing.
 
 Named-type recovery installs each saved creation stamp directly; it does not
 reserve a temporary stamp and overwrite it later. An exhausted creation sequence

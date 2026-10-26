@@ -427,9 +427,9 @@ impl Storage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sql::types::ColType;
     use crate::storage::tests::{make_def, test_budget, test_config};
     use crate::storage::{CatalogPosition, SqlName, TableCreation};
-    use crate::sql::types::ColType;
 
     fn checked_table(name: &str) -> TableDef {
         let mut definition = make_def(name, &[("id", ColType::Int4, true)]);
@@ -446,7 +446,9 @@ mod tests {
         let mut budget = test_budget(&config);
         let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         crate::mem::guard::forbid_alloc(|| {
-            let slot = storage.create_table(checked_table("constraint_owner")).unwrap();
+            let slot = storage
+                .create_table(checked_table("constraint_owner"))
+                .unwrap();
             let original = *storage.table_def(slot, 0);
             let before = storage.catalog_identity_sequence();
             let position = CatalogPosition::new(1, before + 10).unwrap();
@@ -455,24 +457,40 @@ mod tests {
                 rejected.name = SqlName::parse("rejected_restore").unwrap();
                 match rejected_kind {
                     0 => rejected.checks[0].identity = None,
-                    1 => rejected.checks[0].identity = ConstraintIdentity::parse(position.created_at()),
+                    1 => {
+                        rejected.checks[0].identity =
+                            ConstraintIdentity::parse(position.created_at())
+                    }
                     _ => {
                         let duplicate = ConstraintIdentity::parse(position.created_at() + 1);
                         rejected.checks[0].identity = duplicate;
                         rejected.not_null_identities[0] = duplicate;
                     }
                 }
-                assert_eq!(storage.restore_table(position, rejected, TableCreation::Committed).unwrap_err().sqlstate, sqlstate::DATA_EXCEPTION);
+                assert_eq!(
+                    storage
+                        .restore_table(position, rejected, TableCreation::Committed)
+                        .unwrap_err()
+                        .sqlstate,
+                    sqlstate::DATA_EXCEPTION
+                );
                 assert_eq!(storage.catalog_identity_sequence(), before);
                 assert_eq!(storage.find_table("public", "rejected_restore"), None);
                 let current = storage.table_def(slot, 0);
                 assert_eq!(current.checks[0].identity, original.checks[0].identity);
-                assert_eq!(current.not_null_identities[0], original.not_null_identities[0]);
+                assert_eq!(
+                    current.not_null_identities[0],
+                    original.not_null_identities[0]
+                );
             }
-            let next = storage.create_table(checked_table("after_rejection")).unwrap();
+            let next = storage
+                .create_table(checked_table("after_rejection"))
+                .unwrap();
             assert_eq!(next, 1);
             let counter = storage.catalog_identity_sequence();
-            storage.validate_restored_constraint_identities(counter).unwrap();
+            storage
+                .validate_restored_constraint_identities(counter)
+                .unwrap();
         });
     }
 
@@ -483,20 +501,34 @@ mod tests {
         let mut budget = test_budget(&config);
         let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         crate::mem::guard::forbid_alloc(|| {
-            let first = storage.create_table(checked_table("first_constraint_owner")).unwrap();
-            let second = storage.create_table(checked_table("second_constraint_owner")).unwrap();
+            let first = storage
+                .create_table(checked_table("first_constraint_owner"))
+                .unwrap();
+            let second = storage
+                .create_table(checked_table("second_constraint_owner"))
+                .unwrap();
             let counter = storage.catalog_identity_sequence();
-            storage.validate_restored_constraint_identities(counter).unwrap();
+            storage
+                .validate_restored_constraint_identities(counter)
+                .unwrap();
             let original = storage.table_def(first, 0).checks[0].identity;
             let duplicate = storage.table_def(second, 0).checks[0].identity;
             let revision = storage.reserve_table_definition_revision().unwrap();
             storage.tables[first].definition_mut(revision).checks[0].identity = duplicate;
             let before = storage.catalog_identity_sequence();
-            assert_eq!(storage.validate_restored_constraint_identities(before).unwrap_err().sqlstate, sqlstate::DATA_EXCEPTION);
+            assert_eq!(
+                storage
+                    .validate_restored_constraint_identities(before)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::DATA_EXCEPTION
+            );
             assert_eq!(storage.catalog_identity_sequence(), before);
             assert_eq!(storage.table_def(first, 0).checks[0].identity, duplicate);
             storage.tables[first].definition_mut(revision).checks[0].identity = original;
-            storage.validate_restored_constraint_identities(before).unwrap();
+            storage
+                .validate_restored_constraint_identities(before)
+                .unwrap();
         });
     }
 }

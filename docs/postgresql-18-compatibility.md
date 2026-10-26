@@ -110,7 +110,8 @@ boundaries apply through catalogs, wire, WAL, checkpoints, and recovery:
 | PostgreSQL statement shapes | 100 routine inputs; 32 index/partition attributes; 4,096 grouping sets; 12 CUBE elements; 31 GROUPING arguments | Parser/type boundaries and accepted/rejected differential cases |
 | PostgreSQL wire parameters | 65,535 Parse/Bind and SQL PREPARE/EXECUTE parameters | Fixed prepared/portal buffers plus statement memory; maximum-width wire fixture |
 | Durable array count | 65,535 elements; exact slices or streaming traversal | Array text/binary, execution, persistence, and cold-recovery fixtures |
-| Durable constraint identity | 64 constraints per modeled table kind and 64 domain checks | Current manifest and 64-position catalog/trigger OID stride; SQLSTATE 54000 on the next item |
+| Constraint count | 64 constraints per modeled table kind and 64 domain checks | SQLSTATE 54000 on the next item; changing capacity does not renumber existing rules |
+| Durable constraint identity | Creation numbers 1–9,999,999 from the shared catalog counter | CHECK, foreign-key and NOT NULL rules retain identifiers across supported edits and recovery; replacements reserve new numbers; SQLSTATE 54000 on exhaustion |
 | Other definition breadth | Documented 64-item constructs, including LIST bounds, inheritance parents, trigger arguments, and routine configuration entries | Shared parse/storage boundary; widening requires review of representation and identity |
 | Stored default expressions | 120 bytes, including enum member bindings and saved catalog display text | Existing startup reservation; SQLSTATE 54000 names an overfull default or bound enum expression before installation |
 | Startup capacities | Independent catalog, connection, transaction/savepoint, row-version, lock, replication, cache, and checkpoint pools | Configuration and exact startup memory plan; named errors before partial publication |

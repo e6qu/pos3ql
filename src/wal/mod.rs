@@ -14614,7 +14614,12 @@ mod tests {
         ));
         let length = payload.len();
         assert!(definition.constraint_identities().count() > 1);
-        let first = definition.constraint_identities().next().unwrap().unwrap().created_at();
+        let first = definition
+            .constraint_identities()
+            .next()
+            .unwrap()
+            .unwrap()
+            .created_at();
         let last: [u8; 4] = payload.readable()[length - 4..].try_into().unwrap();
         crate::mem::guard::forbid_alloc(|| {
             assert!(decode_table_payload(payload.readable()).is_some());
@@ -14623,7 +14628,10 @@ mod tests {
             }
             for invalid in [0, 50, crate::storage::MAX_CONSTRAINT_CREATION + 1, first] {
                 payload.filled_mut()[length - 4..].copy_from_slice(&(invalid as u32).to_le_bytes());
-                assert!(decode_table_payload(payload.readable()).is_none(), "accepted constraint identity {invalid}");
+                assert!(
+                    decode_table_payload(payload.readable()).is_none(),
+                    "accepted constraint identity {invalid}"
+                );
             }
             payload.filled_mut()[length - 4..].copy_from_slice(&last);
             assert!(decode_table_payload(payload.readable()).is_some());

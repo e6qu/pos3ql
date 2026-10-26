@@ -1357,7 +1357,9 @@ fn constraint_public_identifiers_survive_edits_replacement_and_savepoint_rollbac
             if rows.iter().any(|row| row != "t") {
                 let actual = data_rows(&session.success(&mut engine,
                     "SELECT conname, oid, contype, conrelid, contypid FROM pg_constraint WHERE conrelid = 'constraint_rules'::regclass OR contypid = 'constraint_domain'::regtype; SELECT name, identity FROM saved_constraint_identities ORDER BY name", false));
-                panic!("after {observations} checks; {statement}: {rows:?}; catalog and saved rows: {actual:?}");
+                panic!(
+                    "after {observations} checks; {statement}: {rows:?}; catalog and saved rows: {actual:?}"
+                );
             }
             observations += rows.len();
         }
@@ -1504,7 +1506,10 @@ fn constraint_identity_prepared_changes_survive_commit_and_rollback_with_empty_d
     const RETAINED: &str = "SELECT conname, oid FROM pg_constraint WHERE (conrelid = 'prepared_constraints'::regclass OR contypid = 'prepared_constraint_domain'::regtype) AND conname IN ('table_keep', 'table_nn', 'domain_keep', 'domain_nn') ORDER BY conname";
     for checkpoint in [false, true] {
         for commit in [false, true] {
-            for mode in [crate::config::TransactionMode::Mvcc, crate::config::TransactionMode::Locking] {
+            for mode in [
+                crate::config::TransactionMode::Mvcc,
+                crate::config::TransactionMode::Locking,
+            ] {
                 let name = format!("constraint-prepared-{checkpoint}-{commit}-{mode:?}");
                 let mut config = test_config(&name);
                 config.transaction_mode = mode;
@@ -1533,8 +1538,15 @@ fn constraint_identity_prepared_changes_survive_commit_and_rollback_with_empty_d
                     session.success(&mut engine, "BEGIN; ALTER TABLE prepared_constraints DROP CONSTRAINT table_changed; ALTER TABLE prepared_constraints ADD CONSTRAINT table_changed CHECK (id < 20); ALTER DOMAIN prepared_constraint_domain DROP CONSTRAINT domain_changed; ALTER DOMAIN prepared_constraint_domain ADD CONSTRAINT domain_changed CHECK (VALUE < 20)", false);
                     after = data_rows(&session.success(&mut engine, INVENTORY, true));
                     assert_ne!(before, after);
-                    assert_eq!(data_rows(&session.success(&mut engine, RETAINED, true)), retained);
-                    session.success(&mut engine, "PREPARE TRANSACTION 'constraint-pending'", false);
+                    assert_eq!(
+                        data_rows(&session.success(&mut engine, RETAINED, true)),
+                        retained
+                    );
+                    session.success(
+                        &mut engine,
+                        "PREPARE TRANSACTION 'constraint-pending'",
+                        false,
+                    );
                     if checkpoint {
                         assert!(engine.checkpoint().unwrap());
                     }
@@ -1547,11 +1559,35 @@ fn constraint_identity_prepared_changes_survive_commit_and_rollback_with_empty_d
                     let gid = ast::PreparedTransactionId::parse("constraint-pending").unwrap();
                     assert!(cold.prepared_transactions.find(gid).is_some());
                     let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
-                    assert_eq!(data_rows(&session.success(&mut cold, INVENTORY, true)), before);
-                    session.success(&mut cold, if commit { "COMMIT PREPARED 'constraint-pending'" } else { "ROLLBACK PREPARED 'constraint-pending'" }, false);
-                    assert_eq!(data_rows(&session.success(&mut cold, INVENTORY, true)), if commit { after } else { before });
-                    assert_eq!(data_rows(&session.success(&mut cold, RETAINED, true)), retained);
-                    assert_eq!(data_rows(&session.success(&mut cold, "SELECT id FROM prepared_constraints", true)), ["7"]);
+                    assert_eq!(
+                        data_rows(&session.success(&mut cold, INVENTORY, true)),
+                        before
+                    );
+                    session.success(
+                        &mut cold,
+                        if commit {
+                            "COMMIT PREPARED 'constraint-pending'"
+                        } else {
+                            "ROLLBACK PREPARED 'constraint-pending'"
+                        },
+                        false,
+                    );
+                    assert_eq!(
+                        data_rows(&session.success(&mut cold, INVENTORY, true)),
+                        if commit { after } else { before }
+                    );
+                    assert_eq!(
+                        data_rows(&session.success(&mut cold, RETAINED, true)),
+                        retained
+                    );
+                    assert_eq!(
+                        data_rows(&session.success(
+                            &mut cold,
+                            "SELECT id FROM prepared_constraints",
+                            true
+                        )),
+                        ["7"]
+                    );
                     assert!(cold.prepared_transactions.find(gid).is_none());
                 }
                 std::fs::remove_dir_all(&config.data_dir).unwrap();
@@ -1564,7 +1600,10 @@ fn constraint_identity_prepared_changes_survive_commit_and_rollback_with_empty_d
 #[test]
 fn constraint_identity_exhaustion_preserves_existing_data_and_cold_recovery() {
     for checkpoint in [false, true] {
-        for mode in [crate::config::TransactionMode::Mvcc, crate::config::TransactionMode::Locking] {
+        for mode in [
+            crate::config::TransactionMode::Mvcc,
+            crate::config::TransactionMode::Locking,
+        ] {
             let name = format!("constraint-exhaustion-{checkpoint}-{mode:?}");
             let mut config = test_config(&name);
             config.transaction_mode = mode;
@@ -1585,18 +1624,29 @@ fn constraint_identity_exhaustion_preserves_existing_data_and_cold_recovery() {
                 session.success(&mut engine, "CREATE TABLE constraint_limit(id integer NOT NULL, optional integer, CONSTRAINT table_keep CHECK (id > 0)); CREATE DOMAIN constraint_limit_domain AS integer CONSTRAINT domain_keep CHECK (VALUE > 0); INSERT INTO constraint_limit VALUES (7, 7)", false);
                 before = data_rows(&session.success(&mut engine, INVENTORY, true));
                 assert_eq!(before.len(), 3);
-                engine.storage.replace_catalog_sequence_for_test(crate::storage::MAX_CONSTRAINT_CREATION);
+                engine
+                    .storage
+                    .replace_catalog_sequence_for_test(crate::storage::MAX_CONSTRAINT_CREATION);
                 for statement in [
                     "ALTER TABLE constraint_limit ADD CONSTRAINT rejected CHECK (id < 20)",
                     "ALTER TABLE constraint_limit ALTER COLUMN optional SET NOT NULL",
                     "ALTER DOMAIN constraint_limit_domain ADD CONSTRAINT rejected CHECK (VALUE < 20)",
                     "ALTER DOMAIN constraint_limit_domain SET NOT NULL",
                 ] {
-                    assert_eq!(error_sqlstates(&session.execute(&mut engine, statement, true)), ["54000"], "{statement}");
-                    assert_eq!(data_rows(&session.success(&mut engine, INVENTORY, true)), before);
+                    assert_eq!(
+                        error_sqlstates(&session.execute(&mut engine, statement, true)),
+                        ["54000"],
+                        "{statement}"
+                    );
+                    assert_eq!(
+                        data_rows(&session.success(&mut engine, INVENTORY, true)),
+                        before
+                    );
                 }
                 session.success(&mut engine, "ALTER TABLE constraint_limit ALTER COLUMN id SET NOT NULL; INSERT INTO constraint_limit VALUES (8, NULL)", false);
-                if checkpoint { assert!(engine.checkpoint().unwrap()); }
+                if checkpoint {
+                    assert!(engine.checkpoint().unwrap());
+                }
                 engine.commit_wal().unwrap();
             }
             std::fs::remove_dir_all(&config.data_dir).unwrap();
@@ -1604,7 +1654,10 @@ fn constraint_identity_exhaustion_preserves_existing_data_and_cold_recovery() {
                 let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
                 let mut cold = Engine::new(&config, &mut budget).unwrap();
                 let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
-                assert_eq!(data_rows(&session.success(&mut cold, INVENTORY, true)), before);
+                assert_eq!(
+                    data_rows(&session.success(&mut cold, INVENTORY, true)),
+                    before
+                );
                 assert_eq!(data_rows(&session.success(&mut cold, "SELECT id FROM constraint_limit ORDER BY id; SELECT 9::constraint_limit_domain", true)), ["7", "8", "9"]);
             }
             std::fs::remove_dir_all(&config.data_dir).unwrap();

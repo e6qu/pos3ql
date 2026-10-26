@@ -42,6 +42,8 @@ pub(crate) use catalog_sources::{
     SessionIdentity, SessionRole,
 };
 mod constraint_identities;
+#[cfg(test)]
+pub(crate) use constraint_identities::MAX_CONSTRAINT_CREATION;
 pub(crate) use constraint_identities::{
     ConstraintIdentity, ForeignKeyTrigger, validate_constraint_identities,
     validate_constraint_lifetimes,

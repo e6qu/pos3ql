@@ -730,15 +730,25 @@ pub(super) fn attach_constraints(
     for con in constraints {
         match con {
             TableConstraint::NamedNotNull { name, column } => {
-                let column = def.column_index(column).ok_or_else(|| sql_err!(
-                    sqlstate::UNDEFINED_COLUMN, "column \"{}\" does not exist", column
-                ))?;
+                let column = def.column_index(column).ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_COLUMN,
+                        "column \"{}\" does not exist",
+                        column
+                    )
+                })?;
                 if !def.columns[column].not_null.is_required() {
-                    return Err(sql_err!(sqlstate::SYNTAX_ERROR, "conflicting NULL/NOT NULL declarations"));
+                    return Err(sql_err!(
+                        sqlstate::SYNTAX_ERROR,
+                        "conflicting NULL/NOT NULL declarations"
+                    ));
                 }
                 let name = SqlName::parse(name)?;
                 if def.not_null_names[column].is_some_and(|existing| existing != name) {
-                    return Err(sql_err!(sqlstate::SYNTAX_ERROR, "conflicting not-null constraint names"));
+                    return Err(sql_err!(
+                        sqlstate::SYNTAX_ERROR,
+                        "conflicting not-null constraint names"
+                    ));
                 }
                 def.set_not_null_constraint_name(column, name);
             }

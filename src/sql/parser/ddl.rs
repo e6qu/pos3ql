@@ -8016,7 +8016,13 @@ impl<'a> Parser<'a> {
                         not_null_inheritable = false;
                     }
                     if let Some(name) = col_cons_name {
-                        self.push(&mut cons, TableConstraint::NamedNotNull { name, column: col_name })?;
+                        self.push(
+                            &mut cons,
+                            TableConstraint::NamedNotNull {
+                                name,
+                                column: col_name,
+                            },
+                        )?;
                     }
                 } else if self.eat_ident("null")? {
                     if null_clause == Some(true) {

@@ -254,7 +254,10 @@ mod tests {
             remap_table(&original, &mut replacement, &mapping).unwrap();
             assert_eq!(replacement.not_null_names[0], retained_name);
             assert_eq!(replacement.not_null_names[1], Some(explicit));
-            assert_eq!(replacement.not_null_name_edits, super::super::ColumnSet::all(replacement.n_columns));
+            assert_eq!(
+                replacement.not_null_name_edits,
+                super::super::ColumnSet::all(replacement.n_columns)
+            );
         });
     }
 }

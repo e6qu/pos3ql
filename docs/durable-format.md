@@ -49,7 +49,7 @@ they never select a guessed decoder.
 A column container and a row index can contain identical bytes and still be
 different blocks. Their type is part of the object name, so writing one cannot
 replace the other. Headers without the current identity version are rejected.
-Manifest v26 and older manifests are rejected before their references are used.
+Manifest v27 and older manifests are rejected before their references are used.
 
 Role identifiers are independent of catalog slots. The bootstrap administrator
 keeps PostgreSQL OID 10; user roles receive identifiers from 16,385 through
@@ -75,9 +75,9 @@ constraint-created indexes share the 300,000,001–309,999,999 relation band.
 TOAST relations and indexes use creation-stamp companions starting at
 320,000,000 and 340,000,000. Table and view row types start at 130,000,000 and
 140,000,000; their arrays start at 150,000,000 and 160,000,000. These bands depend
-on creation stamps, not configured catalog capacities. The shared allocator
-rejects reservations above 9,999,999 with `54000`; narrower object-specific
-limits still apply. It retains reservations for dropped and rolled-back objects.
+on creation stamps, not configured catalog capacities. New relation or index creation returns `54000` when the shared creation
+sequence would exceed 9,999,999; other catalog changes keep their own limits.
+The sequence retains reservations for dropped and rolled-back objects.
 
 Each constraint-created index owns a separate creation stamp. Renaming its
 constraint, dropping an earlier constraint, or moving its column preserves

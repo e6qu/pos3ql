@@ -11271,18 +11271,18 @@ fn visit_indexes(
         let toid = user_table_oid(storage, slot);
         let mk = |oid: i32,
                   columns: &[u16],
-                      expression_keys: [bool; crate::storage::MAX_INDEX_COLS],
-                      include_columns: &[u16],
-                      descending: [bool; crate::storage::MAX_INDEX_COLS],
-                      nulls_first: [bool; crate::storage::MAX_INDEX_COLS],
-                      predicate: Option<StackStr<{ crate::storage::INDEX_PREDICATE_MAX }>>,
-                      nulls_not_distinct: bool,
-                      is_primary: bool,
-                      is_unique: bool,
-                      is_constraint: bool,
-                      is_exclusion: bool,
-                      timing: crate::storage::ConstraintTiming,
-                      name: StackStr<64>| {
+                  expression_keys: [bool; crate::storage::MAX_INDEX_COLS],
+                  include_columns: &[u16],
+                  descending: [bool; crate::storage::MAX_INDEX_COLS],
+                  nulls_first: [bool; crate::storage::MAX_INDEX_COLS],
+                  predicate: Option<StackStr<{ crate::storage::INDEX_PREDICATE_MAX }>>,
+                  nulls_not_distinct: bool,
+                  is_primary: bool,
+                  is_unique: bool,
+                  is_constraint: bool,
+                  is_exclusion: bool,
+                  timing: crate::storage::ConstraintTiming,
+                  name: StackStr<64>| {
             let mut c = [0u16; crate::storage::MAX_INDEX_COLS];
             c[..columns.len()].copy_from_slice(columns);
             let mut included = [0u16; crate::storage::MAX_INDEX_COLS];
@@ -11326,7 +11326,9 @@ fn visit_indexes(
             if col.primary {
                 let name = stack_str_64(stack_format!(64, "{}_pkey", table_name).as_str());
                 visit(mk(
-                    col.index_identity.expect("admitted inline index has an identity").oid(),
+                    col.index_identity
+                        .expect("admitted inline index has an identity")
+                        .oid(),
                     &[ci as u16],
                     [false; crate::storage::MAX_INDEX_COLS],
                     &[],
@@ -11346,7 +11348,9 @@ fn visit_indexes(
                     stack_format!(64, "{}_{}_key", table_name, col.name.as_str()).as_str(),
                 );
                 visit(mk(
-                    col.index_identity.expect("admitted inline index has an identity").oid(),
+                    col.index_identity
+                        .expect("admitted inline index has an identity")
+                        .oid(),
                     &[ci as u16],
                     [false; crate::storage::MAX_INDEX_COLS],
                     &[],
@@ -11383,7 +11387,9 @@ fn visit_indexes(
                 continue;
             }
             visit(mk(
-                uk.index_identity.expect("admitted unique index has an identity").oid(),
+                uk.index_identity
+                    .expect("admitted unique index has an identity")
+                    .oid(),
                 uk.columns(),
                 [false; crate::storage::MAX_INDEX_COLS],
                 &[],
@@ -11401,7 +11407,10 @@ fn visit_indexes(
         }
         for exclusion in def.exclusions() {
             visit(mk(
-                exclusion.index_identity.expect("admitted exclusion index has an identity").oid(),
+                exclusion
+                    .index_identity
+                    .expect("admitted exclusion index has an identity")
+                    .oid(),
                 exclusion.columns(),
                 [false; crate::storage::MAX_INDEX_COLS],
                 &[],
@@ -21779,9 +21788,10 @@ fn pg_depend<'a>(
 
     let referenced_oid = |dependency: &crate::storage::StoredQueryDependency| match dependency.class
     {
-        crate::storage::DependencyClass::Table => {
-            Some((PG_CLASS_OID, user_table_oid(storage, dependency.slot as usize)))
-        }
+        crate::storage::DependencyClass::Table => Some((
+            PG_CLASS_OID,
+            user_table_oid(storage, dependency.slot as usize),
+        )),
         crate::storage::DependencyClass::View => {
             Some((PG_CLASS_OID, view_oid(storage, dependency.slot as usize)))
         }
@@ -21947,7 +21957,9 @@ fn pg_depend<'a>(
     for (_, trigger) in storage.triggers_with_slots_visible_to(txid) {
         let trigger_oid = crate::storage::trigger_oid(&trigger);
         let relation_oid = match trigger.target {
-            crate::storage::TriggerTarget::Table(table) => user_table_oid(storage, usize::from(table)),
+            crate::storage::TriggerTarget::Table(table) => {
+                user_table_oid(storage, usize::from(table))
+            }
             crate::storage::TriggerTarget::View(view) => view_oid(storage, usize::from(view)),
         };
         push(

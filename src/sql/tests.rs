@@ -1363,12 +1363,50 @@ fn relation_identity_cold_recovery_preserves_replacements_and_surviving_indexes(
             let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
             let mut session = ConfiguredTransactionSession::new(&config, &mut cold_budget);
             assert_eq!(data_rows(&session.success(&mut cold, "SELECT 'identity_cold'::regclass::oid, 'identity_cold'::regtype::oid, 'identity_cold[]'::regtype::oid, 'identity_cold_kept'::regclass::oid, 'identity_cold_view'::regclass::oid, 'identity_cold_view'::regtype::oid, 'identity_cold_sequence'::regclass::oid", false)), before);
-            session.success(&mut cold, "DROP VIEW identity_cold_view; DROP TABLE identity_cold; CREATE TABLE identity_cold(id integer PRIMARY KEY, label text)", false);
+            session.success(&mut cold, "DROP VIEW identity_cold_view; DROP TABLE identity_cold", false);
+            session.success(&mut cold, "CREATE TABLE identity_cold(id integer PRIMARY KEY, label text)", false);
             let new_slot = cold.storage.find_table("public", "identity_cold").unwrap();
             assert_eq!(new_slot, slot);
             assert_ne!(catalog::user_table_oid(&cold.storage, new_slot), original);
             assert_eq!(data_rows(&session.success(&mut cold, "SELECT count(*) FROM pg_class c JOIN identity_cold_saved s ON c.oid = s.oid OR c.oid = s.reltoastrelid; SELECT count(*) FROM pg_type t JOIN identity_cold_saved s ON t.oid = s.reltype; SELECT nextval('identity_cold_sequence')", false)), ["0", "0", "101"]);
         }
+    }
+}
+
+#[test]
+fn relation_identity_exhaustion_keeps_existing_data_and_cold_recovery_usable() {
+    for checkpoint in [false, true] {
+        let name = format!("relation-identity-limit-{checkpoint}");
+        let mut config = test_config(&name);
+        config.max_ddl_per_transaction = 32;
+        config.object_store_on = true;
+        config.object_store_sim = true;
+        config.wal_upload = true;
+        config.wal_upload_sync = true;
+        config.object_store_bucket = format!("{name}-{}", std::process::id());
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        session.success(&mut engine, "CREATE DOMAIN identity_limit_domain AS integer; CREATE TYPE identity_limit_enum AS ENUM ('ready'); CREATE TYPE identity_limit_composite AS (value integer)", false);
+        engine.storage.replace_catalog_sequence_for_test(crate::storage::MAX_RELATION_GENERATION - 2);
+        session.success(&mut engine, "CREATE TABLE identity_limit_orders(id integer PRIMARY KEY); INSERT INTO identity_limit_orders VALUES (7)", false);
+        for sql in ["CREATE TABLE identity_limit_rejected(id integer)", "CREATE INDEX identity_limit_rejected ON identity_limit_orders(id)", "CREATE SEQUENCE identity_limit_rejected", "CREATE VIEW identity_limit_rejected AS SELECT 1 AS value", "CREATE TYPE identity_limit_rejected AS (value integer)"] {
+            assert_eq!(error_sqlstates(&session.execute(&mut engine, sql, false)), ["54000"], "{sql}");
+        }
+        session.success(&mut engine, "ALTER TABLE identity_limit_orders SET (fillfactor = 80); INSERT INTO identity_limit_orders VALUES (8)", false);
+        let before = data_rows(&session.success(&mut engine, "SELECT 'identity_limit_orders'::regclass::oid, 'identity_limit_orders'::regtype::oid, 'identity_limit_orders_pkey'::regclass::oid; SELECT to_regclass('identity_limit_rejected') IS NULL", false));
+        assert_eq!(before[1], "t");
+        if checkpoint { assert!(engine.checkpoint().unwrap()); }
+        drop(session);
+        drop(engine);
+        std::fs::remove_dir_all(&config.data_dir).unwrap();
+        let mut cold_budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut cold_budget);
+        assert_eq!(data_rows(&session.success(&mut cold, "SELECT 'identity_limit_orders'::regclass::oid, 'identity_limit_orders'::regtype::oid, 'identity_limit_orders_pkey'::regclass::oid; SELECT to_regclass('identity_limit_rejected') IS NULL", false)), before);
+        assert_eq!(data_rows(&session.success(&mut cold, "SELECT id FROM identity_limit_orders ORDER BY id; SELECT (NULL::identity_limit_composite).value IS NULL", false)), ["7", "8", "t"]);
+        assert_eq!(error_sqlstates(&session.execute(&mut cold, "CREATE TABLE identity_limit_rejected(id integer)", false)), ["54000"]);
     }
 }
 
@@ -81227,7 +81265,7 @@ fn current_manifest_cold_recovery_rejects_invalid_roots_without_publication_body
         .object_bytes(&manifest_key)
         .unwrap()
         .to_vec();
-    assert!(current.starts_with(b"pos3ql-manifest-v27\n"));
+    assert!(current.starts_with(b"pos3ql-manifest-v28\n"));
     assert!(
         current.windows(b" v4\n".len()).any(|part| part == b" v4\n"),
         "current checkpoint must retain its packed row layout"
@@ -81442,7 +81480,7 @@ fn current_manifest_cold_recovery_rejects_invalid_roots_without_publication_body
         namespace
             .borrow()
             .object_bytes(&manifest_key)
-            .is_some_and(|bytes| bytes.starts_with(b"pos3ql-manifest-v27\n"))
+            .is_some_and(|bytes| bytes.starts_with(b"pos3ql-manifest-v28\n"))
     );
     drop(recovered);
 

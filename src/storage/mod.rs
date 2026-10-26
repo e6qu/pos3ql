@@ -14134,14 +14134,10 @@ impl CatalogSequence {
     }
 
     fn next(&self) -> Result<u64, SqlError> {
-        self.next_bounded(
-            relation_identities::MAX_RELATION_GENERATION,
-            "catalog sequence",
-        )
+        self.next_bounded(u64::MAX, "catalog sequence")
     }
 
     fn next_bounded(&self, maximum: u64, object: &str) -> Result<u64, SqlError> {
-        let maximum = maximum.min(relation_identities::MAX_RELATION_GENERATION);
         let mut current = self.0.load(std::sync::atomic::Ordering::Relaxed);
         loop {
             let next =
@@ -41692,7 +41688,11 @@ impl Storage {
     ) -> Result<TypeDdlUndo, SqlError> {
         self.require_schema_create(schema.as_str(), txid)?;
         let ownership = self.initial_ownership(txid)?;
-        let created_at = self.catalog_sequence.next()?;
+        let created_at = if defer_manifest_binding {
+            self.catalog_sequence.next()?
+        } else {
+            self.catalog_sequence.next_bounded(MAX_RELATION_GENERATION, "relation")?
+        };
         let (mut permissions, mut catalog) = self.type_creation_catalogs();
         if !defer_manifest_binding {
             catalog.bind_composite_fields(&mut spec.fields[..spec.n_fields], txid)?;
@@ -41885,7 +41885,7 @@ impl Storage {
             let undo = self.replace_view_in(&mut owners, target, definition, txid)?;
             return Ok(ViewPublication::Altered(undo));
         }
-        let created_at = self.catalog_sequence.next()?;
+        let created_at = self.catalog_sequence.next_bounded(MAX_RELATION_GENERATION, "relation")?;
         // Reserve and populate the return rule before changing either view.
         // Capacity and identity errors preserve an existing replacement target.
         let rule = self.create_new_rule_in(

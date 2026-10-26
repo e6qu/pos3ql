@@ -27164,7 +27164,7 @@ fn fire_statement_triggers_with_rows<'a>(
             .then(|| super::guc::enter_active_routine_configs(routine.configs()))
             .transpose()?;
         let invocation = TriggerInvocation::new(
-        context.storage(),
+            context.storage(),
             &trigger,
             TriggerRelationIdentity {
                 target,
@@ -63683,8 +63683,10 @@ fn attach_constraint_using_index(
         },
         timing,
     )?;
-    new_definition.uniques[new_definition.n_uniques - 1].index_identity =
-        Some(crate::storage::RelationIdentity::parse(index.created_at).expect("admitted explicit index has an identity"));
+    new_definition.uniques[new_definition.n_uniques - 1].index_identity = Some(
+        crate::storage::RelationIdentity::parse(index.created_at)
+            .expect("admitted explicit index has an identity"),
+    );
     stage_index_rename(storage, wal, txn, slot, constraint_name)
 }
 

@@ -505,9 +505,10 @@ impl Storage {
                             owners.catalog.definitions.len()
                         )
                     })?;
-                (slot, self.catalog_sequence.next()?)
+                (slot, self.catalog_sequence.next_bounded(super::MAX_RELATION_GENERATION, "relation")?)
             }
             super::CatalogAllocation::Restore(position) => {
+                super::RelationIdentity::parse(position.created_at()).ok_or_else(|| sql_err!(sqlstate::DATA_EXCEPTION, "saved sequence has an invalid relation identity"))?;
                 if owners
                     .catalog
                     .definitions

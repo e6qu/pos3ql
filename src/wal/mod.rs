@@ -14596,6 +14596,26 @@ mod tests {
     }
 
     #[test]
+    fn relation_identity_table_payload_rejects_missing_duplicate_and_invalid_index_stamps() {
+        let definition = sample_def();
+        let mut budget = Budget::new(1 << 20);
+        let mut payload = FixedBuf::new(&mut budget, "relation identity payload", 32768).unwrap();
+        assert!(append_payload(&mut payload, &WalOp::CreateTable {
+            identity: crate::storage::CatalogPosition::new(0, 50).unwrap(),
+            definition: &definition,
+        }));
+        let bytes = payload.readable();
+        assert!(decode_table_payload(bytes).is_some());
+        assert!(decode_table_payload(&bytes[..bytes.len() - 1]).is_none());
+        for invalid in [0, crate::storage::MAX_RELATION_GENERATION + 1, 101] {
+            let mut corrupt = bytes.to_vec();
+            let end = corrupt.len();
+            corrupt[end - 8..].copy_from_slice(&invalid.to_le_bytes());
+            assert!(decode_table_payload(&corrupt).is_none(), "accepted index creation stamp {invalid}");
+        }
+    }
+
+    #[test]
     fn catalog_snapshot_table_payload_validates_unique_modes_and_attribute_layouts() {
         use crate::storage::UniqueKeyKind;
         let mut definition = sample_def();

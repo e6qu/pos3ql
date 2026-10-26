@@ -169,7 +169,7 @@ pub(super) fn allocate(
         )?;
         source.bind_table_definition(&mut def, transaction)?;
         let created_at = match allocation {
-            super::CatalogAllocation::New => storage.catalog_sequence.next()?,
+            super::CatalogAllocation::New => storage.catalog_sequence.next_bounded(super::MAX_RELATION_GENERATION, "relation")?,
             super::CatalogAllocation::Restore(position) => {
                 super::RelationIdentity::parse(position.created_at()).ok_or_else(|| {
                     sql_err!(

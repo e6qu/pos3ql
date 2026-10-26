@@ -291,9 +291,6 @@ fn parse_manifest_metadata(text: &str) -> Result<ManifestMetadata, &'static str>
                     .next()
                     .and_then(|word| word.parse().ok())
                     .ok_or("invalid catalog identity allocator")?;
-                if sequence > crate::storage::MAX_RELATION_GENERATION {
-                    return Err("invalid catalog identity allocator");
-                }
                 catalog_sequence = Some(sequence);
                 true
             }

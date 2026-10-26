@@ -1,0 +1,44 @@
+name: Named type identity validation
+
+on:
+  push:
+    branches: [catalog-type-lifetimes]
+
+concurrency:
+  group: named-type-identity-validation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+      - name: Format and retain correction
+        run: |
+          cargo fmt
+          git diff --binary > "$RUNNER_TEMP/formatting.patch"
+      - name: Build every target and lint
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Verify compact identity layouts
+        shell: bash
+        run: |
+          cargo test --lib --locked named_type_creation_code_layout_probe -- --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/layout.log"
+          grep -Eq 'test result: ok\. 1 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/layout.log"
+      - name: Retain layout and formatting evidence
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: named-type-layout-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/formatting.patch
+            ${{ runner.temp }}/layout.log
+          if-no-files-found: error

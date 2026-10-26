@@ -312,7 +312,10 @@ creation stamp after each optional legacy binding and a u32 member count. Enum
 journal kinds 23/147 are rejected. Recovery checks increasing member stamps,
 unchanged existing prefixes and uniqueness across types within each database;
 a fixed 8 KiB bitmap scans the admitted stamp ranges before writer promotion.
-No missing identity is guessed.
+No missing identity is guessed. Labels and sort positions must be unique; saved
+sort keys must be finite and exactly representable as PostgreSQL `float4`.
+Validation and sort renumbering use in-place sorts, then restore creation order
+so existing row-value ordinals cannot move.
 
 A row enum's u32 label-length high bit marks an additional u32 member identity
 before its cached label. A clear high bit retains the legacy decoder. Composite

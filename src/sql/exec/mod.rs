@@ -42591,21 +42591,28 @@ fn build_enum_spec<'a>(
                 "enum definition exceeds the statement arena"
             )
         })?;
-    for (i, &label) in labels.iter().enumerate() {
-        if labels[..i].contains(&label) {
-            return Err(sql_err!(
-                sqlstate::DUPLICATE_OBJECT,
-                "enum label \"{}\" specified more than once",
-                label
-            ));
-        }
-        members[i] = crate::storage::EnumMember {
-            identity: None,
-label: SqlName::parse(label)?,
-            legacy_label: None,
-            sort: (i + 1) as f64,
+    let mut parsed = 0;
+    let mut parse_error = None;
+    for (index, &label) in labels.iter().enumerate() {
+        let label = match SqlName::parse(label) {
+            Ok(label) => label,
+            Err(error) => { parse_error = Some(error); break; }
         };
+        members[index] = crate::storage::EnumMember {
+            identity: None, label, legacy_label: None, sort: (index + 1) as f64,
+        };
+        parsed += 1;
     }
+    let completed = &mut members[..parsed];
+    completed.sort_unstable_by(|left, right| left.label.as_str().cmp(right.label.as_str())
+        .then_with(|| left.sort.total_cmp(&right.sort)));
+    let duplicate = completed.windows(2).filter(|pair| pair[0].label == pair[1].label)
+        .min_by(|left, right| left[1].sort.total_cmp(&right[1].sort)).map(|pair| pair[1].label);
+    completed.sort_unstable_by(|left, right| left.sort.total_cmp(&right.sort));
+    if let Some(label) = duplicate {
+        return Err(sql_err!(sqlstate::DUPLICATE_OBJECT, r#"enum label "{}" specified more than once"#, label.as_str()));
+    }
+    if let Some(error) = parse_error { return Err(error); }
     Ok(members)
 }
 
@@ -47343,20 +47350,13 @@ fn compute_add_value_sort(
             return Ok((f64::from(new_sort), renumbered));
         }
 
-        const RANK_MARKER: u64 = 0x7ff8_0000_0000_0000;
-        for rank in 1..=members.len() {
-            // Temporary NaN payloads retain each rank while the remaining
-            // finite keys are selected, including keys below zero.
-            let member = members
-                .iter_mut()
-                .filter(|member| !member.sort.is_nan())
-                .min_by(|left, right| left.sort.partial_cmp(&right.sort).unwrap())
-                .expect("one finite enum sort key remains for each rank");
-            member.sort = f64::from_bits(RANK_MARKER | rank as u64);
+        if members.iter().any(|member| member.identity.is_none()) {
+            return Err(sql_err!(sqlstate::DATA_EXCEPTION, "enum sort renumbering has an unbound member"));
         }
-        for member in members.iter_mut() {
-            member.sort = (member.sort.to_bits() & !RANK_MARKER) as f64;
-        }
+        members.sort_unstable_by(|left, right| left.sort.total_cmp(&right.sort));
+        for (index, member) in members.iter_mut().enumerate() { member.sort = (index + 1) as f64; }
+        // Public label births preserve original member ordinals after sorting by value.
+        members.sort_unstable_by_key(|member| member.identity.expect("checked member identity").created_at());
         renumbered = true;
     }
 }

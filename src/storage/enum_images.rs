@@ -8,6 +8,28 @@ use crate::mem::fixed_vec::FixedVec;
 use crate::sql::eval::{SqlError, sqlstate};
 use crate::sql_err;
 
+/// Creation order restores member ordinals after each allocation-free validation sort.
+fn validate_members(members: &mut [EnumMember]) -> Result<(), SqlError> {
+    let mut previous = 0;
+    for member in members.iter() {
+        let creation = member.identity.ok_or_else(|| sql_err!(sqlstate::DATA_EXCEPTION,
+            "enum member has no creation identity"))?.created_at();
+        if creation <= previous || !member.sort.is_finite() || f64::from(member.sort as f32) != member.sort {
+            return Err(sql_err!(sqlstate::DATA_EXCEPTION, "enum member identity or sort position is invalid"));
+        }
+        previous = creation;
+    }
+    members.sort_unstable_by(|left, right| left.label.as_str().cmp(right.label.as_str()));
+    let duplicate_label = members.windows(2).any(|pair| pair[0].label == pair[1].label);
+    members.sort_unstable_by(|left, right| left.sort.total_cmp(&right.sort));
+    let duplicate_sort = members.windows(2).any(|pair| pair[0].sort == pair[1].sort);
+    members.sort_unstable_by_key(|member| member.identity.expect("checked member identity").created_at());
+    if duplicate_label || duplicate_sort {
+        return Err(sql_err!(sqlstate::DATA_EXCEPTION, "enum labels or sort positions are duplicated"));
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug)]
 struct ImageSlot {
     owned: bool,
@@ -135,6 +157,12 @@ impl EnumMemberImages {
         &self.members[start..start + count]
     }
 
+    pub(super) fn validate_replay(&mut self, count: usize) -> Result<(), SqlError> {
+        self.validate_count(count)?;
+        let start = self.replay_image() as usize * self.width;
+        validate_members(&mut self.members.as_mut_slice()[start..start + count])
+    }
+
     pub(super) fn replace_from_replay(
         &mut self,
         current: Option<u32>,
@@ -224,6 +252,10 @@ impl EnumImageReservation {
                 Err(error) => { state.release(image); return Err(error); }
             };
             state.members[start + index] = EnumMember { identity: Some(identity), ..*member };
+        }
+        if let Err(error) = validate_members(&mut state.members.as_mut_slice()[start..start + members.len()]) {
+            state.release(image);
+            return Err(error);
         }
         Ok(Self {
             images: Arc::clone(images),
@@ -534,6 +566,99 @@ label: SqlName::parse(label).unwrap(),
             assert_eq!(reused, source);
             assert_eq!(selected.member(0).label, label.label);
             images.lock().unwrap().release(reused);
+        });
+    }
+
+    #[test]
+    fn enum_label_validation_rejects_invalid_values_without_changing_member_ordinals() {
+        crate::mem::guard::forbid_alloc(|| {
+            for case in 0..6 {
+                let mut values = [
+                    EnumMember { identity: super::super::EnumLabelIdentity::parse(1), ..member("later", 2.0) },
+                    EnumMember { identity: super::super::EnumLabelIdentity::parse(2), ..member("earlier", 1.0) },
+                ];
+                match case {
+                    0 => values[1].label = values[0].label,
+                    1 => values[1].sort = values[0].sort,
+                    2 => values[1].sort = f64::NAN,
+                    3 => values[1].sort = 0.1,
+                    4 => values[1].identity = None,
+                    5 => values[1].identity = values[0].identity,
+                    _ => unreachable!(),
+                }
+                let before = values;
+                assert_eq!(validate_members(&mut values).unwrap_err().sqlstate, sqlstate::DATA_EXCEPTION);
+                for (value, saved) in values.iter().zip(before) {
+                    assert_eq!(value.label, saved.label);
+                    assert_eq!(value.identity, saved.identity);
+                    assert_eq!(value.sort.to_bits(), saved.sort.to_bits());
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn enum_label_identity_layout_and_failed_admission_preserve_reserved_images() {
+        assert_eq!(size_of::<super::super::EnumLabelIdentity>(), 3);
+        assert_eq!(size_of::<Option<super::super::EnumLabelIdentity>>(), 3);
+        assert!(size_of::<EnumMember>() <= 144);
+        let images = images(2, 2);
+        let sequence = super::super::CatalogSequence::new(super::super::type_identities::MAX_TYPE_CREATION - 1);
+        crate::mem::guard::forbid_alloc(|| {
+            for _ in 0..8 {
+                let error = EnumImageReservation::write(&images,
+                    &[member("one", 1.0), member("two", 2.0)], &sequence, None).err().unwrap();
+                assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+                let state = images.lock().unwrap();
+                assert!(!state.slots[0].owned);
+                assert_eq!(state.slots[0].readers, 0);
+            }
+            let fresh = super::super::CatalogSequence::new(10);
+            let source = EnumImageReservation::write(&images, &[member("one", 1.0)], &fresh, None).unwrap().publish();
+            let selected = EnumImageRead::capture(&images, Some(source));
+            assert_eq!(selected.member(0).identity.unwrap().created_at(), 11);
+            assert_eq!(selected.member(0).identity.unwrap().oid(), 360_000_011);
+            drop(selected);
+            images.lock().unwrap().release(source);
+        });
+    }
+
+    #[test]
+    fn enum_label_identity_recovery_rejects_duplicates_without_changing_catalogs() {
+        let mut storage = storage(2);
+        crate::mem::guard::forbid_alloc(|| {
+            let first = create(&mut storage, "first");
+            let second = create(&mut storage, "second");
+            storage.validate_restored_enum_label_identities(storage.catalog_identity_sequence()).unwrap();
+            let before_first = storage.enum_for(first, 0);
+            let before_second = storage.enum_for(second, 0);
+            let first_creation = before_first.members().next().unwrap().identity.unwrap();
+            let second_creation = before_second.members().next().unwrap().identity.unwrap();
+            drop(before_first);
+            drop(before_second);
+            let (first_image, second_image) = {
+                let catalog = storage.type_catalog.lock().unwrap();
+                (catalog.enums[first].member_image.unwrap(), catalog.enums[second].member_image.unwrap())
+            };
+            storage.restore_catalog_identity_sequence(100);
+            {
+                let mut images = storage.enum_member_images.lock().unwrap();
+                let width = images.width;
+                images.members[first_image as usize * width].identity = super::super::EnumLabelIdentity::parse(100);
+                images.members[second_image as usize * width].identity = super::super::EnumLabelIdentity::parse(100);
+            }
+            assert_eq!(storage.validate_restored_enum_label_identities(100).unwrap_err().sqlstate, sqlstate::DATA_EXCEPTION);
+            assert_eq!(storage.catalog_identity_sequence(), 100);
+            {
+                let mut images = storage.enum_member_images.lock().unwrap();
+                let width = images.width;
+                images.members[first_image as usize * width].identity = Some(first_creation);
+                images.members[second_image as usize * width].identity = Some(second_creation);
+            }
+            storage.validate_restored_enum_label_identities(100).unwrap();
+            assert_eq!(storage.validate_restored_enum_label_identities(0).unwrap_err().sqlstate, sqlstate::DATA_EXCEPTION);
+            assert_eq!(storage.enum_for(first, 0).members().next().unwrap().identity, Some(first_creation));
+            assert_eq!(storage.enum_for(second, 0).members().next().unwrap().identity, Some(second_creation));
         });
     }
 

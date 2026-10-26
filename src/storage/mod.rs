@@ -41095,7 +41095,9 @@ impl Storage {
         }
         let creation = type_identities::TypeCreationAdmission::restored(created_at)?;
         let maximum_label_creation = {
-            let replay = self.enum_replay_members(count)?;
+            let mut images = self.enum_member_images.lock().expect("enum member-image lock poisoned");
+            images.validate_replay(count)?;
+            let replay = images.replay_members(count);
             let mut previous = created_at;
             for member in replay.iter() {
                 let identity = member.identity.ok_or_else(|| sql_err!(sqlstate::DATA_EXCEPTION,

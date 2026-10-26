@@ -1345,6 +1345,51 @@ fn enum_label_identities_preserve_saved_identifiers_through_edits_and_slot_reuse
 }
 
 #[test]
+fn enum_label_identities_survive_empty_cache_recovery_and_keep_replacements_distinct() {
+    let fixture = include_str!("../../tests/external/differential_exact/27_enum_label_identities.sql");
+    let (setup, _) = fixture.split_once("DROP TYPE enum_identity_scope.order_status;").unwrap();
+    const QUERIES: &str = "SELECT count(*) = 4 FROM saved_label_identities s JOIN pg_enum e ON e.oid = s.identity;
+        SELECT count(*) = 1 FROM saved_label_identities s JOIN pg_enum e ON e.oid = s.identity
+        WHERE s.label = 'new' AND e.enumlabel = 'pending'";
+    for checkpoint in [false, true] {
+        for mode in [crate::config::TransactionMode::Mvcc, crate::config::TransactionMode::Locking] {
+            let name = format!("enum-label-cold-{checkpoint}-{mode:?}");
+            let mut config = test_config(&name);
+            config.transaction_mode = mode;
+            config.max_ddl_per_transaction = 32;
+            config.object_store_on = true;
+            config.object_store_sim = true;
+            config.wal_upload = true;
+            config.wal_upload_sync = true;
+            config.object_store_bucket = format!("{name}-{}", std::process::id());
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+            {
+                let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+                let mut engine = Engine::new(&config, &mut budget).unwrap();
+                let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+                // Uploads grow the simulator's fixture map; queries retain the allocation guard.
+                assert_eq!(data_rows(&session.success(&mut engine, setup, false)), ["t", "t", "t", "t", "t"]);
+                if checkpoint { assert!(engine.checkpoint().unwrap()); }
+                engine.commit_wal().unwrap();
+            }
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+            {
+                let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+                let mut engine = Engine::new(&config, &mut budget).unwrap();
+                let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+                assert_eq!(data_rows(&session.success(&mut engine, QUERIES, true)), ["t", "t"]);
+                session.success(&mut engine,
+                    "DROP TYPE enum_identity_scope.order_status; CREATE TYPE enum_identity_scope.order_status AS ENUM ('new', 'paid')", false);
+                assert_eq!(data_rows(&session.success(&mut engine,
+                    "SELECT count(*) = 0 FROM saved_label_identities s JOIN pg_enum e ON e.oid = s.identity", true)), ["t"]);
+            }
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        }
+    }
+}
+
+#[test]
 fn enum_label_identities_do_not_overlap_for_more_than_one_thousand_members() {
     let labels = (0..1025).map(|index| format!("'label_{index}'")).collect::<Vec<_>>().join(",");
     let sql = format!("CREATE TYPE wide_labels AS ENUM ({labels}); CREATE TYPE next_labels AS ENUM ('only');");

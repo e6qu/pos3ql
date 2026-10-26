@@ -1383,9 +1383,9 @@ fn named_type_public_identifiers_survive_journal_and_checkpoint_recovery() {
             let mut config = test_config(&name);
             config.transaction_mode = mode;
             config.max_ddl_per_transaction = 32;
-        config.max_domains = 1;
-        config.max_enums = 2;
-        config.max_composites = 1;
+            config.max_domains = 1;
+            config.max_enums = 2;
+            config.max_composites = 1;
             config.object_store_on = true;
             config.object_store_sim = true;
             config.wal_upload = true;

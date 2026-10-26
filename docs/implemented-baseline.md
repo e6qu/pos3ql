@@ -486,7 +486,8 @@ creation identifiers through scalar and array values, cached defaults,
 savepoints, database cloning, and journal/checkpoint recovery. Enum labels have
 separate identifiers: renaming a label or inserting another label preserves
 existing identifiers. Recreating a type cannot make saved scalar, array or label
-identifiers refer to its replacement. JSON-to-row conversion accepts table and view row types
+identifiers refer to its replacement. JSON-to-row conversion accepts table and
+view row types
 and enforces their declared field limits. Journal and checkpoint recovery
 preserve these values.
 

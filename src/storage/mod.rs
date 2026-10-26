@@ -41119,9 +41119,16 @@ impl Storage {
                 ));
             }
             {
-                let existing = self.enum_for(slot, 0);
-                let replay = self.enum_replay_members(count)?;
-                if count < existing.members().len() || existing.members().zip(replay.iter())
+                let catalog = self.type_catalog.lock().expect("type catalog lock poisoned");
+                let definition = catalog.enums[slot];
+                let (image, old_count) = definition.pending_definition.filter(|pending| pending.txid == 0)
+                    .map_or((definition.member_image, definition.member_count as usize),
+                        |pending| (Some(pending.image), pending.member_count as usize));
+                let image = image.ok_or_else(|| sql_err!(sqlstate::DATA_EXCEPTION, "stored enum source image is missing"))?;
+                let images = self.enum_member_images.lock().expect("enum member-image lock poisoned");
+                let existing = images.image_members(image, old_count);
+                let replay = images.replay_members(count);
+                if count < old_count || existing.iter().zip(replay.iter())
                     .any(|(old, restored)| old.identity != restored.identity)
                 {
                     return Err(sql_err!(sqlstate::DATA_EXCEPTION, "stored enum member identities changed an existing prefix"));

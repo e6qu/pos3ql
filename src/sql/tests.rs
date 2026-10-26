@@ -27953,21 +27953,36 @@ fn logical_replication_declares_user_types_before_relations_on_sized_stack() {
         .unwrap()
         .expect("typed replication transaction is retained");
     assert!(emitted);
+    let identifiers = data_rows(&run_with_txn_bytes(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        "SELECT 'replication_state'::regtype::oid, \
+                'replication_count'::regtype::oid, 'typed_replication'::regclass::oid",
+    ));
+    assert_eq!(identifiers.len(), 1);
+    let identifiers: Vec<u32> = identifiers[0]
+        .split('|')
+        .map(|identifier| identifier.parse().unwrap())
+        .collect();
+    assert_eq!(identifiers.len(), 3);
     let bytes = send.readable();
-    let enum_type = b"Y\x00\x01\xd4\xc0public\x00replication_state\x00";
-    let domain_type = b"Y\x00\x01\xad\xb0public\x00replication_count\x00";
-    let enum_at = bytes
-        .windows(enum_type.len())
-        .position(|window| window == enum_type)
-        .expect("enum Type message must precede Relation");
-    let domain_at = bytes
-        .windows(domain_type.len())
-        .position(|window| window == domain_type)
-        .expect("domain Type message must precede Relation");
-    let relation_at = bytes
-        .iter()
-        .position(|byte| *byte == b'R')
-        .expect("Relation message follows type declarations");
+    let [enum_at, domain_at, relation_at] = [
+        (b'Y', identifiers[0], "replication_state"),
+        (b'Y', identifiers[1], "replication_count"),
+        (b'R', identifiers[2], "typed_replication"),
+    ]
+    .map(|(tag, identifier, name)| {
+        let mut expected = vec![tag];
+        expected.extend_from_slice(&identifier.to_be_bytes());
+        expected.extend_from_slice(b"public\0");
+        expected.extend_from_slice(name.as_bytes());
+        expected.push(0);
+        bytes
+            .windows(expected.len())
+            .position(|window| window == expected)
+            .unwrap_or_else(|| panic!("replication message for {name} is missing"))
+    });
     assert!(enum_at < relation_at && domain_at < relation_at);
 }
 
@@ -30154,11 +30169,17 @@ fn information_schema_columns_describes_views_from_their_bound_row_type() {
     let domain_dependencies = data_rows(&run_with(
         &mut engine,
         &mut budget,
-        "SELECT objid, refobjid FROM pg_depend WHERE refobjid = 230000",
+        "SELECT owner_type.typname, base_type.typname FROM pg_depend d \
+         JOIN pg_type owner_type ON owner_type.oid = d.objid \
+         JOIN pg_type base_type ON base_type.oid = d.refobjid \
+         WHERE owner_type.typname = 'view_column_coordinate_domain' \
+           AND base_type.typname = 'view_column_coordinate' \
+           AND d.classid = 'pg_type'::regclass AND d.refclassid = 'pg_type'::regclass \
+           AND d.deptype = 'n'",
     ));
     assert_eq!(
         domain_dependencies,
-        ["110001|230000"],
+        ["view_column_coordinate_domain|view_column_coordinate"],
         "domain type dependencies: {domain_dependencies:?}"
     );
     let mut owner = TxnState::new(&mut budget, 256).unwrap();

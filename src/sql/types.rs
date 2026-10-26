@@ -480,13 +480,9 @@ pub enum ColType {
     /// table column can never have this type (DDL refuses records), so it has
     /// no on-disk presence.
     Record,
-    /// A user-defined enum type (`CREATE TYPE ... AS ENUM`). The `u16` is the
-    /// slot of its [`crate::storage::EnumDef`] in the catalog — a runtime
-    /// identity only. A column of an enum type persists the enum's *name* (in
-    /// [`crate::storage::ColumnMeta::domain`], resolved back to a slot on load),
-    /// because slots are not stable across restart. A stored enum *value*
-    /// carries its own label and sort key inline, so [`from_code`](Self::from_code)
-    /// need not recover the slot to decode a row.
+    /// A user-defined enum type (`CREATE TYPE ... AS ENUM`). A bound declaration
+    /// carries its durable creation identity; `None` requires catalog binding
+    /// before use. Stored values retain their label and sort key inline.
     Enum(Option<crate::storage::TypeCreation>),
     /// A named composite type (`CREATE TYPE ... AS (...)`). Unlike `Record`,
     /// this is durable and carries a catalog identity.
@@ -2862,8 +2858,7 @@ impl ColType {
             Self::Macaddr8 => "macaddr8",
             Self::Geometry(kind) => kind.name(),
             Self::Record => "record",
-            // The real enum name is dynamic (per catalog slot); callers that
-            // must title a column after the enum resolve it via the catalog.
+            // Resolve the current name through the bound creation identity.
             Self::Enum(_) => "enum",
             Self::Composite(_) => "record",
         }
@@ -3216,8 +3211,8 @@ pub enum ArrElem {
     Range(RangeKind),
     /// One of PostgreSQL's six built-in multirange types.
     Multirange(RangeKind),
-    /// An enum array keeps the catalog slot as its runtime identity. Table
-    /// metadata also persists the type name and rebinds the slot on startup.
+    /// An enum array carries its element type's durable creation identity.
+    /// `None` requires catalog binding before use.
     Enum(Option<crate::storage::TypeCreation>),
     /// An array of one named composite type.
     Composite(Option<crate::storage::TypeCreation>),

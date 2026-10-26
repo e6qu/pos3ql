@@ -2725,8 +2725,17 @@ def test_catalog_definition_oid_over_raw_wire():
         "WITH (fillfactor='80', deduplicate_items=off) WHERE id > 0",
         definition,
     )
-    overflow = query_oid(0xFFFFFFFF)
-    check("raw wire: unsigned OID overflow is loud", has_sqlstate(overflow, "22003"), overflow)
+    for missing_oid in (0x7FFFFFFF, 0x80000000, 0xFFFFFFFF):
+        missing = query_oid(missing_oid)
+        check(
+            f"raw wire: unsigned missing index OID {missing_oid} returns NULL",
+            not any(kind == b"E" for kind, _ in missing)
+            and [payload for kind, payload in missing if kind == b"D"]
+            == [b"\x00\x01\xff\xff\xff\xff"],
+            missing,
+        )
+    overflow = extended_text_parameter(s, "SELECT pg_get_indexdef($1)", 26, b"4294967296")
+    check("raw wire: OID above the unsigned range is loud", has_sqlstate(overflow, "22003"), overflow)
     s.close()
 
 

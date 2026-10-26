@@ -111,6 +111,15 @@ SQL and wire behavior needs comparison with actual PostgreSQL, including
 SQLSTATEs, types, result shape, and values. SQLSTATE-only and exact-message
 corpora share the same reference connection settings, including UTC and the
 test extension directory; diagnostic style must not change fixture availability.
+Corpus comparisons echo each sent SQL command and retain its results and command
+tags in stdout. This follows [psql's query echo and status output](https://github.com/postgres/postgres/blob/REL_18_6/src/bin/psql/common.c#L1088),
+and preserves ordering even for repeated commands on one input line. They retain
+stdout bytes verbatim and compare stderr diagnostics separately with their source
+file and SQL line number. This preserves which
+statement failed while removing whole notice/warning records and secondary
+DETAIL/HINT fields, including continuation lines. Diagnostic bytes outside UTF-8
+are escaped losslessly rather than replaced; primary error messages remain
+comparison inputs in exact-message mode.
 The port-based corpus harness requires an external reference at `127.0.0.1`;
 forward a remote reference explicitly instead of supplying a host it cannot use.
 Synchronize concurrent catalog changes before comparing current permission

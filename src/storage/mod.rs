@@ -9615,9 +9615,8 @@ pub struct DomainDef {
     /// The value representation is flattened to `base`, but the parent chain
     /// remains explicit so every inherited NOT NULL/CHECK is enforced.
     pub base_domain: Option<UserTypeName>,
-    /// Stable identity of a directly-declared enum or composite base.  The
-    /// execution type carries a runtime slot, but a slot cannot survive a
-    /// cold rebuild or a schema/name move.
+    /// Declared name of a direct enum or composite base. The bound execution
+    /// type and saved source reference carry its durable creation identity.
     pub base_user_type: Option<UserTypeName>,
     pub base: ColType,
     /// The base type's atttypmod (e.g. `varchar(5)` → 9), applied to a value

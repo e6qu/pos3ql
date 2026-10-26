@@ -1332,6 +1332,109 @@ fn numeric_object_privileges_match_postgresql_before_lookup() {
 }
 
 #[test]
+fn constraint_public_identifiers_survive_edits_replacement_and_savepoint_rollback() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("constraint-public-identifiers-{mode:?}"));
+        config.transaction_mode = mode;
+        config.max_ddl_per_transaction = 32;
+        config.max_tables = 5;
+        config.max_domains = 1;
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        let mut observations = 0;
+        for statement in
+            include_str!("../../tests/external/differential_exact/28_constraint_identities.sql")
+                .split(';')
+                .map(str::trim)
+                .filter(|statement| !statement.is_empty())
+        {
+            let output = session.success(&mut engine, statement, true);
+            let rows = data_rows(&output);
+            assert!(rows.iter().all(|row| row == "t"), "{statement}: {rows:?}");
+            observations += rows.len();
+        }
+        assert_eq!(observations, 12);
+    }
+}
+
+#[test]
+fn constraint_public_identifiers_survive_journal_and_checkpoint_recovery() {
+    let fixture =
+        include_str!("../../tests/external/differential_exact/28_constraint_identities.sql");
+    let (setup, _) = fixture.split_once("\nBEGIN;").unwrap();
+    let remaining = &fixture[setup.len()..];
+    const QUERIES: &str =
+        "SELECT count(*) = 5 FROM saved_constraint_identities s JOIN pg_constraint c ON c.oid = s.identity;
+         SELECT count(*) = 4 FROM saved_constraint_triggers s JOIN pg_trigger t ON t.oid = s.identity AND t.tgconstraint = s.parent";
+    for checkpoint in [false, true] {
+        for mode in [
+            crate::config::TransactionMode::Mvcc,
+            crate::config::TransactionMode::Locking,
+        ] {
+            let name = format!("constraint-public-cold-{checkpoint}-{mode:?}");
+            let mut config = test_config(&name);
+            config.transaction_mode = mode;
+            config.max_ddl_per_transaction = 32;
+            config.max_tables = 5;
+            config.max_domains = 1;
+            config.object_store_on = true;
+            config.object_store_sim = true;
+            config.wal_upload = true;
+            config.wal_upload_sync = true;
+            config.object_store_bucket = format!("{name}-{}", std::process::id());
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+            {
+                let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+                let mut engine = Engine::new(&config, &mut budget).unwrap();
+                let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+                let mut observations = 0;
+                for statement in setup
+                    .split(';')
+                    .map(str::trim)
+                    .filter(|statement| !statement.is_empty())
+                {
+                    let output = session.success(&mut engine, statement, false);
+                    let rows = data_rows(&output);
+                    assert!(rows.iter().all(|row| row == "t"), "{statement}: {rows:?}");
+                    observations += rows.len();
+                }
+                assert_eq!(observations, 4);
+                if checkpoint {
+                    assert!(engine.checkpoint().unwrap());
+                }
+                engine.commit_wal().unwrap();
+            }
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+            {
+                let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+                let mut engine = Engine::new(&config, &mut budget).unwrap();
+                let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+                for (statements, guarded, expected) in [(QUERIES, true, 2), (remaining, false, 8)] {
+                    let mut observations = 0;
+                    for statement in statements
+                        .split(';')
+                        .map(str::trim)
+                        .filter(|statement| !statement.is_empty())
+                    {
+                        let output = session.success(&mut engine, statement, guarded);
+                        let rows = data_rows(&output);
+                        assert!(rows.iter().all(|row| row == "t"), "{statement}: {rows:?}");
+                        observations += rows.len();
+                    }
+                    assert_eq!(observations, expected);
+                }
+            }
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        }
+    }
+}
+
+#[test]
 fn named_type_public_identifiers_survive_edits_replacement_and_savepoint_rollback() {
     for mode in [
         crate::config::TransactionMode::Mvcc,

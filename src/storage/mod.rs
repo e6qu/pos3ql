@@ -10644,7 +10644,7 @@ pub(crate) const TABLESPACE_LOCATION_MAX: usize = 256;
 
 /// Stable database identity. Catalog slots are reusable, so session, ACL,
 /// setting, WAL, and object identities carry this OID instead.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct DatabaseOid(i32);
 
 impl DatabaseOid {

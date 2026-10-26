@@ -8,7 +8,7 @@ use crate::sql::eval::{SqlError, sqlstate};
 use crate::sql_err;
 use crate::util::StackStr;
 
-use super::{CatalogDdlState, DatabaseOid, Ownership, PendingOwnership, SqlName};
+use super::{CatalogDdlState, CatalogIdentity, DatabaseOid, Ownership, PendingOwnership, SqlName};
 
 /// One OPTIONS clause follows the parser's complete bounded list.
 pub(crate) const MAX_FOREIGN_OPTIONS: usize = super::MAX_DEFINITION_ITEMS;
@@ -737,6 +737,18 @@ impl ForeignCatalog {
         txid: u32,
         noun: &'static str,
     ) -> Result<usize, SqlError> {
+        CatalogIdentity::require(created_at)?;
+        if entries.iter().any(|entry| {
+            entry.database == database
+                && entry.ddl_state != CatalogDdlState::Absent
+                && entry.created_at == created_at
+        }) {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "foreign catalog creation identity is duplicated"
+            ));
+        }
+
         let slot = entries
             .iter()
             .position(|entry| entry.ddl_state == CatalogDdlState::Absent)
@@ -767,6 +779,19 @@ impl ForeignCatalog {
         definition: D,
         ownership: Ownership,
     ) -> Result<(), SqlError> {
+        CatalogIdentity::require(created_at)?;
+        if entries.iter().enumerate().any(|(other, entry)| {
+            other != slot
+                && entry.database == database
+                && entry.ddl_state != CatalogDdlState::Absent
+                && entry.created_at == created_at
+        }) {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "foreign catalog creation identity is duplicated"
+            ));
+        }
+
         let Some(entry) = entries.get_mut(slot) else {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -875,6 +900,23 @@ impl ForeignCatalog {
         ownership: Ownership,
         empty: D,
     ) -> Result<(), SqlError> {
+        if definition.is_some() {
+            CatalogIdentity::require(created_at)?;
+        }
+        if definition.is_some()
+            && entries.iter().enumerate().any(|(other, entry)| {
+                other != slot
+                    && entry.database == database
+                    && entry.ddl_state != CatalogDdlState::Absent
+                    && entry.created_at == created_at
+            })
+        {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "foreign catalog creation identity is duplicated"
+            ));
+        }
+
         let Some(entry) = entries.get_mut(slot) else {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,

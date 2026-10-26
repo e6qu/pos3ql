@@ -9758,7 +9758,7 @@ fn pg_foreign_data_wrapper<'a>(
         rows[index] = row(
             &[
                 Datum::Int4(2328),
-                Datum::Int4(storage.foreign_wrapper_entry(slot).oid()),
+                Datum::Int4(entry.oid()),
                 text(wrapper.name.as_str(), arena)?,
                 Datum::Int4(storage.role_oid(entry.ownership.owner_to(txid) as usize)),
                 Datum::Int4(match wrapper.handler {
@@ -9805,7 +9805,7 @@ fn pg_foreign_server<'a>(
         rows[index] = row(
             &[
                 Datum::Int4(1417),
-                Datum::Int4(storage.foreign_server_entry(slot).oid()),
+                Datum::Int4(entry.oid()),
                 text(server.name.as_str(), arena)?,
                 Datum::Int4(storage.role_oid(entry.ownership.owner_to(txid) as usize)),
                 Datum::Int4(storage.foreign_wrapper_entry(server.wrapper as usize).oid()),
@@ -9878,7 +9878,7 @@ fn pg_user_mapping<'a>(
         };
         rows[index] = row(
             &[
-                Datum::Int4(storage.foreign_mapping_entry(slot).oid()),
+                Datum::Int4(entry.oid()),
                 Datum::Int4(user),
                 Datum::Int4(storage.foreign_server_entry(mapping.server as usize).oid()),
                 if foreign_mapping_options_visible(storage, mapping, txid) {
@@ -10964,7 +10964,7 @@ pub(crate) fn extended_statistics_columns_by_oid<'a>(
     use core::fmt::Write as _;
     let Some((_, statistics)) = storage
         .extended_statistics_visible(txid)
-        .find(|(slot, _)| storage.extended_statistics(*slot).oid() == oid)
+        .find(|(_, statistics)| statistics.oid() == oid)
     else {
         return Ok(None);
     };
@@ -11000,7 +11000,7 @@ pub(crate) fn extended_statistics_definition_by_oid<'a>(
     use core::fmt::Write as _;
     let Some((_, statistics)) = storage
         .extended_statistics_visible(txid)
-        .find(|(slot, _)| storage.extended_statistics(*slot).oid() == oid)
+        .find(|(_, statistics)| statistics.oid() == oid)
     else {
         return Ok(None);
     };
@@ -11068,7 +11068,7 @@ pub(crate) fn extended_statistics_expressions_by_oid<'a>(
 ) -> Result<Option<Datum<'a>>, SqlError> {
     let Some((_, statistics)) = storage
         .extended_statistics_visible(txid)
-        .find(|(slot, _)| storage.extended_statistics(*slot).oid() == oid)
+        .find(|(_, statistics)| statistics.oid() == oid)
     else {
         return Ok(None);
     };
@@ -12387,7 +12387,7 @@ pub(crate) fn conversion_oid_visibility(storage: &Storage, txid: u32, oid: i32) 
 pub(crate) fn statistics_oid_visibility(storage: &Storage, txid: u32, oid: i32) -> Option<bool> {
     let (slot, statistics) = storage
         .extended_statistics_visible(txid)
-        .find(|(slot, _)| storage.extended_statistics(*slot).oid() == oid)?;
+        .find(|(_, statistics)| statistics.oid() == oid)?;
     let definition = statistics.definition_for(txid);
     Some(
         storage.extended_statistics_slot_on_path(None, definition.name.as_str(), txid)
@@ -16922,7 +16922,7 @@ fn pg_statistic_ext<'a>(
         rows[count] = row(
             &[
                 Datum::Int4(3381),
-                Datum::Int4(storage.extended_statistics(slot).oid()),
+                Datum::Int4(statistics.oid()),
                 Datum::Int4(user_table_oid(storage, usize::from(statistics.table))),
                 text(mutable.name.as_str(), arena)?,
                 Datum::Int4(namespace_oid(storage, mutable.schema.as_str(), txid)),
@@ -17232,7 +17232,7 @@ fn pg_statistic_ext_data<'a>(
         rows[count] = row(
             &[
                 Datum::Int4(3429),
-                Datum::Int4(storage.extended_statistics(slot).oid()),
+                Datum::Int4(statistics.oid()),
                 Datum::Bool(data.inherited),
                 if statistics.kinds.ndistinct() {
                     text(ndistinct.as_str(), arena)?
@@ -17632,12 +17632,12 @@ fn pg_publication<'a>(
         storage.publications_with_slots_visible_to(txid).count(),
     )?;
     let mut count = 0;
-    for (slot, publication) in storage.publications_with_slots_visible_to(txid) {
+    for (_, publication) in storage.publications_with_slots_visible_to(txid) {
         let definition = publication.definition_for(txid);
         rows[count] = row(
             &[
                 Datum::Int4(6104),
-                Datum::Int4(storage.publication_for_event_trigger(slot).oid()),
+                Datum::Int4(publication.oid()),
                 text(publication.name_for(txid).as_str(), arena)?,
                 Datum::Int4(storage.role_oid(publication.ownership.owner_to(txid) as usize)),
                 Datum::Bool(definition.all_tables),
@@ -17667,7 +17667,7 @@ fn pg_publication_namespace<'a>(
         .sum();
     let rows = catalog_rows(arena, row_capacity)?;
     let mut count = 0;
-    for (publication_slot, publication) in storage.publications_with_slots_visible_to(txid) {
+    for (_, publication) in storage.publications_with_slots_visible_to(txid) {
         let publication_definition = publication.definition_for(txid);
         for schema_slot in &publication_definition.schemas[..publication_definition.schema_count] {
             if count == rows.len() {
@@ -17687,11 +17687,7 @@ fn pg_publication_namespace<'a>(
                             .get(),
                     ),
                     Datum::Int4(FIRST_USER_OID + 85_000 + count as i32),
-                    Datum::Int4(
-                        storage
-                            .publication_for_event_trigger(publication_slot)
-                            .oid(),
-                    ),
+                    Datum::Int4(publication.oid()),
                     Datum::Int4(namespace_oid(storage, schema.name.as_str(), txid)),
                 ],
                 arena,
@@ -17721,7 +17717,7 @@ fn pg_publication_rel<'a>(
         .sum();
     let rows = catalog_rows(arena, row_capacity)?;
     let mut count = 0;
-    for (publication_slot, publication) in storage.publications_with_slots_visible_to(txid) {
+    for (_, publication) in storage.publications_with_slots_visible_to(txid) {
         let definition = publication.definition_for(txid);
         if definition.all_tables {
             continue;
@@ -17766,11 +17762,7 @@ fn pg_publication_rel<'a>(
                 &[
                     Datum::Int4(6106),
                     Datum::Int4(FIRST_USER_OID + 90_000 + count as i32),
-                    Datum::Int4(
-                        storage
-                            .publication_for_event_trigger(publication_slot)
-                            .oid(),
-                    ),
+                    Datum::Int4(publication.oid()),
                     Datum::Int4(user_table_oid(storage, *member as usize)),
                     prqual,
                     prattrs,

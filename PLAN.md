@@ -49,7 +49,8 @@ Complete these remaining cases:
   also need exact duplicate counts.
 - Finish lifetime-based SQL identifiers in the remaining catalog families,
   beyond the implemented relation, named-type, enum-label, index and non-index
-  constraint guarantees in the [behavior guide](docs/implemented-baseline.md).
+  constraint, statistics, extension, foreign-data, publication and subscription
+  guarantees in the [behavior guide](docs/implemented-baseline.md).
   Check shared catalogs across databases as well.
 - Keep old row, index and backup data until their readers finish. Pace history
   pruning, file replacement and deletion without holding unrelated owners.

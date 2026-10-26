@@ -509,6 +509,16 @@ up either saved identifier returns no type. Renaming the existing type keeps
 both identifiers. The same checks hold after losing the local data directory
 and recovering from object storage, with either transaction mode.
 
+Statistics, extensions, foreign-data wrappers, foreign servers, user mappings,
+publications and subscriptions also use lifetime identifiers. Editing the
+existing object keeps its identifier. Drop and recreate give its replacement a
+fresh identifier. Journal and checkpoint recovery retain these values.
+
+**User example:** a monitoring tool saves a publication's `oid` from
+`pg_publication`. After the publication is dropped and recreated under the same
+name, the saved value no longer finds it. Restarting with an empty local disk
+preserves the replacement's identifier.
+
 Privilege checks by numeric identifier have PostgreSQL's role-dependent rules.
 For a missing type, schema, function, language, database, tablespace, foreign-data
 wrapper or server identifier, a superuser receives `true` and an ordinary account

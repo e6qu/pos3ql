@@ -9,6 +9,17 @@ jobs:
   focused:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    services:
+      postgres:
+        image: mirror.gcr.io/library/postgres:18@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_INITDB_ARGS: "--lc-collate=C --lc-ctype=C --encoding=UTF8"
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
     steps:
       - uses: actions/checkout@v5
       - uses: actions/cache@v5
@@ -19,6 +30,21 @@ jobs:
           key: catalog-lifetime-dependencies-${{ hashFiles('Cargo.lock') }}
       - name: Formatting
         run: cargo fmt --all -- --check
+      - name: PostgreSQL lifetime oracle
+        env:
+          POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
+        run: |
+          docker exec "$POSTGRES_CONTAINER" mkdir -p /tmp/pos3ql-extensions
+          docker cp tests/external/extensions/. "$POSTGRES_CONTAINER":/tmp/pos3ql-extensions/
+          docker exec -i --env PGOPTIONS='-c extension_control_path=/tmp/pos3ql-extensions' \
+            "$POSTGRES_CONTAINER" psql -X -qAt -v ON_ERROR_STOP=1 -U postgres \
+            < tests/external/differential_exact/32_catalog_lifetimes.sql > "$RUNNER_TEMP/catalog-lifetimes-pg.txt"
+          python3 - "$RUNNER_TEMP/catalog-lifetimes-pg.txt" <<'PYCODE'
+          import pathlib, sys
+          rows = pathlib.Path(sys.argv[1]).read_text().splitlines()
+          assert rows == ['t'] * 8, rows
+          print('PostgreSQL: eight lifetime observations match')
+          PYCODE
       - name: Focused lifetime and recovery regressions
         run: cargo test --lib --locked -- public_identifiers catalog_lifetime metadata_database_copy --test-threads=1
       - name: All-target lint

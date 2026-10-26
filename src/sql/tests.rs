@@ -1761,6 +1761,113 @@ fn constraint_manifest_wide_domains_survive_journal_and_checkpoint_recovery() {
     }
 }
 
+fn catalog_lifetime_config(name: &str, mode: crate::config::TransactionMode) -> Config {
+    let mut config = test_config(name);
+    config.transaction_mode = mode;
+    config.max_ddl_per_transaction = 32;
+    config.max_foreign_data_wrappers = 2;
+    config.max_foreign_servers = 2;
+    config.max_user_mappings = 2;
+    config.max_publications = 2;
+    config.max_subscriptions = 2;
+    config.set_extended_statistics_capacity(2);
+    config.extension_control_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/external/extensions")
+        .to_str()
+        .unwrap()
+        .to_string();
+    config
+}
+
+#[test]
+fn catalog_lifetime_public_identifiers_preserve_edits_and_reject_replacements() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let config = catalog_lifetime_config(&format!("catalog-lifetime-{mode:?}"), mode);
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        let mut observations = 0;
+        for statement in
+            include_str!("../../tests/external/differential_exact/32_catalog_lifetimes.sql")
+                .split(';')
+                .map(str::trim)
+                .filter(|statement| !statement.is_empty())
+        {
+            let output = session.success(&mut engine, statement, true);
+            let rows = data_rows(&output);
+            assert!(rows.iter().all(|row| row == "t"), "{statement}: {rows:?}");
+            observations += rows.len();
+        }
+        assert_eq!(observations, 8);
+    }
+}
+
+#[test]
+fn catalog_lifetime_public_identifiers_survive_empty_disk_recovery() {
+    let fixture = include_str!("../../tests/external/differential_exact/32_catalog_lifetimes.sql");
+    let (setup, remaining) = fixture.split_once("DROP EXTENSION pos3ql_base;").unwrap();
+    for checkpoint in [false, true] {
+        for mode in [
+            crate::config::TransactionMode::Mvcc,
+            crate::config::TransactionMode::Locking,
+        ] {
+            let name = format!("catalog-lifetime-cold-{checkpoint}-{mode:?}");
+            let mut config = catalog_lifetime_config(&name, mode);
+            config.object_store_on = true;
+            config.object_store_sim = true;
+            config.wal_upload = true;
+            config.wal_upload_sync = true;
+            config.object_store_bucket = format!("{name}-{}", std::process::id());
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+            {
+                let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+                let mut engine = Engine::new(&config, &mut budget).unwrap();
+                let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+                for statement in setup
+                    .split(';')
+                    .map(str::trim)
+                    .filter(|statement| !statement.is_empty())
+                {
+                    let output = session.success(&mut engine, statement, false);
+                    assert!(
+                        data_rows(&output).iter().all(|row| row == "t"),
+                        "{statement}"
+                    );
+                }
+                if checkpoint {
+                    assert!(engine.checkpoint().unwrap());
+                }
+                engine.commit_wal().unwrap();
+            }
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+            {
+                let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+                let mut engine = Engine::new(&config, &mut budget).unwrap();
+                let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+                assert_eq!(data_rows(&session.success(&mut engine,
+                    "SELECT count(*) = 7 FROM saved_catalog_lifetimes s JOIN lifetime_catalog c ON c.kind = s.kind AND c.identity = s.identity", true)), ["t"]);
+                session.success(&mut engine, "DROP EXTENSION pos3ql_base", false);
+                for statement in remaining
+                    .split(';')
+                    .map(str::trim)
+                    .filter(|statement| !statement.is_empty())
+                {
+                    let output = session.success(&mut engine, statement, false);
+                    assert!(
+                        data_rows(&output).iter().all(|row| row == "t"),
+                        "{statement}"
+                    );
+                }
+            }
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        }
+    }
+}
+
 #[test]
 fn named_type_public_identifiers_survive_edits_replacement_and_savepoint_rollback() {
     for mode in [

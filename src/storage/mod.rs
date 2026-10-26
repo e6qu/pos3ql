@@ -17911,14 +17911,15 @@ impl Storage {
         owner: u16,
     ) -> Result<(), SqlError> {
         CatalogIdentity::require(created_at)?;
-        self.catalog_sequence.observe(created_at);
         self.foreign_catalog().restore_wrapper(
             slot,
             current_database(),
             created_at,
             definition,
             owner,
-        )
+        )?;
+        self.catalog_sequence.observe(created_at);
+        Ok(())
     }
 
     pub(crate) fn restore_foreign_server(
@@ -17929,14 +17930,15 @@ impl Storage {
         owner: u16,
     ) -> Result<(), SqlError> {
         CatalogIdentity::require(created_at)?;
-        self.catalog_sequence.observe(created_at);
         self.foreign_catalog().restore_server(
             slot,
             current_database(),
             created_at,
             definition,
             owner,
-        )
+        )?;
+        self.catalog_sequence.observe(created_at);
+        Ok(())
     }
 
     pub(crate) fn restore_foreign_user_mapping(
@@ -17946,9 +17948,10 @@ impl Storage {
         definition: foreign::UserMappingDefinition,
     ) -> Result<(), SqlError> {
         CatalogIdentity::require(created_at)?;
-        self.catalog_sequence.observe(created_at);
         self.foreign_catalog()
-            .restore_mapping(slot, current_database(), created_at, definition)
+            .restore_mapping(slot, current_database(), created_at, definition)?;
+        self.catalog_sequence.observe(created_at);
+        Ok(())
     }
 
     pub(crate) fn restore_foreign_table_binding(
@@ -17957,9 +17960,10 @@ impl Storage {
         created_at: u64,
         definition: foreign::ForeignTableDefinition,
     ) -> Result<(), SqlError> {
-        self.catalog_sequence.observe(created_at);
         self.foreign_catalog()
-            .restore_table(slot, current_database(), created_at, definition)
+            .restore_table(slot, current_database(), created_at, definition)?;
+        self.catalog_sequence.observe(created_at);
+        Ok(())
     }
 
     pub(crate) fn replay_set_foreign_wrapper(
@@ -17969,14 +17973,15 @@ impl Storage {
         owner: u16,
         definition: Option<foreign::ForeignDataWrapperDefinition>,
     ) -> Result<(), SqlError> {
-        self.catalog_sequence.observe(created_at);
         self.foreign_catalog().replay_set_wrapper(
             slot,
             current_database(),
             created_at,
             owner,
             definition,
-        )
+        )?;
+        self.catalog_sequence.observe(created_at);
+        Ok(())
     }
 
     pub(crate) fn replay_set_foreign_server(
@@ -17986,14 +17991,15 @@ impl Storage {
         owner: u16,
         definition: Option<foreign::ForeignServerDefinition>,
     ) -> Result<(), SqlError> {
-        self.catalog_sequence.observe(created_at);
         self.foreign_catalog().replay_set_server(
             slot,
             current_database(),
             created_at,
             owner,
             definition,
-        )
+        )?;
+        self.catalog_sequence.observe(created_at);
+        Ok(())
     }
 
     pub(crate) fn replay_set_foreign_user_mapping(
@@ -18002,9 +18008,14 @@ impl Storage {
         created_at: u64,
         definition: Option<foreign::UserMappingDefinition>,
     ) -> Result<(), SqlError> {
+        self.foreign_catalog().replay_set_mapping(
+            slot,
+            current_database(),
+            created_at,
+            definition,
+        )?;
         self.catalog_sequence.observe(created_at);
-        self.foreign_catalog()
-            .replay_set_mapping(slot, current_database(), created_at, definition)
+        Ok(())
     }
 
     pub(crate) fn replay_set_foreign_table(
@@ -18013,9 +18024,14 @@ impl Storage {
         created_at: u64,
         definition: Option<foreign::ForeignTableDefinition>,
     ) -> Result<(), SqlError> {
+        self.foreign_catalog().replay_set_table(
+            slot,
+            current_database(),
+            created_at,
+            definition,
+        )?;
         self.catalog_sequence.observe(created_at);
-        self.foreign_catalog()
-            .replay_set_table(slot, current_database(), created_at, definition)
+        Ok(())
     }
 
     pub(crate) fn first_foreign_server_for_wrapper(
@@ -18117,7 +18133,9 @@ impl Storage {
         txid: u32,
     ) -> Result<usize, SqlError> {
         let ownership = self.initial_ownership(txid)?;
-        let created_at = self.catalog_sequence.next()?;
+        let created_at = self
+            .catalog_sequence
+            .next_bounded(MAX_CATALOG_CREATION, "catalog object")?;
         self.foreign_catalog().create_table(
             current_database(),
             created_at,

@@ -31,8 +31,8 @@ they never select a guessed decoder.
 
 | Object | Identity | Read | Write | Migration |
 |---|---|---:|---:|---|
-| Checkpoint manifest | `pos3ql-manifest-v30` | yes | yes | Retains schema creation identities and database-owner roles, object-permission grant order, explicitly empty permission lists, index-presence hints, allocator counters, typed blocks, enum members, and exact table, view, rule, sequence, routine and materialized-view positions and creation stamps. |
-| Journal record | Version `18` at header byte 17; bytes 18–23 are zero | yes | yes | Schema create, drop and rename records retain creation identity. Catalog images retain declared types, hidden system-column positions, selected sources and permission grant order. Prepared comment roots rebind to restored sources. Parameter permissions retain complete replacement rows. Sequence restarts retain their transaction owner; materialized views retain the backing table identity. Older framing is rejected even when its checksum is valid. |
+| Checkpoint manifest | `pos3ql-manifest-v31` | yes | yes | Retains schema creation identities and database-owner roles, object-permission grant order, explicitly empty permission lists, index-presence hints, allocator counters, typed blocks, enum members, and exact table, view, rule, sequence, routine and materialized-view positions and creation stamps. Publication records retain their creation stamps. |
+| Journal record | Version `19` at header byte 17; bytes 18–23 are zero | yes | yes | Schema create, drop and rename records retain creation identity. Catalog images retain declared types, hidden system-column positions, selected sources and permission grant order. Prepared comment roots rebind to restored sources. Parameter permissions retain complete replacement rows. Sequence restarts retain their transaction owner; materialized views retain the backing table identity. Older framing is rejected even when its checksum is valid. |
 | Immutable block | Header bytes 5–7: `01 00 00` | yes | yes | SHA-256 of `pos3ql:block:v1\0`, the one-byte block type, then payload; LSN is provenance, excluded from identity. |
 | Empty checkpoint root | `pos3ql-empty-manifest-v1` | yes | yes | Fences an as-yet unpublished manifest root. |
 | Commit head | `pos3ql-commit-head-v1` | yes | yes | Names the immutable commit chain and the publishing process incarnation. |
@@ -164,7 +164,7 @@ filters and exact result checks can need more data.
 
 Catalog vectors retain their signed lower bounds in rows, projected values, and
 constant defaults. Each stored vector adds four bytes for this bound; writers
-and readers use manifest v30, journal v18, and table-definition payload v12.
+and readers use manifest v31, journal v19, and table-definition payload v12.
 The codec retains these bounds independently of SQL input conversion; SQL
 array-to-vector casts are rejected. Recovery tests cover text-created vectors,
 checkpointing, and recovery with empty local caches.
@@ -429,7 +429,7 @@ source; values and emitted identifiers require a checked creation.
 Their checked three-byte runtime representation cannot contain zero or an
 out-of-range value. Fresh creation returns `54000` when the shared catalog
 sequence reaches this limit. Unsupported stored stamps are rejected before
-catalog publication; manifest v30 and journal v18 reject earlier framing.
+catalog publication; manifest v31 and journal v19 reject earlier framing.
 
 Named-type recovery installs each saved creation stamp directly; it does not
 reserve a temporary stamp and overwrite it later. An exhausted creation sequence
@@ -608,7 +608,7 @@ required: obsolete readers may be removed without building an offline migration.
 Do not retain a decoder or introduce a conversion fallback solely to support
 an older pos3ql version.
 
-The only accepted checkpoint manifest is v30. Startup, backup retention, and
+The only accepted checkpoint manifest is v31. Startup, backup retention, and
 writer promotion share one allocation-free metadata parser. It requires one
 log position, next row identity, latest transaction identity, large-object
 allocator record, nonzero 32-digit hexadecimal writer identity and final
@@ -665,3 +665,30 @@ The manifest's existing unsigned `next_rowid` field preserves this terminal
 value across recovery. Journal and saved-file observations advance the counter
 with saturating arithmetic, including legacy maximum identities. Row key and
 manifest encodings are unchanged; the allocator adds no startup reservation.
+
+## Catalog object identifiers
+
+Statistics, extensions, foreign-data wrappers, foreign servers, user mappings,
+publications and subscriptions derive their SQL identifiers from durable creation
+stamps, rather than reusable array positions. Every admitted stamp is between
+1 and 9,999,999. The identifier is the stamp plus the following base:
+
+| Catalog | Base |
+|---|---:|
+| `pg_statistic_ext` | 440,000,000 |
+| `pg_extension` | 460,000,000 |
+| `pg_foreign_data_wrapper` | 480,000,000 |
+| `pg_foreign_server` | 500,000,000 |
+| `pg_user_mapping` | 520,000,000 |
+| `pg_publication` | 540,000,000 |
+| `pg_subscription` | 560,000,000 |
+
+Creation reserves from the shared catalog sequence and returns `54000` when its
+representable range is exhausted. The failed reservation installs no object.
+Recovery rejects zero, out-of-range, duplicate or unreserved stamps before writer
+promotion. The check includes prepared catalog changes and uses a fixed bitmap
+rather than memory proportional to catalog churn.
+
+Manifest `pub` records place the creation stamp after the owner and before the
+flags. Journal publication-creation records place the eight-byte little-endian
+stamp before the name. Manifest v31 and journal v19 reject earlier framing.

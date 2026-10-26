@@ -3791,6 +3791,7 @@ impl Engine {
         }
         storage.select_database(crate::storage::DatabaseOid::POSTGRES)?;
         wal.select_database(crate::storage::DatabaseOid::POSTGRES);
+        storage.validate_restored_catalog_identities(storage.catalog_identity_sequence())?;
         storage.validate_restored_relation_identities(storage.catalog_identity_sequence())?;
         storage.validate_restored_constraint_identities(storage.catalog_identity_sequence())?;
         storage.validate_restored_enum_label_identities(storage.catalog_identity_sequence())?;

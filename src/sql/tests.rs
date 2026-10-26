@@ -1460,11 +1460,12 @@ fn constraint_declaration_names_and_rejections_match_postgresql() {
         let mut engine = Engine::new(&config, &mut budget).unwrap();
         let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
         let mut states = Vec::new();
-        for statement in
-            include_str!("../../tests/external/differential_exact/30_constraint_declaration_errors.sql")
-                .split(';')
-                .map(str::trim)
-                .filter(|statement| !statement.is_empty())
+        for statement in include_str!(
+            "../../tests/external/differential_exact/30_constraint_declaration_errors.sql"
+        )
+        .split(';')
+        .map(str::trim)
+        .filter(|statement| !statement.is_empty())
         {
             let output = session.execute(&mut engine, statement, true);
             for (object, kind) in [
@@ -82384,7 +82385,10 @@ fn current_manifest_cold_recovery_rejects_invalid_roots_without_publication_body
         .unwrap()
         .to_vec();
     let current_header = crate::checkpoint::MANIFEST_HEADER.as_bytes();
-    assert_eq!(current.split(|byte| *byte == b'\n').next(), Some(current_header));
+    assert_eq!(
+        current.split(|byte| *byte == b'\n').next(),
+        Some(current_header)
+    );
     assert!(
         current.windows(b" v4\n".len()).any(|part| part == b" v4\n"),
         "current checkpoint must retain its packed row layout"

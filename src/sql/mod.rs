@@ -3791,6 +3791,7 @@ impl Engine {
         }
         storage.select_database(crate::storage::DatabaseOid::POSTGRES)?;
         wal.select_database(crate::storage::DatabaseOid::POSTGRES);
+        storage.validate_restored_relation_identities(storage.catalog_identity_sequence())?;
         // Startup reconciliation makes every recovered commit durable in the
         // configured object store before the server admits any connection.
         if config.wal_upload

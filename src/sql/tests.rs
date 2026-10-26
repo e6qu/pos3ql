@@ -1311,7 +1311,7 @@ fn relation_identity_replacement_and_constraint_edits_match_postgresql() {
         assert_eq!(
             data_rows(&output),
             [
-                "t", "t", "t", "t", "t", "t", "t", "81", "t", "t", "t", "t", "t"
+                "t", "t", "t", "t", "t", "t", "t", "81", "t", "t", "t", "t", "t", "t", "t"
             ]
         );
     }

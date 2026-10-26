@@ -84,7 +84,9 @@ constraint, dropping an earlier constraint, or moving its column preserves
 that identity. Replacing the index reserves a fresh stamp. Manifest
 `implicit_index POSITION CREATED_AT` records and table payload v10 store the
 complete set; missing, duplicate, out-of-range or truncated identities are
-rejected before installation.
+rejected before installation. Recovery also checks relation identities across
+catalog families within each database before durable startup publication. A
+constraint that adopts an explicit index still denotes one relation.
 
 Schemas retain their creation identity through renames, database cloning and
 recovery. For example, after renaming `public` to `archive` and creating a new

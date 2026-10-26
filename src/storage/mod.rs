@@ -57773,6 +57773,26 @@ mod tests {
     }
 
     #[test]
+    fn relation_identity_recovery_rejects_cross_catalog_aliases_without_mutation() {
+        let config = test_config();
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
+        let mut definition = make_def("identity_orders", &[("id", ColType::Int4, true)]);
+        definition.columns[0].primary = true;
+        let slot = storage.create_table(definition).unwrap();
+        let sequence = storage.catalog_identity_sequence();
+        storage.validate_restored_relation_identities(sequence).unwrap();
+        let table_identity = storage.table(slot).created_at();
+        let revision = storage.reserve_table_definition_revision().unwrap();
+        storage.tables[slot].definition_mut(revision).columns[0].index_identity = RelationIdentity::parse(table_identity);
+        let before = storage.catalog_identity_sequence();
+        let error = crate::mem::guard::forbid_alloc(|| storage.validate_restored_relation_identities(before)).unwrap_err();
+        assert_eq!(error.sqlstate, sqlstate::DATA_EXCEPTION);
+        assert!(error.message.as_str().contains("duplicated"));
+        assert_eq!(storage.catalog_identity_sequence(), before);
+    }
+
+    #[test]
     fn catalog_sequence_is_concurrent_monotonic_and_bounded() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<CatalogSequence>();

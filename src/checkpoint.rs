@@ -8833,6 +8833,8 @@ impl Checkpointer {
                     error.message.as_str()
                 ))
             })?;
+        storage.validate_restored_relation_identities(metadata.catalog_sequence)
+            .map_err(|error| CheckpointSetupError::ObjectStore(format!("manifest relation identities rejected: {}", error.message.as_str())))?;
         // Block SSTs load in list order. Versioned reads choose the greatest
         // admissible commit LSN across every member.
         bssts.sort_by_key(|(mindex, idx, ..)| (*mindex, *idx));

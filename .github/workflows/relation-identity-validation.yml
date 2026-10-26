@@ -40,8 +40,8 @@ jobs:
       - name: Retain library executable
         run: |
           cargo test --lib --locked --no-run --message-format=json > "$RUNNER_TEMP/library-build.json"
-          mkdir -p "$RUNNER_TEMP/library"
-          python3 - "$RUNNER_TEMP/library-build.json" "$RUNNER_TEMP/library/tests" <<'PY'
+          mkdir -p "$RUNNER_TEMP/library/deps"
+          python3 - "$RUNNER_TEMP/library-build.json" "$RUNNER_TEMP/library" <<'PY'
           import json
           from pathlib import Path
           import shutil
@@ -52,11 +52,14 @@ jobs:
                          and item.get('profile', {}).get('test') and item.get('executable')]
           if len(executables) != 1:
               raise SystemExit(f'Expected one library executable: {executables}')
-          shutil.copy2(executables[0], sys.argv[2])
+          destination = Path(sys.argv[2])
+          relative = Path('deps') / Path(executables[0]).name
+          shutil.copy2(executables[0], destination / relative)
+          (destination / 'executable').write_text(str(relative))
           PY
           git rev-parse HEAD > "$RUNNER_TEMP/library/revision"
           cd "$RUNNER_TEMP/library"
-          sha256sum tests > SHA256SUMS
+          sha256sum deps/* > SHA256SUMS
       - uses: actions/upload-artifact@v6
         with:
           name: relation-library-${{ github.sha }}
@@ -82,16 +85,27 @@ jobs:
           test "$(cat "$RUNNER_TEMP/library/revision")" = "$(git rev-parse HEAD)"
           cd "$RUNNER_TEMP/library"
           sha256sum --strict --check SHA256SUMS
-          chmod +x tests
       - name: Library partition
         env:
           PARTITION: ${{ matrix.partition }}
         run: |
-          python3 - "$RUNNER_TEMP/library/tests" <<'PY'
+          python3 - "$RUNNER_TEMP/library" <<'PY'
           import os
+          from pathlib import Path
+          import re
           import subprocess
+          import tomllib
           import sys
-          binary = sys.argv[1]
+          root = Path(sys.argv[1])
+          relative = (root / 'executable').read_text()
+          if re.fullmatch(r'deps/pos3ql-[a-f0-9]+', relative) is None:
+              raise SystemExit('Invalid library executable path')
+          binary = str(root / relative)
+          Path(binary).chmod(0o755)
+          stack = tomllib.loads(Path('.cargo/config.toml').read_text())['env']['RUST_MIN_STACK']
+          if stack['force'] is not True:
+              raise SystemExit('Library tests require the repository stack setting')
+          os.environ['RUST_MIN_STACK'] = stack['value']
           listing = subprocess.check_output([binary, '--list'], text=True)
           names = [line.removesuffix(': test') for line in listing.splitlines() if line.endswith(': test')]
           partition = int(os.environ['PARTITION'])
@@ -99,7 +113,9 @@ jobs:
           if priority not in names:
               raise SystemExit('Missing priority cold-read test')
           if partition == 0:
-              subprocess.run(['python3', 'tools/test_command.py', binary, '--exact', priority], check=True)
+              status = subprocess.run(['python3', 'tools/test_command.py', binary, '--exact', priority])
+              if status.returncode:
+                  raise SystemExit(status.returncode)
           excluded = {
               priority,
               'sim::storage::storage_vopr',
@@ -119,7 +135,7 @@ jobs:
           if not selected:
               raise SystemExit('Empty library partition')
           print(f'Partition {partition}: {len(selected)} tests', flush=True)
-          subprocess.run(command, check=True)
+          raise SystemExit(subprocess.run(command).returncode)
           PY
 
   release:

@@ -4534,7 +4534,9 @@ fn object_privilege_query(
         PrivilegeObject::Oid(oid) => Lookup::Numeric(oid),
     };
     let requested = PrivilegeRequirements::parse(privileges, all)?;
-    if storage.role(role).attributes_to(txid).superuser { return Ok(Some(true)); }
+    if class != AccessClass::LargeObject && storage.role(role).attributes_to(txid).superuser {
+        return Ok(Some(true));
+    }
     let object = match target {
         Lookup::Named(object) => Some(object),
         Lookup::Numeric(oid) => {

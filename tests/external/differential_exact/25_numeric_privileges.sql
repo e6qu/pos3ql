@@ -7,8 +7,7 @@ SELECT has_type_privilege(2147483647::oid, 'USAGE')
    AND has_database_privilege(2147483647::oid, 'CONNECT WITH GRANT OPTION')
    AND has_tablespace_privilege(2147483647::oid, 'CREATE WITH GRANT OPTION')
    AND has_foreign_data_wrapper_privilege(2147483647::oid, 'USAGE WITH GRANT OPTION')
-   AND has_server_privilege(2147483647::oid, 'USAGE WITH GRANT OPTION')
-   AND has_largeobject_privilege(2147483647::oid, 'SELECT WITH GRANT OPTION');
+   AND has_server_privilege(2147483647::oid, 'USAGE WITH GRANT OPTION');
 SELECT has_type_privilege('numeric_privilege_reader', 2147483647::oid, 'USAGE') IS NULL
    AND has_schema_privilege('numeric_privilege_reader', 2147483647::oid, 'USAGE') IS NULL
    AND has_function_privilege('numeric_privilege_reader', 2147483647::oid, 'EXECUTE') IS NULL
@@ -21,7 +20,8 @@ SELECT has_type_privilege('numeric_privilege_reader', 2147483647::oid, 'USAGE') 
    AND has_server_privilege('numeric_privilege_reader', 2147483647::oid, 'USAGE') IS NULL
    AND has_largeobject_privilege('numeric_privilege_reader', 2147483647::oid, 'SELECT') IS NULL;
 SELECT has_table_privilege(2147483647::oid, 'SELECT') IS NULL
-   AND has_sequence_privilege(2147483647::oid, 'USAGE') IS NULL;
+   AND has_sequence_privilege(2147483647::oid, 'USAGE') IS NULL
+   AND has_largeobject_privilege(2147483647::oid, 'SELECT WITH GRANT OPTION') IS NULL;
 SELECT lo_create(4294967295::oid) = 4294967295::oid;
 GRANT SELECT ON LARGE OBJECT 4294967295 TO numeric_privilege_reader;
 SELECT has_largeobject_privilege('numeric_privilege_reader', 4294967295::oid, 'SELECT')

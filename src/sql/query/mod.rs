@@ -2696,41 +2696,42 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         Some(super::types::oid::composite_oid(composite_slot))
     }
 
-    fn composite_field_type_mod(
+    fn composite_field_type_mods<'a>(
         &self,
         type_oid: i32,
-        field: usize,
-        arena: &Arena,
-    ) -> Result<Option<i32>, SqlError> {
+        arena: &'a Arena,
+    ) -> Result<Option<&'a [i32]>, SqlError> {
         use super::types::oid;
         if let Some(slot) =
             super::catalog::table_slot_by_row_type_oid(self.storage, self.txid, type_oid, false)
         {
-            return Ok(self
-                .storage
-                .table_def(slot, self.txid)
-                .columns()
-                .get(field)
-                .map(|column| column.type_mod));
+            let definition = self.storage.table_def(slot, self.txid);
+            return arena
+                .alloc_slice_with(definition.n_columns, |index| definition.columns()[index].type_mod)
+                .map(|modifiers| Some(&*modifiers))
+                .map_err(|_| arena_full());
         }
         if let Some(slot) =
             super::catalog::view_slot_by_row_type_oid(self.storage, self.txid, type_oid, false)
         {
+            let view = self.storage.view(slot);
+            let width = view.columns_for(self.txid).names().len();
+            let modifiers = arena.alloc_slice_with(width, |_| -1).map_err(|_| arena_full())?;
             let mark = arena.mark();
-            let result = (|| {
-                let view = self.storage.view(slot);
+            let result: Result<usize, SqlError> = (|| {
                 let columns = arena
-                    .alloc_slice_with(view.columns_for(self.txid).names().len(), |_| {
-                        super::types::ColDesc::new("", 0, 0)
-                    })
+                    .alloc_slice_with(width, |_| super::types::ColDesc::new("", 0, 0))
                     .map_err(|_| arena_full())?;
                 let count =
                     super::catalog::describe_view(self.storage, self.txid, &view, arena, columns)?;
-                Ok(columns[..count].get(field).map(|column| column.type_mod))
+                for (modifier, column) in modifiers.iter_mut().zip(&columns[..count]) {
+                    *modifier = column.type_mod;
+                }
+                Ok(count)
             })();
-            // Only an owned modifier or error escapes the temporary description.
+            // Only modifiers allocated below the mark survive the temporary description.
             unsafe { arena.rewind_to(mark) };
-            return result;
+            return Ok(Some(&modifiers[..result?]));
         }
         let Some(slot) = type_oid
             .checked_sub(oid::FIRST_COMPOSITE)
@@ -2738,16 +2739,17 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         else {
             return Ok(None);
         };
-        Ok(self
-            .storage
-            .composites_with_slots_visible_to(self.txid)
+        let Some(definition) = self.storage.composites_with_slots_visible_to(self.txid)
             .find_map(|(candidate, definition)| (candidate == slot).then_some(definition))
-            .and_then(|definition| {
-                definition
-                    .active_fields()
-                    .nth(field)
-                    .map(|field| field.type_mod)
-            }))
+        else {
+            return Ok(None);
+        };
+        let modifiers = arena.alloc_slice_with(definition.active_field_count(), |_| -1)
+            .map_err(|_| arena_full())?;
+        for (modifier, field) in modifiers.iter_mut().zip(definition.active_fields()) {
+            *modifier = field.type_mod;
+        }
+        Ok(Some(modifiers))
     }
 
     fn is_composite_type_name(&self, type_name: &str) -> bool {
@@ -6606,7 +6608,7 @@ pub(crate) fn select_query_resumable<'a, 'statement>(
             outer_scope: None,
             storage,
             txid,
-            arena: arena,
+            arena,
         };
         let check = |e: &Expr| -> Result<(), SqlError> {
             if user_type_expression_description(e, "", storage, txid).is_some() {
@@ -8654,7 +8656,7 @@ pub fn describe_scope_items<'q>(
                     outer_scope,
                     storage,
                     txid,
-                    arena: arena,
+                    arena,
                 };
                 let user_type = user_type_expression_description(expression, name, storage, txid);
                 let (mut oid, mut typlen) = match user_type {
@@ -9477,7 +9479,7 @@ fn describe_scope_record_star<'q>(
         outer_scope: None,
         storage,
         txid,
-        arena: arena,
+        arena,
     };
     match base {
         Expr::Call { name, .. } if name.eq_ignore_ascii_case("row") => {
@@ -10019,19 +10021,12 @@ impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_> {
         super::exec::visit_catalog_composite_fields(self.storage, self.txid, slot, visit)
     }
 
-    fn named_composite_field(
+    fn visit_named_composite_fields(
         &self,
         type_name: &str,
-        index: usize,
-    ) -> Result<Option<(crate::util::StackStr<64>, crate::sql::exec::StaticTypeMeta)>, SqlError>
-    {
-        crate::sql::exec::catalog_rowtype_field(
-            self.storage,
-            self.txid,
-            type_name,
-            index,
-            self.arena,
-        )
+        visit: &mut dyn FnMut(&str, crate::sql::exec::StaticTypeMeta),
+    ) -> Result<Option<usize>, SqlError> {
+        crate::sql::exec::visit_catalog_rowtype_fields(self.storage, self.txid, type_name, self.arena, visit)
     }
 
     fn is_whole_row(&self, name: &str) -> bool {

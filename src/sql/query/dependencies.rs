@@ -820,7 +820,7 @@ fn collect_dml_routine_calls_with_output<'a>(
         txid,
         returning_output,
         transition: context.transition,
-        arena: arena,
+        arena,
     };
     let mut needs_scope = false;
     fn visit(
@@ -1425,19 +1425,12 @@ impl ColTypeResolver for DependencyTypes<'_, '_, '_> {
         ))
     }
 
-    fn named_composite_field(
+    fn visit_named_composite_fields(
         &self,
         type_name: &str,
-        index: usize,
-    ) -> Result<Option<(crate::util::StackStr<64>, crate::sql::exec::StaticTypeMeta)>, SqlError>
-    {
-        crate::sql::exec::catalog_rowtype_field(
-            self.storage,
-            self.txid,
-            type_name,
-            index,
-            self.arena,
-        )
+        visit: &mut dyn FnMut(&str, crate::sql::exec::StaticTypeMeta),
+    ) -> Result<Option<usize>, SqlError> {
+        crate::sql::exec::visit_catalog_rowtype_fields(self.storage, self.txid, type_name, self.arena, visit)
     }
 
     fn is_whole_row(&self, name: &str) -> bool {
@@ -1513,7 +1506,7 @@ fn collect_routine_dependencies(
         storage,
         txid,
         returning_output: None,
-        arena: arena,
+        arena,
     };
     let needs_scope =
         collect_routine_dependencies_with_resolver(select, storage, txid, dependencies, &resolver)?;
@@ -1535,7 +1528,7 @@ fn collect_routine_dependencies(
                 storage,
                 txid,
                 returning_output: None,
-                arena: arena,
+                arena,
             };
             if collect_routine_dependencies_with_resolver(
                 select,
@@ -1594,7 +1587,7 @@ arena: &Arena,) -> Result<Option<StoredQueryDependency>, SqlError> {
         storage,
         txid,
         returning_output: None,
-        arena: arena,
+        arena,
     };
     let mut argument_oids = [0_i32; crate::storage::MAX_ROUTINE_ARGUMENTS];
     for (output, argument) in argument_oids.iter_mut().zip(args.iter().copied()) {
@@ -1685,7 +1678,7 @@ arena: &Arena,) -> Result<Option<StoredQueryDependency>, SqlError> {
         storage,
         txid,
         returning_output: None,
-        arena: arena,
+        arena,
     };
     let mut argument_oids = [0_i32; 2];
     for (output, argument) in argument_oids.iter_mut().zip(args.iter().copied()) {

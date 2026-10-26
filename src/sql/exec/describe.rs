@@ -505,68 +505,60 @@ pub(crate) fn static_meta_for_column(
     })
 }
 
-/// Copies one declared field; temporary view analysis never escapes its arena mark.
-pub(crate) fn catalog_rowtype_field(
+/// Visits a row type's copied fields without retaining catalog or scratch owners.
+pub(crate) fn visit_catalog_rowtype_fields(
     storage: &crate::storage::Storage,
     txid: u32,
     type_name: &str,
-    index: usize,
     arena: &crate::mem::arena::Arena,
-) -> Result<Option<(crate::util::StackStr<64>, StaticTypeMeta)>, SqlError> {
+    visit: &mut dyn FnMut(&str, StaticTypeMeta),
+) -> Result<Option<usize>, SqlError> {
     let (qualifier, bare) = type_name
         .split_once('.')
         .map_or((None, type_name), |(schema, name)| (Some(schema), name));
     match storage.resolve_relation(qualifier, bare, txid) {
         Some(crate::storage::ResolvedRelation::Table(slot)) => {
-            return Ok(storage
-                .table_def(slot, txid)
-                .columns()
-                .get(index)
-                .and_then(|column| {
-                    static_meta_for_column(storage, column, txid).map(|metadata| {
-                        (
-                            crate::util::StackStr::from_str(column.name.as_str()),
-                            metadata,
-                        )
-                    })
-                }));
+            let count = storage.table_def(slot, txid).n_columns;
+            for index in 0..count {
+                let column = storage.table_def(slot, txid).columns()[index];
+                let metadata = static_meta_for_column(storage, &column, txid)
+                    .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT,
+                        "rowtype field type identity is unavailable"))?;
+                visit(column.name.as_str(), metadata);
+            }
+            return Ok(Some(count));
         }
         Some(crate::storage::ResolvedRelation::View(slot)) => {
+            let mut fields = [None; crate::storage::MAX_COLUMNS];
             let mark = arena.mark();
-            let result = (|| {
+            let result: Result<usize, SqlError> = (|| {
                 let view = storage.view(slot);
                 let columns = arena
-                    .alloc_slice_with(view.columns_for(txid).names().len(), |_| {
-                        ColDesc::new("", 0, 0)
-                    })
-                    .map_err(|_| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "view description exceeds the statement arena"))?;
-                let count =
-                    crate::sql::catalog::describe_view(storage, txid, &view, arena, columns)?;
-                let Some(column) = columns[..count].get(index) else {
-                    return Ok(None);
-                };
-                let (ctype, _) =
-                    crate::sql::exec::catalog_column_type(storage, txid, column.type_oid)
-                        .ok_or_else(|| {
-                            sql_err!(
-                                sqlstate::FEATURE_NOT_SUPPORTED,
-                                "view rowtype field has unsupported type OID {}",
-                                column.type_oid
-                            )
-                        })?;
-                Ok(Some((
-                    crate::util::StackStr::from_str(column.name),
-                    StaticTypeMeta {
+                    .alloc_slice_with(view.columns_for(txid).names().len(), |_| ColDesc::new("", 0, 0))
+                    .map_err(|_| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "view description exceeds the statement arena"))?;
+                let count = crate::sql::catalog::describe_view(storage, txid, &view, arena, columns)?;
+                for (out, column) in fields.iter_mut().zip(&columns[..count]) {
+                    let (ctype, _) = crate::sql::exec::catalog_column_type(storage, txid, column.type_oid)
+                        .ok_or_else(|| sql_err!(sqlstate::FEATURE_NOT_SUPPORTED,
+                            "view rowtype field has unsupported type OID {}", column.type_oid))?;
+                    *out = Some((crate::storage::SqlName::parse(column.name)?, StaticTypeMeta {
                         ctype,
                         type_oid: column.type_oid,
                         type_mod: column.type_mod,
                         collation: column.collation,
-                    },
-                )))
+                    }));
+                }
+                Ok(count)
             })();
-            // Only copied field metadata or an owned error leaves the description.
+            // Copy the complete shape before callbacks can allocate retained output.
             unsafe { arena.rewind_to(mark) };
-            return result;
+            let count = result?;
+            for field in &fields[..count] {
+                let (name, metadata) = field.expect("described view field was copied");
+                visit(name.as_str(), metadata);
+            }
+            return Ok(Some(count));
         }
         _ => {}
     }
@@ -574,26 +566,20 @@ pub(crate) fn catalog_rowtype_field(
         return Ok(None);
     };
     let definition = storage.composite_for(slot, txid);
-    let Some(field) = definition.active_field(index) else {
-        return Ok(None);
-    };
-    let type_oid = storage
-        .routine_type_oid(field.ctype, field.user_type, txid)
-        .ok_or_else(|| {
-            sql_err!(
-                sqlstate::UNDEFINED_OBJECT,
-                "composite field type identity is unavailable"
-            )
-        })?;
-    Ok(Some((
-        crate::util::StackStr::from_str(field.name.as_str()),
-        StaticTypeMeta {
+    let mut count = 0;
+    for field in definition.active_fields() {
+        let type_oid = storage.routine_type_oid(field.ctype, field.user_type, txid)
+            .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT,
+                "composite field type identity is unavailable"))?;
+        visit(field.name.as_str(), StaticTypeMeta {
             ctype: field.ctype,
             type_oid,
             type_mod: field.type_mod,
             collation: field.collation,
-        },
-    )))
+        });
+        count += 1;
+    }
+    Ok(Some(count))
 }
 
 impl ColTypeResolver for CatalogCols<'_> {
@@ -851,19 +837,12 @@ impl ColTypeResolver for CatalogCols<'_> {
         visit_catalog_composite_fields(self.storage, self.txid, slot, visit)
     }
 
-    fn named_composite_field(
+    fn visit_named_composite_fields(
         &self,
         type_name: &str,
-        index: usize,
-    ) -> Result<Option<(crate::util::StackStr<64>, crate::sql::exec::StaticTypeMeta)>, SqlError>
-    {
-        crate::sql::exec::catalog_rowtype_field(
-            self.storage,
-            self.txid,
-            type_name,
-            index,
-            self.arena,
-        )
+        visit: &mut dyn FnMut(&str, crate::sql::exec::StaticTypeMeta),
+    ) -> Result<Option<usize>, SqlError> {
+        crate::sql::exec::visit_catalog_rowtype_fields(self.storage, self.txid, type_name, self.arena, visit)
     }
 }
 
@@ -894,7 +873,7 @@ fn describe_record_star<'q>(
                         output_aliases,
                         storage,
                         txid,
-                        arena: arena,
+                        arena,
                     };
                     &catalog_resolver
                 }
@@ -987,7 +966,7 @@ fn describe_record_star<'q>(
                 output_aliases,
                 storage,
                 txid,
-                arena: arena,
+                arena,
             };
             let mut argument_oids = [oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
             if args.len() > argument_oids.len() {
@@ -1586,11 +1565,11 @@ pub trait ColTypeResolver {
     }
 
     /// One durable named-composite field, copied out of the bounded catalog.
-    fn named_composite_field(
+    fn visit_named_composite_fields(
         &self,
         _type_name: &str,
-        _index: usize,
-    ) -> Result<Option<(crate::util::StackStr<64>, StaticTypeMeta)>, SqlError> {
+        _visit: &mut dyn FnMut(&str, StaticTypeMeta),
+    ) -> Result<Option<usize>, SqlError> {
         Ok(None)
     }
 }
@@ -2471,14 +2450,7 @@ fn record_shape_metadata_dyn(
             Ok((count != 0).then_some(count))
         }
         Expr::WholeRow(table) => Ok(shape_from_columns_metadata(table, columns, visit)),
-        Expr::Cast { type_name, .. } => {
-            let mut n = 0;
-            while let Some((name, meta)) = columns.named_composite_field(type_name, n)? {
-                visit(name.as_str(), meta);
-                n += 1;
-            }
-            Ok((n != 0).then_some(n))
-        }
+        Expr::Cast { type_name, .. } => columns.visit_named_composite_fields(type_name, visit),
         Expr::Column { qualifier, name }
             if matches!(columns.resolve(*qualifier, name), Ok(ColType::Composite(_))) =>
         {
@@ -2704,6 +2676,12 @@ pub fn record_field_metadata(
                 .and_then(|handle| record_shape_field_metadata(handle, field).map(|value| value.0)),
         },
         Expr::Cast { type_name, .. } => {
+            let mut found = None;
+            columns.visit_named_composite_fields(type_name, &mut |name, metadata| {
+                if name.eq_ignore_ascii_case(field) { found = Some(metadata); }
+            })?;
+            found
+        } => {
             let mut index = 0usize;
             let mut found = None;
             while let Some((name, meta)) = columns.named_composite_field(type_name, index)? {
@@ -3144,7 +3122,7 @@ pub(crate) fn infer_type_catalog(
             output_aliases: &[],
             storage,
             txid,
-            arena: arena,
+            arena,
         },
     )
 }

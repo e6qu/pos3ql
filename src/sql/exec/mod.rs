@@ -696,7 +696,7 @@ pub(crate) use copy_transition::CopyTransitionRows;
 pub(super) use schema::rename as stage_schema_rename;
 
 mod describe;
-pub(crate) use describe::{CatalogCols, catalog_composite_field, catalog_rowtype_field, visit_catalog_composite_fields};
+pub(crate) use describe::{CatalogCols, catalog_composite_field, visit_catalog_rowtype_fields, visit_catalog_composite_fields};
 pub use describe::{
     ColTypeResolver, DefCols, NoCols, RECORD_FIELD_NAMES, check_row_field_types,
     could_not_identify, derived_name, describe_items, expr_record_handle as expr_record_handle_pub,
@@ -13862,7 +13862,7 @@ fn remove_schema_from_publications(
             .copy_within(index + 1..definition.schema_count, index);
         definition.schema_count -= 1;
         definition.schemas[definition.schema_count] = u8::MAX;
-        let (slot, prior) = storage.alter_publication(name.as_str(), definition, txn.txid, arena)?;
+        let (slot, prior) = storage.alter_publication(name.as_str(), definition, txn.txid)?;
         let lsn = storage.bump_lsn();
         if let Err(error) = wal.stage_reserved(
             txn.txid,
@@ -13995,8 +13995,7 @@ arena: &Arena,) -> Outcome {
             publish_via_partition_root,
             publish_generated_columns: publish_generated_columns.into(),
         },
-        txn.txid,
-arena,) {
+        txn.txid) {
         Ok(slot) => {
             let owner = storage.publication_owner(slot, txn.txid);
             let lsn = storage.bump_lsn();
@@ -15205,7 +15204,7 @@ arena: &Arena,) -> Outcome {
     if let Err(error) = validate_publication_replica_identity(storage, &definition, txn.txid) {
         return sql_fail(error);
     }
-    let (slot, prior) = match storage.alter_publication(name, definition, txn.txid, arena) {
+    let (slot, prior) = match storage.alter_publication(name, definition, txn.txid) {
         Ok(result) => result,
         Err(error) => return sql_fail(error),
     };
@@ -22504,7 +22503,8 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                     *publish_via_partition_root,
                     *publish_generated_columns,
                     responder,
-arena,),
+                    context.arena,
+                ),
                 Stmt::AlterPublication { name, action } => super::exec::alter_publication(
                     &mut engine.storage,
                     &mut engine.wal,
@@ -22512,7 +22512,8 @@ arena,),
                     name,
                     *action,
                     responder,
-arena,),
+                    context.arena,
+                ),
                 Stmt::DropPublication { names, if_exists } => super::exec::drop_publication(
                     &mut engine.storage,
                     &mut engine.wal,
@@ -44427,7 +44428,7 @@ fn stage_publication_column_drop_dependencies(
         definition.table_filters =
             crate::storage::PublicationFilters::from_sql(&filters[..definition.table_count])?;
         let (altered_slot, prior) =
-            storage.alter_publication(name.as_str(), definition, txn.txid, arena)?;
+            storage.alter_publication(name.as_str(), definition, txn.txid)?;
         let lsn = storage.bump_lsn();
         if let Err(error) = wal.stage_reserved(
             txn.txid,
@@ -46326,7 +46327,7 @@ fn remap_publication_column_projections(
             .materialize_sql(definition.table_count);
         let name = publication.name_for(txn.txid);
         let (altered_slot, prior) =
-            storage.alter_publication(name.as_str(), definition, txn.txid, arena)?;
+            storage.alter_publication(name.as_str(), definition, txn.txid)?;
         let lsn = storage.bump_lsn();
         if let Err(error) = wal.stage_reserved(
             txn.txid,
@@ -46418,7 +46419,7 @@ fn rewrite_table_publication_column_references(
         validate_publication_replica_identity(storage, &definition, txn.txid)?;
         let name = publication.name_for(txn.txid);
         let (altered_slot, prior) =
-            storage.alter_publication(name.as_str(), definition, txn.txid, arena)?;
+            storage.alter_publication(name.as_str(), definition, txn.txid)?;
         let lsn = storage.bump_lsn();
         if let Err(error) = wal.stage_reserved(
             txn.txid,

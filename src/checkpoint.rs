@@ -5586,20 +5586,29 @@ impl Checkpointer {
                 }
                 Some("constraint_identity") => {
                     let Some((_, _, definition, _, _)) = pending_def.as_mut() else {
-                        return Err(CheckpointSetupError::Corrupt("constraint identity outside table"));
+                        return Err(CheckpointSetupError::Corrupt(
+                            "constraint identity outside table",
+                        ));
                     };
                     let position: usize = parse_field(words.next(), "constraint position")?;
                     let created_at: u64 = parse_field(words.next(), "constraint creation")?;
                     let identity = crate::storage::ConstraintIdentity::parse(created_at)
                         .filter(|_| created_at <= metadata.catalog_sequence)
-                        .ok_or(CheckpointSetupError::Corrupt("invalid constraint creation identity"))?;
+                        .ok_or(CheckpointSetupError::Corrupt(
+                            "invalid constraint creation identity",
+                        ))?;
                     if !definition.attributes.validate(definition.n_columns) {
-                        return Err(CheckpointSetupError::Corrupt("constraint requires valid column attributes"));
+                        return Err(CheckpointSetupError::Corrupt(
+                            "constraint requires valid column attributes",
+                        ));
                     }
-                    let target = definition.constraint_identities_mut().nth(position)
-                        .ok_or(CheckpointSetupError::Corrupt("invalid constraint identity position"))?;
+                    let target = definition.constraint_identities_mut().nth(position).ok_or(
+                        CheckpointSetupError::Corrupt("invalid constraint identity position"),
+                    )?;
                     if target.is_some() || words.next().is_some() {
-                        return Err(CheckpointSetupError::Corrupt("duplicate or malformed constraint identity"));
+                        return Err(CheckpointSetupError::Corrupt(
+                            "duplicate or malformed constraint identity",
+                        ));
                     }
                     *target = Some(identity);
                 }
@@ -7549,16 +7558,27 @@ impl Checkpointer {
                         };
                     for check in checks.iter_mut().take(n_checks) {
                         let created_at: u64 = parse_field(words.next(), "domain CHECK identity")?;
-                        check.identity = Some(crate::storage::ConstraintIdentity::parse(created_at)
-                            .filter(|_| created_at <= metadata.catalog_sequence)
-                            .ok_or(CheckpointSetupError::Corrupt("invalid domain CHECK identity"))?);
+                        check.identity = Some(
+                            crate::storage::ConstraintIdentity::parse(created_at)
+                                .filter(|_| created_at <= metadata.catalog_sequence)
+                                .ok_or(CheckpointSetupError::Corrupt(
+                                    "invalid domain CHECK identity",
+                                ))?,
+                        );
                     }
                     let not_null_identity = if not_null != 0 {
-                        let created_at: u64 = parse_field(words.next(), "domain NOT NULL identity")?;
-                        Some(crate::storage::ConstraintIdentity::parse(created_at)
-                            .filter(|_| created_at <= metadata.catalog_sequence)
-                            .ok_or(CheckpointSetupError::Corrupt("invalid domain NOT NULL identity"))?)
-                    } else { None };
+                        let created_at: u64 =
+                            parse_field(words.next(), "domain NOT NULL identity")?;
+                        Some(
+                            crate::storage::ConstraintIdentity::parse(created_at)
+                                .filter(|_| created_at <= metadata.catalog_sequence)
+                                .ok_or(CheckpointSetupError::Corrupt(
+                                    "invalid domain NOT NULL identity",
+                                ))?,
+                        )
+                    } else {
+                        None
+                    };
                     if words.next().is_some() {
                         return Err(CheckpointSetupError::Corrupt("unexpected domain fields"));
                     }
@@ -8894,6 +8914,14 @@ impl Checkpointer {
                 ))
             })?;
         storage
+            .validate_restored_constraint_identities(metadata.catalog_sequence)
+            .map_err(|error| {
+                CheckpointSetupError::ObjectStore(format!(
+                    "manifest constraint identities rejected: {}",
+                    error.message.as_str()
+                ))
+            })?;
+        storage
             .validate_restored_enum_label_identities(metadata.catalog_sequence)
             .map_err(|error| {
                 CheckpointSetupError::ObjectStore(format!(
@@ -9869,36 +9897,63 @@ impl Checkpointer {
         // the table definition is rebuilt.
         for (slot, d) in storage.checkpoint_domains() {
             crate::storage::validate_constraint_identities(d.constraint_identities())?;
-            let parent_name = d.base_domain.map(crate::storage::UserTypeName::storage_name);
-            let base_name = d.base_user_type.map(crate::storage::UserTypeName::storage_name);
+            let parent_name = d
+                .base_domain
+                .map(crate::storage::UserTypeName::storage_name);
+            let base_name = d
+                .base_user_type
+                .map(crate::storage::UserTypeName::storage_name);
             write_database_context(&mut self.manifest_output, &mut database_context, d.database)?;
             use core::fmt::Write;
-            write!(&mut self.manifest_output, "dom6 {} {} {} {} {} {}",
-                slot, d.created_at, d.base.code(), d.base_type_mod, u8::from(d.not_null), d.n_checks
-            ).map_err(|_| manifest_full())?;
+            write!(
+                &mut self.manifest_output,
+                "dom6 {} {} {} {} {} {}",
+                slot,
+                d.created_at,
+                d.base.code(),
+                d.base_type_mod,
+                u8::from(d.not_null),
+                d.n_checks
+            )
+            .map_err(|_| manifest_full())?;
             for value in [
                 d.schema.as_str(),
                 d.name.as_str(),
                 parent_name.as_ref().map_or("", |name| name.as_str()),
-                d.base_domain.as_ref().map_or("", |identity| identity.schema.as_str()),
+                d.base_domain
+                    .as_ref()
+                    .map_or("", |identity| identity.schema.as_str()),
                 base_name.as_ref().map_or("", |name| name.as_str()),
-                d.base_user_type.as_ref().map_or("", |identity| identity.schema.as_str()),
+                d.base_user_type
+                    .as_ref()
+                    .map_or("", |identity| identity.schema.as_str()),
                 d.not_null_name.as_ref().map_or("", |name| name.as_str()),
-                d.default_expr.as_ref().map_or("", |expression| expression.as_str()),
+                d.default_expr
+                    .as_ref()
+                    .map_or("", |expression| expression.as_str()),
             ] {
                 write!(&mut self.manifest_output, " ").map_err(|_| manifest_full())?;
-                write_manifest_hex_value(&mut self.manifest_output, value).map_err(|_| manifest_full())?;
+                write_manifest_hex_value(&mut self.manifest_output, value)
+                    .map_err(|_| manifest_full())?;
             }
             for check in d.checks() {
                 for value in [check.name.as_str(), check.expression.as_str()] {
                     write!(&mut self.manifest_output, " ").map_err(|_| manifest_full())?;
-                    write_manifest_hex_value(&mut self.manifest_output, value).map_err(|_| manifest_full())?;
+                    write_manifest_hex_value(&mut self.manifest_output, value)
+                        .map_err(|_| manifest_full())?;
                 }
-                write!(&mut self.manifest_output, " {}", check.validation.code()).map_err(|_| manifest_full())?;
+                write!(&mut self.manifest_output, " {}", check.validation.code())
+                    .map_err(|_| manifest_full())?;
             }
             for identity in d.constraint_identities() {
-                let identity = identity.ok_or_else(|| sql_err!(sqlstate::DATA_EXCEPTION, "checkpoint constraint has no creation identity"))?;
-                write!(&mut self.manifest_output, " {}", identity.created_at()).map_err(|_| manifest_full())?;
+                let identity = identity.ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::DATA_EXCEPTION,
+                        "checkpoint constraint has no creation identity"
+                    )
+                })?;
+                write!(&mut self.manifest_output, " {}", identity.created_at())
+                    .map_err(|_| manifest_full())?;
             }
             writeln!(&mut self.manifest_output).map_err(|_| manifest_full())?;
         }
@@ -9912,20 +9967,25 @@ impl Checkpointer {
             use core::fmt::Write;
             write!(&mut self.manifest_output, "enm3 {} {} ", slot, e.created_at)
                 .map_err(|_| manifest_full())?;
-            write_manifest_hex_value(&mut self.manifest_output, e.schema.as_str()).map_err(|_| manifest_full())?;
+            write_manifest_hex_value(&mut self.manifest_output, e.schema.as_str())
+                .map_err(|_| manifest_full())?;
             write!(&mut self.manifest_output, " ").map_err(|_| manifest_full())?;
-            write_manifest_hex_value(&mut self.manifest_output, e.name.as_str()).map_err(|_| manifest_full())?;
+            write_manifest_hex_value(&mut self.manifest_output, e.name.as_str())
+                .map_err(|_| manifest_full())?;
             write!(&mut self.manifest_output, " {}", definition.members().len())
                 .map_err(|_| manifest_full())?;
             for m in definition.members() {
                 write!(&mut self.manifest_output, " ").map_err(|_| manifest_full())?;
-                write_manifest_hex_value(&mut self.manifest_output, m.label.as_str()).map_err(|_| manifest_full())?;
+                write_manifest_hex_value(&mut self.manifest_output, m.label.as_str())
+                    .map_err(|_| manifest_full())?;
                 write!(&mut self.manifest_output, " {}", m.sort.to_bits())
                     .map_err(|_| manifest_full())?;
                 write!(&mut self.manifest_output, " ").map_err(|_| manifest_full())?;
                 match m.legacy_label {
-                    Some(label) => write_manifest_hex_value(&mut self.manifest_output, label.as_str())
-                        .map_err(|_| manifest_full())?,
+                    Some(label) => {
+                        write_manifest_hex_value(&mut self.manifest_output, label.as_str())
+                            .map_err(|_| manifest_full())?
+                    }
                     None => write!(&mut self.manifest_output, "-").map_err(|_| manifest_full())?,
                 }
                 let identity = m.identity.ok_or_else(|| {
@@ -10436,9 +10496,16 @@ impl Checkpointer {
             }
 
             for (position, identity) in definition.constraint_identities().enumerate() {
-                let identity = identity.ok_or_else(|| sql_err!(sqlstate::DATA_EXCEPTION, "checkpoint constraint has no creation identity"))?;
-                write_manifest(&mut self.manifest_output,
-                    format_args!("constraint_identity {position} {}", identity.created_at()))?;
+                let identity = identity.ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::DATA_EXCEPTION,
+                        "checkpoint constraint has no creation identity"
+                    )
+                })?;
+                write_manifest(
+                    &mut self.manifest_output,
+                    format_args!("constraint_identity {position} {}", identity.created_at()),
+                )?;
             }
 
             // A slot not sliced this sweep carries its published list

@@ -179,7 +179,6 @@ pub(super) fn allocate(
                         "saved table has an invalid creation identity"
                     )
                 })?;
-                storage.catalog_sequence.observe(position.created_at());
                 position.created_at()
             }
         };
@@ -196,8 +195,11 @@ pub(super) fn allocate(
                 storage.reserve_table_catalog_identities(&mut def)?;
             }
             super::CatalogAllocation::Restore(_) => {
-                storage.validate_table_catalog_identities(&def)?
+                storage.validate_table_catalog_identities(&def, created_at)?
             }
+        }
+        if matches!(allocation, super::CatalogAllocation::Restore(_)) {
+            storage.catalog_sequence.observe(created_at);
         }
         state.install(
             def,

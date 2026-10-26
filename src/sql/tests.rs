@@ -1354,7 +1354,10 @@ fn constraint_public_identifiers_survive_edits_replacement_and_savepoint_rollbac
         {
             let output = session.success(&mut engine, statement, true);
             let rows = data_rows(&output);
-            assert!(rows.iter().all(|row| row == "t"), "after {observations} checks; {statement}: {rows:?}");
+            assert!(
+                rows.iter().all(|row| row == "t"),
+                "after {observations} checks; {statement}: {rows:?}"
+            );
             observations += rows.len();
         }
         assert_eq!(observations, 12);
@@ -1399,7 +1402,10 @@ fn constraint_public_identifiers_survive_journal_and_checkpoint_recovery() {
                 {
                     let output = session.success(&mut engine, statement, false);
                     let rows = data_rows(&output);
-                    assert!(rows.iter().all(|row| row == "t"), "after {observations} checks; {statement}: {rows:?}");
+                    assert!(
+                        rows.iter().all(|row| row == "t"),
+                        "after {observations} checks; {statement}: {rows:?}"
+                    );
                     observations += rows.len();
                 }
                 assert_eq!(observations, 4);
@@ -1422,11 +1428,72 @@ fn constraint_public_identifiers_survive_journal_and_checkpoint_recovery() {
                     {
                         let output = session.success(&mut engine, statement, guarded);
                         let rows = data_rows(&output);
-                        assert!(rows.iter().all(|row| row == "t"), "after {observations} checks; {statement}: {rows:?}");
+                        assert!(
+                            rows.iter().all(|row| row == "t"),
+                            "after {observations} checks; {statement}: {rows:?}"
+                        );
                         observations += rows.len();
                     }
                     assert_eq!(observations, expected);
                 }
+            }
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        }
+    }
+}
+
+#[test]
+fn constraint_manifest_wide_domains_survive_journal_and_checkpoint_recovery() {
+    for checkpoint in [false, true] {
+        for mode in [
+            crate::config::TransactionMode::Mvcc,
+            crate::config::TransactionMode::Locking,
+        ] {
+            let name = format!("wide-domain-constraint-cold-{checkpoint}-{mode:?}");
+            let mut config = test_config(&name);
+            config.transaction_mode = mode;
+            config.max_domains = 1;
+            config.object_store_on = true;
+            config.object_store_sim = true;
+            config.wal_upload = true;
+            config.wal_upload_sync = true;
+            config.object_store_bucket = format!("{name}-{}", std::process::id());
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+            {
+                let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+                let mut engine = Engine::new(&config, &mut budget).unwrap();
+                let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+                assert_eq!(
+                    data_rows(&session.success(
+                        &mut engine,
+                        include_str!("../../tests/external/differential_exact/29_wide_domain_constraints.sql"),
+                        false
+                    )),
+                    ["t"]
+                );
+                if checkpoint {
+                    assert!(engine.checkpoint().unwrap());
+                }
+                engine.commit_wal().unwrap();
+            }
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+            {
+                let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+                let mut engine = Engine::new(&config, &mut budget).unwrap();
+                let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+                assert_eq!(
+                    data_rows(&session.success(
+                        &mut engine,
+                        "SELECT count(*) = 64 AND count(DISTINCT oid) = 64 FROM pg_constraint WHERE contypid = 'wide_constraint_domain'::regtype",
+                        true
+                    )),
+                    ["t"]
+                );
+                assert_eq!(
+                    error_sqlstates(&session.execute(&mut engine, "SELECT (-1)::wide_constraint_domain", true)),
+                    ["23514"]
+                );
             }
             std::fs::remove_dir_all(&config.data_dir).unwrap();
             crate::object_store::sim::drop_namespace(&config.object_store_bucket);
@@ -5341,15 +5408,18 @@ fn catalog_constraint_identity_ranges_reject_overflow_and_keep_triggers_disjoint
         assert!(
             crate::storage::FIRST_EXPLICIT_INDEX_OID as u64
                 + crate::storage::MAX_INDEX_OID_GENERATION
-                + crate::storage::INDEX_CONSTRAINT_OID_OFFSET as u64
+                + (crate::storage::INDEX_CONSTRAINT_OID_OFFSET as u64)
                 < first.oid() as u64
         );
         for trigger in ForeignKeyTrigger::ALL {
             assert!(last.oid() < first.foreign_key_trigger_oid(trigger));
             assert!(first.foreign_key_trigger_oid(trigger) < last.foreign_key_trigger_oid(trigger));
-            assert!(last.foreign_key_trigger_oid(trigger) < crate::storage::FIRST_PARTITION_TRIGGER_OID);
             assert!(
-                crate::storage::TRIGGER_OID_BASE as u64 + crate::storage::MAX_TRIGGER_OID_GENERATION
+                last.foreign_key_trigger_oid(trigger) < crate::storage::FIRST_PARTITION_TRIGGER_OID
+            );
+            assert!(
+                crate::storage::TRIGGER_OID_BASE as u64
+                    + crate::storage::MAX_TRIGGER_OID_GENERATION
                     < first.foreign_key_trigger_oid(trigger) as u64
             );
         }

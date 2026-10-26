@@ -93,7 +93,7 @@ pub(crate) fn capture_before<'a>(
             }
             _ => definitions.definition(storage, child_slot, txid)?,
         };
-        for (foreign_key_index, foreign_key) in child.fkeys().iter().enumerate() {
+        for foreign_key in child.fkeys() {
             let Some(parent_slot) = storage.find_visible(
                 foreign_key.parent_schema.as_str(),
                 foreign_key.parent.as_str(),
@@ -123,11 +123,8 @@ pub(crate) fn capture_before<'a>(
             if !affected {
                 continue;
             }
-            let reference = detached_constraint(
-                child,
-                foreign_key.oid(),
-                foreign_key.name.as_str(),
-            );
+            let reference =
+                detached_constraint(child, foreign_key.oid(), foreign_key.name.as_str());
             if dependent_drops
                 .as_slice()
                 .iter()
@@ -520,8 +517,16 @@ impl EventObjectRef {
             Self::DomainConstraint { domain, constraint } => {
                 let domain_slot = usize::from(domain);
                 let domain = storage.domain_for(domain_slot, txid);
-                let check = domain.checks().iter().find(|check| check.identity == Some(constraint))
-                    .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "domain constraint no longer exists"))?;
+                let check = domain
+                    .checks()
+                    .iter()
+                    .find(|check| check.identity == Some(constraint))
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::UNDEFINED_OBJECT,
+                            "domain constraint no longer exists"
+                        )
+                    })?;
                 let mut identity = EventIdentity::new();
                 write!(
                     identity,
@@ -2227,7 +2232,9 @@ pub(crate) fn catalog_object_address(
         for constraint in storage.domain_for(slot, txid).checks() {
             consider!(EventObjectRef::DomainConstraint {
                 domain: slot as u16,
-                constraint: constraint.identity.expect("admitted domain CHECK has an identity"),
+                constraint: constraint
+                    .identity
+                    .expect("admitted domain CHECK has an identity"),
             });
         }
     }
@@ -2595,7 +2602,9 @@ fn existing_catalog_object(
                         .checks()
                         .iter()
                         .find_map(|check| {
-                            check.identity.filter(|identity| identity.oid() == object_id)
+                            check
+                                .identity
+                                .filter(|identity| identity.oid() == object_id)
                                 .map(|identity| (domain, identity))
                         })
                 })
@@ -3281,11 +3290,7 @@ fn push_alter_table_drops(
                     push_drop_once(
                         output,
                         count,
-                        detached_constraint(
-                            old,
-                            old.fkeys()[index].oid(),
-                            *name,
-                        ),
+                        detached_constraint(old, old.fkeys()[index].oid(), *name),
                         true,
                         false,
                     )?;
@@ -3402,11 +3407,7 @@ fn push_alter_table_drops(
             push_drop_once(
                 output,
                 count,
-                detached_constraint(
-                    old,
-                    old.checks()[index].oid(),
-                    check.name.as_str(),
-                ),
+                detached_constraint(old, old.checks()[index].oid(), check.name.as_str()),
                 false,
                 true,
             )?;
@@ -3417,11 +3418,7 @@ fn push_alter_table_drops(
             push_drop_once(
                 output,
                 count,
-                detached_constraint(
-                    old,
-                    old.fkeys()[index].oid(),
-                    foreign_key.name.as_str(),
-                ),
+                detached_constraint(old, old.fkeys()[index].oid(), foreign_key.name.as_str()),
                 false,
                 true,
             )?;
@@ -3627,7 +3624,7 @@ fn push_table_drop_dependents(
         false,
     )?;
 
-    for (index, check) in table.checks().iter().enumerate() {
+    for check in table.checks() {
         push_drop(
             output,
             count,
@@ -3656,7 +3653,7 @@ fn push_table_drop_dependents(
             )?;
         }
     }
-    for (index, foreign_key) in table.fkeys().iter().enumerate() {
+    for foreign_key in table.fkeys() {
         push_drop(
             output,
             count,
@@ -3833,7 +3830,9 @@ fn push_type_drop_dependents(
                     count,
                     EventObjectRef::DomainConstraint {
                         domain: domain_ref,
-                        constraint: constraint.identity.expect("admitted domain CHECK has an identity"),
+                        constraint: constraint
+                            .identity
+                            .expect("admitted domain CHECK has an identity"),
                     },
                     false,
                     false,

@@ -247,12 +247,16 @@ fn same_domain(image: &DomainDef, source: &DomainDef, transaction: u32) -> bool 
         && image.not_null_identity == source.not_null_identity
         && image.default_expr == source.default_expr
         && image.checks().len() == source.checks().len()
-        && image.checks().iter().zip(source.checks()).all(|(left, right)| {
-            left.identity == right.identity
-                && left.name == right.name
-                && left.expression == right.expression
-                && left.validation == right.validation
-        })
+        && image
+            .checks()
+            .iter()
+            .zip(source.checks())
+            .all(|(left, right)| {
+                left.identity == right.identity
+                    && left.name == right.name
+                    && left.expression == right.expression
+                    && left.validation == right.validation
+            })
 }
 
 fn same_enum(image: &EnumDefinition, source: &super::EnumDef, safe_member_count: usize) -> bool {

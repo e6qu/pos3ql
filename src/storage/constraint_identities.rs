@@ -2,7 +2,9 @@
 
 use core::num::NonZeroU32;
 
-use super::{CheckConstraint, DetachedPartitionBound, DomainDef, DomainSpec, ForeignKey, Storage, TableDef};
+use super::{
+    CheckConstraint, DetachedPartitionBound, DomainDef, DomainSpec, ForeignKey, Storage, TableDef,
+};
 use crate::sql::eval::{SqlError, sqlstate};
 use crate::sql_err;
 
@@ -22,7 +24,12 @@ pub(crate) enum ForeignKeyTrigger {
 }
 
 impl ForeignKeyTrigger {
-    pub(crate) const ALL: [Self; 4] = [Self::ActionDelete, Self::ActionUpdate, Self::CheckInsert, Self::CheckUpdate];
+    pub(crate) const ALL: [Self; 4] = [
+        Self::ActionDelete,
+        Self::ActionUpdate,
+        Self::CheckInsert,
+        Self::CheckUpdate,
+    ];
 
     pub(crate) const fn ordinal(self) -> usize {
         match self {
@@ -65,114 +72,289 @@ impl ConstraintIdentity {
     }
 
     fn reserve(storage: &Storage) -> Result<Self, SqlError> {
-        let created_at = storage.catalog_sequence.next_bounded(MAX_CONSTRAINT_CREATION, "constraint")?;
+        let created_at = storage
+            .catalog_sequence
+            .next_bounded(MAX_CONSTRAINT_CREATION, "constraint")?;
         Ok(Self::parse(created_at).expect("bounded constraint reservation"))
     }
 }
 
 impl CheckConstraint {
     pub(crate) fn oid(&self) -> i32 {
-        self.identity.expect("admitted CHECK has a creation identity").oid()
+        self.identity
+            .expect("admitted CHECK has a creation identity")
+            .oid()
     }
 }
 
 impl ForeignKey {
     pub(crate) fn oid(&self) -> i32 {
-        self.identity.expect("admitted foreign key has a creation identity").oid()
+        self.identity
+            .expect("admitted foreign key has a creation identity")
+            .oid()
     }
 
     pub(crate) fn trigger_oid(&self, trigger: ForeignKeyTrigger) -> i32 {
-        self.identity.expect("admitted foreign key has a creation identity").foreign_key_trigger_oid(trigger)
+        self.identity
+            .expect("admitted foreign key has a creation identity")
+            .foreign_key_trigger_oid(trigger)
     }
 }
 
 impl DetachedPartitionBound {
     pub(crate) fn oid(&self) -> i32 {
-        self.identity.expect("admitted detached partition CHECK has a creation identity").oid()
+        self.identity
+            .expect("admitted detached partition CHECK has a creation identity")
+            .oid()
     }
 }
 
 impl TableDef {
     pub(crate) fn not_null_constraint_oid(&self, column: usize) -> i32 {
         let attribute = usize::from(self.attribute_number(column) - 1);
-        self.not_null_identities[attribute].expect("admitted NOT NULL has a creation identity").oid()
+        self.not_null_identities[attribute]
+            .expect("admitted NOT NULL has a creation identity")
+            .oid()
     }
 
-    pub(crate) fn constraint_identities(&self) -> impl Iterator<Item = Option<ConstraintIdentity>> + Clone + '_ {
-        self.checks().iter().map(|check| check.identity)
+    pub(crate) fn constraint_identities(
+        &self,
+    ) -> impl Iterator<Item = Option<ConstraintIdentity>> + Clone + '_ {
+        self.checks()
+            .iter()
+            .map(|check| check.identity)
             .chain(self.fkeys().iter().map(|key| key.identity))
-            .chain(self.not_null_identities.iter().zip(&self.attributes.slots).filter_map(|(identity, slot)| match *slot {
-                super::column_attributes::AttributeSlot::Live(column) if self.columns[usize::from(column)].not_null.is_required() => Some(*identity),
-                _ => None,
-            }))
-            .chain(self.partition.detached_bound.iter().map(|check| check.identity))
+            .chain(
+                self.not_null_identities
+                    .iter()
+                    .zip(&self.attributes.slots)
+                    .filter_map(|(identity, slot)| match *slot {
+                        super::column_attributes::AttributeSlot::Live(column)
+                            if self.columns[usize::from(column)].not_null.is_required() =>
+                        {
+                            Some(*identity)
+                        }
+                        _ => None,
+                    }),
+            )
+            .chain(
+                self.partition
+                    .detached_bound
+                    .iter()
+                    .map(|check| check.identity),
+            )
     }
 
-    pub(crate) fn constraint_identities_mut(&mut self) -> impl Iterator<Item = &mut Option<ConstraintIdentity>> {
+    pub(crate) fn constraint_identities_mut(
+        &mut self,
+    ) -> impl Iterator<Item = &mut Option<ConstraintIdentity>> {
         let columns = &self.columns;
-        self.checks[..self.n_checks].iter_mut().map(|check| &mut check.identity)
-            .chain(self.fkeys[..self.n_fkeys].iter_mut().map(|key| &mut key.identity))
-            .chain(self.not_null_identities.iter_mut().zip(&self.attributes.slots).filter_map(move |(identity, slot)| match *slot {
-                super::column_attributes::AttributeSlot::Live(column) if columns[usize::from(column)].not_null.is_required() => Some(identity),
-                _ => None,
-            }))
-            .chain(self.partition.detached_bound.iter_mut().map(|check| &mut check.identity))
+        self.checks[..self.n_checks]
+            .iter_mut()
+            .map(|check| &mut check.identity)
+            .chain(
+                self.fkeys[..self.n_fkeys]
+                    .iter_mut()
+                    .map(|key| &mut key.identity),
+            )
+            .chain(
+                self.not_null_identities
+                    .iter_mut()
+                    .zip(&self.attributes.slots)
+                    .filter_map(move |(identity, slot)| match *slot {
+                        super::column_attributes::AttributeSlot::Live(column)
+                            if columns[usize::from(column)].not_null.is_required() =>
+                        {
+                            Some(identity)
+                        }
+                        _ => None,
+                    }),
+            )
+            .chain(
+                self.partition
+                    .detached_bound
+                    .iter_mut()
+                    .map(|check| &mut check.identity),
+            )
     }
 }
 
 impl DomainDef {
     pub(crate) fn not_null_constraint_oid(&self) -> i32 {
-        self.not_null_identity.expect("admitted domain NOT NULL has a creation identity").oid()
+        self.not_null_identity
+            .expect("admitted domain NOT NULL has a creation identity")
+            .oid()
     }
 
-    pub(crate) fn constraint_identities(&self) -> impl Iterator<Item = Option<ConstraintIdentity>> + Clone + '_ {
-        self.checks().iter().map(|check| check.identity)
+    pub(crate) fn constraint_identities(
+        &self,
+    ) -> impl Iterator<Item = Option<ConstraintIdentity>> + Clone + '_ {
+        self.checks()
+            .iter()
+            .map(|check| check.identity)
             .chain(self.not_null.then_some(self.not_null_identity))
     }
 }
 
 impl DomainSpec {
-    pub(crate) fn constraint_identities(&self) -> impl Iterator<Item = Option<ConstraintIdentity>> + Clone + '_ {
-        self.checks[..self.n_checks].iter().map(|check| check.identity)
+    pub(crate) fn constraint_identities(
+        &self,
+    ) -> impl Iterator<Item = Option<ConstraintIdentity>> + Clone + '_ {
+        self.checks[..self.n_checks]
+            .iter()
+            .map(|check| check.identity)
             .chain(self.not_null.then_some(self.not_null_identity))
     }
 
-    pub(crate) fn constraint_identities_mut(&mut self) -> impl Iterator<Item = &mut Option<ConstraintIdentity>> {
-        self.checks[..self.n_checks].iter_mut().map(|check| &mut check.identity)
+    pub(crate) fn constraint_identities_mut(
+        &mut self,
+    ) -> impl Iterator<Item = &mut Option<ConstraintIdentity>> {
+        self.checks[..self.n_checks]
+            .iter_mut()
+            .map(|check| &mut check.identity)
             .chain(self.not_null.then_some(&mut self.not_null_identity))
     }
 }
 
-pub(crate) fn validate_constraint_identities(identities: impl Iterator<Item = Option<ConstraintIdentity>> + Clone) -> Result<(), SqlError> {
+pub(crate) fn validate_constraint_identities(
+    identities: impl Iterator<Item = Option<ConstraintIdentity>> + Clone,
+) -> Result<(), SqlError> {
     for (position, identity) in identities.clone().enumerate() {
-        let identity = identity.ok_or_else(|| sql_err!(sqlstate::DATA_EXCEPTION, "saved constraint has no creation identity"))?;
-        if identities.clone().take(position).any(|earlier| earlier == Some(identity)) {
-            return Err(sql_err!(sqlstate::DATA_EXCEPTION, "saved constraint creation identity is duplicated"));
+        let identity = identity.ok_or_else(|| {
+            sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "saved constraint has no creation identity"
+            )
+        })?;
+        if identities
+            .clone()
+            .take(position)
+            .any(|earlier| earlier == Some(identity))
+        {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "saved constraint creation identity is duplicated"
+            ));
         }
     }
     Ok(())
 }
 
+pub(crate) fn validate_constraint_lifetimes(
+    identities: impl Iterator<Item = Option<ConstraintIdentity>> + Clone,
+    owner_birth: u64,
+) -> Result<(), SqlError> {
+    validate_constraint_identities(identities.clone())?;
+    if identities.flatten().any(|identity| identity.created_at() <= owner_birth) {
+        return Err(sql_err!(sqlstate::DATA_EXCEPTION, "saved constraint creation identity precedes its owner"));
+    }
+    Ok(())
+}
+
 impl Storage {
-    pub(super) fn reserve_constraint_identities(&self, definition: &mut TableDef) -> Result<(), SqlError> {
-        for (identity, slot) in definition.not_null_identities.iter_mut().zip(&definition.attributes.slots) {
+    pub(super) fn reserve_constraint_identities(
+        &self,
+        definition: &mut TableDef,
+    ) -> Result<(), SqlError> {
+        for (identity, slot) in definition
+            .not_null_identities
+            .iter_mut()
+            .zip(&definition.attributes.slots)
+        {
             let active = match *slot {
-                super::column_attributes::AttributeSlot::Live(column) => definition.columns[usize::from(column)].not_null.is_required(),
+                super::column_attributes::AttributeSlot::Live(column) => definition.columns
+                    [usize::from(column)]
+                .not_null
+                .is_required(),
                 _ => false,
             };
-            if !active { *identity = None; }
+            if !active {
+                *identity = None;
+            }
         }
         for identity in definition.constraint_identities_mut() {
-            if identity.is_none() { *identity = Some(ConstraintIdentity::reserve(self)?); }
+            if identity.is_none() {
+                *identity = Some(ConstraintIdentity::reserve(self)?);
+            }
         }
         validate_constraint_identities(definition.constraint_identities())
     }
 
-    pub(super) fn reserve_domain_constraint_identities(&self, definition: &mut DomainSpec) -> Result<(), SqlError> {
-        if !definition.not_null { definition.not_null_identity = None; }
+    pub(super) fn reserve_domain_constraint_identities(
+        &self,
+        definition: &mut DomainSpec,
+    ) -> Result<(), SqlError> {
+        if !definition.not_null {
+            definition.not_null_identity = None;
+        }
         for identity in definition.constraint_identities_mut() {
-            if identity.is_none() { *identity = Some(ConstraintIdentity::reserve(self)?); }
+            if identity.is_none() {
+                *identity = Some(ConstraintIdentity::reserve(self)?);
+            }
         }
         validate_constraint_identities(definition.constraint_identities())
+    }
+}
+
+const VALIDATION_WORDS: usize = 1024;
+const VALIDATION_WIDTH: u64 = (VALIDATION_WORDS * u64::BITS as usize) as u64;
+
+fn validate_window(
+    identities: impl Iterator<Item = Option<ConstraintIdentity>> + Clone,
+    owner_birth: u64,
+    saved_sequence: u64,
+    first: u64,
+    seen: &[u64; VALIDATION_WORDS],
+    owned: &mut [u64; VALIDATION_WORDS],
+) -> Result<(), SqlError> {
+    validate_constraint_identities(identities.clone())?;
+    for identity in identities.flatten() {
+        let created_at = identity.created_at();
+        if created_at <= owner_birth || created_at > saved_sequence {
+            return Err(sql_err!(sqlstate::DATA_EXCEPTION, "saved constraint creation identity is outside its owner lifetime"));
+        }
+        if !(first..first + VALIDATION_WIDTH).contains(&created_at) { continue; }
+        let offset = (created_at - first) as usize;
+        let word = offset / u64::BITS as usize;
+        let bit = 1u64 << (offset % u64::BITS as usize);
+        if seen[word] & bit != 0 {
+            return Err(sql_err!(sqlstate::DATA_EXCEPTION, "saved constraint identity belongs to more than one object"));
+        }
+        owned[word] |= bit;
+    }
+    Ok(())
+}
+
+impl Storage {
+    /// Exclusive startup access includes prepared definitions. Versions of one
+    /// owner may share an identity; distinct tables or domains may not.
+    pub(crate) fn validate_restored_constraint_identities(&mut self, saved_sequence: u64) -> Result<(), SqlError> {
+        for (_, database) in self.databases_visible_to(0) {
+            let last = saved_sequence.clamp(1, MAX_CONSTRAINT_CREATION);
+            for first in (1..=last).step_by(VALIDATION_WIDTH as usize) {
+                let mut seen = [0u64; VALIDATION_WORDS];
+                let mut owned = [0u64; VALIDATION_WORDS];
+                for (slot, table) in self.tables.iter().enumerate() {
+                    if slot == self.large_object_page_table() { continue; }
+                    let state = table.definition.read();
+                    if state.identity.database != database.oid || state.identity.existence == super::CatalogDdlState::Absent { continue; }
+                    owned.fill(0);
+                    self.pending_table_defs.try_for_each_locked(&state, |definition| {
+                        validate_window(definition.constraint_identities(), state.identity.created_at, saved_sequence, first, &seen, &mut owned)
+                    })?;
+                    for (all, owner) in seen.iter_mut().zip(&owned) { *all |= owner; }
+                }
+                let types = self.type_catalog.lock().expect("type catalog lock poisoned");
+                for domain in types.domains.iter().filter(|domain| domain.database == database.oid && domain.ddl_state != super::CatalogDdlState::Absent) {
+                    owned.fill(0);
+                    validate_window(domain.constraint_identities(), domain.created_at, saved_sequence, first, &seen, &mut owned)?;
+                    if let Some(pending) = domain.pending_definition {
+                        validate_window(pending.spec.constraint_identities(), domain.created_at, saved_sequence, first, &seen, &mut owned)?;
+                    }
+                    for (all, owner) in seen.iter_mut().zip(&owned) { *all |= owner; }
+                }
+            }
+        }
+        Ok(())
     }
 }

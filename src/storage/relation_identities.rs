@@ -146,8 +146,9 @@ impl Storage {
     pub(super) fn validate_table_catalog_identities(
         &self,
         definition: &TableDef,
+        owner_birth: u64,
     ) -> Result<(), SqlError> {
-        super::validate_constraint_identities(definition.constraint_identities())?;
+        super::validate_constraint_lifetimes(definition.constraint_identities(), owner_birth)?;
         for (position, identity) in definition.implicit_index_identities().enumerate() {
             let identity = identity.ok_or_else(|| {
                 sql_err!(

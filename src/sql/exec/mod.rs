@@ -64768,6 +64768,7 @@ fn inherit_partition_constraints(
             ));
         }
         let mut inherited = *constraint;
+        inherited.identity = None;
         inherited.columns = columns;
         child.fkeys[child.n_fkeys] = inherited;
         child.n_fkeys += 1;

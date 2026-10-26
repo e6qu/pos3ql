@@ -15228,15 +15228,29 @@ pub(crate) fn table_constraint_oid(
     {
         return Some(constraint.oid());
     }
-    if let Some(constraint) = table.checks().iter().find(|constraint| constraint.name.as_str() == name) {
+    if let Some(constraint) = table
+        .checks()
+        .iter()
+        .find(|constraint| constraint.name.as_str() == name)
+    {
         return Some(constraint.oid());
     }
-    if let Some(constraint) = table.fkeys().iter().find(|constraint| constraint.name.as_str() == name) {
+    if let Some(constraint) = table
+        .fkeys()
+        .iter()
+        .find(|constraint| constraint.name.as_str() == name)
+    {
         return Some(constraint.oid());
     }
-    table.columns().iter().enumerate().find(|(_, column)| {
-        column.not_null.is_required() && not_null_constraint_name(&table, column).as_str() == name
-    }).map(|(column, _)| table.not_null_constraint_oid(column))
+    table
+        .columns()
+        .iter()
+        .enumerate()
+        .find(|(_, column)| {
+            column.not_null.is_required()
+                && not_null_constraint_name(&table, column).as_str() == name
+        })
+        .map(|(column, _)| table.not_null_constraint_oid(column))
 }
 
 /// Resolve a constraint lifetime to its current table and name.
@@ -15490,7 +15504,7 @@ pub fn constraint_def_text<'a>(
         if !storage.table_slot_visible_to(slot, txid) {
             continue;
         }
-        for (check_index, check) in storage.table_def(slot, txid).checks().iter().enumerate() {
+        for check in storage.table_def(slot, txid).checks() {
             let check_oid = check.oid();
             if check_oid != oid {
                 continue;
@@ -15523,7 +15537,7 @@ pub fn constraint_def_text<'a>(
         if !storage.domain_slot_visible_to(slot, txid) {
             continue;
         }
-        for (check_index, check) in domain.checks().iter().enumerate() {
+        for check in domain.checks() {
             let check_oid = check.oid();
             if check_oid != oid {
                 continue;
@@ -20550,7 +20564,7 @@ fn pg_constraint_values<'a>(
         if !storage.table_slot_visible_to(slot, txid) {
             continue;
         }
-        for (check_index, check) in storage.table_def(slot, txid).checks().iter().enumerate() {
+        for check in storage.table_def(slot, txid).checks() {
             if n == out.len() {
                 return Err(catalog_capacity_exceeded("pg_constraint"));
             }
@@ -20731,7 +20745,7 @@ fn pg_constraint_values<'a>(
         if !storage.domain_slot_visible_to(slot, txid) {
             continue;
         }
-        for (check_index, check) in domain.checks().iter().enumerate() {
+        for check in domain.checks() {
             if n == out.len() {
                 return Err(catalog_capacity_exceeded("pg_constraint"));
             }
@@ -25996,8 +26010,12 @@ fn pg_trigger<'a>(
                         17,
                         child_oid,
                     ),
-                    crate::storage::ForeignKeyTrigger::CheckInsert => (child_oid, 1644, 5, parent_oid),
-                    crate::storage::ForeignKeyTrigger::CheckUpdate => (child_oid, 1645, 17, parent_oid),
+                    crate::storage::ForeignKeyTrigger::CheckInsert => {
+                        (child_oid, 1644, 5, parent_oid)
+                    }
+                    crate::storage::ForeignKeyTrigger::CheckUpdate => {
+                        (child_oid, 1645, 17, parent_oid)
+                    }
                 };
                 rows[count] = row(
                     &[

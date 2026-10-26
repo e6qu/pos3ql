@@ -2967,7 +2967,8 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             n += 1;
             n += 3;
             n += def.implicit_index_identities().count() * 8;
-            n += def.constraint_identities().count() * crate::storage::ConstraintIdentity::ENCODED_BYTES;
+            n += def.constraint_identities().count()
+                * crate::storage::ConstraintIdentity::ENCODED_BYTES;
             n
         }
         WalOp::BeginTableRewrite {
@@ -3538,7 +3539,8 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             for c in def.checks() {
                 n += 1 + c.name.as_str().len() + 2 + c.expression.as_str().len() + 1;
             }
-            n += def.constraint_identities().count() * crate::storage::ConstraintIdentity::ENCODED_BYTES;
+            n += def.constraint_identities().count()
+                * crate::storage::ConstraintIdentity::ENCODED_BYTES;
             n
         }
         WalOp::RestoreDomain(payload)
@@ -4719,7 +4721,9 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                     );
             }
             for identity in def.constraint_identities() {
-                let Some(identity) = identity else { return false; };
+                let Some(identity) = identity else {
+                    return false;
+                };
                 ok &= buffer.append(&identity.to_le_bytes());
             }
             ok
@@ -5716,7 +5720,9 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                     && buffer.append(&[c.validation.code()]);
             }
             for identity in def.constraint_identities() {
-                let Some(identity) = identity else { return false; };
+                let Some(identity) = identity else {
+                    return false;
+                };
                 ok &= buffer.append(&identity.to_le_bytes());
             }
             ok
@@ -7975,11 +7981,14 @@ fn decode_op_inner<'a>(
                 *identity = Some(crate::storage::RelationIdentity::parse(created_at)?);
             }
             for identity in def.constraint_identities_mut() {
-                let bytes = payload.get(at..at + crate::storage::ConstraintIdentity::ENCODED_BYTES)?;
+                let bytes =
+                    payload.get(at..at + crate::storage::ConstraintIdentity::ENCODED_BYTES)?;
                 at += crate::storage::ConstraintIdentity::ENCODED_BYTES;
-                *identity = Some(crate::storage::ConstraintIdentity::from_le_bytes(bytes.try_into().ok()?)?);
+                *identity = Some(crate::storage::ConstraintIdentity::from_le_bytes(
+                    bytes.try_into().ok()?,
+                )?);
             }
-            crate::storage::validate_constraint_identities(def.constraint_identities()).ok()?;
+            crate::storage::validate_constraint_lifetimes(def.constraint_identities(), identity.created_at()).ok()?;
             for (position, identity) in def.implicit_index_identities().enumerate() {
                 if def
                     .implicit_index_identities()
@@ -9914,15 +9923,23 @@ fn decode_op_inner<'a>(
                 };
             }
             for check in checks.iter_mut().take(n_checks) {
-                let bytes = payload.get(at..at + crate::storage::ConstraintIdentity::ENCODED_BYTES)?;
+                let bytes =
+                    payload.get(at..at + crate::storage::ConstraintIdentity::ENCODED_BYTES)?;
                 at += crate::storage::ConstraintIdentity::ENCODED_BYTES;
-                check.identity = Some(crate::storage::ConstraintIdentity::from_le_bytes(bytes.try_into().ok()?)?);
+                check.identity = Some(crate::storage::ConstraintIdentity::from_le_bytes(
+                    bytes.try_into().ok()?,
+                )?);
             }
             let not_null_identity = if not_null {
-                let bytes = payload.get(at..at + crate::storage::ConstraintIdentity::ENCODED_BYTES)?;
+                let bytes =
+                    payload.get(at..at + crate::storage::ConstraintIdentity::ENCODED_BYTES)?;
                 at += crate::storage::ConstraintIdentity::ENCODED_BYTES;
-                Some(crate::storage::ConstraintIdentity::from_le_bytes(bytes.try_into().ok()?)?)
-            } else { None };
+                Some(crate::storage::ConstraintIdentity::from_le_bytes(
+                    bytes.try_into().ok()?,
+                )?)
+            } else {
+                None
+            };
             if at != payload.len() {
                 return None;
             }
@@ -9945,7 +9962,7 @@ fn decode_op_inner<'a>(
                 pending_definition: None,
                 ddl_state: crate::storage::CatalogDdlState::Absent,
             };
-            crate::storage::validate_constraint_identities(definition.constraint_identities()).ok()?;
+            crate::storage::validate_constraint_lifetimes(definition.constraint_identities(), definition.created_at).ok()?;
             if decoded_domain.is_none()
                 && (kind == KIND_CREATE_DOMAIN_TYPED) != domain_needs_typed_journal(&definition)
             {

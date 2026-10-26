@@ -40,13 +40,17 @@ jobs:
         run: |
           set -euo pipefail
           docker exec "$POSTGRES_CONTAINER" psql -U postgres -X -At -c 'SELECT version()'
-          docker exec "$POSTGRES_CONTAINER" createdb -U postgres constraint_identities
-          docker exec -i "$POSTGRES_CONTAINER" psql -U postgres -d constraint_identities -X -Atq -v ON_ERROR_STOP=1 < tests/external/differential_exact/28_constraint_identities.sql > "$RUNNER_TEMP/constraint-identities.reference"
-          test "$(wc -l < "$RUNNER_TEMP/constraint-identities.reference")" -eq 12
-          if grep -v '^t$' "$RUNNER_TEMP/constraint-identities.reference"; then
-            exit 1
-          fi
-          cat "$RUNNER_TEMP/constraint-identities.reference"
+          for specification in 28_constraint_identities:12 29_wide_domain_constraints:1; do
+            database=${specification%:*}
+            expected=${specification##*:}
+            docker exec "$POSTGRES_CONTAINER" createdb -U postgres "$database"
+            docker exec -i "$POSTGRES_CONTAINER" psql -U postgres -d "$database" -X -Atq -v ON_ERROR_STOP=1 < "tests/external/differential_exact/$database.sql" > "$RUNNER_TEMP/$database.reference"
+            test "$(wc -l < "$RUNNER_TEMP/$database.reference")" -eq "$expected"
+            if grep -v '^t$' "$RUNNER_TEMP/$database.reference"; then
+              exit 1
+            fi
+            cat "$RUNNER_TEMP/$database.reference"
+          done
       - name: Format and retain correction
         run: |
           cargo fmt
@@ -57,8 +61,8 @@ jobs:
       - name: Verify constraint lifetimes and cold recovery
         shell: bash
         run: |
-          python3 tools/test_command.py cargo test --lib --locked -- constraint_public_identifiers --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/constraint-lifetimes.log"
-          grep -Eq 'test result: ok\. 2 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/constraint-lifetimes.log"
+          python3 tools/test_command.py cargo test --lib --locked -- constraint_public_identifiers constraint_manifest_wide --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/constraint-lifetimes.log"
+          grep -Eq 'test result: ok\. 3 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/constraint-lifetimes.log"
       - name: Build every target and lint
         run: cargo clippy --all-targets --locked -- -D warnings
       - name: Retain constraint and formatting evidence
@@ -68,7 +72,7 @@ jobs:
           name: constraint-identities-${{ github.sha }}
           path: |
             ${{ runner.temp }}/formatting.patch
-            ${{ runner.temp }}/constraint-identities.reference
+            ${{ runner.temp }}/*.reference
             ${{ runner.temp }}/constraint-check.log
             ${{ runner.temp }}/constraint-lifetimes.log
           if-no-files-found: error

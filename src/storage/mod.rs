@@ -42,7 +42,9 @@ pub(crate) use catalog_sources::{
     SessionIdentity, SessionRole,
 };
 mod constraint_identities;
-pub(crate) use constraint_identities::{ConstraintIdentity, ForeignKeyTrigger, validate_constraint_identities};
+pub(crate) use constraint_identities::{
+    ConstraintIdentity, ForeignKeyTrigger, validate_constraint_identities, validate_constraint_lifetimes,
+};
 mod column_maps;
 pub(crate) use column_maps::{RelationColumnMap, RelationRowDecoder};
 mod definition_images;
@@ -40224,10 +40226,14 @@ impl Storage {
         };
         match creation {
             type_identities::TypeCreationAdmission::Fresh => {
+                spec.not_null_identity = None;
+                for identity in spec.constraint_identities_mut() {
+                    *identity = None;
+                }
                 self.reserve_domain_constraint_identities(&mut spec)?;
             }
             type_identities::TypeCreationAdmission::Restored(_) => {
-                validate_constraint_identities(spec.constraint_identities())?;
+                validate_constraint_lifetimes(spec.constraint_identities(), created_at)?;
             }
         }
         catalog
@@ -40499,6 +40505,7 @@ impl Storage {
         let prior = domain.pending_definition;
         constraint_names::domain(domain.definition_for(txid).name, &mut spec)?;
         self.reserve_domain_constraint_identities(&mut spec)?;
+        validate_constraint_lifetimes(spec.constraint_identities(), domain.created_at)?;
         let source = type_references::TypeIdentity::new(
             origin,
             domain.database,
@@ -47556,8 +47563,8 @@ impl Storage {
         revision: TableDefinitionRevision,
         rewrites_rows: bool,
     ) -> Result<(), SqlError> {
-        self.validate_table_catalog_identities(&definition)?;
         let state = self.tables[index].definition.read();
+        self.validate_table_catalog_identities(&definition, state.identity.created_at)?;
         let source = self.catalog_object_identity(
             catalog_sources::CatalogObjectSlot::Table(index),
             state.identity.database,

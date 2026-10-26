@@ -484,6 +484,21 @@ impl DefinitionVersions {
             .map(|head| self.read(head.tail as usize).version)
     }
 
+    pub(super) fn try_for_each_locked(
+        &self,
+        state: &DefinitionState,
+        mut visit: impl FnMut(&TableDef) -> Result<(), SqlError>,
+    ) -> Result<(), SqlError> {
+        visit(state.committed())?;
+        let mut tail = state.pending.map(|head| head.tail);
+        while let Some(slot) = tail {
+            let entry = self.read(slot as usize);
+            visit(&entry.version.def)?;
+            tail = entry.previous;
+        }
+        Ok(())
+    }
+
     pub(super) fn latest_index_identities(
         &self,
         state: &DefinitionState,

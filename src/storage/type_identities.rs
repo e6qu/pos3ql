@@ -7,14 +7,14 @@ pub(crate) const MAX_TYPE_CREATION: u64 = 9_999_999;
 /// A nonzero stamp with a three-byte optional representation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(C)]
-pub struct TypeCreation {
+pub(crate) struct TypeCreation {
     low: NonZeroU8,
     upper: [u8; 2],
 }
 
 impl TypeCreation {
     /// Rejects zero and stamps outside the named-type identifier range.
-    pub const fn parse(created_at: u64) -> Option<Self> {
+    pub(crate) const fn parse(created_at: u64) -> Option<Self> {
         if created_at == 0 || created_at > MAX_TYPE_CREATION {
             return None;
         }
@@ -30,7 +30,7 @@ impl TypeCreation {
         })
     }
 
-    pub const fn created_at(self) -> u64 {
+    pub(crate) const fn created_at(self) -> u64 {
         (self.low.get() - 1) as u64 + 255 * u16::from_le_bytes(self.upper) as u64
     }
 }
@@ -50,11 +50,17 @@ mod tests {
                 for low in [0, 1, 253, 254] {
                     let created_at = upper * 255 + low + 1;
                     if created_at <= MAX_TYPE_CREATION {
-                        assert_eq!(TypeCreation::parse(created_at).unwrap().created_at(), created_at);
+                        assert_eq!(
+                            TypeCreation::parse(created_at).unwrap().created_at(),
+                            created_at
+                        );
                     }
                 }
             }
-            assert_eq!(TypeCreation::parse(MAX_TYPE_CREATION).unwrap().created_at(), MAX_TYPE_CREATION);
+            assert_eq!(
+                TypeCreation::parse(MAX_TYPE_CREATION).unwrap().created_at(),
+                MAX_TYPE_CREATION
+            );
             for rejected in [0, MAX_TYPE_CREATION + 1, u64::MAX] {
                 assert!(TypeCreation::parse(rejected).is_none());
             }

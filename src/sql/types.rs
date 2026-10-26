@@ -6179,26 +6179,26 @@ mod named_type_layout_probe {
     }
 
     #[derive(Debug, Clone, Copy, PartialEq)]
-struct ProjectedColumnMeta {
-    pub name: crate::storage::SqlName,
-    pub ctype: ProjectedColType,
-    pub type_mod: i32,
-    pub collation: crate::sql::ast::Collation,
-    pub storage: crate::sql::ast::ColumnStorage,
-    pub compression: crate::sql::ast::ColumnCompression,
-    pub not_null: crate::storage::NotNullOrigin,
-    pub not_null_inheritable: bool,
-    pub unique: bool,
-    pub primary: bool,
-    pub auto_increment: bool,
-    pub default: crate::storage::ColumnDefault,
-    pub is_identity: bool,
-    pub identity_always: bool,
-    pub auto_increment_step: i64,
-    pub user_type: Option<crate::storage::UserTypeName>,
-    pub statistics_target: i16,
-    pub statistics_options: crate::sql::ast::ColumnStatisticsOptions,
-}
+    struct ProjectedColumnMeta {
+        pub name: crate::storage::SqlName,
+        pub ctype: ProjectedColType,
+        pub type_mod: i32,
+        pub collation: crate::sql::ast::Collation,
+        pub storage: crate::sql::ast::ColumnStorage,
+        pub compression: crate::sql::ast::ColumnCompression,
+        pub not_null: crate::storage::NotNullOrigin,
+        pub not_null_inheritable: bool,
+        pub unique: bool,
+        pub primary: bool,
+        pub auto_increment: bool,
+        pub default: crate::storage::ColumnDefault,
+        pub is_identity: bool,
+        pub identity_always: bool,
+        pub auto_increment_step: i64,
+        pub user_type: Option<crate::storage::UserTypeName>,
+        pub statistics_target: i16,
+        pub statistics_options: crate::sql::ast::ColumnStatisticsOptions,
+    }
 
     #[test]
     fn named_type_creation_code_layout_probe() {

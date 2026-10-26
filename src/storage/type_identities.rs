@@ -31,7 +31,7 @@ impl TypeCreation {
     }
 
     pub(crate) const fn created_at(self) -> u64 {
-        (self.low.get() - 1) as u64 + 255 * u16::from_le_bytes(self.upper) as u64
+        self.low.get() as u64 + 255 * u16::from_le_bytes(self.upper) as u64
     }
 }
 

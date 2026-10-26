@@ -11,6 +11,9 @@ must not be sent. If the final response is lost, the client may not know whether
 the commit happened; it must check before retrying an operation that could
 charge the customer twice.
 
+[Architecture](architecture.md) explains column-group packing, indexes, caches
+and the difference between network concurrency and SQL CPU workers.
+
 pos3ql connects directly to the shared S3-compatible HTTP API. It uses one
 implementation for supported endpoints, with no vendor SDK, translation proxy,
 or database behavior selected by the endpoint's brand.
@@ -28,7 +31,7 @@ upload waits; success for either order waits for its own durable log position.
 `object_store_get_slots` reserves independent read clients. A selected-column
 scan starts a bounded batch of missing columns before waiting, retaining
 completed extents across resumption. Atomic operations use a separate block
-client and can still wait synchronously; SQL CPU execution remains serial.
+client and can still wait synchronously; SQL CPU work uses one worker.
 A SELECT uses that client from its first routine or state-changing expression
 until the statement finishes, including reads after a routine returns. For
 example, a function can prepare a query and then read an uncached invoice
@@ -156,7 +159,7 @@ that query's output label or position reuses the saved value, following
 | `DeleteObject` | Delete one key; deleting an absent key is idempotent. |
 
 The bucket is the durable namespace. `object_store_prefix` isolates one pos3ql
-database within it. Object keys and list prefixes are encoded once at the S3
+instance and its SQL databases within it. Object keys and list prefixes are encoded once at the S3
 client boundary; storage and database code never inspect endpoint brands.
 
 ETags are opaque generation tokens. pos3ql must not assume that an ETag is an

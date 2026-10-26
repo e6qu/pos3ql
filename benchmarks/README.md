@@ -18,6 +18,11 @@ SeaweedFS run on the same test host. Different operation counts and saved data
 layouts limit timing comparisons; request metrics describe the actual storage
 work performed.
 
+The [current interpretation](../docs/performance.md#what-the-retained-measurements-actually-show)
+quotes representative old results and distinguishes operations, statements and
+transactions per second. New code requires a new run; theoretical block counts
+and bandwidth calculations do not update these historical reports.
+
 ## Comparison evidence
 
 | Date | Evidence |

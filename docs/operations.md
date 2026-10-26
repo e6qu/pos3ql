@@ -37,7 +37,7 @@ curl --fail http://127.0.0.1:9187/capacity
 ```
 
 `/capacity` shows the reservations chosen at startup and their current use.
-More client connections do not currently mean more statements executing together.
+More connections allow more waiting work; SQL CPU execution still uses one worker.
 
 | Path | Success | Meaning |
 |---|---:|---|
@@ -73,6 +73,56 @@ does not shorten that delay. An idle server also retries a failure that happened
 before a checkpoint started. An empty retry releases its wakeup without changing
 publication readiness. This pacing applies to background maintenance; the commit
 barrier still decides when client responses are durable.
+
+## Scheduled work and schema migrations
+
+Internal checkpointing, file merges, row-history cleanup and eligible object
+deletion run from the server event loop. They advance between client work and
+while idle; no OS cron job is required. A successful COMMIT does not wait for a
+full checkpoint, but it does wait for its durable journal publication.
+Maintenance retries and quotas are described in [architecture](architecture.md#maintenance-and-scheduling).
+
+Application tasks are different. Use an external scheduler, such as an OS cron
+job or your deployment's job runner, to connect with an ordinary PostgreSQL
+client. There is no built-in SQL job scheduler or native background-worker ABI;
+`pg_cron` is not a qualified extension. For example, a daily application job can
+run a reviewed SQL file:
+
+```cron
+0 2 * * * PGSERVICE=orders_jobs /usr/bin/psql -X -v ON_ERROR_STOP=1 -f /etc/orders/remove_expired_orders.sql
+```
+
+`orders_jobs` is an operator-configured libpq service, not a pos3ql setting.
+Give it the required database, host, TLS and account settings, keep passwords in
+an owner-only credential file, record failures and prevent overlapping runs in
+the scheduler. Choose small transactions that fit the configured buffers. A
+scheduler retry after a lost commit reply must check whether its work already
+happened.
+
+Schema migration tools also use ordinary clients and supported SQL. They must
+coordinate which runner applies a migration and record applied versions. pos3ql
+provides transactional DDL and savepoints, but no migration runner or history
+table. For example, with `orders` already present:
+
+```sql
+BEGIN;
+SET LOCAL lock_timeout = '5s';
+ALTER TABLE orders ADD COLUMN fulfilled_at timestamptz;
+COMMIT;
+```
+
+A conflicting relation lock can make this fail with `55P03`; rollback before
+retrying. ADD COLUMN, CREATE INDEX, constraint validation and type rewrites can
+have different locking, row-scan and memory costs. A single large migration is
+not made nonblocking by the scheduler. Rehearse the actual SQL and data shape
+under the intended startup capacities.
+
+Binary upgrades are a separate operation. There is no automatic conversion of
+older pos3ql formats. Check the [format matrix](durable-format.md), stop the
+appropriate traffic, retain the source and verify logical export/restore into a
+fresh namespace when required. [Offline backup commands](backup-restore.md)
+promote their own writer and fence a running server on that prefix; do not put
+one on a live-server cron schedule as though it were a nonblocking SQL backup.
 
 ## Metrics and alerts
 

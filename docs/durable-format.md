@@ -3,24 +3,16 @@
 Use this guide to identify the formats the current binary reads and writes.
 Compatibility with earlier pos3ql versions is not required. Existing older
 readers are listed as implemented behavior, not a promise to retain them.
-No automatic upgrade, downgrade, or offline migration is promised.
+No automatic upgrade, downgrade, or offline migration is provided. Application
+schema changes and binary format changes have different procedures; see
+[operations](operations.md#scheduled-work-and-schema-migrations). [Architecture](architecture.md)
+explains the layout and physical limits before the byte-level inventory here.
 
 **User example:** after an incompatible format change, a database saved by an
 older pos3ql binary may fail startup. Use a fresh object-store prefix or an
 explicitly verified logical export and restore between the chosen binaries.
 Never point a new database at an old prefix and assume its objects are disposable.
 Unknown formats stop startup explicitly.
-
-Each saved table requires one `hidx <table-slot> <0-or-1>` index-presence record,
-including tables without an index. Missing, duplicate, unknown-table or malformed
-records stop startup. Journal kind 156 stores a ten-byte typed table position
-(slot and creation stamp) followed by a strict zero-or-one flag. Recovery rejects
-a different table lifetime before applying the hint. A hint alone does not make
-an unknown row estimate valid. Prepared records older than the checkpoint floor
-cannot overwrite the checkpoint's newer relation counts or index hints.
-The internal large-object page table requires a false hint and has no user
-catalog position. Catalog history encodes permission items with role identifiers
-and numeric render caches; SQL output refreshes the current role names.
 
 Object storage is the durable tier. Immutable objects may outlive the binary
 that wrote them, so every root and row SST carries a format identity that is
@@ -202,6 +194,18 @@ types, lengths, array elements, expression framing and the hidden relation
 identifier. Invalid images fail with `22000` before writer promotion.
 
 ## Format details for implementers
+
+Each saved table requires one `hidx <table-slot> <0-or-1>` index-presence record,
+including tables without an index. Missing, duplicate, unknown-table or malformed
+records stop startup. Journal kind 156 stores a ten-byte typed table position
+(slot and creation stamp) followed by a strict zero-or-one flag. Recovery rejects
+a different table lifetime before applying the hint. A hint alone does not make
+an unknown row estimate valid. Prepared records older than the checkpoint floor
+cannot overwrite the checkpoint's newer relation counts or index hints.
+The internal large-object page table requires a false hint and has no user
+catalog position. Catalog history encodes permission items with role identifiers
+and numeric render caches; SQL output refreshes the current role names.
+
 
 The manifest header versions the catalog and root record grammar. Each `dsst`
 manifest reference separately names its row SST format. `v2` uses direct

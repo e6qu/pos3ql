@@ -1,22 +1,13 @@
-//! The block grid: the one unit every persisted byte travels in.
+//! Immutable table and index blocks, formats, caches and provider-neutral I/O.
 //!
-//! A block is fixed-size, self-describing and checksummed, and it is
-//! *content-addressed* — its identity hashes the block type and payload with
-//! SHA-256. The layers above need no separate identity or duplicate-write
-//! tracking. Writing a
-//! block twice is writing it once, so a retry after an ambiguous failure is
-//! free rather than a duplicate. Nothing has to be overwritten, so only the
-//! root of the tree needs compare-and-swap. And a block that reads back with
-//! the wrong bytes cannot be mistaken for a different valid block, because its
-//! name is what it should contain.
+//! Blocks are at most 256 KiB, with a typed payload and checksum. Their names
+//! hash the block type and payload with SHA-256; the journal position records
+//! provenance without changing that identity. Retrying an upload keeps the same
+//! name and bytes, but can repeat network requests and transferred bytes.
 //!
-//! The header carries a CRC-32C as well as the identity hash: the CRC catches a
-//! damaged read cheaply on every access, while the hash is what makes the name
-//! meaningful and is checked when a block arrives from somewhere untrusted.
-//!
-//! Nothing here allocates. Encoding writes into a caller-provided buffer and
-//! decoding borrows from one, so a block lives in whatever pool its owner
-//! reserved at startup.
+//! Mutable checkpoint and commit roots are published separately with conditional
+//! writes. Journal batches, descriptors and writer fences are not data blocks.
+//! Encoders use caller-reserved buffers; decoders borrow their input.
 
 macro_rules! delegate_async_block_reads {
     () => {
@@ -126,10 +117,8 @@ pub(crate) use write_batch::BlockWriteBatch;
 
 use crate::wal::crc32c::crc32c;
 
-/// Bytes in a block, header included. Large enough that an object-storage GET
-/// is worth its round trip, small enough that reading one row does not drag a
-/// megabyte behind it. The read path is ranged, so this is the granularity a
-/// cache miss costs.
+/// Maximum framed block bytes, including the header. Packed ranges and short
+/// blocks can make a request smaller; overflow rows can require several requests.
 pub(crate) const BLOCK_SIZE: usize = 256 * 1024;
 
 /// `checksum` u32 | `block_type` u8 | `format` u8 | `reserved` [u8; 2] | `lsn` u64 |
@@ -152,9 +141,8 @@ pub(crate) enum BlockType {
     ManifestLog = 4,
     /// A WAL segment shipped to the bucket.
     WalSegment = 5,
-    /// An SST's complete block roster (every identity the SST comprises,
-    /// itself included last as the index/filter are known by then) — what
-    /// garbage collection walks instead of the data blocks themselves.
+    /// An SST's block roster, excluding the roster object's own identity.
+    /// Garbage collection retains that object through the SST handle.
     SstRoster = 6,
     /// Commit-LSN-versioned sorted rows.
     SstDataV2 = 8,

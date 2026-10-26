@@ -1,6 +1,7 @@
 # Contributing to pos3ql
 
-Read [README.md](README.md), [PLAN.md](PLAN.md), [AGENTS.md](AGENTS.md), and
+Read [README.md](README.md), [architecture](docs/architecture.md),
+[PLAN.md](PLAN.md), [AGENTS.md](AGENTS.md), and
 [terminology](docs/terminology.md) before changing a boundary. License terms are
 in [LICENSE](LICENSE).
 
@@ -33,6 +34,14 @@ numbers, error codes, and source provenance in the appropriate technical guide.
 Use the documentation index to avoid repeating the same contract across files.
 Preserve dated measurements and upstream licenses; simplify current guidance
 without rewriting historical evidence.
+
+Architecture claims must identify current code paths and remaining gaps. Distinguish
+hard encodings, startup reservations, configured examples, calculated ceilings and
+measured results. State throughput units and workload/hardware/revision; never
+turn addressable bytes or same-host timings into a production capacity promise.
+Comments explain current invariants and costs, including repeated network work
+on retries. Remove completed-work narration from current guides and the roadmap;
+retain immutable evidence and upstream provenance in their indexes.
 
 ## Engineering boundaries
 

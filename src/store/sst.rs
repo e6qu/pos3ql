@@ -1,24 +1,14 @@
-//! A sorted string table over the block grid.
+//! Immutable row generations, sorted by row identity and descending commit position.
 //!
-//! An SST is a table's row versions written once, in key order, and never changed —
-//! which is what lets it be a run of immutable blocks rather than a file that
-//! is seeked within. Current rows are packed into [`BlockType::SstDataV2`]
-//! blocks in key order (row-packed or self-describing PAX), and sparse
-//! [`BlockType::SstIndexV2`] leaves record,
-//! for each data block, the first key it holds and the block's identity. A
-//! large SST adds one root over those leaves. Given the root identity a reader
-//! can find any key; nothing else about the SST needs naming.
+//! Full slices group values by column (PAX); small deltas keep compressed rows.
+//! Packed references name verified ranges within shared physical objects. Sparse
+//! index leaves, an optional root and a Bloom filter narrow candidate groups.
+//! A miss can still need several generations, column extents or overflow blocks;
+//! an index descent is not a fixed object-request count for a SQL query.
 //!
-//! The index is *sparse* — one entry per data block, not per row. Finding a key
-//! is a binary search of the index for the last block whose first key does not
-//! exceed the target, then a scan of that one block. A lookup reads a filter,
-//! one index leaf and one data block (plus the root for a multi-leaf SST).
-//! That is the whole point of the sparse index: lookup cost stays bounded as
-//! the table grows, and the index is cacheable alongside the data.
-//!
-//! SSTs key versions by `(rowid, commit_lsn)`: row identities ascend, and
-//! versions of one row descend by commit LSN so a snapshot lookup finds the
-//! newest admissible image first.
+//! Builders and readers reuse startup buffers. Roster, index and assembled-row
+//! bounds are checked independently; index addressability alone is not a usable
+//! database-size guarantee.
 
 use crate::mem::arena::Arena;
 use crate::sql::types::ColType;
@@ -73,7 +63,8 @@ pub(crate) struct SstHandle {
     pub(crate) index: BlockId,
     pub(crate) filter: BlockId,
     /// The SST's complete block roster: every identity it comprises (data,
-    /// chain, filter, index), so garbage collection can enumerate an SST by
+    /// chain, filter, index), excluding the roster object itself. Garbage collection
+    /// retains the roster through this handle and enumerates the other blocks by
     /// reading one block instead of all of them.
     pub(crate) roster: BlockId,
     pub(crate) format: RowSstFormat,
@@ -189,9 +180,8 @@ const TOMB_FLAG: u32 = 1 << 30;
 pub(crate) const MAX_ASSEMBLED: usize =
     (MAX_PAYLOAD - VERSIONED_ENTRY_HEADER - 2 - MAX_CHAIN * 32) + MAX_CHAIN * MAX_PAYLOAD;
 
-/// The most overflow blocks one chained row may span. With ~256 KiB blocks
-/// this caps a single row at about 4 MiB — far above anything the engine's
-/// arenas admit — and exceeding it is a loud error, never truncation.
+/// Maximum overflow blocks following a row's inline head. `MAX_ASSEMBLED`
+/// includes both; statement and protocol buffers can impose smaller limits.
 const MAX_CHAIN: usize = 16;
 const PAX_V2_MAGIC: u32 = 0x3258_4150;
 const PAX_COLUMN_MAGIC: u32 = 0x3143_4150;
@@ -208,9 +198,8 @@ const PACKED_GROUP_TARGET: usize = MAX_PAYLOAD / 2;
 const VERSIONED_INDEX_ENTRY: usize = 16 + 32;
 const PACKED_VERSIONED_INDEX_ENTRY: usize = 16 + 32 + 4 + 4 + 32;
 
-/// The most data blocks a single-block index can point at. A larger SST needs a
-/// multi-block index, which is a later concern; this bound is checked and raised
-/// rather than silently overrun.
+/// Entries in one packed index leaf. Larger generations add leaves under a root;
+/// the separately bounded physical-block roster can fill first.
 const MAX_DATA_BLOCKS: usize = MAX_PAYLOAD / PACKED_VERSIONED_INDEX_ENTRY;
 
 /// The most block identities one roster block can list — and so the most
@@ -298,21 +287,19 @@ pub(crate) struct SstWriter {
 /// keys, degrading gracefully past the top as before.
 const FILTER_TIERS: [usize; 3] = [2 * 1024, 16 * 1024, FILTER_BYTES];
 
-/// The most index leaves a root block tracks: at 44 bytes per entry a root
-/// could hold ~5900, but the writer's own memory bounds it lower — still
-/// about 26 million data blocks (terabytes) per SST, checked and raised
-/// rather than overrun.
+/// Startup-reserved index leaves. Root framing and the physical-block roster
+/// impose independent limits; multiplying leaf capacities is not a size promise.
 const MAX_LEAVES: usize = 4096;
 
 /// A root index block starts with this in place of a leaf's entry count.
-/// Unambiguous: a leaf's count is at most `MAX_DATA_BLOCKS` (~6.5k).
+/// Unambiguous: a leaf's count is at most `MAX_DATA_BLOCKS`.
 pub(crate) const INDEX_ROOT_MAGIC: u32 = 0xFFFF_FFFF;
 
 const VERSIONED_ROOT_ENTRY: usize = 16 + 4 + 32;
 
 impl SstWriter {
-    /// Allocates the writer's fixed buffers (about 0.9 MiB). Startup only —
-    /// after the freeze, `reset` is how a writer is reused.
+    /// Allocates fixed writer buffers at startup. `budget_bytes` accounts for
+    /// every buffer; after the memory freeze, reuse the writer with `reset`.
     pub(crate) fn new() -> Self {
         Self {
             pending: vec![0u8; MAX_PAYLOAD].into_boxed_slice(),

@@ -24,6 +24,11 @@ range indexes skip disjoint intervals. “Pruning” means safely skipping such
 data. The sections below specify the saved summaries, exact checks, and memory
 limits used to do this.
 
+The [architecture](architecture.md#reads-and-storage-layout) places these indexes
+alongside row generations, PAX column groups and caches. Its physical bounds
+apply in addition to the navigation structures below. Index pruning is a way to
+reduce work, not a guaranteed request count or a measured query rate.
+
 ## How objects are organized
 
 GiST point, box, polygon, and circle classes and SP-GiST quad-point, k-d point,

@@ -8473,8 +8473,8 @@ fn decode_op_inner<'a>(
                 name,
             })
         }),
-        KIND_CREATE_PUBLICATION_V2 | KIND_CREATE_PUBLICATION_V3 => decode_large_op(|| {
-            let wide_columns = kind == KIND_CREATE_PUBLICATION_V3;
+        KIND_CREATE_PUBLICATION_V2 => None,
+        KIND_CREATE_PUBLICATION_V3 => decode_large_op(|| {
             let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
             at += 8;
             crate::storage::CatalogIdentity::parse(created_at)?;
@@ -8483,6 +8483,9 @@ fn decode_op_inner<'a>(
             at += 2;
             let flags = *payload.get(at)?;
             at += 1;
+            if flags & !0x7f != 0 {
+                return None;
+            }
             let count = *payload.get(at)? as usize;
             at += 1;
             let schema_count = *payload.get(at)? as usize;
@@ -8498,17 +8501,12 @@ fn decode_op_inner<'a>(
                 *table = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
                 at += 2;
             }
-            let mask_bytes = count
-                * if wide_columns {
-                    ColumnSet::ENCODED_BYTES
-                } else {
-                    core::mem::size_of::<u64>()
-                };
+            let mask_bytes = count * ColumnSet::ENCODED_BYTES;
             let encoded_masks = payload.get(at..at + mask_bytes)?;
             at += mask_bytes;
             let table_column_masks = WalColumnSets::Encoded {
                 bytes: encoded_masks,
-                wide: wide_columns,
+                wide: true,
             };
             let mut table_include_descendants = [false; crate::storage::MAX_PUBLICATION_TABLES];
             for descendants in &mut table_include_descendants[..count] {

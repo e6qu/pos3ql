@@ -1,4 +1,8 @@
-//! Immutable SST publication and cold recovery through the manifest CAS.
+//! Save immutable table/index generations, publish their inventory, and recover it.
+//!
+//! Maintenance advances in bounded turns between client work and socket waits.
+//! Captured output stays private until uploads and the conditional manifest write
+//! finish. Readers and named backups retain objects that cleanup must preserve.
 
 use crate::mem::mutex::Mutex;
 use core::cmp::Ordering;
@@ -17570,6 +17574,9 @@ fn load_publication(storage: &mut Storage, line: &str) -> Result<(), CheckpointS
     let creation = crate::storage::CatalogIdentity::require(created_at)
         .map_err(|_| CheckpointSetupError::Corrupt("invalid publication creation identity"))?;
     let flags: u8 = parse_field(words.next(), "pub flags")?;
+    if flags & !0x7f != 0 {
+        return Err(CheckpointSetupError::Corrupt("invalid publication flags"));
+    }
     let count: usize = parse_field(words.next(), "pub table count")?;
     let schema_count: usize = parse_field(words.next(), "pub schema count")?;
     if count > crate::storage::MAX_PUBLICATION_TABLES {

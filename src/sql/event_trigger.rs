@@ -1908,7 +1908,7 @@ fn primary_object(
             let definition = statistics.definition_for(txid);
             base_object(
                 catalog::PG_STATISTIC_EXT_OID,
-                storage.extended_statistics(slot).oid(),
+                statistics.oid(),
                 "statistics object",
                 Some(definition.schema.as_str()),
                 Some(definition.name.as_str()),
@@ -1917,11 +1917,11 @@ fn primary_object(
             )
         }
         ObjectRef::Publication(slot) => {
-            let publication = storage.publication_for_event_trigger(slot);
+            let publication = storage.publication_at(slot);
             let name = publication.name_for(txid);
             base_object(
                 catalog::PG_PUBLICATION_OID,
-                storage.publication_for_event_trigger(slot).oid(),
+                publication.oid(),
                 "publication",
                 None,
                 Some(name.as_str()),
@@ -1930,7 +1930,7 @@ fn primary_object(
             )
         }
         ObjectRef::Subscription(slot) => {
-            let subscription = storage.subscription_for_event_trigger(slot);
+            let subscription = storage.subscription_at(slot);
             let name = subscription.name_for(txid);
             base_object(
                 catalog::PG_SUBSCRIPTION_OID,
@@ -1946,7 +1946,7 @@ fn primary_object(
             let extension = storage.extension(slot);
             base_object(
                 catalog::PG_EXTENSION_OID,
-                storage.extension(slot).oid(),
+                extension.oid(),
                 "extension",
                 None,
                 Some(extension.name.as_str()),
@@ -2718,7 +2718,7 @@ fn existing_catalog_object(
             storage
                 .publications_with_slots_visible_to(txid)
                 .find_map(|(slot, _)| {
-                    (storage.publication_for_event_trigger(slot).oid() == object_id).then_some(slot)
+                    (storage.publication_at(slot).oid() == object_id).then_some(slot)
                 })
                 .ok_or_else(|| catalog_lookup_failed(class_id, object_id))?,
         )),
@@ -2731,7 +2731,7 @@ fn existing_catalog_object(
         catalog::PG_EXTENSION_OID => EventObjectRef::Primary(ObjectRef::Extension(
             storage
                 .extensions_visible_to(txid)
-                .find_map(|(slot, _)| (storage.extension(slot).oid() == object_id).then_some(slot))
+                .find_map(|(slot, extension)| (extension.oid() == object_id).then_some(slot))
                 .ok_or_else(|| catalog_lookup_failed(class_id, object_id))?,
         )),
         catalog::PG_LARGEOBJECT_OID => EventObjectRef::Primary(ObjectRef::LargeObject(

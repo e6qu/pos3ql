@@ -89,6 +89,11 @@ cannot move the conflicting row to another partition (`0A000`).
 
 ## Capacity boundaries
 
+The [architecture size table](architecture.md#memory-and-physical-size) covers
+block, overflow-row, saved-generation, heap and instance-wide inventory limits.
+The [performance guide](performance.md#estimating-bandwidth-and-throughput)
+explains why none of those numbers establishes a transactions-per-second rate.
+
 Some limits come from PostgreSQL, some are smaller implementation limits, and
 some are reservations you choose in the startup configuration. These are
 different promises. A wide query can be a supported SQL shape yet still need
@@ -112,6 +117,7 @@ boundaries apply through catalogs, wire, WAL, checkpoints, and recovery:
 | Durable array count | 65,535 elements; exact slices or streaming traversal | Array text/binary, execution, persistence, and cold-recovery fixtures |
 | Constraint count | 64 constraints per modeled table kind and 64 domain checks | SQLSTATE 54000 on the next item; changing capacity does not renumber existing rules |
 | Durable constraint identity | Creation numbers 1–9,999,999 from the shared catalog counter | CHECK, foreign-key and NOT NULL rules retain identifiers across supported edits and recovery; replacements reserve new numbers; SQLSTATE 54000 on exhaustion |
+| Other catalog lifetime identities | Statistics, extensions, foreign-data wrappers/servers/mappings, publications and subscriptions use creation numbers 1–9,999,999 | Shared catalog counter; edits/recovery preserve identity, replacement reserves a new one; `54000` on exhaustion |
 | Other definition breadth | Documented 64-item constructs, including LIST bounds, inheritance parents, trigger arguments, and routine configuration entries | Shared parse/storage boundary; widening requires review of representation and identity |
 | Stored default expressions | 120 bytes, including enum member bindings and saved catalog display text | Existing startup reservation; SQLSTATE 54000 names an overfull default or bound enum expression before installation |
 | Startup capacities | Independent catalog, connection, transaction/savepoint, row-version, lock, replication, cache, and checkpoint pools | Configuration and exact startup memory plan; named errors before partial publication |
@@ -144,8 +150,9 @@ boundaries apply through catalogs, wire, WAL, checkpoints, and recovery:
 | Statement memory | Retained heap/spilled row images, escaped query metadata, lists, joins, programs, retry logs, event graphs, JSON widths, table-function rows, and variable-width geometry | Fixed arenas; arena exhaustion is a program-limit error |
 | Value-specific limits | Full-text, XML/XPath, JSON/path nesting, rendered values, GUC bytes, and finite catalog identities | Typed source boundaries and specialized contracts below |
 
-Startup-sized catalogs have independent capacities; table count does not silently
-size unrelated classes. Transaction bounds also cover prepared and subscription
+Catalog families have separate startup capacities. Set consequential limits
+explicitly: for example, omitting `max_extended_statistics` currently derives
+its capacity from `max_tables`; the development file states it explicitly. Transaction bounds also cover prepared and subscription
 slots. The active transaction identity registry reserves
 `max_connections + max_prepared_transactions` entries. Creating a transaction
 returns `54000` if none is free; existing transactions remain usable, and ending
@@ -189,8 +196,9 @@ changes, but a PostgreSQL physical standby cannot replay pos3ql's journal.
 Similarly, familiar index names describe SQL behavior; they do not imply
 PostgreSQL's on-disk page layout.
 
-- Query execution is still serial. Workspace and catalog synchronization
-  prepare for the [remaining concurrency work](../PLAN.md#remaining-work).
+- SQL CPU work uses one worker; eligible object-store reads and uploads overlap.
+  [Architecture](architecture.md) separates those paths from the
+  [remaining CPU-worker work](../PLAN.md#remaining-work).
 - PostgreSQL's cost model and exact EXPLAIN text are not compatibility complete.
   PostgreSQL parallel-query/JIT and planner/executor hooks do not exist.
 - Heap layout, heap-version `ctid`, transaction-header columns (`xmin`, `xmax`,

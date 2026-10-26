@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Project documents: [README.md](README.md), [PLAN.md](PLAN.md), [BUGS.md](BUGS.md), and [docs/terminology.md](docs/terminology.md).
+Project documents: [README.md](README.md), [PLAN.md](PLAN.md), [BUGS.md](BUGS.md), [architecture](docs/architecture.md), and [docs/terminology.md](docs/terminology.md).
 Development and review workflow: [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Boyscout Rule

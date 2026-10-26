@@ -1,5 +1,11 @@
 # Backup and restore
 
+These commands operate on the configured instance's object-store prefix,
+including its SQL databases. They are offline writer operations, not SQL
+scheduled jobs. [Operations](operations.md#scheduled-work-and-schema-migrations)
+explains scheduling and binary/schema migrations; backups preserve saved bytes
+and do not convert an incompatible pos3ql format.
+
 **User example:** before an upgrade, stop traffic and the server, create a
 backup named `before-upgrade`, then restart the server. If the upgrade damages
 data, stop it again and restore that point. To protect against losing the

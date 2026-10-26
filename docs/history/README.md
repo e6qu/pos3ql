@@ -9,6 +9,14 @@ For example, an old report showing costly checkpoint rewrites describes the
 binary and workload recorded there. It is evidence for that investigation,
 not a measurement of today's code.
 
+## Before this architecture review
+
+Revision `27af086bff6a9e02f5c05bac1774b6bea50cc03c` preserves the
+[earlier detailed behavior narrative](https://github.com/e6qu/pos3ql/blob/27af086bff6a9e02f5c05bac1774b6bea50cc03c/docs/implemented-baseline.md).
+Current application behavior is consolidated in the [behavior guide](../implemented-baseline.md)
+and code/storage structure in [architecture](../architecture.md). Old implementation
+steps are historical evidence, not additional open roadmap items.
+
 ## Original implementation record
 
 Revision `708d5b475845492bdaa29dd573a6f508770acc62` (PR #599) preserves the

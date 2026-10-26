@@ -25,6 +25,10 @@ WAL, checkpoints, and object-store cold recovery. `xmloption` is a
 transactional session setting: `content` accepts fragments and `document`
 requires exactly one document element.
 
+The [capacity inventory](postgresql-18-compatibility.md#capacity-boundaries)
+also applies to statement, wire and saved-row sizes. XMLTABLE support does not
+remove the XML/XPath limits or establish a query-throughput rate.
+
 ## SQL/XML expressions
 
 The supported SQL syntax is:
@@ -69,6 +73,6 @@ Crossing a limit returns a named program-limit error and never allocates a
 growing runtime structure.
 
 External entity retrieval and native XML/XSLT libraries are not part of the
-runtime. This preserves the `libc`-only core and prevents XML evaluation from
+runtime. This keeps XML inside the fixed-memory core and prevents evaluation from
 opening an unbudgeted I/O path. PostgreSQL's unsupported `DEFAULT` namespace
 spelling in `XMLTABLE` is rejected explicitly as well.

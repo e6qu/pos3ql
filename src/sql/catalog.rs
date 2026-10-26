@@ -14294,10 +14294,7 @@ fn pg_description<'a>(
                 else {
                     continue;
                 };
-                (
-                    storage.publication_for_event_trigger(slot).oid(),
-                    PG_PUBLICATION_OID,
-                )
+                (storage.publication_at(slot).oid(), PG_PUBLICATION_OID)
             }
             crate::storage::CommentClass::Subscription => {
                 let Some((_, subscription)) = storage
@@ -15129,8 +15126,7 @@ fn visit_comments_for_object(
                         storage
                             .publications_with_slots_visible_to(txid)
                             .any(|(slot, _)| {
-                                storage.publication_for_event_trigger(slot).oid() == oid
-                                    && csub == slot as u32
+                                storage.publication_at(slot).oid() == oid && csub == slot as u32
                             })
                     })
             }
@@ -21018,7 +21014,7 @@ fn pg_extension<'a>(
         out[index] = row(
             &[
                 Datum::Int4(3079),
-                Datum::Int4(storage.extension(slot).oid()),
+                Datum::Int4(extension.oid()),
                 text(extension.name.as_str(), arena)?,
                 Datum::Int4(owner_oid(
                     storage,

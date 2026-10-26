@@ -20,8 +20,8 @@ machines still need qualification.
 
 For example, a cached invoice can be read while another connection waits for
 storage. A successful order commit must survive loss of both local caches.
-The [plan](PLAN.md) lists the remaining implementation and evidence required
-for final qualification and the later execution and deployment work.
+The [plan](PLAN.md) orders the remaining correctness work, multiple CPU workers
+and qualification on separate machines.
 
 See [what works today](docs/implemented-baseline.md) and the
 [remaining plan](PLAN.md) for the details and the evidence still needed.
@@ -42,14 +42,16 @@ A database where you can:
 - Judge speed and cost from repeatable measurements against vanilla
   PostgreSQL, including a comparison with the same CPU and memory allowance.
 
-The storage layout should make useful reads small and avoid rewriting unchanged
-data. For example, reading two columns of a wide table should not require
-downloading every column. [Storage layout](docs/durable-format.md) and
-[indexes](docs/index-navigation.md) describe the existing mechanisms; the
-[performance guide](docs/performance.md) explains how we measure their effect.
+Full saved slices group values by column; small updates use compressed row
+groups. Packed objects, ranged reads, immutable indexes and overlapping storage
+requests reduce unnecessary work. For example, reading two columns can avoid
+fetching a large description column. These are implemented mechanisms; their
+production benefit still needs measurement. [Architecture](docs/architecture.md)
+explains the request path, optimizations and physical size limits;
+[performance](docs/performance.md) distinguishes measured results from estimates.
 
 One active server writes to each configured object-store prefix, the group of
-object names belonging to that database. The goal is concurrent transactions
+object names belonging to that pos3ql instance and its SQL databases. The goal is concurrent transactions
 inside that server. Logical replication creates separate, asynchronously
 updated databases. [Replacement](docs/operations.md#controlled-replacement)
 transfers write ownership to another server.
@@ -111,8 +113,8 @@ reservations for the host before starting the server.
 
 ## Documentation
 
-The [documentation index](docs/README.md) routes questions about compatibility,
-running the server, backups, storage, and performance. [CONTRIBUTING.md](CONTRIBUTING.md)
+The [documentation index](docs/README.md) routes questions about architecture,
+SQL limits, scheduling and migrations, backups, storage and performance. [CONTRIBUTING.md](CONTRIBUTING.md)
 explains development and checks. [BUGS.md](BUGS.md) lists only known defects
 that cannot currently be fixed because of a stated blocker; it is not a list
 of all unfinished work. License terms are in [LICENSE](LICENSE).

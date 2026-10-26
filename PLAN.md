@@ -1,118 +1,101 @@
 # Finish pos3ql
 
-[Overview](README.md) · [What works today](docs/implemented-baseline.md) ·
-[Compatibility limits](docs/postgresql-18-compatibility.md) · [Contributing](CONTRIBUTING.md)
+[Overview](README.md) · [Architecture](docs/architecture.md) ·
+[Current behavior](docs/implemented-baseline.md) ·
+[Limits](docs/postgresql-18-compatibility.md) · [Contributing](CONTRIBUTING.md)
 
 ## The destination
 
-Use PostgreSQL SQL and tools with object storage as the durable copy. A confirmed
-order must survive loss of the server's disk. A slow download or upload must
-allow unrelated work to progress. Memory limits are chosen before startup.
+Applications use supported PostgreSQL SQL and clients while object storage holds
+the durable copy. A confirmed order survives loss of the server's disk. Reports,
+updates and maintenance make progress without unrelated work waiting on every
+storage request. Memory and concurrency are chosen before startup; exhaustion
+returns an explicit error.
 
-One server owns the right to publish changes to a prefix. That does not require
-performing every storage request one at a time. SQL execution on several CPU
-workers is separate from overlapping network requests.
+One active process publishes to a prefix containing the instance's SQL databases.
+Its commit history must retain durable order. Reads, independent uploads and SQL
+CPU execution do not all need to be serialized to preserve that order.
 
-SQL execution still uses one CPU worker. Object-store I/O overlaps and batches
-requests; commits retain durable order. Login-trigger commits yield while
-waiting for durability and run their triggers once. State-changing statements use a
-separate synchronous read client where replay could repeat effects. Metadata
-capture and some maintenance reads also remain synchronous. Same-host MinIO
-and SeaweedFS checks establish portability; they do not prove production speed.
-See the [current contract and examples](docs/implemented-baseline.md).
+Today, object-store I/O overlaps and batches requests, while SQL CPU work uses
+one worker. Some state-changing, metadata and maintenance reads still wait
+synchronously. Same-host MinIO and SeaweedFS checks establish portability;
+they do not establish production performance. The owning guides describe
+[current behavior](docs/implemented-baseline.md), [physical limits](docs/architecture.md#memory-and-physical-size)
+and [what has actually been measured](docs/performance.md).
 
 ## Remaining work
 
-### Finish shared publication and bounded maintenance
+### Complete coherent publication and bounded maintenance
 
-**Example:** replacing a table must not invalidate a report that already selected
-its rows or definitions. Cleanup should let ordinary queries run between turns.
+**Example:** a report must finish using the rows and definitions it selected,
+even when another connection replaces a table or maintenance replaces saved files.
+A waiting schema edit must never attach itself to a new object that reused a name.
 
-Connect retained catalog rows to every later lookup of table and type
-definitions, columns, index bindings and comments. The [behavior guide](docs/implemented-baseline.md)
-owns the implemented admission, permission, comment, statistics and bound-view
-rename guarantees;
-their regressions remain in the implementing change.
+- Connect retained catalog rows to every later definition, column, index,
+  comment and dependency lookup. Preserve exact duplicate dependency counts.
+  Finish source-lifetime checks and private edits for remaining catalog families.
+- Finish lifetime SQL identifiers beyond the families guaranteed in the
+  [behavior guide](docs/implemented-baseline.md#schema-changes-and-object-identity).
+  Check shared catalogs and database-template copies, including recovery.
+- Complete reader-safe row/index history and backup retention. Pace pruning,
+  replacement and deletion without holding unrelated owners.
+- Make remaining synchronous metadata and maintenance storage reads yield with
+  bounded retained state. Recovery can keep exclusive startup access; ordinary
+  operation must allow unrelated work to progress.
 
-Preserve PostgreSQL's distinction between listing rows and looking up an object
-for use. After another connection renames `orders` to `sales`, an older
-repeatable-read listing can still show `orders`, while `to_regclass('sales')`
-resolves the current name. Permission functions and displayed account names
-also follow their current lookup rules. Freezing every lookup at the report's
-read position would produce the wrong result.
+Follow PostgreSQL's distinction between listing an old catalog row and resolving
+an object for current use. After `orders` becomes `sales`, an older report can
+still list `orders` while `to_regclass('sales')` resolves the current name.
+Freezing all lookups at the report's position would be incorrect.
 
-Complete these remaining cases:
+Acceptance: complete transactions publish and recover together; source reuse
+cannot redirect retained data; cleanup respects readers and backups. Cover
+rollback, savepoints, prepared transactions, fixed-capacity exhaustion and
+recovery after deleting local caches. Reject corrupt or stale restored state
+before writer promotion. Resumption preserves effects once, including triggers
+and issued sequence values. Lost commit replies resolve to all changes or none.
 
-- Apply checked source identities and private publication to the remaining
-  catalog families. Cover edits after another connection replaced a catalog
-  tuple. Listings and direct lookups can expose different rows; dependency rows
-  also need exact duplicate counts.
-- Finish lifetime-based SQL identifiers in the remaining catalog families,
-  beyond the implemented relation, named-type, enum-label, index and non-index
-  constraint, statistics, extension, foreign-data, publication and subscription
-  guarantees in the [behavior guide](docs/implemented-baseline.md).
-  Check shared catalogs across databases as well.
-- Keep old row, index and backup data until their readers finish. Pace history
-  pruning, file replacement and deletion without holding unrelated owners.
-- Replace remaining synchronous metadata and maintenance reads with bounded
-  work that yields while waiting for storage. Recovery may retain exclusive
-  startup access; ordinary publication must let unrelated operations progress.
+### Execute SQL on startup-reserved CPU workers
 
-Raising memory limits is not a completion criterion. Preserve rollback,
-savepoints, prepared transactions, exhaustion cleanup and cold recovery as each
-case is connected. Validate restored catalogs and their captured root versions
-before writer promotion; rejected or stale restoration must change no roots.
+**Example:** independent connections can use several CPU cores while each
+connection preserves command order and every confirmed transaction stays recoverable.
 
-Done when publication and recovery preserve complete transactions, identity reuse cannot expose
-replacement data to old readers, deletion respects readers and backups, and
-rollback and exhaustion release every owner within startup reservations.
-Lost commit replies must resolve to all of the transaction's changes or none.
-Waiting and resuming a command must preserve its effects exactly once, including
-event triggers and sequence values.
+Finish shared execution-state ownership, then replace the serial dispatcher with
+fixed workers. Preserve database/account identity, fair queues, cancellation,
+locks, storage waits and commit order. A global lock running all statements in
+turn does not meet this goal. Measure read, write and mixed-load scaling and
+overload; extra connection or object-request slots alone do not establish it.
 
-### Run statements on startup-reserved CPU workers
+### Qualify realistic size, performance and recovery
 
-**Example:** several connections can use several CPU cores while preserving each
-connection's command order.
+**Example:** a user can choose hardware from measured typical and slow response
+times, sustainable transaction rates, storage traffic and failure behavior.
 
-Protect remaining shared execution state, replace the serial dispatcher with
-fixed workers, and preserve database identity, fair queues, cancellation, storage
-waits and commit order. A global lock that runs every statement in turn does
-not satisfy this goal. Measure useful scaling for read, write and mixed loads,
-including overload. Storage I/O already overlaps; execution on several CPU cores is separate.
+Discover and record fixed hosts, independent object storage, network/routing and
+owner-only configuration paths without publishing credentials. Run the
+[measurement suite](docs/performance.md) repeatedly. Keep both vanilla PostgreSQL
+18 controls: host-available resources and the same CPU/memory allowance as pos3ql.
+Record PostgreSQL's ordinary durable medium and pos3ql's object store/cache tiers.
 
-### Publish realistic performance and recovery evidence
-
-**Example:** a user can compare typical and slow request times, required hardware,
-storage traffic and what happens when a server fails.
-
-Run the [measurement suite](docs/performance.md) repeatedly on fixed hardware
-with independently operated object storage. Discover and record hosts, network,
-routing and owner-only configuration paths without publishing credentials.
-
-Keep both vanilla PostgreSQL 18 controls: host-available resources and the same
-CPU/memory allowance as pos3ql. PostgreSQL uses ordinary durable storage; report
-its medium and settings alongside pos3ql's object store and caches.
-
-Measure warm and empty caches, writes, joins, maintenance, large catalogs,
-workers, logical replicas, delay, recovery, and failover across machines through
-real client routing. Retain raw results, revisions, latency distributions,
-throughput, CPU, memory, access paths, object requests and transferred bytes.
-No representative deployment run has been published yet. Shared-host and hosted
-runner timings remain exploratory.
+Cover useful data sizes, warm/empty caches, reads/writes, joins, large catalogs,
+maintenance, workers, logical replicas, delays, recovery and multi-host failover
+through actual client routing. Retain revisions, raw results, errors, latency
+distributions, throughput units, CPU/RSS, object requests, bytes and cost inputs.
+No representative deployment run or qualified production size/TPS/bandwidth
+claim has been published. Theoretical addressability and calculated examples
+are not acceptance evidence.
 
 ## Rules throughout
 
-Match supported PostgreSQL SQL, SQLSTATEs, types, catalogs and wire behavior.
-Reject unsupported behavior clearly. Earlier pos3ql versions are not compatibility
-targets. Keep [durable formats](docs/durable-format.md) and current recovery
-checks accurate whenever bytes change.
+Fix encountered defects in the same complete PR unless an actual blocker
+prevents repair. Diagnose failures and timeouts; do not extend limits to hide
+them. Match supported PostgreSQL SQL, types, errors, catalogs and wire behavior.
+Reject unsupported behavior and stored formats explicitly. Earlier pos3ql
+versions are not compatibility targets.
 
-No runtime heap growth, allocating sorts or growing pools. Use explicit settings
-and consequential arguments, no silent fallbacks or needless wrappers. Fix every
-encountered defect in this PR unless an actual external blocker prevents it.
-Diagnose timeout causes; never increase durations to conceal them.
-
-Keep current contracts in their [owning guides](docs/README.md), unfinished
-work here, and historical observations with their [evidence](benchmarks/README.md).
-The roadmap is complete only when all remaining acceptance criteria are met.
+No runtime heap growth, growing pools or allocating sorts. Keep consequential
+settings explicit and avoid needless wrappers and fallbacks. Capacity increases
+are not a completion criterion. Keep current contracts in their
+[owning guides](docs/README.md), open acceptance criteria here, and historical
+observations with their original [evidence](benchmarks/README.md). The roadmap is
+finished only when every remaining acceptance criterion is demonstrated.

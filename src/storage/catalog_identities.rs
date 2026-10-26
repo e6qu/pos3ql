@@ -138,14 +138,22 @@ impl Storage {
             .subscription_catalog
             .lock()
             .expect("subscription catalog lock poisoned");
-        for (_, database) in self.databases_visible_to(0) {
+        // Subscription OIDs belong to a shared catalog. Other families are
+        // database-local and template copies may preserve their numeric OIDs.
+        let scopes = core::iter::once(None).chain(
+            self.databases_visible_to(0)
+                .map(|(_, database)| Some(database.oid)),
+        );
+        for database in scopes {
             for first in (1..=saved_sequence.clamp(1, MAX_CATALOG_CREATION)).step_by(WIDTH) {
                 let mut seen = [0u64; WORDS];
                 let mut check = |database_oid: DatabaseOid,
                                  state: CatalogDdlState,
                                  created_at: u64|
                  -> Result<(), SqlError> {
-                    if database_oid != database.oid || state == CatalogDdlState::Absent {
+                    if database.is_some_and(|selected| database_oid != selected)
+                        || state == CatalogDdlState::Absent
+                    {
                         return Ok(());
                     }
                     CatalogIdentity::require(created_at)?;
@@ -170,38 +178,40 @@ impl Storage {
                     *word |= bit;
                     Ok(())
                 };
-                for definition in statistics.definitions.iter() {
-                    check(
-                        definition.database,
-                        definition.ddl_state,
-                        definition.created_at,
-                    )?;
-                }
-                for definition in extensions.definitions.iter() {
-                    check(
-                        definition.database,
-                        definition.ddl_state,
-                        definition.created_at,
-                    )?;
-                }
-                for slot in 0..foreign.wrapper_capacity() {
-                    let entry = foreign.entry_wrapper(slot);
-                    check(entry.database, entry.ddl_state, entry.created_at)?;
-                }
-                for slot in 0..foreign.server_capacity() {
-                    let entry = foreign.entry_server(slot);
-                    check(entry.database, entry.ddl_state, entry.created_at)?;
-                }
-                for slot in 0..foreign.mapping_capacity() {
-                    let entry = foreign.entry_mapping(slot);
-                    check(entry.database, entry.ddl_state, entry.created_at)?;
-                }
-                for definition in publications.iter() {
-                    check(
-                        definition.database,
-                        definition.ddl_state,
-                        definition.created_at,
-                    )?;
+                if database.is_some() {
+                    for definition in statistics.definitions.iter() {
+                        check(
+                            definition.database,
+                            definition.ddl_state,
+                            definition.created_at,
+                        )?;
+                    }
+                    for definition in extensions.definitions.iter() {
+                        check(
+                            definition.database,
+                            definition.ddl_state,
+                            definition.created_at,
+                        )?;
+                    }
+                    for slot in 0..foreign.wrapper_capacity() {
+                        let entry = foreign.entry_wrapper(slot);
+                        check(entry.database, entry.ddl_state, entry.created_at)?;
+                    }
+                    for slot in 0..foreign.server_capacity() {
+                        let entry = foreign.entry_server(slot);
+                        check(entry.database, entry.ddl_state, entry.created_at)?;
+                    }
+                    for slot in 0..foreign.mapping_capacity() {
+                        let entry = foreign.entry_mapping(slot);
+                        check(entry.database, entry.ddl_state, entry.created_at)?;
+                    }
+                    for definition in publications.iter() {
+                        check(
+                            definition.database,
+                            definition.ddl_state,
+                            definition.created_at,
+                        )?;
+                    }
                 }
                 for definition in subscriptions.definitions.iter() {
                     check(
@@ -271,6 +281,62 @@ mod tests {
             );
             storage.subscription_catalog.lock().unwrap().definitions[0].created_at = 8;
             storage.validate_restored_catalog_identities(8).unwrap();
+        });
+    }
+
+    #[test]
+    fn catalog_lifetime_database_scopes_preserve_clones_and_shared_identifiers() {
+        let mut storage = storage();
+        for (slot, database) in [DatabaseOid::POSTGRES, DatabaseOid::TEMPLATE1]
+            .into_iter()
+            .enumerate()
+        {
+            storage.publications.lock().unwrap()[slot] = PublicationDef {
+                database,
+                created_at: 7,
+                ddl_state: CatalogDdlState::Present,
+                ..PublicationDef::EMPTY
+            };
+        }
+        crate::mem::guard::forbid_alloc(|| storage.validate_restored_catalog_identities(7))
+            .unwrap();
+        for (slot, database) in [DatabaseOid::POSTGRES, DatabaseOid::TEMPLATE1]
+            .into_iter()
+            .enumerate()
+        {
+            storage.subscription_catalog.lock().unwrap().definitions[slot] = SubscriptionDef {
+                database,
+                created_at: 8,
+                definition_generation: 1,
+                ddl_state: CatalogDdlState::Present,
+                ..SubscriptionDef::EMPTY
+            };
+        }
+        let sequence = storage.catalog_identity_sequence();
+        crate::mem::guard::forbid_alloc(|| {
+            assert_eq!(
+                storage
+                    .validate_restored_catalog_identities(8)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::DATA_EXCEPTION
+            );
+            assert_eq!(
+                storage
+                    .restore_subscription_stream_identity(1, 8, 2)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::DATA_EXCEPTION
+            );
+            assert_eq!(storage.catalog_identity_sequence(), sequence);
+            assert_eq!(
+                storage.subscription_catalog.lock().unwrap().definitions[1].definition_generation,
+                1
+            );
+            storage
+                .restore_subscription_stream_identity(1, 9, 2)
+                .unwrap();
+            storage.validate_restored_catalog_identities(9).unwrap();
         });
     }
 

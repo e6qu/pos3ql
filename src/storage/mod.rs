@@ -1,9 +1,9 @@
-//! Table storage: the in-memory write path of the LSM.
+//! Resident rows, catalogs and transaction visibility within fixed startup pools.
 //!
-//! Row bytes live in startup-sized heap buffers; each table maps rowid →
-//! location. Updates write a new copy and repoint the map. Compaction reclaims
-//! superseded bytes; object storage retains durable versions. All capacities
-//! are fixed at startup.
+//! In object-store mode, durable journals and immutable table/index files outlive
+//! disposable RAM and disk caches. In local-only mode, the local journal is durable.
+//! Selected readers retain their original bytes and definitions through waits;
+//! reclamation must preserve those owners. SQL currently uses one CPU worker.
 
 mod catalog_history;
 pub(crate) use catalog_history::{
@@ -22336,7 +22336,7 @@ impl Storage {
             }
 
             for source_slot in 0..self.publication_count() {
-                let mut definition = self.publication_for_event_trigger(source_slot);
+                let mut definition = self.publication_at(source_slot);
                 if definition.database != source || definition.ddl_state != CatalogDdlState::Present
                 {
                     continue;
@@ -37482,7 +37482,7 @@ impl Storage {
         })
     }
 
-    pub(crate) fn publication_for_event_trigger(&self, slot: usize) -> PublicationDef {
+    pub(crate) fn publication_at(&self, slot: usize) -> PublicationDef {
         self.publications
             .lock()
             .expect("publication catalog lock poisoned")[slot]
@@ -38068,7 +38068,7 @@ impl Storage {
         }
     }
 
-    pub(crate) fn subscription_for_event_trigger(&self, slot: usize) -> SubscriptionDef {
+    pub(crate) fn subscription_at(&self, slot: usize) -> SubscriptionDef {
         self.subscription_catalog
             .lock()
             .expect("subscription catalog lock poisoned")
@@ -59317,7 +59317,7 @@ mod tests {
         assert_eq!(storage.publications_with_slots().count(), WORKERS);
         for (slot, definition) in storage.publications_with_slots() {
             assert_eq!(
-                storage.publication_for_event_trigger(slot).created_at,
+                storage.publication_at(slot).created_at,
                 definition.created_at
             );
         }
@@ -59373,19 +59373,13 @@ mod tests {
             });
         }
         storage.rollback_publication_create(0);
-        assert_eq!(storage.publication_for_event_trigger(0).created_at, 0);
-        assert_eq!(
-            storage.publication_for_event_trigger(0).ddl_state,
-            CatalogDdlState::Absent
-        );
+        assert_eq!(storage.publication_at(0).created_at, 0);
+        assert_eq!(storage.publication_at(0).ddl_state, CatalogDdlState::Absent);
 
         storage.drop_publication("publication_1", 9).unwrap();
         storage.commit_publication_drop(1);
-        assert_eq!(storage.publication_for_event_trigger(1).created_at, 0);
-        assert_eq!(
-            storage.publication_for_event_trigger(1).ddl_state,
-            CatalogDdlState::Absent
-        );
+        assert_eq!(storage.publication_at(1).created_at, 0);
+        assert_eq!(storage.publication_at(1).ddl_state, CatalogDdlState::Absent);
     }
 
     #[test]

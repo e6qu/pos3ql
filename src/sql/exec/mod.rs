@@ -14026,7 +14026,7 @@ pub fn create_publication(
                 txn.txid,
                 lsn,
                 &WalOp::CreatePublication {
-                    created_at: storage.publication_for_event_trigger(slot).created_at,
+                    created_at: storage.publication_at(slot).created_at,
                     name: name.as_str(),
                     owner,
                     all_tables,
@@ -39025,7 +39025,7 @@ pub fn comment(
             if let Err(error) = storage.require_publication_owner(slot, txid) {
                 return sql_fail(error);
             }
-            let publication = storage.publication_for_event_trigger(slot);
+            let publication = storage.publication_at(slot);
             (
                 CommentClass::Publication,
                 SqlName::EMPTY,
@@ -44462,7 +44462,7 @@ fn stage_publication_column_drop_dependencies(
         table_definition,
     } = dependency;
     for slot in 0..storage.publication_count() {
-        let publication = storage.publication_for_event_trigger(slot);
+        let publication = storage.publication_at(slot);
         if !publication.visible_to(txn.txid) {
             continue;
         }
@@ -46387,7 +46387,7 @@ fn remap_publication_column_projections(
     column_mapping: &[u16; MAX_COLUMNS],
 ) -> Result<(), SqlError> {
     for slot in 0..storage.publication_count() {
-        let publication = storage.publication_for_event_trigger(slot);
+        let publication = storage.publication_at(slot);
         if !publication.visible_to(txn.txid) {
             continue;
         }
@@ -46475,7 +46475,7 @@ fn rewrite_table_publication_column_references(
         return Ok(());
     }
     for slot in 0..storage.publication_count() {
-        let publication = storage.publication_for_event_trigger(slot);
+        let publication = storage.publication_at(slot);
         if !publication.visible_to(txn.txid) {
             continue;
         }

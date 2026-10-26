@@ -45,6 +45,9 @@ pub(super) fn build_def(
             ));
         }
         def.columns[i] = build_column(c, storage, txid, arena)?;
+        if let Some(name) = c.not_null_name {
+            def.set_not_null_constraint_name(i, SqlName::parse(name)?);
+        }
     }
     // A generation expression may not reference another generated column (42P17);
     // needs the full column set, so check once the table is assembled.
@@ -859,6 +862,7 @@ pub(super) fn attach_constraints(
                     ));
                 }
                 let mut c = CheckConstraint {
+                    identity: None,
                     name: constraint_name,
                     expression: crate::util::StackStr::new(),
                     validation: storage_validation(*validation),

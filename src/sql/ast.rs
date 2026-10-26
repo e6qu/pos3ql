@@ -4025,12 +4025,19 @@ pub struct SeqOwner<'a> {
 /// A `CREATE DOMAIN name [AS] basetype[(typmod)] [constraint...]`. The base
 /// type name and its typmod are raw (resolved in exec); constraint predicate
 /// and default expressions are raw source text, re-parsed when enforced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DomainNullability<'a> {
+    Unspecified,
+    Nullable,
+    NotNull { name: Option<&'a str> },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CreateDomain<'a> {
     pub name: QualName<'a>,
     pub base_type: &'a str,
     pub base_type_mod: i32,
-    pub not_null: bool,
+    pub nullability: DomainNullability<'a>,
     pub default_text: Option<&'a str>,
     pub checks: &'a [DomainCheck<'a>],
 }
@@ -4471,6 +4478,7 @@ pub struct ColumnDef<'a> {
     /// explicit algorithm in `pg_attribute.attcompression`.
     pub compression: ColumnCompression,
     pub not_null: bool,
+    pub not_null_name: Option<&'a str>,
     /// `NOT NULL NO INHERIT` is a distinct constraint state, not a later
     /// executor-side exception to ordinary table inheritance.
     pub not_null_inheritable: bool,

@@ -261,6 +261,7 @@ mod tests {
                     base_type_mod: -1,
                     not_null: false,
                     not_null_name: None,
+                    not_null_identity: None,
                     default_expr: None,
                     checks: [CheckConstraint::EMPTY; MAX_DOMAIN_CHECKS],
                     n_checks: 0,

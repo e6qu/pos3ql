@@ -41,6 +41,13 @@ pub(crate) use catalog_sources::{
     CatalogAllocation, CatalogDdlDecision, CatalogDdlUndo, CatalogPosition, RoleOid,
     SessionIdentity, SessionRole,
 };
+mod constraint_identities;
+#[cfg(test)]
+pub(crate) use constraint_identities::MAX_CONSTRAINT_CREATION;
+pub(crate) use constraint_identities::{
+    ConstraintIdentity, ForeignKeyTrigger, validate_constraint_identities,
+    validate_constraint_lifetimes,
+};
 mod column_maps;
 pub(crate) use column_maps::{RelationColumnMap, RelationRowDecoder};
 mod definition_images;
@@ -1855,6 +1862,7 @@ impl ExclusionConstraint {
 /// candidate row at INSERT/UPDATE time.
 #[derive(Debug, Clone, Copy)]
 pub struct CheckConstraint {
+    pub(crate) identity: Option<ConstraintIdentity>,
     pub name: SqlName,
     pub expression: StackStr<CHECK_SQL_MAX>,
     pub validation: ConstraintValidation,
@@ -1862,6 +1870,7 @@ pub struct CheckConstraint {
 
 impl CheckConstraint {
     pub const EMPTY: Self = CheckConstraint {
+        identity: None,
         name: SqlName::EMPTY,
         expression: StackStr::new(),
         validation: ConstraintValidation::EnforcedValidated,
@@ -1872,6 +1881,7 @@ impl CheckConstraint {
 /// parent table's column tuple.
 #[derive(Debug, Clone, Copy)]
 pub struct ForeignKey {
+    pub(crate) identity: Option<ConstraintIdentity>,
     pub name: SqlName,
     pub columns: [u16; MAX_INDEX_COLS],
     pub n_cols: usize,
@@ -1887,6 +1897,7 @@ pub struct ForeignKey {
 
 impl ForeignKey {
     pub const EMPTY: Self = ForeignKey {
+        identity: None,
         name: SqlName::EMPTY,
         parent_schema: SqlName::EMPTY,
         columns: [0u16; MAX_INDEX_COLS],
@@ -1928,6 +1939,8 @@ pub struct TableDef {
     pub columns: [ColumnMeta; MAX_COLUMNS],
     pub n_columns: usize,
     pub(crate) not_null_names: [Option<SqlName>; MAX_COLUMNS],
+    pub(crate) not_null_name_edits: ColumnSet,
+    pub(crate) not_null_identities: [Option<ConstraintIdentity>; MAX_RELATION_COLUMNS],
     pub(crate) attributes: column_attributes::ColumnAttributes,
     pub(crate) inline_index_identities: [Option<RelationIdentity>; MAX_RELATION_COLUMNS],
     pub uniques: [UniqueKey; MAX_UNIQUES],
@@ -2131,6 +2144,7 @@ pub struct PartitionDef {
 /// catalog expression on every row write.
 #[derive(Debug, Clone, Copy)]
 pub struct DetachedPartitionBound {
+    pub(crate) identity: Option<ConstraintIdentity>,
     /// PostgreSQL-visible generated CHECK identity. It is absent for HASH,
     /// whose concurrent detach does not create a constraint.
     pub name: SqlName,
@@ -2348,6 +2362,8 @@ impl TableDef {
             columns: [ColumnMeta::EMPTY; MAX_COLUMNS],
             n_columns: 0,
             not_null_names: [None; MAX_COLUMNS],
+            not_null_name_edits: ColumnSet::EMPTY,
+            not_null_identities: [None; MAX_RELATION_COLUMNS],
             attributes: column_attributes::ColumnAttributes::EMPTY,
             inline_index_identities: [None; MAX_RELATION_COLUMNS],
             uniques: [UniqueKey::EMPTY; MAX_UNIQUES],
@@ -9615,9 +9631,8 @@ pub struct DomainDef {
     /// The value representation is flattened to `base`, but the parent chain
     /// remains explicit so every inherited NOT NULL/CHECK is enforced.
     pub base_domain: Option<UserTypeName>,
-    /// Stable identity of a directly-declared enum or composite base.  The
-    /// execution type carries a runtime slot, but a slot cannot survive a
-    /// cold rebuild or a schema/name move.
+    /// Declared name of a direct enum or composite base. The bound execution
+    /// type and saved source reference carry its durable creation identity.
     pub base_user_type: Option<UserTypeName>,
     pub base: ColType,
     /// The base type's atttypmod (e.g. `varchar(5)` → 9), applied to a value
@@ -9625,6 +9640,7 @@ pub struct DomainDef {
     pub base_type_mod: i32,
     pub not_null: bool,
     pub not_null_name: Option<SqlName>,
+    pub(crate) not_null_identity: Option<ConstraintIdentity>,
     pub default_expr: Option<StackStr<DEFAULT_EXPR_MAX>>,
     pub checks: [CheckConstraint; MAX_DOMAIN_CHECKS],
     pub n_checks: usize,
@@ -9663,6 +9679,7 @@ impl DomainDef {
         base_type_mod: -1,
         not_null: false,
         not_null_name: None,
+        not_null_identity: None,
         default_expr: None,
         checks: [CheckConstraint::EMPTY; MAX_DOMAIN_CHECKS],
         n_checks: 0,
@@ -9692,6 +9709,7 @@ impl DomainDef {
                 base_type_mod: pending.spec.base_type_mod,
                 not_null: pending.spec.not_null,
                 not_null_name: pending.spec.not_null_name,
+                not_null_identity: pending.spec.not_null_identity,
                 default_expr: pending.spec.default_expr,
                 checks: pending.spec.checks,
                 n_checks: pending.spec.n_checks,
@@ -9711,6 +9729,7 @@ pub(crate) struct DomainSpec {
     pub base_type_mod: i32,
     pub not_null: bool,
     pub not_null_name: Option<SqlName>,
+    pub(crate) not_null_identity: Option<ConstraintIdentity>,
     pub default_expr: Option<StackStr<DEFAULT_EXPR_MAX>>,
     pub checks: [CheckConstraint; MAX_DOMAIN_CHECKS],
     pub n_checks: usize,
@@ -21559,15 +21578,23 @@ impl Storage {
                 let has_index =
                     self.relation_has_index(CatalogPosition::new(source_slot, created_at)?, 0);
                 let serial_values = self.table_serial_values(source_slot);
+                let target_slot = allocation.select(
+                    DatabaseCloneKind::Table,
+                    created_at,
+                    self.tables
+                        .iter()
+                        .take(self.table_count())
+                        .enumerate()
+                        .filter_map(|(slot, table)| table.is_free().then_some(slot)),
+                )?;
                 let target_slot = table_creation::allocate(
                     self,
                     definition,
-                    allocation.table(created_at)?,
+                    CatalogAllocation::Restore(CatalogPosition::new(target_slot, created_at)?),
                     TableCreation::Pending(txid),
                 )?;
                 {
                     let target_table = &mut self.tables[target_slot];
-                    target_table.identity_mut().created_at = created_at;
                     target_table.identity_mut().ownership = ownership;
                     target_table.statistics.set_image(statistics, None, false);
                     target_table
@@ -40210,6 +40237,18 @@ impl Storage {
                 catalog.domains.len()
             ));
         };
+        match creation {
+            type_identities::TypeCreationAdmission::Fresh => {
+                spec.not_null_identity = None;
+                for identity in spec.constraint_identities_mut() {
+                    *identity = None;
+                }
+                self.reserve_domain_constraint_identities(&mut spec)?;
+            }
+            type_identities::TypeCreationAdmission::Restored(_) => {
+                validate_constraint_lifetimes(spec.constraint_identities(), created_at)?;
+            }
+        }
         catalog
             .identities
             .replace(NamedTypeSlot::Domain(new), current_database(), created_at)?;
@@ -40235,6 +40274,7 @@ impl Storage {
             base_type_mod: spec.base_type_mod,
             not_null: spec.not_null,
             not_null_name: spec.not_null_name,
+            not_null_identity: spec.not_null_identity,
             default_expr: spec.default_expr,
             checks: spec.checks,
             n_checks: spec.n_checks,
@@ -40246,6 +40286,9 @@ impl Storage {
             },
         };
         creation.installed(&self.catalog_sequence, created_at);
+        for identity in spec.constraint_identities().flatten() {
+            self.catalog_sequence.observe(identity.created_at());
+        }
         Ok(TypeDdlUndo::created(
             type_references::TypeIdentity::new(
                 catalog.origin,
@@ -40474,6 +40517,8 @@ impl Storage {
         let domain = &mut catalog.domains[slot];
         let prior = domain.pending_definition;
         constraint_names::domain(domain.definition_for(txid).name, &mut spec)?;
+        self.reserve_domain_constraint_identities(&mut spec)?;
+        validate_constraint_lifetimes(spec.constraint_identities(), domain.created_at)?;
         let source = type_references::TypeIdentity::new(
             origin,
             domain.database,
@@ -40538,6 +40583,7 @@ impl Storage {
                 base_type_mod: domain.base_type_mod,
                 not_null: domain.not_null,
                 not_null_name: domain.not_null_name,
+                not_null_identity: domain.not_null_identity,
                 default_expr: domain.default_expr,
                 checks: domain.checks,
                 n_checks: domain.n_checks,
@@ -47530,8 +47576,8 @@ impl Storage {
         revision: TableDefinitionRevision,
         rewrites_rows: bool,
     ) -> Result<(), SqlError> {
-        self.validate_implicit_index_identities(&definition)?;
         let state = self.tables[index].definition.read();
+        self.validate_table_catalog_identities(&definition, state.identity.created_at)?;
         let source = self.catalog_object_identity(
             catalog_sources::CatalogObjectSlot::Table(index),
             state.identity.database,
@@ -58514,6 +58560,7 @@ mod tests {
                         base_type_mod: -1,
                         not_null: false,
                         not_null_name: None,
+                        not_null_identity: None,
                         default_expr: None,
                         checks: [CheckConstraint::EMPTY; MAX_DOMAIN_CHECKS],
                         n_checks: 0,

@@ -3792,6 +3792,7 @@ impl Engine {
         storage.select_database(crate::storage::DatabaseOid::POSTGRES)?;
         wal.select_database(crate::storage::DatabaseOid::POSTGRES);
         storage.validate_restored_relation_identities(storage.catalog_identity_sequence())?;
+        storage.validate_restored_constraint_identities(storage.catalog_identity_sequence())?;
         storage.validate_restored_enum_label_identities(storage.catalog_identity_sequence())?;
         // Startup reconciliation makes every recovered commit durable in the
         // configured object store before the server admits any connection.
@@ -23010,6 +23011,7 @@ fn apply_wal_op(
                 base_type_mod: def.base_type_mod,
                 not_null: def.not_null,
                 not_null_name: def.not_null_name,
+                not_null_identity: def.not_null_identity,
                 default_expr: def.default_expr,
                 checks: def.checks,
                 n_checks: def.n_checks,

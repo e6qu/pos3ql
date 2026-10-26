@@ -74,6 +74,13 @@ fn choose(
     ))
 }
 
+impl TableDef {
+    pub(crate) fn set_not_null_constraint_name(&mut self, column: usize, name: SqlName) {
+        self.not_null_names[column] = Some(name);
+        self.not_null_name_edits.insert(column);
+    }
+}
+
 pub(crate) fn table(definition: &mut TableDef) -> Result<(), SqlError> {
     for position in 0..definition.n_columns {
         let column = definition.columns[position];
@@ -127,10 +134,18 @@ pub(crate) fn table(definition: &mut TableDef) -> Result<(), SqlError> {
                     .any(|constraint| constraint.name == name)
                 || definition.not_null_names[..position].contains(&Some(name)))
         {
+            if definition.checks().iter().any(|check| check.name == name) {
+                // PostgreSQL reports this mixed collision through its catalog index.
+                return Err(sql_err!(
+                    sqlstate::UNIQUE_VIOLATION,
+                    "duplicate key value violates unique constraint \"pg_constraint_conrelid_contypid_conname_index\""
+                ));
+            }
             return Err(sql_err!(
                 sqlstate::DUPLICATE_OBJECT,
-                "constraint \"{}\" already exists",
-                name.as_str()
+                "constraint \"{}\" for relation \"{}\" already exists",
+                name.as_str(),
+                definition.name.as_str()
             ));
         }
     }
@@ -156,8 +171,16 @@ pub(crate) fn remap_table(
             names[target] = previous.not_null_names[column];
         }
     }
+    for (column, name) in names[..definition.n_columns].iter_mut().enumerate() {
+        if definition.not_null_name_edits.contains(column) {
+            *name = definition.not_null_names[column];
+        }
+    }
     definition.not_null_names = names;
-    table(definition)
+    table(definition)?;
+    // Later admission may remap the same draft again; these names are canonical.
+    definition.not_null_name_edits = super::ColumnSet::all(definition.n_columns);
+    Ok(())
 }
 
 pub(super) fn domain(name: SqlName, spec: &mut DomainSpec) -> Result<(), SqlError> {
@@ -170,14 +193,16 @@ pub(super) fn domain(name: SqlName, spec: &mut DomainSpec) -> Result<(), SqlErro
                 .any(|constraint| constraint.name == name)
         })?);
     }
-    if spec.not_null_name.is_some_and(|name| {
-        spec.checks[..spec.n_checks]
+    if let Some(constraint) = spec.not_null_name
+        && spec.checks[..spec.n_checks]
             .iter()
-            .any(|constraint| constraint.name == name)
-    }) {
+            .any(|check| check.name == constraint)
+    {
         return Err(sql_err!(
             sqlstate::DUPLICATE_OBJECT,
-            "domain constraint name already exists"
+            "constraint \"{}\" for domain \"{}\" already exists",
+            constraint.as_str(),
+            name.as_str()
         ));
     }
     Ok(())
@@ -234,6 +259,15 @@ mod tests {
             Storage::validate_not_null_names(&replacement).unwrap();
             assert_eq!(original.not_null_names[0], None);
             assert_eq!(original.not_null_names[1], retained_name);
+            let explicit = SqlName::parse("explicit_added_name").unwrap();
+            replacement.set_not_null_constraint_name(1, explicit);
+            remap_table(&original, &mut replacement, &mapping).unwrap();
+            assert_eq!(replacement.not_null_names[0], retained_name);
+            assert_eq!(replacement.not_null_names[1], Some(explicit));
+            assert_eq!(
+                replacement.not_null_name_edits,
+                super::super::ColumnSet::all(replacement.n_columns)
+            );
         });
     }
 }

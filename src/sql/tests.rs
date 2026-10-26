@@ -1332,6 +1332,436 @@ fn numeric_object_privileges_match_postgresql_before_lookup() {
 }
 
 #[test]
+fn constraint_public_identifiers_survive_edits_replacement_and_savepoint_rollback() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("constraint-public-identifiers-{mode:?}"));
+        config.transaction_mode = mode;
+        config.max_ddl_per_transaction = 32;
+        config.max_tables = 5;
+        config.max_domains = 1;
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        let mut observations = 0;
+        for statement in
+            include_str!("../../tests/external/differential_exact/28_constraint_identities.sql")
+                .split(';')
+                .map(str::trim)
+                .filter(|statement| !statement.is_empty())
+        {
+            let output = session.success(&mut engine, statement, true);
+            let rows = data_rows(&output);
+            if rows.iter().any(|row| row != "t") {
+                let actual = data_rows(&session.success(&mut engine,
+                    "SELECT conname, oid, contype, conrelid, contypid FROM pg_constraint WHERE conrelid = 'constraint_rules'::regclass OR contypid = 'constraint_domain'::regtype; SELECT name, identity FROM saved_constraint_identities ORDER BY name", false));
+                panic!(
+                    "after {observations} checks; {statement}: {rows:?}; catalog and saved rows: {actual:?}"
+                );
+            }
+            observations += rows.len();
+        }
+        assert_eq!(observations, 14);
+    }
+}
+
+#[test]
+fn constraint_public_identifiers_survive_journal_and_checkpoint_recovery() {
+    let fixture =
+        include_str!("../../tests/external/differential_exact/28_constraint_identities.sql");
+    let (setup, _) = fixture.split_once("\nBEGIN;").unwrap();
+    let remaining = &fixture[setup.len()..];
+    const QUERIES: &str =
+        "SELECT count(*) = 5 FROM saved_constraint_identities s JOIN pg_constraint c ON c.oid = s.identity;
+         SELECT count(*) = 4 FROM saved_constraint_triggers s JOIN pg_trigger t ON t.oid = s.identity AND t.tgconstraint = s.parent";
+    for checkpoint in [false, true] {
+        for mode in [
+            crate::config::TransactionMode::Mvcc,
+            crate::config::TransactionMode::Locking,
+        ] {
+            let name = format!("constraint-public-cold-{checkpoint}-{mode:?}");
+            let mut config = test_config(&name);
+            config.transaction_mode = mode;
+            config.max_ddl_per_transaction = 32;
+            config.max_tables = 5;
+            config.max_domains = 1;
+            config.object_store_on = true;
+            config.object_store_sim = true;
+            config.wal_upload = true;
+            config.wal_upload_sync = true;
+            config.object_store_bucket = format!("{name}-{}", std::process::id());
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+            {
+                let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+                let mut engine = Engine::new(&config, &mut budget).unwrap();
+                let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+                let mut observations = 0;
+                for statement in setup
+                    .split(';')
+                    .map(str::trim)
+                    .filter(|statement| !statement.is_empty())
+                {
+                    let output = session.success(&mut engine, statement, false);
+                    let rows = data_rows(&output);
+                    assert!(
+                        rows.iter().all(|row| row == "t"),
+                        "after {observations} checks; {statement}: {rows:?}"
+                    );
+                    observations += rows.len();
+                }
+                assert_eq!(observations, 5);
+                if checkpoint {
+                    assert!(engine.checkpoint().unwrap());
+                }
+                engine.commit_wal().unwrap();
+            }
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+            {
+                let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+                let mut engine = Engine::new(&config, &mut budget).unwrap();
+                let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+                for (statements, guarded, expected) in [(QUERIES, true, 2), (remaining, false, 9)] {
+                    let mut observations = 0;
+                    for statement in statements
+                        .split(';')
+                        .map(str::trim)
+                        .filter(|statement| !statement.is_empty())
+                    {
+                        let output = session.success(&mut engine, statement, guarded);
+                        let rows = data_rows(&output);
+                        assert!(
+                            rows.iter().all(|row| row == "t"),
+                            "after {observations} checks; {statement}: {rows:?}"
+                        );
+                        observations += rows.len();
+                    }
+                    assert_eq!(observations, expected);
+                }
+            }
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        }
+    }
+}
+
+#[test]
+fn constraint_declaration_names_and_rejections_match_postgresql() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("constraint-declarations-{mode:?}"));
+        config.transaction_mode = mode;
+        config.max_tables = 1;
+        config.max_domains = 4;
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        let mut states = Vec::new();
+        for statement in include_str!(
+            "../../tests/external/differential_exact/30_constraint_declaration_errors.sql"
+        )
+        .split(';')
+        .map(str::trim)
+        .filter(|statement| !statement.is_empty())
+        {
+            let output = session.execute(&mut engine, statement, true);
+            for (object, expected) in [
+                (
+                    "declaration_check_name",
+                    "constraint \"repeated_name\" for domain \"declaration_check_name\" already exists",
+                ),
+                (
+                    "declaration_nn_name",
+                    "constraint \"repeated_name\" for domain \"declaration_nn_name\" already exists",
+                ),
+                (
+                    "declaration_table_check_name",
+                    "duplicate key value violates unique constraint \"pg_constraint_conrelid_contypid_conname_index\"",
+                ),
+                (
+                    "declaration_table_nn_name",
+                    "duplicate key value violates unique constraint \"pg_constraint_conrelid_contypid_conname_index\"",
+                ),
+                (
+                    "declaration_table_duplicate_nn",
+                    "constraint \"repeated_name\" for relation \"declaration_table_duplicate_nn\" already exists",
+                ),
+            ] {
+                if statement.contains(object) {
+                    assert!(
+                        String::from_utf8_lossy(&output).contains(expected),
+                        "{statement}: expected {expected}; {output:?}"
+                    );
+                }
+            }
+            states.extend(error_sqlstates(&output).into_iter().map(str::to_owned));
+        }
+        assert_eq!(
+            states,
+            [
+                "42P17", "42601", "42601", "42P17", "42P17", "42601", "42710", "42710", "23505",
+                "23505", "42710"
+            ]
+        );
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "SELECT count(*) = 0 FROM pg_type WHERE typname LIKE 'declaration_%'",
+                true
+            )),
+            ["t"]
+        );
+        let mut observations = 0;
+        for statement in include_str!(
+            "../../tests/external/differential_exact/31_domain_constraint_declarations.sql"
+        )
+        .split(';')
+        .map(str::trim)
+        .filter(|statement| !statement.is_empty())
+        {
+            let output = session.success(&mut engine, statement, true);
+            let rows = data_rows(&output);
+            assert!(rows.iter().all(|row| row == "t"), "{statement}: {rows:?}");
+            observations += rows.len();
+        }
+        assert_eq!(observations, 8);
+    }
+}
+
+#[test]
+fn constraint_identity_prepared_changes_survive_commit_and_rollback_with_empty_disk() {
+    const INVENTORY: &str = "SELECT conname, oid FROM pg_constraint WHERE conrelid = 'prepared_constraints'::regclass OR contypid = 'prepared_constraint_domain'::regtype";
+    const RETAINED: &str = "SELECT conname, oid FROM pg_constraint WHERE (conrelid = 'prepared_constraints'::regclass OR contypid = 'prepared_constraint_domain'::regtype) AND conname IN ('table_keep', 'table_nn', 'domain_keep', 'domain_nn')";
+    for checkpoint in [false, true] {
+        for commit in [false, true] {
+            for mode in [
+                crate::config::TransactionMode::Mvcc,
+                crate::config::TransactionMode::Locking,
+            ] {
+                let name = format!("constraint-prepared-{checkpoint}-{commit}-{mode:?}");
+                let mut config = test_config(&name);
+                config.transaction_mode = mode;
+                config.max_tables = 1;
+                config.max_domains = 1;
+                config.max_prepared_transactions = 1;
+                config.max_ddl_per_transaction = 16;
+                config.object_store_on = true;
+                config.object_store_sim = true;
+                config.wal_upload = true;
+                config.wal_upload_sync = true;
+                config.object_store_bucket = format!("{name}-{}", std::process::id());
+                crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+                let before;
+                let after;
+                let retained;
+                {
+                    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+                    let mut engine = Engine::new(&config, &mut budget).unwrap();
+                    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+                    session.success(&mut engine, "CREATE TABLE prepared_constraints(id integer CONSTRAINT table_nn NOT NULL, CONSTRAINT table_keep CHECK (id > 0), CONSTRAINT table_changed CHECK (id < 10)); CREATE DOMAIN prepared_constraint_domain AS integer CONSTRAINT domain_nn NOT NULL CONSTRAINT domain_keep CHECK (VALUE > 0) CONSTRAINT domain_changed CHECK (VALUE < 10); INSERT INTO prepared_constraints VALUES (7)", false);
+                    before = data_rows(&session.success(&mut engine, INVENTORY, true));
+                    retained = data_rows(&session.success(&mut engine, RETAINED, true));
+                    assert_eq!(before.len(), 6);
+                    assert_eq!(retained.len(), 4);
+                    session.success(&mut engine, "BEGIN; ALTER TABLE prepared_constraints DROP CONSTRAINT table_changed; ALTER TABLE prepared_constraints ADD CONSTRAINT table_changed CHECK (id < 20); ALTER DOMAIN prepared_constraint_domain DROP CONSTRAINT domain_changed; ALTER DOMAIN prepared_constraint_domain ADD CONSTRAINT domain_changed CHECK (VALUE < 20)", false);
+                    after = data_rows(&session.success(&mut engine, INVENTORY, true));
+                    assert_ne!(before, after);
+                    assert_eq!(
+                        data_rows(&session.success(&mut engine, RETAINED, true)),
+                        retained
+                    );
+                    session.success(
+                        &mut engine,
+                        "PREPARE TRANSACTION 'constraint-pending'",
+                        false,
+                    );
+                    if checkpoint {
+                        assert!(engine.checkpoint().unwrap());
+                    }
+                    engine.commit_wal().unwrap();
+                }
+                std::fs::remove_dir_all(&config.data_dir).unwrap();
+                {
+                    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+                    let mut cold = Engine::new(&config, &mut budget).unwrap();
+                    let gid = ast::PreparedTransactionId::parse("constraint-pending").unwrap();
+                    assert!(cold.prepared_transactions.find(gid).is_some());
+                    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+                    assert_eq!(
+                        data_rows(&session.success(&mut cold, INVENTORY, true)),
+                        before
+                    );
+                    session.success(
+                        &mut cold,
+                        if commit {
+                            "COMMIT PREPARED 'constraint-pending'"
+                        } else {
+                            "ROLLBACK PREPARED 'constraint-pending'"
+                        },
+                        false,
+                    );
+                    assert_eq!(
+                        data_rows(&session.success(&mut cold, INVENTORY, true)),
+                        if commit { after } else { before }
+                    );
+                    assert_eq!(
+                        data_rows(&session.success(&mut cold, RETAINED, true)),
+                        retained
+                    );
+                    assert_eq!(
+                        data_rows(&session.success(
+                            &mut cold,
+                            "SELECT id FROM prepared_constraints",
+                            true
+                        )),
+                        ["7"]
+                    );
+                    assert!(cold.prepared_transactions.find(gid).is_none());
+                }
+                std::fs::remove_dir_all(&config.data_dir).unwrap();
+                crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+            }
+        }
+    }
+}
+
+#[test]
+fn constraint_identity_exhaustion_preserves_existing_data_and_cold_recovery() {
+    for checkpoint in [false, true] {
+        for mode in [
+            crate::config::TransactionMode::Mvcc,
+            crate::config::TransactionMode::Locking,
+        ] {
+            let name = format!("constraint-exhaustion-{checkpoint}-{mode:?}");
+            let mut config = test_config(&name);
+            config.transaction_mode = mode;
+            config.max_tables = 1;
+            config.max_domains = 1;
+            config.object_store_on = true;
+            config.object_store_sim = true;
+            config.wal_upload = true;
+            config.wal_upload_sync = true;
+            config.object_store_bucket = format!("{name}-{}", std::process::id());
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+            const INVENTORY: &str = "SELECT conname, oid FROM pg_constraint WHERE conrelid = 'constraint_limit'::regclass OR contypid = 'constraint_limit_domain'::regtype";
+            let before;
+            {
+                let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+                let mut engine = Engine::new(&config, &mut budget).unwrap();
+                let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+                session.success(&mut engine, "CREATE TABLE constraint_limit(id integer NOT NULL, optional integer, CONSTRAINT table_keep CHECK (id > 0)); CREATE DOMAIN constraint_limit_domain AS integer CONSTRAINT domain_keep CHECK (VALUE > 0); INSERT INTO constraint_limit VALUES (7, 7)", false);
+                before = data_rows(&session.success(&mut engine, INVENTORY, true));
+                assert_eq!(before.len(), 3);
+                engine
+                    .storage
+                    .replace_catalog_sequence_for_test(crate::storage::MAX_CONSTRAINT_CREATION);
+                for statement in [
+                    "ALTER TABLE constraint_limit ADD CONSTRAINT rejected CHECK (id < 20)",
+                    "ALTER TABLE constraint_limit ALTER COLUMN optional SET NOT NULL",
+                    "ALTER DOMAIN constraint_limit_domain ADD CONSTRAINT rejected CHECK (VALUE < 20)",
+                    "ALTER DOMAIN constraint_limit_domain SET NOT NULL",
+                ] {
+                    assert_eq!(
+                        error_sqlstates(&session.execute(&mut engine, statement, true)),
+                        ["54000"],
+                        "{statement}"
+                    );
+                    assert_eq!(
+                        data_rows(&session.success(&mut engine, INVENTORY, true)),
+                        before
+                    );
+                }
+                session.success(&mut engine, "ALTER TABLE constraint_limit ALTER COLUMN id SET NOT NULL; INSERT INTO constraint_limit VALUES (8, NULL)", false);
+                if checkpoint {
+                    assert!(engine.checkpoint().unwrap());
+                }
+                engine.commit_wal().unwrap();
+            }
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+            {
+                let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+                let mut cold = Engine::new(&config, &mut budget).unwrap();
+                let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+                assert_eq!(
+                    data_rows(&session.success(&mut cold, INVENTORY, true)),
+                    before
+                );
+                assert_eq!(data_rows(&session.success(&mut cold, "SELECT count(*) = 2 AND sum(id) = 15 FROM constraint_limit; SELECT 9::constraint_limit_domain", true)), ["t", "9"]);
+            }
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        }
+    }
+}
+
+#[test]
+fn constraint_manifest_wide_domains_survive_journal_and_checkpoint_recovery() {
+    for checkpoint in [false, true] {
+        for mode in [
+            crate::config::TransactionMode::Mvcc,
+            crate::config::TransactionMode::Locking,
+        ] {
+            let name = format!("wide-domain-constraint-cold-{checkpoint}-{mode:?}");
+            let mut config = test_config(&name);
+            config.transaction_mode = mode;
+            config.max_domains = 1;
+            config.object_store_on = true;
+            config.object_store_sim = true;
+            config.wal_upload = true;
+            config.wal_upload_sync = true;
+            config.object_store_bucket = format!("{name}-{}", std::process::id());
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+            {
+                let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+                let mut engine = Engine::new(&config, &mut budget).unwrap();
+                let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+                assert_eq!(
+                    data_rows(&session.success(
+                        &mut engine,
+                        include_str!(
+                            "../../tests/external/differential_exact/29_wide_domain_constraints.sql"
+                        ),
+                        false
+                    )),
+                    ["t"]
+                );
+                if checkpoint {
+                    assert!(engine.checkpoint().unwrap());
+                }
+                engine.commit_wal().unwrap();
+            }
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+            {
+                let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+                let mut engine = Engine::new(&config, &mut budget).unwrap();
+                let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+                assert_eq!(
+                    data_rows(&session.success(
+                        &mut engine,
+                        "SELECT count(*) = 64 AND count(DISTINCT oid) = 64 FROM pg_constraint WHERE contypid = 'wide_constraint_domain'::regtype",
+                        true
+                    )),
+                    ["t"]
+                );
+                assert_eq!(
+                    error_sqlstates(&session.execute(
+                        &mut engine,
+                        "SELECT (-1)::wide_constraint_domain",
+                        true
+                    )),
+                    ["23514"]
+                );
+            }
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        }
+    }
+}
+
+#[test]
 fn named_type_public_identifiers_survive_edits_replacement_and_savepoint_rollback() {
     for mode in [
         crate::config::TransactionMode::Mvcc,
@@ -1760,7 +2190,7 @@ fn relation_identity_exhaustion_keeps_existing_data_and_cold_recovery_usable() {
         session.success(&mut engine, "CREATE DOMAIN identity_limit_domain AS integer; CREATE TYPE identity_limit_enum AS ENUM ('ready'); CREATE TYPE identity_limit_composite AS (value integer)", false);
         engine
             .storage
-            .replace_catalog_sequence_for_test(crate::storage::MAX_RELATION_GENERATION - 2);
+            .replace_catalog_sequence_for_test(crate::storage::MAX_RELATION_GENERATION - 3);
         session.success(&mut engine, "CREATE TABLE identity_limit_orders(id integer PRIMARY KEY); INSERT INTO identity_limit_orders VALUES (7)", false);
         for sql in [
             "CREATE TABLE identity_limit_rejected(id integer)",
@@ -1916,7 +2346,21 @@ fn metadata_database_copy_recovers_exact_positions_after_other_transaction_rollb
         crate::mem::guard::forbid_alloc(|| assert!(image.append(&mut bytes)));
         bytes.readable().to_vec()
     }
-    const DEFINITION: &str = "CREATE DOMAIN code AS integer; CREATE TYPE state AS ENUM ('ready'); CREATE TYPE payload AS (id code); CREATE TABLE orders(id code PRIMARY KEY, state state); INSERT INTO orders VALUES (7, 'ready'); COMMENT ON CONSTRAINT orders_pkey ON orders IS 'primary key'; CREATE VIEW order_report AS SELECT id FROM orders; CREATE SEQUENCE order_counter START 10; CREATE FUNCTION order_body() RETURNS integer LANGUAGE SQL AS 'SELECT 1'; CREATE MATERIALIZED VIEW saved_report AS SELECT id FROM orders";
+    fn identities(engine: &mut Engine, budget: &Budget) -> Vec<String> {
+        let output = run_with_fixed_memory_and_ddl_capacity(
+            engine,
+            budget,
+            "SELECT relname, oid FROM pg_class WHERE relname IN ('orders', 'orders_pkey', 'order_report', 'order_counter', 'copied_counter', 'saved_report'); SELECT conname, oid FROM pg_constraint WHERE conrelid = 'orders'::regclass OR contypid = 'code'::regtype; SELECT typname, oid FROM pg_type WHERE typname IN ('code', 'state', 'payload', 'orders')",
+            4 << 20,
+            16,
+        );
+        assert!(error_sqlstates(&output).is_empty());
+        let mut rows = data_rows(&output);
+        assert_eq!(rows.len(), 13);
+        rows.sort_unstable();
+        rows
+    }
+    const DEFINITION: &str = "CREATE DOMAIN code AS integer CONSTRAINT code_positive CHECK (VALUE > 0) CONSTRAINT code_nn NOT NULL; CREATE TYPE state AS ENUM ('ready'); CREATE TYPE payload AS (id code); CREATE TABLE orders(id code PRIMARY KEY, state state); INSERT INTO orders VALUES (7, 'ready'); COMMENT ON CONSTRAINT orders_pkey ON orders IS 'primary key'; CREATE VIEW order_report AS SELECT id FROM orders; CREATE SEQUENCE order_counter START 10; CREATE FUNCTION order_body() RETURNS integer LANGUAGE SQL AS 'SELECT 1'; CREATE MATERIALIZED VIEW saved_report AS SELECT id FROM orders";
     for checkpoint in [false, true] {
         for mode in [
             crate::config::TransactionMode::Mvcc,
@@ -1940,6 +2384,7 @@ fn metadata_database_copy_recovers_exact_positions_after_other_transaction_rollb
             let mut retained =
                 ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
             retained.success(&mut engine, DEFINITION, false);
+            let template_identities = identities(&mut engine, &budget);
             engine
                 .select_database(crate::storage::DatabaseOid::POSTGRES)
                 .unwrap();
@@ -1959,6 +2404,7 @@ fn metadata_database_copy_recovers_exact_positions_after_other_transaction_rollb
                 .unwrap();
             engine.select_database(copied).unwrap();
             let original = positions(&engine);
+            assert_eq!(identities(&mut engine, &budget), template_identities);
             retained.success(&mut engine, "ALTER SEQUENCE order_counter RENAME TO copied_counter; CREATE OR REPLACE FUNCTION order_body() RETURNS integer LANGUAGE SQL AS 'SELECT 2'; REFRESH MATERIALIZED VIEW saved_report", false);
             if checkpoint {
                 assert!(engine.checkpoint().unwrap());
@@ -1976,6 +2422,15 @@ fn metadata_database_copy_recovers_exact_positions_after_other_transaction_rollb
                 "checkpoint={checkpoint}, mode={mode:?}"
             );
             let mut session = ConfiguredTransactionSession::new(&config, &mut cold_budget);
+            // The sequence rename is the only identifier inventory name change.
+            let mut expected = template_identities.clone();
+            for row in &mut expected {
+                if row.starts_with("order_counter|") {
+                    *row = row.replacen("order_counter|", "copied_counter|", 1);
+                }
+            }
+            expected.sort_unstable();
+            assert_eq!(identities(&mut cold, &cold_budget), expected);
             assert_eq!(data_rows(&session.success(&mut cold, "SELECT nextval('copied_counter'); SELECT order_body(); SELECT id FROM saved_report; SELECT id FROM order_report; SELECT obj_description(oid, 'pg_constraint') FROM pg_constraint WHERE conrelid = 'orders'::regclass AND contype = 'p'", false)), ["10", "2", "7", "7", "primary key"]);
         }
     }
@@ -5226,88 +5681,33 @@ fn relation_identity_view_rowtype_json_preserves_field_limits() {
 }
 
 #[test]
-fn wide_schema_catalog_oid_bands_are_disjoint_at_declared_capacities() {
-    use crate::storage::MAX_TABLE_CATALOG_SLOTS;
+fn catalog_constraint_identity_ranges_reject_overflow_and_keep_triggers_disjoint() {
+    use crate::storage::{ConstraintIdentity, ForeignKeyTrigger, MAX_TABLE_CATALOG_SLOTS};
     crate::mem::guard::forbid_alloc(|| {
-        assert_eq!(
-            catalog::foreign_key_constraint_oid(0, 0),
-            catalog::FIRST_FK_OID
-        );
-        assert_eq!(
-            catalog::check_constraint_oid(0, 0),
-            catalog::FIRST_CHECK_OID
-        );
-        assert_eq!(
-            catalog::domain_check_constraint_oid(0, 0),
-            catalog::FIRST_DOMAIN_CHECK_OID
-        );
-        assert_eq!(
-            catalog::foreign_key_constraint_oid(1, 0),
-            catalog::foreign_key_constraint_oid(0, crate::storage::MAX_FKEYS - 1) + 1
-        );
-        assert_eq!(
-            catalog::check_constraint_oid(1, 0),
-            catalog::check_constraint_oid(0, crate::storage::MAX_CHECKS - 1) + 1
-        );
-        assert_eq!(
-            catalog::domain_check_constraint_oid(1, 0),
-            catalog::domain_check_constraint_oid(0, crate::storage::MAX_DOMAIN_CHECKS - 1) + 1
-        );
-        assert_eq!(
-            catalog::not_null_constraint_oid(0, 0),
-            catalog::FIRST_NOT_NULL_OID
-        );
-        assert_eq!(
-            catalog::not_null_constraint_oid(
-                MAX_TABLE_CATALOG_SLOTS - 1,
-                crate::storage::MAX_RELATION_COLUMNS - 1,
-            ),
-            catalog::FIRST_NOT_NULL_OID
-                + (MAX_TABLE_CATALOG_SLOTS * crate::storage::MAX_RELATION_COLUMNS) as i32
-                - 1,
-        );
-        let ranges = [
-            (
-                catalog::FIRST_FK_OID,
-                MAX_TABLE_CATALOG_SLOTS * crate::storage::MAX_FKEYS,
-            ),
-            (
-                catalog::FIRST_CHECK_OID,
-                MAX_TABLE_CATALOG_SLOTS * crate::storage::MAX_CHECKS,
-            ),
-            (
-                catalog::FIRST_DOMAIN_CHECK_OID,
-                crate::storage::MAX_DOMAIN_CATALOG_SLOTS * crate::storage::MAX_DOMAIN_CHECKS,
-            ),
-            (
-                catalog::FIRST_NOT_NULL_OID,
-                MAX_TABLE_CATALOG_SLOTS * crate::storage::MAX_RELATION_COLUMNS,
-            ),
-            (
-                catalog::FIRST_DETACHED_PARTITION_CHECK_OID,
-                MAX_TABLE_CATALOG_SLOTS,
-            ),
-        ];
-        for pair in ranges.windows(2) {
-            assert!(pair[0].0 + pair[0].1 as i32 <= pair[1].0);
-        }
+        assert!(ConstraintIdentity::parse(0).is_none());
+        assert!(ConstraintIdentity::parse(10_000_000).is_none());
+        assert!(ConstraintIdentity::parse(u64::MAX).is_none());
+        let first = ConstraintIdentity::parse(1).unwrap();
+        let last = ConstraintIdentity::parse(9_999_999).unwrap();
+        assert!(first.oid() < last.oid());
         assert!(
             crate::storage::FIRST_EXPLICIT_INDEX_OID as u64
                 + crate::storage::MAX_INDEX_OID_GENERATION
                 + (crate::storage::INDEX_CONSTRAINT_OID_OFFSET as u64)
-                < crate::storage::FIRST_PARTITION_TRIGGER_OID as u64
+                < first.oid() as u64
         );
-        assert!(
-            crate::storage::TRIGGER_OID_BASE as u64 + crate::storage::MAX_TRIGGER_OID_GENERATION
-                < catalog::FIRST_FOREIGN_KEY_TRIGGER_OID as u64
-        );
-        assert!(
-            catalog::foreign_key_trigger_oid(
-                MAX_TABLE_CATALOG_SLOTS - 1,
-                crate::storage::MAX_FKEYS - 1,
-                3
-            ) < crate::storage::FIRST_PARTITION_TRIGGER_OID
-        );
+        for trigger in ForeignKeyTrigger::ALL {
+            assert!(last.oid() < first.foreign_key_trigger_oid(trigger));
+            assert!(first.foreign_key_trigger_oid(trigger) < last.foreign_key_trigger_oid(trigger));
+            assert!(
+                last.foreign_key_trigger_oid(trigger) < crate::storage::FIRST_PARTITION_TRIGGER_OID
+            );
+            assert!(
+                crate::storage::TRIGGER_OID_BASE as u64
+                    + crate::storage::MAX_TRIGGER_OID_GENERATION
+                    < first.foreign_key_trigger_oid(trigger) as u64
+            );
+        }
         assert!(
             crate::storage::FIRST_PARTITION_TRIGGER_OID as u64
                 + crate::storage::MAX_TRIGGER_OID_GENERATION * MAX_TABLE_CATALOG_SLOTS as u64
@@ -81996,7 +82396,11 @@ fn current_manifest_cold_recovery_rejects_invalid_roots_without_publication_body
         .object_bytes(&manifest_key)
         .unwrap()
         .to_vec();
-    assert!(current.starts_with(b"pos3ql-manifest-v29\n"));
+    let current_header = crate::checkpoint::MANIFEST_HEADER.as_bytes();
+    assert_eq!(
+        current.split(|byte| *byte == b'\n').next(),
+        Some(current_header)
+    );
     assert!(
         current.windows(b" v4\n".len()).any(|part| part == b" v4\n"),
         "current checkpoint must retain its packed row layout"
@@ -82031,6 +82435,11 @@ fn current_manifest_cold_recovery_rejects_invalid_roots_without_publication_body
         "pos3ql-manifest-v22",
         "pos3ql-manifest-v23",
         "pos3ql-manifest-v24",
+        "pos3ql-manifest-v25",
+        "pos3ql-manifest-v26",
+        "pos3ql-manifest-v27",
+        "pos3ql-manifest-v28",
+        "pos3ql-manifest-v29",
     ] {
         rejected_roots.push((format!("{header}\n{body}"), "unsupported manifest format"));
     }
@@ -82211,7 +82620,9 @@ fn current_manifest_cold_recovery_rejects_invalid_roots_without_publication_body
         namespace
             .borrow()
             .object_bytes(&manifest_key)
-            .is_some_and(|bytes| bytes.starts_with(b"pos3ql-manifest-v29\n"))
+            .is_some_and(|bytes| {
+                bytes.split(|byte| *byte == b'\n').next() == Some(current_header)
+            })
     );
     drop(recovered);
 

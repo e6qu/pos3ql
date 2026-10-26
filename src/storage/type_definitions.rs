@@ -233,53 +233,30 @@ fn same_type_name(left: Option<super::UserTypeName>, right: Option<super::UserTy
 }
 
 fn same_domain(image: &DomainDef, source: &DomainDef, transaction: u32) -> bool {
-    let pending = source
-        .pending_definition
-        .as_ref()
-        .filter(|pending| pending.txid == transaction);
-    let (schema, name) = pending
-        .and_then(|pending| pending.identity)
-        .map_or((source.schema, source.name), |identity| {
-            (identity.schema, identity.name)
-        });
-    let (base_domain, base_user_type, base, type_mod, not_null, default, checks) = match pending {
-        Some(pending) => (
-            pending.spec.base_domain,
-            pending.spec.base_user_type,
-            pending.spec.base,
-            pending.spec.base_type_mod,
-            pending.spec.not_null,
-            pending.spec.default_expr,
-            &pending.spec.checks[..pending.spec.n_checks],
-        ),
-        None => (
-            source.base_domain,
-            source.base_user_type,
-            source.base,
-            source.base_type_mod,
-            source.not_null,
-            source.default_expr,
-            source.checks(),
-        ),
-    };
-    image.schema == schema
-        && image.name == name
+    let source = source.definition_for(transaction);
+    image.schema == source.schema
+        && image.name == source.name
         && image.ownership == source.ownership
         && image.ddl_state == source.ddl_state
-        && same_type_name(image.base_domain, base_domain)
-        && same_type_name(image.base_user_type, base_user_type)
-        && image.base == base
-        && image.base_type_mod == type_mod
-        && image.not_null == not_null
-        && image.not_null_name
-            == pending.map_or(source.not_null_name, |pending| pending.spec.not_null_name)
-        && image.default_expr == default
-        && image.checks().len() == checks.len()
-        && image.checks().iter().zip(checks).all(|(left, right)| {
-            left.name == right.name
-                && left.expression == right.expression
-                && left.validation == right.validation
-        })
+        && same_type_name(image.base_domain, source.base_domain)
+        && same_type_name(image.base_user_type, source.base_user_type)
+        && image.base == source.base
+        && image.base_type_mod == source.base_type_mod
+        && image.not_null == source.not_null
+        && image.not_null_name == source.not_null_name
+        && image.not_null_identity == source.not_null_identity
+        && image.default_expr == source.default_expr
+        && image.checks().len() == source.checks().len()
+        && image
+            .checks()
+            .iter()
+            .zip(source.checks())
+            .all(|(left, right)| {
+                left.identity == right.identity
+                    && left.name == right.name
+                    && left.expression == right.expression
+                    && left.validation == right.validation
+            })
 }
 
 fn same_enum(image: &EnumDefinition, source: &super::EnumDef, safe_member_count: usize) -> bool {
@@ -459,25 +436,7 @@ impl TypeDefinitionImages {
             return Ok(definition);
         }
         self.domains.copy(key, source, |definition| {
-            if let Some(pending) = source
-                .pending_definition
-                .as_ref()
-                .filter(|pending| pending.txid == transaction)
-            {
-                if let Some(identity) = pending.identity {
-                    definition.schema = identity.schema;
-                    definition.name = identity.name;
-                }
-                definition.base_domain = pending.spec.base_domain;
-                definition.base_user_type = pending.spec.base_user_type;
-                definition.base = pending.spec.base;
-                definition.base_type_mod = pending.spec.base_type_mod;
-                definition.not_null = pending.spec.not_null;
-                definition.default_expr = pending.spec.default_expr;
-                definition.checks.copy_from_slice(&pending.spec.checks);
-                definition.n_checks = pending.spec.n_checks;
-            }
-            definition.pending_definition = None;
+            *definition = source.definition_for(transaction);
         })
     }
 
@@ -769,6 +728,7 @@ mod tests {
             NamedTypeSlot::Domain(_) => {
                 let mut checks = [CheckConstraint::EMPTY; MAX_DOMAIN_CHECKS];
                 checks[0] = CheckConstraint {
+                    identity: None,
                     name: SqlName::parse("positive").unwrap(),
                     expression: crate::util::StackStr::from_str("VALUE > 0"),
                     validation: ConstraintValidation::EnforcedValidated,
@@ -783,6 +743,7 @@ mod tests {
                         base_type_mod: -1,
                         not_null: true,
                         not_null_name: None,
+                        not_null_identity: None,
                         default_expr: None,
                         checks,
                         n_checks: 1,
@@ -1447,6 +1408,7 @@ mod tests {
                     base_type_mod: -1,
                     not_null: false,
                     not_null_name: None,
+                    not_null_identity: None,
                     default_expr: None,
                     checks: [CheckConstraint::EMPTY; MAX_DOMAIN_CHECKS],
                     n_checks: 0,
@@ -1538,6 +1500,7 @@ mod tests {
             base_type_mod: -1,
             not_null: false,
             not_null_name: None,
+            not_null_identity: None,
             default_expr: None,
             checks: [CheckConstraint::EMPTY; MAX_DOMAIN_CHECKS],
             n_checks: 0,
@@ -1681,6 +1644,7 @@ mod tests {
                                 base_type_mod: -1,
                                 not_null: false,
                                 not_null_name: None,
+                                not_null_identity: None,
                                 default_expr: None,
                                 checks: [CheckConstraint::EMPTY; MAX_DOMAIN_CHECKS],
                                 n_checks: 0,
@@ -1937,6 +1901,7 @@ mod tests {
                                     base_type_mod: -1,
                                     not_null: false,
                                     not_null_name: None,
+                                    not_null_identity: None,
                                     default_expr: None,
                                     checks: [CheckConstraint::EMPTY; MAX_DOMAIN_CHECKS],
                                     n_checks: 0,
@@ -2133,6 +2098,7 @@ mod tests {
                         base_type_mod: -1,
                         not_null: false,
                         not_null_name: None,
+                        not_null_identity: None,
                         default_expr: Some(crate::util::StackStr::from_str(marker)),
                         checks: [CheckConstraint::EMPTY; MAX_DOMAIN_CHECKS],
                         n_checks: 0,

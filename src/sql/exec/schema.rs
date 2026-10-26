@@ -78,6 +78,7 @@ pub(crate) fn rename(
             base_type_mod: definition.base_type_mod,
             not_null: definition.not_null,
             not_null_name: definition.not_null_name,
+            not_null_identity: definition.not_null_identity,
             default_expr: definition.default_expr,
             checks: definition.checks,
             n_checks: definition.n_checks,

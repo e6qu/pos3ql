@@ -426,6 +426,7 @@ mod tests {
                 let mut dependent = storage.tables[other].definition_mut(revision);
                 dependent.n_fkeys = 1;
                 dependent.fkeys[0] = crate::storage::ForeignKey {
+                    identity: None,
                     parent_schema: original.schema,
                     parent: original.name,
                     n_cols: 1,

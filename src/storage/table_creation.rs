@@ -30,6 +30,7 @@ pub(super) fn allocate(
         ));
     }
     super::constraint_names::table(&mut def)?;
+    def.not_null_name_edits = super::ColumnSet::EMPTY;
     let transaction = match creation {
         TableCreation::Committed => 0,
         TableCreation::Pending(transaction) => transaction,
@@ -179,21 +180,27 @@ pub(super) fn allocate(
                         "saved table has an invalid creation identity"
                     )
                 })?;
-                storage.catalog_sequence.observe(position.created_at());
                 position.created_at()
             }
         };
         match allocation {
             super::CatalogAllocation::New => {
+                def.not_null_identities.fill(None);
+                for identity in def.constraint_identities_mut() {
+                    *identity = None;
+                }
                 def.inline_index_identities.fill(None);
                 for identity in def.implicit_index_identities_mut() {
                     *identity = None;
                 }
-                storage.reserve_implicit_index_identities(&mut def)?;
+                storage.reserve_table_catalog_identities(&mut def)?;
             }
             super::CatalogAllocation::Restore(_) => {
-                storage.validate_implicit_index_identities(&def)?
+                storage.validate_table_catalog_identities(&def, created_at)?
             }
+        }
+        if matches!(allocation, super::CatalogAllocation::Restore(_)) {
+            storage.catalog_sequence.observe(created_at);
         }
         state.install(
             def,

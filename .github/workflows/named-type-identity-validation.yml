@@ -72,8 +72,8 @@ jobs:
       - name: Diagnose new cold-recovery and privilege regressions
         shell: bash
         run: |
-          python3 tools/test_command.py cargo test --lib --locked -- named_type_cached_defaults numeric_object_privileges type_recovery_installs_saved_birth restored_type_identity_rejects tablespace_identity_bounds catalog_oid_inputs --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/new-type-regressions.log"
-          grep -Eq 'test result: ok\. 7 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/new-type-regressions.log"
+          python3 tools/test_command.py cargo test --lib --locked -- named_type_cached_defaults numeric_object_privileges type_recovery_installs_saved_birth restored_type_identity_rejects tablespace_identity_bounds catalog_oid_inputs type_creation_lookup_preserves declared_type_bindings_reject --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/new-type-regressions.log"
+          grep -Eq 'test result: ok\. 9 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/new-type-regressions.log"
       - name: Enum label identities, corruption and replay lock regression
         shell: bash
         run: |

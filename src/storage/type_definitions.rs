@@ -57,9 +57,12 @@ impl TypeDefinitionTarget {
         let snapshot = catalog
             .type_snapshot(self.slot(), transaction)?
             .filter(|snapshot| snapshot.identity.database() == super::current_database());
-        snapshot
-            .map(|snapshot| TypeReference::from_bound_name(snapshot.name))
-            .transpose()
+        Ok(snapshot.and_then(|snapshot| catalog.source_reference_by_creation(
+            snapshot.identity.slot().kind(),
+            super::type_identities::TypeCreation::parse(snapshot.identity.created_at())
+                .expect("selected type birth was admitted"),
+            super::current_database(),
+        )))
     }
 
     pub(super) fn validate(
@@ -913,6 +916,94 @@ mod tests {
                 assert_eq!(definition.name.as_str(), "reader_source");
                 assert_eq!(definition.fields()[0].name.as_str(), "before");
             }
+        }
+    }
+
+    #[test]
+    fn type_creation_lookup_preserves_family_database_and_retained_definitions() {
+        use super::super::{DatabaseOid, NamedTypeKind};
+        use super::super::type_identities::TypeCreation;
+        for source in SOURCES {
+            let mut storage = fixture(1);
+            create(&mut storage, source).unwrap();
+            let reference = reference(&storage, source);
+            let birth = {
+                let catalog = storage.type_catalog.lock().unwrap();
+                TypeCreation::parse(catalog.type_snapshot(source, 0).unwrap().unwrap()
+                    .identity.created_at()).unwrap()
+            };
+            let database = super::super::current_database();
+            let images = storage.type_definition_images();
+            crate::mem::guard::forbid_alloc(|| {
+                {
+                    let catalog = storage.type_catalog.lock().unwrap();
+                    assert_eq!(catalog.source_reference_by_creation(source.kind(), birth, database),
+                        Some(reference));
+                    for kind in [NamedTypeKind::Domain, NamedTypeKind::Enum, NamedTypeKind::Composite] {
+                        if kind != source.kind() {
+                            assert!(catalog.source_reference_by_creation(kind, birth, database).is_none());
+                        }
+                    }
+                    assert!(catalog.source_reference_by_creation(source.kind(), birth,
+                        DatabaseOid::parse(2).unwrap()).is_none());
+                    assert!(catalog.source_reference_by_creation(source.kind(),
+                        TypeCreation::parse(9_999_999).unwrap(), database).is_none());
+                }
+                retain(&images, &storage, reference).unwrap();
+                retire(&mut storage, source);
+                let selected = {
+                    let catalog = storage.type_catalog.lock().unwrap();
+                    let selected = catalog.source_reference_by_creation(source.kind(), birth, database).unwrap();
+                    assert_eq!(selected, reference);
+                    assert!(catalog.resolve_source_reference(selected, database, 0).unwrap().is_none());
+                    selected
+                };
+                assert_retained(&capture(&images, &storage, selected).unwrap());
+                drop(images);
+                assert_eq!(create(&mut storage, source).unwrap(), source.index());
+                let catalog = storage.type_catalog.lock().unwrap();
+                assert!(catalog.source_reference_by_creation(source.kind(), birth, database).is_none());
+                assert!(catalog.resolve_source_reference(reference, database, 0).unwrap().is_none());
+                let new_birth = TypeCreation::parse(catalog.type_snapshot(source, 0).unwrap().unwrap()
+                    .identity.created_at()).unwrap();
+                assert_ne!(birth, new_birth);
+                assert!(catalog.source_reference_by_creation(source.kind(), new_birth, database).is_some());
+            });
+        }
+    }
+
+    #[test]
+    fn declared_type_bindings_reject_reused_sources_instead_of_resolving_names() {
+        use super::super::{ColumnMeta, UserTypeName};
+        for source in SOURCES {
+            let mut storage = fixture(1);
+            create(&mut storage, source).unwrap();
+            let (bound, stored) = {
+                let catalog = storage.type_catalog.lock().unwrap();
+                let snapshot = catalog.type_snapshot(source, 0).unwrap().unwrap();
+                let column = ColumnMeta {
+                    ctype: snapshot.base,
+                    user_type: Some(snapshot.name),
+                    ..ColumnMeta::EMPTY
+                };
+                let saved = snapshot.name.storage_name();
+                let restored = ColumnMeta {
+                    ctype: ColType::from_code(snapshot.base.code()).unwrap(),
+                    user_type: Some(UserTypeName::from_storage(snapshot.name.schema, saved.as_str()).unwrap()),
+                    ..column
+                };
+                (column, restored)
+            };
+            crate::mem::guard::forbid_alloc(|| {
+                assert_eq!(storage.declared_column_type(&bound, 0).unwrap(),
+                    storage.declared_column_type(&stored, 0).unwrap());
+                retire(&mut storage, source);
+                assert_eq!(create(&mut storage, source).unwrap(), source.index());
+                for column in [&bound, &stored] {
+                    assert_eq!(storage.declared_column_type(column, 0).unwrap_err().sqlstate,
+                        sqlstate::UNDEFINED_OBJECT);
+                }
+            });
         }
     }
 

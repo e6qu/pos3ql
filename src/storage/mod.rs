@@ -40030,189 +40030,27 @@ impl Storage {
         column: &ColumnMeta,
         txid: u32,
     ) -> Result<DeclaredColumnType, SqlError> {
-        use crate::sql::types::oid;
-        let mut rebound = *column;
-        if column.user_type.is_some_and(|identity| {
-            matches!(identity.binding, type_references::TypeBinding::Captured(_))
-        }) {
-            let result = self.bind_routine_result(
-                RoutineResult {
-                    ctype: column.ctype,
-                    user_type: column.user_type,
-                },
-                txid,
-            )?;
-            rebound.ctype = result.ctype;
-            rebound.user_type = result.user_type;
-        }
-        let column = &rebound;
-
-        // A scalar domain may contain an array of another domain. Its base
-        // element's slot is not the identity of the column declaration.
-        if let Some(UserTypeName { schema, name, .. }) = column.user_type
-            && let Some(slot) = self.domain_identity_slot(schema.as_str(), name.as_str(), txid)
-            && matches!(
-                self.domain_for(slot, txid).base,
-                ColType::Array(ArrElem::Domain { .. })
-            )
-        {
-            return Ok(DeclaredColumnType::UserDefined {
-                oid: oid::domain_oid(slot as u16),
-                schema,
-                name,
-            });
-        }
-        match column.ctype {
-            ColType::Array(ArrElem::Domain { slot, .. }) => {
-                let UserTypeName { schema, name, .. } = column.user_type.ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::PROTOCOL_VIOLATION,
-                        "domain-array column type lacks its durable identity"
-                    )
-                })?;
-                if self.domain_identity_slot(schema.as_str(), name.as_str(), txid)
-                    != Some(slot as usize)
-                {
-                    return Err(sql_err!(
-                        sqlstate::PROTOCOL_VIOLATION,
-                        "domain-array column type does not match its durable identity"
-                    ));
-                }
-                return Ok(DeclaredColumnType::Builtin {
-                    oid: oid::domain_array_oid(slot),
-                });
-            }
-            _ if column.user_type.is_some_and(|identity| {
-                self.domain_identity_slot(identity.schema.as_str(), identity.name.as_str(), txid)
-                    .is_some()
-            }) =>
+        let Some(identity) = column.user_type else {
+            if matches!(column.ctype, ColType::Enum(_) | ColType::Composite(_))
+                || matches!(column.ctype, ColType::Array(element) if element.user_type_slot().is_some())
             {
-                let UserTypeName { schema, name, .. } =
-                    column.user_type.expect("domain checked above");
-                let slot = self
-                    .domain_identity_slot(schema.as_str(), name.as_str(), txid)
-                    .expect("domain checked above");
-                return Ok(DeclaredColumnType::UserDefined {
-                    oid: oid::domain_oid(slot as u16),
-                    schema,
-                    name,
-                });
+                return Err(sql_err!(
+                    sqlstate::PROTOCOL_VIOLATION,
+                    "named column type lacks its durable identity"
+                ));
             }
-            ColType::Enum(slot) => {
-                let UserTypeName { schema, name, .. } = column.user_type.ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::PROTOCOL_VIOLATION,
-                        "enum column type lacks its durable identity"
-                    )
-                })?;
-                if self.enum_identity_slot(schema.as_str(), name.as_str(), txid)
-                    != Some(slot as usize)
-                {
-                    return Err(sql_err!(
-                        sqlstate::PROTOCOL_VIOLATION,
-                        "enum column type does not match its durable identity"
-                    ));
-                }
-                return Ok(DeclaredColumnType::UserDefined {
-                    oid: oid::enum_oid(slot),
-                    schema,
-                    name,
-                });
-            }
-            ColType::Array(ArrElem::Enum(slot)) => {
-                let UserTypeName { schema, name, .. } = column.user_type.ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::PROTOCOL_VIOLATION,
-                        "enum-array column type lacks its durable identity"
-                    )
-                })?;
-                if self.enum_identity_slot(schema.as_str(), name.as_str(), txid)
-                    != Some(slot as usize)
-                {
-                    return Err(sql_err!(
-                        sqlstate::PROTOCOL_VIOLATION,
-                        "enum-array column type does not match its durable identity"
-                    ));
-                }
-                return Ok(DeclaredColumnType::Builtin {
-                    oid: oid::enum_array_oid(slot),
-                });
-            }
-            ColType::Composite(slot) => {
-                let UserTypeName { schema, name, .. } = column.user_type.ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::PROTOCOL_VIOLATION,
-                        "composite column type lacks its durable identity"
-                    )
-                })?;
-                if self.composite_identity_slot(schema.as_str(), name.as_str(), txid)
-                    != Some(slot as usize)
-                {
-                    return Err(sql_err!(
-                        sqlstate::PROTOCOL_VIOLATION,
-                        "composite column type does not match its durable identity"
-                    ));
-                }
-                return Ok(DeclaredColumnType::UserDefined {
-                    oid: oid::composite_oid(slot),
-                    schema,
-                    name,
-                });
-            }
-            ColType::Array(ArrElem::Composite(slot)) => {
-                let UserTypeName { schema, name, .. } = column.user_type.ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::PROTOCOL_VIOLATION,
-                        "composite-array column type lacks its durable identity"
-                    )
-                })?;
-                if self.composite_identity_slot(schema.as_str(), name.as_str(), txid)
-                    != Some(slot as usize)
-                {
-                    return Err(sql_err!(
-                        sqlstate::PROTOCOL_VIOLATION,
-                        "composite-array column type does not match its durable identity"
-                    ));
-                }
-                return Ok(DeclaredColumnType::Builtin {
-                    oid: oid::composite_array_oid(slot),
-                });
-            }
-            _ => {}
-        }
-
-        let Some(UserTypeName { schema, name, .. }) = column.user_type else {
-            return Ok(DeclaredColumnType::Builtin {
-                oid: column.ctype.oid(),
-            });
+            return Ok(DeclaredColumnType::Builtin { oid: column.ctype.oid() });
         };
-        if let Some(slot) = self.domain_identity_slot(schema.as_str(), name.as_str(), txid) {
-            return Ok(DeclaredColumnType::UserDefined {
-                oid: oid::domain_oid(slot as u16),
-                schema,
-                name,
-            });
-        }
-        if let Some(slot) = self.enum_identity_slot(schema.as_str(), name.as_str(), txid) {
-            return Ok(DeclaredColumnType::UserDefined {
-                oid: oid::enum_oid(slot as u16),
-                schema,
-                name,
-            });
-        }
-        if let Some(slot) = self.composite_identity_slot(schema.as_str(), name.as_str(), txid) {
-            return Ok(DeclaredColumnType::UserDefined {
-                oid: oid::composite_oid(slot as u16),
-                schema,
-                name,
-            });
-        }
-        Err(sql_err!(
-            sqlstate::UNDEFINED_OBJECT,
-            "declared column type \"{}.{}\" does not exist",
-            schema.as_str(),
-            name.as_str()
-        ))
+        let catalog = self.type_catalog.lock().expect("type catalog lock poisoned");
+        let bound = catalog.bind_type_reference(
+            RoutineResult { ctype: column.ctype, user_type: Some(identity) },
+            current_database(), txid,
+        )?;
+        let source = catalog.resolve_type_reference(
+            bound.user_type.expect("named column type was bound"), current_database(), txid,
+        )?.ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT,
+            "declared column type no longer exists"))?;
+        Ok(source.declared_type(bound.ctype))
     }
 
     pub fn domain(&self, slot: usize) -> DomainDef {
@@ -43545,7 +43383,6 @@ impl Storage {
         user_type: Option<UserTypeName>,
         txid: u32,
     ) -> Option<i32> {
-        use crate::sql::types::oid;
         if let Some(kind) = polymorphic_type(ctype, user_type) {
             return Some(kind.oid());
         }
@@ -43564,22 +43401,7 @@ impl Storage {
         let bound = catalog
             .bind_type_reference(RoutineResult { ctype, user_type }, current_database(), txid)
             .ok()?;
-        let array = match snapshot.identity.slot() {
-            NamedTypeSlot::Domain(_) => {
-                matches!(bound.ctype, ColType::Array(ArrElem::Domain { .. }))
-                    && !matches!(snapshot.base, ColType::Array(ArrElem::Domain { .. }))
-            }
-            _ => matches!(bound.ctype, ColType::Array(_)),
-        };
-        let slot = u16::try_from(snapshot.identity.slot().index()).ok()?;
-        Some(match (snapshot.identity.slot(), array) {
-            (NamedTypeSlot::Domain(_), false) => oid::domain_oid(slot),
-            (NamedTypeSlot::Domain(_), true) => oid::domain_array_oid(slot),
-            (NamedTypeSlot::Enum(_), false) => oid::enum_oid(slot),
-            (NamedTypeSlot::Enum(_), true) => oid::enum_array_oid(slot),
-            (NamedTypeSlot::Composite(_), false) => oid::composite_oid(slot),
-            (NamedTypeSlot::Composite(_), true) => oid::composite_array_oid(slot),
-        })
+        Some(snapshot.declared_type(bound.ctype).catalog_oid())
     }
 
     /// Binds the transient representation slot in a persisted routine type to
@@ -43755,7 +43577,6 @@ impl Storage {
         array: bool,
         txid: u32,
     ) -> Option<i32> {
-        use crate::sql::types::oid;
         let catalog = self
             .type_catalog
             .lock()
@@ -43763,15 +43584,7 @@ impl Storage {
         let source = catalog
             .resolve_type_reference(identity, current_database(), txid)
             .ok()??;
-        let index = u16::try_from(source.identity.slot().index()).ok()?;
-        Some(match (source.identity.slot(), array) {
-            (NamedTypeSlot::Domain(_), false) => oid::domain_oid(index),
-            (NamedTypeSlot::Domain(_), true) => oid::domain_array_oid(index),
-            (NamedTypeSlot::Enum(_), false) => oid::enum_oid(index),
-            (NamedTypeSlot::Enum(_), true) => oid::enum_array_oid(index),
-            (NamedTypeSlot::Composite(_), false) => oid::composite_oid(index),
-            (NamedTypeSlot::Composite(_), true) => oid::composite_array_oid(index),
-        })
+        Some(source.oid(array))
     }
 
     pub(crate) fn routine_slot_by_signature(
@@ -62445,7 +62258,7 @@ mod tests {
                 .declared_column_type(&column, 0)
                 .unwrap_err()
                 .sqlstate,
-            sqlstate::PROTOCOL_VIOLATION
+            sqlstate::UNDEFINED_OBJECT
         );
     }
 

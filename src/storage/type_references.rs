@@ -544,6 +544,40 @@ pub(super) struct TypeSnapshot {
 }
 
 impl TypeSnapshot {
+    pub(super) fn oid(&self, array: bool) -> i32 {
+        use crate::sql::types::oid;
+        let slot = u16::try_from(self.identity.slot().index())
+            .expect("admitted type slot fits its catalog representation");
+        match (self.identity.slot(), array) {
+            (NamedTypeSlot::Domain(_), false) => oid::domain_oid(slot),
+            (NamedTypeSlot::Domain(_), true) => oid::domain_array_oid(slot),
+            (NamedTypeSlot::Enum(_), false) => oid::enum_oid(slot),
+            (NamedTypeSlot::Enum(_), true) => oid::enum_array_oid(slot),
+            (NamedTypeSlot::Composite(_), false) => oid::composite_oid(slot),
+            (NamedTypeSlot::Composite(_), true) => oid::composite_array_oid(slot),
+        }
+    }
+
+    pub(super) fn declared_type(&self, bound: ColType) -> super::DeclaredColumnType {
+        let array = match self.identity.slot() {
+            NamedTypeSlot::Domain(_) => {
+                matches!(bound, ColType::Array(ArrElem::Domain { .. }))
+                    && !matches!(self.base, ColType::Array(ArrElem::Domain { .. }))
+            }
+            _ => matches!(bound, ColType::Array(_)),
+        };
+        let oid = self.oid(array);
+        if array {
+            super::DeclaredColumnType::Builtin { oid }
+        } else {
+            super::DeclaredColumnType::UserDefined {
+                oid,
+                schema: self.name.schema,
+                name: self.name.name,
+            }
+        }
+    }
+
     pub(super) fn representation(&self, declared: ColType) -> Result<ColType, SqlError> {
         match self.identity.slot() {
             NamedTypeSlot::Domain(slot)
@@ -751,39 +785,43 @@ impl TypeCatalog {
         Ok(())
     }
 
+    pub(super) fn source_reference_by_creation(
+        &self,
+        kind: super::NamedTypeKind,
+        creation: TypeCreation,
+        database: DatabaseOid,
+    ) -> Option<TypeReference> {
+        let slot = self.identities.lookup(database, creation.created_at())?;
+        if slot.kind() != kind {
+            return None;
+        }
+        Some(TypeReference(ReferenceIdentity::Captured(TypeIdentity::new(
+            self.origin, database, slot, creation.created_at(),
+        ))))
+    }
+
     pub(super) fn resolve_source_reference(
         &self,
         reference: TypeReference,
         database: DatabaseOid,
         transaction: u32,
     ) -> Result<Option<TypeSnapshot>, SqlError> {
-        match reference.0 {
-            ReferenceIdentity::Captured(key) => {
-                if key.origin() != self.origin || key.database() != database {
-                    return Err(sql_err!(
-                        sqlstate::UNDEFINED_OBJECT,
-                        "captured type reference belongs to a different catalog"
-                    ));
-                }
-                if self.identities.lookup(database, key.created_at()) != Some(key.slot()) {
-                    return Ok(None);
-                }
-                Ok(self
-                    .type_snapshot(key.slot(), transaction)?
-                    .filter(|snapshot| snapshot.identity == key))
-            }
-            ReferenceIdentity::Stored(key) => {
-                if self.identities.lookup(database, key.created_at()) != Some(key.slot()) {
-                    return Ok(None);
-                }
-                Ok(self
-                    .type_snapshot(key.slot(), transaction)?
-                    .filter(|snapshot| {
-                        snapshot.identity.database() == database
-                            && snapshot.identity.created_at() == key.created_at()
-                    }))
-            }
+        if let ReferenceIdentity::Captured(key) = reference.0
+            && (key.origin() != self.origin || key.database() != database)
+        {
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "captured type reference belongs to a different catalog"
+            ));
         }
+        let key = reference.stored();
+        let Some(bound) = self.source_reference_by_creation(
+            key.slot().kind(), key.created_at, database,
+        ).filter(|bound| bound.slot() == key.slot()) else {
+            return Ok(None);
+        };
+        Ok(self.type_snapshot(bound.slot(), transaction)?
+            .filter(|snapshot| reference.refers_to(snapshot.identity, database)))
     }
 
     pub(super) fn resolve_type_reference(

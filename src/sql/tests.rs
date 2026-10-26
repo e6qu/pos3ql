@@ -2316,8 +2316,13 @@ fn metadata_database_copy_recovers_exact_positions_after_other_transaction_rollb
         bytes.readable().to_vec()
     }
     fn identities(engine: &mut Engine, budget: &Budget) -> Vec<String> {
-        let output = run_with_fixed_memory_and_ddl_capacity(engine, budget,
-            "SELECT relname, oid FROM pg_class WHERE relname IN ('orders', 'orders_pkey', 'order_report', 'order_counter', 'copied_counter', 'saved_report'); SELECT conname, oid FROM pg_constraint WHERE conrelid = 'orders'::regclass OR contypid = 'code'::regtype; SELECT typname, oid FROM pg_type WHERE typname IN ('code', 'state', 'payload', 'orders')", 4 << 20, 16);
+        let output = run_with_fixed_memory_and_ddl_capacity(
+            engine,
+            budget,
+            "SELECT relname, oid FROM pg_class WHERE relname IN ('orders', 'orders_pkey', 'order_report', 'order_counter', 'copied_counter', 'saved_report'); SELECT conname, oid FROM pg_constraint WHERE conrelid = 'orders'::regclass OR contypid = 'code'::regtype; SELECT typname, oid FROM pg_type WHERE typname IN ('code', 'state', 'payload', 'orders')",
+            4 << 20,
+            16,
+        );
         assert!(error_sqlstates(&output).is_empty());
         let mut rows = data_rows(&output);
         assert_eq!(rows.len(), 13);

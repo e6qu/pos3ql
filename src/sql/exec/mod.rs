@@ -67576,8 +67576,10 @@ fn alter_table_relation(
                         new_def.columns[i].not_null.drop_local()
                     };
                 if !new_def.columns[i].not_null.is_required() {
-                    let attribute = usize::from(new_def.attribute_number(i) - 1);
-                    new_def.not_null_identities[attribute] = None;
+                    if let ColSource::Keep(original) | ColSource::Cast { orig: original, .. } = source[i] {
+                        let attribute = usize::from(def.attribute_number(original) - 1);
+                        new_def.not_null_identities[attribute] = None;
+                    }
                     new_def.not_null_names[i] = None;
                     new_def.not_null_name_edits.insert(i);
                 }

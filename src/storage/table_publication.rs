@@ -256,6 +256,7 @@ impl DefinitionPublication {
             else {
                 return Ok(None);
             };
+            definition.not_null_name_edits = super::ColumnSet::EMPTY;
             // Every affected definition is published once. No catalog entry
             // changes before all counters and owners have been admitted.
             for owner in owners.slots.iter().flatten() {

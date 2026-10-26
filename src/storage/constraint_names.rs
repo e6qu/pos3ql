@@ -141,7 +141,6 @@ pub(crate) fn table(definition: &mut TableDef) -> Result<(), SqlError> {
             ));
         }
     }
-    definition.not_null_name_edits = super::ColumnSet::EMPTY;
     Ok(())
 }
 
@@ -170,7 +169,10 @@ pub(crate) fn remap_table(
         }
     }
     definition.not_null_names = names;
-    table(definition)
+    table(definition)?;
+    // Later admission may remap the same draft again; these names are canonical.
+    definition.not_null_name_edits = super::ColumnSet::all(definition.n_columns);
+    Ok(())
 }
 
 pub(super) fn domain(name: SqlName, spec: &mut DomainSpec) -> Result<(), SqlError> {
@@ -252,7 +254,7 @@ mod tests {
             remap_table(&original, &mut replacement, &mapping).unwrap();
             assert_eq!(replacement.not_null_names[0], retained_name);
             assert_eq!(replacement.not_null_names[1], Some(explicit));
-            assert_eq!(replacement.not_null_name_edits, super::super::ColumnSet::EMPTY);
+            assert_eq!(replacement.not_null_name_edits, super::super::ColumnSet::all(replacement.n_columns));
         });
     }
 }

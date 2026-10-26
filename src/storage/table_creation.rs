@@ -30,6 +30,7 @@ pub(super) fn allocate(
         ));
     }
     super::constraint_names::table(&mut def)?;
+    def.not_null_name_edits = super::ColumnSet::EMPTY;
     let transaction = match creation {
         TableCreation::Committed => 0,
         TableCreation::Pending(transaction) => transaction,

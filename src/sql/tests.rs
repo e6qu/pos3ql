@@ -1582,7 +1582,7 @@ fn constraint_identity_exhaustion_preserves_existing_data_and_cold_recovery() {
                 let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
                 let mut engine = Engine::new(&config, &mut budget).unwrap();
                 let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
-                session.success(&mut engine, "CREATE TABLE constraint_limit(id integer NOT NULL, optional integer, CONSTRAINT table_keep CHECK (id > 0)); CREATE DOMAIN constraint_limit_domain AS integer CONSTRAINT domain_keep CHECK (VALUE > 0); INSERT INTO constraint_limit VALUES (7, NULL)", false);
+                session.success(&mut engine, "CREATE TABLE constraint_limit(id integer NOT NULL, optional integer, CONSTRAINT table_keep CHECK (id > 0)); CREATE DOMAIN constraint_limit_domain AS integer CONSTRAINT domain_keep CHECK (VALUE > 0); INSERT INTO constraint_limit VALUES (7, 7)", false);
                 before = data_rows(&session.success(&mut engine, INVENTORY, true));
                 assert_eq!(before.len(), 3);
                 engine.storage.replace_catalog_sequence_for_test(crate::storage::MAX_CONSTRAINT_CREATION);

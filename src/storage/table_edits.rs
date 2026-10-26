@@ -228,6 +228,7 @@ impl<'storage> TableDefinitionEdit<'storage> {
             column_mapping,
         )?;
         super::constraint_names::remap_table(current, &mut definition, column_mapping)?;
+        definition.not_null_name_edits = super::ColumnSet::EMPTY;
         self.storage
             .reserve_table_catalog_identities(&mut definition)?;
         // Column-only edits replace pg_attribute rows. Keep track of edits

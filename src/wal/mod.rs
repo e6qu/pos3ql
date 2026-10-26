@@ -14601,6 +14601,36 @@ mod tests {
     }
 
     #[test]
+    fn constraint_identity_table_payload_rejects_missing_duplicate_and_pre_owner_stamps() {
+        let definition = sample_def();
+        let mut budget = Budget::new(32768);
+        let mut payload = FixedBuf::new(&mut budget, "constraint identity payload", 32768).unwrap();
+        assert!(append_payload(
+            &mut payload,
+            &WalOp::CreateTable {
+                identity: crate::storage::CatalogPosition::new(0, 50).unwrap(),
+                definition: &definition,
+            }
+        ));
+        let length = payload.len();
+        assert!(definition.constraint_identities().count() > 1);
+        let first = definition.constraint_identities().next().unwrap().unwrap().created_at();
+        let last: [u8; 4] = payload.readable()[length - 4..].try_into().unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            assert!(decode_table_payload(payload.readable()).is_some());
+            for missing in 1..=4 {
+                assert!(decode_table_payload(&payload.readable()[..length - missing]).is_none());
+            }
+            for invalid in [0, 50, crate::storage::MAX_CONSTRAINT_CREATION + 1, first] {
+                payload.filled_mut()[length - 4..].copy_from_slice(&(invalid as u32).to_le_bytes());
+                assert!(decode_table_payload(payload.readable()).is_none(), "accepted constraint identity {invalid}");
+            }
+            payload.filled_mut()[length - 4..].copy_from_slice(&last);
+            assert!(decode_table_payload(payload.readable()).is_some());
+        });
+    }
+
+    #[test]
     fn catalog_snapshot_table_payload_validates_unique_modes_and_attribute_layouts() {
         use crate::storage::UniqueKeyKind;
         let mut definition = sample_def();

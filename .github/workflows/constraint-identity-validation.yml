@@ -67,7 +67,7 @@ jobs:
         shell: bash
         run: |
           python3 tools/test_command.py cargo test --lib --locked -- constraint_public_identifiers constraint_manifest_wide constraint_declaration_names constraint_identity_ --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/constraint-lifetimes.log"
-          grep -Eq 'test result: ok\. 10 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/constraint-lifetimes.log"
+          grep -Eq 'test result: ok\. 11 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/constraint-lifetimes.log"
       - name: Verify related catalog and recovery behavior
         shell: bash
         run: |

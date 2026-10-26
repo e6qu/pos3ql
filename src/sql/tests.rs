@@ -2315,10 +2315,12 @@ fn metadata_database_copy_recovers_exact_positions_after_other_transaction_rollb
         crate::mem::guard::forbid_alloc(|| assert!(image.append(&mut bytes)));
         bytes.readable().to_vec()
     }
-    fn identities(engine: &mut Engine, session: &mut ConfiguredTransactionSession) -> Vec<String> {
-        engine.commit_wal().unwrap();
-        let mut rows = data_rows(&session.success(engine,
-            "SELECT relname, oid FROM pg_class WHERE relname IN ('orders', 'orders_pkey', 'order_report', 'order_counter', 'copied_counter', 'saved_report'); SELECT conname, oid FROM pg_constraint WHERE conrelid = 'orders'::regclass OR contypid = 'code'::regtype; SELECT typname, oid FROM pg_type WHERE typname IN ('code', 'state', 'payload', 'orders')", true));
+    fn identities(engine: &mut Engine, budget: &Budget) -> Vec<String> {
+        let output = run_with_fixed_memory_and_ddl_capacity(engine, budget,
+            "SELECT relname, oid FROM pg_class WHERE relname IN ('orders', 'orders_pkey', 'order_report', 'order_counter', 'copied_counter', 'saved_report'); SELECT conname, oid FROM pg_constraint WHERE conrelid = 'orders'::regclass OR contypid = 'code'::regtype; SELECT typname, oid FROM pg_type WHERE typname IN ('code', 'state', 'payload', 'orders')", 4 << 20, 16);
+        assert!(error_sqlstates(&output).is_empty());
+        let mut rows = data_rows(&output);
+        assert_eq!(rows.len(), 13);
         rows.sort_unstable();
         rows
     }
@@ -2346,7 +2348,7 @@ fn metadata_database_copy_recovers_exact_positions_after_other_transaction_rollb
             let mut retained =
                 ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
             retained.success(&mut engine, DEFINITION, false);
-            let template_identities = identities(&mut engine, &mut retained);
+            let template_identities = identities(&mut engine, &budget);
             engine
                 .select_database(crate::storage::DatabaseOid::POSTGRES)
                 .unwrap();
@@ -2366,7 +2368,7 @@ fn metadata_database_copy_recovers_exact_positions_after_other_transaction_rollb
                 .unwrap();
             engine.select_database(copied).unwrap();
             let original = positions(&engine);
-            assert_eq!(identities(&mut engine, &mut retained), template_identities);
+            assert_eq!(identities(&mut engine, &budget), template_identities);
             retained.success(&mut engine, "ALTER SEQUENCE order_counter RENAME TO copied_counter; CREATE OR REPLACE FUNCTION order_body() RETURNS integer LANGUAGE SQL AS 'SELECT 2'; REFRESH MATERIALIZED VIEW saved_report", false);
             if checkpoint {
                 assert!(engine.checkpoint().unwrap());
@@ -2392,7 +2394,7 @@ fn metadata_database_copy_recovers_exact_positions_after_other_transaction_rollb
                 }
             }
             expected.sort_unstable();
-            assert_eq!(identities(&mut cold, &mut session), expected);
+            assert_eq!(identities(&mut cold, &cold_budget), expected);
             assert_eq!(data_rows(&session.success(&mut cold, "SELECT nextval('copied_counter'); SELECT order_body(); SELECT id FROM saved_report; SELECT id FROM order_report; SELECT obj_description(oid, 'pg_constraint') FROM pg_constraint WHERE conrelid = 'orders'::regclass AND contype = 'p'", false)), ["10", "2", "7", "7", "primary key"]);
         }
     }

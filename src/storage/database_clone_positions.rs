@@ -28,6 +28,12 @@ pub(crate) enum DatabaseCloneKind {
     Conversion = 17,
     TextSearch = 18,
     TextSearchBuiltin = 19,
+    Cast = 20,
+    AccessMethod = 21,
+    EventTrigger = 22,
+    Operator = 23,
+    OperatorFamily = 24,
+    OperatorClass = 25,
 }
 
 impl DatabaseCloneKind {
@@ -53,6 +59,12 @@ impl DatabaseCloneKind {
             17 => Self::Conversion,
             18 => Self::TextSearch,
             19 => Self::TextSearchBuiltin,
+            20 => Self::Cast,
+            21 => Self::AccessMethod,
+            22 => Self::EventTrigger,
+            23 => Self::Operator,
+            24 => Self::OperatorFamily,
+            25 => Self::OperatorClass,
             _ => return None,
         })
     }
@@ -458,6 +470,69 @@ impl Storage {
                     );
                 }
             }
+        }
+        let casts = self.casts.lock().expect("cast catalog lock poisoned");
+        for (slot, definition) in casts.iter().enumerate() {
+            object(
+                DatabaseCloneKind::Cast,
+                slot,
+                definition.created_at,
+                definition.database,
+                definition.ddl_state,
+            );
+        }
+        let operators = self
+            .operator_catalog
+            .lock()
+            .expect("operator catalog lock poisoned");
+        for (slot, definition) in operators.access_methods.iter().enumerate() {
+            object(
+                DatabaseCloneKind::AccessMethod,
+                slot,
+                definition.created_at,
+                definition.database,
+                definition.ddl_state,
+            );
+        }
+        let events = self
+            .event_triggers
+            .lock()
+            .expect("event trigger catalog lock poisoned");
+        for (slot, definition) in events.iter().enumerate() {
+            object(
+                DatabaseCloneKind::EventTrigger,
+                slot,
+                definition.created_at,
+                definition.database,
+                definition.ddl_state,
+            );
+        }
+        for (slot, definition) in operators.operators.iter().enumerate() {
+            object(
+                DatabaseCloneKind::Operator,
+                slot,
+                definition.created_at,
+                definition.database,
+                definition.ddl_state,
+            );
+        }
+        for (slot, definition) in operators.families.iter().enumerate() {
+            object(
+                DatabaseCloneKind::OperatorFamily,
+                slot,
+                definition.created_at,
+                definition.database,
+                definition.ddl_state,
+            );
+        }
+        for (slot, definition) in operators.classes.iter().enumerate() {
+            object(
+                DatabaseCloneKind::OperatorClass,
+                slot,
+                definition.created_at,
+                definition.database,
+                definition.ddl_state,
+            );
         }
     }
 }

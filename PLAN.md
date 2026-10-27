@@ -37,7 +37,8 @@ A waiting schema edit must never attach itself to a new object that reused a nam
 - Finish identifiers for the catalog families still outside the
   [behavior guide's guarantees](docs/implemented-baseline.md#schema-changes-and-object-identity).
   Reusing a slot must never attach an old identifier or comment to a replacement.
-  Cover shared catalogs, copied databases and recovery after deleting local caches.
+  Finish the remaining families and retained metadata beyond these guarantees;
+  cover shared catalogs and recovery after deleting local caches.
 - Keep older rows, indexes and saved files until readers and backups finish.
   Remove obsolete versions in limited batches so other queries keep moving.
 - Let remaining metadata and maintenance downloads pause without occupying the

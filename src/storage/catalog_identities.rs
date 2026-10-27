@@ -161,6 +161,15 @@ impl Storage {
             .text_catalog
             .lock()
             .expect("text catalog lock poisoned");
+        let casts = self.casts.lock().expect("cast catalog lock poisoned");
+        let operators = self
+            .operator_catalog
+            .lock()
+            .expect("operator catalog lock poisoned");
+        let events = self
+            .event_triggers
+            .lock()
+            .expect("event trigger catalog lock poisoned");
         // Subscription OIDs belong to a shared catalog. Other families are
         // database-local and template copies may preserve their numeric OIDs.
         let scopes = core::iter::once(None).chain(
@@ -267,6 +276,48 @@ impl Storage {
                             }
                         }
                     }
+                    for definition in casts.iter() {
+                        check(
+                            definition.database,
+                            definition.ddl_state,
+                            definition.created_at,
+                        )?;
+                    }
+                    for definition in operators.access_methods.iter() {
+                        check(
+                            definition.database,
+                            definition.ddl_state,
+                            definition.created_at,
+                        )?;
+                    }
+                    for definition in events.iter() {
+                        check(
+                            definition.database,
+                            definition.ddl_state,
+                            definition.created_at,
+                        )?;
+                    }
+                    for definition in operators.operators.iter() {
+                        check(
+                            definition.database,
+                            definition.ddl_state,
+                            definition.created_at,
+                        )?;
+                    }
+                    for definition in operators.families.iter() {
+                        check(
+                            definition.database,
+                            definition.ddl_state,
+                            definition.created_at,
+                        )?;
+                    }
+                    for definition in operators.classes.iter() {
+                        check(
+                            definition.database,
+                            definition.ddl_state,
+                            definition.created_at,
+                        )?;
+                    }
                     for definition in publications.iter() {
                         check(
                             definition.database,
@@ -284,6 +335,9 @@ impl Storage {
                 }
             }
         }
+        drop(events);
+        drop(operators);
+        drop(casts);
         drop(text);
         drop(statistics);
         drop(extensions);
@@ -300,7 +354,24 @@ impl Storage {
                     self.validate_saved_collations(
                         state.identity.database,
                         definition.columns().iter().map(|column| column.collation),
-                    )
+                    )?;
+                    if let TableAccessMethod::Catalog(selected) = definition.access_method {
+                        let catalog = self
+                            .operator_catalog
+                            .lock()
+                            .expect("operator catalog lock poisoned");
+                        if !catalog.access_methods.iter().any(|root| {
+                            root.database == state.identity.database
+                                && root.ddl_state != CatalogDdlState::Absent
+                                && root.oid() == selected
+                        }) {
+                            return Err(sql_err!(
+                                sqlstate::DATA_EXCEPTION,
+                                "stored table access method does not match a live lifetime"
+                            ));
+                        }
+                    }
+                    Ok(())
                 })?;
         }
         {
@@ -341,6 +412,27 @@ impl Storage {
                 definition.database,
                 definition.collations[..definition.n_cols].iter().copied(),
             )?;
+            let catalog = self
+                .operator_catalog
+                .lock()
+                .expect("operator catalog lock poisoned");
+            for class in definition.operator_classes[..definition.n_cols]
+                .iter()
+                .flatten()
+            {
+                if let IndexOperatorClass::Catalog(selected) = class
+                    && !catalog.classes.iter().any(|root| {
+                        root.database == definition.database
+                            && root.ddl_state != CatalogDdlState::Absent
+                            && root.oid() == selected.get()
+                    })
+                {
+                    return Err(sql_err!(
+                        sqlstate::DATA_EXCEPTION,
+                        "stored index operator class does not match a live lifetime"
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -382,6 +474,221 @@ mod tests {
         config.max_subscriptions = 2;
         let mut budget = test_budget(&config);
         Storage::new(&config, &mut budget, 0).unwrap()
+    }
+
+    #[test]
+    fn catalog_lifetime_executable_roots_require_unique_reserved_births_per_database() {
+        let storage = storage();
+        let prior = current_database();
+        crate::sql::set_execution_database_oid(DatabaseOid::POSTGRES);
+        for family in 0..6 {
+            let set = |birth, state| match family {
+                0 => {
+                    let mut catalog = storage.casts.lock().unwrap();
+                    catalog[0].database = DatabaseOid::POSTGRES;
+                    catalog[0].created_at = birth;
+                    catalog[0].ddl_state = state;
+                }
+                1 => {
+                    let mut catalog = storage.event_triggers.lock().unwrap();
+                    catalog[0].database = DatabaseOid::POSTGRES;
+                    catalog[0].created_at = birth;
+                    catalog[0].ddl_state = state;
+                }
+                kind => {
+                    let mut catalog = storage.operator_catalog.lock().unwrap();
+                    match kind {
+                        2 => {
+                            let root = &mut catalog.access_methods[0];
+                            root.database = DatabaseOid::POSTGRES;
+                            root.created_at = birth;
+                            root.ddl_state = state;
+                        }
+                        3 => {
+                            let root = &mut catalog.operators[0];
+                            root.database = DatabaseOid::POSTGRES;
+                            root.created_at = birth;
+                            root.ddl_state = state;
+                        }
+                        4 => {
+                            let root = &mut catalog.families[0];
+                            root.database = DatabaseOid::POSTGRES;
+                            root.created_at = birth;
+                            root.ddl_state = state;
+                        }
+                        5 => {
+                            let root = &mut catalog.classes[0];
+                            root.database = DatabaseOid::POSTGRES;
+                            root.created_at = birth;
+                            root.ddl_state = state;
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+            };
+            crate::mem::guard::forbid_alloc(|| {
+                for birth in [0, MAX_CATALOG_CREATION + 1] {
+                    set(birth, CatalogDdlState::Present);
+                    assert_eq!(
+                        storage
+                            .validate_restored_catalog_identities(MAX_CATALOG_CREATION)
+                            .unwrap_err()
+                            .sqlstate,
+                        sqlstate::DATA_EXCEPTION
+                    );
+                }
+                set(1, CatalogDdlState::Present);
+                assert_eq!(
+                    storage
+                        .validate_restored_catalog_identities(0)
+                        .unwrap_err()
+                        .sqlstate,
+                    sqlstate::DATA_EXCEPTION
+                );
+                storage.validate_restored_catalog_identities(1).unwrap();
+                {
+                    let mut roots = storage.text_catalog.lock().unwrap();
+                    roots.conversions[0] = ConversionDef {
+                        database: DatabaseOid::POSTGRES,
+                        created_at: 1,
+                        ddl_state: CatalogDdlState::Present,
+                        ..ConversionDef::EMPTY
+                    };
+                }
+                assert_eq!(
+                    storage
+                        .validate_restored_catalog_identities(1)
+                        .unwrap_err()
+                        .sqlstate,
+                    sqlstate::DATA_EXCEPTION
+                );
+                storage.text_catalog.lock().unwrap().conversions[0].database =
+                    DatabaseOid::TEMPLATE1;
+                storage.validate_restored_catalog_identities(1).unwrap();
+                storage.text_catalog.lock().unwrap().conversions[0] = ConversionDef::EMPTY;
+                set(0, CatalogDdlState::Absent);
+            });
+        }
+        crate::sql::set_execution_database_oid(prior);
+    }
+
+    #[test]
+    fn catalog_lifetime_executable_replay_rejects_invalid_births_before_mutation() {
+        let mut storage = storage();
+        crate::mem::guard::forbid_alloc(|| {
+            for birth in [0, MAX_CATALOG_CREATION + 1, u64::MAX] {
+                let mut cast = CastDef::EMPTY;
+                cast.created_at = birth;
+                assert_eq!(
+                    storage.create_cast_from_image(cast).unwrap_err().sqlstate,
+                    sqlstate::DATA_EXCEPTION
+                );
+                assert_eq!(
+                    storage
+                        .replay_set_operator(birth, OperatorDefinition::EMPTY)
+                        .unwrap_err()
+                        .sqlstate,
+                    sqlstate::DATA_EXCEPTION
+                );
+                assert_eq!(
+                    storage
+                        .replay_set_operator_family(birth, OperatorFamilyDefinition::EMPTY)
+                        .unwrap_err()
+                        .sqlstate,
+                    sqlstate::DATA_EXCEPTION
+                );
+                assert_eq!(
+                    storage
+                        .replay_set_operator_class(birth, OperatorClassDefinition::EMPTY)
+                        .unwrap_err()
+                        .sqlstate,
+                    sqlstate::DATA_EXCEPTION
+                );
+                assert_eq!(
+                    storage
+                        .replay_event_trigger(0, birth, EventTriggerDefinition::EMPTY)
+                        .unwrap_err()
+                        .sqlstate,
+                    sqlstate::DATA_EXCEPTION
+                );
+                assert!(CatalogIdentity::parse(birth).is_none());
+            }
+            assert!(
+                storage
+                    .casts
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|root| root.ddl_state == CatalogDdlState::Absent)
+            );
+            let catalog = storage.operator_catalog.lock().unwrap();
+            assert!(
+                catalog
+                    .access_methods
+                    .iter()
+                    .all(|root| root.ddl_state == CatalogDdlState::Absent)
+            );
+            assert!(
+                catalog
+                    .operators
+                    .iter()
+                    .all(|root| root.ddl_state == CatalogDdlState::Absent)
+            );
+            assert!(
+                catalog
+                    .families
+                    .iter()
+                    .all(|root| root.ddl_state == CatalogDdlState::Absent)
+            );
+            assert!(
+                catalog
+                    .classes
+                    .iter()
+                    .all(|root| root.ddl_state == CatalogDdlState::Absent)
+            );
+            assert!(
+                storage
+                    .event_triggers
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|root| root.ddl_state == CatalogDdlState::Absent)
+            );
+        });
+    }
+
+    #[test]
+    fn catalog_lifetime_executable_identifiers_reject_unreserved_ranges() {
+        crate::mem::guard::forbid_alloc(|| {
+            for birth in [1, MAX_CATALOG_CREATION] {
+                assert_eq!(
+                    AccessMethodOid::parse(ACCESS_METHOD_OID_BASE + birth as i32)
+                        .unwrap()
+                        .get(),
+                    ACCESS_METHOD_OID_BASE + birth as i32
+                );
+                assert_eq!(
+                    OperatorClassOid::parse(OPERATOR_CLASS_OID_BASE + birth as i32)
+                        .unwrap()
+                        .get(),
+                    OPERATOR_CLASS_OID_BASE + birth as i32
+                );
+                assert!(
+                    StoredDependencyIdentity::OperatorOid(OPERATOR_OID_BASE + birth as i32)
+                        .valid_for(DependencyClass::Operator)
+                );
+            }
+            for offset in [0, MAX_CATALOG_CREATION as i32 + 1] {
+                assert!(AccessMethodOid::parse(ACCESS_METHOD_OID_BASE + offset).is_none());
+                assert!(OperatorClassOid::parse(OPERATOR_CLASS_OID_BASE + offset).is_none());
+                assert!(
+                    !StoredDependencyIdentity::OperatorOid(OPERATOR_OID_BASE + offset)
+                        .valid_for(DependencyClass::Operator)
+                );
+            }
+            assert!(AccessMethodOid::parse(i32::MAX).is_none());
+            assert!(OperatorClassOid::parse(i32::MAX).is_none());
+        });
     }
 
     #[test]

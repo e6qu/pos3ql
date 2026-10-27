@@ -210,7 +210,8 @@ Renames preserve object identity; drop and recreate reserve fresh identities
 for relations, row/array types, named types, enum members, indexes, CHECK,
 foreign-key and NOT NULL constraints, statistics, extensions, foreign-data
 wrappers, servers, user mappings, publications, subscriptions, collations,
-conversions, and text-search parsers, templates, dictionaries and configurations.
+conversions, text-search parsers, templates, dictionaries and configurations, casts,
+operators, operator families, operator classes, access methods and event triggers.
 Removing an earlier column or rule does not renumber survivors. Foreign-key triggers retain
 their constraint links. `ADD CONSTRAINT ... USING INDEX` preserves the existing
 index identifier. Database-template copies preserve database-local identifiers, foreign-wrapper,
@@ -226,6 +227,11 @@ CREATE TABLE orders(id integer);
 SELECT has_table_privilege(identity, 'SELECT') IS NULL FROM saved_order_identity;
 -- true: the old identifier does not grant access to the replacement
 ```
+
+Database-local identities may be the same in a template and its copy. Recovery
+keeps their edits separate: renaming an operator class in `reporting`, for example,
+cannot rename the original class in `template1`. Saved tables, indexes, comments
+and views in the copy keep their selected identifiers after loss of local caches.
 
 A resolved text comparison keeps its original collation's ordering and case
 mapping, even after that collation is dropped and its internal slot is reused.

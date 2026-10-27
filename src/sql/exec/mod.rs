@@ -51184,7 +51184,7 @@ pub fn create_access_method(
         Err(error) => return sql_fail(error),
     };
     let slot = match storage.create_access_method(
-        0,
+        crate::storage::CatalogCreation::New,
         crate::storage::AccessMethodDefinition { name, handler },
         txn.txid,
     ) {

@@ -23490,7 +23490,9 @@ fn apply_wal_op(
             handler,
         } => {
             let slot = storage.create_access_method(
-                created_at,
+                crate::storage::CatalogCreation::Restore(crate::storage::CatalogIdentity::require(
+                    created_at,
+                )?),
                 crate::storage::AccessMethodDefinition {
                     name: crate::storage::SqlName::parse(name)?,
                     handler,

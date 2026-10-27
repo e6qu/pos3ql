@@ -3184,6 +3184,54 @@ impl CollationDef {
 
 pub(crate) const MAX_CATALOG_CREATION: u64 = 9_999_999;
 
+#[derive(Clone, Copy)]
+enum TextSearchIdentity {
+    Builtin { oid: i32, ordinal: u8 },
+    Created(CatalogIdentity),
+}
+
+impl TextSearchIdentity {
+    fn admit(created_at: u64, definition: TextSearchDefinition) -> Result<Self, SqlError> {
+        if created_at != 0 {
+            let created = CatalogIdentity::require(created_at)?;
+            if definition.oid() != text_search_lifetime_oid(definition.kind(), created_at)? {
+                return Err(sql_err!(
+                    sqlstate::DATA_EXCEPTION,
+                    "stored text search identity does not match its lifetime"
+                ));
+            }
+            return Ok(Self::Created(created));
+        }
+        use crate::sql::ast::TextSearchObjectKind as Kind;
+        let ordinal = match (definition.kind(), definition.oid()) {
+            (Kind::Parser, 3722) => 0,
+            (Kind::Template, 3727) => 1,
+            (Kind::Template, 13_234) => 2,
+            (Kind::Dictionary, 3765) => 3,
+            (Kind::Dictionary, 13_247) => 4,
+            (Kind::Configuration, 3748) => 5,
+            (Kind::Configuration, 13_248) => 6,
+            _ => {
+                return Err(sql_err!(
+                    sqlstate::DATA_EXCEPTION,
+                    "stored text search object has no valid builtin or creation identity"
+                ));
+            }
+        };
+        Ok(Self::Builtin {
+            oid: definition.oid(),
+            ordinal,
+        })
+    }
+
+    fn clone_key(self) -> (DatabaseCloneKind, u64) {
+        match self {
+            Self::Builtin { oid, .. } => (DatabaseCloneKind::TextSearchBuiltin, oid as u64),
+            Self::Created(created) => (DatabaseCloneKind::TextSearch, created.created_at()),
+        }
+    }
+}
+
 fn text_search_lifetime_oid(
     kind: crate::sql::ast::TextSearchObjectKind,
     created_at: u64,
@@ -4335,7 +4383,7 @@ impl StoredDependencyIdentity {
             Self::Collation(_) => class == DependencyClass::Collation,
             Self::TextSearchConfigurationOid(oid) => {
                 class == DependencyClass::TextSearchConfiguration
-                    && (700_000_001..=709_999_999).contains(&oid)
+                    && (matches!(oid, 3748 | 13_248) || (700_000_001..=709_999_999).contains(&oid))
             }
             Self::RoutineOid(oid) => {
                 class == DependencyClass::Routine
@@ -21616,9 +21664,11 @@ impl Storage {
                 {
                     continue;
                 }
+                let (kind, identity) =
+                    TextSearchIdentity::admit(identity, definition.definition)?.clone_key();
                 let target_slot = allocation.select(
-                    DatabaseCloneKind::TextSearch,
-                    definition.created_at,
+                    kind,
+                    identity,
                     text_catalog
                         .text_search_objects
                         .iter()
@@ -50258,14 +50308,7 @@ impl Storage {
         created_at: u64,
         definition: TextSearchDefinition,
     ) -> Result<(), SqlError> {
-        CatalogIdentity::require(created_at)?;
-        if definition.oid() != text_search_lifetime_oid(definition.kind(), created_at)? {
-            return Err(sql_err!(
-                sqlstate::DATA_EXCEPTION,
-                "stored text search identity does not match its lifetime"
-            ));
-        }
-
+        TextSearchIdentity::admit(created_at, definition)?;
         if definition.oid() <= 0 || !definition.executable_shape() {
             return Err(sql_err!(
                 sqlstate::INVALID_OBJECT_DEFINITION,

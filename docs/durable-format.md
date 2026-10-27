@@ -732,7 +732,9 @@ dependencies use `c` followed by the decimal four-byte code; configuration
 dependencies retain their public identifier. Replay validates their class.
 
 Database-copy position records add kind 16 (collation), 17 (conversion) and 18
-(text search), retaining their creation stamps and exact target positions. Copies
+(user text search), retaining their creation stamps and exact target positions.
+Kind 19 holds built-in text-search objects, using their fixed PostgreSQL identifiers
+as clone-position keys; their stored creation stamp remains zero. Copies
 retain the source's database-local public identifiers and comparison choices;
 there is no slot remapping inside saved columns. Recovery checks text roots and
 saved comparison references before writer promotion. Earlier formats are rejected.

@@ -242,12 +242,30 @@ impl Storage {
                             definition.created_at,
                         )?;
                     }
-                    for definition in text.text_search_objects.iter() {
-                        check(
-                            definition.database,
-                            definition.ddl_state,
+                    let mut builtin_seen = 0u8;
+                    for definition in text.text_search_objects.iter().filter(|root| {
+                        root.ddl_state != CatalogDdlState::Absent && Some(root.database) == database
+                    }) {
+                        match TextSearchIdentity::admit(
                             definition.created_at,
-                        )?;
+                            definition.definition,
+                        )? {
+                            TextSearchIdentity::Created(created) => check(
+                                definition.database,
+                                definition.ddl_state,
+                                created.created_at(),
+                            )?,
+                            TextSearchIdentity::Builtin { ordinal, .. } => {
+                                let bit = 1 << ordinal;
+                                if builtin_seen & bit != 0 {
+                                    return Err(sql_err!(
+                                        sqlstate::DATA_EXCEPTION,
+                                        "stored builtin text search identity is duplicated"
+                                    ));
+                                }
+                                builtin_seen |= bit;
+                            }
+                        }
                     }
                     for definition in publications.iter() {
                         check(
@@ -420,7 +438,7 @@ mod tests {
                 catalog
                     .text_search_objects
                     .iter()
-                    .all(|root| root.ddl_state == CatalogDdlState::Absent)
+                    .all(|root| root.created_at == 0)
             );
         });
     }
@@ -490,8 +508,9 @@ mod tests {
             assert_eq!(catalog.conversions[0].ddl_state, CatalogDdlState::Absent);
             assert_eq!(
                 catalog.text_search_objects[0].ddl_state,
-                CatalogDdlState::Absent
+                CatalogDdlState::Present
             );
+            assert_eq!(catalog.text_search_objects[0].definition.oid(), 3722);
         });
     }
 

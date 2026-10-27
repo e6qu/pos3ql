@@ -27,6 +27,7 @@ pub(crate) enum DatabaseCloneKind {
     Collation = 16,
     Conversion = 17,
     TextSearch = 18,
+    TextSearchBuiltin = 19,
 }
 
 impl DatabaseCloneKind {
@@ -51,6 +52,7 @@ impl DatabaseCloneKind {
             16 => Self::Collation,
             17 => Self::Conversion,
             18 => Self::TextSearch,
+            19 => Self::TextSearchBuiltin,
             _ => return None,
         })
     }
@@ -433,10 +435,17 @@ impl Storage {
             );
         }
         for (slot, definition) in text.text_search_objects.iter().enumerate() {
+            if definition.database != database || definition.ddl_state == CatalogDdlState::Absent {
+                continue;
+            }
+            let (kind, identity) =
+                TextSearchIdentity::admit(definition.created_at, definition.definition)
+                    .expect("admitted text object has a checked identity")
+                    .clone_key();
             object(
-                DatabaseCloneKind::TextSearch,
+                kind,
                 slot,
-                definition.created_at,
+                identity,
                 definition.database,
                 definition.ddl_state,
             );

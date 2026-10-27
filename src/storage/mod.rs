@@ -12,7 +12,6 @@ pub(crate) use catalog_history::{
 };
 mod catalog_identities;
 mod catalog_sources;
-use catalog_identities::MAX_CATALOG_CREATION;
 pub(crate) use catalog_identities::{CatalogCreation, CatalogIdentity};
 mod parameter_acls;
 use parameter_acls::ParameterAclGrantIdentity;

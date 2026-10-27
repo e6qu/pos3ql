@@ -355,6 +355,179 @@ mod tests {
     }
 
     #[test]
+    fn catalog_lifetime_text_exhaustion_preserves_empty_roots() {
+        let mut storage = storage();
+        let name = SqlName::parse("exhausted_text").unwrap();
+        let schema = SqlName::parse("public").unwrap();
+        let collation = CollationDefinition {
+            schema,
+            name,
+            owner: 10,
+            provider: CollationProvider::Libc,
+            collate: crate::util::StackStr::from_str("C"),
+            ctype: crate::util::StackStr::from_str("C"),
+            behavior: CollationBehavior::Bytewise,
+            ..CollationDefinition::EMPTY
+        };
+        let conversion = ConversionDefinition {
+            schema,
+            name,
+            owner: 10,
+            ..ConversionDefinition::EMPTY
+        };
+        let template = TextSearchDefinition::Template {
+            schema,
+            name,
+            oid: 0,
+            init: 0,
+            lexize: 3726,
+            behavior: TextSearchDictionaryBehavior::Simple { accept: true },
+        };
+        storage.catalog_sequence.observe(MAX_CATALOG_CREATION);
+        crate::mem::guard::forbid_alloc(|| {
+            assert_eq!(
+                storage.create_collation(collation, 7).unwrap_err().sqlstate,
+                sqlstate::PROGRAM_LIMIT_EXCEEDED
+            );
+            assert_eq!(
+                storage
+                    .create_conversion(conversion, 7)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::PROGRAM_LIMIT_EXCEEDED
+            );
+            assert_eq!(
+                storage
+                    .create_text_search_object(template, 7)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::PROGRAM_LIMIT_EXCEEDED
+            );
+            let catalog = storage.text_catalog.lock().unwrap();
+            assert!(
+                catalog
+                    .collations
+                    .iter()
+                    .all(|root| root.ddl_state == CatalogDdlState::Absent)
+            );
+            assert!(
+                catalog
+                    .conversions
+                    .iter()
+                    .all(|root| root.ddl_state == CatalogDdlState::Absent)
+            );
+            assert!(
+                catalog
+                    .text_search_objects
+                    .iter()
+                    .all(|root| root.ddl_state == CatalogDdlState::Absent)
+            );
+        });
+    }
+
+    #[test]
+    fn catalog_lifetime_text_replay_rejects_invalid_births_before_mutation() {
+        let mut storage = storage();
+        let schema = SqlName::parse("public").unwrap();
+        let name = SqlName::parse("bad_text_birth").unwrap();
+        let collation = CollationDefinition {
+            schema,
+            name,
+            owner: 10,
+            provider: CollationProvider::Libc,
+            collate: crate::util::StackStr::from_str("C"),
+            ctype: crate::util::StackStr::from_str("C"),
+            behavior: CollationBehavior::Bytewise,
+            ..CollationDefinition::EMPTY
+        };
+        let conversion = ConversionDefinition {
+            schema,
+            name,
+            owner: 10,
+            ..ConversionDefinition::EMPTY
+        };
+        let template = TextSearchDefinition::Template {
+            schema,
+            name,
+            oid: 660_000_001,
+            init: 0,
+            lexize: 3726,
+            behavior: TextSearchDictionaryBehavior::Simple { accept: true },
+        };
+        crate::mem::guard::forbid_alloc(|| {
+            for birth in [0, MAX_CATALOG_CREATION + 1, u64::MAX] {
+                assert_eq!(
+                    storage
+                        .replay_collation(0, birth, collation)
+                        .unwrap_err()
+                        .sqlstate,
+                    sqlstate::DATA_EXCEPTION
+                );
+                assert_eq!(
+                    storage
+                        .replay_conversion(0, birth, conversion)
+                        .unwrap_err()
+                        .sqlstate,
+                    sqlstate::DATA_EXCEPTION
+                );
+                assert_eq!(
+                    storage
+                        .replay_text_search_object(0, birth, template)
+                        .unwrap_err()
+                        .sqlstate,
+                    sqlstate::DATA_EXCEPTION
+                );
+            }
+            assert_eq!(
+                storage
+                    .replay_text_search_object(0, 2, template)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::DATA_EXCEPTION
+            );
+            let catalog = storage.text_catalog.lock().unwrap();
+            assert_eq!(catalog.collations[0].ddl_state, CatalogDdlState::Absent);
+            assert_eq!(catalog.conversions[0].ddl_state, CatalogDdlState::Absent);
+            assert_eq!(
+                catalog.text_search_objects[0].ddl_state,
+                CatalogDdlState::Absent
+            );
+        });
+    }
+
+    #[test]
+    fn catalog_lifetime_collation_codes_reject_slots_and_invalid_algorithms() {
+        use crate::sql::ast::{CatalogCollation, Collation};
+        crate::mem::guard::forbid_alloc(|| {
+            for birth in [1, 41, MAX_CATALOG_CREATION] {
+                for (database, unicode) in [(false, false), (true, false), (false, true)] {
+                    let selected =
+                        CatalogCollation::from_creation(birth, database, unicode).unwrap();
+                    let value = Collation::Catalog(selected);
+                    assert_eq!(Collation::from_code(value.code()), Some(value));
+                    assert_eq!(selected.created_at(), birth);
+                }
+            }
+            for code in [
+                5,
+                132,
+                134,
+                255,
+                0x8000_0000,
+                0x8000_0001,
+                0x8000_0007,
+                u32::MAX,
+            ] {
+                assert!(Collation::from_code(code).is_none(), "{code}");
+            }
+            assert!(CatalogCollation::from_creation(1, true, true).is_none());
+            for birth in [0, MAX_CATALOG_CREATION + 1, u64::MAX] {
+                assert!(CatalogCollation::from_creation(birth, false, false).is_none());
+            }
+        });
+    }
+
+    #[test]
     fn catalog_lifetime_corruption_is_rejected_without_allocation() {
         let storage = storage();
         storage.publications.lock().unwrap()[0] = PublicationDef {

@@ -14722,10 +14722,22 @@ mod tests {
         let mut definition = sample_def();
         let mut budget = Budget::new(4096);
         let mut payload = FixedBuf::new(&mut budget, "table collation payload", 4096).unwrap();
-        for code in 0..=u8::MAX {
-            let Some(collation) = crate::sql::ast::Collation::from_code(u32::from(code)) else {
-                continue;
-            };
+        let named = [
+            (1, false, false),
+            (41, true, false),
+            (9_999_999, false, true),
+        ]
+        .map(|(creation, database, unicode)| {
+            crate::sql::ast::Collation::Catalog(
+                crate::sql::ast::CatalogCollation::from_creation(creation, database, unicode)
+                    .unwrap(),
+            )
+        });
+        for collation in crate::sql::ast::Collation::BUILTIN
+            .into_iter()
+            .chain([crate::sql::ast::Collation::None])
+            .chain(named)
+        {
             definition.columns[1].collation = collation;
             crate::mem::guard::forbid_alloc(|| {
                 payload.clear();

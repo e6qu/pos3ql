@@ -21564,7 +21564,11 @@ fn pg_depend<'a>(
                 crate::storage::StoredDependencyIdentity::RoutineOid(oid) => oid,
                 crate::storage::StoredDependencyIdentity::Name
                 | crate::storage::StoredDependencyIdentity::OperatorOid(_)
-                | crate::storage::StoredDependencyIdentity::Type(_) => return None,
+                | crate::storage::StoredDependencyIdentity::Type(_)
+                | crate::storage::StoredDependencyIdentity::Collation(_)
+                | crate::storage::StoredDependencyIdentity::TextSearchConfigurationOid(_) => {
+                    return None;
+                }
             },
         )),
         crate::storage::DependencyClass::Operator => Some((
@@ -21573,19 +21577,26 @@ fn pg_depend<'a>(
                 crate::storage::StoredDependencyIdentity::OperatorOid(oid) => oid,
                 crate::storage::StoredDependencyIdentity::Name
                 | crate::storage::StoredDependencyIdentity::RoutineOid(_)
-                | crate::storage::StoredDependencyIdentity::Type(_) => return None,
+                | crate::storage::StoredDependencyIdentity::Type(_)
+                | crate::storage::StoredDependencyIdentity::Collation(_)
+                | crate::storage::StoredDependencyIdentity::TextSearchConfigurationOid(_) => {
+                    return None;
+                }
             },
         )),
         crate::storage::DependencyClass::Collation => Some((
             PG_COLLATION_OID,
-            storage.collation(usize::from(dependency.slot)).oid(),
+            match dependency.identity {
+                crate::storage::StoredDependencyIdentity::Collation(selected) => selected.oid(),
+                _ => return None,
+            },
         )),
         crate::storage::DependencyClass::TextSearchConfiguration => Some((
             PG_TS_CONFIG_OID,
-            storage
-                .text_search_object(dependency.slot as usize)
-                .definition_for(txid)
-                .oid(),
+            match dependency.identity {
+                crate::storage::StoredDependencyIdentity::TextSearchConfigurationOid(oid) => oid,
+                _ => return None,
+            },
         )),
     };
     let referenced_column = |dependency: &crate::storage::StoredQueryDependency, column: usize| {

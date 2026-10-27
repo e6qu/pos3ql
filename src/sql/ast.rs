@@ -202,9 +202,6 @@ pub enum PublicationDescendants {
     Include,
 }
 
-/// A resolved built-in collation identity.  The parser resolves the spelling
-/// once, so execution cannot accept a `COLLATE` clause and accidentally lose
-/// its semantics.
 /// The selected comparison algorithm and database-local object lifetime.
 /// Its private encoding cannot be confused with a reusable catalog slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

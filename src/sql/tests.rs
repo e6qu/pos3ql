@@ -1780,6 +1780,208 @@ fn catalog_lifetime_config(name: &str, mode: crate::config::TransactionMode) -> 
 }
 
 #[test]
+fn catalog_lifetime_text_identifiers_reject_replacements_in_both_modes() {
+    let fixture = include_str!("../../tests/external/differential/196_text_catalog_lifetimes.sql");
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let config = catalog_lifetime_config(&format!("text-lifetimes-{mode:?}"), mode);
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        for sql in fixture
+            .split(';')
+            .map(str::trim)
+            .filter(|sql| !sql.is_empty())
+        {
+            let output = session.success(&mut engine, sql, true);
+            assert!(
+                data_rows(&output).iter().all(|row| row == "t"),
+                "{sql}: {}",
+                String::from_utf8_lossy(&output)
+            );
+        }
+    }
+}
+
+#[test]
+fn catalog_lifetime_collation_comparison_survives_drop_and_slot_reuse() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let config = catalog_lifetime_config(&format!("retained-collation-{mode:?}"), mode);
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        session.success(
+            &mut engine,
+            "CREATE COLLATION retained_collation FROM pg_catalog.pg_unicode_fast",
+            true,
+        );
+        let original = engine
+            .storage
+            .resolve_collation(None, "retained_collation", 0)
+            .unwrap();
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "SELECT upper('straße' COLLATE retained_collation)",
+                true
+            )),
+            ["STRASSE"]
+        );
+        session.success(&mut engine, "DROP COLLATION retained_collation; CREATE COLLATION retained_collation (PROVIDER = libc, LOCALE = 'C')", true);
+        let replacement = engine
+            .storage
+            .resolve_collation(None, "retained_collation", 0)
+            .unwrap();
+        assert_ne!(original.oid(), replacement.oid());
+        crate::mem::guard::forbid_alloc(|| {
+            assert_eq!(
+                engine.storage.compare_text(original, "Z", "a").unwrap(),
+                core::cmp::Ordering::Less
+            );
+            let access = crate::sql::query::storage_catalog(&engine.storage, &session.arena, 0);
+            assert!(
+                crate::sql::eval::CatalogAccess::uses_full_unicode_case_mapping(&access, original)
+                    .unwrap()
+            );
+            assert!(
+                !crate::sql::eval::CatalogAccess::uses_full_unicode_case_mapping(
+                    &access,
+                    replacement
+                )
+                .unwrap()
+            );
+        });
+        session.success(&mut engine, "DROP COLLATION retained_collation", true);
+        crate::mem::guard::forbid_alloc(|| {
+            assert_eq!(
+                engine.storage.compare_text(original, "Z", "a").unwrap(),
+                core::cmp::Ordering::Less
+            );
+            assert_eq!(
+                engine.storage.compare_text(replacement, "Z", "a").unwrap(),
+                core::cmp::Ordering::Less
+            );
+        });
+    }
+}
+
+#[test]
+fn catalog_lifetime_text_roots_and_bound_queries_survive_empty_cache_recovery() {
+    let fixture = include_str!("../../tests/external/differential/196_text_catalog_lifetimes.sql");
+    let (setup, _) = fixture.split_once("-- replacement checks").unwrap();
+    for checkpoint in [false, true] {
+        for mode in [
+            crate::config::TransactionMode::Mvcc,
+            crate::config::TransactionMode::Locking,
+        ] {
+            let name = format!("text-lifetime-cold-{checkpoint}-{mode:?}");
+            let mut config = catalog_lifetime_config(&name, mode);
+            config.object_store_on = true;
+            config.object_store_sim = true;
+            config.wal_upload = true;
+            config.wal_upload_sync = true;
+            config.object_store_bucket = format!("{name}-{}", std::process::id());
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+            {
+                let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+                let mut engine = Engine::new(&config, &mut budget).unwrap();
+                let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+                for sql in setup
+                    .split(';')
+                    .map(str::trim)
+                    .filter(|sql| !sql.is_empty())
+                {
+                    session.success(&mut engine, sql, false);
+                }
+                session.success(&mut engine, "CREATE TABLE retained_words(value text COLLATE text_lifetime_byte); CREATE INDEX retained_words_index ON retained_words(value); INSERT INTO retained_words VALUES('z'), ('a'); CREATE TYPE retained_record AS (value text COLLATE text_lifetime_byte); CREATE VIEW retained_report AS SELECT value COLLATE text_lifetime_byte AS value, to_tsvector('text_lifetime_config', value) AS terms FROM retained_words", false);
+                if checkpoint {
+                    assert!(engine.checkpoint().unwrap());
+                }
+                session.success(&mut engine, "ALTER COLLATION text_lifetime_byte RENAME TO text_lifetime_renamed; ALTER TEXT SEARCH CONFIGURATION text_lifetime_config RENAME TO text_lifetime_config_renamed", false);
+                engine.commit_wal().unwrap();
+            }
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+            {
+                let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+                let mut engine = Engine::new(&config, &mut budget).unwrap();
+                let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+                assert_eq!(data_rows(&session.success(&mut engine, "SELECT value FROM retained_words ORDER BY value; SELECT value FROM retained_report ORDER BY value; SELECT obj_description(oid, 'pg_collation') FROM pg_collation WHERE collname='text_lifetime_renamed'; SELECT count(*) = 4 FROM saved_text_lifetimes s JOIN text_lifetime_catalog c ON s.kind=c.kind AND s.identity=c.identity", false)), ["a", "z", "a", "z", "original collation", "t"]);
+            }
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        }
+    }
+}
+
+#[test]
+fn catalog_lifetime_text_template_copy_preserves_references_through_recovery() {
+    let fixture = include_str!("../../tests/external/differential/196_text_catalog_lifetimes.sql");
+    let (setup, _) = fixture.split_once("-- replacement checks").unwrap();
+    for checkpoint in [false, true] {
+        let name = format!("text-template-cold-{checkpoint}");
+        let mut config = catalog_lifetime_config(&name, crate::config::TransactionMode::Mvcc);
+        config.object_store_on = true;
+        config.object_store_sim = true;
+        config.wal_upload = true;
+        config.wal_upload_sync = true;
+        config.object_store_bucket = format!("{name}-{}", std::process::id());
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        let target;
+        {
+            let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+            let mut engine = Engine::new(&config, &mut budget).unwrap();
+            let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+            engine
+                .select_database(crate::storage::DatabaseOid::TEMPLATE1)
+                .unwrap();
+            for sql in setup
+                .split(';')
+                .map(str::trim)
+                .filter(|sql| !sql.is_empty())
+            {
+                session.success(&mut engine, sql, false);
+            }
+            session.success(&mut engine, "CREATE TABLE copied_words(value text COLLATE text_lifetime_byte); INSERT INTO copied_words VALUES('z'), ('a'); CREATE TYPE copied_record AS (value text COLLATE text_lifetime_byte); CREATE INDEX copied_words_index ON copied_words(value); CREATE VIEW copied_report AS SELECT value COLLATE text_lifetime_byte AS value, to_tsvector('text_lifetime_config', value) AS terms FROM copied_words", false);
+            engine
+                .select_database(crate::storage::DatabaseOid::POSTGRES)
+                .unwrap();
+            session.success(
+                &mut engine,
+                "CREATE DATABASE text_template_copy TEMPLATE template1",
+                false,
+            );
+            target = engine
+                .storage
+                .database_named("text_template_copy", 0)
+                .unwrap()
+                .1
+                .oid;
+            engine.select_database(target).unwrap();
+            assert_eq!(data_rows(&session.success(&mut engine, "SELECT count(*) = 6 FROM saved_text_lifetimes s JOIN text_lifetime_catalog c ON s.kind=c.kind AND s.identity=c.identity; SELECT value FROM copied_report ORDER BY value", false)), ["t", "a", "z"]);
+            if checkpoint {
+                assert!(engine.checkpoint().unwrap());
+            }
+            engine.commit_wal().unwrap();
+        }
+        std::fs::remove_dir_all(&config.data_dir).unwrap();
+        {
+            let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+            let mut engine = Engine::new(&config, &mut budget).unwrap();
+            engine.select_database(target).unwrap();
+            let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+            assert_eq!(data_rows(&session.success(&mut engine, "SELECT count(*) = 6 FROM saved_text_lifetimes s JOIN text_lifetime_catalog c ON s.kind=c.kind AND s.identity=c.identity; SELECT value FROM copied_report ORDER BY value; SELECT obj_description(oid, 'pg_collation') FROM pg_collation WHERE collname='text_lifetime_byte'; SELECT to_tsvector('text_lifetime_config', 'Cats 42') = '''42'':2 ''cats'':1'::tsvector", false)), ["t", "a", "z", "original collation", "t"]);
+        }
+        std::fs::remove_dir_all(&config.data_dir).unwrap();
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    }
+}
+
+#[test]
 fn catalog_lifetime_public_identifiers_preserve_edits_and_reject_replacements() {
     for mode in [
         crate::config::TransactionMode::Mvcc,

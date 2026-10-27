@@ -1420,6 +1420,9 @@ pub struct ColumnMeta {
     pub statistics_options: crate::sql::ast::ColumnStatisticsOptions,
 }
 
+// Recovery and copied execution schemas reserve at most 512 bytes per column.
+const _: () = assert!(core::mem::size_of::<ColumnMeta>() <= 512);
+
 /// Durable provenance of a table column's effective `NOT NULL` constraint.
 /// Partitions can retain a local constraint while also inheriting one, so a
 /// boolean cannot represent parent ALTER and DETACH semantics.

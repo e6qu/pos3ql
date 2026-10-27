@@ -5935,6 +5935,9 @@ mod named_type_layout_tests {
         assert!(size_of::<Datum<'_>>() <= 32);
         assert!(size_of::<OwnedDatum>() <= 128);
         assert!(size_of::<ColumnDefault>() <= 256);
+        assert_eq!(size_of::<crate::sql::ast::CatalogCollation>(), 4);
+        assert_eq!(size_of::<crate::sql::ast::Collation>(), 4);
+        assert_eq!(align_of::<crate::sql::ast::Collation>(), 1);
         assert!(size_of::<ColumnMeta>() <= 512);
     }
 }

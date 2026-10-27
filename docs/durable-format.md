@@ -723,6 +723,9 @@ the configured database locale, and bit 1 selects full Unicode case mapping.
 The two algorithm bits cannot both be set. Built-in codes remain 0–4 and 133;
 old slot codes, unknown bits and out-of-range identities are rejected. Table
 columns, composite fields and index columns use this same representation.
+The runtime value uses four bytes with byte alignment; a checked three-byte
+creation and a closed comparison choice keep column metadata within its existing
+512-byte startup reservation.
 
 Public identifier bases are 580,000,000 for collations, 620,000,000 for conversions,
 and 640,000,000 / 660,000,000 / 680,000,000 / 700,000,000 for text-search parsers,

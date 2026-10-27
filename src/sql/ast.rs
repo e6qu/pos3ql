@@ -205,7 +205,18 @@ pub enum PublicationDescendants {
 /// The selected comparison algorithm and database-local object lifetime.
 /// Its private encoding cannot be confused with a reusable catalog slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CatalogCollation(core::num::NonZeroU32);
+pub struct CatalogCollation {
+    creation: [u8; 3],
+    algorithm: CollationAlgorithm,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum CollationAlgorithm {
+    Bytewise,
+    DatabaseLocale,
+    UnicodeCaseMapping,
+}
 
 impl CatalogCollation {
     pub(crate) const fn from_creation(
@@ -213,28 +224,30 @@ impl CatalogCollation {
         database_locale: bool,
         unicode_case: bool,
     ) -> Option<Self> {
-        if created_at == 0
-            || created_at > crate::storage::MAX_CATALOG_CREATION
-            || (database_locale && unicode_case)
-        {
+        if created_at == 0 || created_at > crate::storage::MAX_CATALOG_CREATION {
             return None;
         }
-        match core::num::NonZeroU32::new(
-            (created_at as u32) << 2 | (unicode_case as u32) << 1 | database_locale as u32,
-        ) {
-            Some(encoded) => Some(Self(encoded)),
-            None => None,
-        }
+        let algorithm = match (database_locale, unicode_case) {
+            (false, false) => CollationAlgorithm::Bytewise,
+            (true, false) => CollationAlgorithm::DatabaseLocale,
+            (false, true) => CollationAlgorithm::UnicodeCaseMapping,
+            (true, true) => return None,
+        };
+        let bytes = (created_at as u32).to_le_bytes();
+        Some(Self {
+            creation: [bytes[0], bytes[1], bytes[2]],
+            algorithm,
+        })
     }
 
     pub(crate) const fn created_at(self) -> u64 {
-        (self.0.get() >> 2) as u64
+        u32::from_le_bytes([self.creation[0], self.creation[1], self.creation[2], 0]) as u64
     }
     pub(crate) const fn database_locale(self) -> bool {
-        self.0.get() & 1 != 0
+        matches!(self.algorithm, CollationAlgorithm::DatabaseLocale)
     }
     pub(crate) const fn unicode_case(self) -> bool {
-        self.0.get() & 2 != 0
+        matches!(self.algorithm, CollationAlgorithm::UnicodeCaseMapping)
     }
     pub(crate) const fn oid(self) -> i32 {
         580_000_000 + self.created_at() as i32
@@ -252,6 +265,11 @@ pub enum Collation {
     /// An immutable comparison choice, independent of name and physical slot.
     Catalog(CatalogCollation),
 }
+
+// The algorithm's unused tags also encode built-ins, avoiding a second tag
+// and alignment padding in every copied column and execution schema.
+const _: [(); 4] = [(); core::mem::size_of::<Collation>()];
+const _: [(); 1] = [(); core::mem::align_of::<Collation>()];
 
 impl Collation {
     /// Every built-in catalog collation. `None` is an attribute state, not a
@@ -322,7 +340,12 @@ impl Collation {
             Self::Posix => 2,
             Self::UcsBasic => 3,
             Self::None => 4,
-            Self::Catalog(selected) => 0x8000_0000 | selected.0.get(),
+            Self::Catalog(selected) => {
+                0x8000_0000
+                    | (selected.created_at() as u32) << 2
+                    | (selected.unicode_case() as u32) << 1
+                    | selected.database_locale() as u32
+            }
             Self::PgUnicodeFast => 133,
         }
     }

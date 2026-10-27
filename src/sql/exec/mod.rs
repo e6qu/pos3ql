@@ -7455,6 +7455,7 @@ fn stage_role_membership(
         txn.txid,
         lsn,
         &WalOp::UpsertRoleMembership {
+            identity: storage.role_membership(membership).position(membership, txn.txid),
             role: role_name.as_str(),
             member: member_name.as_str(),
             grantor: grantor_name.as_str(),
@@ -8017,7 +8018,7 @@ pub fn drop_role(
             let (changed_slot, prior) = match storage.change_role_membership(
                 membership.role as usize,
                 membership.member as usize,
-                membership.grantor_to(txn.txid) as usize,
+                membership.grantor as usize,
                 membership.options_to(txn.txid),
                 false,
                 txn.txid,
@@ -8030,6 +8031,7 @@ pub fn drop_role(
                 txn.txid,
                 lsn,
                 &WalOp::DropRoleMembership {
+                    identity: storage.role_membership(changed_slot).position(changed_slot, txn.txid),
                     role: role_name.as_str(),
                     member: member_name.as_str(),
                 },
@@ -8328,7 +8330,7 @@ pub fn grant_role(
                 ));
             }
             let base = storage
-                .find_role_membership_visible(role, member, txn.txid)
+                .find_role_membership_visible(role, member, grantor, txn.txid)
                 .map_or_else(
                     || crate::storage::RoleMembershipOptions {
                         admin: false,
@@ -8358,6 +8360,7 @@ pub fn grant_role(
             let member_name = storage.role_name(member, txn.txid);
             let grantor_name = storage.role_name(grantor, txn.txid);
             let operation = WalOp::UpsertRoleMembership {
+                identity: storage.role_membership(slot).position(slot, txn.txid),
                 role: role_name.as_str(),
                 member: member_name.as_str(),
                 grantor: grantor_name.as_str(),
@@ -8466,7 +8469,8 @@ pub fn revoke_role(
                     member_name.as_str()
                 ));
             };
-            let Some(existing) = storage.find_role_membership_visible(role, member, txn.txid)
+            let grantor = selected_grantor.unwrap_or(current_slot);
+            let Some(existing) = storage.find_role_membership_visible(role, member, grantor, txn.txid)
             else {
                 responder.notice(
                     sqlstate::WARNING_PRIVILEGE_NOT_GRANTED,
@@ -8480,15 +8484,6 @@ pub fn revoke_role(
                 )?;
                 continue;
             };
-            if selected_grantor.is_some_and(|grantor| {
-                storage.role_membership(existing).grantor_to(txn.txid) as usize != grantor
-            }) {
-                responder.notice(
-                    sqlstate::WARNING_PRIVILEGE_NOT_GRANTED,
-                    "role membership was not granted by the specified role",
-                )?;
-                continue;
-            }
             let old_options = storage.role_membership(existing).options_to(txn.txid);
             let (exists, options) = match option {
                 Some(crate::sql::ast::RoleMembershipOption::Admin) => (
@@ -8523,7 +8518,7 @@ pub fn revoke_role(
                     "dependent role privileges exist"
                 ));
             }
-            let row_grantor = storage.role_membership(existing).grantor_to(txn.txid) as usize;
+            let row_grantor = storage.role_membership(existing).grantor as usize;
             let (slot, prior) = match storage.change_role_membership(
                 role,
                 member,
@@ -8541,6 +8536,7 @@ pub fn revoke_role(
             let grantor_name = storage.role_name(row_grantor, txn.txid);
             let operation = if exists {
                 WalOp::UpsertRoleMembership {
+                    identity: storage.role_membership(slot).position(slot, txn.txid),
                     role: role_name.as_str(),
                     member: member_name.as_str(),
                     grantor: grantor_name.as_str(),
@@ -8548,6 +8544,7 @@ pub fn revoke_role(
                 }
             } else {
                 WalOp::DropRoleMembership {
+                    identity: storage.role_membership(slot).position(slot, txn.txid),
                     role: role_name.as_str(),
                     member: member_name.as_str(),
                 }
@@ -8605,7 +8602,7 @@ fn cascade_role_membership_grants(
             let membership = storage.role_membership(slot);
             if membership.visible_to(txn.txid)
                 && membership.role as usize == role
-                && membership.grantor_to(txn.txid) as usize == lost_grantor
+                && membership.grantor as usize == lost_grantor
             {
                 dependent[dependent_count] = slot;
                 dependent_count += 1;
@@ -8618,7 +8615,7 @@ fn cascade_role_membership_grants(
             }
             let member = membership.member as usize;
             let options = membership.options_to(txn.txid);
-            let grantor = membership.grantor_to(txn.txid) as usize;
+            let grantor = membership.grantor as usize;
             let propagates =
                 options.admin && !storage.role_can_admin_excluding(member, role, slot, txn.txid);
             let (changed, prior) =
@@ -8630,6 +8627,7 @@ fn cascade_role_membership_grants(
                 txn.txid,
                 lsn,
                 &WalOp::DropRoleMembership {
+                    identity: storage.role_membership(changed).position(changed, txn.txid),
                     role: role_name.as_str(),
                     member: member_name.as_str(),
                 },
@@ -8942,7 +8940,7 @@ pub fn alter_default_privileges(
                 };
                 let baseline = Storage::default_acl_baseline(*owner, *schema, class, grantee);
                 let defined = (new_privileges, new_options) != baseline;
-                let (slot, prior) = match storage.change_default_acl(
+                let Some((slot, prior)) = (match storage.change_default_acl(
                     crate::storage::DefaultAclKey {
                         owner: *owner,
                         schema: *schema,
@@ -8956,7 +8954,7 @@ pub fn alter_default_privileges(
                 ) {
                     Ok(change) => change,
                     Err(error) => return sql_fail(error),
-                };
+                }) else { continue };
                 if let Err(error) = txn.record_ddl(super::txn::DdlUndo::DefaultAclChanged {
                     slot: slot as u32,
                     prior,
@@ -9615,7 +9613,7 @@ fn drop_owned_privileges(
         if !defined || (!roles.contains(&entry.owner) && !roles.contains(&entry.grantee)) {
             continue;
         }
-        let (changed, prior) = storage.change_default_acl(
+        let Some((changed, prior)) = storage.change_default_acl(
             crate::storage::DefaultAclKey {
                 owner: entry.owner,
                 schema: entry.schema,
@@ -9626,7 +9624,7 @@ fn drop_owned_privileges(
             PrivilegeSet::NONE,
             PrivilegeSet::NONE,
             txn.txid,
-        )?;
+        )? else { continue };
         if let Err(error) = txn.record_ddl(super::txn::DdlUndo::DefaultAclChanged {
             slot: changed as u32,
             prior,
@@ -13924,6 +13922,28 @@ pub(crate) fn drop_schema(
     }
     for &slot in &slots[..n_slots] {
         let name = storage.schema_def_for(slot, txn.txid).name;
+        for default_slot in 0..storage.default_acl_entry_count() {
+            let entry = storage.default_acl_entry(default_slot);
+            if entry.database != storage.current_database_oid()
+                || usize::from(entry.schema) != slot || entry.image_to(txn.txid).is_none() {
+                continue;
+            }
+            let change = match storage.change_default_acl(
+                crate::storage::DefaultAclKey {
+                    owner: entry.owner, schema: entry.schema, class: entry.class, grantee: entry.grantee,
+                }, false, crate::storage::PrivilegeSet::NONE, crate::storage::PrivilegeSet::NONE, txn.txid,
+            ) {
+                Ok(change) => change,
+                Err(error) => return sql_fail(error),
+            };
+            if let Some((changed, prior)) = change
+                && let Err(error) = txn.record_ddl(super::txn::DdlUndo::DefaultAclChanged {
+                    slot: changed as u32, prior,
+                }) {
+                storage.restore_default_acl_pending(changed, prior);
+                return sql_fail(error);
+            }
+        }
         if let Err(error) = storage.drop_schema_in(slot, txn.txid) {
             return sql_fail(error);
         }

@@ -43,7 +43,7 @@ jobs:
           path = Path(os.environ['RUNNER_TEMP'], 'catalog-reference')
           output = path.joinpath('output.txt').read_text()
           observations = [line for line in output.splitlines() if line in ('t', 'f')]
-          assert len(observations) == 10 and all(value == 't' for value in observations), output
+          assert len(observations) == 18 and all(value == 't' for value in observations), output
           print(path.joinpath('version.txt').read_text().strip())
           print(f'PostgreSQL: {len(observations)} true observations')
           PY
@@ -70,7 +70,17 @@ jobs:
             target
           key: remaining-catalog-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
       - name: Format
-        run: cargo fmt --all -- --check
+        run: |
+          cargo fmt --all
+          git diff --binary -- src > "$RUNNER_TEMP/catalog-format.patch"
+          git diff --exit-code -- src
+      - name: Retain runner formatting patch
+        if: always() && matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@v6
+        with:
+          name: remaining-catalog-format
+          path: ${{ runner.temp }}/catalog-format.patch
+          if-no-files-found: error
       - name: Compile and lint all targets
         run: cargo clippy --all-targets --locked -- -D warnings
       - name: Catalog lifetime regressions

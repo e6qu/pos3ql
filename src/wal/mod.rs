@@ -26,7 +26,7 @@ use crc32c::crc32c;
 
 /// On-disk record header length shared by recovery and logical decoding.
 pub(crate) const HEADER_LEN: usize = 24;
-pub(crate) const RECORD_VERSION: u8 = 21;
+pub(crate) const RECORD_VERSION: u8 = 22;
 
 /// One contiguous, committed journal range ready for immutable publication.
 /// Construction is private to the journal, so callers cannot pair an LSN with
@@ -112,6 +112,9 @@ wal_record_kinds! {
     KIND_SET_OBJECT_ACL = 32;
     KIND_REWRITE_TABLE = 33;
     KIND_SET_DEFAULT_ACL = 34;
+/// Retains reservations consumed by coalesced metadata changes, including
+/// create-and-remove sequences that leave no live catalog row.
+    KIND_CATALOG_RESERVATION = 157;
 // Publication records carry the typed ordinary-descendant selection added
 // after the original record layout. New kinds make older bytes fail recovery
 // loudly instead of being reinterpreted as a different catalog contract.
@@ -1720,12 +1723,14 @@ pub(crate) enum WalOp<'a> {
         new_name: &'a str,
     },
     UpsertRoleMembership {
+        identity: crate::storage::CatalogPosition,
         role: &'a str,
         member: &'a str,
         grantor: &'a str,
         options: crate::storage::RoleMembershipOptions,
     },
     DropRoleMembership {
+        identity: crate::storage::CatalogPosition,
         role: &'a str,
         member: &'a str,
     },
@@ -1770,15 +1775,11 @@ pub(crate) enum WalOp<'a> {
         grant_options: crate::storage::PrivilegeSet,
     },
     SetDefaultAcl {
-        owner: &'a str,
-        /// Empty denotes the global default; otherwise a schema name.
-        schema: &'a str,
-        class: u8,
-        grantee: &'a str,
-        defined: bool,
-        privileges: crate::storage::PrivilegeSet,
-        grant_options: crate::storage::PrivilegeSet,
+        slot: u16,
+        expected: Option<crate::storage::DefaultAclGrantImage>,
+        image: Option<crate::storage::DefaultAclGrantImage>,
     },
+    ReserveCatalogSequence(core::num::NonZeroU64),
     SetParameterAcl {
         parameter: &'a str,
         expected: Option<crate::storage::ParameterAclOid>,
@@ -2800,10 +2801,60 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::SetColumnAcl { .. } => KIND_SET_COLUMN_ACL,
         WalOp::BeginTableRewrite { .. } => KIND_REWRITE_TABLE,
         WalOp::SetDefaultAcl { .. } => KIND_SET_DEFAULT_ACL,
+        WalOp::ReserveCatalogSequence(_) => KIND_CATALOG_RESERVATION,
         WalOp::SetParameterAcl { .. } => KIND_SET_PARAMETER_ACL,
         WalOp::PreparedCatalogRow { .. } => KIND_PREPARED_CATALOG_ROW,
         WalOp::SetRelationIndexHint { .. } => KIND_SET_RELATION_INDEX_HINT,
     }
+}
+
+fn default_acl_image_len(image: crate::storage::DefaultAclGrantImage) -> usize {
+    14 + usize::from(image.identity.schema.is_some()) * 8 + usize::from(image.grantee.is_some()) * 4
+}
+
+fn append_default_acl_image(buffer: &mut crate::mem::FixedBuf, image: crate::storage::DefaultAclGrantImage) -> bool {
+    let flags = u8::from(image.identity.schema.is_some()) | (u8::from(image.grantee.is_some()) << 1);
+    let mut ok = buffer.append(&image.identity.creation.get().to_le_bytes())
+        && buffer.append(&image.identity.owner.get().to_le_bytes())
+        && buffer.append(&[image.identity.class as u8, flags]);
+    if let Some(schema) = image.identity.schema { ok &= buffer.append(&schema.created_at().to_le_bytes()); }
+    if let Some(grantee) = image.grantee { ok &= buffer.append(&grantee.get().to_le_bytes()); }
+    ok && buffer.append(&image.privileges.0.to_le_bytes()) && buffer.append(&image.grant_options.0.to_le_bytes())
+}
+
+fn take_default_acl_image(payload: &[u8], at: &mut usize) -> Option<crate::storage::DefaultAclGrantImage> {
+    let creation = u32::from_le_bytes(payload.get(*at..*at+4)?.try_into().ok()?);
+    *at += 4;
+    let creation = crate::storage::CatalogIdentity::parse(u64::from(creation))?;
+    let owner = i32::from_le_bytes(payload.get(*at..*at+4)?.try_into().ok()?);
+    *at += 4;
+    let owner = crate::storage::RoleOid::parse(owner)?;
+    let class = crate::storage::DefaultPrivilegeClass::from_u8(*payload.get(*at)?)?;
+    *at += 1;
+    let flags = *payload.get(*at)?;
+    *at += 1;
+    if flags & !3 != 0 { return None; }
+    let schema = if flags & 1 != 0 {
+        let creation = u64::from_le_bytes(payload.get(*at..*at+8)?.try_into().ok()?);
+        *at += 8;
+        Some(crate::storage::SchemaIdentity::parse(creation)?)
+    } else { None };
+    let grantee = if flags & 2 != 0 {
+        let oid = i32::from_le_bytes(payload.get(*at..*at+4)?.try_into().ok()?);
+        *at += 4;
+        Some(crate::storage::RoleOid::parse(oid)?)
+    } else { None };
+    let privileges = u16::from_le_bytes(payload.get(*at..*at+2)?.try_into().ok()?);
+    *at += 2;
+    let grant_options = u16::from_le_bytes(payload.get(*at..*at+2)?.try_into().ok()?);
+    *at += 2;
+    if privileges & !class.all_privileges().0 != 0 || grant_options & !privileges != 0 { return None; }
+    let image = crate::storage::DefaultAclGrantImage {
+        identity: crate::storage::DefaultAclIdentity { creation, owner, schema, class }, grantee,
+        privileges: crate::storage::PrivilegeSet(privileges), grant_options: crate::storage::PrivilegeSet(grant_options),
+    };
+    image.validate().ok()?;
+    Some(image)
 }
 
 fn encoded_payload_len(operation: &WalOp) -> usize {
@@ -3976,8 +4027,8 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             member,
             grantor,
             ..
-        } => 1 + role.len() + 1 + member.len() + 1 + grantor.len() + 1,
-        WalOp::DropRoleMembership { role, member } => 1 + role.len() + 1 + member.len(),
+        } => crate::storage::CatalogPosition::ENCODED_BYTES + 1 + role.len() + 1 + member.len() + 1 + grantor.len() + 1,
+        WalOp::DropRoleMembership { role, member, .. } => crate::storage::CatalogPosition::ENCODED_BYTES + 1 + role.len() + 1 + member.len(),
         WalOp::SetRoleSetting {
             role,
             database,
@@ -4034,12 +4085,10 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             grantor,
             ..
         } => 1 + 1 + schema.len() + 1 + name.len() + 2 + 1 + grantee.len() + 1 + grantor.len() + 4,
-        WalOp::SetDefaultAcl {
-            owner,
-            schema,
-            grantee,
-            ..
-        } => 1 + owner.len() + 1 + schema.len() + 1 + 1 + grantee.len() + 1 + 4,
+        WalOp::ReserveCatalogSequence(_) => 8,
+        WalOp::SetDefaultAcl { expected, image, .. } => {
+            3 + expected.map_or(0, default_acl_image_len) + image.map_or(0, default_acl_image_len)
+        }
         WalOp::SetParameterAcl {
             parameter, image, ..
         } => {
@@ -6291,6 +6340,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             name_bytes(buffer, name) && name_bytes(buffer, new_name)
         }
         WalOp::UpsertRoleMembership {
+            identity,
             role,
             member,
             grantor,
@@ -6299,13 +6349,14 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             let flags = u8::from(options.admin)
                 | (u8::from(options.inherit) << 1)
                 | (u8::from(options.set) << 2);
-            name_bytes(buffer, role)
+            buffer.append(&identity.encode())
+                && name_bytes(buffer, role)
                 && name_bytes(buffer, member)
                 && name_bytes(buffer, grantor)
                 && buffer.append(&[flags])
         }
-        WalOp::DropRoleMembership { role, member } => {
-            name_bytes(buffer, role) && name_bytes(buffer, member)
+        WalOp::DropRoleMembership { identity, role, member } => {
+            buffer.append(&identity.encode()) && name_bytes(buffer, role) && name_bytes(buffer, member)
         }
         WalOp::SetRoleSetting {
             role,
@@ -6386,22 +6437,14 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 && buffer.append(&privileges.0.to_le_bytes())
                 && buffer.append(&grant_options.0.to_le_bytes())
         }
-        WalOp::SetDefaultAcl {
-            owner,
-            schema,
-            class,
-            grantee,
-            defined,
-            privileges,
-            grant_options,
-        } => {
-            name_bytes(buffer, owner)
-                && name_bytes(buffer, schema)
-                && buffer.append(&[*class])
-                && name_bytes(buffer, grantee)
-                && buffer.append(&[u8::from(*defined)])
-                && buffer.append(&privileges.0.to_le_bytes())
-                && buffer.append(&grant_options.0.to_le_bytes())
+        WalOp::ReserveCatalogSequence(value) => buffer.append(&value.get().to_le_bytes()),
+        WalOp::SetDefaultAcl { slot, expected, image } => {
+            assert_ne!(expected, image, "journal default privilege changes have an effect");
+            let flags = u8::from(expected.is_some()) | (u8::from(image.is_some()) << 1);
+            let mut ok = buffer.append(&slot.to_le_bytes()) && buffer.append(&[flags]);
+            if let Some(expected) = expected { ok &= append_default_acl_image(buffer, *expected); }
+            if let Some(image) = image { ok &= append_default_acl_image(buffer, *image); }
+            ok
         }
         WalOp::SetParameterAcl {
             parameter,
@@ -11487,6 +11530,7 @@ fn decode_op_inner<'a>(
             (at == payload.len()).then_some(WalOp::RenameRole { name, new_name })
         }),
         KIND_UPSERT_ROLE_MEMBERSHIP => decode_large_op(|| {
+            let identity = take_catalog_position(payload, &mut at)?;
             let role = take_name(&mut at)?;
             let member = take_name(&mut at)?;
             let grantor = take_name(&mut at)?;
@@ -11496,6 +11540,7 @@ fn decode_op_inner<'a>(
                 return None;
             }
             Some(WalOp::UpsertRoleMembership {
+                identity,
                 role,
                 member,
                 grantor,
@@ -11507,9 +11552,10 @@ fn decode_op_inner<'a>(
             })
         }),
         KIND_DROP_ROLE_MEMBERSHIP => decode_large_op(|| {
+            let identity = take_catalog_position(payload, &mut at)?;
             let role = take_name(&mut at)?;
             let member = take_name(&mut at)?;
-            (at == payload.len()).then_some(WalOp::DropRoleMembership { role, member })
+            (at == payload.len()).then_some(WalOp::DropRoleMembership { identity, role, member })
         }),
         KIND_SET_ROLE_SETTING => decode_large_op(|| {
             let flags = *payload.get(at)?;
@@ -11666,36 +11712,20 @@ fn decode_op_inner<'a>(
                 grant_options: crate::storage::PrivilegeSet(grant_options),
             })
         }),
+        KIND_CATALOG_RESERVATION => decode_large_op(|| {
+            let value = u64::from_le_bytes(payload.try_into().ok()?);
+            Some(WalOp::ReserveCatalogSequence(core::num::NonZeroU64::new(value)?))
+        }),
         KIND_SET_DEFAULT_ACL => decode_large_op(|| {
-            let owner = take_name(&mut at)?;
-            let schema = take_name(&mut at)?;
-            let class = *payload.get(at)?;
-            at += 1;
-            let typed_class = crate::storage::DefaultPrivilegeClass::from_u8(class)?;
-            let grantee = take_name(&mut at)?;
-            let defined = match *payload.get(at)? {
-                0 => false,
-                1 => true,
-                _ => return None,
-            };
-            at += 1;
-            let privileges = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
+            let slot = u16::from_le_bytes(payload.get(at..at+2)?.try_into().ok()?);
             at += 2;
-            let grant_options = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
-            at += 2;
-            if privileges & !typed_class.all_privileges().0 != 0 || grant_options & !privileges != 0
-            {
-                return None;
-            }
-            (at == payload.len()).then_some(WalOp::SetDefaultAcl {
-                owner,
-                schema,
-                class,
-                grantee,
-                defined,
-                privileges: crate::storage::PrivilegeSet(privileges),
-                grant_options: crate::storage::PrivilegeSet(grant_options),
-            })
+            if slot == u16::MAX { return None; }
+            let flags = *payload.get(at)?;
+            at += 1;
+            if flags == 0 || flags & !3 != 0 { return None; }
+            let expected = if flags & 1 != 0 { Some(take_default_acl_image(payload, &mut at)?) } else { None };
+            let image = if flags & 2 != 0 { Some(take_default_acl_image(payload, &mut at)?) } else { None };
+            (at == payload.len() && expected != image).then_some(WalOp::SetDefaultAcl { slot, expected, image })
         }),
         KIND_SET_RELATION_INDEX_HINT => decode_large_op(|| {
             let position = crate::storage::CatalogPosition::decode(payload.get(..10)?)?;

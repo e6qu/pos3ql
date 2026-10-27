@@ -34,6 +34,7 @@ pub(crate) enum DatabaseCloneKind {
     Operator = 23,
     OperatorFamily = 24,
     OperatorClass = 25,
+    DefaultAcl = 26,
 }
 
 impl DatabaseCloneKind {
@@ -65,6 +66,7 @@ impl DatabaseCloneKind {
             23 => Self::Operator,
             24 => Self::OperatorFamily,
             25 => Self::OperatorClass,
+            26 => Self::DefaultAcl,
             _ => return None,
         })
     }
@@ -533,6 +535,17 @@ impl Storage {
                 definition.database,
                 definition.ddl_state,
             );
+        }
+        drop(operators);
+        drop(casts);
+        drop(text);
+        {
+            let catalog = self.acl_catalog.lock().expect("ACL catalog lock poisoned");
+            for (slot, entry) in catalog.defaults.iter().enumerate() {
+                if let Some(image) = entry.committed {
+                    object(DatabaseCloneKind::DefaultAcl, slot, image.clone_key(), entry.database, CatalogDdlState::Present);
+                }
+            }
         }
     }
 }

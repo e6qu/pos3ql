@@ -6300,37 +6300,28 @@ impl Engine {
                 continue;
             }
             let entry = self.storage.default_acl_entry(slot as usize);
-            let (defined, privileges, grant_options) = self.storage.default_acl_state(
-                entry.owner,
-                entry.schema,
-                entry.class,
-                entry.grantee,
-                txn.txid,
-            );
-            let owner = self.storage.role_name(entry.owner as usize, txn.txid);
-            let schema = if entry.schema == crate::storage::DEFAULT_ACL_ALL_SCHEMAS {
-                crate::storage::SqlName::EMPTY
-            } else {
-                self.storage
-                    .schema_def_for(entry.schema as usize, txn.txid)
-                    .name
-            };
-            let grantee = (entry.grantee != crate::storage::PUBLIC_ROLE)
-                .then(|| self.storage.role_name(entry.grantee as usize, txn.txid));
+            let expected = entry.committed;
+            let image = entry.image_to(txn.txid);
+            if expected == image { continue; }
             let lsn = self.storage.bump_lsn();
             if let Err(error) = self.wal.stage_reserved(
                 txn.txid,
                 lsn,
                 &WalOp::SetDefaultAcl {
-                    owner: owner.as_str(),
-                    schema: schema.as_str(),
-                    class: entry.class as u8,
-                    grantee: grantee.as_ref().map_or("PUBLIC", |role| role.as_str()),
-                    defined,
-                    privileges,
-                    grant_options,
+                    slot: u16::try_from(slot).expect("default privilege admission checks the physical position"),
+                    expected,
+                    image,
                 },
             ) {
+                self.rollback_txn(txn, guc);
+                return Err(error);
+            }
+        }
+        if txn.ddl().iter().any(|undo| matches!(undo, DdlUndo::DefaultAclChanged { .. })) {
+            let value = core::num::NonZeroU64::new(self.storage.catalog_identity_sequence())
+                .expect("a default privilege change retains a positive creation reservation");
+            let lsn = self.storage.bump_lsn();
+            if let Err(error) = self.wal.stage_reserved(txn.txid, lsn, &WalOp::ReserveCatalogSequence(value)) {
                 self.rollback_txn(txn, guc);
                 return Err(error);
             }
@@ -21584,6 +21575,9 @@ fn apply_wal_op(
                 .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "corrupt WAL database scope"))?;
             storage.select_database(database)?;
         }
+        WalOp::ReserveCatalogSequence(value) => {
+            storage.restore_catalog_identity_sequence(value.get());
+        }
         WalOp::CreateLargeObject {
             oid,
             created_at,
@@ -23880,15 +23874,16 @@ fn apply_wal_op(
         WalOp::DropRole { name } => storage.remove_role(name),
         WalOp::RenameRole { name, new_name } => storage.replay_rename_role(name, new_name)?,
         WalOp::UpsertRoleMembership {
+            identity,
             role,
             member,
             grantor,
             options,
         } => {
-            storage.install_role_membership(role, member, grantor, options)?;
+            storage.install_role_membership(identity, role, member, grantor, options)?;
         }
-        WalOp::DropRoleMembership { role, member } => {
-            storage.remove_role_membership(role, member);
+        WalOp::DropRoleMembership { identity, role, member } => {
+            storage.remove_role_membership(identity, role, member)?;
         }
         WalOp::SetRoleSetting {
             role,
@@ -24245,78 +24240,8 @@ fn apply_wal_op(
                 0,
             )?;
         }
-        WalOp::SetDefaultAcl {
-            owner,
-            schema,
-            class,
-            grantee,
-            defined,
-            privileges,
-            grant_options,
-        } => {
-            let class = crate::storage::DefaultPrivilegeClass::from_u8(class).ok_or_else(|| {
-                sql_err!(
-                    sqlstate::INTERNAL_ERROR,
-                    "corrupt WAL default privilege class {}",
-                    class
-                )
-            })?;
-            let Some(owner_slot) = storage.find_role(owner) else {
-                if !defined {
-                    storage.set_lsn(lsn);
-                    return Ok(());
-                }
-                return Err(sql_err!(
-                    sqlstate::UNDEFINED_OBJECT,
-                    "WAL default privilege owner \"{}\" does not exist",
-                    owner
-                ));
-            };
-            let owner = owner_slot as u16;
-            let schema = if schema.is_empty() {
-                crate::storage::DEFAULT_ACL_ALL_SCHEMAS
-            } else {
-                let Some(schema_slot) = storage.find_schema(schema) else {
-                    if !defined {
-                        storage.set_lsn(lsn);
-                        return Ok(());
-                    }
-                    return Err(sql_err!(
-                        sqlstate::INVALID_SCHEMA_NAME,
-                        "WAL default privilege schema \"{}\" does not exist",
-                        schema
-                    ));
-                };
-                schema_slot as u16
-            };
-            let grantee = if grantee == "PUBLIC" {
-                crate::storage::PUBLIC_ROLE
-            } else {
-                let Some(grantee_slot) = storage.find_role(grantee) else {
-                    if !defined {
-                        storage.set_lsn(lsn);
-                        return Ok(());
-                    }
-                    return Err(sql_err!(
-                        sqlstate::UNDEFINED_OBJECT,
-                        "WAL default privilege grantee \"{}\" does not exist",
-                        grantee
-                    ));
-                };
-                grantee_slot as u16
-            };
-            storage.change_default_acl(
-                crate::storage::DefaultAclKey {
-                    owner,
-                    schema,
-                    class,
-                    grantee,
-                },
-                defined,
-                privileges,
-                grant_options,
-                0,
-            )?;
+        WalOp::SetDefaultAcl { slot, expected, image } => {
+            storage.install_default_acl_image(usize::from(slot), expected, image, 0)?;
         }
     }
     storage.set_lsn(lsn);

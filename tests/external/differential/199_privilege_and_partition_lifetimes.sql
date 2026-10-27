@@ -29,6 +29,38 @@ SELECT saved.oid <> current_membership.oid
   WHERE current_membership.roleid = 'lifetime_member_group'::regrole
     AND current_membership.member = 'lifetime_member_second'::regrole;
 
+GRANT lifetime_member_group TO lifetime_member_first WITH ADMIN OPTION;
+
+CREATE TABLE lifetime_saved_secondary_membership AS
+  SELECT oid FROM pg_auth_members
+  WHERE roleid = 'lifetime_member_group'::regrole
+    AND member = 'lifetime_member_second'::regrole;
+
+SET ROLE lifetime_member_first;
+
+GRANT lifetime_member_group TO lifetime_member_second;
+
+RESET ROLE;
+
+SELECT count(*) = 2 FROM pg_auth_members
+  WHERE roleid = 'lifetime_member_group'::regrole
+    AND member = 'lifetime_member_second'::regrole;
+
+SELECT count(*) = 1 FROM lifetime_saved_secondary_membership saved
+  JOIN pg_auth_members current_membership ON current_membership.oid = saved.oid
+  WHERE current_membership.grantor = 'postgres'::regrole;
+
+SET ROLE lifetime_member_first;
+
+REVOKE lifetime_member_group FROM lifetime_member_second;
+
+RESET ROLE;
+
+SELECT count(*) = 1 AND min(oid) = (SELECT oid FROM lifetime_saved_secondary_membership)
+  FROM pg_auth_members
+  WHERE roleid = 'lifetime_member_group'::regrole
+    AND member = 'lifetime_member_second'::regrole;
+
 ALTER DEFAULT PRIVILEGES IN SCHEMA lifetime_privileges
   GRANT SELECT ON TABLES TO lifetime_member_first;
 
@@ -67,6 +99,40 @@ SELECT saved.oid <> current_defaults.oid
   FROM lifetime_saved_defaults saved, pg_default_acl current_defaults
   WHERE current_defaults.defaclnamespace = 'lifetime_privileges'::regnamespace
     AND current_defaults.defaclobjtype = 'r';
+
+ALTER DEFAULT PRIVILEGES REVOKE USAGE ON TYPES FROM PUBLIC;
+
+SELECT cardinality(defaclacl) = 1 FROM pg_default_acl
+  WHERE defaclrole = CURRENT_USER::regrole AND defaclnamespace = 0
+    AND defaclobjtype = 'T';
+
+ALTER DEFAULT PRIVILEGES GRANT USAGE ON TYPES TO PUBLIC;
+
+SELECT count(*) = 0 FROM pg_default_acl
+  WHERE defaclrole = CURRENT_USER::regrole AND defaclnamespace = 0
+    AND defaclobjtype = 'T';
+
+ALTER DEFAULT PRIVILEGES REVOKE ALL ON TABLES FROM CURRENT_USER;
+
+SELECT cardinality(defaclacl) = 0 FROM pg_default_acl
+  WHERE defaclrole = CURRENT_USER::regrole AND defaclnamespace = 0
+    AND defaclobjtype = 'r';
+
+ALTER DEFAULT PRIVILEGES GRANT ALL ON TABLES TO CURRENT_USER;
+
+SELECT count(*) = 0 FROM pg_default_acl
+  WHERE defaclrole = CURRENT_USER::regrole AND defaclnamespace = 0
+    AND defaclobjtype = 'r';
+
+DROP SCHEMA lifetime_privileges;
+
+CREATE SCHEMA lifetime_privileges;
+
+SELECT count(*) = 0 FROM pg_default_acl
+  WHERE defaclrole = CURRENT_USER::regrole AND defaclobjtype = 'r';
+
+ALTER DEFAULT PRIVILEGES IN SCHEMA lifetime_privileges
+  GRANT SELECT ON TABLES TO lifetime_member_first;
 
 CREATE TABLE lifetime_partition_root(id integer) PARTITION BY RANGE (id);
 
@@ -126,7 +192,7 @@ DROP TABLE lifetime_partition_root CASCADE;
 
 DROP FUNCTION lifetime_partition_hook();
 
-DROP TABLE lifetime_saved_membership, lifetime_saved_defaults,
+DROP TABLE lifetime_saved_membership, lifetime_saved_secondary_membership, lifetime_saved_defaults,
   lifetime_saved_partition_trigger, lifetime_saved_reattachment;
 
 ALTER DEFAULT PRIVILEGES IN SCHEMA lifetime_privileges

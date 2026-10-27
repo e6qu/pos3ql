@@ -213,7 +213,7 @@ fn parse_writer_fence(bytes: &[u8]) -> Result<(&str, WriterToken), &'static str>
     Ok((state, token))
 }
 
-pub(crate) const MANIFEST_HEADER: &str = "pos3ql-manifest-v33";
+pub(crate) const MANIFEST_HEADER: &str = "pos3ql-manifest-v34";
 
 struct ManifestMetadata {
     lsn: u64,
@@ -4763,6 +4763,7 @@ impl Checkpointer {
                 }
                 Some("rmem") => {
                     finish_pending(storage, &mut slot_of, &mut pending_def)?;
+                    let identity = parse_catalog_position(&mut words, metadata.catalog_sequence)?;
                     let decode = |word: Option<&str>, missing: &'static str| {
                         word.ok_or(CheckpointSetupError::Corrupt(missing))
                             .and_then(decode_hex_name)
@@ -4776,6 +4777,7 @@ impl Checkpointer {
                     }
                     storage
                         .install_role_membership(
+                            identity,
                             &role,
                             &member,
                             &grantor,
@@ -5292,63 +5294,42 @@ impl Checkpointer {
                 }
                 Some("dacl") => {
                     finish_pending(storage, &mut slot_of, &mut pending_def)?;
-                    let decode = |word: Option<&str>, missing: &'static str| {
-                        word.ok_or(CheckpointSetupError::Corrupt(missing))
-                            .and_then(decode_hex_name)
+                    let slot: u16 = parse_field(words.next(), "default privilege position")?;
+                    let creation: u64 = parse_field(words.next(), "default privilege creation")?;
+                    let creation = crate::storage::CatalogIdentity::parse(creation)
+                        .filter(|creation| creation.created_at() <= metadata.catalog_sequence)
+                        .ok_or(CheckpointSetupError::Corrupt("invalid default privilege creation"))?;
+                    let owner: i32 = parse_field(words.next(), "default privilege owner")?;
+                    let owner = crate::storage::RoleOid::parse(owner)
+                        .ok_or(CheckpointSetupError::Corrupt("invalid default privilege owner"))?;
+                    let namespace = words.next().ok_or(CheckpointSetupError::Corrupt("default privilege namespace missing"))?;
+                    let schema = if namespace == "-" { None } else {
+                        let created_at: u64 = parse_field(Some(namespace), "default privilege namespace")?;
+                        Some(crate::storage::SchemaIdentity::parse(created_at)
+                            .ok_or(CheckpointSetupError::Corrupt("invalid default privilege namespace"))?)
                     };
-                    let owner = decode(words.next(), "dacl owner missing")?;
-                    let schema = decode(words.next(), "dacl schema missing")?;
-                    let class: u8 = parse_field(words.next(), "dacl class")?;
+                    let grantee = words.next().ok_or(CheckpointSetupError::Corrupt("default privilege grantee missing"))?;
+                    let grantee = if grantee == "PUBLIC" { None } else {
+                        let oid: i32 = parse_field(Some(grantee), "default privilege grantee")?;
+                        Some(crate::storage::RoleOid::parse(oid)
+                            .ok_or(CheckpointSetupError::Corrupt("invalid default privilege grantee"))?)
+                    };
+                    let class: u8 = parse_field(words.next(), "default privilege class")?;
                     let class = crate::storage::DefaultPrivilegeClass::from_u8(class)
-                        .ok_or(CheckpointSetupError::Corrupt("invalid dacl class"))?;
-                    let grantee = decode(words.next(), "dacl grantee missing")?;
-                    let privileges: u16 = parse_field(words.next(), "dacl privileges")?;
-                    let grant_options: u16 = parse_field(words.next(), "dacl grant options")?;
-                    if words.next().is_some()
-                        || privileges & !class.all_privileges().0 != 0
-                        || grant_options & !privileges != 0
-                    {
-                        return Err(CheckpointSetupError::Corrupt("invalid dacl record"));
+                        .ok_or(CheckpointSetupError::Corrupt("invalid default privilege class"))?;
+                    let privileges: u16 = parse_field(words.next(), "default privileges")?;
+                    let grant_options: u16 = parse_field(words.next(), "default grant options")?;
+                    if words.next().is_some() || privileges & !class.all_privileges().0 != 0
+                        || grant_options & !privileges != 0 || slot == u16::MAX {
+                        return Err(CheckpointSetupError::Corrupt("invalid default privilege record"));
                     }
-                    let owner = storage
-                        .find_role(&owner)
-                        .ok_or(CheckpointSetupError::Corrupt("dacl owner does not exist"))?
-                        as u16;
-                    let schema = if schema.is_empty() {
-                        crate::storage::DEFAULT_ACL_ALL_SCHEMAS
-                    } else {
-                        storage
-                            .find_schema(&schema)
-                            .ok_or(CheckpointSetupError::Corrupt("dacl schema does not exist"))?
-                            as u16
-                    };
-                    let grantee = if grantee == "PUBLIC" {
-                        crate::storage::PUBLIC_ROLE
-                    } else {
-                        storage
-                            .find_role(&grantee)
-                            .ok_or(CheckpointSetupError::Corrupt("dacl grantee does not exist"))?
-                            as u16
-                    };
-                    storage
-                        .change_default_acl(
-                            crate::storage::DefaultAclKey {
-                                owner,
-                                schema,
-                                class,
-                                grantee,
-                            },
-                            true,
-                            crate::storage::PrivilegeSet(privileges),
-                            crate::storage::PrivilegeSet(grant_options),
-                            0,
-                        )
-                        .map_err(|error| {
-                            CheckpointSetupError::ObjectStore(format!(
-                                "manifest default ACL rejected: {}",
-                                error.message.as_str()
-                            ))
-                        })?;
+                    storage.install_default_acl_image(usize::from(slot), None, Some(crate::storage::DefaultAclGrantImage {
+                        identity: crate::storage::DefaultAclIdentity { creation, owner, schema, class },
+                        grantee,
+                        privileges: crate::storage::PrivilegeSet(privileges),
+                        grant_options: crate::storage::PrivilegeSet(grant_options),
+                    }), 0).map_err(|error| CheckpointSetupError::ObjectStore(format!(
+                        "manifest default privilege rejected: {}", error.message.as_str())))?;
                 }
                 Some("pacl") => {
                     finish_pending(storage, &mut slot_of, &mut pending_def)?;
@@ -9709,7 +9690,7 @@ impl Checkpointer {
                 ),
             )?;
         }
-        for (_, membership) in storage.live_role_memberships() {
+        for (slot, membership) in storage.live_role_memberships() {
             use core::fmt::Write;
             let mut role = StackStr::<130>::new();
             let mut member = StackStr::<130>::new();
@@ -9744,7 +9725,9 @@ impl Checkpointer {
             write_manifest(
                 &mut self.manifest_output,
                 format_args!(
-                    "rmem {} {} {} {}",
+                    "rmem {} {} {} {} {} {}",
+                    slot,
+                    membership.created_at,
                     role.as_str(),
                     member.as_str(),
                     grantor.as_str(),
@@ -12884,48 +12867,25 @@ impl Checkpointer {
                 ),
             )?;
         }
-        for (_, acl) in storage.checkpoint_default_acls() {
-            write_database_context(
-                &mut self.manifest_output,
-                &mut database_context,
-                acl.database,
-            )?;
+        for (slot, acl) in storage.checkpoint_default_acls() {
+            write_database_context(&mut self.manifest_output, &mut database_context, acl.database)?;
             use core::fmt::Write;
-            let owner = storage.role(acl.owner as usize).name;
-            let schema = if acl.schema == crate::storage::DEFAULT_ACL_ALL_SCHEMAS {
-                crate::storage::SqlName::EMPTY
-            } else {
-                storage.schema_def(acl.schema as usize).name
-            };
-            let grantee = if acl.grantee == crate::storage::PUBLIC_ROLE {
-                crate::storage::SqlName::parse("PUBLIC").expect("PUBLIC fits")
-            } else {
-                storage.role(acl.grantee as usize).name
-            };
-            let mut owner_hex = StackStr::<130>::new();
-            let mut schema_hex = StackStr::<130>::new();
-            let mut grantee_hex = StackStr::<130>::new();
-            for byte in owner.as_str().as_bytes() {
-                let _ = write!(owner_hex, "{byte:02x}");
-            }
-            for byte in schema.as_str().as_bytes() {
-                let _ = write!(schema_hex, "{byte:02x}");
-            }
-            for byte in grantee.as_str().as_bytes() {
-                let _ = write!(grantee_hex, "{byte:02x}");
-            }
-            write_manifest(
-                &mut self.manifest_output,
-                format_args!(
-                    "dacl {} {} {} {} {} {}",
-                    owner_hex.as_str(),
-                    schema_hex.as_str(),
-                    acl.class as u8,
-                    grantee_hex.as_str(),
-                    acl.privileges.0,
-                    acl.grant_options.0
-                ),
-            )?;
+            let image = acl.committed.expect("checkpoint default privileges are present");
+            let mut schema = StackStr::<32>::new();
+            match image.identity.schema {
+                Some(identity) => write!(&mut schema, "{}", identity.created_at()),
+                None => write!(&mut schema, "-"),
+            }.expect("default privilege namespace fits its exact decimal width");
+            let mut grantee = StackStr::<32>::new();
+            match image.grantee {
+                Some(role) => write!(&mut grantee, "{}", role.get()),
+                None => write!(&mut grantee, "PUBLIC"),
+            }.expect("default privilege grantee fits its exact decimal width");
+            write_manifest(&mut self.manifest_output, format_args!(
+                "dacl {} {} {} {} {} {} {} {}", slot, image.identity.creation.created_at(),
+                image.identity.owner.get(), schema.as_str(), grantee.as_str(), image.identity.class as u8,
+                image.privileges.0, image.grant_options.0,
+            ))?;
         }
         for row in storage.parameter_acl_rows_visible(0) {
             self.parameter_acl_arena.reset();
@@ -19908,7 +19868,7 @@ mod stored_dependency_tests {
             )
             .unwrap();
         let manifest = format!(
-            "pos3ql-manifest-v33\nlsn 7\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nvix 0 1 0 0 - {} 1 7\ntypes_end\nend\n",
+            "pos3ql-manifest-v34\nlsn 7\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nvix 0 1 0 0 - {} 1 7\ntypes_end\nend\n",
             index_gc_hex(old.roster)
         );
         // Two backups and two readers share the same graph at the four-block limit.
@@ -20363,7 +20323,7 @@ mod stored_dependency_tests {
                     let mut budget = Budget::new(bytes);
                     let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
                     let mut checkpointer = Checkpointer::new(&config, &mut budget).unwrap();
-                    let mut manifest = String::from("pos3ql-manifest-v33\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\ntypes_end\n");
+                    let mut manifest = String::from("pos3ql-manifest-v34\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\ntypes_end\n");
                     for (oid, name) in [(first_oid, first_name), (second_oid, second_name)] {
                         let encoded = name
                             .as_bytes()
@@ -20389,7 +20349,7 @@ mod stored_dependency_tests {
                     let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
                     let mut checkpointer = Checkpointer::new(&config, &mut budget).unwrap();
                     assert!(matches!(checkpointer.load_manifest_text(&mut storage,
-                        "pos3ql-manifest-v33\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nsset 73616d706c65 6669727374\nsset 73616d706c65 7365636f6e64\ntypes_end\nend\n"),
+                        "pos3ql-manifest-v34\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nsset 73616d706c65 6669727374\nsset 73616d706c65 7365636f6e64\ntypes_end\nend\n"),
                         Err(CheckpointSetupError::Corrupt("duplicate system setting record"))));
                     assert_eq!(storage.system_settings().find(|(_, image)| image.live).unwrap().1
                         .value.as_str(), "first");
@@ -20398,7 +20358,7 @@ mod stored_dependency_tests {
                     let mut budget = Budget::new(bytes);
                     let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
                     let mut checkpointer = Checkpointer::new(&config, &mut budget).unwrap();
-                    let manifest = format!("pos3ql-manifest-v33\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nptx 10 1 2 0 5 10 6669727374\nptx {transaction_id} 1 2 0 5 10 {gid}\ntypes_end\nend\n");
+                    let manifest = format!("pos3ql-manifest-v34\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nptx 10 1 2 0 5 10 6669727374\nptx {transaction_id} 1 2 0 5 10 {gid}\ntypes_end\nend\n");
                     match checkpointer.load_manifest_text(&mut storage, &manifest) {
                         Err(CheckpointSetupError::ObjectStore(message)) => {
                             assert!(message.contains("duplicate prepared transaction catalog identity"));
@@ -20574,7 +20534,8 @@ mod stored_dependency_tests {
                 "pos3ql-manifest-v30",
                 "pos3ql-manifest-v31",
                 "pos3ql-manifest-v32",
-                "pos3ql-manifest-v33 trailing",
+                "pos3ql-manifest-v33",
+                "pos3ql-manifest-v34 trailing",
             ] {
                 let rejected = stack_format!(512, "{header}\n{body}");
                 assert!(matches!(
@@ -20656,11 +20617,11 @@ mod stored_dependency_tests {
 
     #[test]
     fn backup_commit_floor_includes_prepared_transactions_and_logical_slots() {
-        let manifest = b"pos3ql-manifest-v33\nlsn 100\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nptx 7 41 50 0 5 10 78\nrslot 736c6f74 60 70 0\ntypes_end\nend\n";
+        let manifest = b"pos3ql-manifest-v34\nlsn 100\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nptx 7 41 50 0 5 10 78\nrslot 736c6f74 60 70 0\ntypes_end\nend\n";
         assert_eq!(manifest_lsn(manifest).unwrap(), 100);
         assert_eq!(manifest_commit_retention_floor(manifest).unwrap(), 40);
 
-        let slot_only = b"pos3ql-manifest-v33\nlsn 100\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nrslot 736c6f74 60 70 0\ntypes_end\nend\n";
+        let slot_only = b"pos3ql-manifest-v34\nlsn 100\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nrslot 736c6f74 60 70 0\ntypes_end\nend\n";
         assert_eq!(manifest_commit_retention_floor(slot_only).unwrap(), 60);
     }
 
@@ -21022,7 +20983,7 @@ mod stored_dependency_tests {
         let mut manifest = FixedBuf::new(&mut budget, "manifest", 1024).unwrap();
         manifest
             .append(
-                b"pos3ql-manifest-v33\nlsn 7\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\ntypes_end\nend\n",
+                b"pos3ql-manifest-v34\nlsn 7\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\ntypes_end\nend\n",
             );
         let before = manifest.readable().to_vec();
         retag_manifest_root(&mut manifest, replacement).unwrap();

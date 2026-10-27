@@ -3979,6 +3979,11 @@ pub(crate) fn collect<'a>(
             continue;
         }
         if let DdlUndo::CommentSet { slot, .. } = entry {
+            // Removing an object's comment during DROP is bookkeeping, not
+            // an explicit COMMENT command on a still-visible object.
+            if !matches!(statement, Stmt::Comment { .. }) {
+                continue;
+            }
             let reference = comment_reference(storage, txid, slot as usize, statement)?;
             if seen_commands.as_slice().contains(&reference) {
                 continue;

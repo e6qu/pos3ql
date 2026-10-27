@@ -1,6 +1,7 @@
 //! Backend message construction: the typed layer between the engine and
 //! the raw send buffer.
 
+use crate::mem::arena::{Arena, ArenaFull};
 use crate::mem::buffer::FixedBuf;
 use crate::sql::ast::ExplainSerialize;
 use crate::sql::types::{ColDesc, Datum};
@@ -109,6 +110,9 @@ pub struct Responder<'b> {
     /// Composite utility commands execute ordinary DROP helpers but publish
     /// one command tag of their own.
     suppress_command_complete: bool,
+    /// Last complete frame produced by the typed command writer. DDL keeps
+    /// its tag in statement memory while end triggers run, preserving notices.
+    last_command_completion: Option<(usize, usize)>,
     /// Typed affected-row count for an internally executed DML command. This
     /// never derives state from a serialized command tag.
     affected_rows: Option<u64>,
@@ -501,6 +505,7 @@ impl<'b> Responder<'b> {
             render: crate::sql::guc::RenderContext::default(),
             discard_query_output: false,
             suppress_command_complete: false,
+            last_command_completion: None,
             affected_rows: None,
             discarded_rows: 0,
             discard_serialize: ExplainSerialize::None,
@@ -522,6 +527,7 @@ impl<'b> Responder<'b> {
             render: crate::sql::guc::RenderContext::default(),
             discard_query_output: false,
             suppress_command_complete: false,
+            last_command_completion: None,
             affected_rows: None,
             discarded_rows: 0,
             discard_serialize: ExplainSerialize::None,
@@ -544,6 +550,7 @@ impl<'b> Responder<'b> {
             render: crate::sql::guc::RenderContext::default(),
             discard_query_output: false,
             suppress_command_complete: false,
+            last_command_completion: None,
             affected_rows: None,
             discarded_rows: 0,
             discard_serialize: ExplainSerialize::None,
@@ -567,6 +574,7 @@ impl<'b> Responder<'b> {
             render: crate::sql::guc::RenderContext::default(),
             discard_query_output: false,
             suppress_command_complete: false,
+            last_command_completion: None,
             affected_rows: None,
             discarded_rows: 0,
             discard_serialize: ExplainSerialize::None,
@@ -1909,9 +1917,48 @@ impl<'b> Responder<'b> {
         if self.discard_query_output || self.suppress_command_complete {
             return Ok(());
         }
+        // Compact before saving an absolute offset; MsgOut appends without
+        // consuming bytes, so the completed frame remains at this position.
+        let _ = self.buffer.writable();
+        let start = self.buffer.mark();
         let mut m = MsgOut::begin(self.buffer, wire::MSG_COMMAND_COMPLETE);
         m.cstr(tag);
-        m.finish()
+        m.finish()?;
+        self.last_command_completion = Some((start, self.buffer.mark()));
+        Ok(())
+    }
+
+    pub(crate) fn begin_command_completion_capture(&mut self) {
+        self.last_command_completion = None;
+    }
+
+    pub(crate) fn take_command_completion_tag<'a>(
+        &mut self,
+        arena: &'a Arena,
+        retain: bool,
+    ) -> Result<Option<&'a str>, ArenaFull> {
+        let Some((start, end)) = self.last_command_completion.take() else {
+            return Ok(None);
+        };
+        assert_eq!(
+            end,
+            self.buffer.mark(),
+            "command completion must finish statement output"
+        );
+        assert!(
+            end >= start + 6,
+            "command completion has a header and terminator"
+        );
+        let retained = if retain {
+            let tag = core::str::from_utf8(&self.buffer.filled_mut()[start + 5..end - 1])
+                .expect("command tags originate as UTF-8 strings");
+            arena.alloc_str(tag).map(Some)
+        } else {
+            Ok(None)
+        };
+        // Also remove success if the statement reservation cannot retain it.
+        self.buffer.truncate_to(start);
+        retained
     }
 
     /// Publishes an affected-row count alongside a DML command completion.
@@ -2114,6 +2161,64 @@ mod tests {
     use crate::mem::Budget;
     use crate::mem::arena::Arena;
     use crate::sql::types::{RangeKind, RecordField, oid};
+
+    #[test]
+    fn event_trigger_completion_capture_preserves_notices_and_compaction() {
+        let mut budget = Budget::new(8192);
+        let mut buffer = FixedBuf::new(&mut budget, "completion capture", 4096).unwrap();
+        let arena = Arena::new(&mut budget, "completion tags", 1024).unwrap();
+        buffer.append(b"prefix");
+        buffer.consume(3);
+        let mut response = Responder::new(&mut buffer);
+        crate::mem::guard::forbid_alloc(|| {
+            response.begin_command_completion_capture();
+            response.notice("00000", "before completion").unwrap();
+            let expected = response.buffer.readable().len();
+            response.command_complete("CREATE TABLE").unwrap();
+            let tag = response
+                .take_command_completion_tag(&arena, true)
+                .unwrap()
+                .unwrap();
+            assert_eq!(tag, "CREATE TABLE");
+            assert_eq!(response.buffer.len(), expected);
+            response.notice("00000", "hook notice").unwrap();
+            response.command_complete(tag).unwrap();
+            let bytes = response.buffer.readable();
+            assert!(bytes.ends_with(b"CREATE TABLE\0"));
+            assert!(
+                bytes
+                    .windows(b"hook notice".len())
+                    .any(|part| part == b"hook notice")
+            );
+        });
+    }
+
+    #[test]
+    fn event_trigger_completion_exhaustion_never_leaves_success() {
+        let mut budget = Budget::new(8192);
+        let mut buffer = FixedBuf::new(&mut budget, "completion exhaustion", 4096).unwrap();
+        let arena = Arena::new(&mut budget, "completion tags", 1).unwrap();
+        let mut response = Responder::new(&mut buffer);
+        crate::mem::guard::forbid_alloc(|| {
+            response.begin_command_completion_capture();
+            response
+                .notice("00000", "notice retained on failure")
+                .unwrap();
+            let expected = response.buffer.len();
+            response.command_complete("CREATE TABLE").unwrap();
+            assert!(response.take_command_completion_tag(&arena, true).is_err());
+            assert_eq!(response.buffer.len(), expected);
+            response.begin_command_completion_capture();
+            response.command_complete("DROP TABLE").unwrap();
+            assert!(
+                response
+                    .take_command_completion_tag(&arena, false)
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(response.buffer.len(), expected);
+        });
+    }
 
     #[test]
     fn select_one_wire_bytes() {

@@ -228,6 +228,11 @@ SELECT has_table_privilege(identity, 'SELECT') IS NULL FROM saved_order_identity
 -- true: the old identifier does not grant access to the replacement
 ```
 
+DDL success follows its end-of-command event triggers. A hook that raises an
+error rolls the command back and keeps its notices, without sending a success
+tag first. Internal comment cleanup during DROP does not become an extra
+COMMENT command in the event-trigger command list.
+
 User-defined operator classes and families can select modeled built-in operators
 and user operators by their exact argument types. Explicit `pg_catalog.<` selects
 the built-in comparison; an unqualified `<` follows the configured schema search

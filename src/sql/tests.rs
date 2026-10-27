@@ -1780,6 +1780,56 @@ fn catalog_lifetime_config(name: &str, mode: crate::config::TransactionMode) -> 
 }
 
 #[test]
+fn event_trigger_failures_keep_notices_without_success_command_tags() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let config = catalog_lifetime_config(&format!("event-completion-{mode:?}"), mode);
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        session.success(&mut engine, "SET client_min_messages = notice", true);
+        session.success(&mut engine, "CREATE FUNCTION completion_hook() RETURNS event_trigger LANGUAGE plpgsql AS 'BEGIN RAISE NOTICE ''hook notice''; RAISE EXCEPTION USING ERRCODE=''ZX123'', MESSAGE=''hook rejected''; RETURN; END'; CREATE EVENT TRIGGER completion_end ON ddl_command_end WHEN TAG IN ('CREATE TABLE') EXECUTE FUNCTION completion_hook()", true);
+        for sql in [
+            "CREATE TABLE completion_direct(value integer)",
+            "DO 'BEGIN CREATE TABLE completion_nested(value integer); END'",
+            "DO 'BEGIN EXECUTE ''CREATE TABLE completion_dynamic(value integer)''; END'",
+        ] {
+            let output = session.execute(&mut engine, sql, true);
+            assert_eq!(
+                error_sqlstates(&output),
+                ["ZX123"],
+                "{sql}: {}",
+                String::from_utf8_lossy(&output)
+            );
+            assert!(
+                command_tags(&output).is_empty(),
+                "failed DDL reported success: {}",
+                String::from_utf8_lossy(&output)
+            );
+            assert!(
+                message_types(&output).contains(&b'N'),
+                "the hook's notice must survive its error"
+            );
+        }
+        assert_eq!(data_rows(&session.success(&mut engine, "SELECT to_regclass('completion_direct') IS NULL AND to_regclass('completion_nested') IS NULL AND to_regclass('completion_dynamic') IS NULL", true)), ["t"]);
+        session.success(&mut engine, "CREATE OR REPLACE FUNCTION completion_hook() RETURNS event_trigger LANGUAGE plpgsql AS 'BEGIN RAISE NOTICE ''hook success''; RETURN; END'", true);
+        let output = session.success(
+            &mut engine,
+            "CREATE TABLE completion_success(value integer)",
+            true,
+        );
+        assert_eq!(command_tags(&output), ["CREATE TABLE"]);
+        let types = message_types(&output);
+        assert!(
+            types.iter().position(|tag| *tag == b'N').unwrap()
+                < types.iter().position(|tag| *tag == b'C').unwrap()
+        );
+    }
+}
+
+#[test]
 fn catalog_lifetime_executable_objects_match_postgresql_in_both_modes() {
     let fixture =
         include_str!("../../tests/external/differential/197_executable_catalog_lifetimes.sql");
@@ -2016,8 +2066,7 @@ fn catalog_lifetime_copied_executable_edits_stay_in_their_database_after_recover
                     "ALTER EVENT TRIGGER lifetime_exec_trigger RENAME TO lifetime_exec_trigger_moved",
                     "ALTER OPERATOR public.=== (integer, integer) SET SCHEMA lifetime_exec_moved",
                     "COMMENT ON OPERATOR FAMILY lifetime_exec_family_moved USING btree IS 'copied family'",
-                    "CREATE FUNCTION lifetime_exec_not_same(integer, integer) RETURNS boolean LANGUAGE SQL IMMUTABLE RETURN $1 <> $2",
-                    "CREATE OPERATOR public.=== (FUNCTION = lifetime_exec_not_same, LEFTARG = integer, RIGHTARG = integer)",
+                    "CREATE OPERATOR public.=== (FUNCTION = lifetime_exec_compare, LEFTARG = integer, RIGHTARG = integer)",
                 ] {
                     session.success(&mut engine, sql, false);
                 }
@@ -2041,7 +2090,7 @@ fn catalog_lifetime_copied_executable_edits_stay_in_their_database_after_recover
                     data_rows(&session.success(&mut engine, REPORT, false)),
                     ["t"]
                 );
-                assert_eq!(data_rows(&session.success(&mut engine, "SELECT NOT (2 OPERATOR(public.===) 2); SELECT obj_description(oid,'pg_opfamily')='copied family' FROM pg_opfamily WHERE opfname='lifetime_exec_family_moved'; SELECT count(*)=1 FROM pg_opclass WHERE opcname='lifetime_exec_class_moved'; SELECT count(*)=1 FROM pg_event_trigger WHERE evtname='lifetime_exec_trigger_moved'; SELECT value FROM lifetime_exec_rows WHERE value=7", false)), ["t", "t", "t", "t", "7"]);
+                assert_eq!(data_rows(&session.success(&mut engine, "SELECT (2 OPERATOR(public.===) 2)=0; SELECT obj_description(oid,'pg_opfamily')='copied family' FROM pg_opfamily WHERE opfname='lifetime_exec_family_moved'; SELECT count(*)=1 FROM pg_opclass WHERE opcname='lifetime_exec_class_moved'; SELECT count(*)=1 FROM pg_event_trigger WHERE evtname='lifetime_exec_trigger_moved'; SELECT value FROM lifetime_exec_rows WHERE value=7", false)), ["t", "t", "t", "t", "7"]);
                 engine
                     .select_database(crate::storage::DatabaseOid::TEMPLATE1)
                     .unwrap();

@@ -15179,7 +15179,18 @@ impl Engine {
         } else {
             event_trigger::BeforeDdl::EMPTY
         };
+        if event_drop || event_end {
+            responder.begin_command_completion_capture();
+        }
         let outcome = execute(self, txn, sqlprep, cursors, guc, responder);
+        let completion = if event_drop || event_end {
+            match responder.take_command_completion_tag(arena, matches!(outcome, Ok(Ok(())))) {
+                Ok(tag) => tag,
+                Err(_) => return Ok(Err(eval::arena_full())),
+            }
+        } else {
+            None
+        };
         if matches!(outcome, Ok(Ok(())))
             && (event_drop || event_end)
             && let Some(tag) = event_tag
@@ -15204,6 +15215,9 @@ impl Engine {
             )
         {
             return Ok(Err(error));
+        }
+        if let Some(tag) = completion {
+            responder.command_complete(tag)?;
         }
         outcome
     }
@@ -15495,6 +15509,9 @@ impl Engine {
         } else {
             event_trigger::BeforeDdl::EMPTY
         };
+        if event_drop || event_end {
+            responder.begin_command_completion_capture();
+        }
         let outcome = match statement {
             Stmt::Explain { options, statement } => {
                 let settings = if options.settings {
@@ -17777,6 +17794,14 @@ impl Engine {
             }
             Stmt::Deallocate(name) => self.execute_deallocate_statement(*name, sqlprep, responder),
         };
+        let completion = if event_drop || event_end {
+            match responder.take_command_completion_tag(arena, matches!(outcome, Ok(Ok(())))) {
+                Ok(tag) => tag,
+                Err(_) => return Ok(Err(eval::arena_full())),
+            }
+        } else {
+            None
+        };
         if matches!(outcome, Ok(Ok(())))
             && (event_drop || event_end)
             && let Some(tag) = event_tag
@@ -17801,6 +17826,9 @@ impl Engine {
             )
         {
             return Ok(Err(error));
+        }
+        if let Some(tag) = completion {
+            responder.command_complete(tag)?;
         }
         outcome
     }

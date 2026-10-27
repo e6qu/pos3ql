@@ -2458,7 +2458,7 @@ fn collect_expression<'a>(
         dependencies.push(StoredQueryDependency {
             class: DependencyClass::Collation,
             slot: slot as u16,
-            identity: StoredDependencyIdentity::Name,
+            identity: StoredDependencyIdentity::Collation(storage.collation(slot).binding()),
             referenced_columns: crate::storage::ColumnSet::EMPTY,
             schema: definition.schema,
             name: definition.name,
@@ -2770,7 +2770,7 @@ fn collect_regcollation(
     };
     let Some((slot, definition)) = storage
         .collations_visible_to(txid)
-        .find(|(slot, _)| crate::sql::ast::Collation::Catalog(*slot as u8).oid() == oid)
+        .find(|(slot, _)| storage.collation(*slot).oid() == oid)
     else {
         return Ok(());
     };
@@ -2782,7 +2782,7 @@ fn collect_regcollation(
     dependencies.push(StoredQueryDependency {
         class: DependencyClass::Collation,
         slot: slot as u16,
-        identity: StoredDependencyIdentity::Name,
+        identity: StoredDependencyIdentity::Collation(storage.collation(slot).binding()),
         referenced_columns: crate::storage::ColumnSet::EMPTY,
         schema: definition.schema,
         name: definition.name,
@@ -2837,7 +2837,7 @@ fn collect_text_search_configuration(
     dependencies.push(StoredQueryDependency {
         class: DependencyClass::TextSearchConfiguration,
         slot: slot as u16,
-        identity: StoredDependencyIdentity::Name,
+        identity: StoredDependencyIdentity::TextSearchConfigurationOid(definition.oid()),
         referenced_columns: crate::storage::ColumnSet::EMPTY,
         schema: definition.schema(),
         name: definition.name(),

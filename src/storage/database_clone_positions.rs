@@ -24,6 +24,10 @@ pub(crate) enum DatabaseCloneKind {
     Statistics = 13,
     Publication = 14,
     Extension = 15,
+    Collation = 16,
+    Conversion = 17,
+    TextSearch = 18,
+    TextSearchBuiltin = 19,
 }
 
 impl DatabaseCloneKind {
@@ -45,6 +49,10 @@ impl DatabaseCloneKind {
             13 => Self::Statistics,
             14 => Self::Publication,
             15 => Self::Extension,
+            16 => Self::Collation,
+            17 => Self::Conversion,
+            18 => Self::TextSearch,
+            19 => Self::TextSearchBuiltin,
             _ => return None,
         })
     }
@@ -403,6 +411,53 @@ impl Storage {
                 definition.database,
                 definition.ddl_state,
             );
+        }
+        let text = self
+            .text_catalog
+            .lock()
+            .expect("text catalog lock poisoned");
+        for (slot, definition) in text.collations.iter().enumerate() {
+            object(
+                DatabaseCloneKind::Collation,
+                slot,
+                definition.created_at,
+                definition.database,
+                definition.ddl_state,
+            );
+        }
+        for (slot, definition) in text.conversions.iter().enumerate() {
+            object(
+                DatabaseCloneKind::Conversion,
+                slot,
+                definition.created_at,
+                definition.database,
+                definition.ddl_state,
+            );
+        }
+        for selected_kind in [
+            DatabaseCloneKind::TextSearch,
+            DatabaseCloneKind::TextSearchBuiltin,
+        ] {
+            for (slot, definition) in text.text_search_objects.iter().enumerate() {
+                if definition.database != database
+                    || definition.ddl_state == CatalogDdlState::Absent
+                {
+                    continue;
+                }
+                let (kind, identity) =
+                    TextSearchIdentity::admit(definition.created_at, definition.definition)
+                        .expect("admitted text object has a checked identity")
+                        .clone_key();
+                if kind == selected_kind {
+                    object(
+                        kind,
+                        slot,
+                        identity,
+                        definition.database,
+                        definition.ddl_state,
+                    );
+                }
+            }
         }
     }
 }

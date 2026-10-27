@@ -29877,9 +29877,12 @@ pub fn create_collation(
                 ));
             };
             let mut definition = match source {
-                crate::sql::ast::Collation::Catalog(slot) => storage
-                    .collation(usize::from(slot))
-                    .definition_for(txn.txid),
+                crate::sql::ast::Collation::Catalog(selected) => {
+                    match storage.collation_definition(selected, txn.txid) {
+                        Ok(definition) => definition,
+                        Err(error) => return sql_fail(error),
+                    }
+                }
                 crate::sql::ast::Collation::C => CollationDefinition {
                     provider: CollationProvider::Libc,
                     collate: StackStr::from_str("C"),
@@ -31237,7 +31240,7 @@ pub(crate) fn drop_collation(
     if let Err(error) = require_definition_owner(storage, txn.txid, definition.owner, "collation") {
         return sql_fail(error);
     }
-    let identity = crate::sql::ast::Collation::Catalog(slot as u8);
+    let identity = crate::sql::ast::Collation::Catalog(storage.collation(slot).binding());
     let StoredDependencyClosure {
         views: dependent_views,
         matviews: dependent_matviews,

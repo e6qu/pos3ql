@@ -11826,10 +11826,8 @@ impl Engine {
                 | ast::Collation::PgUnicodeFast => {
                     Ok(Some(ast::ParsedCollation::Builtin(collation)))
                 }
-                ast::Collation::Catalog(slot) => {
-                    let definition = storage
-                        .collation(usize::from(slot))
-                        .definition_for(txn.txid);
+                ast::Collation::Catalog(selected) => {
+                    let definition = storage.collation_definition(selected, txn.txid)?;
                     let schema = arena
                         .alloc_str(definition.schema.as_str())
                         .map_err(|_| query::arena_full_pub())?;

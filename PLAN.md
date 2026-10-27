@@ -34,11 +34,10 @@ A waiting schema edit must never attach itself to a new object that reused a nam
 - When a report lists an object's saved name, its later column, index, comment
   and dependency reads must still refer to that same object. Unfinished edits
   must stay private to their transaction. Preserve repeated dependency rows.
-- Extend stable object identifiers beyond the families guaranteed in the
-  [behavior guide](docs/implemented-baseline.md#schema-changes-and-object-identity).
-  Reusing an internal slot must not change an existing object's identifier or
-  attach its comments to a replacement. Check shared catalogs, database copies
-  and recovery after deleting local caches.
+- Finish identifiers for the catalog families still outside the
+  [behavior guide's guarantees](docs/implemented-baseline.md#schema-changes-and-object-identity).
+  Reusing a slot must never attach an old identifier or comment to a replacement.
+  Cover shared catalogs, copied databases and recovery after deleting local caches.
 - Keep older rows, indexes and saved files until readers and backups finish.
   Remove obsolete versions in limited batches so other queries keep moving.
 - Let remaining metadata and maintenance downloads pause without occupying the

@@ -5178,20 +5178,17 @@ fn rewrite_stored_collation<'a>(
                 name.name
             )
         })?;
-    if !context
-        .storage
-        .collations_visible_to(context.txid)
-        .any(|(slot, _)| slot == dependency.slot as usize)
-    {
-        return Err(sql_err!(
-            sqlstate::UNDEFINED_OBJECT,
-            "stored collation dependency \"{}\" does not exist",
-            name.name
-        ));
+    match dependency.identity {
+        crate::storage::StoredDependencyIdentity::Collation(selected) => {
+            Ok(crate::sql::ast::ParsedCollation::Builtin(
+                crate::sql::ast::Collation::Catalog(selected),
+            ))
+        }
+        _ => Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "stored collation identity has the wrong class"
+        )),
     }
-    Ok(crate::sql::ast::ParsedCollation::Builtin(
-        crate::sql::ast::Collation::Catalog(dependency.slot as u8),
-    ))
 }
 
 fn rewrite_stored_regcollation_operand<'a>(
@@ -5222,18 +5219,15 @@ fn rewrite_stored_regcollation_operand<'a>(
     }) else {
         return Ok(operand);
     };
-    if !context
-        .storage
-        .collations_visible_to(context.txid)
-        .any(|(slot, _)| slot == usize::from(dependency.slot))
-    {
-        return Err(sql_err!(
-            sqlstate::UNDEFINED_OBJECT,
-            "stored collation dependency \"{}\" does not exist",
-            written
-        ));
-    }
-    let oid = crate::sql::ast::Collation::Catalog(dependency.slot as u8).oid();
+    let oid = match dependency.identity {
+        crate::storage::StoredDependencyIdentity::Collation(selected) => selected.oid(),
+        _ => {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "stored collation identity has the wrong class"
+            ));
+        }
+    };
     let rendered = arena.alloc_str_display(oid).map_err(|_| arena_full())?;
     arena
         .alloc(Expr::Str(rendered))
@@ -5288,33 +5282,37 @@ fn rewrite_stored_text_search_arguments<'a>(
     }) else {
         return Ok(args);
     };
-    let definition = context
+    let oid = match dependency.identity {
+        crate::storage::StoredDependencyIdentity::TextSearchConfigurationOid(oid) => oid,
+        _ => {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "stored text search identity has the wrong class"
+            ));
+        }
+    };
+    if !context
         .storage
         .text_search_objects_visible_to(context.txid)
-        .find_map(|(slot, definition)| (slot == dependency.slot as usize).then_some(definition))
-        .ok_or_else(|| {
-            sql_err!(
-                sqlstate::UNDEFINED_OBJECT,
-                "stored text search configuration dependency \"{}\" does not exist",
-                written
-            )
-        })?;
-    let qualified = crate::stack_format!(
-        128,
-        "{}.{}",
-        definition.schema().as_str(),
-        definition.name().as_str()
-    );
-    if qualified.is_truncated() {
+        .any(|(_, definition)| definition.oid() == oid)
+    {
         return Err(sql_err!(
-            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "text search configuration name is too long"
+            sqlstate::UNDEFINED_OBJECT,
+            "stored text search configuration dependency does not exist"
         ));
     }
-    let rendered = arena
-        .alloc_str(qualified.as_str())
+    // Keep the selected identifier through later execution; a new name lookup
+    // after a wait could select an object which reused the old spelling.
+    let operand = arena
+        .alloc(Expr::Int(i64::from(oid)))
         .map_err(|_| arena_full())?;
-    let first = arena.alloc(Expr::Str(rendered)).map_err(|_| arena_full())?;
+    let first = arena
+        .alloc(Expr::Cast {
+            operand,
+            type_name: "regconfig",
+            type_mod: -1,
+        })
+        .map_err(|_| arena_full())?;
     let rewritten = arena.alloc_slice_copy(args).map_err(|_| arena_full())?;
     rewritten[0] = first;
     Ok(rewritten)

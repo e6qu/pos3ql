@@ -12,7 +12,6 @@ pub(crate) use catalog_history::{
 };
 mod catalog_identities;
 mod catalog_sources;
-use catalog_identities::MAX_CATALOG_CREATION;
 pub(crate) use catalog_identities::{CatalogCreation, CatalogIdentity};
 mod parameter_acls;
 use parameter_acls::ParameterAclGrantIdentity;
@@ -1420,6 +1419,9 @@ pub struct ColumnMeta {
     /// `ANALYZE` paths. This is a typed catalog value, never an option string.
     pub statistics_options: crate::sql::ast::ColumnStatisticsOptions,
 }
+
+// Recovery and copied execution schemas reserve at most 512 bytes per column.
+const _: () = assert!(core::mem::size_of::<ColumnMeta>() <= 512);
 
 /// Durable provenance of a table column's effective `NOT NULL` constraint.
 /// Partitions can retain a local constraint while also inheriting one, so a
@@ -3168,9 +3170,82 @@ impl CollationDef {
             .map_or(self.definition, |pending| pending.definition)
     }
 
-    pub(crate) fn oid(self, slot: usize) -> i32 {
-        crate::sql::ast::Collation::Catalog(slot as u8).oid()
+    pub(crate) fn binding(self) -> crate::sql::ast::CatalogCollation {
+        crate::sql::ast::CatalogCollation::from_creation(
+            self.created_at,
+            self.definition.behavior == CollationBehavior::Database,
+            self.definition.provider == CollationProvider::Builtin
+                && self.definition.locale.as_str() == "PG_UNICODE_FAST",
+        )
+        .expect("admitted collation has a checked lifetime and immutable behavior")
     }
+
+    pub(crate) fn oid(self) -> i32 {
+        self.binding().oid()
+    }
+}
+
+pub(crate) const MAX_CATALOG_CREATION: u64 = 9_999_999;
+
+#[derive(Clone, Copy)]
+enum TextSearchIdentity {
+    Builtin { oid: i32, ordinal: u8 },
+    Created(CatalogIdentity),
+}
+
+impl TextSearchIdentity {
+    fn admit(created_at: u64, definition: TextSearchDefinition) -> Result<Self, SqlError> {
+        if created_at != 0 {
+            let created = CatalogIdentity::require(created_at)?;
+            if definition.oid() != text_search_lifetime_oid(definition.kind(), created_at)? {
+                return Err(sql_err!(
+                    sqlstate::DATA_EXCEPTION,
+                    "stored text search identity does not match its lifetime"
+                ));
+            }
+            return Ok(Self::Created(created));
+        }
+        use crate::sql::ast::TextSearchObjectKind as Kind;
+        let ordinal = match (definition.kind(), definition.oid()) {
+            (Kind::Parser, 3722) => 0,
+            (Kind::Template, 3727) => 1,
+            (Kind::Template, 13_234) => 2,
+            (Kind::Dictionary, 3765) => 3,
+            (Kind::Dictionary, 13_247) => 4,
+            (Kind::Configuration, 3748) => 5,
+            (Kind::Configuration, 13_248) => 6,
+            _ => {
+                return Err(sql_err!(
+                    sqlstate::DATA_EXCEPTION,
+                    "stored text search object has no valid builtin or creation identity"
+                ));
+            }
+        };
+        Ok(Self::Builtin {
+            oid: definition.oid(),
+            ordinal,
+        })
+    }
+
+    fn clone_key(self) -> (DatabaseCloneKind, u64) {
+        match self {
+            Self::Builtin { oid, .. } => (DatabaseCloneKind::TextSearchBuiltin, oid as u64),
+            Self::Created(created) => (DatabaseCloneKind::TextSearch, created.created_at()),
+        }
+    }
+}
+
+fn text_search_lifetime_oid(
+    kind: crate::sql::ast::TextSearchObjectKind,
+    created_at: u64,
+) -> Result<i32, SqlError> {
+    let base = match kind {
+        crate::sql::ast::TextSearchObjectKind::Parser => 640_000_000,
+        crate::sql::ast::TextSearchObjectKind::Template => 660_000_000,
+        crate::sql::ast::TextSearchObjectKind::Dictionary => 680_000_000,
+        crate::sql::ast::TextSearchObjectKind::Configuration => 700_000_000,
+    };
+    Ok(base + CatalogIdentity::require(created_at)?.get() as i32)
 }
 
 pub(crate) const TEXT_SEARCH_TOKEN_TYPES: usize = 23;
@@ -3464,8 +3539,11 @@ impl ConversionDef {
             .map_or(self.definition, |pending| pending.definition)
     }
 
-    pub(crate) fn oid(self, slot: usize) -> i32 {
-        21_000 + slot as i32
+    pub(crate) fn oid(self) -> i32 {
+        620_000_000
+            + CatalogIdentity::parse(self.created_at)
+                .expect("admitted conversion has a checked lifetime")
+                .get() as i32
     }
 }
 
@@ -4259,6 +4337,8 @@ pub enum StoredDependencyIdentity {
     Name,
     RoutineOid(i32),
     OperatorOid(i32),
+    Collation(crate::sql::ast::CatalogCollation),
+    TextSearchConfigurationOid(i32),
     Type(TypeReference),
 }
 
@@ -4269,10 +4349,17 @@ impl StoredDependencyIdentity {
             return source.storage_key();
         }
         let mut key = StackStr::new();
+        if let Self::Collation(selected) = self {
+            write!(key, "c{}", Collation::Catalog(selected).code())
+                .expect("bounded collation identity");
+            return key;
+        }
         let oid = match self {
             Self::Name => 0,
-            Self::RoutineOid(oid) | Self::OperatorOid(oid) => oid,
-            Self::Type(_) => unreachable!(),
+            Self::RoutineOid(oid)
+            | Self::OperatorOid(oid)
+            | Self::TextSearchConfigurationOid(oid) => oid,
+            Self::Type(_) | Self::Collation(_) => unreachable!(),
         };
         write!(key, "{oid}").expect("bounded dependency identity");
         key
@@ -4293,7 +4380,14 @@ impl StoredDependencyIdentity {
                     | DependencyClass::Domain
                     | DependencyClass::Enum
                     | DependencyClass::Composite
+                    | DependencyClass::Collation
+                    | DependencyClass::TextSearchConfiguration
             ),
+            Self::Collation(_) => class == DependencyClass::Collation,
+            Self::TextSearchConfigurationOid(oid) => {
+                class == DependencyClass::TextSearchConfiguration
+                    && (matches!(oid, 3748 | 13_248) || (700_000_001..=709_999_999).contains(&oid))
+            }
             Self::RoutineOid(oid) => {
                 class == DependencyClass::Routine
                     && (ROUTINE_OID_BASE..TRIGGER_OID_BASE).contains(&oid)
@@ -4306,7 +4400,12 @@ impl StoredDependencyIdentity {
     }
 
     pub(crate) fn from_storage(class: DependencyClass, encoded: &str) -> Option<Self> {
-        let identity = if matches!(
+        let identity = if class == DependencyClass::Collation {
+            match Collation::from_code(encoded.strip_prefix('c')?.parse().ok()?)? {
+                Collation::Catalog(selected) => Self::Collation(selected),
+                _ => return None,
+            }
+        } else if matches!(
             class,
             DependencyClass::Domain | DependencyClass::Enum | DependencyClass::Composite
         ) {
@@ -4316,6 +4415,7 @@ impl StoredDependencyIdentity {
             match class {
                 DependencyClass::Routine => Self::RoutineOid(oid),
                 DependencyClass::Operator => Self::OperatorOid(oid),
+                DependencyClass::TextSearchConfiguration => Self::TextSearchConfigurationOid(oid),
                 _ if oid == 0 => Self::Name,
                 _ => return None,
             }
@@ -18901,32 +19001,35 @@ impl Storage {
                 StoredDependencyIdentity::RoutineOid(oid) => self.routine_slot_by_oid(oid, txid),
                 StoredDependencyIdentity::Name
                 | StoredDependencyIdentity::OperatorOid(_)
-                | StoredDependencyIdentity::Type(_) => None,
+                | StoredDependencyIdentity::Type(_)
+                | StoredDependencyIdentity::Collation(_)
+                | StoredDependencyIdentity::TextSearchConfigurationOid(_) => None,
             },
             DependencyClass::Operator => match dependency.identity {
                 StoredDependencyIdentity::OperatorOid(oid) => self.operator_slot_by_oid(oid, txid),
                 StoredDependencyIdentity::Name
                 | StoredDependencyIdentity::RoutineOid(_)
-                | StoredDependencyIdentity::Type(_) => None,
+                | StoredDependencyIdentity::Type(_)
+                | StoredDependencyIdentity::Collation(_)
+                | StoredDependencyIdentity::TextSearchConfigurationOid(_) => None,
             },
-            DependencyClass::Collation => self.collation_slot(schema, name, txid).or_else(|| {
-                let slot = usize::from(dependency.slot);
-                self.text_catalog
-                    .lock()
-                    .expect("text catalog lock poisoned")
-                    .collations
-                    .get(slot)
-                    .is_some_and(|collation| {
-                        collation.database == current_database() && collation.visible_to(txid)
+            DependencyClass::Collation => match dependency.identity {
+                StoredDependencyIdentity::Collation(selected) => {
+                    self.collations_visible_to(txid).find_map(|(slot, _)| {
+                        (self.collation(slot).binding() == selected).then_some(slot)
                     })
-                    .then_some(slot)
-            }),
-            DependencyClass::TextSearchConfiguration => self.text_search_slot(
-                crate::sql::ast::TextSearchObjectKind::Configuration,
-                schema,
-                name,
-                txid,
-            ),
+                }
+                _ => None,
+            },
+            DependencyClass::TextSearchConfiguration => match dependency.identity {
+                StoredDependencyIdentity::TextSearchConfigurationOid(oid) => self
+                    .text_search_slot_by_oid(
+                        crate::sql::ast::TextSearchObjectKind::Configuration,
+                        oid,
+                        txid,
+                    ),
+                _ => None,
+            },
         }
         .ok_or_else(|| {
             sql_err!(
@@ -21049,18 +21152,13 @@ impl Storage {
             | Collation::UcsBasic
             | Collation::PgUnicodeFast => CollationBehavior::Bytewise,
             Collation::Default => CollationBehavior::Database,
-            Collation::Catalog(slot) => self
-                .text_catalog
-                .lock()
-                .expect("text catalog lock poisoned")
-                .collations
-                .get(usize::from(slot))
-                .filter(|definition| {
-                    definition.database == current_database()
-                        && definition.ddl_state != CatalogDdlState::Absent
-                })
-                .map(|definition| definition.definition.behavior)
-                .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "collation does not exist"))?,
+            Collation::Catalog(selected) => {
+                if selected.database_locale() {
+                    CollationBehavior::Database
+                } else {
+                    CollationBehavior::Bytewise
+                }
+            }
         };
         match behavior {
             CollationBehavior::Bytewise => Ok(left.cmp(right)),
@@ -21134,18 +21232,7 @@ impl Storage {
     ) -> Result<(), SqlError> {
         let needs_locale = match collation {
             Collation::Default => true,
-            Collation::Catalog(slot) => self
-                .text_catalog
-                .lock()
-                .expect("text catalog lock poisoned")
-                .collations
-                .get(usize::from(slot))
-                .filter(|definition| {
-                    definition.database == current_database()
-                        && definition.ddl_state != CatalogDdlState::Absent
-                })
-                .map(|definition| definition.definition.behavior == CollationBehavior::Database)
-                .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "collation does not exist"))?,
+            Collation::Catalog(selected) => selected.database_locale(),
             _ => false,
         };
         if !needs_locale {
@@ -21530,9 +21617,6 @@ impl Storage {
         let prior_database = current_database();
         crate::sql::set_execution_database_oid(target);
         let result = (|| {
-            // Catalog collation identities are one byte. Configuration rejects
-            // capacities above the representable range before allocation.
-            let mut collation_slots = [u8::MAX; u8::MAX as usize];
             for source_slot in 0..self.schema_count() {
                 let source_schema = self.schema_def(source_slot);
                 if source_schema.database != source
@@ -21556,31 +21640,26 @@ impl Storage {
                 .text_catalog
                 .lock()
                 .expect("text catalog lock poisoned");
-            for (source_slot, target_mapping) in collation_slots
-                .iter_mut()
-                .enumerate()
-                .take(text_catalog.collations.len())
-            {
+            for source_slot in 0..text_catalog.collations.len() {
                 let mut definition = text_catalog.collations[source_slot];
                 if definition.database != source || definition.ddl_state != CatalogDdlState::Present
                 {
                     continue;
                 }
-                let target_slot = text_catalog
-                    .collations
-                    .iter()
-                    .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
-                    .ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                            "collation catalog is full"
-                        )
-                    })?;
+                let target_slot =
+                    allocation.select(
+                        DatabaseCloneKind::Collation,
+                        definition.created_at,
+                        text_catalog.collations.iter().enumerate().filter_map(
+                            |(slot, candidate)| {
+                                (candidate.ddl_state == CatalogDdlState::Absent).then_some(slot)
+                            },
+                        ),
+                    )?;
                 definition.database = target;
                 definition.pending = None;
                 definition.ddl_state = CatalogDdlState::PendingCreate { txid };
                 text_catalog.collations[target_slot] = definition;
-                *target_mapping = target_slot as u8;
             }
             for source_slot in 0..text_catalog.text_search_objects.len() {
                 let mut definition = text_catalog.text_search_objects[source_slot];
@@ -21588,16 +21667,20 @@ impl Storage {
                 {
                     continue;
                 }
-                let target_slot = text_catalog
-                    .text_search_objects
-                    .iter()
-                    .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
-                    .ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                            "text-search catalog is full"
-                        )
-                    })?;
+                let (kind, identity) =
+                    TextSearchIdentity::admit(definition.created_at, definition.definition)?
+                        .clone_key();
+                let target_slot = allocation.select(
+                    kind,
+                    identity,
+                    text_catalog
+                        .text_search_objects
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(slot, candidate)| {
+                            (candidate.ddl_state == CatalogDdlState::Absent).then_some(slot)
+                        }),
+                )?;
                 definition.database = target;
                 definition.pending = None;
                 definition.ddl_state = CatalogDdlState::PendingCreate { txid };
@@ -21609,16 +21692,16 @@ impl Storage {
                 {
                     continue;
                 }
-                let target_slot = text_catalog
-                    .conversions
-                    .iter()
-                    .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
-                    .ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                            "conversion catalog is full"
-                        )
-                    })?;
+                let target_slot =
+                    allocation.select(
+                        DatabaseCloneKind::Conversion,
+                        definition.created_at,
+                        text_catalog.conversions.iter().enumerate().filter_map(
+                            |(slot, candidate)| {
+                                (candidate.ddl_state == CatalogDdlState::Absent).then_some(slot)
+                            },
+                        ),
+                    )?;
                 definition.database = target;
                 definition.pending = None;
                 definition.ddl_state = CatalogDdlState::PendingCreate { txid };
@@ -21731,15 +21814,8 @@ impl Storage {
                 definition.pending_definition = None;
                 definition.ddl_state = CatalogDdlState::PendingCreate { txid };
                 for field in definition.fields.iter_mut().take(definition.n_fields) {
-                    if let Collation::Catalog(source) = field.collation {
-                        let target = collation_slots[usize::from(source)];
-                        if target == u8::MAX {
-                            return Err(sql_err!(
-                                sqlstate::INTERNAL_ERROR,
-                                "template composite references an uncloned collation"
-                            ));
-                        }
-                        field.collation = Collation::Catalog(target);
+                    if let Collation::Catalog(selected) = field.collation {
+                        self.collation_definition(selected, txid)?;
                     }
                 }
                 type_catalog.identities.replace(
@@ -21787,15 +21863,8 @@ impl Storage {
                 }
                 let mut definition = *self.tables[source_slot].definition();
                 for column in definition.columns.iter_mut().take(definition.n_columns) {
-                    if let Collation::Catalog(source) = column.collation {
-                        let target = collation_slots[usize::from(source)];
-                        if target == u8::MAX {
-                            return Err(sql_err!(
-                                sqlstate::INTERNAL_ERROR,
-                                "template relation references an uncloned collation"
-                            ));
-                        }
-                        column.collation = Collation::Catalog(target);
+                    if let Collation::Catalog(selected) = column.collation {
+                        self.collation_definition(selected, txid)?;
                     }
                 }
                 self.rebind_template_table_types(&mut definition, source, target, txid)?;
@@ -22305,15 +22374,8 @@ impl Storage {
                     })?;
                 definition.table_binding = Some(self.capture_index_binding(copied_table, txid));
                 for collation in definition.collations.iter_mut().take(definition.n_cols) {
-                    if let Collation::Catalog(source) = *collation {
-                        let target = collation_slots[usize::from(source)];
-                        if target == u8::MAX {
-                            return Err(sql_err!(
-                                sqlstate::INTERNAL_ERROR,
-                                "template index references an uncloned collation"
-                            ));
-                        }
-                        *collation = Collation::Catalog(target);
+                    if let Collation::Catalog(selected) = *collation {
+                        self.collation_definition(selected, txid)?;
                     }
                 }
                 maintenance.states[target_slot] = maintenance.states[source_slot];
@@ -49802,6 +49864,25 @@ impl Storage {
         }
     }
 
+    pub(crate) fn collation_definition(
+        &self,
+        selected: crate::sql::ast::CatalogCollation,
+        txid: u32,
+    ) -> Result<CollationDefinition, SqlError> {
+        self.text_catalog
+            .lock()
+            .expect("text catalog lock poisoned")
+            .collations
+            .iter()
+            .find(|root| {
+                root.database == current_database()
+                    && root.visible_to(txid)
+                    && root.binding() == selected
+            })
+            .map(|root| root.definition_for(txid))
+            .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "collation does not exist"))
+    }
+
     pub(crate) fn resolve_collation(
         &self,
         schema: Option<&str>,
@@ -49818,7 +49899,7 @@ impl Storage {
             }
         }
         let slot = self.collation_slot_on_path(schema, name, txid)?;
-        u8::try_from(slot).ok().map(Collation::Catalog)
+        Some(Collation::Catalog(self.collation(slot).binding()))
     }
 
     pub(crate) fn conversion_slot(&self, schema: &str, name: &str, txid: u32) -> Option<usize> {
@@ -49915,7 +49996,9 @@ impl Storage {
                     catalog.collations.len()
                 )
             })?;
-        let created_at = self.catalog_sequence.next()?;
+        let created_at = self
+            .catalog_sequence
+            .next_bounded(MAX_CATALOG_CREATION, "text catalog object")?;
         catalog.collations[slot] = CollationDef {
             database: current_database(),
             created_at,
@@ -49977,7 +50060,9 @@ impl Storage {
                     catalog.conversions.len()
                 )
             })?;
-        let created_at = self.catalog_sequence.next()?;
+        let created_at = self
+            .catalog_sequence
+            .next_bounded(MAX_CATALOG_CREATION, "text catalog object")?;
         catalog.conversions[slot] = ConversionDef {
             database: current_database(),
             created_at,
@@ -50030,14 +50115,10 @@ impl Storage {
                     catalog.text_search_objects.len()
                 )
             })?;
-        let base = match definition.kind() {
-            crate::sql::ast::TextSearchObjectKind::Parser => 310_000,
-            crate::sql::ast::TextSearchObjectKind::Template => 311_000,
-            crate::sql::ast::TextSearchObjectKind::Dictionary => 312_000,
-            crate::sql::ast::TextSearchObjectKind::Configuration => 313_000,
-        };
-        definition.set_oid(base + slot as i32);
-        let created_at = self.catalog_sequence.next()?;
+        let created_at = self
+            .catalog_sequence
+            .next_bounded(MAX_CATALOG_CREATION, "text catalog object")?;
+        definition.set_oid(text_search_lifetime_oid(definition.kind(), created_at)?);
         catalog.text_search_objects[slot] = TextSearchDef {
             database: current_database(),
             created_at,
@@ -50231,6 +50312,7 @@ impl Storage {
         created_at: u64,
         definition: TextSearchDefinition,
     ) -> Result<(), SqlError> {
+        TextSearchIdentity::admit(created_at, definition)?;
         if definition.oid() <= 0 || !definition.executable_shape() {
             return Err(sql_err!(
                 sqlstate::INVALID_OBJECT_DEFINITION,
@@ -50631,6 +50713,7 @@ impl Storage {
         created_at: u64,
         definition: CollationDefinition,
     ) -> Result<(), SqlError> {
+        CatalogIdentity::require(created_at)?;
         let behavior = self.executable_collation_behavior(
             definition.provider,
             definition.collate.as_str(),
@@ -50735,6 +50818,7 @@ impl Storage {
         created_at: u64,
         definition: ConversionDefinition,
     ) -> Result<(), SqlError> {
+        CatalogIdentity::require(created_at)?;
         let mut catalog = self
             .text_catalog
             .lock()

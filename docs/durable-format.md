@@ -743,7 +743,6 @@ retain the source's database-local public identifiers and comparison choices;
 there is no slot remapping inside saved columns. Recovery checks text roots and
 saved comparison references before writer promotion. Earlier formats are rejected.
 
-
 ## Executable catalog identities and copied edits
 
 Cast, operator, operator-family, operator-class, access-method and event-trigger

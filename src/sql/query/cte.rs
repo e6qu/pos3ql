@@ -5291,32 +5291,28 @@ fn rewrite_stored_text_search_arguments<'a>(
             ));
         }
     };
-    let definition = context
+    if !context
         .storage
         .text_search_objects_visible_to(context.txid)
-        .find_map(|(_, definition)| (definition.oid() == oid).then_some(definition))
-        .ok_or_else(|| {
-            sql_err!(
-                sqlstate::UNDEFINED_OBJECT,
-                "stored text search configuration dependency does not exist"
-            )
-        })?;
-    let qualified = crate::stack_format!(
-        128,
-        "{}.{}",
-        definition.schema().as_str(),
-        definition.name().as_str()
-    );
-    if qualified.is_truncated() {
+        .any(|(_, definition)| definition.oid() == oid)
+    {
         return Err(sql_err!(
-            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "text search configuration name is too long"
+            sqlstate::UNDEFINED_OBJECT,
+            "stored text search configuration dependency does not exist"
         ));
     }
-    let rendered = arena
-        .alloc_str(qualified.as_str())
+    // Keep the selected identifier through later execution; a new name lookup
+    // after a wait could select an object which reused the old spelling.
+    let operand = arena
+        .alloc(Expr::Int(i64::from(oid)))
         .map_err(|_| arena_full())?;
-    let first = arena.alloc(Expr::Str(rendered)).map_err(|_| arena_full())?;
+    let first = arena
+        .alloc(Expr::Cast {
+            operand,
+            type_name: "regconfig",
+            type_mod: -1,
+        })
+        .map_err(|_| arena_full())?;
     let rewritten = arena.alloc_slice_copy(args).map_err(|_| arena_full())?;
     rewritten[0] = first;
     Ok(rewritten)

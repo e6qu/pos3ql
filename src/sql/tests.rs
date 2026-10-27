@@ -1918,7 +1918,7 @@ fn catalog_lifetime_text_roots_and_bound_queries_survive_empty_cache_recovery() 
                 if checkpoint {
                     assert!(engine.checkpoint().unwrap());
                 }
-                session.success(&mut engine, "ALTER COLLATION text_lifetime_byte RENAME TO text_lifetime_renamed; ALTER TEXT SEARCH CONFIGURATION text_lifetime_config RENAME TO text_lifetime_config_renamed", false);
+                session.success(&mut engine, "ALTER COLLATION text_lifetime_byte RENAME TO text_lifetime_renamed; ALTER TEXT SEARCH CONFIGURATION text_lifetime_config RENAME TO text_lifetime_config_renamed; CREATE TEXT SEARCH CONFIGURATION text_lifetime_config (COPY = pg_catalog.english)", false);
                 engine.commit_wal().unwrap();
             }
             std::fs::remove_dir_all(&config.data_dir).unwrap();
@@ -1926,7 +1926,7 @@ fn catalog_lifetime_text_roots_and_bound_queries_survive_empty_cache_recovery() 
                 let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
                 let mut engine = Engine::new(&config, &mut budget).unwrap();
                 let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
-                assert_eq!(data_rows(&session.success(&mut engine, "SELECT value FROM retained_words ORDER BY value; SELECT value FROM retained_report ORDER BY value; SELECT obj_description(oid, 'pg_collation') FROM pg_collation WHERE collname='text_lifetime_renamed'; SELECT count(*) = 4 FROM saved_text_lifetimes s JOIN text_lifetime_catalog c ON s.kind=c.kind AND s.identity=c.identity", false)), ["a", "z", "a", "z", "original collation", "t"]);
+                assert_eq!(data_rows(&session.success(&mut engine, "SELECT value FROM retained_words ORDER BY value; SELECT value, terms::text FROM retained_report ORDER BY value; SELECT obj_description(oid, 'pg_collation') FROM pg_collation WHERE collname='text_lifetime_renamed'; SELECT count(*) = 4 FROM saved_text_lifetimes s JOIN text_lifetime_catalog c ON s.kind=c.kind AND s.identity=c.identity", false)), ["a", "z", "a|'a':1", "z|'z':1", "original collation", "t"]);
             }
             std::fs::remove_dir_all(&config.data_dir).unwrap();
             crate::object_store::sim::drop_namespace(&config.object_store_bucket);
@@ -1982,7 +1982,7 @@ fn catalog_lifetime_text_template_copy_preserves_references_through_recovery() {
                     .1
                     .oid;
                 engine.select_database(target).unwrap();
-                assert_eq!(data_rows(&session.success(&mut engine, "SELECT count(*) = 6 FROM saved_text_lifetimes s JOIN text_lifetime_catalog c ON s.kind=c.kind AND s.identity=c.identity; SELECT value FROM copied_report ORDER BY value", false)), ["t", "a", "z"]);
+                assert_eq!(data_rows(&session.success(&mut engine, "SELECT count(*) = 6 FROM saved_text_lifetimes s JOIN text_lifetime_catalog c ON s.kind=c.kind AND s.identity=c.identity; SELECT value, terms::text FROM copied_report ORDER BY value", false)), ["t", "a|'a':1", "z|'z':1"]);
                 if checkpoint {
                     assert!(engine.checkpoint().unwrap());
                 }
@@ -1994,7 +1994,7 @@ fn catalog_lifetime_text_template_copy_preserves_references_through_recovery() {
                 let mut engine = Engine::new(&config, &mut budget).unwrap();
                 engine.select_database(target).unwrap();
                 let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
-                assert_eq!(data_rows(&session.success(&mut engine, "SELECT count(*) = 6 FROM saved_text_lifetimes s JOIN text_lifetime_catalog c ON s.kind=c.kind AND s.identity=c.identity; SELECT value FROM copied_report ORDER BY value; SELECT obj_description(oid, 'pg_collation') FROM pg_collation WHERE collname='text_lifetime_byte'; SELECT to_tsvector('text_lifetime_config', 'Cats 42') = '''42'':2 ''cats'':1'::tsvector", false)), ["t", "a", "z", "original collation", "t"]);
+                assert_eq!(data_rows(&session.success(&mut engine, "SELECT count(*) = 6 FROM saved_text_lifetimes s JOIN text_lifetime_catalog c ON s.kind=c.kind AND s.identity=c.identity; SELECT value, terms::text FROM copied_report ORDER BY value; SELECT obj_description(oid, 'pg_collation') FROM pg_collation WHERE collname='text_lifetime_byte'; SELECT to_tsvector('text_lifetime_config', 'Cats 42') = '''42'':2 ''cats'':1'::tsvector", false)), ["t", "a|'a':1", "z|'z':1", "original collation", "t"]);
             }
             std::fs::remove_dir_all(&config.data_dir).unwrap();
             crate::object_store::sim::drop_namespace(&config.object_store_bucket);

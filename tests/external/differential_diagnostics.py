@@ -105,7 +105,7 @@ def write_transcript(stdout, byte_count, stderr, diagnostics, copy_positions, ou
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--source", type=Path, required=True)
+    parser.add_argument("--source", required=True)
     parser.add_argument("--stdout", type=Path, required=True)
     parser.add_argument("--stderr", type=Path, required=True)
     parser.add_argument("--diagnostics", choices=("sqlstate", "verbose"), required=True)
@@ -118,7 +118,7 @@ def main():
                 arguments.stderr.read_bytes().decode("utf-8", errors="surrogateescape"),
                 arguments.diagnostics,
                 copy_line_positions(
-                    arguments.source.read_bytes().decode("utf-8", errors="surrogateescape"),
+                    Path(arguments.source).read_bytes().decode("utf-8", errors="surrogateescape"),
                     arguments.source,
                 ),
                 sys.stdout.buffer,

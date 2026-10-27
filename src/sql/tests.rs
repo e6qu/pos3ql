@@ -11816,6 +11816,115 @@ fn session_discard_temporary_is_transactional_and_all_releases_session_state() {
 }
 
 #[test]
+fn session_discard_namespace_follows_creation_rollback_and_connection_lifetime() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        for (create, drop) in [
+            (
+                "CREATE TEMP TABLE namespace_first(id integer)",
+                "DROP TABLE namespace_first",
+            ),
+            (
+                "CREATE TEMP VIEW namespace_first AS SELECT 7 AS id",
+                "DROP VIEW namespace_first",
+            ),
+            (
+                "CREATE TEMP SEQUENCE namespace_first",
+                "DROP SEQUENCE namespace_first",
+            ),
+        ] {
+            let config =
+                catalog_lifetime_config(&format!("temporary-namespace-{mode:?}-{create}"), mode);
+            let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+            let mut engine = Engine::new(&config, &mut budget).unwrap();
+            let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+            let mut peer =
+                ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+            assert_eq!(
+                data_rows(&session.success(&mut engine, "SELECT pg_my_temp_schema() = 0", true)),
+                ["t"]
+            );
+            session.success(&mut engine, "BEGIN; SAVEPOINT before_namespace", true);
+            session.success(&mut engine, create, true);
+            assert_eq!(
+                data_rows(&session.success(&mut engine, "SELECT pg_my_temp_schema() <> 0", true)),
+                ["t"]
+            );
+            session.success(&mut engine, "ROLLBACK TO before_namespace; COMMIT", true);
+            assert_eq!(data_rows(&session.success(&mut engine, "SELECT pg_my_temp_schema() = 0; SELECT count(*) FROM pg_namespace WHERE nspname = 'pg_temp_1'", true)), ["t", "0"]);
+            session.success(&mut engine, create, true);
+            let namespace =
+                data_rows(&session.success(&mut engine, "SELECT pg_my_temp_schema()", true))[0]
+                    .clone();
+            session.success(&mut engine, drop, true);
+            assert_eq!(data_rows(&session.success(&mut engine, &format!("SELECT pg_my_temp_schema() = {namespace}; SELECT 'pg_temp'::regnamespace::oid = {namespace}; SELECT nspowner = 10 FROM pg_namespace WHERE oid = {namespace}"), true)), ["t", "t", "t"]);
+            assert_eq!(data_rows(&peer.success(&mut engine, &format!("SELECT pg_my_temp_schema() = 0, pg_is_other_temp_schema({namespace}); SELECT 'pg_temp_1'::regnamespace::oid = {namespace}"), true)), ["t|t", "t"]);
+            assert_eq!(
+                command_tags(&session.success(&mut engine, "DISCARD TEMP", true)),
+                ["DISCARD TEMP"]
+            );
+            engine.storage.drop_connection_temporary_relations(1);
+            assert_eq!(data_rows(&peer.success(&mut engine, &format!("SELECT pg_is_other_temp_schema({namespace}); SELECT count(*) FROM pg_namespace WHERE oid = {namespace}"), true)), ["f", "0"]);
+        }
+    }
+}
+
+#[test]
+fn drop_schema_removes_owned_statistics_outside_schema_transactionally() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let config = catalog_lifetime_config(&format!("drop-schema-statistics-{mode:?}"), mode);
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        session.success(&mut engine, "CREATE SCHEMA statistics_owner; CREATE TABLE statistics_owner.rows(id integer, value integer); CREATE STATISTICS public.outside_statistics ON id, value FROM statistics_owner.rows", true);
+        assert_eq!(
+            error_sqlstates(&session.execute(
+                &mut engine,
+                "DROP SCHEMA statistics_owner RESTRICT",
+                true
+            )),
+            ["2BP01"]
+        );
+        session.success(
+            &mut engine,
+            "BEGIN; SAVEPOINT before_drop; DROP SCHEMA statistics_owner CASCADE",
+            true,
+        );
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "SELECT count(*) FROM pg_statistic_ext WHERE stxname = 'outside_statistics'",
+                true
+            )),
+            ["0"]
+        );
+        session.success(&mut engine, "ROLLBACK TO before_drop; COMMIT", true);
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "SELECT count(*) FROM pg_statistic_ext WHERE stxname = 'outside_statistics'",
+                true
+            )),
+            ["1"]
+        );
+        session.success(&mut engine, "DROP SCHEMA statistics_owner CASCADE", true);
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "SELECT count(*) FROM pg_statistic_ext WHERE stxname = 'outside_statistics'",
+                true
+            )),
+            ["0"]
+        );
+    }
+}
+
+#[test]
 fn session_discard_capacity_failure_preserves_objects_and_session_settings() {
     for mode in [
         crate::config::TransactionMode::Mvcc,

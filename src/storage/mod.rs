@@ -13833,8 +13833,41 @@ struct SnapshotState {
     statement_reclamation_pending: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TemporaryNamespaceIdentity {
+    database: DatabaseOid,
+    connection: i32,
+}
+
+impl TemporaryNamespaceIdentity {
+    pub(crate) fn oid(self) -> i32 {
+        self.connection
+            .checked_add(FIRST_TEMP_NAMESPACE_OID)
+            .expect("temporary namespace identity was checked at creation")
+    }
+
+    pub(crate) fn name(self) -> SqlName {
+        SqlName::parse(stack_format!(63, "pg_temp_{}", self.connection).as_str())
+            .expect("checked connection identity fits a temporary schema name")
+    }
+}
+
+#[derive(Clone, Copy)]
+struct TemporaryNamespace {
+    identity: TemporaryNamespaceIdentity,
+    creation: Option<core::num::NonZeroU32>,
+}
+
+impl TemporaryNamespace {
+    fn visible_to(self, transaction: u32) -> bool {
+        self.identity.database == current_database()
+            && self.creation.is_none_or(|owner| owner.get() == transaction)
+    }
+}
+
 struct TemporaryTransactionState {
     transactions: FixedVec<u32>,
+    namespaces: FixedVec<TemporaryNamespace>,
 }
 
 impl TemporaryTransactionState {
@@ -17390,6 +17423,151 @@ impl Storage {
         state.clear(txid);
     }
 
+    pub(crate) fn create_temporary_namespace(
+        &self,
+        transaction: u32,
+    ) -> Result<Option<TemporaryNamespaceIdentity>, SqlError> {
+        let identity = TemporaryNamespaceIdentity {
+            database: current_database(),
+            connection: self.current_connection_id(),
+        };
+        if identity
+            .connection
+            .checked_add(FIRST_TEMP_NAMESPACE_OID)
+            .is_none_or(|oid| oid <= 0)
+        {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "temporary namespace identity exhausted"
+            ));
+        }
+        let creation = core::num::NonZeroU32::new(transaction).ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "temporary namespace creation requires a transaction"
+            )
+        })?;
+        let mut state = self
+            .temporary_transactions
+            .lock()
+            .expect("temporary transaction lock poisoned");
+        if state
+            .namespaces
+            .iter()
+            .any(|namespace| namespace.identity == identity)
+        {
+            return Ok(None);
+        }
+        state
+            .namespaces
+            .push(TemporaryNamespace {
+                identity,
+                creation: Some(creation),
+            })
+            .map_err(|_| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "temporary namespace registry exhausted"
+                )
+            })?;
+        state.mark(transaction);
+        Ok(Some(identity))
+    }
+
+    pub(crate) fn finish_temporary_namespace(
+        &self,
+        identity: TemporaryNamespaceIdentity,
+        transaction: u32,
+        decision: CatalogDdlDecision,
+    ) {
+        let mut state = self
+            .temporary_transactions
+            .lock()
+            .expect("temporary transaction lock poisoned");
+        let index = state
+            .namespaces
+            .iter()
+            .position(|namespace| namespace.identity == identity)
+            .expect("temporary namespace undo retains its connection");
+        assert_eq!(
+            state.namespaces[index]
+                .creation
+                .map(core::num::NonZeroU32::get),
+            Some(transaction)
+        );
+        match decision {
+            CatalogDdlDecision::Commit => state.namespaces[index].creation = None,
+            CatalogDdlDecision::Rollback => {
+                state.namespaces.swap_remove(index);
+            }
+        }
+    }
+
+    pub(crate) fn temporary_namespace_for_connection(
+        &self,
+        connection: i32,
+        transaction: u32,
+    ) -> Option<TemporaryNamespaceIdentity> {
+        self.temporary_transactions
+            .lock()
+            .expect("temporary transaction lock poisoned")
+            .namespaces
+            .iter()
+            .find(|namespace| {
+                namespace.visible_to(transaction) && namespace.identity.connection == connection
+            })
+            .map(|namespace| namespace.identity)
+    }
+
+    pub(crate) fn temporary_namespace_by_oid(
+        &self,
+        oid: i32,
+        transaction: u32,
+    ) -> Option<TemporaryNamespaceIdentity> {
+        self.temporary_transactions
+            .lock()
+            .expect("temporary transaction lock poisoned")
+            .namespaces
+            .iter()
+            .find(|namespace| namespace.visible_to(transaction) && namespace.identity.oid() == oid)
+            .map(|namespace| namespace.identity)
+    }
+
+    pub(crate) fn temporary_namespace_capacity(&self) -> usize {
+        self.temporary_transactions
+            .lock()
+            .expect("temporary transaction lock poisoned")
+            .namespaces
+            .capacity()
+    }
+
+    pub(crate) fn capture_temporary_namespaces(
+        &self,
+        transaction: u32,
+        output: &mut [Option<TemporaryNamespaceIdentity>],
+    ) -> Result<usize, SqlError> {
+        let state = self
+            .temporary_transactions
+            .lock()
+            .expect("temporary transaction lock poisoned");
+        let mut count = 0;
+        for namespace in state
+            .namespaces
+            .iter()
+            .filter(|namespace| namespace.visible_to(transaction))
+        {
+            let target = output.get_mut(count).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "temporary namespace capture exhausted"
+                )
+            })?;
+            *target = Some(namespace.identity);
+            count += 1;
+        }
+        Ok(count)
+    }
+
     pub(crate) fn temporary_schema(&self) -> Result<SqlName, SqlError> {
         SqlName::parse(stack_format!(63, "pg_temp_{}", self.current_connection_id()).as_str())
     }
@@ -17456,6 +17634,18 @@ impl Storage {
                     sequence.database,
                     sequence.created_at,
                 ));
+            }
+        }
+        let mut state = self
+            .temporary_transactions
+            .lock()
+            .expect("temporary transaction lock poisoned");
+        let mut index = 0;
+        while index < state.namespaces.len() {
+            if state.namespaces[index].identity.connection == connection_id {
+                state.namespaces.swap_remove(index);
+            } else {
+                index += 1;
             }
         }
     }
@@ -19104,6 +19294,8 @@ impl Storage {
                 * size_of::<RecentTransactionStatus>()
             + (config.max_connections as usize + config.max_prepared_transactions)
                 * size_of::<u32>()
+            + (config.max_connections as usize + config.max_subscriptions)
+                * size_of::<TemporaryNamespace>()
             + config.max_routines * size_of::<FunctionCumulativeStatistics>()
             + (config.max_connections as usize + config.max_prepared_transactions)
                 * config.max_routines
@@ -19867,6 +20059,11 @@ impl Storage {
         )?;
         let temporary_transactions = Mutex::new(TemporaryTransactionState {
             transactions: FixedVec::new(budget, "temporary_transactions", transaction_capacity)?,
+            namespaces: FixedVec::new(
+                budget,
+                "temporary_namespaces",
+                config.max_connections as usize + config.max_subscriptions,
+            )?,
         });
         let backends = FixedVec::new(budget, "backend_activity", config.max_connections as usize)?;
         let backend_signals =

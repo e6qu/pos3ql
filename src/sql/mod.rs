@@ -7266,6 +7266,13 @@ impl Engine {
                 DdlUndo::DatabaseDropped(slot) => self.storage.commit_database_drop(*slot as usize),
                 // The reset already happened in place; committing keeps it.
                 DdlUndo::SequenceReset { .. } => {}
+                DdlUndo::TemporaryNamespaceCreated(identity) => {
+                    self.storage.finish_temporary_namespace(
+                        *identity,
+                        txn.txid,
+                        crate::storage::CatalogDdlDecision::Commit,
+                    )
+                }
                 DdlUndo::SchemaCreated(slot) => {
                     self.storage.commit_schema_create(*slot as usize);
                 }
@@ -20283,6 +20290,11 @@ fn rollback_catalog_change(storage: &mut Storage, undo: DdlUndo, txid: u32) {
         } => {
             storage.set_table_serial_value(table as usize, column as usize, prior);
         }
+        DdlUndo::TemporaryNamespaceCreated(identity) => storage.finish_temporary_namespace(
+            identity,
+            txid,
+            crate::storage::CatalogDdlDecision::Rollback,
+        ),
         DdlUndo::SchemaCreated(slot) => storage.rollback_schema_create(slot as usize),
         DdlUndo::SchemaDropped(slot) => storage.rollback_schema_drop(slot as usize, txid),
         DdlUndo::MatviewQueryChanged(undo) => {

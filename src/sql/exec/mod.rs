@@ -904,6 +904,25 @@ fn create_owned_sequence(
     Ok(slot)
 }
 
+fn ensure_temporary_namespace(
+    storage: &Storage,
+    txn: &mut TxnState,
+    persistence: crate::storage::RelationPersistence,
+) -> Result<(), SqlError> {
+    if persistence == crate::storage::RelationPersistence::Temporary
+        && let Some(identity) = storage.create_temporary_namespace(txn.txid)?
+        && let Err(error) = txn.record_ddl(super::txn::DdlUndo::TemporaryNamespaceCreated(identity))
+    {
+        storage.finish_temporary_namespace(
+            identity,
+            txn.txid,
+            crate::storage::CatalogDdlDecision::Rollback,
+        );
+        return Err(error);
+    }
+    Ok(())
+}
+
 pub fn create_table(
     storage: &mut Storage,
     wal: &mut Wal,
@@ -989,6 +1008,9 @@ fn create_table_kind(
         Ok(n) => n,
         Err(e) => return sql_fail(e),
     };
+    if let Err(error) = ensure_temporary_namespace(storage, txn, def.persistence) {
+        return sql_fail(error);
+    }
     def.kind = if foreign.is_some() {
         crate::storage::TableKind::Foreign
     } else {
@@ -12339,7 +12361,15 @@ pub(crate) fn drop_schema(
     }
     for (statistics, definition) in storage.extended_statistics_visible(txn.txid) {
         let mutable = definition.definition_for(txn.txid);
-        if in_listed(storage, mutable.schema.as_str())
+        if (in_listed(storage, mutable.schema.as_str())
+            || (cascade
+                && in_listed(
+                    storage,
+                    storage
+                        .table_def(usize::from(definition.table), txn.txid)
+                        .schema
+                        .as_str(),
+                )))
             && let Err(error) = push(SchemaObject::Statistics(statistics), &mut n_objects)
         {
             return sql_fail(error);
@@ -13769,13 +13799,14 @@ pub(crate) fn drop_schema(
                 if let Err(error) = storage.drop_extended_statistics(*statistics, txn.txid) {
                     return sql_fail(error);
                 }
-                if !storage.access_object_is_temporary(
-                    crate::storage::AccessObject {
-                        class: crate::storage::AccessClass::Statistics,
-                        slot: *statistics as u16,
-                    },
-                    txn.txid,
-                ) {
+                if storage
+                    .table_def(
+                        usize::from(storage.extended_statistics(*statistics).table),
+                        txn.txid,
+                    )
+                    .persistence
+                    != crate::storage::RelationPersistence::Temporary
+                {
                     let lsn = storage.bump_lsn();
                     if let Err(error) = wal.stage_reserved(
                         txn.txid,
@@ -36513,6 +36544,9 @@ pub fn create_view(
         Ok(schema) => schema,
         Err(error) => return sql_fail(error),
     };
+    if let Err(error) = ensure_temporary_namespace(storage, txn, persistence) {
+        return sql_fail(error);
+    }
     let sqlname = match SqlName::parse(name.name) {
         Ok(name) => name,
         Err(error) => return sql_fail(error),
@@ -39476,6 +39510,9 @@ pub fn create_table_as(
         Ok(s) => s,
         Err(e) => return sql_fail(e),
     };
+    if let Err(error) = ensure_temporary_namespace(storage, txn, def.persistence) {
+        return sql_fail(error);
+    }
     def.name = match SqlName::parse(name.name) {
         Ok(n) => n,
         Err(e) => return sql_fail(e),
@@ -40401,6 +40438,9 @@ pub fn create_sequence(
         Ok(n) => n,
         Err(e) => return sql_fail(e),
     };
+    if let Err(error) = ensure_temporary_namespace(storage, txn, persistence.into()) {
+        return sql_fail(error);
+    }
     if storage.relation_name_taken(schema.as_str(), name.name, txn.txid) {
         if if_not_exists {
             responder.notice(

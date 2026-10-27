@@ -32104,8 +32104,12 @@ fn add_operator_family_members(
         match *member {
             crate::sql::ast::OperatorFamilyMember::Operator { strategy, operator } => {
                 let signature = resolve_operator_signature(storage, txid, operator)?;
-                let oid =
-                    catalog::operator_oid_for_signature(storage, txid, operator.name, signature)?;
+                let oid = crate::sql::catalog::operator_oid_for_signature(
+                    storage,
+                    txid,
+                    operator.name,
+                    signature,
+                )?;
                 let Some(left) = signature.left else {
                     return Err(sql_err!(
                         sqlstate::INVALID_OBJECT_DEFINITION,
@@ -32692,7 +32696,7 @@ pub(crate) fn create_operator_class(
                         right: Some(input),
                     },
                 };
-                let oid = match catalog::operator_oid_for_signature(
+                let oid = match crate::sql::catalog::operator_oid_for_signature(
                     storage, txn.txid, operator, signature,
                 ) {
                     Ok(oid) => oid,

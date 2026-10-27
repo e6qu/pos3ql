@@ -21665,7 +21665,8 @@ impl Storage {
                     continue;
                 }
                 let (kind, identity) =
-                    TextSearchIdentity::admit(identity, definition.definition)?.clone_key();
+                    TextSearchIdentity::admit(definition.created_at, definition.definition)?
+                        .clone_key();
                 let target_slot = allocation.select(
                     kind,
                     identity,

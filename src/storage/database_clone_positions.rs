@@ -434,21 +434,30 @@ impl Storage {
                 definition.ddl_state,
             );
         }
-        for (slot, definition) in text.text_search_objects.iter().enumerate() {
-            if definition.database != database || definition.ddl_state == CatalogDdlState::Absent {
-                continue;
+        for selected_kind in [
+            DatabaseCloneKind::TextSearch,
+            DatabaseCloneKind::TextSearchBuiltin,
+        ] {
+            for (slot, definition) in text.text_search_objects.iter().enumerate() {
+                if definition.database != database
+                    || definition.ddl_state == CatalogDdlState::Absent
+                {
+                    continue;
+                }
+                let (kind, identity) =
+                    TextSearchIdentity::admit(definition.created_at, definition.definition)
+                        .expect("admitted text object has a checked identity")
+                        .clone_key();
+                if kind == selected_kind {
+                    object(
+                        kind,
+                        slot,
+                        identity,
+                        definition.database,
+                        definition.ddl_state,
+                    );
+                }
             }
-            let (kind, identity) =
-                TextSearchIdentity::admit(definition.created_at, definition.definition)
-                    .expect("admitted text object has a checked identity")
-                    .clone_key();
-            object(
-                kind,
-                slot,
-                identity,
-                definition.database,
-                definition.ddl_state,
-            );
         }
     }
 }

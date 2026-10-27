@@ -230,7 +230,10 @@ SELECT has_table_privilege(identity, 'SELECT') IS NULL FROM saved_order_identity
 
 DDL success follows its end-of-command event triggers. A hook that raises an
 error rolls the command back and keeps its notices, without sending a success
-tag first. Internal comment cleanup during DROP does not become an extra
+tag first. Supported static DDL in a `DO` block or routine uses the same
+transactional path as dynamic `EXECUTE`. For example, a failing end hook for
+`DO 'BEGIN CREATE TABLE orders(id integer); END'` leaves no `orders` table
+and sends no successful `DO` tag. Internal comment cleanup during DROP does not become an extra
 COMMENT command in the event-trigger command list.
 
 User-defined operator classes and families can select modeled built-in operators

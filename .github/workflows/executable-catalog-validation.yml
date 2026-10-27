@@ -27,4 +27,4 @@ jobs:
       - name: Compile and lint all targets
         run: cargo clippy --all-targets --locked -- -D warnings
       - name: Catalog execution and recovery regressions
-        run: cargo test --lib --locked -- catalog_lifetime operator cast access_method event_trigger database_template named_type_layout --test-threads=1
+        run: cargo test --lib --locked -- catalog_lifetime operator cast access_method event_trigger database_template named_type_layout protocol_completion event_graphs --test-threads=1

@@ -1826,6 +1826,15 @@ fn event_trigger_failures_keep_notices_without_success_command_tags() {
             types.iter().position(|tag| *tag == b'N').unwrap()
                 < types.iter().position(|tag| *tag == b'C').unwrap()
         );
+        for sql in [
+            "DO 'BEGIN CREATE TABLE completion_static_success(value integer); END'",
+            "DO 'BEGIN EXECUTE ''CREATE TABLE completion_dynamic_success(value integer)''; END'",
+        ] {
+            let output = session.success(&mut engine, sql, true);
+            assert_eq!(command_tags(&output), ["DO"]);
+            assert!(message_types(&output).contains(&b'N'));
+        }
+        assert_eq!(data_rows(&session.success(&mut engine, "SELECT to_regclass('completion_static_success') IS NOT NULL AND to_regclass('completion_dynamic_success') IS NOT NULL", true)), ["t"]);
     }
 }
 

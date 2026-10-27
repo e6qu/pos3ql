@@ -16214,7 +16214,7 @@ struct PlpgsqlCursorMotion<'a> {
 }
 
 #[derive(Clone, Copy)]
-struct BoundPlpgsqlDynamicQuery<'a> {
+struct BoundPlpgsqlCommand<'a> {
     source: &'a str,
     statement: &'a Stmt<'a>,
     arguments: &'a [Datum<'a>],
@@ -16348,6 +16348,10 @@ enum TriggerStatement<'a> {
     SelectInto(TriggerSelectInto<'a>),
     DynamicQuery(PlpgsqlDynamicQuery<'a>),
     DynamicSelectInto(PlpgsqlDynamicSelectInto<'a>),
+    Utility {
+        source: &'a str,
+        statement: &'a Stmt<'a>,
+    },
     CursorOpen(PlpgsqlCursorOpen<'a>),
     CursorMotion(PlpgsqlCursorMotion<'a>),
     CursorClose(SqlName),
@@ -18864,6 +18868,24 @@ fn parse_trigger_statement<'a>(
     {
         return Ok(TriggerStatement::Dml(parse_trigger_dml(segment, arena)?));
     }
+    if ["create", "alter", "drop", "comment", "grant", "revoke"]
+        .iter()
+        .any(|keyword| strip_trigger_keyword(segment, keyword).is_some())
+    {
+        use crate::sql::lexer::{Lexer, Tok};
+        let mut lexer = Lexer::new(segment, arena);
+        // A utility starts with two words; assignment punctuation belongs to
+        // the local-variable parser even when the variable is named alter.
+        if matches!(
+            (lexer.next_token(), lexer.next_token()),
+            (Ok(Tok::Ident(_)), Ok(Tok::Ident(_) | Tok::QuotedIdent(_)))
+        ) {
+            return Ok(TriggerStatement::Utility {
+                source: segment,
+                statement: super::parser::parse_stored_statement(segment, arena)?,
+            });
+        }
+    }
     if let Some(assignment) = parse_trigger_assignment(segment, arena)? {
         return Ok(TriggerStatement::Assign(assignment));
     }
@@ -21228,7 +21250,7 @@ fn bind_plpgsql_dynamic_query<'a>(
     context: &TriggerExecContext<'_, 'a, '_>,
     query: PlpgsqlDynamicQuery<'a>,
     scope: &TriggerLocalScope<'_, 'a>,
-) -> Result<BoundPlpgsqlDynamicQuery<'a>, SqlError> {
+) -> Result<BoundPlpgsqlCommand<'a>, SqlError> {
     let command = eval_trigger_expression(context, query.command, scope)?;
     if command.is_null() {
         return Err(sql_err!(
@@ -21247,7 +21269,7 @@ fn bind_plpgsql_dynamic_query<'a>(
             context.arena,
         )?;
     }
-    Ok(BoundPlpgsqlDynamicQuery {
+    Ok(BoundPlpgsqlCommand {
         source: command,
         statement: super::parser::parse_stored_statement(command, context.arena)?,
         arguments: &*arguments,
@@ -21256,9 +21278,9 @@ fn bind_plpgsql_dynamic_query<'a>(
 
 fn resolve_plpgsql_dynamic_prepared<'a>(
     context: &TriggerExecContext<'_, 'a, '_>,
-    query: BoundPlpgsqlDynamicQuery<'a>,
+    query: BoundPlpgsqlCommand<'a>,
     scope: &TriggerLocalScope<'_, 'a>,
-) -> Result<BoundPlpgsqlDynamicQuery<'a>, SqlError> {
+) -> Result<BoundPlpgsqlCommand<'a>, SqlError> {
     let Stmt::ExecutePrepared { name, args } = query.statement else {
         return Ok(query);
     };
@@ -21309,7 +21331,7 @@ fn resolve_plpgsql_dynamic_prepared<'a>(
         .arena
         .alloc_str(text)
         .map_err(|_| super::query::arena_full_pub())?;
-    Ok(BoundPlpgsqlDynamicQuery {
+    Ok(BoundPlpgsqlCommand {
         source: text,
         statement: super::parser::parse_stored_statement(text, context.arena)?,
         arguments: &*values,
@@ -21318,7 +21340,7 @@ fn resolve_plpgsql_dynamic_prepared<'a>(
 
 fn execute_bound_plpgsql_dynamic_query<'a>(
     context: &TriggerExecContext<'_, 'a, '_>,
-    query: BoundPlpgsqlDynamicQuery<'a>,
+    query: BoundPlpgsqlCommand<'a>,
     scope: &TriggerLocalScope<'_, 'a>,
     sequence: &dyn crate::sql::eval::SequenceAccess,
     emit: &mut dyn for<'row> FnMut(&[Datum<'row>]) -> Result<(), SqlError>,
@@ -21369,7 +21391,7 @@ fn execute_plpgsql_dynamic_query<'a>(
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn execute_bound_plpgsql_dynamic_dml<'a>(
     context: &mut TriggerExecContext<'_, 'a, '_>,
-    query: BoundPlpgsqlDynamicQuery<'a>,
+    query: BoundPlpgsqlCommand<'a>,
     scope: &TriggerLocalScope<'_, 'a>,
     transition_relations: Option<&'a [(&'a str, &'a crate::sql::ast::MaterializedCte<'a>)]>,
     capture: Option<&mut dyn FnMut(&[Datum]) -> Result<(), SqlError>>,
@@ -21540,12 +21562,12 @@ fn execute_bound_plpgsql_dynamic_dml<'a>(
     }
 }
 
-/// Dynamic utility commands use the routine's durable DDL executor. Atomic
+/// Static and dynamic utility commands use the routine's durable DDL executor. Atomic
 /// trigger hosts deliberately have no catalog/WAL owner, so they cannot make a
 /// utility command appear durable by bypassing that boundary.
-fn execute_bound_plpgsql_dynamic_utility<'a>(
+fn execute_bound_plpgsql_utility<'a>(
     context: &mut TriggerExecContext<'_, 'a, '_>,
-    query: BoundPlpgsqlDynamicQuery<'a>,
+    query: BoundPlpgsqlCommand<'a>,
 ) -> Result<(), SqlError> {
     if !query.arguments.is_empty() && !matches!(query.statement, Stmt::DeclareCursor { .. }) {
         return Err(sql_err!(
@@ -21570,7 +21592,7 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
             PlpgsqlExecHost::Atomic { .. } => {
                 return Err(sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
-                    "PL/pgSQL dynamic utility commands are not valid in trigger execution"
+                    "PL/pgSQL utility commands are not valid in trigger execution"
                 ));
             }
         };
@@ -21590,11 +21612,11 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
             else {
                 return Err(sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
-                    "PL/pgSQL dynamic utility commands are not valid in trigger execution"
+                    "PL/pgSQL utility commands are not valid in trigger execution"
                 ));
             };
             context.responder.without_query_output(|responder| {
-                engine.execute_dynamic_utility(
+                engine.execute_routine_utility(
                     query.statement,
                     context.txn,
                     sqlprep,
@@ -21617,7 +21639,7 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                 )
             })
         };
-        dynamic_utility_outcome(outcome)?;
+        routine_utility_outcome(outcome)?;
 
         let prior_user = crate::sql::eval::funcs::system::current_identity();
         let authorization_identity = resolved
@@ -21678,7 +21700,7 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                         );
                         let old_path = engine.storage.swap_path(path);
                         let outcome = context.responder.without_query_output(|responder| {
-                            engine.execute_dynamic_utility(
+                            engine.execute_routine_utility(
                                 requalified,
                                 context.txn,
                                 sqlprep,
@@ -21712,11 +21734,11 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                         engine.storage.swap_path(old_path);
                         outcome
                     };
-                    dynamic_utility_outcome(outcome)?;
+                    routine_utility_outcome(outcome)?;
                 } else {
-                    execute_bound_plpgsql_dynamic_utility(
+                    execute_bound_plpgsql_utility(
                         context,
-                        BoundPlpgsqlDynamicQuery {
+                        BoundPlpgsqlCommand {
                             source: "",
                             statement: requalified,
                             arguments: &[],
@@ -21745,11 +21767,11 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
     else {
         return Err(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
-            "PL/pgSQL dynamic utility commands are not valid in trigger execution"
+            "PL/pgSQL utility commands are not valid in trigger execution"
         ));
     };
     let outcome = context.responder.without_query_output(|responder| {
-        engine.execute_dynamic_utility(
+        engine.execute_routine_utility(
             query.statement,
             context.txn,
             sqlprep,
@@ -23396,21 +23418,21 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                 ))),
                 _ => Ok(Err(sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
-                    "PL/pgSQL dynamic utility command is not implemented"
+                    "PL/pgSQL utility command is not implemented"
                 ))),
             },
         )
     });
-    dynamic_utility_outcome(outcome)
+    routine_utility_outcome(outcome)
 }
 
-fn dynamic_utility_outcome(outcome: Outcome) -> Result<(), SqlError> {
+fn routine_utility_outcome(outcome: Outcome) -> Result<(), SqlError> {
     match outcome {
         Ok(Ok(())) => Ok(()),
         Ok(Err(error)) => Err(error),
         Err(_) => Err(sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "dynamic utility command response exceeded the output buffer"
+            "PL/pgSQL utility command response exceeded the output buffer"
         )),
     }
 }
@@ -23450,7 +23472,7 @@ fn execute_plpgsql_dynamic_explain(
 ) -> Result<(), SqlError> {
     let planned = resolve_plpgsql_dynamic_prepared(
         context,
-        BoundPlpgsqlDynamicQuery {
+        BoundPlpgsqlCommand {
             source: "",
             statement,
             arguments,
@@ -25213,12 +25235,24 @@ fn execute_trigger_block<'a>(
                         0
                     }
                     _ => {
-                        execute_bound_plpgsql_dynamic_utility(context, query)?;
+                        execute_bound_plpgsql_utility(context, query)?;
                         0
                     }
                 };
                 status.set_row_count(row_count)?;
 
+                Ok(None)
+            }),
+            TriggerStatement::Utility { source, statement } => execute_trigger_statement(|| {
+                execute_bound_plpgsql_utility(
+                    context,
+                    BoundPlpgsqlCommand {
+                        source,
+                        statement,
+                        arguments: &[],
+                    },
+                )?;
+                status.set_row_count(0)?;
                 Ok(None)
             }),
             TriggerStatement::Perform(query) => execute_trigger_statement(|| {

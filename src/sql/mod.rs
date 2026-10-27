@@ -15056,10 +15056,10 @@ impl Engine {
         result
     }
 
-    /// Runs a typed dynamic utility through the same command boundary as
+    /// Runs a typed procedural utility through the same command boundary as
     /// static DDL while its executor remains in the procedural module.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn execute_dynamic_utility<F>(
+    pub(crate) fn execute_routine_utility<F>(
         &mut self,
         statement: &Stmt,
         txn: &mut TxnState,

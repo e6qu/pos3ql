@@ -1780,6 +1780,346 @@ fn catalog_lifetime_config(name: &str, mode: crate::config::TransactionMode) -> 
 }
 
 #[test]
+fn event_trigger_failures_keep_notices_without_success_command_tags() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let config = catalog_lifetime_config(&format!("event-completion-{mode:?}"), mode);
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        session.success(&mut engine, "SET client_min_messages = notice", true);
+        session.success(&mut engine, "CREATE FUNCTION completion_hook() RETURNS event_trigger LANGUAGE plpgsql AS 'BEGIN RAISE NOTICE ''hook notice''; RAISE EXCEPTION USING ERRCODE=''ZX123'', MESSAGE=''hook rejected''; RETURN; END'; CREATE EVENT TRIGGER completion_end ON ddl_command_end WHEN TAG IN ('CREATE TABLE') EXECUTE FUNCTION completion_hook()", true);
+        for sql in [
+            "CREATE TABLE completion_direct(value integer)",
+            "DO 'BEGIN CREATE TABLE completion_nested(value integer); END'",
+            "DO 'BEGIN EXECUTE ''CREATE TABLE completion_dynamic(value integer)''; END'",
+        ] {
+            let output = session.execute(&mut engine, sql, true);
+            assert_eq!(
+                error_sqlstates(&output),
+                ["ZX123"],
+                "{sql}: {}",
+                String::from_utf8_lossy(&output)
+            );
+            assert!(
+                command_tags(&output).is_empty(),
+                "failed DDL reported success: {}",
+                String::from_utf8_lossy(&output)
+            );
+            assert!(
+                message_types(&output).contains(&b'N'),
+                "the hook's notice must survive its error"
+            );
+        }
+        assert_eq!(data_rows(&session.success(&mut engine, "SELECT to_regclass('completion_direct') IS NULL AND to_regclass('completion_nested') IS NULL AND to_regclass('completion_dynamic') IS NULL", true)), ["t"]);
+        session.success(&mut engine, "CREATE OR REPLACE FUNCTION completion_hook() RETURNS event_trigger LANGUAGE plpgsql AS 'BEGIN RAISE NOTICE ''hook success''; RETURN; END'", true);
+        let output = session.success(
+            &mut engine,
+            "CREATE TABLE completion_success(value integer)",
+            true,
+        );
+        assert_eq!(command_tags(&output), ["CREATE TABLE"]);
+        let types = message_types(&output);
+        assert!(
+            types.iter().position(|tag| *tag == b'N').unwrap()
+                < types.iter().position(|tag| *tag == b'C').unwrap()
+        );
+        for sql in [
+            "DO 'BEGIN CREATE TABLE completion_static_success(value integer); END'",
+            "DO 'BEGIN EXECUTE ''CREATE TABLE completion_dynamic_success(value integer)''; END'",
+        ] {
+            let output = session.success(&mut engine, sql, true);
+            assert_eq!(command_tags(&output), ["DO"]);
+            assert!(message_types(&output).contains(&b'N'));
+        }
+        assert_eq!(data_rows(&session.success(&mut engine, "SELECT to_regclass('completion_static_success') IS NOT NULL AND to_regclass('completion_dynamic_success') IS NOT NULL", true)), ["t"]);
+    }
+}
+
+#[test]
+fn catalog_lifetime_executable_objects_match_postgresql_in_both_modes() {
+    let fixture =
+        include_str!("../../tests/external/differential/197_executable_catalog_lifetimes.sql");
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let config = catalog_lifetime_config(&format!("executable-lifetimes-{mode:?}"), mode);
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        for sql in fixture
+            .split("\n\n")
+            .map(str::trim)
+            .filter(|sql| !sql.is_empty())
+        {
+            let output = session.success(&mut engine, sql, true);
+            assert!(
+                data_rows(&output).iter().all(|row| row == "t"),
+                "{sql}: {}",
+                String::from_utf8_lossy(&output)
+            );
+        }
+    }
+}
+
+#[test]
+fn catalog_lifetime_operator_members_keep_qualified_names_and_boolean_contracts() {
+    let fixture =
+        include_str!("../../tests/external/differential/197_executable_catalog_lifetimes.sql");
+    let (setup, _) = fixture.split_once("-- mutation checks").unwrap();
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let config = catalog_lifetime_config(&format!("operator-member-contracts-{mode:?}"), mode);
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        for sql in setup
+            .split("\n\n")
+            .map(str::trim)
+            .filter(|sql| !sql.is_empty())
+        {
+            session.success(&mut engine, sql, true);
+        }
+        for sql in [
+            "CREATE DOMAIN lifetime_exec_boolean AS boolean",
+            "CREATE FUNCTION lifetime_exec_bool_result(integer,integer) RETURNS lifetime_exec_boolean LANGUAGE SQL IMMUTABLE RETURN ($1 = $2)::lifetime_exec_boolean",
+            "CREATE OPERATOR public.#=# (FUNCTION=lifetime_exec_bool_result, LEFTARG=integer, RIGHTARG=integer)",
+        ] {
+            session.success(&mut engine, sql, true);
+        }
+        for (sql, state, message) in [
+            (
+                "CREATE OPERATOR CLASS rejected_exec_domain_result FOR TYPE integer USING btree FAMILY lifetime_exec_family AS OPERATOR 3 public.#=#, FUNCTION 1 lifetime_exec_compare(integer,integer)",
+                "42P17",
+                "index search operators must return boolean",
+            ),
+            (
+                "CREATE OPERATOR CLASS rejected_exec_result FOR TYPE integer USING btree FAMILY lifetime_exec_family AS OPERATOR 3 pg_catalog.+, FUNCTION 1 lifetime_exec_compare(integer,integer)",
+                "42P17",
+                "index search operators must return boolean",
+            ),
+            (
+                "CREATE OPERATOR CLASS rejected_exec_schema FOR TYPE integer USING btree FAMILY lifetime_exec_family AS OPERATOR 3 lifetime_exec_moved.=, FUNCTION 1 lifetime_exec_compare(integer,integer)",
+                "42883",
+                "operator does not exist: integer lifetime_exec_moved.= integer",
+            ),
+        ] {
+            let output = session.execute(&mut engine, sql, true);
+            let expected = format!("M{message}\0");
+            assert!(
+                output
+                    .windows(expected.len())
+                    .any(|field| field == expected.as_bytes()),
+                "{sql}: {}",
+                String::from_utf8_lossy(&output)
+            );
+            assert_eq!(
+                error_sqlstates(&output),
+                [state],
+                "{sql}: {}",
+                String::from_utf8_lossy(&output)
+            );
+        }
+        assert_eq!(data_rows(&session.success(&mut engine, "SELECT count(*)=0 FROM pg_opclass WHERE opcname IN ('rejected_exec_domain_result','rejected_exec_result','rejected_exec_schema'); SELECT count(*)=2 FROM lifetime_exec_report WHERE same AND label='low-cast'", true)), ["t", "t"]);
+    }
+}
+
+#[test]
+fn catalog_lifetime_executable_exhaustion_keeps_declarations_private() {
+    let fixture =
+        include_str!("../../tests/external/differential/197_executable_catalog_lifetimes.sql");
+    let (prerequisites, _) = fixture.split_once("-- executable objects").unwrap();
+    let declarations = [
+        "CREATE ACCESS METHOD exhausted_exec_heap TYPE TABLE HANDLER heap_tableam_handler",
+        "CREATE CAST (lifetime_exec_value AS text) WITH FUNCTION lifetime_exec_text AS ASSIGNMENT",
+        "CREATE OPERATOR === (FUNCTION = lifetime_exec_same, LEFTARG = integer, RIGHTARG = integer)",
+        "CREATE OPERATOR FAMILY exhausted_exec_family USING btree",
+        "CREATE OPERATOR CLASS exhausted_exec_class FOR TYPE integer USING btree FAMILY lifetime_exec_family AS OPERATOR 3 =, FUNCTION 1 lifetime_exec_compare(integer, integer)",
+        "CREATE EVENT TRIGGER exhausted_exec_trigger ON ddl_command_end EXECUTE FUNCTION lifetime_exec_event()",
+    ];
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let config = catalog_lifetime_config(&format!("executable-exhaustion-{mode:?}"), mode);
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        for sql in prerequisites
+            .split("\n\n")
+            .map(str::trim)
+            .filter(|sql| !sql.is_empty())
+        {
+            session.success(&mut engine, sql, true);
+        }
+        session.success(
+            &mut engine,
+            "CREATE OPERATOR FAMILY lifetime_exec_family USING btree",
+            true,
+        );
+        let prior = engine
+            .storage
+            .replace_catalog_sequence_for_test(crate::storage::MAX_CATALOG_CREATION);
+        for sql in declarations {
+            let output = session.execute(&mut engine, sql, true);
+            assert_eq!(
+                error_sqlstates(&output),
+                ["54000"],
+                "{sql}: {}",
+                String::from_utf8_lossy(&output)
+            );
+            assert_eq!(data_rows(&session.success(&mut engine, "SELECT count(*) = 0 FROM pg_am WHERE amname='exhausted_exec_heap'; SELECT count(*) = 0 FROM pg_cast WHERE castsource='lifetime_exec_value'::regtype AND casttarget='text'::regtype; SELECT count(*) = 0 FROM pg_operator WHERE oprname='==='; SELECT count(*) = 0 FROM pg_opfamily WHERE opfname='exhausted_exec_family'; SELECT count(*) = 0 FROM pg_opclass WHERE opcname='exhausted_exec_class'; SELECT count(*) = 0 FROM pg_event_trigger WHERE evtname='exhausted_exec_trigger'; SELECT count(*) = 0 FROM pg_amop WHERE amopfamily=(SELECT oid FROM pg_opfamily WHERE opfname='lifetime_exec_family')", true)), ["t", "t", "t", "t", "t", "t", "t"]);
+        }
+        engine.storage.replace_catalog_sequence_for_test(prior);
+    }
+}
+
+#[test]
+fn catalog_lifetime_copied_executable_edits_stay_in_their_database_after_recovery() {
+    let fixture =
+        include_str!("../../tests/external/differential/197_executable_catalog_lifetimes.sql");
+    let (setup, _) = fixture.split_once("-- mutation checks").unwrap();
+    const IDENTITIES: &str = "SELECT count(*) = 6 FROM saved_exec_lifetimes s JOIN lifetime_exec_catalog c ON s.kind=c.kind AND s.identity=c.identity";
+    const REPORT: &str =
+        "SELECT count(*) = 2 FROM lifetime_exec_report WHERE same AND label='low-cast'";
+    for checkpoint in [false, true] {
+        for mode in [
+            crate::config::TransactionMode::Mvcc,
+            crate::config::TransactionMode::Locking,
+        ] {
+            let name = format!("executable-copy-cold-{checkpoint}-{mode:?}");
+            let mut config = catalog_lifetime_config(&name, mode);
+            config.object_store_on = true;
+            config.object_store_sim = true;
+            config.wal_upload = true;
+            config.wal_upload_sync = true;
+            config.object_store_bucket = format!("{name}-{}", std::process::id());
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+            let target;
+            {
+                let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+                let mut engine = Engine::new(&config, &mut budget).unwrap();
+                engine
+                    .select_database(crate::storage::DatabaseOid::TEMPLATE1)
+                    .unwrap();
+                let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+                let (prerequisites, objects) = setup.split_once("-- executable objects").unwrap();
+                for sql in prerequisites
+                    .split("\n\n")
+                    .map(str::trim)
+                    .filter(|sql| !sql.is_empty())
+                {
+                    session.success(&mut engine, sql, false);
+                }
+                for sql in [
+                    "CREATE ACCESS METHOD lifetime_exec_hole_heap TYPE TABLE HANDLER heap_tableam_handler",
+                    "CREATE CAST (lifetime_exec_value AS varchar) WITH INOUT",
+                    "CREATE OPERATOR ## (FUNCTION = lifetime_exec_same, LEFTARG = integer, RIGHTARG = integer)",
+                    "CREATE OPERATOR FAMILY lifetime_exec_hole_family USING btree",
+                    "CREATE OPERATOR CLASS lifetime_exec_hole_class FOR TYPE integer USING btree FAMILY lifetime_exec_hole_family AS OPERATOR 3 ##, FUNCTION 1 lifetime_exec_compare(integer, integer)",
+                    "CREATE EVENT TRIGGER lifetime_exec_hole_event ON ddl_command_end EXECUTE FUNCTION lifetime_exec_event()",
+                ] {
+                    session.success(&mut engine, sql, false);
+                }
+                for sql in objects
+                    .split("\n\n")
+                    .map(str::trim)
+                    .filter(|sql| !sql.is_empty())
+                {
+                    session.success(&mut engine, sql, false);
+                }
+                for sql in [
+                    "DROP OPERATOR CLASS lifetime_exec_hole_class USING btree",
+                    "DROP OPERATOR FAMILY lifetime_exec_hole_family USING btree",
+                    "DROP OPERATOR ## (integer, integer)",
+                    "DROP CAST (lifetime_exec_value AS varchar)",
+                    "DROP ACCESS METHOD lifetime_exec_hole_heap",
+                    "DROP EVENT TRIGGER lifetime_exec_hole_event",
+                ] {
+                    session.success(&mut engine, sql, false);
+                }
+                if checkpoint {
+                    assert!(engine.checkpoint().unwrap());
+                }
+                engine
+                    .select_database(crate::storage::DatabaseOid::POSTGRES)
+                    .unwrap();
+                session.success(
+                    &mut engine,
+                    "CREATE DATABASE executable_copy TEMPLATE template1",
+                    false,
+                );
+                target = engine
+                    .storage
+                    .database_named("executable_copy", 0)
+                    .unwrap()
+                    .1
+                    .oid;
+                engine.select_database(target).unwrap();
+                assert_eq!(
+                    data_rows(&session.success(&mut engine, IDENTITIES, false)),
+                    ["t"]
+                );
+                assert_eq!(
+                    data_rows(&session.success(&mut engine, REPORT, false)),
+                    ["t"]
+                );
+                for sql in [
+                    "ALTER OPERATOR FAMILY lifetime_exec_family USING btree RENAME TO lifetime_exec_family_moved",
+                    "ALTER OPERATOR CLASS lifetime_exec_class USING btree RENAME TO lifetime_exec_class_moved",
+                    "ALTER EVENT TRIGGER lifetime_exec_trigger RENAME TO lifetime_exec_trigger_moved",
+                    "ALTER OPERATOR public.=== (integer, integer) SET SCHEMA lifetime_exec_moved",
+                    "COMMENT ON OPERATOR FAMILY lifetime_exec_family_moved USING btree IS 'copied family'",
+                    "CREATE OPERATOR public.=== (FUNCTION = lifetime_exec_compare, LEFTARG = integer, RIGHTARG = integer)",
+                ] {
+                    session.success(&mut engine, sql, false);
+                }
+                assert_eq!(
+                    data_rows(&session.success(&mut engine, REPORT, false)),
+                    ["t"]
+                );
+                engine.commit_wal().unwrap();
+            }
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+            {
+                let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+                let mut engine = Engine::new(&config, &mut budget).unwrap();
+                let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+                engine.select_database(target).unwrap();
+                assert_eq!(
+                    data_rows(&session.success(&mut engine, IDENTITIES, false)),
+                    ["t"]
+                );
+                assert_eq!(
+                    data_rows(&session.success(&mut engine, REPORT, false)),
+                    ["t"]
+                );
+                assert_eq!(data_rows(&session.success(&mut engine, "SELECT (2 OPERATOR(public.===) 2)=0; SELECT obj_description(oid,'pg_opfamily')='copied family' FROM pg_opfamily WHERE opfname='lifetime_exec_family_moved'; SELECT count(*)=1 FROM pg_opclass WHERE opcname='lifetime_exec_class_moved'; SELECT count(*)=1 FROM pg_event_trigger WHERE evtname='lifetime_exec_trigger_moved'; SELECT value FROM lifetime_exec_rows WHERE value=7", false)), ["t", "t", "t", "t", "7"]);
+                engine
+                    .select_database(crate::storage::DatabaseOid::TEMPLATE1)
+                    .unwrap();
+                assert_eq!(
+                    data_rows(&session.success(&mut engine, IDENTITIES, false)),
+                    ["t"]
+                );
+                assert_eq!(
+                    data_rows(&session.success(&mut engine, REPORT, false)),
+                    ["t"]
+                );
+                assert_eq!(data_rows(&session.success(&mut engine, "SELECT 2 OPERATOR(public.===) 2; SELECT obj_description(oid,'pg_opfamily')='original family' FROM pg_opfamily WHERE opfname='lifetime_exec_family'; SELECT count(*)=1 FROM pg_opclass WHERE opcname='lifetime_exec_class'; SELECT count(*)=1 FROM pg_event_trigger WHERE evtname='lifetime_exec_trigger'", false)), ["t", "t", "t", "t"]);
+            }
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        }
+    }
+}
+
+#[test]
 fn catalog_lifetime_text_identifiers_reject_replacements_in_both_modes() {
     let fixture = include_str!("../../tests/external/differential/196_text_catalog_lifetimes.sql");
     for mode in [

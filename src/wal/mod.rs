@@ -26,7 +26,7 @@ use crc32c::crc32c;
 
 /// On-disk record header length shared by recovery and logical decoding.
 pub(crate) const HEADER_LEN: usize = 24;
-pub(crate) const RECORD_VERSION: u8 = 20;
+pub(crate) const RECORD_VERSION: u8 = 21;
 
 /// One contiguous, committed journal range ready for immutable publication.
 /// Construction is private to the journal, so callers cannot pair an LSN with
@@ -126,9 +126,8 @@ wal_record_kinds! {
 /// storage replay effect; pgoutput consumes it in command order.
     KIND_LOGICAL_MESSAGE = 131;
     KIND_BRIN_MAINTENANCE = 132;
-/// Wider text-search slot identity. Kind 111 remains decodable so existing
-/// journals retain their durable meaning.
-    KIND_SET_TEXT_SEARCH_V2 = 133;
+/// Text-search definitions retain two-byte catalog positions.
+    KIND_SET_TEXT_SEARCH = 133;
 /// Wide relation column sets. V2 publication and original trigger records
 /// remain readable as one-word sets.
     KIND_CREATE_PUBLICATION_V3 = 139;
@@ -223,7 +222,6 @@ wal_record_kinds! {
     KIND_COMMIT_PREPARED = 108;
     KIND_ROLLBACK_PREPARED = 109;
     KIND_PREPARED_LOCKS = 110;
-    KIND_SET_TEXT_SEARCH = 111;
     KIND_DROP_TEXT_SEARCH = 112;
     KIND_CREATE_LARGE_OBJECT = 113;
     KIND_DROP_LARGE_OBJECT = 114;
@@ -1327,7 +1325,7 @@ pub(crate) enum WalOp<'a> {
         name: &'a str,
     },
     CreateAccessMethod {
-        created_at: u64,
+        identity: crate::storage::CatalogPosition,
         name: &'a str,
         handler: crate::storage::TableAccessMethodHandler,
     },
@@ -1560,13 +1558,16 @@ pub(crate) enum WalOp<'a> {
         payload: &'a [u8],
         wide_results: bool,
     },
-    SetCast(crate::storage::CastDef),
+    SetCast {
+        identity: crate::storage::CatalogPosition,
+        definition: crate::storage::CastDef,
+    },
     DropCast {
         source: crate::storage::RoutineResult,
         target: crate::storage::RoutineResult,
     },
     SetOperator {
-        created_at: u64,
+        identity: crate::storage::CatalogPosition,
         definition: crate::storage::OperatorDefinition,
     },
     DropOperator {
@@ -1575,7 +1576,7 @@ pub(crate) enum WalOp<'a> {
         signature: crate::storage::OperatorSignature,
     },
     SetOperatorFamily {
-        created_at: u64,
+        identity: crate::storage::CatalogPosition,
         definition: &'a crate::storage::OperatorFamilyDefinition,
     },
     RestoreOperatorFamily(&'a [u8]),
@@ -1584,7 +1585,7 @@ pub(crate) enum WalOp<'a> {
         name: &'a str,
     },
     SetOperatorClass {
-        created_at: u64,
+        identity: crate::storage::CatalogPosition,
         definition: &'a crate::storage::OperatorClassDefinition,
     },
     RestoreOperatorClass(&'a [u8]),
@@ -2756,7 +2757,7 @@ fn op_kind(operation: &WalOp) -> u8 {
             wide_results: false,
             ..
         } => KIND_CREATE_ROUTINE,
-        WalOp::SetCast(_) => KIND_SET_CAST,
+        WalOp::SetCast { .. } => KIND_SET_CAST,
         WalOp::DropCast { .. } => KIND_DROP_CAST,
         WalOp::SetOperator { .. } => KIND_SET_OPERATOR,
         WalOp::DropOperator { .. } => KIND_DROP_OPERATOR,
@@ -2770,7 +2771,7 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::DropCollation { .. } => KIND_DROP_COLLATION,
         WalOp::SetConversion { .. } => KIND_SET_CONVERSION,
         WalOp::DropConversion { .. } => KIND_DROP_CONVERSION,
-        WalOp::SetTextSearch { .. } => KIND_SET_TEXT_SEARCH_V2,
+        WalOp::SetTextSearch { .. } => KIND_SET_TEXT_SEARCH,
         WalOp::DropTextSearch { .. } => KIND_DROP_TEXT_SEARCH,
         WalOp::SetEventTrigger { .. } => KIND_SET_EVENT_TRIGGER,
         WalOp::DropEventTrigger { .. } => KIND_DROP_EVENT_TRIGGER,
@@ -3354,7 +3355,9 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             1 + name.len() + 1 + new_name.len() + 24 + 2
         }
         WalOp::DropTablespace { name } => 1 + name.len(),
-        WalOp::CreateAccessMethod { name, .. } => 8 + 1 + name.len() + 1,
+        WalOp::CreateAccessMethod { name, .. } => {
+            crate::storage::CatalogPosition::ENCODED_BYTES + 1 + name.len() + 1
+        }
         WalOp::DropAccessMethod { name } => 1 + name.len(),
         WalOp::CreateDatabase {
             definition,
@@ -3726,8 +3729,9 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                 + def.creation_path.as_str().len()
                 + dependencies.encoded_len()
         }
-        WalOp::SetCast(definition) => {
-            8 + routine_result_len(definition.source)
+        WalOp::SetCast { definition, .. } => {
+            crate::storage::CatalogPosition::ENCODED_BYTES
+                + routine_result_len(definition.source)
                 + routine_result_len(definition.target)
                 + 1
                 + usize::from(matches!(
@@ -3744,7 +3748,8 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                 .implementation
                 .result()
                 .unwrap_or(crate::storage::RoutineResult::TEXT);
-            8 + 1
+            crate::storage::CatalogPosition::ENCODED_BYTES
+                + 1
                 + definition.schema.as_str().len()
                 + 1
                 + definition.name.as_str().len()
@@ -3762,7 +3767,8 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             signature,
         } => 1 + schema.len() + 1 + name.len() + operator_signature_len(*signature),
         WalOp::SetOperatorFamily { definition, .. } => {
-            8 + 1
+            crate::storage::CatalogPosition::ENCODED_BYTES
+                + 1
                 + definition.schema.as_str().len()
                 + 1
                 + definition.name.as_str().len()
@@ -3833,7 +3839,8 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
         }
         WalOp::DropEventTrigger { name } => 1 + name.len(),
         WalOp::SetOperatorClass { definition, .. } => {
-            8 + 1
+            crate::storage::CatalogPosition::ENCODED_BYTES
+                + 1
                 + definition.schema.as_str().len()
                 + 1
                 + definition.name.as_str().len()
@@ -5426,11 +5433,11 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
         }
         WalOp::DropTablespace { name } => name_bytes(buffer, name),
         WalOp::CreateAccessMethod {
-            created_at,
+            identity,
             name,
             handler,
         } => {
-            buffer.append(&created_at.to_le_bytes())
+            buffer.append(&identity.encode())
                 && name_bytes(buffer, name)
                 && buffer.append(&[handler.code()])
         }
@@ -5947,8 +5954,16 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             ok &= name_bytes(buffer, def.creation_path.as_str()) && dependencies.append(buffer);
             ok
         }
-        WalOp::SetCast(definition) => {
-            let mut ok = buffer.append(&definition.created_at.to_le_bytes())
+        WalOp::SetCast {
+            identity,
+            definition,
+        } => {
+            assert_eq!(
+                identity.created_at(),
+                definition.created_at,
+                "cast image lifetime must match its position"
+            );
+            let mut ok = buffer.append(&identity.encode())
                 && append_routine_result(buffer, definition.source)
                 && append_routine_result(buffer, definition.target);
             ok &= match definition.method {
@@ -5964,7 +5979,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             append_routine_result(buffer, *source) && append_routine_result(buffer, *target)
         }
         WalOp::SetOperator {
-            created_at,
+            identity,
             definition,
         } => {
             let result = definition
@@ -5972,7 +5987,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 .result()
                 .unwrap_or(crate::storage::RoutineResult::TEXT);
             let function = definition.implementation.routine().unwrap_or(0);
-            buffer.append(&created_at.to_le_bytes())
+            buffer.append(&identity.encode())
                 && name_bytes(buffer, definition.schema.as_str())
                 && name_bytes(buffer, definition.name.as_str())
                 && append_operator_signature(buffer, definition.signature)
@@ -6085,7 +6100,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
         }
         WalOp::DropEventTrigger { name } => name_bytes(buffer, name),
         WalOp::SetOperatorFamily {
-            created_at,
+            identity,
             definition,
         } => {
             let operator_count = definition
@@ -6098,7 +6113,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 .iter()
                 .filter(|member| member.used)
                 .count();
-            let mut ok = buffer.append(&created_at.to_le_bytes())
+            let mut ok = buffer.append(&identity.encode())
                 && name_bytes(buffer, definition.schema.as_str())
                 && name_bytes(buffer, definition.name.as_str())
                 && buffer.append(&definition.owner.to_le_bytes())
@@ -6121,7 +6136,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             name_bytes(buffer, schema) && name_bytes(buffer, name)
         }
         WalOp::SetOperatorClass {
-            created_at,
+            identity,
             definition,
         } => {
             let operator_count = definition
@@ -6134,7 +6149,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 .iter()
                 .filter(|member| member.used)
                 .count();
-            let mut ok = buffer.append(&created_at.to_le_bytes())
+            let mut ok = buffer.append(&identity.encode())
                 && name_bytes(buffer, definition.schema.as_str())
                 && name_bytes(buffer, definition.name.as_str())
                 && buffer.append(&definition.owner.to_le_bytes())
@@ -7346,7 +7361,10 @@ pub(crate) fn decode_foreign_table_payload(
 #[inline(never)]
 pub(crate) fn decode_operator_family_payload(
     payload: &[u8],
-) -> Option<(u64, crate::storage::OperatorFamilyDefinition)> {
+) -> Option<(
+    crate::storage::CatalogPosition,
+    crate::storage::OperatorFamilyDefinition,
+)> {
     let mut decoded = None;
     decode_op_inner(
         KIND_SET_OPERATOR_FAMILY,
@@ -7362,7 +7380,10 @@ pub(crate) fn decode_operator_family_payload(
 #[inline(never)]
 pub(crate) fn decode_operator_class_payload(
     payload: &[u8],
-) -> Option<(u64, crate::storage::OperatorClassDefinition)> {
+) -> Option<(
+    crate::storage::CatalogPosition,
+    crate::storage::OperatorClassDefinition,
+)> {
     let mut decoded = None;
     decode_op_inner(
         KIND_SET_OPERATOR_CLASS,
@@ -7393,8 +7414,18 @@ struct WalDecodeOutput<'output, 'payload> {
             Option<crate::storage::foreign::ForeignTableDefinition>,
         )>,
     >,
-    operator_family: Option<&'output mut Option<(u64, crate::storage::OperatorFamilyDefinition)>>,
-    operator_class: Option<&'output mut Option<(u64, crate::storage::OperatorClassDefinition)>>,
+    operator_family: Option<
+        &'output mut Option<(
+            crate::storage::CatalogPosition,
+            crate::storage::OperatorFamilyDefinition,
+        )>,
+    >,
+    operator_class: Option<
+        &'output mut Option<(
+            crate::storage::CatalogPosition,
+            crate::storage::OperatorClassDefinition,
+        )>,
+    >,
 }
 
 impl WalDecodeOutput<'_, '_> {
@@ -9613,13 +9644,12 @@ fn decode_op_inner<'a>(
             (at == payload.len()).then_some(WalOp::DropTablespace { name })
         }),
         KIND_CREATE_ACCESS_METHOD => decode_large_op(|| {
-            let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
-            at += 8;
+            let identity = take_catalog_position(payload, &mut at)?;
             let name = take_name(&mut at)?;
             let handler = crate::storage::TableAccessMethodHandler::from_code(*payload.get(at)?)?;
             at += 1;
             (at == payload.len()).then_some(WalOp::CreateAccessMethod {
-                created_at,
+                identity,
                 name,
                 handler,
             })
@@ -10454,8 +10484,7 @@ fn decode_op_inner<'a>(
             })
         }),
         KIND_SET_CAST => decode_large_op(|| {
-            let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
-            at += 8;
+            let identity = take_catalog_position(payload, &mut at)?;
             let source = decode_routine_result(payload, &mut at)?;
             let target = decode_routine_result(payload, &mut at)?;
             let method = match *payload.get(at)? {
@@ -10480,15 +10509,18 @@ fn decode_op_inner<'a>(
             };
             let context = crate::storage::CastContext::from_code(*payload.get(at)?)?;
             at += 1;
-            (at == payload.len()).then_some(WalOp::SetCast(crate::storage::CastDef {
-                database: crate::storage::DatabaseOid::POSTGRES,
-                created_at,
-                source,
-                target,
-                method,
-                context,
-                ddl_state: crate::storage::CatalogDdlState::Absent,
-            }))
+            (at == payload.len()).then_some(WalOp::SetCast {
+                identity,
+                definition: crate::storage::CastDef {
+                    database: crate::storage::DatabaseOid::POSTGRES,
+                    created_at: identity.created_at(),
+                    source,
+                    target,
+                    method,
+                    context,
+                    ddl_state: crate::storage::CatalogDdlState::Absent,
+                },
+            })
         }),
         KIND_DROP_CAST => decode_large_op(|| {
             let source = decode_routine_result(payload, &mut at)?;
@@ -10496,8 +10528,7 @@ fn decode_op_inner<'a>(
             (at == payload.len()).then_some(WalOp::DropCast { source, target })
         }),
         KIND_SET_OPERATOR => decode_large_op(|| {
-            let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
-            at += 8;
+            let identity = take_catalog_position(payload, &mut at)?;
             let schema = SqlName::parse(take_name(&mut at)?).ok()?;
             let name = SqlName::parse(take_name(&mut at)?).ok()?;
             let signature = decode_operator_signature(payload, &mut at)?;
@@ -10522,7 +10553,7 @@ fn decode_op_inner<'a>(
                 return None;
             }
             (at == payload.len()).then_some(WalOp::SetOperator {
-                created_at,
+                identity,
                 definition: crate::storage::OperatorDefinition {
                     schema,
                     name,
@@ -10672,16 +10703,9 @@ fn decode_op_inner<'a>(
                 },
             })
         }),
-        KIND_SET_TEXT_SEARCH | KIND_SET_TEXT_SEARCH_V2 => decode_large_op(|| {
-            let slot = if kind == KIND_SET_TEXT_SEARCH {
-                let slot = u16::from(*payload.get(at)?);
-                at += 1;
-                slot
-            } else {
-                let slot = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
-                at += 2;
-                slot
-            };
+        KIND_SET_TEXT_SEARCH => decode_large_op(|| {
+            let slot = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
+            at += 2;
             let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
             at += 8;
             let object_kind = *payload.get(at)?;
@@ -10832,8 +10856,7 @@ fn decode_op_inner<'a>(
             (at == payload.len()).then_some(WalOp::DropEventTrigger { name })
         }),
         KIND_SET_OPERATOR_FAMILY => decode_large_op(|| {
-            let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
-            at += 8;
+            let identity = take_catalog_position(payload, &mut at)?;
             let schema = SqlName::parse(take_name(&mut at)?).ok()?;
             let name = SqlName::parse(take_name(&mut at)?).ok()?;
             let owner = i32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
@@ -10900,7 +10923,7 @@ fn decode_op_inner<'a>(
                 functions,
             };
             if let Some(output) = decoded_operator_family {
-                *output = Some((created_at, definition));
+                *output = Some((identity, definition));
             }
             Some(WalOp::RestoreOperatorFamily(payload))
         }),
@@ -10917,8 +10940,7 @@ fn decode_op_inner<'a>(
             })
         }),
         KIND_SET_OPERATOR_CLASS => decode_large_op(|| {
-            let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
-            at += 8;
+            let identity = take_catalog_position(payload, &mut at)?;
             let schema = SqlName::parse(take_name(&mut at)?).ok()?;
             let name = SqlName::parse(take_name(&mut at)?).ok()?;
             let owner = i32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
@@ -11002,7 +11024,7 @@ fn decode_op_inner<'a>(
                 functions,
             };
             if let Some(output) = decoded_operator_class {
-                *output = Some((created_at, definition));
+                *output = Some((identity, definition));
             }
             Some(WalOp::RestoreOperatorClass(payload))
         }),
@@ -12999,21 +13021,29 @@ mod tests {
             lextypes: 3721,
         };
         let operations = [
-            WalOp::SetCast(crate::storage::CastDef {
-                database: crate::storage::DatabaseOid::POSTGRES,
-                created_at: 9,
-                source: custom,
-                target: crate::storage::RoutineResult::TEXT,
-                method: crate::storage::CastMethod::Function(701_002),
-                context: crate::storage::CastContext::Assignment,
-                ddl_state: crate::storage::CatalogDdlState::Present,
-            }),
+            WalOp::CreateAccessMethod {
+                identity: crate::storage::CatalogPosition::new(7, 8).unwrap(),
+                name: "catalog_heap",
+                handler: crate::storage::TableAccessMethodHandler::Heap,
+            },
+            WalOp::SetCast {
+                identity: crate::storage::CatalogPosition::new(3, 9).unwrap(),
+                definition: crate::storage::CastDef {
+                    database: crate::storage::DatabaseOid::POSTGRES,
+                    created_at: 9,
+                    source: custom,
+                    target: crate::storage::RoutineResult::TEXT,
+                    method: crate::storage::CastMethod::Function(701_002),
+                    context: crate::storage::CastContext::Assignment,
+                    ddl_state: crate::storage::CatalogDdlState::Present,
+                },
+            },
             WalOp::DropCast {
                 source: custom,
                 target: crate::storage::RoutineResult::TEXT,
             },
             WalOp::SetOperator {
-                created_at: 11,
+                identity: crate::storage::CatalogPosition::new(4, 11).unwrap(),
                 definition: operator,
             },
             WalOp::DropOperator {
@@ -13022,7 +13052,7 @@ mod tests {
                 signature: binary_signature,
             },
             WalOp::SetOperatorFamily {
-                created_at: 12,
+                identity: crate::storage::CatalogPosition::new(4, 12).unwrap(),
                 definition: &family,
             },
             WalOp::DropOperatorFamily {
@@ -13030,7 +13060,7 @@ mod tests {
                 name: "mood_ops",
             },
             WalOp::SetOperatorClass {
-                created_at: 13,
+                identity: crate::storage::CatalogPosition::new(4, 13).unwrap(),
                 definition: &class,
             },
             WalOp::DropOperatorClass {
@@ -13078,8 +13108,8 @@ mod tests {
             assert!(decode_op(kind, &trailing[..payload.len() + 1]).is_none());
         }
 
-        // Kind 111 encoded one-byte slots. Keep it readable after widening
-        // newly written records so existing journals remain recoverable.
+        // Retired kind 111 encoded one-byte slots and must never be guessed
+        // from a payload framed as the current journal format.
         let operation = WalOp::SetTextSearch {
             slot: 7,
             created_at: 18,
@@ -13090,10 +13120,7 @@ mod tests {
         let mut legacy = [0; 4096];
         legacy[0] = payload[0];
         legacy[1..payload.len() - 1].copy_from_slice(&payload[2..]);
-        assert!(matches!(
-            decode_op(KIND_SET_TEXT_SEARCH, &legacy[..payload.len() - 1]),
-            Some(WalOp::SetTextSearch { slot: 7, .. })
-        ));
+        assert!(decode_op(111, &legacy[..payload.len() - 1]).is_none());
     }
 
     #[test]

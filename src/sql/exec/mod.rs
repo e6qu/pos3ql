@@ -16214,7 +16214,7 @@ struct PlpgsqlCursorMotion<'a> {
 }
 
 #[derive(Clone, Copy)]
-struct BoundPlpgsqlDynamicQuery<'a> {
+struct BoundPlpgsqlCommand<'a> {
     source: &'a str,
     statement: &'a Stmt<'a>,
     arguments: &'a [Datum<'a>],
@@ -16348,6 +16348,10 @@ enum TriggerStatement<'a> {
     SelectInto(TriggerSelectInto<'a>),
     DynamicQuery(PlpgsqlDynamicQuery<'a>),
     DynamicSelectInto(PlpgsqlDynamicSelectInto<'a>),
+    Utility {
+        source: &'a str,
+        statement: &'a Stmt<'a>,
+    },
     CursorOpen(PlpgsqlCursorOpen<'a>),
     CursorMotion(PlpgsqlCursorMotion<'a>),
     CursorClose(SqlName),
@@ -18864,6 +18868,30 @@ fn parse_trigger_statement<'a>(
     {
         return Ok(TriggerStatement::Dml(parse_trigger_dml(segment, arena)?));
     }
+    if ["create", "alter", "drop", "comment", "grant", "revoke"]
+        .iter()
+        .any(|keyword| strip_trigger_keyword(segment, keyword).is_some())
+    {
+        use crate::sql::lexer::{Lexer, Tok};
+        let mut lexer = Lexer::new(segment, arena);
+        let first = lexer
+            .next_token()
+            .map_err(|error| super::parse_error_to_sql(&error.into()))?;
+        let second = lexer
+            .next_token()
+            .map_err(|error| super::parse_error_to_sql(&error.into()))?;
+        // A utility starts with two words; assignment punctuation belongs to
+        // the local-variable parser even when the variable is named alter.
+        if matches!(
+            (first, second),
+            (Tok::Ident(_), Tok::Ident(_) | Tok::QuotedIdent(_))
+        ) {
+            return Ok(TriggerStatement::Utility {
+                source: segment,
+                statement: super::parser::parse_stored_statement(segment, arena)?,
+            });
+        }
+    }
     if let Some(assignment) = parse_trigger_assignment(segment, arena)? {
         return Ok(TriggerStatement::Assign(assignment));
     }
@@ -21228,7 +21256,7 @@ fn bind_plpgsql_dynamic_query<'a>(
     context: &TriggerExecContext<'_, 'a, '_>,
     query: PlpgsqlDynamicQuery<'a>,
     scope: &TriggerLocalScope<'_, 'a>,
-) -> Result<BoundPlpgsqlDynamicQuery<'a>, SqlError> {
+) -> Result<BoundPlpgsqlCommand<'a>, SqlError> {
     let command = eval_trigger_expression(context, query.command, scope)?;
     if command.is_null() {
         return Err(sql_err!(
@@ -21247,7 +21275,7 @@ fn bind_plpgsql_dynamic_query<'a>(
             context.arena,
         )?;
     }
-    Ok(BoundPlpgsqlDynamicQuery {
+    Ok(BoundPlpgsqlCommand {
         source: command,
         statement: super::parser::parse_stored_statement(command, context.arena)?,
         arguments: &*arguments,
@@ -21256,9 +21284,9 @@ fn bind_plpgsql_dynamic_query<'a>(
 
 fn resolve_plpgsql_dynamic_prepared<'a>(
     context: &TriggerExecContext<'_, 'a, '_>,
-    query: BoundPlpgsqlDynamicQuery<'a>,
+    query: BoundPlpgsqlCommand<'a>,
     scope: &TriggerLocalScope<'_, 'a>,
-) -> Result<BoundPlpgsqlDynamicQuery<'a>, SqlError> {
+) -> Result<BoundPlpgsqlCommand<'a>, SqlError> {
     let Stmt::ExecutePrepared { name, args } = query.statement else {
         return Ok(query);
     };
@@ -21309,7 +21337,7 @@ fn resolve_plpgsql_dynamic_prepared<'a>(
         .arena
         .alloc_str(text)
         .map_err(|_| super::query::arena_full_pub())?;
-    Ok(BoundPlpgsqlDynamicQuery {
+    Ok(BoundPlpgsqlCommand {
         source: text,
         statement: super::parser::parse_stored_statement(text, context.arena)?,
         arguments: &*values,
@@ -21318,7 +21346,7 @@ fn resolve_plpgsql_dynamic_prepared<'a>(
 
 fn execute_bound_plpgsql_dynamic_query<'a>(
     context: &TriggerExecContext<'_, 'a, '_>,
-    query: BoundPlpgsqlDynamicQuery<'a>,
+    query: BoundPlpgsqlCommand<'a>,
     scope: &TriggerLocalScope<'_, 'a>,
     sequence: &dyn crate::sql::eval::SequenceAccess,
     emit: &mut dyn for<'row> FnMut(&[Datum<'row>]) -> Result<(), SqlError>,
@@ -21369,7 +21397,7 @@ fn execute_plpgsql_dynamic_query<'a>(
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn execute_bound_plpgsql_dynamic_dml<'a>(
     context: &mut TriggerExecContext<'_, 'a, '_>,
-    query: BoundPlpgsqlDynamicQuery<'a>,
+    query: BoundPlpgsqlCommand<'a>,
     scope: &TriggerLocalScope<'_, 'a>,
     transition_relations: Option<&'a [(&'a str, &'a crate::sql::ast::MaterializedCte<'a>)]>,
     capture: Option<&mut dyn FnMut(&[Datum]) -> Result<(), SqlError>>,
@@ -21540,12 +21568,12 @@ fn execute_bound_plpgsql_dynamic_dml<'a>(
     }
 }
 
-/// Dynamic utility commands use the routine's durable DDL executor. Atomic
+/// Static and dynamic utility commands use the routine's durable DDL executor. Atomic
 /// trigger hosts deliberately have no catalog/WAL owner, so they cannot make a
 /// utility command appear durable by bypassing that boundary.
-fn execute_bound_plpgsql_dynamic_utility<'a>(
+fn execute_bound_plpgsql_utility<'a>(
     context: &mut TriggerExecContext<'_, 'a, '_>,
-    query: BoundPlpgsqlDynamicQuery<'a>,
+    query: BoundPlpgsqlCommand<'a>,
 ) -> Result<(), SqlError> {
     if !query.arguments.is_empty() && !matches!(query.statement, Stmt::DeclareCursor { .. }) {
         return Err(sql_err!(
@@ -21570,7 +21598,7 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
             PlpgsqlExecHost::Atomic { .. } => {
                 return Err(sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
-                    "PL/pgSQL dynamic utility commands are not valid in trigger execution"
+                    "PL/pgSQL utility commands are not valid in trigger execution"
                 ));
             }
         };
@@ -21590,11 +21618,11 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
             else {
                 return Err(sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
-                    "PL/pgSQL dynamic utility commands are not valid in trigger execution"
+                    "PL/pgSQL utility commands are not valid in trigger execution"
                 ));
             };
             context.responder.without_query_output(|responder| {
-                engine.execute_dynamic_utility(
+                engine.execute_routine_utility(
                     query.statement,
                     context.txn,
                     sqlprep,
@@ -21617,7 +21645,7 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                 )
             })
         };
-        dynamic_utility_outcome(outcome)?;
+        routine_utility_outcome(outcome)?;
 
         let prior_user = crate::sql::eval::funcs::system::current_identity();
         let authorization_identity = resolved
@@ -21678,7 +21706,7 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                         );
                         let old_path = engine.storage.swap_path(path);
                         let outcome = context.responder.without_query_output(|responder| {
-                            engine.execute_dynamic_utility(
+                            engine.execute_routine_utility(
                                 requalified,
                                 context.txn,
                                 sqlprep,
@@ -21712,11 +21740,11 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                         engine.storage.swap_path(old_path);
                         outcome
                     };
-                    dynamic_utility_outcome(outcome)?;
+                    routine_utility_outcome(outcome)?;
                 } else {
-                    execute_bound_plpgsql_dynamic_utility(
+                    execute_bound_plpgsql_utility(
                         context,
-                        BoundPlpgsqlDynamicQuery {
+                        BoundPlpgsqlCommand {
                             source: "",
                             statement: requalified,
                             arguments: &[],
@@ -21745,11 +21773,11 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
     else {
         return Err(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
-            "PL/pgSQL dynamic utility commands are not valid in trigger execution"
+            "PL/pgSQL utility commands are not valid in trigger execution"
         ));
     };
     let outcome = context.responder.without_query_output(|responder| {
-        engine.execute_dynamic_utility(
+        engine.execute_routine_utility(
             query.statement,
             context.txn,
             sqlprep,
@@ -23396,21 +23424,21 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                 ))),
                 _ => Ok(Err(sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
-                    "PL/pgSQL dynamic utility command is not implemented"
+                    "PL/pgSQL utility command is not implemented"
                 ))),
             },
         )
     });
-    dynamic_utility_outcome(outcome)
+    routine_utility_outcome(outcome)
 }
 
-fn dynamic_utility_outcome(outcome: Outcome) -> Result<(), SqlError> {
+fn routine_utility_outcome(outcome: Outcome) -> Result<(), SqlError> {
     match outcome {
         Ok(Ok(())) => Ok(()),
         Ok(Err(error)) => Err(error),
         Err(_) => Err(sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "dynamic utility command response exceeded the output buffer"
+            "PL/pgSQL utility command response exceeded the output buffer"
         )),
     }
 }
@@ -23450,7 +23478,7 @@ fn execute_plpgsql_dynamic_explain(
 ) -> Result<(), SqlError> {
     let planned = resolve_plpgsql_dynamic_prepared(
         context,
-        BoundPlpgsqlDynamicQuery {
+        BoundPlpgsqlCommand {
             source: "",
             statement,
             arguments,
@@ -25213,12 +25241,24 @@ fn execute_trigger_block<'a>(
                         0
                     }
                     _ => {
-                        execute_bound_plpgsql_dynamic_utility(context, query)?;
+                        execute_bound_plpgsql_utility(context, query)?;
                         0
                     }
                 };
                 status.set_row_count(row_count)?;
 
+                Ok(None)
+            }),
+            TriggerStatement::Utility { source, statement } => execute_trigger_statement(|| {
+                execute_bound_plpgsql_utility(
+                    context,
+                    BoundPlpgsqlCommand {
+                        source,
+                        statement,
+                        arguments: &[],
+                    },
+                )?;
+                status.set_row_count(0)?;
                 Ok(None)
             }),
             TriggerStatement::Perform(query) => execute_trigger_statement(|| {
@@ -29055,11 +29095,11 @@ fn resolve_function_slot_exact(
         })
 }
 
-fn resolve_operator_identity(
+fn resolve_operator_signature(
     storage: &Storage,
     txid: u32,
     identity: crate::sql::ast::OperatorIdentity<'_>,
-) -> Result<(usize, crate::storage::OperatorSignature), SqlError> {
+) -> Result<crate::storage::OperatorSignature, SqlError> {
     let (left, right) = match identity.operands {
         crate::sql::ast::OperatorOperands::Prefix(right) => {
             (None, Some(resolve_routine_type(storage, txid, right)?))
@@ -29069,7 +29109,17 @@ fn resolve_operator_identity(
             Some(resolve_routine_type(storage, txid, right)?),
         ),
     };
-    let signature = crate::storage::OperatorSignature { left, right };
+    Ok(crate::storage::OperatorSignature { left, right })
+}
+
+fn resolve_operator_identity(
+    storage: &Storage,
+    txid: u32,
+    identity: crate::sql::ast::OperatorIdentity<'_>,
+) -> Result<(usize, crate::storage::OperatorSignature), SqlError> {
+    let signature = resolve_operator_signature(storage, txid, identity)?;
+    let left = signature.left;
+    let right = signature.right;
     let left_oid = left
         .and_then(|argument| storage.routine_type_oid(argument.ctype, argument.user_type, txid));
     let right_oid = right
@@ -29340,7 +29390,15 @@ pub(crate) fn create_cast(
         }
     };
     let lsn = storage.bump_lsn();
-    if let Err(error) = wal.stage_reserved(txn.txid, lsn, &WalOp::SetCast(definition)) {
+    if let Err(error) = wal.stage_reserved(
+        txn.txid,
+        lsn,
+        &WalOp::SetCast {
+            identity: crate::storage::CatalogPosition::new(slot, definition.created_at)
+                .expect("admitted cast position"),
+            definition,
+        },
+    ) {
         storage.rollback_cast_create(slot);
         return sql_fail(error);
     }
@@ -29535,7 +29593,8 @@ fn operator_link_or_shell(
         txn.txid,
         lsn,
         &WalOp::SetOperator {
-            created_at,
+            identity: crate::storage::CatalogPosition::new(slot, created_at)
+                .expect("admitted executable catalog position"),
             definition: durable,
         },
     ) {
@@ -29683,7 +29742,8 @@ pub(crate) fn create_operator(
             txn.txid,
             lsn,
             &WalOp::SetOperator {
-                created_at,
+                identity: crate::storage::CatalogPosition::new(slot, created_at)
+                    .expect("admitted executable catalog position"),
                 definition: durable,
             },
         ) {
@@ -31595,7 +31655,8 @@ fn stage_operator(
         txn.txid,
         lsn,
         &WalOp::SetOperator {
-            created_at,
+            identity: crate::storage::CatalogPosition::new(slot, created_at)
+                .expect("admitted executable catalog position"),
             definition: durable,
         },
     ) {
@@ -31992,7 +32053,8 @@ pub(crate) fn create_operator_family(
         txn.txid,
         lsn,
         &WalOp::SetOperatorFamily {
-            created_at,
+            identity: crate::storage::CatalogPosition::new(slot, created_at)
+                .expect("admitted executable catalog position"),
             definition: &definition,
         },
     ) {
@@ -32081,7 +32143,13 @@ fn add_operator_family_members(
     for member in members {
         match *member {
             crate::sql::ast::OperatorFamilyMember::Operator { strategy, operator } => {
-                let (slot, signature) = resolve_operator_identity(storage, txid, operator)?;
+                let signature = resolve_operator_signature(storage, txid, operator)?;
+                let oid = crate::sql::catalog::operator_oid_for_signature(
+                    storage,
+                    txid,
+                    operator.name,
+                    signature,
+                )?;
                 let Some(left) = signature.left else {
                     return Err(sql_err!(
                         sqlstate::INVALID_OBJECT_DEFINITION,
@@ -32123,7 +32191,7 @@ fn add_operator_family_members(
                     strategy,
                     left,
                     right,
-                    operator: storage.operator(slot).oid(),
+                    operator: oid,
                 };
             }
             crate::sql::ast::OperatorFamilyMember::CompareFunction {
@@ -32274,7 +32342,8 @@ fn stage_operator_family(
         txn.txid,
         lsn,
         &WalOp::SetOperatorFamily {
-            created_at,
+            identity: crate::storage::CatalogPosition::new(slot, created_at)
+                .expect("admitted executable catalog position"),
             definition: &durable,
         },
     ) {
@@ -32477,7 +32546,8 @@ fn stage_operator_class(
         txn.txid,
         lsn,
         &WalOp::SetOperatorClass {
-            created_at,
+            identity: crate::storage::CatalogPosition::new(slot, created_at)
+                .expect("admitted executable catalog position"),
             definition: &durable,
         },
     ) {
@@ -32629,7 +32699,8 @@ pub(crate) fn create_operator_class(
             txn.txid,
             lsn,
             &WalOp::SetOperatorFamily {
-                created_at,
+                identity: crate::storage::CatalogPosition::new(slot, created_at)
+                    .expect("admitted executable catalog position"),
                 definition: &definition,
             },
         ) {
@@ -32665,8 +32736,10 @@ pub(crate) fn create_operator_class(
                         right: Some(input),
                     },
                 };
-                let slot = match operator_link_slot(storage, txn.txid, operator, signature) {
-                    Ok(slot) => slot,
+                let oid = match crate::sql::catalog::operator_oid_for_signature(
+                    storage, txn.txid, operator, signature,
+                ) {
+                    Ok(oid) => oid,
                     Err(error) => return sql_fail(error),
                 };
                 let left = signature.left.expect("btree class operator is binary");
@@ -32694,7 +32767,7 @@ pub(crate) fn create_operator_class(
                     strategy,
                     left,
                     right,
-                    operator: storage.operator(slot).oid(),
+                    operator: oid,
                 };
             }
             crate::sql::ast::OperatorClassMember::CompareFunction {
@@ -32786,7 +32859,8 @@ pub(crate) fn create_operator_class(
         txn.txid,
         lsn,
         &WalOp::SetOperatorClass {
-            created_at,
+            identity: crate::storage::CatalogPosition::new(slot, created_at)
+                .expect("admitted executable catalog position"),
             definition: &durable,
         },
     ) {
@@ -51184,7 +51258,6 @@ pub fn create_access_method(
         Err(error) => return sql_fail(error),
     };
     let slot = match storage.create_access_method(
-        0,
         crate::storage::AccessMethodDefinition { name, handler },
         txn.txid,
     ) {
@@ -51201,7 +51274,8 @@ pub fn create_access_method(
         txn.txid,
         lsn,
         &WalOp::CreateAccessMethod {
-            created_at,
+            identity: crate::storage::CatalogPosition::new(slot, created_at)
+                .expect("admitted executable catalog position"),
             name: name.as_str(),
             handler,
         },
@@ -72567,6 +72641,45 @@ pub fn coltype_of_oid_pub(o: i32) -> Option<crate::sql::types::ColType> {
 mod tests {
     use super::*;
     use crate::mem::budget::Budget;
+
+    #[test]
+    fn event_trigger_static_utility_parse_preserves_lexical_errors() {
+        for (sql, capacity, message) in [
+            (
+                "CREATE TABLE orders(id integer)",
+                1,
+                "statement too large for SQL arena",
+            ),
+            (
+                "create \"unterminated",
+                4096,
+                "unterminated quoted identifier",
+            ),
+        ] {
+            let mut budget = Budget::new(8192);
+            let arena = Arena::new(&mut budget, "procedural utility parsing", capacity).unwrap();
+            let error = crate::mem::guard::forbid_alloc(|| {
+                parse_trigger_statement(sql, &arena, &[], false, PlpgsqlProgramKind::Anonymous)
+                    .err()
+                    .expect("invalid utility input must fail")
+            });
+            assert_eq!(error.sqlstate, sqlstate::SYNTAX_ERROR);
+            assert_eq!(error.message.as_str(), message);
+        }
+        let mut budget = Budget::new(8192);
+        let arena = Arena::new(&mut budget, "procedural assignment parsing", 4096).unwrap();
+        let statement = crate::mem::guard::forbid_alloc(|| {
+            parse_trigger_statement(
+                "alter := 1",
+                &arena,
+                &[],
+                false,
+                PlpgsqlProgramKind::Anonymous,
+            )
+            .unwrap()
+        });
+        assert!(matches!(statement, TriggerStatement::LocalAssign(_)));
+    }
 
     #[test]
     fn statement_row_replication_selection_rejects_another_transaction_without_recapture() {

@@ -15056,10 +15056,10 @@ impl Engine {
         result
     }
 
-    /// Runs a typed dynamic utility through the same command boundary as
+    /// Runs a typed procedural utility through the same command boundary as
     /// static DDL while its executor remains in the procedural module.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn execute_dynamic_utility<F>(
+    pub(crate) fn execute_routine_utility<F>(
         &mut self,
         statement: &Stmt,
         txn: &mut TxnState,
@@ -15179,7 +15179,18 @@ impl Engine {
         } else {
             event_trigger::BeforeDdl::EMPTY
         };
+        if event_drop || event_end {
+            responder.begin_command_completion_capture();
+        }
         let outcome = execute(self, txn, sqlprep, cursors, guc, responder);
+        let completion = if event_drop || event_end {
+            match responder.take_command_completion_tag(arena, matches!(outcome, Ok(Ok(())))) {
+                Ok(tag) => tag,
+                Err(_) => return Ok(Err(eval::arena_full())),
+            }
+        } else {
+            None
+        };
         if matches!(outcome, Ok(Ok(())))
             && (event_drop || event_end)
             && let Some(tag) = event_tag
@@ -15204,6 +15215,9 @@ impl Engine {
             )
         {
             return Ok(Err(error));
+        }
+        if let Some(tag) = completion {
+            responder.command_complete(tag)?;
         }
         outcome
     }
@@ -15495,6 +15509,9 @@ impl Engine {
         } else {
             event_trigger::BeforeDdl::EMPTY
         };
+        if event_drop || event_end {
+            responder.begin_command_completion_capture();
+        }
         let outcome = match statement {
             Stmt::Explain { options, statement } => {
                 let settings = if options.settings {
@@ -17777,6 +17794,14 @@ impl Engine {
             }
             Stmt::Deallocate(name) => self.execute_deallocate_statement(*name, sqlprep, responder),
         };
+        let completion = if event_drop || event_end {
+            match responder.take_command_completion_tag(arena, matches!(outcome, Ok(Ok(())))) {
+                Ok(tag) => tag,
+                Err(_) => return Ok(Err(eval::arena_full())),
+            }
+        } else {
+            None
+        };
         if matches!(outcome, Ok(Ok(())))
             && (event_drop || event_end)
             && let Some(tag) = event_tag
@@ -17801,6 +17826,9 @@ impl Engine {
             )
         {
             return Ok(Err(error));
+        }
+        if let Some(tag) = completion {
+            responder.command_complete(tag)?;
         }
         outcome
     }
@@ -21616,8 +21644,11 @@ fn apply_wal_op(
         | WalOp::CommitPrepared { .. }
         | WalOp::RollbackPrepared { .. } => {}
         WalOp::Truncate { .. } | WalOp::LogicalMessage { .. } => {}
-        WalOp::SetCast(definition) => {
-            storage.create_cast_from_image(definition)?;
+        WalOp::SetCast {
+            identity,
+            definition,
+        } => {
+            storage.create_cast_from_image(identity, definition)?;
         }
         WalOp::DropCast { source, target } => {
             let source = storage.bind_routine_result(source, 0)?;
@@ -21628,10 +21659,10 @@ fn apply_wal_op(
             storage.commit_cast_drop(slot);
         }
         WalOp::SetOperator {
-            created_at,
+            identity,
             definition,
         } => {
-            storage.replay_set_operator(created_at, definition)?;
+            storage.replay_set_operator(identity, definition)?;
         }
         WalOp::DropOperator {
             schema,
@@ -21688,20 +21719,20 @@ fn apply_wal_op(
         } => storage.replay_event_trigger(usize::from(slot), created_at, definition)?,
         WalOp::DropEventTrigger { name } => storage.replay_drop_event_trigger(name),
         WalOp::SetOperatorFamily {
-            created_at,
+            identity,
             definition,
         } => {
-            storage.replay_set_operator_family(created_at, *definition)?;
+            storage.replay_set_operator_family(identity, *definition)?;
         }
         WalOp::RestoreOperatorFamily(payload) => {
-            let (created_at, definition) = crate::wal::decode_operator_family_payload(payload)
+            let (identity, definition) = crate::wal::decode_operator_family_payload(payload)
                 .ok_or_else(|| {
                     sql_err!(
                         sqlstate::DATA_EXCEPTION,
                         "journal operator-family definition is corrupt"
                     )
                 })?;
-            storage.replay_set_operator_family(created_at, definition)?;
+            storage.replay_set_operator_family(identity, definition)?;
         }
         WalOp::DropOperatorFamily { schema, name } => {
             let slot = storage
@@ -21716,20 +21747,20 @@ fn apply_wal_op(
             storage.commit_operator_family_drop(slot);
         }
         WalOp::SetOperatorClass {
-            created_at,
+            identity,
             definition,
         } => {
-            storage.replay_set_operator_class(created_at, *definition)?;
+            storage.replay_set_operator_class(identity, *definition)?;
         }
         WalOp::RestoreOperatorClass(payload) => {
-            let (created_at, definition) = crate::wal::decode_operator_class_payload(payload)
+            let (identity, definition) = crate::wal::decode_operator_class_payload(payload)
                 .ok_or_else(|| {
                     sql_err!(
                         sqlstate::DATA_EXCEPTION,
                         "journal operator-class definition is corrupt"
                     )
                 })?;
-            storage.replay_set_operator_class(created_at, definition)?;
+            storage.replay_set_operator_class(identity, definition)?;
         }
         WalOp::DropOperatorClass { schema, name } => {
             let slot = storage
@@ -23485,19 +23516,17 @@ fn apply_wal_op(
             storage.commit_tablespace_drop(slot);
         }
         WalOp::CreateAccessMethod {
-            created_at,
+            identity,
             name,
             handler,
         } => {
-            let slot = storage.create_access_method(
-                created_at,
+            storage.replay_access_method(
+                identity,
                 crate::storage::AccessMethodDefinition {
                     name: crate::storage::SqlName::parse(name)?,
                     handler,
                 },
-                0,
             )?;
-            storage.commit_access_method_create(slot);
         }
         WalOp::DropAccessMethod { name } => {
             let slot = storage.access_method_slot(name, 0).ok_or_else(|| {

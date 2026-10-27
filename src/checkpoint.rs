@@ -213,7 +213,7 @@ fn parse_writer_fence(bytes: &[u8]) -> Result<(&str, WriterToken), &'static str>
     Ok((state, token))
 }
 
-pub(crate) const MANIFEST_HEADER: &str = "pos3ql-manifest-v32";
+pub(crate) const MANIFEST_HEADER: &str = "pos3ql-manifest-v33";
 
 struct ManifestMetadata {
     lsn: u64,
@@ -3834,21 +3834,21 @@ impl Checkpointer {
                 }
                 Some("am") => {
                     finish_pending(storage, &mut slot_of, &mut pending_def)?;
-                    let created_at: u64 = parse_field(words.next(), "access method sequence")?;
+                    let identity = parse_catalog_position(&mut words, metadata.catalog_sequence)?;
                     let name = decode_hex_name(
                         words
                             .next()
                             .ok_or(CheckpointSetupError::Corrupt("access method name missing"))?,
                     )?;
                     let handler: u8 = parse_field(words.next(), "access method handler")?;
-                    if words.next().is_some() || created_at == 0 {
+                    if words.next().is_some() {
                         return Err(CheckpointSetupError::Corrupt(
                             "invalid access method record",
                         ));
                     }
-                    let slot = storage
-                        .create_access_method(
-                            created_at,
+                    storage
+                        .replay_access_method(
+                            identity,
                             crate::storage::AccessMethodDefinition {
                                 name: sql_name(&name)?,
                                 handler: crate::storage::TableAccessMethodHandler::from_code(
@@ -3858,7 +3858,6 @@ impl Checkpointer {
                                     CheckpointSetupError::Corrupt("invalid access method handler"),
                                 )?,
                             },
-                            0,
                         )
                         .map_err(|error| {
                             CheckpointSetupError::ObjectStore(format!(
@@ -3866,7 +3865,6 @@ impl Checkpointer {
                                 error.message.as_str()
                             ))
                         })?;
-                    storage.commit_access_method_create(slot);
                 }
                 Some("table2") => {
                     finish_pending(storage, &mut slot_of, &mut pending_def)?;
@@ -6538,7 +6536,7 @@ impl Checkpointer {
                 }
                 Some("cst") => {
                     finish_pending(storage, &mut slot_of, &mut pending_def)?;
-                    let created_at = parse_field(words.next(), "cast created_at")?;
+                    let identity = parse_catalog_position(&mut words, metadata.catalog_sequence)?;
                     let source = manifest_routine_result(&mut words)?;
                     let target = manifest_routine_result(&mut words)?;
                     let method_code: u8 = parse_field(words.next(), "cast method")?;
@@ -6560,15 +6558,18 @@ impl Checkpointer {
                         return Err(CheckpointSetupError::Corrupt("trailing cast fields"));
                     }
                     storage
-                        .create_cast_from_image(crate::storage::CastDef {
-                            database: crate::storage::DatabaseOid::POSTGRES,
-                            created_at,
-                            source,
-                            target,
-                            method,
-                            context,
-                            ddl_state: crate::storage::CatalogDdlState::Absent,
-                        })
+                        .create_cast_from_image(
+                            identity,
+                            crate::storage::CastDef {
+                                database: crate::storage::DatabaseOid::POSTGRES,
+                                created_at: identity.created_at(),
+                                source,
+                                target,
+                                method,
+                                context,
+                                ddl_state: crate::storage::CatalogDdlState::Absent,
+                            },
+                        )
                         .map_err(|error| {
                             CheckpointSetupError::ObjectStore(format!(
                                 "manifest cast rejected: {}",
@@ -6956,7 +6957,7 @@ impl Checkpointer {
                 }
                 Some("opr") => {
                     finish_pending(storage, &mut slot_of, &mut pending_def)?;
-                    let created_at = parse_field(words.next(), "operator created_at")?;
+                    let identity = parse_catalog_position(&mut words, metadata.catalog_sequence)?;
                     let schema =
                         sql_name(&decode_hex_name(words.next().ok_or(
                             CheckpointSetupError::Corrupt("operator schema missing"),
@@ -7003,7 +7004,7 @@ impl Checkpointer {
                     };
                     storage
                         .replay_set_operator(
-                            created_at,
+                            identity,
                             crate::storage::OperatorDefinition {
                                 schema,
                                 name,
@@ -7061,7 +7062,11 @@ impl Checkpointer {
                     definition.negator = linked(negator_oid)?;
                     let created_at = storage.operator(slot).created_at;
                     storage
-                        .replay_set_operator(created_at, definition)
+                        .replay_set_operator(
+                            crate::storage::CatalogPosition::new(slot, created_at)
+                                .expect("admitted executable catalog position"),
+                            definition,
+                        )
                         .map_err(|error| {
                             CheckpointSetupError::ObjectStore(format!(
                                 "manifest operator links rejected: {}",
@@ -7071,7 +7076,7 @@ impl Checkpointer {
                 }
                 Some("opf") => {
                     finish_pending(storage, &mut slot_of, &mut pending_def)?;
-                    let created_at = parse_field(words.next(), "operator family created_at")?;
+                    let identity = parse_catalog_position(&mut words, metadata.catalog_sequence)?;
                     let schema = sql_name(&decode_hex_name(words.next().ok_or(
                         CheckpointSetupError::Corrupt("operator family schema missing"),
                     )?)?)?;
@@ -7092,7 +7097,7 @@ impl Checkpointer {
                     }
                     storage
                         .replay_set_operator_family(
-                            created_at,
+                            identity,
                             crate::storage::OperatorFamilyDefinition {
                                 schema,
                                 name,
@@ -7129,7 +7134,7 @@ impl Checkpointer {
                         let left = manifest_routine_result(&mut words)?;
                         let right = manifest_routine_result(&mut words)?;
                         let operator_oid = parse_field(words.next(), "operator family operator")?;
-                        if storage.operator_slot_by_oid(operator_oid, 0).is_none() {
+                        if storage.operator_contract(operator_oid, 0).is_none() {
                             return Err(CheckpointSetupError::Corrupt(
                                 "operator family operator missing",
                             ));
@@ -7178,7 +7183,11 @@ impl Checkpointer {
                     }
                     let created_at = storage.operator_family(family_slot).created_at;
                     storage
-                        .replay_set_operator_family(created_at, definition)
+                        .replay_set_operator_family(
+                            crate::storage::CatalogPosition::new(family_slot, created_at)
+                                .expect("admitted executable catalog position"),
+                            definition,
+                        )
                         .map_err(|error| {
                             CheckpointSetupError::ObjectStore(format!(
                                 "manifest operator family member rejected: {}",
@@ -7188,7 +7197,7 @@ impl Checkpointer {
                 }
                 Some("opc") => {
                     finish_pending(storage, &mut slot_of, &mut pending_def)?;
-                    let created_at = parse_field(words.next(), "operator class created_at")?;
+                    let identity = parse_catalog_position(&mut words, metadata.catalog_sequence)?;
                     let schema = sql_name(&decode_hex_name(words.next().ok_or(
                         CheckpointSetupError::Corrupt("operator class schema missing"),
                     )?)?)?;
@@ -7227,7 +7236,7 @@ impl Checkpointer {
                     }
                     storage
                         .replay_set_operator_class(
-                            created_at,
+                            identity,
                             crate::storage::OperatorClassDefinition {
                                 schema,
                                 name,
@@ -7269,7 +7278,7 @@ impl Checkpointer {
                         let left = manifest_routine_result(&mut words)?;
                         let right = manifest_routine_result(&mut words)?;
                         let operator = parse_field(words.next(), "operator class operator")?;
-                        if storage.operator_slot_by_oid(operator, 0).is_none() {
+                        if storage.operator_contract(operator, 0).is_none() {
                             return Err(CheckpointSetupError::Corrupt(
                                 "operator class operator missing",
                             ));
@@ -7318,7 +7327,11 @@ impl Checkpointer {
                     }
                     let created_at = storage.operator_class(class_slot).created_at;
                     storage
-                        .replay_set_operator_class(created_at, definition)
+                        .replay_set_operator_class(
+                            crate::storage::CatalogPosition::new(class_slot, created_at)
+                                .expect("admitted executable catalog position"),
+                            definition,
+                        )
                         .map_err(|error| {
                             CheckpointSetupError::ObjectStore(format!(
                                 "manifest operator class member rejected: {}",
@@ -10094,7 +10107,7 @@ impl Checkpointer {
             writeln!(&mut self.manifest_output).map_err(|_| manifest_full())?;
         }
         write_manifest(&mut self.manifest_output, "types_end")?;
-        for (_, method) in storage.checkpoint_access_methods() {
+        for (slot, method) in storage.checkpoint_access_methods() {
             write_database_context(
                 &mut self.manifest_output,
                 &mut database_context,
@@ -10108,7 +10121,8 @@ impl Checkpointer {
             write_manifest(
                 &mut self.manifest_output,
                 format_args!(
-                    "am {} {} {}",
+                    "am {} {} {} {}",
+                    slot,
                     method.created_at,
                     name.as_str(),
                     method.definition.handler.code(),
@@ -11541,7 +11555,7 @@ impl Checkpointer {
                 ),
             )?;
         }
-        for (_, cast) in storage.checkpoint_casts() {
+        for (slot, cast) in storage.checkpoint_casts() {
             write_database_context(
                 &mut self.manifest_output,
                 &mut database_context,
@@ -11554,7 +11568,8 @@ impl Checkpointer {
             write_manifest(
                 &mut self.manifest_output,
                 format_args!(
-                    "cst {} {} {} {} {} {}",
+                    "cst {} {} {} {} {} {} {}",
+                    slot,
                     cast.created_at,
                     ManifestRoutineResult(cast.source),
                     ManifestRoutineResult(cast.target),
@@ -11718,7 +11733,7 @@ impl Checkpointer {
                 ),
             )?;
         }
-        for (_, operator) in storage.checkpoint_operators() {
+        for (slot, operator) in storage.checkpoint_operators() {
             write_database_context(
                 &mut self.manifest_output,
                 &mut database_context,
@@ -11741,7 +11756,8 @@ impl Checkpointer {
             write_manifest(
                 &mut self.manifest_output,
                 format_args!(
-                    "opr {} {} {} {} {} {} {} {} {} {} {} {} {}",
+                    "opr {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
+                    slot,
                     operator.created_at,
                     ManifestName(definition.schema.as_str()),
                     ManifestName(definition.name.as_str()),
@@ -11780,7 +11796,7 @@ impl Checkpointer {
                 ),
             )?;
         }
-        for (_, family) in storage.checkpoint_operator_families() {
+        for (slot, family) in storage.checkpoint_operator_families() {
             write_database_context(
                 &mut self.manifest_output,
                 &mut database_context,
@@ -11790,7 +11806,8 @@ impl Checkpointer {
             write_manifest(
                 &mut self.manifest_output,
                 format_args!(
-                    "opf {} {} {} {}",
+                    "opf {} {} {} {} {}",
+                    slot,
                     family.created_at,
                     ManifestName(definition.schema.as_str()),
                     ManifestName(definition.name.as_str()),
@@ -11823,7 +11840,7 @@ impl Checkpointer {
                 )?;
             }
         }
-        for (_, class) in storage.checkpoint_operator_classes() {
+        for (slot, class) in storage.checkpoint_operator_classes() {
             write_database_context(
                 &mut self.manifest_output,
                 &mut database_context,
@@ -11833,7 +11850,8 @@ impl Checkpointer {
             write_manifest(
                 &mut self.manifest_output,
                 format_args!(
-                    "opc {} {} {} {} {} {} {} {}",
+                    "opc {} {} {} {} {} {} {} {} {}",
+                    slot,
                     class.created_at,
                     ManifestName(definition.schema.as_str()),
                     ManifestName(definition.name.as_str()),
@@ -19890,7 +19908,7 @@ mod stored_dependency_tests {
             )
             .unwrap();
         let manifest = format!(
-            "pos3ql-manifest-v32\nlsn 7\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nvix 0 1 0 0 - {} 1 7\ntypes_end\nend\n",
+            "pos3ql-manifest-v33\nlsn 7\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nvix 0 1 0 0 - {} 1 7\ntypes_end\nend\n",
             index_gc_hex(old.roster)
         );
         // Two backups and two readers share the same graph at the four-block limit.
@@ -20345,7 +20363,7 @@ mod stored_dependency_tests {
                     let mut budget = Budget::new(bytes);
                     let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
                     let mut checkpointer = Checkpointer::new(&config, &mut budget).unwrap();
-                    let mut manifest = String::from("pos3ql-manifest-v32\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\ntypes_end\n");
+                    let mut manifest = String::from("pos3ql-manifest-v33\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\ntypes_end\n");
                     for (oid, name) in [(first_oid, first_name), (second_oid, second_name)] {
                         let encoded = name
                             .as_bytes()
@@ -20371,7 +20389,7 @@ mod stored_dependency_tests {
                     let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
                     let mut checkpointer = Checkpointer::new(&config, &mut budget).unwrap();
                     assert!(matches!(checkpointer.load_manifest_text(&mut storage,
-                        "pos3ql-manifest-v32\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nsset 73616d706c65 6669727374\nsset 73616d706c65 7365636f6e64\ntypes_end\nend\n"),
+                        "pos3ql-manifest-v33\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nsset 73616d706c65 6669727374\nsset 73616d706c65 7365636f6e64\ntypes_end\nend\n"),
                         Err(CheckpointSetupError::Corrupt("duplicate system setting record"))));
                     assert_eq!(storage.system_settings().find(|(_, image)| image.live).unwrap().1
                         .value.as_str(), "first");
@@ -20380,7 +20398,7 @@ mod stored_dependency_tests {
                     let mut budget = Budget::new(bytes);
                     let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
                     let mut checkpointer = Checkpointer::new(&config, &mut budget).unwrap();
-                    let manifest = format!("pos3ql-manifest-v32\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nptx 10 1 2 0 5 10 6669727374\nptx {transaction_id} 1 2 0 5 10 {gid}\ntypes_end\nend\n");
+                    let manifest = format!("pos3ql-manifest-v33\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nptx 10 1 2 0 5 10 6669727374\nptx {transaction_id} 1 2 0 5 10 {gid}\ntypes_end\nend\n");
                     match checkpointer.load_manifest_text(&mut storage, &manifest) {
                         Err(CheckpointSetupError::ObjectStore(message)) => {
                             assert!(message.contains("duplicate prepared transaction catalog identity"));
@@ -20555,7 +20573,8 @@ mod stored_dependency_tests {
                 "pos3ql-manifest-v29",
                 "pos3ql-manifest-v30",
                 "pos3ql-manifest-v31",
-                "pos3ql-manifest-v32 trailing",
+                "pos3ql-manifest-v32",
+                "pos3ql-manifest-v33 trailing",
             ] {
                 let rejected = stack_format!(512, "{header}\n{body}");
                 assert!(matches!(
@@ -20637,11 +20656,11 @@ mod stored_dependency_tests {
 
     #[test]
     fn backup_commit_floor_includes_prepared_transactions_and_logical_slots() {
-        let manifest = b"pos3ql-manifest-v32\nlsn 100\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nptx 7 41 50 0 5 10 78\nrslot 736c6f74 60 70 0\ntypes_end\nend\n";
+        let manifest = b"pos3ql-manifest-v33\nlsn 100\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nptx 7 41 50 0 5 10 78\nrslot 736c6f74 60 70 0\ntypes_end\nend\n";
         assert_eq!(manifest_lsn(manifest).unwrap(), 100);
         assert_eq!(manifest_commit_retention_floor(manifest).unwrap(), 40);
 
-        let slot_only = b"pos3ql-manifest-v32\nlsn 100\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nrslot 736c6f74 60 70 0\ntypes_end\nend\n";
+        let slot_only = b"pos3ql-manifest-v33\nlsn 100\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nrslot 736c6f74 60 70 0\ntypes_end\nend\n";
         assert_eq!(manifest_commit_retention_floor(slot_only).unwrap(), 60);
     }
 
@@ -21003,7 +21022,7 @@ mod stored_dependency_tests {
         let mut manifest = FixedBuf::new(&mut budget, "manifest", 1024).unwrap();
         manifest
             .append(
-                b"pos3ql-manifest-v32\nlsn 7\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\ntypes_end\nend\n",
+                b"pos3ql-manifest-v33\nlsn 7\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\ntypes_end\nend\n",
             );
         let before = manifest.readable().to_vec();
         retag_manifest_root(&mut manifest, replacement).unwrap();

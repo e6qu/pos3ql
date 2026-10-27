@@ -210,7 +210,8 @@ Renames preserve object identity; drop and recreate reserve fresh identities
 for relations, row/array types, named types, enum members, indexes, CHECK,
 foreign-key and NOT NULL constraints, statistics, extensions, foreign-data
 wrappers, servers, user mappings, publications, subscriptions, collations,
-conversions, and text-search parsers, templates, dictionaries and configurations.
+conversions, text-search parsers, templates, dictionaries and configurations, casts,
+operators, operator families, operator classes, access methods and event triggers.
 Removing an earlier column or rule does not renumber survivors. Foreign-key triggers retain
 their constraint links. `ADD CONSTRAINT ... USING INDEX` preserves the existing
 index identifier. Database-template copies preserve database-local identifiers, foreign-wrapper,
@@ -226,6 +227,24 @@ CREATE TABLE orders(id integer);
 SELECT has_table_privilege(identity, 'SELECT') IS NULL FROM saved_order_identity;
 -- true: the old identifier does not grant access to the replacement
 ```
+
+DDL success follows its end-of-command event triggers. A hook that raises an
+error rolls the command back and keeps its notices, without sending a success
+tag first. Supported static DDL in a `DO` block or routine uses the same
+transactional path as dynamic `EXECUTE`. For example, a failing end hook for
+`DO 'BEGIN CREATE TABLE orders(id integer); END'` leaves no `orders` table
+and sends no successful `DO` tag. Internal comment cleanup during DROP does not become an extra
+COMMENT command in the event-trigger command list.
+
+User-defined operator classes and families can select modeled built-in operators
+and user operators by their exact argument types. Explicit `pg_catalog.<` selects
+the built-in comparison; an unqualified `<` follows the configured schema search
+order. Member contracts and recovered references use the same checks.
+
+Database-local identities may be the same in a template and its copy. Recovery
+keeps their edits separate: renaming an operator class in `reporting`, for example,
+cannot rename the original class in `template1`. Saved tables, indexes, comments
+and views in the copy keep their selected identifiers after loss of local caches.
 
 A resolved text comparison keeps its original collation's ordering and case
 mapping, even after that collation is dropped and its internal slot is reused.

@@ -18874,11 +18874,17 @@ fn parse_trigger_statement<'a>(
     {
         use crate::sql::lexer::{Lexer, Tok};
         let mut lexer = Lexer::new(segment, arena);
+        let first = lexer
+            .next_token()
+            .map_err(|error| super::parse_error_to_sql(&error.into()))?;
+        let second = lexer
+            .next_token()
+            .map_err(|error| super::parse_error_to_sql(&error.into()))?;
         // A utility starts with two words; assignment punctuation belongs to
         // the local-variable parser even when the variable is named alter.
         if matches!(
-            (lexer.next_token(), lexer.next_token()),
-            (Ok(Tok::Ident(_)), Ok(Tok::Ident(_) | Tok::QuotedIdent(_)))
+            (first, second),
+            (Tok::Ident(_), Tok::Ident(_) | Tok::QuotedIdent(_))
         ) {
             return Ok(TriggerStatement::Utility {
                 source: segment,
@@ -72635,6 +72641,45 @@ pub fn coltype_of_oid_pub(o: i32) -> Option<crate::sql::types::ColType> {
 mod tests {
     use super::*;
     use crate::mem::budget::Budget;
+
+    #[test]
+    fn event_trigger_static_utility_parse_preserves_lexical_errors() {
+        for (sql, capacity, message) in [
+            (
+                "CREATE TABLE orders(id integer)",
+                1,
+                "statement too large for SQL arena",
+            ),
+            (
+                "create \"unterminated",
+                4096,
+                "unterminated quoted identifier",
+            ),
+        ] {
+            let mut budget = Budget::new(8192);
+            let arena = Arena::new(&mut budget, "procedural utility parsing", capacity).unwrap();
+            let error = crate::mem::guard::forbid_alloc(|| {
+                parse_trigger_statement(sql, &arena, &[], false, PlpgsqlProgramKind::Anonymous)
+                    .err()
+                    .expect("invalid utility input must fail")
+            });
+            assert_eq!(error.sqlstate, sqlstate::SYNTAX_ERROR);
+            assert_eq!(error.message.as_str(), message);
+        }
+        let mut budget = Budget::new(8192);
+        let arena = Arena::new(&mut budget, "procedural assignment parsing", 4096).unwrap();
+        let statement = crate::mem::guard::forbid_alloc(|| {
+            parse_trigger_statement(
+                "alter := 1",
+                &arena,
+                &[],
+                false,
+                PlpgsqlProgramKind::Anonymous,
+            )
+            .unwrap()
+        });
+        assert!(matches!(statement, TriggerStatement::LocalAssign(_)));
+    }
 
     #[test]
     fn statement_row_replication_selection_rejects_another_transaction_without_recapture() {

@@ -13840,6 +13840,10 @@ pub(crate) struct TemporaryNamespaceIdentity {
 }
 
 impl TemporaryNamespaceIdentity {
+    pub(crate) fn connection_id(self) -> i32 {
+        self.connection
+    }
+
     pub(crate) fn oid(self) -> i32 {
         self.connection
             .checked_add(FIRST_TEMP_NAMESPACE_OID)
@@ -17509,33 +17513,17 @@ impl Storage {
         }
     }
 
-    pub(crate) fn temporary_namespace_for_connection(
+    pub(crate) fn find_temporary_namespace(
         &self,
-        connection: i32,
         transaction: u32,
+        matches: impl Fn(TemporaryNamespaceIdentity) -> bool,
     ) -> Option<TemporaryNamespaceIdentity> {
         self.temporary_transactions
             .lock()
             .expect("temporary transaction lock poisoned")
             .namespaces
             .iter()
-            .find(|namespace| {
-                namespace.visible_to(transaction) && namespace.identity.connection == connection
-            })
-            .map(|namespace| namespace.identity)
-    }
-
-    pub(crate) fn temporary_namespace_by_oid(
-        &self,
-        oid: i32,
-        transaction: u32,
-    ) -> Option<TemporaryNamespaceIdentity> {
-        self.temporary_transactions
-            .lock()
-            .expect("temporary transaction lock poisoned")
-            .namespaces
-            .iter()
-            .find(|namespace| namespace.visible_to(transaction) && namespace.identity.oid() == oid)
+            .find(|namespace| namespace.visible_to(transaction) && matches(namespace.identity))
             .map(|namespace| namespace.identity)
     }
 

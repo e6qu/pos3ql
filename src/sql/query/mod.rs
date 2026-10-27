@@ -4377,7 +4377,12 @@ fn privilege_relation_oid(
         ));
     }
     if let Some(schema) = parsed.schema.as_ref() {
-        if super::catalog::schema_oid_by_name(storage, transaction, schema.as_str()).is_none() {
+        let schema_exists = if schema.as_str() == "pg_temp" {
+            super::catalog::current_temporary_namespace_oid(storage, transaction) != 0
+        } else {
+            super::catalog::schema_oid_by_name(storage, transaction, schema.as_str()).is_some()
+        };
+        if !schema_exists {
             return Err(sql_err!(
                 sqlstate::INVALID_SCHEMA_NAME,
                 r#"schema "{}" does not exist"#,

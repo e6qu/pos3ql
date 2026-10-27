@@ -11859,7 +11859,15 @@ fn session_discard_namespace_follows_creation_rollback_and_connection_lifetime()
                 data_rows(&session.success(&mut engine, "SELECT pg_my_temp_schema()", true))[0]
                     .clone();
             session.success(&mut engine, drop, true);
-            assert_eq!(data_rows(&session.success(&mut engine, &format!("SELECT pg_my_temp_schema() = {namespace}; SELECT 'pg_temp'::regnamespace::oid = {namespace}; SELECT nspowner = 10 FROM pg_namespace WHERE oid = {namespace}"), true)), ["t", "t", "t"]);
+            assert_eq!(data_rows(&session.success(&mut engine, &format!("SELECT pg_my_temp_schema() = {namespace}; SELECT nspname::regnamespace::oid = {namespace}, nspowner = 10 FROM pg_namespace WHERE oid = {namespace}"), true)), ["t", "t|t"]);
+            assert_eq!(
+                error_sqlstates(&session.execute(
+                    &mut engine,
+                    "SELECT 'pg_temp'::regnamespace",
+                    true
+                )),
+                ["3F000"]
+            );
             assert_eq!(data_rows(&peer.success(&mut engine, &format!("SELECT pg_my_temp_schema() = 0, pg_is_other_temp_schema({namespace}); SELECT 'pg_temp_1'::regnamespace::oid = {namespace}"), true)), ["t|t", "t"]);
             assert_eq!(
                 command_tags(&session.success(&mut engine, "DISCARD TEMP", true)),
@@ -70895,7 +70903,7 @@ fn relation_persistence_is_typed_session_scoped_and_transactional() {
             &mut engine,
             &mut budget,
             11,
-            "SELECT pg_my_temp_schema() = 'pg_temp'::regnamespace",
+            "SELECT nspname::regnamespace::oid = pg_my_temp_schema() FROM pg_namespace WHERE oid = pg_my_temp_schema()",
         )),
         ["t"]
     );

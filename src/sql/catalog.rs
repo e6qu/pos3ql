@@ -10701,12 +10701,16 @@ fn namespace_oid(storage: &Storage, schema: &str, txid: u32) -> i32 {
 
 pub(crate) fn current_temporary_namespace_oid(storage: &Storage, txid: u32) -> i32 {
     storage
-        .temporary_namespace_for_connection(storage.current_connection_id(), txid)
+        .find_temporary_namespace(txid, |namespace| {
+            namespace.connection_id() == storage.current_connection_id()
+        })
         .map_or(0, crate::storage::TemporaryNamespaceIdentity::oid)
 }
 
 pub(crate) fn is_other_temporary_namespace(storage: &Storage, txid: u32, oid: i32) -> bool {
-    storage.temporary_namespace_by_oid(oid, txid).is_some()
+    storage
+        .find_temporary_namespace(txid, |namespace| namespace.oid() == oid)
+        .is_some()
         && current_temporary_namespace_oid(storage, txid) != oid
 }
 
@@ -10720,7 +10724,7 @@ pub(crate) fn schema_name_by_oid(
         PG_TOAST_NS_OID => crate::storage::SqlName::parse("pg_toast").ok(),
         INFORMATION_SCHEMA_NS_OID => crate::storage::SqlName::parse("information_schema").ok(),
         _ => storage
-            .temporary_namespace_by_oid(oid, txid)
+            .find_temporary_namespace(txid, |namespace| namespace.oid() == oid)
             .map(crate::storage::TemporaryNamespaceIdentity::name)
             .or_else(|| {
                 storage
@@ -10736,12 +10740,14 @@ pub(crate) fn schema_oid_by_name(storage: &Storage, txid: u32, name: &str) -> Op
         "pg_catalog" => Some(PG_CATALOG_NS_OID),
         "pg_toast" => Some(PG_TOAST_NS_OID),
         "information_schema" => Some(INFORMATION_SCHEMA_NS_OID),
-        "pg_temp" => (current_temporary_namespace_oid(storage, txid) != 0)
-            .then(|| current_temporary_namespace_oid(storage, txid)),
         _ if name.starts_with("pg_temp_") => name[8..]
             .parse::<i32>()
             .ok()
-            .and_then(|connection| storage.temporary_namespace_for_connection(connection, txid))
+            .and_then(|connection| {
+                storage.find_temporary_namespace(txid, |namespace| {
+                    namespace.connection_id() == connection
+                })
+            })
             .map(crate::storage::TemporaryNamespaceIdentity::oid),
         _ => storage
             .find_schema_visible(name, txid)
@@ -10750,36 +10756,16 @@ pub(crate) fn schema_oid_by_name(storage: &Storage, txid: u32, name: &str) -> Op
 }
 
 pub(crate) fn schema_oid_by_written(storage: &Storage, txid: u32, written: &str) -> Option<i32> {
-    for name in [
-        "public",
-        "pg_catalog",
-        "pg_toast",
-        "information_schema",
-        "pg_temp",
-    ] {
+    for name in ["public", "pg_catalog", "pg_toast", "information_schema"] {
         if identifier_spelling_matches(written, name) {
             return schema_oid_by_name(storage, txid, name);
         }
     }
-    if let Some(name) = (0..storage.table_count())
-        .find_map(|slot| {
-            let table = storage.table_def(slot, txid);
-            (storage.table_slot_visible_to(slot, txid)
-                && table.persistence == crate::storage::RelationPersistence::Temporary
-                && identifier_spelling_matches(written, table.schema.as_str()))
-            .then_some(table.schema)
-        })
-        .or_else(|| {
-            (0..storage.sequence_count()).find_map(|slot| {
-                let sequence = storage.sequence_for(slot, txid);
-                (storage.sequence_slot_visible_to(slot, txid)
-                    && sequence.persistence == crate::storage::RelationPersistence::Temporary
-                    && identifier_spelling_matches(written, sequence.schema.as_str()))
-                .then_some(sequence.schema)
-            })
-        })
-    {
-        return schema_oid_by_name(storage, txid, name.as_str());
+    // pg_temp is a relation qualifier, not a catalog namespace name.
+    if let Some(namespace) = storage.find_temporary_namespace(txid, |namespace| {
+        identifier_spelling_matches(written, namespace.name().as_str())
+    }) {
+        return Some(namespace.oid());
     }
     storage.visible_schemas(txid).find_map(|(slot, schema)| {
         identifier_spelling_matches(written, schema.name.as_str())

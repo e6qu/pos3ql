@@ -7,8 +7,10 @@ ROLLBACK TO before_namespace;
 COMMIT;
 SELECT pg_my_temp_schema() = 0;
 CREATE TEMP VIEW cleanup_first AS SELECT 7 AS id;
-SELECT pg_my_temp_schema() <> 0,
-       'pg_temp'::regnamespace::oid = pg_my_temp_schema();
+SELECT pg_my_temp_schema() <> 0;
+SELECT 'pg_temp'::regnamespace;
+SELECT nspname::regnamespace::oid = pg_my_temp_schema()
+FROM pg_namespace WHERE oid = pg_my_temp_schema();
 SELECT nspowner = 10 FROM pg_namespace WHERE oid = pg_my_temp_schema();
 DROP VIEW cleanup_first;
 SELECT pg_my_temp_schema() <> 0;

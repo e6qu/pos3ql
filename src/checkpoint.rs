@@ -3834,29 +3834,21 @@ impl Checkpointer {
                 }
                 Some("am") => {
                     finish_pending(storage, &mut slot_of, &mut pending_def)?;
-                    let created_at: u64 = parse_field(words.next(), "access method sequence")?;
+                    let identity = parse_catalog_position(&mut words, metadata.catalog_sequence)?;
                     let name = decode_hex_name(
                         words
                             .next()
                             .ok_or(CheckpointSetupError::Corrupt("access method name missing"))?,
                     )?;
                     let handler: u8 = parse_field(words.next(), "access method handler")?;
-                    if words.next().is_some() || created_at == 0 {
+                    if words.next().is_some() {
                         return Err(CheckpointSetupError::Corrupt(
                             "invalid access method record",
                         ));
                     }
-                    let slot = storage
-                        .create_access_method(
-                            crate::storage::CatalogCreation::Restore(
-                                crate::storage::CatalogIdentity::require(created_at).map_err(
-                                    |_| {
-                                        CheckpointSetupError::Corrupt(
-                                            "invalid access method identity",
-                                        )
-                                    },
-                                )?,
-                            ),
+                    storage
+                        .replay_access_method(
+                            identity,
                             crate::storage::AccessMethodDefinition {
                                 name: sql_name(&name)?,
                                 handler: crate::storage::TableAccessMethodHandler::from_code(
@@ -3866,7 +3858,6 @@ impl Checkpointer {
                                     CheckpointSetupError::Corrupt("invalid access method handler"),
                                 )?,
                             },
-                            0,
                         )
                         .map_err(|error| {
                             CheckpointSetupError::ObjectStore(format!(
@@ -3874,7 +3865,6 @@ impl Checkpointer {
                                 error.message.as_str()
                             ))
                         })?;
-                    storage.commit_access_method_create(slot);
                 }
                 Some("table2") => {
                     finish_pending(storage, &mut slot_of, &mut pending_def)?;
@@ -6546,7 +6536,7 @@ impl Checkpointer {
                 }
                 Some("cst") => {
                     finish_pending(storage, &mut slot_of, &mut pending_def)?;
-                    let created_at = parse_field(words.next(), "cast created_at")?;
+                    let identity = parse_catalog_position(&mut words, metadata.catalog_sequence)?;
                     let source = manifest_routine_result(&mut words)?;
                     let target = manifest_routine_result(&mut words)?;
                     let method_code: u8 = parse_field(words.next(), "cast method")?;
@@ -6568,15 +6558,18 @@ impl Checkpointer {
                         return Err(CheckpointSetupError::Corrupt("trailing cast fields"));
                     }
                     storage
-                        .create_cast_from_image(crate::storage::CastDef {
-                            database: crate::storage::DatabaseOid::POSTGRES,
-                            created_at,
-                            source,
-                            target,
-                            method,
-                            context,
-                            ddl_state: crate::storage::CatalogDdlState::Absent,
-                        })
+                        .create_cast_from_image(
+                            identity,
+                            crate::storage::CastDef {
+                                database: crate::storage::DatabaseOid::POSTGRES,
+                                created_at: identity.created_at(),
+                                source,
+                                target,
+                                method,
+                                context,
+                                ddl_state: crate::storage::CatalogDdlState::Absent,
+                            },
+                        )
                         .map_err(|error| {
                             CheckpointSetupError::ObjectStore(format!(
                                 "manifest cast rejected: {}",
@@ -6964,7 +6957,7 @@ impl Checkpointer {
                 }
                 Some("opr") => {
                     finish_pending(storage, &mut slot_of, &mut pending_def)?;
-                    let created_at = parse_field(words.next(), "operator created_at")?;
+                    let identity = parse_catalog_position(&mut words, metadata.catalog_sequence)?;
                     let schema =
                         sql_name(&decode_hex_name(words.next().ok_or(
                             CheckpointSetupError::Corrupt("operator schema missing"),
@@ -7011,7 +7004,7 @@ impl Checkpointer {
                     };
                     storage
                         .replay_set_operator(
-                            created_at,
+                            identity,
                             crate::storage::OperatorDefinition {
                                 schema,
                                 name,
@@ -7069,7 +7062,11 @@ impl Checkpointer {
                     definition.negator = linked(negator_oid)?;
                     let created_at = storage.operator(slot).created_at;
                     storage
-                        .replay_set_operator(created_at, definition)
+                        .replay_set_operator(
+                            crate::storage::CatalogPosition::new(slot, created_at)
+                                .expect("admitted executable catalog position"),
+                            definition,
+                        )
                         .map_err(|error| {
                             CheckpointSetupError::ObjectStore(format!(
                                 "manifest operator links rejected: {}",
@@ -7079,7 +7076,7 @@ impl Checkpointer {
                 }
                 Some("opf") => {
                     finish_pending(storage, &mut slot_of, &mut pending_def)?;
-                    let created_at = parse_field(words.next(), "operator family created_at")?;
+                    let identity = parse_catalog_position(&mut words, metadata.catalog_sequence)?;
                     let schema = sql_name(&decode_hex_name(words.next().ok_or(
                         CheckpointSetupError::Corrupt("operator family schema missing"),
                     )?)?)?;
@@ -7100,7 +7097,7 @@ impl Checkpointer {
                     }
                     storage
                         .replay_set_operator_family(
-                            created_at,
+                            identity,
                             crate::storage::OperatorFamilyDefinition {
                                 schema,
                                 name,
@@ -7137,7 +7134,7 @@ impl Checkpointer {
                         let left = manifest_routine_result(&mut words)?;
                         let right = manifest_routine_result(&mut words)?;
                         let operator_oid = parse_field(words.next(), "operator family operator")?;
-                        if storage.operator_slot_by_oid(operator_oid, 0).is_none() {
+                        if storage.operator_contract(operator_oid, 0).is_none() {
                             return Err(CheckpointSetupError::Corrupt(
                                 "operator family operator missing",
                             ));
@@ -7186,7 +7183,11 @@ impl Checkpointer {
                     }
                     let created_at = storage.operator_family(family_slot).created_at;
                     storage
-                        .replay_set_operator_family(created_at, definition)
+                        .replay_set_operator_family(
+                            crate::storage::CatalogPosition::new(family_slot, created_at)
+                                .expect("admitted executable catalog position"),
+                            definition,
+                        )
                         .map_err(|error| {
                             CheckpointSetupError::ObjectStore(format!(
                                 "manifest operator family member rejected: {}",
@@ -7196,7 +7197,7 @@ impl Checkpointer {
                 }
                 Some("opc") => {
                     finish_pending(storage, &mut slot_of, &mut pending_def)?;
-                    let created_at = parse_field(words.next(), "operator class created_at")?;
+                    let identity = parse_catalog_position(&mut words, metadata.catalog_sequence)?;
                     let schema = sql_name(&decode_hex_name(words.next().ok_or(
                         CheckpointSetupError::Corrupt("operator class schema missing"),
                     )?)?)?;
@@ -7235,7 +7236,7 @@ impl Checkpointer {
                     }
                     storage
                         .replay_set_operator_class(
-                            created_at,
+                            identity,
                             crate::storage::OperatorClassDefinition {
                                 schema,
                                 name,
@@ -7277,7 +7278,7 @@ impl Checkpointer {
                         let left = manifest_routine_result(&mut words)?;
                         let right = manifest_routine_result(&mut words)?;
                         let operator = parse_field(words.next(), "operator class operator")?;
-                        if storage.operator_slot_by_oid(operator, 0).is_none() {
+                        if storage.operator_contract(operator, 0).is_none() {
                             return Err(CheckpointSetupError::Corrupt(
                                 "operator class operator missing",
                             ));
@@ -7326,7 +7327,11 @@ impl Checkpointer {
                     }
                     let created_at = storage.operator_class(class_slot).created_at;
                     storage
-                        .replay_set_operator_class(created_at, definition)
+                        .replay_set_operator_class(
+                            crate::storage::CatalogPosition::new(class_slot, created_at)
+                                .expect("admitted executable catalog position"),
+                            definition,
+                        )
                         .map_err(|error| {
                             CheckpointSetupError::ObjectStore(format!(
                                 "manifest operator class member rejected: {}",
@@ -10102,7 +10107,7 @@ impl Checkpointer {
             writeln!(&mut self.manifest_output).map_err(|_| manifest_full())?;
         }
         write_manifest(&mut self.manifest_output, "types_end")?;
-        for (_, method) in storage.checkpoint_access_methods() {
+        for (slot, method) in storage.checkpoint_access_methods() {
             write_database_context(
                 &mut self.manifest_output,
                 &mut database_context,
@@ -10116,7 +10121,8 @@ impl Checkpointer {
             write_manifest(
                 &mut self.manifest_output,
                 format_args!(
-                    "am {} {} {}",
+                    "am {} {} {} {}",
+                    slot,
                     method.created_at,
                     name.as_str(),
                     method.definition.handler.code(),
@@ -11549,7 +11555,7 @@ impl Checkpointer {
                 ),
             )?;
         }
-        for (_, cast) in storage.checkpoint_casts() {
+        for (slot, cast) in storage.checkpoint_casts() {
             write_database_context(
                 &mut self.manifest_output,
                 &mut database_context,
@@ -11562,7 +11568,8 @@ impl Checkpointer {
             write_manifest(
                 &mut self.manifest_output,
                 format_args!(
-                    "cst {} {} {} {} {} {}",
+                    "cst {} {} {} {} {} {} {}",
+                    slot,
                     cast.created_at,
                     ManifestRoutineResult(cast.source),
                     ManifestRoutineResult(cast.target),
@@ -11726,7 +11733,7 @@ impl Checkpointer {
                 ),
             )?;
         }
-        for (_, operator) in storage.checkpoint_operators() {
+        for (slot, operator) in storage.checkpoint_operators() {
             write_database_context(
                 &mut self.manifest_output,
                 &mut database_context,
@@ -11749,7 +11756,8 @@ impl Checkpointer {
             write_manifest(
                 &mut self.manifest_output,
                 format_args!(
-                    "opr {} {} {} {} {} {} {} {} {} {} {} {} {}",
+                    "opr {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
+                    slot,
                     operator.created_at,
                     ManifestName(definition.schema.as_str()),
                     ManifestName(definition.name.as_str()),
@@ -11788,7 +11796,7 @@ impl Checkpointer {
                 ),
             )?;
         }
-        for (_, family) in storage.checkpoint_operator_families() {
+        for (slot, family) in storage.checkpoint_operator_families() {
             write_database_context(
                 &mut self.manifest_output,
                 &mut database_context,
@@ -11798,7 +11806,8 @@ impl Checkpointer {
             write_manifest(
                 &mut self.manifest_output,
                 format_args!(
-                    "opf {} {} {} {}",
+                    "opf {} {} {} {} {}",
+                    slot,
                     family.created_at,
                     ManifestName(definition.schema.as_str()),
                     ManifestName(definition.name.as_str()),
@@ -11831,7 +11840,7 @@ impl Checkpointer {
                 )?;
             }
         }
-        for (_, class) in storage.checkpoint_operator_classes() {
+        for (slot, class) in storage.checkpoint_operator_classes() {
             write_database_context(
                 &mut self.manifest_output,
                 &mut database_context,
@@ -11841,7 +11850,8 @@ impl Checkpointer {
             write_manifest(
                 &mut self.manifest_output,
                 format_args!(
-                    "opc {} {} {} {} {} {} {} {}",
+                    "opc {} {} {} {} {} {} {} {} {}",
+                    slot,
                     class.created_at,
                     ManifestName(definition.schema.as_str()),
                     ManifestName(definition.name.as_str()),

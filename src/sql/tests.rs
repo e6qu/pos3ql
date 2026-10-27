@@ -1807,6 +1807,70 @@ fn catalog_lifetime_executable_objects_match_postgresql_in_both_modes() {
 }
 
 #[test]
+fn catalog_lifetime_operator_members_keep_qualified_names_and_boolean_contracts() {
+    let fixture =
+        include_str!("../../tests/external/differential/197_executable_catalog_lifetimes.sql");
+    let (setup, _) = fixture.split_once("-- mutation checks").unwrap();
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let config = catalog_lifetime_config(&format!("operator-member-contracts-{mode:?}"), mode);
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        for sql in setup
+            .split("\n\n")
+            .map(str::trim)
+            .filter(|sql| !sql.is_empty())
+        {
+            session.success(&mut engine, sql, true);
+        }
+        for sql in [
+            "CREATE DOMAIN lifetime_exec_boolean AS boolean",
+            "CREATE FUNCTION lifetime_exec_bool_result(integer,integer) RETURNS lifetime_exec_boolean LANGUAGE SQL IMMUTABLE RETURN ($1 = $2)::lifetime_exec_boolean",
+            "CREATE OPERATOR public.#=# (FUNCTION=lifetime_exec_bool_result, LEFTARG=integer, RIGHTARG=integer)",
+        ] {
+            session.success(&mut engine, sql, true);
+        }
+        for (sql, state, message) in [
+            (
+                "CREATE OPERATOR CLASS rejected_exec_domain_result FOR TYPE integer USING btree FAMILY lifetime_exec_family AS OPERATOR 3 public.#=#, FUNCTION 1 lifetime_exec_compare(integer,integer)",
+                "42P17",
+                "index search operators must return boolean",
+            ),
+            (
+                "CREATE OPERATOR CLASS rejected_exec_result FOR TYPE integer USING btree FAMILY lifetime_exec_family AS OPERATOR 3 pg_catalog.+, FUNCTION 1 lifetime_exec_compare(integer,integer)",
+                "42P17",
+                "index search operators must return boolean",
+            ),
+            (
+                "CREATE OPERATOR CLASS rejected_exec_schema FOR TYPE integer USING btree FAMILY lifetime_exec_family AS OPERATOR 3 lifetime_exec_moved.=, FUNCTION 1 lifetime_exec_compare(integer,integer)",
+                "42883",
+                "operator does not exist: integer lifetime_exec_moved.= integer",
+            ),
+        ] {
+            let output = session.execute(&mut engine, sql, true);
+            let expected = format!("M{message}\0");
+            assert!(
+                output
+                    .windows(expected.len())
+                    .any(|field| field == expected.as_bytes()),
+                "{sql}: {}",
+                String::from_utf8_lossy(&output)
+            );
+            assert_eq!(
+                error_sqlstates(&output),
+                [state],
+                "{sql}: {}",
+                String::from_utf8_lossy(&output)
+            );
+        }
+        assert_eq!(data_rows(&session.success(&mut engine, "SELECT count(*)=0 FROM pg_opclass WHERE opcname IN ('rejected_exec_domain_result','rejected_exec_result','rejected_exec_schema'); SELECT count(*)=2 FROM lifetime_exec_report WHERE same AND label='low-cast'", true)), ["t", "t"]);
+    }
+}
+
+#[test]
 fn catalog_lifetime_executable_exhaustion_keeps_declarations_private() {
     let fixture =
         include_str!("../../tests/external/differential/197_executable_catalog_lifetimes.sql");
@@ -1885,12 +1949,43 @@ fn catalog_lifetime_copied_executable_edits_stay_in_their_database_after_recover
                     .select_database(crate::storage::DatabaseOid::TEMPLATE1)
                     .unwrap();
                 let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
-                for sql in setup
+                let (prerequisites, objects) = setup.split_once("-- executable objects").unwrap();
+                for sql in prerequisites
                     .split("\n\n")
                     .map(str::trim)
                     .filter(|sql| !sql.is_empty())
                 {
                     session.success(&mut engine, sql, false);
+                }
+                for sql in [
+                    "CREATE ACCESS METHOD lifetime_exec_hole_heap TYPE TABLE HANDLER heap_tableam_handler",
+                    "CREATE CAST (lifetime_exec_value AS varchar) WITH INOUT",
+                    "CREATE OPERATOR ## (FUNCTION = lifetime_exec_same, LEFTARG = integer, RIGHTARG = integer)",
+                    "CREATE OPERATOR FAMILY lifetime_exec_hole_family USING btree",
+                    "CREATE OPERATOR CLASS lifetime_exec_hole_class FOR TYPE integer USING btree FAMILY lifetime_exec_hole_family AS OPERATOR 3 ##, FUNCTION 1 lifetime_exec_compare(integer, integer)",
+                    "CREATE EVENT TRIGGER lifetime_exec_hole_event ON ddl_command_end EXECUTE FUNCTION lifetime_exec_event()",
+                ] {
+                    session.success(&mut engine, sql, false);
+                }
+                for sql in objects
+                    .split("\n\n")
+                    .map(str::trim)
+                    .filter(|sql| !sql.is_empty())
+                {
+                    session.success(&mut engine, sql, false);
+                }
+                for sql in [
+                    "DROP OPERATOR CLASS lifetime_exec_hole_class USING btree",
+                    "DROP OPERATOR FAMILY lifetime_exec_hole_family USING btree",
+                    "DROP OPERATOR ## (integer, integer)",
+                    "DROP CAST (lifetime_exec_value AS varchar)",
+                    "DROP ACCESS METHOD lifetime_exec_hole_heap",
+                    "DROP EVENT TRIGGER lifetime_exec_hole_event",
+                ] {
+                    session.success(&mut engine, sql, false);
+                }
+                if checkpoint {
+                    assert!(engine.checkpoint().unwrap());
                 }
                 engine
                     .select_database(crate::storage::DatabaseOid::POSTGRES)
@@ -1915,9 +2010,6 @@ fn catalog_lifetime_copied_executable_edits_stay_in_their_database_after_recover
                     data_rows(&session.success(&mut engine, REPORT, false)),
                     ["t"]
                 );
-                if checkpoint {
-                    assert!(engine.checkpoint().unwrap());
-                }
                 for sql in [
                     "ALTER OPERATOR FAMILY lifetime_exec_family USING btree RENAME TO lifetime_exec_family_moved",
                     "ALTER OPERATOR CLASS lifetime_exec_class USING btree RENAME TO lifetime_exec_class_moved",

@@ -580,30 +580,44 @@ mod tests {
                 let mut cast = CastDef::EMPTY;
                 cast.created_at = birth;
                 assert_eq!(
-                    storage.create_cast_from_image(cast).unwrap_err().sqlstate,
-                    sqlstate::DATA_EXCEPTION
-                );
-                assert_eq!(
                     storage
-                        .replay_set_operator(birth, OperatorDefinition::EMPTY)
+                        .create_cast_from_image(CatalogPosition::new(0, 1).unwrap(), cast)
                         .unwrap_err()
                         .sqlstate,
                     sqlstate::DATA_EXCEPTION
                 );
-                assert_eq!(
-                    storage
-                        .replay_set_operator_family(birth, OperatorFamilyDefinition::EMPTY)
-                        .unwrap_err()
-                        .sqlstate,
-                    sqlstate::DATA_EXCEPTION
-                );
-                assert_eq!(
-                    storage
-                        .replay_set_operator_class(birth, OperatorClassDefinition::EMPTY)
-                        .unwrap_err()
-                        .sqlstate,
-                    sqlstate::DATA_EXCEPTION
-                );
+                if let Ok(identity) = CatalogPosition::new(0, birth) {
+                    assert_eq!(
+                        storage
+                            .replay_set_operator(identity, OperatorDefinition::EMPTY)
+                            .unwrap_err()
+                            .sqlstate,
+                        sqlstate::DATA_EXCEPTION
+                    );
+                    assert_eq!(
+                        storage
+                            .replay_set_operator_family(identity, OperatorFamilyDefinition::EMPTY)
+                            .unwrap_err()
+                            .sqlstate,
+                        sqlstate::DATA_EXCEPTION
+                    );
+                    assert_eq!(
+                        storage
+                            .replay_set_operator_class(identity, OperatorClassDefinition::EMPTY)
+                            .unwrap_err()
+                            .sqlstate,
+                        sqlstate::DATA_EXCEPTION
+                    );
+                    assert_eq!(
+                        storage
+                            .replay_access_method(identity, AccessMethodDefinition::EMPTY)
+                            .unwrap_err()
+                            .sqlstate,
+                        sqlstate::DATA_EXCEPTION
+                    );
+                } else {
+                    assert_eq!(birth, 0);
+                }
                 assert_eq!(
                     storage
                         .replay_event_trigger(0, birth, EventTriggerDefinition::EMPTY)

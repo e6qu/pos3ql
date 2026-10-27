@@ -228,6 +228,11 @@ SELECT has_table_privilege(identity, 'SELECT') IS NULL FROM saved_order_identity
 -- true: the old identifier does not grant access to the replacement
 ```
 
+User-defined operator classes and families can select modeled built-in operators
+and user operators by their exact argument types. Explicit `pg_catalog.<` selects
+the built-in comparison; an unqualified `<` follows the configured schema search
+order. Member contracts and recovered references use the same checks.
+
 Database-local identities may be the same in a template and its copy. Recovery
 keeps their edits separate: renaming an operator class in `reporting`, for example,
 cannot rename the original class in `template1`. Saved tables, indexes, comments

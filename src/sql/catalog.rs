@@ -4379,8 +4379,8 @@ pub(crate) fn intrinsic_record_field(
     ))
 }
 
-/// PostgreSQL 18.4 operator OIDs for the evaluator's scalar integer core.
-/// The resolver deliberately exposes only operations the engine evaluates;
+/// Modeled PostgreSQL operator contracts; scalar entries were first checked
+/// against 18.4. The resolver exposes only operations the engine evaluates;
 /// unsupported operator catalog entries remain explicit errors, never fake
 /// catalog rows.
 #[derive(Clone, Copy)]
@@ -13014,6 +13014,112 @@ pub(crate) fn operator_oid_by_name(
         }
     }
     Ok(None)
+}
+
+/// Exact operator contracts used by executable catalog declarations.
+pub(crate) fn builtin_operator_contract(
+    oid: i32,
+) -> Option<(crate::storage::OperatorSignature, ColType)> {
+    CATALOG_OPERATORS.iter().find_map(|operator| {
+        (operator.oid == oid).then_some((
+            crate::storage::OperatorSignature {
+                left: operator.left.map(crate::storage::RoutineResult::builtin),
+                right: operator.right.map(crate::storage::RoutineResult::builtin),
+            },
+            operator.result,
+        ))
+    })
+}
+
+pub(crate) fn operator_oid_for_signature(
+    storage: &Storage,
+    txid: u32,
+    name: crate::sql::ast::QualName<'_>,
+    signature: crate::storage::OperatorSignature,
+) -> Result<i32, SqlError> {
+    let missing = || {
+        use core::fmt::Write;
+        let mut message = StackStr::<1024>::from_str("operator does not exist: ");
+        if let Some(left) = signature.left {
+            let qualified = left
+                .user_type
+                .is_some_and(|identity| !storage.schema_is_on_path(identity.schema, txid));
+            write_routine_type_name(&mut message, left.ctype, left.user_type, qualified)
+                .expect("bounded operator type");
+            message
+                .write_char(' ')
+                .expect("bounded operator diagnostic");
+        }
+        if let Some(schema) = name.schema {
+            write_identifier(&mut message, schema);
+            message
+                .write_char('.')
+                .expect("bounded operator diagnostic");
+        }
+        message
+            .write_str(name.name)
+            .expect("bounded operator diagnostic");
+        if let Some(right) = signature.right {
+            message
+                .write_char(' ')
+                .expect("bounded operator diagnostic");
+            let qualified = right
+                .user_type
+                .is_some_and(|identity| !storage.schema_is_on_path(identity.schema, txid));
+            write_routine_type_name(&mut message, right.ctype, right.user_type, qualified)
+                .expect("bounded operator type");
+        }
+        sql_err!(sqlstate::UNDEFINED_FUNCTION, "{}", message.as_str())
+    };
+    let builtin = || {
+        CATALOG_OPERATORS.iter().find_map(|operator| {
+            let declared = crate::storage::OperatorSignature {
+                left: operator.left.map(crate::storage::RoutineResult::builtin),
+                right: operator.right.map(crate::storage::RoutineResult::builtin),
+            };
+            (operator.name == name.name && declared == signature).then_some(operator.oid)
+        })
+    };
+    let type_oid = |argument: crate::storage::RoutineResult| {
+        storage
+            .routine_type_oid(argument.ctype, argument.user_type, txid)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "operator argument type does not exist"
+                )
+            })
+    };
+    let left = signature.left.map(type_oid).transpose()?;
+    let right = signature.right.map(type_oid).transpose()?;
+    let user = |schema: &str| -> Result<Option<i32>, SqlError> {
+        Ok(storage
+            .operator_slot_for_oids(Some(schema), name.name, left, right, txid)?
+            .map(|slot| storage.operator(slot).oid()))
+    };
+    if let Some(schema) = name.schema {
+        return if schema == "pg_catalog" {
+            builtin()
+        } else {
+            user(schema)?
+        }
+        .ok_or_else(missing);
+    }
+    for entry in storage.path().entries() {
+        let found = match entry {
+            crate::storage::PathEntry::Catalog => builtin(),
+            crate::storage::PathEntry::Schema(slot) => user(
+                storage
+                    .schema_def_for(usize::from(*slot), txid)
+                    .name
+                    .as_str(),
+            )?,
+        };
+        if let Some(oid) = found {
+            return Ok(oid);
+        }
+    }
+    Err(missing())
 }
 
 pub(crate) fn operator_oid_for_types(name: &str, left: ColType, right: ColType) -> Option<i32> {

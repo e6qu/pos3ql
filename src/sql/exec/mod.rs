@@ -29055,11 +29055,11 @@ fn resolve_function_slot_exact(
         })
 }
 
-fn resolve_operator_identity(
+fn resolve_operator_signature(
     storage: &Storage,
     txid: u32,
     identity: crate::sql::ast::OperatorIdentity<'_>,
-) -> Result<(usize, crate::storage::OperatorSignature), SqlError> {
+) -> Result<crate::storage::OperatorSignature, SqlError> {
     let (left, right) = match identity.operands {
         crate::sql::ast::OperatorOperands::Prefix(right) => {
             (None, Some(resolve_routine_type(storage, txid, right)?))
@@ -29069,7 +29069,17 @@ fn resolve_operator_identity(
             Some(resolve_routine_type(storage, txid, right)?),
         ),
     };
-    let signature = crate::storage::OperatorSignature { left, right };
+    Ok(crate::storage::OperatorSignature { left, right })
+}
+
+fn resolve_operator_identity(
+    storage: &Storage,
+    txid: u32,
+    identity: crate::sql::ast::OperatorIdentity<'_>,
+) -> Result<(usize, crate::storage::OperatorSignature), SqlError> {
+    let signature = resolve_operator_signature(storage, txid, identity)?;
+    let left = signature.left;
+    let right = signature.right;
     let left_oid = left
         .and_then(|argument| storage.routine_type_oid(argument.ctype, argument.user_type, txid));
     let right_oid = right
@@ -29340,7 +29350,15 @@ pub(crate) fn create_cast(
         }
     };
     let lsn = storage.bump_lsn();
-    if let Err(error) = wal.stage_reserved(txn.txid, lsn, &WalOp::SetCast(definition)) {
+    if let Err(error) = wal.stage_reserved(
+        txn.txid,
+        lsn,
+        &WalOp::SetCast {
+            identity: crate::storage::CatalogPosition::new(slot, definition.created_at)
+                .expect("admitted cast position"),
+            definition,
+        },
+    ) {
         storage.rollback_cast_create(slot);
         return sql_fail(error);
     }
@@ -29535,7 +29553,8 @@ fn operator_link_or_shell(
         txn.txid,
         lsn,
         &WalOp::SetOperator {
-            created_at,
+            identity: crate::storage::CatalogPosition::new(slot, created_at)
+                .expect("admitted executable catalog position"),
             definition: durable,
         },
     ) {
@@ -29683,7 +29702,8 @@ pub(crate) fn create_operator(
             txn.txid,
             lsn,
             &WalOp::SetOperator {
-                created_at,
+                identity: crate::storage::CatalogPosition::new(slot, created_at)
+                    .expect("admitted executable catalog position"),
                 definition: durable,
             },
         ) {
@@ -31595,7 +31615,8 @@ fn stage_operator(
         txn.txid,
         lsn,
         &WalOp::SetOperator {
-            created_at,
+            identity: crate::storage::CatalogPosition::new(slot, created_at)
+                .expect("admitted executable catalog position"),
             definition: durable,
         },
     ) {
@@ -31992,7 +32013,8 @@ pub(crate) fn create_operator_family(
         txn.txid,
         lsn,
         &WalOp::SetOperatorFamily {
-            created_at,
+            identity: crate::storage::CatalogPosition::new(slot, created_at)
+                .expect("admitted executable catalog position"),
             definition: &definition,
         },
     ) {
@@ -32081,7 +32103,9 @@ fn add_operator_family_members(
     for member in members {
         match *member {
             crate::sql::ast::OperatorFamilyMember::Operator { strategy, operator } => {
-                let (slot, signature) = resolve_operator_identity(storage, txid, operator)?;
+                let signature = resolve_operator_signature(storage, txid, operator)?;
+                let oid =
+                    catalog::operator_oid_for_signature(storage, txid, operator.name, signature)?;
                 let Some(left) = signature.left else {
                     return Err(sql_err!(
                         sqlstate::INVALID_OBJECT_DEFINITION,
@@ -32123,7 +32147,7 @@ fn add_operator_family_members(
                     strategy,
                     left,
                     right,
-                    operator: storage.operator(slot).oid(),
+                    operator: oid,
                 };
             }
             crate::sql::ast::OperatorFamilyMember::CompareFunction {
@@ -32274,7 +32298,8 @@ fn stage_operator_family(
         txn.txid,
         lsn,
         &WalOp::SetOperatorFamily {
-            created_at,
+            identity: crate::storage::CatalogPosition::new(slot, created_at)
+                .expect("admitted executable catalog position"),
             definition: &durable,
         },
     ) {
@@ -32477,7 +32502,8 @@ fn stage_operator_class(
         txn.txid,
         lsn,
         &WalOp::SetOperatorClass {
-            created_at,
+            identity: crate::storage::CatalogPosition::new(slot, created_at)
+                .expect("admitted executable catalog position"),
             definition: &durable,
         },
     ) {
@@ -32629,7 +32655,8 @@ pub(crate) fn create_operator_class(
             txn.txid,
             lsn,
             &WalOp::SetOperatorFamily {
-                created_at,
+                identity: crate::storage::CatalogPosition::new(slot, created_at)
+                    .expect("admitted executable catalog position"),
                 definition: &definition,
             },
         ) {
@@ -32665,8 +32692,10 @@ pub(crate) fn create_operator_class(
                         right: Some(input),
                     },
                 };
-                let slot = match operator_link_slot(storage, txn.txid, operator, signature) {
-                    Ok(slot) => slot,
+                let oid = match catalog::operator_oid_for_signature(
+                    storage, txn.txid, operator, signature,
+                ) {
+                    Ok(oid) => oid,
                     Err(error) => return sql_fail(error),
                 };
                 let left = signature.left.expect("btree class operator is binary");
@@ -32694,7 +32723,7 @@ pub(crate) fn create_operator_class(
                     strategy,
                     left,
                     right,
-                    operator: storage.operator(slot).oid(),
+                    operator: oid,
                 };
             }
             crate::sql::ast::OperatorClassMember::CompareFunction {
@@ -32786,7 +32815,8 @@ pub(crate) fn create_operator_class(
         txn.txid,
         lsn,
         &WalOp::SetOperatorClass {
-            created_at,
+            identity: crate::storage::CatalogPosition::new(slot, created_at)
+                .expect("admitted executable catalog position"),
             definition: &durable,
         },
     ) {
@@ -51184,7 +51214,6 @@ pub fn create_access_method(
         Err(error) => return sql_fail(error),
     };
     let slot = match storage.create_access_method(
-        crate::storage::CatalogCreation::New,
         crate::storage::AccessMethodDefinition { name, handler },
         txn.txid,
     ) {
@@ -51201,7 +51230,8 @@ pub fn create_access_method(
         txn.txid,
         lsn,
         &WalOp::CreateAccessMethod {
-            created_at,
+            identity: crate::storage::CatalogPosition::new(slot, created_at)
+                .expect("admitted executable catalog position"),
             name: name.as_str(),
             handler,
         },

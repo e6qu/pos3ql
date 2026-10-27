@@ -751,10 +751,18 @@ identifiers add a checked creation stamp (1–9,999,999) to bases 720,000,000,
 740,000,000, 760,000,000, 780,000,000, 800,000,000 and 820,000,000 respectively.
 Creation rejects counter exhaustion with `54000` before publishing a root;
 restoration rejects invalid or unreserved stamps with `22000`. Access-method
-restoration requires a checked identity explicitly, rather than a zero sentinel.
+creation and restoration are separate entry points; restoration requires an
+explicit checked position rather than a zero sentinel.
 Stored index classes, table handlers and operator dependencies reject identifiers
 outside their own family range. Recovery validates saved table-handler and index-
 class references, including private table definitions, before writer promotion.
+
+Manifest `am`, `cst`, `opr`, `opf` and `opc` headers retain physical position
+before creation stamp; event-trigger headers already retain both. Journal
+access-method, cast, operator, family and class images use the shared ten-byte
+position (two-byte slot, eight-byte creation stamp). Restore never substitutes
+an available slot for the saved one. This preserves holes left by DROP, so a
+later database-copy record can safely reuse those holes after checkpoint recovery.
 
 Database-copy inventory kinds 20–25 retain exact positions for casts, access
 methods, event triggers, operators, operator families and operator classes in

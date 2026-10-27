@@ -19,7 +19,7 @@ CREATE OPERATOR === (FUNCTION = lifetime_exec_same, LEFTARG = integer, RIGHTARG 
 
 CREATE OPERATOR FAMILY lifetime_exec_family USING btree;
 
-CREATE OPERATOR CLASS lifetime_exec_class FOR TYPE integer USING btree FAMILY lifetime_exec_family AS OPERATOR 1 <, OPERATOR 2 <=, OPERATOR 3 ===, OPERATOR 4 >=, OPERATOR 5 >, FUNCTION 1 lifetime_exec_compare(integer, integer);
+CREATE OPERATOR CLASS lifetime_exec_class FOR TYPE integer USING btree FAMILY lifetime_exec_family AS OPERATOR 1 pg_catalog.<, OPERATOR 2 pg_catalog.<=, OPERATOR 3 ===, OPERATOR 4 pg_catalog.>=, OPERATOR 5 pg_catalog.>, FUNCTION 1 lifetime_exec_compare(integer, integer);
 
 CREATE EVENT TRIGGER lifetime_exec_trigger ON ddl_command_end EXECUTE FUNCTION lifetime_exec_event();
 
@@ -66,6 +66,34 @@ SELECT obj_description(oid, 'pg_am') = 'original access method' FROM pg_am WHERE
 SELECT obj_description(oid, 'pg_cast') = 'original cast' FROM pg_cast WHERE castsource = 'lifetime_exec_value'::regtype AND casttarget = 'text'::regtype;
 
 -- mutation checks
+CREATE SCHEMA lifetime_exec_shadow;
+
+CREATE FUNCTION lifetime_exec_less(integer, integer) RETURNS boolean LANGUAGE SQL IMMUTABLE RETURN $1 OPERATOR(pg_catalog.<) $2;
+
+CREATE OPERATOR lifetime_exec_shadow.< (FUNCTION = lifetime_exec_less, LEFTARG = integer, RIGHTARG = integer);
+
+CREATE OPERATOR FAMILY public.lifetime_exec_shadow_family USING btree;
+
+SET search_path = lifetime_exec_shadow, pg_catalog, public;
+
+CREATE OPERATOR CLASS public.lifetime_exec_shadow_class FOR TYPE integer USING btree FAMILY public.lifetime_exec_shadow_family AS OPERATOR 1 <, OPERATOR 3 pg_catalog.=, FUNCTION 1 public.lifetime_exec_compare(integer, integer);
+
+SELECT count(*)=1 FROM pg_amop WHERE amopfamily=(SELECT oid FROM pg_opfamily WHERE opfname='lifetime_exec_shadow_family') AND amopstrategy=1 AND amopopr='lifetime_exec_shadow.<(integer,integer)'::regoperator::oid;
+
+SELECT count(*)=1 FROM pg_amop WHERE amopfamily=(SELECT oid FROM pg_opfamily WHERE opfname='lifetime_exec_shadow_family') AND amopstrategy=3 AND amopopr='pg_catalog.=(integer,integer)'::regoperator::oid;
+
+DROP OPERATOR CLASS public.lifetime_exec_shadow_class USING btree;
+
+DROP OPERATOR FAMILY public.lifetime_exec_shadow_family USING btree;
+
+DROP OPERATOR lifetime_exec_shadow.< (integer,integer);
+
+DROP FUNCTION public.lifetime_exec_less(integer,integer);
+
+SET search_path = public;
+
+DROP SCHEMA lifetime_exec_shadow;
+
 BEGIN;
 
 SAVEPOINT before_exec_rename;
@@ -110,7 +138,7 @@ CREATE OPERATOR === (FUNCTION = lifetime_exec_same, LEFTARG = integer, RIGHTARG 
 
 CREATE OPERATOR FAMILY lifetime_exec_family USING btree;
 
-CREATE OPERATOR CLASS lifetime_exec_class FOR TYPE integer USING btree FAMILY lifetime_exec_family AS OPERATOR 1 <, OPERATOR 2 <=, OPERATOR 3 ===, OPERATOR 4 >=, OPERATOR 5 >, FUNCTION 1 lifetime_exec_compare(integer, integer);
+CREATE OPERATOR CLASS lifetime_exec_class FOR TYPE integer USING btree FAMILY lifetime_exec_family AS OPERATOR 1 pg_catalog.<, OPERATOR 2 pg_catalog.<=, OPERATOR 3 ===, OPERATOR 4 pg_catalog.>=, OPERATOR 5 pg_catalog.>, FUNCTION 1 lifetime_exec_compare(integer, integer);
 
 CREATE EVENT TRIGGER lifetime_exec_trigger ON ddl_command_end EXECUTE FUNCTION lifetime_exec_event();
 

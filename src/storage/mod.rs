@@ -47313,7 +47313,6 @@ impl Storage {
 
     pub(crate) fn create_access_method(
         &self,
-        creation: CatalogCreation,
         definition: AccessMethodDefinition,
         txid: u32,
     ) -> Result<usize, SqlError> {
@@ -47327,8 +47326,9 @@ impl Storage {
                 definition.name.as_str()
             ));
         }
-        let created_at = creation.resolve(&self.catalog_sequence)?;
-        self.catalog_sequence.observe(created_at);
+        let created_at = self
+            .catalog_sequence
+            .next_bounded(MAX_CATALOG_CREATION, "access method")?;
         let mut catalog = self
             .operator_catalog
             .lock()
@@ -47359,6 +47359,55 @@ impl Storage {
             created_at,
             definition,
             ddl_state: CatalogDdlState::PendingCreate { txid },
+        };
+        Ok(slot)
+    }
+
+    pub(crate) fn replay_access_method(
+        &self,
+        identity: CatalogPosition,
+        definition: AccessMethodDefinition,
+    ) -> Result<usize, SqlError> {
+        CatalogIdentity::require(identity.created_at())?;
+        if matches!(
+            definition.name.as_str(),
+            "heap" | "btree" | "hash" | "gist" | "gin" | "brin" | "spgist"
+        ) {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "stored access method shadows a builtin"
+            ));
+        }
+        let mut catalog = self
+            .operator_catalog
+            .lock()
+            .expect("operator catalog lock poisoned");
+        let slot = identity.slot();
+        if slot >= catalog.access_methods.len()
+            || catalog.access_methods[slot].ddl_state != CatalogDdlState::Absent
+        {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "stored access method position is unavailable"
+            ));
+        }
+        if catalog.access_methods.iter().any(|root| {
+            root.database == current_database()
+                && root.ddl_state != CatalogDdlState::Absent
+                && (root.created_at == identity.created_at()
+                    || root.definition.name == definition.name)
+        }) {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "stored access method identity or name is duplicated"
+            ));
+        }
+        self.catalog_sequence.observe(identity.created_at());
+        catalog.access_methods[slot] = AccessMethodDef {
+            database: current_database(),
+            created_at: identity.created_at(),
+            definition,
+            ddl_state: CatalogDdlState::Present,
         };
         Ok(slot)
     }
@@ -49619,9 +49668,16 @@ impl Storage {
 
     pub(crate) fn create_cast_from_image(
         &mut self,
+        identity: CatalogPosition,
         mut definition: CastDef,
     ) -> Result<usize, SqlError> {
         CatalogIdentity::require(definition.created_at)?;
+        if definition.created_at != identity.created_at() {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "stored cast lifetime does not match its position"
+            ));
+        }
         // The enclosing journal or manifest record carries the database scope.
         definition.database = current_database();
         definition.source = self.bind_routine_result(definition.source, 0)?;
@@ -49638,16 +49694,13 @@ impl Storage {
         }) {
             return Err(sql_err!(sqlstate::DUPLICATE_OBJECT, "cast already exists"));
         }
-        let Some(slot) = casts
-            .iter()
-            .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
-        else {
+        let slot = identity.slot();
+        if slot >= casts.len() || casts[slot].ddl_state != CatalogDdlState::Absent {
             return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "too many casts (limit {})",
-                casts.len()
+                sqlstate::DATA_EXCEPTION,
+                "stored cast position is unavailable"
             ));
-        };
+        }
         self.catalog_sequence.observe(definition.created_at);
         definition.ddl_state = CatalogDdlState::Present;
         casts[slot] = definition;
@@ -51931,6 +51984,19 @@ impl Storage {
         })
     }
 
+    pub(crate) fn operator_contract(
+        &self,
+        oid: i32,
+        txid: u32,
+    ) -> Option<(OperatorSignature, Option<RoutineResult>)> {
+        if let Some((signature, result)) = crate::sql::catalog::builtin_operator_contract(oid) {
+            return Some((signature, Some(RoutineResult::builtin(result))));
+        }
+        let slot = self.operator_slot_by_oid(oid, txid)?;
+        let definition = self.operator_for(slot, txid);
+        Some((definition.signature, definition.implementation.result()))
+    }
+
     pub(crate) fn operator_for(&self, slot: usize, txid: u32) -> OperatorDefinition {
         self.operator(slot).definition_for(txid)
     }
@@ -52282,10 +52348,11 @@ impl Storage {
 
     pub(crate) fn replay_set_operator(
         &self,
-        created_at: u64,
+        identity: CatalogPosition,
         mut definition: OperatorDefinition,
     ) -> Result<usize, SqlError> {
-        CatalogIdentity::require(created_at)?;
+        let created_at = identity.created_at();
+        let creation = CatalogIdentity::require(created_at)?;
         if let Some(left) = definition.signature.left {
             definition.signature.left = Some(self.bind_routine_result(left, 0)?);
         }
@@ -52301,7 +52368,7 @@ impl Storage {
         self.validate_operator_definition(
             definition,
             0,
-            Some(OPERATOR_OID_BASE + CatalogIdentity::require(created_at)?.get() as i32),
+            Some(OPERATOR_OID_BASE + creation.get() as i32),
         )?;
         let mut catalog = self
             .operator_catalog
@@ -52330,20 +52397,17 @@ impl Storage {
                 "operator already exists with the same argument types"
             ));
         }
-        let slot = match existing {
-            Some(slot) => slot,
-            None => catalog
-                .operators
-                .iter()
-                .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
-                .ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "too many operators (limit {})",
-                        catalog.operators.len()
-                    )
-                })?,
-        };
+        let slot = identity.slot();
+        if slot >= catalog.operators.len()
+            || existing.is_some_and(|selected| selected != slot)
+            || (catalog.operators[slot].ddl_state != CatalogDdlState::Absent
+                && existing != Some(slot))
+        {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "stored executable catalog position is unavailable or stale"
+            ));
+        }
         self.catalog_sequence.observe(created_at);
         catalog.operators[slot] = OperatorDef {
             database: current_database(),
@@ -52574,21 +52638,22 @@ impl Storage {
                 }
                 continue;
             }
-            let operator_slot = self
-                .operator_slot_by_oid(member.operator, txid)
-                .ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::UNDEFINED_FUNCTION,
-                        "operator-family operator does not exist"
-                    )
-                })?;
-            let operator = self.operator_for(operator_slot, txid);
-            if operator.signature.left != Some(member.left)
-                || operator.signature.right != Some(member.right)
-                || operator
-                    .implementation
-                    .result()
-                    .is_none_or(|result| result.ctype != ColType::Bool)
+            let (signature, result) =
+                self.operator_contract(member.operator, txid)
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::UNDEFINED_FUNCTION,
+                            "operator-family operator does not exist"
+                        )
+                    })?;
+            if result != Some(RoutineResult::builtin(ColType::Bool)) {
+                return Err(sql_err!(
+                    sqlstate::INVALID_OBJECT_DEFINITION,
+                    "index search operators must return boolean"
+                ));
+            }
+            if signature.left != Some(member.left)
+                || signature.right != Some(member.right)
                 || definition.operators[..index].iter().any(|prior| {
                     prior.used
                         && prior.strategy == member.strategy
@@ -52703,9 +52768,10 @@ impl Storage {
 
     pub(crate) fn replay_set_operator_family(
         &self,
-        created_at: u64,
+        identity: CatalogPosition,
         mut definition: OperatorFamilyDefinition,
     ) -> Result<usize, SqlError> {
+        let created_at = identity.created_at();
         CatalogIdentity::require(created_at)?;
         for member in definition.operators.iter_mut().filter(|member| member.used) {
             member.left = self.bind_routine_result(member.left, 0)?;
@@ -52742,20 +52808,17 @@ impl Storage {
                 "operator family already exists for access method \"btree\""
             ));
         }
-        let slot = match existing {
-            Some(slot) => slot,
-            None => catalog
-                .families
-                .iter()
-                .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
-                .ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "too many operator families (limit {})",
-                        catalog.families.len()
-                    )
-                })?,
-        };
+        let slot = identity.slot();
+        if slot >= catalog.families.len()
+            || existing.is_some_and(|selected| selected != slot)
+            || (catalog.families[slot].ddl_state != CatalogDdlState::Absent
+                && existing != Some(slot))
+        {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "stored executable catalog position is unavailable or stale"
+            ));
+        }
         self.catalog_sequence.observe(created_at);
         catalog.families[slot] = OperatorFamilyDef {
             database: current_database(),
@@ -53078,21 +53141,22 @@ impl Storage {
                 }
                 continue;
             }
-            let slot = self
-                .operator_slot_by_oid(member.operator, txid)
-                .ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::UNDEFINED_FUNCTION,
-                        "operator-class operator does not exist"
-                    )
-                })?;
-            let operator = self.operator_for(slot, txid);
-            if operator.signature.left != Some(member.left)
-                || operator.signature.right != Some(member.right)
-                || operator
-                    .implementation
-                    .result()
-                    .is_none_or(|result| result.ctype != ColType::Bool)
+            let (signature, result) =
+                self.operator_contract(member.operator, txid)
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::UNDEFINED_FUNCTION,
+                            "operator-class operator does not exist"
+                        )
+                    })?;
+            if result != Some(RoutineResult::builtin(ColType::Bool)) {
+                return Err(sql_err!(
+                    sqlstate::INVALID_OBJECT_DEFINITION,
+                    "index search operators must return boolean"
+                ));
+            }
+            if signature.left != Some(member.left)
+                || signature.right != Some(member.right)
                 || definition.operators[..index].iter().any(|prior| {
                     prior.used
                         && prior.strategy == member.strategy
@@ -53230,9 +53294,10 @@ impl Storage {
 
     pub(crate) fn replay_set_operator_class(
         &self,
-        created_at: u64,
+        identity: CatalogPosition,
         mut definition: OperatorClassDefinition,
     ) -> Result<usize, SqlError> {
+        let created_at = identity.created_at();
         CatalogIdentity::require(created_at)?;
         definition.input = self.bind_routine_result(definition.input, 0)?;
         definition.storage = self.bind_routine_result(definition.storage, 0)?;
@@ -53266,20 +53331,17 @@ impl Storage {
                 "operator class already exists for access method \"btree\""
             ));
         }
-        let slot = match existing {
-            Some(slot) => slot,
-            None => catalog
-                .classes
-                .iter()
-                .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
-                .ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "too many operator classes (limit {})",
-                        catalog.classes.len()
-                    )
-                })?,
-        };
+        let slot = identity.slot();
+        if slot >= catalog.classes.len()
+            || existing.is_some_and(|selected| selected != slot)
+            || (catalog.classes[slot].ddl_state != CatalogDdlState::Absent
+                && existing != Some(slot))
+        {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "stored executable catalog position is unavailable or stale"
+            ));
+        }
         self.catalog_sequence.observe(created_at);
         catalog.classes[slot] = OperatorClassDef {
             database: current_database(),
@@ -58778,7 +58840,6 @@ mod tests {
                 scope.spawn(move || {
                     let slot = storage
                         .create_access_method(
-                            CatalogCreation::New,
                             AccessMethodDefinition {
                                 name: SqlName::parse(worker_name).unwrap(),
                                 handler: TableAccessMethodHandler::Heap,
@@ -58837,7 +58898,6 @@ mod tests {
             let name = stack_format!(63, "am_{slot}");
             let created = storage
                 .create_access_method(
-                    CatalogCreation::New,
                     AccessMethodDefinition {
                         name: SqlName::parse(name.as_str()).unwrap(),
                         handler: TableAccessMethodHandler::Heap,
@@ -58850,7 +58910,6 @@ mod tests {
         assert!(
             storage
                 .create_access_method(
-                    CatalogCreation::New,
                     AccessMethodDefinition {
                         name: SqlName::parse("am_full").unwrap(),
                         handler: TableAccessMethodHandler::Heap,

@@ -1780,6 +1780,33 @@ fn catalog_lifetime_config(name: &str, mode: crate::config::TransactionMode) -> 
 }
 
 #[test]
+fn catalog_lifetime_privileges_and_partition_triggers_match_postgresql() {
+    let fixture = include_str!(
+        "../../tests/external/differential/199_privilege_and_partition_lifetimes.sql"
+    );
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let config = catalog_lifetime_config(&format!("privilege-partition-{mode:?}"), mode);
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        let mut mismatches = Vec::new();
+        for sql in fixture.split("-- cleanup").next().unwrap().split("\n\n") {
+            if sql.trim().is_empty() {
+                continue;
+            }
+            let output = session.success(&mut engine, sql, true);
+            if sql.trim_start().starts_with("SELECT") && data_rows(&output) != ["t"] {
+                mismatches.push((sql, data_rows(&output)));
+            }
+        }
+        assert!(mismatches.is_empty(), "{mode:?}: {mismatches:?}");
+    }
+}
+
+#[test]
 fn event_trigger_failures_keep_notices_without_success_command_tags() {
     for mode in [
         crate::config::TransactionMode::Mvcc,

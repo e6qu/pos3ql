@@ -1,0 +1,77 @@
+name: Remaining catalog validation
+on:
+  push:
+    branches: [remaining-catalog-lifetimes]
+concurrency:
+  group: remaining-catalog-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  reference:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      reference:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: pos3ql-reference
+        ports: [5432:5432]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      PGHOST: 127.0.0.1
+      PGPORT: 5432
+      PGUSER: postgres
+      PGDATABASE: postgres
+      PGPASSWORD: pos3ql-reference
+    steps:
+      - uses: actions/checkout@v5
+      - name: PostgreSQL identity reference and provenance
+        env:
+          REFERENCE_CONTAINER: ${{ job.services.reference.id }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/catalog-reference"
+          psql -XAt -v ON_ERROR_STOP=1 -c 'SELECT version()' > "$RUNNER_TEMP/catalog-reference/version.txt"
+          docker inspect --format '{{.Image}}' "$REFERENCE_CONTAINER" > "$RUNNER_TEMP/catalog-reference/image.txt"
+          sha256sum tests/external/differential/199_privilege_and_partition_lifetimes.sql > "$RUNNER_TEMP/catalog-reference/fixture.sha256"
+          psql -XAt -v ON_ERROR_STOP=1 -f tests/external/differential/199_privilege_and_partition_lifetimes.sql > "$RUNNER_TEMP/catalog-reference/output.txt" 2> "$RUNNER_TEMP/catalog-reference/diagnostics.txt"
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          path = Path(os.environ['RUNNER_TEMP'], 'catalog-reference')
+          output = path.joinpath('output.txt').read_text()
+          observations = [line for line in output.splitlines() if line in ('t', 'f')]
+          assert len(observations) == 10 and all(value == 't' for value in observations), output
+          print(path.joinpath('version.txt').read_text().strip())
+          print(f'PostgreSQL: {len(observations)} true observations')
+          PY
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: remaining-catalog-postgresql-reference
+          path: ${{ runner.temp }}/catalog-reference/
+          if-no-files-found: error
+  focused:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: remaining-catalog-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Compile and lint all targets
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Catalog lifetime regressions
+        run: cargo test --lib --locked -- catalog_lifetime_privileges_and_partition_triggers --test-threads=1

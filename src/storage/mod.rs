@@ -17451,11 +17451,17 @@ impl Storage {
             .temporary_transactions
             .lock()
             .expect("temporary transaction lock poisoned");
-        if state
+        if let Some(namespace) = state
             .namespaces
             .iter()
-            .any(|namespace| namespace.identity == identity)
+            .find(|namespace| namespace.identity == identity)
         {
+            if !namespace.visible_to(transaction) {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "temporary namespace belongs to another transaction"
+                ));
+            }
             return Ok(None);
         }
         state

@@ -23,8 +23,8 @@ they never select a guessed decoder.
 
 | Object | Identity | Read | Write | Migration |
 |---|---|---:|---:|---|
-| Checkpoint manifest | `pos3ql-manifest-v31` | yes | yes | Retains schema creation identities and database-owner roles, object-permission grant order, explicitly empty permission lists, index-presence hints, allocator counters, typed blocks, enum members, and exact table, view, rule, sequence, routine and materialized-view positions and creation stamps. Publication records retain their creation stamps. |
-| Journal record | Version `19` at header byte 17; bytes 18–23 are zero | yes | yes | Schema create, drop and rename records retain creation identity. Catalog images retain declared types, hidden system-column positions, selected sources and permission grant order. Prepared comment roots rebind to restored sources. Parameter permissions retain complete replacement rows. Sequence restarts retain their transaction owner; materialized views retain the backing table identity. Older framing is rejected even when its checksum is valid. |
+| Checkpoint manifest | `pos3ql-manifest-v32` | yes | yes | Retains schema creation identities and database-owner roles, object-permission grant order, explicitly empty permission lists, index-presence hints, allocator counters, typed blocks, enum members, and exact table, view, rule, sequence, routine and materialized-view positions and creation stamps. Publication records retain their creation stamps. |
+| Journal record | Version `20` at header byte 17; bytes 18–23 are zero | yes | yes | Schema create, drop and rename records retain creation identity. Catalog images retain declared types, hidden system-column positions, selected sources and permission grant order. Prepared comment roots rebind to restored sources. Parameter permissions retain complete replacement rows. Sequence restarts retain their transaction owner; materialized views retain the backing table identity. Older framing is rejected even when its checksum is valid. |
 | Immutable block | Header bytes 5–7: `01 00 00` | yes | yes | SHA-256 of `pos3ql:block:v1\0`, the one-byte block type, then payload; LSN is provenance, excluded from identity. |
 | Empty checkpoint root | `pos3ql-empty-manifest-v1` | yes | yes | Fences an as-yet unpublished manifest root. |
 | Commit head | `pos3ql-commit-head-v1` | yes | yes | Names the immutable commit chain and the publishing process incarnation. |
@@ -41,7 +41,7 @@ they never select a guessed decoder.
 A column container and a row index can contain identical bytes and still be
 different blocks. Their type is part of the object name, so writing one cannot
 replace the other. Headers without the current identity version are rejected.
-Manifest v29 and older manifests are rejected before their references are used.
+Manifest v31 and older manifests are rejected before their references are used.
 
 Role identifiers are independent of catalog slots. The bootstrap administrator
 keeps PostgreSQL OID 10; user roles receive identifiers from 16,385 through
@@ -79,7 +79,7 @@ keys keep their stamps beside stable attribute numbers in the table definition;
 the shared column metadata stays within its existing 512-byte recovery bound.
 Renaming its constraint, dropping an earlier constraint, or moving its column preserves
 that identity. Replacing the index reserves a fresh stamp. Manifest
-`implicit_index POSITION CREATED_AT` records and table payload v12 store the
+`implicit_index POSITION CREATED_AT` records and table payload v13 store the
 complete set; missing, duplicate, out-of-range or truncated identities are
 rejected before installation. Recovery also checks relation identities across
 catalog families within each database before durable startup publication. A
@@ -102,7 +102,7 @@ identifiers. The shared counter permits identities 1–9,999,999; reserving anot
 returns `54000` rather than wrapping. Renames and unchanged rules preserve their
 identities; dropping and recreating a rule reserves a new one.
 
-Table payload v12 and domain payload marker 252 append one four-byte,
+Table payload v13 and domain payload marker 252 append one four-byte,
 little-endian identity per constraint. Tables order CHECKs, foreign keys, live
 NOT NULL attributes by stable attribute number, then the detached partition
 CHECK. Domains order CHECKs, then NOT NULL when required. Manifest
@@ -156,7 +156,7 @@ filters and exact result checks can need more data.
 
 Catalog vectors retain their signed lower bounds in rows, projected values, and
 constant defaults. Each stored vector adds four bytes for this bound; writers
-and readers use manifest v31, journal v19, and table-definition payload v12.
+and readers use manifest v32, journal v20, and table-definition payload v13.
 The codec retains these bounds independently of SQL input conversion; SQL
 array-to-vector casts are rejected. Recovery tests cover text-created vectors,
 checkpointing, and recovery with empty local caches.
@@ -321,7 +321,7 @@ system column; the two body fields exist only in catalog history. The journal re
 
 Unique keys retain an explicit mode: tag `0` means NULLs are distinct, tag `1`
 means primary key, and tag `2` means `NULLS NOT DISTINCT`. Other tags are rejected.
-The checkpoint `ukey` record starts with this tag. Table-definition payload v12
+The checkpoint `ukey` record starts with this tag. Table-definition payload v13
 stores the tag, key-column count and timing as three bytes before the column
 positions. Older format identities are rejected before these records are read.
 
@@ -433,7 +433,7 @@ source; values and emitted identifiers require a checked creation.
 Their checked three-byte runtime representation cannot contain zero or an
 out-of-range value. Fresh creation returns `54000` when the shared catalog
 sequence reaches this limit. Unsupported stored stamps are rejected before
-catalog publication; manifest v31 and journal v19 reject earlier framing.
+catalog publication; manifest v32 and journal v20 reject earlier framing.
 
 Named-type recovery installs each saved creation stamp directly; it does not
 reserve a temporary stamp and overwrite it later. An exhausted creation sequence
@@ -489,7 +489,7 @@ PostgreSQL polymorphic type. The schema is stored separately and database scope
 comes from the enclosing record. The SQL name after the prefix retains its
 original colons and Unicode bytes. Manifests hex-encode these fields. Tables,
 composites, routine signatures/results, aggregate types, casts and operator
-contracts share this encoding. Table definition payloads use version 12.
+contracts share this encoding. Table definition payloads use version 13.
 
 Bit and varbit modifiers store the bit count directly: `bit(6)` stores `6`.
 Character modifiers include their four-byte header: `varchar(7)` stores `11`.
@@ -621,7 +621,7 @@ required: obsolete readers may be removed without building an offline migration.
 Do not retain a decoder or introduce a conversion fallback solely to support
 an older pos3ql version.
 
-The only accepted checkpoint manifest is v31. Startup, backup retention, and
+The only accepted checkpoint manifest is v32. Startup, backup retention, and
 writer promotion share one allocation-free metadata parser. It requires one
 log position, next row identity, latest transaction identity, large-object
 allocator record, nonzero 32-digit hexadecimal writer identity and final
@@ -712,4 +712,27 @@ own comments. This internal key does not change PostgreSQL's exposed `objsubid`.
 
 Manifest `pub` records place the creation stamp after the owner and before the
 flags. Journal publication-creation records place the eight-byte little-endian
-stamp before the name. Manifest v31 and journal v19 reject earlier framing.
+stamp before the name. Manifest v31 and journal v20 reject earlier framing.
+
+## Text comparison and text-search identities
+
+Manifest v32, journal v20 and table payload v13 replace slot-based text identities.
+A named collation stores a four-byte little-endian code: bit 31 marks a named
+collation, bits 2–30 hold its checked creation identity (1–9,999,999), bit 0 selects
+the configured database locale, and bit 1 selects full Unicode case mapping.
+The two algorithm bits cannot both be set. Built-in codes remain 0–4 and 133;
+old slot codes, unknown bits and out-of-range identities are rejected. Table
+columns, composite fields and index columns use this same representation.
+
+Public identifier bases are 580,000,000 for collations, 620,000,000 for conversions,
+and 640,000,000 / 660,000,000 / 680,000,000 / 700,000,000 for text-search parsers,
+templates, dictionaries and configurations. Each adds the checked creation stamp.
+Names and physical positions never determine these identifiers. Stored collation
+dependencies use `c` followed by the decimal four-byte code; configuration
+dependencies retain their public identifier. Replay validates their class.
+
+Database-copy position records add kind 16 (collation), 17 (conversion) and 18
+(text search), retaining their creation stamps and exact target positions. Copies
+retain the source's database-local public identifiers and comparison choices;
+there is no slot remapping inside saved columns. Recovery checks text roots and
+saved comparison references before writer promotion. Earlier formats are rejected.

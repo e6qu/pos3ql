@@ -209,7 +209,8 @@ releases earlier owners rather than holding unrelated tables.
 Renames preserve object identity; drop and recreate reserve fresh identities
 for relations, row/array types, named types, enum members, indexes, CHECK,
 foreign-key and NOT NULL constraints, statistics, extensions, foreign-data
-wrappers, servers, user mappings, publications and subscriptions. Removing an
+wrappers, servers, user mappings, publications, subscriptions, collations,
+conversions, and text-search parsers, templates, dictionaries and configurations. Removing an
 earlier column or rule does not renumber survivors. Foreign-key triggers retain
 their constraint links. `ADD CONSTRAINT ... USING INDEX` preserves the existing
 index identifier. Database-template copies preserve database-local identifiers, foreign-wrapper,
@@ -225,6 +226,12 @@ CREATE TABLE orders(id integer);
 SELECT has_table_privilege(identity, 'SELECT') IS NULL FROM saved_order_identity;
 -- true: the old identifier does not grant access to the replacement
 ```
+
+A resolved text comparison keeps its original collation's ordering and case
+mapping, even after that collation is dropped and its internal slot is reused.
+For example, a paused query using a copy of `pg_unicode_fast` still expands
+`upper('straße')` to `STRASSE`; creating another collation cannot change that
+choice. Name lookups for new commands still use the current catalog.
 
 Saved type references and enum constants follow their original type/member,
 including arrays, records and defaults. Renaming enum label `pending` to

@@ -348,6 +348,7 @@ pub struct TxnState {
     reason = "CommentSet carries its payload inline (no heap after startup); the undo list is a small fixed pool"
 )]
 pub(crate) enum DdlUndo {
+    TemporaryNamespaceCreated(crate::storage::TemporaryNamespaceIdentity),
     /// CREATE TABLE at this slot — undo by dropping it.
     Created(u32),
     /// DROP TABLE at this slot (rows retained until commit) — undo by

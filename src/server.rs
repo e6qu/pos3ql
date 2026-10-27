@@ -1,5 +1,8 @@
-//! The single-threaded server: one reactor, a fixed array of connection
-//! slots whose buffers are allocated once at startup, and the query engine.
+//! One SQL CPU worker driven by socket readiness and fixed connection slots.
+//!
+//! Eligible reads, uploads and commit waits retain their buffers while the
+//! reactor runs other connections and bounded maintenance. State-changing and
+//! some metadata reads still finish synchronously; this is not a CPU worker pool.
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};

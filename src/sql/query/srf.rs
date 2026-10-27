@@ -663,7 +663,7 @@ fn publication_table_rows<'a>(
         };
         rows[row_count] = crate::sql::exec::encode_projected_pub(
             &[
-                Datum::Oid(crate::sql::catalog::publication_oid(info.publication_slot) as u32),
+                Datum::Oid(storage.publication_at(info.publication_slot).oid() as u32),
                 Datum::Oid(crate::sql::catalog::user_table_oid(storage, info.relation_slot) as u32),
                 publication_int2vector(column_mask, &table, arena)?,
                 qual,

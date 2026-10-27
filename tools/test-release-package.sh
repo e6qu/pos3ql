@@ -21,7 +21,7 @@ PACKAGE=$(find "$WORK" -mindepth 1 -maxdepth 1 -type d -name 'pos3ql-*')
 [[ -f "$PACKAGE/etc/pos3ql/pos3ql-failover.conf.example" ]]
 [[ -f "$PACKAGE/lib/systemd/system/pos3ql.service" ]]
 [[ -f "$PACKAGE/lib/systemd/system/pos3ql-failover.service" ]]
-[[ -f "$PACKAGE/share/doc/pos3ql/operations.md" ]]
+[[ -f "$PACKAGE/share/doc/pos3ql/docs/operations.md" ]]
 [[ -f "$PACKAGE/share/doc/pos3ql/CONTRIBUTING.md" ]]
 [[ -f "$PACKAGE/share/doc/pos3ql/docs/README.md" ]]
 python3 "$(dirname "$0")/check-docs.py" --root "$PACKAGE/share/doc/pos3ql"

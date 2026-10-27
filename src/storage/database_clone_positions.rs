@@ -17,6 +17,13 @@ pub(crate) enum DatabaseCloneKind {
     Rule = 6,
     MaterializedView = 7,
     Routine = 8,
+    ForeignWrapper = 9,
+    ForeignServer = 10,
+    UserMapping = 11,
+    ForeignTable = 12,
+    Statistics = 13,
+    Publication = 14,
+    Extension = 15,
 }
 
 impl DatabaseCloneKind {
@@ -31,6 +38,13 @@ impl DatabaseCloneKind {
             6 => Self::Rule,
             7 => Self::MaterializedView,
             8 => Self::Routine,
+            9 => Self::ForeignWrapper,
+            10 => Self::ForeignServer,
+            11 => Self::UserMapping,
+            12 => Self::ForeignTable,
+            13 => Self::Statistics,
+            14 => Self::Publication,
+            15 => Self::Extension,
             _ => return None,
         })
     }
@@ -308,6 +322,88 @@ impl Storage {
                 definition.ddl_state,
             );
         }
+        let catalog = self.foreign_catalog();
+        for slot in 0..catalog.wrapper_capacity() {
+            let entry = catalog.entry_wrapper(slot);
+            object(
+                DatabaseCloneKind::ForeignWrapper,
+                slot,
+                entry.created_at,
+                entry.database,
+                entry.ddl_state,
+            );
+        }
+        for slot in 0..catalog.server_capacity() {
+            let entry = catalog.entry_server(slot);
+            object(
+                DatabaseCloneKind::ForeignServer,
+                slot,
+                entry.created_at,
+                entry.database,
+                entry.ddl_state,
+            );
+        }
+        for slot in 0..catalog.mapping_capacity() {
+            let entry = catalog.entry_mapping(slot);
+            object(
+                DatabaseCloneKind::UserMapping,
+                slot,
+                entry.created_at,
+                entry.database,
+                entry.ddl_state,
+            );
+        }
+        for slot in 0..catalog.table_capacity() {
+            let entry = catalog.entry_table(slot);
+            object(
+                DatabaseCloneKind::ForeignTable,
+                slot,
+                entry.created_at,
+                entry.database,
+                entry.ddl_state,
+            );
+        }
+        drop(catalog);
+        for (slot, definition) in self
+            .extended_statistics_catalog
+            .lock()
+            .expect("statistics catalog lock poisoned")
+            .definitions
+            .iter()
+            .enumerate()
+        {
+            object(
+                DatabaseCloneKind::Statistics,
+                slot,
+                definition.created_at,
+                definition.database,
+                definition.ddl_state,
+            );
+        }
+        for (slot, definition) in self
+            .publications
+            .lock()
+            .expect("publication catalog lock poisoned")
+            .iter()
+            .enumerate()
+        {
+            object(
+                DatabaseCloneKind::Publication,
+                slot,
+                definition.created_at,
+                definition.database,
+                definition.ddl_state,
+            );
+        }
+        for (slot, definition) in self.extension_catalog().definitions.iter().enumerate() {
+            object(
+                DatabaseCloneKind::Extension,
+                slot,
+                definition.created_at,
+                definition.database,
+                definition.ddl_state,
+            );
+        }
     }
 }
 
@@ -350,7 +446,7 @@ mod tests {
                 assert!(DatabaseClonePositions::decode(&bytes[..end]).is_none());
             }
             let mut invalid = bytes;
-            invalid[4] = 9;
+            invalid[4] = u8::MAX;
             assert!(DatabaseClonePositions::decode(&invalid).is_none());
             invalid = bytes;
             invalid[7..15].fill(0);

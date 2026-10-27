@@ -4163,6 +4163,7 @@ impl<'a> Parser<'a> {
             let members = self.role_name_list("user name")?;
             let roles = self.arena_slice(&[group])?;
             return Ok(Stmt::GrantRole {
+                syntax: crate::sql::ast::RoleMembershipSyntax::AlterGroup,
                 roles,
                 members,
                 options: crate::sql::ast::RoleMembershipPatch::EMPTY,
@@ -4174,6 +4175,7 @@ impl<'a> Parser<'a> {
             let members = self.role_name_list("user name")?;
             let roles = self.arena_slice(&[group])?;
             return Ok(Stmt::RevokeRole {
+                syntax: crate::sql::ast::RoleMembershipSyntax::AlterGroup,
                 roles,
                 members,
                 option: None,

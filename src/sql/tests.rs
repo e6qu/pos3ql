@@ -1761,6 +1761,365 @@ fn constraint_manifest_wide_domains_survive_journal_and_checkpoint_recovery() {
     }
 }
 
+fn catalog_lifetime_config(name: &str, mode: crate::config::TransactionMode) -> Config {
+    let mut config = test_config(name);
+    config.transaction_mode = mode;
+    config.max_ddl_per_transaction = 32;
+    config.max_foreign_data_wrappers = 2;
+    config.max_foreign_servers = 2;
+    config.max_user_mappings = 2;
+    config.max_publications = 2;
+    config.max_subscriptions = 2;
+    config.set_extended_statistics_capacity(2);
+    config.extension_control_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/external/extensions")
+        .to_str()
+        .unwrap()
+        .to_string();
+    config
+}
+
+#[test]
+fn catalog_lifetime_public_identifiers_preserve_edits_and_reject_replacements() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let config = catalog_lifetime_config(&format!("catalog-lifetime-{mode:?}"), mode);
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        let mut observations = 0;
+        for statement in
+            include_str!("../../tests/external/differential_exact/32_catalog_lifetimes.sql")
+                .split(';')
+                .map(str::trim)
+                .filter(|statement| !statement.is_empty())
+        {
+            let output = session.success(&mut engine, statement, true);
+            let rows = data_rows(&output);
+            assert!(rows.iter().all(|row| row == "t"), "{statement}: {rows:?}");
+            observations += rows.len();
+        }
+        assert_eq!(observations, 8);
+    }
+}
+
+#[test]
+fn catalog_lifetime_shared_subscriptions_keep_database_and_identity_through_recovery() {
+    const CREATE: &str = "CREATE SUBSCRIPTION shared_catalog_sub CONNECTION 'host=127.0.0.1 port=5432 user=repl dbname=publisher sslmode=disable' PUBLICATION orders WITH (connect = false, slot_name = NONE)";
+    const CHECK: &str = "SELECT count(*) = 2 AND count(DISTINCT oid) = 2 AND count(DISTINCT subdbid) = 2 FROM pg_subscription WHERE subname = 'shared_catalog_sub'; SELECT count(*) = 1 FROM saved_shared_subscription s JOIN pg_subscription c ON c.oid = s.identity AND c.subdbid = s.database_identity";
+    for checkpoint in [false, true] {
+        for mode in [
+            crate::config::TransactionMode::Mvcc,
+            crate::config::TransactionMode::Locking,
+        ] {
+            let name = format!("catalog-lifetime-shared-{checkpoint}-{mode:?}");
+            let mut config = catalog_lifetime_config(&name, mode);
+            config.object_store_on = true;
+            config.object_store_sim = true;
+            config.wal_upload = true;
+            config.wal_upload_sync = true;
+            config.object_store_bucket = format!("{name}-{}", std::process::id());
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+            let databases;
+            {
+                let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+                let mut engine = Engine::new(&config, &mut budget).unwrap();
+                let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+                session.success(
+                    &mut engine,
+                    "CREATE DATABASE catalog_first TEMPLATE template0",
+                    false,
+                );
+                session.success(
+                    &mut engine,
+                    "CREATE DATABASE catalog_second TEMPLATE template0",
+                    false,
+                );
+                databases = ["catalog_first", "catalog_second"].map(|name| {
+                    let slot = engine.storage.database_slot(name, 0).unwrap();
+                    engine.storage.database(slot).oid
+                });
+                for database in databases {
+                    engine.select_database(database).unwrap();
+                    session.success(&mut engine, CREATE, false);
+                    session.success(&mut engine, "CREATE TABLE saved_shared_subscription AS SELECT oid AS identity, subdbid AS database_identity FROM pg_subscription WHERE subname = 'shared_catalog_sub' AND subdbid = (SELECT oid FROM pg_database WHERE datname = current_database())", false);
+                }
+                for database in databases {
+                    engine.select_database(database).unwrap();
+                    assert_eq!(
+                        data_rows(&session.success(&mut engine, CHECK, false)),
+                        ["t", "t"]
+                    );
+                    assert_eq!(data_rows(&session.success(&mut engine,
+                        "BEGIN; ALTER SUBSCRIPTION shared_catalog_sub RENAME TO shared_catalog_temporary; SELECT count(*) = 1 FROM pg_subscription WHERE subname = 'shared_catalog_temporary' AND subdbid = (SELECT oid FROM pg_database WHERE datname = current_database()); ROLLBACK", false)), ["t"]);
+                }
+                if checkpoint {
+                    assert!(engine.checkpoint().unwrap());
+                }
+                engine.commit_wal().unwrap();
+            }
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+            {
+                let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+                let mut engine = Engine::new(&config, &mut budget).unwrap();
+                let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+                for database in databases {
+                    engine.select_database(database).unwrap();
+                    assert_eq!(
+                        data_rows(&session.success(&mut engine, CHECK, false)),
+                        ["t", "t"]
+                    );
+                }
+                engine.select_database(databases[0]).unwrap();
+                session.success(&mut engine, "DROP SUBSCRIPTION shared_catalog_sub", false);
+                session.success(&mut engine, CREATE, false);
+                assert_eq!(data_rows(&session.success(&mut engine, "SELECT count(*) = 0 FROM saved_shared_subscription s JOIN pg_subscription c ON c.oid = s.identity", false)), ["t"]);
+                engine.select_database(databases[1]).unwrap();
+                assert_eq!(
+                    data_rows(&session.success(&mut engine, CHECK, false)),
+                    ["t", "t"]
+                );
+            }
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        }
+    }
+}
+
+#[test]
+fn catalog_lifetime_template_copies_preserve_local_identifiers_and_statistics() {
+    let fixture = include_str!("../../tests/external/differential_exact/32_catalog_lifetimes.sql");
+    let setup = fixture.split_once("DROP EXTENSION pos3ql_base;").unwrap().0;
+    const CHECK: &str = "SELECT count(*) = 6 FROM saved_catalog_lifetimes s JOIN lifetime_catalog c ON c.kind = s.kind AND c.identity = s.identity";
+    const FOREIGN_LINKS: &str = "SELECT count(*) = 1 FROM pg_foreign_table f JOIN pg_class c ON c.oid = f.ftrelid JOIN pg_foreign_server s ON s.oid = f.ftserver JOIN pg_foreign_data_wrapper w ON w.oid = s.srvfdw WHERE c.relname = 'copied_foreign' AND s.srvname = 'lifetime_server' AND w.fdwname = 'lifetime_wrapper'";
+    const COMMENTS: &str = "SELECT obj_description(oid, 'pg_foreign_data_wrapper') FROM pg_foreign_data_wrapper WHERE fdwname = 'lifetime_wrapper'; SELECT obj_description(oid, 'pg_foreign_server') FROM pg_foreign_server WHERE srvname = 'lifetime_server'; SELECT obj_description(oid, 'pg_statistic_ext') FROM pg_statistic_ext WHERE stxname = 'lifetime_statistics'; SELECT obj_description(oid, 'pg_publication') FROM pg_publication WHERE pubname = 'lifetime_publication'";
+    for checkpoint in [false, true] {
+        for mode in [
+            crate::config::TransactionMode::Mvcc,
+            crate::config::TransactionMode::Locking,
+        ] {
+            let name = format!("catalog-lifetime-copy-{checkpoint}-{mode:?}");
+            let mut config = catalog_lifetime_config(&name, mode);
+            config.max_foreign_data_wrappers = 4;
+            config.max_foreign_servers = 4;
+            config.max_user_mappings = 4;
+            config.max_publications = 4;
+            config.set_extended_statistics_capacity(4);
+            config.object_store_on = true;
+            config.object_store_sim = true;
+            config.wal_upload = true;
+            config.wal_upload_sync = true;
+            config.object_store_bucket = format!("{name}-{}", std::process::id());
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+            let copied;
+            {
+                let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+                let mut engine = Engine::new(&config, &mut budget).unwrap();
+                let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+                engine
+                    .select_database(crate::storage::DatabaseOid::TEMPLATE1)
+                    .unwrap();
+                for statement in setup
+                    .split(';')
+                    .map(str::trim)
+                    .filter(|statement| !statement.is_empty())
+                {
+                    let output = session.success(&mut engine, statement, false);
+                    assert!(
+                        data_rows(&output).iter().all(|row| row == "t"),
+                        "{statement}"
+                    );
+                }
+                session.success(&mut engine, "DROP SUBSCRIPTION lifetime_subscription; DELETE FROM saved_catalog_lifetimes WHERE kind = 'subscription'", false);
+                session.success(&mut engine, "CREATE FOREIGN TABLE copied_foreign(a integer) SERVER lifetime_server; COMMENT ON FOREIGN DATA WRAPPER lifetime_wrapper IS 'wrapper comment'; COMMENT ON SERVER lifetime_server IS 'server comment'; COMMENT ON STATISTICS lifetime_statistics IS 'statistics comment'; COMMENT ON PUBLICATION lifetime_publication IS 'publication comment'", false);
+                assert_eq!(
+                    data_rows(&session.success(&mut engine, CHECK, false)),
+                    ["t"]
+                );
+                engine
+                    .select_database(crate::storage::DatabaseOid::POSTGRES)
+                    .unwrap();
+                let mut discarded =
+                    ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+                discarded.success(&mut engine, "BEGIN; CREATE FOREIGN DATA WRAPPER discarded_wrapper NO HANDLER NO VALIDATOR; CREATE SERVER discarded_server FOREIGN DATA WRAPPER discarded_wrapper; CREATE USER MAPPING FOR PUBLIC SERVER discarded_server; CREATE PUBLICATION discarded_publication", false);
+                let mut blocker =
+                    ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(3);
+                blocker.success(&mut engine, "BEGIN; CREATE FOREIGN DATA WRAPPER blocking_wrapper NO HANDLER NO VALIDATOR; CREATE SERVER blocking_first FOREIGN DATA WRAPPER blocking_wrapper; CREATE SERVER blocking_second FOREIGN DATA WRAPPER blocking_wrapper", false);
+                assert_eq!(
+                    error_sqlstates(&session.execute(
+                        &mut engine,
+                        "CREATE DATABASE catalog_copy TEMPLATE template1",
+                        false
+                    )),
+                    ["54000"]
+                );
+                assert!(engine.storage.database_slot("catalog_copy", 0).is_none());
+                assert_eq!(
+                    (0..config.max_foreign_data_wrappers)
+                        .filter(|slot| engine.storage.foreign_wrapper_entry(*slot).ddl_state
+                            != crate::storage::CatalogDdlState::Absent)
+                        .count(),
+                    3,
+                    "failed cloning must release its partial foreign wrapper"
+                );
+                blocker.success(&mut engine, "ROLLBACK", false);
+                session.success(
+                    &mut engine,
+                    "CREATE DATABASE catalog_copy TEMPLATE template1",
+                    false,
+                );
+                copied = engine
+                    .storage
+                    .database(engine.storage.database_slot("catalog_copy", 0).unwrap())
+                    .oid;
+                discarded.success(&mut engine, "ROLLBACK", false);
+                engine.select_database(copied).unwrap();
+                assert_eq!(
+                    data_rows(&session.success(&mut engine, CHECK, false)),
+                    ["t"]
+                );
+                assert_eq!(
+                    data_rows(&session.success(&mut engine, FOREIGN_LINKS, false)),
+                    ["t"]
+                );
+                assert_eq!(
+                    data_rows(&session.success(&mut engine, COMMENTS, false)),
+                    [
+                        "wrapper comment",
+                        "server comment",
+                        "statistics comment",
+                        "publication comment"
+                    ]
+                );
+                session.success(
+                    &mut engine,
+                    "ALTER STATISTICS lifetime_statistics SET STATISTICS 43",
+                    false,
+                );
+                if checkpoint {
+                    assert!(engine.checkpoint().unwrap());
+                }
+                engine.commit_wal().unwrap();
+            }
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+            {
+                let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+                let mut engine = Engine::new(&config, &mut budget).unwrap();
+                let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+                for (database, target) in
+                    [(crate::storage::DatabaseOid::TEMPLATE1, 42), (copied, 43)]
+                {
+                    engine.select_database(database).unwrap();
+                    assert_eq!(
+                        data_rows(&session.success(&mut engine, CHECK, false)),
+                        ["t"]
+                    );
+                    assert_eq!(data_rows(&session.success(&mut engine, &format!("SELECT stxstattarget = {target} FROM pg_statistic_ext WHERE stxname = 'lifetime_statistics'"), false)), ["t"]);
+                    assert_eq!(
+                        data_rows(&session.success(&mut engine, FOREIGN_LINKS, false)),
+                        ["t"]
+                    );
+                    assert_eq!(
+                        data_rows(&session.success(&mut engine, COMMENTS, false)),
+                        [
+                            "wrapper comment",
+                            "server comment",
+                            "statistics comment",
+                            "publication comment"
+                        ],
+                        "cold comments: checkpoint={checkpoint}, mode={mode:?}, database={database:?}"
+                    );
+                }
+                engine.select_database(copied).unwrap();
+                session.success(&mut engine, "DROP PUBLICATION lifetime_publication; CREATE PUBLICATION lifetime_publication FOR TABLE lifetime_rows; DROP STATISTICS lifetime_statistics; CREATE STATISTICS lifetime_statistics ON a, b FROM lifetime_rows; DROP FOREIGN DATA WRAPPER lifetime_wrapper CASCADE; CREATE FOREIGN DATA WRAPPER lifetime_wrapper NO HANDLER NO VALIDATOR; CREATE SERVER lifetime_server FOREIGN DATA WRAPPER lifetime_wrapper", false);
+                assert_eq!(
+                    data_rows(&session.success(&mut engine, COMMENTS, false)),
+                    ["NULL"; 4]
+                );
+                engine
+                    .select_database(crate::storage::DatabaseOid::TEMPLATE1)
+                    .unwrap();
+                assert_eq!(
+                    data_rows(&session.success(&mut engine, COMMENTS, false)),
+                    [
+                        "wrapper comment",
+                        "server comment",
+                        "statistics comment",
+                        "publication comment"
+                    ]
+                );
+            }
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        }
+    }
+}
+
+#[test]
+fn catalog_lifetime_public_identifiers_survive_empty_disk_recovery() {
+    let fixture = include_str!("../../tests/external/differential_exact/32_catalog_lifetimes.sql");
+    let (setup, remaining) = fixture.split_once("DROP EXTENSION pos3ql_base;").unwrap();
+    for checkpoint in [false, true] {
+        for mode in [
+            crate::config::TransactionMode::Mvcc,
+            crate::config::TransactionMode::Locking,
+        ] {
+            let name = format!("catalog-lifetime-cold-{checkpoint}-{mode:?}");
+            let mut config = catalog_lifetime_config(&name, mode);
+            config.object_store_on = true;
+            config.object_store_sim = true;
+            config.wal_upload = true;
+            config.wal_upload_sync = true;
+            config.object_store_bucket = format!("{name}-{}", std::process::id());
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+            {
+                let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+                let mut engine = Engine::new(&config, &mut budget).unwrap();
+                let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+                for statement in setup
+                    .split(';')
+                    .map(str::trim)
+                    .filter(|statement| !statement.is_empty())
+                {
+                    let output = session.success(&mut engine, statement, false);
+                    assert!(
+                        data_rows(&output).iter().all(|row| row == "t"),
+                        "{statement}"
+                    );
+                }
+                if checkpoint {
+                    assert!(engine.checkpoint().unwrap());
+                }
+                engine.commit_wal().unwrap();
+            }
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+            {
+                let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+                let mut engine = Engine::new(&config, &mut budget).unwrap();
+                let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+                assert_eq!(data_rows(&session.success(&mut engine,
+                    "SELECT count(*) = 7 FROM saved_catalog_lifetimes s JOIN lifetime_catalog c ON c.kind = s.kind AND c.identity = s.identity", false)), ["t"]);
+                session.success(&mut engine, "DROP EXTENSION pos3ql_base", false);
+                for statement in remaining
+                    .split(';')
+                    .map(str::trim)
+                    .filter(|statement| !statement.is_empty())
+                {
+                    let output = session.success(&mut engine, statement, false);
+                    assert!(
+                        data_rows(&output).iter().all(|row| row == "t"),
+                        "{statement}"
+                    );
+                }
+            }
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        }
+    }
+}
+
 #[test]
 fn named_type_public_identifiers_survive_edits_replacement_and_savepoint_rollback() {
     for mode in [
@@ -11171,6 +11530,485 @@ fn relation_mode_changes_check_ownership_locks_and_relation_kinds() {
             data_rows(&writer.success(&mut engine, "SELECT ev_enabled FROM pg_rewrite WHERE ev_class = 'locked_rule_view'::regclass AND rulename = '_RETURN'", true)),
             ["O"]
         );
+    }
+}
+
+#[test]
+fn protocol_completion_rewrite_actions_emit_one_outer_tag() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let config = catalog_lifetime_config(&format!("rewrite-completion-{mode:?}"), mode);
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        let fixture = include_str!("../../tests/external/differential/122_rewrite_rules.sql");
+        session.success(
+            &mut engine,
+            fixture
+                .split_once("INSERT INTO rewrite_source(value)")
+                .unwrap()
+                .0,
+            true,
+        );
+        for (sql, tag) in [
+            (
+                "INSERT INTO rewrite_source(value) VALUES (DEFAULT), (5)",
+                "INSERT 0 2",
+            ),
+            ("UPDATE rewrite_source SET value = value + 4", "UPDATE 2"),
+            ("DELETE FROM rewrite_source", "DELETE 0"),
+        ] {
+            let output = session.success(&mut engine, sql, true);
+            assert_eq!(command_tags(&output), [tag], "{mode:?}: {sql}");
+            assert!(data_rows(&output).is_empty());
+        }
+        assert_eq!(data_rows(&session.success(&mut engine, "SELECT id, value FROM rewrite_source ORDER BY value; SELECT count(*) FROM rewrite_log", true)), ["40|5", "40|9", "6"]);
+        let output = session.success(
+            &mut engine,
+            "INSERT INTO rewrite_source(value) VALUES (7) RETURNING id",
+            true,
+        );
+        assert_eq!(command_tags(&output), ["INSERT 0 1"]);
+        assert_eq!(data_rows(&output), ["40"]);
+        session.success(&mut engine, "CREATE TABLE completion_redirect(id integer); CREATE TABLE completion_destination(id integer); CREATE RULE completion_redirect_rule AS ON INSERT TO completion_redirect DO INSTEAD INSERT INTO completion_destination VALUES (NEW.id) RETURNING completion_destination.id", true);
+        let output = session.success(
+            &mut engine,
+            "INSERT INTO completion_redirect VALUES (7), (9) RETURNING id",
+            true,
+        );
+        assert_eq!(command_tags(&output), ["INSERT 0 2"]);
+        assert_eq!(data_rows(&output), ["7", "9"]);
+    }
+}
+
+#[test]
+fn protocol_completion_cursor_close_distinguishes_named_and_all() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let config = catalog_lifetime_config(&format!("cursor-completion-{mode:?}"), mode);
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        let output = session.success(&mut engine, "BEGIN; DECLARE first_cursor CURSOR FOR SELECT 1; DECLARE second_cursor CURSOR FOR SELECT 2; CLOSE first_cursor; CLOSE ALL; CLOSE ALL", true);
+        assert_eq!(
+            command_tags(&output),
+            [
+                "BEGIN",
+                "DECLARE CURSOR",
+                "DECLARE CURSOR",
+                "CLOSE CURSOR",
+                "CLOSE CURSOR ALL",
+                "CLOSE CURSOR ALL"
+            ]
+        );
+        let rejected = session.execute(&mut engine, "FETCH FROM second_cursor", true);
+        assert_eq!(error_sqlstates(&rejected), ["34000"]);
+        assert!(command_tags(&rejected).is_empty());
+        session.success(&mut engine, "ROLLBACK", true);
+    }
+}
+
+#[test]
+fn protocol_completion_creation_distinguishes_empty_unpopulated_and_skipped() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let config = catalog_lifetime_config(&format!("creation-completion-{mode:?}"), mode);
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        for (sql, tag) in [
+            ("CREATE TABLE completion_data AS SELECT 1 AS id", "SELECT 1"),
+            (
+                "CREATE TABLE completion_empty AS SELECT 1 AS id WHERE false",
+                "SELECT 0",
+            ),
+            (
+                "CREATE TABLE completion_unpopulated AS SELECT 1 AS id WITH NO DATA",
+                "CREATE TABLE AS",
+            ),
+            (
+                "CREATE TABLE IF NOT EXISTS completion_data AS SELECT 2 AS id",
+                "CREATE TABLE AS",
+            ),
+            (
+                "CREATE MATERIALIZED VIEW completion_saved AS SELECT 1 AS id",
+                "SELECT 1",
+            ),
+            (
+                "CREATE MATERIALIZED VIEW completion_saved_empty AS SELECT 1 AS id WHERE false",
+                "SELECT 0",
+            ),
+            (
+                "CREATE MATERIALIZED VIEW completion_saved_unpopulated AS SELECT 1 AS id WITH NO DATA",
+                "CREATE MATERIALIZED VIEW",
+            ),
+            (
+                "CREATE MATERIALIZED VIEW IF NOT EXISTS completion_saved AS SELECT 2 AS id",
+                "CREATE MATERIALIZED VIEW",
+            ),
+        ] {
+            let output = session.success(&mut engine, sql, true);
+            assert_eq!(command_tags(&output), [tag], "{mode:?}: {sql}");
+            assert!(data_rows(&output).is_empty());
+        }
+        assert_eq!(data_rows(&session.success(&mut engine, "SELECT id FROM completion_data; SELECT id FROM completion_saved; SELECT count(*) FROM completion_empty", true)), ["1", "1", "0"]);
+    }
+}
+
+#[test]
+fn protocol_completion_schema_elements_and_legacy_membership_keep_outer_tags() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let config = catalog_lifetime_config(&format!("schema-completion-{mode:?}"), mode);
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        let output = session.success(&mut engine, "CREATE SCHEMA completion_schema CREATE TABLE rows(id integer) CREATE VIEW rows_view AS SELECT id FROM rows GRANT SELECT ON TABLE rows, rows_view TO public", true);
+        assert_eq!(command_tags(&output), ["CREATE SCHEMA"]);
+        let rejected = session.execute(
+            &mut engine,
+            "CREATE SCHEMA completion_failed CREATE TABLE wrong_schema.rows(id integer)",
+            true,
+        );
+        assert_eq!(error_sqlstates(&rejected), ["42P15"]);
+        assert!(command_tags(&rejected).is_empty());
+        assert!(
+            engine
+                .storage
+                .find_schema_visible("completion_failed", 0)
+                .is_none()
+        );
+        session.success(
+            &mut engine,
+            "CREATE ROLE completion_group; CREATE ROLE completion_member",
+            true,
+        );
+        for (sql, tag) in [
+            ("GRANT completion_group TO completion_member", "GRANT ROLE"),
+            (
+                "REVOKE completion_group FROM completion_member",
+                "REVOKE ROLE",
+            ),
+            (
+                "ALTER GROUP completion_group ADD USER completion_member",
+                "ALTER ROLE",
+            ),
+            (
+                "ALTER GROUP completion_group DROP USER completion_member",
+                "ALTER ROLE",
+            ),
+        ] {
+            assert_eq!(
+                command_tags(&session.success(&mut engine, sql, true)),
+                [tag]
+            );
+        }
+    }
+}
+
+#[test]
+fn session_discard_temporary_is_transactional_and_all_releases_session_state() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let config = catalog_lifetime_config(&format!("discard-session-{mode:?}"), mode);
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        let mut peer =
+            ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+        assert_eq!(
+            command_tags(&session.success(&mut engine, "DISCARD TEMP", true)),
+            ["DISCARD TEMP"]
+        );
+        session.success(&mut engine, "CREATE TABLE discard_durable(id integer); INSERT INTO discard_durable VALUES(99); CREATE SEQUENCE discard_permanent_sequence START 10; CREATE TEMP TABLE discard_rows(id serial PRIMARY KEY, value integer); INSERT INTO discard_rows(value) VALUES(7), (9); CREATE TEMP VIEW discard_view AS SELECT id, value FROM discard_rows; CREATE TEMP SEQUENCE discard_sequence; CREATE TEMP TABLE discard_child(id integer REFERENCES discard_rows(id)); CREATE STATISTICS discard_statistics ON id, value FROM discard_rows; SELECT pg_advisory_lock(55); PREPARE discard_prepared AS SELECT 99", true);
+        let namespace =
+            data_rows(&session.success(&mut engine, "SELECT pg_my_temp_schema()", true))[0].clone();
+        assert_eq!(
+            data_rows(&peer.success(&mut engine, "SELECT pg_try_advisory_lock(55)", true)),
+            ["f"]
+        );
+        session.success(&mut engine, "BEGIN; SAVEPOINT before_discard", true);
+        let output = session.success(&mut engine, "DISCARD TEMP", true);
+        assert_eq!(command_tags(&output), ["DISCARD TEMP"]);
+        assert!(!message_types(&output).contains(&b'N'));
+        let absent = "SELECT to_regclass('discard_rows') IS NULL, to_regclass('discard_view') IS NULL, to_regclass('discard_sequence') IS NULL, to_regclass('discard_child') IS NULL; SELECT count(*) FROM pg_statistic_ext WHERE stxname = 'discard_statistics'";
+        assert_eq!(
+            data_rows(&session.success(&mut engine, absent, true)),
+            ["t|t|t|t", "0"]
+        );
+        session.success(
+            &mut engine,
+            "ROLLBACK TO SAVEPOINT before_discard; COMMIT",
+            true,
+        );
+        assert_eq!(data_rows(&session.success(&mut engine, "SELECT count(*) FROM discard_rows; SELECT count(*) FROM discard_view; SELECT count(*) FROM pg_statistic_ext WHERE stxname = 'discard_statistics'; SELECT nextval('discard_permanent_sequence')", true)), ["2", "2", "1", "10"]);
+        assert_eq!(
+            command_tags(&session.success(&mut engine, "DISCARD PLANS", true)),
+            ["DISCARD PLANS"]
+        );
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "SELECT currval('discard_permanent_sequence')",
+                true
+            )),
+            ["10"]
+        );
+        assert_eq!(
+            command_tags(&session.success(&mut engine, "DISCARD SEQUENCES", true)),
+            ["DISCARD SEQUENCES"]
+        );
+        let missing_value = session.execute(
+            &mut engine,
+            "SELECT currval('discard_permanent_sequence')",
+            true,
+        );
+        assert_eq!(error_sqlstates(&missing_value), ["55000"]);
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "SELECT nextval('discard_permanent_sequence')",
+                true
+            )),
+            ["11"]
+        );
+        assert_eq!(
+            command_tags(&session.success(&mut engine, "DISCARD ALL", true)),
+            ["DISCARD ALL"]
+        );
+        assert_eq!(
+            data_rows(&session.success(&mut engine, absent, true)),
+            ["t|t|t|t", "0"]
+        );
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                &format!(
+                    "SELECT pg_my_temp_schema() = {namespace}; SELECT id FROM discard_durable"
+                ),
+                true
+            )),
+            ["t", "99"]
+        );
+        assert_eq!(
+            error_sqlstates(&session.execute(&mut engine, "EXECUTE discard_prepared", true)),
+            ["26000"]
+        );
+        assert_eq!(
+            data_rows(&peer.success(
+                &mut engine,
+                "SELECT pg_try_advisory_lock(55); SELECT pg_advisory_unlock(55)",
+                true
+            )),
+            ["t", "t"]
+        );
+    }
+}
+
+#[test]
+fn session_discard_namespace_follows_creation_rollback_and_connection_lifetime() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        for (create, drop) in [
+            (
+                "CREATE TEMP TABLE namespace_first(id integer)",
+                "DROP TABLE namespace_first",
+            ),
+            (
+                "CREATE TEMP VIEW namespace_first AS SELECT 7 AS id",
+                "DROP VIEW namespace_first",
+            ),
+            (
+                "CREATE TEMP SEQUENCE namespace_first",
+                "DROP SEQUENCE namespace_first",
+            ),
+        ] {
+            let config =
+                catalog_lifetime_config(&format!("temporary-namespace-{mode:?}-{create}"), mode);
+            let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+            let mut engine = Engine::new(&config, &mut budget).unwrap();
+            let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+            let mut peer =
+                ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+            assert_eq!(
+                data_rows(&session.success(&mut engine, "SELECT pg_my_temp_schema() = 0", true)),
+                ["t"]
+            );
+            session.success(&mut engine, "BEGIN; SAVEPOINT before_namespace", true);
+            session.success(&mut engine, create, true);
+            assert_eq!(
+                data_rows(&session.success(&mut engine, "SELECT pg_my_temp_schema() <> 0", true)),
+                ["t"]
+            );
+            session.success(&mut engine, "ROLLBACK TO before_namespace; COMMIT", true);
+            assert_eq!(data_rows(&session.success(&mut engine, "SELECT pg_my_temp_schema() = 0; SELECT count(*) FROM pg_namespace WHERE nspname = 'pg_temp_1'", true)), ["t", "0"]);
+            session.success(&mut engine, create, true);
+            let namespace =
+                data_rows(&session.success(&mut engine, "SELECT pg_my_temp_schema()", true))[0]
+                    .clone();
+            session.success(&mut engine, drop, true);
+            assert_eq!(data_rows(&session.success(&mut engine, &format!("SELECT pg_my_temp_schema() = {namespace}; SELECT nspname::regnamespace::oid = {namespace}, nspowner = 10 FROM pg_namespace WHERE oid = {namespace}"), true)), ["t", "t|t"]);
+            assert_eq!(
+                error_sqlstates(&session.execute(
+                    &mut engine,
+                    "SELECT 'pg_temp'::regnamespace",
+                    true
+                )),
+                ["3F000"]
+            );
+            assert_eq!(data_rows(&peer.success(&mut engine, &format!("SELECT pg_my_temp_schema() = 0, pg_is_other_temp_schema({namespace}); SELECT 'pg_temp_1'::regnamespace::oid = {namespace}"), true)), ["t|t", "t"]);
+            assert_eq!(
+                command_tags(&session.success(&mut engine, "DISCARD TEMP", true)),
+                ["DISCARD TEMP"]
+            );
+            engine.storage.drop_connection_temporary_relations(1);
+            assert_eq!(data_rows(&peer.success(&mut engine, &format!("SELECT pg_is_other_temp_schema({namespace}); SELECT count(*) FROM pg_namespace WHERE oid = {namespace}"), true)), ["f", "0"]);
+        }
+    }
+}
+
+#[test]
+fn drop_schema_removes_owned_statistics_outside_schema_transactionally() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let config = catalog_lifetime_config(&format!("drop-schema-statistics-{mode:?}"), mode);
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        session.success(&mut engine, "CREATE SCHEMA statistics_owner; CREATE TABLE statistics_owner.rows(id integer, value integer); CREATE STATISTICS public.outside_statistics ON id, value FROM statistics_owner.rows", true);
+        assert_eq!(
+            error_sqlstates(&session.execute(
+                &mut engine,
+                "DROP SCHEMA statistics_owner RESTRICT",
+                true
+            )),
+            ["2BP01"]
+        );
+        session.success(
+            &mut engine,
+            "BEGIN; SAVEPOINT before_drop; DROP SCHEMA statistics_owner CASCADE",
+            true,
+        );
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "SELECT count(*) FROM pg_statistic_ext WHERE stxname = 'outside_statistics'",
+                true
+            )),
+            ["0"]
+        );
+        session.success(&mut engine, "ROLLBACK TO before_drop; COMMIT", true);
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "SELECT count(*) FROM pg_statistic_ext WHERE stxname = 'outside_statistics'",
+                true
+            )),
+            ["1"]
+        );
+        session.success(&mut engine, "DROP SCHEMA statistics_owner CASCADE", true);
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "SELECT count(*) FROM pg_statistic_ext WHERE stxname = 'outside_statistics'",
+                true
+            )),
+            ["0"]
+        );
+    }
+}
+
+#[test]
+fn session_discard_capacity_failure_preserves_objects_and_session_settings() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = catalog_lifetime_config(&format!("discard-capacity-{mode:?}"), mode);
+        config.max_ddl_per_transaction = 3;
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        for sql in [
+            "CREATE TEMP TABLE discard_first(id integer)",
+            "CREATE TEMP TABLE discard_second(id integer)",
+            "CREATE TEMP TABLE discard_third(id integer)",
+            "CREATE TEMP VIEW discard_dependent AS SELECT id FROM discard_first",
+            "PREPARE discard_kept AS SELECT 7",
+            "SET application_name = 'kept'",
+        ] {
+            session.success(&mut engine, sql, true);
+        }
+        for sql in ["DISCARD TEMP", "DISCARD ALL"] {
+            let output = session.execute(&mut engine, sql, true);
+            assert_eq!(error_sqlstates(&output), ["54000"], "{sql}");
+            assert!(command_tags(&output).is_empty());
+            assert_eq!(data_rows(&session.success(&mut engine, "SELECT to_regclass('discard_first') IS NOT NULL, to_regclass('discard_second') IS NOT NULL, to_regclass('discard_third') IS NOT NULL, to_regclass('discard_dependent') IS NOT NULL; SHOW application_name; EXECUTE discard_kept", true)), ["t|t|t|t", "kept", "7"]);
+        }
+        for sql in [
+            "DROP VIEW discard_dependent",
+            "DROP TABLE discard_first",
+            "DROP TABLE discard_second",
+            "DROP TABLE discard_third",
+        ] {
+            session.success(&mut engine, sql, true);
+        }
+        assert_eq!(
+            command_tags(&session.success(&mut engine, "DISCARD ALL", true)),
+            ["DISCARD ALL"]
+        );
+    }
+}
+
+#[test]
+fn session_discard_temporary_drops_do_not_enter_wal_or_checkpoint() {
+    for checkpoint in [false, true] {
+        for mode in [
+            crate::config::TransactionMode::Mvcc,
+            crate::config::TransactionMode::Locking,
+        ] {
+            let name = format!("discard-recovery-{checkpoint}-{mode:?}");
+            let mut config = catalog_lifetime_config(&name, mode);
+            config.object_store_on = true;
+            config.object_store_sim = true;
+            config.wal_upload = true;
+            config.wal_upload_sync = true;
+            config.object_store_bucket = format!("{name}-{}", std::process::id());
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+            {
+                let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+                let mut engine = Engine::new(&config, &mut budget).unwrap();
+                let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+                session.success(&mut engine, "CREATE TABLE discard_saved(id integer); INSERT INTO discard_saved VALUES(99); CREATE TEMP TABLE discard_ephemeral(id serial PRIMARY KEY, value integer); INSERT INTO discard_ephemeral(value) VALUES(7); CREATE TEMP SEQUENCE discard_ephemeral_sequence; CREATE TEMP VIEW discard_ephemeral_view AS SELECT id FROM discard_ephemeral; CREATE STATISTICS discard_ephemeral_statistics ON id, value FROM discard_ephemeral; DISCARD TEMP", false);
+                if checkpoint {
+                    assert!(engine.checkpoint().unwrap());
+                }
+                engine.commit_wal().unwrap();
+            }
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+            {
+                let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+                let mut engine = Engine::new(&config, &mut budget).unwrap();
+                let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+                assert_eq!(data_rows(&session.success(&mut engine, "SELECT id FROM discard_saved; SELECT count(*) FROM pg_class WHERE relname LIKE 'discard_ephemeral%'; SELECT count(*) FROM pg_statistic_ext WHERE stxname = 'discard_ephemeral_statistics'", false)), ["99", "0", "0"]);
+            }
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        }
     }
 }
 
@@ -25690,11 +26528,8 @@ fn catalog_snapshot_schema_resolution_retains_only_its_owned_definition() {
                     crate::sql::catalog::synthesize_definition(Some(qualifier), catalog, &arena)?;
                 assert!(shape.rows.is_empty());
                 assert_eq!(shape.def.name.as_str(), catalog);
-                assert_eq!(
-                    arena.used() - before,
-                    core::mem::size_of::<
-                        crate::mem::arena::InternedValue<(crate::storage::TableDef, usize)>,
-                    >()
+                assert!(
+                    arena.used() - before < core::mem::size_of::<crate::storage::TableDef>() / 4
                 );
                 let materialized = crate::sql::catalog::synthesize(
                     &engine.storage,
@@ -32374,6 +33209,77 @@ fn serial_auto_increment() {
     assert!(run("INSERT INTO u(name) VALUES ('f') RETURNING id").contains('5'));
     assert!(run("TRUNCATE u RESTART IDENTITY").contains("TRUNCATE TABLE"));
     assert!(run("INSERT INTO u(name) VALUES ('g') RETURNING id").contains('1'));
+}
+
+#[test]
+fn serial_recovery_keeps_saved_counters_independent_of_rows() {
+    for checkpoint in [false, true] {
+        for mode in [
+            crate::config::TransactionMode::Mvcc,
+            crate::config::TransactionMode::Locking,
+        ] {
+            let name = format!("serial-recovery-{checkpoint}-{mode:?}");
+            let mut config = catalog_lifetime_config(&name, mode);
+            config.object_store_on = true;
+            config.object_store_sim = true;
+            config.wal_upload = true;
+            config.wal_upload_sync = true;
+            config.object_store_bucket = format!("{name}-{}", std::process::id());
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+            {
+                let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+                let mut engine = Engine::new(&config, &mut budget).unwrap();
+                let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+                session.success(&mut engine, "CREATE TABLE serial_saved (id serial)", false);
+                let table = engine.storage.find_table("public", "serial_saved").unwrap();
+                // Both saved counter layers are independent of explicitly inserted values.
+                engine.storage.set_table_serial_value(table, 0, 21);
+                session.success(&mut engine, "INSERT INTO serial_saved VALUES (100)", false);
+                assert_eq!(
+                    data_rows(&session.success(
+                        &mut engine,
+                        "INSERT INTO serial_saved DEFAULT VALUES RETURNING id",
+                        false
+                    )),
+                    ["1"]
+                );
+                if checkpoint {
+                    assert!(engine.checkpoint().unwrap());
+                }
+                engine.commit_wal().unwrap();
+            }
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+            {
+                let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+                let mut engine = Engine::new(&config, &mut budget).unwrap();
+                let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+                let table = engine.storage.find_table("public", "serial_saved").unwrap();
+                assert_eq!(
+                    engine.storage.table_serial_value(table, 0),
+                    21,
+                    "checkpoint={checkpoint}, mode={mode:?}"
+                );
+                assert_eq!(
+                    data_rows(&session.success(
+                        &mut engine,
+                        "INSERT INTO serial_saved DEFAULT VALUES RETURNING id",
+                        false
+                    )),
+                    ["2"]
+                );
+                assert_eq!(
+                    data_rows(&session.success(
+                        &mut engine,
+                        "SELECT id FROM serial_saved ORDER BY id",
+                        false
+                    )),
+                    ["1", "2", "100"]
+                );
+            }
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        }
+    }
 }
 
 #[test]
@@ -69997,7 +70903,7 @@ fn relation_persistence_is_typed_session_scoped_and_transactional() {
             &mut engine,
             &mut budget,
             11,
-            "SELECT pg_my_temp_schema() = 'pg_temp'::regnamespace",
+            "SELECT nspname::regnamespace::oid = pg_my_temp_schema() FROM pg_namespace WHERE oid = pg_my_temp_schema()",
         )),
         ["t"]
     );

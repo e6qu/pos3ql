@@ -35,7 +35,7 @@ failover routing remain in [the plan](../PLAN.md).
 
 ## Current execution and evidence limits
 
-Statements still execute one at a time. `query_workspace_slots` reserves
+SQL CPU work still uses one worker; eligible object I/O overlaps. `query_workspace_slots` reserves
 independent statement arenas and DML row-selection buffers, leased together
 through a fixed, ordered dispatcher pool. More slots isolate state and account
 for memory; they do not currently add execution throughput. Subscription apply
@@ -63,6 +63,81 @@ matches, extra ON conditions, and LEFT JOIN preservation share the same path.
 A build beyond the fixed entry ceiling chooses a nested-loop plan before
 execution. [The compatibility guide](postgresql-18-compatibility.md) records
 other SQL and capacity limits.
+
+## Estimating bandwidth and throughput
+
+A SQL statement is a command such as SELECT or UPDATE. A transaction can contain
+several statements and one commit. The benchmark's `ops/s` is its recorded
+workload operation count divided by elapsed time; it is not automatically SQL
+statements per second or committed transactions per second. Specify which unit
+you measured, how errors count, and whether connection and commit time are
+included.
+
+There is no current qualified production TPS, QPS, maximum database size or
+sustained bandwidth result. [Architecture](architecture.md#memory-and-physical-size)
+lists hard physical limits and configurable inventories. Do not infer a
+petabyte database or unlimited throughput from object-store capacity alone.
+
+For planning, use explicit assumptions. If average request occupancy is `L`
+seconds, a read transfers `S` bytes, `C` request slots are usable, and available
+link bandwidth is `B` bytes/second, an optimistic read ceiling is:
+
+```text
+completed object reads/second <= min(C / L, B / S)
+useful query rate <= completed reads/second / uncached reads per query
+```
+
+This excludes CPU, signing/TLS, metadata reads, queueing, retries, contention,
+maintenance and protocol traffic. Smaller ranged reads change `S`; cache hits
+avoid object requests. More slots can hide latency until another limit dominates.
+
+**Calculated example, not a measured deployment:** assume four read slots,
+20 ms average occupancy per 256 KiB response, and 100 MiB/s available to data
+responses. The slot bound is `4 / 0.020 = 200` reads/s; the bandwidth bound is
+`100 MiB / 256 KiB = 400` reads/s. The smaller bound gives at most 50 MiB/s.
+If every query needs eight such uncached reads, the storage ceiling is 25
+queries/s before CPU and other traffic. This is not a forecast for cached
+queries or for an actual S3-compatible provider.
+
+Commit latency has a different critical path. Batch bytes and descriptor must
+be durable before the conditional commit-head update. Grouping transactions
+amortizes that work but does not remove ordered root publication.
+
+**Calculated example:** assume the two independent uploads overlap and each
+phase, including the later root update, takes 20 ms; assume no overlap between
+successive batches and negligible transfer/CPU costs. That is at least 40 ms
+per batch, at most 25 batches/s. With `commit_queue_slots` at least eight and
+log bytes fitting their reserved buffers, eight transactions per batch would
+give an optimistic 200 committed transactions/s under those assumptions. One
+transaction per batch would give 25. Real batch occupancy, bytes, network
+latency and CPU must be measured; the server does not promise these rates or
+promise eight transactions per batch.
+
+One CPU worker imposes another ceiling: if SQL processing itself costs 2 ms per
+operation, that worker can perform at most 500 operations/s before maintenance
+and scheduling overhead. The example's 2 ms is an assumption, not a measured
+pos3ql execution cost. Network and CPU ceilings cannot simply be added.
+
+## What the retained measurements actually show
+
+The [2026-09-23 resource-matched matrix](https://github.com/e6qu/pos3ql/blob/708d5b475845492bdaa29dd573a6f508770acc62/benchmarks/baselines/2026-09-23-resource-matched-postgresql-10000/report.md)
+records revision `90861f1bb8b464b8032e79fac8d6a28681aaa9ba`, 10,000 rows,
+four clients, 12 available CPUs and a 949.81 MiB fixed pos3ql plan. MinIO and
+SeaweedFS ran on the same host; matched PostgreSQL had the same CPU quota and
+memory allowance and used its recorded ordinary durable storage.
+
+| Historical workload | pos3ql ops/s | pos3ql p99 | Matched PostgreSQL ops/s | Matched PostgreSQL p99 |
+|---|---:|---:|---:|---:|
+| MinIO, mixed with checkpoints | 130.43 | 557.86 ms | 3,152.76 | 10.05 ms |
+| SeaweedFS, mixed with checkpoints | 130.27 | 441.96 ms | 3,488.84 | 7.33 ms |
+
+These results expose a substantial gap in those old setups. They are not
+measurements of the current branch, realistic independent-storage qualification
+or evidence that either provider is faster. Preserve their raw artifacts and
+workload definitions. Current capacity and performance claims require a new,
+repeated run with independently operated storage, recorded hardware and network,
+working-set sizes, errors, CPU, memory, requests and transferred bytes. Retain
+both host-available and resource-matched vanilla PostgreSQL controls.
 
 ## Running the suite
 
@@ -330,7 +405,7 @@ reported rather than required to be linear.
 
 ## Remaining qualification
 
-Execution remains serial. The [roadmap](../PLAN.md#remaining-work) defines
+SQL CPU execution still uses one worker. The [roadmap](../PLAN.md#remaining-work) defines
 the shared-state and worker prerequisites, representative deployment inputs,
 and required scaling, recovery, freshness, and failover evidence. Timing claims
 require repeated long runs on pinned hardware with independent object storage;

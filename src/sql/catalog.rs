@@ -50,16 +50,16 @@ mod type_io;
 
 /// A materialized catalog relation: its shape plus rows in the arena.
 #[derive(Clone, Copy)]
-pub struct SynthTable<'a> {
-    pub def: &'a TableDef,
+pub(crate) struct SynthTable<'a> {
+    pub def: &'a crate::storage::RelationDefinition<'a>,
     pub rows: &'a [&'a [Datum<'a>]],
     /// Addressable system columns encoded after `def.n_columns`, and therefore
     /// omitted from star expansion and the relation's positive attributes.
     pub hidden_columns: usize,
 }
 
-/// Stable per-name OIDs so a table's oid is consistent within a session.
-/// User relations start above the reserved range.
+/// Base for synthetic publication-membership identifiers. Publication objects
+/// themselves derive identifiers from their durable creation stamps.
 const FIRST_USER_OID: i32 = 16384;
 const PG_CATALOG_NS_OID: i32 = 11;
 const PG_TOAST_NS_OID: i32 = 99;
@@ -9687,22 +9687,6 @@ pub(crate) fn view_slot_by_row_type_oid(
     })
 }
 
-const FIRST_FOREIGN_DATA_WRAPPER_OID: i32 = 510_000;
-const FIRST_FOREIGN_SERVER_OID: i32 = 520_000;
-const FIRST_USER_MAPPING_OID: i32 = 530_000;
-
-pub(crate) const fn foreign_data_wrapper_oid(slot: usize) -> i32 {
-    FIRST_FOREIGN_DATA_WRAPPER_OID + slot as i32
-}
-
-pub(crate) const fn foreign_server_oid(slot: usize) -> i32 {
-    FIRST_FOREIGN_SERVER_OID + slot as i32
-}
-
-const fn user_mapping_oid(slot: usize) -> i32 {
-    FIRST_USER_MAPPING_OID + slot as i32
-}
-
 fn foreign_options_datum<'a>(
     options: &crate::storage::foreign::ForeignOptions,
     arena: &'a Arena,
@@ -9774,7 +9758,7 @@ fn pg_foreign_data_wrapper<'a>(
         rows[index] = row(
             &[
                 Datum::Int4(2328),
-                Datum::Int4(foreign_data_wrapper_oid(slot)),
+                Datum::Int4(entry.oid()),
                 text(wrapper.name.as_str(), arena)?,
                 Datum::Int4(storage.role_oid(entry.ownership.owner_to(txid) as usize)),
                 Datum::Int4(match wrapper.handler {
@@ -9821,10 +9805,10 @@ fn pg_foreign_server<'a>(
         rows[index] = row(
             &[
                 Datum::Int4(1417),
-                Datum::Int4(foreign_server_oid(slot)),
+                Datum::Int4(entry.oid()),
                 text(server.name.as_str(), arena)?,
                 Datum::Int4(storage.role_oid(entry.ownership.owner_to(txid) as usize)),
-                Datum::Int4(foreign_data_wrapper_oid(server.wrapper as usize)),
+                Datum::Int4(storage.foreign_wrapper_entry(server.wrapper as usize).oid()),
                 match server.server_type {
                     Some(value) => text(value.as_str(), arena)?,
                     None => Datum::Null,
@@ -9865,7 +9849,7 @@ fn pg_foreign_table<'a>(
         rows[index] = row(
             &[
                 Datum::Int4(user_table_oid(storage, table.table as usize)),
-                Datum::Int4(foreign_server_oid(table.server as usize)),
+                Datum::Int4(storage.foreign_server_entry(table.server as usize).oid()),
                 foreign_options_datum(&table.options, arena)?,
             ],
             arena,
@@ -9884,7 +9868,7 @@ fn pg_user_mapping<'a>(
     let rows = arena
         .alloc_slice_with(count, |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
-    for (index, (slot, entry)) in storage.foreign_user_mappings(txid).enumerate() {
+    for (index, (_, entry)) in storage.foreign_user_mappings(txid).enumerate() {
         let mapping = entry.definition_for(txid);
         let user = match mapping.user {
             crate::storage::foreign::ForeignMappingUser::Public => 0,
@@ -9894,9 +9878,9 @@ fn pg_user_mapping<'a>(
         };
         rows[index] = row(
             &[
-                Datum::Int4(user_mapping_oid(slot)),
+                Datum::Int4(entry.oid()),
                 Datum::Int4(user),
-                Datum::Int4(foreign_server_oid(mapping.server as usize)),
+                Datum::Int4(storage.foreign_server_entry(mapping.server as usize).oid()),
                 if foreign_mapping_options_visible(storage, mapping, txid) {
                     foreign_options_datum(&mapping.options, arena)?
                 } else {
@@ -9919,7 +9903,7 @@ fn pg_user_mappings<'a>(
     let rows = arena
         .alloc_slice_with(count, |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
-    for (index, (slot, entry)) in storage.foreign_user_mappings(txid).enumerate() {
+    for (index, (_, entry)) in storage.foreign_user_mappings(txid).enumerate() {
         let mapping = entry.definition_for(txid);
         let server = storage
             .foreign_server_by_slot(mapping.server as usize, txid)
@@ -9938,8 +9922,8 @@ fn pg_user_mappings<'a>(
         };
         rows[index] = row(
             &[
-                Datum::Int4(user_mapping_oid(slot)),
-                Datum::Int4(foreign_server_oid(mapping.server as usize)),
+                Datum::Int4(entry.oid()),
+                Datum::Int4(storage.foreign_server_entry(mapping.server as usize).oid()),
                 text(server.name.as_str(), arena)?,
                 Datum::Int4(user),
                 user_name,
@@ -10716,46 +10700,18 @@ fn namespace_oid(storage: &Storage, schema: &str, txid: u32) -> i32 {
 }
 
 pub(crate) fn current_temporary_namespace_oid(storage: &Storage, txid: u32) -> i32 {
-    let Ok(schema) = storage.temporary_schema() else {
-        return 0;
-    };
-    let exists = (0..storage.table_count()).any(|slot| {
-        storage.table_slot_visible_to(slot, txid)
-            && storage.table_def(slot, txid).schema == schema
-            && storage.table_def(slot, txid).persistence
-                == crate::storage::RelationPersistence::Temporary
-    }) || (0..storage.sequence_count()).any(|slot| {
-        storage.sequence_slot_visible_to(slot, txid)
-            && storage.sequence_for(slot, txid).schema == schema
-            && storage.sequence_for(slot, txid).persistence
-                == crate::storage::RelationPersistence::Temporary
-    });
-    if exists {
-        namespace_oid(storage, schema.as_str(), txid)
-    } else {
-        0
-    }
+    storage
+        .find_temporary_namespace(txid, |namespace| {
+            namespace.connection_id() == storage.current_connection_id()
+        })
+        .map_or(0, crate::storage::TemporaryNamespaceIdentity::oid)
 }
 
 pub(crate) fn is_other_temporary_namespace(storage: &Storage, txid: u32, oid: i32) -> bool {
-    let current = current_temporary_namespace_oid(storage, txid);
-    oid != current
-        && ((0..storage.table_count()).any(|slot| {
-            storage.table_slot_visible_to(slot, txid)
-                && storage.table_def(slot, txid).persistence
-                    == crate::storage::RelationPersistence::Temporary
-                && namespace_oid(storage, storage.table_def(slot, txid).schema.as_str(), txid)
-                    == oid
-        }) || (0..storage.sequence_count()).any(|slot| {
-            storage.sequence_slot_visible_to(slot, txid)
-                && storage.sequence_for(slot, txid).persistence
-                    == crate::storage::RelationPersistence::Temporary
-                && namespace_oid(
-                    storage,
-                    storage.sequence_for(slot, txid).schema.as_str(),
-                    txid,
-                ) == oid
-        }))
+    storage
+        .find_temporary_namespace(txid, |namespace| namespace.oid() == oid)
+        .is_some()
+        && current_temporary_namespace_oid(storage, txid) != oid
 }
 
 pub(crate) fn schema_name_by_oid(
@@ -10767,14 +10723,9 @@ pub(crate) fn schema_name_by_oid(
         PG_CATALOG_NS_OID => crate::storage::SqlName::parse("pg_catalog").ok(),
         PG_TOAST_NS_OID => crate::storage::SqlName::parse("pg_toast").ok(),
         INFORMATION_SCHEMA_NS_OID => crate::storage::SqlName::parse("information_schema").ok(),
-        _ => (0..storage.table_count())
-            .find_map(|slot| {
-                let table = storage.table_def(slot, txid);
-                (storage.table_slot_visible_to(slot, txid)
-                    && table.persistence == crate::storage::RelationPersistence::Temporary
-                    && namespace_oid(storage, table.schema.as_str(), txid) == oid)
-                    .then_some(table.schema)
-            })
+        _ => storage
+            .find_temporary_namespace(txid, |namespace| namespace.oid() == oid)
+            .map(crate::storage::TemporaryNamespaceIdentity::name)
             .or_else(|| {
                 storage
                     .visible_schemas(txid)
@@ -10789,24 +10740,15 @@ pub(crate) fn schema_oid_by_name(storage: &Storage, txid: u32, name: &str) -> Op
         "pg_catalog" => Some(PG_CATALOG_NS_OID),
         "pg_toast" => Some(PG_TOAST_NS_OID),
         "information_schema" => Some(INFORMATION_SCHEMA_NS_OID),
-        "pg_temp" => (current_temporary_namespace_oid(storage, txid) != 0)
-            .then(|| current_temporary_namespace_oid(storage, txid)),
-        _ if name.starts_with("pg_temp_") => {
-            let oid = namespace_oid(storage, name, txid);
-            (oid != 0
-                && ((0..storage.table_count()).any(|slot| {
-                    storage.table_slot_visible_to(slot, txid)
-                        && storage.table_def(slot, txid).persistence
-                            == crate::storage::RelationPersistence::Temporary
-                        && storage.table_def(slot, txid).schema.as_str() == name
-                }) || (0..storage.sequence_count()).any(|slot| {
-                    storage.sequence_slot_visible_to(slot, txid)
-                        && storage.sequence_for(slot, txid).persistence
-                            == crate::storage::RelationPersistence::Temporary
-                        && storage.sequence_for(slot, txid).schema.as_str() == name
-                })))
-            .then_some(oid)
-        }
+        _ if name.starts_with("pg_temp_") => name[8..]
+            .parse::<i32>()
+            .ok()
+            .and_then(|connection| {
+                storage.find_temporary_namespace(txid, |namespace| {
+                    namespace.connection_id() == connection
+                })
+            })
+            .map(crate::storage::TemporaryNamespaceIdentity::oid),
         _ => storage
             .find_schema_visible(name, txid)
             .map(|slot| namespace_oid_for_slot(storage, slot)),
@@ -10814,36 +10756,16 @@ pub(crate) fn schema_oid_by_name(storage: &Storage, txid: u32, name: &str) -> Op
 }
 
 pub(crate) fn schema_oid_by_written(storage: &Storage, txid: u32, written: &str) -> Option<i32> {
-    for name in [
-        "public",
-        "pg_catalog",
-        "pg_toast",
-        "information_schema",
-        "pg_temp",
-    ] {
+    for name in ["public", "pg_catalog", "pg_toast", "information_schema"] {
         if identifier_spelling_matches(written, name) {
             return schema_oid_by_name(storage, txid, name);
         }
     }
-    if let Some(name) = (0..storage.table_count())
-        .find_map(|slot| {
-            let table = storage.table_def(slot, txid);
-            (storage.table_slot_visible_to(slot, txid)
-                && table.persistence == crate::storage::RelationPersistence::Temporary
-                && identifier_spelling_matches(written, table.schema.as_str()))
-            .then_some(table.schema)
-        })
-        .or_else(|| {
-            (0..storage.sequence_count()).find_map(|slot| {
-                let sequence = storage.sequence_for(slot, txid);
-                (storage.sequence_slot_visible_to(slot, txid)
-                    && sequence.persistence == crate::storage::RelationPersistence::Temporary
-                    && identifier_spelling_matches(written, sequence.schema.as_str()))
-                .then_some(sequence.schema)
-            })
-        })
-    {
-        return schema_oid_by_name(storage, txid, name.as_str());
+    // pg_temp is a relation qualifier, not a catalog namespace name.
+    if let Some(namespace) = storage.find_temporary_namespace(txid, |namespace| {
+        identifier_spelling_matches(written, namespace.name().as_str())
+    }) {
+        return Some(namespace.oid());
     }
     storage.visible_schemas(txid).find_map(|(slot, schema)| {
         identifier_spelling_matches(written, schema.name.as_str())
@@ -10970,16 +10892,6 @@ const fn foreign_key_action_routine(action: crate::storage::FkAction, update: bo
         (FkAction::NoAction, true) => 1655,
     }
 }
-const FIRST_EXTENDED_STATISTICS_OID: i32 = 300_000;
-const FIRST_EXTENSION_OID: i32 = 500_000;
-
-pub(crate) fn extension_oid(slot: usize) -> i32 {
-    FIRST_EXTENSION_OID + slot as i32
-}
-
-pub(crate) fn extended_statistics_oid(slot: usize) -> i32 {
-    FIRST_EXTENDED_STATISTICS_OID + slot as i32
-}
 
 pub(crate) fn extended_statistics_columns_by_oid<'a>(
     storage: &Storage,
@@ -10990,7 +10902,7 @@ pub(crate) fn extended_statistics_columns_by_oid<'a>(
     use core::fmt::Write as _;
     let Some((_, statistics)) = storage
         .extended_statistics_visible(txid)
-        .find(|(slot, _)| extended_statistics_oid(*slot) == oid)
+        .find(|(_, statistics)| statistics.oid() == oid)
     else {
         return Ok(None);
     };
@@ -11026,7 +10938,7 @@ pub(crate) fn extended_statistics_definition_by_oid<'a>(
     use core::fmt::Write as _;
     let Some((_, statistics)) = storage
         .extended_statistics_visible(txid)
-        .find(|(slot, _)| extended_statistics_oid(*slot) == oid)
+        .find(|(_, statistics)| statistics.oid() == oid)
     else {
         return Ok(None);
     };
@@ -11094,7 +11006,7 @@ pub(crate) fn extended_statistics_expressions_by_oid<'a>(
 ) -> Result<Option<Datum<'a>>, SqlError> {
     let Some((_, statistics)) = storage
         .extended_statistics_visible(txid)
-        .find(|(slot, _)| extended_statistics_oid(*slot) == oid)
+        .find(|(_, statistics)| statistics.oid() == oid)
     else {
         return Ok(None);
     };
@@ -12413,7 +12325,7 @@ pub(crate) fn conversion_oid_visibility(storage: &Storage, txid: u32, oid: i32) 
 pub(crate) fn statistics_oid_visibility(storage: &Storage, txid: u32, oid: i32) -> Option<bool> {
     let (slot, statistics) = storage
         .extended_statistics_visible(txid)
-        .find(|(slot, _)| extended_statistics_oid(*slot) == oid)?;
+        .find(|(_, statistics)| statistics.oid() == oid)?;
     let definition = statistics.definition_for(txid);
     Some(
         storage.extended_statistics_slot_on_path(None, definition.name.as_str(), txid)
@@ -14142,22 +14054,22 @@ fn pg_description<'a>(
                 continue;
             }
             crate::storage::CommentClass::ForeignServer => {
-                let Ok(slot) = usize::try_from(subid) else {
+                let Some((_, entry)) = storage
+                    .foreign_servers(txid)
+                    .find(|(_, entry)| entry.creation().get() == subid)
+                else {
                     continue;
                 };
-                let Some(_) = storage.foreign_server_by_slot(slot, txid) else {
-                    continue;
-                };
-                (foreign_server_oid(slot), 1417)
+                (entry.oid(), 1417)
             }
             crate::storage::CommentClass::ForeignDataWrapper => {
-                let Ok(slot) = usize::try_from(subid) else {
+                let Some((_, entry)) = storage
+                    .foreign_wrappers(txid)
+                    .find(|(_, entry)| entry.creation().get() == subid)
+                else {
                     continue;
                 };
-                let Some(_) = storage.foreign_wrapper_by_slot(slot, txid) else {
-                    continue;
-                };
-                (foreign_data_wrapper_oid(slot), 2328)
+                (entry.oid(), 2328)
             }
             crate::storage::CommentClass::AccessMethod => {
                 let Ok(oid) = i32::try_from(subid) else {
@@ -14234,7 +14146,7 @@ fn pg_description<'a>(
                 let Some(slot) = storage.extension_slot(name, txid) else {
                     continue;
                 };
-                (extension_oid(slot), 3079)
+                (storage.extension(slot).oid(), 3079)
             }
             crate::storage::CommentClass::Trigger => {
                 let trigger = storage
@@ -14302,31 +14214,31 @@ fn pg_description<'a>(
                 (crate::storage::policy_oid(&policy), PG_POLICY_OID)
             }
             crate::storage::CommentClass::Statistics => {
-                let Some((slot, _)) = storage
+                let Some((_, statistics)) = storage
                     .extended_statistics_visible(txid)
-                    .find(|(slot, _)| *slot as u32 == subid)
+                    .find(|(_, statistics)| statistics.creation().get() == subid)
                 else {
                     continue;
                 };
-                (extended_statistics_oid(slot), PG_STATISTIC_EXT_OID)
+                (statistics.oid(), PG_STATISTIC_EXT_OID)
             }
             crate::storage::CommentClass::Publication => {
-                let Some((slot, _)) = storage
+                let Some((_, publication)) = storage
                     .publications_with_slots_visible_to(txid)
-                    .find(|(slot, _)| *slot as u32 == subid)
+                    .find(|(_, publication)| publication.creation().get() == subid)
                 else {
                     continue;
                 };
-                (publication_oid(slot), PG_PUBLICATION_OID)
+                (publication.oid(), PG_PUBLICATION_OID)
             }
             crate::storage::CommentClass::Subscription => {
                 let Some((_, subscription)) = storage
-                    .subscriptions_with_slots_visible_to(txid)
+                    .subscriptions_with_slots_visible_to(Some(storage.current_database_oid()), txid)
                     .find(|(_, subscription)| subscription.created_at as u32 == subid)
                 else {
                     continue;
                 };
-                (subscription_oid(&subscription), PG_SUBSCRIPTION_OID)
+                (subscription.oid(), PG_SUBSCRIPTION_OID)
             }
             crate::storage::CommentClass::Rule => {
                 let rule = storage
@@ -14930,9 +14842,8 @@ fn visit_comments_for_object(
                 class == crate::storage::CommentClass::ForeignServer
                     && subid == 0
                     && signed_oid.is_some_and(|server_oid| {
-                        usize::try_from(csub).ok().is_some_and(|slot| {
-                            foreign_server_oid(slot) == server_oid
-                                && storage.foreign_server_by_slot(slot, txid).is_some()
+                        storage.foreign_servers(txid).any(|(_, entry)| {
+                            entry.creation().get() == csub && entry.oid() == server_oid
                         })
                     })
             }
@@ -14940,9 +14851,8 @@ fn visit_comments_for_object(
                 class == crate::storage::CommentClass::ForeignDataWrapper
                     && subid == 0
                     && signed_oid.is_some_and(|wrapper_oid| {
-                        usize::try_from(csub).ok().is_some_and(|slot| {
-                            foreign_data_wrapper_oid(slot) == wrapper_oid
-                                && storage.foreign_wrapper_by_slot(slot, txid).is_some()
+                        storage.foreign_wrappers(txid).any(|(_, entry)| {
+                            entry.creation().get() == csub && entry.oid() == wrapper_oid
                         })
                     })
             }
@@ -15137,9 +15047,11 @@ fn visit_comments_for_object(
                 class == crate::storage::CommentClass::Statistics
                     && subid == 0
                     && signed_oid.is_some_and(|oid| {
-                        storage.extended_statistics_visible(txid).any(|(slot, _)| {
-                            extended_statistics_oid(slot) == oid && csub == slot as u32
-                        })
+                        storage
+                            .extended_statistics_visible(txid)
+                            .any(|(_, statistics)| {
+                                statistics.oid() == oid && csub == statistics.creation().get()
+                            })
                     })
             }
             "pg_publication" => {
@@ -15148,19 +15060,23 @@ fn visit_comments_for_object(
                     && signed_oid.is_some_and(|oid| {
                         storage
                             .publications_with_slots_visible_to(txid)
-                            .any(|(slot, _)| publication_oid(slot) == oid && csub == slot as u32)
+                            .any(|(_, publication)| {
+                                publication.oid() == oid && csub == publication.creation().get()
+                            })
                     })
             }
             "pg_subscription" => {
                 class == crate::storage::CommentClass::Subscription
                     && subid == 0
                     && signed_oid.is_some_and(|oid| {
-                        storage.subscriptions_with_slots_visible_to(txid).any(
-                            |(_, subscription)| {
-                                subscription_oid(&subscription) == oid
-                                    && csub == subscription.created_at as u32
-                            },
-                        )
+                        storage
+                            .subscriptions_with_slots_visible_to(
+                                Some(storage.current_database_oid()),
+                                txid,
+                            )
+                            .any(|(_, subscription)| {
+                                subscription.oid() == oid && csub == subscription.created_at as u32
+                            })
                     })
             }
             "pg_extension" => {
@@ -15168,7 +15084,7 @@ fn visit_comments_for_object(
                     && subid == 0
                     && storage
                         .extension_slot(name, txid)
-                        .is_some_and(|slot| Some(extension_oid(slot)) == signed_oid)
+                        .is_some_and(|slot| Some(storage.extension(slot).oid()) == signed_oid)
             }
             "pg_class" => {
                 class == crate::storage::CommentClass::Relation
@@ -16511,26 +16427,24 @@ fn materialize_with_hidden(
     Ok((definition, count))
 }
 
-fn allocate_definition(
+fn allocate_definition<'a>(
     definition: TableDef,
     hidden_columns: usize,
-    arena: &Arena,
-) -> Result<&TableDef, SqlError> {
-    let def = arena
-        .alloc_interned(
-            (definition, hidden_columns),
-            |(left, left_hidden), (right, right_hidden)| {
-                // These definitions come only from materialize_with_hidden: all other
-                // TableDef fields have its fixed empty values.
-                left_hidden == right_hidden
-                    && left.name == right.name
-                    && left.n_columns == right.n_columns
-                    && left.columns[..left.n_columns + left_hidden]
-                        == right.columns[..right.n_columns + right_hidden]
-            },
-        )
+    arena: &'a Arena,
+) -> Result<&'a crate::storage::RelationDefinition<'a>, SqlError> {
+    let width = definition.n_columns + hidden_columns;
+    let columns = arena
+        .alloc_slice_copy(&definition.columns[..width])
         .map_err(|_| arena_full())?;
-    Ok(&def.0)
+    arena
+        .alloc(crate::storage::RelationDefinition {
+            schema: definition.schema,
+            name: definition.name,
+            n_columns: definition.n_columns,
+            columns,
+        })
+        .map(|definition| &*definition)
+        .map_err(|_| arena_full())
 }
 
 fn finish_with_hidden<'a>(
@@ -16784,14 +16698,6 @@ fn pg_stats<'a>(
     finish(def, &rows[..count], arena)
 }
 
-pub(crate) fn publication_oid(slot: usize) -> i32 {
-    FIRST_USER_OID + 80_000 + slot as i32
-}
-
-pub(crate) fn subscription_oid(subscription: &crate::storage::SubscriptionDef) -> i32 {
-    FIRST_USER_OID + 95_000 + subscription.created_at as i32
-}
-
 fn policy_command_name(command: PolicyCommandKind) -> &'static str {
     match command {
         PolicyCommandKind::All => "ALL",
@@ -16948,7 +16854,7 @@ fn pg_statistic_ext<'a>(
         rows[count] = row(
             &[
                 Datum::Int4(3381),
-                Datum::Int4(extended_statistics_oid(slot)),
+                Datum::Int4(statistics.oid()),
                 Datum::Int4(user_table_oid(storage, usize::from(statistics.table))),
                 text(mutable.name.as_str(), arena)?,
                 Datum::Int4(namespace_oid(storage, mutable.schema.as_str(), txid)),
@@ -17258,7 +17164,7 @@ fn pg_statistic_ext_data<'a>(
         rows[count] = row(
             &[
                 Datum::Int4(3429),
-                Datum::Int4(extended_statistics_oid(slot)),
+                Datum::Int4(statistics.oid()),
                 Datum::Bool(data.inherited),
                 if statistics.kinds.ndistinct() {
                     text(ndistinct.as_str(), arena)?
@@ -17658,12 +17564,12 @@ fn pg_publication<'a>(
         storage.publications_with_slots_visible_to(txid).count(),
     )?;
     let mut count = 0;
-    for (slot, publication) in storage.publications_with_slots_visible_to(txid) {
+    for (_, publication) in storage.publications_with_slots_visible_to(txid) {
         let definition = publication.definition_for(txid);
         rows[count] = row(
             &[
                 Datum::Int4(6104),
-                Datum::Int4(publication_oid(slot)),
+                Datum::Int4(publication.oid()),
                 text(publication.name_for(txid).as_str(), arena)?,
                 Datum::Int4(storage.role_oid(publication.ownership.owner_to(txid) as usize)),
                 Datum::Bool(definition.all_tables),
@@ -17693,7 +17599,7 @@ fn pg_publication_namespace<'a>(
         .sum();
     let rows = catalog_rows(arena, row_capacity)?;
     let mut count = 0;
-    for (publication_slot, publication) in storage.publications_with_slots_visible_to(txid) {
+    for (_, publication) in storage.publications_with_slots_visible_to(txid) {
         let publication_definition = publication.definition_for(txid);
         for schema_slot in &publication_definition.schemas[..publication_definition.schema_count] {
             if count == rows.len() {
@@ -17713,7 +17619,7 @@ fn pg_publication_namespace<'a>(
                             .get(),
                     ),
                     Datum::Int4(FIRST_USER_OID + 85_000 + count as i32),
-                    Datum::Int4(publication_oid(publication_slot)),
+                    Datum::Int4(publication.oid()),
                     Datum::Int4(namespace_oid(storage, schema.name.as_str(), txid)),
                 ],
                 arena,
@@ -17743,7 +17649,7 @@ fn pg_publication_rel<'a>(
         .sum();
     let rows = catalog_rows(arena, row_capacity)?;
     let mut count = 0;
-    for (publication_slot, publication) in storage.publications_with_slots_visible_to(txid) {
+    for (_, publication) in storage.publications_with_slots_visible_to(txid) {
         let definition = publication.definition_for(txid);
         if definition.all_tables {
             continue;
@@ -17788,7 +17694,7 @@ fn pg_publication_rel<'a>(
                 &[
                     Datum::Int4(6106),
                     Datum::Int4(FIRST_USER_OID + 90_000 + count as i32),
-                    Datum::Int4(publication_oid(publication_slot)),
+                    Datum::Int4(publication.oid()),
                     Datum::Int4(user_table_oid(storage, *member as usize)),
                     prqual,
                     prattrs,
@@ -18782,19 +18688,23 @@ fn pg_replication_origin<'a>(
     let definition = schema::require("pg_replication_origin", false);
     let rows = arena
         .alloc_slice_with(
-            storage.subscriptions_with_slots_visible_to(txid).count(),
+            storage
+                .subscriptions_with_slots_visible_to(Some(storage.current_database_oid()), txid)
+                .count(),
             |_| &[] as &[Datum],
         )
         .map_err(|_| arena_full())?;
     let mut count = 0usize;
-    for (slot, subscription) in storage.subscriptions_with_slots_visible_to(txid) {
+    for (slot, subscription) in
+        storage.subscriptions_with_slots_visible_to(Some(storage.current_database_oid()), txid)
+    {
         if count == rows.len() {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "pg_replication_origin changed while it was being read"
             ));
         }
-        let name = stack_format!(64, "pg_{}", subscription_oid(&subscription));
+        let name = stack_format!(64, "pg_{}", subscription.oid());
         rows[count] = row(
             &[Datum::Oid(slot as u32 + 1), text(name.as_str(), arena)?],
             arena,
@@ -18812,19 +18722,23 @@ fn pg_replication_origin_status<'a>(
     let definition = schema::require("pg_replication_origin_status", false);
     let rows = arena
         .alloc_slice_with(
-            storage.subscriptions_with_slots_visible_to(txid).count(),
+            storage
+                .subscriptions_with_slots_visible_to(Some(storage.current_database_oid()), txid)
+                .count(),
             |_| &[] as &[Datum],
         )
         .map_err(|_| arena_full())?;
     let mut count = 0usize;
-    for (slot, subscription) in storage.subscriptions_with_slots_visible_to(txid) {
+    for (slot, subscription) in
+        storage.subscriptions_with_slots_visible_to(Some(storage.current_database_oid()), txid)
+    {
         if count == rows.len() {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "pg_replication_origin_status changed while it was being read"
             ));
         }
-        let name = stack_format!(64, "pg_{}", subscription_oid(&subscription));
+        let name = stack_format!(64, "pg_{}", subscription.oid());
         rows[count] = row(
             &[
                 Datum::Oid(slot as u32 + 1),
@@ -18936,10 +18850,12 @@ fn pg_subscription<'a>(
     let definition = schema::require("pg_subscription", false);
     let rows = catalog_rows(
         arena,
-        storage.subscriptions_with_slots_visible_to(txid).count(),
+        storage
+            .subscriptions_with_slots_visible_to(None, txid)
+            .count(),
     )?;
     let mut count = 0;
-    for (_slot, subscription) in storage.subscriptions_with_slots_visible_to(txid) {
+    for (_slot, subscription) in storage.subscriptions_with_slots_visible_to(None, txid) {
         if count == rows.len() {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -18966,10 +18882,10 @@ fn pg_subscription<'a>(
         rows[count] = row(
             &[
                 Datum::Int4(PG_SUBSCRIPTION_OID),
-                Datum::Int4(subscription_oid(&subscription)),
-                Datum::Int4(storage.current_database_oid().get()),
+                Datum::Int4(subscription.oid()),
+                Datum::Int4(subscription.database.get()),
                 skip_lsn,
-                text(subscription.name.as_str(), arena)?,
+                text(subscription.name_for(txid).as_str(), arena)?,
                 Datum::Int4(storage.role_oid(subscription.ownership.owner_to(txid) as usize)),
                 Datum::Bool(subscription.enabled_to(txid)),
                 Datum::Bool(definition.behavior.binary),
@@ -19016,7 +18932,7 @@ fn pg_subscription_rel<'a>(
 ) -> Result<SynthTable<'a>, SqlError> {
     let definition = schema::require("pg_subscription_rel", false);
     let count = storage
-        .subscriptions_with_slots_visible_to(txid)
+        .subscriptions_with_slots_visible_to(Some(storage.current_database_oid()), txid)
         .map(|(_, subscription)| {
             storage
                 .subscription_relations_visible_to(&subscription, txid)
@@ -19027,7 +18943,9 @@ fn pg_subscription_rel<'a>(
         .alloc_slice_with(count, |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
     let mut index = 0;
-    for (_, subscription) in storage.subscriptions_with_slots_visible_to(txid) {
+    for (_, subscription) in
+        storage.subscriptions_with_slots_visible_to(Some(storage.current_database_oid()), txid)
+    {
         for relation in storage.subscription_relations_visible_to(&subscription, txid) {
             if index == rows.len() {
                 return Err(sql_err!(
@@ -19039,7 +18957,7 @@ fn pg_subscription_rel<'a>(
             let rendered_lsn = stack_format!(32, "0/{lsn:X}");
             rows[index] = row(
                 &[
-                    Datum::Int4(subscription_oid(&subscription)),
+                    Datum::Int4(subscription.oid()),
                     Datum::Int4(user_table_oid(storage, relation.table_slot())),
                     text(relation.state().pg_code(), arena)?,
                     if lsn == 0 {
@@ -19065,13 +18983,13 @@ fn pg_stat_subscription<'a>(
     let rows = catalog_rows(
         arena,
         storage
-            .subscriptions_with_slots_visible_to(txid)
+            .subscriptions_with_slots_visible_to(Some(storage.current_database_oid()), txid)
             .filter(|(_, subscription)| subscription.enabled_to(txid))
             .count(),
     )?;
     let mut count = 0;
     for (_, subscription) in storage
-        .subscriptions_with_slots_visible_to(txid)
+        .subscriptions_with_slots_visible_to(Some(storage.current_database_oid()), txid)
         .filter(|(_, subscription)| subscription.enabled_to(txid))
     {
         if count == rows.len() {
@@ -19088,7 +19006,7 @@ fn pg_stat_subscription<'a>(
         };
         rows[count] = row(
             &[
-                Datum::Oid(subscription_oid(&subscription) as u32),
+                Datum::Oid(subscription.oid() as u32),
                 text(subscription.name_for(txid).as_str(), arena)?,
                 text("apply", arena)?,
                 Datum::Null,
@@ -19115,10 +19033,14 @@ fn pg_stat_subscription_stats<'a>(
     let definition = schema::require("pg_stat_subscription_stats", false);
     let rows = catalog_rows(
         arena,
-        storage.subscriptions_with_slots_visible_to(txid).count(),
+        storage
+            .subscriptions_with_slots_visible_to(Some(storage.current_database_oid()), txid)
+            .count(),
     )?;
     let mut count = 0;
-    for (_, subscription) in storage.subscriptions_with_slots_visible_to(txid) {
+    for (_, subscription) in
+        storage.subscriptions_with_slots_visible_to(Some(storage.current_database_oid()), txid)
+    {
         if count == rows.len() {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -19128,7 +19050,7 @@ fn pg_stat_subscription_stats<'a>(
         }
         rows[count] = row(
             &[
-                Datum::Oid(subscription_oid(&subscription) as u32),
+                Datum::Oid(subscription.oid() as u32),
                 text(subscription.name_for(txid).as_str(), arena)?,
                 Datum::Int8(subscription.apply_error_count),
                 Datum::Int8(subscription.sync_error_count),
@@ -21044,7 +20966,7 @@ fn pg_extension<'a>(
         out[index] = row(
             &[
                 Datum::Int4(3079),
-                Datum::Int4(extension_oid(slot)),
+                Datum::Int4(extension.oid()),
                 text(extension.name.as_str(), arena)?,
                 Datum::Int4(owner_oid(
                     storage,
@@ -21120,9 +21042,9 @@ fn extension_dependency_catalog_identity(
                 txid,
             ),
         ),
-        AccessClass::Statistics => (3381, extended_statistics_oid(slot)),
+        AccessClass::Statistics => (3381, storage.extended_statistics(slot).oid()),
         AccessClass::Tablespace => return None,
-        AccessClass::Extension => (3079, extension_oid(slot)),
+        AccessClass::Extension => (3079, storage.extension(slot).oid()),
         AccessClass::Trigger => (2620, crate::storage::trigger_oid(&storage.trigger(slot))),
         AccessClass::EventTrigger => (3466, storage.event_trigger(slot).oid()),
         AccessClass::Database => (1262, 5),
@@ -21133,8 +21055,8 @@ fn extension_dependency_catalog_identity(
                 .find_map(|(candidate, object)| (candidate == slot).then_some(object.oid.get()))?
                 as i32,
         ),
-        AccessClass::ForeignDataWrapper => (2328, foreign_data_wrapper_oid(slot)),
-        AccessClass::ForeignServer => (1417, foreign_server_oid(slot)),
+        AccessClass::ForeignDataWrapper => (2328, storage.foreign_wrapper_entry(slot).oid()),
+        AccessClass::ForeignServer => (1417, storage.foreign_server_entry(slot).oid()),
         AccessClass::Language => (PG_LANGUAGE_OID, object.slot.into()),
     })
 }
@@ -21933,7 +21855,7 @@ fn pg_depend<'a>(
             class,
             object,
             3079,
-            extension_oid(dependency.extension as usize),
+            storage.extension(dependency.extension as usize).oid(),
             0,
             match dependency.kind {
                 crate::storage::ExtensionDependencyKind::Member => "e",
@@ -30253,7 +30175,7 @@ fn pg_namespace<'a>(
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
     let def = schema::require("pg_namespace", false);
-    let capacity = 4 + storage.schema_count() + storage.table_count() + storage.sequence_count();
+    let capacity = 4 + storage.schema_count() + storage.temporary_namespace_capacity();
     let out = arena
         .alloc_slice_with(capacity, |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
@@ -30319,53 +30241,19 @@ fn pg_namespace<'a>(
         )?;
         n += 1;
     }
-    // PostgreSQL exposes every live session's temporary namespace in the
-    // catalogs while name resolution still restricts pg_temp to this session.
-    // Derive these virtual namespaces from their objects so no durable schema
-    // entry can outlive a connection.
+    // A connection retains its namespace after dropping its last temporary object.
     let temporary = arena
-        .alloc_slice_with(storage.table_count() + storage.sequence_count(), |_| {
-            (crate::storage::SqlName::EMPTY, 0_u16)
-        })
+        .alloc_slice_with(storage.temporary_namespace_capacity(), |_| None)
         .map_err(|_| arena_full())?;
-    let mut temporary_count = 0usize;
-    for slot in 0..storage.table_count() {
-        if !storage.table_slot_visible_to(slot, txid) {
-            continue;
-        }
-        let table = storage.table_def(slot, txid);
-        if table.persistence != crate::storage::RelationPersistence::Temporary
-            || temporary[..temporary_count]
-                .iter()
-                .any(|(schema, _)| *schema == table.schema)
-        {
-            continue;
-        }
-        temporary[temporary_count] = (table.schema, table.identity().ownership.owner_to(txid));
-        temporary_count += 1;
-    }
-    for slot in 0..storage.sequence_count() {
-        if !storage.sequence_slot_visible_to(slot, txid) {
-            continue;
-        }
-        let sequence = storage.sequence_for(slot, txid);
-        if sequence.persistence != crate::storage::RelationPersistence::Temporary
-            || temporary[..temporary_count]
-                .iter()
-                .any(|(schema, _)| *schema == sequence.schema)
-        {
-            continue;
-        }
-        temporary[temporary_count] = (sequence.schema, sequence.ownership.owner_to(txid));
-        temporary_count += 1;
-    }
-    for &(schema, owner) in &temporary[..temporary_count] {
+    let count = storage.capture_temporary_namespaces(txid, temporary)?;
+    for namespace in temporary[..count].iter().flatten() {
+        let schema = namespace.name();
         out[n] = row(
             &[
                 Datum::Int4(PG_NAMESPACE_OID),
-                Datum::Int4(namespace_oid(storage, schema.as_str(), txid)),
+                Datum::Int4(namespace.oid()),
                 text(schema.as_str(), arena)?,
-                Datum::Int4(storage.role_oid(usize::from(owner))),
+                Datum::Int4(storage.role_oid(0)),
                 Datum::Null,
             ],
             arena,

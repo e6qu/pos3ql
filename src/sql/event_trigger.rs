@@ -1183,10 +1183,16 @@ fn comment_reference(
                 .ok_or_else(graph_full)?,
         )),
         CommentClass::ForeignServer => EventObjectRef::Primary(ObjectRef::ForeignServer(
-            usize::try_from(subid).map_err(|_| graph_full())?,
+            storage
+                .foreign_servers(txid)
+                .find_map(|(slot, entry)| (entry.creation().get() == subid).then_some(slot))
+                .ok_or_else(graph_full)?,
         )),
         CommentClass::ForeignDataWrapper => EventObjectRef::Primary(ObjectRef::ForeignDataWrapper(
-            usize::try_from(subid).map_err(|_| graph_full())?,
+            storage
+                .foreign_wrappers(txid)
+                .find_map(|(slot, entry)| (entry.creation().get() == subid).then_some(slot))
+                .ok_or_else(graph_full)?,
         )),
         CommentClass::AccessMethod => {
             let oid = i32::try_from(subid).map_err(|_| graph_full())?;
@@ -1236,18 +1242,22 @@ fn comment_reference(
         CommentClass::Statistics => EventObjectRef::Primary(ObjectRef::Statistics(
             storage
                 .extended_statistics_visible(txid)
-                .find_map(|(slot, _)| (slot as u32 == subid).then_some(slot))
+                .find_map(|(slot, statistics)| {
+                    (statistics.creation().get() == subid).then_some(slot)
+                })
                 .ok_or_else(graph_full)?,
         )),
         CommentClass::Publication => EventObjectRef::Primary(ObjectRef::Publication(
             storage
                 .publications_with_slots_visible_to(txid)
-                .find_map(|(slot, _)| (slot as u32 == subid).then_some(slot))
+                .find_map(|(slot, publication)| {
+                    (publication.creation().get() == subid).then_some(slot)
+                })
                 .ok_or_else(graph_full)?,
         )),
         CommentClass::Subscription => EventObjectRef::Primary(ObjectRef::Subscription(
             storage
-                .subscriptions_with_slots_visible_to(txid)
+                .subscriptions_with_slots_visible_to(Some(storage.current_database_oid()), txid)
                 .find_map(|(slot, subscription)| {
                     (subscription.created_at as u32 == subid).then_some(slot)
                 })
@@ -1908,7 +1918,7 @@ fn primary_object(
             let definition = statistics.definition_for(txid);
             base_object(
                 catalog::PG_STATISTIC_EXT_OID,
-                catalog::extended_statistics_oid(slot),
+                statistics.oid(),
                 "statistics object",
                 Some(definition.schema.as_str()),
                 Some(definition.name.as_str()),
@@ -1917,11 +1927,11 @@ fn primary_object(
             )
         }
         ObjectRef::Publication(slot) => {
-            let publication = storage.publication_for_event_trigger(slot);
+            let publication = storage.publication_at(slot);
             let name = publication.name_for(txid);
             base_object(
                 catalog::PG_PUBLICATION_OID,
-                catalog::publication_oid(slot),
+                publication.oid(),
                 "publication",
                 None,
                 Some(name.as_str()),
@@ -1930,11 +1940,11 @@ fn primary_object(
             )
         }
         ObjectRef::Subscription(slot) => {
-            let subscription = storage.subscription_for_event_trigger(slot);
+            let subscription = storage.subscription_at(slot);
             let name = subscription.name_for(txid);
             base_object(
                 catalog::PG_SUBSCRIPTION_OID,
-                catalog::subscription_oid(&subscription),
+                subscription.oid(),
                 "subscription",
                 None,
                 Some(name.as_str()),
@@ -1946,7 +1956,7 @@ fn primary_object(
             let extension = storage.extension(slot);
             base_object(
                 catalog::PG_EXTENSION_OID,
-                catalog::extension_oid(slot),
+                extension.oid(),
                 "extension",
                 None,
                 Some(extension.name.as_str()),
@@ -1973,7 +1983,7 @@ fn primary_object(
                 .ok_or_else(graph_full)?;
             base_object(
                 1417,
-                catalog::foreign_server_oid(slot),
+                storage.foreign_server_entry(slot).oid(),
                 "foreign server",
                 None,
                 Some(server.name.as_str()),
@@ -1987,7 +1997,7 @@ fn primary_object(
                 .ok_or_else(graph_full)?;
             base_object(
                 2328,
-                catalog::foreign_data_wrapper_oid(slot),
+                storage.foreign_wrapper_entry(slot).oid(),
                 "foreign data wrapper",
                 None,
                 Some(wrapper.name.as_str()),
@@ -2289,7 +2299,9 @@ pub(crate) fn catalog_object_address(
     for (slot, _) in storage.publications_with_slots_visible_to(txid) {
         consider!(EventObjectRef::Primary(ObjectRef::Publication(slot)));
     }
-    for (slot, _) in storage.subscriptions_with_slots_visible_to(txid) {
+    for (slot, _) in
+        storage.subscriptions_with_slots_visible_to(Some(storage.current_database_oid()), txid)
+    {
         consider!(EventObjectRef::Primary(ObjectRef::Subscription(slot)));
     }
     for (slot, _) in storage.extensions_visible_to(txid) {
@@ -2648,7 +2660,7 @@ fn existing_catalog_object(
             storage
                 .extended_statistics_visible(txid)
                 .find_map(|(slot, _)| {
-                    (catalog::extended_statistics_oid(slot) == object_id).then_some(slot)
+                    (storage.extended_statistics(slot).oid() == object_id).then_some(slot)
                 })
                 .ok_or_else(|| catalog_lookup_failed(class_id, object_id))?,
         )),
@@ -2717,21 +2729,21 @@ fn existing_catalog_object(
         catalog::PG_PUBLICATION_OID => EventObjectRef::Primary(ObjectRef::Publication(
             storage
                 .publications_with_slots_visible_to(txid)
-                .find_map(|(slot, _)| (catalog::publication_oid(slot) == object_id).then_some(slot))
+                .find_map(|(slot, _)| {
+                    (storage.publication_at(slot).oid() == object_id).then_some(slot)
+                })
                 .ok_or_else(|| catalog_lookup_failed(class_id, object_id))?,
         )),
         catalog::PG_SUBSCRIPTION_OID => EventObjectRef::Primary(ObjectRef::Subscription(
             storage
-                .subscriptions_with_slots_visible_to(txid)
-                .find_map(|(slot, subscription)| {
-                    (catalog::subscription_oid(&subscription) == object_id).then_some(slot)
-                })
+                .subscriptions_with_slots_visible_to(None, txid)
+                .find_map(|(slot, subscription)| (subscription.oid() == object_id).then_some(slot))
                 .ok_or_else(|| catalog_lookup_failed(class_id, object_id))?,
         )),
         catalog::PG_EXTENSION_OID => EventObjectRef::Primary(ObjectRef::Extension(
             storage
                 .extensions_visible_to(txid)
-                .find_map(|(slot, _)| (catalog::extension_oid(slot) == object_id).then_some(slot))
+                .find_map(|(slot, extension)| (extension.oid() == object_id).then_some(slot))
                 .ok_or_else(|| catalog_lookup_failed(class_id, object_id))?,
         )),
         catalog::PG_LARGEOBJECT_OID => EventObjectRef::Primary(ObjectRef::LargeObject(

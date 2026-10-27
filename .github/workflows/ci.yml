@@ -82,6 +82,7 @@ jobs:
             index_file_owners_miri_
             enum_image_ownership_pool_
             storage::definition_pool::tests
+            catalog_lifetime_schemas_share_bounded_images
             owned_ordered_source_tags
             stable_spill_generation_ranges
             stable_spill_generation_exhaustion

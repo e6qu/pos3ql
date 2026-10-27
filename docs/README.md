@@ -6,6 +6,9 @@ an example of a future goal is labeled as remaining work in the plan.
 
 | Your question | Start here |
 |---|---|
+| How do requests, commits, column groups and caches work? | [Architecture](architecture.md) |
+| What are the size and throughput limits? | [Physical limits](architecture.md#memory-and-physical-size), [performance](performance.md#estimating-bandwidth-and-throughput) |
+| How do scheduled tasks and migrations run? | [Scheduling and migrations](operations.md#scheduled-work-and-schema-migrations) |
 | Can my application use this PostgreSQL feature? | [Compatibility and limits](postgresql-18-compatibility.md) |
 | How do I install, monitor, or replace a server? | [Installation](../packaging/README.md), [operations](operations.md) |
 | How do I recover an earlier state or copy the database? | [Backup and restore](backup-restore.md) |
@@ -20,7 +23,8 @@ an example of a future goal is labeled as remaining work in the plan.
 |---|---|
 | [Project overview](../README.md) | Purpose, status, destination, and first run |
 | [Roadmap](../PLAN.md) | Remaining work, its order, and how we know it is done |
-| [What works today](implemented-baseline.md) | Current behavior and concurrency preparation |
+| [Architecture](architecture.md) | Request path, object-store optimizations, physical bounds and source map |
+| [What works today](implemented-baseline.md) | Application behavior, transaction visibility and schema changes |
 | [PostgreSQL 18 compatibility](postgresql-18-compatibility.md) | Supported behavior, capacity limits, and features outside the design |
 | [Contributing](../CONTRIBUTING.md) | Development, verification, and PR workflow |
 | [Agent rules](../AGENTS.md) | Required engineering and change rules |
@@ -33,7 +37,7 @@ an example of a future goal is labeled as remaining work in the plan.
 - [Operations, credentials, readiness, and replacement](operations.md)
 - [Backup, export, and point-in-time recovery](backup-restore.md)
 - [S3-compatible storage profile and qualification](object-storage.md)
-- [Durable formats and migration](durable-format.md)
+- [Durable formats and binary compatibility](durable-format.md)
 - [Immutable index navigation](index-navigation.md)
 - [Performance harness and interpretation](performance.md)
 

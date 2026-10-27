@@ -1,16 +1,19 @@
-//! Table storage: the in-memory write path of the LSM.
+//! Resident rows, catalogs and transaction visibility within fixed startup pools.
 //!
-//! Row bytes live in startup-sized heap buffers; each table maps rowid →
-//! location. Updates write a new copy and repoint the map. Compaction reclaims
-//! superseded bytes; object storage retains durable versions. All capacities
-//! are fixed at startup.
+//! In object-store mode, durable journals and immutable table/index files outlive
+//! disposable RAM and disk caches. In local-only mode, the local journal is durable.
+//! Selected readers retain their original bytes and definitions through waits;
+//! reclamation must preserve those owners. SQL currently uses one CPU worker.
 
 mod catalog_history;
 pub(crate) use catalog_history::{
     CatalogHistory, CatalogHistoryBatch, CatalogPublication, CatalogRelationIdentity,
     CatalogRowImage, HistoricalCatalogRow,
 };
+mod catalog_identities;
 mod catalog_sources;
+use catalog_identities::MAX_CATALOG_CREATION;
+pub(crate) use catalog_identities::{CatalogCreation, CatalogIdentity};
 mod parameter_acls;
 use parameter_acls::ParameterAclGrantIdentity;
 use parameter_acls::ParameterAclRows;
@@ -51,6 +54,7 @@ pub(crate) use constraint_identities::{
 mod column_maps;
 pub(crate) use column_maps::{RelationColumnMap, RelationRowDecoder};
 mod definition_images;
+pub(crate) use definition_images::{DefinitionImageId, RelationDefinition};
 mod definition_pool;
 mod index_bindings;
 mod key_preparation;
@@ -1393,9 +1397,8 @@ pub struct ColumnMeta {
     pub not_null_inheritable: bool,
     pub unique: bool,
     pub primary: bool,
-    /// `serial`/`bigserial`/`smallserial` or GENERATED AS IDENTITY: when the
-    /// column is omitted (or DEFAULT) on INSERT, it is assigned one past the
-    /// column's current maximum.
+    /// `serial`/`bigserial`/`smallserial` or GENERATED AS IDENTITY: an omitted
+    /// or DEFAULT value advances its generator, independently of stored rows.
     pub auto_increment: bool,
     /// DEFAULT or `GENERATED ALWAYS AS (...) STORED`, including its source for
     /// catalog rendering and replay.
@@ -3714,7 +3717,7 @@ pub(crate) struct ExtendedStatisticsDef {
 
 #[derive(Clone, Copy)]
 pub(crate) struct ExtendedStatisticsSpec {
-    pub(crate) created_at: u64,
+    pub(crate) creation: CatalogCreation,
     pub(crate) schema: SqlName,
     pub(crate) name: SqlName,
     pub(crate) table: u16,
@@ -5593,6 +5596,7 @@ pub(crate) enum PublicationAlteration {
 /// and manifests) on the same semantic boundary.
 #[derive(Clone, Copy)]
 pub struct PublicationSpec<'a> {
+    pub(crate) creation: CatalogCreation,
     pub name: SqlName,
     pub all_tables: bool,
     pub tables: &'a [u16],
@@ -13829,8 +13833,45 @@ struct SnapshotState {
     statement_reclamation_pending: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TemporaryNamespaceIdentity {
+    database: DatabaseOid,
+    connection: i32,
+}
+
+impl TemporaryNamespaceIdentity {
+    pub(crate) fn connection_id(self) -> i32 {
+        self.connection
+    }
+
+    pub(crate) fn oid(self) -> i32 {
+        self.connection
+            .checked_add(FIRST_TEMP_NAMESPACE_OID)
+            .expect("temporary namespace identity was checked at creation")
+    }
+
+    pub(crate) fn name(self) -> SqlName {
+        SqlName::parse(stack_format!(63, "pg_temp_{}", self.connection).as_str())
+            .expect("checked connection identity fits a temporary schema name")
+    }
+}
+
+#[derive(Clone, Copy)]
+struct TemporaryNamespace {
+    identity: TemporaryNamespaceIdentity,
+    creation: Option<core::num::NonZeroU32>,
+}
+
+impl TemporaryNamespace {
+    fn visible_to(self, transaction: u32) -> bool {
+        self.identity.database == current_database()
+            && self.creation.is_none_or(|owner| owner.get() == transaction)
+    }
+}
+
 struct TemporaryTransactionState {
     transactions: FixedVec<u32>,
+    namespaces: FixedVec<TemporaryNamespace>,
 }
 
 impl TemporaryTransactionState {
@@ -17386,6 +17427,141 @@ impl Storage {
         state.clear(txid);
     }
 
+    pub(crate) fn create_temporary_namespace(
+        &self,
+        transaction: u32,
+    ) -> Result<Option<TemporaryNamespaceIdentity>, SqlError> {
+        let identity = TemporaryNamespaceIdentity {
+            database: current_database(),
+            connection: self.current_connection_id(),
+        };
+        if identity
+            .connection
+            .checked_add(FIRST_TEMP_NAMESPACE_OID)
+            .is_none_or(|oid| oid <= 0)
+        {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "temporary namespace identity exhausted"
+            ));
+        }
+        let creation = core::num::NonZeroU32::new(transaction).ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "temporary namespace creation requires a transaction"
+            )
+        })?;
+        let mut state = self
+            .temporary_transactions
+            .lock()
+            .expect("temporary transaction lock poisoned");
+        if let Some(namespace) = state
+            .namespaces
+            .iter()
+            .find(|namespace| namespace.identity == identity)
+        {
+            if !namespace.visible_to(transaction) {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "temporary namespace belongs to another transaction"
+                ));
+            }
+            return Ok(None);
+        }
+        state
+            .namespaces
+            .push(TemporaryNamespace {
+                identity,
+                creation: Some(creation),
+            })
+            .map_err(|_| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "temporary namespace registry exhausted"
+                )
+            })?;
+        state.mark(transaction);
+        Ok(Some(identity))
+    }
+
+    pub(crate) fn finish_temporary_namespace(
+        &self,
+        identity: TemporaryNamespaceIdentity,
+        transaction: u32,
+        decision: CatalogDdlDecision,
+    ) {
+        let mut state = self
+            .temporary_transactions
+            .lock()
+            .expect("temporary transaction lock poisoned");
+        let index = state
+            .namespaces
+            .iter()
+            .position(|namespace| namespace.identity == identity)
+            .expect("temporary namespace undo retains its connection");
+        assert_eq!(
+            state.namespaces[index]
+                .creation
+                .map(core::num::NonZeroU32::get),
+            Some(transaction)
+        );
+        match decision {
+            CatalogDdlDecision::Commit => state.namespaces[index].creation = None,
+            CatalogDdlDecision::Rollback => {
+                state.namespaces.swap_remove(index);
+            }
+        }
+    }
+
+    pub(crate) fn find_temporary_namespace(
+        &self,
+        transaction: u32,
+        matches: impl Fn(TemporaryNamespaceIdentity) -> bool,
+    ) -> Option<TemporaryNamespaceIdentity> {
+        self.temporary_transactions
+            .lock()
+            .expect("temporary transaction lock poisoned")
+            .namespaces
+            .iter()
+            .find(|namespace| namespace.visible_to(transaction) && matches(namespace.identity))
+            .map(|namespace| namespace.identity)
+    }
+
+    pub(crate) fn temporary_namespace_capacity(&self) -> usize {
+        self.temporary_transactions
+            .lock()
+            .expect("temporary transaction lock poisoned")
+            .namespaces
+            .capacity()
+    }
+
+    pub(crate) fn capture_temporary_namespaces(
+        &self,
+        transaction: u32,
+        output: &mut [Option<TemporaryNamespaceIdentity>],
+    ) -> Result<usize, SqlError> {
+        let state = self
+            .temporary_transactions
+            .lock()
+            .expect("temporary transaction lock poisoned");
+        let mut count = 0;
+        for namespace in state
+            .namespaces
+            .iter()
+            .filter(|namespace| namespace.visible_to(transaction))
+        {
+            let target = output.get_mut(count).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "temporary namespace capture exhausted"
+                )
+            })?;
+            *target = Some(namespace.identity);
+            count += 1;
+        }
+        Ok(count)
+    }
+
     pub(crate) fn temporary_schema(&self) -> Result<SqlName, SqlError> {
         SqlName::parse(stack_format!(63, "pg_temp_{}", self.current_connection_id()).as_str())
     }
@@ -17452,6 +17628,18 @@ impl Storage {
                     sequence.database,
                     sequence.created_at,
                 ));
+            }
+        }
+        let mut state = self
+            .temporary_transactions
+            .lock()
+            .expect("temporary transaction lock poisoned");
+        let mut index = 0;
+        while index < state.namespaces.len() {
+            if state.namespaces[index].identity.connection == connection_id {
+                state.namespaces.swap_remove(index);
+            } else {
+                index += 1;
             }
         }
     }
@@ -17906,14 +18094,15 @@ impl Storage {
         definition: foreign::ForeignDataWrapperDefinition,
         owner: u16,
     ) -> Result<(), SqlError> {
-        self.catalog_sequence.observe(created_at);
         self.foreign_catalog().restore_wrapper(
             slot,
             current_database(),
             created_at,
             definition,
             owner,
-        )
+        )?;
+        self.catalog_sequence.observe(created_at);
+        Ok(())
     }
 
     pub(crate) fn restore_foreign_server(
@@ -17923,14 +18112,15 @@ impl Storage {
         definition: foreign::ForeignServerDefinition,
         owner: u16,
     ) -> Result<(), SqlError> {
-        self.catalog_sequence.observe(created_at);
         self.foreign_catalog().restore_server(
             slot,
             current_database(),
             created_at,
             definition,
             owner,
-        )
+        )?;
+        self.catalog_sequence.observe(created_at);
+        Ok(())
     }
 
     pub(crate) fn restore_foreign_user_mapping(
@@ -17939,9 +18129,10 @@ impl Storage {
         created_at: u64,
         definition: foreign::UserMappingDefinition,
     ) -> Result<(), SqlError> {
-        self.catalog_sequence.observe(created_at);
         self.foreign_catalog()
-            .restore_mapping(slot, current_database(), created_at, definition)
+            .restore_mapping(slot, current_database(), created_at, definition)?;
+        self.catalog_sequence.observe(created_at);
+        Ok(())
     }
 
     pub(crate) fn restore_foreign_table_binding(
@@ -17950,9 +18141,10 @@ impl Storage {
         created_at: u64,
         definition: foreign::ForeignTableDefinition,
     ) -> Result<(), SqlError> {
-        self.catalog_sequence.observe(created_at);
         self.foreign_catalog()
-            .restore_table(slot, current_database(), created_at, definition)
+            .restore_table(slot, current_database(), created_at, definition)?;
+        self.catalog_sequence.observe(created_at);
+        Ok(())
     }
 
     pub(crate) fn replay_set_foreign_wrapper(
@@ -17962,14 +18154,15 @@ impl Storage {
         owner: u16,
         definition: Option<foreign::ForeignDataWrapperDefinition>,
     ) -> Result<(), SqlError> {
-        self.catalog_sequence.observe(created_at);
         self.foreign_catalog().replay_set_wrapper(
             slot,
             current_database(),
             created_at,
             owner,
             definition,
-        )
+        )?;
+        self.catalog_sequence.observe(created_at);
+        Ok(())
     }
 
     pub(crate) fn replay_set_foreign_server(
@@ -17979,14 +18172,15 @@ impl Storage {
         owner: u16,
         definition: Option<foreign::ForeignServerDefinition>,
     ) -> Result<(), SqlError> {
-        self.catalog_sequence.observe(created_at);
         self.foreign_catalog().replay_set_server(
             slot,
             current_database(),
             created_at,
             owner,
             definition,
-        )
+        )?;
+        self.catalog_sequence.observe(created_at);
+        Ok(())
     }
 
     pub(crate) fn replay_set_foreign_user_mapping(
@@ -17995,9 +18189,14 @@ impl Storage {
         created_at: u64,
         definition: Option<foreign::UserMappingDefinition>,
     ) -> Result<(), SqlError> {
+        self.foreign_catalog().replay_set_mapping(
+            slot,
+            current_database(),
+            created_at,
+            definition,
+        )?;
         self.catalog_sequence.observe(created_at);
-        self.foreign_catalog()
-            .replay_set_mapping(slot, current_database(), created_at, definition)
+        Ok(())
     }
 
     pub(crate) fn replay_set_foreign_table(
@@ -18006,9 +18205,14 @@ impl Storage {
         created_at: u64,
         definition: Option<foreign::ForeignTableDefinition>,
     ) -> Result<(), SqlError> {
+        self.foreign_catalog().replay_set_table(
+            slot,
+            current_database(),
+            created_at,
+            definition,
+        )?;
         self.catalog_sequence.observe(created_at);
-        self.foreign_catalog()
-            .replay_set_table(slot, current_database(), created_at, definition)
+        Ok(())
     }
 
     pub(crate) fn first_foreign_server_for_wrapper(
@@ -18049,7 +18253,9 @@ impl Storage {
         txid: u32,
     ) -> Result<usize, SqlError> {
         let ownership = self.initial_ownership(txid)?;
-        let created_at = self.catalog_sequence.next()?;
+        let created_at = self
+            .catalog_sequence
+            .next_bounded(MAX_CATALOG_CREATION, "catalog object")?;
         let slot = self.foreign_catalog().create_wrapper(
             current_database(),
             created_at,
@@ -18070,7 +18276,9 @@ impl Storage {
         txid: u32,
     ) -> Result<usize, SqlError> {
         let ownership = self.initial_ownership(txid)?;
-        let created_at = self.catalog_sequence.next()?;
+        let created_at = self
+            .catalog_sequence
+            .next_bounded(MAX_CATALOG_CREATION, "catalog object")?;
         let slot = self.foreign_catalog().create_server(
             current_database(),
             created_at,
@@ -18093,7 +18301,9 @@ impl Storage {
         if let foreign::ForeignMappingUser::Role(role) = definition.user {
             self.role_reference_ready(usize::from(role), txid)?;
         }
-        let created_at = self.catalog_sequence.next()?;
+        let created_at = self
+            .catalog_sequence
+            .next_bounded(MAX_CATALOG_CREATION, "catalog object")?;
         self.foreign_catalog()
             .create_mapping(current_database(), created_at, definition, txid)
     }
@@ -18104,7 +18314,9 @@ impl Storage {
         txid: u32,
     ) -> Result<usize, SqlError> {
         let ownership = self.initial_ownership(txid)?;
-        let created_at = self.catalog_sequence.next()?;
+        let created_at = self
+            .catalog_sequence
+            .next_bounded(MAX_CATALOG_CREATION, "catalog object")?;
         self.foreign_catalog().create_table(
             current_database(),
             created_at,
@@ -18189,6 +18401,17 @@ impl Storage {
         class: foreign::ForeignObjectClass,
         slot: usize,
     ) {
+        let comment = match class {
+            foreign::ForeignObjectClass::Wrapper => Some((
+                CommentClass::ForeignDataWrapper,
+                self.foreign_wrapper_entry(slot).creation(),
+            )),
+            foreign::ForeignObjectClass::Server => Some((
+                CommentClass::ForeignServer,
+                self.foreign_server_entry(slot).creation(),
+            )),
+            foreign::ForeignObjectClass::Mapping | foreign::ForeignObjectClass::Table => None,
+        };
         self.foreign_catalog().commit_drop(class, slot);
         let access = match class {
             foreign::ForeignObjectClass::Wrapper => Some(AccessClass::ForeignDataWrapper),
@@ -18203,11 +18426,8 @@ impl Storage {
             self.clear_object_acl_entries(object);
             self.clear_extension_dependencies_for_object(object);
         }
-        if class == foreign::ForeignObjectClass::Server {
-            self.drop_comments_by_subid(CommentClass::ForeignServer, slot as u32);
-        }
-        if class == foreign::ForeignObjectClass::Wrapper {
-            self.drop_comments_by_subid(CommentClass::ForeignDataWrapper, slot as u32);
+        if let Some((class, creation)) = comment {
+            self.drop_comments_by_subid(class, creation.get());
         }
     }
 
@@ -19068,6 +19288,8 @@ impl Storage {
                 * size_of::<RecentTransactionStatus>()
             + (config.max_connections as usize + config.max_prepared_transactions)
                 * size_of::<u32>()
+            + (config.max_connections as usize + config.max_subscriptions)
+                * size_of::<TemporaryNamespace>()
             + config.max_routines * size_of::<FunctionCumulativeStatistics>()
             + (config.max_connections as usize + config.max_prepared_transactions)
                 * config.max_routines
@@ -19831,6 +20053,11 @@ impl Storage {
         )?;
         let temporary_transactions = Mutex::new(TemporaryTransactionState {
             transactions: FixedVec::new(budget, "temporary_transactions", transaction_capacity)?,
+            namespaces: FixedVec::new(
+                budget,
+                "temporary_namespaces",
+                config.max_connections as usize + config.max_subscriptions,
+            )?,
         });
         let backends = FixedVec::new(budget, "backend_activity", config.max_connections as usize)?;
         let backend_signals =
@@ -22284,16 +22511,17 @@ impl Storage {
                     .extended_statistics_catalog
                     .lock()
                     .expect("extended-statistics catalog lock poisoned");
-                let target_slot = statistics_catalog
-                    .definitions
-                    .iter()
-                    .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
-                    .ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                            "statistics catalog is full"
-                        )
-                    })?;
+                let target_slot = allocation.select(
+                    DatabaseCloneKind::Statistics,
+                    definition.created_at,
+                    statistics_catalog
+                        .definitions
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(slot, candidate)| {
+                            (candidate.ddl_state == CatalogDdlState::Absent).then_some(slot)
+                        }),
+                )?;
                 definition.database = target;
                 definition.ownership = definition.ownership.committed();
                 definition.pending_definition = None;
@@ -22305,7 +22533,7 @@ impl Storage {
             }
 
             for source_slot in 0..self.publication_count() {
-                let mut definition = self.publication_for_event_trigger(source_slot);
+                let mut definition = self.publication_at(source_slot);
                 if definition.database != source || definition.ddl_state != CatalogDdlState::Present
                 {
                     continue;
@@ -22357,15 +22585,16 @@ impl Storage {
                     .publications
                     .lock()
                     .expect("publication catalog lock poisoned");
-                let target_slot = publications
-                    .iter()
-                    .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
-                    .ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                            "publication catalog is full"
-                        )
-                    })?;
+                let target_slot = allocation.select(
+                    DatabaseCloneKind::Publication,
+                    definition.created_at,
+                    publications
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(slot, candidate)| {
+                            (candidate.ddl_state == CatalogDdlState::Absent).then_some(slot)
+                        }),
+                )?;
                 definition.database = target;
                 definition.pending_name = None;
                 definition.pending_definition = None;
@@ -22373,6 +22602,25 @@ impl Storage {
                 definition.ddl_state = CatalogDdlState::PendingCreate { txid };
                 publications[target_slot] = definition;
             }
+
+            self.foreign_catalog()
+                .clone_database(source, target, allocation, txid, |table| {
+                    self.cloned_access_object(
+                        AccessObject {
+                            class: AccessClass::Table,
+                            slot: table,
+                        },
+                        source,
+                        target,
+                    )
+                    .map(|object| object.slot)
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::DATA_EXCEPTION,
+                            "template foreign table was not cloned"
+                        )
+                    })
+                })?;
 
             for (_, mut definition) in (ExtensionIter {
                 catalog: &self.extension_catalog,
@@ -22399,16 +22647,17 @@ impl Storage {
                     })?
                     .slot;
                 let mut catalog = self.extension_catalog();
-                let target_slot = catalog
-                    .definitions
-                    .iter()
-                    .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
-                    .ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                            "extension catalog is full"
-                        )
-                    })?;
+                let target_slot = allocation.select(
+                    DatabaseCloneKind::Extension,
+                    definition.created_at,
+                    catalog
+                        .definitions
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(slot, candidate)| {
+                            (candidate.ddl_state == CatalogDdlState::Absent).then_some(slot)
+                        }),
+                )?;
                 definition.database = target;
                 definition.ownership = definition.ownership.committed();
                 definition.pending = None;
@@ -22591,9 +22840,9 @@ impl Storage {
                     0,
                 )?;
             }
-            let mut comments = self.comment_catalog();
-            for source_slot in 0..comments.entries.len() {
-                let mut entry = comments.entries[source_slot];
+            let comment_capacity = self.comment_catalog().entries.len();
+            for source_slot in 0..comment_capacity {
+                let mut entry = self.comment_catalog().entries[source_slot];
                 if !entry.used
                     || entry.database != Some(source)
                     || entry.live.is_none()
@@ -22601,6 +22850,13 @@ impl Storage {
                 {
                     continue;
                 }
+                let Some(subid) =
+                    self.cloned_comment_subid(entry.class, entry.subid, source, target)?
+                else {
+                    continue;
+                };
+                entry.subid = subid;
+                let mut comments = self.comment_catalog();
                 let target_slot = comments
                     .entries
                     .iter()
@@ -22608,43 +22864,12 @@ impl Storage {
                     .ok_or_else(|| {
                         sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "comment catalog is full")
                     })?;
-                if entry.class == CommentClass::Constraint {
-                    let source_table = self
-                        .tables
-                        .get(entry.subid as usize)
-                        .filter(|table| table.database() == source)
-                        .ok_or_else(|| {
-                            sql_err!(
-                                sqlstate::DATA_EXCEPTION,
-                                "template constraint comment has no source table"
-                            )
-                        })?;
-                    entry.subid = self
-                        .tables
-                        .iter()
-                        .take(self.table_count())
-                        .enumerate()
-                        .find_map(|(slot, table)| {
-                            let identity = table.identity();
-                            (identity.database == target
-                                && identity.created_at == source_table.created_at()
-                                && identity.existence.visible_to(txid))
-                            .then_some(slot as u32)
-                        })
-                        .ok_or_else(|| {
-                            sql_err!(
-                                sqlstate::INTERNAL_ERROR,
-                                "template constraint comment table was not cloned"
-                            )
-                        })?;
-                }
                 entry.database = Some(target);
                 entry.pending = None;
                 entry.pending_identity = None;
                 entry.pending_drop = None;
                 comments.entries[target_slot] = entry;
             }
-            drop(comments);
 
             // Partition links are runtime table slots. Rebind them only after
             // every target relation exists; names are the durable identity.
@@ -22689,6 +22914,86 @@ impl Storage {
         })();
         crate::sql::set_execution_database_oid(prior_database);
         result
+    }
+
+    fn cloned_comment_subid(
+        &self,
+        class: CommentClass,
+        subid: u32,
+        source: DatabaseOid,
+        target: DatabaseOid,
+    ) -> Result<Option<u32>, SqlError> {
+        let invalid = || {
+            sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "template comment source was not cloned"
+            )
+        };
+        if class == CommentClass::Subscription {
+            return Ok(None);
+        }
+        if class == CommentClass::Statistics {
+            let statistics = {
+                let catalog = self
+                    .extended_statistics_catalog
+                    .lock()
+                    .expect("extended-statistics catalog lock poisoned");
+                catalog.definitions.iter().copied().find(|statistics| {
+                    statistics.database == source
+                        && statistics.ddl_state == CatalogDdlState::Present
+                        && statistics.creation().get() == subid
+                })
+            }
+            .ok_or_else(invalid)?;
+            if self.table_def(usize::from(statistics.table), 0).persistence
+                == RelationPersistence::Temporary
+            {
+                return Ok(None);
+            }
+            return Ok(Some(subid));
+        }
+        // Database-local birth keys survive copying and recovery slot changes.
+        let object_class = match class {
+            CommentClass::Constraint => AccessClass::Table,
+            CommentClass::Trigger | CommentClass::Rule => {
+                if subid & (1 << 31) == 0 {
+                    AccessClass::Table
+                } else {
+                    AccessClass::View
+                }
+            }
+            _ => return Ok(Some(subid)),
+        };
+        let encoded_target = matches!(class, CommentClass::Trigger | CommentClass::Rule);
+        let slot = if encoded_target {
+            (subid & !(1 << 31)).checked_sub(1).ok_or_else(invalid)?
+        } else {
+            subid
+        };
+        let slot = u16::try_from(slot).map_err(|_| invalid())?;
+        let capacity = match object_class {
+            AccessClass::Table => self.tables.len(),
+            AccessClass::View => self.view_count(),
+            _ => unreachable!("comment class selects a slot catalog"),
+        };
+        if usize::from(slot) >= capacity {
+            return Err(invalid());
+        }
+        let source_object = AccessObject {
+            class: object_class,
+            slot,
+        };
+        if self.access_object_is_temporary(source_object, 0) {
+            return Ok(None);
+        }
+        let copied = self
+            .cloned_access_object(source_object, source, target)
+            .ok_or_else(invalid)?;
+        Ok(Some(if encoded_target {
+            (u32::from(copied.slot) + 1) | (subid & (1 << 31))
+        } else {
+            u32::from(copied.slot)
+        }))
     }
 
     fn clear_database_catalog(&mut self, database: DatabaseOid) {
@@ -23097,6 +23402,7 @@ impl Storage {
                 self.clear_committed_dependencies(StoredQueryDependencyOwner::Policy(slot as u16));
             }
         }
+        self.foreign_catalog().clear_database(database);
     }
 
     pub(crate) fn alter_database_definition(
@@ -23160,6 +23466,8 @@ impl Storage {
             .ddl_state
             .pending_txid()
             .expect("database create owns its catalog clone");
+        self.foreign_catalog()
+            .commit_database_create(database, txid);
         for schema in self
             .schemas
             .lock()
@@ -24499,24 +24807,24 @@ impl Storage {
                 })?
             }
             AccessClass::ForeignDataWrapper => {
-                let created_at = self.foreign_catalog().entry_wrapper(source_slot).created_at;
-                self.foreign_catalog()
-                    .checkpoint_wrappers()
-                    .find_map(|(slot, candidate)| {
-                        (candidate.database == target_database
-                            && candidate.created_at == created_at)
-                            .then_some(slot)
-                    })?
+                let catalog = self.foreign_catalog();
+                let created_at = catalog.entry_wrapper(source_slot).created_at;
+                (0..catalog.wrapper_capacity()).find(|slot| {
+                    let candidate = catalog.entry_wrapper(*slot);
+                    candidate.database == target_database
+                        && candidate.created_at == created_at
+                        && candidate.ddl_state != CatalogDdlState::Absent
+                })?
             }
             AccessClass::ForeignServer => {
-                let created_at = self.foreign_catalog().entry_server(source_slot).created_at;
-                self.foreign_catalog()
-                    .checkpoint_servers()
-                    .find_map(|(slot, candidate)| {
-                        (candidate.database == target_database
-                            && candidate.created_at == created_at)
-                            .then_some(slot)
-                    })?
+                let catalog = self.foreign_catalog();
+                let created_at = catalog.entry_server(source_slot).created_at;
+                (0..catalog.server_capacity()).find(|slot| {
+                    let candidate = catalog.entry_server(*slot);
+                    candidate.database == target_database
+                        && candidate.created_at == created_at
+                        && candidate.ddl_state != CatalogDdlState::Absent
+                })?
             }
             AccessClass::Database | AccessClass::Tablespace | AccessClass::Language => return None,
         };
@@ -29959,7 +30267,9 @@ impl Storage {
                     catalog.definitions.len()
                 )
             })?;
-        let created_at = self.catalog_sequence.next()?;
+        let created_at = self
+            .catalog_sequence
+            .next_bounded(MAX_CATALOG_CREATION, "catalog object")?;
         catalog.definitions[slot] = ExtensionDef {
             database: current_database(),
             created_at,
@@ -29983,7 +30293,19 @@ impl Storage {
         owner: usize,
         created_at: u64,
     ) -> Result<usize, SqlError> {
+        CatalogIdentity::require(created_at)?;
         let mut catalog = self.extension_catalog();
+        if catalog.definitions.iter().any(|extension| {
+            extension.database == current_database()
+                && extension.ddl_state != CatalogDdlState::Absent
+                && extension.created_at == created_at
+                && extension.name != name
+        }) {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "extension creation identity is duplicated"
+            ));
+        }
         let definition = ExtensionDef {
             database: current_database(),
             created_at,
@@ -30864,77 +31186,6 @@ impl Storage {
                 && table.database() == current_database()
                 && table.live()
         })
-    }
-
-    /// Floors every serial column's sequence at the maximum value stored in
-    /// its rows. Run once after recovery: a journal or checkpoint written
-    /// before sequences were journaled carries no positions, and handing out
-    /// a value at or below an existing row's would violate the key.
-    pub fn reconcile_serials(&mut self) {
-        for i in 0..self.tables.len() {
-            if !self.tables[i].live() {
-                continue;
-            }
-            let n_columns = {
-                let definition = self.tables[i].definition();
-                definition.n_columns
-            };
-            let mut auto = [false; MAX_COLUMNS];
-            let mut any = false;
-            for (c, slot) in auto.iter_mut().enumerate().take(n_columns) {
-                *slot = self.tables[i].definition().columns()[c].auto_increment;
-                any |= *slot;
-            }
-            if !any {
-                continue;
-            }
-            let mut schema = [crate::sql::types::ColType::Bool; MAX_COLUMNS];
-            self.tables[i].definition().schema(&mut schema);
-            let mut max = [0i64; MAX_COLUMNS];
-            let mut rowids: Vec<(u64, RowHome)> = Vec::new();
-            for (rowid, state) in self.resident_rows(i).iter() {
-                if let Some(home) = state.visible_at(0, SNAPSHOT_ALL, u64::MAX).flatten() {
-                    rowids.push((rowid, home));
-                }
-            }
-            for (rowid, home) in rowids {
-                let mut vals = [0i64; MAX_COLUMNS];
-                let mut have = [false; MAX_COLUMNS];
-                self.with_row_bytes(i, rowid, home, |bytes| {
-                    let mut row = [crate::sql::types::Datum::Null; MAX_COLUMNS];
-                    if rowenc::decode(bytes, &schema[..n_columns], &mut row).is_err() {
-                        return Ok(());
-                    }
-                    for c in 0..n_columns {
-                        if !auto[c] {
-                            continue;
-                        }
-                        let v = match row[c] {
-                            crate::sql::types::Datum::Int2(x) => i64::from(x),
-                            crate::sql::types::Datum::Int4(x) => i64::from(x),
-                            crate::sql::types::Datum::Int8(x) => x,
-                            _ => continue,
-                        };
-                        vals[c] = v;
-                        have[c] = true;
-                    }
-                    Ok(())
-                })
-                .unwrap_or(());
-                for c in 0..n_columns {
-                    if have[c] {
-                        max[c] = max[c].max(vals[c]);
-                    }
-                }
-            }
-            for c in 0..n_columns {
-                if auto[c] {
-                    let prior = self.table_serial_value(i, c);
-                    self.replay_table_serial_value(i, c, prior.max(max[c]), 0)
-                        .expect("recovered serial column exists");
-                }
-            }
-        }
     }
 
     /// Attaches the spilled-row read path. The local temporary store is always
@@ -37437,7 +37688,7 @@ impl Storage {
         })
     }
 
-    pub(crate) fn publication_for_event_trigger(&self, slot: usize) -> PublicationDef {
+    pub(crate) fn publication_at(&self, slot: usize) -> PublicationDef {
         self.publications
             .lock()
             .expect("publication catalog lock poisoned")[slot]
@@ -37990,6 +38241,7 @@ impl Storage {
 
     pub(crate) fn subscriptions_with_slots_visible_to(
         &self,
+        database: Option<DatabaseOid>,
         txid: u32,
     ) -> impl Iterator<Item = (usize, SubscriptionDef)> + '_ {
         SubscriptionIter {
@@ -37997,7 +38249,8 @@ impl Storage {
             next_slot: 0,
         }
         .filter(move |(_, subscription)| {
-            subscription.database == current_database() && subscription.visible_to(txid)
+            database.is_none_or(|database| subscription.database == database)
+                && subscription.visible_to(txid)
         })
     }
 
@@ -38023,7 +38276,7 @@ impl Storage {
         }
     }
 
-    pub(crate) fn subscription_for_event_trigger(&self, slot: usize) -> SubscriptionDef {
+    pub(crate) fn subscription_at(&self, slot: usize) -> SubscriptionDef {
         self.subscription_catalog
             .lock()
             .expect("subscription catalog lock poisoned")
@@ -38045,7 +38298,7 @@ impl Storage {
     }
 
     pub(crate) fn subscription(&self, name: &str, txid: u32) -> Option<(usize, SubscriptionDef)> {
-        self.subscriptions_with_slots_visible_to(txid)
+        self.subscriptions_with_slots_visible_to(Some(current_database()), txid)
             .find(|(_, subscription)| subscription.name_for(txid).as_str() == name)
     }
 
@@ -38140,7 +38393,9 @@ impl Storage {
         };
         let mut publications = [SqlName::EMPTY; MAX_SUBSCRIPTION_PUBLICATIONS];
         publications[..spec.publications.len()].copy_from_slice(spec.publications);
-        let created_at = self.catalog_sequence.next()?;
+        let created_at = self
+            .catalog_sequence
+            .next_bounded(MAX_CATALOG_CREATION, "catalog object")?;
         catalog.definitions[slot] = SubscriptionDef {
             database: current_database(),
             created_at,
@@ -38245,7 +38500,8 @@ impl Storage {
         created_at: u64,
         definition_generation: u64,
     ) -> Result<(), SqlError> {
-        if created_at == 0 || definition_generation == 0 {
+        CatalogIdentity::require(created_at)?;
+        if definition_generation == 0 {
             return Err(sql_err!(
                 sqlstate::INVALID_PARAMETER_VALUE,
                 "subscription stream identity must be nonzero"
@@ -38255,7 +38511,27 @@ impl Storage {
             .subscription_catalog
             .lock()
             .expect("subscription catalog lock poisoned");
-        let subscription = &mut catalog.definitions[slot];
+        if catalog
+            .definitions
+            .iter()
+            .enumerate()
+            .any(|(other, subscription)| {
+                other != slot
+                    && subscription.ddl_state != CatalogDdlState::Absent
+                    && subscription.created_at == created_at
+            })
+        {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "subscription creation identity is duplicated"
+            ));
+        }
+        let subscription = catalog.definitions.get_mut(slot).ok_or_else(|| {
+            sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "subscription source slot is out of range"
+            )
+        })?;
         subscription.created_at = created_at;
         subscription.definition_generation = definition_generation;
         self.catalog_sequence.observe(created_at);
@@ -39258,9 +39534,20 @@ impl Storage {
                 publications.len()
             ));
         };
+        let created_at = spec.creation.resolve(&self.catalog_sequence)?;
+        if publications.iter().any(|publication| {
+            publication.database == current_database()
+                && publication.ddl_state != CatalogDdlState::Absent
+                && publication.created_at == created_at
+        }) {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "publication creation identity is duplicated"
+            ));
+        }
         publications[slot] = PublicationDef {
             database: current_database(),
-            created_at: self.catalog_sequence.next()?,
+            created_at,
             name: spec.name,
             pending_name: None,
             all_tables: spec.all_tables,
@@ -39281,6 +39568,7 @@ impl Storage {
             ownership,
             ddl_state: CatalogDdlState::PendingCreate { txid },
         };
+        self.catalog_sequence.observe(created_at);
         Ok(slot)
     }
 
@@ -39331,11 +39619,12 @@ impl Storage {
             .publications
             .lock()
             .expect("publication catalog lock poisoned");
+        let creation = publications[slot].creation();
         if publications[slot].ddl_state.commit_drop() == CatalogDdlState::Absent {
             publications[slot] = PublicationDef::EMPTY;
         }
         drop(publications);
-        self.drop_comments_by_subid(CommentClass::Publication, slot as u32);
+        self.drop_comments_by_subid(CommentClass::Publication, creation.get());
     }
 
     pub(crate) fn alter_publication(
@@ -45231,12 +45520,17 @@ impl Storage {
                 catalog.definitions.len()
             ));
         };
-        let created_at = if spec.created_at == 0 {
-            self.catalog_sequence.next()?
-        } else {
-            self.catalog_sequence.observe(spec.created_at);
-            spec.created_at
-        };
+        let created_at = spec.creation.resolve(&self.catalog_sequence)?;
+        if catalog.definitions.iter().any(|statistics| {
+            statistics.database == current_database()
+                && statistics.ddl_state != CatalogDdlState::Absent
+                && statistics.created_at == created_at
+        }) {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "statistics creation identity is duplicated"
+            ));
+        }
         catalog.definitions[slot] = ExtendedStatisticsDef {
             database: current_database(),
             created_at,
@@ -45258,6 +45552,7 @@ impl Storage {
             pending_data_txid: None,
             ddl_state: CatalogDdlState::PendingCreate { txid },
         };
+        self.catalog_sequence.observe(created_at);
         Ok(slot)
     }
 
@@ -45437,15 +45732,17 @@ impl Storage {
     }
 
     fn retire_extended_statistics(&self, slot: usize) {
-        {
+        let creation = {
             let mut catalog = self
                 .extended_statistics_catalog
                 .lock()
                 .expect("extended-statistics catalog lock poisoned");
+            let creation = catalog.definitions[slot].creation();
             Self::clear_pending_extended_statistics_data(&mut catalog, slot);
             catalog.definitions[slot] = ExtendedStatisticsDef::EMPTY;
-        }
-        self.drop_comments_by_subid(CommentClass::Statistics, slot as u32);
+            creation
+        };
+        self.drop_comments_by_subid(CommentClass::Statistics, creation.get());
     }
 
     fn commit_extended_statistics_for_table(&self, table: usize) {
@@ -45691,14 +45988,22 @@ impl Storage {
         &mut self,
         spec: ExtendedStatisticsSpec,
     ) -> Result<usize, SqlError> {
+        let CatalogCreation::Restore(identity) = spec.creation else {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "statistics replay requires a restored identity"
+            ));
+        };
+        let created_at = identity.created_at();
         {
             let mut catalog = self
                 .extended_statistics_catalog
                 .lock()
                 .expect("extended-statistics catalog lock poisoned");
             if let Some(slot) = catalog.definitions.iter().position(|statistics| {
-                statistics.ddl_state != CatalogDdlState::Absent
-                    && statistics.created_at == spec.created_at
+                statistics.database == current_database()
+                    && statistics.ddl_state != CatalogDdlState::Absent
+                    && statistics.created_at == created_at
             }) {
                 if catalog
                     .definitions
@@ -45706,6 +46011,7 @@ impl Storage {
                     .enumerate()
                     .any(|(other, statistics)| {
                         other != slot
+                            && statistics.database == current_database()
                             && statistics.ddl_state != CatalogDdlState::Absent
                             && statistics.mutable.schema == spec.schema
                             && statistics.mutable.name == spec.name
@@ -59111,7 +59417,7 @@ mod tests {
         }
 
         let full = ExtendedStatisticsSpec {
-            created_at: 0,
+            creation: CatalogCreation::New,
             schema: SqlName::parse("public").unwrap(),
             name: SqlName::parse("statistics_full").unwrap(),
             table: table as u16,
@@ -59222,7 +59528,7 @@ mod tests {
         assert_eq!(storage.publications_with_slots().count(), WORKERS);
         for (slot, definition) in storage.publications_with_slots() {
             assert_eq!(
-                storage.publication_for_event_trigger(slot).created_at,
+                storage.publication_at(slot).created_at,
                 definition.created_at
             );
         }
@@ -59231,6 +59537,7 @@ mod tests {
         let empty_descendants: [bool; 0] = [];
         let empty_filters: [StackStr<PUBLICATION_FILTER_SQL_MAX>; 0] = [];
         let full = PublicationSpec {
+            creation: CatalogCreation::New,
             name: SqlName::parse("publication_full").unwrap(),
             all_tables: true,
             tables: &[],
@@ -59254,6 +59561,7 @@ mod tests {
             storage
                 .create_publication(
                     PublicationSpec {
+                        creation: CatalogCreation::New,
                         name: pending_name,
                         ..full
                     },
@@ -59276,19 +59584,13 @@ mod tests {
             });
         }
         storage.rollback_publication_create(0);
-        assert_eq!(storage.publication_for_event_trigger(0).created_at, 0);
-        assert_eq!(
-            storage.publication_for_event_trigger(0).ddl_state,
-            CatalogDdlState::Absent
-        );
+        assert_eq!(storage.publication_at(0).created_at, 0);
+        assert_eq!(storage.publication_at(0).ddl_state, CatalogDdlState::Absent);
 
         storage.drop_publication("publication_1", 9).unwrap();
         storage.commit_publication_drop(1);
-        assert_eq!(storage.publication_for_event_trigger(1).created_at, 0);
-        assert_eq!(
-            storage.publication_for_event_trigger(1).ddl_state,
-            CatalogDdlState::Absent
-        );
+        assert_eq!(storage.publication_at(1).created_at, 0);
+        assert_eq!(storage.publication_at(1).ddl_state, CatalogDdlState::Absent);
     }
 
     #[test]
@@ -59453,10 +59755,14 @@ mod tests {
             assert_eq!(catalog.relations.capacity(), WORKERS);
         }
         assert_eq!(
-            storage.subscriptions_with_slots_visible_to(0).count(),
+            storage
+                .subscriptions_with_slots_visible_to(Some(storage.current_database_oid()), 0)
+                .count(),
             WORKERS
         );
-        for (slot, definition) in storage.subscriptions_with_slots_visible_to(0) {
+        for (slot, definition) in
+            storage.subscriptions_with_slots_visible_to(Some(storage.current_database_oid()), 0)
+        {
             let nested = storage
                 .subscription(definition.name.as_str(), 0)
                 .expect("copied iterator releases the catalog lock");

@@ -28,7 +28,9 @@ sudo install -m 0644 lib/systemd/system/pos3ql-failover.service /etc/systemd/sys
 
 Configure object storage,
 TLS, authentication, memory capacities, and an owner-only object-store
-credential file before enabling the service. Then run:
+credential file before enabling the service. Review the architecture and physical
+limits in `share/doc/pos3ql/docs/architecture.md`; the starter file is an example,
+not a qualified production size or throughput profile. Then run:
 
 ```sh
 sudo systemctl daemon-reload
@@ -39,7 +41,7 @@ curl --fail http://127.0.0.1:9187/readyz
 The installed archive includes its documentation. See
 `share/doc/pos3ql/docs/README.md` for the documentation index and
 `share/doc/pos3ql/docs/operations.md` for probes, credential rotation, alerts,
-and controlled replacement. The previous flat operator paths redirect there.
+and controlled replacement. The canonical guides live under that documentation index.
 
 On one passive candidate for a durable object prefix, copy
 `etc/pos3ql/pos3ql-failover.conf.example` to

@@ -1,4 +1,8 @@
-//! Immutable SST publication and cold recovery through the manifest CAS.
+//! Save immutable table/index generations, publish their inventory, and recover it.
+//!
+//! Maintenance advances in bounded turns between client work and socket waits.
+//! Captured output stays private until uploads and the conditional manifest write
+//! finish. Readers and named backups retain objects that cleanup must preserve.
 
 use crate::mem::mutex::Mutex;
 use core::cmp::Ordering;
@@ -209,7 +213,7 @@ fn parse_writer_fence(bytes: &[u8]) -> Result<(&str, WriterToken), &'static str>
     Ok((state, token))
 }
 
-pub(crate) const MANIFEST_HEADER: &str = "pos3ql-manifest-v30";
+pub(crate) const MANIFEST_HEADER: &str = "pos3ql-manifest-v31";
 
 struct ManifestMetadata {
     lsn: u64,
@@ -8914,6 +8918,14 @@ impl Checkpointer {
                 ))
             })?;
         storage
+            .validate_restored_catalog_identities(metadata.catalog_sequence)
+            .map_err(|error| {
+                CheckpointSetupError::ObjectStore(format!(
+                    "manifest catalog identities rejected: {}",
+                    error.message.as_str()
+                ))
+            })?;
+        storage
             .validate_restored_relation_identities(metadata.catalog_sequence)
             .map_err(|error| {
                 CheckpointSetupError::ObjectStore(format!(
@@ -9088,7 +9100,15 @@ impl Checkpointer {
             }
             let slot = storage
                 .replay_extended_statistics(crate::storage::ExtendedStatisticsSpec {
-                    created_at: statistics.created_at,
+                    creation: crate::storage::CatalogCreation::Restore(
+                        crate::storage::CatalogIdentity::require(statistics.created_at).map_err(
+                            |_| {
+                                CheckpointSetupError::Corrupt(
+                                    "invalid statistics creation identity",
+                                )
+                            },
+                        )?,
+                    ),
                     schema: statistics.schema,
                     name: statistics.name,
                     table: table as u16,
@@ -10991,9 +11011,10 @@ impl Checkpointer {
                 )) << 6);
             write!(
                 &mut self.manifest_output,
-                "pub {} {} {} {} {}",
+                "pub {} {} {} {} {} {}",
                 name.as_str(),
                 publication.ownership.owner,
+                publication.created_at,
                 flags,
                 publication.table_count,
                 publication.schema_count
@@ -17549,7 +17570,13 @@ fn load_publication(storage: &mut Storage, line: &str) -> Result<(), CheckpointS
         .ok_or(CheckpointSetupError::Corrupt("pub name"))
         .and_then(decode_hex_name)?;
     let owner: u16 = parse_field(words.next(), "pub owner")?;
+    let created_at = parse_field(words.next(), "pub creation stamp")?;
+    let creation = crate::storage::CatalogIdentity::require(created_at)
+        .map_err(|_| CheckpointSetupError::Corrupt("invalid publication creation identity"))?;
     let flags: u8 = parse_field(words.next(), "pub flags")?;
+    if flags & !0x7f != 0 {
+        return Err(CheckpointSetupError::Corrupt("invalid publication flags"));
+    }
     let count: usize = parse_field(words.next(), "pub table count")?;
     let schema_count: usize = parse_field(words.next(), "pub schema count")?;
     if count > crate::storage::MAX_PUBLICATION_TABLES {
@@ -17600,6 +17627,7 @@ fn load_publication(storage: &mut Storage, line: &str) -> Result<(), CheckpointS
     let slot = storage
         .create_publication(
             crate::storage::PublicationSpec {
+                creation: crate::storage::CatalogCreation::Restore(creation),
                 name: sql_name(&name)?,
                 all_tables: flags & 1 != 0,
                 tables: &tables[..count],
@@ -18357,7 +18385,7 @@ fn load_subscription_relation(
         ));
     }
     let slot = storage
-        .subscriptions_with_slots_visible_to(0)
+        .subscriptions_with_slots_visible_to(Some(storage.current_database_oid()), 0)
         .find(|(_, subscription)| {
             subscription.created_at == created_at
                 && subscription.definition_generation == definition_generation
@@ -19862,7 +19890,7 @@ mod stored_dependency_tests {
             )
             .unwrap();
         let manifest = format!(
-            "pos3ql-manifest-v30\nlsn 7\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nvix 0 1 0 0 - {} 1 7\ntypes_end\nend\n",
+            "pos3ql-manifest-v31\nlsn 7\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nvix 0 1 0 0 - {} 1 7\ntypes_end\nend\n",
             index_gc_hex(old.roster)
         );
         // Two backups and two readers share the same graph at the four-block limit.
@@ -20317,7 +20345,7 @@ mod stored_dependency_tests {
                     let mut budget = Budget::new(bytes);
                     let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
                     let mut checkpointer = Checkpointer::new(&config, &mut budget).unwrap();
-                    let mut manifest = String::from("pos3ql-manifest-v30\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\ntypes_end\n");
+                    let mut manifest = String::from("pos3ql-manifest-v31\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\ntypes_end\n");
                     for (oid, name) in [(first_oid, first_name), (second_oid, second_name)] {
                         let encoded = name
                             .as_bytes()
@@ -20343,7 +20371,7 @@ mod stored_dependency_tests {
                     let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
                     let mut checkpointer = Checkpointer::new(&config, &mut budget).unwrap();
                     assert!(matches!(checkpointer.load_manifest_text(&mut storage,
-                        "pos3ql-manifest-v30\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nsset 73616d706c65 6669727374\nsset 73616d706c65 7365636f6e64\ntypes_end\nend\n"),
+                        "pos3ql-manifest-v31\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nsset 73616d706c65 6669727374\nsset 73616d706c65 7365636f6e64\ntypes_end\nend\n"),
                         Err(CheckpointSetupError::Corrupt("duplicate system setting record"))));
                     assert_eq!(storage.system_settings().find(|(_, image)| image.live).unwrap().1
                         .value.as_str(), "first");
@@ -20352,7 +20380,7 @@ mod stored_dependency_tests {
                     let mut budget = Budget::new(bytes);
                     let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
                     let mut checkpointer = Checkpointer::new(&config, &mut budget).unwrap();
-                    let manifest = format!("pos3ql-manifest-v30\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nptx 10 1 2 0 5 10 6669727374\nptx {transaction_id} 1 2 0 5 10 {gid}\ntypes_end\nend\n");
+                    let manifest = format!("pos3ql-manifest-v31\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nptx 10 1 2 0 5 10 6669727374\nptx {transaction_id} 1 2 0 5 10 {gid}\ntypes_end\nend\n");
                     match checkpointer.load_manifest_text(&mut storage, &manifest) {
                         Err(CheckpointSetupError::ObjectStore(message)) => {
                             assert!(message.contains("duplicate prepared transaction catalog identity"));
@@ -20525,7 +20553,8 @@ mod stored_dependency_tests {
                 "pos3ql-manifest-v27",
                 "pos3ql-manifest-v28",
                 "pos3ql-manifest-v29",
-                "pos3ql-manifest-v30 trailing",
+                "pos3ql-manifest-v30",
+                "pos3ql-manifest-v31 trailing",
             ] {
                 let rejected = stack_format!(512, "{header}\n{body}");
                 assert!(matches!(
@@ -20607,11 +20636,11 @@ mod stored_dependency_tests {
 
     #[test]
     fn backup_commit_floor_includes_prepared_transactions_and_logical_slots() {
-        let manifest = b"pos3ql-manifest-v30\nlsn 100\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nptx 7 41 50 0 5 10 78\nrslot 736c6f74 60 70 0\ntypes_end\nend\n";
+        let manifest = b"pos3ql-manifest-v31\nlsn 100\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nptx 7 41 50 0 5 10 78\nrslot 736c6f74 60 70 0\ntypes_end\nend\n";
         assert_eq!(manifest_lsn(manifest).unwrap(), 100);
         assert_eq!(manifest_commit_retention_floor(manifest).unwrap(), 40);
 
-        let slot_only = b"pos3ql-manifest-v30\nlsn 100\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nrslot 736c6f74 60 70 0\ntypes_end\nend\n";
+        let slot_only = b"pos3ql-manifest-v31\nlsn 100\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nrslot 736c6f74 60 70 0\ntypes_end\nend\n";
         assert_eq!(manifest_commit_retention_floor(slot_only).unwrap(), 60);
     }
 
@@ -20973,7 +21002,7 @@ mod stored_dependency_tests {
         let mut manifest = FixedBuf::new(&mut budget, "manifest", 1024).unwrap();
         manifest
             .append(
-                b"pos3ql-manifest-v30\nlsn 7\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\ntypes_end\nend\n",
+                b"pos3ql-manifest-v31\nlsn 7\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\ntypes_end\nend\n",
             );
         let before = manifest.readable().to_vec();
         retag_manifest_root(&mut manifest, replacement).unwrap();

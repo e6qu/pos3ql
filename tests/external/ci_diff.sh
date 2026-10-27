@@ -1436,27 +1436,33 @@ fi
 fi
 
 # --- curated differential SQL corpus (rows + SQLSTATEs must match) ----------
-# Ask psql for SQLSTATE-only diagnostics so multiline DETAIL cannot become rows.
-normalize() {
-  sed -E \
-    -e 's/^psql:[^:]*:[0-9]+: ERROR:  ([0-9A-Z]{5})$/ERROR \1/' \
-    -e 's/^ERROR:  ([0-9A-Z]{5})$/ERROR \1/' \
-    -e '/^(psql:[^:]*:[0-9]+: )?(NOTICE|WARNING):/d'
-}
-run_corpus() { # host port outfile file
+# Data stays byte-exact; diagnostic records retain the failing SQL line.
+run_corpus() { # host port outfile file diagnostics
+  local diagnostics=$5 status=0
+  case "$diagnostics" in
+    sqlstate|verbose) ;;
+    *) printf 'FAIL: unknown corpus diagnostics %s\n' "$diagnostics" >&2; return 1 ;;
+  esac
   if [[ "$1" == "$PGHOST" && "$2" == "$PGPORT" ]]; then
     PGOPTIONS="-c timezone=UTC -c extension_control_path=$REFERENCE_EXTENSION_CONTROL_ROOT" \
-      psql -h "$1" -p "$2" -U "$PGUSER" -d postgres -X -a -q -P pager=off \
-        -v VERBOSITY=sqlstate -f "$4" 2>&1
+      psql -h "$1" -p "$2" -U "$PGUSER" -d postgres -X -e -P pager=off \
+        -v VERBOSITY="$diagnostics" -f "$4" > "$3.stdout" 2> "$3.stderr" || status=$?
   else
-    psql -h "$1" -p "$2" -U "$PGUSER" -d postgres -X -a -q -P pager=off \
-      -v VERBOSITY=sqlstate -f "$4" 2>&1
-  fi | normalize > "$3"
+    psql -h "$1" -p "$2" -U "$PGUSER" -d postgres -X -e -P pager=off \
+      -v VERBOSITY="$diagnostics" -f "$4" > "$3.stdout" 2> "$3.stderr" || status=$?
+  fi
   if [[ "$2" == "$P3_PORT" ]] && ! server_alive "$P3_PID"; then
     echo "pos3ql exited while running $(basename "$4")"
     tail -80 "$WORK/p3.log"
     exit 1
   fi
+  if [[ "$status" != 0 ]]; then
+    printf 'FAIL: corpus psql client exited with status %s\n' "$status" >&2
+    cat "$3.stderr" >&2
+    return 1
+  fi
+  python3 "$EXT/differential_diagnostics.py" --source "$4" --stdout "$3.stdout" \
+    --stderr "$3.stderr" --diagnostics "$diagnostics" > "$3" || return 1
 }
 reset_user_extensions() { # host port
   psql -h "$1" -p "$2" -U "$PGUSER" -d postgres -X -A -t -q \
@@ -1512,8 +1518,8 @@ for f in "$EXT"/differential/*.sql; do
     corpus_ordinal=$((corpus_ordinal + 1))
     continue
   fi
-  run_corpus "$PGHOST" "$PGPORT" "$WORK/$n.pg" "$f"
-  run_corpus 127.0.0.1 "$P3_PORT" "$WORK/$n.p3" "$f"
+  run_corpus "$PGHOST" "$PGPORT" "$WORK/$n.pg" "$f" sqlstate || exit 1
+  run_corpus 127.0.0.1 "$P3_PORT" "$WORK/$n.p3" "$f" sqlstate || exit 1
   if diff -u "$WORK/$n.pg" "$WORK/$n.p3" > "$WORK/$n.diff"; then ok "corpus: $n"
   else bad "corpus: $n"; head -40 "$WORK/$n.diff"; fi
   reset_corpus_pair
@@ -1550,21 +1556,10 @@ fi
 if [[ "$AUXILIARY_PHASE" == all || "$AUXILIARY_PHASE" == exact ]]; then
 restart_p3_fresh || exit 1
 echo "=== exact-error corpora (message wording must match) ==="
-normalize_exact() {
-  sed -E \
-    -e 's/^psql:[^:]*:[0-9]+: ERROR:  ([0-9A-Z]{5}): *(.*)/ERROR \1 \2/' \
-    -e 's/^ERROR:  ([0-9A-Z]{5}): *(.*)/ERROR \1 \2/' \
-    -e '/^LINE [0-9]+:/d' -e '/^ *\^ *$/d' \
-    -e '/^psql:[^:]*:[0-9]+: (HINT|DETAIL|LOCATION|CONTEXT|SCHEMA NAME|TABLE NAME|COLUMN NAME|CONSTRAINT NAME|DATATYPE NAME|NOTICE|WARNING):/d' \
-    -e '/^(HINT|DETAIL|LOCATION|CONTEXT|SCHEMA NAME|TABLE NAME|COLUMN NAME|CONSTRAINT NAME|DATATYPE NAME|NOTICE|WARNING):/d'
-}
-run_exact() { # host port outfile file
-  psql -h "$1" -p "$2" -U "$PGUSER" -d postgres -X -a -q -P pager=off -v VERBOSITY=verbose -f "$4" 2>&1 | normalize_exact > "$3"
-}
 for f in "$EXT"/differential_exact/*.sql; do
   n=$(basename "$f" .sql)
-  run_exact "$PGHOST" "$PGPORT" "$WORK/$n.pg" "$f"
-  run_exact 127.0.0.1 "$P3_PORT" "$WORK/$n.p3" "$f"
+  run_corpus "$PGHOST" "$PGPORT" "$WORK/$n.pg" "$f" verbose || exit 1
+  run_corpus 127.0.0.1 "$P3_PORT" "$WORK/$n.p3" "$f" verbose || exit 1
   if diff -u "$WORK/$n.pg" "$WORK/$n.p3" > "$WORK/$n.diff"; then ok "exact errors: $n"
   else bad "exact errors: $n"; head -40 "$WORK/$n.diff"; fi
 done

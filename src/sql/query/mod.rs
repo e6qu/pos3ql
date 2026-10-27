@@ -4377,7 +4377,12 @@ fn privilege_relation_oid(
         ));
     }
     if let Some(schema) = parsed.schema.as_ref() {
-        if super::catalog::schema_oid_by_name(storage, transaction, schema.as_str()).is_none() {
+        let schema_exists = if schema.as_str() == "pg_temp" {
+            super::catalog::current_temporary_namespace_oid(storage, transaction) != 0
+        } else {
+            super::catalog::schema_oid_by_name(storage, transaction, schema.as_str()).is_some()
+        };
+        if !schema_exists {
             return Err(sql_err!(
                 sqlstate::INVALID_SCHEMA_NAME,
                 r#"schema "{}" does not exist"#,
@@ -4610,12 +4615,12 @@ fn object_privilege_query(
                     .map(usize::from),
                 AccessClass::ForeignDataWrapper => {
                     storage.foreign_wrappers(txid).find_map(|(slot, _)| {
-                        (super::catalog::foreign_data_wrapper_oid(slot) == oid).then_some(slot)
+                        (storage.foreign_wrapper_entry(slot).oid() == oid).then_some(slot)
                     })
                 }
                 AccessClass::ForeignServer => {
                     storage.foreign_servers(txid).find_map(|(slot, _)| {
-                        (super::catalog::foreign_server_oid(slot) == oid).then_some(slot)
+                        (storage.foreign_server_entry(slot).oid() == oid).then_some(slot)
                     })
                 }
                 AccessClass::LargeObject => LargeObjectOid::parse(oid as u32)

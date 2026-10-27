@@ -202,6 +202,7 @@ impl CatalogSnapshotRelation {
 fn affected_catalogs(change: &super::txn::DdlUndo) -> &'static [&'static str] {
     use super::txn::DdlUndo::*;
     match change {
+        TemporaryNamespaceCreated(_) => &["pg_namespace"],
         Created(_)
         | Dropped(_)
         | TableAltered(_)

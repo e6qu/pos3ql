@@ -904,6 +904,25 @@ fn create_owned_sequence(
     Ok(slot)
 }
 
+fn ensure_temporary_namespace(
+    storage: &Storage,
+    txn: &mut TxnState,
+    persistence: crate::storage::RelationPersistence,
+) -> Result<(), SqlError> {
+    if persistence == crate::storage::RelationPersistence::Temporary
+        && let Some(identity) = storage.create_temporary_namespace(txn.txid)?
+        && let Err(error) = txn.record_ddl(super::txn::DdlUndo::TemporaryNamespaceCreated(identity))
+    {
+        storage.finish_temporary_namespace(
+            identity,
+            txn.txid,
+            crate::storage::CatalogDdlDecision::Rollback,
+        );
+        return Err(error);
+    }
+    Ok(())
+}
+
 pub fn create_table(
     storage: &mut Storage,
     wal: &mut Wal,
@@ -989,6 +1008,9 @@ fn create_table_kind(
         Ok(n) => n,
         Err(e) => return sql_fail(e),
     };
+    if let Err(error) = ensure_temporary_namespace(storage, txn, def.persistence) {
+        return sql_fail(error);
+    }
     def.kind = if foreign.is_some() {
         crate::storage::TableKind::Foreign
     } else {
@@ -4153,7 +4175,7 @@ fn copy_like_statistics(
             )?;
             let slot = storage.create_extended_statistics(
                 ExtendedStatisticsSpec {
-                    created_at: 0,
+                    creation: crate::storage::CatalogCreation::New,
                     schema: target.schema,
                     name,
                     table: target_slot as u16,
@@ -4183,13 +4205,16 @@ fn copy_like_statistics(
                         class: crate::storage::CommentClass::Statistics,
                         schema: definition.schema,
                         name: definition.name,
-                        subid: source_statistics_slot as u32,
+                        subid: storage
+                            .extended_statistics(source_statistics_slot)
+                            .creation()
+                            .get(),
                     },
                     CommentIdentity {
                         class: crate::storage::CommentClass::Statistics,
                         schema: target.schema,
                         name,
-                        subid: slot as u32,
+                        subid: storage.extended_statistics(slot).creation().get(),
                     },
                 )?;
             }
@@ -4348,8 +4373,8 @@ fn copy_comment_if_present(
 /// The next value of a serial/identity column: a real sequence, as PostgreSQL
 /// has it. Explicit inserts do not advance it, deletes and TRUNCATE do not
 /// rewind it, and the advance survives a rollback (a consumed number stays
-/// consumed). The counter is journaled at commit and floored against the
-/// stored rows at startup.
+/// consumed). Recovery restores saved generator positions without inferring
+/// them from stored row values.
 fn next_auto_value<'x>(
     storage: &mut Storage,
     table_index: usize,
@@ -8196,6 +8221,7 @@ pub fn set_session_authorization(
 }
 
 pub struct GrantRoleRequest<'a> {
+    pub syntax: crate::sql::ast::RoleMembershipSyntax,
     pub roles: &'a [&'a str],
     pub members: &'a [&'a str],
     pub options: crate::sql::ast::RoleMembershipPatch,
@@ -8211,6 +8237,7 @@ pub fn grant_role(
     responder: &mut Responder,
 ) -> Outcome {
     let GrantRoleRequest {
+        syntax,
         roles,
         members,
         options,
@@ -8349,11 +8376,12 @@ pub fn grant_role(
             }
         }
     }
-    responder.command_complete("GRANT ROLE")?;
+    responder.command_complete(syntax.grant_tag())?;
     sql_ok()
 }
 
 pub struct RevokeRoleRequest<'a> {
+    pub syntax: crate::sql::ast::RoleMembershipSyntax,
     pub roles: &'a [&'a str],
     pub members: &'a [&'a str],
     pub option: Option<crate::sql::ast::RoleMembershipOption>,
@@ -8370,6 +8398,7 @@ pub fn revoke_role(
     responder: &mut Responder,
 ) -> Outcome {
     let RevokeRoleRequest {
+        syntax,
         roles,
         members,
         option,
@@ -8543,7 +8572,7 @@ pub fn revoke_role(
             }
         }
     }
-    responder.command_complete("REVOKE ROLE")?;
+    responder.command_complete(syntax.revoke_tag())?;
     sql_ok()
 }
 
@@ -10087,9 +10116,11 @@ pub(crate) fn drop_owned(
                         wal,
                         txn,
                         scratch,
-                        &[schema.as_str()],
-                        false,
-                        true,
+                        SchemaDropTarget::Named {
+                            names: &[schema.as_str()],
+                            if_exists: false,
+                            cascade: true,
+                        },
                         arena,
                         seq_session,
                         responder,
@@ -10455,9 +10486,11 @@ pub(crate) fn drop_owned(
                         wal,
                         txn,
                         scratch,
-                        &[schema.as_str()],
-                        false,
-                        false,
+                        SchemaDropTarget::Named {
+                            names: &[schema.as_str()],
+                            if_exists: false,
+                            cascade: false,
+                        },
                         arena,
                         seq_session,
                         responder,
@@ -12046,24 +12079,46 @@ enum SchemaObject {
     },
 }
 
-/// DROP SCHEMA [IF EXISTS] name [, ...] [CASCADE | RESTRICT]: RESTRICT (the
-/// default) refuses a non-empty schema with PostgreSQL's dependency report;
-/// CASCADE drops every contained catalog object and severs inbound foreign
-/// keys from surviving tables.
+pub(crate) enum SchemaDropTarget<'a> {
+    Named {
+        names: &'a [&'a str],
+        if_exists: bool,
+        cascade: bool,
+    },
+    TemporaryObjects,
+}
+
+/// Drop selected schemas or clear this connection's temporary objects using
+/// the same dependency graph, fixed undo capacity and transactional rollback.
+/// Temporary cleanup retains its namespace and emits no durable drop records.
+/// Named RESTRICT refuses non-empty schemas; CASCADE also removes dependents.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn drop_schema(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
     scratch: &mut DmlScratch,
-    names: &[&str],
-    if_exists: bool,
-    cascade: bool,
+    target: SchemaDropTarget<'_>,
     arena: &Arena,
     seq_session: &crate::sql::guc::SeqSession,
     responder: &mut Responder,
 ) -> Outcome {
     use core::fmt::Write as _;
+    let (names, if_exists, cascade, temporary) = match target {
+        SchemaDropTarget::Named {
+            names,
+            if_exists,
+            cascade,
+        } => (names, if_exists, cascade, None),
+        SchemaDropTarget::TemporaryObjects => {
+            let schema = match storage.temporary_schema() {
+                Ok(schema) => schema,
+                Err(error) => return sql_fail(error),
+            };
+            // The private namespace survives clearing its contents.
+            (&[][..], false, true, Some(schema))
+        }
+    };
     let slots = match arena.alloc_slice_with(names.len(), |_| usize::MAX) {
         Ok(slots) => slots,
         Err(_) => return sql_fail(arena_full()),
@@ -12119,16 +12174,22 @@ pub(crate) fn drop_schema(
             }
         }
     }
+    let selected_schema = temporary.or_else(|| {
+        slots[..n_slots]
+            .first()
+            .map(|&slot| storage.schema_def_for(slot, txn.txid).name)
+    });
     // Everything the drop sweeps up, across all listed schemas.
     let schema_transaction = txn.txid;
     let in_listed = |storage: &Storage, schema: &str| {
-        slots[..n_slots].iter().any(|&slot| {
-            storage
-                .schema_def_for(slot, schema_transaction)
-                .name
-                .as_str()
-                == schema
-        })
+        temporary.is_some_and(|selected| selected.as_str() == schema)
+            || slots[..n_slots].iter().any(|&slot| {
+                storage
+                    .schema_def_for(slot, schema_transaction)
+                    .name
+                    .as_str()
+                    == schema
+            })
     };
     let enum_uses_listed_schema =
         |storage: &Storage, base: ColType, txid: u32| -> Result<bool, SqlError> {
@@ -12300,7 +12361,15 @@ pub(crate) fn drop_schema(
     }
     for (statistics, definition) in storage.extended_statistics_visible(txn.txid) {
         let mutable = definition.definition_for(txn.txid);
-        if in_listed(storage, mutable.schema.as_str())
+        if (in_listed(storage, mutable.schema.as_str())
+            || (cascade
+                && in_listed(
+                    storage,
+                    storage
+                        .table_def(usize::from(definition.table), txn.txid)
+                        .schema
+                        .as_str(),
+                )))
             && let Err(error) = push(SchemaObject::Statistics(statistics), &mut n_objects)
         {
             return sql_fail(error);
@@ -12564,7 +12633,9 @@ pub(crate) fn drop_schema(
                             slot: policy_slot,
                             root_schema: direct_dependency
                                 .map(|dependency| dependency.schema)
-                                .unwrap_or(storage.schema_def_for(slots[0], txn.txid).name),
+                                .unwrap_or_else(|| {
+                                    selected_schema.expect("dependent object has a selected schema")
+                                }),
                             root_class: direct_dependency.map(|dependency| dependency.class),
                             root_slot: direct_dependency
                                 .map_or(usize::MAX, |dependency| usize::from(dependency.slot)),
@@ -12622,7 +12693,9 @@ pub(crate) fn drop_schema(
                         slot: policy_slot,
                         root_schema: direct_dependency
                             .map(|dependency| dependency.schema)
-                            .unwrap_or(storage.schema_def_for(slots[0], txn.txid).name),
+                            .unwrap_or_else(|| {
+                                selected_schema.expect("dependent object has a selected schema")
+                            }),
                         root_class: direct_dependency.map(|dependency| dependency.class),
                         root_slot: direct_dependency
                             .map_or(usize::MAX, |dependency| usize::from(dependency.slot)),
@@ -12659,6 +12732,9 @@ pub(crate) fn drop_schema(
     // schema's dependents in OID (creation) order; a severed constraint
     // sorts with its child table, after it.
     let schema_rank = |storage: &Storage, schema: &str| -> usize {
+        if temporary.is_some_and(|selected| selected.as_str() == schema) {
+            return 1;
+        }
         slots[..n_slots]
             .iter()
             .position(|&slot| storage.schema_def_for(slot, txn.txid).name.as_str() == schema)
@@ -13203,7 +13279,7 @@ pub(crate) fn drop_schema(
             return sql_fail(error);
         }
     }
-    if reported_object_count == 1 {
+    if temporary.is_none() && reported_object_count == 1 {
         let mut line = crate::util::StackStr::<192>::new();
         let object = objects[..n_objects]
             .iter()
@@ -13217,7 +13293,7 @@ pub(crate) fn drop_schema(
             crate::sql::eval::sqlstate::SUCCESSFUL_COMPLETION,
             stack_format!(224, "drop cascades to {}", line.as_str()).as_str(),
         )?;
-    } else if reported_object_count > 1 {
+    } else if temporary.is_none() && reported_object_count > 1 {
         let mut detail =
             crate::util::StackStr::<{ crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES }>::new();
         for (i, o) in objects[..n_objects]
@@ -13567,17 +13643,19 @@ pub(crate) fn drop_schema(
                 let identity = storage.sequence_position(*sequence);
                 let sequence = storage.sequence_for(*sequence, txn.txid);
                 let (schema, name) = (sequence.schema, sequence.name);
-                let lsn = storage.bump_lsn();
-                if let Err(error) = wal.stage_reserved(
-                    txn.txid,
-                    lsn,
-                    &WalOp::DropSequence {
-                        identity,
-                        schema: schema.as_str(),
-                        name: name.as_str(),
-                    },
-                ) {
-                    return sql_fail(error);
+                if sequence.persistence != crate::storage::RelationPersistence::Temporary {
+                    let lsn = storage.bump_lsn();
+                    if let Err(error) = wal.stage_reserved(
+                        txn.txid,
+                        lsn,
+                        &WalOp::DropSequence {
+                            identity,
+                            schema: schema.as_str(),
+                            name: name.as_str(),
+                        },
+                    ) {
+                        return sql_fail(error);
+                    }
                 }
                 match storage.drop_sequence(schema.as_str(), name.as_str(), txn.txid) {
                     Ok(Some(slot)) => {
@@ -13721,17 +13799,26 @@ pub(crate) fn drop_schema(
                 if let Err(error) = storage.drop_extended_statistics(*statistics, txn.txid) {
                     return sql_fail(error);
                 }
-                let lsn = storage.bump_lsn();
-                if let Err(error) = wal.stage_reserved(
-                    txn.txid,
-                    lsn,
-                    &WalOp::DropExtendedStatistics {
-                        schema: definition.schema.as_str(),
-                        name: definition.name.as_str(),
-                    },
-                ) {
-                    storage.rollback_extended_statistics_drop(*statistics, txn.txid);
-                    return sql_fail(error);
+                if storage
+                    .table_def(
+                        usize::from(storage.extended_statistics(*statistics).table),
+                        txn.txid,
+                    )
+                    .persistence
+                    != crate::storage::RelationPersistence::Temporary
+                {
+                    let lsn = storage.bump_lsn();
+                    if let Err(error) = wal.stage_reserved(
+                        txn.txid,
+                        lsn,
+                        &WalOp::DropExtendedStatistics {
+                            schema: definition.schema.as_str(),
+                            name: definition.name.as_str(),
+                        },
+                    ) {
+                        storage.rollback_extended_statistics_drop(*statistics, txn.txid);
+                        return sql_fail(error);
+                    }
                 }
                 if let Err(error) =
                     txn.record_ddl(super::txn::DdlUndo::StatisticsDropped(*statistics as u32))
@@ -13770,17 +13857,19 @@ pub(crate) fn drop_schema(
                         continue;
                     }
                     let (schema, name) = (sequence.schema, sequence.name);
-                    let lsn = storage.bump_lsn();
-                    if let Err(error) = wal.stage_reserved(
-                        txn.txid,
-                        lsn,
-                        &WalOp::DropSequence {
-                            identity: storage.sequence_position(sequence_slot),
-                            schema: schema.as_str(),
-                            name: name.as_str(),
-                        },
-                    ) {
-                        return sql_fail(error);
+                    if sequence.persistence != crate::storage::RelationPersistence::Temporary {
+                        let lsn = storage.bump_lsn();
+                        if let Err(error) = wal.stage_reserved(
+                            txn.txid,
+                            lsn,
+                            &WalOp::DropSequence {
+                                identity: storage.sequence_position(sequence_slot),
+                                schema: schema.as_str(),
+                                name: name.as_str(),
+                            },
+                        ) {
+                            return sql_fail(error);
+                        }
                     }
                     match storage.drop_sequence(schema.as_str(), name.as_str(), txn.txid) {
                         Ok(Some(slot)) => {
@@ -13808,17 +13897,19 @@ pub(crate) fn drop_schema(
                         return sql_fail(error);
                     }
                 }
-                let lsn = storage.bump_lsn();
-                if let Err(e) = wal.stage_reserved(
-                    txn.txid,
-                    lsn,
-                    &WalOp::DropTable {
-                        identity: storage.table_position(*t),
-                        schema: def.schema.as_str(),
-                        name: def.name.as_str(),
-                    },
-                ) {
-                    return sql_fail(e);
+                if def.persistence != crate::storage::RelationPersistence::Temporary {
+                    let lsn = storage.bump_lsn();
+                    if let Err(e) = wal.stage_reserved(
+                        txn.txid,
+                        lsn,
+                        &WalOp::DropTable {
+                            identity: storage.table_position(*t),
+                            schema: def.schema.as_str(),
+                            name: def.name.as_str(),
+                        },
+                    ) {
+                        return sql_fail(e);
+                    }
                 }
                 let dropped = match storage.drop_table_in(*t, txn.txid) {
                     Ok(undo) => undo,
@@ -14002,6 +14093,7 @@ pub fn create_publication(
     };
     match storage.create_publication(
         crate::storage::PublicationSpec {
+            creation: crate::storage::CatalogCreation::New,
             name,
             all_tables,
             tables: &members[..table_count],
@@ -14025,6 +14117,7 @@ pub fn create_publication(
                 txn.txid,
                 lsn,
                 &WalOp::CreatePublication {
+                    created_at: storage.publication_at(slot).created_at,
                     name: name.as_str(),
                     owner,
                     all_tables,
@@ -21691,9 +21784,11 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                     &mut engine.wal,
                     txn,
                     &mut engine.dml_scratch,
-                    names,
-                    *if_exists,
-                    *cascade,
+                    super::exec::SchemaDropTarget::Named {
+                        names,
+                        if_exists: *if_exists,
+                        cascade: *cascade,
+                    },
                     context.arena,
                     guc.seq_session(),
                     responder,
@@ -22209,6 +22304,7 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                     responder,
                 ),
                 Stmt::GrantRole {
+                    syntax,
                     roles,
                     members,
                     options,
@@ -22218,6 +22314,7 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                     &mut engine.wal,
                     txn,
                     super::exec::GrantRoleRequest {
+                        syntax: *syntax,
                         roles,
                         members,
                         options: *options,
@@ -22227,6 +22324,7 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                     responder,
                 ),
                 Stmt::RevokeRole {
+                    syntax,
                     roles,
                     members,
                     option,
@@ -22237,6 +22335,7 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                     &mut engine.wal,
                     txn,
                     super::exec::RevokeRoleRequest {
+                        syntax: *syntax,
                         roles,
                         members,
                         option: *option,
@@ -22814,7 +22913,7 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                     sql,
                     *with_data,
                     *if_not_exists,
-                    *kind == crate::sql::ast::CreateTableAsKind::MaterializedView,
+                    *kind,
                     *options,
                     *persistence,
                     guc.search_path().as_str(),
@@ -23244,7 +23343,7 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                     engine.execute_deallocate_statement(*name, sqlprep, responder)
                 }
                 Stmt::Discard(target) => engine.execute_discard_statement(
-                    *target, sqlprep, cursors, guc, responder,
+                    *target, txn, context.arena, sqlprep, cursors, guc, responder,
                 ),
                 Stmt::Show(name) => engine.show(name, guc, txn, responder),
                 Stmt::ShowAll => engine.show_all(guc, txn, responder),
@@ -36445,6 +36544,9 @@ pub fn create_view(
         Ok(schema) => schema,
         Err(error) => return sql_fail(error),
     };
+    if let Err(error) = ensure_temporary_namespace(storage, txn, persistence) {
+        return sql_fail(error);
+    }
     let sqlname = match SqlName::parse(name.name) {
         Ok(name) => name,
         Err(error) => return sql_fail(error),
@@ -38718,7 +38820,7 @@ pub fn comment(
                 CommentClass::Statistics,
                 definition.schema,
                 definition.name,
-                slot as u32,
+                storage.extended_statistics(slot).creation().get(),
             )
         }
         CommentTarget::Role(role_name) => {
@@ -38987,7 +39089,7 @@ pub fn comment(
                 CommentClass::ForeignDataWrapper,
                 SqlName::EMPTY,
                 wrapper.name,
-                slot as u32,
+                storage.foreign_wrapper_entry(slot).creation().get(),
             )
         }
         CommentTarget::ForeignServer(server_name) => {
@@ -39009,7 +39111,7 @@ pub fn comment(
                 CommentClass::ForeignServer,
                 SqlName::EMPTY,
                 server.name,
-                slot as u32,
+                storage.foreign_server_entry(slot).creation().get(),
             )
         }
         CommentTarget::Publication(publication_name) => {
@@ -39023,12 +39125,12 @@ pub fn comment(
             if let Err(error) = storage.require_publication_owner(slot, txid) {
                 return sql_fail(error);
             }
-            let publication = storage.publication_for_event_trigger(slot);
+            let publication = storage.publication_at(slot);
             (
                 CommentClass::Publication,
                 SqlName::EMPTY,
                 publication.name_for(txid),
-                slot as u32,
+                publication.creation().get(),
             )
         }
         CommentTarget::Subscription(subscription_name) => {
@@ -39312,7 +39414,7 @@ pub fn create_table_as(
     sql: &str,
     with_data: bool,
     if_not_exists: bool,
-    materialized: bool,
+    kind: crate::sql::ast::CreateTableAsKind,
     options: crate::sql::ast::TableAsOptions<'_>,
     persistence: crate::sql::ast::RelationPersistence,
     raw_path: &str,
@@ -39322,6 +39424,7 @@ pub fn create_table_as(
     responder: &mut Responder,
 ) -> Outcome {
     use crate::storage::{ColumnMeta, SqlName, TableDef};
+    let materialized = kind == crate::sql::ast::CreateTableAsKind::MaterializedView;
     let crate::sql::ast::TableAsOptions {
         access_method,
         tablespace,
@@ -39407,6 +39510,9 @@ pub fn create_table_as(
         Ok(s) => s,
         Err(e) => return sql_fail(e),
     };
+    if let Err(error) = ensure_temporary_namespace(storage, txn, def.persistence) {
+        return sql_fail(error);
+    }
     def.name = match SqlName::parse(name.name) {
         Ok(n) => n,
         Err(e) => return sql_fail(e),
@@ -39532,7 +39638,7 @@ pub fn create_table_as(
                 sqlstate::DUPLICATE_TABLE,
                 stack_format!(128, "relation \"{}\" already exists, skipping", name.name).as_str(),
             )?;
-            responder.command_complete("CREATE TABLE AS")?;
+            responder.command_complete(kind.ddl_tag())?;
             return sql_ok();
         }
         Err(e) => return sql_fail(e),
@@ -39700,7 +39806,11 @@ pub fn create_table_as(
             Err(e) => return sql_fail(e),
         }
     }
-    responder.command_complete(stack_format!(32, "SELECT {count}").as_str())?;
+    if with_data {
+        responder.command_complete(stack_format!(32, "SELECT {count}").as_str())?;
+    } else {
+        responder.command_complete(kind.ddl_tag())?;
+    }
     sql_ok()
 }
 
@@ -40328,6 +40438,9 @@ pub fn create_sequence(
         Ok(n) => n,
         Err(e) => return sql_fail(e),
     };
+    if let Err(error) = ensure_temporary_namespace(storage, txn, persistence.into()) {
+        return sql_fail(error);
+    }
     if storage.relation_name_taken(schema.as_str(), name.name, txn.txid) {
         if if_not_exists {
             responder.notice(
@@ -44460,7 +44573,7 @@ fn stage_publication_column_drop_dependencies(
         table_definition,
     } = dependency;
     for slot in 0..storage.publication_count() {
-        let publication = storage.publication_for_event_trigger(slot);
+        let publication = storage.publication_at(slot);
         if !publication.visible_to(txn.txid) {
             continue;
         }
@@ -46385,7 +46498,7 @@ fn remap_publication_column_projections(
     column_mapping: &[u16; MAX_COLUMNS],
 ) -> Result<(), SqlError> {
     for slot in 0..storage.publication_count() {
-        let publication = storage.publication_for_event_trigger(slot);
+        let publication = storage.publication_at(slot);
         if !publication.visible_to(txn.txid) {
             continue;
         }
@@ -46473,7 +46586,7 @@ fn rewrite_table_publication_column_references(
         return Ok(());
     }
     for slot in 0..storage.publication_count() {
-        let publication = storage.publication_for_event_trigger(slot);
+        let publication = storage.publication_at(slot);
         if !publication.visible_to(txn.txid) {
             continue;
         }
@@ -47885,7 +47998,7 @@ pub fn create_statistics(
     }
     let slot = match storage.create_extended_statistics(
         ExtendedStatisticsSpec {
-            created_at: 0,
+            creation: crate::storage::CatalogCreation::New,
             schema,
             name,
             table: table as u16,

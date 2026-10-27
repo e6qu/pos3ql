@@ -85,7 +85,7 @@ impl<'a> Index<'a> {
 
 #[derive(Clone, Copy)]
 pub(super) struct CatalogRow<'a> {
-    pub(super) definition: &'a crate::storage::TableDef,
+    pub(super) definition: &'a crate::storage::RelationDefinition<'a>,
     pub(super) values: &'a [Datum<'a>],
 }
 

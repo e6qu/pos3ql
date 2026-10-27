@@ -8,7 +8,7 @@ use crate::sql::eval::{SqlError, sqlstate};
 use crate::sql_err;
 use crate::util::StackStr;
 
-use super::{CatalogDdlState, DatabaseOid, Ownership, PendingOwnership, SqlName};
+use super::{CatalogDdlState, CatalogIdentity, DatabaseOid, Ownership, PendingOwnership, SqlName};
 
 /// One OPTIONS clause follows the parser's complete bounded list.
 pub(crate) const MAX_FOREIGN_OPTIONS: usize = super::MAX_DEFINITION_ITEMS;
@@ -737,6 +737,18 @@ impl ForeignCatalog {
         txid: u32,
         noun: &'static str,
     ) -> Result<usize, SqlError> {
+        CatalogIdentity::require(created_at)?;
+        if entries.iter().any(|entry| {
+            entry.database == database
+                && entry.ddl_state != CatalogDdlState::Absent
+                && entry.created_at == created_at
+        }) {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "foreign catalog creation identity is duplicated"
+            ));
+        }
+
         let slot = entries
             .iter()
             .position(|entry| entry.ddl_state == CatalogDdlState::Absent)
@@ -767,6 +779,19 @@ impl ForeignCatalog {
         definition: D,
         ownership: Ownership,
     ) -> Result<(), SqlError> {
+        CatalogIdentity::require(created_at)?;
+        if entries.iter().enumerate().any(|(other, entry)| {
+            other != slot
+                && entry.database == database
+                && entry.ddl_state != CatalogDdlState::Absent
+                && entry.created_at == created_at
+        }) {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "foreign catalog creation identity is duplicated"
+            ));
+        }
+
         let Some(entry) = entries.get_mut(slot) else {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -875,6 +900,23 @@ impl ForeignCatalog {
         ownership: Ownership,
         empty: D,
     ) -> Result<(), SqlError> {
+        if definition.is_some() {
+            CatalogIdentity::require(created_at)?;
+        }
+        if definition.is_some()
+            && entries.iter().enumerate().any(|(other, entry)| {
+                other != slot
+                    && entry.database == database
+                    && entry.ddl_state != CatalogDdlState::Absent
+                    && entry.created_at == created_at
+            })
+        {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "foreign catalog creation identity is duplicated"
+            ));
+        }
+
         let Some(entry) = entries.get_mut(slot) else {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -1237,24 +1279,6 @@ impl ForeignCatalog {
             .filter(move |(_, entry)| entry.database == database && entry.visible_to(txid))
     }
 
-    pub(crate) fn checkpoint_wrappers(
-        &self,
-    ) -> impl Iterator<Item = (usize, &ForeignCatalogEntry<ForeignDataWrapperDefinition>)> {
-        self.wrappers
-            .iter()
-            .enumerate()
-            .filter(|(_, entry)| entry.ddl_state.committed_exists())
-    }
-
-    pub(crate) fn checkpoint_servers(
-        &self,
-    ) -> impl Iterator<Item = (usize, &ForeignCatalogEntry<ForeignServerDefinition>)> {
-        self.servers
-            .iter()
-            .enumerate()
-            .filter(|(_, entry)| entry.ddl_state.committed_exists())
-    }
-
     pub(crate) fn checkpoint_wrapper(
         &self,
         slot: usize,
@@ -1416,5 +1440,165 @@ impl ForeignEntryMut<'_> {
             Self::Mapping(entry) => &mut entry.ownership,
             Self::Table(entry) => &mut entry.ownership,
         }
+    }
+}
+
+impl ForeignCatalog {
+    pub(super) fn clone_database(
+        &mut self,
+        source: DatabaseOid,
+        target: DatabaseOid,
+        allocation: super::DatabaseCloneAllocation<'_>,
+        transaction: u32,
+        table_slot: impl Fn(u16) -> Result<u16, SqlError>,
+    ) -> Result<(), SqlError> {
+        Self::clone_entries(
+            &mut self.wrappers,
+            source,
+            target,
+            allocation,
+            super::DatabaseCloneKind::ForeignWrapper,
+            transaction,
+            Ok,
+        )?;
+        let wrappers = &self.wrappers;
+        Self::clone_entries(
+            &mut self.servers,
+            source,
+            target,
+            allocation,
+            super::DatabaseCloneKind::ForeignServer,
+            transaction,
+            |mut definition| {
+                definition.wrapper =
+                    Self::cloned_parent(wrappers, definition.wrapper, source, target)?;
+                Ok(definition)
+            },
+        )?;
+        let servers = &self.servers;
+        Self::clone_entries(
+            &mut self.mappings,
+            source,
+            target,
+            allocation,
+            super::DatabaseCloneKind::UserMapping,
+            transaction,
+            |mut definition| {
+                definition.server =
+                    Self::cloned_parent(servers, definition.server, source, target)?;
+                Ok(definition)
+            },
+        )?;
+        Self::clone_entries(
+            &mut self.tables,
+            source,
+            target,
+            allocation,
+            super::DatabaseCloneKind::ForeignTable,
+            transaction,
+            |mut definition| {
+                definition.table = table_slot(definition.table)?;
+                definition.server =
+                    Self::cloned_parent(servers, definition.server, source, target)?;
+                Ok(definition)
+            },
+        )
+    }
+
+    fn cloned_parent<D: Copy>(
+        entries: &[ForeignCatalogEntry<D>],
+        source_slot: u16,
+        source: DatabaseOid,
+        target: DatabaseOid,
+    ) -> Result<u16, SqlError> {
+        let invalid = || {
+            sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "template foreign catalog parent was not cloned"
+            )
+        };
+        let parent = entries
+            .get(usize::from(source_slot))
+            .filter(|entry| entry.database == source && entry.ddl_state == CatalogDdlState::Present)
+            .ok_or_else(invalid)?;
+        entries
+            .iter()
+            .position(|entry| {
+                entry.database == target
+                    && entry.ddl_state != CatalogDdlState::Absent
+                    && entry.created_at == parent.created_at
+            })
+            .and_then(|slot| u16::try_from(slot).ok())
+            .ok_or_else(invalid)
+    }
+
+    fn clone_entries<D: Copy>(
+        entries: &mut FixedVec<ForeignCatalogEntry<D>>,
+        source: DatabaseOid,
+        target: DatabaseOid,
+        allocation: super::DatabaseCloneAllocation<'_>,
+        kind: super::DatabaseCloneKind,
+        transaction: u32,
+        definition: impl Fn(D) -> Result<D, SqlError>,
+    ) -> Result<(), SqlError> {
+        for source_slot in 0..entries.len() {
+            let mut entry = entries[source_slot];
+            if entry.database != source || entry.ddl_state != CatalogDdlState::Present {
+                continue;
+            }
+            CatalogIdentity::require(entry.created_at)?;
+            let target_slot = allocation.select(
+                kind,
+                entry.created_at,
+                entries.iter().enumerate().filter_map(|(slot, entry)| {
+                    (entry.ddl_state == CatalogDdlState::Absent).then_some(slot)
+                }),
+            )?;
+            entry.definition = definition(entry.definition)?;
+            entry.database = target;
+            entry.pending = None;
+            entry.ownership = entry.ownership.committed();
+            entry.ddl_state = CatalogDdlState::PendingCreate { txid: transaction };
+            entries[target_slot] = entry;
+        }
+        Ok(())
+    }
+
+    pub(super) fn commit_database_create(&mut self, database: DatabaseOid, transaction: u32) {
+        fn commit<D: Copy>(
+            entries: &mut [ForeignCatalogEntry<D>],
+            database: DatabaseOid,
+            transaction: u32,
+        ) {
+            for entry in entries {
+                if entry.database == database
+                    && entry.ddl_state == (CatalogDdlState::PendingCreate { txid: transaction })
+                {
+                    entry.ddl_state = CatalogDdlState::Present;
+                }
+            }
+        }
+        commit(&mut self.wrappers, database, transaction);
+        commit(&mut self.servers, database, transaction);
+        commit(&mut self.mappings, database, transaction);
+        commit(&mut self.tables, database, transaction);
+    }
+
+    pub(super) fn clear_database(&mut self, database: DatabaseOid) {
+        fn clear<D: Copy>(entries: &mut [ForeignCatalogEntry<D>], database: DatabaseOid, empty: D) {
+            for entry in entries {
+                if entry.database == database {
+                    *entry = ForeignCatalogEntry::empty(empty);
+                }
+            }
+        }
+        clear(
+            &mut self.wrappers,
+            database,
+            ForeignDataWrapperDefinition::EMPTY,
+        );
+        clear(&mut self.servers, database, ForeignServerDefinition::EMPTY);
+        clear(&mut self.mappings, database, UserMappingDefinition::EMPTY);
+        clear(&mut self.tables, database, ForeignTableDefinition::EMPTY);
     }
 }

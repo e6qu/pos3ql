@@ -15,7 +15,9 @@ CREATE PUBLICATION orders_feed FOR TABLE orders;
 A subscriber needs matching table definitions, connection credentials, and a
 subscription to `orders_feed`. Bootstrap copies the initial rows; later commits
 send changes. The publisher and subscriber paths are tested with real PostgreSQL.
-This is not a physical PostgreSQL standby or a second writer sharing one prefix.
+Each subscriber has its own durable state and startup reservations. The
+[architecture](architecture.md) distinguishes those databases from multiple SQL
+databases inside one prefix, and from additional CPU execution workers.
 
 pos3ql's recovery journal is not PostgreSQL physical XLOG. Physical replication
 and logical decoding of prepared transactions are explicitly rejected.
@@ -64,8 +66,7 @@ as in PostgreSQL. Expiration schedules history cleanup at the next
 statement boundary, so it does not walk every table under the validity guard.
 Exports reserve `max_connections` entries at startup,
 separately from transaction snapshot entries. Exhaustion returns `54000` without
-replacing a valid export or partly importing a snapshot. These protections do
-not enable parallel SQL execution.
+replacing a valid export or partly importing a snapshot. These protections retain snapshot correctness; SQL CPU work still uses one worker.
 
 ## Subscriber
 
@@ -109,6 +110,12 @@ entries, or about 104 MiB across the default 16 subscription workers. Reducing
 `subscription_relation_capacity` reduces that reservation after restart.
 Selected UPDATE and DELETE rows retain their original bytes and schema through
 triggers; selection copies matching rows without copying every row scanned.
+
+The [subscription catalog](https://www.postgresql.org/docs/18/catalog-pg-subscription.html)
+is shared across SQL databases. `pg_subscription.subdbid` identifies each
+subscription's owning database; reading that catalog from another database does
+not change ownership or start another worker. Subscription names are local to
+their database, while their object identifiers are shared and remain unique.
 
 ## SQL and monitoring
 

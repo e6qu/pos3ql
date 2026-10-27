@@ -89,6 +89,11 @@ cannot move the conflicting row to another partition (`0A000`).
 
 ## Capacity boundaries
 
+The [architecture size table](architecture.md#memory-and-physical-size) covers
+block, overflow-row, saved-generation, heap and instance-wide inventory limits.
+The [performance guide](performance.md#estimating-bandwidth-and-throughput)
+explains why none of those numbers establishes a transactions-per-second rate.
+
 Some limits come from PostgreSQL, some are smaller implementation limits, and
 some are reservations you choose in the startup configuration. These are
 different promises. A wide query can be a supported SQL shape yet still need
@@ -112,6 +117,7 @@ boundaries apply through catalogs, wire, WAL, checkpoints, and recovery:
 | Durable array count | 65,535 elements; exact slices or streaming traversal | Array text/binary, execution, persistence, and cold-recovery fixtures |
 | Constraint count | 64 constraints per modeled table kind and 64 domain checks | SQLSTATE 54000 on the next item; changing capacity does not renumber existing rules |
 | Durable constraint identity | Creation numbers 1–9,999,999 from the shared catalog counter | CHECK, foreign-key and NOT NULL rules retain identifiers across supported edits and recovery; replacements reserve new numbers; SQLSTATE 54000 on exhaustion |
+| Other catalog lifetime identities | Statistics, extensions, foreign-data wrappers/servers/mappings, publications and subscriptions use creation numbers 1–9,999,999 | Shared catalog counter; edits/recovery preserve identity, replacement reserves a new one; `54000` on exhaustion |
 | Other definition breadth | Documented 64-item constructs, including LIST bounds, inheritance parents, trigger arguments, and routine configuration entries | Shared parse/storage boundary; widening requires review of representation and identity |
 | Stored default expressions | 120 bytes, including enum member bindings and saved catalog display text | Existing startup reservation; SQLSTATE 54000 names an overfull default or bound enum expression before installation |
 | Startup capacities | Independent catalog, connection, transaction/savepoint, row-version, lock, replication, cache, and checkpoint pools | Configuration and exact startup memory plan; named errors before partial publication |
@@ -122,8 +128,9 @@ boundaries apply through catalogs, wire, WAL, checkpoints, and recovery:
 | Object-row source retention | 64 point-source slots per query workspace, separate from scan sources; checked shared lease counts | Complete captured generations and newest deletion metadata; SQLSTATE 54000 on exhaustion, without reducing scan capacity |
 | Retained row metadata | 64 copied point reads per query workspace; each reserves the configured maximum pending and committed versions | Startup-owned metadata, heap sources, and saved-file roots; SQLSTATE 54000 on exhaustion, with no shared version lock held during retention; captured-table admission returns 40001 before reserving a slot when its identity changed |
 | Bound prepared statements | Existing `max_prepared` statement slots and `prepared_bytes` per slot | Releasing a name preserves bytes needed by bound portals; slots are reusable after the last portal closes; exhaustion remains SQLSTATE 54000 |
+| Temporary namespaces | One fixed entry per connection/subscription slot; first creation consumes a transaction DDL undo entry | Creation rolls back; an established empty namespace survives ordinary drops and DISCARD, then disappears at disconnect. Namespace state never enters durable records |
 | Streamed COPY statement-trigger inputs | `txn_rows` records and `copy_transition_bytes` (256 KiB default) per connection and subscription worker | Startup-owned encoded values; no later source lookup; SQLSTATE 54000 aborts COPY on row/byte exhaustion; cleanup permits a smaller retry |
-| DML output schema | Shared startup schema-image pool: table slots × (`max_catalog_versions_per_object` + 1) × `query_workspace_slots`; released after output analysis | SQLSTATE 54000 before partial description on exhaustion; descriptions avoid full schema copies in the statement arena |
+| Execution schema images | DML output and catalog execution share the startup schema-image pool: table slots × (`max_catalog_versions_per_object` + 1) × `query_workspace_slots`; images release with their owning scope or output analysis | SQLSTATE 54000 before partial description on exhaustion; catalog descriptions retain only their visible/hidden column metadata in the statement arena; full execution schemas use reserved images |
 | Resident row metadata | `table_rows` stable row cells per user table, `large_object_pages` for the internal page table; each has a fixed row-identity lookup index with at least eight buckets and at most one-half load | Both arrays and inline controls are charged at startup; a row update at full capacity replaces its cell, while a new row fails with SQLSTATE 54000; lookup backshifts never move another row cell |
 | Reader-history cleanup | Fixed cursor, retry and pressure-scan controls; at most 64 stable slot visits per ordinary maintenance turn; no table-sized identity buffer or query walk slot | Normal statement/transaction completion schedules work, including idle/download waits; explicit synchronous completion is available. Every batch rechecks readers; owner contention retries after one second without changing readiness. Later releases cannot be erased by a partial pass |
 | Heap location capture | Fixed table/slot cursor in the startup relocation workspace; at most 64 stable slot visits per ordinary turn, with a separate 65,536-unit preparation/copy allowance | Starting does no metadata sweep; busy version/table owners retain the cursor for a healthy one-second retry. Pre-publication errors release private scratch; a published move retains its mapping through errors or task destruction. Late writes and template clones rehome into the append tail |
@@ -144,8 +151,9 @@ boundaries apply through catalogs, wire, WAL, checkpoints, and recovery:
 | Statement memory | Retained heap/spilled row images, escaped query metadata, lists, joins, programs, retry logs, event graphs, JSON widths, table-function rows, and variable-width geometry | Fixed arenas; arena exhaustion is a program-limit error |
 | Value-specific limits | Full-text, XML/XPath, JSON/path nesting, rendered values, GUC bytes, and finite catalog identities | Typed source boundaries and specialized contracts below |
 
-Startup-sized catalogs have independent capacities; table count does not silently
-size unrelated classes. Transaction bounds also cover prepared and subscription
+Catalog families have separate startup capacities. Set consequential limits
+explicitly: for example, omitting `max_extended_statistics` currently derives
+its capacity from `max_tables`; the development file states it explicitly. Transaction bounds also cover prepared and subscription
 slots. The active transaction identity registry reserves
 `max_connections + max_prepared_transactions` entries. Creating a transaction
 returns `54000` if none is free; existing transactions remain usable, and ending
@@ -189,8 +197,9 @@ changes, but a PostgreSQL physical standby cannot replay pos3ql's journal.
 Similarly, familiar index names describe SQL behavior; they do not imply
 PostgreSQL's on-disk page layout.
 
-- Query execution is still serial. Workspace and catalog synchronization
-  prepare for the [remaining concurrency work](../PLAN.md#remaining-work).
+- SQL CPU work uses one worker; eligible object-store reads and uploads overlap.
+  [Architecture](architecture.md) separates those paths from the
+  [remaining CPU-worker work](../PLAN.md#remaining-work).
 - PostgreSQL's cost model and exact EXPLAIN text are not compatibility complete.
   PostgreSQL parallel-query/JIT and planner/executor hooks do not exist.
 - Heap layout, heap-version `ctid`, transaction-header columns (`xmin`, `xmax`,

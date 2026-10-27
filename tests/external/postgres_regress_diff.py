@@ -14,134 +14,13 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from result_diff import has_outer_order_by, rows_key
+from sql_script import split_sql
 
 try:
     import psycopg
 except ImportError:
     psycopg = None
 
-
-def split_sql(source):
-    """Yield (first_line, statement, copy_data) at SQL/psql lexical boundaries."""
-    statements = []
-    buffer = []
-    state = "normal"
-    dollar = ""
-    block_depth = 0
-    line = 1
-    first_line = 1
-    has_code = False
-    index = 0
-
-    def starts_dollar(offset):
-        match = re.match(r"\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$", source[offset:])
-        return match.group(0) if match else None
-
-    while index < len(source):
-        char = source[index]
-        following = source[index + 1] if index + 1 < len(source) else ""
-        if state == "normal":
-            if char == "'":
-                state = "single"
-                has_code = True
-                buffer.append(char)
-            elif char == '"':
-                state = "double"
-                has_code = True
-                buffer.append(char)
-            elif char == "-" and following == "-":
-                state = "line_comment"
-                buffer.extend((char, following))
-                index += 1
-            elif char == "/" and following == "*":
-                state = "block_comment"
-                block_depth = 1
-                buffer.extend((char, following))
-                index += 1
-            elif char == "$" and (tag := starts_dollar(index)) is not None:
-                state = "dollar"
-                dollar = tag
-                has_code = True
-                buffer.append(tag)
-                index += len(tag) - 1
-            elif char == ";":
-                buffer.append(char)
-                statement = "".join(buffer).strip()
-                if has_code:
-                    copy_data = None
-                    if re.search(r"\bCOPY\b[\s\S]*\bFROM\s+stdin\s*;\s*$", statement,
-                                 re.IGNORECASE):
-                        data_start = index + 1
-                        if source.startswith("\r\n", data_start):
-                            data_start += 2
-                        elif source.startswith("\n", data_start):
-                            data_start += 1
-                        terminator = re.search(r"(?m)^\\\.\s*(?:\r?\n|$)", source[data_start:])
-                        if terminator is None:
-                            raise ValueError(f"unterminated COPY data at line {first_line}")
-                        copy_data = source[data_start:data_start + terminator.start()]
-                        consumed_end = data_start + terminator.end()
-                        line += source[index + 1:consumed_end].count("\n")
-                        index = consumed_end - 1
-                    statements.append((first_line, statement, copy_data))
-                buffer.clear()
-                first_line = line
-                has_code = False
-            else:
-                buffer.append(char)
-                if not char.isspace():
-                    has_code = True
-        elif state == "single":
-            buffer.append(char)
-            if char == "'":
-                if following == "'":
-                    buffer.append(following)
-                    index += 1
-                else:
-                    state = "normal"
-        elif state == "double":
-            buffer.append(char)
-            if char == '"':
-                if following == '"':
-                    buffer.append(following)
-                    index += 1
-                else:
-                    state = "normal"
-        elif state == "dollar":
-            if source.startswith(dollar, index):
-                buffer.append(dollar)
-                index += len(dollar) - 1
-                state = "normal"
-            else:
-                buffer.append(char)
-        elif state == "line_comment":
-            buffer.append(char)
-            if char == "\n":
-                state = "normal"
-        else:
-            buffer.append(char)
-            if char == "/" and following == "*":
-                buffer.append(following)
-                index += 1
-                block_depth += 1
-            elif char == "*" and following == "/":
-                buffer.append(following)
-                index += 1
-                block_depth -= 1
-                if block_depth == 0:
-                    state = "normal"
-        if char == "\n":
-            line += 1
-            if not buffer or not "".join(buffer).strip():
-                first_line = line
-        index += 1
-
-    if state not in {"normal", "line_comment"}:
-        raise ValueError(f"unterminated {state} at end of SQL input")
-    trailing = "".join(buffer).strip()
-    if has_code:
-        statements.append((first_line, trailing, None))
-    return statements
 
 
 def read_upstream(path, first_line, last_line):
@@ -284,7 +163,7 @@ def main():
     try:
         for filename, first_line, last_line, upstream in sources:
             source = read_upstream(filename, first_line, last_line)
-            for line, sql, copy_data in split_sql(source):
+            for line, sql, copy_data in split_sql(source).statements:
                 if upstream:
                     upstream_total += 1
                 else:

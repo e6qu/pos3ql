@@ -17,6 +17,11 @@ expression. Invalid paths and unsupported behavior are not silently accepted.
 For multi-row documents, `JSON_TABLE` turns selected values into rows you can
 join, filter, or insert like other query results.
 
+Use the [capacity inventory](postgresql-18-compatibility.md#capacity-boundaries)
+for statement and wire limits. Document support does not imply an unbounded JSON
+value or a separate columnar JSON storage engine; [architecture](architecture.md)
+describes the shared durable row layout.
+
 ## Supported surface
 
 - `jsonpath` and `jsonpath[]` use PostgreSQL OIDs 4072 and 4073. Text input, binary v1 input/output, arrays, parameters, results, COPY, rows, WAL, checkpoints, and cold recovery retain that identity.

@@ -3,24 +3,16 @@
 Use this guide to identify the formats the current binary reads and writes.
 Compatibility with earlier pos3ql versions is not required. Existing older
 readers are listed as implemented behavior, not a promise to retain them.
-No automatic upgrade, downgrade, or offline migration is promised.
+No automatic upgrade, downgrade, or offline migration is provided. Application
+schema changes and binary format changes have different procedures; see
+[operations](operations.md#scheduled-work-and-schema-migrations). [Architecture](architecture.md)
+explains the layout and physical limits before the byte-level inventory here.
 
 **User example:** after an incompatible format change, a database saved by an
 older pos3ql binary may fail startup. Use a fresh object-store prefix or an
 explicitly verified logical export and restore between the chosen binaries.
 Never point a new database at an old prefix and assume its objects are disposable.
 Unknown formats stop startup explicitly.
-
-Each saved table requires one `hidx <table-slot> <0-or-1>` index-presence record,
-including tables without an index. Missing, duplicate, unknown-table or malformed
-records stop startup. Journal kind 156 stores a ten-byte typed table position
-(slot and creation stamp) followed by a strict zero-or-one flag. Recovery rejects
-a different table lifetime before applying the hint. A hint alone does not make
-an unknown row estimate valid. Prepared records older than the checkpoint floor
-cannot overwrite the checkpoint's newer relation counts or index hints.
-The internal large-object page table requires a false hint and has no user
-catalog position. Catalog history encodes permission items with role identifiers
-and numeric render caches; SQL output refreshes the current role names.
 
 Object storage is the durable tier. Immutable objects may outlive the binary
 that wrote them, so every root and row SST carries a format identity that is
@@ -31,8 +23,8 @@ they never select a guessed decoder.
 
 | Object | Identity | Read | Write | Migration |
 |---|---|---:|---:|---|
-| Checkpoint manifest | `pos3ql-manifest-v30` | yes | yes | Retains schema creation identities and database-owner roles, object-permission grant order, explicitly empty permission lists, index-presence hints, allocator counters, typed blocks, enum members, and exact table, view, rule, sequence, routine and materialized-view positions and creation stamps. |
-| Journal record | Version `18` at header byte 17; bytes 18–23 are zero | yes | yes | Schema create, drop and rename records retain creation identity. Catalog images retain declared types, hidden system-column positions, selected sources and permission grant order. Prepared comment roots rebind to restored sources. Parameter permissions retain complete replacement rows. Sequence restarts retain their transaction owner; materialized views retain the backing table identity. Older framing is rejected even when its checksum is valid. |
+| Checkpoint manifest | `pos3ql-manifest-v31` | yes | yes | Retains schema creation identities and database-owner roles, object-permission grant order, explicitly empty permission lists, index-presence hints, allocator counters, typed blocks, enum members, and exact table, view, rule, sequence, routine and materialized-view positions and creation stamps. Publication records retain their creation stamps. |
+| Journal record | Version `19` at header byte 17; bytes 18–23 are zero | yes | yes | Schema create, drop and rename records retain creation identity. Catalog images retain declared types, hidden system-column positions, selected sources and permission grant order. Prepared comment roots rebind to restored sources. Parameter permissions retain complete replacement rows. Sequence restarts retain their transaction owner; materialized views retain the backing table identity. Older framing is rejected even when its checksum is valid. |
 | Immutable block | Header bytes 5–7: `01 00 00` | yes | yes | SHA-256 of `pos3ql:block:v1\0`, the one-byte block type, then payload; LSN is provenance, excluded from identity. |
 | Empty checkpoint root | `pos3ql-empty-manifest-v1` | yes | yes | Fences an as-yet unpublished manifest root. |
 | Commit head | `pos3ql-commit-head-v1` | yes | yes | Names the immutable commit chain and the publishing process incarnation. |
@@ -164,7 +156,7 @@ filters and exact result checks can need more data.
 
 Catalog vectors retain their signed lower bounds in rows, projected values, and
 constant defaults. Each stored vector adds four bytes for this bound; writers
-and readers use manifest v30, journal v18, and table-definition payload v12.
+and readers use manifest v31, journal v19, and table-definition payload v12.
 The codec retains these bounds independently of SQL input conversion; SQL
 array-to-vector casts are rejected. Recovery tests cover text-created vectors,
 checkpointing, and recovery with empty local caches.
@@ -202,6 +194,18 @@ types, lengths, array elements, expression framing and the hidden relation
 identifier. Invalid images fail with `22000` before writer promotion.
 
 ## Format details for implementers
+
+Each saved table requires one `hidx <table-slot> <0-or-1>` index-presence record,
+including tables without an index. Missing, duplicate, unknown-table or malformed
+records stop startup. Journal kind 156 stores a ten-byte typed table position
+(slot and creation stamp) followed by a strict zero-or-one flag. Recovery rejects
+a different table lifetime before applying the hint. A hint alone does not make
+an unknown row estimate valid. Prepared records older than the checkpoint floor
+cannot overwrite the checkpoint's newer relation counts or index hints.
+The internal large-object page table requires a false hint and has no user
+catalog position. Catalog history encodes permission items with role identifiers
+and numeric render caches; SQL output refreshes the current role names.
+
 
 The manifest header versions the catalog and root record grammar. Each `dsst`
 manifest reference separately names its row SST format. `v2` uses direct
@@ -429,7 +433,7 @@ source; values and emitted identifiers require a checked creation.
 Their checked three-byte runtime representation cannot contain zero or an
 out-of-range value. Fresh creation returns `54000` when the shared catalog
 sequence reaches this limit. Unsupported stored stamps are rejected before
-catalog publication; manifest v30 and journal v18 reject earlier framing.
+catalog publication; manifest v31 and journal v19 reject earlier framing.
 
 Named-type recovery installs each saved creation stamp directly; it does not
 reserve a temporary stamp and overwrite it later. An exhausted creation sequence
@@ -557,6 +561,10 @@ when an aborted creation leaves a gap in either catalog.
 
 ## Catalog identities and sequence restarts
 
+Recovery restores saved generator positions; it does not scan row values to
+infer them. For example, explicitly inserting serial value 100 does not make
+the next automatically generated value 101, either before or after recovery.
+
 **User example:** one connection creates a materialized report inside a transaction
 and later rolls it back. Another connection creates a different report and commits.
 After loss of the local disk, the committed report keeps its catalog identity,
@@ -584,12 +592,17 @@ Ordinary `nextval` advances remain nontransactional.
 
 Database creation journal records also retain a copy inventory: a four-byte
 count followed by eleven bytes per copied table, named type, sequence, view,
-rewrite rule, materialized view or routine. Each entry has a one-byte kind and
+rewrite rule, materialized view, routine, statistics object, publication,
+extension, foreign wrapper, foreign server, user mapping or foreign-table binding.
+Each entry has a one-byte kind and
 the ten-byte catalog position. Entries are ordered by kind and slot; unknown
 kinds, duplicate slots, missing source lifetimes, unavailable positions and
 unused entries are errors. The source lifetime selects each copied object,
 so unrelated rolled-back creations cannot change its recovered slot. Encoding
 uses the existing fixed journal buffers and adds no startup allocation.
+Copies remap wrapper/server/table parents to the destination and preserve
+local SQL identifiers. Table and view comment references are rebound to copied
+objects. Shared subscriptions and their comments are not copied.
 `max_rules`, like other catalog slot capacities, cannot exceed 65,535.
 
 The added binary positions are included in the common journal size calculation;
@@ -608,7 +621,7 @@ required: obsolete readers may be removed without building an offline migration.
 Do not retain a decoder or introduce a conversion fallback solely to support
 an older pos3ql version.
 
-The only accepted checkpoint manifest is v30. Startup, backup retention, and
+The only accepted checkpoint manifest is v31. Startup, backup retention, and
 writer promotion share one allocation-free metadata parser. It requires one
 log position, next row identity, latest transaction identity, large-object
 allocator record, nonzero 32-digit hexadecimal writer identity and final
@@ -665,3 +678,38 @@ The manifest's existing unsigned `next_rowid` field preserves this terminal
 value across recovery. Journal and saved-file observations advance the counter
 with saturating arithmetic, including legacy maximum identities. Row key and
 manifest encodings are unchanged; the allocator adds no startup reservation.
+
+## Catalog object identifiers
+
+Statistics, extensions, foreign-data wrappers, foreign servers, user mappings,
+publications and subscriptions derive their SQL identifiers from durable creation
+stamps, rather than reusable array positions. Every admitted stamp is between
+1 and 9,999,999. The identifier is the stamp plus the following base:
+
+| Catalog | Base |
+|---|---:|
+| `pg_statistic_ext` | 440,000,000 |
+| `pg_extension` | 460,000,000 |
+| `pg_foreign_data_wrapper` | 480,000,000 |
+| `pg_foreign_server` | 500,000,000 |
+| `pg_user_mapping` | 520,000,000 |
+| `pg_publication` | 540,000,000 |
+| `pg_subscription` | 560,000,000 |
+
+Creation reserves from the shared catalog sequence and returns `54000` when its
+representable range is exhausted. The failed reservation installs no object.
+Recovery rejects zero, out-of-range, duplicate or unreserved stamps before writer
+promotion. The check includes prepared catalog changes and uses a fixed bitmap
+rather than memory proportional to catalog churn. Database-template copies may
+preserve numeric identifiers in database-local catalogs; shared subscription
+identifiers must remain unique across databases.
+
+Comments on statistics, publications, foreign wrappers and foreign servers use
+the database and creation stamp as their internal object key. They survive
+checkpoint recovery even when catalog slots change. Copying a database preserves
+these keys within the new database; dropping a copied object clears only its
+own comments. This internal key does not change PostgreSQL's exposed `objsubid`.
+
+Manifest `pub` records place the creation stamp after the owner and before the
+flags. Journal publication-creation records place the eight-byte little-endian
+stamp before the name. Manifest v31 and journal v19 reject earlier framing.

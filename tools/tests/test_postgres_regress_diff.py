@@ -14,7 +14,7 @@ class SplitSqlTests(unittest.TestCase):
         source = """-- prefix ;\nSELECT ';'; /* ; /* nested */ */ SELECT 2;
 CREATE FUNCTION f() RETURNS text AS $$ BEGIN RETURN ';'; END $$ LANGUAGE plpgsql;
 """
-        statements = MODULE.split_sql(source)
+        statements = MODULE.split_sql(source).statements
         self.assertEqual(len(statements), 3)
         self.assertIn("SELECT ';'", statements[0][1])
         self.assertEqual(statements[1][1], "/* ; /* nested */ */ SELECT 2;")
@@ -23,7 +23,7 @@ CREATE FUNCTION f() RETURNS text AS $$ BEGIN RETURN ';'; END $$ LANGUAGE plpgsql
 
     def test_inline_copy_data_is_attached_to_copy_statement(self):
         source = "COPY t FROM stdin;\n1\tone\n2\ttwo\n\\.\nSELECT count(*) FROM t;\n"
-        statements = MODULE.split_sql(source)
+        statements = MODULE.split_sql(source).statements
         self.assertEqual(len(statements), 2)
         self.assertEqual(statements[0][1], "COPY t FROM stdin;")
         self.assertEqual(statements[0][2], "1\tone\n2\ttwo\n")
@@ -33,6 +33,30 @@ CREATE FUNCTION f() RETURNS text AS $$ BEGIN RETURN ';'; END $$ LANGUAGE plpgsql
     def test_unterminated_inline_copy_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "unterminated COPY data"):
             MODULE.split_sql("COPY t FROM stdin;\n1\n")
+
+    def test_copy_options_comments_and_marker_preserve_following_line(self):
+        source = "/* COPY fake FROM stdin; */\nCOPY \"t\" (id)\nFROM /* input */ STDIN WITH (FORMAT csv); -- rows\n1\r\n\\.\r\n\nSELECT 2;\n"
+        parsed = MODULE.split_sql(source)
+        self.assertEqual(parsed.copy_inputs, ((3, 5),))
+        self.assertEqual(parsed.statements[0][2], "1\r\n")
+        self.assertEqual(parsed.statements[1], (7, "SELECT 2;", None))
+
+    def test_copy_lookalikes_inside_queries_and_quoted_bodies_are_not_input(self):
+        source = "COPY (SELECT 'FROM stdin') TO STDOUT; SELECT E'can\\\'t; split'; SELECT $$ COPY t FROM STDIN; $$; SELECT name$part;"
+        parsed = MODULE.split_sql(source)
+        self.assertEqual(len(parsed.statements), 4)
+        self.assertEqual(parsed.copy_inputs, ())
+        self.assertTrue(all(statement[2] is None for statement in parsed.statements))
+
+    def test_invalid_query_copy_from_still_drains_psql_input(self):
+        parsed = MODULE.split_sql("COPY (SELECT 1) FROM STDIN;\n\\.\nSELECT 43;\n")
+        self.assertEqual(parsed.copy_inputs, ((1, 2),))
+        self.assertEqual(parsed.statements[0][2], "")
+        self.assertEqual(parsed.statements[1], (3, "SELECT 43;", None))
+
+    def test_copy_header_cannot_swallow_a_second_command(self):
+        with self.assertRaisesRegex(ValueError, "COPY input must start on a new line"):
+            MODULE.split_sql("COPY t FROM STDIN; SELECT 1;\n\\.\n")
 
     def test_display_only_psql_commands_are_removed(self):
         path = pathlib.Path(self.id().replace(".", "_") + ".sql")
@@ -46,7 +70,7 @@ CREATE FUNCTION f() RETURNS text AS $$ BEGIN RETURN ';'; END $$ LANGUAGE plpgsql
         path = pathlib.Path(self.id().replace(".", "_") + ".sql")
         try:
             path.write_text("SELECT 1;\nSELECT 2;\nSELECT 3;\n", encoding="utf-8")
-            statements = MODULE.split_sql(MODULE.read_upstream(path, 2, 2))
+            statements = list(MODULE.split_sql(MODULE.read_upstream(path, 2, 2)).statements)
             self.assertEqual(statements, [(2, "SELECT 2;", None)])
         finally:
             path.unlink(missing_ok=True)

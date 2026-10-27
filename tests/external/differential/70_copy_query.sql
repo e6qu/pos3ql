@@ -25,5 +25,6 @@ COPY (SELECT s, count(*) AS c FROM cq GROUP BY s ORDER BY s) TO STDOUT WITH CSV;
 
 -- Only TO STDOUT is accepted for a query source (a query cannot be COPY FROM).
 COPY (SELECT id FROM cq) FROM STDIN;
+\.
 
 DROP TABLE cq;

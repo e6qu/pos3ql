@@ -1,6 +1,7 @@
 # Contributing to pos3ql
 
-Read [README.md](README.md), [PLAN.md](PLAN.md), [AGENTS.md](AGENTS.md), and
+Read [README.md](README.md), [architecture](docs/architecture.md),
+[PLAN.md](PLAN.md), [AGENTS.md](AGENTS.md), and
 [terminology](docs/terminology.md) before changing a boundary. License terms are
 in [LICENSE](LICENSE).
 
@@ -33,6 +34,14 @@ numbers, error codes, and source provenance in the appropriate technical guide.
 Use the documentation index to avoid repeating the same contract across files.
 Preserve dated measurements and upstream licenses; simplify current guidance
 without rewriting historical evidence.
+
+Architecture claims must identify current code paths and remaining gaps. Distinguish
+hard encodings, startup reservations, configured examples, calculated ceilings and
+measured results. State throughput units and workload/hardware/revision; never
+turn addressable bytes or same-host timings into a production capacity promise.
+Comments explain current invariants and costs, including repeated network work
+on retries. Remove completed-work narration from current guides and the roadmap;
+retain immutable evidence and upstream provenance in their indexes.
 
 ## Engineering boundaries
 
@@ -99,7 +108,23 @@ Verify the invariant or external contract, not a test that merely restates the
 implementation. Boundary changes generally need accepted/rejected capacity,
 rollback, failure cleanup, WAL/checkpoint, and empty-cache recovery coverage.
 SQL and wire behavior needs comparison with actual PostgreSQL, including
-SQLSTATEs, types, result shape, and values.
+SQLSTATEs, types, result shape, and values. SQLSTATE-only and exact-message
+corpora share the same reference connection settings, including UTC and the
+test extension directory; diagnostic style must not change fixture availability.
+Corpus comparisons echo each sent SQL command and retain its results and command
+tags in stdout. COPY errors retain their command's source position even when
+psql drains input before reporting the error; other diagnostic positions stay
+exact. The shared SQL lexer recognizes input boundaries, including COPY options,
+without treating quoted text or COPY data as SQL. This follows [psql's query echo and status output](https://github.com/postgres/postgres/blob/REL_18_6/src/bin/psql/common.c#L1088),
+and preserves ordering even for repeated commands on one input line. They retain
+stdout bytes verbatim and compare stderr diagnostics separately with their source
+file and SQL line number. This preserves which
+statement failed while removing whole notice/warning records and secondary
+DETAIL/HINT fields, including continuation lines. Diagnostic bytes outside UTF-8
+are escaped losslessly rather than replaced; primary error messages remain
+comparison inputs in exact-message mode.
+The port-based corpus harness requires an external reference at `127.0.0.1`;
+forward a remote reference explicitly instead of supplying a host it cannot use.
 Synchronize concurrent catalog changes before comparing current permission
 lookups. For example, after another connection grants access to `orders`,
 `LOCK TABLE orders IN ACCESS SHARE MODE` acquires a new relation lock and makes

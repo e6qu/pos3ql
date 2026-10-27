@@ -8,6 +8,8 @@
 - Use a coined term only when it carries a repeated, specific meaning; define it here.
 - Single-letter names are limited to conventional local indices and published algorithm notation.
 
+For the complete request path and interactions, see [architecture](architecture.md).
+
 ## Modules
 
 - `config`: configuration and memory budget.
@@ -28,7 +30,7 @@ For example, write “keep the order version that this transaction read” befor
 describing snapshot retention. The definitions below make technical details
 consistent; readers should not need to memorize them to use the database.
 
-- **block**: fixed-size, checksummed, content-addressed storage unit.
+- **block**: checksummed, content-addressed storage unit with at most 256 KiB including its header.
 - **block store**: provider-neutral internal interface over object storage and cache tiers; it is not a network protocol or deployable storage service.
 - **backup**: a named, checkpoint-consistent manifest and commit-head image whose reachable blocks and commit history are retained until deletion.
 - **backup export**: a restartable copy of one named backup and its durable object graph into an empty independently configured object-store prefix.
@@ -43,7 +45,7 @@ consistent; readers should not need to memorize them to use the database.
 - **MVCC**: keeping row versions so transactions see the versions allowed by their isolation level. For example, a repeatable-read transaction can keep seeing an order's old status after another transaction commits an update.
 - **LSN**: log sequence number, a position in the recovery journal. It identifies replay and replication progress; only validated transaction boundaries are accepted as recovery targets.
 - **OID**: object identifier used in PostgreSQL catalogs and type metadata.
-- **prefix**: the beginning of object names assigned to one database inside a bucket. Separate prefixes keep their object names apart.
+- **prefix**: the beginning of object names assigned to one pos3ql instance inside a bucket, including its SQL databases. Separate prefixes keep instance namespaces apart.
 - **promotion**: transfer of durable write ownership to a fresh process incarnation by compare-and-swap.
 - **PAX**: column-oriented row groups inside an SST, allowing selected-column reads. A query for order IDs need not fetch a large description column solely to read those IDs.
 - **physical-demand proof**: the columns a query path may read from a physical row.

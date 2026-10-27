@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Host filesystem metadata is not part of a release archive.
+export COPYFILE_DISABLE=1
+
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 OUTPUT=${1:-"$ROOT/dist"}
 BINARY=${POS3QL_RELEASE_BINARY:-"$ROOT/target/release/pos3ql"}
@@ -35,11 +38,6 @@ cp -R "$ROOT/docs" "$DOCUMENTS/docs"
 mkdir -p "$DOCUMENTS/packaging" "$DOCUMENTS/benchmarks"
 install -m 0644 "$ROOT/packaging/README.md" "$DOCUMENTS/packaging/README.md"
 install -m 0644 "$ROOT/benchmarks/README.md" "$DOCUMENTS/benchmarks/README.md"
-# Keep the previously shipped operator paths as links to the canonical tree.
-for document in operations object-storage backup-restore; do
-  printf '# Operator documentation\n\nSee [%s](docs/%s.md).\n' \
-    "$document" "$document" > "$DOCUMENTS/$document.md"
-done
 
 ARCHIVE="$OUTPUT/$NAME.tar.gz"
 if [[ $(tar --version) == *"GNU tar"* ]]; then

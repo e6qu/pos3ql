@@ -1,10 +1,7 @@
 #!/usr/bin/env bash
-# Differential conformance: run the same SQL corpus against REAL
-# PostgreSQL 18 and against pos3ql, normalize, and diff.
-#
-# This is a generic validator for PostgreSQL implementations: rows, tags,
-# and column headers must match exactly; errors must match by SQLSTATE
-# (message wording is normalized away). Any diff is a semantic divergence.
+# Run the same SQL corpus against PostgreSQL 18 and pos3ql.
+# Compare sent commands, data, tags, and source-positioned SQLSTATEs;
+# exact-error fixtures also compare primary messages.
 #
 # Usage: tests/external/differential.sh [--keep]
 
@@ -22,6 +19,11 @@ REFERENCE_HOST=${POS3QL_REFERENCE_PG_HOST:-}
 REFERENCE_PORT=${POS3QL_REFERENCE_PG_PORT:-}
 REFERENCE_DATABASE=${POS3QL_REFERENCE_PG_DATABASE:-postgres}
 if [[ -n "$REFERENCE_HOST" ]]; then
+  # Auxiliary oracles address both servers by loopback port, not by host name.
+  if [[ "$REFERENCE_HOST" != 127.0.0.1 ]]; then
+    printf '%s\n' 'FAIL: this corpus harness requires POS3QL_REFERENCE_PG_HOST=127.0.0.1; forward a remote reference to a loopback port' >&2
+    exit 1
+  fi
   if [[ -z "$REFERENCE_PORT" || -z "${POS3QL_REFERENCE_PSQL:-}" ]]; then
     printf '%s\n' 'FAIL: an external PostgreSQL reference requires both POS3QL_REFERENCE_PG_PORT and POS3QL_REFERENCE_PSQL'
     exit 1
@@ -238,34 +240,40 @@ if [[ $P3_READY -ne 1 ]] || ! server_alive "$P3_PID"; then
   exit 1
 fi
 
-# SQLSTATE-only psql diagnostics keep multiline DETAIL out of result rows.
-normalize() {
-  sed -E \
-    -e 's/^psql:[^:]*:[0-9]+: ERROR:  ([0-9A-Z]{5})$/ERROR \1/' \
-    -e 's/^ERROR:  ([0-9A-Z]{5})$/ERROR \1/' \
-    -e '/^(psql:[^:]*:[0-9]+: )?(NOTICE|WARNING):/d'
-}
-
-run_corpus() { # port name file
+# Data stays byte-exact; diagnostic records retain the failing SQL line.
+run_corpus() { # port name file diagnostics
+  local diagnostics=$4 status=0
+  case "$diagnostics" in
+    sqlstate|verbose) ;;
+    *) printf 'FAIL: unknown corpus diagnostics %s\n' "$diagnostics" >&2; return 1 ;;
+  esac
   printf 'RUN: differential: %s\n' "$2"
   if [[ "$1" == "$PG_PORT" ]]; then
     PGOPTIONS="-c timezone=UTC -c extension_control_path=$REFERENCE_EXTENSION_CONTROL_ROOT" \
-      stdbuf -o0 -e0 "$PSQL" -h 127.0.0.1 -p "$1" -U postgres -d "$REFERENCE_DATABASE" -X -a -q -P pager=off \
-        -v VERBOSITY=sqlstate -f "$3" 2>&1
+      "$PSQL" -h 127.0.0.1 -p "$1" -U postgres -d "$REFERENCE_DATABASE" -X -e -P pager=off \
+        -v VERBOSITY="$diagnostics" -f "$3" > "$WORK/$2.stdout" 2> "$WORK/$2.stderr" || status=$?
   else
-    stdbuf -o0 -e0 "$PSQL" -h 127.0.0.1 -p "$1" -U postgres -X -a -q -P pager=off \
-      -v VERBOSITY=sqlstate -f "$3" 2>&1
-  fi | normalize > "$WORK/$2"
+    "$PSQL" -h 127.0.0.1 -p "$1" -U postgres -X -e -P pager=off \
+      -v VERBOSITY="$diagnostics" -f "$3" > "$WORK/$2.stdout" 2> "$WORK/$2.stderr" || status=$?
+  fi
   if [[ "$1" == "$P3_PORT" ]] && ! server_alive "$P3_PID"; then
     bad "pos3ql exited during $(basename "$3")"
     printf '%s\n' 'Last client transcript:'
-    tail -40 "$WORK/$2"
+    tail -40 "$WORK/$2.stdout"
+    cat "$WORK/$2.stderr"
     printf '%s\n' 'Server log:'
     tail -80 "$WORK/p3.log"
     wait "$P3_PID"
     printf 'pos3ql exit status: %s\n' "$?"
     exit 1
   fi
+  if [[ "$status" != 0 ]]; then
+    printf 'FAIL: corpus psql client exited with status %s\n' "$status" >&2
+    cat "$WORK/$2.stderr" >&2
+    return 1
+  fi
+  python3 "$EXT/differential_diagnostics.py" --source "$3" --stdout "$WORK/$2.stdout" \
+    --stderr "$WORK/$2.stderr" --diagnostics "$diagnostics" > "$WORK/$2" || return 1
 }
 reset_user_extensions() { # port
   local database=postgres
@@ -338,8 +346,8 @@ if [[ "$CORPUS_SHARD_MODE" != none ]]; then
       continue
     fi
     name=$(basename "$f" .sql)
-    run_corpus "$PG_PORT" "$name.pg" "$f"
-    run_corpus "$P3_PORT" "$name.p3" "$f"
+    run_corpus "$PG_PORT" "$name.pg" "$f" sqlstate || exit 1
+    run_corpus "$P3_PORT" "$name.p3" "$f" sqlstate || exit 1
     if diff -u "$WORK/$name.pg" "$WORK/$name.p3" > "$WORK/$name.diff"; then
       ok "differential: $name"
     else
@@ -371,34 +379,16 @@ reset_pair
 fi
 
 if want_auxiliary exact; then
-# Exact-error corpora: the SQLSTATE normalizer above makes wording invisible,
-# which let five message-fidelity fixes ship guarded only by unit tests. These
-# corpora compare the full ERROR line — SQLSTATE and message text — dropping
-# only PostgreSQL's positional decorations (LINE/caret/HINT/...), which pos3ql
-# does not emit and which say where, not what.
-normalize_exact() {
-  sed -E \
-    -e 's/^psql:[^:]*:[0-9]+: ERROR:  ([0-9A-Z]{5}): *(.*)/ERROR \1 \2/' \
-    -e 's/^ERROR:  ([0-9A-Z]{5}): *(.*)/ERROR \1 \2/' \
-    -e '/^LINE [0-9]+:/d' \
-    -e '/^ *\^ *$/d' \
-    -e '/^psql:[^:]*:[0-9]+: (HINT|DETAIL|LOCATION|CONTEXT|SCHEMA NAME|TABLE NAME|COLUMN NAME|CONSTRAINT NAME|DATATYPE NAME|NOTICE|WARNING):/d' \
-    -e '/^(HINT|DETAIL|LOCATION|CONTEXT|SCHEMA NAME|TABLE NAME|COLUMN NAME|CONSTRAINT NAME|DATATYPE NAME|NOTICE|WARNING):/d'
-}
+# Exact-error corpora compare SQLSTATEs and primary messages at each SQL line.
+# Secondary diagnostic fields are excluded; stdout remains byte-exact.
 
-run_exact() { # port name file
-  local database=postgres
-  [[ "$1" == "$PG_PORT" ]] && database=$REFERENCE_DATABASE
-  stdbuf -o0 -e0 "$PSQL" -h 127.0.0.1 -p "$1" -U postgres -d "$database" -X -a -q -P pager=off \
-    -v VERBOSITY=verbose -f "$3" 2>&1 | normalize_exact > "$WORK/$2"
-}
 
 printf '%s\n' '' '=== exact-error corpora (message wording must match) ==='
 restart_pos3ql_clean
 for f in $EXT/differential_exact/*.sql; do
   name=$(basename "$f" .sql)
-  run_exact "$PG_PORT" "$name.pg" "$f"
-  run_exact "$P3_PORT" "$name.p3" "$f"
+  run_corpus "$PG_PORT" "$name.pg" "$f" verbose || exit 1
+  run_corpus "$P3_PORT" "$name.p3" "$f" verbose || exit 1
   if diff -u "$WORK/$name.pg" "$WORK/$name.p3" > "$WORK/$name.diff"; then
     ok "exact errors: $name"
   else

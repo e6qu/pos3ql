@@ -12066,10 +12066,10 @@ pub(crate) enum SchemaDropTarget<'a> {
     TemporaryObjects,
 }
 
-/// DROP SCHEMA [IF EXISTS] name [, ...] [CASCADE | RESTRICT]: RESTRICT (the
-/// default) refuses a non-empty schema with PostgreSQL's dependency report;
-/// CASCADE drops every contained catalog object and severs inbound foreign
-/// keys from surviving tables.
+/// Drop selected schemas or clear this connection's temporary objects using
+/// the same dependency graph, fixed undo capacity and transactional rollback.
+/// Temporary cleanup retains its namespace and emits no durable drop records.
+/// Named RESTRICT refuses non-empty schemas; CASCADE also removes dependents.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn drop_schema(
     storage: &mut Storage,
@@ -23312,7 +23312,7 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                     engine.execute_deallocate_statement(*name, sqlprep, responder)
                 }
                 Stmt::Discard(target) => engine.execute_discard_statement(
-                    *target, txn, arena, sqlprep, cursors, guc, responder,
+                    *target, txn, context.arena, sqlprep, cursors, guc, responder,
                 ),
                 Stmt::Show(name) => engine.show(name, guc, txn, responder),
                 Stmt::ShowAll => engine.show_all(guc, txn, responder),

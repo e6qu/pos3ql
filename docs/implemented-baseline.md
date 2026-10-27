@@ -53,6 +53,33 @@ Check application state before retrying an operation that could charge twice.
 If installation fails after durability, the server rejects further work with
 `08007` and requires restart and recovery; it does not undo durable changes.
 
+## Temporary objects and connection cleanup
+
+Temporary tables, views and sequences belong to the connection that created
+them. `DISCARD TEMP` drops them through the same transactional dependency checks
+as an ordinary drop. A rollback restores their rows and definitions:
+
+```sql
+CREATE TEMP TABLE import_rows (id integer);
+INSERT INTO import_rows VALUES (7);
+BEGIN;
+DISCARD TEMP;
+ROLLBACK;
+SELECT id FROM import_rows; -- returns 7
+```
+
+The connection's temporary namespace keeps its identity. Temporary objects do
+not enter the durable journal or checkpoint. `DISCARD ALL`, outside an explicit
+transaction, also clears prepared statements, cursors, session settings,
+notifications, sequence-session state and session advisory locks. A temporary
+cleanup capacity error leaves those other session settings intact.
+
+`DISCARD SEQUENCES` clears this connection's remembered sequence values; it does
+not rewind the sequence. `DISCARD PLANS` succeeds because execution rebuilds
+plans rather than retaining a reusable execution-plan cache. Temporary schemas
+currently support tables, views and sequences; named types and routines require
+ordinary schemas.
+
 ## Account identity and permissions
 
 A connection follows the account that logged in, including through renames:

@@ -1889,7 +1889,8 @@ fn append_record(buffer: &mut FixedBuf, lsn: u64, operation: &WalOp) -> Result<(
     assert_eq!(
         buffer.len(),
         mark + total,
-        "WAL payload length must match its typed encoding: {operation:?}"
+        "WAL payload length must match record kind {}",
+        op_kind(operation)
     );
 
     let filled = buffer.filled_mut();
@@ -2956,7 +2957,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             for fk in def.fkeys() {
                 n += 1 + fk.parent_schema.as_str().len();
             }
-            n += def.n_columns;
+            n += def.n_columns * crate::sql::ast::Collation::None.code().to_le_bytes().len();
             n += encoded_partition_len(def.partition);
             n += 1 + def.inheritance.parents_ref().len() * 2;
             n += match def.type_membership {
@@ -3313,7 +3314,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                     .filter(|(_, value)| value.is_some())
                     .map(|(_, value)| 2 + value.unwrap().len())
                     .sum::<usize>()
-                + n_cols * 2
+                + n_cols * (crate::sql::ast::Collation::None.code().to_le_bytes().len() + 1)
                 + n_cols * 5
                 + 1
                 + n_cols * 5
@@ -3594,7 +3595,15 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
         } => {
             let mut n = 2 + 8 + 1 + def.name.as_str().len() + 1 + def.schema.as_str().len() + 2;
             for field in def.fields() {
-                n += 1 + field.name.as_str().len() + 2 + 1 + 1 + 1 + 4 + 1 + 1;
+                n += 1
+                    + field.name.as_str().len()
+                    + 2
+                    + 1
+                    + 1
+                    + 1
+                    + 4
+                    + field.collation.code().to_le_bytes().len()
+                    + 1;
                 if let Some(identity) = field.user_type {
                     n += 1
                         + identity.schema.as_str().len()
@@ -14748,6 +14757,13 @@ mod tests {
                         definition: &definition
                     }
                 ));
+                assert_eq!(
+                    payload.len(),
+                    encoded_payload_len(&WalOp::CreateTable {
+                        identity: crate::storage::CatalogPosition::new(0, 1).unwrap(),
+                        definition: &definition,
+                    })
+                );
                 let (_, restored) = decode_table_payload(payload.readable()).unwrap();
                 assert_eq!(restored.columns[1].collation, collation);
             });

@@ -210,8 +210,8 @@ Renames preserve object identity; drop and recreate reserve fresh identities
 for relations, row/array types, named types, enum members, indexes, CHECK,
 foreign-key and NOT NULL constraints, statistics, extensions, foreign-data
 wrappers, servers, user mappings, publications, subscriptions, collations,
-conversions, and text-search parsers, templates, dictionaries and configurations. Removing an
-earlier column or rule does not renumber survivors. Foreign-key triggers retain
+conversions, and text-search parsers, templates, dictionaries and configurations.
+Removing an earlier column or rule does not renumber survivors. Foreign-key triggers retain
 their constraint links. `ADD CONSTRAINT ... USING INDEX` preserves the existing
 index identifier. Database-template copies preserve database-local identifiers, foreign-wrapper,
 server, mapping and table links, and their copied comments. Shared subscriptions

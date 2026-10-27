@@ -7,8 +7,8 @@ Record an entry only with its reproducer, observed behavior and exact blocker;
 retain repaired-defect evidence in the fixing PR. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 Unfinished features and their verification criteria belong in [PLAN.md](PLAN.md).
-Current guarantees, including catalog identities, retained text-comparison choices, transactional session cleanup
-and recovery checks, belong in
+Current guarantees, including catalog identities, retained text-comparison
+choices, transactional session cleanup and recovery checks, belong in
 the [behavior guide](docs/implemented-baseline.md),
 [architecture and physical limits](docs/architecture.md), and
 [storage format guide](docs/durable-format.md).

@@ -712,7 +712,7 @@ own comments. This internal key does not change PostgreSQL's exposed `objsubid`.
 
 Manifest `pub` records place the creation stamp after the owner and before the
 flags. Journal publication-creation records place the eight-byte little-endian
-stamp before the name. Manifest v31 and journal v20 reject earlier framing.
+stamp before the name. Manifest v32 and journal v20 reject earlier framing.
 
 ## Text comparison and text-search identities
 

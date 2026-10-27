@@ -290,15 +290,18 @@ impl Storage {
         drop(foreign);
         drop(publications);
         drop(subscriptions);
-        for table in 0..self.table_count() {
-            if !self.table_slot_visible_to(table, 0) {
+        for table in self.tables.iter().take(self.table_count()) {
+            let state = table.definition.read();
+            if state.identity.existence == CatalogDdlState::Absent {
                 continue;
             }
-            let definition = self.table_def(table, 0);
-            self.validate_saved_collations(
-                self.table(table).database(),
-                definition.columns().iter().map(|column| column.collation),
-            )?;
+            self.pending_table_defs
+                .try_for_each_locked(&state, |definition| {
+                    self.validate_saved_collations(
+                        state.identity.database,
+                        definition.columns().iter().map(|column| column.collation),
+                    )
+                })?;
         }
         {
             let types = self
@@ -318,6 +321,15 @@ impl Storage {
                         .filter(|field| !field.dropped)
                         .map(|field| field.collation),
                 )?;
+                if let Some(pending) = definition.pending_definition.as_ref() {
+                    self.validate_saved_collations(
+                        definition.database,
+                        pending.fields[..pending.n_fields]
+                            .iter()
+                            .filter(|field| !field.dropped)
+                            .map(|field| field.collation),
+                    )?;
+                }
             }
         }
         for definition in self
@@ -370,6 +382,57 @@ mod tests {
         config.max_subscriptions = 2;
         let mut budget = test_budget(&config);
         Storage::new(&config, &mut budget, 0).unwrap()
+    }
+
+    #[test]
+    fn catalog_lifetime_saved_collations_check_every_database_and_pending_definition() {
+        for pending in [false, true] {
+            let storage = storage();
+            let prior = current_database();
+            crate::sql::set_execution_database_oid(DatabaseOid::TEMPLATE1);
+            let mut definition = crate::storage::tests::make_def(
+                "foreign_database_text",
+                &[("value", crate::sql::types::ColType::Text, false)],
+            );
+            let invalid = Collation::Catalog(
+                crate::sql::ast::CatalogCollation::from_creation(41, false, false).unwrap(),
+            );
+            if !pending {
+                definition.columns[0].collation = invalid;
+            }
+            let table = storage.create_table_in(definition, 7).unwrap();
+            storage.commit_create(table);
+            if pending {
+                definition.columns[0].collation = invalid;
+                storage
+                    .pending_table_defs
+                    .stage(
+                        &storage.tables[table].definition,
+                        PendingTableDef {
+                            txid: 8,
+                            revision: 1,
+                            def: definition,
+                            transition: [u16::MAX; MAX_COLUMNS],
+                            column_mapping: [None; MAX_COLUMNS],
+                            rewrites_rows: false,
+                            class_tuple_private: true,
+                        },
+                        2,
+                    )
+                    .unwrap();
+            }
+            crate::sql::set_execution_database_oid(DatabaseOid::POSTGRES);
+            crate::mem::guard::forbid_alloc(|| {
+                assert_eq!(
+                    storage
+                        .validate_restored_catalog_identities(100)
+                        .unwrap_err()
+                        .sqlstate,
+                    sqlstate::DATA_EXCEPTION
+                );
+            });
+            crate::sql::set_execution_database_oid(prior);
+        }
     }
 
     #[test]

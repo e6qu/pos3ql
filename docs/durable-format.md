@@ -593,8 +593,8 @@ Ordinary `nextval` advances remain nontransactional.
 Database creation journal records also retain a copy inventory: a four-byte
 count followed by eleven bytes per copied table, named type, sequence, view,
 rewrite rule, materialized view, routine, statistics object, publication,
-extension, foreign wrapper, foreign server, user mapping or foreign-table binding.
-Each entry has a one-byte kind and
+extension, foreign wrapper, foreign server, user mapping, foreign-table binding,
+collation, conversion or text-search object. Each entry has a one-byte kind and
 the ten-byte catalog position. Entries are ordered by kind and slot; unknown
 kinds, duplicate slots, missing source lifetimes, unavailable positions and
 unused entries are errors. The source lifetime selects each copied object,

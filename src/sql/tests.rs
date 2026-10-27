@@ -1781,9 +1781,8 @@ fn catalog_lifetime_config(name: &str, mode: crate::config::TransactionMode) -> 
 
 #[test]
 fn catalog_lifetime_privileges_and_partition_triggers_match_postgresql() {
-    let fixture = include_str!(
-        "../../tests/external/differential/199_privilege_and_partition_lifetimes.sql"
-    );
+    let fixture =
+        include_str!("../../tests/external/differential/199_privilege_and_partition_lifetimes.sql");
     for mode in [
         crate::config::TransactionMode::Mvcc,
         crate::config::TransactionMode::Locking,

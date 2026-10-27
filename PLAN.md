@@ -25,49 +25,53 @@ and [what has actually been measured](docs/performance.md).
 
 ## Remaining work
 
-### Complete coherent publication and bounded maintenance
+### Finish transaction visibility and keep maintenance moving
 
 **Example:** a report must finish using the rows and definitions it selected,
 even when another connection replaces a table or maintenance replaces saved files.
 A waiting schema edit must never attach itself to a new object that reused a name.
 
-- Connect retained catalog rows to every later definition, column, index,
-  comment and dependency lookup. Preserve exact duplicate dependency counts.
-  Finish source-lifetime checks and private edits for remaining catalog families.
-- Finish lifetime SQL identifiers beyond the families guaranteed in the
+- When a report lists an object's saved name, its later column, index, comment
+  and dependency reads must still refer to that same object. Unfinished edits
+  must stay private to their transaction. Preserve repeated dependency rows.
+- Extend stable object identifiers beyond the families guaranteed in the
   [behavior guide](docs/implemented-baseline.md#schema-changes-and-object-identity).
-  Check shared catalogs and database-template copies, including recovery and
-  comments that must stay attached when physical catalog slots change.
-- Complete reader-safe row/index history and backup retention. Pace pruning,
-  replacement and deletion without holding unrelated owners.
-- Make remaining synchronous metadata and maintenance storage reads yield with
-  bounded retained state. Recovery can keep exclusive startup access; ordinary
-  operation must allow unrelated work to progress.
+  Reusing an internal slot must not change an existing object's identifier or
+  attach its comments to a replacement. Check shared catalogs, database copies
+  and recovery after deleting local caches.
+- Keep older rows, indexes and saved files until readers and backups finish.
+  Remove obsolete versions in limited batches so other queries keep moving.
+- Let remaining metadata and maintenance downloads pause without occupying the
+  SQL worker. Save enough state to resume within the fixed memory budget.
+  Recovery can keep exclusive startup access; ordinary operation must allow
+  unrelated work to progress.
 
 Follow PostgreSQL's distinction between listing an old catalog row and resolving
 an object for current use. After `orders` becomes `sales`, an older report can
 still list `orders` while `to_regclass('sales')` resolves the current name.
 Freezing all lookups at the report's position would be incorrect.
 
-Acceptance: complete transactions publish and recover together; source reuse
-cannot redirect retained data; cleanup respects readers and backups. Cover
+Acceptance: every confirmed transaction reappears as a whole after recovery.
+Reusing a name or slot never redirects an old reader to replacement data;
+cleanup respects readers and backups. Cover
 rollback, savepoints, prepared transactions, fixed-capacity exhaustion and
 recovery after deleting local caches. Reject corrupt or stale restored state
 before writer promotion. Resumption preserves effects once, including triggers
 and issued sequence values. Lost commit replies resolve to all changes or none.
 
-### Execute SQL on startup-reserved CPU workers
+### Run independent SQL commands on several CPU workers
 
 **Example:** independent connections can use several CPU cores while each
 connection preserves command order and every confirmed transaction stays recoverable.
 
-Finish shared execution-state ownership, then replace the serial dispatcher with
-fixed workers. Preserve database/account identity, fair queues, cancellation,
-locks, storage waits and commit order. A global lock running all statements in
+Give each worker its own temporary execution state while protecting shared
+rows, definitions, locks and transactions. Choose the fixed worker pool before
+startup. Preserve database/account identity, fair queues, cancellation, storage
+waits and commit order. A global lock running all statements in
 turn does not meet this goal. Measure read, write and mixed-load scaling and
 overload; extra connection or object-request slots alone do not establish it.
 
-### Qualify realistic size, performance and recovery
+### Measure realistic workloads and server replacement
 
 **Example:** a user can choose hardware from measured typical and slow response
 times, sustainable transaction rates, storage traffic and failure behavior.

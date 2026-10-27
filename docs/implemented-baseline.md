@@ -68,7 +68,9 @@ ROLLBACK;
 SELECT id FROM import_rows; -- returns 7
 ```
 
-The connection's temporary namespace keeps its identity. Temporary objects do
+The connection's temporary namespace keeps its identity, even when it is empty.
+`pg_temp` qualifies table names; a `regnamespace` cast needs the actual schema
+name from `pg_namespace`, not that alias. Temporary objects do
 not enter the durable journal or checkpoint. `DISCARD ALL`, outside an explicit
 transaction, also clears prepared statements, cursors, session settings,
 notifications, sequence-session state and session advisory locks. A temporary

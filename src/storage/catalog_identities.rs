@@ -4,8 +4,6 @@ use core::num::NonZeroU32;
 
 use super::*;
 
-pub(super) const MAX_CATALOG_CREATION: u64 = 9_999_999;
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct CatalogIdentity(NonZeroU32);
 
@@ -159,6 +157,10 @@ impl Storage {
             .subscription_catalog
             .lock()
             .expect("subscription catalog lock poisoned");
+        let text = self
+            .text_catalog
+            .lock()
+            .expect("text catalog lock poisoned");
         // Subscription OIDs belong to a shared catalog. Other families are
         // database-local and template copies may preserve their numeric OIDs.
         let scopes = core::iter::once(None).chain(
@@ -226,6 +228,27 @@ impl Storage {
                         let entry = foreign.entry_mapping(slot);
                         check(entry.database, entry.ddl_state, entry.created_at)?;
                     }
+                    for definition in text.collations.iter() {
+                        check(
+                            definition.database,
+                            definition.ddl_state,
+                            definition.created_at,
+                        )?;
+                    }
+                    for definition in text.conversions.iter() {
+                        check(
+                            definition.database,
+                            definition.ddl_state,
+                            definition.created_at,
+                        )?;
+                    }
+                    for definition in text.text_search_objects.iter() {
+                        check(
+                            definition.database,
+                            definition.ddl_state,
+                            definition.created_at,
+                        )?;
+                    }
                     for definition in publications.iter() {
                         check(
                             definition.database,
@@ -241,6 +264,77 @@ impl Storage {
                         definition.created_at,
                     )?;
                 }
+            }
+        }
+        drop(text);
+        drop(statistics);
+        drop(extensions);
+        drop(foreign);
+        drop(publications);
+        drop(subscriptions);
+        for table in 0..self.table_count() {
+            if !self.table_slot_visible_to(table, 0) {
+                continue;
+            }
+            let definition = self.table_def(table, 0);
+            self.validate_saved_collations(
+                self.table(table).database(),
+                definition.columns().iter().map(|column| column.collation),
+            )?;
+        }
+        {
+            let types = self
+                .type_catalog
+                .lock()
+                .expect("type catalog lock poisoned");
+            for definition in types
+                .composites
+                .iter()
+                .filter(|definition| definition.ddl_state != CatalogDdlState::Absent)
+            {
+                self.validate_saved_collations(
+                    definition.database,
+                    definition
+                        .fields()
+                        .iter()
+                        .filter(|field| !field.dropped)
+                        .map(|field| field.collation),
+                )?;
+            }
+        }
+        for definition in self
+            .index_catalog()
+            .iter()
+            .filter(|definition| definition.ddl_state != CatalogDdlState::Absent)
+        {
+            self.validate_saved_collations(
+                definition.database,
+                definition.collations[..definition.n_cols].iter().copied(),
+            )?;
+        }
+        Ok(())
+    }
+    fn validate_saved_collations(
+        &self,
+        database: DatabaseOid,
+        values: impl Iterator<Item = Collation>,
+    ) -> Result<(), SqlError> {
+        let catalog = self
+            .text_catalog
+            .lock()
+            .expect("text catalog lock poisoned");
+        for value in values {
+            if let Collation::Catalog(selected) = value
+                && !catalog.collations.iter().any(|root| {
+                    root.database == database
+                        && root.ddl_state != CatalogDdlState::Absent
+                        && root.binding() == selected
+                })
+            {
+                return Err(sql_err!(
+                    sqlstate::DATA_EXCEPTION,
+                    "stored collation reference does not match a live lifetime"
+                ));
             }
         }
         Ok(())

@@ -3087,7 +3087,12 @@ mod hash_tests {
     fn locale_capable_collation_hash_never_excludes_an_equal_text_pair() {
         let left = [Datum::Text("a")];
         let right = [Datum::Text("A")];
-        for collation in [Collation::Default, Collation::Catalog(0)] {
+        for collation in [
+            Collation::Default,
+            Collation::Catalog(
+                crate::sql::ast::CatalogCollation::from_creation(1, false, false).unwrap(),
+            ),
+        ] {
             assert_eq!(
                 hash_key_collated(&left, &[0], &[collation]),
                 hash_key_collated(&right, &[0], &[collation]),

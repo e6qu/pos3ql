@@ -1,0 +1,26 @@
+name: Text catalog validation
+on:
+  push:
+    branches: [retained-catalog-definitions]
+concurrency:
+  group: text-catalog-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  focused:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: text-catalog-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Compile and lint all targets
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Text catalog and recovery regressions
+        run: cargo test --lib --locked -- collation conversion text_search catalog_lifetime database_template --test-threads=1

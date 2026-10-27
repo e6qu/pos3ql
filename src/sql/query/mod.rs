@@ -2795,14 +2795,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
     ) -> Result<bool, SqlError> {
         Ok(match collation {
             super::ast::Collation::PgUnicodeFast => true,
-            super::ast::Collation::Catalog(slot) => {
-                let definition = self
-                    .storage
-                    .collation(usize::from(slot))
-                    .definition_for(self.txid);
-                definition.provider == crate::storage::CollationProvider::Builtin
-                    && definition.locale.as_str() == "PG_UNICODE_FAST"
-            }
+            super::ast::Collation::Catalog(selected) => selected.unicode_case(),
             _ => false,
         })
     }

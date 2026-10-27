@@ -1840,7 +1840,7 @@ fn primary_object(
             let definition = collation.definition_for(txid);
             base_object(
                 catalog::PG_COLLATION_OID,
-                collation.oid(slot),
+                collation.oid(),
                 "collation",
                 Some(definition.schema.as_str()),
                 Some(definition.name.as_str()),
@@ -1853,7 +1853,7 @@ fn primary_object(
             let definition = conversion.definition_for(txid);
             base_object(
                 catalog::PG_CONVERSION_OID,
-                conversion.oid(slot),
+                conversion.oid(),
                 "conversion",
                 Some(definition.schema.as_str()),
                 Some(definition.name.as_str()),
@@ -2643,17 +2643,13 @@ fn existing_catalog_object(
         catalog::PG_COLLATION_OID => EventObjectRef::Primary(ObjectRef::Collation(
             storage
                 .collations_visible_to(txid)
-                .find_map(|(slot, _)| {
-                    (storage.collation(slot).oid(slot) == object_id).then_some(slot)
-                })
+                .find_map(|(slot, _)| (storage.collation(slot).oid() == object_id).then_some(slot))
                 .ok_or_else(|| catalog_lookup_failed(class_id, object_id))?,
         )),
         catalog::PG_CONVERSION_OID => EventObjectRef::Primary(ObjectRef::Conversion(
             storage
                 .conversions_visible_to(txid)
-                .find_map(|(slot, _)| {
-                    (storage.conversion(slot).oid(slot) == object_id).then_some(slot)
-                })
+                .find_map(|(slot, _)| (storage.conversion(slot).oid() == object_id).then_some(slot))
                 .ok_or_else(|| catalog_lookup_failed(class_id, object_id))?,
         )),
         catalog::PG_STATISTIC_EXT_OID => EventObjectRef::Primary(ObjectRef::Statistics(

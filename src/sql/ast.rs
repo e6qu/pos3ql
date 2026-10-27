@@ -205,6 +205,45 @@ pub enum PublicationDescendants {
 /// A resolved built-in collation identity.  The parser resolves the spelling
 /// once, so execution cannot accept a `COLLATE` clause and accidentally lose
 /// its semantics.
+/// The selected comparison algorithm and database-local object lifetime.
+/// Its private encoding cannot be confused with a reusable catalog slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CatalogCollation(core::num::NonZeroU32);
+
+impl CatalogCollation {
+    pub(crate) const fn from_creation(
+        created_at: u64,
+        database_locale: bool,
+        unicode_case: bool,
+    ) -> Option<Self> {
+        if created_at == 0
+            || created_at > crate::storage::MAX_CATALOG_CREATION
+            || (database_locale && unicode_case)
+        {
+            return None;
+        }
+        match core::num::NonZeroU32::new(
+            (created_at as u32) << 2 | (unicode_case as u32) << 1 | database_locale as u32,
+        ) {
+            Some(encoded) => Some(Self(encoded)),
+            None => None,
+        }
+    }
+
+    pub(crate) const fn created_at(self) -> u64 {
+        (self.0.get() >> 2) as u64
+    }
+    pub(crate) const fn database_locale(self) -> bool {
+        self.0.get() & 1 != 0
+    }
+    pub(crate) const fn unicode_case(self) -> bool {
+        self.0.get() & 2 != 0
+    }
+    pub(crate) const fn oid(self) -> i32 {
+        580_000_000 + self.created_at() as i32
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Collation {
     None,
@@ -213,9 +252,8 @@ pub enum Collation {
     Posix,
     UcsBasic,
     PgUnicodeFast,
-    /// A database-local catalog slot. The slot, rather than a spelling, is the
-    /// durable identity across rename and schema moves.
-    Catalog(u8),
+    /// An immutable comparison choice, independent of name and physical slot.
+    Catalog(CatalogCollation),
 }
 
 impl Collation {
@@ -237,7 +275,7 @@ impl Collation {
             Self::Posix => 951,
             Self::UcsBasic => 962,
             Self::PgUnicodeFast => 6411,
-            Self::Catalog(slot) => 20_000 + slot as i32,
+            Self::Catalog(selected) => selected.oid(),
         }
     }
 
@@ -280,27 +318,36 @@ impl Collation {
         }
     }
 
-    pub const fn code(self) -> u8 {
+    pub const fn code(self) -> u32 {
         match self {
             Self::Default => 0,
             Self::C => 1,
             Self::Posix => 2,
             Self::UcsBasic => 3,
             Self::None => 4,
-            Self::Catalog(slot) => 5 + slot,
+            Self::Catalog(selected) => 0x8000_0000 | selected.0.get(),
             Self::PgUnicodeFast => 133,
         }
     }
 
-    pub const fn from_code(code: u8) -> Option<Self> {
+    pub const fn from_code(code: u32) -> Option<Self> {
         match code {
             0 => Some(Self::Default),
             1 => Some(Self::C),
             2 => Some(Self::Posix),
             3 => Some(Self::UcsBasic),
             4 => Some(Self::None),
-            5..=132 => Some(Self::Catalog(code - 5)),
             133 => Some(Self::PgUnicodeFast),
+            _ if code & 0x8000_0000 != 0 => {
+                match CatalogCollation::from_creation(
+                    ((code & 0x7fff_ffff) >> 2) as u64,
+                    code & 1 != 0,
+                    code & 2 != 0,
+                ) {
+                    Some(selected) => Some(Self::Catalog(selected)),
+                    None => None,
+                }
+            }
             _ => None,
         }
     }

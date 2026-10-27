@@ -24,6 +24,9 @@ pub(crate) enum DatabaseCloneKind {
     Statistics = 13,
     Publication = 14,
     Extension = 15,
+    Collation = 16,
+    Conversion = 17,
+    TextSearch = 18,
 }
 
 impl DatabaseCloneKind {
@@ -45,6 +48,9 @@ impl DatabaseCloneKind {
             13 => Self::Statistics,
             14 => Self::Publication,
             15 => Self::Extension,
+            16 => Self::Collation,
+            17 => Self::Conversion,
+            18 => Self::TextSearch,
             _ => return None,
         })
     }
@@ -398,6 +404,37 @@ impl Storage {
         for (slot, definition) in self.extension_catalog().definitions.iter().enumerate() {
             object(
                 DatabaseCloneKind::Extension,
+                slot,
+                definition.created_at,
+                definition.database,
+                definition.ddl_state,
+            );
+        }
+        let text = self
+            .text_catalog
+            .lock()
+            .expect("text catalog lock poisoned");
+        for (slot, definition) in text.collations.iter().enumerate() {
+            object(
+                DatabaseCloneKind::Collation,
+                slot,
+                definition.created_at,
+                definition.database,
+                definition.ddl_state,
+            );
+        }
+        for (slot, definition) in text.conversions.iter().enumerate() {
+            object(
+                DatabaseCloneKind::Conversion,
+                slot,
+                definition.created_at,
+                definition.database,
+                definition.ddl_state,
+            );
+        }
+        for (slot, definition) in text.text_search_objects.iter().enumerate() {
+            object(
+                DatabaseCloneKind::TextSearch,
                 slot,
                 definition.created_at,
                 definition.database,

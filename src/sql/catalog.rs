@@ -12318,7 +12318,7 @@ pub(crate) fn operator_family_oid_visibility(
 pub(crate) fn conversion_oid_visibility(storage: &Storage, txid: u32, oid: i32) -> Option<bool> {
     let (slot, definition) = storage
         .conversions_visible_to(txid)
-        .find(|(slot, _)| storage.conversion(*slot).oid(*slot) == oid)?;
+        .find(|(slot, _)| storage.conversion(*slot).oid() == oid)?;
     Some(storage.conversion_slot_on_path(None, definition.name.as_str(), txid) == Some(slot))
 }
 
@@ -13809,7 +13809,7 @@ pub fn collation_oid_is_visible(storage: &Storage, txid: u32, oid: i32) -> bool 
         .any(|collation| collation.oid() == oid)
         || storage
             .collations_visible_to(txid)
-            .any(|(slot, _)| crate::sql::ast::Collation::Catalog(slot as u8).oid() == oid)
+            .any(|(slot, _)| storage.collation(slot).oid() == oid)
 }
 
 pub(crate) fn collation_oid_visibility(storage: &Storage, txid: u32, oid: i32) -> Option<bool> {
@@ -13821,7 +13821,7 @@ pub(crate) fn collation_oid_visibility(storage: &Storage, txid: u32, oid: i32) -
     }
     let (slot, definition) = storage
         .collations_visible_to(txid)
-        .find(|(slot, _)| crate::sql::ast::Collation::Catalog(*slot as u8).oid() == oid)?;
+        .find(|(slot, _)| storage.collation(*slot).oid() == oid)?;
     Some(storage.collation_slot_on_path(None, definition.name.as_str(), txid) == Some(slot))
 }
 
@@ -13839,7 +13839,7 @@ pub(crate) fn collation_oid_by_name(storage: &Storage, txid: u32, written: &str)
             .find_map(|(slot, definition)| {
                 (definition.schema.as_str() == schema
                     && identifier_spelling_matches(written_name, definition.name.as_str()))
-                .then_some(crate::sql::ast::Collation::Catalog(slot as u8).oid())
+                .then_some(storage.collation(slot).oid())
             })
     };
     if let Some(schema) = written_schema {
@@ -13888,12 +13888,14 @@ pub(crate) fn collation_name_by_oid<'a>(
     }
     let Some((slot, definition)) = storage
         .collations_visible_to(txid)
-        .find(|(slot, _)| crate::sql::ast::Collation::Catalog(*slot as u8).oid() == oid)
+        .find(|(slot, _)| storage.collation(*slot).oid() == oid)
     else {
         return Ok(None);
     };
     let visible_unqualified = storage.resolve_collation(None, definition.name.as_str(), txid)
-        == Some(crate::sql::ast::Collation::Catalog(slot as u8));
+        == Some(crate::sql::ast::Collation::Catalog(
+            storage.collation(slot).binding(),
+        ));
     if !visible_unqualified {
         write_identifier(&mut rendered, definition.schema.as_str());
         let _ = rendered.write_char('.');
@@ -14163,13 +14165,13 @@ fn pg_description<'a>(
                 let Some(slot) = storage.collation_slot(schema, name, txid) else {
                     continue;
                 };
-                (storage.collation(slot).oid(slot), PG_COLLATION_OID)
+                (storage.collation(slot).oid(), PG_COLLATION_OID)
             }
             crate::storage::CommentClass::Conversion => {
                 let Some(slot) = storage.conversion_slot(schema, name, txid) else {
                     continue;
                 };
-                (storage.conversion(slot).oid(slot), PG_CONVERSION_OID)
+                (storage.conversion(slot).oid(), PG_CONVERSION_OID)
             }
             crate::storage::CommentClass::EventTrigger => {
                 let Some(slot) = storage.event_trigger_slot(name, txid) else {
@@ -14934,14 +14936,14 @@ fn visit_comments_for_object(
                     && subid == 0
                     && storage
                         .collation_slot(schema, name, txid)
-                        .is_some_and(|slot| Some(storage.collation(slot).oid(slot)) == signed_oid)
+                        .is_some_and(|slot| Some(storage.collation(slot).oid()) == signed_oid)
             }
             "pg_conversion" => {
                 class == crate::storage::CommentClass::Conversion
                     && subid == 0
                     && storage
                         .conversion_slot(schema, name, txid)
-                        .is_some_and(|slot| Some(storage.conversion(slot).oid(slot)) == signed_oid)
+                        .is_some_and(|slot| Some(storage.conversion(slot).oid()) == signed_oid)
             }
             "pg_event_trigger" => {
                 class == crate::storage::CommentClass::EventTrigger
@@ -21322,7 +21324,7 @@ fn pg_depend<'a>(
     for (slot, collation) in storage.collations_visible_to(txid) {
         push(
             PG_COLLATION_OID,
-            storage.collation(slot).oid(slot),
+            storage.collation(slot).oid(),
             PG_NAMESPACE_OID,
             namespace_oid(storage, collation.schema.as_str(), txid),
             0,
@@ -21330,7 +21332,7 @@ fn pg_depend<'a>(
         )?;
     }
     for (slot, conversion) in storage.conversions_visible_to(txid) {
-        let oid = 21_000 + slot as i32;
+        let oid = storage.conversion(slot).oid();
         push(
             PG_CONVERSION_OID,
             oid,
@@ -21576,7 +21578,7 @@ fn pg_depend<'a>(
         )),
         crate::storage::DependencyClass::Collation => Some((
             PG_COLLATION_OID,
-            crate::sql::ast::Collation::Catalog(dependency.slot as u8).oid(),
+            storage.collation(usize::from(dependency.slot)).oid(),
         )),
         crate::storage::DependencyClass::TextSearchConfiguration => Some((
             PG_TS_CONFIG_OID,
@@ -27716,7 +27718,7 @@ fn pg_collation<'a>(
         output[count] = row(
             &[
                 Datum::Int4(PG_COLLATION_OID),
-                Datum::Int4(stored.oid(slot)),
+                Datum::Int4(stored.oid()),
                 text(collation.name.as_str(), arena)?,
                 Datum::Int4(namespace_oid(storage, collation.schema.as_str(), txid)),
                 Datum::Int4(collation.owner),
@@ -27750,7 +27752,7 @@ fn pg_conversion<'a>(
         output[count] = row(
             &[
                 Datum::Int4(PG_CONVERSION_OID),
-                Datum::Int4(storage.conversion(slot).oid(slot)),
+                Datum::Int4(storage.conversion(slot).oid()),
                 text(conversion.name.as_str(), arena)?,
                 Datum::Int4(namespace_oid(storage, conversion.schema.as_str(), txid)),
                 Datum::Int4(conversion.owner),

@@ -26,7 +26,7 @@ use crc32c::crc32c;
 
 /// On-disk record header length shared by recovery and logical decoding.
 pub(crate) const HEADER_LEN: usize = 24;
-pub(crate) const RECORD_VERSION: u8 = 19;
+pub(crate) const RECORD_VERSION: u8 = 20;
 
 /// One contiguous, committed journal range ready for immutable publication.
 /// Construction is private to the journal, so callers cannot pair an LSN with
@@ -252,7 +252,7 @@ wal_record_kinds! {
 /// A table definition is an independently versioned payload inside the
 /// object-native logical WAL. Replays reject a definition from an incompatible
 /// schema instead of assigning later bytes to a different column property.
-const TABLE_DEF_PAYLOAD_VERSION: u8 = 12;
+const TABLE_DEF_PAYLOAD_VERSION: u8 = 13;
 const DOMAIN_PAYLOAD_VERSION: u8 = u8::MAX - 3;
 const NO_DOMAIN_BASE_CREATION: u32 = 0;
 
@@ -4694,7 +4694,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 ok &= name_bytes(buffer, fk.parent_schema.as_str());
             }
             for column in def.columns() {
-                ok &= buffer.append(&[column.collation.code()]);
+                ok &= buffer.append(&column.collation.code().to_le_bytes());
             }
             ok &= append_partition(buffer, def.partition);
             ok &= buffer.append(&[def.inheritance.parents_ref().len() as u8]);
@@ -5281,10 +5281,8 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             }
             ok &= buffer.append(&[0xa6]);
             for position in 0..*n_cols {
-                ok &= buffer.append(&[
-                    collations[position].code(),
-                    u8::from(explicit_collations[position]),
-                ]);
+                ok &= buffer.append(&collations[position].code().to_le_bytes())
+                    && buffer.append(&[u8::from(explicit_collations[position])]);
             }
             ok &= buffer.append(&[0xa7]);
             for operator_class in &operator_classes[..*n_cols] {
@@ -5812,7 +5810,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                     && buffer.append(&[u8::from(field.not_null)])
                     && buffer.append(&[field.ctype.code()])
                     && buffer.append(&field.type_mod.to_le_bytes())
-                    && buffer.append(&[field.collation.code()]);
+                    && buffer.append(&field.collation.code().to_le_bytes());
                 match field.user_type {
                     Some(identity) => {
                         ok &= buffer.append(&[1])
@@ -7929,10 +7927,10 @@ fn decode_op_inner<'a>(
             for f in 0..def.n_fkeys {
                 def.fkeys[f].parent_schema = SqlName::parse(take_name(&mut at)?).ok()?;
             }
-            let collations = payload.get(at..at + n_cols)?;
-            at += n_cols;
-            for (column, code) in def.columns[..n_cols].iter_mut().zip(collations) {
-                column.collation = crate::sql::ast::Collation::from_code(*code)?;
+            for column in &mut def.columns[..n_cols] {
+                let code = u32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
+                at += 4;
+                column.collation = crate::sql::ast::Collation::from_code(code)?;
             }
             def.partition = decode_partition(payload, &mut at)?;
             let n_parents = *payload.get(at)? as usize;
@@ -9335,8 +9333,8 @@ fn decode_op_inner<'a>(
             let mut collations = [crate::sql::ast::Collation::Default; MAX_INDEX_COLS];
             let mut explicit_collations = [false; MAX_INDEX_COLS];
             for position in 0..n_cols {
-                let code = *payload.get(at)?;
-                at += 1;
+                let code = u32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
+                at += 4;
                 explicit_collations[position] = match *payload.get(at)? {
                     0 => false,
                     1 => true,
@@ -10095,8 +10093,10 @@ fn decode_op_inner<'a>(
                 at += 1;
                 let type_mod = i32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
                 at += 4;
-                let collation = crate::sql::ast::Collation::from_code(*payload.get(at)?)?;
-                at += 1;
+                let collation = crate::sql::ast::Collation::from_code(u32::from_le_bytes(
+                    payload.get(at..at + 4)?.try_into().ok()?,
+                ))?;
+                at += 4;
                 let has_user_type = *payload.get(at)?;
                 at += 1;
                 let user_type = match has_user_type {
@@ -14723,7 +14723,7 @@ mod tests {
         let mut budget = Budget::new(4096);
         let mut payload = FixedBuf::new(&mut budget, "table collation payload", 4096).unwrap();
         for code in 0..=u8::MAX {
-            let Some(collation) = crate::sql::ast::Collation::from_code(code) else {
+            let Some(collation) = crate::sql::ast::Collation::from_code(u32::from(code)) else {
                 continue;
             };
             definition.columns[1].collation = collation;

@@ -22,6 +22,8 @@ impl Checkpointer {
         self.file_io.cancel();
         self.file_gc = FileGcProgress::Unloaded;
         self.file_index_walk = None;
+        self.file_backup_scratch.clear();
+        self.file_backup_roster_loaded = false;
         self.block_garbage_loaded = false;
         self.doomed_blocks.clear();
         self.legacy_garbage_loaded = false;
@@ -69,7 +71,6 @@ impl Checkpointer {
         );
         if result.is_err() && !self.block_garbage_loaded {
             self.reset_file_gc();
-            self.backup_roster_loaded = false;
         }
         result
     }
@@ -184,17 +185,17 @@ impl Checkpointer {
             FileGcProgress::Unloaded => {
                 self.capture_gc_roots(storage)?;
                 self.file_index_walk = None;
-                if self.backup_roster_loaded {
+                if self.file_backup_roster_loaded {
                     self.file_gc = FileGcProgress::Manifests { index: 0 };
                 } else {
-                    self.backup_scratch.clear();
+                    self.file_backup_scratch.clear();
                     self.file_gc = FileGcProgress::Backups {
                         cursor: ListCursor::START,
                     };
                 }
             }
             FileGcProgress::Backups { cursor } => {
-                let names = &mut self.backup_scratch;
+                let names = &mut self.file_backup_scratch;
                 let mut invalid = false;
                 let Poll::Ready(next) =
                     self.file_io
@@ -228,12 +229,12 @@ impl Checkpointer {
                 } else {
                     names.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
                     names.dedup_by(|a, b| a.as_str() == b.as_str());
-                    self.backup_roster_loaded = true;
+                    self.file_backup_roster_loaded = true;
                     self.file_gc = FileGcProgress::Manifests { index: 0 };
                 }
             }
             FileGcProgress::Manifests { index } => {
-                if index > self.backup_scratch.len() {
+                if index > self.file_backup_scratch.len() {
                     self.file_gc = FileGcProgress::Walk { position: 0 };
                     return Ok(false);
                 }
@@ -244,7 +245,7 @@ impl Checkpointer {
                         stack_format!(
                             128,
                             "backups/{}/manifest",
-                            self.backup_scratch[index - 1].as_str()
+                            self.file_backup_scratch[index - 1].as_str()
                         )
                     };
                     let Poll::Ready(bytes) = self.file_io.get(key.as_str())? else {

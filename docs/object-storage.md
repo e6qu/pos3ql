@@ -101,7 +101,9 @@ backup manifest or commit-chain descriptor, or deletes the configured batch of
 obsolete journal objects. Waiting for any of these responses releases the SQL
 worker, including when foreground block reads or commit uploads are active.
 Checkpoints can publish and free row-cache space while journal cleanup waits.
-The two tasks have separate startup-reserved backup lists and deletion queues.
+Journal cleanup, saved-file cleanup and backup administration have separate
+startup-reserved backup lists. The two cleanup tasks also have separate deletion
+queues, so a failed backup preflight cannot overwrite a partial file inventory.
 Each journal pass stops at its captured cutoff; new commits cannot extend that
 pass indefinitely. Later checkpoints queue the latest requested cutoff, while
 a more conservative retention decision cancels the pending deletion work.

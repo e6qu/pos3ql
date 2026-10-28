@@ -10457,9 +10457,9 @@ impl Engine {
         if ckpt.block_reads_busy() {
             return CheckpointBeat::WaitingForReads;
         }
-        // A checkpoint beat advances publication state that cannot be replayed
-        // after yielding. Its block reads therefore own the store
-        // synchronously, just as an explicit CHECKPOINT does.
+        // Capture and merge still include transitions that cannot be replayed
+        // after yielding. Their block reads remain synchronous; file cleanup
+        // uses its own resumable client.
         let atomic_reads = ckpt.atomic_block_read_scope();
         let remote_maintenance_was_pending = ckpt.published_maintenance_pending();
         let checkpoint = ckpt.checkpoint_step(&mut self.storage);

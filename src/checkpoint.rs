@@ -1375,6 +1375,8 @@ pub(crate) struct Checkpointer {
     commit_scratch: Vec<StackStr<64>>,
     backup_scratch: Vec<StackStr<BACKUP_NAME_BYTES>>,
     backup_roster_loaded: bool,
+    file_backup_scratch: Vec<StackStr<BACKUP_NAME_BYTES>>,
+    file_backup_roster_loaded: bool,
     garbage_scratch: Vec<StackStr<64>>,
     prune_backup_scratch: Vec<StackStr<BACKUP_NAME_BYTES>>,
     prune_backup_roster_loaded: bool,
@@ -1551,7 +1553,8 @@ impl Checkpointer {
             + config.checkpoint_garbage_batch_objects
                 * (core::mem::size_of::<StackStr<80>>() + 2 * core::mem::size_of::<StackStr<64>>())
             + config.checkpoint_commit_batches * core::mem::size_of::<StackStr<64>>()
-            + 2 * config.max_backups * core::mem::size_of::<StackStr<BACKUP_NAME_BYTES>>()
+            + 3 * config.max_backups * core::mem::size_of::<StackStr<BACKUP_NAME_BYTES>>()
+            + core::mem::size_of::<bool>()
             + config.checkpoint_merge_entries * core::mem::size_of::<(SstKey, u8)>()
     }
 
@@ -2407,6 +2410,8 @@ impl Checkpointer {
             commit_scratch: Vec::with_capacity(config.checkpoint_commit_batches),
             backup_scratch: Vec::with_capacity(config.max_backups),
             backup_roster_loaded: false,
+            file_backup_scratch: Vec::with_capacity(config.max_backups),
+            file_backup_roster_loaded: false,
             garbage_scratch: Vec::with_capacity(config.checkpoint_garbage_batch_objects),
             prune_backup_scratch: Vec::with_capacity(config.max_backups),
             prune_backup_roster_loaded: false,
@@ -20680,6 +20685,51 @@ mod stored_dependency_tests {
     }
 
     #[test]
+    fn maintenance_metadata_failed_backup_preflight_cannot_replace_a_partial_file_inventory() {
+        let (_, storage, _, mut config) = index_gc_fixture("gc-backup-preflight", 32);
+        config.max_backups = 65;
+        let mut budget = Budget::new(Checkpointer::budget_bytes(&config));
+        let mut checkpoint = Checkpointer::new(&config, &mut budget).unwrap();
+        assert_eq!(budget.remaining(), 0);
+        let manifest = b"pos3ql-manifest-v34\nlsn 0\nnext_rowid 1\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\ntypes_end\nend\n";
+        for index in 0..65 {
+            checkpoint
+                .client
+                .put(
+                    &format!("backups/point{index:03}/manifest"),
+                    manifest,
+                    Precondition::None,
+                )
+                .unwrap();
+        }
+        // Capture roots, then consume only the first 64-name page.
+        for _ in 0..2 {
+            assert!(
+                !crate::mem::guard::forbid_alloc(
+                    || checkpoint.collect_block_garbage_batch(&storage)
+                )
+                .unwrap()
+            );
+        }
+        assert!(matches!(checkpoint.file_gc, FileGcProgress::Backups { .. }));
+        assert_eq!(checkpoint.file_backup_scratch.len(), 64);
+        assert!(!checkpoint.file_backup_roster_loaded);
+        let error =
+            crate::mem::guard::forbid_alloc(|| checkpoint.preflight_backup("no-room")).unwrap_err();
+        assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+        assert_eq!(checkpoint.backup_scratch.len(), 65);
+        assert_eq!(checkpoint.file_backup_scratch.len(), 64);
+        assert!(!checkpoint.file_backup_roster_loaded);
+        assert!(
+            crate::mem::guard::forbid_alloc(|| drain_block_gc(&mut checkpoint, &storage)).unwrap()
+        );
+        assert_eq!(checkpoint.file_backup_scratch.len(), 65);
+        drop(checkpoint);
+        drop(storage);
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    }
+
+    #[test]
     fn maintenance_metadata_stalled_journal_does_not_block_checkpoint_publication() {
         let (mut checkpoint, mut storage, _, config) =
             index_gc_fixture("journal-checkpoint-overlap", 32);
@@ -21322,7 +21372,7 @@ mod stored_dependency_tests {
         backups.max_backups += 1;
         assert_eq!(
             Checkpointer::budget_bytes(&backups) - base_bytes,
-            2 * core::mem::size_of::<StackStr<BACKUP_NAME_BYTES>>()
+            3 * core::mem::size_of::<StackStr<BACKUP_NAME_BYTES>>()
         );
 
         let mut live_blocks = base.clone();

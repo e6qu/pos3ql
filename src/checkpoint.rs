@@ -705,9 +705,11 @@ enum ValueIndexPhase {
     Finish(Option<ValueIndexHandle>),
 }
 
-#[derive(Clone, Copy)]
-enum IndexOutputOwner {
-    Schedule,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PhysicalOutputOwner {
+    Table,
+    Merge,
+    IndexSchedule,
     Index,
 }
 
@@ -1318,7 +1320,7 @@ pub(crate) struct Checkpointer {
     captured_checkpoint_epoch: u64,
     published_checkpoint_epoch: u64,
     block_output: crate::store::BlockWriteBatch,
-    index_output_owner: Option<IndexOutputOwner>,
+    physical_output_owner: Option<PhysicalOutputOwner>,
     table_output: FixedVec<CheckpointVersion>,
     table_job: Option<TableSliceJob>,
     commit_publication: Option<CommitPublication>,
@@ -1654,6 +1656,7 @@ impl Checkpointer {
     /// relation replacement supersedes the pair — its blocks sweep as
     /// orphans. A crash loses only the job's progress, never data.
     fn merge_beat(&mut self, storage: &Storage) -> Result<(), SqlError> {
+        self.claim_physical_output(PhysicalOutputOwner::Merge)?;
         let Some(mut job) = self.merge_job.take() else {
             if let Some(job) = self.merge_candidate(storage) {
                 self.merge_scratch.clear();
@@ -2342,7 +2345,7 @@ impl Checkpointer {
                 config.checkpoint_write_entries,
             )
             .map_err(CheckpointSetupError::Budget)?,
-            index_output_owner: None,
+            physical_output_owner: None,
             table_job: None,
             commit_publication: None,
             blocks,
@@ -3127,27 +3130,47 @@ impl Checkpointer {
         !self.block_output.is_empty()
     }
 
+    fn claim_physical_output(&mut self, owner: PhysicalOutputOwner) -> Result<(), SqlError> {
+        if !self.block_output.is_empty() {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "physical output must finish before another producer can write"
+            ));
+        }
+        // A producer can finish a turn without emitting bytes. Its old tag
+        // must never classify a later table or merge emission as stale index work.
+        self.physical_output_owner = Some(owner);
+        Ok(())
+    }
+
     pub(crate) fn physical_output_stale(&self, storage: &Storage) -> bool {
         !self.block_output.is_empty()
-            && match self.index_output_owner {
-                Some(IndexOutputOwner::Schedule) => self
+            && match self.physical_output_owner {
+                Some(PhysicalOutputOwner::IndexSchedule) => self
                     .value_schedule_job
                     .as_ref()
                     .is_none_or(|job| !Self::value_schedule_job_is_current(storage, job)),
-                Some(IndexOutputOwner::Index) => self
+                Some(PhysicalOutputOwner::Index) => self
                     .value_job
                     .as_ref()
                     .is_none_or(|job| !Self::value_job_is_current(storage, job)),
-                None => false,
+                Some(PhysicalOutputOwner::Table | PhysicalOutputOwner::Merge) => false,
+                None => true,
             }
     }
 
     pub(crate) fn advance_physical_output(&mut self, storage: &Storage) -> Result<bool, SqlError> {
+        if !self.block_output.is_empty() && self.physical_output_owner.is_none() {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "physical output has no producing job"
+            ));
+        }
         if self.physical_output_stale(storage) {
             self.block_output
                 .discard(&mut self.block_uploads)
                 .map_err(upload_to_sql)?;
-            self.index_output_owner = None;
+            self.physical_output_owner = None;
             return Ok(true);
         }
         self.drain_block_output()
@@ -3179,7 +3202,7 @@ impl Checkpointer {
 
     fn drain_block_output(&mut self) -> Result<bool, SqlError> {
         if self.block_output.is_empty() {
-            self.index_output_owner = None;
+            self.physical_output_owner = None;
             return Ok(true);
         }
         let before = self.block_output.object_puts();
@@ -3195,7 +3218,7 @@ impl Checkpointer {
         let complete = result.map_err(upload_to_sql)?;
         if complete {
             self.block_output.consume();
-            self.index_output_owner = None;
+            self.physical_output_owner = None;
         }
         Ok(complete)
     }
@@ -13165,6 +13188,12 @@ impl Checkpointer {
     }
 
     fn queue_manifest_upload(&mut self, lsn: u64) -> Result<(), SqlError> {
+        if !self.block_output.is_empty() {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "checkpoint publication waits for immutable output durability"
+            ));
+        }
         if self.writer_was_fenced() {
             return Err(sql_err!(
                 SQLSTATE_CAS,
@@ -13593,6 +13622,7 @@ impl Checkpointer {
     }
 
     fn advance_table_slice(&mut self, storage: &Storage) -> Result<(), SqlError> {
+        self.claim_physical_output(PhysicalOutputOwner::Table)?;
         let mut job = self.table_job.take().expect("scheduled table output");
         if !Self::table_slice_matches(storage, &job) {
             self.block_output
@@ -14635,6 +14665,7 @@ impl Checkpointer {
     }
 
     fn value_index_schedule_beat(&mut self, storage: &Storage) -> Result<(), SqlError> {
+        self.claim_physical_output(PhysicalOutputOwner::IndexSchedule)?;
         let mut job = self
             .value_schedule_job
             .take()
@@ -14646,7 +14677,6 @@ impl Checkpointer {
             self.value_changed_rowids.clear();
             return Ok(());
         }
-        self.index_output_owner = Some(IndexOutputOwner::Schedule);
         #[cfg(feature = "checkpoint-profile")]
         let started = checkpoint_profile_start();
         let before = self
@@ -14774,6 +14804,7 @@ impl Checkpointer {
     /// entries and block transfers. A failed beat restarts from the retained
     /// sorted source; content-addressed writes make the replay idempotent.
     fn value_index_write_beat(&mut self, storage: &Storage) -> Result<(), SqlError> {
+        self.claim_physical_output(PhysicalOutputOwner::Index)?;
         let mut job = self.value_job.take().expect("checked by caller");
         if !Self::value_job_is_current(storage, &job) {
             self.value_writer.reset();
@@ -14788,7 +14819,6 @@ impl Checkpointer {
             .lock()
             .expect("block store lock poisoned")
             .io_stats();
-        self.index_output_owner = Some(IndexOutputOwner::Index);
         let result = self.write_value_index_entries(storage, &mut job, before);
         #[cfg(feature = "checkpoint-profile")]
         profile_checkpoint_phase(
@@ -15146,27 +15176,53 @@ impl Checkpointer {
                     .sort_unstable_by_key(|handle| handle.roster);
                 self.garbage_sst_roots.dedup_by_key(|handle| handle.roster);
                 for h in self.garbage_sst_roots.iter().copied() {
-                    keep.insert(h.roster)?;
-                    let n = self
-                        .blocks
-                        .lock()
-                        .expect("block store lock poisoned")
-                        .get(&h.roster, scratch)
-                        .map(|(n, _)| n)
-                        .map_err(|e| {
-                            sql_err!(SQLSTATE_IO, "gc roster {:?} read: {:?}", h.roster, e)
-                        })?;
-                    for id_bytes in scratch[..n].chunks(32) {
-                        if id_bytes.len() != 32 {
-                            return Err(sql_err!(
-                                SQLSTATE_IO,
-                                "gc roster is not a multiple of 32 bytes"
-                            ));
+                    retain_row_roster_blocks(&self.blocks, &mut keep, scratch, h.roster)?;
+                }
+                // A schema change can make a captured manifest's local install
+                // inapplicable. Tables still own their older installed files.
+                // Stream missing roots without enlarging the reserved inventory.
+                for slot in 0..storage.physical_table_count() {
+                    let table = storage.table(slot);
+                    if !table.live()
+                        || table.definition().persistence
+                            == crate::storage::RelationPersistence::Temporary
+                    {
+                        continue;
+                    }
+                    let count = table.spill_generations().len();
+                    for index in 0..count {
+                        let handle = table
+                            .spill_generations()
+                            .handle(index)
+                            .expect("installed generation position");
+                        if self
+                            .garbage_sst_roots
+                            .binary_search_by_key(&handle.roster, |h| h.roster)
+                            .is_err()
+                        {
+                            retain_row_roster_blocks(
+                                &self.blocks,
+                                &mut keep,
+                                scratch,
+                                handle.roster,
+                            )?;
                         }
-
-                        let mut id = [0u8; 32];
-                        id.copy_from_slice(id_bytes);
-                        keep.insert(BlockId(id))?;
+                    }
+                }
+                if let Some(job) = &self.merge_job {
+                    for source in [job.old0.handle, job.old1.handle] {
+                        if self
+                            .garbage_sst_roots
+                            .binary_search_by_key(&source.roster, |h| h.roster)
+                            .is_err()
+                        {
+                            retain_row_roster_blocks(
+                                &self.blocks,
+                                &mut keep,
+                                scratch,
+                                source.roster,
+                            )?;
+                        }
                     }
                 }
                 storage.copy_retained_index_roots(&mut self.garbage_index_roots)?;
@@ -15619,6 +15675,32 @@ fn retain_block(keep: &mut BlockKeepSet<'_>, id: BlockId) -> Result<(), SqlError
     keep.insert(id)
 }
 
+fn retain_row_roster_blocks(
+    blocks: &std::sync::Arc<Mutex<TieredStore<OwnedObjectStore>>>,
+    keep: &mut BlockKeepSet<'_>,
+    scratch: &mut [u8],
+    roster: BlockId,
+) -> Result<(), SqlError> {
+    retain_block(keep, roster)?;
+    let (length, kind) = blocks
+        .lock()
+        .expect("block store lock poisoned")
+        .get(&roster, scratch)
+        .map_err(|error| sql_err!(SQLSTATE_IO, "gc roster {:?} read: {:?}", roster, error))?;
+    if kind != BlockType::SstRoster || !length.is_multiple_of(32) {
+        return Err(sql_err!(
+            SQLSTATE_IO,
+            "invalid saved row roster type or length"
+        ));
+    }
+    for bytes in scratch[..length].chunks_exact(32) {
+        let mut id = [0u8; 32];
+        id.copy_from_slice(bytes);
+        retain_block(keep, BlockId(id))?;
+    }
+    Ok(())
+}
+
 fn retain_manifest_blocks(
     blocks: &std::sync::Arc<Mutex<TieredStore<OwnedObjectStore>>>,
     keep: &mut BlockKeepSet<'_>,
@@ -15652,24 +15734,7 @@ fn retain_manifest_blocks(
                 }
                 let roster = parse_block_id(roster)
                     .map_err(|_| sql_err!(SQLSTATE_IO, "saved manifest has a bad dsst roster"))?;
-                retain_block(keep, roster)?;
-                let n = blocks
-                    .lock()
-                    .expect("block store lock poisoned")
-                    .get(&roster, scratch)
-                    .map(|(n, _)| n)
-                    .map_err(|error| sql_err!(SQLSTATE_IO, "saved row roster read: {:?}", error))?;
-                for id_bytes in scratch[..n].chunks(32) {
-                    if id_bytes.len() != 32 {
-                        return Err(sql_err!(
-                            SQLSTATE_IO,
-                            "saved row roster is not a multiple of 32 bytes"
-                        ));
-                    }
-                    let mut id = [0; 32];
-                    id.copy_from_slice(id_bytes);
-                    retain_block(keep, BlockId(id))?;
-                }
+                retain_row_roster_blocks(blocks, keep, scratch, roster)?;
             }
             Some("vix") => {
                 words
@@ -20388,6 +20453,179 @@ mod stored_dependency_tests {
                 .is_some()
         );
         drop(checkpointer);
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    }
+
+    #[test]
+    fn maintenance_metadata_retired_index_owner_cannot_discard_merge_output() {
+        let (mut checkpoint, storage, table, config) = index_gc_fixture("merge-output-owner", 32);
+        checkpoint.reset_merge_writer(&storage, table).unwrap();
+        let mut sources = Vec::with_capacity(2);
+        let mut merged_checksum = Crc32c::new();
+        for rowid in 1u64..=2 {
+            let mut row = [0u8; 7];
+            crate::storage::rowenc::encode(
+                &[crate::sql::types::Datum::Int4(rowid as i32)],
+                &mut row,
+            );
+            let mut header = [0u8; 20];
+            header[..8].copy_from_slice(&rowid.to_le_bytes());
+            header[16..].copy_from_slice(&(row.len() as u32).to_le_bytes());
+            let mut checksum = Crc32c::new();
+            checksum.update(&header);
+            checksum.update(&row);
+            merged_checksum.update(&header);
+            merged_checksum.update(&row);
+            checkpoint.slice_writer.reset();
+            let mut blocks = checkpoint.blocks.lock().unwrap();
+            checkpoint
+                .slice_writer
+                .append(&mut *blocks, rowid, &row)
+                .unwrap();
+            sources.push(PrevSst {
+                handle: checkpoint
+                    .slice_writer
+                    .finish(&mut *blocks)
+                    .unwrap()
+                    .unwrap(),
+                count: 1,
+                crc: checksum.finish(),
+            });
+            checkpoint
+                .merge_writer
+                .append(&mut *blocks, rowid, &row)
+                .unwrap();
+        }
+        let old0 = sources[0];
+        let old1 = sources[1];
+        assert!(checkpoint.prev_ssts[table].push(old0));
+        assert!(checkpoint.prev_ssts[table].push(old1));
+        checkpoint.merge_job = Some(MergeJob {
+            slot: table,
+            at: 0,
+            old0,
+            old1,
+            drop_tombstones: true,
+            oldest_snapshot: None,
+            phase: MergePhase::Write { cursor: 0 },
+            schedule_len: 0,
+            count: 2,
+            crc: merged_checksum,
+        });
+        // Index completion can leave no bytes and no remaining index job.
+        checkpoint.physical_output_owner = Some(PhysicalOutputOwner::Index);
+        assert!(checkpoint.value_job.is_none());
+        crate::mem::guard::forbid_alloc(|| checkpoint.merge_beat(&storage)).unwrap();
+        assert!(checkpoint.physical_output_pending());
+        assert_eq!(
+            checkpoint.physical_output_owner,
+            Some(PhysicalOutputOwner::Merge)
+        );
+        assert!(!checkpoint.physical_output_stale(&storage));
+        for _ in 0..16 {
+            if crate::mem::guard::forbid_alloc(|| checkpoint.advance_physical_output(&storage))
+                .unwrap()
+            {
+                break;
+            }
+        }
+        assert!(!checkpoint.physical_output_pending());
+        crate::mem::guard::forbid_alloc(|| checkpoint.merge_beat(&storage)).unwrap();
+        let merged = checkpoint.merge_done[table]
+            .as_ref()
+            .unwrap()
+            .merged
+            .unwrap();
+        checkpoint
+            .client
+            .get(
+                &format!("blocks/{}", index_gc_hex(merged.handle.roster)),
+                None,
+            )
+            .unwrap();
+        drop(checkpoint);
+        drop(storage);
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    }
+
+    #[test]
+    fn maintenance_metadata_live_files_outlast_a_different_published_generation() {
+        let (mut checkpoint, storage, table, config) =
+            index_gc_fixture("gc-live-before-install", 32);
+        let mut saved = Vec::with_capacity(3);
+        for rowid in 1u64..=3 {
+            let mut row = [0u8; 7];
+            crate::storage::rowenc::encode(
+                &[crate::sql::types::Datum::Int4(rowid as i32)],
+                &mut row,
+            );
+            checkpoint.slice_writer.reset();
+            let mut blocks = checkpoint.blocks.lock().unwrap();
+            checkpoint
+                .slice_writer
+                .append(&mut *blocks, rowid, &row)
+                .unwrap();
+            saved.push(
+                checkpoint
+                    .slice_writer
+                    .finish(&mut *blocks)
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        let [live, published, orphan] = saved.as_slice() else {
+            unreachable!()
+        };
+        let reservation = storage
+            .reserve_spill_generation(
+                table,
+                storage.table(table).created_at(),
+                storage.table(table).rewrite_generation(),
+            )
+            .unwrap();
+        storage
+            .append_spill_through(&reservation, *live, 0)
+            .unwrap();
+        assert!(checkpoint.prev_ssts[table].push(PrevSst {
+            handle: *published,
+            count: 1,
+            crc: 0
+        }));
+        assert!(
+            crate::mem::guard::forbid_alloc(|| checkpoint.collect_block_garbage_batch(&storage))
+                .unwrap()
+        );
+        for handle in [live, published] {
+            checkpoint
+                .client
+                .get(&format!("blocks/{}", index_gc_hex(handle.roster)), None)
+                .unwrap();
+        }
+        assert!(
+            checkpoint
+                .client
+                .get(&format!("blocks/{}", index_gc_hex(orphan.roster)), None)
+                .unwrap_err()
+                .is_not_found()
+        );
+        let target = storage
+            .capture_spill_publication(
+                table,
+                storage.table(table).created_at(),
+                storage.table(table).rewrite_generation(),
+            )
+            .unwrap();
+        storage.clear_spill_publication(&target).unwrap();
+        assert!(checkpoint.collect_block_garbage_batch(&storage).unwrap());
+        assert!(
+            checkpoint
+                .client
+                .get(&format!("blocks/{}", index_gc_hex(live.roster)), None)
+                .unwrap_err()
+                .is_not_found()
+        );
+        drop(checkpoint);
+        drop(storage);
         crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     }
 

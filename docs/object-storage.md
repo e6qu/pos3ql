@@ -110,6 +110,14 @@ including when releasing a reader makes another file-cleanup pass necessary.
 If a checkpoint has already written new files, a finishing reader queues file
 cleanup until that checkpoint publishes. Its unfinished files remain owned;
 they are not abandoned objects that cleanup may delete.
+Every physical output batch records whether it belongs to a table, merge,
+index preparation or index writer. Changing producers requires the previous
+batch to finish. An index task ending without output cannot cause a later
+merge's files to be discarded as obsolete index work. The manifest waits for
+all required immutable uploads before publication.
+Cleanup retains installed table files and active merge inputs even when a
+different captured file list has published. It validates each saved row-file
+inventory's block type and length before using it to decide what to delete.
 
 **User example:** a slow response while deleting last week's obsolete journal
 must not delay reading a cached order or saving new orders to free cache space.

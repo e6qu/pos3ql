@@ -1805,6 +1805,8 @@ fn catalog_lifetime_privileges_and_partition_triggers_match_postgresql() {
     }
 }
 
+const CATALOG_LIFETIME_DEFINITION_BEHAVIOR: &str = "SELECT lifetime_query(5); SELECT pg_get_expr(polqual, polrelid) FROM pg_policy WHERE polname='lifetime_row_policy'; SELECT ev_enabled FROM pg_rewrite WHERE rulename='lifetime_rewrite'";
+
 fn privilege_partition_inventory(
     engine: &mut Engine,
     session: &mut ConfiguredTransactionSession,
@@ -1860,7 +1862,7 @@ fn catalog_lifetime_privileges_and_partition_triggers_survive_copies_and_empty_d
                 }
                 source_inventory = privilege_partition_inventory(&mut engine, &mut session);
                 assert_eq!(source_inventory.len(), 8);
-                session.success(&mut engine, "BEGIN; SAVEPOINT lifetime_before; REVOKE lifetime_member_group FROM lifetime_member_second; ALTER DEFAULT PRIVILEGES IN SCHEMA lifetime_privileges REVOKE SELECT ON TABLES FROM lifetime_member_first; ALTER TABLE lifetime_partition_root DETACH PARTITION lifetime_partition_child; ROLLBACK TO lifetime_before; COMMIT", false);
+                session.success(&mut engine, "BEGIN; SAVEPOINT lifetime_before; REVOKE lifetime_member_group FROM lifetime_member_second; ALTER DEFAULT PRIVILEGES IN SCHEMA lifetime_privileges REVOKE SELECT ON TABLES FROM lifetime_member_first; ALTER TABLE lifetime_partition_root DETACH PARTITION lifetime_partition_child; DROP FUNCTION lifetime_query(integer); CREATE FUNCTION lifetime_query(value integer) RETURNS integer LANGUAGE sql AS 'SELECT $1 + 3'; DROP POLICY lifetime_row_policy ON lifetime_saved_defaults; CREATE POLICY lifetime_row_policy ON lifetime_saved_defaults USING (false); DROP RULE lifetime_rewrite ON lifetime_saved_defaults; CREATE RULE lifetime_rewrite AS ON UPDATE TO lifetime_saved_defaults DO INSTEAD NOTHING; ROLLBACK TO lifetime_before; COMMIT", false);
                 assert_eq!(
                     privilege_partition_inventory(&mut engine, &mut session),
                     source_inventory
@@ -1881,8 +1883,16 @@ fn catalog_lifetime_privileges_and_partition_triggers_survive_copies_and_empty_d
                     privilege_partition_inventory(&mut engine, &mut session),
                     source_inventory
                 );
-                session.success(&mut engine, "ALTER DEFAULT PRIVILEGES IN SCHEMA lifetime_privileges GRANT INSERT ON TABLES TO lifetime_member_second; ALTER TABLE lifetime_partition_root DETACH PARTITION lifetime_partition_child; ALTER TABLE lifetime_partition_root ATTACH PARTITION lifetime_partition_child FOR VALUES FROM (0) TO (10); ALTER TABLE lifetime_partition_child DISABLE TRIGGER lifetime_partition_hook", false);
+                session.success(&mut engine, "ALTER DEFAULT PRIVILEGES IN SCHEMA lifetime_privileges GRANT INSERT ON TABLES TO lifetime_member_second; ALTER TABLE lifetime_partition_root DETACH PARTITION lifetime_partition_child; ALTER TABLE lifetime_partition_root ATTACH PARTITION lifetime_partition_child FOR VALUES FROM (0) TO (10); ALTER TABLE lifetime_partition_child DISABLE TRIGGER lifetime_partition_hook; CREATE OR REPLACE FUNCTION lifetime_query(value integer) RETURNS integer LANGUAGE sql AS 'SELECT $1 + 3'; ALTER POLICY lifetime_row_policy ON lifetime_saved_defaults USING (false); ALTER TABLE lifetime_saved_defaults DISABLE RULE lifetime_rewrite", false);
                 copied_inventory = privilege_partition_inventory(&mut engine, &mut session);
+                assert_eq!(
+                    data_rows(&session.success(
+                        &mut engine,
+                        CATALOG_LIFETIME_DEFINITION_BEHAVIOR,
+                        true
+                    )),
+                    ["8", "false", "D"]
+                );
                 assert_ne!(copied_inventory, source_inventory);
                 engine
                     .select_database(crate::storage::DatabaseOid::TEMPLATE1)
@@ -1909,6 +1919,18 @@ fn catalog_lifetime_privileges_and_partition_triggers_survive_copies_and_empty_d
                     assert_eq!(
                         &privilege_partition_inventory(&mut engine, &mut session),
                         expected
+                    );
+                    assert_eq!(
+                        data_rows(&session.success(
+                            &mut engine,
+                            CATALOG_LIFETIME_DEFINITION_BEHAVIOR,
+                            true
+                        )),
+                        if database == target {
+                            ["8", "false", "D"]
+                        } else {
+                            ["7", "true", "O"]
+                        }
                     );
                 }
                 session.success(
@@ -1966,7 +1988,7 @@ fn catalog_lifetime_privileges_and_partition_triggers_keep_prepared_changes_priv
                         session.success(&mut engine, sql, false);
                     }
                     before = privilege_partition_inventory(&mut engine, &mut session);
-                    session.success(&mut engine, "BEGIN; REVOKE lifetime_member_group FROM lifetime_member_second; GRANT lifetime_member_group TO lifetime_member_second; ALTER DEFAULT PRIVILEGES IN SCHEMA lifetime_privileges REVOKE SELECT ON TABLES FROM lifetime_member_first; ALTER DEFAULT PRIVILEGES IN SCHEMA lifetime_privileges GRANT SELECT ON TABLES TO lifetime_member_first; ALTER TABLE lifetime_partition_root DETACH PARTITION lifetime_partition_child; ALTER TABLE lifetime_partition_root ATTACH PARTITION lifetime_partition_child FOR VALUES FROM (0) TO (10); ALTER TABLE lifetime_partition_child DISABLE TRIGGER lifetime_partition_hook", false);
+                    session.success(&mut engine, "BEGIN; REVOKE lifetime_member_group FROM lifetime_member_second; GRANT lifetime_member_group TO lifetime_member_second; ALTER DEFAULT PRIVILEGES IN SCHEMA lifetime_privileges REVOKE SELECT ON TABLES FROM lifetime_member_first; ALTER DEFAULT PRIVILEGES IN SCHEMA lifetime_privileges GRANT SELECT ON TABLES TO lifetime_member_first; ALTER TABLE lifetime_partition_root DETACH PARTITION lifetime_partition_child; ALTER TABLE lifetime_partition_root ATTACH PARTITION lifetime_partition_child FOR VALUES FROM (0) TO (10); ALTER TABLE lifetime_partition_child DISABLE TRIGGER lifetime_partition_hook; DROP FUNCTION lifetime_query(integer); CREATE FUNCTION lifetime_query(value integer) RETURNS integer LANGUAGE sql AS 'SELECT $1 + 3'; DROP POLICY lifetime_row_policy ON lifetime_saved_defaults; CREATE POLICY lifetime_row_policy ON lifetime_saved_defaults USING (false); DROP RULE lifetime_rewrite ON lifetime_saved_defaults; CREATE RULE lifetime_rewrite AS ON UPDATE TO lifetime_saved_defaults DO INSTEAD NOTHING", false);
                     after = privilege_partition_inventory(&mut engine, &mut session);
                     assert_ne!(before, after);
                     let mut observer = ConfiguredTransactionSession::new(&config, &mut budget)
@@ -2010,6 +2032,18 @@ fn catalog_lifetime_privileges_and_partition_triggers_keep_prepared_changes_priv
                     assert_eq!(
                         privilege_partition_inventory(&mut engine, &mut session),
                         if commit { after } else { before }
+                    );
+                    assert_eq!(
+                        data_rows(&session.success(
+                            &mut engine,
+                            CATALOG_LIFETIME_DEFINITION_BEHAVIOR,
+                            true
+                        )),
+                        if commit {
+                            ["8", "false", "O"]
+                        } else {
+                            ["7", "true", "O"]
+                        }
                     );
                 }
                 std::fs::remove_dir_all(&config.data_dir).unwrap();

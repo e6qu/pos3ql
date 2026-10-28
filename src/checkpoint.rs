@@ -1543,6 +1543,7 @@ impl Checkpointer {
             + core::mem::size_of::<FileGcProgress>()
             + core::mem::size_of::<Option<crate::store::ValueRosterWalk>>()
             + core::mem::size_of::<Option<u64>>()
+            + 2 * core::mem::size_of::<Option<SstVersionCursor>>()
             + 2 * SstWriter::budget_bytes()
             + ValueIndexWriter::budget_bytes()
             + table_bookkeeping

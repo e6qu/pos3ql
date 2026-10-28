@@ -1219,6 +1219,14 @@ pub(crate) struct SstVersionCursor {
     offset: usize,
     data_len: usize,
     loaded_ref: Option<DataBlockRef>,
+    chain: ChainReadProgress,
+}
+
+#[derive(Clone, Copy, Default)]
+struct ChainReadProgress {
+    key: Option<SstKey>,
+    chunk: usize,
+    written: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -1249,6 +1257,7 @@ impl SstVersionCursor {
             offset: 0,
             data_len: 0,
             loaded_ref: None,
+            chain: ChainReadProgress::default(),
         }
     }
 
@@ -1338,7 +1347,8 @@ impl SstVersionCursor {
     }
 
     /// Copies the exact scheduled version into `out` while walking forward.
-    /// `decoded` must remain unchanged between calls for this cursor.
+    /// `decoded` stays unchanged between calls. While a row waits, `assembly`
+    /// retains its completed fragments until that row finishes.
     #[expect(
         clippy::too_many_arguments,
         reason = "caller-owned fixed scratch makes cursor suspension allocation-free"
@@ -1370,27 +1380,30 @@ impl SstVersionCursor {
                     super::BlockError::Truncated,
                 )));
             };
-            self.offset += before - entries.bytes.len();
+            let next_offset = self.offset + before - entries.bytes.len();
             if entry.key < target {
+                self.offset = next_offset;
                 continue;
             }
             if entry.key > target {
                 return Ok(None);
             }
             if entry.tombstone {
+                self.offset = next_offset;
                 return Ok(Some(SstProbe {
                     key: entry.key,
                     len: None,
                 }));
             }
             if entry.is_chained() {
-                assemble_chain(store, &entry, assembly)?;
+                assemble_chain(store, &entry, assembly, &mut self.chain)?;
             } else {
                 if assembly.len() < entry.total_len {
                     return Err(SstError::Store(StoreError::BufferTooSmall));
                 }
                 assembly[..entry.total_len].copy_from_slice(entry.head);
             }
+            self.offset = next_offset;
             return Ok(Some(SstProbe {
                 key: entry.key,
                 len: Some(entry.total_len as u32),
@@ -2459,7 +2472,7 @@ impl<'a> SstReader<'a> {
                     }));
                 }
                 if entry.is_chained() {
-                    assemble_chain(store, &entry, into)?;
+                    assemble_chain(store, &entry, into, &mut ChainReadProgress::default())?;
                 } else {
                     if into.len() < entry.total_len {
                         return Err(SstError::Store(StoreError::BufferTooSmall));
@@ -2607,7 +2620,12 @@ impl<'a> SstReader<'a> {
                         if entry.tombstone {
                             emit(entry.key.rowid, None);
                         } else if entry.is_chained() {
-                            assemble_chain(store, &entry, self.assembly)?;
+                            assemble_chain(
+                                store,
+                                &entry,
+                                self.assembly,
+                                &mut ChainReadProgress::default(),
+                            )?;
                             chained = Some((entry.key.rowid, entry.total_len));
                             break;
                         } else {
@@ -3279,7 +3297,7 @@ pub(crate) fn copy_block_entry_at(
         return Err(SstError::Store(StoreError::BufferTooSmall));
     }
     if entry.is_chained() {
-        assemble_chain(store, &entry, out)?;
+        assemble_chain(store, &entry, out, &mut ChainReadProgress::default())?;
     } else {
         out.copy_from_slice(entry.head);
     }
@@ -3292,23 +3310,37 @@ fn assemble_chain(
     store: &mut dyn BlockStore,
     entry: &DataEntry<'_>,
     into: &mut [u8],
+    progress: &mut ChainReadProgress,
 ) -> Result<(), SstError> {
     if into.len() < entry.total_len {
         return Err(SstError::Store(StoreError::BufferTooSmall));
     }
-    into[..entry.head.len()].copy_from_slice(entry.head);
-    let mut at = entry.head.len();
-    for id_bytes in entry.chain.chunks(32) {
+    if progress.key != Some(entry.key) {
+        into[..entry.head.len()].copy_from_slice(entry.head);
+        *progress = ChainReadProgress {
+            key: Some(entry.key),
+            chunk: 0,
+            written: entry.head.len(),
+        };
+    }
+    for id_bytes in entry.chain.chunks_exact(32).skip(progress.chunk) {
         let mut id = [0u8; 32];
         id.copy_from_slice(id_bytes);
-        let (n, _) = store.get(&BlockId(id), &mut into[at..])?;
-        at += n;
+        let (n, kind) = store.get(&BlockId(id), &mut into[progress.written..entry.total_len])?;
+        if kind != BlockType::SstData || n == 0 {
+            return Err(SstError::Store(StoreError::Corrupt(
+                super::BlockError::Payload,
+            )));
+        }
+        progress.written += n;
+        progress.chunk += 1;
     }
-    if at != entry.total_len {
+    if progress.written != entry.total_len {
         return Err(SstError::Store(StoreError::Corrupt(
             super::BlockError::Truncated,
         )));
     }
+    *progress = ChainReadProgress::default();
     Ok(())
 }
 
@@ -3784,6 +3816,171 @@ mod tests {
             "schedule scan fetched PAX column extents: {} reads",
             store.reads() - before
         );
+    }
+
+    #[test]
+    fn checkpoint_reads_version_cursor_retains_each_waiting_overflow_fragment() {
+        struct WaitingOverflowStore {
+            inner: MemoryBlockStore,
+            pending: Option<BlockId>,
+            overflow_requests: usize,
+            wrong_type: bool,
+        }
+        impl BlockStore for WaitingOverflowStore {
+            fn put(
+                &mut self,
+                bytes: &[u8],
+                kind: BlockType,
+                lsn: u64,
+            ) -> Result<BlockId, StoreError> {
+                self.inner.put(bytes, kind, lsn)
+            }
+            fn get(
+                &mut self,
+                id: &BlockId,
+                into: &mut [u8],
+            ) -> Result<(usize, BlockType), StoreError> {
+                let block = self.inner.get(id, into)?;
+                if block.1 != BlockType::SstData {
+                    return Ok(block);
+                }
+                if self.wrong_type {
+                    return Ok((block.0, BlockType::SstIndexV2));
+                }
+                self.overflow_requests += 1;
+                if self.pending == Some(*id) {
+                    self.pending = None;
+                    Ok(block)
+                } else {
+                    self.pending = Some(*id);
+                    into[..block.0].fill(0xee);
+                    Err(StoreError::NotReady)
+                }
+            }
+        }
+        let (_budget, mut inner) = store();
+        let row: Vec<_> = (0..3 * MAX_PAYLOAD)
+            .map(|at| ((at / 997 + at) % 251) as u8)
+            .collect();
+        let mut writer = SstWriter::new();
+        let key = SstKey::at(1, 9);
+        writer.append_version(&mut inner, key, &row).unwrap();
+        let handle = writer.finish(&mut inner).unwrap().unwrap();
+        let mut store = WaitingOverflowStore {
+            inner,
+            pending: None,
+            overflow_requests: 0,
+            wrong_type: true,
+        };
+        let mut cursor = SstVersionCursor::new(handle);
+        let mut index = vec![0; MAX_PAYLOAD];
+        let mut raw = vec![0; MAX_PAYLOAD];
+        let mut decoded = vec![0; MAX_PAYLOAD];
+        let mut column = vec![0; MAX_PAYLOAD];
+        let mut out = vec![0; MAX_ASSEMBLED];
+        crate::mem::guard::forbid_alloc(|| {
+            assert_eq!(
+                cursor.copy_exact(
+                    &mut store,
+                    key,
+                    &mut index,
+                    &mut raw,
+                    &mut decoded,
+                    &mut column,
+                    &mut out,
+                ),
+                Err(SstError::Store(StoreError::Corrupt(
+                    super::super::BlockError::Payload
+                )))
+            );
+            store.wrong_type = false;
+            for attempt in 0..4 {
+                let result = cursor.copy_exact(
+                    &mut store,
+                    key,
+                    &mut index,
+                    &mut raw,
+                    &mut decoded,
+                    &mut column,
+                    &mut out,
+                );
+                if attempt < 3 {
+                    assert_eq!(result, Err(SstError::Store(StoreError::NotReady)));
+                } else {
+                    let probe = result.unwrap().unwrap();
+                    assert_eq!(probe.key, key);
+                    assert_eq!(probe.len, Some(row.len() as u32));
+                    assert_eq!(&out[..row.len()], row);
+                }
+            }
+            assert_eq!(
+                store.overflow_requests, 6,
+                "completed fragments must not be fetched again"
+            );
+        });
+    }
+
+    #[test]
+    fn checkpoint_reads_version_cursor_preserves_unmatched_and_unconsumed_rows() {
+        let (_budget, mut store) = store();
+        let mut writer = SstWriter::new();
+        writer
+            .append_version(&mut store, SstKey::at(1, 9), b"one")
+            .unwrap();
+        writer
+            .append_version(&mut store, SstKey::at(3, 9), b"three")
+            .unwrap();
+        let handle = writer.finish(&mut store).unwrap().unwrap();
+        let mut cursor = SstVersionCursor::new(handle);
+        let mut index = vec![0; MAX_PAYLOAD];
+        let mut raw = vec![0; MAX_PAYLOAD];
+        let mut decoded = vec![0; MAX_PAYLOAD];
+        let mut column = vec![0; MAX_PAYLOAD];
+        let mut out = vec![0; MAX_ASSEMBLED];
+        crate::mem::guard::forbid_alloc(|| {
+            assert!(
+                cursor
+                    .copy_exact(
+                        &mut store,
+                        SstKey::at(2, 9),
+                        &mut index,
+                        &mut raw,
+                        &mut decoded,
+                        &mut column,
+                        &mut out
+                    )
+                    .unwrap()
+                    .is_none()
+            );
+            let key = SstKey::at(3, 9);
+            assert_eq!(
+                cursor.copy_exact(
+                    &mut store,
+                    key,
+                    &mut index,
+                    &mut raw,
+                    &mut decoded,
+                    &mut column,
+                    &mut out[..2]
+                ),
+                Err(SstError::Store(StoreError::BufferTooSmall))
+            );
+            let probe = cursor
+                .copy_exact(
+                    &mut store,
+                    key,
+                    &mut index,
+                    &mut raw,
+                    &mut decoded,
+                    &mut column,
+                    &mut out,
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(probe.key, key);
+            assert_eq!(probe.len, Some(5));
+            assert_eq!(&out[..5], b"three");
+        });
     }
 
     #[test]

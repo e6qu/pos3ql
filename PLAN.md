@@ -46,6 +46,9 @@ A waiting schema edit must never attach itself to a new object that reused a nam
   without occupying the SQL worker. Save enough state to resume within the
   fixed memory budget, as journal and saved-file cleanup do for backup listings,
   retention manifests, file inventories and obsolete-object deletions.
+  Retain completed column and large-row fragments across waits, including with
+  disabled caches. Advance source positions and output checksums only after the
+  corresponding row or group finishes; retries must not skip or repeat data.
   Recovery can keep exclusive startup access; ordinary operation must allow
   unrelated work to progress.
 

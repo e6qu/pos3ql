@@ -1,0 +1,27 @@
+name: Checkpoint read validation
+on:
+  push:
+    branches: [resumable-checkpoint-reads]
+concurrency:
+  group: checkpoint-read-validation
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  readers:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: checkpoint-read-dependencies-${{ hashFiles('Cargo.lock') }}
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: >-
+          cargo test --lib --locked --features checkpoint-profile --
+          store::sst::tests:: checkpoint_budget maintenance_metadata_
+          --test-threads=1

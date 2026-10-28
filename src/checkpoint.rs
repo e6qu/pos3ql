@@ -3012,7 +3012,7 @@ impl Checkpointer {
         self.commit_publication.is_some()
     }
 
-    pub(crate) fn upload_slots(&self) -> usize {
+    pub(crate) fn background_io_slots(&self) -> usize {
         1 + self.uploads.slots()
             + self.block_uploads.slots()
             + self.manifest_uploads.slots()
@@ -3022,8 +3022,8 @@ impl Checkpointer {
                 .map_or(0, |uploads| uploads.slots())
     }
 
-    pub(crate) fn pending_upload_fd(&self, slot: usize) -> Option<std::os::fd::RawFd> {
-        if slot == self.upload_slots() - 1 {
+    pub(crate) fn pending_background_io_fd(&self, slot: usize) -> Option<std::os::fd::RawFd> {
+        if slot == self.background_io_slots() - 1 {
             return self.metadata_io.fd();
         }
         if slot < self.uploads.slots() {
@@ -3046,8 +3046,8 @@ impl Checkpointer {
         }
     }
 
-    pub(crate) fn pending_upload_wants_write(&self, slot: usize) -> bool {
-        if slot == self.upload_slots() - 1 {
+    pub(crate) fn pending_background_io_wants_write(&self, slot: usize) -> bool {
+        if slot == self.background_io_slots() - 1 {
             return self.metadata_io.wants_write();
         }
         if slot < self.uploads.slots() {
@@ -3071,7 +3071,7 @@ impl Checkpointer {
         }
     }
 
-    pub(crate) fn next_upload_deadline(&self) -> Option<std::time::Instant> {
+    pub(crate) fn next_background_io_deadline(&self) -> Option<std::time::Instant> {
         [
             self.metadata_io.deadline(),
             self.uploads.next_deadline(),
@@ -3101,7 +3101,7 @@ impl Checkpointer {
         .min()
     }
 
-    pub(crate) fn advance_background_uploads(&mut self, now: std::time::Instant) {
+    pub(crate) fn advance_background_io(&mut self, now: std::time::Instant) {
         self.metadata_io.advance(now);
         self.block_uploads.advance(now);
         self.manifest_uploads.advance(now);
@@ -19822,7 +19822,7 @@ mod stored_dependency_tests {
                         Instant::now() < deadline,
                         "credential validation did not finish"
                     );
-                    checkpoint.advance_background_uploads(Instant::now());
+                    checkpoint.advance_background_io(Instant::now());
                     match checkpoint.advance_credential_reload() {
                         Ok(CredentialReloadStep::Pending) => {
                             assert!(

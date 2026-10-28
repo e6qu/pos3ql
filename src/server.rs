@@ -129,7 +129,7 @@ pub struct Server {
     shutdown_read: i32,
     /// One registered socket per fixed durable-block GET slot.
     block_read_fds: FixedVec<Option<i32>>,
-    upload_fds: FixedVec<Option<i32>>,
+    background_io_fds: FixedVec<Option<i32>>,
     writer_probe_fd: Option<i32>,
     read_capacity_generation: u64,
     subscriptions: FixedVec<SubscriptionWorker>,
@@ -769,7 +769,7 @@ impl Server {
         usize::from(config.object_store_on && !config.operations_listen_addr.is_empty())
     }
 
-    fn upload_slots(config: &Config) -> usize {
+    fn background_io_slots(config: &Config) -> usize {
         if config.object_store_on {
             config
                 .object_store_put_slots
@@ -796,12 +796,12 @@ impl Server {
             config.operations_max_connections
         };
         let block_reads = Self::block_read_slots(config);
-        let uploads = Self::upload_slots(config);
+        let background_io = Self::background_io_slots(config);
         Reactor::budget_bytes(
             connections
                 + 2
                 + block_reads
-                + uploads
+                + background_io
                 + 2 * config.max_subscriptions
                 + usize::from(operations_connections != 0)
                 + operations_connections
@@ -815,7 +815,7 @@ impl Server {
                     + core::mem::size_of::<u32>()
                     + OPERATIONS_REQUEST_BYTES
                     + OPERATIONS_RESPONSE_BYTES)
-            + (block_reads + uploads) * core::mem::size_of::<Option<i32>>()
+            + (block_reads + background_io) * core::mem::size_of::<Option<i32>>()
             + Self::extra_budget_bytes(config)
     }
 
@@ -863,9 +863,9 @@ impl Server {
         };
 
         let block_read_slots = Self::block_read_slots(config);
-        let upload_slots = Self::upload_slots(config);
+        let background_io_slots = Self::background_io_slots(config);
         if block_read_slots
-            .saturating_add(upload_slots)
+            .saturating_add(background_io_slots)
             .saturating_add(config.max_subscriptions.saturating_mul(2))
             >= 999_998
         {
@@ -882,7 +882,7 @@ impl Server {
             max_conns
                 + 2
                 + block_read_slots
-                + upload_slots
+                + background_io_slots
                 + 2 * config.max_subscriptions
                 + usize::from(operations_listener.is_some())
                 + operations_connections
@@ -909,7 +909,8 @@ impl Server {
             QueryWorkspaceLeases::new(budget, config.query_workspace_slots, max_conns)?;
         let query_dispatches = QueryDispatchQueue::new(budget, config.query_workspace_slots)?;
         let mut block_read_fds = FixedVec::new(budget, "block_read_fds", block_read_slots)?;
-        let mut upload_fds = FixedVec::new(budget, "upload_fds", upload_slots)?;
+        let mut background_io_fds =
+            FixedVec::new(budget, "background_io_fds", background_io_slots)?;
         let mut subscriptions =
             FixedVec::new(budget, "subscription_workers", config.max_subscriptions)?;
         let mut operations_slots =
@@ -926,8 +927,10 @@ impl Server {
                 .push(None)
                 .expect("sized from object_store_get_slots");
         }
-        for _ in 0..upload_slots {
-            upload_fds.push(None).expect("configured upload slots");
+        for _ in 0..background_io_slots {
+            background_io_fds
+                .push(None)
+                .expect("configured background I/O slots");
         }
         for i in (0..max_conns as u32).rev() {
             slots
@@ -1147,7 +1150,7 @@ impl Server {
             tls_config,
             shutdown_read: pipe_fds[0],
             block_read_fds,
-            upload_fds,
+            background_io_fds,
             writer_probe_fd: None,
             read_capacity_generation: 0,
             subscriptions,
@@ -1290,7 +1293,7 @@ impl Server {
                     completed_block_read |= self.advance_block_io(slot)?;
                 } else if event.token == WRITER_PROBE_TOKEN {
                     // The owned control GET advances once after this event batch.
-                } else if self.upload_slot(event.token).is_some() {
+                } else if self.background_io_slot(event.token).is_some() {
                     // All upload slots advance together below, including slots
                     // whose connect or request send just became writable.
                 } else if let Some((subscription, sql)) = self.subscription_slot(event.token) {
@@ -1386,7 +1389,7 @@ impl Server {
             // Reconcile after it does so every pending read has reactor
             // interest before this loop can block again.
             self.sync_block_read_interest()?;
-            self.sync_upload_interest()?;
+            self.sync_background_io_interest()?;
             self.sync_writer_probe_interest()?;
             // Active checkpoint and compaction work advances even on an
             // idle server — a trigger must not wait for the next client
@@ -2002,12 +2005,15 @@ impl Server {
         Ok(())
     }
 
-    fn sync_upload_interest(&mut self) -> std::io::Result<()> {
-        assert_eq!(self.upload_fds.len(), self.engine.upload_slots());
-        for slot in 0..self.upload_fds.len() {
-            let wanted = self.engine.pending_upload_fd(slot);
+    fn sync_background_io_interest(&mut self) -> std::io::Result<()> {
+        assert_eq!(
+            self.background_io_fds.len(),
+            self.engine.background_io_slots()
+        );
+        for slot in 0..self.background_io_fds.len() {
+            let wanted = self.engine.pending_background_io_fd(slot);
             let token = BLOCK_IO_TOKEN - (self.block_read_fds.len() + slot) as u64;
-            match (self.upload_fds[slot], wanted) {
+            match (self.background_io_fds[slot], wanted) {
                 (Some(old), Some(fd)) if old == fd => {
                     self.reactor.register_read(fd, token)?;
                 }
@@ -2018,14 +2024,14 @@ impl Server {
                     if let Some(fd) = wanted {
                         self.reactor.register_read(fd, token)?;
                     }
-                    self.upload_fds[slot] = wanted;
+                    self.background_io_fds[slot] = wanted;
                 }
             }
             if let Some(fd) = wanted {
                 self.reactor.set_write_interest(
                     fd,
                     token,
-                    self.engine.pending_upload_wants_write(slot),
+                    self.engine.pending_background_io_wants_write(slot),
                 )?;
             }
         }
@@ -2060,10 +2066,10 @@ impl Server {
         Ok(())
     }
 
-    fn upload_slot(&self, token: u64) -> Option<usize> {
+    fn background_io_slot(&self, token: u64) -> Option<usize> {
         let offset = BLOCK_IO_TOKEN.checked_sub(token)? as usize;
         let slot = offset.checked_sub(self.block_read_fds.len())?;
-        (slot < self.upload_fds.len()).then_some(slot)
+        (slot < self.background_io_fds.len()).then_some(slot)
     }
 
     fn block_slot(&self, token: u64) -> Option<usize> {

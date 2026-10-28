@@ -25,7 +25,9 @@ jobs:
       - name: Metadata waits and retained cleanup positions
         run: >-
           cargo test --locked --lib -- maintenance_metadata_ cleanup_download_overlap_
+          object_store::http::tests::
           checkpoint_maintenance_capacities_ automatic_checkpoint_deletes_
           --test-threads=1
       - name: Warnings and ownership boundaries
+        if: always()
         run: cargo clippy --all-targets --locked -- -D warnings

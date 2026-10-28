@@ -93415,9 +93415,13 @@ fn maintenance_metadata_waits_leave_cached_sql_runnable_through_log_deletion() {
     let (mut engine, mut budget, mut config) =
         sliced_cleanup_fixture("metadata-cleanup-cached-orders", false);
     let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
-    while engine.storage.history_cleanup_pending() {
+    for _ in 0..64 {
+        if !engine.storage.history_cleanup_pending() {
+            break;
+        }
         assert!(!engine.checkpoint_beat().failed());
     }
+    assert!(!engine.storage.history_cleanup_pending());
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     config.object_store_on = true;
@@ -93450,13 +93454,32 @@ fn maintenance_metadata_waits_leave_cached_sql_runnable_through_log_deletion() {
             }
         }
         if stream.is_none() {
-            let (accepted, _) = listener.accept().unwrap();
+            let (accepted, _) = loop {
+                engine
+                    .advance_wal_publication(Instant::now(), CommitProgressMode::Reactor)
+                    .unwrap();
+                match listener.accept() {
+                    Ok(connection) => break connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "metadata request did not connect"
+                        );
+                        std::thread::yield_now();
+                    }
+                    Err(error) => panic!("accept metadata request: {error}"),
+                }
+            };
+            accepted.set_nonblocking(false).unwrap();
             accepted
                 .set_read_timeout(Some(Duration::from_secs(2)))
                 .unwrap();
             stream = Some(accepted);
         }
         let stream = stream.as_mut().unwrap();
+        engine
+            .advance_wal_publication(Instant::now(), CommitProgressMode::Reactor)
+            .unwrap();
         let mut request = Vec::new();
         while !request.ends_with(b"\r\n\r\n") {
             let mut byte = [0];
@@ -93465,17 +93488,25 @@ fn maintenance_metadata_waits_leave_cached_sql_runnable_through_log_deletion() {
         }
         assert!(request.starts_with(method.as_bytes()));
         for _ in 0..3 {
-            assert_eq!(
-                crate::mem::guard::forbid_alloc(|| engine.checkpoint_beat()),
-                CheckpointBeat::WaitingForReads
-            );
-            assert!(!engine.checkpoint_can_progress());
             let output = session.success(
                 &mut engine,
                 "SELECT count(*) = 80 AND min(id) = 1 AND max(id) = 80 FROM cleanup_orders",
                 true,
             );
             assert_eq!(data_rows(&output), ["t"]);
+            // Releasing a statement reader may queue CPU-only history cleanup.
+            // It must finish in bounded turns without polling the held socket.
+            for _ in 0..64 {
+                assert!(!engine.ckpt.as_ref().unwrap().metadata_io_ready());
+                let history = engine.storage.history_cleanup_pending();
+                let beat = crate::mem::guard::forbid_alloc(|| engine.checkpoint_beat());
+                if beat == CheckpointBeat::WaitingForReads {
+                    break;
+                }
+                assert_eq!(beat, CheckpointBeat::Advanced);
+                assert!(history, "only local reader-history work may advance here");
+            }
+            assert!(!engine.checkpoint_can_progress());
         }
         write!(
             stream,
@@ -94065,6 +94096,7 @@ fn check_cleanup_during_download(
     listener.set_nonblocking(true).unwrap();
     let deadline = Instant::now() + Duration::from_secs(2);
     let (mut stream, _) = loop {
+        engine.advance_pending_block_read(0).unwrap();
         match listener.accept() {
             Ok(connection) => break connection,
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -94074,6 +94106,8 @@ fn check_cleanup_during_download(
             Err(error) => panic!("accept GET: {error}"),
         }
     };
+    stream.set_nonblocking(false).unwrap();
+    engine.advance_pending_block_read(0).unwrap();
     stream
         .set_read_timeout(Some(Duration::from_secs(2)))
         .unwrap();
@@ -98044,6 +98078,7 @@ fn atomic_block_reads_function_and_sequence_effects_survive_cold_http_reads_once
                     }
                     Err(error) => panic!("accept object read: {error}"),
                 };
+                stream.set_nonblocking(false).unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(2)))
                     .unwrap();

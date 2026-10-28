@@ -17,8 +17,8 @@ use crate::crypto::sha256::{HexDigest, sha256};
 use crate::mem::budget::{Budget, BudgetError};
 use crate::mem::buffer::FixedBuf;
 use crate::object_store::{
-    ByteRange, Credentials, EntityTag, Error, GetResult, ListCursor, MAX_OBJECT_KEY_BYTES,
-    Precondition,
+    ByteRange, Credentials, EntityTag, Error, GetResult, ListCursor,
+    MAX_LIST_PAGE_KEYS as LIST_MAX_KEYS, MAX_OBJECT_KEY_BYTES, Precondition,
 };
 use crate::stack_format;
 use crate::util::StackStr;
@@ -28,7 +28,6 @@ use super::signature_v4::{SigningInput, format_timestamp, sign, signed_headers, 
 type S3Error = Error;
 
 const MAX_ATTEMPTS: u32 = 3;
-const LIST_MAX_KEYS: usize = 1000;
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
 const EMPTY_SHA256_HEX: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 

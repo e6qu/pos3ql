@@ -178,6 +178,7 @@ fn parse_credentials_file(text: &str) -> Result<Credentials, &'static str> {
 /// S3 object keys are at most 1,024 bytes. Both concrete clients enforce the
 /// same provider-neutral boundary before issuing or simulating an operation.
 pub(crate) const MAX_OBJECT_KEY_BYTES: usize = 1024;
+pub(crate) const MAX_LIST_PAGE_KEYS: usize = 1000;
 
 /// The next page retains both the opaque provider token and the ordering check.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -575,6 +576,9 @@ impl Client {
         limit: usize,
         mut each: impl FnMut(&str),
     ) -> Result<Option<ListCursor>, Error> {
+        if !(1..=MAX_LIST_PAGE_KEYS).contains(&limit) {
+            return Err(Error::Protocol("invalid list page key count"));
+        }
         match self {
             Self::S3(client) => client.list_page(prefix, cursor, limit, each),
             Self::Simulator(client) => {

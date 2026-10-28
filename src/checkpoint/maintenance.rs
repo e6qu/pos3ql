@@ -28,213 +28,6 @@ enum Operation {
     },
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::io::{Read, Write};
-    use std::net::{TcpListener, TcpStream};
-
-    fn network() -> (MetadataIo, TcpListener) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let mut config = Config::default_dev();
-        config.object_store_on = true;
-        config.object_store_sim = false;
-        config.object_store_endpoint = listener.local_addr().unwrap().to_string();
-        config.object_store_bucket = "maintenance-network".to_owned();
-        config.object_store_prefix = "db space/".to_owned();
-        config.object_store_access_key = "test-access".to_owned();
-        config.object_store_secret_key = "test-secret".to_owned();
-        let mut budget = Budget::new(MetadataIo::budget_bytes(&config));
-        let io = MetadataIo::new(&config, &mut budget).unwrap();
-        assert_eq!(budget.remaining(), 0);
-        (io, listener)
-    }
-
-    fn accept(io: &mut MetadataIo, listener: &TcpListener) -> (TcpStream, String) {
-        let deadline = Instant::now() + Duration::from_secs(2);
-        let (mut stream, _) = loop {
-            io.advance(Instant::now());
-            match listener.accept() {
-                Ok(connection) => break connection,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    assert!(
-                        Instant::now() < deadline,
-                        "metadata request did not connect"
-                    );
-                    std::thread::yield_now();
-                }
-                Err(error) => panic!("accept metadata request: {error}"),
-            }
-        };
-        stream
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
-        let mut bytes = Vec::new();
-        while !bytes.ends_with(b"\r\n\r\n") {
-            let mut byte = [0];
-            stream.read_exact(&mut byte).unwrap();
-            bytes.push(byte[0]);
-            assert!(bytes.len() <= 8192);
-        }
-        (stream, String::from_utf8(bytes).unwrap())
-    }
-
-    fn finish(io: &mut MetadataIo) {
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while !io.ready() {
-            crate::mem::guard::forbid_alloc(|| io.advance(Instant::now()));
-            assert!(
-                Instant::now() < deadline,
-                "metadata response did not finish"
-            );
-            std::thread::yield_now();
-        }
-    }
-
-    #[test]
-    fn maintenance_metadata_waits_retain_requests_pages_and_idempotent_deletes() {
-        let (mut io, listener) = network();
-        let mut observed = Vec::new();
-        assert!(
-            crate::mem::guard::forbid_alloc(
-                || io.list("commits/", ListCursor::START, |_| panic!("unfinished page"))
-            )
-            .unwrap()
-            .is_pending()
-        );
-        let (mut stream, request) = accept(&mut io, &listener);
-        assert!(request.starts_with("GET /maintenance-network?encoding-type=url&list-type=2&max-keys=64&prefix=db%20space%2Fcommits%2F HTTP/1.1"));
-        assert!(!io.ready());
-        assert!(io.busy());
-        assert!(io.fd().is_some());
-        let wrong = io.get("commits/wrong.head").unwrap_err();
-        assert_eq!(wrong.sqlstate, sqlstate::INTERNAL_ERROR);
-        assert!(!io.ready());
-        let body = "<ListBucketResult><IsTruncated>true</IsTruncated><NextContinuationToken>page&amp;two</NextContinuationToken><Contents><Key>db%20space%2Fcommits%2Fa.head</Key></Contents></ListBucketResult>";
-        write!(
-            stream,
-            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n{}",
-            body.len(),
-            &body[..30]
-        )
-        .unwrap();
-        crate::mem::guard::forbid_alloc(|| io.advance(Instant::now()));
-        assert!(!io.ready());
-        assert!(
-            io.list("commits/", ListCursor::START, |_| panic!("partial page"))
-                .unwrap()
-                .is_pending()
-        );
-        stream.write_all(body[30..].as_bytes()).unwrap();
-        finish(&mut io);
-        let Poll::Ready(Some(cursor)) = io
-            .list("commits/", ListCursor::START, |key| {
-                observed.push(key.to_owned())
-            })
-            .unwrap()
-        else {
-            panic!("completed page");
-        };
-        assert_eq!(observed, ["commits/a.head"]);
-        assert_eq!(cursor.token.unwrap().as_str(), "page&two");
-        assert_eq!(cursor.after.as_str(), "commits/a.head");
-        assert!(!io.busy());
-        assert!(
-            io.list("commits/", cursor, |_| panic!("unfinished second page"))
-                .unwrap()
-                .is_pending()
-        );
-        let mut request = Vec::new();
-        while !request.ends_with(b"\r\n\r\n") {
-            io.advance(Instant::now());
-            let mut byte = [0];
-            stream.read_exact(&mut byte).unwrap();
-            request.push(byte[0]);
-        }
-        assert!(
-            String::from_utf8(request)
-                .unwrap()
-                .contains("continuation-token=page%26two&")
-        );
-        let body = "<ListBucketResult><IsTruncated>false</IsTruncated><Contents><Key>db%20space%2Fcommits%2Fb.batch</Key></Contents></ListBucketResult>";
-        write!(
-            stream,
-            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n{body}",
-            body.len()
-        )
-        .unwrap();
-        finish(&mut io);
-        let mut count = 0;
-        assert_eq!(
-            crate::mem::guard::forbid_alloc(|| io.list("commits/", cursor, |key| {
-                assert_eq!(key, "commits/b.batch");
-                count += 1;
-            }))
-            .unwrap(),
-            Poll::Ready(None)
-        );
-        assert_eq!(count, 1);
-        assert!(io.delete("commits/b.batch").unwrap().is_pending());
-        let mut request = Vec::new();
-        while !request.ends_with(b"\r\n\r\n") {
-            io.advance(Instant::now());
-            let mut byte = [0];
-            stream.read_exact(&mut byte).unwrap();
-            request.push(byte[0]);
-        }
-        assert!(request.starts_with(b"DELETE /maintenance-network/db%20space/commits/b.batch "));
-        let missing = "<Error><Code>NoSuchKey</Code></Error>";
-        write!(
-            stream,
-            "HTTP/1.1 404 Not Found\r\ncontent-length: {}\r\n\r\n{missing}",
-            missing.len()
-        )
-        .unwrap();
-        finish(&mut io);
-        assert_eq!(
-            crate::mem::guard::forbid_alloc(|| io.delete("commits/b.batch")).unwrap(),
-            Poll::Ready(())
-        );
-        assert!(!io.busy());
-    }
-
-    #[test]
-    fn maintenance_metadata_deadlines_and_credential_drain_release_owned_requests() {
-        let (mut io, listener) = network();
-        assert!(io.get("backups/saved/manifest").unwrap().is_pending());
-        let (_stream, request) = accept(&mut io, &listener);
-        assert!(request.starts_with("GET /maintenance-network/db%20space/backups/saved/manifest "));
-        let deadline = io.deadline().unwrap();
-        crate::mem::guard::forbid_alloc(|| io.advance(deadline));
-        assert!(io.ready());
-        assert!(io.fd().is_none());
-        let error = io.get("backups/saved/manifest").unwrap_err();
-        assert_eq!(error.sqlstate, sqlstate::IO_ERROR);
-        assert!(!io.busy());
-        assert!(io.get("backups/saved/manifest").unwrap().is_pending());
-        let (mut stream, _) = accept(&mut io, &listener);
-        stream
-            .write_all(b"HTTP/1.1 200 OK\r\netag: \"manifest\"\r\ncontent-length: 5\r\n\r\nsaved")
-            .unwrap();
-        finish(&mut io);
-        crate::mem::guard::forbid_alloc(|| {
-            let Poll::Ready(bytes) = io.get("backups/saved/manifest").unwrap() else {
-                panic!("GET complete");
-            };
-            assert_eq!(bytes, b"saved");
-            io.set_admission(crate::object_store::RequestAdmission::Draining);
-            assert!(io.get("backups/other/manifest").unwrap().is_pending());
-            assert!(!io.busy());
-            io.replace_credentials(Credentials::new("replacement", "secret", "").unwrap());
-            io.set_admission(crate::object_store::RequestAdmission::Open);
-            assert!(io.delete("commits/old.batch").unwrap().is_pending());
-            io.cancel();
-            assert!(!io.busy());
-        });
-    }
-}
-
 #[allow(
     clippy::large_enum_variant,
     reason = "completed page cursor stays in fixed request state"
@@ -478,5 +271,214 @@ impl MetadataIo {
             "maintenance retains its signed request through consumption"
         );
         self.client.replace_credentials(credentials);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+
+    fn network() -> (MetadataIo, TcpListener) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let mut config = Config::default_dev();
+        config.object_store_on = true;
+        config.object_store_sim = false;
+        config.object_store_endpoint = listener.local_addr().unwrap().to_string();
+        config.object_store_bucket = "maintenance-network".to_owned();
+        config.object_store_prefix = "db space/".to_owned();
+        config.object_store_access_key = "test-access".to_owned();
+        config.object_store_secret_key = "test-secret".to_owned();
+        let mut budget = Budget::new(MetadataIo::budget_bytes(&config));
+        let io = MetadataIo::new(&config, &mut budget).unwrap();
+        assert_eq!(budget.remaining(), 0);
+        (io, listener)
+    }
+
+    fn accept(io: &mut MetadataIo, listener: &TcpListener) -> (TcpStream, String) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let (mut stream, _) = loop {
+            io.advance(Instant::now());
+            match listener.accept() {
+                Ok(connection) => break connection,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "metadata request did not connect"
+                    );
+                    std::thread::yield_now();
+                }
+                Err(error) => panic!("accept metadata request: {error}"),
+            }
+        };
+        stream.set_nonblocking(false).unwrap();
+        io.advance(Instant::now());
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut bytes = Vec::new();
+        while !bytes.ends_with(b"\r\n\r\n") {
+            let mut byte = [0];
+            stream.read_exact(&mut byte).unwrap();
+            bytes.push(byte[0]);
+            assert!(bytes.len() <= 8192);
+        }
+        (stream, String::from_utf8(bytes).unwrap())
+    }
+
+    fn finish(io: &mut MetadataIo) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !io.ready() {
+            crate::mem::guard::forbid_alloc(|| io.advance(Instant::now()));
+            assert!(
+                Instant::now() < deadline,
+                "metadata response did not finish"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn maintenance_metadata_waits_retain_requests_pages_and_idempotent_deletes() {
+        let (mut io, listener) = network();
+        let mut observed = Vec::new();
+        assert!(
+            crate::mem::guard::forbid_alloc(
+                || io.list("commits/", ListCursor::START, |_| panic!("unfinished page"))
+            )
+            .unwrap()
+            .is_pending()
+        );
+        let (mut stream, request) = accept(&mut io, &listener);
+        assert!(request.starts_with("GET /maintenance-network?encoding-type=url&list-type=2&max-keys=64&prefix=db%20space%2Fcommits%2F HTTP/1.1"));
+        assert!(!io.ready());
+        assert!(io.busy());
+        assert!(io.fd().is_some());
+        let wrong = io.get("commits/wrong.head").unwrap_err();
+        assert_eq!(wrong.sqlstate, sqlstate::INTERNAL_ERROR);
+        assert!(!io.ready());
+        let body = "<ListBucketResult><IsTruncated>true</IsTruncated><NextContinuationToken>page&amp;two</NextContinuationToken><Contents><Key>db%20space%2Fcommits%2Fa.head</Key></Contents></ListBucketResult>";
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n{}",
+            body.len(),
+            &body[..30]
+        )
+        .unwrap();
+        crate::mem::guard::forbid_alloc(|| io.advance(Instant::now()));
+        assert!(!io.ready());
+        assert!(
+            io.list("commits/", ListCursor::START, |_| panic!("partial page"))
+                .unwrap()
+                .is_pending()
+        );
+        stream.write_all(&body.as_bytes()[30..]).unwrap();
+        finish(&mut io);
+        let Poll::Ready(Some(cursor)) = io
+            .list("commits/", ListCursor::START, |key| {
+                observed.push(key.to_owned())
+            })
+            .unwrap()
+        else {
+            panic!("completed page");
+        };
+        assert_eq!(observed, ["commits/a.head"]);
+        assert_eq!(cursor.token.unwrap().as_str(), "page&two");
+        assert_eq!(cursor.after.as_str(), "commits/a.head");
+        assert!(!io.busy());
+        assert!(
+            io.list("commits/", cursor, |_| panic!("unfinished second page"))
+                .unwrap()
+                .is_pending()
+        );
+        let mut request = Vec::new();
+        while !request.ends_with(b"\r\n\r\n") {
+            io.advance(Instant::now());
+            let mut byte = [0];
+            stream.read_exact(&mut byte).unwrap();
+            request.push(byte[0]);
+        }
+        assert!(
+            String::from_utf8(request)
+                .unwrap()
+                .contains("continuation-token=page%26two&")
+        );
+        let body = "<ListBucketResult><IsTruncated>false</IsTruncated><Contents><Key>db%20space%2Fcommits%2Fb.batch</Key></Contents></ListBucketResult>";
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        finish(&mut io);
+        let mut count = 0;
+        assert_eq!(
+            crate::mem::guard::forbid_alloc(|| io.list("commits/", cursor, |key| {
+                assert_eq!(key, "commits/b.batch");
+                count += 1;
+            }))
+            .unwrap(),
+            Poll::Ready(None)
+        );
+        assert_eq!(count, 1);
+        assert!(io.delete("commits/b.batch").unwrap().is_pending());
+        let mut request = Vec::new();
+        while !request.ends_with(b"\r\n\r\n") {
+            io.advance(Instant::now());
+            let mut byte = [0];
+            stream.read_exact(&mut byte).unwrap();
+            request.push(byte[0]);
+        }
+        assert!(request.starts_with(b"DELETE /maintenance-network/db%20space/commits/b.batch "));
+        let missing = "<Error><Code>NoSuchKey</Code></Error>";
+        write!(
+            stream,
+            "HTTP/1.1 404 Not Found\r\ncontent-length: {}\r\n\r\n{missing}",
+            missing.len()
+        )
+        .unwrap();
+        finish(&mut io);
+        assert_eq!(
+            crate::mem::guard::forbid_alloc(|| io.delete("commits/b.batch")).unwrap(),
+            Poll::Ready(())
+        );
+        assert!(!io.busy());
+    }
+
+    #[test]
+    fn maintenance_metadata_deadlines_and_credential_drain_release_owned_requests() {
+        let (mut io, listener) = network();
+        assert!(io.get("backups/saved/manifest").unwrap().is_pending());
+        let (_stream, request) = accept(&mut io, &listener);
+        assert!(request.starts_with("GET /maintenance-network/db%20space/backups/saved/manifest "));
+        let deadline = io.deadline().unwrap();
+        crate::mem::guard::forbid_alloc(|| io.advance(deadline));
+        assert!(io.ready());
+        assert!(io.fd().is_none());
+        let error = io.get("backups/saved/manifest").unwrap_err();
+        assert_eq!(error.sqlstate, sqlstate::IO_ERROR);
+        assert!(!io.busy());
+        assert!(io.get("backups/saved/manifest").unwrap().is_pending());
+        let (mut stream, _) = accept(&mut io, &listener);
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\netag: \"manifest\"\r\ncontent-length: 5\r\n\r\nsaved")
+            .unwrap();
+        finish(&mut io);
+        crate::mem::guard::forbid_alloc(|| {
+            let Poll::Ready(bytes) = io.get("backups/saved/manifest").unwrap() else {
+                panic!("GET complete");
+            };
+            assert_eq!(bytes, b"saved");
+            io.set_admission(crate::object_store::RequestAdmission::Draining);
+            assert!(io.get("backups/other/manifest").unwrap().is_pending());
+            assert!(!io.busy());
+            io.replace_credentials(Credentials::new("replacement", "secret", "").unwrap());
+            io.set_admission(crate::object_store::RequestAdmission::Open);
+            assert!(io.delete("commits/old.batch").unwrap().is_pending());
+            io.cancel();
+            assert!(!io.busy());
+        });
     }
 }

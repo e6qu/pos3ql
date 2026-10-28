@@ -8151,7 +8151,7 @@ impl Engine {
     ) -> Result<bool, SqlError> {
         self.check_publication_health()?;
         if let Some(checkpointer) = self.ckpt.as_mut() {
-            checkpointer.advance_background_uploads(now);
+            checkpointer.advance_background_io(now);
         }
         self.wal.commit();
         if !self.wal_upload {
@@ -8240,20 +8240,22 @@ impl Engine {
         }
     }
 
-    pub(crate) fn upload_slots(&self) -> usize {
-        self.ckpt.as_ref().map_or(0, Checkpointer::upload_slots)
-    }
-
-    pub(crate) fn pending_upload_fd(&self, slot: usize) -> Option<std::os::fd::RawFd> {
+    pub(crate) fn background_io_slots(&self) -> usize {
         self.ckpt
             .as_ref()
-            .and_then(|checkpointer| checkpointer.pending_upload_fd(slot))
+            .map_or(0, Checkpointer::background_io_slots)
     }
 
-    pub(crate) fn pending_upload_wants_write(&self, slot: usize) -> bool {
+    pub(crate) fn pending_background_io_fd(&self, slot: usize) -> Option<std::os::fd::RawFd> {
         self.ckpt
             .as_ref()
-            .is_some_and(|checkpointer| checkpointer.pending_upload_wants_write(slot))
+            .and_then(|checkpointer| checkpointer.pending_background_io_fd(slot))
+    }
+
+    pub(crate) fn pending_background_io_wants_write(&self, slot: usize) -> bool {
+        self.ckpt
+            .as_ref()
+            .is_some_and(|checkpointer| checkpointer.pending_background_io_wants_write(slot))
     }
 
     pub(crate) fn next_publication_deadline(&self) -> Option<std::time::Instant> {
@@ -8274,7 +8276,7 @@ impl Engine {
             journal,
             self.ckpt
                 .as_ref()
-                .and_then(Checkpointer::next_upload_deadline),
+                .and_then(Checkpointer::next_background_io_deadline),
         ]
         .into_iter()
         .flatten()

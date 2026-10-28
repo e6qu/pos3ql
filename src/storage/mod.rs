@@ -14,6 +14,8 @@ mod catalog_identities;
 mod catalog_sources;
 pub(crate) use catalog_identities::{CatalogCreation, CatalogIdentity};
 mod default_acls;
+mod partition_triggers;
+pub(crate) use partition_triggers::{PartitionTriggerImage, PartitionTriggerState};
 mod parameter_acls;
 use parameter_acls::ParameterAclGrantIdentity;
 use parameter_acls::ParameterAclRows;
@@ -6659,13 +6661,7 @@ pub(crate) const FIRST_EXPLICIT_INDEX_OID: i32 = 300_000_000;
 pub(crate) const FIRST_PARTITION_TRIGGER_OID: i32 = 1_000_000_000;
 pub(crate) const TRIGGER_CONSTRAINT_OID_OFFSET: i32 = 500_000;
 pub(crate) const MAX_INDEX_OID_GENERATION: u64 = relation_identities::MAX_RELATION_GENERATION;
-// Reserve complete table-slot strides and the derived constraint OID at the
-// top of the signed OID space. Validate before installation, not catalog reads.
-pub(crate) const MAX_TRIGGER_OID_GENERATION: u64 = (i32::MAX as u64
-    - FIRST_PARTITION_TRIGGER_OID as u64
-    - TRIGGER_CONSTRAINT_OID_OFFSET as u64
-    - (MAX_TABLE_CATALOG_SLOTS as u64 - 1))
-    / MAX_TABLE_CATALOG_SLOTS as u64;
+pub(crate) const MAX_TRIGGER_OID_GENERATION: u64 = MAX_CATALOG_CREATION;
 
 fn bounded_catalog_generation(value: u64, maximum: u64, object: &str) -> Result<u64, SqlError> {
     if value == 0 || value > maximum {
@@ -9366,38 +9362,6 @@ pub(crate) enum TriggerEnabled {
     Replica,
     Always,
     Disabled,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct PendingPartitionTriggerState {
-    txid: u32,
-    enabled: TriggerEnabled,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct PartitionTriggerState {
-    trigger: u16,
-    table: u16,
-    enabled: TriggerEnabled,
-    present: bool,
-    pending: Option<PendingPartitionTriggerState>,
-}
-
-impl PartitionTriggerState {
-    const EMPTY: Self = Self {
-        trigger: u16::MAX,
-        table: u16::MAX,
-        enabled: TriggerEnabled::Origin,
-        present: false,
-        pending: None,
-    };
-
-    fn enabled_to(self, txid: u32) -> Option<TriggerEnabled> {
-        self.pending
-            .filter(|pending| pending.txid == txid)
-            .map(|pending| pending.enabled)
-            .or(self.present.then_some(self.enabled))
-    }
 }
 
 impl TriggerEnabled {
@@ -22650,6 +22614,8 @@ impl Storage {
                 trigger_catalog.definitions[target_slot] = definition;
             }
 
+            self.copy_partition_trigger_images(source, txid)?;
+
             let extended_statistics_capacity = self.extended_statistics_count();
             for source_slot in 0..extended_statistics_capacity {
                 let mut definition = self.extended_statistics(source_slot);
@@ -23410,7 +23376,11 @@ impl Storage {
                 if catalog.definitions[slot].database == database {
                     catalog.definitions[slot] = TriggerDef::EMPTY;
                     for state in catalog.partition_states.iter_mut() {
-                        if usize::from(state.trigger) == slot {
+                        if state
+                            .committed
+                            .or_else(|| state.pending.and_then(|pending| pending.image))
+                            .is_some_and(|image| image.trigger.slot() == slot)
+                        {
                             *state = PartitionTriggerState::EMPTY;
                         }
                     }
@@ -44624,157 +44594,6 @@ impl Storage {
             })
     }
 
-    pub(crate) fn partition_trigger_enabled_to(
-        &self,
-        trigger: usize,
-        table: usize,
-        txid: u32,
-    ) -> TriggerEnabled {
-        let override_enabled = self
-            .trigger_catalog
-            .lock()
-            .expect("trigger catalog lock poisoned")
-            .partition_states
-            .iter()
-            .find(|state| state.trigger as usize == trigger && state.table as usize == table)
-            .and_then(|state| state.enabled_to(txid));
-        override_enabled.unwrap_or_else(|| self.trigger_to(trigger, txid).enabled_to(txid))
-    }
-
-    pub(crate) fn stage_partition_trigger_enabled(
-        &mut self,
-        trigger: usize,
-        table: usize,
-        enabled: TriggerEnabled,
-        txid: u32,
-    ) -> Result<Option<(usize, PartitionTriggerState)>, SqlError> {
-        let mut catalog = self
-            .trigger_catalog
-            .lock()
-            .expect("trigger catalog lock poisoned");
-        let existing = catalog.partition_states.iter().position(|state| {
-            state.trigger as usize == trigger
-                && state.table as usize == table
-                && (state.present || state.pending.is_some())
-        });
-        let slot = existing.or_else(|| {
-            catalog
-                .partition_states
-                .iter()
-                .position(|state| !state.present && state.pending.is_none())
-        });
-        let Some(slot) = slot else {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "partition trigger state exceeds the startup catalog capacity"
-            ));
-        };
-        let prior = catalog.partition_states[slot];
-        if let Some(pending) = prior.pending
-            && pending.txid != txid
-        {
-            return Err(self.catalog_ddl_wait_error(
-                txid,
-                pending.txid,
-                catalog.definitions[trigger].name.as_str(),
-            ));
-        }
-        if prior.enabled_to(txid) == Some(enabled) {
-            return Ok(None);
-        }
-        catalog.partition_states[slot] = PartitionTriggerState {
-            trigger: trigger as u16,
-            table: table as u16,
-            enabled: prior.enabled,
-            present: prior.present,
-            pending: Some(PendingPartitionTriggerState { txid, enabled }),
-        };
-        Ok(Some((slot, prior)))
-    }
-
-    pub(crate) fn commit_partition_trigger_state(&mut self, slot: usize, txid: u32) {
-        let mut catalog = self
-            .trigger_catalog
-            .lock()
-            .expect("trigger catalog lock poisoned");
-        let state = &mut catalog.partition_states[slot];
-        if let Some(pending) = state.pending
-            && pending.txid == txid
-        {
-            state.enabled = pending.enabled;
-            state.present = true;
-            state.pending = None;
-        }
-    }
-
-    pub(crate) fn rollback_partition_trigger_state(
-        &mut self,
-        slot: usize,
-        prior: PartitionTriggerState,
-    ) {
-        self.trigger_catalog
-            .lock()
-            .expect("trigger catalog lock poisoned")
-            .partition_states[slot] = prior;
-    }
-
-    pub(crate) fn restore_partition_trigger_state(
-        &mut self,
-        trigger: usize,
-        table: usize,
-        enabled: TriggerEnabled,
-    ) -> Result<(), SqlError> {
-        let mut catalog = self
-            .trigger_catalog
-            .lock()
-            .expect("trigger catalog lock poisoned");
-        if catalog.partition_states.iter().any(|state| {
-            state.present && state.trigger as usize == trigger && state.table as usize == table
-        }) {
-            return Err(sql_err!(
-                sqlstate::DUPLICATE_OBJECT,
-                "duplicate partition trigger state in checkpoint"
-            ));
-        }
-        let Some(slot) = catalog
-            .partition_states
-            .iter()
-            .position(|state| !state.present && state.pending.is_none())
-        else {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "too many partition trigger states in checkpoint"
-            ));
-        };
-        catalog.partition_states[slot] = PartitionTriggerState {
-            trigger: trigger as u16,
-            table: table as u16,
-            enabled,
-            present: true,
-            pending: None,
-        };
-        Ok(())
-    }
-
-    pub(crate) fn partition_trigger_states(
-        &self,
-    ) -> impl Iterator<Item = (usize, usize, TriggerEnabled)> + '_ {
-        PartitionTriggerStateIter {
-            catalog: &self.trigger_catalog,
-            next_slot: 0,
-        }
-        .filter_map(|state| {
-            (state.present
-                && self.table_def(usize::from(state.table), 0).persistence
-                    != RelationPersistence::Temporary)
-                .then_some((
-                    usize::from(state.trigger),
-                    usize::from(state.table),
-                    state.enabled,
-                ))
-        })
-    }
-
     pub(crate) const fn trigger_access_object(slot: usize) -> AccessObject {
         AccessObject {
             class: AccessClass::Trigger,
@@ -45208,11 +45027,6 @@ impl Storage {
             .lock()
             .expect("trigger catalog lock poisoned");
         catalog.definitions[slot] = TriggerDef::EMPTY;
-        for state in catalog.partition_states.iter_mut() {
-            if usize::from(state.trigger) == slot {
-                *state = PartitionTriggerState::EMPTY;
-            }
-        }
     }
 
     fn clear_trigger_dependents(&self, slot: usize, trigger: TriggerDef) {
@@ -59340,13 +59154,18 @@ mod tests {
                         ddl_state: CatalogDdlState::Present,
                         ..TriggerDef::EMPTY
                     };
-                    catalog.partition_states[worker] = PartitionTriggerState {
-                        trigger: worker as u16,
-                        table: worker as u16,
-                        enabled: TriggerEnabled::Replica,
-                        present: true,
-                        pending: None,
-                    };
+                    catalog.partition_states
+                        [storage.partition_trigger_state_slot(worker, worker)] =
+                        PartitionTriggerState {
+                            database: current_database(),
+                            committed: Some(PartitionTriggerImage {
+                                creation: CatalogIdentity::require(worker as u64 + 10).unwrap(),
+                                trigger: CatalogPosition::new(worker, worker as u64 + 1).unwrap(),
+                                table: CatalogPosition::new(worker, worker as u64 + 1).unwrap(),
+                                enabled: TriggerEnabled::Replica,
+                            }),
+                            pending: None,
+                        };
                 });
             }
         });
@@ -59411,6 +59230,10 @@ mod tests {
         storage.commit_trigger_drop(0);
         assert_eq!(storage.trigger(0).created_at, 0);
         assert_eq!(storage.trigger(0).ddl_state, CatalogDdlState::Absent);
+        let image = storage.partition_trigger_image_to(0, 0, 0).unwrap();
+        storage
+            .install_partition_trigger_image(Some(image), None, 0)
+            .unwrap();
         assert_eq!(storage.partition_trigger_states().count(), WORKERS - 1);
     }
 

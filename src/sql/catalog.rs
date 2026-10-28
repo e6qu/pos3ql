@@ -13474,7 +13474,7 @@ pub fn trigger_def_text<'a>(
         for child in 0..storage.table_count() {
             if storage.table_slot_visible_to(child, txid)
                 && storage.partition_descends_from(child, usize::from(parent), txid)
-                && partition_trigger_oid(&trigger, child)? == oid
+                && storage.partition_trigger_oid_to(&trigger, child, txid)? == oid
             {
                 found = Some((trigger, crate::storage::TriggerTarget::Table(child as u16)));
                 break;
@@ -20609,7 +20609,7 @@ fn pg_constraint_values<'a>(
             let mut clone = [Datum::Null; 29];
             clone.copy_from_slice(out[root_row]);
             clone[0] = Datum::Int4(
-                partition_trigger_oid(&trigger, child)?
+                storage.partition_trigger_oid_to(&trigger, child, txid)?
                     + crate::storage::TRIGGER_CONSTRAINT_OID_OFFSET,
             );
             clone[2] = Datum::Int4(user_table_oid(storage, child));
@@ -21909,7 +21909,7 @@ fn pg_depend<'a>(
             {
                 continue;
             }
-            let clone_oid = partition_trigger_oid(&trigger, child)?;
+            let clone_oid = storage.partition_trigger_oid_to(&trigger, child, txid)?;
             let child_relation_oid = user_table_oid(storage, child);
             push(
                 2620,
@@ -21975,7 +21975,7 @@ fn pg_depend<'a>(
             let parent_oid = if direct_parent == parent_table {
                 trigger_oid
             } else {
-                partition_trigger_oid(&trigger, direct_parent)?
+                storage.partition_trigger_oid_to(&trigger, direct_parent, txid)?
             };
             push(2620, clone_oid, 2620, parent_oid, 0, "P")?;
             push(2620, clone_oid, PG_CLASS_OID, child_relation_oid, 0, "S")?;
@@ -25994,25 +25994,6 @@ fn pg_amproc<'a>(
     finish(definition, &rows[..count], arena)
 }
 
-fn partition_trigger_oid(
-    trigger: &crate::storage::TriggerDef,
-    table: usize,
-) -> Result<i32, SqlError> {
-    let ordinal = trigger
-        .created_at
-        .checked_mul(crate::storage::MAX_TABLE_CATALOG_SLOTS as u64)
-        .and_then(|value| value.checked_add(table as u64))
-        .and_then(|value| i32::try_from(value).ok())
-        .and_then(|value| crate::storage::FIRST_PARTITION_TRIGGER_OID.checked_add(value))
-        .ok_or_else(|| {
-            sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "partition trigger OID range exhausted"
-            )
-        })?;
-    Ok(ordinal)
-}
-
 fn pg_trigger<'a>(
     storage: &Storage,
     txid: u32,
@@ -26292,9 +26273,9 @@ fn pg_trigger<'a>(
             let parent_oid = if direct_parent == parent_table {
                 crate::storage::trigger_oid(&trigger)
             } else {
-                partition_trigger_oid(&trigger, direct_parent)?
+                storage.partition_trigger_oid_to(&trigger, direct_parent, txid)?
             };
-            let clone_oid = partition_trigger_oid(&trigger, child)?;
+            let clone_oid = storage.partition_trigger_oid_to(&trigger, child, txid)?;
             let mut clone = [Datum::Null; 20];
             clone.copy_from_slice(rows[root_row]);
             let parent_definition = storage.table_def(parent_table, txid);

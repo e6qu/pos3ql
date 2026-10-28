@@ -12037,31 +12037,18 @@ impl Checkpointer {
                 ),
             )?;
         }
-        for (trigger_slot, table_slot, enabled) in storage.partition_trigger_states() {
-            use core::fmt::Write;
-            let trigger = storage.trigger(trigger_slot);
-            write_database_context(
-                &mut self.manifest_output,
-                &mut database_context,
-                trigger.database,
-            )?;
-            let table = storage.table_def(table_slot, 0);
-            let mut schema = StackStr::<130>::new();
-            let mut table_name = StackStr::<130>::new();
-            for byte in table.schema.as_str().as_bytes() {
-                let _ = write!(schema, "{byte:02x}");
-            }
-            for byte in table.name.as_str().as_bytes() {
-                let _ = write!(table_name, "{byte:02x}");
-            }
+        for (database, image) in storage.partition_trigger_states() {
+            write_database_context(&mut self.manifest_output, &mut database_context, database)?;
             write_manifest(
                 &mut self.manifest_output,
                 format_args!(
-                    "trgs {} {} {} {}",
-                    trigger.created_at,
-                    schema.as_str(),
-                    table_name.as_str(),
-                    enabled.code(),
+                    "trgs {} {} {} {} {} {}",
+                    image.creation.get(),
+                    image.trigger.slot(),
+                    image.trigger.created_at(),
+                    image.table.slot(),
+                    image.table.created_at(),
+                    image.enabled.code(),
                 ),
             )?;
         }
@@ -18087,58 +18074,47 @@ fn load_partition_trigger_state(
             "partition trigger state record",
         ));
     }
-    let created_at: u64 = parse_field(words.next(), "partition trigger created_at")?;
-    let schema = decode_hex_name(
-        words
-            .next()
-            .ok_or(CheckpointSetupError::Corrupt("partition trigger schema"))?,
-    )?;
-    let table_name = decode_hex_name(
-        words
-            .next()
-            .ok_or(CheckpointSetupError::Corrupt("partition trigger table"))?,
-    )?;
+    let creation = crate::storage::CatalogIdentity::parse(parse_field(
+        words.next(),
+        "inherited trigger identity",
+    )?)
+    .ok_or(CheckpointSetupError::Corrupt("inherited trigger identity"))?;
+    let trigger = crate::storage::CatalogPosition::new(
+        parse_field(words.next(), "inherited trigger parent position")?,
+        parse_field(words.next(), "inherited trigger parent identity")?,
+    )
+    .map_err(|_| CheckpointSetupError::Corrupt("inherited trigger parent"))?;
+    crate::storage::CatalogIdentity::require(trigger.created_at())
+        .map_err(|_| CheckpointSetupError::Corrupt("inherited trigger parent identity"))?;
+    let table = crate::storage::CatalogPosition::new(
+        parse_field(words.next(), "inherited trigger table position")?,
+        parse_field(words.next(), "inherited trigger table identity")?,
+    )
+    .map_err(|_| CheckpointSetupError::Corrupt("inherited trigger table"))?;
     let enabled = crate::storage::TriggerEnabled::from_code(parse_field::<u8>(
         words.next(),
-        "partition trigger enabled",
+        "inherited trigger enabled",
     )?)
-    .ok_or(CheckpointSetupError::Corrupt("partition trigger enabled"))?;
+    .ok_or(CheckpointSetupError::Corrupt("inherited trigger enabled"))?;
     if words.next().is_some() {
         return Err(CheckpointSetupError::Corrupt(
-            "malformed partition trigger state",
-        ));
-    }
-    let trigger = storage
-        .triggers_with_slots_visible_to(0)
-        .find_map(|(slot, trigger)| (trigger.created_at == created_at).then_some((slot, trigger)))
-        .ok_or(CheckpointSetupError::Corrupt(
-            "partition trigger parent does not exist",
-        ))?;
-    let table = match storage.resolve_relation(Some(&schema), &table_name, 0) {
-        Some(crate::storage::ResolvedRelation::Table(table)) => table,
-        _ => {
-            return Err(CheckpointSetupError::Corrupt(
-                "partition trigger table does not exist",
-            ));
-        }
-    };
-    let crate::storage::TriggerTarget::Table(parent) = trigger.1.target else {
-        return Err(CheckpointSetupError::Corrupt(
-            "view trigger has partition state",
-        ));
-    };
-    if !matches!(trigger.1.level, crate::sql::ast::TriggerLevel::Row)
-        || !storage.partition_descends_from(table, usize::from(parent), 0)
-    {
-        return Err(CheckpointSetupError::Corrupt(
-            "partition trigger state targets an unrelated table",
+            "malformed inherited trigger state",
         ));
     }
     storage
-        .restore_partition_trigger_state(trigger.0, table, enabled)
+        .install_partition_trigger_image(
+            None,
+            Some(crate::storage::PartitionTriggerImage {
+                creation,
+                trigger,
+                table,
+                enabled,
+            }),
+            0,
+        )
         .map_err(|error| {
             CheckpointSetupError::ObjectStore(format!(
-                "manifest partition trigger rejected: {}",
+                "manifest inherited trigger rejected: {}",
                 error.message.as_str()
             ))
         })

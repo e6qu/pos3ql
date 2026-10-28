@@ -343,8 +343,8 @@ impl Storage {
                 "stored default privilege change selects a different lifetime"
             ));
         }
-        if let Some(key) = key {
-            if catalog.defaults.iter().enumerate().any(|(other, entry)| {
+        if let Some(key) = key
+            && catalog.defaults.iter().enumerate().any(|(other, entry)| {
                 other != slot
                     && entry.database == current_database()
                     && entry.committed.is_some()
@@ -352,12 +352,12 @@ impl Storage {
                     && entry.schema == key.schema
                     && entry.class == key.class
                     && entry.grantee == key.grantee
-            }) {
-                return Err(sql_err!(
-                    sqlstate::DATA_EXCEPTION,
-                    "stored default privilege grant is duplicated"
-                ));
-            }
+            })
+        {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "stored default privilege grant is duplicated"
+            ));
         }
         while catalog.defaults.len() <= slot {
             catalog

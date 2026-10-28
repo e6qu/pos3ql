@@ -115,6 +115,7 @@ wal_record_kinds! {
 /// Retains reservations consumed by coalesced metadata changes, including
 /// create-and-remove sequences that leave no live catalog row.
     KIND_CATALOG_RESERVATION = 157;
+    KIND_SET_PARTITION_TRIGGER = 158;
 // Publication records carry the typed ordinary-descendant selection added
 // after the original record layout. New kinds make older bytes fail recovery
 // loudly instead of being reinterpreted as a different catalog contract.
@@ -1780,6 +1781,10 @@ pub(crate) enum WalOp<'a> {
         image: Option<crate::storage::DefaultAclGrantImage>,
     },
     ReserveCatalogSequence(core::num::NonZeroU64),
+    SetPartitionTrigger {
+        expected: Option<crate::storage::PartitionTriggerImage>,
+        image: Option<crate::storage::PartitionTriggerImage>,
+    },
     SetParameterAcl {
         parameter: &'a str,
         expected: Option<crate::storage::ParameterAclOid>,
@@ -2802,6 +2807,7 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::BeginTableRewrite { .. } => KIND_REWRITE_TABLE,
         WalOp::SetDefaultAcl { .. } => KIND_SET_DEFAULT_ACL,
         WalOp::ReserveCatalogSequence(_) => KIND_CATALOG_RESERVATION,
+        WalOp::SetPartitionTrigger { .. } => KIND_SET_PARTITION_TRIGGER,
         WalOp::SetParameterAcl { .. } => KIND_SET_PARAMETER_ACL,
         WalOp::PreparedCatalogRow { .. } => KIND_PREPARED_CATALOG_ROW,
         WalOp::SetRelationIndexHint { .. } => KIND_SET_RELATION_INDEX_HINT,
@@ -4124,6 +4130,9 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             ..
         } => 1 + 1 + schema.len() + 1 + name.len() + 2 + 1 + grantee.len() + 1 + grantor.len() + 4,
         WalOp::ReserveCatalogSequence(_) => 8,
+        WalOp::SetPartitionTrigger { expected, image } => {
+            1 + 25 * (usize::from(expected.is_some()) + usize::from(image.is_some()))
+        }
         WalOp::SetDefaultAcl {
             expected, image, ..
         } => 3 + expected.map_or(0, default_acl_image_len) + image.map_or(0, default_acl_image_len),
@@ -6482,6 +6491,21 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 && buffer.append(&grant_options.0.to_le_bytes())
         }
         WalOp::ReserveCatalogSequence(value) => buffer.append(&value.get().to_le_bytes()),
+        WalOp::SetPartitionTrigger { expected, image } => {
+            assert_ne!(
+                expected, image,
+                "journal inherited trigger changes have an effect"
+            );
+            let flags = u8::from(expected.is_some()) | (u8::from(image.is_some()) << 1);
+            let mut ok = buffer.append(&[flags]);
+            for image in [expected, image].into_iter().flatten() {
+                ok &= buffer.append(&image.creation.get().to_le_bytes())
+                    && buffer.append(&image.trigger.encode())
+                    && buffer.append(&image.table.encode())
+                    && buffer.append(&[image.enabled.code()]);
+            }
+            ok
+        }
         WalOp::SetDefaultAcl {
             slot,
             expected,
@@ -11770,6 +11794,40 @@ fn decode_op_inner<'a>(
                 privileges: crate::storage::PrivilegeSet(privileges),
                 grant_options: crate::storage::PrivilegeSet(grant_options),
             })
+        }),
+        KIND_SET_PARTITION_TRIGGER => decode_large_op(|| {
+            let flags = *payload.first()?;
+            if flags == 0 || flags & !3 != 0 {
+                return None;
+            }
+            let mut at = 1;
+            let mut take = || -> Option<crate::storage::PartitionTriggerImage> {
+                let creation = crate::storage::CatalogIdentity::parse(u64::from(
+                    u32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?),
+                ))?;
+                at += 4;
+                let trigger = crate::storage::CatalogPosition::decode(payload.get(at..at + 10)?)?;
+                crate::storage::CatalogIdentity::parse(trigger.created_at())?;
+                at += 10;
+                let table = crate::storage::CatalogPosition::decode(payload.get(at..at + 10)?)?;
+                at += 10;
+                let enabled = crate::storage::TriggerEnabled::from_code(*payload.get(at)?)?;
+                at += 1;
+                Some(crate::storage::PartitionTriggerImage {
+                    creation,
+                    trigger,
+                    table,
+                    enabled,
+                })
+            };
+            let expected = if flags & 1 != 0 { Some(take()?) } else { None };
+            let image = if flags & 2 != 0 { Some(take()?) } else { None };
+            (at == payload.len()
+                && expected != image
+                && !expected.zip(image).is_some_and(|(old, new)| {
+                    old.trigger.slot() != new.trigger.slot() || old.table.slot() != new.table.slot()
+                }))
+            .then_some(WalOp::SetPartitionTrigger { expected, image })
         }),
         KIND_CATALOG_RESERVATION => decode_large_op(|| {
             let value = u64::from_le_bytes(payload.try_into().ok()?);

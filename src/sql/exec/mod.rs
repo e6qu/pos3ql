@@ -64662,7 +64662,7 @@ fn validate_relation_persistence_change(
 #[allow(clippy::too_many_arguments)]
 fn stage_partition_trigger_mode(
     storage: &mut Storage,
-    wal: &mut Wal,
+    _wal: &mut Wal,
     txn: &mut TxnState,
     trigger_slot: usize,
     table: usize,
@@ -64673,26 +64673,6 @@ fn stage_partition_trigger_mode(
     else {
         return Ok(());
     };
-    let trigger_name = storage.trigger_to(trigger_slot, txn.txid).name_to(txn.txid);
-    let table_def = *storage.table_def(table, txn.txid);
-    if table_def.persistence != crate::storage::RelationPersistence::Temporary {
-        let lsn = storage.bump_lsn();
-        if let Err(error) = wal.stage_reserved(
-            txn.txid,
-            lsn,
-            &WalOp::AlterTrigger {
-                name: trigger_name.as_str(),
-                target: crate::wal::TriggerTargetKind::Table,
-                table_schema: table_def.schema.as_str(),
-                table: table_def.name.as_str(),
-                new_name: trigger_name.as_str(),
-                enabled: mode.code(),
-            },
-        ) {
-            storage.rollback_partition_trigger_state(state_slot, prior);
-            return Err(error);
-        }
-    }
     if let Err(error) = txn.record_ddl(super::txn::DdlUndo::PartitionTriggerAltered {
         slot: state_slot as u32,
         prior,

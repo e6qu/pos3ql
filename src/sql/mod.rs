@@ -6320,13 +6320,46 @@ impl Engine {
                 return Err(error);
             }
         }
-        if txn
-            .ddl()
-            .iter()
-            .any(|undo| matches!(undo, DdlUndo::DefaultAclChanged { .. }))
-        {
+        for (index, undo) in txn.ddl().iter().enumerate() {
+            let DdlUndo::PartitionTriggerAltered { slot, .. } = *undo else {
+                continue;
+            };
+            if txn.ddl()[index + 1..].iter().any(|later| matches!(later, DdlUndo::PartitionTriggerAltered {slot: other, ..} if *other == slot)) {continue;}
+            let state = self.storage.partition_trigger_state(slot as usize);
+            let expected = state.committed;
+            let image = state.image_to(txn.txid);
+            if expected == image {
+                continue;
+            }
+            let selected = image
+                .or(expected)
+                .expect("a changed inherited trigger has an image");
+            if self
+                .storage
+                .table_def(selected.table.slot(), txn.txid)
+                .persistence
+                == crate::storage::RelationPersistence::Temporary
+            {
+                continue;
+            }
+            let lsn = self.storage.bump_lsn();
+            if let Err(error) = self.wal.stage_reserved(
+                txn.txid,
+                lsn,
+                &WalOp::SetPartitionTrigger { expected, image },
+            ) {
+                self.rollback_txn(txn, guc);
+                return Err(error);
+            }
+        }
+        if txn.ddl().iter().any(|undo| {
+            matches!(
+                undo,
+                DdlUndo::DefaultAclChanged { .. } | DdlUndo::PartitionTriggerAltered { .. }
+            )
+        }) {
             let value = core::num::NonZeroU64::new(self.storage.catalog_identity_sequence())
-                .expect("a default privilege change retains a positive creation reservation");
+                .expect("a catalog change retains a positive creation reservation");
             let lsn = self.storage.bump_lsn();
             if let Err(error) =
                 self.wal
@@ -15180,11 +15213,11 @@ impl Engine {
         } else {
             event_trigger::BeforeDdl::EMPTY
         };
-        if event_drop || event_end {
+        if event_tag.is_some() {
             responder.begin_command_completion_capture();
         }
         let outcome = execute(self, txn, sqlprep, cursors, guc, responder);
-        let completion = if event_drop || event_end {
+        let completion = if event_tag.is_some() {
             match responder.take_command_completion_tag(arena, matches!(outcome, Ok(Ok(())))) {
                 Ok(tag) => tag,
                 Err(_) => return Ok(Err(eval::arena_full())),
@@ -15192,6 +15225,12 @@ impl Engine {
         } else {
             None
         };
+        if matches!(outcome, Ok(Ok(())))
+            && event_tag.is_some()
+            && let Err(error) = self.storage.reconcile_partition_triggers(txn)
+        {
+            return Ok(Err(error));
+        }
         if matches!(outcome, Ok(Ok(())))
             && (event_drop || event_end)
             && let Some(tag) = event_tag
@@ -15510,7 +15549,7 @@ impl Engine {
         } else {
             event_trigger::BeforeDdl::EMPTY
         };
-        if event_drop || event_end {
+        if event_tag.is_some() {
             responder.begin_command_completion_capture();
         }
         let outcome = match statement {
@@ -17795,7 +17834,7 @@ impl Engine {
             }
             Stmt::Deallocate(name) => self.execute_deallocate_statement(*name, sqlprep, responder),
         };
-        let completion = if event_drop || event_end {
+        let completion = if event_tag.is_some() {
             match responder.take_command_completion_tag(arena, matches!(outcome, Ok(Ok(())))) {
                 Ok(tag) => tag,
                 Err(_) => return Ok(Err(eval::arena_full())),
@@ -17803,6 +17842,12 @@ impl Engine {
         } else {
             None
         };
+        if matches!(outcome, Ok(Ok(())))
+            && event_tag.is_some()
+            && let Err(error) = self.storage.reconcile_partition_triggers(txn)
+        {
+            return Ok(Err(error));
+        }
         if matches!(outcome, Ok(Ok(())))
             && (event_drop || event_end)
             && let Some(tag) = event_tag
@@ -21585,6 +21630,9 @@ fn apply_wal_op(
                 .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "corrupt WAL database scope"))?;
             storage.select_database(database)?;
         }
+        WalOp::SetPartitionTrigger { expected, image } => {
+            storage.install_partition_trigger_image(expected, image, 0)?;
+        }
         WalOp::ReserveCatalogSequence(value) => {
             storage.restore_catalog_identity_sequence(value.get());
         }
@@ -22065,15 +22113,6 @@ fn apply_wal_op(
                     0,
                 )?;
                 storage.commit_trigger_alter(slot, 0);
-            } else if let crate::storage::TriggerTarget::Table(table) = target
-                && name == new_name
-                && let Some(slot) = storage.trigger_slot_inherited_by(usize::from(table), name, 0)
-            {
-                if let Some((state, _)) =
-                    storage.stage_partition_trigger_enabled(slot, usize::from(table), enabled, 0)?
-                {
-                    storage.commit_partition_trigger_state(state, 0);
-                }
             } else {
                 return Err(sql_err!(
                     sqlstate::UNDEFINED_OBJECT,

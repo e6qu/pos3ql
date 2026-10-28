@@ -161,7 +161,7 @@ requests and resumes the same position with the new credentials.
 | Credential validation | One conditional upload client with a 128-byte body when `object_store_credentials_file` is configured. The candidate must also read back the result. |
 | Operational ownership check | One fixed client and one receipt slot per `operations_max_connections` when the operational listener and object storage are enabled. Shares the explicit TLS budget. |
 | `checkpoint_manifest_bytes` | Bytes in each of three fixed buffers: metadata scratch, retained manifest, and manifest upload body. |
-| Background metadata | Two independent clients, for journal and saved-file cleanup. Each reserves `object_store_head_bytes`, `object_store_response_bytes`, request state and one reactor descriptor. Key strings reserve 1,024 bytes each: 64 for journal cleanup, and `min(checkpoint_garbage_batch_objects, 1000)` for file cleanup. File traversal state and deduplication entries are charged to checkpoint startup memory. No runtime growth. |
+| Background metadata | Two independent clients, for journal and saved-file cleanup. Each reserves `object_store_head_bytes`, `object_store_response_bytes`, request state and one reactor descriptor. Key buffers hold up to 1,024 bytes each: 64 for journal cleanup, and `min(checkpoint_garbage_batch_objects, 1000)` for file cleanup. File traversal state and deduplication entries are charged to checkpoint startup memory. No runtime growth. |
 | `checkpoint_write_entries` | Committed versions retained by one table output schedule; SQLSTATE 54000 names exhaustion before publication. |
 | `commit_queue_slots` | Complete transaction and session-context buffers retained through asynchronous publication; at least 1 in object-store mode. |
 

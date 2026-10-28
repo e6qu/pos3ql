@@ -1,16 +1,13 @@
-//! Assembling the read path: RAM frames over a disk file over a base store.
+//! Fixed RAM frames and an optional disk cache in front of a base block store.
 //!
-//! Stages A and B built each tier on its own. This is where they stack into the
-//! read path the founding vision named — memory and disk as a cache in front of
-//! object storage — and where `block_cache_bytes` and `disk_cache_bytes` stop
-//! being config fields wired to nothing: each sizes the tier it names, and a
-//! zero for either drops that tier from the stack rather than building an empty
-//! one that would miss on every read.
+//! `block_cache_bytes` and `disk_cache_bytes` select whole frames and slots;
+//! zero disables that tier. Checkpoint startup rejects nonzero budgets too small
+//! for one unit. The server's base store is durable object storage, so losing
+//! either cache does not lose committed data.
 //!
-//! The base store is a type parameter, so the same stack sits over the object
-//! backend in the running server and over the memory backend under test. What
-//! the assembled stack presents is still a [`BlockStore`]: a caller reads and
-//! writes blocks and never learns how many tiers answered.
+//! Ordinary reads and writes use the same block-store contract through every
+//! layer. Maintenance can probe cached bytes without consuming a query's pending
+//! remote read, then admit its separately downloaded, verified response.
 
 use std::path::Path;
 
@@ -21,8 +18,8 @@ use super::cache::BlockCache;
 use super::disk::{DiskCache, DiskError};
 
 /// One tier's byte budget, and how many whole units of that tier it buys. A
-/// budget smaller than one unit buys nothing and is reported as such, so the
-/// caller can drop the tier rather than build a cache that cannot hold a block.
+/// budget smaller than one unit is reported so the caller can reject an
+/// undersized nonzero setting before construction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct TierSizing {
     pub(crate) bytes: usize,
@@ -89,10 +86,8 @@ impl StackPlan {
     }
 }
 
-/// The read path over `base`, with whichever tiers the plan sized to at least
-/// one unit. A tier asked for but too small is dropped, not built empty; both
-/// dropped leaves the base store answering directly, which is the RAM-only
-/// database the earlier phases already were.
+/// Assemble the resolved whole-unit tiers over `base`. Callers reject
+/// undersized nonzero plans first; a disabled tier forwards to the next one.
 ///
 /// The disk tier needs a file, so `cache_dir` is where its slot file lives; it
 /// is unused when the disk tier is absent.

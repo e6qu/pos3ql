@@ -1,25 +1,13 @@
-//! The disk tier: a fixed-size cache file between RAM and the bucket.
+//! A fixed disk cache between RAM frames and the durable block store.
 //!
-//! One preallocated file of equal-sized slots, an in-RAM index from block
-//! identity to slot, and CLOCK eviction over the slots — the same discipline as
-//! the WAL journal (a file sized once at startup, never grown) and the same
-//! eviction as the RAM cache, one tier down. A read that missed the RAM frames
-//! lands here before it has to cross the network.
+//! Startup reserves a file of equal-sized slots and an in-memory identity
+//! index. CLOCK eviction reuses slots without growing either reservation.
+//! Slots contain complete framed blocks; reads verify their checksum and
+//! identity, and writes must finish before a slot enters the index.
 //!
-//! The file is pure cache. Every block in it is re-fetchable from the store
-//! behind, so a slot that reads back wrong — a torn write from a crash
-//! mid-update, a bit rot on the platter — is a miss, never data loss: the block
-//! is dropped and re-fetched. That is what lets the slot header be small and the
-//! write be a single positioned write with no fsync. A store could not reason
-//! this way; a cache can, because losing a block here costs only the round trip
-//! to fetch it again.
-//!
-//! A slot holds a framed block, header and all, exactly as [`super::encode`]
-//! produced it. The block's own checksum and identity are what a read is
-//! validated against, so a slot needs no integrity metadata of its own — the
-//! block already carries it, and the identity is what proves the slot holds the
-//! block the index thinks it does rather than a stale one a torn write left
-//! behind.
+//! No cache write needs fsync: the backing store already owns the durable copy.
+//! Damaged or missing cache bytes become a cache miss. Maintenance probes do not
+//! start a remote request or consume a query's pending read.
 
 use std::fs::File;
 use std::os::unix::fs::FileExt;

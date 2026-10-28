@@ -1,20 +1,12 @@
-//! The RAM tier: a fixed set of frames in front of a slower block store.
+//! A fixed RAM cache of verified immutable block payloads.
 //!
-//! This is where `block_cache_bytes` finally means something. A read asks the
-//! cache first and only reaches the store it wraps on a miss, so a working set
-//! that fits here is served without a round trip while one that does not still
-//! answers — slower, from whatever the cache sits in front of.
+//! Ordinary writes reach the backing store before admission. Maintenance can
+//! also admit a verified download without repeating its upload. Frames are
+//! never dirty; eviction loses only the reusable copy.
 //!
-//! Eviction is CLOCK, as TigerBeetle's grid cache has it: one referenced bit
-//! per frame and a hand that sweeps, clearing bits until it meets a frame that
-//! has not been touched since the last pass. It approximates least-recently-used
-//! closely enough for this and costs one bit and one pointer, where true LRU
-//! costs a list whose links must be maintained on every hit.
-//!
-//! Being a cache rather than a store is what lets it evict at all: every block
-//! here is re-fetchable from the layer behind, so dropping one loses nothing but
-//! time. That is also why a frame is never dirty — writes go through to the
-//! store first, and the cache only remembers what the store already accepted.
+//! CLOCK eviction uses one reference bit per frame and a bounded hand sweep.
+//! Design reference: TigerBeetle's grid cache. Frame storage and the identity
+//! index are reserved at startup and never grow.
 
 use crate::mem::budget::{Budget, BudgetError};
 use crate::mem::fixed_map::FixedMap;

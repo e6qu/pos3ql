@@ -1,7 +1,7 @@
 //! Object-resident secondary-index generations.
 //!
-//! A generation is an immutable sequence of data blocks plus one
-//! roster block naming them. Each entry carries the equality hash, encoded
+//! A generation owns immutable data blocks through chained rosters or
+//! navigation trees with bounded depth. Each entry carries the equality hash, encoded
 //! key tuple, optional included-column payload, row identity, and commit LSN.
 //! Readers can therefore reject an equality miss and satisfy a covering scan
 //! without fetching a row; every candidate is still checked against the

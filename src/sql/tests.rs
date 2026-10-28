@@ -97382,6 +97382,10 @@ fn checkpoint_reads_held_merge_keeps_cached_queries_and_foreground_read_owners()
     use std::time::{Duration, Instant};
 
     fn advance(engine: &mut Engine) {
+        // Simulated upload completions update fixture inventories outside the runtime guard.
+        engine
+            .advance_wal_publication(Instant::now(), CommitProgressMode::Manual)
+            .unwrap();
         for slot in 0..engine.ckpt.as_ref().unwrap().block_read_slots() {
             if engine.pending_block_read_fd(slot).is_some() {
                 crate::mem::guard::forbid_alloc(|| engine.advance_pending_block_read(slot))
@@ -97740,7 +97744,23 @@ fn checkpoint_reads_held_merge_keeps_cached_queries_and_foreground_read_owners()
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
                     Err(error) => panic!("accept merge resumption: {error}"),
                 }
-                assert!(Instant::now() < deadline, "merge did not resume");
+                assert!(
+                    Instant::now() < deadline,
+                    "merge did not resume: runnable={}, output={}, output_ready={}, reads_ready={}, read_generation={}, sockets={:?}",
+                    engine.checkpoint_can_progress(),
+                    engine.ckpt.as_ref().unwrap().physical_output_pending(),
+                    engine
+                        .ckpt
+                        .as_ref()
+                        .unwrap()
+                        .physical_output_ready(Instant::now()),
+                    engine.ckpt.as_ref().unwrap().merge_reads_ready(),
+                    engine.read_capacity_generation(),
+                    [
+                        engine.pending_block_read_fd(0),
+                        engine.pending_block_read_fd(1)
+                    ],
+                );
                 std::thread::yield_now();
             }
             assert!(!engine.ckpt.as_ref().unwrap().retained_output_pending());

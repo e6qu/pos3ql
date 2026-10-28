@@ -30821,33 +30821,30 @@ fn partition_before_trigger_clones_fire_after_routing_and_cannot_move_rows() {
 
 #[test]
 fn partition_trigger_clones_share_one_postgresql_name_order() {
-    let (mut engine, mut budget) = test_engine();
-    let output = run_with(
-        &mut engine,
-        &mut budget,
-        "CREATE TABLE ordered_partition_trigger_log (position serial, name text);
-         CREATE TABLE ordered_partition_trigger_root (id integer) PARTITION BY RANGE (id);
-         CREATE TABLE ordered_partition_trigger_leaf PARTITION OF ordered_partition_trigger_root
-           FOR VALUES FROM (0) TO (10);
-         CREATE FUNCTION ordered_partition_trigger() RETURNS trigger LANGUAGE plpgsql AS
-           'BEGIN INSERT INTO ordered_partition_trigger_log (name) VALUES (TG_NAME); RETURN NEW; END';
-         CREATE TRIGGER z_before BEFORE INSERT ON ordered_partition_trigger_root
-           FOR EACH ROW EXECUTE FUNCTION ordered_partition_trigger();
-         CREATE TRIGGER a_before BEFORE INSERT ON ordered_partition_trigger_leaf
-           FOR EACH ROW EXECUTE FUNCTION ordered_partition_trigger();
-         CREATE TRIGGER z_after AFTER INSERT ON ordered_partition_trigger_root
-           FOR EACH ROW EXECUTE FUNCTION ordered_partition_trigger();
-         CREATE TRIGGER a_after AFTER INSERT ON ordered_partition_trigger_leaf
-           FOR EACH ROW EXECUTE FUNCTION ordered_partition_trigger();
-         INSERT INTO ordered_partition_trigger_root VALUES (1);
-         SELECT name FROM ordered_partition_trigger_log ORDER BY position;",
-    );
-    assert_eq!(
-        data_rows(&output),
-        ["a_before", "z_before", "a_after", "z_after"],
-        "{}",
-        String::from_utf8_lossy(&output)
-    );
+    let fixture = include_str!("../../tests/external/differential/200_partition_trigger_dispatch.sql");
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let config = catalog_lifetime_config(&format!("partition-trigger-dispatch-{mode:?}"), mode);
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        let output = session.success(&mut engine, fixture, true);
+        assert_eq!(
+            data_rows(&output),
+            [
+                "a_before:STATEMENT",
+                "a_before:ROW",
+                "z_before:ROW",
+                "a_after:ROW",
+                "z_after:ROW",
+                "a_after:STATEMENT",
+            ],
+            "{mode:?}: {}",
+            String::from_utf8_lossy(&output)
+        );
+    }
 }
 
 #[test]

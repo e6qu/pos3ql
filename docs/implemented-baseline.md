@@ -247,6 +247,9 @@ its own enabled mode, so `ALTER TABLE ONLY orders DISABLE TRIGGER audit_order`
 does not disable existing children's copies. Copied definitions and later edits
 stay in their own database through restart. Saved trigger and policy positions
 are restored exactly; recovery rejects stale, missing or corrupt saved images.
+Row triggers declared directly on a child use their own mode; only inherited
+row triggers use the child's saved copy. A parent's statement trigger fires
+once for a command targeting that parent and is not inherited by its children.
 
 ```sql
 CREATE TABLE orders(id integer);

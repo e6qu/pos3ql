@@ -26840,6 +26840,7 @@ fn fire_row_triggers<'a, T: Into<crate::storage::TriggerTarget>>(
     while let Some(trigger_slot) = context
         .storage()
         .trigger_metadata_for_target(target, context.txn.txid)
+        .filter(|(_, trigger)| matches!(trigger.level, TriggerLevel::Row))
         .filter(|(_, trigger)| {
             last_name.is_none_or(|last| trigger.name_to(context.txn.txid).as_str() > last.as_str())
         })
@@ -27151,6 +27152,7 @@ fn fire_partition_row_triggers<'a>(
             if !(root_already_fired && target == root) {
                 let candidate = storage
                     .triggers_for_table(target, txn.txid)
+                    .filter(|(_, trigger)| matches!(trigger.level, TriggerLevel::Row))
                     .filter(|(_, trigger)| {
                         last_name
                             .is_none_or(|last| trigger.name_to(txn.txid).as_str() > last.as_str())

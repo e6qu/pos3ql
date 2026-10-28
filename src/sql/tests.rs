@@ -97384,7 +97384,7 @@ fn checkpoint_reads_held_merge_keeps_cached_queries_and_foreground_read_owners()
     fn advance(engine: &mut Engine) {
         // Simulated upload completions update fixture inventories outside the runtime guard.
         engine
-            .advance_wal_publication(Instant::now(), CommitProgressMode::Manual)
+            .advance_wal_publication(Instant::now(), CommitProgressMode::Inline)
             .unwrap();
         for slot in 0..engine.ckpt.as_ref().unwrap().block_read_slots() {
             if engine.pending_block_read_fd(slot).is_some() {

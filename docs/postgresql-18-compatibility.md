@@ -56,7 +56,8 @@ the saved TZif transitions, including in `to_timestamp(..., '... TZ')`.
 `pg_timezone_abbrevs` reports these meanings at the transaction's start time.
 Named zones require installed files under `/usr/share/zoneinfo`; fixed
 abbreviations do not depend on optional legacy files such as `EST`.
-The pinned definitions retain their [upstream source and checksum](../src/sql/timezone_abbreviation_data.rs).
+The definitions come from [PostgreSQL 18.6's Default set](https://github.com/postgres/postgres/blob/REL_18_6/src/timezone/tznames/Default)
+and are checksum-pinned when generating the executable's abbreviation data.
 Only the pinned Default set is available. The `timezone_abbreviations` setting
 is unsupported and rejected.
 

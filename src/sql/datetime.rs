@@ -277,6 +277,20 @@ impl FormatDateConvention {
     }
 }
 
+fn claim_format_integer(slot: &mut Option<i32>, value: i32, field: &str) -> Result<(), SqlError> {
+    // PostgreSQL permits replacing an earlier zero but rejects conflicting
+    // nonzero values, even when a later TZ field changed interpretation.
+    if slot.is_some_and(|previous| previous != 0 && previous != value) {
+        return Err(sql_err!(
+            sqlstate::INVALID_DATETIME_FORMAT,
+            "conflicting values for \"{}\" field in formatting string",
+            field
+        ));
+    }
+    *slot = Some(value);
+    Ok(())
+}
+
 /// A fully resolved date/time format-model result. Parsing produces this
 /// typed state before either `to_date` or `to_timestamp` consumes it, so the
 /// two entry points cannot disagree about a calendar interpretation.
@@ -556,14 +570,22 @@ pub fn parse_formatted(input: &str, fmt: &str) -> Result<FormattedDateTime, SqlE
                 };
                 input_position += 1;
             }
-            timezone_hour = Some(read_num(&mut input_position, 2).ok_or_else(bad)? as i32);
+            claim_format_integer(
+                &mut timezone_hour,
+                read_num(&mut input_position, 2).ok_or_else(bad)? as i32,
+                &fmt[format_index..format_index + 3],
+            )?;
             format_index += 3;
         } else if starts_with_ci(format_bytes, format_index, b"TZM") {
             if !numeric_timezone {
                 timezone_sign = 1;
             }
             numeric_timezone = true;
-            timezone_minute = Some(read_num(&mut input_position, 2).ok_or_else(bad)? as i32);
+            claim_format_integer(
+                &mut timezone_minute,
+                read_num(&mut input_position, 2).ok_or_else(bad)? as i32,
+                &fmt[format_index..format_index + 3],
+            )?;
             format_index += 3;
         } else if starts_with_ci(format_bytes, format_index, b"TZ") {
             while !exact

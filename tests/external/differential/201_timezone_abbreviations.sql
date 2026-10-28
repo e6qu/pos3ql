@@ -20,7 +20,8 @@ SELECT '2012-06-01 12:00 MSK'::timestamptz = '2012-06-01 08:00+00'::timestamptz
 
 SELECT to_timestamp('2021-06-01 12:00 +03 EST', 'YYYY-MM-DD HH24:MI TZH TZ') = '2021-06-01 17:00+00'::timestamptz
    AND to_timestamp('2021-06-01 12:00 EST +03', 'YYYY-MM-DD HH24:MI TZ TZH') = '2021-06-01 09:00+00'::timestamptz
-   AND to_timestamp('2021-06-01 12:00 +03:15 EST 45', 'YYYY-MM-DD HH24:MI TZH:TZM TZ TZM') = '2021-06-01 08:15+00'::timestamptz;
+   AND to_timestamp('2021-06-01 12:00 +03:15 EST 15', 'YYYY-MM-DD HH24:MI TZH:TZM TZ TZM') = '2021-06-01 08:45+00'::timestamptz
+   AND to_timestamp('2021-06-01 12:00 +03:00 EST 45', 'YYYY-MM-DD HH24:MI TZH:TZM TZ TZM') = '2021-06-01 08:15+00'::timestamptz;
 
 SELECT count(*) = 3 FROM pg_timezone_abbrevs
 WHERE (abbrev = 'EST' AND extract(epoch FROM utc_offset) = -18000 AND NOT is_dst)

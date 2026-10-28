@@ -100,9 +100,15 @@ provider's continuation token and checking key order. One turn reads at most one
 backup manifest or commit-chain descriptor, or deletes the configured batch of
 obsolete journal objects. Waiting for any of these responses releases the SQL
 worker, including when foreground block reads or commit uploads are active.
+Checkpoints can publish and free row-cache space while journal cleanup waits.
+The two tasks have separate startup-reserved backup lists and deletion queues.
+Each journal pass stops at its captured cutoff; new commits cannot extend that
+pass indefinitely. Later checkpoints queue the latest requested cutoff, while
+a more conservative retention decision cancels the pending deletion work.
 
 **User example:** a slow response while deleting last week's obsolete journal
-must not delay reading a cached order. Cleanup retains its exact request and
+must not delay reading a cached order or saving new orders to free cache space.
+Cleanup retains its exact request and
 position. A failed deletion does not advance that position; retrying the same
 DELETE is safe even if its response was lost. Each request keeps the existing
 30-second deadline. Errors reach waiting checkpoint commands and use the normal

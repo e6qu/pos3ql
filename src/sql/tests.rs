@@ -81766,12 +81766,7 @@ fn automatic_checkpoint_deletes_at_most_one_configured_object_per_beat() {
         .maintenance_pending(&engine.storage)
     {
         let lists_before = namespace.borrow().list_count;
-        engine
-            .ckpt
-            .as_mut()
-            .unwrap()
-            .checkpoint_step(&mut engine.storage)
-            .unwrap();
+        assert!(!engine.checkpoint_beat().failed());
         maintenance_lists += namespace.borrow().list_count - lists_before;
         let after = obsolete_objects(&mut engine);
         assert!(
@@ -81787,8 +81782,8 @@ fn automatic_checkpoint_deletes_at_most_one_configured_object_per_beat() {
     assert_eq!(remaining, 0);
     assert!(beats > 1, "maintenance was not paced across dispatch beats");
     assert_eq!(
-        maintenance_lists, 4,
-        "backup retention, commit pruning, legacy and block garbage each scan once"
+        maintenance_lists, 5,
+        "independent journal/block backup rosters and each garbage prefix scan once"
     );
 
     drop(engine);

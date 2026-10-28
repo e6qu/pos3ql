@@ -10080,6 +10080,15 @@ impl Engine {
             })
     }
 
+    fn checkpoint_capture_due(&self, checkpointer: &Checkpointer) -> bool {
+        checkpointer.sweep_active()
+            || checkpointer.physical_maintenance_pending(&self.storage)
+            || checkpointer.merge_work_pending(&self.storage)
+            || self.storage.heap.used() * 100 >= self.storage.heap.capacity() * 65
+            || self.wal.used_bytes() * 100 >= self.wal.capacity_bytes() * 50
+            || self.storage.history_pressure()
+    }
+
     /// Heap and history cleanup use no object client. Publication and merge
     /// work still wait for statement-owned block reads to finish.
     pub(crate) fn checkpoint_can_progress(&self) -> bool {
@@ -10089,10 +10098,17 @@ impl Engine {
         if let Some(checkpointer) = self.ckpt.as_ref()
             && checkpointer.commit_cleanup_pending()
             && !checkpointer.credential_install_pending()
+            && !checkpointer.published_maintenance_pending()
         {
-            return checkpointer.metadata_io_ready()
-                || self.local_cleanup.is_some()
-                || self.storage.history_cleanup_pending();
+            if checkpointer.metadata_io_ready() {
+                return true;
+            }
+            if !self.checkpoint_capture_due(checkpointer)
+                && !checkpointer.manifest_publication_pending()
+                && !checkpointer.physical_output_pending()
+            {
+                return self.local_cleanup.is_some() || self.storage.history_cleanup_pending();
+            }
         }
         if let Some(checkpointer) = self.ckpt.as_ref()
             && checkpointer.manifest_publication_pending()
@@ -10162,6 +10178,33 @@ impl Engine {
         if self.fatal_commit_failure.is_some() {
             return CheckpointBeat::LocalFailure;
         }
+        let journal_progress = if let Some(checkpointer) = self.ckpt.as_mut()
+            && checkpointer.commit_cleanup_pending()
+            && !checkpointer.credential_install_pending()
+            && !checkpointer.published_maintenance_pending()
+        {
+            if !checkpointer.metadata_io_ready() {
+                CheckpointBeat::WaitingForReads
+            } else {
+                match checkpointer.advance_commit_cleanup() {
+                    Ok(true) => CheckpointBeat::Durable,
+                    Ok(false) if !checkpointer.metadata_io_ready() => {
+                        CheckpointBeat::WaitingForReads
+                    }
+                    Ok(false) => CheckpointBeat::Advanced,
+                    Err(error) => {
+                        self.remember_checkpoint_failure(&error);
+                        crate::logging::error_args(
+                            "checkpoint_commit_cleanup_failed",
+                            format_args!("{}: {}", error.sqlstate, error.message.as_str()),
+                        );
+                        return CheckpointBeat::StorageFailure;
+                    }
+                }
+            }
+        } else {
+            CheckpointBeat::Idle
+        };
         if let Some(checkpointer) = self.ckpt.as_mut()
             && checkpointer.manifest_publication_pending()
         {
@@ -10170,7 +10213,13 @@ impl Engine {
                     .storage
                     .advance_history_cleanup(core::num::NonZeroUsize::new(64).unwrap())
                 {
-                    crate::storage::HistoryReclamation::Idle => CheckpointBeat::WaitingForReads,
+                    crate::storage::HistoryReclamation::Idle => {
+                        if journal_progress == CheckpointBeat::Idle {
+                            CheckpointBeat::WaitingForReads
+                        } else {
+                            journal_progress
+                        }
+                    }
                     crate::storage::HistoryReclamation::Advanced => CheckpointBeat::Advanced,
                     crate::storage::HistoryReclamation::WaitingForOwner => {
                         CheckpointBeat::WaitingForOwner
@@ -10220,28 +10269,6 @@ impl Engine {
             .ckpt
             .as_ref()
             .is_some_and(Checkpointer::credential_install_pending);
-        if !credential_draining
-            && self.local_cleanup.is_none()
-            && !self.storage.history_cleanup_pending()
-            && let Some(checkpointer) = self.ckpt.as_mut()
-            && checkpointer.commit_cleanup_pending()
-        {
-            if !checkpointer.metadata_io_ready() {
-                return CheckpointBeat::WaitingForReads;
-            }
-            return match checkpointer.advance_commit_cleanup() {
-                Ok(()) if !checkpointer.metadata_io_ready() => CheckpointBeat::WaitingForReads,
-                Ok(()) => CheckpointBeat::Advanced,
-                Err(error) => {
-                    self.remember_checkpoint_failure(&error);
-                    crate::logging::error_args(
-                        "checkpoint_commit_cleanup_failed",
-                        format_args!("{}: {}", error.sqlstate, error.message.as_str()),
-                    );
-                    CheckpointBeat::StorageFailure
-                }
-            };
-        }
         let journal_pending = self.unpromoted_commits != 0
             || (self.commit_progress == CommitProgressMode::Reactor
                 && self.durable_retry_pending());
@@ -10283,7 +10310,11 @@ impl Engine {
                 && self.durable_retry_pending());
         let history_pending = self.storage.history_cleanup_pending();
         if reads_pending && self.local_cleanup.is_none() && !history_pending {
-            return CheckpointBeat::WaitingForReads;
+            return if journal_progress == CheckpointBeat::Idle {
+                CheckpointBeat::WaitingForReads
+            } else {
+                journal_progress
+            };
         }
         // Preserve the durable retry barrier whenever storage work can run.
         // With an owned GET, only already-published local cleanup may advance.
@@ -10335,11 +10366,11 @@ impl Engine {
                 }
             };
         }
-        let progress = if retried_upload {
+        let progress = if retried_upload || journal_progress == CheckpointBeat::Durable {
             CheckpointBeat::Durable
         } else {
             match history {
-                crate::storage::HistoryReclamation::Idle => CheckpointBeat::Idle,
+                crate::storage::HistoryReclamation::Idle => journal_progress,
                 crate::storage::HistoryReclamation::Advanced => CheckpointBeat::Advanced,
                 crate::storage::HistoryReclamation::WaitingForOwner => {
                     CheckpointBeat::WaitingForOwner
@@ -10348,7 +10379,13 @@ impl Engine {
         };
         if reads_pending {
             return match history {
-                crate::storage::HistoryReclamation::Idle => CheckpointBeat::WaitingForReads,
+                crate::storage::HistoryReclamation::Idle => {
+                    if progress == CheckpointBeat::Idle {
+                        CheckpointBeat::WaitingForReads
+                    } else {
+                        progress
+                    }
+                }
                 crate::storage::HistoryReclamation::Advanced => CheckpointBeat::Advanced,
                 crate::storage::HistoryReclamation::WaitingForOwner => {
                     CheckpointBeat::WaitingForOwner
@@ -10396,17 +10433,14 @@ impl Engine {
                 CheckpointBeat::Advanced
             };
         }
+        let capture_due = self
+            .ckpt
+            .as_ref()
+            .is_some_and(|c| self.checkpoint_capture_due(c));
         let Some(ckpt) = self.ckpt.as_mut() else {
             return progress;
         };
-        let wal_full = self.wal.used_bytes() * 100 >= self.wal.capacity_bytes() * 50;
-        if !(ckpt.sweep_active()
-            || ckpt.maintenance_pending(&self.storage)
-            || ckpt.merge_work_pending(&self.storage)
-            || heap_full
-            || wal_full
-            || history_full)
-        {
+        if !capture_due {
             return progress;
         }
         self.wal.commit();

@@ -1368,6 +1368,9 @@ pub(crate) struct Checkpointer {
     backup_scratch: Vec<StackStr<BACKUP_NAME_BYTES>>,
     backup_roster_loaded: bool,
     garbage_scratch: Vec<StackStr<64>>,
+    prune_backup_scratch: Vec<StackStr<BACKUP_NAME_BYTES>>,
+    prune_backup_roster_loaded: bool,
+    commit_garbage_scratch: Vec<StackStr<64>>,
     delete_objects_per_beat: usize,
     commit_prune: CommitPruneProgress,
     legacy_garbage_loaded: bool,
@@ -1383,6 +1386,7 @@ pub(crate) struct Checkpointer {
     published_lsn_pending_maintenance: Option<u64>,
     /// Durable-WAL boundary awaiting paced commit-object deletion.
     commit_prune_through: Option<u64>,
+    commit_prune_next: Option<u64>,
     legacy_garbage_pending: bool,
     block_garbage_pending: bool,
     sliced_generation: Vec<u64>,
@@ -1528,6 +1532,7 @@ impl Checkpointer {
                 .saturating_mul(config.max_spill_generations_per_table)
                 .saturating_mul(core::mem::size_of::<(usize, SlotInstall)>());
         core::mem::size_of::<CommitPruneProgress>()
+            + core::mem::size_of::<Option<u64>>()
             + 2 * SstWriter::budget_bytes()
             + ValueIndexWriter::budget_bytes()
             + table_bookkeeping
@@ -1535,9 +1540,9 @@ impl Checkpointer {
                 * core::mem::size_of::<ValueInstall>()
             + config.checkpoint_live_blocks * core::mem::size_of::<(BlockId, Option<BlockType>)>()
             + config.checkpoint_garbage_batch_objects
-                * (core::mem::size_of::<StackStr<80>>() + core::mem::size_of::<StackStr<64>>())
+                * (core::mem::size_of::<StackStr<80>>() + 2 * core::mem::size_of::<StackStr<64>>())
             + config.checkpoint_commit_batches * core::mem::size_of::<StackStr<64>>()
-            + config.max_backups * core::mem::size_of::<StackStr<BACKUP_NAME_BYTES>>()
+            + 2 * config.max_backups * core::mem::size_of::<StackStr<BACKUP_NAME_BYTES>>()
             + config.checkpoint_merge_entries * core::mem::size_of::<(SstKey, u8)>()
     }
 
@@ -1834,10 +1839,13 @@ impl Checkpointer {
             || self.merge_candidate(storage).is_some()
     }
 
-    pub(crate) fn maintenance_pending(&self, storage: &Storage) -> bool {
+    pub(crate) fn physical_maintenance_pending(&self, storage: &Storage) -> bool {
         self.published_lsn_pending_maintenance.is_some()
-            || self.commit_cleanup_pending()
             || storage.retained_file_reclamation_pending()
+    }
+
+    pub(crate) fn maintenance_pending(&self, storage: &Storage) -> bool {
+        self.physical_maintenance_pending(storage) || self.commit_cleanup_pending()
     }
 
     pub(crate) fn published_maintenance_pending(&self) -> bool {
@@ -1852,13 +1860,14 @@ impl Checkpointer {
         self.metadata_io.ready()
     }
 
-    pub(crate) fn advance_commit_cleanup(&mut self) -> Result<(), SqlError> {
+    pub(crate) fn advance_commit_cleanup(&mut self) -> Result<bool, SqlError> {
         if let Some(floor) = self.commit_prune_through
             && self.prune_commit_batch(floor)?
         {
-            self.commit_prune_through = None;
+            self.commit_prune_through = self.commit_prune_next.take();
+            return Ok(true);
         }
-        Ok(())
+        Ok(false)
     }
 
     /// A schedule beat: scan a bounded stretch of one member, collecting
@@ -2386,6 +2395,9 @@ impl Checkpointer {
             backup_scratch: Vec::with_capacity(config.max_backups),
             backup_roster_loaded: false,
             garbage_scratch: Vec::with_capacity(config.checkpoint_garbage_batch_objects),
+            prune_backup_scratch: Vec::with_capacity(config.max_backups),
+            prune_backup_roster_loaded: false,
+            commit_garbage_scratch: Vec::with_capacity(config.checkpoint_garbage_batch_objects),
             delete_objects_per_beat: config.checkpoint_delete_objects_per_beat,
             commit_prune: CommitPruneProgress::Unloaded,
             legacy_garbage_loaded: false,
@@ -2395,6 +2407,7 @@ impl Checkpointer {
             sweeping: false,
             published_lsn_pending_maintenance: None,
             commit_prune_through: None,
+            commit_prune_next: None,
             legacy_garbage_pending: false,
             block_garbage_pending: false,
             sliced_generation: vec![0; table_capacity],
@@ -3477,8 +3490,16 @@ impl Checkpointer {
     }
 
     /// Schedules deletion of commit objects covered by a durable manifest.
-    /// Repeated scheduling keeps the more conservative boundary.
+    /// Finish the current boundary before the latest newer one. A lower
+    /// retention boundary cancels pending work before any further deletion.
     pub(crate) fn schedule_commit_prune(&mut self, up_to_lsn: u64) {
+        if let Some(current) = self.commit_prune_through
+            && up_to_lsn > current
+        {
+            self.commit_prune_next = Some(up_to_lsn);
+            return;
+        }
+        self.commit_prune_next = None;
         let floor = self
             .commit_prune_through
             .map_or(up_to_lsn, |pending| pending.min(up_to_lsn));
@@ -3488,7 +3509,7 @@ impl Checkpointer {
         {
             self.commit_prune = CommitPruneProgress::Unloaded;
             self.metadata_io.cancel();
-            self.garbage_scratch.clear();
+            self.commit_garbage_scratch.clear();
         }
         self.commit_prune_through = Some(floor);
     }
@@ -3541,15 +3562,16 @@ impl Checkpointer {
 
     fn invalidate_backup_roster(&mut self) {
         self.backup_roster_loaded = false;
+        self.prune_backup_roster_loaded = false;
         if !matches!(self.commit_prune, CommitPruneProgress::Unloaded) {
             self.commit_prune = CommitPruneProgress::Unloaded;
             self.metadata_io.cancel();
-            self.garbage_scratch.clear();
+            self.commit_garbage_scratch.clear();
         }
     }
 
     fn begin_prune_boundary(&mut self, up_to_lsn: u64, oldest: Option<u64>) {
-        self.garbage_scratch.clear();
+        self.commit_garbage_scratch.clear();
         self.commit_prune = CommitPruneProgress::FindBoundary {
             floor: oldest.map_or(up_to_lsn, |backup| up_to_lsn.min(backup)),
             cursor: self.commit_head,
@@ -3592,9 +3614,9 @@ impl Checkpointer {
     ) -> Result<bool, SqlError> {
         match self.commit_prune {
             CommitPruneProgress::Unloaded => {
-                self.garbage_scratch.clear();
-                if self.backup_roster_loaded {
-                    if self.backup_scratch.is_empty() {
+                self.commit_garbage_scratch.clear();
+                if self.prune_backup_roster_loaded {
+                    if self.prune_backup_scratch.is_empty() {
                         self.begin_prune_boundary(up_to_lsn, None);
                         return Ok(false);
                     }
@@ -3604,14 +3626,14 @@ impl Checkpointer {
                     };
                     return Ok(false);
                 }
-                self.backup_scratch.clear();
+                self.prune_backup_scratch.clear();
                 self.commit_prune = CommitPruneProgress::Backups {
                     cursor: ListCursor::START,
                 };
                 self.advance_commit_prune(up_to_lsn, deleted)
             }
             CommitPruneProgress::Backups { cursor } => {
-                let names = &mut self.backup_scratch;
+                let names = &mut self.prune_backup_scratch;
                 let mut invalid = false;
                 let Poll::Ready(next) = self.metadata_io.list("backups/", cursor, |key| {
                     let Some(name) = key
@@ -3631,20 +3653,20 @@ impl Checkpointer {
                 };
                 if invalid {
                     self.commit_prune = CommitPruneProgress::Unloaded;
-                    self.backup_scratch.clear();
+                    self.prune_backup_scratch.clear();
                     return Err(sql_err!(
                         sqlstate::PROGRAM_LIMIT_EXCEEDED,
                         "backup roster exceeds max_backups ({}) or contains an invalid backup name",
-                        self.backup_scratch.capacity()
+                        self.prune_backup_scratch.capacity()
                     ));
                 }
                 if let Some(cursor) = next {
                     self.commit_prune = CommitPruneProgress::Backups { cursor };
                 } else {
-                    self.backup_scratch
+                    self.prune_backup_scratch
                         .sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
-                    self.backup_roster_loaded = true;
-                    if self.backup_scratch.is_empty() {
+                    self.prune_backup_roster_loaded = true;
+                    if self.prune_backup_scratch.is_empty() {
                         self.begin_prune_boundary(up_to_lsn, None);
                     } else {
                         self.commit_prune = CommitPruneProgress::BackupFloors {
@@ -3656,14 +3678,15 @@ impl Checkpointer {
                 Ok(false)
             }
             CommitPruneProgress::BackupFloors { index, oldest } => {
-                let key = stack_format!(128, "backups/{}/manifest", self.backup_scratch[index]);
+                let key =
+                    stack_format!(128, "backups/{}/manifest", self.prune_backup_scratch[index]);
                 let Poll::Ready(bytes) = self.metadata_io.get(key.as_str())? else {
                     return Ok(false);
                 };
                 let floor = manifest_commit_retention_floor(bytes)
                     .map_err(|message| sql_err!(SQLSTATE_IO, "backup manifest: {message}"))?;
                 let oldest = Some(oldest.map_or(floor, |current| current.min(floor)));
-                if index + 1 == self.backup_scratch.len() {
+                if index + 1 == self.prune_backup_scratch.len() {
                     self.begin_prune_boundary(up_to_lsn, oldest);
                 } else {
                     self.commit_prune = CommitPruneProgress::BackupFloors {
@@ -3723,8 +3746,16 @@ impl Checkpointer {
                 cursor,
             } => {
                 let mut overflow = false;
-                let doomed = &mut self.garbage_scratch;
+                // Canonical names are ordered by their fixed-width first LSN.
+                // New commits must not extend this completed checkpoint's scan.
+                let last_candidate = stack_format!(64, "commits/{floor:020}-ffffffff.head");
+                let mut past_floor = false;
+                let doomed = &mut self.commit_garbage_scratch;
                 let Poll::Ready(next) = self.metadata_io.list("commits/", cursor, |key| {
+                    if key > last_candidate.as_str() {
+                        past_floor = true;
+                        return;
+                    }
                     let is_doomed = commit_object_identity(key).is_some_and(|identity| {
                         identity.first_lsn <= floor && Some(identity) != boundary
                     });
@@ -3740,7 +3771,7 @@ impl Checkpointer {
                     return Ok(false);
                 };
                 self.commit_prune = match next {
-                    Some(cursor) if !overflow => CommitPruneProgress::List {
+                    Some(cursor) if !overflow && !past_floor => CommitPruneProgress::List {
                         floor,
                         boundary,
                         cursor,
@@ -3758,18 +3789,21 @@ impl Checkpointer {
                 boundary,
                 overflow,
             } => {
-                for _ in 0..self.delete_objects_per_beat.min(self.garbage_scratch.len()) {
+                for _ in 0..self
+                    .delete_objects_per_beat
+                    .min(self.commit_garbage_scratch.len())
+                {
                     let key = *self
-                        .garbage_scratch
+                        .commit_garbage_scratch
                         .last()
                         .expect("nonempty staged commit deletion batch");
                     if self.metadata_io.delete(key.as_str())?.is_pending() {
                         return Ok(false);
                     }
-                    self.garbage_scratch.pop();
+                    self.commit_garbage_scratch.pop();
                     *deleted += 1;
                 }
-                if !self.garbage_scratch.is_empty() {
+                if !self.commit_garbage_scratch.is_empty() {
                     return Ok(false);
                 }
                 self.commit_prune = if overflow {
@@ -9413,7 +9447,6 @@ impl Checkpointer {
             ));
         }
         loop {
-            self.metadata_io.wait_ready()?;
             match self.checkpoint_step(storage)? {
                 CheckpointStep::Idle => return Ok(None),
                 CheckpointStep::Working => {
@@ -9455,12 +9488,10 @@ impl Checkpointer {
             ));
         }
         self.observe_retained_root_release(storage);
-        while self.published_lsn_pending_maintenance.is_some() {
+        while self.published_lsn_pending_maintenance.is_some() || self.commit_cleanup_pending() {
             self.metadata_io.wait_ready()?;
-            if let Some(up_to_lsn) = self.commit_prune_through {
-                if self.prune_commit_batch(up_to_lsn)? {
-                    self.commit_prune_through = None;
-                }
+            self.advance_commit_cleanup()?;
+            if self.published_lsn_pending_maintenance.is_none() {
                 continue;
             }
             if self.legacy_garbage_pending {
@@ -9508,12 +9539,6 @@ impl Checkpointer {
             return Ok(CheckpointStep::Working);
         }
         if self.published_lsn_pending_maintenance.is_some() {
-            if let Some(up_to_lsn) = self.commit_prune_through {
-                if self.prune_commit_batch(up_to_lsn)? {
-                    self.commit_prune_through = None;
-                }
-                return Ok(CheckpointStep::Working);
-            }
             if self.legacy_garbage_pending {
                 self.legacy_garbage_pending = !self.collect_garbage_batch()?;
                 return Ok(CheckpointStep::Working);
@@ -20295,7 +20320,7 @@ mod stored_dependency_tests {
             CommitPruneProgress::Backups { cursor } => cursor,
             _ => panic!("backup inventory must span several bounded pages"),
         };
-        let names = checkpointer.backup_scratch.len();
+        let names = checkpointer.prune_backup_scratch.len();
         assert!(names > 0 && names < 70);
         namespace.borrow_mut().faults.fail_from_op = Some(0);
         assert_eq!(
@@ -20304,7 +20329,7 @@ mod stored_dependency_tests {
                 .sqlstate,
             sqlstate::IO_ERROR
         );
-        assert_eq!(checkpointer.backup_scratch.len(), names);
+        assert_eq!(checkpointer.prune_backup_scratch.len(), names);
         assert!(matches!(checkpointer.commit_prune,
             CommitPruneProgress::Backups { cursor: retained } if retained == cursor));
         namespace.borrow_mut().faults.fail_from_op = None;
@@ -20324,7 +20349,7 @@ mod stored_dependency_tests {
                 "turn {turn} exceeded one metadata read"
             );
         }
-        assert_eq!(checkpointer.backup_scratch.len(), 70);
+        assert_eq!(checkpointer.prune_backup_scratch.len(), 70);
         assert!(matches!(
             checkpointer.commit_prune,
             CommitPruneProgress::FindBoundary { floor: 4, .. }
@@ -20354,6 +20379,214 @@ mod stored_dependency_tests {
             namespace
                 .borrow()
                 .object_bytes(&format!("{}{lookalike}", config.object_store_prefix))
+                .is_some()
+        );
+        drop(checkpointer);
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    }
+
+    #[test]
+    fn maintenance_metadata_stalled_journal_does_not_block_checkpoint_publication() {
+        let (mut checkpoint, mut storage, _, config) =
+            index_gc_fixture("journal-checkpoint-overlap", 32);
+        checkpoint.checkpoint(&mut storage).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut metadata_config = config.clone();
+        metadata_config.object_store_sim = false;
+        metadata_config.object_store_endpoint = listener.local_addr().unwrap().to_string();
+        metadata_config.object_store_access_key = "test-access".to_owned();
+        metadata_config.object_store_secret_key = "test-secret".to_owned();
+        let mut budget = Budget::new(MetadataIo::budget_bytes(&metadata_config));
+        checkpoint.metadata_io = MetadataIo::new(&metadata_config, &mut budget).unwrap();
+        checkpoint.schedule_commit_prune(0);
+        assert!(!crate::mem::guard::forbid_alloc(|| checkpoint.advance_commit_cleanup()).unwrap());
+        assert!(!checkpoint.metadata_io_ready());
+        let request = checkpoint.request_checkpoint().unwrap();
+        let mut published = false;
+        for _ in 0..128 {
+            if matches!(
+                checkpoint.checkpoint_step(&mut storage).unwrap(),
+                CheckpointStep::Published { .. }
+            ) {
+                published = true;
+                break;
+            }
+        }
+        assert!(
+            published,
+            "cache-saving publication must not wait for obsolete journal I/O"
+        );
+        assert!(checkpoint.checkpoint_request_satisfied(request));
+        assert!(checkpoint.commit_cleanup_pending());
+        assert!(
+            !checkpoint.metadata_io_ready(),
+            "the test server never answered the journal request"
+        );
+        drop(checkpoint);
+        drop(storage);
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    }
+
+    #[test]
+    fn maintenance_metadata_journal_queues_do_not_alias_physical_cleanup_or_old_targets() {
+        let (mut checkpoint, storage, _, config) = index_gc_fixture("journal-private-queues", 32);
+        checkpoint.delete_objects_per_beat = 1;
+        let mut batches = Vec::new();
+        for lsn in 1..=8 {
+            checkpoint
+                .publish_commit_batch(lsn, b"opaque log bytes")
+                .unwrap();
+            batches.push(checkpoint.commit_head.unwrap());
+        }
+        checkpoint
+            .client
+            .put("sst/orphan", b"obsolete bytes", Precondition::None)
+            .unwrap();
+        checkpoint.schedule_commit_prune(2);
+        checkpoint.schedule_commit_prune(5);
+        checkpoint.schedule_commit_prune(7);
+        assert_eq!(checkpoint.commit_prune_through, Some(2));
+        assert_eq!(checkpoint.commit_prune_next, Some(7));
+        for _ in 0..32 {
+            if matches!(checkpoint.commit_prune, CommitPruneProgress::Delete { .. }) {
+                break;
+            }
+            assert!(
+                !crate::mem::guard::forbid_alloc(|| checkpoint.advance_commit_cleanup()).unwrap()
+            );
+        }
+        assert!(matches!(
+            checkpoint.commit_prune,
+            CommitPruneProgress::Delete { .. }
+        ));
+        let queued = checkpoint.commit_garbage_scratch.clone();
+        assert_eq!(queued.len(), 2);
+        assert!(checkpoint.collect_garbage_batch().unwrap());
+        checkpoint.load_backup_names().unwrap();
+        assert_eq!(checkpoint.commit_garbage_scratch, queued);
+        assert!(checkpoint.garbage_scratch.is_empty());
+        assert!(checkpoint.backup_roster_loaded);
+        let mut complete = false;
+        for _ in 0..4 {
+            complete =
+                crate::mem::guard::forbid_alloc(|| checkpoint.advance_commit_cleanup()).unwrap();
+            if complete {
+                break;
+            }
+        }
+        assert!(complete);
+        assert_eq!(checkpoint.commit_prune_through, Some(7));
+        checkpoint.schedule_commit_prune(4);
+        assert_eq!(checkpoint.commit_prune_through, Some(4));
+        assert_eq!(checkpoint.commit_prune_next, None);
+        for _ in 0..32 {
+            if !checkpoint.commit_cleanup_pending() {
+                break;
+            }
+            crate::mem::guard::forbid_alloc(|| checkpoint.advance_commit_cleanup()).unwrap();
+        }
+        assert!(!checkpoint.commit_cleanup_pending());
+        let namespace = crate::object_store::sim::open_namespace(&config.object_store_bucket, 0);
+        for batch in batches {
+            let key = format!(
+                "{}commits/{:020}-{:08x}.batch",
+                config.object_store_prefix, batch.first_lsn, batch.digest
+            );
+            assert_eq!(
+                namespace.borrow().object_bytes(&key).is_some(),
+                batch.first_lsn >= 4
+            );
+        }
+        drop(checkpoint);
+        drop(storage);
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    }
+
+    #[test]
+    fn maintenance_metadata_pruning_stops_before_a_growing_newer_commit_tail() {
+        let mut config = Config::default_dev();
+        config.object_store_on = true;
+        config.object_store_sim = true;
+        config.block_cache_bytes = 0;
+        config.disk_cache_bytes = 0;
+        config.checkpoint_garbage_batch_objects = 16;
+        config.checkpoint_delete_objects_per_beat = 2;
+        config.object_store_bucket = format!("metadata-prune-tail-{}", std::process::id());
+        config.data_dir = std::env::temp_dir()
+            .join(&config.object_store_bucket)
+            .to_str()
+            .unwrap()
+            .to_owned();
+        config.remove_test_data_dir_on_drop();
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        let namespace = crate::object_store::sim::open_namespace(&config.object_store_bucket, 0);
+        let mut budget = Budget::new(Checkpointer::budget_bytes(&config));
+        let mut checkpointer = Checkpointer::new(&config, &mut budget).unwrap();
+        let mut first = Vec::new();
+        for lsn in 1..=100 {
+            checkpointer
+                .publish_commit_batch(lsn, b"confirmed log bytes")
+                .unwrap();
+            if lsn <= 4 {
+                first.push(checkpointer.commit_head.unwrap());
+            }
+        }
+        for _ in 0..110 {
+            if matches!(checkpointer.commit_prune, CommitPruneProgress::List { .. }) {
+                break;
+            }
+            assert!(
+                !crate::mem::guard::forbid_alloc(|| checkpointer.prune_commit_batch(4)).unwrap()
+            );
+        }
+        assert!(matches!(
+            checkpointer.commit_prune,
+            CommitPruneProgress::List { .. }
+        ));
+        for lsn in 101..=164 {
+            checkpointer
+                .publish_commit_batch(lsn, b"newer confirmed log bytes")
+                .unwrap();
+        }
+        assert!(!crate::mem::guard::forbid_alloc(|| checkpointer.prune_commit_batch(4)).unwrap());
+        assert!(matches!(
+            checkpointer.commit_prune,
+            CommitPruneProgress::Delete {
+                overflow: false,
+                ..
+            }
+        ));
+        let mut done = false;
+        for lsn in 165..=168 {
+            checkpointer
+                .publish_commit_batch(lsn, b"growing log tail")
+                .unwrap();
+            done = crate::mem::guard::forbid_alloc(|| checkpointer.prune_commit_batch(4)).unwrap();
+            if done {
+                break;
+            }
+        }
+        assert!(done, "new commits must not extend the old cleanup decision");
+        for batch in first {
+            for suffix in ["batch", "head"] {
+                let key = format!(
+                    "{}commits/{:020}-{:08x}.{suffix}",
+                    config.object_store_prefix, batch.first_lsn, batch.digest
+                );
+                assert_eq!(
+                    namespace.borrow().object_bytes(&key).is_some(),
+                    batch.first_lsn == 4
+                );
+            }
+        }
+        let latest = checkpointer.commit_head.unwrap();
+        assert!(
+            namespace
+                .borrow()
+                .object_bytes(&format!(
+                    "{}commits/{:020}-{:08x}.batch",
+                    config.object_store_prefix, latest.first_lsn, latest.digest
+                ))
                 .is_some()
         );
         drop(checkpointer);
@@ -20395,14 +20628,14 @@ mod stored_dependency_tests {
             crate::mem::guard::forbid_alloc(|| checkpointer.prune_commit_batch(8)).unwrap_err();
         assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
         assert!(error.message.as_str().contains("max_backups (2)"));
-        assert!(!checkpointer.backup_roster_loaded);
-        assert!(checkpointer.backup_scratch.is_empty());
-        assert!(checkpointer.garbage_scratch.is_empty());
+        assert!(!checkpointer.prune_backup_roster_loaded);
+        assert!(checkpointer.prune_backup_scratch.is_empty());
+        assert!(checkpointer.commit_garbage_scratch.is_empty());
         assert!(checkpointer.delete_backup("old").unwrap());
         assert!(!checkpointer.prune_commit_batch(8).unwrap());
         assert_eq!(
             checkpointer
-                .backup_scratch
+                .prune_backup_scratch
                 .iter()
                 .map(StackStr::as_str)
                 .collect::<Vec<_>>(),
@@ -20428,7 +20661,7 @@ mod stored_dependency_tests {
             checkpointer.commit_prune,
             CommitPruneProgress::Unloaded
         ));
-        assert!(!checkpointer.backup_roster_loaded);
+        assert!(!checkpointer.prune_backup_roster_loaded);
         assert!(!checkpointer.prune_commit_batch(8).unwrap());
         assert!(!checkpointer.prune_commit_batch(8).unwrap());
         assert!(matches!(
@@ -20795,7 +21028,7 @@ mod stored_dependency_tests {
         backups.max_backups += 1;
         assert_eq!(
             Checkpointer::budget_bytes(&backups) - base_bytes,
-            core::mem::size_of::<StackStr<BACKUP_NAME_BYTES>>()
+            2 * core::mem::size_of::<StackStr<BACKUP_NAME_BYTES>>()
         );
 
         let mut live_blocks = base.clone();
@@ -20826,7 +21059,7 @@ mod stored_dependency_tests {
         garbage.checkpoint_garbage_batch_objects += 1;
         assert_eq!(
             Checkpointer::budget_bytes(&garbage) - base_bytes,
-            core::mem::size_of::<StackStr<80>>() + core::mem::size_of::<StackStr<64>>()
+            core::mem::size_of::<StackStr<80>>() + 2 * core::mem::size_of::<StackStr<64>>()
         );
 
         let mut delete_pacing = base.clone();

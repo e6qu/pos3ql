@@ -17,7 +17,8 @@ Its commit history must retain durable order. Reads, independent uploads and SQL
 CPU execution do not all need to be serialized to preserve that order.
 
 Today, object-store I/O overlaps and batches requests, while SQL CPU work uses
-one worker. Journal cleanup yields while its metadata requests wait; some
+one worker. Journal cleanup yields while its metadata requests wait and does
+not prevent checkpoints from freeing row-cache space; some
 state-changing, checkpoint capture and block-cleanup reads still wait
 synchronously. Same-host MinIO and SeaweedFS checks establish portability;
 they do not establish production performance. The owning guides describe

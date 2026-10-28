@@ -20396,12 +20396,23 @@ mod stored_dependency_tests {
         let (mut checkpoint, mut storage, table, config) =
             index_gc_fixture("reader-release-unpublished-files", 32);
         let mut saved = Vec::with_capacity(2);
-        for (rowid, value) in [(1, b"old".as_slice()), (2, b"new".as_slice())] {
+        for rowid in 1u64..=2 {
+            let mut value = [0u8; 7];
+            crate::storage::rowenc::encode(
+                &[crate::sql::types::Datum::Int4(rowid as i32)],
+                &mut value,
+            );
+            let mut checksum = Crc32c::new();
+            let mut header = [0u8; 20];
+            header[..8].copy_from_slice(&rowid.to_le_bytes());
+            header[16..].copy_from_slice(&(value.len() as u32).to_le_bytes());
+            checksum.update(&header);
+            checksum.update(&value);
             checkpoint.slice_writer.reset();
             let mut blocks = checkpoint.blocks.lock().unwrap();
             checkpoint
                 .slice_writer
-                .append(&mut *blocks, rowid, value)
+                .append(&mut *blocks, rowid, &value)
                 .unwrap();
             saved.push(PrevSst {
                 handle: checkpoint
@@ -20410,7 +20421,7 @@ mod stored_dependency_tests {
                     .unwrap()
                     .unwrap(),
                 count: 1,
-                crc: 0,
+                crc: checksum.finish(),
             });
         }
         let old = saved[0];

@@ -1722,7 +1722,7 @@ impl GucState {
         let mut state = self.store.borrow_mut();
         let mut values = state.current;
         store(&mut values.timezone, display.as_str())?;
-        values.parsed_timezone = super::timezone::Timezone::fixed(seconds_east, "");
+        values.parsed_timezone = super::timezone::Timezone::fixed(seconds_east, "", false);
         finish_setting_change(&mut state, values, GUC_TIMEZONE, local, false);
         Ok(())
     }
@@ -2767,8 +2767,8 @@ fn is_utc(v: &str) -> bool {
         || v.eq_ignore_ascii_case("universal")
 }
 
-/// Parses a time-zone value to (offset east of UTC in seconds, non-ISO
-/// abbreviation), or None for a named/DST zone we do not model. Matches
+/// Parses a session TimeZone as an installed zone or fixed offset. Datetime
+/// input recognizes abbreviations separately. Matches
 /// PostgreSQL's inverted sign conventions: `Etc/GMT+5` is UTC-5 and a bare
 /// `+05:30` is UTC-5:30.
 pub fn parse_timezone(v: &str) -> Option<super::timezone::Timezone> {
@@ -2777,15 +2777,21 @@ pub fn parse_timezone(v: &str) -> Option<super::timezone::Timezone> {
     if is_utc(t) || t.eq_ignore_ascii_case("z") || t.eq_ignore_ascii_case("zulu") {
         return Some(Timezone::utc());
     }
-    // A named IANA zone (with DST) from the embedded set.
+    // Session settings select installed IANA zones, including their history.
     if let Some(timezone) = super::timezone::lookup(t) {
         return Some(timezone);
     }
     // Etc/GMT±N and GMT±N: the sign is inverted; the abbreviation PostgreSQL
     // shows is the resulting ISO offset (e.g. Etc/GMT+5 -> "-05").
-    let etc = if t.len() >= 7 && t[..7].eq_ignore_ascii_case("etc/gmt") {
+    let etc = if t
+        .get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("etc/gmt"))
+    {
         Some(&t[7..])
-    } else if t.len() >= 3 && t[..3].eq_ignore_ascii_case("gmt") {
+    } else if t
+        .get(..3)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("gmt"))
+    {
         Some(&t[3..])
     } else {
         None
@@ -2798,11 +2804,12 @@ pub fn parse_timezone(v: &str) -> Option<super::timezone::Timezone> {
         return Some(Timezone::fixed(
             offset,
             super::datetime::iso_offset_string(offset).as_str(),
+            false,
         ));
     }
     // Bare numeric offset: POSIX inverted sign, no abbreviation shown.
     if t.starts_with('+') || t.starts_with('-') {
-        return Some(Timezone::fixed(-parse_hms(t)?, ""));
+        return Some(Timezone::fixed(-parse_hms(t)?, "", false));
     }
     None
 }

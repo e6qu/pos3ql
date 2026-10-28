@@ -213,7 +213,7 @@ fn parse_writer_fence(bytes: &[u8]) -> Result<(&str, WriterToken), &'static str>
     Ok((state, token))
 }
 
-pub(crate) const MANIFEST_HEADER: &str = "pos3ql-manifest-v33";
+pub(crate) const MANIFEST_HEADER: &str = "pos3ql-manifest-v34";
 
 struct ManifestMetadata {
     lsn: u64,
@@ -4763,22 +4763,26 @@ impl Checkpointer {
                 }
                 Some("rmem") => {
                     finish_pending(storage, &mut slot_of, &mut pending_def)?;
-                    let decode = |word: Option<&str>, missing: &'static str| {
-                        word.ok_or(CheckpointSetupError::Corrupt(missing))
-                            .and_then(decode_hex_name)
-                    };
-                    let role = decode(words.next(), "rmem role missing")?;
-                    let member = decode(words.next(), "rmem member missing")?;
-                    let grantor = decode(words.next(), "rmem grantor missing")?;
+                    let identity = parse_catalog_position(&mut words, metadata.catalog_sequence)?;
+                    let role_oid =
+                        |word, name| -> Result<crate::storage::RoleOid, CheckpointSetupError> {
+                            crate::storage::RoleOid::parse(parse_field(word, name)?).ok_or(
+                                CheckpointSetupError::Corrupt("invalid membership role identifier"),
+                            )
+                        };
+                    let role = role_oid(words.next(), "rmem role missing")?;
+                    let member = role_oid(words.next(), "rmem member missing")?;
+                    let grantor = role_oid(words.next(), "rmem grantor missing")?;
                     let flags: u8 = parse_field(words.next(), "rmem flags")?;
                     if words.next().is_some() || flags & !0x07 != 0 {
                         return Err(CheckpointSetupError::Corrupt("invalid rmem record"));
                     }
                     storage
                         .install_role_membership(
-                            &role,
-                            &member,
-                            &grantor,
+                            identity,
+                            role,
+                            member,
+                            grantor,
                             crate::storage::RoleMembershipOptions {
                                 admin: flags & 1 != 0,
                                 inherit: flags & 2 != 0,
@@ -5292,60 +5296,75 @@ impl Checkpointer {
                 }
                 Some("dacl") => {
                     finish_pending(storage, &mut slot_of, &mut pending_def)?;
-                    let decode = |word: Option<&str>, missing: &'static str| {
-                        word.ok_or(CheckpointSetupError::Corrupt(missing))
-                            .and_then(decode_hex_name)
+                    let slot: u16 = parse_field(words.next(), "default privilege position")?;
+                    let creation: u64 = parse_field(words.next(), "default privilege creation")?;
+                    let creation = crate::storage::CatalogIdentity::parse(creation)
+                        .filter(|creation| creation.created_at() <= metadata.catalog_sequence)
+                        .ok_or(CheckpointSetupError::Corrupt(
+                            "invalid default privilege creation",
+                        ))?;
+                    let owner: i32 = parse_field(words.next(), "default privilege owner")?;
+                    let owner = crate::storage::RoleOid::parse(owner).ok_or(
+                        CheckpointSetupError::Corrupt("invalid default privilege owner"),
+                    )?;
+                    let namespace = words.next().ok_or(CheckpointSetupError::Corrupt(
+                        "default privilege namespace missing",
+                    ))?;
+                    let schema = if namespace == "-" {
+                        None
+                    } else {
+                        let created_at: u64 =
+                            parse_field(Some(namespace), "default privilege namespace")?;
+                        Some(crate::storage::SchemaIdentity::parse(created_at).ok_or(
+                            CheckpointSetupError::Corrupt("invalid default privilege namespace"),
+                        )?)
                     };
-                    let owner = decode(words.next(), "dacl owner missing")?;
-                    let schema = decode(words.next(), "dacl schema missing")?;
-                    let class: u8 = parse_field(words.next(), "dacl class")?;
-                    let class = crate::storage::DefaultPrivilegeClass::from_u8(class)
-                        .ok_or(CheckpointSetupError::Corrupt("invalid dacl class"))?;
-                    let grantee = decode(words.next(), "dacl grantee missing")?;
-                    let privileges: u16 = parse_field(words.next(), "dacl privileges")?;
-                    let grant_options: u16 = parse_field(words.next(), "dacl grant options")?;
+                    let grantee = words.next().ok_or(CheckpointSetupError::Corrupt(
+                        "default privilege grantee missing",
+                    ))?;
+                    let grantee = if grantee == "PUBLIC" {
+                        None
+                    } else {
+                        let oid: i32 = parse_field(Some(grantee), "default privilege grantee")?;
+                        Some(crate::storage::RoleOid::parse(oid).ok_or(
+                            CheckpointSetupError::Corrupt("invalid default privilege grantee"),
+                        )?)
+                    };
+                    let class: u8 = parse_field(words.next(), "default privilege class")?;
+                    let class = crate::storage::DefaultPrivilegeClass::from_u8(class).ok_or(
+                        CheckpointSetupError::Corrupt("invalid default privilege class"),
+                    )?;
+                    let privileges: u16 = parse_field(words.next(), "default privileges")?;
+                    let grant_options: u16 = parse_field(words.next(), "default grant options")?;
                     if words.next().is_some()
                         || privileges & !class.all_privileges().0 != 0
                         || grant_options & !privileges != 0
+                        || slot == u16::MAX
                     {
-                        return Err(CheckpointSetupError::Corrupt("invalid dacl record"));
+                        return Err(CheckpointSetupError::Corrupt(
+                            "invalid default privilege record",
+                        ));
                     }
-                    let owner = storage
-                        .find_role(&owner)
-                        .ok_or(CheckpointSetupError::Corrupt("dacl owner does not exist"))?
-                        as u16;
-                    let schema = if schema.is_empty() {
-                        crate::storage::DEFAULT_ACL_ALL_SCHEMAS
-                    } else {
-                        storage
-                            .find_schema(&schema)
-                            .ok_or(CheckpointSetupError::Corrupt("dacl schema does not exist"))?
-                            as u16
-                    };
-                    let grantee = if grantee == "PUBLIC" {
-                        crate::storage::PUBLIC_ROLE
-                    } else {
-                        storage
-                            .find_role(&grantee)
-                            .ok_or(CheckpointSetupError::Corrupt("dacl grantee does not exist"))?
-                            as u16
-                    };
                     storage
-                        .change_default_acl(
-                            crate::storage::DefaultAclKey {
-                                owner,
-                                schema,
-                                class,
+                        .install_default_acl_image(
+                            usize::from(slot),
+                            None,
+                            Some(crate::storage::DefaultAclGrantImage {
+                                identity: crate::storage::DefaultAclIdentity {
+                                    creation,
+                                    owner,
+                                    schema,
+                                    class,
+                                },
                                 grantee,
-                            },
-                            true,
-                            crate::storage::PrivilegeSet(privileges),
-                            crate::storage::PrivilegeSet(grant_options),
+                                privileges: crate::storage::PrivilegeSet(privileges),
+                                grant_options: crate::storage::PrivilegeSet(grant_options),
+                            }),
                             0,
                         )
                         .map_err(|error| {
                             CheckpointSetupError::ObjectStore(format!(
-                                "manifest default ACL rejected: {}",
+                                "manifest default privilege rejected: {}",
                                 error.message.as_str()
                             ))
                         })?;
@@ -9709,45 +9728,19 @@ impl Checkpointer {
                 ),
             )?;
         }
-        for (_, membership) in storage.live_role_memberships() {
-            use core::fmt::Write;
-            let mut role = StackStr::<130>::new();
-            let mut member = StackStr::<130>::new();
-            let mut grantor = StackStr::<130>::new();
-            for byte in storage
-                .role(membership.role as usize)
-                .name
-                .as_str()
-                .as_bytes()
-            {
-                let _ = write!(role, "{byte:02x}");
-            }
-            for byte in storage
-                .role(membership.member as usize)
-                .name
-                .as_str()
-                .as_bytes()
-            {
-                let _ = write!(member, "{byte:02x}");
-            }
-            for byte in storage
-                .role(membership.grantor as usize)
-                .name
-                .as_str()
-                .as_bytes()
-            {
-                let _ = write!(grantor, "{byte:02x}");
-            }
+        for (slot, membership) in storage.live_role_memberships() {
             let flags = u8::from(membership.options.admin)
                 | (u8::from(membership.options.inherit) << 1)
                 | (u8::from(membership.options.set) << 2);
             write_manifest(
                 &mut self.manifest_output,
                 format_args!(
-                    "rmem {} {} {} {}",
-                    role.as_str(),
-                    member.as_str(),
-                    grantor.as_str(),
+                    "rmem {} {} {} {} {} {}",
+                    slot,
+                    membership.created_at,
+                    storage.role(usize::from(membership.role)).oid().get(),
+                    storage.role(usize::from(membership.member)).oid().get(),
+                    storage.role(usize::from(membership.grantor)).oid().get(),
                     flags
                 ),
             )?;
@@ -11888,7 +11881,7 @@ impl Checkpointer {
                 )?;
             }
         }
-        for (_, trigger) in storage.checkpoint_triggers() {
+        for (slot, trigger) in storage.checkpoint_triggers() {
             write_database_context(
                 &mut self.manifest_output,
                 &mut database_context,
@@ -11971,7 +11964,8 @@ impl Checkpointer {
             write_manifest(
                 &mut self.manifest_output,
                 format_args!(
-                    "trg {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
+                    "trg {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
+                    slot,
                     trigger.created_at,
                     target_kind,
                     hname.as_str(),
@@ -12018,31 +12012,18 @@ impl Checkpointer {
                 ),
             )?;
         }
-        for (trigger_slot, table_slot, enabled) in storage.partition_trigger_states() {
-            use core::fmt::Write;
-            let trigger = storage.trigger(trigger_slot);
-            write_database_context(
-                &mut self.manifest_output,
-                &mut database_context,
-                trigger.database,
-            )?;
-            let table = storage.table_def(table_slot, 0);
-            let mut schema = StackStr::<130>::new();
-            let mut table_name = StackStr::<130>::new();
-            for byte in table.schema.as_str().as_bytes() {
-                let _ = write!(schema, "{byte:02x}");
-            }
-            for byte in table.name.as_str().as_bytes() {
-                let _ = write!(table_name, "{byte:02x}");
-            }
+        for (database, image) in storage.partition_trigger_states() {
+            write_database_context(&mut self.manifest_output, &mut database_context, database)?;
             write_manifest(
                 &mut self.manifest_output,
                 format_args!(
-                    "trgs {} {} {} {}",
-                    trigger.created_at,
-                    schema.as_str(),
-                    table_name.as_str(),
-                    enabled.code(),
+                    "trgs {} {} {} {} {} {}",
+                    image.creation.get(),
+                    image.trigger.slot(),
+                    image.trigger.created_at(),
+                    image.table.slot(),
+                    image.table.created_at(),
+                    image.enabled.code(),
                 ),
             )?;
         }
@@ -12085,7 +12066,8 @@ impl Checkpointer {
             // policy definition to select its committed image.
             write!(
                 &mut self.manifest_output,
-                "pol {} {} {} {} {} {} {}{}",
+                "pol {} {} {} {} {} {} {} {}{}",
+                slot,
                 policy.created_at,
                 policy.command.code(),
                 u8::from(policy.permissive),
@@ -12884,46 +12866,40 @@ impl Checkpointer {
                 ),
             )?;
         }
-        for (_, acl) in storage.checkpoint_default_acls() {
+        for (slot, acl) in storage.checkpoint_default_acls() {
             write_database_context(
                 &mut self.manifest_output,
                 &mut database_context,
                 acl.database,
             )?;
             use core::fmt::Write;
-            let owner = storage.role(acl.owner as usize).name;
-            let schema = if acl.schema == crate::storage::DEFAULT_ACL_ALL_SCHEMAS {
-                crate::storage::SqlName::EMPTY
-            } else {
-                storage.schema_def(acl.schema as usize).name
-            };
-            let grantee = if acl.grantee == crate::storage::PUBLIC_ROLE {
-                crate::storage::SqlName::parse("PUBLIC").expect("PUBLIC fits")
-            } else {
-                storage.role(acl.grantee as usize).name
-            };
-            let mut owner_hex = StackStr::<130>::new();
-            let mut schema_hex = StackStr::<130>::new();
-            let mut grantee_hex = StackStr::<130>::new();
-            for byte in owner.as_str().as_bytes() {
-                let _ = write!(owner_hex, "{byte:02x}");
+            let image = acl
+                .committed
+                .expect("checkpoint default privileges are present");
+            let mut schema = StackStr::<32>::new();
+            match image.identity.schema {
+                Some(identity) => write!(&mut schema, "{}", identity.created_at()),
+                None => write!(&mut schema, "-"),
             }
-            for byte in schema.as_str().as_bytes() {
-                let _ = write!(schema_hex, "{byte:02x}");
+            .expect("default privilege namespace fits its exact decimal width");
+            let mut grantee = StackStr::<32>::new();
+            match image.grantee {
+                Some(role) => write!(&mut grantee, "{}", role.get()),
+                None => write!(&mut grantee, "PUBLIC"),
             }
-            for byte in grantee.as_str().as_bytes() {
-                let _ = write!(grantee_hex, "{byte:02x}");
-            }
+            .expect("default privilege grantee fits its exact decimal width");
             write_manifest(
                 &mut self.manifest_output,
                 format_args!(
-                    "dacl {} {} {} {} {} {}",
-                    owner_hex.as_str(),
-                    schema_hex.as_str(),
-                    acl.class as u8,
-                    grantee_hex.as_str(),
-                    acl.privileges.0,
-                    acl.grant_options.0
+                    "dacl {} {} {} {} {} {} {} {}",
+                    slot,
+                    image.identity.creation.created_at(),
+                    image.identity.owner.get(),
+                    schema.as_str(),
+                    grantee.as_str(),
+                    image.identity.class as u8,
+                    image.privileges.0,
+                    image.grant_options.0,
                 ),
             )?;
         }
@@ -17715,7 +17691,10 @@ fn load_policy(storage: &mut Storage, line: &str) -> Result<(), CheckpointSetupE
     if words.next() != Some("pol") {
         return Err(CheckpointSetupError::Corrupt("policy record"));
     }
+    let slot = parse_field(words.next(), "policy position")?;
     let created_at = parse_field(words.next(), "policy created_at")?;
+    let identity = crate::storage::CatalogPosition::new(slot, created_at)
+        .map_err(|_| CheckpointSetupError::Corrupt("policy position"))?;
     let command =
         crate::storage::PolicyCommandKind::from_code(parse_field(words.next(), "policy command")?)
             .ok_or(CheckpointSetupError::Corrupt("policy command"))?;
@@ -17772,8 +17751,8 @@ fn load_policy(storage: &mut Storage, line: &str) -> Result<(), CheckpointSetupE
         _ => return Err(CheckpointSetupError::Corrupt("policy table does not exist")),
     };
     storage
-        .restore_policy(
-            created_at,
+        .replay_set_policy(
+            identity,
             crate::storage::RecoveredPolicySpec {
                 name,
                 table,
@@ -17790,6 +17769,7 @@ fn load_policy(storage: &mut Storage, line: &str) -> Result<(), CheckpointSetupE
                 error.message.as_str()
             ))
         })
+        .map(|_| ())
 }
 
 fn load_trigger(storage: &mut Storage, line: &str) -> Result<(), CheckpointSetupError> {
@@ -17797,7 +17777,10 @@ fn load_trigger(storage: &mut Storage, line: &str) -> Result<(), CheckpointSetup
     if words.next() != Some("trg") {
         return Err(CheckpointSetupError::Corrupt("trigger record"));
     }
+    let slot = parse_field(words.next(), "trigger position")?;
     let created_at = parse_field(words.next(), "trigger created_at")?;
+    let identity = crate::storage::CatalogPosition::new(slot, created_at)
+        .map_err(|_| CheckpointSetupError::Corrupt("trigger position"))?;
     let target_kind: u8 = parse_field(words.next(), "trigger target")?;
     let name = sql_name(&decode_hex_name(
         words
@@ -18039,7 +18022,7 @@ fn load_trigger(storage: &mut Storage, line: &str) -> Result<(), CheckpointSetup
     }
     storage
         .restore_trigger(
-            created_at,
+            identity,
             crate::storage::TriggerSpec {
                 name,
                 target,
@@ -18074,58 +18057,47 @@ fn load_partition_trigger_state(
             "partition trigger state record",
         ));
     }
-    let created_at: u64 = parse_field(words.next(), "partition trigger created_at")?;
-    let schema = decode_hex_name(
-        words
-            .next()
-            .ok_or(CheckpointSetupError::Corrupt("partition trigger schema"))?,
-    )?;
-    let table_name = decode_hex_name(
-        words
-            .next()
-            .ok_or(CheckpointSetupError::Corrupt("partition trigger table"))?,
-    )?;
+    let creation = crate::storage::CatalogIdentity::parse(parse_field(
+        words.next(),
+        "inherited trigger identity",
+    )?)
+    .ok_or(CheckpointSetupError::Corrupt("inherited trigger identity"))?;
+    let trigger = crate::storage::CatalogPosition::new(
+        parse_field(words.next(), "inherited trigger parent position")?,
+        parse_field(words.next(), "inherited trigger parent identity")?,
+    )
+    .map_err(|_| CheckpointSetupError::Corrupt("inherited trigger parent"))?;
+    crate::storage::CatalogIdentity::require(trigger.created_at())
+        .map_err(|_| CheckpointSetupError::Corrupt("inherited trigger parent identity"))?;
+    let table = crate::storage::CatalogPosition::new(
+        parse_field(words.next(), "inherited trigger table position")?,
+        parse_field(words.next(), "inherited trigger table identity")?,
+    )
+    .map_err(|_| CheckpointSetupError::Corrupt("inherited trigger table"))?;
     let enabled = crate::storage::TriggerEnabled::from_code(parse_field::<u8>(
         words.next(),
-        "partition trigger enabled",
+        "inherited trigger enabled",
     )?)
-    .ok_or(CheckpointSetupError::Corrupt("partition trigger enabled"))?;
+    .ok_or(CheckpointSetupError::Corrupt("inherited trigger enabled"))?;
     if words.next().is_some() {
         return Err(CheckpointSetupError::Corrupt(
-            "malformed partition trigger state",
-        ));
-    }
-    let trigger = storage
-        .triggers_with_slots_visible_to(0)
-        .find_map(|(slot, trigger)| (trigger.created_at == created_at).then_some((slot, trigger)))
-        .ok_or(CheckpointSetupError::Corrupt(
-            "partition trigger parent does not exist",
-        ))?;
-    let table = match storage.resolve_relation(Some(&schema), &table_name, 0) {
-        Some(crate::storage::ResolvedRelation::Table(table)) => table,
-        _ => {
-            return Err(CheckpointSetupError::Corrupt(
-                "partition trigger table does not exist",
-            ));
-        }
-    };
-    let crate::storage::TriggerTarget::Table(parent) = trigger.1.target else {
-        return Err(CheckpointSetupError::Corrupt(
-            "view trigger has partition state",
-        ));
-    };
-    if !matches!(trigger.1.level, crate::sql::ast::TriggerLevel::Row)
-        || !storage.partition_descends_from(table, usize::from(parent), 0)
-    {
-        return Err(CheckpointSetupError::Corrupt(
-            "partition trigger state targets an unrelated table",
+            "malformed inherited trigger state",
         ));
     }
     storage
-        .restore_partition_trigger_state(trigger.0, table, enabled)
+        .install_partition_trigger_image(
+            None,
+            Some(crate::storage::PartitionTriggerImage {
+                creation,
+                trigger,
+                table,
+                enabled,
+            }),
+            0,
+        )
         .map_err(|error| {
             CheckpointSetupError::ObjectStore(format!(
-                "manifest partition trigger rejected: {}",
+                "manifest inherited trigger rejected: {}",
                 error.message.as_str()
             ))
         })
@@ -19908,7 +19880,7 @@ mod stored_dependency_tests {
             )
             .unwrap();
         let manifest = format!(
-            "pos3ql-manifest-v33\nlsn 7\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nvix 0 1 0 0 - {} 1 7\ntypes_end\nend\n",
+            "pos3ql-manifest-v34\nlsn 7\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nvix 0 1 0 0 - {} 1 7\ntypes_end\nend\n",
             index_gc_hex(old.roster)
         );
         // Two backups and two readers share the same graph at the four-block limit.
@@ -20363,7 +20335,7 @@ mod stored_dependency_tests {
                     let mut budget = Budget::new(bytes);
                     let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
                     let mut checkpointer = Checkpointer::new(&config, &mut budget).unwrap();
-                    let mut manifest = String::from("pos3ql-manifest-v33\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\ntypes_end\n");
+                    let mut manifest = String::from("pos3ql-manifest-v34\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\ntypes_end\n");
                     for (oid, name) in [(first_oid, first_name), (second_oid, second_name)] {
                         let encoded = name
                             .as_bytes()
@@ -20389,7 +20361,7 @@ mod stored_dependency_tests {
                     let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
                     let mut checkpointer = Checkpointer::new(&config, &mut budget).unwrap();
                     assert!(matches!(checkpointer.load_manifest_text(&mut storage,
-                        "pos3ql-manifest-v33\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nsset 73616d706c65 6669727374\nsset 73616d706c65 7365636f6e64\ntypes_end\nend\n"),
+                        "pos3ql-manifest-v34\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nsset 73616d706c65 6669727374\nsset 73616d706c65 7365636f6e64\ntypes_end\nend\n"),
                         Err(CheckpointSetupError::Corrupt("duplicate system setting record"))));
                     assert_eq!(storage.system_settings().find(|(_, image)| image.live).unwrap().1
                         .value.as_str(), "first");
@@ -20398,7 +20370,7 @@ mod stored_dependency_tests {
                     let mut budget = Budget::new(bytes);
                     let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
                     let mut checkpointer = Checkpointer::new(&config, &mut budget).unwrap();
-                    let manifest = format!("pos3ql-manifest-v33\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nptx 10 1 2 0 5 10 6669727374\nptx {transaction_id} 1 2 0 5 10 {gid}\ntypes_end\nend\n");
+                    let manifest = format!("pos3ql-manifest-v34\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nptx 10 1 2 0 5 10 6669727374\nptx {transaction_id} 1 2 0 5 10 {gid}\ntypes_end\nend\n");
                     match checkpointer.load_manifest_text(&mut storage, &manifest) {
                         Err(CheckpointSetupError::ObjectStore(message)) => {
                             assert!(message.contains("duplicate prepared transaction catalog identity"));
@@ -20574,7 +20546,8 @@ mod stored_dependency_tests {
                 "pos3ql-manifest-v30",
                 "pos3ql-manifest-v31",
                 "pos3ql-manifest-v32",
-                "pos3ql-manifest-v33 trailing",
+                "pos3ql-manifest-v33",
+                "pos3ql-manifest-v34 trailing",
             ] {
                 let rejected = stack_format!(512, "{header}\n{body}");
                 assert!(matches!(
@@ -20656,11 +20629,11 @@ mod stored_dependency_tests {
 
     #[test]
     fn backup_commit_floor_includes_prepared_transactions_and_logical_slots() {
-        let manifest = b"pos3ql-manifest-v33\nlsn 100\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nptx 7 41 50 0 5 10 78\nrslot 736c6f74 60 70 0\ntypes_end\nend\n";
+        let manifest = b"pos3ql-manifest-v34\nlsn 100\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nptx 7 41 50 0 5 10 78\nrslot 736c6f74 60 70 0\ntypes_end\nend\n";
         assert_eq!(manifest_lsn(manifest).unwrap(), 100);
         assert_eq!(manifest_commit_retention_floor(manifest).unwrap(), 40);
 
-        let slot_only = b"pos3ql-manifest-v33\nlsn 100\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nrslot 736c6f74 60 70 0\ntypes_end\nend\n";
+        let slot_only = b"pos3ql-manifest-v34\nlsn 100\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nrslot 736c6f74 60 70 0\ntypes_end\nend\n";
         assert_eq!(manifest_commit_retention_floor(slot_only).unwrap(), 60);
     }
 
@@ -21022,7 +20995,7 @@ mod stored_dependency_tests {
         let mut manifest = FixedBuf::new(&mut budget, "manifest", 1024).unwrap();
         manifest
             .append(
-                b"pos3ql-manifest-v33\nlsn 7\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\ntypes_end\nend\n",
+                b"pos3ql-manifest-v34\nlsn 7\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\ntypes_end\nend\n",
             );
         let before = manifest.readable().to_vec();
         retag_manifest_root(&mut manifest, replacement).unwrap();

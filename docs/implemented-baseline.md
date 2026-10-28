@@ -105,9 +105,29 @@ after that savepoint. Prepared transactions retain their locks through recovery;
 `pg_locks` uses durable account and relation identities.
 
 Permission changes on one object wait for its transaction, while changes on
-other objects can proceed. Permission lists preserve grant order and explicitly
+other objects can proceed. Object permission lists preserve grant order and explicitly
 empty lists through restart. Revoking the owner's own SELECT permission does
 not remove its right to grant SELECT.
+
+Memberships granted by different accounts remain independent. Revoking one
+account's grant keeps the others. Changing ADMIN, INHERIT or SET options keeps
+the membership identifier; revoking and recreating a membership gives it a new
+identifier. Superusers' implicit grants are recorded under the bootstrap
+administrator; inherited administrators grant under the account that holds ADMIN.
+Administrator grants apply PostgreSQL's checks against granting privileges back
+to their source. Membership edits for the same role
+wait for its transaction, including a prepared transaction after recovery;
+other roles and catalog readers can proceed. Repeated grants emit a NOTICE,
+while revoking a missing grant emits a WARNING, matching PostgreSQL's fields.
+
+Default privileges describe what new objects receive. Their catalog identifier
+belongs to the owner, schema and object class, while their permission list is
+sorted by account identifier. For example, granting SELECT on future tables to
+`reader` and INSERT to `writer`, then removing `reader`, preserves the row and
+`writer`'s grant. Returning to the ordinary defaults removes that row; adding a
+grant later creates a new identifier. Dropping a schema removes its default
+privileges automatically. These distinctions survive savepoints, prepared
+transactions, database copies and recovery with empty local caches.
 
 Numeric missing-object permission checks follow PostgreSQL's account-dependent
 rules. A missing table, sequence or large-object identifier returns NULL. For a
@@ -211,13 +231,25 @@ for relations, row/array types, named types, enum members, indexes, CHECK,
 foreign-key and NOT NULL constraints, statistics, extensions, foreign-data
 wrappers, servers, user mappings, publications, subscriptions, collations,
 conversions, text-search parsers, templates, dictionaries and configurations, casts,
-operators, operator families, operator classes, access methods and event triggers.
+operators, operator families, operator classes, access methods, event triggers,
+memberships, default privileges, declared and inherited triggers, rewrite rules,
+routines and row-security policies.
 Removing an earlier column or rule does not renumber survivors. Foreign-key triggers retain
 their constraint links. `ADD CONSTRAINT ... USING INDEX` preserves the existing
 index identifier. Database-template copies preserve database-local identifiers, foreign-wrapper,
 server, mapping and table links, and their copied comments. Shared subscriptions
-remain owned by their original database. Remaining identifier families are
-tracked in the plan.
+remain owned by their original database. Remaining catalog lookup and reader
+lifetime guarantees are tracked in the plan.
+
+An inherited trigger keeps its identifier when disabled or renamed. Detaching
+and reattaching its partition creates a new trigger identifier. Each child keeps
+its own enabled mode, so `ALTER TABLE ONLY orders DISABLE TRIGGER audit_order`
+does not disable existing children's copies. Copied definitions and later edits
+stay in their own database through restart. Saved trigger and policy positions
+are restored exactly; recovery rejects stale, missing or corrupt saved images.
+Row triggers declared directly on a child use their own mode; only inherited
+row triggers use the child's saved copy. A parent's statement trigger fires
+once for a command targeting that parent and is not inherited by its children.
 
 ```sql
 CREATE TABLE orders(id integer);

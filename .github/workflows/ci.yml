@@ -30,6 +30,7 @@ jobs:
       - name: Socket readiness and allocation-free catalog publication
         run: >-
           cargo test --lib --locked -- io:: mem::mutex::tests type_ domain_ enum_ composite_ table_name catalog_creation_
+          timezone_abbreviation_ fixed_default_abbreviations_ degree_special_and_random_math_
           --test-threads=1
 
       - name: macOS allocation-free mutex boundary

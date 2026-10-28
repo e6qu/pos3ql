@@ -3,10 +3,10 @@
 //! transitions. Fixed-offset zones (UTC, `+05:30`) are the degenerate case
 //! with no transitions.
 //!
-//! DST rules follow the POSIX form (the `Mm.w.d` transition: month, week,
-//! day-of-week, local seconds-after-midnight). This is exact for current rules;
-//! it does not model historical rule changes (PostgreSQL's full timezone database
-//! does), which only affects timestamps from before a zone's present rule.
+//! Installed TZif files supply historical transitions; their POSIX footer rules
+//! cover later instants. Datetime input recognizes session-zone abbreviations
+//! before PostgreSQL's pinned Default abbreviation set, independently of whether
+//! the host happens to install legacy files named EST, MST or HST.
 
 use core::fmt::Write;
 
@@ -41,6 +41,7 @@ pub struct PosixZone {
     dst_off: i32,
     std_abbrev: StackStr<8>,
     dst_abbrev: StackStr<8>,
+    std_is_dst: bool,
     dst: Option<Dst>,
 }
 
@@ -50,6 +51,16 @@ pub struct PosixZone {
 pub enum Timezone {
     Posix(PosixZone),
     Tzif(super::tzif::TzifSlot),
+    Abbreviation {
+        zone: super::tzif::TzifSlot,
+        name: StackStr<8>,
+    },
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum AbbreviationDefinition {
+    Fixed { offset: i32, is_dst: bool },
+    Dynamic(&'static str),
 }
 
 use core::cell::Cell;
@@ -73,7 +84,7 @@ pub fn session() -> Timezone {
 
 impl Timezone {
     /// A fixed-offset zone (no DST): UTC, `Etc/GMT±N`, bare numeric offsets.
-    pub fn fixed(off_secs: i32, abbrev: &str) -> Timezone {
+    pub fn fixed(off_secs: i32, abbrev: &str, is_dst: bool) -> Timezone {
         let mut a = StackStr::new();
         let _ = write!(a, "{abbrev}");
         Timezone::Posix(PosixZone {
@@ -81,20 +92,32 @@ impl Timezone {
             dst_off: off_secs,
             std_abbrev: a,
             dst_abbrev: a,
+            std_is_dst: is_dst,
             dst: None,
         })
     }
 
     pub fn utc() -> Timezone {
-        Timezone::fixed(0, "UTC")
+        Timezone::fixed(0, "UTC", false)
     }
 
     /// The offset (seconds east of UTC) and abbreviation in effect at `utc`
     /// microseconds-since-2000.
     pub fn resolve(&self, utc: i64) -> (i32, StackStr<8>) {
+        let (offset, abbreviation, _) = self.resolve_info(utc);
+        (offset, abbreviation)
+    }
+
+    pub(crate) fn resolve_info(&self, utc: i64) -> (i32, StackStr<8>, bool) {
         match self {
-            Timezone::Posix(z) => z.resolve(utc),
-            Timezone::Tzif(slot) => super::tzif::resolve(*slot, utc),
+            Timezone::Posix(z) => z.resolve_info(utc),
+            Timezone::Tzif(slot) => super::tzif::resolve_info(*slot, utc),
+            Timezone::Abbreviation { zone, name } => {
+                // An obsolete Default alias absent from its zone uses the zone
+                // itself, as PostgreSQL's dynamic-abbreviation contract specifies.
+                super::tzif::resolve_abbreviation(*zone, name.as_str(), utc)
+                    .unwrap_or_else(|| super::tzif::resolve_info(*zone, utc))
+            }
         }
     }
 
@@ -103,6 +126,12 @@ impl Timezone {
     /// a forward gap it keeps the pre-transition offset. Both choices are the
     /// latest UTC candidate among the offsets surrounding the local time.
     pub fn resolve_local(&self, local: i64) -> Option<i64> {
+        if let Self::Abbreviation { zone, .. } = self {
+            // PostgreSQL probes an abbreviation using the ordinary zone's UTC
+            // interpretation, then forces the abbreviation's matching offset.
+            let probe = Self::Tzif(*zone).resolve_local(local)?;
+            return local.checked_sub(i64::from(self.resolve(probe).0) * 1_000_000);
+        }
         let probes = [
             local.checked_sub(2 * DAY_US).unwrap_or(local),
             local,
@@ -120,9 +149,36 @@ impl Timezone {
         }
         matching.or(fallback)
     }
+
+    pub(crate) fn visit_abbreviations(self, utc: i64, visit: impl FnMut(StackStr<8>, i32, bool)) {
+        match self {
+            Self::Posix(zone) => {
+                zone.visit_abbreviations(visit);
+            }
+            Self::Tzif(slot) | Self::Abbreviation { zone: slot, .. } => {
+                super::tzif::visit_abbreviations(slot, utc, visit);
+            }
+        }
+    }
 }
 
 impl PosixZone {
+    pub(crate) fn visit_abbreviations(self, mut visit: impl FnMut(StackStr<8>, i32, bool)) {
+        visit(self.std_abbrev, self.std_off, self.std_is_dst);
+        if self.dst.is_some() && self.dst_abbrev != self.std_abbrev {
+            visit(self.dst_abbrev, self.dst_off, true);
+        }
+    }
+
+    pub(crate) fn abbreviation(&self, name: &str) -> Option<(i32, StackStr<8>, bool)> {
+        if self.std_abbrev.as_str().eq_ignore_ascii_case(name) {
+            Some((self.std_off, self.std_abbrev, self.std_is_dst))
+        } else if self.dst.is_some() && self.dst_abbrev.as_str().eq_ignore_ascii_case(name) {
+            Some((self.dst_off, self.dst_abbrev, true))
+        } else {
+            None
+        }
+    }
     /// The offset (seconds east of UTC) and abbreviation in effect at `utc`
     /// microseconds-since-2000.
     pub fn resolve(&self, utc: i64) -> (i32, StackStr<8>) {
@@ -135,7 +191,7 @@ impl PosixZone {
     pub(crate) fn resolve_info(&self, utc: i64) -> (i32, StackStr<8>, bool) {
         match self.dst {
             Some(dst) if self.in_dst(utc, dst) => (self.dst_off, self.dst_abbrev, true),
-            _ => (self.std_off, self.std_abbrev, false),
+            _ => (self.std_off, self.std_abbrev, self.std_is_dst),
         }
     }
 
@@ -187,6 +243,55 @@ const H: i32 = 3600;
 /// Looks up an IANA zone name (case-insensitive) from TZif history.
 pub fn lookup(name: &str) -> Option<Timezone> {
     super::tzif::load(name).map(Timezone::Tzif)
+}
+
+/// Input abbreviation precedence follows PostgreSQL's DecodeTimezoneAbbrev:
+/// session-zone meanings, then Default. SET TimeZone uses named zones instead.
+pub(crate) fn lookup_abbreviation(name: &str) -> Option<Timezone> {
+    if name.is_empty() || !name.bytes().all(|byte| byte.is_ascii_alphabetic()) {
+        return None;
+    }
+    match session() {
+        Timezone::Posix(zone) => {
+            if let Some((offset, abbreviation, is_dst)) = zone.abbreviation(name) {
+                return Some(Timezone::fixed(offset, abbreviation.as_str(), is_dst));
+            }
+        }
+        Timezone::Tzif(zone) | Timezone::Abbreviation { zone, .. } => {
+            if let Some(meaning) = super::tzif::abbreviation_meaning(zone, name) {
+                return Some(match meaning {
+                    super::tzif::AbbreviationMeaning::Fixed { offset, is_dst } => {
+                        Timezone::fixed(offset, name, is_dst)
+                    }
+                    super::tzif::AbbreviationMeaning::Historical => Timezone::Abbreviation {
+                        zone,
+                        name: StackStr::from_str(name),
+                    },
+                });
+            }
+        }
+    }
+    let &(abbreviation, definition) = super::timezone_abbreviation_data::DEFAULT
+        .iter()
+        .find(|(abbreviation, _)| abbreviation.eq_ignore_ascii_case(name))?;
+    match definition {
+        AbbreviationDefinition::Fixed { offset, is_dst } => {
+            Some(Timezone::fixed(offset, abbreviation, is_dst))
+        }
+        AbbreviationDefinition::Dynamic(zone) => {
+            let Timezone::Tzif(zone) = lookup(zone)? else {
+                unreachable!("a named time zone retains its TZif history")
+            };
+            Some(Timezone::Abbreviation {
+                zone,
+                name: StackStr::from_str(abbreviation),
+            })
+        }
+    }
+}
+
+pub(crate) fn lookup_input(name: &str) -> Option<Timezone> {
+    lookup_abbreviation(name).or_else(|| lookup(name))
 }
 
 /// Parses a POSIX `TZ` string (the TZif footer form): `std offset [dst
@@ -302,6 +407,7 @@ pub fn parse_posix_tz(s: &str) -> Option<PosixZone> {
             dst_off: std_off,
             std_abbrev,
             dst_abbrev: std_abbrev,
+            std_is_dst: false,
             dst: None,
         });
     }
@@ -329,6 +435,7 @@ pub fn parse_posix_tz(s: &str) -> Option<PosixZone> {
         dst_off,
         std_abbrev,
         dst_abbrev,
+        std_is_dst: false,
         dst: Some(Dst { start, end }),
     })
 }
@@ -392,5 +499,26 @@ mod tests {
         assert_eq!(Timezone::utc().resolve(ts(2021, 7, 1, 0)).0, 0);
         let kolkata = zone("Asia/Kolkata");
         assert_eq!(kolkata.resolve(ts(2021, 7, 1, 0)).0, 5 * H + 1800);
+    }
+
+    #[test]
+    fn fixed_default_abbreviations_need_no_zone_catalog_or_runtime_allocation() {
+        set_session(Timezone::utc());
+        assert!(lookup("EST").is_none());
+        crate::mem::guard::forbid_alloc(|| {
+            for &(name, definition) in super::super::timezone_abbreviation_data::DEFAULT {
+                if let AbbreviationDefinition::Fixed { offset, is_dst } = definition {
+                    let zone = lookup_abbreviation(name).unwrap();
+                    let (actual_offset, _, actual_dst) = zone.resolve_info(0);
+                    assert_eq!((actual_offset, actual_dst), (offset, is_dst), "{name}");
+                }
+            }
+            assert!(lookup_input("Unknown_Zone").is_none());
+            assert_eq!(lookup_input("eSt").unwrap().resolve(0).0, -5 * H);
+            for name in ["éééé", "Etc/éé"] {
+                assert!(super::super::guc::parse_timezone(name).is_none());
+            }
+        });
+        assert!(lookup("EST").is_none());
     }
 }

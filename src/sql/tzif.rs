@@ -29,6 +29,7 @@ const MAX_TRANSITIONS: usize = 512;
 
 /// Local-time type capacity per zone (offset/abbreviation combinations).
 const MAX_TYPES: usize = 32;
+pub(crate) const MAX_ABBREVIATIONS: usize = MAX_TYPES + 2;
 
 /// Distinct TZif zones one server lifetime can load. Exceeding it is a loud
 /// error; sessions use a handful.
@@ -257,6 +258,12 @@ pub fn load(name: &str) -> Option<TzifSlot> {
 /// The offset (seconds east) and abbreviation zone `slot` has at `utc`
 /// (microseconds since 2000).
 pub fn resolve(slot: TzifSlot, utc_micros: i64) -> (i32, StackStr<8>) {
+    let (offset, abbreviation, _) = resolve_info(slot, utc_micros);
+    (offset, abbreviation)
+}
+
+/// The callback cannot retain a reference beyond ownership of the cache.
+fn with_zone<T>(slot: TzifSlot, read: impl FnOnce(&ZoneData) -> T) -> T {
     CACHE.with(|cache| {
         let cache = cache.borrow();
         let cache = cache
@@ -266,22 +273,103 @@ pub fn resolve(slot: TzifSlot, utc_micros: i64) -> (i32, StackStr<8>) {
             .zones
             .get(slot.0 as usize)
             .expect("a TZif slot is retained for the server lifetime");
-        let unix = utc_micros.div_euclid(1_000_000) + PG_EPOCH_UNIX_SECONDS;
-        let n = zone.n_transitions;
-        if n == 0 || unix < zone.times[0] {
-            let t = zone.types[zone.first_type as usize];
-            return (t.utoff, t.abbrev);
-        }
-        if unix >= zone.times[n - 1]
-            && let Some(footer) = &zone.footer
-        {
-            return footer.resolve(utc_micros);
-        }
-        // The last transition at or before `unix`.
-        let i = zone.times[..n].partition_point(|&t| t <= unix) - 1;
-        let t = zone.types[zone.type_after[i] as usize];
-        (t.utoff, t.abbrev)
+        read(zone)
     })
+}
+
+pub(crate) fn resolve_info(slot: TzifSlot, utc_micros: i64) -> (i32, StackStr<8>, bool) {
+    with_zone(slot, |zone| resolve_zone(zone, utc_micros))
+}
+
+pub(crate) enum AbbreviationMeaning {
+    Fixed { offset: i32, is_dst: bool },
+    Historical,
+}
+
+pub(crate) fn abbreviation_meaning(slot: TzifSlot, name: &str) -> Option<AbbreviationMeaning> {
+    with_zone(slot, |zone| {
+        let mut selected = None;
+        let recorded = zone.types.iter().filter_map(|kind| {
+            kind.abbrev
+                .as_str()
+                .eq_ignore_ascii_case(name)
+                .then_some((kind.utoff, kind.is_dst))
+        });
+        let future = zone
+            .footer
+            .and_then(|footer| footer.abbreviation(name))
+            .map(|(offset, _, is_dst)| (offset, is_dst));
+        for value in recorded.chain(future) {
+            if selected.is_some_and(|prior| prior != value) {
+                return Some(AbbreviationMeaning::Historical);
+            }
+            selected = Some(value);
+        }
+        selected.map(|(offset, is_dst)| AbbreviationMeaning::Fixed { offset, is_dst })
+    })
+}
+
+/// PostgreSQL's pg_interpret_timezone_abbrev selects the latest matching era
+/// before the instant, or the earliest matching era when it was used only later.
+fn abbreviation_at(zone: &ZoneData, name: &str, utc: i64) -> Option<(i32, StackStr<8>, bool)> {
+    let unix = utc.div_euclid(1_000_000) + PG_EPOCH_UNIX_SECONDS;
+    let count = zone.n_transitions;
+    if (count == 0 || unix >= zone.times[count - 1])
+        && let Some(kind) = zone.footer.and_then(|footer| footer.abbreviation(name))
+    {
+        return Some(kind);
+    }
+    let cutoff = zone.times[..count].partition_point(|&time| time <= unix);
+    let before = zone.type_after[..cutoff].iter().rev().copied();
+    let initial = core::iter::once(zone.first_type);
+    let after = zone.type_after[cutoff..count].iter().copied();
+    before.chain(initial).chain(after).find_map(|kind| {
+        let kind = zone.types[usize::from(kind)];
+        kind.abbrev.as_str().eq_ignore_ascii_case(name).then_some((
+            kind.utoff,
+            kind.abbrev,
+            kind.is_dst,
+        ))
+    })
+}
+
+pub(crate) fn resolve_abbreviation(
+    slot: TzifSlot,
+    name: &str,
+    utc: i64,
+) -> Option<(i32, StackStr<8>, bool)> {
+    with_zone(slot, |zone| abbreviation_at(zone, name, utc))
+}
+
+pub(crate) fn visit_abbreviations(
+    slot: TzifSlot,
+    utc: i64,
+    mut visit: impl FnMut(StackStr<8>, i32, bool),
+) {
+    with_zone(slot, |zone| {
+        for (index, kind) in zone.types.iter().enumerate() {
+            let name = kind.abbrev.as_str();
+            if name.is_empty()
+                || !name.bytes().all(|byte| byte.is_ascii_uppercase())
+                || zone.types[..index]
+                    .iter()
+                    .any(|prior| prior.abbrev == kind.abbrev)
+            {
+                continue;
+            }
+            if let Some((offset, abbreviation, is_dst)) = abbreviation_at(zone, name, utc) {
+                visit(abbreviation, offset, is_dst);
+            }
+        }
+        if let Some(footer) = zone.footer {
+            footer.visit_abbreviations(|abbreviation, offset, is_dst| {
+                if zone.types.iter().any(|kind| kind.abbrev == abbreviation) {
+                    return;
+                }
+                visit(abbreviation, offset, is_dst);
+            });
+        }
+    });
 }
 
 /// Visits every installed zone at one instant without consuming retained
@@ -503,6 +591,40 @@ mod tests {
     fn load_or_skip(name: &str) -> Option<TzifSlot> {
         init_catalog();
         load(name)
+    }
+
+    #[test]
+    fn timezone_abbreviation_history_selects_prior_and_first_future_meanings() {
+        let mut zone = EMPTY_ZONE;
+        for (kind, offset, name, is_dst) in [
+            (0, 9_000, "LOC", false),
+            (1, 10_800, "LOC", false),
+            (2, 14_400, "SUM", true),
+            (3, 14_400, "LOC", false),
+        ] {
+            zone.types[kind] = TypeInfo {
+                utoff: offset,
+                abbrev: StackStr::from_str(name),
+                is_dst,
+            };
+        }
+        zone.times[..3].copy_from_slice(&[-100, 0, 100]);
+        zone.type_after[..3].copy_from_slice(&[1, 2, 3]);
+        zone.n_transitions = 3;
+        crate::mem::guard::forbid_alloc(|| {
+            for (unix, name, offset, is_dst) in [
+                (-200, "LOC", 9_000, false),
+                (-50, "LOC", 10_800, false),
+                (50, "LOC", 10_800, false),
+                (150, "LOC", 14_400, false),
+                (-200, "SUM", 14_400, true),
+            ] {
+                let utc = (unix - PG_EPOCH_UNIX_SECONDS) * 1_000_000;
+                let actual = abbreviation_at(&zone, name, utc).unwrap();
+                assert_eq!((actual.0, actual.2), (offset, is_dst));
+            }
+            assert!(abbreviation_at(&zone, "UNKNOWN", 0).is_none());
+        });
     }
 
     #[test]

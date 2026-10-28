@@ -10537,80 +10537,105 @@ fn pg_default_acl<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    use crate::storage::{
-        DEFAULT_ACL_ALL_SCHEMAS, DefaultPrivilegeClass, PUBLIC_ROLE, PrivilegeSet,
-    };
+    use crate::storage::{DefaultPrivilegeClass, PrivilegeSet};
     use core::fmt::Write;
 
-    let def = schema::require("pg_default_acl", false);
+    let definition = schema::require("pg_default_acl", false);
+    let images = storage.snapshot_default_acl_grants(txid, arena)?;
+    let group_key = |image: &crate::storage::DefaultAclGrantImage| {
+        (
+            image.identity.owner.get(),
+            image.identity.schema.map_or(0, |schema| schema.oid()),
+            image.identity.class as u8,
+        )
+    };
+    let groups = images
+        .iter()
+        .enumerate()
+        .filter(|(index, image)| *index == 0 || group_key(image) != group_key(&images[*index - 1]))
+        .count();
     let rows = arena
-        .alloc_slice_with(storage.default_acl_entry_count(), |_| &[] as &[Datum])
+        .alloc_slice_with(groups, |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
-    let mut row_count = 0usize;
-
-    for (entry_slot, entry) in storage.default_acl_entries() {
-        let (defined, _, _) =
-            storage.default_acl_state(entry.owner, entry.schema, entry.class, entry.grantee, txid);
-        if !defined
-            || storage
-                .default_acl_entries()
-                .take_while(|(slot, _)| *slot < entry_slot)
-                .any(|(_, earlier)| {
-                    let (earlier_defined, _, _) = storage.default_acl_state(
-                        earlier.owner,
-                        earlier.schema,
-                        earlier.class,
-                        earlier.grantee,
-                        txid,
-                    );
-                    earlier_defined
-                        && earlier.owner == entry.owner
-                        && earlier.schema == entry.schema
-                        && earlier.class == entry.class
-                })
-        {
-            continue;
-        }
-        let acl_values = arena
-            .alloc_slice_with(storage.role_count() + 1, |_| Datum::Null)
-            .map_err(|_| arena_full())?;
-        let mut acl_count = 0usize;
-        for role_index in 0..=storage.role_count() {
-            let grantee = if role_index == storage.role_count() {
-                PUBLIC_ROLE
-            } else {
-                if !storage.role(role_index).visible_to(txid) {
-                    continue;
-                }
-                role_index as u16
-            };
-            let (explicit, privileges, grant_options) =
-                storage.default_acl_state(entry.owner, entry.schema, entry.class, grantee, txid);
-            let (privileges, grant_options) = if explicit {
-                (privileges, grant_options)
-            } else if entry.schema == DEFAULT_ACL_ALL_SCHEMAS {
-                Storage::default_acl_baseline(entry.owner, entry.schema, entry.class, grantee)
-            } else {
-                (PrivilegeSet::NONE, PrivilegeSet::NONE)
-            };
-            let include = if entry.schema == DEFAULT_ACL_ALL_SCHEMAS {
-                grantee == entry.owner
-                    || explicit
-                    || (grantee == PUBLIC_ROLE && entry.class.default_public_privileges().0 != 0)
-            } else {
-                explicit
-            };
-            if !include {
-                continue;
+    let mut position = 0;
+    let mut row_count = 0;
+    while position < images.len() {
+        let first = images[position];
+        let start = position;
+        while position < images.len() && group_key(&images[position]) == group_key(&first) {
+            if images[position].identity != first.identity
+                || (position > start && images[position].grantee == images[position - 1].grantee)
+            {
+                return Err(sql_err!(
+                    sqlstate::DATA_EXCEPTION,
+                    "default privilege group identity is inconsistent"
+                ));
             }
-            let named_grantee =
-                (grantee != PUBLIC_ROLE).then(|| storage.role_name(grantee as usize, txid));
-            let grantee_name =
-                super::types::acl_identifier(named_grantee.as_ref().map_or("", SqlName::as_str));
-            let owner_name = storage.role_name(entry.owner as usize, txid);
-            let owner_name = super::types::acl_identifier(owner_name.as_str());
-            let mut rendered = StackStr::<256>::new();
-            let _ = write!(rendered, "{}=", grantee_name.as_str());
+            position += 1;
+        }
+        let selected = &images[start..position];
+        let owner = first.identity.owner;
+        let implicit_owner = first.identity.schema.is_none()
+            && !selected.iter().any(|image| image.grantee == Some(owner));
+        let public = first.identity.class.default_public_privileges();
+        let implicit_public = first.identity.schema.is_none()
+            && public != PrivilegeSet::NONE
+            && !selected.iter().any(|image| image.grantee.is_none());
+        let grants = arena
+            .alloc_slice_with(
+                selected.len() + usize::from(implicit_owner) + usize::from(implicit_public),
+                |_| (None, PrivilegeSet::NONE, PrivilegeSet::NONE),
+            )
+            .map_err(|_| arena_full())?;
+        let mut count = 0;
+        if implicit_owner {
+            grants[count] = (
+                Some(owner),
+                first.identity.class.all_privileges(),
+                PrivilegeSet::NONE,
+            );
+            count += 1;
+        }
+        if implicit_public {
+            grants[count] = (None, public, PrivilegeSet::NONE);
+            count += 1;
+        }
+        for image in selected {
+            if image.privileges != PrivilegeSet::NONE {
+                grants[count] = (image.grantee, image.privileges, image.grant_options);
+                count += 1;
+            }
+        }
+        // PostgreSQL sorts default-permission items by grantee identifier;
+        // role slots are reusable and cannot determine that order.
+        grants[..count]
+            .sort_unstable_by_key(|(grantee, _, _)| grantee.map_or(0, |role| role.get() as u32));
+        let values = arena
+            .alloc_slice_with(count, |_| Datum::Null)
+            .map_err(|_| arena_full())?;
+        let owner_name = storage.role_name_by_oid(owner, txid).ok_or_else(|| {
+            sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "default privilege owner identity is unavailable"
+            )
+        })?;
+        let owner_acl_name = super::types::acl_identifier(owner_name.as_str());
+        for (index, &(grantee, privileges, options)) in grants[..count].iter().enumerate() {
+            let name = match grantee {
+                None => None,
+                Some(role) if role == owner => Some(owner_name),
+                Some(role) => Some(storage.role_name_by_oid(role, txid).ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::DATA_EXCEPTION,
+                        "default privilege grantee identity is unavailable"
+                    )
+                })?),
+            };
+            let name = super::types::acl_identifier(name.as_ref().map_or("", SqlName::as_str));
+            // Two quoted role identifiers, eight optional grant stars and =/.
+            let mut rendered = StackStr::<{ 2 * 130 + 16 + 2 }>::new();
+            write!(rendered, "{}=", name.as_str())
+                .expect("a quoted ACL grantee fits the exact item bound");
             for (privilege, letter) in [
                 (PrivilegeSet::INSERT, 'a'),
                 (PrivilegeSet::SELECT, 'r'),
@@ -10625,29 +10650,21 @@ fn pg_default_acl<'a>(
                 (PrivilegeSet::EXECUTE, 'X'),
             ] {
                 if privileges.contains(privilege) {
-                    let _ = write!(rendered, "{letter}");
-                    if grant_options.contains(privilege) {
-                        let _ = write!(rendered, "*");
+                    rendered
+                        .write_char(letter)
+                        .expect("default ACL privileges fit the exact item bound");
+                    if options.contains(privilege) {
+                        rendered
+                            .write_char('*')
+                            .expect("default ACL grant stars fit the exact item bound");
                     }
                 }
             }
-            let _ = write!(rendered, "/{}", owner_name.as_str());
-            acl_values[acl_count] = text(rendered.as_str(), arena)?;
-            acl_count += 1;
+            write!(rendered, "/{}", owner_acl_name.as_str())
+                .expect("a quoted ACL owner fits the exact item bound");
+            values[index] = text(rendered.as_str(), arena)?;
         }
-        let namespace = if entry.schema == DEFAULT_ACL_ALL_SCHEMAS {
-            0
-        } else {
-            namespace_oid(
-                storage,
-                storage
-                    .schema_def_for(entry.schema as usize, txid)
-                    .name
-                    .as_str(),
-                txid,
-            )
-        };
-        let object_type = match entry.class {
+        let object_type = match first.identity.class {
             DefaultPrivilegeClass::Table => "r",
             DefaultPrivilegeClass::Sequence => "S",
             DefaultPrivilegeClass::Function => "f",
@@ -10656,21 +10673,21 @@ fn pg_default_acl<'a>(
         };
         rows[row_count] = row(
             &[
-                Datum::Int4(90_000 + entry_slot as i32),
+                Datum::Int4(first.identity.oid()),
                 Datum::Int4(826),
-                Datum::Int4(storage.role_oid(entry.owner as usize)),
-                Datum::Int4(namespace),
+                Datum::Int4(owner.get()),
+                Datum::Int4(first.identity.schema.map_or(0, |schema| schema.oid())),
                 text(object_type, arena)?,
                 Datum::Array {
                     element: super::types::ArrElem::AclItem,
-                    raw: super::array::build(&acl_values[..acl_count], arena)?,
+                    raw: super::array::build(values, arena)?,
                 },
             ],
             arena,
         )?;
         row_count += 1;
     }
-    finish(def, &rows[..row_count], arena)
+    finish(definition, rows, arena)
 }
 
 use crate::storage::FIRST_TEMP_NAMESPACE_OID;
@@ -13443,7 +13460,7 @@ pub fn trigger_def_text<'a>(
     arena: &'a Arena,
 ) -> Result<Option<&'a str>, SqlError> {
     let mut found = None;
-    for (_, trigger) in storage.triggers_with_slots_visible_to(txid) {
+    for (trigger_slot, trigger) in storage.triggers_with_slots_visible_to(txid) {
         if crate::storage::trigger_oid(&trigger) == oid {
             found = Some((trigger, trigger.target));
             break;
@@ -13457,7 +13474,11 @@ pub fn trigger_def_text<'a>(
         for child in 0..storage.table_count() {
             if storage.table_slot_visible_to(child, txid)
                 && storage.partition_descends_from(child, usize::from(parent), txid)
-                && partition_trigger_oid(&trigger, child)? == oid
+                && storage.partition_trigger_oid_to(
+                    trigger.position(trigger_slot),
+                    storage.table_position(child),
+                    txid,
+                )? == oid
             {
                 found = Some((trigger, crate::storage::TriggerTarget::Table(child as u16)));
                 break;
@@ -20523,7 +20544,7 @@ fn pg_constraint_values<'a>(
     }
     // User constraint triggers have a pg_constraint identity linked from
     // pg_trigger.tgconstraint. They do not own an index.
-    for (_, trigger) in storage.triggers_with_slots_visible_to(txid) {
+    for (trigger_slot, trigger) in storage.triggers_with_slots_visible_to(txid) {
         let crate::storage::TriggerKind::Constraint { timing, .. } = trigger.kind else {
             continue;
         };
@@ -20592,8 +20613,11 @@ fn pg_constraint_values<'a>(
             let mut clone = [Datum::Null; 29];
             clone.copy_from_slice(out[root_row]);
             clone[0] = Datum::Int4(
-                partition_trigger_oid(&trigger, child)?
-                    + crate::storage::TRIGGER_CONSTRAINT_OID_OFFSET,
+                storage.partition_trigger_oid_to(
+                    trigger.position(trigger_slot),
+                    storage.table_position(child),
+                    txid,
+                )? + crate::storage::TRIGGER_CONSTRAINT_OID_OFFSET,
             );
             clone[2] = Datum::Int4(user_table_oid(storage, child));
             clone[18] = Datum::Int4(namespace_oid(
@@ -21819,7 +21843,7 @@ fn pg_depend<'a>(
             )?;
         }
     }
-    for (_, trigger) in storage.triggers_with_slots_visible_to(txid) {
+    for (trigger_slot, trigger) in storage.triggers_with_slots_visible_to(txid) {
         let trigger_oid = crate::storage::trigger_oid(&trigger);
         let relation_oid = match trigger.target {
             crate::storage::TriggerTarget::Table(table) => {
@@ -21892,7 +21916,11 @@ fn pg_depend<'a>(
             {
                 continue;
             }
-            let clone_oid = partition_trigger_oid(&trigger, child)?;
+            let clone_oid = storage.partition_trigger_oid_to(
+                trigger.position(trigger_slot),
+                storage.table_position(child),
+                txid,
+            )?;
             let child_relation_oid = user_table_oid(storage, child);
             push(
                 2620,
@@ -21958,7 +21986,11 @@ fn pg_depend<'a>(
             let parent_oid = if direct_parent == parent_table {
                 trigger_oid
             } else {
-                partition_trigger_oid(&trigger, direct_parent)?
+                storage.partition_trigger_oid_to(
+                    trigger.position(trigger_slot),
+                    storage.table_position(direct_parent),
+                    txid,
+                )?
             };
             push(2620, clone_oid, 2620, parent_oid, 0, "P")?;
             push(2620, clone_oid, PG_CLASS_OID, child_relation_oid, 0, "S")?;
@@ -25977,25 +26009,6 @@ fn pg_amproc<'a>(
     finish(definition, &rows[..count], arena)
 }
 
-fn partition_trigger_oid(
-    trigger: &crate::storage::TriggerDef,
-    table: usize,
-) -> Result<i32, SqlError> {
-    let ordinal = trigger
-        .created_at
-        .checked_mul(crate::storage::MAX_TABLE_CATALOG_SLOTS as u64)
-        .and_then(|value| value.checked_add(table as u64))
-        .and_then(|value| i32::try_from(value).ok())
-        .and_then(|value| crate::storage::FIRST_PARTITION_TRIGGER_OID.checked_add(value))
-        .ok_or_else(|| {
-            sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "partition trigger OID range exhausted"
-            )
-        })?;
-    Ok(ordinal)
-}
-
 fn pg_trigger<'a>(
     storage: &Storage,
     txid: u32,
@@ -26275,9 +26288,17 @@ fn pg_trigger<'a>(
             let parent_oid = if direct_parent == parent_table {
                 crate::storage::trigger_oid(&trigger)
             } else {
-                partition_trigger_oid(&trigger, direct_parent)?
+                storage.partition_trigger_oid_to(
+                    trigger.position(trigger_slot),
+                    storage.table_position(direct_parent),
+                    txid,
+                )?
             };
-            let clone_oid = partition_trigger_oid(&trigger, child)?;
+            let clone_oid = storage.partition_trigger_oid_to(
+                trigger.position(trigger_slot),
+                storage.table_position(child),
+                txid,
+            )?;
             let mut clone = [Datum::Null; 20];
             clone.copy_from_slice(rows[root_row]);
             let parent_definition = storage.table_def(parent_table, txid);
@@ -29284,7 +29305,7 @@ fn pg_timezone_names<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
     let mut count = 0usize;
     let mut found_error = None;
     let complete = crate::sql::tzif::visit_current(
-        crate::sql::datetime::now_micros(),
+        crate::sql::datetime::transaction_micros(),
         |name, offset, abbreviation, is_dst| {
             if found_error.is_some() {
                 return;
@@ -29338,16 +29359,26 @@ fn pg_timezone_names<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
 
 fn pg_timezone_abbrevs<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
     let definition = schema::require("pg_timezone_abbrevs", false);
+    let defaults = super::timezone_abbreviation_data::DEFAULT;
+    let now = super::datetime::transaction_micros();
     let rows = arena
-        .alloc_slice_with(
-            crate::sql::catalog_metadata::TIMEZONE_ABBREVIATIONS.len(),
-            |_| &[] as &[Datum],
-        )
+        .alloc_slice_with(defaults.len() + super::tzif::MAX_ABBREVIATIONS, |_| {
+            &[] as &[Datum]
+        })
         .map_err(|_| arena_full())?;
-    for (target, &(abbreviation, offset, is_dst)) in rows
-        .iter_mut()
-        .zip(crate::sql::catalog_metadata::TIMEZONE_ABBREVIATIONS)
-    {
+    let mut count = 0;
+    let mut append = |abbreviation: &str, offset: i32, is_dst: bool| -> Result<(), SqlError> {
+        if abbreviation.is_empty() || !abbreviation.bytes().all(|byte| byte.is_ascii_uppercase()) {
+            return Ok(());
+        }
+        if rows[..count].iter().any(
+            |values| matches!(values.first(), Some(Datum::Text(name)) if *name == abbreviation),
+        ) {
+            return Ok(());
+        }
+        let target = rows
+            .get_mut(count)
+            .ok_or_else(|| catalog_capacity_exceeded("pg_timezone_abbrevs"))?;
         *target = row(
             &[
                 text(abbreviation, arena)?,
@@ -29360,8 +29391,34 @@ fn pg_timezone_abbrevs<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError>
             ],
             arena,
         )?;
+        count += 1;
+        Ok(())
+    };
+    let mut error = None;
+    super::timezone::session().visit_abbreviations(now, |name, offset, is_dst| {
+        if error.is_none() {
+            error = append(name.as_str(), offset, is_dst).err();
+        }
+    });
+    if let Some(error) = error {
+        return Err(error);
     }
-    finish(definition, rows, arena)
+    for &(name, _) in defaults {
+        let zone = super::timezone::lookup_abbreviation(name).ok_or_else(|| {
+            sql_err!(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "time zone abbreviation \"{}\" requires unavailable zone data",
+                name
+            )
+        })?;
+        let (offset, _, is_dst) = zone.resolve_info(now);
+        append(name, offset, is_dst)?;
+    }
+    rows[..count].sort_unstable_by(|left, right| match (left[0], right[0]) {
+        (Datum::Text(left), Datum::Text(right)) => left.cmp(right),
+        _ => unreachable!("abbreviation catalog names are text"),
+    });
+    finish(definition, &rows[..count], arena)
 }
 
 fn pg_type<'a>(
@@ -30546,10 +30603,10 @@ fn pg_auth_members<'a>(
         let options = membership.options_to(txid);
         output[count] = row(
             &[
-                Datum::Int4(Storage::role_membership_oid(slot)),
+                Datum::Int4(membership.oid(txid)),
                 Datum::Int4(storage.role_oid(membership.role as usize)),
                 Datum::Int4(storage.role_oid(membership.member as usize)),
-                Datum::Int4(storage.role_oid(membership.grantor_to(txid) as usize)),
+                Datum::Int4(storage.role_oid(membership.grantor as usize)),
                 Datum::Bool(options.admin),
                 Datum::Bool(options.inherit),
                 Datum::Bool(options.set),

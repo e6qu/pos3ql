@@ -13,6 +13,9 @@ pub(crate) use catalog_history::{
 mod catalog_identities;
 mod catalog_sources;
 pub(crate) use catalog_identities::{CatalogCreation, CatalogIdentity};
+mod default_acls;
+mod partition_triggers;
+pub(crate) use partition_triggers::{PartitionTriggerImage, PartitionTriggerState};
 mod parameter_acls;
 use parameter_acls::ParameterAclGrantIdentity;
 use parameter_acls::ParameterAclRows;
@@ -4393,7 +4396,8 @@ impl StoredDependencyIdentity {
             }
             Self::RoutineOid(oid) => {
                 class == DependencyClass::Routine
-                    && (ROUTINE_OID_BASE..TRIGGER_OID_BASE).contains(&oid)
+                    && (ROUTINE_OID_BASE + 1..=ROUTINE_OID_BASE + MAX_CATALOG_CREATION as i32)
+                        .contains(&oid)
             }
             Self::OperatorOid(oid) => {
                 class == DependencyClass::Operator
@@ -5222,7 +5226,10 @@ impl RuleDef {
     }
 
     pub(crate) fn oid(self) -> i32 {
-        catalog_object_oid(26_000, self.created_at)
+        880_000_000
+            + CatalogIdentity::parse(self.created_at)
+                .expect("admitted rewrite rule has a checked identity")
+                .get() as i32
     }
 }
 
@@ -6658,13 +6665,7 @@ pub(crate) const FIRST_EXPLICIT_INDEX_OID: i32 = 300_000_000;
 pub(crate) const FIRST_PARTITION_TRIGGER_OID: i32 = 1_000_000_000;
 pub(crate) const TRIGGER_CONSTRAINT_OID_OFFSET: i32 = 500_000;
 pub(crate) const MAX_INDEX_OID_GENERATION: u64 = relation_identities::MAX_RELATION_GENERATION;
-// Reserve complete table-slot strides and the derived constraint OID at the
-// top of the signed OID space. Validate before installation, not catalog reads.
-pub(crate) const MAX_TRIGGER_OID_GENERATION: u64 = (i32::MAX as u64
-    - FIRST_PARTITION_TRIGGER_OID as u64
-    - TRIGGER_CONSTRAINT_OID_OFFSET as u64
-    - (MAX_TABLE_CATALOG_SLOTS as u64 - 1))
-    / MAX_TABLE_CATALOG_SLOTS as u64;
+pub(crate) const MAX_TRIGGER_OID_GENERATION: u64 = MAX_CATALOG_CREATION;
 
 fn bounded_catalog_generation(value: u64, maximum: u64, object: &str) -> Result<u64, SqlError> {
     if value == 0 || value > maximum {
@@ -6690,8 +6691,8 @@ pub(crate) const AGGREGATE_INIT_MAX: usize = 256;
 /// User-defined routine OIDs occupy a stable, disjoint catalog range.
 pub(crate) const ROUTINE_OID_BASE: i32 = 100_000;
 
-/// Trigger definitions share the table-sized catalog budget.  A trigger has no
-/// runtime allocation: its target and function are stable catalog slots.
+/// Declarations and inherited images use startup pools. Public identifiers
+/// belong to checked creation stamps, independently of reusable storage slots.
 pub(crate) const TRIGGER_OID_BASE: i32 = 140_000;
 pub(crate) const POLICY_OID_BASE: i32 = 180_000;
 pub(crate) const POLICY_EXPRESSION_MAX: usize = CHECK_SQL_MAX;
@@ -7094,11 +7095,6 @@ pub(crate) const ACCESS_METHOD_OID_BASE: i32 = 800_000_000;
 /// Operators and support functions each follow the parser's bounded DDL list.
 pub(crate) const MAX_OPERATOR_FAMILY_MEMBERS: usize = MAX_DEFINITION_ITEMS;
 pub(crate) const MAX_ACCESS_METHODS: usize = 32;
-
-fn catalog_object_oid(base: i32, created_at: u64) -> i32 {
-    base.checked_add(i32::try_from(created_at).expect("catalog OID range exhausted"))
-        .expect("catalog OID range exhausted")
-}
 
 /// Stable identity of a user-defined table access method. Slots are reused
 /// after DROP, while table definitions and WAL retain this OID.
@@ -9367,38 +9363,6 @@ pub(crate) enum TriggerEnabled {
     Disabled,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct PendingPartitionTriggerState {
-    txid: u32,
-    enabled: TriggerEnabled,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct PartitionTriggerState {
-    trigger: u16,
-    table: u16,
-    enabled: TriggerEnabled,
-    present: bool,
-    pending: Option<PendingPartitionTriggerState>,
-}
-
-impl PartitionTriggerState {
-    const EMPTY: Self = Self {
-        trigger: u16::MAX,
-        table: u16::MAX,
-        enabled: TriggerEnabled::Origin,
-        present: false,
-        pending: None,
-    };
-
-    fn enabled_to(self, txid: u32) -> Option<TriggerEnabled> {
-        self.pending
-            .filter(|pending| pending.txid == txid)
-            .map(|pending| pending.enabled)
-            .or(self.present.then_some(self.enabled))
-    }
-}
-
 impl TriggerEnabled {
     pub(crate) const fn code(self) -> u8 {
         match self {
@@ -9658,6 +9622,11 @@ pub(crate) struct RecoveredPolicySpec {
 }
 
 impl TriggerDef {
+    pub(crate) fn position(self, slot: usize) -> CatalogPosition {
+        CatalogPosition::new(slot, self.created_at)
+            .expect("admitted trigger has a checked position")
+    }
+
     pub(crate) const EMPTY: Self = Self {
         database: DatabaseOid::POSTGRES,
         created_at: 0,
@@ -12593,13 +12562,61 @@ pub(crate) struct ColumnAclEntry {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct PendingDefaultAcl {
-    pub txid: u32,
-    /// A zero-valued entry can be meaningful: it is the tombstone produced by
-    /// revoking a built-in PUBLIC default from types or functions.
-    pub defined: bool,
+pub(crate) struct DefaultAclIdentity {
+    pub creation: CatalogIdentity,
+    pub owner: RoleOid,
+    pub schema: Option<SchemaIdentity>,
+    pub class: DefaultPrivilegeClass,
+}
+
+impl DefaultAclIdentity {
+    pub(crate) fn oid(self) -> i32 {
+        840_000_000 + self.creation.get() as i32
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DefaultAclGrantImage {
+    pub identity: DefaultAclIdentity,
+    pub grantee: Option<RoleOid>,
     pub privileges: PrivilegeSet,
     pub grant_options: PrivilegeSet,
+}
+
+impl DefaultAclGrantImage {
+    pub(crate) fn validate(self) -> Result<(), SqlError> {
+        let baseline = if self.identity.schema.is_some() {
+            PrivilegeSet::NONE
+        } else if self.grantee == Some(self.identity.owner) {
+            self.identity.class.all_privileges()
+        } else if self.grantee.is_none() {
+            self.identity.class.default_public_privileges()
+        } else {
+            PrivilegeSet::NONE
+        };
+        if (self.identity.class == DefaultPrivilegeClass::Schema && self.identity.schema.is_some())
+            || self.privileges.0 & !self.identity.class.all_privileges().0 != 0
+            || self.grant_options.0 & !self.privileges.0 != 0
+            || (self.privileges == baseline && self.grant_options == PrivilegeSet::NONE)
+        {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "stored default privilege image is invalid"
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn clone_key(self) -> u64 {
+        (u64::from(self.identity.creation.get()) << 32)
+            | u64::from(self.grantee.map_or(0, |role| role.get() as u32))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PendingDefaultAcl {
+    pub txid: u32,
+    pub image: Option<DefaultAclGrantImage>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -12614,15 +12631,29 @@ pub(crate) struct DefaultAclKey {
 pub(crate) struct DefaultAclEntry {
     pub database: DatabaseOid,
     pub owner: u16,
-    /// DEFAULT_ACL_ALL_SCHEMAS denotes the global default; otherwise this is a
-    /// stable schema slot.
     pub schema: u16,
     pub class: DefaultPrivilegeClass,
     pub grantee: u16,
-    pub defined: bool,
-    pub privileges: PrivilegeSet,
-    pub grant_options: PrivilegeSet,
+    pub committed: Option<DefaultAclGrantImage>,
     pub pending: Option<PendingDefaultAcl>,
+}
+
+impl DefaultAclEntry {
+    const EMPTY: Self = Self {
+        database: DatabaseOid::POSTGRES,
+        owner: PUBLIC_ROLE,
+        schema: DEFAULT_ACL_ALL_SCHEMAS,
+        class: DefaultPrivilegeClass::Table,
+        grantee: PUBLIC_ROLE,
+        committed: None,
+        pending: None,
+    };
+
+    pub(crate) fn image_to(self, txid: u32) -> Option<DefaultAclGrantImage> {
+        self.pending
+            .filter(|pending| pending.txid == txid)
+            .map_or(self.committed, |pending| pending.image)
+    }
 }
 
 /// The four PostgreSQL ACL catalogs share one synchronization boundary.
@@ -12738,9 +12769,9 @@ impl Iterator for DefaultAclIter<'_> {
             let slot = self.next_slot;
             self.next_slot += 1;
             let entry = catalog.defaults[slot];
-            let include = self
-                .database
-                .map_or(entry.defined, |database| entry.database == database);
+            let include = self.database.map_or(entry.committed.is_some(), |database| {
+                entry.database == database
+            });
             if include {
                 return Some((slot, entry));
             }
@@ -12894,13 +12925,14 @@ impl RoleMembershipOptions {
 #[derive(Clone, Copy, Debug)]
 pub struct PendingRoleMembership {
     pub txid: u32,
+    pub created_at: u64,
     pub exists: bool,
-    pub grantor: u16,
     pub options: RoleMembershipOptions,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub struct RoleMembership {
+    pub created_at: u64,
     pub role: u16,
     pub member: u16,
     pub grantor: u16,
@@ -12910,6 +12942,24 @@ pub struct RoleMembership {
 }
 
 impl RoleMembership {
+    pub(crate) fn creation_to(self, txid: u32) -> CatalogIdentity {
+        let created_at = self
+            .pending
+            .filter(|pending| pending.txid == txid)
+            .map_or(self.created_at, |pending| pending.created_at);
+        CatalogIdentity::parse(created_at)
+            .expect("admitted role membership has a checked creation identity")
+    }
+
+    pub(crate) fn position(self, slot: usize, txid: u32) -> CatalogPosition {
+        CatalogPosition::new(slot, self.creation_to(txid).created_at())
+            .expect("admitted role membership has a checked catalog position")
+    }
+
+    pub(crate) fn oid(self, txid: u32) -> i32 {
+        860_000_000 + self.creation_to(txid).get() as i32
+    }
+
     pub fn visible_to(&self, txid: u32) -> bool {
         match self.pending {
             Some(pending) if pending.txid == txid => pending.exists,
@@ -12921,13 +12971,6 @@ impl RoleMembership {
         match self.pending {
             Some(pending) if pending.txid == txid && pending.exists => pending.options,
             _ => self.options,
-        }
-    }
-
-    pub fn grantor_to(&self, txid: u32) -> u16 {
-        match self.pending {
-            Some(pending) if pending.txid == txid && pending.exists => pending.grantor,
-            _ => self.grantor,
         }
     }
 }
@@ -19986,6 +20029,7 @@ impl Storage {
         for _ in 0..config.max_role_memberships {
             role_memberships
                 .push(RoleMembership {
+                    created_at: 0,
                     role: 0,
                     member: 0,
                     grantor: 0,
@@ -22902,35 +22946,29 @@ impl Storage {
             }
             for source_slot in 0..self.default_acl_entry_count() {
                 let entry = self.default_acl_entry(source_slot);
-                if entry.database != source || !entry.defined {
+                if entry.database != source {
                     continue;
                 }
-                let schema = if entry.schema == DEFAULT_ACL_ALL_SCHEMAS {
-                    DEFAULT_ACL_ALL_SCHEMAS
-                } else {
-                    self.cloned_access_object(
-                        AccessObject {
-                            class: AccessClass::Schema,
-                            slot: entry.schema,
-                        },
-                        source,
-                        target,
-                    )
-                    .expect("cloned default-ACL schema exists")
-                    .slot
+                let Some(image) = entry.committed else {
+                    continue;
                 };
-                self.change_default_acl(
-                    DefaultAclKey {
-                        owner: entry.owner,
-                        schema,
-                        class: entry.class,
-                        grantee: entry.grantee,
-                    },
-                    true,
-                    entry.privileges,
-                    entry.grant_options,
-                    0,
-                )?;
+                let target_slot = {
+                    let catalog = self.acl_catalog.lock().expect("ACL catalog lock poisoned");
+                    allocation.select(
+                        DatabaseCloneKind::DefaultAcl,
+                        image.clone_key(),
+                        catalog
+                            .defaults
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(slot, entry)| {
+                                (entry.committed.is_none() && entry.pending.is_none())
+                                    .then_some(slot)
+                            })
+                            .chain(catalog.defaults.len()..catalog.defaults.capacity()),
+                    )?
+                };
+                self.install_default_acl_image(target_slot, None, Some(image), txid)?;
             }
             let comment_capacity = self.comment_catalog().entries.len();
             for source_slot in 0..comment_capacity {
@@ -22963,8 +23001,8 @@ impl Storage {
                 comments.entries[target_slot] = entry;
             }
 
-            // Partition links are runtime table slots. Rebind them only after
-            // every target relation exists; names are the durable identity.
+            // Rebind partition parents by their preserved lifetimes after all
+            // target relations exist, before installing inherited triggers.
             for target_slot in 0..self.tables.len() {
                 if self.tables[target_slot].database() != target
                     || self.tables[target_slot].existence()
@@ -22976,16 +23014,16 @@ impl Storage {
                 else {
                     continue;
                 };
-                let (parent_schema, parent_name) = {
-                    let source_parent = self.tables[usize::from(attachment.parent)].definition();
-                    (source_parent.schema, source_parent.name)
-                };
-                let target_parent = self
-                    .find_visible(parent_schema.as_str(), parent_name.as_str(), txid)
+                let parent_created_at = self.tables[usize::from(attachment.parent)].created_at();
+                let target_parent = (0..self.table_count())
+                    .find(|slot| {
+                        self.table_slot_visible_to(*slot, txid)
+                            && self.table(*slot).created_at() == parent_created_at
+                    })
                     .ok_or_else(|| {
                         sql_err!(
-                            sqlstate::INTERNAL_ERROR,
-                            "template partition parent was not cloned"
+                            sqlstate::DATA_EXCEPTION,
+                            "template partition parent lifetime was not cloned"
                         )
                     })?;
                 let revision = self.reserve_table_definition_revision()?;
@@ -23002,6 +23040,7 @@ impl Storage {
             self.rebind_routine_types_to(txid)?;
             self.rebind_cast_and_operator_types(txid)?;
             self.rebind_all_stored_query_dependencies_to(txid, Some(source))?;
+            self.copy_partition_trigger_images(source, txid)?;
             allocation.validate(self, target)
         })();
         crate::sql::set_execution_database_oid(prior_database);
@@ -23185,7 +23224,7 @@ impl Storage {
                 }
                 entry.database = DatabaseOid::POSTGRES;
                 entry.owner = PUBLIC_ROLE;
-                entry.defined = false;
+                entry.committed = None;
                 entry.pending = None;
             }
         }
@@ -23340,7 +23379,11 @@ impl Storage {
                 if catalog.definitions[slot].database == database {
                     catalog.definitions[slot] = TriggerDef::EMPTY;
                     for state in catalog.partition_states.iter_mut() {
-                        if usize::from(state.trigger) == slot {
+                        if state
+                            .committed
+                            .or_else(|| state.pending.and_then(|pending| pending.image))
+                            .is_some_and(|image| image.trigger.slot() == slot)
+                        {
                             *state = PartitionTriggerState::EMPTY;
                         }
                     }
@@ -23972,6 +24015,18 @@ impl Storage {
         self.role(slot).name_to(txid)
     }
 
+    pub(crate) fn role_name_by_oid(&self, oid: RoleOid, txid: u32) -> Option<SqlName> {
+        let catalog = self
+            .role_catalog
+            .lock()
+            .expect("role catalog lock poisoned");
+        catalog
+            .roles
+            .iter()
+            .find(|role| role.visible_to(txid) && role.lifetime == Some(oid))
+            .map(|role| role.name_to(txid))
+    }
+
     fn role_slot_visible(&self, slot: usize, txid: u32) -> bool {
         self.role_catalog
             .lock()
@@ -24036,10 +24091,6 @@ impl Storage {
     /// OIDs survive renames and recovery, and are not reused for a new role.
     pub fn role_oid(&self, slot: usize) -> i32 {
         self.role(slot).oid().get()
-    }
-
-    pub fn role_membership_oid(slot: usize) -> i32 {
-        32_768 + slot as i32
     }
 
     pub(crate) fn role_slot_by_oid(&self, oid: i32, txid: u32) -> Option<usize> {
@@ -26734,221 +26785,6 @@ impl Storage {
         Ok(prior)
     }
 
-    fn default_acl_visible(
-        entry: &DefaultAclEntry,
-        txid: u32,
-    ) -> (bool, PrivilegeSet, PrivilegeSet) {
-        match entry.pending {
-            Some(pending) if pending.txid == txid => {
-                (pending.defined, pending.privileges, pending.grant_options)
-            }
-            _ => (entry.defined, entry.privileges, entry.grant_options),
-        }
-    }
-
-    pub(crate) const fn default_acl_baseline(
-        owner: u16,
-        schema: u16,
-        class: DefaultPrivilegeClass,
-        grantee: u16,
-    ) -> (PrivilegeSet, PrivilegeSet) {
-        if schema != DEFAULT_ACL_ALL_SCHEMAS {
-            return (PrivilegeSet::NONE, PrivilegeSet::NONE);
-        }
-        if grantee == owner {
-            let all = class.all_privileges();
-            return (all, PrivilegeSet::NONE);
-        }
-        if grantee == PUBLIC_ROLE {
-            return (class.default_public_privileges(), PrivilegeSet::NONE);
-        }
-        (PrivilegeSet::NONE, PrivilegeSet::NONE)
-    }
-
-    pub(crate) fn default_acl_state(
-        &self,
-        owner: u16,
-        schema: u16,
-        class: DefaultPrivilegeClass,
-        grantee: u16,
-        txid: u32,
-    ) -> (bool, PrivilegeSet, PrivilegeSet) {
-        self.acl_catalog
-            .lock()
-            .expect("ACL catalog lock poisoned")
-            .defaults
-            .iter()
-            .find(|entry| {
-                entry.database == current_database()
-                    && entry.owner == owner
-                    && entry.schema == schema
-                    && entry.class == class
-                    && entry.grantee == grantee
-            })
-            .map(|entry| Self::default_acl_visible(entry, txid))
-            .unwrap_or((false, PrivilegeSet::NONE, PrivilegeSet::NONE))
-    }
-
-    pub(crate) fn default_acl_effective(
-        &self,
-        owner: u16,
-        schema: u16,
-        class: DefaultPrivilegeClass,
-        grantee: u16,
-        txid: u32,
-    ) -> (PrivilegeSet, PrivilegeSet) {
-        let (defined, privileges, grant_options) =
-            self.default_acl_state(owner, schema, class, grantee, txid);
-        if defined {
-            (privileges, grant_options)
-        } else {
-            Self::default_acl_baseline(owner, schema, class, grantee)
-        }
-    }
-
-    pub(crate) fn change_default_acl(
-        &self,
-        key: DefaultAclKey,
-        defined: bool,
-        privileges: PrivilegeSet,
-        grant_options: PrivilegeSet,
-        txid: u32,
-    ) -> Result<(usize, Option<PendingDefaultAcl>), SqlError> {
-        self.role_reference_ready(usize::from(key.owner), txid)?;
-        if key.grantee != PUBLIC_ROLE {
-            self.role_reference_ready(usize::from(key.grantee), txid)?;
-        }
-        let DefaultAclKey {
-            owner,
-            schema,
-            class,
-            grantee,
-        } = key;
-        let mut catalog = self.acl_catalog.lock().expect("ACL catalog lock poisoned");
-        let slot = catalog
-            .defaults
-            .iter()
-            .position(|entry| {
-                entry.database == current_database()
-                    && entry.owner == owner
-                    && entry.schema == schema
-                    && entry.class == class
-                    && entry.grantee == grantee
-            })
-            .or_else(|| {
-                catalog
-                    .defaults
-                    .iter()
-                    .position(|entry| entry.owner == PUBLIC_ROLE && entry.pending.is_none())
-            })
-            .unwrap_or(catalog.defaults.len());
-        if slot == catalog.defaults.len() {
-            catalog
-                .defaults
-                .push(DefaultAclEntry {
-                    database: current_database(),
-                    owner,
-                    schema,
-                    class,
-                    grantee,
-                    defined: false,
-                    privileges: PrivilegeSet::NONE,
-                    grant_options: PrivilegeSet::NONE,
-                    pending: None,
-                })
-                .map_err(|_| {
-                    sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "too many default privilege entries (limit {})",
-                        catalog.defaults.capacity()
-                    )
-                })?;
-        } else if catalog.defaults[slot].owner == PUBLIC_ROLE {
-            let entry = &mut catalog.defaults[slot];
-            entry.database = current_database();
-            entry.owner = owner;
-            entry.schema = schema;
-            entry.class = class;
-            entry.grantee = grantee;
-            entry.defined = false;
-            entry.privileges = PrivilegeSet::NONE;
-            entry.grant_options = PrivilegeSet::NONE;
-        }
-        let entry = &mut catalog.defaults[slot];
-        let prior = entry.pending;
-        if txid == 0 {
-            entry.defined = defined;
-            entry.privileges = privileges;
-            entry.grant_options = grant_options;
-            entry.pending = None;
-            if !defined {
-                entry.owner = PUBLIC_ROLE;
-            }
-        } else {
-            entry.pending = Some(PendingDefaultAcl {
-                txid,
-                defined,
-                privileges,
-                grant_options,
-            });
-        }
-        Ok((slot, prior))
-    }
-
-    pub(crate) fn default_acl_entry(&self, slot: usize) -> DefaultAclEntry {
-        self.acl_catalog
-            .lock()
-            .expect("ACL catalog lock poisoned")
-            .defaults[slot]
-    }
-
-    pub(crate) fn default_acl_entry_count(&self) -> usize {
-        self.acl_catalog
-            .lock()
-            .expect("ACL catalog lock poisoned")
-            .defaults
-            .len()
-    }
-
-    pub(crate) fn default_acl_entries(
-        &self,
-    ) -> impl Iterator<Item = (usize, DefaultAclEntry)> + '_ {
-        DefaultAclIter {
-            catalog: &self.acl_catalog,
-            database: Some(current_database()),
-            next_slot: 0,
-        }
-    }
-
-    pub(crate) fn commit_default_acl(&self, slot: usize, txid: u32) {
-        let mut catalog = self.acl_catalog.lock().expect("ACL catalog lock poisoned");
-        let entry = &mut catalog.defaults[slot];
-        if let Some(pending) = entry.pending
-            && pending.txid == txid
-        {
-            entry.defined = pending.defined;
-            entry.privileges = pending.privileges;
-            entry.grant_options = pending.grant_options;
-            entry.pending = None;
-            if !entry.defined {
-                entry.owner = PUBLIC_ROLE;
-            }
-        }
-    }
-
-    pub(crate) fn restore_default_acl_pending(
-        &self,
-        slot: usize,
-        prior: Option<PendingDefaultAcl>,
-    ) {
-        let mut catalog = self.acl_catalog.lock().expect("ACL catalog lock poisoned");
-        let entry = &mut catalog.defaults[slot];
-        entry.pending = prior;
-        if prior.is_none() && !entry.defined {
-            entry.owner = PUBLIC_ROLE;
-        }
-    }
-
     pub(crate) fn acl_entry(&self, slot: usize) -> AclEntry {
         self.acl_catalog
             .lock()
@@ -28126,15 +27962,6 @@ impl Storage {
                     entry.pending = None;
                 }
             }
-            for entry in catalog.defaults.iter_mut() {
-                if entry.owner == slot as u16 || entry.grantee == slot as u16 {
-                    entry.owner = PUBLIC_ROLE;
-                    entry.defined = false;
-                    entry.privileges = PrivilegeSet::NONE;
-                    entry.grant_options = PrivilegeSet::NONE;
-                    entry.pending = None;
-                }
-            }
             drop(catalog);
             roles.roles[slot] = RoleDef {
                 lifetime: None,
@@ -28149,6 +27976,7 @@ impl Storage {
                     || membership.grantor as usize == slot
                 {
                     *membership = RoleMembership {
+                        created_at: 0,
                         role: 0,
                         member: 0,
                         grantor: 0,
@@ -28234,6 +28062,7 @@ impl Storage {
         &self,
         role: usize,
         member: usize,
+        grantor: usize,
         txid: u32,
     ) -> Option<usize> {
         self.role_catalog
@@ -28245,6 +28074,7 @@ impl Storage {
                 membership.visible_to(txid)
                     && membership.role as usize == role
                     && membership.member as usize == member
+                    && membership.grantor as usize == grantor
             })
     }
 
@@ -28257,6 +28087,7 @@ impl Storage {
         exists: bool,
         txid: u32,
     ) -> Result<(usize, Option<PendingRoleMembership>), SqlError> {
+        self.lock_role_memberships(role, txid)?;
         for source in [role, member, grantor] {
             self.role_reference_ready(source, txid)?;
         }
@@ -28268,6 +28099,7 @@ impl Storage {
             (membership.live || membership.pending.is_some())
                 && membership.role as usize == role
                 && membership.member as usize == member
+                && membership.grantor as usize == grantor
         });
         let slot = match existing {
             Some(slot) => slot,
@@ -28300,14 +28132,21 @@ impl Storage {
             ));
         }
         let prior = catalog.memberships[slot].pending;
+        let created_at = if exists && !catalog.memberships[slot].visible_to(txid) {
+            self.catalog_sequence
+                .next_bounded(MAX_CATALOG_CREATION, "role membership")?
+        } else {
+            catalog.memberships[slot].creation_to(txid).created_at()
+        };
         if existing.is_none() {
             catalog.memberships[slot].role = role as u16;
             catalog.memberships[slot].member = member as u16;
+            catalog.memberships[slot].grantor = grantor as u16;
         }
         catalog.memberships[slot].pending = Some(PendingRoleMembership {
             txid,
+            created_at,
             exists,
-            grantor: grantor as u16,
             options,
         });
         Ok((slot, prior))
@@ -28322,7 +28161,7 @@ impl Storage {
             return;
         };
         catalog.memberships[slot].live = pending.exists;
-        catalog.memberships[slot].grantor = pending.grantor;
+        catalog.memberships[slot].created_at = pending.created_at;
         catalog.memberships[slot].options = pending.options;
         if !pending.exists {
             catalog.memberships[slot].role = 0;
@@ -28348,13 +28187,15 @@ impl Storage {
         }
     }
 
-    pub fn install_role_membership(
+    pub(crate) fn install_role_membership(
         &self,
-        role_name: &str,
-        member_name: &str,
-        grantor_name: &str,
+        identity: CatalogPosition,
+        role_oid: RoleOid,
+        member_oid: RoleOid,
+        grantor_oid: RoleOid,
         options: RoleMembershipOptions,
     ) -> Result<usize, SqlError> {
+        CatalogIdentity::require(identity.created_at())?;
         let mut catalog = self
             .role_catalog
             .lock()
@@ -28362,57 +28203,76 @@ impl Storage {
         let role = catalog
             .roles
             .iter()
-            .position(|role| role.live && role.name.as_str() == role_name)
+            .position(|role| role.live && role.oid() == role_oid)
             .ok_or_else(|| {
                 sql_err!(
-                    sqlstate::UNDEFINED_OBJECT,
-                    "membership role \"{}\" does not exist",
-                    role_name
+                    sqlstate::DATA_EXCEPTION,
+                    "stored membership role identifier {} is unavailable",
+                    role_oid.get()
                 )
             })?;
         let member = catalog
             .roles
             .iter()
-            .position(|role| role.live && role.name.as_str() == member_name)
+            .position(|role| role.live && role.oid() == member_oid)
             .ok_or_else(|| {
                 sql_err!(
-                    sqlstate::UNDEFINED_OBJECT,
-                    "membership member \"{}\" does not exist",
-                    member_name
+                    sqlstate::DATA_EXCEPTION,
+                    "stored membership member identifier {} is unavailable",
+                    member_oid.get()
                 )
             })?;
         let grantor = catalog
             .roles
             .iter()
-            .position(|role| role.live && role.name.as_str() == grantor_name)
+            .position(|role| role.live && role.oid() == grantor_oid)
             .ok_or_else(|| {
                 sql_err!(
-                    sqlstate::UNDEFINED_OBJECT,
-                    "membership grantor \"{}\" does not exist",
-                    grantor_name
+                    sqlstate::DATA_EXCEPTION,
+                    "stored membership grantor identifier {} is unavailable",
+                    grantor_oid.get()
                 )
             })?;
-        if let Some(slot) = catalog.memberships.iter().position(|membership| {
-            membership.visible_to(0)
-                && membership.role as usize == role
-                && membership.member as usize == member
-        }) {
-            catalog.memberships[slot].grantor = grantor as u16;
-            catalog.memberships[slot].options = options;
-            return Ok(slot);
+        let slot = identity.slot();
+        if slot >= catalog.memberships.len() {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "stored role membership position is out of range"
+            ));
         }
-        let slot = catalog
+        if catalog
             .memberships
             .iter()
-            .position(|membership| !membership.live && membership.pending.is_none())
-            .ok_or_else(|| {
-                sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "too many role memberships (limit {})",
-                    catalog.memberships.len()
-                )
-            })?;
+            .enumerate()
+            .any(|(other, entry)| {
+                other != slot
+                    && entry.live
+                    && ((entry.role as usize == role
+                        && entry.member as usize == member
+                        && entry.grantor as usize == grantor)
+                        || entry.created_at == identity.created_at())
+            })
+        {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "stored role membership identity is duplicated"
+            ));
+        }
+        let occupied = catalog.memberships[slot];
+        if occupied.pending.is_some()
+            || (occupied.live
+                && (occupied.created_at != identity.created_at()
+                    || occupied.role as usize != role
+                    || occupied.member as usize != member
+                    || occupied.grantor as usize != grantor))
+        {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "stored role membership identity is unavailable"
+            ));
+        }
         catalog.memberships[slot] = RoleMembership {
+            created_at: identity.created_at(),
             role: role as u16,
             member: member as u16,
             grantor: grantor as u16,
@@ -28420,6 +28280,7 @@ impl Storage {
             live: true,
             pending: None,
         };
+        self.catalog_sequence.observe(identity.created_at());
         Ok(slot)
     }
 
@@ -28712,29 +28573,30 @@ impl Storage {
         Ok(())
     }
 
-    pub fn remove_role_membership(&self, role_name: &str, member_name: &str) {
+    pub(crate) fn remove_role_membership(&self, identity: CatalogPosition) -> Result<(), SqlError> {
+        CatalogIdentity::require(identity.created_at())?;
         let mut catalog = self
             .role_catalog
             .lock()
             .expect("role catalog lock poisoned");
-        let role = catalog
-            .roles
-            .iter()
-            .position(|role| role.live && role.name.as_str() == role_name);
-        let member = catalog
-            .roles
-            .iter()
-            .position(|role| role.live && role.name.as_str() == member_name);
-        let (Some(role), Some(member)) = (role, member) else {
-            return;
-        };
-        if let Some(slot) = catalog.memberships.iter().position(|membership| {
-            membership.visible_to(0)
-                && membership.role as usize == role
-                && membership.member as usize == member
-        }) {
-            catalog.memberships[slot].live = false;
+        let entry = catalog
+            .memberships
+            .get(identity.slot())
+            .copied()
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::DATA_EXCEPTION,
+                    "stored role membership position is out of range"
+                )
+            })?;
+        if !entry.live || entry.pending.is_some() || entry.created_at != identity.created_at() {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "stored role membership removal selects a different lifetime"
+            ));
         }
+        catalog.memberships[identity.slot()].live = false;
+        Ok(())
     }
 
     /// Whether `member` may SET ROLE to `target`, following membership edges
@@ -28754,6 +28616,219 @@ impl Storage {
         let mut visited = self.role_graph_scratch();
         self.reachable_roles(member, txid, false, require_set, &mut visited);
         visited.get(target).copied().unwrap_or(false)
+    }
+
+    pub(crate) fn validate_role_admin_grants(
+        &self,
+        role: usize,
+        grantor: usize,
+        members: &[usize],
+        txid: u32,
+        arena: &Arena,
+    ) -> Result<(), SqlError> {
+        if grantor == 0 {
+            return Ok(());
+        }
+        let cycle = || {
+            sql_err!(
+                sqlstate::INVALID_GRANT_OPERATION,
+                "ADMIN option cannot be granted back to your own grantor"
+            )
+        };
+        if members.contains(&0) {
+            return Err(cycle());
+        }
+        let capacity = || {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "role grant dependency traversal exceeds SQL arena"
+            )
+        };
+        #[derive(Clone, Copy)]
+        struct GrantEdge {
+            member: u16,
+            admin: bool,
+            removed: bool,
+            next: usize,
+        }
+        let (role_count, excluded, heads, counts, edges) = {
+            let catalog = self
+                .role_catalog
+                .lock()
+                .expect("role catalog lock poisoned");
+            let role_count = catalog.roles.len();
+            if grantor >= role_count {
+                return Err(sql_err!(
+                    sqlstate::DATA_EXCEPTION,
+                    "role grantor position is out of range"
+                ));
+            }
+            let excluded = arena
+                .alloc_slice_with(role_count, |_| false)
+                .map_err(|_| capacity())?;
+            for member in members {
+                let excluded = excluded.get_mut(*member).ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::DATA_EXCEPTION,
+                        "role grant recipient position is out of range"
+                    )
+                })?;
+                *excluded = true;
+            }
+            let heads = arena
+                .alloc_slice_with(role_count, |_| usize::MAX)
+                .map_err(|_| capacity())?;
+            let counts = arena
+                .alloc_slice_with(role_count, |_| 0u32)
+                .map_err(|_| capacity())?;
+            let visible = |membership: &&RoleMembership| {
+                membership.visible_to(txid) && usize::from(membership.role) == role
+            };
+            for membership in catalog.memberships.iter().filter(&visible) {
+                if usize::from(membership.member) >= role_count
+                    || usize::from(membership.grantor) >= role_count
+                {
+                    return Err(sql_err!(
+                        sqlstate::DATA_EXCEPTION,
+                        "role grant references an invalid account position"
+                    ));
+                }
+            }
+            let mut input = catalog.memberships.iter().filter(&visible);
+            let count = input.clone().count();
+            let edges = arena
+                .alloc_slice_with(count, |slot| {
+                    let membership = input
+                        .next()
+                        .expect("the guarded membership count is stable");
+                    let grantor = usize::from(membership.grantor);
+                    let member = usize::from(membership.member);
+                    let admin = membership.options_to(txid).admin;
+                    counts[member] += u32::from(admin);
+                    let edge = GrantEdge {
+                        member: membership.member,
+                        admin,
+                        removed: false,
+                        next: heads[grantor],
+                    };
+                    heads[grantor] = slot;
+                    edge
+                })
+                .map_err(|_| capacity())?;
+            (role_count, excluded, heads, counts, edges)
+        };
+        let queued = arena
+            .alloc_slice_with(role_count, |_| false)
+            .map_err(|_| capacity())?;
+        let queue = arena
+            .alloc_slice_with(role_count, |_| 0u16)
+            .map_err(|_| capacity())?;
+        let mut queued_count = 0;
+        // Simulate removing the recipients. Only losing a final ADMIN grant
+        // propagates to grants issued by that member; unrelated grants survive.
+        for edge in edges.iter_mut() {
+            let member = usize::from(edge.member);
+            if excluded[member] {
+                edge.removed = true;
+                if edge.admin {
+                    counts[member] -= 1;
+                    if counts[member] == 0 && !queued[member] {
+                        queued[member] = true;
+                        queue[queued_count] = edge.member;
+                        queued_count += 1;
+                    }
+                }
+            }
+        }
+        let mut at = 0;
+        while at < queued_count {
+            let mut slot = heads[usize::from(queue[at])];
+            at += 1;
+            while slot != usize::MAX {
+                let edge = edges[slot];
+                if !edge.removed {
+                    edges[slot].removed = true;
+                    if edge.admin {
+                        let member = usize::from(edge.member);
+                        counts[member] -= 1;
+                        if counts[member] == 0 && !queued[member] {
+                            queued[member] = true;
+                            queue[queued_count] = edge.member;
+                            queued_count += 1;
+                        }
+                    }
+                }
+                slot = edge.next;
+            }
+        }
+        if counts[grantor] == 0 {
+            return Err(cycle());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn role_membership_grantor(
+        &self,
+        member: usize,
+        target: usize,
+        txid: u32,
+        arena: &Arena,
+    ) -> Result<usize, SqlError> {
+        let catalog = self
+            .role_catalog
+            .lock()
+            .expect("role catalog lock poisoned");
+        if catalog.roles[member].attributes_to(txid).superuser {
+            return Ok(0);
+        }
+        let distance = arena
+            .alloc_slice_with(catalog.roles.len(), |_| usize::MAX)
+            .map_err(|_| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "role membership traversal exceeds SQL arena"
+                )
+            })?;
+        distance[member] = 0;
+        loop {
+            let mut changed = false;
+            for membership in catalog
+                .memberships
+                .iter()
+                .filter(|membership| membership.visible_to(txid))
+            {
+                if !membership.options_to(txid).inherit {
+                    continue;
+                }
+                let hops = distance[usize::from(membership.member)];
+                let destination = &mut distance[usize::from(membership.role)];
+                if hops != usize::MAX && hops + 1 < *destination {
+                    *destination = hops + 1;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        catalog
+            .memberships
+            .iter()
+            .filter(|membership| {
+                membership.visible_to(txid)
+                    && usize::from(membership.role) == target
+                    && membership.options_to(txid).admin
+                    && distance[usize::from(membership.member)] != usize::MAX
+            })
+            .map(|membership| usize::from(membership.member))
+            .min_by_key(|slot| (distance[*slot], catalog.roles[*slot].oid().get()))
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INSUFFICIENT_PRIVILEGE,
+                    "admin option for role \"{}\" is required",
+                    catalog.roles[target].name_to(txid).as_str()
+                )
+            })
     }
 
     pub fn role_can_admin(&self, member: usize, target: usize, txid: u32) -> bool {
@@ -28800,7 +28875,7 @@ impl Storage {
         .any(|(_, membership)| {
             membership.visible_to(txid)
                 && membership.role as usize == role
-                && membership.grantor_to(txid) as usize == grantor
+                && membership.grantor as usize == grantor
         })
     }
 
@@ -34001,16 +34076,25 @@ impl Storage {
     }
 
     /// Whether `table` is a physical descendant of `ancestor` in the catalog
-    /// snapshot. Attachment slots are typed and acyclic at DDL time, so this
-    /// walk cannot reinterpret an unrelated table as part of the hierarchy.
+    /// snapshot. Bound corrupt stored cycles before walking their attachments.
     pub(crate) fn partition_descends_from(
         &self,
         mut table: usize,
         ancestor: usize,
         txid: u32,
     ) -> bool {
-        while let Some(attachment) = self.table_def(table, txid).partition.attachment {
+        if table >= self.table_count() || ancestor >= self.table_count() || table == ancestor {
+            return false;
+        }
+        let database = self.table(table).database();
+        for _ in 0..self.table_count() {
+            let Some(attachment) = self.table_def(table, txid).partition.attachment else {
+                return false;
+            };
             table = usize::from(attachment.parent);
+            if table >= self.table_count() || self.table(table).database() != database {
+                return false;
+            }
             if table == ancestor {
                 return true;
             }
@@ -44083,6 +44167,11 @@ impl Storage {
         }
     }
 
+    pub(crate) fn policy_position(&self, slot: usize) -> CatalogPosition {
+        CatalogPosition::new(slot, self.policy(slot).created_at)
+            .expect("admitted policy has a checked position")
+    }
+
     pub(crate) fn policy_role_capacity(&self) -> usize {
         self.policy_roles_per_image
     }
@@ -44206,7 +44295,9 @@ impl Storage {
                 catalog.definitions.len()
             ));
         };
-        let created_at = self.catalog_sequence.next()?;
+        let created_at = self
+            .catalog_sequence
+            .next_bounded(MAX_CATALOG_CREATION, "row-security policy")?;
         owners.write_query_image(
             self,
             self.committed_dependency_image(StoredQueryDependencyOwner::Policy(slot as u16)),
@@ -44441,10 +44532,12 @@ impl Storage {
 
     pub(crate) fn replay_set_policy<'a>(
         &mut self,
+        identity: CatalogPosition,
         spec: RecoveredPolicySpec,
         roles: impl ExactSizeIterator<Item = &'a str>,
         dependencies: StoredQueryDependencies,
     ) -> Result<usize, SqlError> {
+        CatalogIdentity::require(identity.created_at())?;
         let role_count = roles.len();
         if role_count == 0 || role_count > self.policy_roles_per_image {
             return Err(sql_err!(
@@ -44513,30 +44606,38 @@ impl Storage {
         );
         owners.validate_target(0, type_contracts::QueryTargetUse::Read)?;
         let catalog = &mut owners.catalog;
-        let existing = catalog.definitions.iter().position(|policy| {
-            policy.database == current_database()
-                && policy.visible_to(0)
-                && policy.table == table
-                && policy.name == spec.name
-        });
-        let slot = existing
-            .or_else(|| {
-                catalog
-                    .definitions
-                    .iter()
-                    .position(|policy| policy.ddl_state == CatalogDdlState::Absent)
-            })
-            .ok_or_else(|| {
-                sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "row-security policy catalog is full (limit {})",
-                    catalog.definitions.len()
-                )
-            })?;
-        let created_at = match existing {
-            Some(slot) => catalog.definitions[slot].created_at,
-            None => self.catalog_sequence.next()?,
+        let slot = identity.slot();
+        let Some(current) = catalog.definitions.get(slot).copied() else {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "stored row-security policy position is out of range"
+            ));
         };
+        if (current.ddl_state != CatalogDdlState::Absent
+            && (current.database != current_database()
+                || current.created_at != identity.created_at()
+                || current.ddl_state != CatalogDdlState::Present
+                || current.pending_definition.is_some()
+                || current.table != table
+                || current.name != spec.name))
+            || catalog
+                .definitions
+                .iter()
+                .enumerate()
+                .any(|(other, policy)| {
+                    other != slot
+                        && policy.database == current_database()
+                        && policy.ddl_state != CatalogDdlState::Absent
+                        && (policy.created_at == identity.created_at()
+                            || (policy.table == table && policy.name == spec.name))
+                })
+        {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "stored row-security policy selects another lifetime"
+            ));
+        }
+        let created_at = identity.created_at();
         owners.write_query_image(
             self,
             self.committed_dependency_image(StoredQueryDependencyOwner::Policy(slot as u16)),
@@ -44560,31 +44661,8 @@ impl Storage {
             pending_definition: None,
             ddl_state: CatalogDdlState::Present,
         };
-        Ok(slot)
-    }
-
-    pub(crate) fn replay_drop_policy(&mut self, table: usize, name: &str) {
-        if let Some(slot) = self.policy_slot_on(table, name, 0) {
-            self.drop_policy(slot, 0);
-            self.commit_policy_drop(slot);
-        }
-    }
-
-    pub(crate) fn restore_policy<'a>(
-        &mut self,
-        created_at: u64,
-        spec: RecoveredPolicySpec,
-        roles: impl ExactSizeIterator<Item = &'a str>,
-        dependencies: StoredQueryDependencies,
-    ) -> Result<(), SqlError> {
-        let slot = self.replay_set_policy(spec, roles, dependencies)?;
-        self.policy_catalog
-            .lock()
-            .expect("policy catalog lock poisoned")
-            .definitions[slot]
-            .created_at = created_at;
         self.catalog_sequence.observe(created_at);
-        Ok(())
+        Ok(slot)
     }
 
     pub(crate) fn triggers_for_table(
@@ -44686,6 +44764,10 @@ impl Storage {
             .definitions[slot]
     }
 
+    pub(crate) fn trigger_position(&self, slot: usize) -> CatalogPosition {
+        self.trigger(slot).position(slot)
+    }
+
     pub(crate) fn trigger_capacity(&self) -> usize {
         self.trigger_catalog
             .lock()
@@ -44724,157 +44806,6 @@ impl Storage {
                     && self.partition_descends_from(table, usize::from(parent), txid))
                 .then_some(slot)
             })
-    }
-
-    pub(crate) fn partition_trigger_enabled_to(
-        &self,
-        trigger: usize,
-        table: usize,
-        txid: u32,
-    ) -> TriggerEnabled {
-        let override_enabled = self
-            .trigger_catalog
-            .lock()
-            .expect("trigger catalog lock poisoned")
-            .partition_states
-            .iter()
-            .find(|state| state.trigger as usize == trigger && state.table as usize == table)
-            .and_then(|state| state.enabled_to(txid));
-        override_enabled.unwrap_or_else(|| self.trigger_to(trigger, txid).enabled_to(txid))
-    }
-
-    pub(crate) fn stage_partition_trigger_enabled(
-        &mut self,
-        trigger: usize,
-        table: usize,
-        enabled: TriggerEnabled,
-        txid: u32,
-    ) -> Result<Option<(usize, PartitionTriggerState)>, SqlError> {
-        let mut catalog = self
-            .trigger_catalog
-            .lock()
-            .expect("trigger catalog lock poisoned");
-        let existing = catalog.partition_states.iter().position(|state| {
-            state.trigger as usize == trigger
-                && state.table as usize == table
-                && (state.present || state.pending.is_some())
-        });
-        let slot = existing.or_else(|| {
-            catalog
-                .partition_states
-                .iter()
-                .position(|state| !state.present && state.pending.is_none())
-        });
-        let Some(slot) = slot else {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "partition trigger state exceeds the startup catalog capacity"
-            ));
-        };
-        let prior = catalog.partition_states[slot];
-        if let Some(pending) = prior.pending
-            && pending.txid != txid
-        {
-            return Err(self.catalog_ddl_wait_error(
-                txid,
-                pending.txid,
-                catalog.definitions[trigger].name.as_str(),
-            ));
-        }
-        if prior.enabled_to(txid) == Some(enabled) {
-            return Ok(None);
-        }
-        catalog.partition_states[slot] = PartitionTriggerState {
-            trigger: trigger as u16,
-            table: table as u16,
-            enabled: prior.enabled,
-            present: prior.present,
-            pending: Some(PendingPartitionTriggerState { txid, enabled }),
-        };
-        Ok(Some((slot, prior)))
-    }
-
-    pub(crate) fn commit_partition_trigger_state(&mut self, slot: usize, txid: u32) {
-        let mut catalog = self
-            .trigger_catalog
-            .lock()
-            .expect("trigger catalog lock poisoned");
-        let state = &mut catalog.partition_states[slot];
-        if let Some(pending) = state.pending
-            && pending.txid == txid
-        {
-            state.enabled = pending.enabled;
-            state.present = true;
-            state.pending = None;
-        }
-    }
-
-    pub(crate) fn rollback_partition_trigger_state(
-        &mut self,
-        slot: usize,
-        prior: PartitionTriggerState,
-    ) {
-        self.trigger_catalog
-            .lock()
-            .expect("trigger catalog lock poisoned")
-            .partition_states[slot] = prior;
-    }
-
-    pub(crate) fn restore_partition_trigger_state(
-        &mut self,
-        trigger: usize,
-        table: usize,
-        enabled: TriggerEnabled,
-    ) -> Result<(), SqlError> {
-        let mut catalog = self
-            .trigger_catalog
-            .lock()
-            .expect("trigger catalog lock poisoned");
-        if catalog.partition_states.iter().any(|state| {
-            state.present && state.trigger as usize == trigger && state.table as usize == table
-        }) {
-            return Err(sql_err!(
-                sqlstate::DUPLICATE_OBJECT,
-                "duplicate partition trigger state in checkpoint"
-            ));
-        }
-        let Some(slot) = catalog
-            .partition_states
-            .iter()
-            .position(|state| !state.present && state.pending.is_none())
-        else {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "too many partition trigger states in checkpoint"
-            ));
-        };
-        catalog.partition_states[slot] = PartitionTriggerState {
-            trigger: trigger as u16,
-            table: table as u16,
-            enabled,
-            present: true,
-            pending: None,
-        };
-        Ok(())
-    }
-
-    pub(crate) fn partition_trigger_states(
-        &self,
-    ) -> impl Iterator<Item = (usize, usize, TriggerEnabled)> + '_ {
-        PartitionTriggerStateIter {
-            catalog: &self.trigger_catalog,
-            next_slot: 0,
-        }
-        .filter_map(|state| {
-            (state.present
-                && self.table_def(usize::from(state.table), 0).persistence
-                    != RelationPersistence::Temporary)
-                .then_some((
-                    usize::from(state.trigger),
-                    usize::from(state.table),
-                    state.enabled,
-                ))
-        })
     }
 
     pub(crate) const fn trigger_access_object(slot: usize) -> AccessObject {
@@ -45217,10 +45148,11 @@ impl Storage {
 
     pub(crate) fn restore_trigger(
         &mut self,
-        created_at: u64,
+        identity: CatalogPosition,
         spec: TriggerSpec,
         enabled: TriggerEnabled,
     ) -> Result<usize, SqlError> {
+        let created_at = identity.created_at();
         bounded_catalog_generation(created_at, MAX_TRIGGER_OID_GENERATION, "trigger")?;
         if !spec.is_valid() {
             return Err(sql_err!(
@@ -45249,16 +45181,22 @@ impl Storage {
                 "duplicate trigger in checkpoint"
             ));
         }
-        let Some(slot) = catalog
+        let slot = identity.slot();
+        if catalog
             .definitions
-            .iter()
-            .position(|trigger| trigger.ddl_state == CatalogDdlState::Absent)
-        else {
+            .get(slot)
+            .is_none_or(|trigger| trigger.ddl_state != CatalogDdlState::Absent)
+            || catalog.definitions.iter().any(|trigger| {
+                trigger.database == current_database()
+                    && trigger.ddl_state != CatalogDdlState::Absent
+                    && trigger.created_at == created_at
+            })
+        {
             return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "too many triggers in checkpoint"
+                sqlstate::DATA_EXCEPTION,
+                "stored trigger position or lifetime is unavailable"
             ));
-        };
+        }
         self.catalog_sequence.observe(created_at);
         catalog.definitions[slot] = TriggerDef {
             database: current_database(),
@@ -45305,14 +45243,25 @@ impl Storage {
     }
 
     fn clear_trigger_slot(&self, slot: usize) {
+        let trigger = self.trigger(slot);
+        let temporary = self.access_object_is_temporary(trigger.target.access_object(), 0);
         let mut catalog = self
             .trigger_catalog
             .lock()
             .expect("trigger catalog lock poisoned");
         catalog.definitions[slot] = TriggerDef::EMPTY;
-        for state in catalog.partition_states.iter_mut() {
-            if usize::from(state.trigger) == slot {
-                *state = PartitionTriggerState::EMPTY;
+        if temporary {
+            for state in catalog.partition_states.iter_mut() {
+                if state
+                    .committed
+                    .or_else(|| state.pending.and_then(|pending| pending.image))
+                    .is_some_and(|image| {
+                        image.trigger.slot() == slot
+                            && image.trigger.created_at() == trigger.created_at
+                    })
+                {
+                    *state = PartitionTriggerState::EMPTY;
+                }
             }
         }
     }
@@ -45389,6 +45338,7 @@ impl Storage {
         dependencies: StoredQueryDependencies,
         transaction: u32,
     ) -> Result<RoutineChange, SqlError> {
+        CatalogIdentity::require(position.created_at())?;
         if definition.created_at != position.created_at() || position.slot() >= self.routine_count()
         {
             return Err(sql_err!(
@@ -48633,7 +48583,9 @@ impl Storage {
         if matches!(relation, ObjectLockTarget::Role(_))
             && !matches!(
                 mode,
-                TableLockMode::AccessShare | TableLockMode::AccessExclusive
+                TableLockMode::AccessShare
+                    | TableLockMode::ShareUpdateExclusive
+                    | TableLockMode::AccessExclusive
             )
         {
             return Err(sql_err!(
@@ -49080,7 +49032,6 @@ impl Storage {
                     let source = i32::try_from(rowid)
                         .ok()
                         .and_then(RoleOid::parse)
-                        .filter(|source| *source != RoleOid::BOOTSTRAP)
                         .filter(|_| schema.is_empty() && table.is_empty())
                         .ok_or_else(|| {
                             sql_err!(
@@ -49090,6 +49041,7 @@ impl Storage {
                         })?;
                     let mode = match mode {
                         0 => crate::sql::ast::TableLockMode::AccessShare,
+                        3 => crate::sql::ast::TableLockMode::ShareUpdateExclusive,
                         7 => crate::sql::ast::TableLockMode::AccessExclusive,
                         _ => {
                             return Err(sql_err!(
@@ -49098,6 +49050,14 @@ impl Storage {
                             ));
                         }
                     };
+                    if source == RoleOid::BOOTSTRAP
+                        && mode != crate::sql::ast::TableLockMode::ShareUpdateExclusive
+                    {
+                        return Err(sql_err!(
+                            sqlstate::DATA_EXCEPTION,
+                            "prepared lock WAL has an invalid bootstrap role-lock mode"
+                        ));
+                    }
                     self.observe_role_oid(source);
                     self.lock_object(txid, ObjectLockTarget::Role(source), mode, false)?;
                 }
@@ -51273,7 +51233,9 @@ impl Storage {
                     self.rule_count()
                 )
             })?;
-        let created_at = self.catalog_sequence.next()?;
+        let created_at = self
+            .catalog_sequence
+            .next_bounded(MAX_CATALOG_CREATION, "rewrite rule")?;
         owners.write_query_image(
             self,
             self.committed_dependency_image(StoredQueryDependencyOwner::Rule(slot as u16)),
@@ -51556,6 +51518,7 @@ impl Storage {
         definition: RuleDefinition,
         dependencies: StoredQueryDependencies,
     ) -> Result<(), SqlError> {
+        CatalogIdentity::require(created_at)?;
         if slot >= self.rule_count() {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -53918,6 +53881,37 @@ mod tests {
         assert_eq!(unchanged.read_snapshot, 7);
         assert_eq!(unchanged.commit_snapshot, 13);
         replace_execution_visibility(prior);
+    }
+
+    #[test]
+    fn catalog_lifetime_routine_dependencies_use_their_complete_creation_range() {
+        crate::mem::guard::forbid_alloc(|| {
+            for birth in [1, 40_000, 40_001, MAX_CATALOG_CREATION] {
+                let identity =
+                    StoredDependencyIdentity::RoutineOid(ROUTINE_OID_BASE + birth as i32);
+                assert!(identity.valid_for(DependencyClass::Routine));
+                assert!(!identity.valid_for(DependencyClass::Operator));
+                assert_eq!(
+                    StoredDependencyIdentity::from_storage(
+                        DependencyClass::Routine,
+                        identity.storage_key().as_str()
+                    ),
+                    Some(identity)
+                );
+            }
+            for birth in [0, MAX_CATALOG_CREATION + 1] {
+                let identity =
+                    StoredDependencyIdentity::RoutineOid(ROUTINE_OID_BASE + birth as i32);
+                assert!(!identity.valid_for(DependencyClass::Routine));
+                assert!(
+                    StoredDependencyIdentity::from_storage(
+                        DependencyClass::Routine,
+                        identity.storage_key().as_str()
+                    )
+                    .is_none()
+                );
+            }
+        });
     }
 
     #[test]
@@ -58700,6 +58694,7 @@ mod tests {
         const WORKERS: usize = 4;
         let names = ["role_a", "role_b", "role_c", "role_d"];
         let mut config = test_config();
+        config.max_connections = WORKERS as u32;
         config.max_roles = 1 + WORKERS;
         config.max_role_memberships = WORKERS;
         config.max_role_settings = WORKERS;
@@ -58721,16 +58716,24 @@ mod tests {
                         admin: true,
                         ..RoleMembershipOptions::DEFAULT
                     };
-                    let (membership, _) = storage
-                        .change_role_membership(
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                    let (membership, _) = loop {
+                        match storage.change_role_membership(
                             BOOTSTRAP_ROLE as usize,
                             role,
                             0,
                             options,
                             true,
                             txid,
-                        )
-                        .unwrap();
+                        ) {
+                            Ok(change) => break change,
+                            Err(error) if error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT => {
+                                assert!(std::time::Instant::now() < deadline, "{error:?}");
+                                std::thread::yield_now();
+                            }
+                            Err(error) => panic!("{error:?}"),
+                        }
+                    };
                     storage.commit_role_membership_change(membership);
 
                     let (setting, _) = storage
@@ -58742,6 +58745,7 @@ mod tests {
                         )
                         .unwrap();
                     storage.commit_role_setting(setting);
+                    storage.release_object_locks(txid);
                 });
             }
         });
@@ -59442,13 +59446,18 @@ mod tests {
                         ddl_state: CatalogDdlState::Present,
                         ..TriggerDef::EMPTY
                     };
-                    catalog.partition_states[worker] = PartitionTriggerState {
-                        trigger: worker as u16,
-                        table: worker as u16,
-                        enabled: TriggerEnabled::Replica,
-                        present: true,
-                        pending: None,
-                    };
+                    catalog.partition_states
+                        [storage.partition_trigger_state_slot(worker, worker)] =
+                        PartitionTriggerState {
+                            database: current_database(),
+                            committed: Some(PartitionTriggerImage {
+                                creation: CatalogIdentity::require(worker as u64 + 10).unwrap(),
+                                trigger: CatalogPosition::new(worker, worker as u64 + 1).unwrap(),
+                                table: CatalogPosition::new(worker, worker as u64 + 1).unwrap(),
+                                enabled: TriggerEnabled::Replica,
+                            }),
+                            pending: None,
+                        };
                 });
             }
         });
@@ -59513,6 +59522,10 @@ mod tests {
         storage.commit_trigger_drop(0);
         assert_eq!(storage.trigger(0).created_at, 0);
         assert_eq!(storage.trigger(0).ddl_state, CatalogDdlState::Absent);
+        let image = storage.partition_trigger_image_to(0, 0, 0).unwrap();
+        storage
+            .install_partition_trigger_image(Some(image), None, 0)
+            .unwrap();
         assert_eq!(storage.partition_trigger_states().count(), WORKERS - 1);
     }
 
@@ -60323,7 +60336,8 @@ mod tests {
                             PrivilegeSet::NONE,
                             txid,
                         )
-                        .unwrap();
+                        .unwrap()
+                        .expect("the fresh default privilege declaration changes its baseline");
                     storage.commit_default_acl(default_slot, txid);
 
                     let parameter = crate::sql::ast::ParameterName::parse(parameter)

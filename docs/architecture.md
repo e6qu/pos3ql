@@ -203,6 +203,15 @@ read pos3ql objects.
 | `src/object_store.rs`, `src/object_store/` | Provider-neutral outcomes, S3 HTTP/TLS, signing and conditional operations |
 | `src/mem/`, `src/config.rs` | Startup sizing, fixed buffers/pools and allocation enforcement |
 
+`src/storage/catalog_identities.rs` checks durable catalog creation stamps and
+counter reservations. `default_acls.rs` keeps a default-permission group's
+identity separate from its recipients; `partition_triggers.rs` stores inherited
+trigger identities and modes in the existing startup-reserved matrix. SQL records
+private changes for rollback and publishes their final expected/replacement
+images at commit. Checkpoint and journal readers restore saved positions and
+reject references to replacement objects. Database copies rebind parent links
+within the new database before installing inherited triggers.
+
 The remaining order is coherent shared row/catalog publication and bounded
 maintenance, startup-reserved CPU workers, then representative performance and
 multi-host recovery/failover qualification. Current [behavior](implemented-baseline.md),

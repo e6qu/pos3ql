@@ -277,6 +277,20 @@ impl FormatDateConvention {
     }
 }
 
+fn claim_format_integer(slot: &mut Option<i32>, value: i32, field: &str) -> Result<(), SqlError> {
+    // PostgreSQL permits replacing an earlier zero but rejects conflicting
+    // nonzero values, even when a later TZ field changed interpretation.
+    if slot.is_some_and(|previous| previous != 0 && previous != value) {
+        return Err(sql_err!(
+            sqlstate::INVALID_DATETIME_FORMAT,
+            "conflicting values for \"{}\" field in formatting string",
+            field
+        ));
+    }
+    *slot = Some(value);
+    Ok(())
+}
+
 /// A fully resolved date/time format-model result. Parsing produces this
 /// typed state before either `to_date` or `to_timestamp` consumes it, so the
 /// two entry points cannot disagree about a calendar interpretation.
@@ -311,6 +325,8 @@ pub fn parse_formatted(input: &str, fmt: &str) -> Result<FormattedDateTime, SqlE
     let mut julian = None;
     let mut date_convention = FormatDateConvention::Unset;
     let (mut timezone_sign, mut timezone_hour, mut timezone_minute) = (1i32, None, None);
+    let mut timezone_name = None;
+    let mut numeric_timezone = false;
     let mut twelve_hour = false;
     let mut pm = None;
     let mut bc = false;
@@ -542,6 +558,8 @@ pub fn parse_formatted(input: &str, fmt: &str) -> Result<FormattedDateTime, SqlE
             century = Some(read_num(&mut input_position, 2).ok_or_else(bad)?);
             format_index += 2;
         } else if starts_with_ci(format_bytes, format_index, b"TZH") {
+            numeric_timezone = true;
+            timezone_sign = 1;
             if input_position < input_bytes.len()
                 && matches!(input_bytes[input_position], b'+' | b'-')
             {
@@ -552,10 +570,22 @@ pub fn parse_formatted(input: &str, fmt: &str) -> Result<FormattedDateTime, SqlE
                 };
                 input_position += 1;
             }
-            timezone_hour = Some(read_num(&mut input_position, 2).ok_or_else(bad)? as i32);
+            claim_format_integer(
+                &mut timezone_hour,
+                read_num(&mut input_position, 2).ok_or_else(bad)? as i32,
+                &fmt[format_index..format_index + 3],
+            )?;
             format_index += 3;
         } else if starts_with_ci(format_bytes, format_index, b"TZM") {
-            timezone_minute = Some(read_num(&mut input_position, 2).ok_or_else(bad)? as i32);
+            if !numeric_timezone {
+                timezone_sign = 1;
+            }
+            numeric_timezone = true;
+            claim_format_integer(
+                &mut timezone_minute,
+                read_num(&mut input_position, 2).ok_or_else(bad)? as i32,
+                &fmt[format_index..format_index + 3],
+            )?;
             format_index += 3;
         } else if starts_with_ci(format_bytes, format_index, b"TZ") {
             while !exact
@@ -575,17 +605,16 @@ pub fn parse_formatted(input: &str, fmt: &str) -> Result<FormattedDateTime, SqlE
             let zone = if name.eq_ignore_ascii_case("UTC") || name.eq_ignore_ascii_case("GMT") {
                 super::timezone::Timezone::utc()
             } else {
-                super::timezone::lookup(name).ok_or_else(|| {
+                super::timezone::lookup_abbreviation(name).ok_or_else(|| {
                     sql_err!(
-                        sqlstate::INVALID_PARAMETER_VALUE,
-                        "time zone \"{}\" not recognized",
-                        name
+                        sqlstate::INVALID_DATETIME_FORMAT,
+                        "invalid value \"{}\" for \"TZ\"",
+                        &input[start..]
                     )
                 })?
             };
-            timezone_hour = Some(zone.resolve(0).0 / 3600);
-            timezone_minute = Some((zone.resolve(0).0.unsigned_abs() / 60 % 60) as i32);
-            timezone_sign = zone.resolve(0).0.signum();
+            timezone_name = Some(zone);
+            numeric_timezone = false;
             format_index += 2;
         } else if up == b'J' {
             date_convention = date_convention.claim(FormatDateConvention::Julian)?;
@@ -781,18 +810,33 @@ pub fn parse_formatted(input: &str, fmt: &str) -> Result<FormattedDateTime, SqlE
         minute,
         second: s,
         microsecond: us,
-        timezone_offset_seconds: match (timezone_hour, timezone_minute) {
-            (None, None) => None,
-            (hour, minute) => {
-                let hour = hour.unwrap_or(0);
-                let minute = minute.unwrap_or(0);
-                if hour.unsigned_abs() > 15 || !(0..=59).contains(&minute) {
-                    return Err(sql_err!(
-                        sqlstate::DATETIME_FIELD_OVERFLOW,
-                        "time zone displacement out of range"
-                    ));
+        timezone_offset_seconds: if let Some(zone) = timezone_name.filter(|_| !numeric_timezone) {
+            let local = make_timestamp(
+                y,
+                i64::from(month),
+                i64::from(d),
+                h,
+                minute,
+                s as f64 + us as f64 / 1_000_000.0,
+            )?;
+            let utc = zone
+                .resolve_local(local)
+                .ok_or_else(timestamp_out_of_range)?;
+            Some(i32::try_from((local - utc) / 1_000_000).map_err(|_| timestamp_out_of_range())?)
+        } else {
+            match (timezone_hour, timezone_minute) {
+                (None, None) => None,
+                (hour, minute) => {
+                    let hour = hour.unwrap_or(0);
+                    let minute = minute.unwrap_or(0);
+                    if hour.unsigned_abs() > 15 || !(0..=59).contains(&minute) {
+                        return Err(sql_err!(
+                            sqlstate::DATETIME_FIELD_OVERFLOW,
+                            "time zone displacement out of range"
+                        ));
+                    }
+                    Some(timezone_sign * (hour.unsigned_abs() as i32 * 3600 + minute * 60))
                 }
-                Some(timezone_sign * (hour.unsigned_abs() as i32 * 3600 + minute * 60))
             }
         },
     })
@@ -1075,21 +1119,17 @@ pub fn parse_timestamp(s: &str, apply_timezone: bool) -> Result<i64, SqlError> {
 
     // Trailing *named* zone (`... Europe/Moscow`, `... EST`, `... UTC`): the
     // name resolves at the timestamp's own instant, so a historical rule
-    // applies to a historical timestamp. Detected before the numeric-offset
-    // split, since a name never contains the digits an offset must.
+    // applies to a historical timestamp. A name such as Etc/GMT+5 must be
+    // recognized before splitting numeric-offset suffixes.
     let mut named_zone: Option<super::timezone::Timezone> = None;
     let rest = if let Some((head, name)) = rest.rsplit_once(' ') {
         let name = name.trim();
-        let name_like = !name.is_empty()
-            && name
-                .chars()
-                .all(|c| c.is_ascii_alphabetic() || c == '/' || c == '_')
-            && name.chars().any(|c| c.is_ascii_alphabetic());
+        let name_like = name.bytes().any(|byte| byte.is_ascii_alphabetic());
         if name_like {
             if name.eq_ignore_ascii_case("utc") || name.eq_ignore_ascii_case("gmt") {
                 named_zone = Some(super::timezone::Timezone::utc());
             } else {
-                named_zone = Some(super::timezone::lookup(name).ok_or_else(|| {
+                named_zone = Some(super::timezone::lookup_input(name).ok_or_else(|| {
                     // PostgreSQL reports the name case-folded.
                     let mut folded = crate::util::StackStr::<64>::new();
                     use core::fmt::Write as _;
@@ -1227,7 +1267,7 @@ fn parse_time_parts(s: &str, type_name: &str) -> Result<(i64, Option<i32>), SqlE
         } else if name.eq_ignore_ascii_case("utc") || name.eq_ignore_ascii_case("gmt") {
             (head, Some(0))
         } else {
-            match super::timezone::lookup(name) {
+            match super::timezone::lookup_input(name) {
                 Some(z) => (head, Some(z.resolve(now_micros()).0)),
                 None => return Err(bad()),
             }

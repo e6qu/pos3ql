@@ -96,7 +96,7 @@ impl Storage {
                         .pending
                         .filter(|pending| {
                             pending.txid != txid
-                                && [entry.role, entry.member, entry.grantor, pending.grantor]
+                                && [entry.role, entry.member, entry.grantor]
                                     .contains(&(role as u16))
                         })
                         .map(|pending| pending.txid)
@@ -113,7 +113,7 @@ impl Storage {
                 });
             let granted = catalog.memberships.iter().any(|entry| {
                 entry.visible_to(txid)
-                    && entry.grantor_to(txid) == role as u16
+                    && entry.grantor == role as u16
                     && entry.role != role as u16
                     && entry.member != role as u16
             });
@@ -388,7 +388,7 @@ impl Storage {
                 return Ok(Some(RoleObjectDependency::ParameterPrivilege));
             }
             if catalog.defaults.iter().any(|entry| {
-                let (defined, _, _) = Self::default_acl_visible(entry, txid);
+                let defined = entry.image_to(txid).is_some();
                 defined && (entry.owner == role as u16 || entry.grantee == role as u16)
             }) {
                 return Ok(Some(RoleObjectDependency::DefaultPrivilege));

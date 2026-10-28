@@ -26,7 +26,7 @@ use crc32c::crc32c;
 
 /// On-disk record header length shared by recovery and logical decoding.
 pub(crate) const HEADER_LEN: usize = 24;
-pub(crate) const RECORD_VERSION: u8 = 21;
+pub(crate) const RECORD_VERSION: u8 = 22;
 
 /// One contiguous, committed journal range ready for immutable publication.
 /// Construction is private to the journal, so callers cannot pair an LSN with
@@ -112,6 +112,10 @@ wal_record_kinds! {
     KIND_SET_OBJECT_ACL = 32;
     KIND_REWRITE_TABLE = 33;
     KIND_SET_DEFAULT_ACL = 34;
+/// Retains reservations consumed by coalesced metadata changes, including
+/// create-and-remove sequences that leave no live catalog row.
+    KIND_CATALOG_RESERVATION = 157;
+    KIND_SET_PARTITION_TRIGGER = 158;
 // Publication records carry the typed ordinary-descendant selection added
 // after the original record layout. New kinds make older bytes fail recovery
 // loudly instead of being reinterpreted as a different catalog contract.
@@ -1168,6 +1172,7 @@ pub(crate) enum WalOp<'a> {
         new_name: &'a str,
     },
     CreateTrigger {
+        identity: crate::storage::CatalogPosition,
         name: &'a str,
         target: TriggerTargetKind,
         table_schema: &'a str,
@@ -1190,12 +1195,14 @@ pub(crate) enum WalOp<'a> {
         argument_count: usize,
     },
     DropTrigger {
+        identity: crate::storage::CatalogPosition,
         name: &'a str,
         target: TriggerTargetKind,
         table_schema: &'a str,
         table: &'a str,
     },
     AlterTrigger {
+        identity: crate::storage::CatalogPosition,
         name: &'a str,
         target: TriggerTargetKind,
         table_schema: &'a str,
@@ -1204,6 +1211,7 @@ pub(crate) enum WalOp<'a> {
         enabled: u8,
     },
     SetPolicy {
+        identity: crate::storage::CatalogPosition,
         schema: &'a str,
         table: &'a str,
         name: &'a str,
@@ -1215,6 +1223,7 @@ pub(crate) enum WalOp<'a> {
         dependencies: WalStoredQueryDependencies<'a>,
     },
     DropPolicy {
+        identity: crate::storage::CatalogPosition,
         schema: &'a str,
         table: &'a str,
         name: &'a str,
@@ -1720,14 +1729,14 @@ pub(crate) enum WalOp<'a> {
         new_name: &'a str,
     },
     UpsertRoleMembership {
-        role: &'a str,
-        member: &'a str,
-        grantor: &'a str,
+        identity: crate::storage::CatalogPosition,
+        role: crate::storage::RoleOid,
+        member: crate::storage::RoleOid,
+        grantor: crate::storage::RoleOid,
         options: crate::storage::RoleMembershipOptions,
     },
     DropRoleMembership {
-        role: &'a str,
-        member: &'a str,
+        identity: crate::storage::CatalogPosition,
     },
     SetRoleSetting {
         role: Option<&'a str>,
@@ -1770,14 +1779,14 @@ pub(crate) enum WalOp<'a> {
         grant_options: crate::storage::PrivilegeSet,
     },
     SetDefaultAcl {
-        owner: &'a str,
-        /// Empty denotes the global default; otherwise a schema name.
-        schema: &'a str,
-        class: u8,
-        grantee: &'a str,
-        defined: bool,
-        privileges: crate::storage::PrivilegeSet,
-        grant_options: crate::storage::PrivilegeSet,
+        slot: u16,
+        expected: Option<crate::storage::DefaultAclGrantImage>,
+        image: Option<crate::storage::DefaultAclGrantImage>,
+    },
+    ReserveCatalogSequence(core::num::NonZeroU64),
+    SetPartitionTrigger {
+        expected: Option<crate::storage::PartitionTriggerImage>,
+        image: Option<crate::storage::PartitionTriggerImage>,
     },
     SetParameterAcl {
         parameter: &'a str,
@@ -2800,10 +2809,88 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::SetColumnAcl { .. } => KIND_SET_COLUMN_ACL,
         WalOp::BeginTableRewrite { .. } => KIND_REWRITE_TABLE,
         WalOp::SetDefaultAcl { .. } => KIND_SET_DEFAULT_ACL,
+        WalOp::ReserveCatalogSequence(_) => KIND_CATALOG_RESERVATION,
+        WalOp::SetPartitionTrigger { .. } => KIND_SET_PARTITION_TRIGGER,
         WalOp::SetParameterAcl { .. } => KIND_SET_PARAMETER_ACL,
         WalOp::PreparedCatalogRow { .. } => KIND_PREPARED_CATALOG_ROW,
         WalOp::SetRelationIndexHint { .. } => KIND_SET_RELATION_INDEX_HINT,
     }
+}
+
+fn default_acl_image_len(image: crate::storage::DefaultAclGrantImage) -> usize {
+    14 + usize::from(image.identity.schema.is_some()) * 8 + usize::from(image.grantee.is_some()) * 4
+}
+
+fn append_default_acl_image(
+    buffer: &mut crate::mem::FixedBuf,
+    image: crate::storage::DefaultAclGrantImage,
+) -> bool {
+    let flags =
+        u8::from(image.identity.schema.is_some()) | (u8::from(image.grantee.is_some()) << 1);
+    let mut ok = buffer.append(&image.identity.creation.get().to_le_bytes())
+        && buffer.append(&image.identity.owner.get().to_le_bytes())
+        && buffer.append(&[image.identity.class as u8, flags]);
+    if let Some(schema) = image.identity.schema {
+        ok &= buffer.append(&schema.created_at().to_le_bytes());
+    }
+    if let Some(grantee) = image.grantee {
+        ok &= buffer.append(&grantee.get().to_le_bytes());
+    }
+    ok && buffer.append(&image.privileges.0.to_le_bytes())
+        && buffer.append(&image.grant_options.0.to_le_bytes())
+}
+
+fn take_default_acl_image(
+    payload: &[u8],
+    at: &mut usize,
+) -> Option<crate::storage::DefaultAclGrantImage> {
+    let creation = u32::from_le_bytes(payload.get(*at..*at + 4)?.try_into().ok()?);
+    *at += 4;
+    let creation = crate::storage::CatalogIdentity::parse(u64::from(creation))?;
+    let owner = i32::from_le_bytes(payload.get(*at..*at + 4)?.try_into().ok()?);
+    *at += 4;
+    let owner = crate::storage::RoleOid::parse(owner)?;
+    let class = crate::storage::DefaultPrivilegeClass::from_u8(*payload.get(*at)?)?;
+    *at += 1;
+    let flags = *payload.get(*at)?;
+    *at += 1;
+    if flags & !3 != 0 {
+        return None;
+    }
+    let schema = if flags & 1 != 0 {
+        let creation = u64::from_le_bytes(payload.get(*at..*at + 8)?.try_into().ok()?);
+        *at += 8;
+        Some(crate::storage::SchemaIdentity::parse(creation)?)
+    } else {
+        None
+    };
+    let grantee = if flags & 2 != 0 {
+        let oid = i32::from_le_bytes(payload.get(*at..*at + 4)?.try_into().ok()?);
+        *at += 4;
+        Some(crate::storage::RoleOid::parse(oid)?)
+    } else {
+        None
+    };
+    let privileges = u16::from_le_bytes(payload.get(*at..*at + 2)?.try_into().ok()?);
+    *at += 2;
+    let grant_options = u16::from_le_bytes(payload.get(*at..*at + 2)?.try_into().ok()?);
+    *at += 2;
+    if privileges & !class.all_privileges().0 != 0 || grant_options & !privileges != 0 {
+        return None;
+    }
+    let image = crate::storage::DefaultAclGrantImage {
+        identity: crate::storage::DefaultAclIdentity {
+            creation,
+            owner,
+            schema,
+            class,
+        },
+        grantee,
+        privileges: crate::storage::PrivilegeSet(privileges),
+        grant_options: crate::storage::PrivilegeSet(grant_options),
+    };
+    image.validate().ok()?;
+    Some(image)
 }
 
 fn encoded_payload_len(operation: &WalOp) -> usize {
@@ -3205,7 +3292,9 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             argument_count,
             ..
         } => {
-            1 + name.len()
+            crate::storage::CatalogPosition::ENCODED_BYTES
+                + 1
+                + name.len()
                 + 1
                 + 1
                 + table_schema.len()
@@ -3234,7 +3323,17 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             target: _,
             table_schema,
             table,
-        } => 1 + name.len() + 1 + 1 + table_schema.len() + 1 + table.len(),
+            ..
+        } => {
+            crate::storage::CatalogPosition::ENCODED_BYTES
+                + 1
+                + name.len()
+                + 1
+                + 1
+                + table_schema.len()
+                + 1
+                + table.len()
+        }
         WalOp::AlterTrigger {
             name,
             target: _,
@@ -3242,7 +3341,19 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             table,
             new_name,
             ..
-        } => 1 + name.len() + 1 + 1 + table_schema.len() + 1 + table.len() + 1 + new_name.len() + 1,
+        } => {
+            crate::storage::CatalogPosition::ENCODED_BYTES
+                + 1
+                + name.len()
+                + 1
+                + 1
+                + table_schema.len()
+                + 1
+                + table.len()
+                + 1
+                + new_name.len()
+                + 1
+        }
         WalOp::SetPolicy {
             schema,
             table,
@@ -3253,7 +3364,9 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             dependencies,
             ..
         } => {
-            1 + schema.len()
+            crate::storage::CatalogPosition::ENCODED_BYTES
+                + 1
+                + schema.len()
                 + 1
                 + table.len()
                 + 1
@@ -3270,7 +3383,16 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             schema,
             table,
             name,
-        } => 1 + schema.len() + 1 + table.len() + 1 + name.len(),
+            ..
+        } => {
+            crate::storage::CatalogPosition::ENCODED_BYTES
+                + 1
+                + schema.len()
+                + 1
+                + table.len()
+                + 1
+                + name.len()
+        }
         WalOp::Commit { committed_at, .. } => 5 + usize::from(committed_at.is_some()) * 8,
         WalOp::PrepareTransaction { gid, .. } => 4 + 4 + 4 + 8 + 1 + gid.len(),
         WalOp::PreparedLocks { encoded, .. } => 4 + 4 + encoded.len(),
@@ -3971,13 +4093,8 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
         }
         WalOp::DropRole { name } => 1 + name.len(),
         WalOp::RenameRole { name, new_name } => 1 + name.len() + 1 + new_name.len(),
-        WalOp::UpsertRoleMembership {
-            role,
-            member,
-            grantor,
-            ..
-        } => 1 + role.len() + 1 + member.len() + 1 + grantor.len() + 1,
-        WalOp::DropRoleMembership { role, member } => 1 + role.len() + 1 + member.len(),
+        WalOp::UpsertRoleMembership { .. } => crate::storage::CatalogPosition::ENCODED_BYTES + 13,
+        WalOp::DropRoleMembership { .. } => crate::storage::CatalogPosition::ENCODED_BYTES,
         WalOp::SetRoleSetting {
             role,
             database,
@@ -4034,12 +4151,13 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             grantor,
             ..
         } => 1 + 1 + schema.len() + 1 + name.len() + 2 + 1 + grantee.len() + 1 + grantor.len() + 4,
+        WalOp::ReserveCatalogSequence(_) => 8,
+        WalOp::SetPartitionTrigger { expected, image } => {
+            1 + 25 * (usize::from(expected.is_some()) + usize::from(image.is_some()))
+        }
         WalOp::SetDefaultAcl {
-            owner,
-            schema,
-            grantee,
-            ..
-        } => 1 + owner.len() + 1 + schema.len() + 1 + 1 + grantee.len() + 1 + 4,
+            expected, image, ..
+        } => 3 + expected.map_or(0, default_acl_image_len) + image.map_or(0, default_acl_image_len),
         WalOp::SetParameterAcl {
             parameter, image, ..
         } => {
@@ -6291,6 +6409,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             name_bytes(buffer, name) && name_bytes(buffer, new_name)
         }
         WalOp::UpsertRoleMembership {
+            identity,
             role,
             member,
             grantor,
@@ -6299,14 +6418,13 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             let flags = u8::from(options.admin)
                 | (u8::from(options.inherit) << 1)
                 | (u8::from(options.set) << 2);
-            name_bytes(buffer, role)
-                && name_bytes(buffer, member)
-                && name_bytes(buffer, grantor)
+            buffer.append(&identity.encode())
+                && buffer.append(&role.get().to_le_bytes())
+                && buffer.append(&member.get().to_le_bytes())
+                && buffer.append(&grantor.get().to_le_bytes())
                 && buffer.append(&[flags])
         }
-        WalOp::DropRoleMembership { role, member } => {
-            name_bytes(buffer, role) && name_bytes(buffer, member)
-        }
+        WalOp::DropRoleMembership { identity } => buffer.append(&identity.encode()),
         WalOp::SetRoleSetting {
             role,
             database,
@@ -6386,22 +6504,40 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 && buffer.append(&privileges.0.to_le_bytes())
                 && buffer.append(&grant_options.0.to_le_bytes())
         }
+        WalOp::ReserveCatalogSequence(value) => buffer.append(&value.get().to_le_bytes()),
+        WalOp::SetPartitionTrigger { expected, image } => {
+            assert_ne!(
+                expected, image,
+                "journal inherited trigger changes have an effect"
+            );
+            let flags = u8::from(expected.is_some()) | (u8::from(image.is_some()) << 1);
+            let mut ok = buffer.append(&[flags]);
+            for image in [expected, image].into_iter().flatten() {
+                ok &= buffer.append(&image.creation.get().to_le_bytes())
+                    && buffer.append(&image.trigger.encode())
+                    && buffer.append(&image.table.encode())
+                    && buffer.append(&[image.enabled.code()]);
+            }
+            ok
+        }
         WalOp::SetDefaultAcl {
-            owner,
-            schema,
-            class,
-            grantee,
-            defined,
-            privileges,
-            grant_options,
+            slot,
+            expected,
+            image,
         } => {
-            name_bytes(buffer, owner)
-                && name_bytes(buffer, schema)
-                && buffer.append(&[*class])
-                && name_bytes(buffer, grantee)
-                && buffer.append(&[u8::from(*defined)])
-                && buffer.append(&privileges.0.to_le_bytes())
-                && buffer.append(&grant_options.0.to_le_bytes())
+            assert_ne!(
+                expected, image,
+                "journal default privilege changes have an effect"
+            );
+            let flags = u8::from(expected.is_some()) | (u8::from(image.is_some()) << 1);
+            let mut ok = buffer.append(&slot.to_le_bytes()) && buffer.append(&[flags]);
+            if let Some(expected) = expected {
+                ok &= append_default_acl_image(buffer, *expected);
+            }
+            if let Some(image) = image {
+                ok &= append_default_acl_image(buffer, *image);
+            }
+            ok
         }
         WalOp::SetParameterAcl {
             parameter,
@@ -6507,6 +6643,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             statistics,
         } => name_bytes(buffer, schema) && name_bytes(buffer, name) && statistics.append(buffer),
         WalOp::CreateTrigger {
+            identity,
             name,
             target,
             table_schema,
@@ -6529,7 +6666,8 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             argument_count,
         } => {
             let when_len = when.map_or(0usize, |value| value.len() + 1);
-            name_bytes(buffer, name)
+            buffer.append(&identity.encode())
+                && name_bytes(buffer, name)
                 && buffer.append(&[target.code()])
                 && name_bytes(buffer, table_schema)
                 && name_bytes(buffer, table)
@@ -6557,17 +6695,20 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                     .all(|argument| name_bytes(buffer, argument))
         }
         WalOp::DropTrigger {
+            identity,
             name,
             target,
             table_schema,
             table,
         } => {
-            name_bytes(buffer, name)
+            buffer.append(&identity.encode())
+                && name_bytes(buffer, name)
                 && buffer.append(&[target.code()])
                 && name_bytes(buffer, table_schema)
                 && name_bytes(buffer, table)
         }
         WalOp::AlterTrigger {
+            identity,
             name,
             target,
             table_schema,
@@ -6575,7 +6716,8 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             new_name,
             enabled,
         } => {
-            name_bytes(buffer, name)
+            buffer.append(&identity.encode())
+                && name_bytes(buffer, name)
                 && buffer.append(&[target.code()])
                 && name_bytes(buffer, table_schema)
                 && name_bytes(buffer, table)
@@ -6583,6 +6725,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 && buffer.append(&[*enabled])
         }
         WalOp::SetPolicy {
+            identity,
             schema,
             table,
             name,
@@ -6598,7 +6741,8 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 buffer.append(&length.to_le_bytes())
                     && value.is_none_or(|source| buffer.append(source.as_bytes()))
             };
-            name_bytes(buffer, schema)
+            buffer.append(&identity.encode())
+                && name_bytes(buffer, schema)
                 && name_bytes(buffer, table)
                 && name_bytes(buffer, name)
                 && buffer.append(&[*command, u8::from(*permissive)])
@@ -6611,10 +6755,16 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 && dependencies.append(buffer)
         }
         WalOp::DropPolicy {
+            identity,
             schema,
             table,
             name,
-        } => name_bytes(buffer, schema) && name_bytes(buffer, table) && name_bytes(buffer, name),
+        } => {
+            buffer.append(&identity.encode())
+                && name_bytes(buffer, schema)
+                && name_bytes(buffer, table)
+                && name_bytes(buffer, name)
+        }
     }
 }
 
@@ -8902,6 +9052,8 @@ fn decode_op_inner<'a>(
         }),
         KIND_CREATE_TRIGGER | KIND_CREATE_TRIGGER_V2 => decode_large_op(|| {
             let wide_columns = kind == KIND_CREATE_TRIGGER_V2;
+            let identity = take_catalog_position(payload, &mut at)?;
+            crate::storage::CatalogIdentity::parse(identity.created_at())?;
             let name = take_name(&mut at)?;
             let target = TriggerTargetKind::from_code(*payload.get(at)?)?;
             at += 1;
@@ -8983,6 +9135,7 @@ fn decode_op_inner<'a>(
                 )
                 && at == payload.len())
             .then_some(WalOp::CreateTrigger {
+                identity,
                 name,
                 target,
                 table_schema,
@@ -9006,12 +9159,15 @@ fn decode_op_inner<'a>(
             })
         }),
         KIND_DROP_TRIGGER => decode_large_op(|| {
+            let identity = take_catalog_position(payload, &mut at)?;
+            crate::storage::CatalogIdentity::parse(identity.created_at())?;
             let name = take_name(&mut at)?;
             let target = TriggerTargetKind::from_code(*payload.get(at)?)?;
             at += 1;
             let table_schema = take_name(&mut at)?;
             let table = take_name(&mut at)?;
             (at == payload.len()).then_some(WalOp::DropTrigger {
+                identity,
                 name,
                 target,
                 table_schema,
@@ -9019,6 +9175,8 @@ fn decode_op_inner<'a>(
             })
         }),
         KIND_ALTER_TRIGGER => decode_large_op(|| {
+            let identity = take_catalog_position(payload, &mut at)?;
+            crate::storage::CatalogIdentity::parse(identity.created_at())?;
             let name = take_name(&mut at)?;
             let target = TriggerTargetKind::from_code(*payload.get(at)?)?;
             at += 1;
@@ -9029,6 +9187,7 @@ fn decode_op_inner<'a>(
             crate::storage::TriggerEnabled::from_code(enabled)?;
             at += 1;
             (at == payload.len()).then_some(WalOp::AlterTrigger {
+                identity,
                 name,
                 target,
                 table_schema,
@@ -9038,6 +9197,8 @@ fn decode_op_inner<'a>(
             })
         }),
         KIND_SET_POLICY | KIND_SET_POLICY_V2 => decode_large_op(|| {
+            let identity = take_catalog_position(payload, &mut at)?;
+            crate::storage::CatalogIdentity::parse(identity.created_at())?;
             let schema = take_name(&mut at)?;
             let table = take_name(&mut at)?;
             let name = take_name(&mut at)?;
@@ -9088,6 +9249,7 @@ fn decode_op_inner<'a>(
             decode_stored_query_dependencies(encoded)?;
             at = payload.len();
             (at == payload.len()).then_some(WalOp::SetPolicy {
+                identity,
                 schema,
                 table,
                 name,
@@ -9100,10 +9262,13 @@ fn decode_op_inner<'a>(
             })
         }),
         KIND_DROP_POLICY => decode_large_op(|| {
+            let identity = take_catalog_position(payload, &mut at)?;
+            crate::storage::CatalogIdentity::parse(identity.created_at())?;
             let schema = take_name(&mut at)?;
             let table = take_name(&mut at)?;
             let name = take_name(&mut at)?;
             (at == payload.len()).then_some(WalOp::DropPolicy {
+                identity,
                 schema,
                 table,
                 name,
@@ -11487,15 +11652,25 @@ fn decode_op_inner<'a>(
             (at == payload.len()).then_some(WalOp::RenameRole { name, new_name })
         }),
         KIND_UPSERT_ROLE_MEMBERSHIP => decode_large_op(|| {
-            let role = take_name(&mut at)?;
-            let member = take_name(&mut at)?;
-            let grantor = take_name(&mut at)?;
+            let identity = take_catalog_position(payload, &mut at)?;
+            crate::storage::CatalogIdentity::parse(identity.created_at())?;
+            let mut take_role = || {
+                let oid = crate::storage::RoleOid::parse(i32::from_le_bytes(
+                    payload.get(at..at + 4)?.try_into().ok()?,
+                ))?;
+                at += 4;
+                Some(oid)
+            };
+            let role = take_role()?;
+            let member = take_role()?;
+            let grantor = take_role()?;
             let flags = *payload.get(at)?;
             at += 1;
             if at != payload.len() || flags & !0x07 != 0 {
                 return None;
             }
             Some(WalOp::UpsertRoleMembership {
+                identity,
                 role,
                 member,
                 grantor,
@@ -11507,9 +11682,9 @@ fn decode_op_inner<'a>(
             })
         }),
         KIND_DROP_ROLE_MEMBERSHIP => decode_large_op(|| {
-            let role = take_name(&mut at)?;
-            let member = take_name(&mut at)?;
-            (at == payload.len()).then_some(WalOp::DropRoleMembership { role, member })
+            let identity = take_catalog_position(payload, &mut at)?;
+            crate::storage::CatalogIdentity::parse(identity.created_at())?;
+            (at == payload.len()).then_some(WalOp::DropRoleMembership { identity })
         }),
         KIND_SET_ROLE_SETTING => decode_large_op(|| {
             let flags = *payload.get(at)?;
@@ -11666,35 +11841,71 @@ fn decode_op_inner<'a>(
                 grant_options: crate::storage::PrivilegeSet(grant_options),
             })
         }),
-        KIND_SET_DEFAULT_ACL => decode_large_op(|| {
-            let owner = take_name(&mut at)?;
-            let schema = take_name(&mut at)?;
-            let class = *payload.get(at)?;
-            at += 1;
-            let typed_class = crate::storage::DefaultPrivilegeClass::from_u8(class)?;
-            let grantee = take_name(&mut at)?;
-            let defined = match *payload.get(at)? {
-                0 => false,
-                1 => true,
-                _ => return None,
-            };
-            at += 1;
-            let privileges = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
-            at += 2;
-            let grant_options = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
-            at += 2;
-            if privileges & !typed_class.all_privileges().0 != 0 || grant_options & !privileges != 0
-            {
+        KIND_SET_PARTITION_TRIGGER => decode_large_op(|| {
+            let flags = *payload.first()?;
+            if flags == 0 || flags & !3 != 0 {
                 return None;
             }
-            (at == payload.len()).then_some(WalOp::SetDefaultAcl {
-                owner,
-                schema,
-                class,
-                grantee,
-                defined,
-                privileges: crate::storage::PrivilegeSet(privileges),
-                grant_options: crate::storage::PrivilegeSet(grant_options),
+            let mut at = 1;
+            let mut take = || -> Option<crate::storage::PartitionTriggerImage> {
+                let creation = crate::storage::CatalogIdentity::parse(u64::from(
+                    u32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?),
+                ))?;
+                at += 4;
+                let trigger = crate::storage::CatalogPosition::decode(payload.get(at..at + 10)?)?;
+                crate::storage::CatalogIdentity::parse(trigger.created_at())?;
+                at += 10;
+                let table = crate::storage::CatalogPosition::decode(payload.get(at..at + 10)?)?;
+                at += 10;
+                let enabled = crate::storage::TriggerEnabled::from_code(*payload.get(at)?)?;
+                at += 1;
+                Some(crate::storage::PartitionTriggerImage {
+                    creation,
+                    trigger,
+                    table,
+                    enabled,
+                })
+            };
+            let expected = if flags & 1 != 0 { Some(take()?) } else { None };
+            let image = if flags & 2 != 0 { Some(take()?) } else { None };
+            (at == payload.len()
+                && expected != image
+                && !expected.zip(image).is_some_and(|(old, new)| {
+                    old.trigger.slot() != new.trigger.slot() || old.table.slot() != new.table.slot()
+                }))
+            .then_some(WalOp::SetPartitionTrigger { expected, image })
+        }),
+        KIND_CATALOG_RESERVATION => decode_large_op(|| {
+            let value = u64::from_le_bytes(payload.try_into().ok()?);
+            Some(WalOp::ReserveCatalogSequence(core::num::NonZeroU64::new(
+                value,
+            )?))
+        }),
+        KIND_SET_DEFAULT_ACL => decode_large_op(|| {
+            let slot = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
+            at += 2;
+            if slot == u16::MAX {
+                return None;
+            }
+            let flags = *payload.get(at)?;
+            at += 1;
+            if flags == 0 || flags & !3 != 0 {
+                return None;
+            }
+            let expected = if flags & 1 != 0 {
+                Some(take_default_acl_image(payload, &mut at)?)
+            } else {
+                None
+            };
+            let image = if flags & 2 != 0 {
+                Some(take_default_acl_image(payload, &mut at)?)
+            } else {
+                None
+            };
+            (at == payload.len() && expected != image).then_some(WalOp::SetDefaultAcl {
+                slot,
+                expected,
+                image,
             })
         }),
         KIND_SET_RELATION_INDEX_HINT => decode_large_op(|| {
@@ -14926,12 +15137,161 @@ mod tests {
     }
 
     #[test]
+    fn catalog_lifetime_privileges_and_partition_triggers_journal_rejects_corrupt_images() {
+        use crate::storage::{
+            CatalogIdentity, CatalogPosition, DefaultAclGrantImage, DefaultAclIdentity,
+            DefaultPrivilegeClass, PartitionTriggerImage, PrivilegeSet, RoleOid, SchemaIdentity,
+            TriggerEnabled,
+        };
+        let mut budget = Budget::new(4096);
+        let mut payload = FixedBuf::new(&mut budget, "catalog image payload", 2048).unwrap();
+        let mut restored = FixedBuf::new(&mut budget, "catalog image roundtrip", 2048).unwrap();
+        let default = DefaultAclGrantImage {
+            identity: DefaultAclIdentity {
+                creation: CatalogIdentity::parse(41).unwrap(),
+                owner: RoleOid::BOOTSTRAP,
+                schema: Some(SchemaIdentity::parse(17).unwrap()),
+                class: DefaultPrivilegeClass::Table,
+            },
+            grantee: Some(RoleOid::parse(16_400).unwrap()),
+            privileges: PrivilegeSet::SELECT,
+            grant_options: PrivilegeSet::NONE,
+        };
+        let trigger = PartitionTriggerImage {
+            creation: CatalogIdentity::parse(42).unwrap(),
+            trigger: CatalogPosition::new(3, 18).unwrap(),
+            table: CatalogPosition::new(5, 19).unwrap(),
+            enabled: TriggerEnabled::Replica,
+        };
+        let mut roundtrip = |operation: WalOp| {
+            payload.clear();
+            restored.clear();
+            let kind = op_kind(&operation);
+            crate::mem::guard::forbid_alloc(|| {
+                assert!(append_payload(&mut payload, &operation));
+                assert_eq!(payload.len(), encoded_payload_len(&operation));
+                let decoded =
+                    decode_op(kind, payload.readable()).expect("valid saved catalog image");
+                assert!(append_payload(&mut restored, &decoded));
+                assert_eq!(payload.readable(), restored.readable());
+                for truncated in 0..payload.len() {
+                    assert!(decode_op(kind, &payload.readable()[..truncated]).is_none());
+                }
+                assert!(payload.append(&[0]));
+                assert!(decode_op(kind, payload.readable()).is_none());
+            });
+        };
+        roundtrip(WalOp::SetDefaultAcl {
+            slot: 3,
+            expected: None,
+            image: Some(default),
+        });
+        roundtrip(WalOp::SetDefaultAcl {
+            slot: 3,
+            expected: Some(default),
+            image: None,
+        });
+        roundtrip(WalOp::SetDefaultAcl {
+            slot: 3,
+            expected: Some(default),
+            image: Some(DefaultAclGrantImage {
+                privileges: PrivilegeSet::INSERT,
+                ..default
+            }),
+        });
+        roundtrip(WalOp::SetPartitionTrigger {
+            expected: None,
+            image: Some(trigger),
+        });
+        roundtrip(WalOp::SetPartitionTrigger {
+            expected: Some(trigger),
+            image: None,
+        });
+        roundtrip(WalOp::SetPartitionTrigger {
+            expected: Some(trigger),
+            image: Some(PartitionTriggerImage {
+                enabled: TriggerEnabled::Disabled,
+                ..trigger
+            }),
+        });
+        roundtrip(WalOp::ReserveCatalogSequence(
+            core::num::NonZeroU64::new(43).unwrap(),
+        ));
+        let membership = CatalogPosition::new(3, 43).unwrap();
+        roundtrip(WalOp::UpsertRoleMembership {
+            identity: membership,
+            role: RoleOid::BOOTSTRAP,
+            member: RoleOid::parse(16_400).unwrap(),
+            grantor: RoleOid::BOOTSTRAP,
+            options: crate::storage::RoleMembershipOptions::DEFAULT,
+        });
+        roundtrip(WalOp::DropRoleMembership {
+            identity: membership,
+        });
+        assert!(decode_op(KIND_CATALOG_RESERVATION, &[0; 8]).is_none());
+        payload.clear();
+        assert!(append_payload(
+            &mut payload,
+            &WalOp::UpsertRoleMembership {
+                identity: membership,
+                role: RoleOid::BOOTSTRAP,
+                member: RoleOid::parse(16_400).unwrap(),
+                grantor: RoleOid::BOOTSTRAP,
+                options: crate::storage::RoleMembershipOptions::DEFAULT,
+            }
+        ));
+        let valid = payload.readable().to_vec();
+        for oid in [0i32, 11, 16_384, -1] {
+            for offset in [10, 14, 18] {
+                let mut corrupt = valid.clone();
+                corrupt[offset..offset + 4].copy_from_slice(&oid.to_le_bytes());
+                assert!(decode_op(KIND_UPSERT_ROLE_MEMBERSHIP, &corrupt).is_none());
+            }
+        }
+        payload.clear();
+        assert!(append_payload(
+            &mut payload,
+            &WalOp::SetPartitionTrigger {
+                expected: None,
+                image: Some(trigger)
+            }
+        ));
+        let valid = payload.readable().to_vec();
+        for (offset, replacement) in [(0, 0), (0, 4), (25, b'?')] {
+            let mut corrupt = valid.clone();
+            corrupt[offset] = replacement;
+            assert!(decode_op(KIND_SET_PARTITION_TRIGGER, &corrupt).is_none());
+        }
+        for birth in [0u32, 10_000_000, u32::MAX] {
+            let mut corrupt = valid.clone();
+            corrupt[1..5].copy_from_slice(&birth.to_le_bytes());
+            assert!(decode_op(KIND_SET_PARTITION_TRIGGER, &corrupt).is_none());
+        }
+        payload.clear();
+        assert!(append_payload(
+            &mut payload,
+            &WalOp::SetDefaultAcl {
+                slot: 3,
+                expected: None,
+                image: Some(default)
+            }
+        ));
+        let valid = payload.readable().to_vec();
+        for (offset, replacement) in [(2, 0), (2, 4), (11, 255), (12, 4)] {
+            let mut corrupt = valid.clone();
+            corrupt[offset] = replacement;
+            assert!(decode_op(KIND_SET_DEFAULT_ACL, &corrupt).is_none());
+        }
+    }
+
+    #[test]
     fn create_trigger_payload_requires_typed_qualification() {
         let mut budget = Budget::new(1024);
         let mut payload = FixedBuf::new(&mut budget, "trigger payload", 1024).unwrap();
         assert!(append_payload(
             &mut payload,
             &WalOp::CreateTrigger {
+                identity: crate::storage::CatalogPosition::new(3, 41).unwrap(),
                 name: "audit_row",
                 target: TriggerTargetKind::Table,
                 table_schema: "public",
@@ -14965,6 +15325,7 @@ mod tests {
         assert!(append_payload(
             &mut payload,
             &WalOp::CreateTrigger {
+                identity: crate::storage::CatalogPosition::new(3, 41).unwrap(),
                 name: "audit_statement",
                 target: TriggerTargetKind::Table,
                 table_schema: "public",
@@ -15006,6 +15367,7 @@ mod tests {
         assert!(append_payload(
             &mut payload,
             &WalOp::CreateTrigger {
+                identity: crate::storage::CatalogPosition::new(3, 41).unwrap(),
                 name: "write_view",
                 target: TriggerTargetKind::View,
                 table_schema: "public",
@@ -15096,6 +15458,7 @@ mod tests {
         assert!(append_payload(
             &mut payload,
             &WalOp::SetPolicy {
+                identity: crate::storage::CatalogPosition::new(3, 41).unwrap(),
                 schema: "public",
                 table: "protected",
                 name: "reader_rows",
@@ -15131,6 +15494,13 @@ mod tests {
         };
         let using = "tenant = 'reader'";
         let with_check = "tenant = current_user";
+        assert!(
+            payload.append(
+                &crate::storage::CatalogPosition::new(3, 41)
+                    .unwrap()
+                    .encode()
+            )
+        );
         assert!(
             append_name(&mut payload, "public")
                 && append_name(&mut payload, "protected")
@@ -15266,6 +15636,7 @@ mod tests {
         assert!(append_payload(
             &mut payload,
             &WalOp::CreateTrigger {
+                identity: crate::storage::CatalogPosition::new(3, 41).unwrap(),
                 name: "audit_row",
                 target: TriggerTargetKind::Table,
                 table_schema: "public",
@@ -15612,6 +15983,7 @@ mod tests {
             wal.append_committed(
                 20,
                 &WalOp::CreateTrigger {
+                    identity: crate::storage::CatalogPosition::new(3, 41).unwrap(),
                     name: "audit_row",
                     target: TriggerTargetKind::Table,
                     table_schema: "public",
@@ -15638,6 +16010,7 @@ mod tests {
             wal.append_committed(
                 21,
                 &WalOp::AlterTrigger {
+                    identity: crate::storage::CatalogPosition::new(3, 41).unwrap(),
                     name: "audit_row",
                     target: TriggerTargetKind::Table,
                     table_schema: "public",
@@ -15650,6 +16023,7 @@ mod tests {
             wal.append_committed(
                 22,
                 &WalOp::DropTrigger {
+                    identity: crate::storage::CatalogPosition::new(3, 41).unwrap(),
                     name: "audit_row_disabled",
                     target: TriggerTargetKind::Table,
                     table_schema: "public",

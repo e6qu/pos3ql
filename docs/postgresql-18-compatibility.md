@@ -47,6 +47,20 @@ can display their generated values. Copying non-null statistics values into
 user tables, including `pg_statistic[]`, is unsupported and fails with `0A000`
 before storing unreadable data. NULL values remain valid.
 
+Datetime input uses PostgreSQL 18.6's Default abbreviation definitions and the
+current session zone's meanings. For example, `2021-06-01 12:00 EST` means
+17:00 UTC even in summer; `America/New_York` follows that date's daylight-time
+rule instead. With `TimeZone = 'Asia/Shanghai'`, its `CST` means UTC+8 and takes
+precedence over Default's North American UTC−6. Historical abbreviations use
+the saved TZif transitions, including in `to_timestamp(..., '... TZ')`.
+`pg_timezone_abbrevs` reports these meanings at the transaction's start time.
+Named zones require installed files under `/usr/share/zoneinfo`; fixed
+abbreviations do not depend on optional legacy files such as `EST`.
+The definitions come from [PostgreSQL 18.6's Default set](https://github.com/postgres/postgres/blob/REL_18_6/src/timezone/tznames/Default)
+and are checksum-pinned when generating the executable's abbreviation data.
+Only the pinned Default set is available. The `timezone_abbreviations` setting
+is unsupported and rejected.
+
 ## Physical access paths
 
 | Method | Object-native path |

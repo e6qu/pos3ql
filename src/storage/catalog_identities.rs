@@ -170,6 +170,21 @@ impl Storage {
             .event_triggers
             .lock()
             .expect("event trigger catalog lock poisoned");
+        let roles = self
+            .role_catalog
+            .lock()
+            .expect("role catalog lock poisoned");
+        let defaults = self.acl_catalog.lock().expect("ACL catalog lock poisoned");
+        let rules = self.view_rule_catalog();
+        let routines = self.routines.lock().expect("routine catalog lock poisoned");
+        let policies = self
+            .policy_catalog
+            .lock()
+            .expect("policy catalog lock poisoned");
+        let triggers = self
+            .trigger_catalog
+            .lock()
+            .expect("trigger catalog lock poisoned");
         // Subscription OIDs belong to a shared catalog. Other families are
         // database-local and template copies may preserve their numeric OIDs.
         let scopes = core::iter::once(None).chain(
@@ -210,7 +225,104 @@ impl Storage {
                     *word |= bit;
                     Ok(())
                 };
+                for membership in roles.memberships.iter() {
+                    if membership.live {
+                        check(
+                            database.unwrap_or(DatabaseOid::POSTGRES),
+                            CatalogDdlState::Present,
+                            membership.created_at,
+                        )?;
+                    }
+                    if let Some(pending) = membership.pending
+                        && pending.exists
+                        && (!membership.live || membership.created_at != pending.created_at)
+                    {
+                        check(
+                            database.unwrap_or(DatabaseOid::POSTGRES),
+                            CatalogDdlState::Present,
+                            pending.created_at,
+                        )?;
+                    }
+                }
                 if database.is_some() {
+                    for definition in rules.rules.iter() {
+                        check(
+                            definition.database,
+                            definition.ddl_state,
+                            definition.created_at,
+                        )?;
+                    }
+                    for definition in routines.iter() {
+                        check(
+                            definition.database,
+                            definition.ddl_state,
+                            definition.created_at,
+                        )?;
+                    }
+                    for definition in policies.definitions.iter() {
+                        check(
+                            definition.database,
+                            definition.ddl_state,
+                            definition.created_at,
+                        )?;
+                    }
+                    for definition in triggers.definitions.iter() {
+                        check(
+                            definition.database,
+                            definition.ddl_state,
+                            definition.created_at,
+                        )?;
+                    }
+                    for state in triggers.partition_states.iter() {
+                        if let Some(image) = state.committed {
+                            check(
+                                state.database,
+                                CatalogDdlState::Present,
+                                image.creation.created_at(),
+                            )?;
+                        }
+                        if let Some(image) = state.pending.and_then(|pending| pending.image)
+                            && state
+                                .committed
+                                .is_none_or(|old| old.creation != image.creation)
+                        {
+                            check(
+                                state.database,
+                                CatalogDdlState::Present,
+                                image.creation.created_at(),
+                            )?;
+                        }
+                    }
+                    for (slot, entry) in defaults.defaults.iter().enumerate() {
+                        let pending =
+                            entry
+                                .pending
+                                .and_then(|pending| pending.image)
+                                .filter(|image| {
+                                    entry.committed.is_none_or(|old| {
+                                        old.identity.creation != image.identity.creation
+                                    })
+                                });
+                        for image in [entry.committed, pending].into_iter().flatten() {
+                            let repeated = defaults.defaults[..slot].iter().any(|earlier| {
+                                earlier.database == entry.database
+                                    && earlier
+                                        .committed
+                                        .into_iter()
+                                        .chain(earlier.pending.and_then(|pending| pending.image))
+                                        .any(|other| {
+                                            other.identity.creation == image.identity.creation
+                                        })
+                            });
+                            if !repeated {
+                                check(
+                                    entry.database,
+                                    CatalogDdlState::Present,
+                                    image.identity.creation.created_at(),
+                                )?;
+                            }
+                        }
+                    }
                     for definition in statistics.definitions.iter() {
                         check(
                             definition.database,
@@ -335,6 +447,12 @@ impl Storage {
                 }
             }
         }
+        drop(policies);
+        drop(routines);
+        drop(rules);
+        drop(triggers);
+        drop(defaults);
+        drop(roles);
         drop(events);
         drop(operators);
         drop(casts);
@@ -344,6 +462,8 @@ impl Storage {
         drop(foreign);
         drop(publications);
         drop(subscriptions);
+        self.validate_default_acl_images()?;
+        self.validate_partition_trigger_images()?;
         for table in self.tables.iter().take(self.table_count()) {
             let state = table.definition.read();
             if state.identity.existence == CatalogDdlState::Absent {

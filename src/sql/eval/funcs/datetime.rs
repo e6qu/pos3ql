@@ -29,13 +29,15 @@ fn session_offset(utc_micros: i64) -> i32 {
 
 fn timezone_from_datum(value: Datum<'_>) -> Result<crate::sql::timezone::Timezone, SqlError> {
     match text_view(value) {
-        Datum::Text(name) => guc::parse_timezone(name).ok_or_else(|| {
-            sql_err!(
-                sqlstate::INVALID_PARAMETER_VALUE,
-                "time zone \"{}\" not recognized",
-                name
-            )
-        }),
+        Datum::Text(name) => crate::sql::timezone::lookup_abbreviation(name)
+            .or_else(|| guc::parse_timezone(name))
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INVALID_PARAMETER_VALUE,
+                    "time zone \"{}\" not recognized",
+                    name
+                )
+            }),
         Datum::Interval(interval) if interval.months == 0 && interval.days == 0 => {
             let seconds = i32::try_from(interval.micros / 1_000_000).map_err(|_| {
                 sql_err!(
@@ -43,7 +45,7 @@ fn timezone_from_datum(value: Datum<'_>) -> Result<crate::sql::timezone::Timezon
                     "interval time zone is out of range"
                 )
             })?;
-            Ok(crate::sql::timezone::Timezone::fixed(seconds, ""))
+            Ok(crate::sql::timezone::Timezone::fixed(seconds, "", false))
         }
         Datum::Interval(_) => Err(sql_err!(
             sqlstate::INVALID_PARAMETER_VALUE,

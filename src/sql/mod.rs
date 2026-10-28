@@ -57,6 +57,7 @@ pub mod snapshot;
 mod spgist_catalog;
 pub(crate) mod statistics;
 pub mod timezone;
+mod timezone_abbreviation_data;
 pub mod to_char;
 pub(crate) mod two_phase;
 pub mod txn;
@@ -6300,37 +6301,71 @@ impl Engine {
                 continue;
             }
             let entry = self.storage.default_acl_entry(slot as usize);
-            let (defined, privileges, grant_options) = self.storage.default_acl_state(
-                entry.owner,
-                entry.schema,
-                entry.class,
-                entry.grantee,
-                txn.txid,
-            );
-            let owner = self.storage.role_name(entry.owner as usize, txn.txid);
-            let schema = if entry.schema == crate::storage::DEFAULT_ACL_ALL_SCHEMAS {
-                crate::storage::SqlName::EMPTY
-            } else {
-                self.storage
-                    .schema_def_for(entry.schema as usize, txn.txid)
-                    .name
-            };
-            let grantee = (entry.grantee != crate::storage::PUBLIC_ROLE)
-                .then(|| self.storage.role_name(entry.grantee as usize, txn.txid));
+            let expected = entry.committed;
+            let image = entry.image_to(txn.txid);
+            if expected == image {
+                continue;
+            }
             let lsn = self.storage.bump_lsn();
             if let Err(error) = self.wal.stage_reserved(
                 txn.txid,
                 lsn,
                 &WalOp::SetDefaultAcl {
-                    owner: owner.as_str(),
-                    schema: schema.as_str(),
-                    class: entry.class as u8,
-                    grantee: grantee.as_ref().map_or("PUBLIC", |role| role.as_str()),
-                    defined,
-                    privileges,
-                    grant_options,
+                    slot: u16::try_from(slot)
+                        .expect("default privilege admission checks the physical position"),
+                    expected,
+                    image,
                 },
             ) {
+                self.rollback_txn(txn, guc);
+                return Err(error);
+            }
+        }
+        for (index, undo) in txn.ddl().iter().enumerate() {
+            let DdlUndo::PartitionTriggerAltered { slot, .. } = *undo else {
+                continue;
+            };
+            if txn.ddl()[index + 1..].iter().any(|later| matches!(later, DdlUndo::PartitionTriggerAltered {slot: other, ..} if *other == slot)) {continue;}
+            let state = self.storage.partition_trigger_state(slot as usize);
+            let expected = state.committed;
+            let image = state.image_to(txn.txid);
+            if expected == image {
+                continue;
+            }
+            let selected = image
+                .or(expected)
+                .expect("a changed inherited trigger has an image");
+            if self
+                .storage
+                .table_def(selected.table.slot(), txn.txid)
+                .persistence
+                == crate::storage::RelationPersistence::Temporary
+            {
+                continue;
+            }
+            let lsn = self.storage.bump_lsn();
+            if let Err(error) = self.wal.stage_reserved(
+                txn.txid,
+                lsn,
+                &WalOp::SetPartitionTrigger { expected, image },
+            ) {
+                self.rollback_txn(txn, guc);
+                return Err(error);
+            }
+        }
+        if txn.ddl().iter().any(|undo| {
+            matches!(
+                undo,
+                DdlUndo::DefaultAclChanged { .. } | DdlUndo::PartitionTriggerAltered { .. }
+            )
+        }) {
+            let value = core::num::NonZeroU64::new(self.storage.catalog_identity_sequence())
+                .expect("a catalog change retains a positive creation reservation");
+            let lsn = self.storage.bump_lsn();
+            if let Err(error) =
+                self.wal
+                    .stage_reserved(txn.txid, lsn, &WalOp::ReserveCatalogSequence(value))
+            {
                 self.rollback_txn(txn, guc);
                 return Err(error);
             }
@@ -15179,11 +15214,11 @@ impl Engine {
         } else {
             event_trigger::BeforeDdl::EMPTY
         };
-        if event_drop || event_end {
+        if event_tag.is_some() {
             responder.begin_command_completion_capture();
         }
         let outcome = execute(self, txn, sqlprep, cursors, guc, responder);
-        let completion = if event_drop || event_end {
+        let completion = if event_tag.is_some() {
             match responder.take_command_completion_tag(arena, matches!(outcome, Ok(Ok(())))) {
                 Ok(tag) => tag,
                 Err(_) => return Ok(Err(eval::arena_full())),
@@ -15191,6 +15226,14 @@ impl Engine {
         } else {
             None
         };
+        if matches!(outcome, Ok(Ok(())))
+            && event_tag.is_some()
+            && let Err(error) = self
+                .storage
+                .reconcile_partition_triggers(txn, event_ddl_mark)
+        {
+            return Ok(Err(error));
+        }
         if matches!(outcome, Ok(Ok(())))
             && (event_drop || event_end)
             && let Some(tag) = event_tag
@@ -15509,7 +15552,7 @@ impl Engine {
         } else {
             event_trigger::BeforeDdl::EMPTY
         };
-        if event_drop || event_end {
+        if event_tag.is_some() {
             responder.begin_command_completion_capture();
         }
         let outcome = match statement {
@@ -17794,7 +17837,7 @@ impl Engine {
             }
             Stmt::Deallocate(name) => self.execute_deallocate_statement(*name, sqlprep, responder),
         };
-        let completion = if event_drop || event_end {
+        let completion = if event_tag.is_some() {
             match responder.take_command_completion_tag(arena, matches!(outcome, Ok(Ok(())))) {
                 Ok(tag) => tag,
                 Err(_) => return Ok(Err(eval::arena_full())),
@@ -17802,6 +17845,14 @@ impl Engine {
         } else {
             None
         };
+        if matches!(outcome, Ok(Ok(())))
+            && event_tag.is_some()
+            && let Err(error) = self
+                .storage
+                .reconcile_partition_triggers(txn, event_ddl_mark)
+        {
+            return Ok(Err(error));
+        }
         if matches!(outcome, Ok(Ok(())))
             && (event_drop || event_end)
             && let Some(tag) = event_tag
@@ -21584,6 +21635,12 @@ fn apply_wal_op(
                 .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "corrupt WAL database scope"))?;
             storage.select_database(database)?;
         }
+        WalOp::SetPartitionTrigger { expected, image } => {
+            storage.install_partition_trigger_image(expected, image, 0)?;
+        }
+        WalOp::ReserveCatalogSequence(value) => {
+            storage.restore_catalog_identity_sequence(value.get());
+        }
         WalOp::CreateLargeObject {
             oid,
             created_at,
@@ -21796,6 +21853,7 @@ fn apply_wal_op(
             storage.apply_replication_slot_advance(advance);
         }
         WalOp::SetPolicy {
+            identity,
             schema,
             table,
             name,
@@ -21820,6 +21878,7 @@ fn apply_wal_op(
             let dependencies =
                 storage.rebind_stored_query_dependencies(dependencies.materialize()?, 0)?;
             storage.replay_set_policy(
+                identity,
                 crate::storage::RecoveredPolicySpec {
                     name: crate::storage::SqlName::parse(name)?,
                     table: table_slot,
@@ -21844,17 +21903,43 @@ fn apply_wal_op(
             )?;
         }
         WalOp::DropPolicy {
+            identity,
             schema,
             table,
             name,
         } => {
-            if let Some(crate::storage::ResolvedRelation::Table(table_slot)) =
+            let Some(crate::storage::ResolvedRelation::Table(table_slot)) =
                 storage.resolve_relation(Some(schema), table, 0)
-            {
-                storage.replay_drop_policy(table_slot, name);
+            else {
+                return Err(sql_err!(
+                    sqlstate::DATA_EXCEPTION,
+                    "journal policy table is unavailable"
+                ));
+            };
+            let slot = identity.slot();
+            if slot >= storage.policy_count() {
+                return Err(sql_err!(
+                    sqlstate::DATA_EXCEPTION,
+                    "journal policy position is out of range"
+                ));
             }
+            let policy = storage.policy(slot);
+            if policy.database != storage.current_database_oid()
+                || !policy.visible_to(0)
+                || policy.created_at != identity.created_at()
+                || usize::from(policy.table) != table_slot
+                || policy.name.as_str() != name
+            {
+                return Err(sql_err!(
+                    sqlstate::DATA_EXCEPTION,
+                    "journal policy removal selects another lifetime"
+                ));
+            }
+            storage.drop_policy(slot, 0);
+            storage.commit_policy_drop(slot);
         }
         WalOp::CreateTrigger {
+            identity,
             name,
             target,
             table_schema,
@@ -21983,14 +22068,20 @@ fn apply_wal_op(
                 arguments: crate::storage::TriggerArguments::parse(&arguments[..argument_count])?,
             };
             if or_replace && let Some(existing) = storage.trigger_slot_on(target, name, 0) {
+                if storage.trigger_position(existing) != identity {
+                    return Err(sql_err!(
+                        sqlstate::DATA_EXCEPTION,
+                        "journal trigger replacement selects another lifetime"
+                    ));
+                }
                 storage.replace_trigger(existing, spec, 0)?;
                 storage.commit_trigger_alter(existing, 0);
             } else {
-                let slot = storage.create_trigger(spec, 0)?;
-                storage.commit_trigger_create(slot);
+                storage.restore_trigger(identity, spec, crate::storage::TriggerEnabled::Origin)?;
             }
         }
         WalOp::DropTrigger {
+            identity,
             name,
             target,
             table_schema,
@@ -22015,12 +22106,30 @@ fn apply_wal_op(
                     ));
                 }
             };
-            if let Some(slot) = storage.trigger_slot_on(target, name, 0) {
-                storage.drop_trigger(slot, 0)?;
-                storage.commit_trigger_drop(slot);
+            let slot = identity.slot();
+            if slot >= storage.trigger_capacity() {
+                return Err(sql_err!(
+                    sqlstate::DATA_EXCEPTION,
+                    "journal trigger position is out of range"
+                ));
             }
+            let trigger = storage.trigger(slot);
+            if trigger.database != storage.current_database_oid()
+                || !trigger.visible_to(0)
+                || storage.trigger_position(slot) != identity
+                || trigger.target != target
+                || trigger.name_to(0).as_str() != name
+            {
+                return Err(sql_err!(
+                    sqlstate::DATA_EXCEPTION,
+                    "journal trigger removal selects another lifetime"
+                ));
+            }
+            storage.drop_trigger(slot, 0)?;
+            storage.commit_trigger_drop(slot);
         }
         WalOp::AlterTrigger {
+            identity,
             name,
             target,
             table_schema,
@@ -22054,6 +22163,12 @@ fn apply_wal_op(
                 )
             })?;
             if let Some(slot) = storage.trigger_slot_on(target, name, 0) {
+                if storage.trigger_position(slot) != identity {
+                    return Err(sql_err!(
+                        sqlstate::DATA_EXCEPTION,
+                        "journal trigger edit selects another lifetime"
+                    ));
+                }
                 storage.alter_trigger(
                     slot,
                     crate::storage::SqlName::parse(new_name)?,
@@ -22061,15 +22176,6 @@ fn apply_wal_op(
                     0,
                 )?;
                 storage.commit_trigger_alter(slot, 0);
-            } else if let crate::storage::TriggerTarget::Table(table) = target
-                && name == new_name
-                && let Some(slot) = storage.trigger_slot_inherited_by(usize::from(table), name, 0)
-            {
-                if let Some((state, _)) =
-                    storage.stage_partition_trigger_enabled(slot, usize::from(table), enabled, 0)?
-                {
-                    storage.commit_partition_trigger_state(state, 0);
-                }
             } else {
                 return Err(sql_err!(
                     sqlstate::UNDEFINED_OBJECT,
@@ -23880,15 +23986,16 @@ fn apply_wal_op(
         WalOp::DropRole { name } => storage.remove_role(name),
         WalOp::RenameRole { name, new_name } => storage.replay_rename_role(name, new_name)?,
         WalOp::UpsertRoleMembership {
+            identity,
             role,
             member,
             grantor,
             options,
         } => {
-            storage.install_role_membership(role, member, grantor, options)?;
+            storage.install_role_membership(identity, role, member, grantor, options)?;
         }
-        WalOp::DropRoleMembership { role, member } => {
-            storage.remove_role_membership(role, member);
+        WalOp::DropRoleMembership { identity } => {
+            storage.remove_role_membership(identity)?;
         }
         WalOp::SetRoleSetting {
             role,
@@ -24246,77 +24353,11 @@ fn apply_wal_op(
             )?;
         }
         WalOp::SetDefaultAcl {
-            owner,
-            schema,
-            class,
-            grantee,
-            defined,
-            privileges,
-            grant_options,
+            slot,
+            expected,
+            image,
         } => {
-            let class = crate::storage::DefaultPrivilegeClass::from_u8(class).ok_or_else(|| {
-                sql_err!(
-                    sqlstate::INTERNAL_ERROR,
-                    "corrupt WAL default privilege class {}",
-                    class
-                )
-            })?;
-            let Some(owner_slot) = storage.find_role(owner) else {
-                if !defined {
-                    storage.set_lsn(lsn);
-                    return Ok(());
-                }
-                return Err(sql_err!(
-                    sqlstate::UNDEFINED_OBJECT,
-                    "WAL default privilege owner \"{}\" does not exist",
-                    owner
-                ));
-            };
-            let owner = owner_slot as u16;
-            let schema = if schema.is_empty() {
-                crate::storage::DEFAULT_ACL_ALL_SCHEMAS
-            } else {
-                let Some(schema_slot) = storage.find_schema(schema) else {
-                    if !defined {
-                        storage.set_lsn(lsn);
-                        return Ok(());
-                    }
-                    return Err(sql_err!(
-                        sqlstate::INVALID_SCHEMA_NAME,
-                        "WAL default privilege schema \"{}\" does not exist",
-                        schema
-                    ));
-                };
-                schema_slot as u16
-            };
-            let grantee = if grantee == "PUBLIC" {
-                crate::storage::PUBLIC_ROLE
-            } else {
-                let Some(grantee_slot) = storage.find_role(grantee) else {
-                    if !defined {
-                        storage.set_lsn(lsn);
-                        return Ok(());
-                    }
-                    return Err(sql_err!(
-                        sqlstate::UNDEFINED_OBJECT,
-                        "WAL default privilege grantee \"{}\" does not exist",
-                        grantee
-                    ));
-                };
-                grantee_slot as u16
-            };
-            storage.change_default_acl(
-                crate::storage::DefaultAclKey {
-                    owner,
-                    schema,
-                    class,
-                    grantee,
-                },
-                defined,
-                privileges,
-                grant_options,
-                0,
-            )?;
+            storage.install_default_acl_image(usize::from(slot), expected, image, 0)?;
         }
     }
     storage.set_lsn(lsn);

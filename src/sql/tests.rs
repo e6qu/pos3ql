@@ -1780,6 +1780,586 @@ fn catalog_lifetime_config(name: &str, mode: crate::config::TransactionMode) -> 
 }
 
 #[test]
+fn catalog_lifetime_privileges_and_partition_triggers_match_postgresql() {
+    let fixture =
+        include_str!("../../tests/external/differential/199_privilege_and_partition_lifetimes.sql");
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let config = catalog_lifetime_config(&format!("privilege-partition-{mode:?}"), mode);
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        let mut mismatches = Vec::new();
+        for sql in fixture.split("-- cleanup").next().unwrap().split("\n\n") {
+            if sql.trim().is_empty() {
+                continue;
+            }
+            let output = session.success(&mut engine, sql, true);
+            if sql.trim_start().starts_with("SELECT") && data_rows(&output) != ["t"] {
+                mismatches.push((sql, data_rows(&output)));
+            }
+        }
+        assert!(mismatches.is_empty(), "{mode:?}: {mismatches:?}");
+    }
+}
+
+#[test]
+fn timezone_abbreviation_input_and_catalogs_match_postgresql_without_legacy_zone_files() {
+    let fixture = include_str!("../../tests/external/differential/201_timezone_abbreviations.sql");
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let config = catalog_lifetime_config(&format!("timezone-abbreviations-{mode:?}"), mode);
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        let output = session.success(&mut engine, fixture, true);
+        assert_eq!(
+            data_rows(&output),
+            ["t"; 11],
+            "{mode:?}: {}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+}
+
+#[test]
+fn timezone_abbreviation_format_conflicts_fail_before_completion_and_keep_the_session_usable() {
+    let fixture =
+        include_str!("../../tests/external/differential_exact/34_timezone_format_fields.sql");
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let config = catalog_lifetime_config(&format!("timezone-format-conflicts-{mode:?}"), mode);
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        session.success(&mut engine, "SET timezone = 'UTC'", true);
+        let mut errors = 0;
+        for sql in fixture
+            .split("\n\n")
+            .filter(|sql| sql.trim_start().starts_with("SELECT"))
+        {
+            let output = session.execute(&mut engine, sql, true);
+            assert_eq!(
+                error_sqlstates(&output),
+                ["22007"],
+                "{sql}: {}",
+                String::from_utf8_lossy(&output)
+            );
+            assert!(command_tags(&output).is_empty());
+            errors += 1;
+        }
+        assert_eq!(errors, 4);
+        assert_eq!(
+            data_rows(&session.success(&mut engine, "SELECT 1", true)),
+            ["1"]
+        );
+    }
+}
+
+const CATALOG_LIFETIME_DEFINITION_BEHAVIOR: &str = "SELECT lifetime_query(5); SELECT pg_get_expr(polqual, polrelid) FROM pg_policy WHERE polname='lifetime_row_policy'; SELECT ev_enabled FROM pg_rewrite WHERE rulename='lifetime_rewrite'";
+
+fn privilege_partition_inventory(
+    engine: &mut Engine,
+    session: &mut ConfiguredTransactionSession,
+) -> Vec<String> {
+    let output = session.success(engine,
+        "SELECT oid, roleid, member, grantor FROM pg_auth_members WHERE roleid='lifetime_member_group'::regrole; SELECT oid, defaclacl FROM pg_default_acl WHERE defaclnamespace='lifetime_privileges'::regnamespace; SELECT oid, tgparentid, tgenabled FROM pg_trigger WHERE tgname='lifetime_partition_hook'; SELECT 'function', 'lifetime_query(integer)'::regprocedure::oid; SELECT 'policy', oid FROM pg_policy WHERE polname='lifetime_row_policy'; SELECT 'rule', oid FROM pg_rewrite WHERE rulename='lifetime_rewrite'", true);
+    // Compare catalogs as sets. SQL ORDER BY uploads temporary sorter blocks;
+    // the simulator's remote objects allocate outside the guarded client path.
+    let mut rows = data_rows(&output);
+    rows.sort_unstable();
+    rows
+}
+
+#[test]
+fn catalog_lifetime_privileges_and_partition_triggers_survive_copies_and_empty_disk() {
+    let fixture =
+        include_str!("../../tests/external/differential/199_privilege_and_partition_lifetimes.sql");
+    for checkpoint in [false, true] {
+        for mode in [
+            crate::config::TransactionMode::Mvcc,
+            crate::config::TransactionMode::Locking,
+        ] {
+            let name = format!("privilege-partition-copy-{checkpoint}-{mode:?}");
+            let mut config = catalog_lifetime_config(&name, mode);
+            config.max_tables = 16;
+            config.object_store_on = true;
+            config.object_store_sim = true;
+            config.wal_upload = true;
+            config.wal_upload_sync = true;
+            config.object_store_bucket = format!("{name}-{}", std::process::id());
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+            let source_inventory;
+            let copied_inventory;
+            let target;
+            {
+                let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+                let mut engine = Engine::new(&config, &mut budget).unwrap();
+                engine
+                    .select_database(crate::storage::DatabaseOid::TEMPLATE1)
+                    .unwrap();
+                let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+                for sql in fixture
+                    .split("-- cleanup")
+                    .next()
+                    .unwrap()
+                    .split("\n\n")
+                    .filter(|sql| !sql.trim().is_empty())
+                {
+                    let output = session.success(&mut engine, sql, false);
+                    if sql.trim_start().starts_with("SELECT") {
+                        assert_eq!(data_rows(&output), ["t"], "{sql}");
+                    }
+                }
+                source_inventory = privilege_partition_inventory(&mut engine, &mut session);
+                assert_eq!(source_inventory.len(), 8);
+                session.success(&mut engine, "BEGIN; SAVEPOINT lifetime_before; REVOKE lifetime_member_group FROM lifetime_member_second; ALTER DEFAULT PRIVILEGES IN SCHEMA lifetime_privileges REVOKE SELECT ON TABLES FROM lifetime_member_first; ALTER TABLE lifetime_partition_root DETACH PARTITION lifetime_partition_child; DROP FUNCTION lifetime_query(integer); CREATE FUNCTION lifetime_query(value integer) RETURNS integer LANGUAGE sql AS 'SELECT $1 + 3'; DROP POLICY lifetime_row_policy ON lifetime_saved_defaults; CREATE POLICY lifetime_row_policy ON lifetime_saved_defaults USING (false); DROP RULE lifetime_rewrite ON lifetime_saved_defaults; CREATE RULE lifetime_rewrite AS ON UPDATE TO lifetime_saved_defaults DO INSTEAD NOTHING; ROLLBACK TO lifetime_before; COMMIT", false);
+                assert_eq!(
+                    privilege_partition_inventory(&mut engine, &mut session),
+                    source_inventory
+                );
+                session.success(
+                    &mut engine,
+                    "CREATE DATABASE privilege_copy TEMPLATE template1",
+                    false,
+                );
+                target = engine
+                    .storage
+                    .database_named("privilege_copy", 0)
+                    .unwrap()
+                    .1
+                    .oid;
+                engine.select_database(target).unwrap();
+                assert_eq!(
+                    privilege_partition_inventory(&mut engine, &mut session),
+                    source_inventory
+                );
+                session.success(&mut engine, "ALTER DEFAULT PRIVILEGES IN SCHEMA lifetime_privileges GRANT INSERT ON TABLES TO lifetime_member_second; ALTER TABLE lifetime_partition_root DETACH PARTITION lifetime_partition_child; ALTER TABLE lifetime_partition_root ATTACH PARTITION lifetime_partition_child FOR VALUES FROM (0) TO (10); ALTER TABLE lifetime_partition_child DISABLE TRIGGER lifetime_partition_hook; CREATE OR REPLACE FUNCTION lifetime_query(value integer) RETURNS integer LANGUAGE sql AS 'SELECT $1 + 3'; ALTER POLICY lifetime_row_policy ON lifetime_saved_defaults USING (false); ALTER TABLE lifetime_saved_defaults DISABLE RULE lifetime_rewrite", false);
+                copied_inventory = privilege_partition_inventory(&mut engine, &mut session);
+                assert_eq!(
+                    data_rows(&session.success(
+                        &mut engine,
+                        CATALOG_LIFETIME_DEFINITION_BEHAVIOR,
+                        true
+                    )),
+                    ["8", "false", "D"]
+                );
+                assert_ne!(copied_inventory, source_inventory);
+                engine
+                    .select_database(crate::storage::DatabaseOid::TEMPLATE1)
+                    .unwrap();
+                assert_eq!(
+                    privilege_partition_inventory(&mut engine, &mut session),
+                    source_inventory
+                );
+                if checkpoint {
+                    assert!(engine.checkpoint().unwrap());
+                }
+                engine.commit_wal().unwrap();
+            }
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+            {
+                let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+                let mut engine = Engine::new(&config, &mut budget).unwrap();
+                let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+                for (database, expected) in [
+                    (crate::storage::DatabaseOid::TEMPLATE1, &source_inventory),
+                    (target, &copied_inventory),
+                ] {
+                    engine.select_database(database).unwrap();
+                    assert_eq!(
+                        &privilege_partition_inventory(&mut engine, &mut session),
+                        expected
+                    );
+                    assert_eq!(
+                        data_rows(&session.success(
+                            &mut engine,
+                            CATALOG_LIFETIME_DEFINITION_BEHAVIOR,
+                            true
+                        )),
+                        if database == target {
+                            ["8", "false", "D"]
+                        } else {
+                            ["7", "true", "O"]
+                        }
+                    );
+                }
+                session.success(
+                    &mut engine,
+                    "INSERT INTO lifetime_partition_root VALUES (7)",
+                    false,
+                );
+                assert_eq!(
+                    data_rows(&session.success(
+                        &mut engine,
+                        "SELECT id FROM lifetime_partition_child",
+                        true
+                    )),
+                    ["7"]
+                );
+            }
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        }
+    }
+}
+
+#[test]
+fn catalog_lifetime_privileges_and_partition_triggers_keep_prepared_changes_private() {
+    let fixture =
+        include_str!("../../tests/external/differential/199_privilege_and_partition_lifetimes.sql");
+    for checkpoint in [false, true] {
+        for commit in [false, true] {
+            for mode in [
+                crate::config::TransactionMode::Mvcc,
+                crate::config::TransactionMode::Locking,
+            ] {
+                let name = format!("privilege-partition-prepared-{checkpoint}-{commit}-{mode:?}");
+                let mut config = catalog_lifetime_config(&name, mode);
+                config.max_prepared_transactions = 1;
+                config.object_store_on = true;
+                config.object_store_sim = true;
+                config.wal_upload = true;
+                config.wal_upload_sync = true;
+                config.object_store_bucket = format!("{name}-{}", std::process::id());
+                crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+                let before;
+                let after;
+                {
+                    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+                    let mut engine = Engine::new(&config, &mut budget).unwrap();
+                    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+                    for sql in fixture
+                        .split("-- cleanup")
+                        .next()
+                        .unwrap()
+                        .split("\n\n")
+                        .filter(|sql| !sql.trim().is_empty())
+                    {
+                        session.success(&mut engine, sql, false);
+                    }
+                    before = privilege_partition_inventory(&mut engine, &mut session);
+                    session.success(&mut engine, "BEGIN; REVOKE lifetime_member_group FROM lifetime_member_second; GRANT lifetime_member_group TO lifetime_member_second; ALTER DEFAULT PRIVILEGES IN SCHEMA lifetime_privileges REVOKE SELECT ON TABLES FROM lifetime_member_first; ALTER DEFAULT PRIVILEGES IN SCHEMA lifetime_privileges GRANT SELECT ON TABLES TO lifetime_member_first; ALTER TABLE lifetime_partition_root DETACH PARTITION lifetime_partition_child; ALTER TABLE lifetime_partition_root ATTACH PARTITION lifetime_partition_child FOR VALUES FROM (0) TO (10); ALTER TABLE lifetime_partition_child DISABLE TRIGGER lifetime_partition_hook; DROP FUNCTION lifetime_query(integer); CREATE FUNCTION lifetime_query(value integer) RETURNS integer LANGUAGE sql AS 'SELECT $1 + 3'; DROP POLICY lifetime_row_policy ON lifetime_saved_defaults; CREATE POLICY lifetime_row_policy ON lifetime_saved_defaults USING (false); DROP RULE lifetime_rewrite ON lifetime_saved_defaults; CREATE RULE lifetime_rewrite AS ON UPDATE TO lifetime_saved_defaults DO INSTEAD NOTHING", false);
+                    after = privilege_partition_inventory(&mut engine, &mut session);
+                    assert_ne!(before, after);
+                    let mut observer = ConfiguredTransactionSession::new(&config, &mut budget)
+                        .with_connection_id(2);
+                    assert_eq!(
+                        privilege_partition_inventory(&mut engine, &mut observer),
+                        before
+                    );
+                    session.success(
+                        &mut engine,
+                        "PREPARE TRANSACTION 'privilege-partition-pending'",
+                        false,
+                    );
+                    assert_eq!(
+                        privilege_partition_inventory(&mut engine, &mut observer),
+                        before
+                    );
+                    if checkpoint {
+                        assert!(engine.checkpoint().unwrap());
+                    }
+                    engine.commit_wal().unwrap();
+                }
+                std::fs::remove_dir_all(&config.data_dir).unwrap();
+                {
+                    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+                    let mut engine = Engine::new(&config, &mut budget).unwrap();
+                    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+                    assert_eq!(
+                        privilege_partition_inventory(&mut engine, &mut session),
+                        before
+                    );
+                    session.success(
+                        &mut engine,
+                        if commit {
+                            "COMMIT PREPARED 'privilege-partition-pending'"
+                        } else {
+                            "ROLLBACK PREPARED 'privilege-partition-pending'"
+                        },
+                        false,
+                    );
+                    assert_eq!(
+                        privilege_partition_inventory(&mut engine, &mut session),
+                        if commit { after } else { before }
+                    );
+                    assert_eq!(
+                        data_rows(&session.success(
+                            &mut engine,
+                            CATALOG_LIFETIME_DEFINITION_BEHAVIOR,
+                            true
+                        )),
+                        if commit {
+                            ["8", "false", "O"]
+                        } else {
+                            ["7", "true", "O"]
+                        }
+                    );
+                }
+                std::fs::remove_dir_all(&config.data_dir).unwrap();
+                crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+            }
+        }
+    }
+}
+
+#[test]
+fn catalog_lifetime_privileges_and_partition_triggers_reserve_exhausted_ids_through_recovery() {
+    let fixture =
+        include_str!("../../tests/external/differential/199_privilege_and_partition_lifetimes.sql");
+    for checkpoint in [false, true] {
+        for mode in [
+            crate::config::TransactionMode::Mvcc,
+            crate::config::TransactionMode::Locking,
+        ] {
+            let name = format!("permission-reservation-{checkpoint}-{mode:?}");
+            let mut config = catalog_lifetime_config(&name, mode);
+            config.object_store_on = true;
+            config.object_store_sim = true;
+            config.wal_upload = true;
+            config.wal_upload_sync = true;
+            config.object_store_bucket = format!("{name}-{}", std::process::id());
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+            let before;
+            {
+                let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+                let mut engine = Engine::new(&config, &mut budget).unwrap();
+                let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+                for sql in fixture
+                    .split("-- cleanup")
+                    .next()
+                    .unwrap()
+                    .split("\n\n")
+                    .filter(|sql| !sql.trim().is_empty())
+                {
+                    session.success(&mut engine, sql, false);
+                }
+                before = privilege_partition_inventory(&mut engine, &mut session);
+                engine
+                    .storage
+                    .replace_catalog_sequence_for_test(crate::storage::MAX_CATALOG_CREATION - 1);
+                session.success(&mut engine, "BEGIN; ALTER DEFAULT PRIVILEGES REVOKE USAGE ON TYPES FROM PUBLIC; ALTER DEFAULT PRIVILEGES GRANT USAGE ON TYPES TO PUBLIC; COMMIT", false);
+                assert_eq!(
+                    engine.storage.catalog_identity_sequence(),
+                    crate::storage::MAX_CATALOG_CREATION
+                );
+                assert_eq!(
+                    privilege_partition_inventory(&mut engine, &mut session),
+                    before
+                );
+                for sql in [
+                    "GRANT lifetime_member_first TO lifetime_member_second",
+                    "ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC",
+                    "CREATE FUNCTION exhausted_query() RETURNS integer LANGUAGE sql AS 'SELECT 1'",
+                    "CREATE POLICY exhausted_policy ON lifetime_saved_defaults USING (true)",
+                    "CREATE RULE exhausted_rule AS ON UPDATE TO lifetime_saved_defaults DO INSTEAD NOTHING",
+                    "CREATE TRIGGER exhausted_trigger AFTER INSERT ON lifetime_partition_root FOR EACH ROW EXECUTE FUNCTION lifetime_partition_hook()",
+                ] {
+                    let output = session.execute(&mut engine, sql, false);
+                    assert_eq!(
+                        error_sqlstates(&output),
+                        ["54000"],
+                        "{sql}: {}",
+                        String::from_utf8_lossy(&output)
+                    );
+                    assert!(
+                        command_tags(&output).is_empty(),
+                        "failed creation reported success: {sql}"
+                    );
+                    assert_eq!(
+                        privilege_partition_inventory(&mut engine, &mut session),
+                        before
+                    );
+                }
+                if checkpoint {
+                    assert!(engine.checkpoint().unwrap());
+                }
+                engine.commit_wal().unwrap();
+            }
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+            {
+                let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+                let mut engine = Engine::new(&config, &mut budget).unwrap();
+                let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+                assert!(
+                    engine.storage.catalog_identity_sequence()
+                        >= crate::storage::MAX_CATALOG_CREATION
+                );
+                assert_eq!(
+                    privilege_partition_inventory(&mut engine, &mut session),
+                    before
+                );
+                let output = session.execute(
+                    &mut engine,
+                    "ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC",
+                    false,
+                );
+                assert_eq!(error_sqlstates(&output), ["54000"]);
+                session.success(
+                    &mut engine,
+                    "GRANT lifetime_member_group TO lifetime_member_second WITH ADMIN OPTION",
+                    false,
+                );
+                assert_eq!(
+                    privilege_partition_inventory(&mut engine, &mut session),
+                    before
+                );
+            }
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        }
+    }
+}
+
+#[test]
+fn catalog_lifetime_membership_grantors_reject_cycles_and_match_wire_diagnostics() {
+    let fixture =
+        include_str!("../../tests/external/differential_exact/33_membership_grantors.sql");
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let config = catalog_lifetime_config(&format!("membership-diagnostics-{mode:?}"), mode);
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        let mut errors = Vec::new();
+        let mut notices = Vec::new();
+        let mut observations = 0;
+        for sql in fixture.split("\n\n").filter(|sql| !sql.trim().is_empty()) {
+            let output = session.execute(&mut engine, sql, true);
+            let states = error_sqlstates(&output);
+            if !states.is_empty() {
+                assert!(
+                    String::from_utf8_lossy(&output)
+                        .contains("ADMIN option cannot be granted back to your own grantor"),
+                    "{sql}: {}",
+                    String::from_utf8_lossy(&output)
+                );
+                assert!(command_tags(&output).is_empty());
+            }
+            errors.extend(states.into_iter().map(str::to_owned));
+            let rows = data_rows(&output);
+            assert!(rows.iter().all(|row| row == "t"), "{sql}: {rows:?}");
+            observations += rows.len();
+            let mut offset = 0;
+            while offset < output.len() {
+                let length =
+                    u32::from_be_bytes(output[offset + 1..offset + 5].try_into().unwrap()) as usize;
+                if output[offset] == b'N' {
+                    let payload = &output[offset + 5..offset + 1 + length];
+                    let field = |key| {
+                        let value = payload
+                            .split(|byte| *byte == 0)
+                            .find(|value| value.first() == Some(&key))
+                            .unwrap();
+                        std::str::from_utf8(&value[1..]).unwrap().to_owned()
+                    };
+                    notices.push((field(b'S'), field(b'C'), field(b'M')));
+                }
+                offset += 1 + length;
+            }
+        }
+        assert_eq!(errors, ["0LP01", "0LP01"]);
+        assert_eq!(observations, 3);
+        assert_eq!(notices, [
+            ("NOTICE".to_owned(), "00000".to_owned(), "role \"grant_chain_first\" has already been granted membership in role \"grant_chain_group\" by role \"grant_chain_second\"".to_owned()),
+            ("WARNING".to_owned(), "01000".to_owned(), "role \"grant_chain_first\" has not been granted membership in role \"grant_chain_group\" by role \"grant_chain_second\"".to_owned()),
+        ]);
+    }
+}
+
+#[test]
+fn catalog_lifetime_membership_locks_keep_other_roles_moving_through_prepared_recovery() {
+    for checkpoint in [false, true] {
+        for mode in [
+            crate::config::TransactionMode::Mvcc,
+            crate::config::TransactionMode::Locking,
+        ] {
+            let name = format!("membership-locks-{checkpoint}-{mode:?}");
+            let mut config = catalog_lifetime_config(&name, mode);
+            config.max_prepared_transactions = 1;
+            config.object_store_on = true;
+            config.object_store_sim = true;
+            config.wal_upload = true;
+            config.wal_upload_sync = true;
+            config.object_store_bucket = format!("{name}-{}", std::process::id());
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+            {
+                let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+                let mut engine = Engine::new(&config, &mut budget).unwrap();
+                let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+                session.success(&mut engine, "CREATE ROLE locked_memberships; CREATE ROLE independent_memberships; CREATE ROLE membership_recipient; GRANT locked_memberships TO membership_recipient; GRANT postgres TO membership_recipient; BEGIN; GRANT locked_memberships TO membership_recipient; GRANT postgres TO membership_recipient; PREPARE TRANSACTION 'membership-locks'", false);
+                if checkpoint {
+                    assert!(engine.checkpoint().unwrap());
+                }
+                engine.commit_wal().unwrap();
+            }
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+            {
+                let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+                let mut engine = Engine::new(&config, &mut budget).unwrap();
+                let mut resolver = ConfiguredTransactionSession::new(&config, &mut budget);
+                let mut waiter =
+                    ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+                waiter.success(&mut engine, "BEGIN; SELECT 1", true);
+                let locked = engine
+                    .storage
+                    .find_role_visible("locked_memberships", 0)
+                    .unwrap();
+                let bootstrap = engine.storage.find_role_visible("postgres", 0).unwrap();
+                let independent = engine
+                    .storage
+                    .find_role_visible("independent_memberships", 0)
+                    .unwrap();
+                let transaction = waiter.transaction.txid;
+                crate::mem::guard::forbid_alloc(|| {
+                    assert_eq!(
+                        engine
+                            .storage
+                            .lock_role_memberships(locked, transaction)
+                            .unwrap_err()
+                            .sqlstate,
+                        sqlstate::INTERNAL_LOCK_WAIT
+                    );
+                    assert_eq!(
+                        engine
+                            .storage
+                            .lock_role_memberships(bootstrap, transaction)
+                            .unwrap_err()
+                            .sqlstate,
+                        sqlstate::INTERNAL_LOCK_WAIT
+                    );
+                    engine
+                        .storage
+                        .lock_role_memberships(independent, transaction)
+                        .unwrap();
+                });
+                resolver.success(&mut engine, "COMMIT PREPARED 'membership-locks'", false);
+                crate::mem::guard::forbid_alloc(|| {
+                    engine.storage.lock_role_memberships(locked, transaction)
+                })
+                .unwrap();
+                crate::mem::guard::forbid_alloc(|| {
+                    engine.storage.lock_role_memberships(bootstrap, transaction)
+                })
+                .unwrap();
+                waiter.success(&mut engine, "ROLLBACK", true);
+            }
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        }
+    }
+}
+
+#[test]
 fn event_trigger_failures_keep_notices_without_success_command_tags() {
     for mode in [
         crate::config::TransactionMode::Mvcc,
@@ -6604,7 +7184,7 @@ fn relation_identity_view_rowtype_json_preserves_field_limits() {
 
 #[test]
 fn catalog_constraint_identity_ranges_reject_overflow_and_keep_triggers_disjoint() {
-    use crate::storage::{ConstraintIdentity, ForeignKeyTrigger, MAX_TABLE_CATALOG_SLOTS};
+    use crate::storage::{ConstraintIdentity, ForeignKeyTrigger};
     crate::mem::guard::forbid_alloc(|| {
         assert!(ConstraintIdentity::parse(0).is_none());
         assert!(ConstraintIdentity::parse(10_000_000).is_none());
@@ -6632,9 +7212,7 @@ fn catalog_constraint_identity_ranges_reject_overflow_and_keep_triggers_disjoint
         }
         assert!(
             crate::storage::FIRST_PARTITION_TRIGGER_OID as u64
-                + crate::storage::MAX_TRIGGER_OID_GENERATION * MAX_TABLE_CATALOG_SLOTS as u64
-                + MAX_TABLE_CATALOG_SLOTS as u64
-                - 1
+                + crate::storage::MAX_CATALOG_CREATION
                 + crate::storage::TRIGGER_CONSTRAINT_OID_OFFSET as u64
                 <= i32::MAX as u64
         );
@@ -18985,7 +19563,8 @@ fn configured_acl_capacities_exceed_legacy_limits_and_survive_object_cold_recove
     const OBJECT_GRANTEES: usize = 60;
     const OBJECT_ACLS: usize = 3 + 1 + OBJECT_TABLES * (OBJECT_GRANTEES + 1);
     const COLUMN_ACLS: usize = USER_ROLES * 14;
-    const DEFAULT_ACLS: usize = 5 * 60 - 4;
+    // Every owner's unchanged baseline grant needs no exception entry.
+    const DEFAULT_ACLS: usize = 5 * (60 - 1);
     const PARAMETER_ACLS: usize = 3 * (60 + 1);
 
     let mut config = test_config("configured-acl-capacities");
@@ -19172,7 +19751,7 @@ fn configured_acl_capacities_exceed_legacy_limits_and_survive_object_cold_recove
             "ALTER DEFAULT PRIVILEGES FOR ROLE scaled_acl_role_006 \
              GRANT SELECT ON TABLES TO scaled_acl_role_001, scaled_acl_role_002, \
              scaled_acl_role_003, scaled_acl_role_004, scaled_acl_role_005",
-            "too many default privilege entries (limit 296)",
+            "too many default privilege entries (limit 295)",
         ),
         (
             "GRANT SET ON PARAMETER statement_timeout TO scaled_acl_role_001",
@@ -26199,7 +26778,7 @@ fn default_privileges_apply_additively_and_replay_from_wal() {
     );
     assert_eq!(
         data_rows(&output),
-        ["T|t|2", "r|t|2", "r|f|1", "1", "2", "f"],
+        ["T|t|1", "r|t|2", "r|f|1", "1", "2", "f"],
         "{}",
         String::from_utf8_lossy(&output)
     );
@@ -30300,33 +30879,31 @@ fn partition_before_trigger_clones_fire_after_routing_and_cannot_move_rows() {
 
 #[test]
 fn partition_trigger_clones_share_one_postgresql_name_order() {
-    let (mut engine, mut budget) = test_engine();
-    let output = run_with(
-        &mut engine,
-        &mut budget,
-        "CREATE TABLE ordered_partition_trigger_log (position serial, name text);
-         CREATE TABLE ordered_partition_trigger_root (id integer) PARTITION BY RANGE (id);
-         CREATE TABLE ordered_partition_trigger_leaf PARTITION OF ordered_partition_trigger_root
-           FOR VALUES FROM (0) TO (10);
-         CREATE FUNCTION ordered_partition_trigger() RETURNS trigger LANGUAGE plpgsql AS
-           'BEGIN INSERT INTO ordered_partition_trigger_log (name) VALUES (TG_NAME); RETURN NEW; END';
-         CREATE TRIGGER z_before BEFORE INSERT ON ordered_partition_trigger_root
-           FOR EACH ROW EXECUTE FUNCTION ordered_partition_trigger();
-         CREATE TRIGGER a_before BEFORE INSERT ON ordered_partition_trigger_leaf
-           FOR EACH ROW EXECUTE FUNCTION ordered_partition_trigger();
-         CREATE TRIGGER z_after AFTER INSERT ON ordered_partition_trigger_root
-           FOR EACH ROW EXECUTE FUNCTION ordered_partition_trigger();
-         CREATE TRIGGER a_after AFTER INSERT ON ordered_partition_trigger_leaf
-           FOR EACH ROW EXECUTE FUNCTION ordered_partition_trigger();
-         INSERT INTO ordered_partition_trigger_root VALUES (1);
-         SELECT name FROM ordered_partition_trigger_log ORDER BY position;",
-    );
-    assert_eq!(
-        data_rows(&output),
-        ["a_before", "z_before", "a_after", "z_after"],
-        "{}",
-        String::from_utf8_lossy(&output)
-    );
+    let fixture =
+        include_str!("../../tests/external/differential/200_partition_trigger_dispatch.sql");
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let config = catalog_lifetime_config(&format!("partition-trigger-dispatch-{mode:?}"), mode);
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        let output = session.success(&mut engine, fixture, true);
+        assert_eq!(
+            data_rows(&output),
+            [
+                "a_before:STATEMENT",
+                "a_before:ROW",
+                "z_before:ROW",
+                "a_after:ROW",
+                "z_after:ROW",
+                "a_after:STATEMENT",
+            ],
+            "{mode:?}: {}",
+            String::from_utf8_lossy(&output)
+        );
+    }
 }
 
 #[test]
@@ -85596,7 +86173,7 @@ fn degree_special_and_random_math_matches_postgresql_18() {
         String::from_utf8_lossy(&landmarks)
     );
     // PostgreSQL delegates these transcendental functions to the platform
-    // math library, whose correctly rounded result can differ in the last bit.
+    // math library, whose result can differ in the last bits across hosts.
     let approx = |e: &mut Engine, b: &mut Budget, sql: &str, want: f64| {
         let got: f64 = data_rows(&run_with(e, b, sql))[0]
             .parse()

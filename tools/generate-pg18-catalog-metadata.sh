@@ -45,17 +45,6 @@ source_image=$(docker inspect "$container" --format '{{.Image}}')
         ORDER BY c.oid;"
     printf '%s\n\n' '];'
     printf '%s\n' '#[rustfmt::skip]'
-    printf '%s\n' 'pub(crate) const TIMEZONE_ABBREVIATIONS: &[(&str, i32, bool)] = &['
-    docker exec "$container" psql -U postgres -Atc "
-        SELECT format(
-            '    (%s, %s, %s),',
-            chr(34) || abbrev || chr(34),
-            extract(epoch FROM utc_offset)::integer,
-            CASE WHEN is_dst THEN 'true' ELSE 'false' END)
-        FROM pg_catalog.pg_timezone_abbrevs
-        ORDER BY abbrev;"
-    printf '%s\n\n' '];'
-    printf '%s\n' '#[rustfmt::skip]'
     printf '%s\n' 'pub(crate) const ATTRIBUTE_ROWS: &[[Datum<'"'"'static>; 25]] = &['
     docker exec "$container" psql -U postgres -Atc "
         SELECT format(

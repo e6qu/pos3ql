@@ -28,7 +28,7 @@ impl ViewCatalogIdentity {
         return_rule_created_at: u64,
     ) -> Option<Self> {
         (super::RelationIdentity::parse(created_at).is_some()
-            && return_rule_created_at != 0
+            && super::CatalogIdentity::parse(return_rule_created_at).is_some()
             && created_at != return_rule_created_at)
             .then_some(Self {
                 slot,

@@ -6691,8 +6691,8 @@ pub(crate) const AGGREGATE_INIT_MAX: usize = 256;
 /// User-defined routine OIDs occupy a stable, disjoint catalog range.
 pub(crate) const ROUTINE_OID_BASE: i32 = 100_000;
 
-/// Trigger definitions share the table-sized catalog budget.  A trigger has no
-/// runtime allocation: its target and function are stable catalog slots.
+/// Declarations and inherited images use startup pools. Public identifiers
+/// belong to checked creation stamps, independently of reusable storage slots.
 pub(crate) const TRIGGER_OID_BASE: i32 = 140_000;
 pub(crate) const POLICY_OID_BASE: i32 = 180_000;
 pub(crate) const POLICY_EXPRESSION_MAX: usize = CHECK_SQL_MAX;

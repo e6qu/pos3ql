@@ -84,4 +84,8 @@ jobs:
       - name: Compile and lint all targets
         run: cargo clippy --all-targets --locked -- -D warnings
       - name: Catalog lifetime regressions
-        run: python3 tools/test_command.py cargo test --lib --locked -- catalog_lifetime_privileges_and_partition_triggers --test-threads=1
+        run: python3 tools/test_command.py cargo test --lib --locked -- catalog_lifetime --test-threads=1
+      - name: Journal and identity range regressions
+        run: |
+          python3 tools/test_command.py cargo test --lib --locked -- wal::tests:: --test-threads=1
+          python3 tools/test_command.py cargo test --lib --locked -- catalog_constraint_identity_ranges_reject_overflow_and_keep_triggers_disjoint --test-threads=1

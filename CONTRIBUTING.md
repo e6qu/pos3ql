@@ -97,6 +97,9 @@ ordered `object-audit.jsonl` of writes, deletions and recovery roots. The audit
 omits credentials and subscription connection strings. Use these records to
 trace a missing block to its publication and deletion; keep the failing seed
 and request deadlines when fixing it.
+The synthetic S3 server retains a filename boundary behind each opaque listing
+token. Deleting a returned page or inserting an earlier filename must not repeat
+or skip later files; client-side ordering validation remains strict.
 The ingestion job also retains its object-store fixture, server logs and mutation
 audit as `ingest-failure`. Retention works without a crash-only SQL output file.
 The second crash job builds once and repeats its seed with explicit 0, 1 and

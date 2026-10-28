@@ -37,9 +37,9 @@ use crate::storage::{
 };
 use crate::store::{
     BlockId, BlockStore, BlockType, BlockWriter, MAX_ASSEMBLED, MAX_INLINE_ROW, OwnedObjectStore,
-    RowSstFormat, SstCursor, SstHandle, SstKey, SstReader, SstVersionCursor, SstWriter, StackPlan,
-    StoreError, TieredStore, ValueIndexHandle, ValueIndexStream, ValueIndexStreamStep,
-    ValueIndexWriter, block_keys_at, copy_block_entry_at,
+    RowSstFormat, SstCursor, SstHandle, SstKey, SstMetadataCursor, SstMetadataStep, SstReader,
+    SstVersionCursor, SstWriter, StackPlan, StoreError, TieredStore, ValueIndexHandle,
+    ValueIndexStream, ValueIndexStreamStep, ValueIndexWriter, block_keys_at, copy_block_entry_at,
 };
 use crate::util::StackStr;
 use crate::wal::crc32c::Crc32c;
@@ -846,8 +846,8 @@ impl SlotList {
 
 /// Where a paced merge stands between beats.
 enum MergePhase {
-    /// Building the id schedule: member `rank`'s scan resumes at `resume_lo`.
-    Schedule { rank: u8, resume_lo: SstKey },
+    /// The selected member retains its metadata cursor between turns.
+    Schedule { rank: u8 },
     /// Streaming scheduled entries into the merged SST from `cursor`.
     Write { cursor: usize },
     /// The handle is private until its last output emission is durable.
@@ -1414,6 +1414,7 @@ pub(crate) struct Checkpointer {
     /// block across beats. Transient index/PAX decode buffers are shared
     /// because only one source advances at a time.
     merge_source_cursors: [Option<SstVersionCursor>; 2],
+    merge_metadata_cursors: [Option<SstMetadataCursor>; 2],
     merge_source_decoded: Box<[u8]>,
     merge_source_index: Box<[u8]>,
     merge_source_raw: Box<[u8]>,
@@ -1480,7 +1481,7 @@ const MERGE_TRIGGER: usize = 4;
 /// per write beat, and a cheap-entry cap so a tombstone-heavy stretch (which
 /// emits no blocks) still bounds its walking and checksum work. One row can
 /// cross the read budget because its PAX columns are one indivisible image.
-const MERGE_SCHEDULE_BEAT_BLOCKS: usize = 8;
+const MERGE_SCHEDULE_BEAT_NODES: usize = 8;
 const MERGE_WRITE_BEAT_BLOCKS: usize = 4;
 const MERGE_WRITE_BEAT_READS: u64 = 8;
 const MERGE_BEAT_ENTRIES: usize = 64 * 1024;
@@ -1544,6 +1545,7 @@ impl Checkpointer {
             + core::mem::size_of::<Option<crate::store::ValueRosterWalk>>()
             + core::mem::size_of::<Option<u64>>()
             + 2 * core::mem::size_of::<Option<SstVersionCursor>>()
+            + 2 * core::mem::size_of::<Option<SstMetadataCursor>>()
             + 2 * SstWriter::budget_bytes()
             + ValueIndexWriter::budget_bytes()
             + table_bookkeeping
@@ -1681,6 +1683,10 @@ impl Checkpointer {
                     Some(SstVersionCursor::new(job.old0.handle)),
                     Some(SstVersionCursor::new(job.old1.handle)),
                 ];
+                self.merge_metadata_cursors = [
+                    Some(SstMetadataCursor::new(job.old0.handle)),
+                    Some(SstMetadataCursor::new(job.old1.handle)),
+                ];
                 self.merge_job = Some(job);
             }
             return Ok(());
@@ -1712,9 +1718,7 @@ impl Checkpointer {
                 .io_stats(),
         );
         let outcome = match job.phase {
-            MergePhase::Schedule { rank, resume_lo } => {
-                self.merge_schedule_beat(&mut job, rank, resume_lo)
-            }
+            MergePhase::Schedule { rank } => self.merge_schedule_beat(&mut job, rank),
             MergePhase::Write { cursor } => self.merge_write_beat(&mut job, cursor),
             MergePhase::Finish { merged } => Ok(MergeBeatOutcome::Finished(merged)),
         };
@@ -1732,10 +1736,11 @@ impl Checkpointer {
                     Some(SstVersionCursor::new(job.old0.handle)),
                     Some(SstVersionCursor::new(job.old1.handle)),
                 ];
-                job.phase = MergePhase::Schedule {
-                    rank: 0,
-                    resume_lo: SstKey::MIN,
-                };
+                self.merge_metadata_cursors = [
+                    Some(SstMetadataCursor::new(job.old0.handle)),
+                    Some(SstMetadataCursor::new(job.old1.handle)),
+                ];
+                job.phase = MergePhase::Schedule { rank: 0 };
                 job.schedule_len = 0;
                 job.count = 0;
                 job.crc = Crc32c::new();
@@ -1838,10 +1843,7 @@ impl Checkpointer {
                 old1,
                 drop_tombstones: at == 0 && !storage.has_active_snapshots(),
                 oldest_snapshot: storage.oldest_snapshot(),
-                phase: MergePhase::Schedule {
-                    rank: 0,
-                    resume_lo: SstKey::MIN,
-                },
+                phase: MergePhase::Schedule { rank: 0 },
                 schedule_len: 0,
                 count: 0,
                 crc: Crc32c::new(),
@@ -1897,29 +1899,34 @@ impl Checkpointer {
         &mut self,
         job: &mut MergeJob,
         rank: u8,
-        resume_lo: SstKey,
     ) -> Result<MergeBeatOutcome, SqlError> {
-        self.sst_arena.reset();
-        let mut reader = SstReader::new(&self.sst_arena).map_err(sst_to_sql)?;
-        let member = if rank == 0 { &job.old0 } else { &job.old1 };
         let scratch = &mut self.merge_scratch;
-        let blocks = &self.blocks;
         let mut overflow = false;
-        let next = reader
-            .scan_versions_bounded(
-                &mut *blocks.lock().expect("block store lock poisoned"),
-                &member.handle,
-                resume_lo,
-                MERGE_SCHEDULE_BEAT_BLOCKS,
-                &mut |key, tombstone| {
-                    if scratch.len() == scratch.capacity() {
-                        overflow = true;
-                        return;
-                    }
-                    scratch.push((key, rank | (u8::from(tombstone) << 1)));
-                },
-            )
-            .map_err(sst_to_sql)?;
+        let mut done = false;
+        for _ in 0..MERGE_SCHEDULE_BEAT_NODES {
+            let step = self.merge_metadata_cursors[usize::from(rank)]
+                .as_mut()
+                .expect("merge metadata cursor initialized with the job")
+                .step(
+                    &mut *self.blocks.lock().expect("block store lock poisoned"),
+                    &mut self.merge_source_index,
+                    &mut self.merge_source_raw,
+                    &mut self.merge_source_decoded[..crate::store::MAX_PAYLOAD],
+                    &mut self.merge_source_column,
+                    &mut |key, tombstone| {
+                        if scratch.len() == scratch.capacity() {
+                            overflow = true;
+                            return;
+                        }
+                        scratch.push((key, rank | (u8::from(tombstone) << 1)));
+                    },
+                )
+                .map_err(sst_to_sql)?;
+            if matches!(step, SstMetadataStep::Done) {
+                done = true;
+                break;
+            }
+        }
         if overflow {
             // The pair's counts under-reported its entries (corruption would
             // show elsewhere); remember it so the scheduler stops proposing
@@ -1930,16 +1937,10 @@ impl Checkpointer {
             }
             return Ok(MergeBeatOutcome::Cancel);
         }
-        job.phase = match (next, rank) {
-            (Some(lo), _) => MergePhase::Schedule {
-                rank,
-                resume_lo: lo,
-            },
-            (None, 0) => MergePhase::Schedule {
-                rank: 1,
-                resume_lo: SstKey::MIN,
-            },
-            (None, _) => {
+        job.phase = match (done, rank) {
+            (false, _) => MergePhase::Schedule { rank },
+            (true, 0) => MergePhase::Schedule { rank: 1 },
+            (true, _) => {
                 // Exact duplicates choose the newer list member.
                 self.merge_scratch
                     .sort_unstable_by_key(|&(key, kind)| (key, kind & 1));
@@ -2447,6 +2448,7 @@ impl Checkpointer {
             slice_writer: SstWriter::new(),
             merge_writer: SstWriter::new(),
             merge_source_cursors: [None, None],
+            merge_metadata_cursors: [None, None],
             merge_source_decoded: vec![0; 2 * crate::store::MAX_PAYLOAD].into_boxed_slice(),
             merge_source_index: vec![0; crate::store::MAX_PAYLOAD].into_boxed_slice(),
             merge_source_raw: vec![0; crate::store::MAX_PAYLOAD].into_boxed_slice(),

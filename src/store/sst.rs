@@ -1207,6 +1207,151 @@ pub(crate) struct SstCursor {
     done: bool,
 }
 
+/// Retained metadata-only scan for merge scheduling. One step reads at most
+/// one index or row descriptor; PAX column extents are never downloaded here.
+pub(crate) struct SstMetadataCursor {
+    handle: SstHandle,
+    leaf: usize,
+    leaf_count: Option<usize>,
+    stage: MetadataReadStage,
+}
+
+#[derive(Clone, Copy)]
+enum MetadataReadStage {
+    Root,
+    Leaf(BlockId),
+    Data { position: usize, count: usize },
+    Done,
+}
+
+pub(crate) enum SstMetadataStep {
+    Progress,
+    Done,
+}
+
+impl SstMetadataCursor {
+    pub(crate) fn new(handle: SstHandle) -> Self {
+        Self {
+            handle,
+            leaf: 0,
+            leaf_count: None,
+            stage: MetadataReadStage::Root,
+        }
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "caller-owned fixed scratch survives waiting reads"
+    )]
+    pub(crate) fn step(
+        &mut self,
+        store: &mut dyn BlockStore,
+        index: &mut [u8],
+        raw: &mut [u8],
+        decoded: &mut [u8],
+        range: &mut [u8],
+        emit: &mut dyn FnMut(SstKey, bool),
+    ) -> Result<SstMetadataStep, SstError> {
+        if self.leaf_count.is_some_and(|count| self.leaf >= count) {
+            self.stage = MetadataReadStage::Done;
+        }
+        match self.stage {
+            MetadataReadStage::Done => return Ok(SstMetadataStep::Done),
+            MetadataReadStage::Root => {
+                load_index(store, &self.handle.index, index)?;
+                let head = u32::from_le_bytes(index[..4].try_into().unwrap());
+                if head == INDEX_ROOT_MAGIC {
+                    let leaves = u32::from_le_bytes(index[4..8].try_into().unwrap()) as usize;
+                    self.leaf_count = Some(leaves);
+                    if self.leaf >= leaves {
+                        self.stage = MetadataReadStage::Done;
+                    } else {
+                        let at = 8 + self.leaf * VERSIONED_ROOT_ENTRY;
+                        let mut id = [0; 32];
+                        id.copy_from_slice(&index[at + 20..at + VERSIONED_ROOT_ENTRY]);
+                        self.stage = MetadataReadStage::Leaf(BlockId(id));
+                    }
+                } else {
+                    self.leaf_count = Some(1);
+                    self.select_leaf(head as usize);
+                }
+            }
+            MetadataReadStage::Leaf(id) => {
+                load_index(store, &id, index)?;
+                let count = u32::from_le_bytes(index[..4].try_into().unwrap());
+                if count == INDEX_ROOT_MAGIC {
+                    return Err(SstError::Store(StoreError::Corrupt(
+                        super::BlockError::Payload,
+                    )));
+                }
+                self.select_leaf(count as usize);
+            }
+            MetadataReadStage::Data { position, count } => {
+                let reference = block_ref_at(index, position, self.handle.uses_packed_references());
+                let (length, kind) = read_data_block_raw_ref(store, reference, raw, range)?;
+                match (self.handle.format, kind) {
+                    (
+                        RowSstFormat::PackedPaxV3 | RowSstFormat::PackedV4,
+                        BlockType::SstDataPaxV2,
+                    ) => {
+                        let layout = pax_layout(&raw[..length])?;
+                        for row in 0..layout.rows() {
+                            let (key, tombstone) = layout.row_key(&raw[..length], row)?;
+                            emit(key, tombstone);
+                        }
+                    }
+                    (
+                        RowSstFormat::DirectV2 | RowSstFormat::PackedV4,
+                        BlockType::SstDataV2 | BlockType::SstDataV2Lz4,
+                    ) => {
+                        let length = decode_data_block(&raw[..length], kind, decoded)?;
+                        let mut entries = DataBlock {
+                            bytes: &decoded[..length],
+                        };
+                        while !entries.bytes.is_empty() {
+                            let entry = entries.next().ok_or(SstError::Store(
+                                StoreError::Corrupt(super::BlockError::Truncated),
+                            ))?;
+                            emit(entry.key, entry.tombstone);
+                        }
+                    }
+                    _ => {
+                        return Err(SstError::Store(StoreError::Corrupt(
+                            super::BlockError::UnknownType,
+                        )));
+                    }
+                }
+                if position + 1 < count {
+                    self.stage = MetadataReadStage::Data {
+                        position: position + 1,
+                        count,
+                    };
+                } else {
+                    self.leaf += 1;
+                    self.stage = MetadataReadStage::Root;
+                }
+            }
+        }
+        if self.leaf_count.is_some_and(|count| self.leaf >= count) {
+            self.stage = MetadataReadStage::Done;
+        }
+        Ok(if matches!(self.stage, MetadataReadStage::Done) {
+            SstMetadataStep::Done
+        } else {
+            SstMetadataStep::Progress
+        })
+    }
+
+    fn select_leaf(&mut self, count: usize) {
+        if count == 0 {
+            self.leaf += 1;
+            self.stage = MetadataReadStage::Root;
+        } else {
+            self.stage = MetadataReadStage::Data { position: 0, count };
+        }
+    }
+}
+
 /// Suspendable physical-version cursor for row compaction.
 ///
 /// The caller owns one decoded buffer per source and keeps it across dispatch
@@ -2778,6 +2923,7 @@ impl<'a> SstReader<'a> {
     /// does not collapse versions of one row. PAX groups expose keys,
     /// tombstones, and row lengths in their descriptor, so compaction's
     /// scheduling pass never reads column extents it cannot use.
+    #[cfg(test)]
     pub(crate) fn scan_versions_bounded(
         &mut self,
         store: &mut dyn BlockStore,
@@ -2842,6 +2988,7 @@ impl<'a> SstReader<'a> {
         Ok(last_key.and_then(SstKey::successor))
     }
 
+    #[cfg(test)]
     fn scan_version_metadata_block(
         &mut self,
         store: &mut dyn BlockStore,
@@ -2895,6 +3042,7 @@ impl<'a> SstReader<'a> {
     /// Loads leaf `ordinal` of the index into the index scratch and returns
     /// its entry count — `None` past the last leaf. A single-block index is
     /// its own leaf 0; a two-level one descends through the root.
+    #[cfg(test)]
     fn load_leaf(
         &mut self,
         store: &mut dyn BlockStore,
@@ -2924,6 +3072,7 @@ impl<'a> SstReader<'a> {
 
     /// The leaf ordinal whose key range covers `rowid` (the last leaf whose
     /// first key does not exceed it; 0 when `rowid` precedes everything).
+    #[cfg(test)]
     fn leaf_for(
         &mut self,
         store: &mut dyn BlockStore,
@@ -4197,6 +4346,130 @@ mod tests {
                 store.requests, reads,
                 "the next row reuses its completed group"
             );
+        });
+    }
+
+    #[test]
+    fn checkpoint_reads_metadata_cursor_emits_versions_once_across_every_wait() {
+        struct WaitingStore {
+            inner: MemoryBlockStore,
+            pending: Option<BlockId>,
+        }
+        impl BlockStore for WaitingStore {
+            fn put(
+                &mut self,
+                bytes: &[u8],
+                kind: BlockType,
+                lsn: u64,
+            ) -> Result<BlockId, StoreError> {
+                self.inner.put(bytes, kind, lsn)
+            }
+            fn get(
+                &mut self,
+                id: &BlockId,
+                into: &mut [u8],
+            ) -> Result<(usize, BlockType), StoreError> {
+                if self.pending == Some(*id) {
+                    self.pending = None;
+                    self.inner.get(id, into)
+                } else {
+                    self.pending = Some(*id);
+                    into.fill(0xee);
+                    Err(StoreError::NotReady)
+                }
+            }
+            fn get_packed(
+                &mut self,
+                container: &BlockId,
+                offset: usize,
+                length: usize,
+                expected: &BlockId,
+                into: &mut [u8],
+                scratch: &mut [u8],
+            ) -> Result<(usize, BlockType), StoreError> {
+                let (size, kind) = self.get(container, scratch)?;
+                assert_eq!(kind, BlockType::SstPackedContainerV1);
+                let block = super::super::decode_packed_extent(
+                    &scratch[..size],
+                    offset,
+                    length,
+                    expected,
+                    into,
+                )?;
+                assert_ne!(
+                    block.1,
+                    BlockType::SstDataPaxColumnV1,
+                    "scheduling must not fetch column extents"
+                );
+                Ok(block)
+            }
+        }
+        let (_budget, mut inner) = store();
+        let mut writer = SstWriter::new();
+        writer.set_pax_schema(&[ColType::Int4]).unwrap();
+        let mut expected = Vec::with_capacity(21);
+        let mut row = [0; 7];
+        for rowid in 1..=20 {
+            let key = SstKey::at(rowid, 9);
+            if rowid == 10 {
+                writer.append_tombstone_version(&mut inner, key).unwrap();
+                expected.push((key, true));
+            } else {
+                rowenc::encode(&[Datum::Int4(rowid as i32)], &mut row);
+                writer.append_version(&mut inner, key, &row).unwrap();
+                expected.push((key, false));
+                if rowid == 5 {
+                    let prior = SstKey::at(rowid, 7);
+                    writer.append_version(&mut inner, prior, &row).unwrap();
+                    expected.push((prior, false));
+                }
+            }
+            if rowid == 10 {
+                writer.flush_data(&mut inner).unwrap();
+                writer.flush_index_leaf(&mut inner).unwrap();
+            }
+        }
+        writer.flush_data(&mut inner).unwrap();
+        writer.flush_index_leaf(&mut inner).unwrap();
+        let handle = writer.finish(&mut inner).unwrap().unwrap();
+        let turns = 4 * inner.len() + 16;
+        let mut store = WaitingStore {
+            inner,
+            pending: None,
+        };
+        let mut cursor = SstMetadataCursor::new(handle);
+        let mut index = vec![0; MAX_PAYLOAD];
+        let mut raw = vec![0; MAX_PAYLOAD];
+        let mut decoded = vec![0; MAX_PAYLOAD];
+        let mut range = vec![0; MAX_PAYLOAD];
+        crate::mem::guard::forbid_alloc(|| {
+            let mut seen = 0;
+            let mut completed = false;
+            for _ in 0..turns {
+                match cursor.step(
+                    &mut store,
+                    &mut index,
+                    &mut raw,
+                    &mut decoded,
+                    &mut range,
+                    &mut |key, tombstone| {
+                        assert_eq!((key, tombstone), expected[seen]);
+                        seen += 1;
+                    },
+                ) {
+                    Err(SstError::Store(StoreError::NotReady)) | Ok(SstMetadataStep::Progress) => {}
+                    Ok(SstMetadataStep::Done) => {
+                        completed = true;
+                        break;
+                    }
+                    Err(error) => panic!("metadata scan failed: {error:?}"),
+                }
+            }
+            assert!(
+                completed,
+                "metadata cursor must finish without restarting completed reads"
+            );
+            assert_eq!(seen, expected.len());
         });
     }
 

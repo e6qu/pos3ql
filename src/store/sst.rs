@@ -1213,13 +1213,47 @@ pub(crate) struct SstCursor {
 /// beats. Advancing to another scheduled key then reuses the current PAX group
 /// or canonical row block instead of repeating a point lookup and decoding the
 /// same immutable group.
-#[derive(Clone, Copy)]
 pub(crate) struct SstVersionCursor {
     handle: SstHandle,
     offset: usize,
     data_len: usize,
     loaded_ref: Option<DataBlockRef>,
     chain: ChainReadProgress,
+    group_target: Option<SstKey>,
+    group_stage: VersionGroupStage,
+    pax: PaxDecodeProgress,
+}
+
+#[derive(Clone, Copy)]
+enum VersionGroupStage {
+    Root,
+    Leaf(BlockId),
+    Data(DataBlockRef),
+    Columns {
+        reference: DataBlockRef,
+        raw_len: usize,
+    },
+}
+
+struct PaxDecodeProgress {
+    next_column: usize,
+    column_ends: [u32; MAX_COLUMNS],
+    loaded_container: Option<(BlockId, usize)>,
+}
+
+impl PaxDecodeProgress {
+    fn new() -> Self {
+        Self {
+            next_column: 0,
+            column_ends: [0; MAX_COLUMNS],
+            loaded_container: None,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.next_column = 0;
+        self.loaded_container = None;
+    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -1258,6 +1292,9 @@ impl SstVersionCursor {
             data_len: 0,
             loaded_ref: None,
             chain: ChainReadProgress::default(),
+            group_target: None,
+            group_stage: VersionGroupStage::Root,
+            pax: PaxDecodeProgress::new(),
         }
     }
 
@@ -1275,37 +1312,113 @@ impl SstVersionCursor {
         column: &mut [u8],
         assembly: &mut [u8],
     ) -> Result<Option<(DataBlockRef, usize, BlockType)>, SstError> {
-        let Some(reference) = data_block_ref_for_key(store, &self.handle, index, target)? else {
-            return Ok(None);
-        };
-        // The sparse index mapped `target` to the group already exhausted
-        // without finding it. Reloading would loop on an inconsistent caller.
-        if self.loaded_ref == Some(reference) {
-            return Ok(None);
+        if self.group_target.is_some_and(|selected| selected != target) {
+            return Err(SstError::KeyOutOfOrder);
         }
-        let (raw_len, block_type) = read_data_block_raw_ref(store, reference, raw, column)?;
-        self.data_len = match (self.handle.format, block_type) {
-            (RowSstFormat::PackedPaxV3 | RowSstFormat::PackedV4, BlockType::SstDataPaxV2) => {
-                decode_pax_v2(store, &raw[..raw_len], decoded, column, assembly)?
+        self.group_target = Some(target);
+        loop {
+            match self.group_stage {
+                VersionGroupStage::Root | VersionGroupStage::Leaf(_) => {
+                    let id = match self.group_stage {
+                        VersionGroupStage::Root => self.handle.index,
+                        VersionGroupStage::Leaf(id) => id,
+                        _ => unreachable!(),
+                    };
+                    load_index(store, &id, index)?;
+                    let head = u32::from_le_bytes(index[..4].try_into().unwrap());
+                    if head == INDEX_ROOT_MAGIC {
+                        if !matches!(self.group_stage, VersionGroupStage::Root) {
+                            return Err(SstError::Store(StoreError::Corrupt(
+                                super::BlockError::Payload,
+                            )));
+                        }
+                        let leaves = u32::from_le_bytes(index[4..8].try_into().unwrap()) as usize;
+                        let leaf = root_leaf_containing(index, leaves, target).unwrap_or(0);
+                        let at = 8 + leaf * VERSIONED_ROOT_ENTRY;
+                        let mut id = [0; 32];
+                        id.copy_from_slice(&index[at + 20..at + VERSIONED_ROOT_ENTRY]);
+                        self.group_stage = VersionGroupStage::Leaf(BlockId(id));
+                    } else {
+                        let reference = block_containing(
+                            index,
+                            head as usize,
+                            target,
+                            self.handle.uses_packed_references(),
+                        )
+                        .map(|entry| {
+                            block_ref_at(index, entry, self.handle.uses_packed_references())
+                        });
+                        let Some(reference) = reference else {
+                            self.group_target = None;
+                            self.group_stage = VersionGroupStage::Root;
+                            return Ok(None);
+                        };
+                        if self.loaded_ref == Some(reference) {
+                            self.group_target = None;
+                            self.group_stage = VersionGroupStage::Root;
+                            return Ok(None);
+                        }
+                        self.group_stage = VersionGroupStage::Data(reference);
+                    }
+                }
+                VersionGroupStage::Data(reference) => {
+                    let (raw_len, block_type) =
+                        read_data_block_raw_ref(store, reference, raw, column)?;
+                    match (self.handle.format, block_type) {
+                        (
+                            RowSstFormat::PackedPaxV3 | RowSstFormat::PackedV4,
+                            BlockType::SstDataPaxV2,
+                        ) => {
+                            self.pax.clear();
+                            self.group_stage = VersionGroupStage::Columns { reference, raw_len };
+                        }
+                        (
+                            RowSstFormat::DirectV2 | RowSstFormat::PackedV4,
+                            BlockType::SstDataV2 | BlockType::SstDataV2Lz4,
+                        ) => {
+                            let length = decode_data_block(&raw[..raw_len], block_type, decoded)?;
+                            self.finish_group_read(reference, length)?;
+                            return Ok(Some((reference, raw_len, block_type)));
+                        }
+                        _ => {
+                            return Err(SstError::Store(StoreError::Corrupt(
+                                super::BlockError::UnknownType,
+                            )));
+                        }
+                    }
+                }
+                VersionGroupStage::Columns { reference, raw_len } => {
+                    let length = decode_pax_v2(
+                        store,
+                        &raw[..raw_len],
+                        decoded,
+                        column,
+                        assembly,
+                        &mut self.pax,
+                    )?;
+                    self.finish_group_read(reference, length)?;
+                    return Ok(Some((reference, raw_len, BlockType::SstDataPaxV2)));
+                }
             }
-            (
-                RowSstFormat::DirectV2 | RowSstFormat::PackedV4,
-                BlockType::SstDataV2 | BlockType::SstDataV2Lz4,
-            ) => decode_data_block(&raw[..raw_len], block_type, decoded)?,
-            _ => {
-                return Err(SstError::Store(StoreError::Corrupt(
-                    super::BlockError::UnknownType,
-                )));
-            }
-        };
-        self.offset = 0;
-        self.loaded_ref = Some(reference);
-        if self.data_len == 0 {
+        }
+    }
+
+    fn finish_group_read(
+        &mut self,
+        reference: DataBlockRef,
+        length: usize,
+    ) -> Result<(), SstError> {
+        if length == 0 {
             return Err(SstError::Store(StoreError::Corrupt(
                 super::BlockError::Truncated,
             )));
         }
-        Ok(Some((reference, raw_len, block_type)))
+        self.data_len = length;
+        self.offset = 0;
+        self.loaded_ref = Some(reference);
+        self.group_target = None;
+        self.group_stage = VersionGroupStage::Root;
+        Ok(())
     }
 
     /// Loads the complete group containing `target` when the cursor is at a
@@ -1886,13 +1999,22 @@ fn decode_pax_v2(
     output: &mut [u8],
     column_scratch: &mut [u8],
     range_scratch: &mut [u8],
+    progress: &mut PaxDecodeProgress,
 ) -> Result<usize, SstError> {
     let corrupt = || SstError::Store(StoreError::Corrupt(super::BlockError::Payload));
     let layout = pax_layout(input)?;
     let mut extents = [None; MAX_COLUMNS];
     let mut extent_len = 0usize;
-    let mut loaded_container: Option<(BlockId, usize)> = None;
     for (column, extent) in extents.iter_mut().enumerate().take(layout.columns()) {
+        if column < progress.next_column {
+            let end = progress.column_ends[column] as usize;
+            if end < extent_len || end > range_scratch.len() {
+                return Err(corrupt());
+            }
+            *extent = Some((extent_len, end));
+            extent_len = end;
+            continue;
+        }
         let reference = layout.column_ref(input, column)?;
         let (column_len, block_type) = match reference {
             DataBlockRef::Packed {
@@ -1901,16 +2023,17 @@ fn decode_pax_v2(
                 length,
                 id,
             } => {
-                let container_len = if let Some((loaded, length)) = loaded_container
+                let container_len = if let Some((loaded, length)) = progress.loaded_container
                     && loaded == container
                 {
                     length
                 } else {
+                    progress.loaded_container = None;
                     let (length, block_type) = store.get(&container, column_scratch)?;
                     if block_type != BlockType::SstPackedContainerV1 {
                         return Err(corrupt());
                     }
-                    loaded_container = Some((container, length));
+                    progress.loaded_container = Some((container, length));
                     length
                 };
                 super::decode_packed_extent(
@@ -1933,6 +2056,8 @@ fn decode_pax_v2(
         range_scratch[extent_len..end].copy_from_slice(&output[..column_len]);
         *extent = Some((extent_len, end));
         extent_len = end;
+        progress.column_ends[column] = u32::try_from(end).map_err(|_| SstError::RowTooLarge)?;
+        progress.next_column = column + 1;
     }
     let mut written = 0usize;
     for row in 0..layout.rows() {
@@ -1970,6 +2095,7 @@ fn decode_pax_v2(
         }
         written = row_end;
     }
+    progress.clear();
     Ok(written)
 }
 
@@ -2310,6 +2436,7 @@ impl<'a> SstReader<'a> {
                     self.decoded_scratch,
                     self.column_scratch,
                     self.assembly,
+                    &mut PaxDecodeProgress::new(),
                 )?
             }
             (
@@ -2918,34 +3045,6 @@ pub(crate) fn locate_data_block_ref(
     ordinal: usize,
 ) -> Result<Option<DataBlockRef>, SstError> {
     Ok(locate_data_block_with_next(store, handle, buf, ordinal)?.map(|(reference, _)| reference))
-}
-
-/// Resolves the one data block whose key range can contain `key`.
-/// Compaction cursors use this when the next retained version skips whole
-/// source blocks, preserving the per-beat read bound without a Bloom lookup.
-fn data_block_ref_for_key(
-    store: &mut dyn BlockStore,
-    handle: &SstHandle,
-    buf: &mut [u8],
-    key: SstKey,
-) -> Result<Option<DataBlockRef>, SstError> {
-    load_index(store, &handle.index, buf)?;
-    let head = u32::from_le_bytes(buf[0..4].try_into().unwrap());
-    let count = if head == INDEX_ROOT_MAGIC {
-        let leaves = u32::from_le_bytes(buf[4..8].try_into().unwrap()) as usize;
-        let leaf = root_leaf_containing(buf, leaves, key).unwrap_or(0);
-        let at = 8 + leaf * VERSIONED_ROOT_ENTRY;
-        let mut id = [0u8; 32];
-        id.copy_from_slice(&buf[at + 16 + 4..at + VERSIONED_ROOT_ENTRY]);
-        load_index(store, &BlockId(id), buf)?;
-        u32::from_le_bytes(buf[0..4].try_into().unwrap()) as usize
-    } else {
-        head as usize
-    };
-    Ok(
-        block_containing(buf, count, key, handle.uses_packed_references())
-            .map(|entry| block_ref_at(buf, entry, handle.uses_packed_references())),
-    )
 }
 
 /// Resolves one data-block ordinal and, when it shares an index leaf with a
@@ -3980,6 +4079,124 @@ mod tests {
             assert_eq!(probe.key, key);
             assert_eq!(probe.len, Some(5));
             assert_eq!(&out[..5], b"three");
+        });
+    }
+
+    #[test]
+    fn checkpoint_reads_version_cursor_resumes_root_leaf_and_column_downloads_without_cache() {
+        struct WaitingStore {
+            inner: MemoryBlockStore,
+            pending: Option<BlockId>,
+            root: BlockId,
+            root_requests: usize,
+            requests: usize,
+        }
+        impl BlockStore for WaitingStore {
+            fn put(
+                &mut self,
+                bytes: &[u8],
+                kind: BlockType,
+                lsn: u64,
+            ) -> Result<BlockId, StoreError> {
+                self.inner.put(bytes, kind, lsn)
+            }
+            fn get(
+                &mut self,
+                id: &BlockId,
+                into: &mut [u8],
+            ) -> Result<(usize, BlockType), StoreError> {
+                self.requests += 1;
+                self.root_requests += usize::from(*id == self.root);
+                if self.pending == Some(*id) {
+                    self.pending = None;
+                    self.inner.get(id, into)
+                } else {
+                    self.pending = Some(*id);
+                    into.fill(0xee);
+                    Err(StoreError::NotReady)
+                }
+            }
+        }
+        let (_budget, mut inner) = store();
+        let schema = [ColType::Int4; MAX_COLUMNS];
+        let values: [_; MAX_COLUMNS] = core::array::from_fn(|column| Datum::Int4(column as i32));
+        let mut row = vec![0; rowenc::encoded_len(&values)];
+        rowenc::encode(&values, &mut row);
+        let mut writer = SstWriter::new();
+        writer.set_pax_schema(&schema).unwrap();
+        for first in [1, 33] {
+            for rowid in first..first + 32 {
+                writer
+                    .append_version(&mut inner, SstKey::at(rowid, 9), &row)
+                    .unwrap();
+            }
+            writer.flush_data(&mut inner).unwrap();
+            writer.flush_index_leaf(&mut inner).unwrap();
+        }
+        let handle = writer.finish(&mut inner).unwrap().unwrap();
+        let mut store = WaitingStore {
+            inner,
+            pending: None,
+            root: handle.index,
+            root_requests: 0,
+            requests: 0,
+        };
+        let mut cursor = SstVersionCursor::new(handle);
+        let mut index = vec![0; MAX_PAYLOAD];
+        let mut raw = vec![0; MAX_PAYLOAD];
+        let mut decoded = vec![0; MAX_PAYLOAD];
+        let mut column = vec![0; MAX_PAYLOAD];
+        let mut out = vec![0; MAX_ASSEMBLED];
+        crate::mem::guard::forbid_alloc(|| {
+            let mut completed = false;
+            for _ in 0..32 {
+                match cursor.copy_exact(
+                    &mut store,
+                    SstKey::at(1, 9),
+                    &mut index,
+                    &mut raw,
+                    &mut decoded,
+                    &mut column,
+                    &mut out,
+                ) {
+                    Err(SstError::Store(StoreError::NotReady)) => {}
+                    result => {
+                        let probe = result.unwrap().unwrap();
+                        assert_eq!(probe.key, SstKey::at(1, 9));
+                        assert_eq!(probe.len, Some(row.len() as u32));
+                        assert_eq!(&out[..row.len()], row);
+                        completed = true;
+                        break;
+                    }
+                }
+            }
+            assert!(
+                completed,
+                "waiting reads must not restart at an earlier request"
+            );
+            assert_eq!(
+                store.root_requests, 2,
+                "the completed root is never fetched again"
+            );
+            let reads = store.requests;
+            let probe = cursor
+                .copy_exact(
+                    &mut store,
+                    SstKey::at(2, 9),
+                    &mut index,
+                    &mut raw,
+                    &mut decoded,
+                    &mut column,
+                    &mut out,
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(probe.key, SstKey::at(2, 9));
+            assert_eq!(&out[..row.len()], row);
+            assert_eq!(
+                store.requests, reads,
+                "the next row reuses its completed group"
+            );
         });
     }
 

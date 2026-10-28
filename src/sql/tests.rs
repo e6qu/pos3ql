@@ -1805,6 +1805,27 @@ fn catalog_lifetime_privileges_and_partition_triggers_match_postgresql() {
     }
 }
 
+#[test]
+fn timezone_abbreviation_input_and_catalogs_match_postgresql_without_legacy_zone_files() {
+    let fixture = include_str!("../../tests/external/differential/201_timezone_abbreviations.sql");
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let config = catalog_lifetime_config(&format!("timezone-abbreviations-{mode:?}"), mode);
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        let output = session.success(&mut engine, fixture, true);
+        assert_eq!(
+            data_rows(&output),
+            ["t"; 11],
+            "{mode:?}: {}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+}
+
 const CATALOG_LIFETIME_DEFINITION_BEHAVIOR: &str = "SELECT lifetime_query(5); SELECT pg_get_expr(polqual, polrelid) FROM pg_policy WHERE polname='lifetime_row_policy'; SELECT ev_enabled FROM pg_rewrite WHERE rulename='lifetime_rewrite'";
 
 fn privilege_partition_inventory(
@@ -19506,7 +19527,8 @@ fn configured_acl_capacities_exceed_legacy_limits_and_survive_object_cold_recove
     const OBJECT_GRANTEES: usize = 60;
     const OBJECT_ACLS: usize = 3 + 1 + OBJECT_TABLES * (OBJECT_GRANTEES + 1);
     const COLUMN_ACLS: usize = USER_ROLES * 14;
-    const DEFAULT_ACLS: usize = 5 * 60 - 4;
+    // Every owner's unchanged baseline grant needs no exception entry.
+    const DEFAULT_ACLS: usize = 5 * (60 - 1);
     const PARAMETER_ACLS: usize = 3 * (60 + 1);
 
     let mut config = test_config("configured-acl-capacities");
@@ -19693,7 +19715,7 @@ fn configured_acl_capacities_exceed_legacy_limits_and_survive_object_cold_recove
             "ALTER DEFAULT PRIVILEGES FOR ROLE scaled_acl_role_006 \
              GRANT SELECT ON TABLES TO scaled_acl_role_001, scaled_acl_role_002, \
              scaled_acl_role_003, scaled_acl_role_004, scaled_acl_role_005",
-            "too many default privilege entries (limit 296)",
+            "too many default privilege entries (limit 295)",
         ),
         (
             "GRANT SET ON PARAMETER statement_timeout TO scaled_acl_role_001",
@@ -26720,7 +26742,7 @@ fn default_privileges_apply_additively_and_replay_from_wal() {
     );
     assert_eq!(
         data_rows(&output),
-        ["T|t|2", "r|t|2", "r|f|1", "1", "2", "f"],
+        ["T|t|1", "r|t|2", "r|f|1", "1", "2", "f"],
         "{}",
         String::from_utf8_lossy(&output)
     );
@@ -30821,7 +30843,8 @@ fn partition_before_trigger_clones_fire_after_routing_and_cannot_move_rows() {
 
 #[test]
 fn partition_trigger_clones_share_one_postgresql_name_order() {
-    let fixture = include_str!("../../tests/external/differential/200_partition_trigger_dispatch.sql");
+    let fixture =
+        include_str!("../../tests/external/differential/200_partition_trigger_dispatch.sql");
     for mode in [
         crate::config::TransactionMode::Mvcc,
         crate::config::TransactionMode::Locking,
@@ -86114,7 +86137,7 @@ fn degree_special_and_random_math_matches_postgresql_18() {
         String::from_utf8_lossy(&landmarks)
     );
     // PostgreSQL delegates these transcendental functions to the platform
-    // math library, whose correctly rounded result can differ in the last bit.
+    // math library, whose result can differ in the last bits across hosts.
     let approx = |e: &mut Engine, b: &mut Budget, sql: &str, want: f64| {
         let got: f64 = data_rows(&run_with(e, b, sql))[0]
             .parse()

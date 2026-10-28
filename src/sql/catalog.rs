@@ -29305,7 +29305,7 @@ fn pg_timezone_names<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
     let mut count = 0usize;
     let mut found_error = None;
     let complete = crate::sql::tzif::visit_current(
-        crate::sql::datetime::now_micros(),
+        crate::sql::datetime::transaction_micros(),
         |name, offset, abbreviation, is_dst| {
             if found_error.is_some() {
                 return;
@@ -29359,16 +29359,26 @@ fn pg_timezone_names<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
 
 fn pg_timezone_abbrevs<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
     let definition = schema::require("pg_timezone_abbrevs", false);
+    let defaults = super::timezone_abbreviation_data::DEFAULT;
+    let now = super::datetime::transaction_micros();
     let rows = arena
-        .alloc_slice_with(
-            crate::sql::catalog_metadata::TIMEZONE_ABBREVIATIONS.len(),
-            |_| &[] as &[Datum],
-        )
+        .alloc_slice_with(defaults.len() + super::tzif::MAX_ABBREVIATIONS, |_| {
+            &[] as &[Datum]
+        })
         .map_err(|_| arena_full())?;
-    for (target, &(abbreviation, offset, is_dst)) in rows
-        .iter_mut()
-        .zip(crate::sql::catalog_metadata::TIMEZONE_ABBREVIATIONS)
-    {
+    let mut count = 0;
+    let mut append = |abbreviation: &str, offset: i32, is_dst: bool| -> Result<(), SqlError> {
+        if abbreviation.is_empty() || !abbreviation.bytes().all(|byte| byte.is_ascii_uppercase()) {
+            return Ok(());
+        }
+        if rows[..count].iter().any(
+            |values| matches!(values.first(), Some(Datum::Text(name)) if *name == abbreviation),
+        ) {
+            return Ok(());
+        }
+        let target = rows
+            .get_mut(count)
+            .ok_or_else(|| catalog_capacity_exceeded("pg_timezone_abbrevs"))?;
         *target = row(
             &[
                 text(abbreviation, arena)?,
@@ -29381,8 +29391,34 @@ fn pg_timezone_abbrevs<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError>
             ],
             arena,
         )?;
+        count += 1;
+        Ok(())
+    };
+    let mut error = None;
+    super::timezone::session().visit_abbreviations(now, |name, offset, is_dst| {
+        if error.is_none() {
+            error = append(name.as_str(), offset, is_dst).err();
+        }
+    });
+    if let Some(error) = error {
+        return Err(error);
     }
-    finish(definition, rows, arena)
+    for &(name, _) in defaults {
+        let zone = super::timezone::lookup_abbreviation(name).ok_or_else(|| {
+            sql_err!(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "time zone abbreviation \"{}\" requires unavailable zone data",
+                name
+            )
+        })?;
+        let (offset, _, is_dst) = zone.resolve_info(now);
+        append(name, offset, is_dst)?;
+    }
+    rows[..count].sort_unstable_by(|left, right| match (left[0], right[0]) {
+        (Datum::Text(left), Datum::Text(right)) => left.cmp(right),
+        _ => unreachable!("abbreviation catalog names are text"),
+    });
+    finish(definition, &rows[..count], arena)
 }
 
 fn pg_type<'a>(

@@ -57,6 +57,7 @@ pub mod snapshot;
 mod spgist_catalog;
 pub(crate) mod statistics;
 pub mod timezone;
+mod timezone_abbreviation_data;
 pub mod to_char;
 pub(crate) mod two_phase;
 pub mod txn;

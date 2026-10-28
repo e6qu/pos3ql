@@ -13,12 +13,27 @@ SELECT asind(-1), asind(-.5), asind(0), asind(.5), asind(1),
 SELECT atan2d(1,1), atan2d(1,-1), atan2d(-1,-1), atan2d(-1,1),
        atan2d(0,-1);
 
-SELECT erf('-Infinity'::float8), erf(-1), erf(0), erf(1),
-       erf('Infinity'::float8),
-       erfc('-Infinity'::float8), erfc(-1), erfc(0), erfc(1),
-       erfc('Infinity'::float8);
-SELECT gamma(.5), gamma(1), gamma(5), gamma(5.5),
-       lgamma(.5), lgamma(1), lgamma(5), lgamma(5.5);
+SELECT erf('-Infinity'::float8), erf(0), erf('Infinity'::float8),
+       erfc('-Infinity'::float8), erfc(0), erfc('Infinity'::float8),
+       gamma(1), gamma(5), lgamma(1);
+-- Finite C-library results can vary across hosts. Check their error explicitly;
+-- keep exact landmarks, exceptional values and SQL errors as exact comparisons.
+-- https://www.postgresql.org/docs/18/functions-math.html
+SELECT check_name,
+       abs(actual - expected) <=
+         4 * 2.220446049250313e-16::float8 * greatest(1::float8, abs(expected))
+FROM (VALUES
+  ('erf(-1)', erf(-1), -0.8427007929497149::float8),
+  ('erf(1)', erf(1), 0.8427007929497149::float8),
+  ('erfc(-1)', erfc(-1), 1.842700792949715::float8),
+  ('erfc(1)', erfc(1), 0.15729920705028513::float8),
+  ('gamma(.5)', gamma(.5), 1.772453850905516::float8),
+  ('gamma(5.5)', gamma(5.5), 52.34277778455352::float8),
+  ('lgamma(.5)', lgamma(.5), 0.5723649429247001::float8),
+  ('lgamma(5)', lgamma(5), 3.1780538303479458::float8),
+  ('lgamma(5.5)', lgamma(5.5), 3.9578139676187165::float8)
+) AS checks(check_name, actual, expected)
+ORDER BY check_name;
 
 SELECT setseed(0.5);
 SELECT random(), random();
@@ -52,7 +67,9 @@ CREATE TABLE numeric_math_complete (
 CREATE INDEX numeric_math_sine_idx ON numeric_math_complete (sind(angle));
 INSERT INTO numeric_math_complete (id, angle) VALUES
   (1, 0), (2, 30), (3, 90), (4, 180), (5, 270);
-SELECT id, angle, sine, error_value
+-- This output checks saved/generated values to twelve decimal places. The
+-- direct special-function checks above retain a much tighter error bound.
+SELECT id, angle, sine, round(error_value::numeric, 12)
 FROM numeric_math_complete ORDER BY sind(angle), id;
 UPDATE numeric_math_complete SET angle = angle + 30 WHERE id IN (1,2);
 SELECT id, sine FROM numeric_math_complete

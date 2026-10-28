@@ -212,6 +212,17 @@ impl Storage {
                     && matches!(trigger.level, crate::sql::ast::TriggerLevel::Row)
                     && self.table_slot_visible_to(table, txn.txid)
                     && matches!(trigger.target, TriggerTarget::Table(parent) if self.partition_descends_from(table, usize::from(parent), txn.txid));
+                if desired
+                    && current.is_some_and(|image| {
+                        image.trigger.created_at() != trigger.created_at
+                            || image.table != self.table_position(table)
+                    })
+                {
+                    return Err(sql_err!(
+                        sqlstate::DATA_EXCEPTION,
+                        "inherited trigger selects a replaced object"
+                    ));
+                }
                 let change = if desired && current.is_none() {
                     let TriggerTarget::Table(parent) = trigger.target else {
                         unreachable!()

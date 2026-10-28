@@ -1805,11 +1805,23 @@ fn catalog_lifetime_privileges_and_partition_triggers_match_postgresql() {
     }
 }
 
+fn privilege_partition_inventory(
+    engine: &mut Engine,
+    session: &mut ConfiguredTransactionSession,
+) -> Vec<String> {
+    let output = session.success(engine,
+        "SELECT oid, roleid, member, grantor FROM pg_auth_members WHERE roleid='lifetime_member_group'::regrole; SELECT oid, defaclacl FROM pg_default_acl WHERE defaclnamespace='lifetime_privileges'::regnamespace; SELECT oid, tgparentid, tgenabled FROM pg_trigger WHERE tgname='lifetime_partition_hook'", true);
+    // Compare catalogs as sets. SQL ORDER BY uploads temporary sorter blocks;
+    // the simulator's remote objects allocate outside the guarded client path.
+    let mut rows = data_rows(&output);
+    rows.sort_unstable();
+    rows
+}
+
 #[test]
 fn catalog_lifetime_privileges_and_partition_triggers_survive_copies_and_empty_disk() {
     let fixture =
         include_str!("../../tests/external/differential/199_privilege_and_partition_lifetimes.sql");
-    const INVENTORY: &str = "SELECT oid, roleid, member, grantor FROM pg_auth_members WHERE roleid='lifetime_member_group'::regrole ORDER BY oid; SELECT oid, defaclacl FROM pg_default_acl WHERE defaclnamespace='lifetime_privileges'::regnamespace ORDER BY oid; SELECT oid, tgparentid, tgenabled FROM pg_trigger WHERE tgname='lifetime_partition_hook' ORDER BY oid";
     for checkpoint in [false, true] {
         for mode in [
             crate::config::TransactionMode::Mvcc,
@@ -1846,11 +1858,11 @@ fn catalog_lifetime_privileges_and_partition_triggers_survive_copies_and_empty_d
                         assert_eq!(data_rows(&output), ["t"], "{sql}");
                     }
                 }
-                source_inventory = data_rows(&session.success(&mut engine, INVENTORY, true));
+                source_inventory = privilege_partition_inventory(&mut engine, &mut session);
                 assert_eq!(source_inventory.len(), 5);
                 session.success(&mut engine, "BEGIN; SAVEPOINT lifetime_before; REVOKE lifetime_member_group FROM lifetime_member_second; ALTER DEFAULT PRIVILEGES IN SCHEMA lifetime_privileges REVOKE SELECT ON TABLES FROM lifetime_member_first; ALTER TABLE lifetime_partition_root DETACH PARTITION lifetime_partition_child; ROLLBACK TO lifetime_before; COMMIT", false);
                 assert_eq!(
-                    data_rows(&session.success(&mut engine, INVENTORY, true)),
+                    privilege_partition_inventory(&mut engine, &mut session),
                     source_inventory
                 );
                 session.success(
@@ -1866,17 +1878,17 @@ fn catalog_lifetime_privileges_and_partition_triggers_survive_copies_and_empty_d
                     .oid;
                 engine.select_database(target).unwrap();
                 assert_eq!(
-                    data_rows(&session.success(&mut engine, INVENTORY, true)),
+                    privilege_partition_inventory(&mut engine, &mut session),
                     source_inventory
                 );
                 session.success(&mut engine, "ALTER DEFAULT PRIVILEGES IN SCHEMA lifetime_privileges GRANT INSERT ON TABLES TO lifetime_member_second; ALTER TABLE lifetime_partition_root DETACH PARTITION lifetime_partition_child; ALTER TABLE lifetime_partition_root ATTACH PARTITION lifetime_partition_child FOR VALUES FROM (0) TO (10); ALTER TABLE lifetime_partition_child DISABLE TRIGGER lifetime_partition_hook", false);
-                copied_inventory = data_rows(&session.success(&mut engine, INVENTORY, true));
+                copied_inventory = privilege_partition_inventory(&mut engine, &mut session);
                 assert_ne!(copied_inventory, source_inventory);
                 engine
                     .select_database(crate::storage::DatabaseOid::TEMPLATE1)
                     .unwrap();
                 assert_eq!(
-                    data_rows(&session.success(&mut engine, INVENTORY, true)),
+                    privilege_partition_inventory(&mut engine, &mut session),
                     source_inventory
                 );
                 if checkpoint {
@@ -1895,7 +1907,7 @@ fn catalog_lifetime_privileges_and_partition_triggers_survive_copies_and_empty_d
                 ] {
                     engine.select_database(database).unwrap();
                     assert_eq!(
-                        &data_rows(&session.success(&mut engine, INVENTORY, true)),
+                        &privilege_partition_inventory(&mut engine, &mut session),
                         expected
                     );
                 }
@@ -1923,7 +1935,6 @@ fn catalog_lifetime_privileges_and_partition_triggers_survive_copies_and_empty_d
 fn catalog_lifetime_privileges_and_partition_triggers_keep_prepared_changes_private() {
     let fixture =
         include_str!("../../tests/external/differential/199_privilege_and_partition_lifetimes.sql");
-    const INVENTORY: &str = "SELECT oid, member, grantor FROM pg_auth_members WHERE roleid='lifetime_member_group'::regrole ORDER BY oid; SELECT oid, defaclacl FROM pg_default_acl WHERE defaclnamespace='lifetime_privileges'::regnamespace; SELECT oid, tgparentid, tgenabled FROM pg_trigger WHERE tgname='lifetime_partition_hook' ORDER BY oid";
     for checkpoint in [false, true] {
         for commit in [false, true] {
             for mode in [
@@ -1954,14 +1965,14 @@ fn catalog_lifetime_privileges_and_partition_triggers_keep_prepared_changes_priv
                     {
                         session.success(&mut engine, sql, false);
                     }
-                    before = data_rows(&session.success(&mut engine, INVENTORY, true));
+                    before = privilege_partition_inventory(&mut engine, &mut session);
                     session.success(&mut engine, "BEGIN; REVOKE lifetime_member_group FROM lifetime_member_second; GRANT lifetime_member_group TO lifetime_member_second; ALTER DEFAULT PRIVILEGES IN SCHEMA lifetime_privileges REVOKE SELECT ON TABLES FROM lifetime_member_first; ALTER DEFAULT PRIVILEGES IN SCHEMA lifetime_privileges GRANT SELECT ON TABLES TO lifetime_member_first; ALTER TABLE lifetime_partition_root DETACH PARTITION lifetime_partition_child; ALTER TABLE lifetime_partition_root ATTACH PARTITION lifetime_partition_child FOR VALUES FROM (0) TO (10); ALTER TABLE lifetime_partition_child DISABLE TRIGGER lifetime_partition_hook", false);
-                    after = data_rows(&session.success(&mut engine, INVENTORY, true));
+                    after = privilege_partition_inventory(&mut engine, &mut session);
                     assert_ne!(before, after);
                     let mut observer = ConfiguredTransactionSession::new(&config, &mut budget)
                         .with_connection_id(2);
                     assert_eq!(
-                        data_rows(&observer.success(&mut engine, INVENTORY, true)),
+                        privilege_partition_inventory(&mut engine, &mut observer),
                         before
                     );
                     session.success(
@@ -1970,7 +1981,7 @@ fn catalog_lifetime_privileges_and_partition_triggers_keep_prepared_changes_priv
                         false,
                     );
                     assert_eq!(
-                        data_rows(&observer.success(&mut engine, INVENTORY, true)),
+                        privilege_partition_inventory(&mut engine, &mut observer),
                         before
                     );
                     if checkpoint {
@@ -1984,7 +1995,7 @@ fn catalog_lifetime_privileges_and_partition_triggers_keep_prepared_changes_priv
                     let mut engine = Engine::new(&config, &mut budget).unwrap();
                     let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
                     assert_eq!(
-                        data_rows(&session.success(&mut engine, INVENTORY, true)),
+                        privilege_partition_inventory(&mut engine, &mut session),
                         before
                     );
                     session.success(
@@ -1997,7 +2008,7 @@ fn catalog_lifetime_privileges_and_partition_triggers_keep_prepared_changes_priv
                         false,
                     );
                     assert_eq!(
-                        data_rows(&session.success(&mut engine, INVENTORY, true)),
+                        privilege_partition_inventory(&mut engine, &mut session),
                         if commit { after } else { before }
                     );
                 }

@@ -45098,11 +45098,27 @@ impl Storage {
     }
 
     fn clear_trigger_slot(&self, slot: usize) {
+        let trigger = self.trigger(slot);
+        let temporary = self.access_object_is_temporary(trigger.target.access_object(), 0);
         let mut catalog = self
             .trigger_catalog
             .lock()
             .expect("trigger catalog lock poisoned");
         catalog.definitions[slot] = TriggerDef::EMPTY;
+        if temporary {
+            for state in catalog.partition_states.iter_mut() {
+                if state
+                    .committed
+                    .or_else(|| state.pending.and_then(|pending| pending.image))
+                    .is_some_and(|image| {
+                        image.trigger.slot() == slot
+                            && image.trigger.created_at() == trigger.created_at
+                    })
+                {
+                    *state = PartitionTriggerState::EMPTY;
+                }
+            }
+        }
     }
 
     fn clear_trigger_dependents(&self, slot: usize, trigger: TriggerDef) {

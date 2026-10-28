@@ -23,8 +23,8 @@ they never select a guessed decoder.
 
 | Object | Identity | Read | Write | Migration |
 |---|---|---:|---:|---|
-| Checkpoint manifest | `pos3ql-manifest-v33` | yes | yes | Retains schema creation identities and database-owner roles, object-permission grant order, explicitly empty permission lists, index-presence hints, allocator counters, typed blocks, enum members, and exact table, view, rule, sequence, routine and materialized-view positions and creation stamps. Publication records retain their creation stamps. |
-| Journal record | Version `21` at header byte 17; bytes 18–23 are zero | yes | yes | Schema create, drop and rename records retain creation identity. Catalog images retain declared types, hidden system-column positions, selected sources and permission grant order. Prepared comment roots rebind to restored sources. Parameter permissions retain complete replacement rows. Sequence restarts retain their transaction owner; materialized views retain the backing table identity. Older framing is rejected even when its checksum is valid. |
+| Checkpoint manifest | `pos3ql-manifest-v34` | yes | yes | Retains schema creation identities and database-owner roles, object-permission grant order, explicitly empty permission lists, index-presence hints, allocator counters, typed blocks, enum members, and exact table, view, rule, sequence, routine, declared-trigger and materialized-view positions and creation stamps. Publication records retain their creation stamps. |
+| Journal record | Version `22` at header byte 17; bytes 18–23 are zero | yes | yes | Schema create, drop and rename records retain creation identity. Catalog images retain declared types, hidden system-column positions, selected sources and permission grant order. Prepared comment roots rebind to restored sources. Parameter permissions retain complete replacement rows. Sequence restarts retain their transaction owner; materialized views retain the backing table identity. Older framing is rejected even when its checksum is valid. |
 | Immutable block | Header bytes 5–7: `01 00 00` | yes | yes | SHA-256 of `pos3ql:block:v1\0`, the one-byte block type, then payload; LSN is provenance, excluded from identity. |
 | Empty checkpoint root | `pos3ql-empty-manifest-v1` | yes | yes | Fences an as-yet unpublished manifest root. |
 | Commit head | `pos3ql-commit-head-v1` | yes | yes | Names the immutable commit chain and the publishing process incarnation. |
@@ -41,7 +41,7 @@ they never select a guessed decoder.
 A column container and a row index can contain identical bytes and still be
 different blocks. Their type is part of the object name, so writing one cannot
 replace the other. Headers without the current identity version are rejected.
-Manifest v32 and older manifests are rejected before their references are used.
+Manifest v33 and older manifests are rejected before their references are used.
 
 Role identifiers are independent of catalog slots. The bootstrap administrator
 keeps PostgreSQL OID 10; user roles receive identifiers from 16,385 through
@@ -156,7 +156,7 @@ filters and exact result checks can need more data.
 
 Catalog vectors retain their signed lower bounds in rows, projected values, and
 constant defaults. Each stored vector adds four bytes for this bound; writers
-and readers use manifest v33, journal v21, and table-definition payload v13.
+and readers use manifest v34, journal v22, and table-definition payload v13.
 The codec retains these bounds independently of SQL input conversion; SQL
 array-to-vector casts are rejected. Recovery tests cover text-created vectors,
 checkpointing, and recovery with empty local caches.
@@ -289,7 +289,7 @@ Journal records version field-width changes with distinct kind bytes. Current
 writers use publication kinds 139/140, trigger kind 141, routine kind 142,
 composite kind 143, and view kinds 144/145 for wide column sets and 16-bit
 counts. Readers retain the preceding publication, trigger, routine, composite,
-and view kinds. Stored-query dependencies use marker `0xfd`, a length-prefixed
+and view kinds; trigger payloads require the current ten-byte position prefix. Stored-query dependencies use marker `0xfd`, a length-prefixed
 identity and the complete column set. Type identities use `d:<slot>:<creation>`,
 `e:<slot>:<creation>` or `c:<slot>:<creation>`; other identities retain their
 decimal object identifiers or zero for name-based objects. Earlier dependency
@@ -433,7 +433,7 @@ source; values and emitted identifiers require a checked creation.
 Their checked three-byte runtime representation cannot contain zero or an
 out-of-range value. Fresh creation returns `54000` when the shared catalog
 sequence reaches this limit. Unsupported stored stamps are rejected before
-catalog publication; manifest v33 and journal v21 reject earlier framing.
+catalog publication; manifest v34 and journal v22 reject earlier framing.
 
 Named-type recovery installs each saved creation stamp directly; it does not
 reserve a temporary stamp and overwrite it later. An exhausted creation sequence
@@ -622,7 +622,7 @@ required: obsolete readers may be removed without building an offline migration.
 Do not retain a decoder or introduce a conversion fallback solely to support
 an older pos3ql version.
 
-The only accepted checkpoint manifest is v33. Startup, backup retention, and
+The only accepted checkpoint manifest is v34. Startup, backup retention, and
 writer promotion share one allocation-free metadata parser. It requires one
 log position, next row identity, latest transaction identity, large-object
 allocator record, nonzero 32-digit hexadecimal writer identity and final
@@ -713,11 +713,11 @@ own comments. This internal key does not change PostgreSQL's exposed `objsubid`.
 
 Manifest `pub` records place the creation stamp after the owner and before the
 flags. Journal publication-creation records place the eight-byte little-endian
-stamp before the name. Manifest v33 and journal v21 reject earlier framing.
+stamp before the name. Manifest v34 and journal v22 reject earlier framing.
 
 ## Text comparison and text-search identities
 
-Manifest v33, journal v21 and table payload v13 replace slot-based text identities.
+Manifest v34, journal v22 and table payload v13 replace slot-based text identities.
 A named collation stores a four-byte little-endian code: bit 31 marks a named
 collation, bits 2–30 hold its checked creation identity (1–9,999,999), bit 0 selects
 the configured database locale, and bit 1 selects full Unicode case mapping.
@@ -767,5 +767,60 @@ Database-copy inventory kinds 20–25 retain exact positions for casts, access
 methods, event triggers, operators, operator families and operator classes in
 that order. Copies preserve database-local public identifiers. Operator replay
 keys include both the database and creation stamp, so editing a copied operator
-cannot replace its source database's root during recovery. Manifest v33 and
-journal v21 reject earlier framing; table payload v13 remains unchanged.
+cannot replace its source database's root during recovery. Manifest v34 and
+journal v22 reject earlier framing; table payload v13 remains unchanged.
+
+## Memberships, default privileges and inherited triggers
+
+A role membership's identifier belongs to one grant from one account. Changing
+ADMIN, INHERIT or SET options keeps that identifier. Revoking the membership and
+granting it again reserves a new one. Different grantors can independently grant
+the same membership. Implicit grants use PostgreSQL's bootstrap administrator for
+superusers, or the nearest inherited account with ADMIN permission; explicit
+`GRANTED BY` must name an account the caller can use. See PostgreSQL 18.6's
+[grantor selection](https://github.com/postgres/postgres/blob/REL_18_6/src/backend/commands/user.c#L2040-L2140).
+
+Default-privilege identifiers belong to the owner, schema scope and object class,
+not an individual recipient. Removing the first recipient preserves a surviving
+group's identifier. Removing every exception to the ordinary defaults removes
+the catalog row; creating it again reserves a new identifier. Global defaults can
+contain an empty permission list, distinct from having no default-privilege row.
+A schema's deletion removes its default privileges automatically. PostgreSQL
+[sorts saved default grants by recipient and grantor identifiers](https://github.com/postgres/postgres/blob/REL_18_6/src/backend/catalog/aclchk.c),
+so displayed permission lists do not follow reusable account-slot order.
+
+Membership and default-privilege identifiers add their checked creation stamp
+(1–9,999,999) to 860,000,000 and 840,000,000 respectively. Manifest `rmem` records
+begin with physical position and creation stamp. Manifest `dacl` records store
+physical position, group creation stamp, owner role identifier, schema creation
+stamp (`-` for global), recipient identifier (`PUBLIC` for everyone), object class,
+privileges and grant options. Default grants retain numeric role/schema lifetimes,
+so replay cannot attach a saved grant to a replacement account or schema.
+
+Default-grant journal changes contain the two-byte physical position, one flags
+byte, then expected and replacement images when present. Each image has a
+four-byte group stamp, four-byte owner identifier, one-byte class, one-byte scope
+flags, optional eight-byte schema stamp, optional four-byte recipient identifier,
+and two bytes each for privileges and grant options. Database-copy kind 26 uses
+`(group_stamp << 32) | recipient_oid` as its inventory key, with zero for PUBLIC.
+
+Inherited row triggers reserve independent creation stamps. Their identifiers
+are 1,000,000,000 plus that stamp. Disabling or renaming a trigger preserves its
+identifier; detaching and reattaching a partition reserves a new inherited
+trigger. Both the declared trigger and child table retain their exact physical
+positions and creation stamps. A clone's enabled mode is explicit, allowing
+`ALTER TABLE ONLY parent DISABLE TRIGGER name` to leave existing children alone.
+The existing startup reservation remains `max_triggers * max_tables` images;
+the byte budget charges the actual image and pending-transaction sizes.
+
+Manifest `trg` starts with the declared trigger's position and creation stamp.
+Manifest `trgs` stores the inherited stamp, declared-trigger position and stamp,
+child-table position and stamp, then enabled mode. Journal trigger create, alter
+and drop records start with a ten-byte checked position. Kind 158 carries a
+flags byte and expected/replacement inherited images: four-byte clone stamp,
+ten-byte trigger position, ten-byte table position and one-byte enabled mode.
+Kind 157 retains an eight-byte nonzero creation-counter reservation, including
+committed transactions that create and remove all their new permission or clone
+images. Recovery checks expected images rather than silently replacing another
+lifetime. Manifest v34 and journal v22 reject earlier framing; table payload v13
+is unchanged.

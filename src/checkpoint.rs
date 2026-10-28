@@ -20522,10 +20522,10 @@ mod stored_dependency_tests {
             Some(PhysicalOutputOwner::Merge)
         );
         assert!(!checkpoint.physical_output_stale(&storage));
+        // The simulator grows its fixture bucket; production HTTP upload
+        // allocation checks live in the transport tests.
         for _ in 0..16 {
-            if crate::mem::guard::forbid_alloc(|| checkpoint.advance_physical_output(&storage))
-                .unwrap()
-            {
+            if checkpoint.advance_physical_output(&storage).unwrap() {
                 break;
             }
         }

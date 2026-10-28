@@ -274,12 +274,15 @@ impl Storage {
         }
         for trigger_slot in 0..self.trigger_capacity() {
             let trigger = self.trigger_to(trigger_slot, txn.txid);
+            if trigger.database != current_database()
+                || trigger.ddl_state == CatalogDdlState::Absent
+                || matches!(trigger.ddl_state, CatalogDdlState::PendingCreate { txid } if txid != txn.txid)
+            {
+                continue;
+            }
             for table in 0..self.table_count() {
                 let slot = self.partition_trigger_state_slot(trigger_slot, table);
                 let state = self.partition_trigger_state(slot);
-                if trigger.database != current_database() && state.database != current_database() {
-                    continue;
-                }
                 let current = (state.database == current_database())
                     .then(|| state.image_to(txn.txid))
                     .flatten();

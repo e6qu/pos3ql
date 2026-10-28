@@ -27190,7 +27190,8 @@ fn fire_partition_row_triggers<'a>(
                     responder,
                 },
                 crate::storage::TriggerTarget::Table(target as u16),
-                Some(leaf),
+                // Only ancestor declarations use the inherited identity and mode.
+                (target != leaf).then_some(leaf),
                 trigger_slot,
                 definition,
                 event,

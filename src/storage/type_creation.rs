@@ -536,7 +536,7 @@ mod tests {
                 );
             }
             encoded[2..10].copy_from_slice(&(oid.get() as u64).to_le_bytes());
-            for invalid in [1, 2, 3, 4, 5, 6, 8, u8::MAX] {
+            for invalid in [1, 2, 4, 5, 6, 8, u8::MAX] {
                 encoded[1] = invalid;
                 assert_eq!(
                     storage
@@ -559,6 +559,13 @@ mod tests {
                 sqlstate::DATA_EXCEPTION
             );
             assert_eq!(storage.object_lock_view_count(), 0);
+            for role in [oid, crate::storage::RoleOid::BOOTSTRAP] {
+                encoded[1] = 3;
+                encoded[2..10].copy_from_slice(&(role.get() as u64).to_le_bytes());
+                storage.restore_transaction_locks(7, &encoded).unwrap();
+                assert_eq!(storage.object_lock_view_count(), 1);
+                storage.release_object_locks(7);
+            }
             assert_eq!(storage.role_identity_sequence(), sequence);
         });
     }

@@ -49,7 +49,8 @@ Freezing all lookups at the report's position would be incorrect.
 Acceptance: every confirmed transaction reappears as a whole after recovery.
 Reusing a name or slot never redirects an old reader to replacement data;
 cleanup respects readers and backups. Cover
-rollback, savepoints, prepared transactions, fixed-capacity exhaustion and
+rollback, savepoints, prepared transactions, conflicting membership waits,
+declared versus inherited trigger execution, fixed-capacity exhaustion and
 recovery after deleting local caches. Reject corrupt or stale restored state
 before writer promotion. Resumption preserves effects once, including triggers
 and issued sequence values. Lost commit replies resolve to all changes or none.

@@ -58694,6 +58694,7 @@ mod tests {
         const WORKERS: usize = 4;
         let names = ["role_a", "role_b", "role_c", "role_d"];
         let mut config = test_config();
+        config.max_connections = WORKERS as u32;
         config.max_roles = 1 + WORKERS;
         config.max_role_memberships = WORKERS;
         config.max_role_settings = WORKERS;
@@ -58715,16 +58716,24 @@ mod tests {
                         admin: true,
                         ..RoleMembershipOptions::DEFAULT
                     };
-                    let (membership, _) = storage
-                        .change_role_membership(
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                    let (membership, _) = loop {
+                        match storage.change_role_membership(
                             BOOTSTRAP_ROLE as usize,
                             role,
                             0,
                             options,
                             true,
                             txid,
-                        )
-                        .unwrap();
+                        ) {
+                            Ok(change) => break change,
+                            Err(error) if error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT => {
+                                assert!(std::time::Instant::now() < deadline, "{error:?}");
+                                std::thread::yield_now();
+                            }
+                            Err(error) => panic!("{error:?}"),
+                        }
+                    };
                     storage.commit_role_membership_change(membership);
 
                     let (setting, _) = storage
@@ -58736,6 +58745,7 @@ mod tests {
                         )
                         .unwrap();
                     storage.commit_role_setting(setting);
+                    storage.release_object_locks(txid);
                 });
             }
         });

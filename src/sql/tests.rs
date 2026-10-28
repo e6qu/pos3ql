@@ -2211,7 +2211,7 @@ fn catalog_lifetime_membership_grantors_reject_cycles_and_match_wire_diagnostics
             }
         }
         assert_eq!(errors, ["0LP01", "0LP01"]);
-        assert_eq!(observations, 2);
+        assert_eq!(observations, 3);
         assert_eq!(notices, [
             ("NOTICE".to_owned(), "00000".to_owned(), "role \"grant_chain_first\" has already been granted membership in role \"grant_chain_group\" by role \"grant_chain_second\"".to_owned()),
             ("WARNING".to_owned(), "01000".to_owned(), "role \"grant_chain_first\" has not been granted membership in role \"grant_chain_group\" by role \"grant_chain_second\"".to_owned()),
@@ -2239,7 +2239,7 @@ fn catalog_lifetime_membership_locks_keep_other_roles_moving_through_prepared_re
                 let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
                 let mut engine = Engine::new(&config, &mut budget).unwrap();
                 let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
-                session.success(&mut engine, "CREATE ROLE locked_memberships; CREATE ROLE independent_memberships; CREATE ROLE membership_recipient; GRANT locked_memberships TO membership_recipient; BEGIN; GRANT locked_memberships TO membership_recipient; PREPARE TRANSACTION 'membership-locks'", false);
+                session.success(&mut engine, "CREATE ROLE locked_memberships; CREATE ROLE independent_memberships; CREATE ROLE membership_recipient; GRANT locked_memberships TO membership_recipient; GRANT postgres TO membership_recipient; BEGIN; GRANT locked_memberships TO membership_recipient; GRANT postgres TO membership_recipient; PREPARE TRANSACTION 'membership-locks'", false);
                 if checkpoint {
                     assert!(engine.checkpoint().unwrap());
                 }
@@ -2257,6 +2257,7 @@ fn catalog_lifetime_membership_locks_keep_other_roles_moving_through_prepared_re
                     .storage
                     .find_role_visible("locked_memberships", 0)
                     .unwrap();
+                let bootstrap = engine.storage.find_role_visible("postgres", 0).unwrap();
                 let independent = engine
                     .storage
                     .find_role_visible("independent_memberships", 0)
@@ -2271,6 +2272,14 @@ fn catalog_lifetime_membership_locks_keep_other_roles_moving_through_prepared_re
                             .sqlstate,
                         sqlstate::INTERNAL_LOCK_WAIT
                     );
+                    assert_eq!(
+                        engine
+                            .storage
+                            .lock_role_memberships(bootstrap, transaction)
+                            .unwrap_err()
+                            .sqlstate,
+                        sqlstate::INTERNAL_LOCK_WAIT
+                    );
                     engine
                         .storage
                         .lock_role_memberships(independent, transaction)
@@ -2279,6 +2288,10 @@ fn catalog_lifetime_membership_locks_keep_other_roles_moving_through_prepared_re
                 resolver.success(&mut engine, "COMMIT PREPARED 'membership-locks'", false);
                 crate::mem::guard::forbid_alloc(|| {
                     engine.storage.lock_role_memberships(locked, transaction)
+                })
+                .unwrap();
+                crate::mem::guard::forbid_alloc(|| {
+                    engine.storage.lock_role_memberships(bootstrap, transaction)
                 })
                 .unwrap();
                 waiter.success(&mut engine, "ROLLBACK", true);

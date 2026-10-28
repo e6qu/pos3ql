@@ -28629,73 +28629,140 @@ impl Storage {
         if grantor == 0 {
             return Ok(());
         }
-        let catalog = self
-            .role_catalog
-            .lock()
-            .expect("role catalog lock poisoned");
-        let removed = arena
-            .alloc_slice_with(catalog.memberships.len(), |slot| {
-                let membership = catalog.memberships[slot];
-                membership.visible_to(txid)
-                    && usize::from(membership.role) == role
-                    && members.contains(&usize::from(membership.member))
-            })
-            .map_err(|_| {
-                sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "role grant dependency traversal exceeds SQL arena"
-                )
-            })?;
-        // Every surviving grant must still lead to an administrator whose own
-        // grant survives removing the proposed recipients, ending at bootstrap.
-        loop {
-            let mut changed = false;
-            for (slot, membership) in catalog.memberships.iter().enumerate() {
-                if removed[slot]
-                    || !membership.visible_to(txid)
-                    || usize::from(membership.role) != role
-                    || membership.grantor == 0
-                {
-                    continue;
-                }
-                let supported =
-                    catalog
-                        .memberships
-                        .iter()
-                        .enumerate()
-                        .any(|(support, candidate)| {
-                            !removed[support]
-                                && candidate.visible_to(txid)
-                                && usize::from(candidate.role) == role
-                                && candidate.member == membership.grantor
-                                && candidate.options_to(txid).admin
-                        });
-                if !supported {
-                    removed[slot] = true;
-                    changed = true;
-                }
-            }
-            if !changed {
-                break;
-            }
-        }
-        if members.contains(&0)
-            || !catalog
-                .memberships
-                .iter()
-                .enumerate()
-                .any(|(slot, membership)| {
-                    !removed[slot]
-                        && membership.visible_to(txid)
-                        && usize::from(membership.role) == role
-                        && usize::from(membership.member) == grantor
-                        && membership.options_to(txid).admin
-                })
-        {
-            return Err(sql_err!(
+        let cycle = || {
+            sql_err!(
                 sqlstate::INVALID_GRANT_OPERATION,
                 "ADMIN option cannot be granted back to your own grantor"
-            ));
+            )
+        };
+        if members.contains(&0) {
+            return Err(cycle());
+        }
+        let capacity = || {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "role grant dependency traversal exceeds SQL arena"
+            )
+        };
+        #[derive(Clone, Copy)]
+        struct GrantEdge {
+            member: u16,
+            admin: bool,
+            removed: bool,
+            next: usize,
+        }
+        let (role_count, excluded, heads, counts, edges) = {
+            let catalog = self
+                .role_catalog
+                .lock()
+                .expect("role catalog lock poisoned");
+            let role_count = catalog.roles.len();
+            if grantor >= role_count {
+                return Err(sql_err!(
+                    sqlstate::DATA_EXCEPTION,
+                    "role grantor position is out of range"
+                ));
+            }
+            let excluded = arena
+                .alloc_slice_with(role_count, |_| false)
+                .map_err(|_| capacity())?;
+            for member in members {
+                let excluded = excluded.get_mut(*member).ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::DATA_EXCEPTION,
+                        "role grant recipient position is out of range"
+                    )
+                })?;
+                *excluded = true;
+            }
+            let heads = arena
+                .alloc_slice_with(role_count, |_| usize::MAX)
+                .map_err(|_| capacity())?;
+            let counts = arena
+                .alloc_slice_with(role_count, |_| 0u32)
+                .map_err(|_| capacity())?;
+            let visible = |membership: &&RoleMembership| {
+                membership.visible_to(txid) && usize::from(membership.role) == role
+            };
+            for membership in catalog.memberships.iter().filter(&visible) {
+                if usize::from(membership.member) >= role_count
+                    || usize::from(membership.grantor) >= role_count
+                {
+                    return Err(sql_err!(
+                        sqlstate::DATA_EXCEPTION,
+                        "role grant references an invalid account position"
+                    ));
+                }
+            }
+            let mut input = catalog.memberships.iter().filter(&visible);
+            let count = input.clone().count();
+            let edges = arena
+                .alloc_slice_with(count, |slot| {
+                    let membership = input
+                        .next()
+                        .expect("the guarded membership count is stable");
+                    let grantor = usize::from(membership.grantor);
+                    let member = usize::from(membership.member);
+                    let admin = membership.options_to(txid).admin;
+                    counts[member] += u32::from(admin);
+                    let edge = GrantEdge {
+                        member: membership.member,
+                        admin,
+                        removed: false,
+                        next: heads[grantor],
+                    };
+                    heads[grantor] = slot;
+                    edge
+                })
+                .map_err(|_| capacity())?;
+            (role_count, excluded, heads, counts, edges)
+        };
+        let queued = arena
+            .alloc_slice_with(role_count, |_| false)
+            .map_err(|_| capacity())?;
+        let queue = arena
+            .alloc_slice_with(role_count, |_| 0u16)
+            .map_err(|_| capacity())?;
+        let mut queued_count = 0;
+        // Simulate removing the recipients. Only losing a final ADMIN grant
+        // propagates to grants issued by that member; unrelated grants survive.
+        for edge in edges.iter_mut() {
+            let member = usize::from(edge.member);
+            if excluded[member] {
+                edge.removed = true;
+                if edge.admin {
+                    counts[member] -= 1;
+                    if counts[member] == 0 && !queued[member] {
+                        queued[member] = true;
+                        queue[queued_count] = edge.member;
+                        queued_count += 1;
+                    }
+                }
+            }
+        }
+        let mut at = 0;
+        while at < queued_count {
+            let mut slot = heads[usize::from(queue[at])];
+            at += 1;
+            while slot != usize::MAX {
+                let edge = edges[slot];
+                if !edge.removed {
+                    edges[slot].removed = true;
+                    if edge.admin {
+                        let member = usize::from(edge.member);
+                        counts[member] -= 1;
+                        if counts[member] == 0 && !queued[member] {
+                            queued[member] = true;
+                            queue[queued_count] = edge.member;
+                            queued_count += 1;
+                        }
+                    }
+                }
+                slot = edge.next;
+            }
+        }
+        if counts[grantor] == 0 {
+            return Err(cycle());
         }
         Ok(())
     }

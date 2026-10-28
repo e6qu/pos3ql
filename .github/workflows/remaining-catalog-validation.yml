@@ -49,7 +49,7 @@ jobs:
           diagnostics = path.joinpath('grantor-diagnostics.txt').read_text()
           codes = re.findall(r'(ERROR|NOTICE|WARNING):\s+([0-9A-Z]{5}):', diagnostics)
           assert codes == [('ERROR', '0LP01'), ('ERROR', '0LP01'), ('NOTICE', '00000'), ('WARNING', '01000')], diagnostics
-          assert [line for line in path.joinpath('grantor-output.txt').read_text().splitlines() if line in ('t', 'f')] == ['t', 't']
+          assert [line for line in path.joinpath('grantor-output.txt').read_text().splitlines() if line in ('t', 'f')] == ['t', 't', 't']
           print(path.joinpath('version.txt').read_text().strip())
           print(f'PostgreSQL: {len(observations)} true observations')
           PY

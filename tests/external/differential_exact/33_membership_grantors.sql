@@ -26,6 +26,23 @@ SELECT count(*) = 0 FROM pg_auth_members
   WHERE roleid = 'grant_chain_group'::regrole
     AND grantor = 'grant_chain_second'::regrole;
 
+GRANT grant_chain_group TO grant_chain_first WITH ADMIN FALSE;
+
+SET ROLE grant_chain_second;
+
+GRANT grant_chain_group TO grant_chain_first WITH ADMIN OPTION;
+
+RESET ROLE;
+
+SELECT count(*) = 1 FROM pg_auth_members
+  WHERE roleid = 'grant_chain_group'::regrole
+    AND member = 'grant_chain_first'::regrole
+    AND grantor = 'grant_chain_second'::regrole;
+
+GRANT grant_chain_group TO grant_chain_first WITH ADMIN TRUE;
+
+REVOKE grant_chain_group FROM grant_chain_first GRANTED BY grant_chain_second;
+
 GRANT grant_chain_group TO grant_chain_second WITH ADMIN OPTION;
 
 SET ROLE grant_chain_second;

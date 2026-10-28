@@ -150,7 +150,13 @@ impl MetadataIo {
 
     pub(super) fn get(&mut self, key: &str) -> Result<Poll<&[u8]>, SqlError> {
         match self.poll(Operation::Get(Self::key(key)?))? {
-            Poll::Ready(Response::Get) => Ok(Poll::Ready(self.client.body_bytes())),
+            Poll::Ready(Response::Get) => {
+                #[cfg(feature = "checkpoint-profile")]
+                if key.starts_with("blocks/") {
+                    self.block_gets = self.block_gets.saturating_add(1);
+                }
+                Ok(Poll::Ready(self.client.body_bytes()))
+            }
             Poll::Pending => Ok(Poll::Pending),
             _ => unreachable!("matching metadata operation"),
         }
@@ -232,12 +238,6 @@ impl MetadataIo {
             }
         };
         if !matches!(result, Err(Error::WouldBlock)) {
-            #[cfg(feature = "checkpoint-profile")]
-            if matches!(&result, Ok(Response::Get))
-                && matches!(operation, Operation::Get(key) if key.as_str().starts_with("blocks/"))
-            {
-                self.block_gets = self.block_gets.saturating_add(1);
-            }
             if result.is_err() {
                 self.client.cancel_request();
                 self.keys.clear();
@@ -377,6 +377,25 @@ pub(super) mod tests {
                 "metadata response did not finish"
             );
             std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn maintenance_metadata_page_limits_fail_before_request_admission() {
+        let (mut io, listener) = network();
+        for limit in [0, PAGE_KEYS + 1] {
+            let error = crate::mem::guard::forbid_alloc(|| {
+                io.list("blocks/", ListCursor::START, limit, |_| {
+                    panic!("invalid page cannot publish keys")
+                })
+            })
+            .unwrap_err();
+            assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            assert!(!io.busy());
+            assert_eq!(
+                listener.accept().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
         }
     }
 

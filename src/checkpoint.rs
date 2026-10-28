@@ -1342,8 +1342,9 @@ pub(crate) struct Checkpointer {
     pending_value_installs: Vec<ValueInstall>,
     /// Pre-reserved physical-version schedule: (key, source-and-kind).
     merge_scratch: Vec<(SstKey, u8)>,
-    /// Published index identities during a rebuild; untyped block identities
-    /// during garbage collection. Both uses fit checkpoint_live_blocks.
+    /// Published index identities during a rebuild; block identities
+    /// and tagged roster roots during garbage collection. Both uses fit
+    /// checkpoint_live_blocks.
     roster_scratch: Vec<(BlockId, Option<BlockType>)>,
     garbage_seen: FixedMap<BlockId, usize>,
     garbage_sst_roots: Vec<SstHandle>,
@@ -20650,6 +20651,29 @@ mod stored_dependency_tests {
             4,
             "one backup listing and three block pages; live prefixes must not be rescanned"
         );
+        drop(checkpoint);
+        drop(storage);
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    }
+
+    #[test]
+    fn maintenance_metadata_saved_manifest_capacity_fails_before_any_deletion() {
+        let (mut checkpoint, mut storage, _, config) = index_gc_fixture("gc-manifest-capacity", 32);
+        checkpoint.checkpoint(&mut storage).unwrap();
+        let orphan = write_gc_index(&checkpoint, b"orphan kept after rejection");
+        let mut budget = Budget::new(16);
+        checkpoint.manifest_buf =
+            FixedBuf::new(&mut budget, "small manifest reservation", 16).unwrap();
+        let error = crate::mem::guard::forbid_alloc(|| drain_block_gc(&mut checkpoint, &storage))
+            .unwrap_err();
+        assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+        assert!(error.message.as_str().contains("checkpoint_manifest_bytes"));
+        assert!(!checkpoint.block_garbage_loaded);
+        assert!(checkpoint.doomed_blocks.is_empty());
+        checkpoint
+            .client
+            .get(&format!("blocks/{}", index_gc_hex(orphan.roster)), None)
+            .unwrap();
         drop(checkpoint);
         drop(storage);
         crate::object_store::sim::drop_namespace(&config.object_store_bucket);

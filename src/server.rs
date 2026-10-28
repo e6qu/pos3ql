@@ -873,7 +873,7 @@ impl Server {
                 "object request slots",
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
-                    "object_store_get_slots, object_store_put_slots, object_store_block_put_slots, manifest and credential clients and max_subscriptions exceed reactor token capacity",
+                    "object_store_get_slots, object_store_put_slots, object_store_block_put_slots, manifest, cleanup and credential clients and max_subscriptions exceed reactor token capacity",
                 ),
             ));
         }

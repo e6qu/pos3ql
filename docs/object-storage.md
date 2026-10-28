@@ -145,8 +145,8 @@ DELETE is safe even if its response was lost. Each request keeps the existing
 30-second deadline. With the `checkpoint-profile` build feature, file-cleanup
 phase records describe active work in each turn and completed block downloads;
 they exclude time spent waiting between turns. Use client latency and provider
-request counters for total elapsed time and storage traffic. Errors reach waiting checkpoint commands and use the normal
-maintenance retry cadence. Credential installation cancels these repeatable
+request counters for total elapsed time and storage traffic. Errors reach waiting
+checkpoint commands and use the normal maintenance retry cadence. Credential installation cancels these repeatable
 requests and resumes the same position with the new credentials.
 
 

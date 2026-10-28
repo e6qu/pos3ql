@@ -11907,7 +11907,7 @@ impl Checkpointer {
                 )?;
             }
         }
-        for (_, trigger) in storage.checkpoint_triggers() {
+        for (slot, trigger) in storage.checkpoint_triggers() {
             write_database_context(
                 &mut self.manifest_output,
                 &mut database_context,
@@ -11990,7 +11990,8 @@ impl Checkpointer {
             write_manifest(
                 &mut self.manifest_output,
                 format_args!(
-                    "trg {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
+                    "trg {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
+                    slot,
                     trigger.created_at,
                     target_kind,
                     hname.as_str(),
@@ -17797,7 +17798,10 @@ fn load_trigger(storage: &mut Storage, line: &str) -> Result<(), CheckpointSetup
     if words.next() != Some("trg") {
         return Err(CheckpointSetupError::Corrupt("trigger record"));
     }
+    let slot = parse_field(words.next(), "trigger position")?;
     let created_at = parse_field(words.next(), "trigger created_at")?;
+    let identity = crate::storage::CatalogPosition::new(slot, created_at)
+        .map_err(|_| CheckpointSetupError::Corrupt("trigger position"))?;
     let target_kind: u8 = parse_field(words.next(), "trigger target")?;
     let name = sql_name(&decode_hex_name(
         words
@@ -18039,7 +18043,7 @@ fn load_trigger(storage: &mut Storage, line: &str) -> Result<(), CheckpointSetup
     }
     storage
         .restore_trigger(
-            created_at,
+            identity,
             crate::storage::TriggerSpec {
                 name,
                 target,

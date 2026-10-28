@@ -44554,6 +44554,11 @@ impl Storage {
             .definitions[slot]
     }
 
+    pub(crate) fn trigger_position(&self, slot: usize) -> CatalogPosition {
+        CatalogPosition::new(slot, self.trigger(slot).created_at)
+            .expect("admitted trigger has a checked position")
+    }
+
     pub(crate) fn trigger_capacity(&self) -> usize {
         self.trigger_catalog
             .lock()
@@ -44934,10 +44939,11 @@ impl Storage {
 
     pub(crate) fn restore_trigger(
         &mut self,
-        created_at: u64,
+        identity: CatalogPosition,
         spec: TriggerSpec,
         enabled: TriggerEnabled,
     ) -> Result<usize, SqlError> {
+        let created_at = identity.created_at();
         bounded_catalog_generation(created_at, MAX_TRIGGER_OID_GENERATION, "trigger")?;
         if !spec.is_valid() {
             return Err(sql_err!(
@@ -44966,16 +44972,22 @@ impl Storage {
                 "duplicate trigger in checkpoint"
             ));
         }
-        let Some(slot) = catalog
+        let slot = identity.slot();
+        if catalog
             .definitions
-            .iter()
-            .position(|trigger| trigger.ddl_state == CatalogDdlState::Absent)
-        else {
+            .get(slot)
+            .is_none_or(|trigger| trigger.ddl_state != CatalogDdlState::Absent)
+            || catalog.definitions.iter().any(|trigger| {
+                trigger.database == current_database()
+                    && trigger.ddl_state != CatalogDdlState::Absent
+                    && trigger.created_at == created_at
+            })
+        {
             return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "too many triggers in checkpoint"
+                sqlstate::DATA_EXCEPTION,
+                "stored trigger position or lifetime is unavailable"
             ));
-        };
+        }
         self.catalog_sequence.observe(created_at);
         catalog.definitions[slot] = TriggerDef {
             database: current_database(),

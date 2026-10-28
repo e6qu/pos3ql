@@ -1806,6 +1806,120 @@ fn catalog_lifetime_privileges_and_partition_triggers_match_postgresql() {
 }
 
 #[test]
+fn catalog_lifetime_privileges_and_partition_triggers_survive_copies_and_empty_disk() {
+    let fixture =
+        include_str!("../../tests/external/differential/199_privilege_and_partition_lifetimes.sql");
+    const INVENTORY: &str = "SELECT oid, roleid, member, grantor FROM pg_auth_members WHERE roleid='lifetime_member_group'::regrole ORDER BY oid; SELECT oid, defaclacl FROM pg_default_acl WHERE defaclnamespace='lifetime_privileges'::regnamespace ORDER BY oid; SELECT oid, tgparentid, tgenabled FROM pg_trigger WHERE tgname='lifetime_partition_hook' ORDER BY oid";
+    for checkpoint in [false, true] {
+        for mode in [
+            crate::config::TransactionMode::Mvcc,
+            crate::config::TransactionMode::Locking,
+        ] {
+            let name = format!("privilege-partition-copy-{checkpoint}-{mode:?}");
+            let mut config = catalog_lifetime_config(&name, mode);
+            config.max_tables = 16;
+            config.object_store_on = true;
+            config.object_store_sim = true;
+            config.wal_upload = true;
+            config.wal_upload_sync = true;
+            config.object_store_bucket = format!("{name}-{}", std::process::id());
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+            let source_inventory;
+            let copied_inventory;
+            let target;
+            {
+                let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+                let mut engine = Engine::new(&config, &mut budget).unwrap();
+                engine
+                    .select_database(crate::storage::DatabaseOid::TEMPLATE1)
+                    .unwrap();
+                let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+                for sql in fixture
+                    .split("-- cleanup")
+                    .next()
+                    .unwrap()
+                    .split("\n\n")
+                    .filter(|sql| !sql.trim().is_empty())
+                {
+                    let output = session.success(&mut engine, sql, false);
+                    if sql.trim_start().starts_with("SELECT") {
+                        assert_eq!(data_rows(&output), ["t"], "{sql}");
+                    }
+                }
+                source_inventory = data_rows(&session.success(&mut engine, INVENTORY, true));
+                assert_eq!(source_inventory.len(), 5);
+                session.success(&mut engine, "BEGIN; SAVEPOINT lifetime_before; REVOKE lifetime_member_group FROM lifetime_member_second; ALTER DEFAULT PRIVILEGES IN SCHEMA lifetime_privileges REVOKE SELECT ON TABLES FROM lifetime_member_first; ALTER TABLE lifetime_partition_root DETACH PARTITION lifetime_partition_child; ROLLBACK TO lifetime_before; COMMIT", false);
+                assert_eq!(
+                    data_rows(&session.success(&mut engine, INVENTORY, true)),
+                    source_inventory
+                );
+                session.success(
+                    &mut engine,
+                    "CREATE DATABASE privilege_copy TEMPLATE template1",
+                    false,
+                );
+                target = engine
+                    .storage
+                    .database_named("privilege_copy", 0)
+                    .unwrap()
+                    .1
+                    .oid;
+                engine.select_database(target).unwrap();
+                assert_eq!(
+                    data_rows(&session.success(&mut engine, INVENTORY, true)),
+                    source_inventory
+                );
+                session.success(&mut engine, "ALTER DEFAULT PRIVILEGES IN SCHEMA lifetime_privileges GRANT INSERT ON TABLES TO lifetime_member_second; ALTER TABLE lifetime_partition_root DETACH PARTITION lifetime_partition_child; ALTER TABLE lifetime_partition_root ATTACH PARTITION lifetime_partition_child FOR VALUES FROM (0) TO (10); ALTER TABLE lifetime_partition_child DISABLE TRIGGER lifetime_partition_hook", false);
+                copied_inventory = data_rows(&session.success(&mut engine, INVENTORY, true));
+                assert_ne!(copied_inventory, source_inventory);
+                engine
+                    .select_database(crate::storage::DatabaseOid::TEMPLATE1)
+                    .unwrap();
+                assert_eq!(
+                    data_rows(&session.success(&mut engine, INVENTORY, true)),
+                    source_inventory
+                );
+                if checkpoint {
+                    assert!(engine.checkpoint().unwrap());
+                }
+                engine.commit_wal().unwrap();
+            }
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+            {
+                let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+                let mut engine = Engine::new(&config, &mut budget).unwrap();
+                let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+                for (database, expected) in [
+                    (crate::storage::DatabaseOid::TEMPLATE1, &source_inventory),
+                    (target, &copied_inventory),
+                ] {
+                    engine.select_database(database).unwrap();
+                    assert_eq!(
+                        &data_rows(&session.success(&mut engine, INVENTORY, true)),
+                        expected
+                    );
+                }
+                session.success(
+                    &mut engine,
+                    "INSERT INTO lifetime_partition_root VALUES (7)",
+                    false,
+                );
+                assert_eq!(
+                    data_rows(&session.success(
+                        &mut engine,
+                        "SELECT id FROM lifetime_partition_child",
+                        true
+                    )),
+                    ["7"]
+                );
+            }
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        }
+    }
+}
+
+#[test]
 fn event_trigger_failures_keep_notices_without_success_command_tags() {
     for mode in [
         crate::config::TransactionMode::Mvcc,
@@ -6630,7 +6744,7 @@ fn relation_identity_view_rowtype_json_preserves_field_limits() {
 
 #[test]
 fn catalog_constraint_identity_ranges_reject_overflow_and_keep_triggers_disjoint() {
-    use crate::storage::{ConstraintIdentity, ForeignKeyTrigger, MAX_TABLE_CATALOG_SLOTS};
+    use crate::storage::{ConstraintIdentity, ForeignKeyTrigger};
     crate::mem::guard::forbid_alloc(|| {
         assert!(ConstraintIdentity::parse(0).is_none());
         assert!(ConstraintIdentity::parse(10_000_000).is_none());
@@ -6658,9 +6772,7 @@ fn catalog_constraint_identity_ranges_reject_overflow_and_keep_triggers_disjoint
         }
         assert!(
             crate::storage::FIRST_PARTITION_TRIGGER_OID as u64
-                + crate::storage::MAX_TRIGGER_OID_GENERATION * MAX_TABLE_CATALOG_SLOTS as u64
-                + MAX_TABLE_CATALOG_SLOTS as u64
-                - 1
+                + crate::storage::MAX_CATALOG_CREATION
                 + crate::storage::TRIGGER_CONSTRAINT_OID_OFFSET as u64
                 <= i32::MAX as u64
         );

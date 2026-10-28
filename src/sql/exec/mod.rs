@@ -28143,6 +28143,7 @@ pub fn create_trigger(
             txn.txid,
             lsn,
             &WalOp::CreateTrigger {
+                identity: storage.trigger_position(slot),
                 name: trigger.name,
                 target: match target {
                     crate::storage::TriggerTarget::Table(_) => crate::wal::TriggerTargetKind::Table,
@@ -28776,6 +28777,7 @@ pub fn drop_trigger(
             txn.txid,
             lsn,
             &WalOp::DropTrigger {
+                identity: storage.trigger_position(slot),
                 name: trigger.name,
                 target: target_kind,
                 table_schema: schema.as_str(),
@@ -28935,6 +28937,7 @@ pub fn alter_trigger(
             txn.txid,
             lsn,
             &WalOp::AlterTrigger {
+                identity: storage.trigger_position(slot),
                 name: identity.name,
                 target: target_kind,
                 table_schema: schema.as_str(),
@@ -36489,7 +36492,7 @@ pub fn drop_routine(
             let Some((trigger_slot, trigger)) = dependency else {
                 break;
             };
-            if let Err(error) = stage_trigger_drop(storage, wal, txn, trigger) {
+            if let Err(error) = stage_trigger_drop(storage, wal, txn, trigger_slot, trigger) {
                 return sql_fail(error);
             }
             if let Err(error) = storage.drop_trigger(trigger_slot, txn.txid) {
@@ -41876,7 +41879,7 @@ fn drop_type_dependent_routines(
         let Some((slot, trigger)) = dependency else {
             break;
         };
-        stage_trigger_drop(storage, wal, txn, trigger)?;
+        stage_trigger_drop(storage, wal, txn, slot, trigger)?;
         storage.drop_trigger(slot, txn.txid)?;
         txn.record_ddl(super::txn::DdlUndo::TriggerDropped(slot as u32))?;
     }
@@ -45479,7 +45482,7 @@ fn drop_selected_stored_queries(
         let Some((slot, trigger)) = dependency else {
             break;
         };
-        stage_trigger_drop(storage, wal, txn, trigger)?;
+        stage_trigger_drop(storage, wal, txn, slot, trigger)?;
         storage.drop_trigger(slot, txn.txid)?;
         txn.record_ddl(super::txn::DdlUndo::TriggerDropped(slot as u32))?;
     }
@@ -45539,6 +45542,7 @@ fn stage_trigger_drop(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &TxnState,
+    slot: usize,
     trigger: crate::storage::TriggerDef,
 ) -> Result<(), SqlError> {
     if storage.access_object_is_temporary(trigger.target.access_object(), txn.txid) {
@@ -45563,6 +45567,7 @@ fn stage_trigger_drop(
         txn.txid,
         lsn,
         &WalOp::DropTrigger {
+            identity: storage.trigger_position(slot),
             name: trigger.name_to(txn.txid).as_str(),
             target,
             table_schema: schema.as_str(),
@@ -45633,6 +45638,7 @@ fn drop_view_trigger_dependencies(
                 txn.txid,
                 lsn,
                 &WalOp::DropTrigger {
+                    identity: storage.trigger_position(slot),
                     name: trigger.name_to(txn.txid).as_str(),
                     target: crate::wal::TriggerTargetKind::View,
                     table_schema: schema.as_str(),
@@ -64793,6 +64799,7 @@ fn alter_table_trigger_enabled(
                 txn.txid,
                 lsn,
                 &WalOp::AlterTrigger {
+                    identity: storage.trigger_position(slot),
                     name: trigger.name_to(txn.txid).as_str(),
                     target: crate::wal::TriggerTargetKind::Table,
                     table_schema: schema,

@@ -21907,6 +21907,7 @@ fn apply_wal_op(
             }
         }
         WalOp::CreateTrigger {
+            identity,
             name,
             target,
             table_schema,
@@ -22035,14 +22036,20 @@ fn apply_wal_op(
                 arguments: crate::storage::TriggerArguments::parse(&arguments[..argument_count])?,
             };
             if or_replace && let Some(existing) = storage.trigger_slot_on(target, name, 0) {
+                if storage.trigger_position(existing) != identity {
+                    return Err(sql_err!(
+                        sqlstate::DATA_EXCEPTION,
+                        "journal trigger replacement selects another lifetime"
+                    ));
+                }
                 storage.replace_trigger(existing, spec, 0)?;
                 storage.commit_trigger_alter(existing, 0);
             } else {
-                let slot = storage.create_trigger(spec, 0)?;
-                storage.commit_trigger_create(slot);
+                storage.restore_trigger(identity, spec, crate::storage::TriggerEnabled::Origin)?;
             }
         }
         WalOp::DropTrigger {
+            identity,
             name,
             target,
             table_schema,
@@ -22067,12 +22074,30 @@ fn apply_wal_op(
                     ));
                 }
             };
-            if let Some(slot) = storage.trigger_slot_on(target, name, 0) {
-                storage.drop_trigger(slot, 0)?;
-                storage.commit_trigger_drop(slot);
+            let slot = identity.slot();
+            if slot >= storage.trigger_capacity() {
+                return Err(sql_err!(
+                    sqlstate::DATA_EXCEPTION,
+                    "journal trigger position is out of range"
+                ));
             }
+            let trigger = storage.trigger(slot);
+            if trigger.database != storage.current_database_oid()
+                || !trigger.visible_to(0)
+                || storage.trigger_position(slot) != identity
+                || trigger.target != target
+                || trigger.name_to(0).as_str() != name
+            {
+                return Err(sql_err!(
+                    sqlstate::DATA_EXCEPTION,
+                    "journal trigger removal selects another lifetime"
+                ));
+            }
+            storage.drop_trigger(slot, 0)?;
+            storage.commit_trigger_drop(slot);
         }
         WalOp::AlterTrigger {
+            identity,
             name,
             target,
             table_schema,
@@ -22106,6 +22131,12 @@ fn apply_wal_op(
                 )
             })?;
             if let Some(slot) = storage.trigger_slot_on(target, name, 0) {
+                if storage.trigger_position(slot) != identity {
+                    return Err(sql_err!(
+                        sqlstate::DATA_EXCEPTION,
+                        "journal trigger edit selects another lifetime"
+                    ));
+                }
                 storage.alter_trigger(
                     slot,
                     crate::storage::SqlName::parse(new_name)?,

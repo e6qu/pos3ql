@@ -1172,6 +1172,7 @@ pub(crate) enum WalOp<'a> {
         new_name: &'a str,
     },
     CreateTrigger {
+        identity: crate::storage::CatalogPosition,
         name: &'a str,
         target: TriggerTargetKind,
         table_schema: &'a str,
@@ -1194,12 +1195,14 @@ pub(crate) enum WalOp<'a> {
         argument_count: usize,
     },
     DropTrigger {
+        identity: crate::storage::CatalogPosition,
         name: &'a str,
         target: TriggerTargetKind,
         table_schema: &'a str,
         table: &'a str,
     },
     AlterTrigger {
+        identity: crate::storage::CatalogPosition,
         name: &'a str,
         target: TriggerTargetKind,
         table_schema: &'a str,
@@ -3289,7 +3292,9 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             argument_count,
             ..
         } => {
-            1 + name.len()
+            crate::storage::CatalogPosition::ENCODED_BYTES
+                + 1
+                + name.len()
                 + 1
                 + 1
                 + table_schema.len()
@@ -3318,7 +3323,17 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             target: _,
             table_schema,
             table,
-        } => 1 + name.len() + 1 + 1 + table_schema.len() + 1 + table.len(),
+            ..
+        } => {
+            crate::storage::CatalogPosition::ENCODED_BYTES
+                + 1
+                + name.len()
+                + 1
+                + 1
+                + table_schema.len()
+                + 1
+                + table.len()
+        }
         WalOp::AlterTrigger {
             name,
             target: _,
@@ -3326,7 +3341,19 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             table,
             new_name,
             ..
-        } => 1 + name.len() + 1 + 1 + table_schema.len() + 1 + table.len() + 1 + new_name.len() + 1,
+        } => {
+            crate::storage::CatalogPosition::ENCODED_BYTES
+                + 1
+                + name.len()
+                + 1
+                + 1
+                + table_schema.len()
+                + 1
+                + table.len()
+                + 1
+                + new_name.len()
+                + 1
+        }
         WalOp::SetPolicy {
             schema,
             table,
@@ -6629,6 +6656,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             statistics,
         } => name_bytes(buffer, schema) && name_bytes(buffer, name) && statistics.append(buffer),
         WalOp::CreateTrigger {
+            identity,
             name,
             target,
             table_schema,
@@ -6651,7 +6679,8 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             argument_count,
         } => {
             let when_len = when.map_or(0usize, |value| value.len() + 1);
-            name_bytes(buffer, name)
+            buffer.append(&identity.encode())
+                && name_bytes(buffer, name)
                 && buffer.append(&[target.code()])
                 && name_bytes(buffer, table_schema)
                 && name_bytes(buffer, table)
@@ -6679,17 +6708,20 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                     .all(|argument| name_bytes(buffer, argument))
         }
         WalOp::DropTrigger {
+            identity,
             name,
             target,
             table_schema,
             table,
         } => {
-            name_bytes(buffer, name)
+            buffer.append(&identity.encode())
+                && name_bytes(buffer, name)
                 && buffer.append(&[target.code()])
                 && name_bytes(buffer, table_schema)
                 && name_bytes(buffer, table)
         }
         WalOp::AlterTrigger {
+            identity,
             name,
             target,
             table_schema,
@@ -6697,7 +6729,8 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             new_name,
             enabled,
         } => {
-            name_bytes(buffer, name)
+            buffer.append(&identity.encode())
+                && name_bytes(buffer, name)
                 && buffer.append(&[target.code()])
                 && name_bytes(buffer, table_schema)
                 && name_bytes(buffer, table)
@@ -9024,6 +9057,8 @@ fn decode_op_inner<'a>(
         }),
         KIND_CREATE_TRIGGER | KIND_CREATE_TRIGGER_V2 => decode_large_op(|| {
             let wide_columns = kind == KIND_CREATE_TRIGGER_V2;
+            let identity = take_catalog_position(payload, &mut at)?;
+            crate::storage::CatalogIdentity::parse(identity.created_at())?;
             let name = take_name(&mut at)?;
             let target = TriggerTargetKind::from_code(*payload.get(at)?)?;
             at += 1;
@@ -9105,6 +9140,7 @@ fn decode_op_inner<'a>(
                 )
                 && at == payload.len())
             .then_some(WalOp::CreateTrigger {
+                identity,
                 name,
                 target,
                 table_schema,
@@ -9128,12 +9164,15 @@ fn decode_op_inner<'a>(
             })
         }),
         KIND_DROP_TRIGGER => decode_large_op(|| {
+            let identity = take_catalog_position(payload, &mut at)?;
+            crate::storage::CatalogIdentity::parse(identity.created_at())?;
             let name = take_name(&mut at)?;
             let target = TriggerTargetKind::from_code(*payload.get(at)?)?;
             at += 1;
             let table_schema = take_name(&mut at)?;
             let table = take_name(&mut at)?;
             (at == payload.len()).then_some(WalOp::DropTrigger {
+                identity,
                 name,
                 target,
                 table_schema,
@@ -9141,6 +9180,8 @@ fn decode_op_inner<'a>(
             })
         }),
         KIND_ALTER_TRIGGER => decode_large_op(|| {
+            let identity = take_catalog_position(payload, &mut at)?;
+            crate::storage::CatalogIdentity::parse(identity.created_at())?;
             let name = take_name(&mut at)?;
             let target = TriggerTargetKind::from_code(*payload.get(at)?)?;
             at += 1;
@@ -9151,6 +9192,7 @@ fn decode_op_inner<'a>(
             crate::storage::TriggerEnabled::from_code(enabled)?;
             at += 1;
             (at == payload.len()).then_some(WalOp::AlterTrigger {
+                identity,
                 name,
                 target,
                 table_schema,
@@ -15097,6 +15139,7 @@ mod tests {
         assert!(append_payload(
             &mut payload,
             &WalOp::CreateTrigger {
+                identity: crate::storage::CatalogPosition::new(3, 41).unwrap(),
                 name: "audit_row",
                 target: TriggerTargetKind::Table,
                 table_schema: "public",
@@ -15130,6 +15173,7 @@ mod tests {
         assert!(append_payload(
             &mut payload,
             &WalOp::CreateTrigger {
+                identity: crate::storage::CatalogPosition::new(3, 41).unwrap(),
                 name: "audit_statement",
                 target: TriggerTargetKind::Table,
                 table_schema: "public",
@@ -15171,6 +15215,7 @@ mod tests {
         assert!(append_payload(
             &mut payload,
             &WalOp::CreateTrigger {
+                identity: crate::storage::CatalogPosition::new(3, 41).unwrap(),
                 name: "write_view",
                 target: TriggerTargetKind::View,
                 table_schema: "public",
@@ -15431,6 +15476,7 @@ mod tests {
         assert!(append_payload(
             &mut payload,
             &WalOp::CreateTrigger {
+                identity: crate::storage::CatalogPosition::new(3, 41).unwrap(),
                 name: "audit_row",
                 target: TriggerTargetKind::Table,
                 table_schema: "public",
@@ -15777,6 +15823,7 @@ mod tests {
             wal.append_committed(
                 20,
                 &WalOp::CreateTrigger {
+                    identity: crate::storage::CatalogPosition::new(3, 41).unwrap(),
                     name: "audit_row",
                     target: TriggerTargetKind::Table,
                     table_schema: "public",
@@ -15803,6 +15850,7 @@ mod tests {
             wal.append_committed(
                 21,
                 &WalOp::AlterTrigger {
+                    identity: crate::storage::CatalogPosition::new(3, 41).unwrap(),
                     name: "audit_row",
                     target: TriggerTargetKind::Table,
                     table_schema: "public",
@@ -15815,6 +15863,7 @@ mod tests {
             wal.append_committed(
                 22,
                 &WalOp::DropTrigger {
+                    identity: crate::storage::CatalogPosition::new(3, 41).unwrap(),
                     name: "audit_row_disabled",
                     target: TriggerTargetKind::Table,
                     table_schema: "public",

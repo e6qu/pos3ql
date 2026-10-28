@@ -9505,6 +9505,8 @@ impl Checkpointer {
                         self.block_output
                             .wait_ready(&mut self.block_uploads)
                             .map_err(upload_to_sql)?;
+                    } else if self.file_io.busy() {
+                        self.file_io.wait_ready()?;
                     }
                 }
                 CheckpointStep::Published { lsn } => return Ok(Some(lsn)),
@@ -20515,8 +20517,7 @@ mod stored_dependency_tests {
                 )
                 .unwrap()
             );
-            let (mut stream, request) =
-                maintenance::tests::accept(&mut checkpoint.file_io, &listener);
+            let (stream, request) = maintenance::tests::accept(&mut checkpoint.file_io, &listener);
             assert!(request.starts_with(if phase == "delete" { "DELETE " } else { "GET " }));
             for _ in 0..3 {
                 assert!(
@@ -20527,6 +20528,36 @@ mod stored_dependency_tests {
                 );
                 assert!(!checkpoint.file_io_ready());
             }
+            checkpoint.set_credential_admission(crate::object_store::RequestAdmission::Draining);
+            assert!(
+                !checkpoint.object_io_busy(),
+                "repeatable cleanup requests must release credentials"
+            );
+            assert!(
+                !crate::mem::guard::forbid_alloc(
+                    || checkpoint.collect_block_garbage_batch(&storage)
+                )
+                .unwrap()
+            );
+            assert!(
+                !checkpoint.file_io.busy(),
+                "draining credentials cannot admit another request"
+            );
+            drop(stream);
+            checkpoint.set_credential_admission(crate::object_store::RequestAdmission::Open);
+            assert!(
+                !crate::mem::guard::forbid_alloc(
+                    || checkpoint.collect_block_garbage_batch(&storage)
+                )
+                .unwrap()
+            );
+            let (mut stream, repeated) =
+                maintenance::tests::accept(&mut checkpoint.file_io, &listener);
+            assert_eq!(
+                request.lines().next(),
+                repeated.lines().next(),
+                "cancellation changed the retained operation"
+            );
             let empty_list =
                 b"<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>";
             let manifest = b"pos3ql-manifest-v34\nlsn 0\nnext_rowid 1\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\ntypes_end\nend\n";
@@ -20538,7 +20569,7 @@ mod stored_dependency_tests {
             };
             write!(
                 stream,
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nETag: \"fixture\"\r\n\r\n",
                 body.len()
             )
             .unwrap();
@@ -20591,6 +20622,7 @@ mod stored_dependency_tests {
             ));
         }
         let namespace = crate::object_store::sim::open_namespace(&config.object_store_bucket, 0);
+        let lists_before = namespace.borrow().list_count;
         let mut previous = keys.len();
         let mut done = false;
         for _ in 0..256 {
@@ -20613,6 +20645,11 @@ mod stored_dependency_tests {
         }
         assert!(done);
         assert_eq!(previous, 0);
+        assert_eq!(
+            namespace.borrow().list_count - lists_before,
+            4,
+            "one backup listing and three block pages; live prefixes must not be rescanned"
+        );
         drop(checkpoint);
         drop(storage);
         crate::object_store::sim::drop_namespace(&config.object_store_bucket);

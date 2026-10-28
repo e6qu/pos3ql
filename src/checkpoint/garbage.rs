@@ -38,7 +38,35 @@ impl Checkpointer {
         &mut self,
         storage: &Storage,
     ) -> Result<bool, SqlError> {
+        #[cfg(feature = "checkpoint-profile")]
+        let profile = (
+            checkpoint_profile_start(),
+            self.file_io.block_gets(),
+            self.doomed_blocks.len(),
+            match self.file_gc {
+                FileGcProgress::List { .. } => "gc_list",
+                FileGcProgress::Delete { .. } => "gc_delete",
+                _ => "gc_keep",
+            },
+        );
         let result = self.advance_file_gc(storage);
+        #[cfg(feature = "checkpoint-profile")]
+        profile_checkpoint_phase(
+            profile.3,
+            storage.lsn(),
+            None,
+            profile.0,
+            crate::store::BlockIoStats::default(),
+            crate::store::BlockIoStats {
+                object_gets: self.file_io.block_gets().saturating_sub(profile.1),
+                ..crate::store::BlockIoStats::default()
+            },
+            if profile.3 == "gc_delete" {
+                profile.2.saturating_sub(self.doomed_blocks.len())
+            } else {
+                0
+            },
+        );
         if result.is_err() && !self.block_garbage_loaded {
             self.reset_file_gc();
             self.backup_roster_loaded = false;

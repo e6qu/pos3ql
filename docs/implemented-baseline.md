@@ -391,8 +391,11 @@ preserves newer writes, active readers, prepared changes and backup roots.
 Journal cleanup retains backup-list pages, retention manifests, commit-chain
 positions and pending deletions while their requests wait. Those waits release
 the SQL worker; listing, retention checks and deletion stay within their fixed
-startup reservations. Replacing a backup invalidates the pending retention
-decision before cleanup resumes.
+startup reservations. Saved-file cleanup likewise retains its backup, manifest,
+row-inventory, index-tree, listing and deletion positions. Before deleting a file,
+it validates every retained graph. Its requests have a separate client and yield
+to cached SQL; cache hits preserve other queries' pending reads. Replacing a
+backup invalidates the pending retention decision before cleanup resumes.
 Checkpoints can save new rows and free cache space while obsolete-log requests
 wait. Separate fixed queues prevent either task from changing the other's
 pending deletions, and new commits cannot extend an old cleanup pass forever.

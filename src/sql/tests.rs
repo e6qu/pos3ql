@@ -81621,7 +81621,7 @@ fn checkpoint_garbage_is_drained_in_configured_batches_before_success() {
             .unwrap()
             .client
             .put(
-                &format!("blocks/orphan-{index}"),
+                &format!("blocks/{index:064x}"),
                 b"orphan",
                 crate::object_store::Precondition::IfNoneMatchAny,
             )
@@ -81642,7 +81642,9 @@ fn checkpoint_garbage_is_drained_in_configured_batches_before_success() {
         .as_mut()
         .unwrap()
         .client
-        .list("blocks/orphan-", |_| obsolete += 1)
+        .list("blocks/", |key| {
+            obsolete += usize::from((0..5).any(|index| key == format!("blocks/{index:064x}")));
+        })
         .unwrap();
     assert_eq!(obsolete, 0, "successful checkpoint must drain every batch");
     drop(engine);
@@ -93645,7 +93647,17 @@ fn maintenance_metadata_waits_leave_cached_sql_runnable_through_file_deletion() 
             std::thread::yield_now();
         }
     }
-    assert!(!crate::mem::guard::forbid_alloc(|| engine.checkpoint_beat()).failed());
+    for _ in 0..4 {
+        if !engine
+            .ckpt
+            .as_ref()
+            .unwrap()
+            .published_maintenance_pending()
+        {
+            break;
+        }
+        assert!(!crate::mem::guard::forbid_alloc(|| engine.checkpoint_beat()).failed());
+    }
     assert!(
         !engine
             .ckpt
@@ -93720,7 +93732,7 @@ fn maintenance_metadata_reader_release_shares_the_configured_deletion_limit() {
         .unwrap()
         .client
         .put(
-            "blocks/released-reader-orphan",
+            "blocks/ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
             b"obsolete block",
             Precondition::IfNoneMatchAny,
         )
@@ -93737,17 +93749,25 @@ fn maintenance_metadata_reader_release_shares_the_configured_deletion_limit() {
         assert!(engine.storage.retained_file_reclamation_pending());
     });
     let before = namespace.borrow().object_count();
-    assert!(!crate::mem::guard::forbid_alloc(|| engine.checkpoint_beat()).failed());
-    assert_eq!(
-        namespace.borrow().object_count(),
-        before - 1,
-        "a reader release must not add a second deletion batch to a journal turn"
-    );
+    let mut previous = before;
+    for _ in 0..64 {
+        assert!(!crate::mem::guard::forbid_alloc(|| engine.checkpoint_beat()).failed());
+        let count = namespace.borrow().object_count();
+        assert!(
+            previous - count <= 1,
+            "one turn exceeded the shared deletion allowance"
+        );
+        previous = count;
+        if count < before {
+            break;
+        }
+    }
+    assert_eq!(previous, before - 1);
     assert!(
         namespace
             .borrow()
             .object_bytes(&format!(
-                "{}blocks/released-reader-orphan",
+                "{}blocks/ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
                 config.object_store_prefix
             ))
             .is_none()

@@ -60,13 +60,29 @@ pub(super) struct MetadataIo {
     state: State,
     keys: FixedVec<StackStr<MAX_OBJECT_KEY_BYTES>>,
     admission: crate::object_store::RequestAdmission,
+    #[cfg(feature = "checkpoint-profile")]
+    block_gets: u64,
 }
 
 impl MetadataIo {
     pub(super) fn budget_bytes(config: &Config) -> usize {
         Client::budget_bytes(config)
-            + core::mem::size_of::<State>()
+            + Self::state_budget_bytes()
             + PAGE_KEYS * core::mem::size_of::<StackStr<MAX_OBJECT_KEY_BYTES>>()
+    }
+
+    fn state_budget_bytes() -> usize {
+        core::mem::size_of::<State>()
+            + if cfg!(feature = "checkpoint-profile") {
+                core::mem::size_of::<u64>()
+            } else {
+                0
+            }
+    }
+
+    #[cfg(feature = "checkpoint-profile")]
+    pub(super) fn block_gets(&self) -> u64 {
+        self.block_gets
     }
 
     pub(super) fn new(
@@ -74,7 +90,7 @@ impl MetadataIo {
         budget: &mut Budget,
     ) -> Result<Self, super::CheckpointSetupError> {
         budget
-            .draw(core::mem::size_of::<State>(), "maintenance request state")
+            .draw(Self::state_budget_bytes(), "maintenance request state")
             .map_err(super::CheckpointSetupError::Budget)?;
         let mut client = Client::new(config, budget)
             .map_err(|error| super::CheckpointSetupError::ObjectStore(error.to_string()))?;
@@ -85,6 +101,8 @@ impl MetadataIo {
             keys: FixedVec::new(budget, "maintenance page keys", PAGE_KEYS)
                 .map_err(super::CheckpointSetupError::Budget)?,
             admission: crate::object_store::RequestAdmission::Open,
+            #[cfg(feature = "checkpoint-profile")]
+            block_gets: 0,
         })
     }
 
@@ -214,6 +232,12 @@ impl MetadataIo {
             }
         };
         if !matches!(result, Err(Error::WouldBlock)) {
+            #[cfg(feature = "checkpoint-profile")]
+            if matches!(&result, Ok(Response::Get))
+                && matches!(operation, Operation::Get(key) if key.as_str().starts_with("blocks/"))
+            {
+                self.block_gets = self.block_gets.saturating_add(1);
+            }
             if result.is_err() {
                 self.client.cancel_request();
                 self.keys.clear();

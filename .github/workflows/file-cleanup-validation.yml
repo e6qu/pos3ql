@@ -19,4 +19,5 @@ jobs:
           key: file-cleanup-dependencies-${{ hashFiles('Cargo.lock') }}
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets --locked -- -D warnings
-      - run: cargo test --lib --locked -- maintenance_metadata_ index_file_owners_ parallel_physical_ store::value::tests:: store::navigation::tests:: store::tiered::tests:: store::disk::tests:: store::cache::tests:: checkpoint_budget --nocapture --test-threads=1
+      - run: >-
+          cargo test --lib --locked -- maintenance_metadata_ index_file_owners_ parallel_physical_ store::value::tests:: store::navigation::tests:: store::tiered::tests:: store::disk::tests:: store::cache::tests:: checkpoint_budget --nocapture --test-threads=1

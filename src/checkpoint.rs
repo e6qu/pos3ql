@@ -1383,7 +1383,6 @@ pub(crate) struct Checkpointer {
     legacy_garbage_loaded: bool,
     legacy_garbage_overflow: bool,
     block_garbage_loaded: bool,
-    block_garbage_overflow: bool,
     /// Sliced-checkpoint sweep state: whether a sweep is mid-flight, the
     /// table generation each slot's slice captured, and which slots were
     /// sliced this sweep.
@@ -2416,7 +2415,6 @@ impl Checkpointer {
             legacy_garbage_loaded: false,
             legacy_garbage_overflow: false,
             block_garbage_loaded: false,
-            block_garbage_overflow: false,
             sweeping: false,
             published_lsn_pending_maintenance: None,
             commit_prune_through: None,
@@ -2460,6 +2458,12 @@ impl Checkpointer {
             writer_fence_etag: None,
             writer_fenced: false,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn schedule_file_cleanup_for_test(&mut self, lsn: u64) {
+        self.block_garbage_pending = true;
+        self.published_lsn_pending_maintenance = Some(lsn);
     }
 
     #[cfg(test)]
@@ -3595,13 +3599,6 @@ impl Checkpointer {
             ));
         }
         self.backup_roster_loaded = true;
-        Ok(())
-    }
-
-    fn ensure_backup_names_loaded(&mut self) -> Result<(), SqlError> {
-        if !self.backup_roster_loaded {
-            self.load_backup_names()?;
-        }
         Ok(())
     }
 
@@ -9569,7 +9566,7 @@ impl Checkpointer {
     /// Advances captured table/index output, manifest publication or cleanup.
     /// Changed tables need a current slice before manifest capture. Upload and
     /// local installation then retain that capture's identity across turns.
-    /// Some capture and block-cleanup reads still wait synchronously.
+    /// Some capture and table/index merge reads still wait synchronously.
     ///
     /// Failures retain a retryable position or restart the same immutable job.
     /// Repeated PUTs keep the same block identity but still cost requests and
@@ -20431,6 +20428,191 @@ mod stored_dependency_tests {
         let manifest = core::str::from_utf8(checkpoint.manifest_output.readable()).unwrap();
         assert!(manifest.contains(&index_gc_hex(new.handle.roster)));
         assert_eq!(storage.table(table).spill_generations().len(), 2);
+        drop(checkpoint);
+        drop(storage);
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    }
+
+    #[test]
+    fn maintenance_metadata_file_cleanup_waits_keep_each_request_and_position() {
+        use std::io::Write;
+        for phase in ["backups", "manifest", "rows", "index", "list", "delete"] {
+            let (mut checkpoint, storage, _, config) = index_gc_fixture(phase, 32);
+            let index = write_gc_index(&checkpoint, b"retained");
+            let row_roster = checkpoint
+                .blocks
+                .lock()
+                .unwrap()
+                .put(&index.roster.0, BlockType::SstRoster, 0)
+                .unwrap();
+            let namespace =
+                crate::object_store::sim::open_namespace(&config.object_store_bucket, 0);
+            let root = if phase == "rows" {
+                row_roster
+            } else {
+                index.roster
+            };
+            let root_key = format!("blocks/{}", index_gc_hex(root));
+            let root_body = namespace
+                .borrow()
+                .object_bytes(&format!("{}{root_key}", config.object_store_prefix))
+                .unwrap()
+                .to_vec();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let mut network = config.clone();
+            network.object_store_sim = false;
+            network.object_store_endpoint = listener.local_addr().unwrap().to_string();
+            network.object_store_access_key = "test-access".to_owned();
+            network.object_store_secret_key = "test-secret".to_owned();
+            let mut budget = Budget::new(MetadataIo::budget_bytes(&network));
+            checkpoint.file_io = MetadataIo::new(&network, &mut budget).unwrap();
+            assert_eq!(budget.remaining(), 0);
+            checkpoint.published_lsn_pending_maintenance = Some(0);
+            checkpoint.block_garbage_pending = true;
+            let key = stack_format!(80, "blocks/{}", index_gc_hex(index.roster));
+            let state = match phase {
+                "backups" => FileGcProgress::Backups {
+                    cursor: ListCursor::START,
+                },
+                "manifest" => {
+                    checkpoint.manifest_present = true;
+                    FileGcProgress::Manifests { index: 0 }
+                }
+                "rows" | "index" => {
+                    let mut keep = BlockKeepSet::new(
+                        &mut checkpoint.roster_scratch,
+                        &mut checkpoint.garbage_seen,
+                    );
+                    keep.insert_root(
+                        root,
+                        if phase == "rows" {
+                            BlockType::SstRoster
+                        } else {
+                            BlockType::ValueIndexRoster
+                        },
+                    )
+                    .unwrap();
+                    FileGcProgress::Walk { position: 0 }
+                }
+                "list" => {
+                    checkpoint.block_garbage_loaded = true;
+                    FileGcProgress::List {
+                        cursor: ListCursor::START,
+                    }
+                }
+                "delete" => {
+                    checkpoint.block_garbage_loaded = true;
+                    checkpoint.doomed_blocks.push(key);
+                    FileGcProgress::Delete { next: None }
+                }
+                _ => unreachable!(),
+            };
+            checkpoint.file_gc = state;
+            assert!(
+                !crate::mem::guard::forbid_alloc(
+                    || checkpoint.collect_block_garbage_batch(&storage)
+                )
+                .unwrap()
+            );
+            let (mut stream, request) =
+                maintenance::tests::accept(&mut checkpoint.file_io, &listener);
+            assert!(request.starts_with(if phase == "delete" { "DELETE " } else { "GET " }));
+            for _ in 0..3 {
+                assert!(
+                    !crate::mem::guard::forbid_alloc(
+                        || checkpoint.collect_block_garbage_batch(&storage)
+                    )
+                    .unwrap()
+                );
+                assert!(!checkpoint.file_io_ready());
+            }
+            let empty_list =
+                b"<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>";
+            let manifest = b"pos3ql-manifest-v34\nlsn 0\nnext_rowid 1\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\ntypes_end\nend\n";
+            let body: &[u8] = match phase {
+                "rows" | "index" => &root_body,
+                "manifest" => manifest,
+                "delete" => b"",
+                _ => empty_list,
+            };
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            stream.write_all(body).unwrap();
+            maintenance::tests::finish(&mut checkpoint.file_io);
+            let done = crate::mem::guard::forbid_alloc(|| {
+                checkpoint.collect_block_garbage_batch(&storage)
+            })
+            .unwrap();
+            assert!(checkpoint.file_io_ready());
+            assert_eq!(done, phase == "delete");
+            if phase == "rows" || phase == "index" {
+                assert!(matches!(
+                    checkpoint.file_gc,
+                    FileGcProgress::Walk { position: 1 }
+                ));
+                assert!(checkpoint.roster_scratch.len() > 1);
+            }
+            if phase == "delete" {
+                assert!(checkpoint.doomed_blocks.is_empty());
+            }
+            // A changed backup invalidates both a completed mark decision and
+            // an unfinished read. It cannot reuse a previously staged deletion.
+            checkpoint.invalidate_backup_roster();
+            assert!(matches!(checkpoint.file_gc, FileGcProgress::Unloaded));
+            assert!(checkpoint.doomed_blocks.is_empty());
+            assert!(checkpoint.file_index_walk.is_none());
+            drop(checkpoint);
+            drop(storage);
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        }
+    }
+
+    #[test]
+    fn maintenance_metadata_file_cleanup_pages_once_and_deletes_in_bounded_turns() {
+        let (mut checkpoint, storage, _, config) = index_gc_fixture("gc-many-pages", 256);
+        checkpoint.delete_objects_per_beat = 2;
+        let mut keys = Vec::new();
+        for value in 0u64..137 {
+            let id = checkpoint
+                .blocks
+                .lock()
+                .unwrap()
+                .put(&value.to_le_bytes(), BlockType::SstData, 0)
+                .unwrap();
+            keys.push(format!(
+                "{}blocks/{}",
+                config.object_store_prefix,
+                index_gc_hex(id)
+            ));
+        }
+        let namespace = crate::object_store::sim::open_namespace(&config.object_store_bucket, 0);
+        let mut previous = keys.len();
+        let mut done = false;
+        for _ in 0..256 {
+            done = crate::mem::guard::forbid_alloc(|| {
+                checkpoint.collect_block_garbage_batch(&storage)
+            })
+            .unwrap();
+            let left = keys
+                .iter()
+                .filter(|key| namespace.borrow().object_bytes(key).is_some())
+                .count();
+            assert!(
+                previous - left <= 2,
+                "one turn exceeded its delete allowance"
+            );
+            previous = left;
+            if done {
+                break;
+            }
+        }
+        assert!(done);
+        assert_eq!(previous, 0);
         drop(checkpoint);
         drop(storage);
         crate::object_store::sim::drop_namespace(&config.object_store_bucket);

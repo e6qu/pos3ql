@@ -288,7 +288,7 @@ impl MetadataIo {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
@@ -310,7 +310,10 @@ mod tests {
         (io, listener)
     }
 
-    fn accept(io: &mut MetadataIo, listener: &TcpListener) -> (TcpStream, String) {
+    pub(in crate::checkpoint) fn accept(
+        io: &mut MetadataIo,
+        listener: &TcpListener,
+    ) -> (TcpStream, String) {
         let deadline = Instant::now() + Duration::from_secs(2);
         let (mut stream, _) = loop {
             io.advance(Instant::now());
@@ -341,7 +344,7 @@ mod tests {
         (stream, String::from_utf8(bytes).unwrap())
     }
 
-    fn finish(io: &mut MetadataIo) {
+    pub(in crate::checkpoint) fn finish(io: &mut MetadataIo) {
         let deadline = Instant::now() + Duration::from_secs(2);
         while !io.ready() {
             crate::mem::guard::forbid_alloc(|| io.advance(Instant::now()));

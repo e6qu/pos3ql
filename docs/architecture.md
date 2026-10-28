@@ -218,8 +218,12 @@ foreground block reads and journal uploads wait. It has its own fixed backup
 list and deletion queue, so checkpoints can publish and free row-cache space
 while obsolete-log requests wait. A pass has a fixed cutoff; newer checkpoints
 queue the latest next cutoff instead of restarting the active pass.
-Checkpoint capture, block
-garbage collection and table/index merge reads still have synchronous paths.
+Saved-file cleanup uses a second fixed client and retains its backup, manifest,
+row-roster, index-tree and deletion positions across waits. Its cache probes
+preserve query read owners. It validates the complete keep-set before deleting
+files, then continues each listing from its saved cursor. Durable file writers
+remain paused while that decision drains; foreground RAM edits can continue.
+Checkpoint capture and table/index merge reads still have synchronous paths.
 
 The remaining order is coherent shared row/catalog publication and bounded
 maintenance, startup-reserved CPU workers, then representative performance and

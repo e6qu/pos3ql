@@ -164,7 +164,10 @@ impl<S: BlockStore> DiskCache<S> {
     /// Frames `payload` and writes it to a slot. A write failure drops the block
     /// from the cache rather than raising: the block is already safe in the
     /// store, so a cache that could not keep a copy has only lost the reuse.
-    fn admit(&mut self, id: BlockId, block_type: BlockType, lsn: u64, payload: &[u8]) {
+    pub(super) fn admit(&mut self, id: BlockId, block_type: BlockType, lsn: u64, payload: &[u8]) {
+        if self.index.get(&id).is_some() {
+            return;
+        }
         if payload.len() > MAX_PAYLOAD {
             return;
         }

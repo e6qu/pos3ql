@@ -1985,6 +1985,86 @@ mod tests {
     }
 
     #[test]
+    fn maintenance_metadata_navigation_walk_resumes_every_node_without_restarting() {
+        let mut budget = Budget::new(16 << 20);
+        let mut store =
+            crate::store::MemoryBlockStore::new(&mut budget, "resumed navigation", 8 << 20, 2048)
+                .unwrap();
+        let mut writer = NavigationWriter::new();
+        writer.reset(0, false, false);
+        for value in 0u64..1057 {
+            let id = store
+                .put(&value.to_le_bytes(), BlockType::ValueIndexData, 0)
+                .unwrap();
+            writer
+                .append(
+                    &mut store,
+                    id,
+                    1,
+                    SpatialBounds::new(value as f64, 0.0, value as f64, 0.0),
+                )
+                .unwrap();
+        }
+        let root = writer.finish(&mut store).unwrap();
+        let mut scratch = vec![0u8; MAX_PAYLOAD];
+        let mut expected = Vec::new();
+        walk_value_roster(&mut store, root, &mut scratch, |id, kind| {
+            expected.push((id, kind));
+            true
+        })
+        .unwrap();
+        let mut walk = ValueRosterWalk::new(root);
+        let mut seen = Vec::with_capacity(expected.len() * 2);
+        let mut pending = None;
+        let mut successful_reads = 0;
+        let mut done = false;
+        crate::mem::guard::forbid_alloc(|| {
+            for _ in 0..4096 {
+                let result = walk.step(
+                    &mut |id, into| {
+                        if pending != Some(*id) {
+                            pending = Some(*id);
+                            return Err(StoreError::NotReady);
+                        }
+                        pending = None;
+                        successful_reads += 1;
+                        store.get(id, into)
+                    },
+                    &mut scratch,
+                    &mut |id, kind| {
+                        seen.push((id, kind));
+                        true
+                    },
+                );
+                match result {
+                    Ok(ValueRosterStep::Done) => {
+                        done = true;
+                        break;
+                    }
+                    Ok(ValueRosterStep::Pending)
+                    | Err(ValueIndexError::Store(StoreError::NotReady)) => {}
+                    _ => panic!("navigation walk lost its saved position"),
+                }
+            }
+        });
+        assert!(done);
+        // A node can be offered before its GET waits; keep-set insertion is
+        // idempotent. Successful downloads and leaf visits must stay singular.
+        seen.sort_unstable();
+        seen.dedup();
+        expected.sort_unstable();
+        expected.dedup();
+        assert_eq!(seen, expected);
+        assert_eq!(
+            successful_reads,
+            expected
+                .iter()
+                .filter(|(_, kind)| *kind != BlockType::ValueIndexData)
+                .count()
+        );
+    }
+
+    #[test]
     fn chained_roster_roots_are_walked_without_a_flat_block_limit() {
         let mut budget = Budget::new(8 << 20);
         let mut store = MemoryBlockStore::new(&mut budget, "value chain", 4 << 20, 32).unwrap();

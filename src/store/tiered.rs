@@ -346,6 +346,25 @@ impl<S: BlockStore> TieredStore<S> {
         }
     }
 
+    /// Admit an already verified remote response without writing it again.
+    pub(crate) fn cache_verified(
+        &mut self,
+        id: super::BlockId,
+        kind: super::BlockType,
+        payload: &[u8],
+    ) {
+        let layer = match self {
+            Self::WithRam(cache) => {
+                cache.admit(id, kind, payload);
+                cache.inner_mut()
+            }
+            Self::WithoutRam(layer) => layer,
+        };
+        if let Layer::Disk(cache) = layer {
+            cache.admit(id, kind, 0, payload);
+        }
+    }
+
     pub(crate) fn base_mut(&mut self) -> &mut S {
         match self {
             Self::WithRam(cache) => cache.inner_mut().base_mut(),
@@ -558,6 +577,74 @@ mod tests {
         let (n, _) = s.get(id, &mut out).expect("reads");
         out.truncate(n);
         out
+    }
+
+    #[test]
+    fn maintenance_metadata_cache_probes_never_consume_foreground_read_owners() {
+        struct PendingStore {
+            releases: usize,
+            reads: usize,
+        }
+        impl BlockStore for PendingStore {
+            fn put(
+                &mut self,
+                _: &[u8],
+                _: BlockType,
+                _: u64,
+            ) -> Result<BlockId, super::super::StoreError> {
+                panic!("verified cache admission must not PUT")
+            }
+            fn get(
+                &mut self,
+                _: &BlockId,
+                _: &mut [u8],
+            ) -> Result<(usize, BlockType), super::super::StoreError> {
+                self.reads += 1;
+                Err(super::super::StoreError::NotReady)
+            }
+            fn release_read(&mut self, _: &BlockId) {
+                self.releases += 1;
+            }
+        }
+        let payload = b"verified roster bytes";
+        let id = BlockId::for_block(BlockType::SstRoster, payload);
+        for (ram, disk) in [(FRAME, 0), (0, SLOT), (FRAME, SLOT), (0, 0)] {
+            let path = dir();
+            let plan = StackPlan::resolve(ram, disk);
+            let mut budget = Budget::new(plan.ram_budget_bytes());
+            let mut tiers = build(
+                &mut budget,
+                PendingStore {
+                    releases: 0,
+                    reads: 0,
+                },
+                plan,
+                &path,
+            )
+            .unwrap();
+            let mut into = [0u8; 64];
+            crate::mem::guard::forbid_alloc(|| {
+                assert_eq!(tiers.get_cached(&id, &mut into).unwrap(), None);
+                tiers.cache_verified(id, BlockType::SstRoster, payload);
+                // Re-admission after a foreground hit must not duplicate an identity.
+                tiers.cache_verified(id, BlockType::SstRoster, payload);
+                let cached = tiers.get_cached(&id, &mut into).unwrap();
+                assert_eq!(cached.is_some(), ram != 0 || disk != 0);
+                if cached.is_some() {
+                    assert_eq!(&into[..payload.len()], payload);
+                }
+                assert_eq!(tiers.base_mut().reads, 0);
+                assert_eq!(tiers.base_mut().releases, 0);
+                let _ = tiers.get(&id, &mut into);
+                assert_eq!(
+                    tiers.base_mut().releases,
+                    usize::from(ram != 0 || disk != 0)
+                );
+                assert_eq!(tiers.base_mut().reads, usize::from(ram == 0 && disk == 0));
+            });
+            drop(tiers);
+            std::fs::remove_dir_all(path).unwrap();
+        }
     }
 
     #[test]

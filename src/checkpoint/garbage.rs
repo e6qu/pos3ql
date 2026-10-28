@@ -222,6 +222,9 @@ impl Checkpointer {
                     let Poll::Ready(bytes) = self.file_io.get(key.as_str())? else {
                         return Ok(false);
                     };
+                    if bytes.len() > self.manifest_buf.capacity() {
+                        return Err(manifest_full());
+                    }
                     let mut keep = BlockKeepSet {
                         blocks: &mut self.roster_scratch,
                         seen: &mut self.garbage_seen,
@@ -408,5 +411,9 @@ fn read_gc_block(
         return Err(sql_err!(SQLSTATE_IO, "gc block buffer too small"));
     }
     into[..block.payload.len()].copy_from_slice(block.payload);
+    blocks
+        .lock()
+        .expect("block store lock poisoned")
+        .cache_verified(*id, block.block_type, block.payload);
     Ok(Poll::Ready((block.payload.len(), block.block_type)))
 }

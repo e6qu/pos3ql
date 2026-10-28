@@ -93526,6 +93526,136 @@ fn maintenance_metadata_waits_leave_cached_sql_runnable_through_log_deletion() {
 }
 
 #[test]
+fn maintenance_metadata_waits_leave_cached_sql_runnable_through_file_deletion() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::time::{Duration, Instant};
+
+    let (mut engine, mut budget, mut config) =
+        sliced_cleanup_fixture("file-cleanup-cached-orders", false);
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    for _ in 0..64 {
+        if !engine.storage.history_cleanup_pending() {
+            break;
+        }
+        assert!(!engine.checkpoint_beat().failed());
+    }
+    assert!(!engine.storage.history_cleanup_pending());
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    config.object_store_on = true;
+    config.object_store_sim = false;
+    config.object_store_endpoint = listener.local_addr().unwrap().to_string();
+    config.object_store_access_key = "test-access".to_owned();
+    config.object_store_secret_key = "test-secret".to_owned();
+    config.block_cache_bytes = 0;
+    config.disk_cache_bytes = 0;
+    let mut io_budget = Budget::new(crate::checkpoint::Checkpointer::budget_bytes(&config));
+    let mut checkpointer = crate::checkpoint::Checkpointer::new(&config, &mut io_budget).unwrap();
+    checkpointer.schedule_file_cleanup_for_test(0);
+    engine.ckpt = Some(checkpointer);
+    let empty = "<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>";
+    let orphan = format!(
+        "<ListBucketResult><IsTruncated>false</IsTruncated><Contents><Key>{}blocks/0000000000000000000000000000000000000000000000000000000000000000</Key></Contents></ListBucketResult>",
+        config.object_store_prefix
+    );
+    let mut stream = None;
+    for (method, response) in [("GET ", empty), ("GET ", orphan.as_str()), ("DELETE ", "")] {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "cleanup did not start its request"
+            );
+            assert!(!crate::mem::guard::forbid_alloc(|| engine.checkpoint_beat()).failed());
+            if !engine.checkpoint_can_progress() {
+                break;
+            }
+        }
+        if stream.is_none() {
+            let (accepted, _) = loop {
+                engine
+                    .advance_wal_publication(Instant::now(), CommitProgressMode::Reactor)
+                    .unwrap();
+                match listener.accept() {
+                    Ok(connection) => break connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "metadata request did not connect"
+                        );
+                        std::thread::yield_now();
+                    }
+                    Err(error) => panic!("accept metadata request: {error}"),
+                }
+            };
+            accepted.set_nonblocking(false).unwrap();
+            accepted
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            stream = Some(accepted);
+        }
+        let stream = stream.as_mut().unwrap();
+        engine
+            .advance_wal_publication(Instant::now(), CommitProgressMode::Reactor)
+            .unwrap();
+        let mut request = Vec::new();
+        while !request.ends_with(b"\r\n\r\n") {
+            let mut byte = [0];
+            stream.read_exact(&mut byte).unwrap();
+            request.push(byte[0]);
+        }
+        assert!(request.starts_with(method.as_bytes()));
+        for _ in 0..3 {
+            let output = session.success(
+                &mut engine,
+                "SELECT count(*) = 80 AND min(id) = 1 AND max(id) = 80 FROM cleanup_orders",
+                true,
+            );
+            assert_eq!(data_rows(&output), ["t"]);
+            // Releasing a statement reader may queue CPU-only history cleanup.
+            // It must finish in bounded turns without polling the held socket.
+            for _ in 0..64 {
+                assert!(!engine.ckpt.as_ref().unwrap().file_io_ready());
+                let history = engine.storage.history_cleanup_pending();
+                let beat = crate::mem::guard::forbid_alloc(|| engine.checkpoint_beat());
+                if beat == CheckpointBeat::WaitingForReads {
+                    break;
+                }
+                assert_eq!(beat, CheckpointBeat::Advanced);
+                assert!(history, "only local reader-history work may advance here");
+            }
+            assert!(!engine.checkpoint_can_progress());
+        }
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n{response}",
+            response.len()
+        )
+        .unwrap();
+        while !engine.checkpoint_can_progress() {
+            assert!(
+                Instant::now() < deadline,
+                "cleanup did not wake after its response"
+            );
+            crate::mem::guard::forbid_alloc(|| {
+                engine.advance_wal_publication(Instant::now(), CommitProgressMode::Reactor)
+            })
+            .unwrap();
+            std::thread::yield_now();
+        }
+    }
+    assert!(!crate::mem::guard::forbid_alloc(|| engine.checkpoint_beat()).failed());
+    assert!(
+        !engine
+            .ckpt
+            .as_ref()
+            .unwrap()
+            .published_maintenance_pending()
+    );
+}
+
+#[test]
 fn maintenance_metadata_reader_release_shares_the_configured_deletion_limit() {
     use crate::object_store::Precondition;
     let mut config = test_config("journal-reader-release-pacing");

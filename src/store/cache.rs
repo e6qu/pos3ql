@@ -164,7 +164,10 @@ impl<S: BlockStore> BlockCache<S> {
         }
     }
 
-    fn admit(&mut self, id: BlockId, block_type: BlockType, payload: &[u8]) {
+    pub(super) fn admit(&mut self, id: BlockId, block_type: BlockType, payload: &[u8]) {
+        if self.index.get(&id).is_some() {
+            return;
+        }
         // A payload too large for a frame is simply not cached; it still
         // reached the caller from the store, so nothing is lost but the reuse.
         if payload.len() > MAX_PAYLOAD {

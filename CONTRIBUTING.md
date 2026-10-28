@@ -123,7 +123,9 @@ checksum, source and cache key together when changing this fixture dependency.
 Use the existing fixtures and allocation guard for changed runtime behavior.
 Set accepted mock sockets' blocking mode explicitly. Wait for socket readiness
 using the original deadline; a mock server reporting a completed write does not
-guarantee that its client can read the bytes yet.
+guarantee that its client can read the bytes yet. Cleanup regressions should hold
+backup, manifest, roster, listing and deletion responses separately, check that
+cached SQL remains runnable, and verify retention before deleting any file.
 Verify the invariant or external contract, not a test that merely restates the
 implementation. Boundary changes generally need accepted/rejected capacity,
 rollback, failure cleanup, WAL/checkpoint, and empty-cache recovery coverage.

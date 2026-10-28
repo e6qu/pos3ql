@@ -115,12 +115,30 @@ index preparation or index writer. Changing producers requires the previous
 batch to finish. An index task ending without output cannot cause a later
 merge's files to be discarded as obsolete index work. The manifest waits for
 all required immutable uploads before publication.
-Cleanup retains installed table files and active merge inputs even when a
-different captured file list has published. It validates each saved row-file
-inventory's block type and length before using it to decide what to delete.
+Saved-file cleanup has its own startup-reserved client, separate from journal
+cleanup and foreground reads. It retains backup listings, manifest reads, row-file
+inventories and index-tree traversal across responses. Each turn reads at most
+one manifest or roster node, lists at most 64 keys (also bounded by the configured
+delete queue), or deletes the configured batch. A listing continues from its
+saved provider cursor instead of rescanning all live files for each batch.
 
-**User example:** a slow response while deleting last week's obsolete journal
-must not delay reading a cached order or saving new orders to free cache space.
+Cleanup keeps installed table files and active merge inputs even when a
+different captured file list has published. Before listing deletion candidates,
+it completes and validates the full file inventory for live tables, readers,
+unfinished merges, the durable manifest and named backups. Invalid or missing
+rosters and an exhausted keep-set fail before any deletion. A changed backup
+cancels the old decision and starts a new inventory. Durable file writers wait
+until the captured decision has drained; ordinary row edits can continue in RAM.
+
+Verified cached rosters need no remote request. A cache probe never consumes
+another query's pending read. Downloaded blocks are checked for checksum,
+identity and type before their payload is cached or used for retention.
+
+**User example:** while cleanup waits for the object store to list last week's
+files or delete an obsolete journal batch, another connection can read a cached
+order. Log cleanup also allows checkpoints to save new orders and free row-cache
+space. Saved-file cleanup still pauses new file publication until its inventory
+and deletions finish; it releases the SQL worker during each network wait.
 Cleanup retains its exact request and
 position. A failed deletion does not advance that position; retrying the same
 DELETE is safe even if its response was lost. Each request keeps the existing
@@ -138,7 +156,7 @@ requests and resumes the same position with the new credentials.
 | Credential validation | One conditional upload client with a 128-byte body when `object_store_credentials_file` is configured. The candidate must also read back the result. |
 | Operational ownership check | One fixed client and one receipt slot per `operations_max_connections` when the operational listener and object storage are enabled. Shares the explicit TLS budget. |
 | `checkpoint_manifest_bytes` | Bytes in each of three fixed buffers: metadata scratch, retained manifest, and manifest upload body. |
-| Background metadata | One separate client with `object_store_head_bytes` and `object_store_response_bytes`, request state, 64 fixed 1,024-byte key strings and one reactor descriptor. No runtime growth. |
+| Background metadata | Two independent clients, for journal and saved-file cleanup. Each reserves `object_store_head_bytes`, `object_store_response_bytes`, request state, 64 fixed 1,024-byte key strings and one reactor descriptor. File traversal state and deduplication entries are charged to checkpoint startup memory. No runtime growth. |
 | `checkpoint_write_entries` | Committed versions retained by one table output schedule; SQLSTATE 54000 names exhaustion before publication. |
 | `commit_queue_slots` | Complete transaction and session-context buffers retained through asynchronous publication; at least 1 in object-store mode. |
 

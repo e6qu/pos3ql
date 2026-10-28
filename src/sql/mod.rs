@@ -6302,13 +6302,16 @@ impl Engine {
             let entry = self.storage.default_acl_entry(slot as usize);
             let expected = entry.committed;
             let image = entry.image_to(txn.txid);
-            if expected == image { continue; }
+            if expected == image {
+                continue;
+            }
             let lsn = self.storage.bump_lsn();
             if let Err(error) = self.wal.stage_reserved(
                 txn.txid,
                 lsn,
                 &WalOp::SetDefaultAcl {
-                    slot: u16::try_from(slot).expect("default privilege admission checks the physical position"),
+                    slot: u16::try_from(slot)
+                        .expect("default privilege admission checks the physical position"),
                     expected,
                     image,
                 },
@@ -6317,11 +6320,18 @@ impl Engine {
                 return Err(error);
             }
         }
-        if txn.ddl().iter().any(|undo| matches!(undo, DdlUndo::DefaultAclChanged { .. })) {
+        if txn
+            .ddl()
+            .iter()
+            .any(|undo| matches!(undo, DdlUndo::DefaultAclChanged { .. }))
+        {
             let value = core::num::NonZeroU64::new(self.storage.catalog_identity_sequence())
                 .expect("a default privilege change retains a positive creation reservation");
             let lsn = self.storage.bump_lsn();
-            if let Err(error) = self.wal.stage_reserved(txn.txid, lsn, &WalOp::ReserveCatalogSequence(value)) {
+            if let Err(error) =
+                self.wal
+                    .stage_reserved(txn.txid, lsn, &WalOp::ReserveCatalogSequence(value))
+            {
                 self.rollback_txn(txn, guc);
                 return Err(error);
             }
@@ -23882,7 +23892,11 @@ fn apply_wal_op(
         } => {
             storage.install_role_membership(identity, role, member, grantor, options)?;
         }
-        WalOp::DropRoleMembership { identity, role, member } => {
+        WalOp::DropRoleMembership {
+            identity,
+            role,
+            member,
+        } => {
             storage.remove_role_membership(identity, role, member)?;
         }
         WalOp::SetRoleSetting {
@@ -24240,7 +24254,11 @@ fn apply_wal_op(
                 0,
             )?;
         }
-        WalOp::SetDefaultAcl { slot, expected, image } => {
+        WalOp::SetDefaultAcl {
+            slot,
+            expected,
+            image,
+        } => {
             storage.install_default_acl_image(usize::from(slot), expected, image, 0)?;
         }
     }

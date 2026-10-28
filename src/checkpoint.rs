@@ -5298,38 +5298,74 @@ impl Checkpointer {
                     let creation: u64 = parse_field(words.next(), "default privilege creation")?;
                     let creation = crate::storage::CatalogIdentity::parse(creation)
                         .filter(|creation| creation.created_at() <= metadata.catalog_sequence)
-                        .ok_or(CheckpointSetupError::Corrupt("invalid default privilege creation"))?;
+                        .ok_or(CheckpointSetupError::Corrupt(
+                            "invalid default privilege creation",
+                        ))?;
                     let owner: i32 = parse_field(words.next(), "default privilege owner")?;
-                    let owner = crate::storage::RoleOid::parse(owner)
-                        .ok_or(CheckpointSetupError::Corrupt("invalid default privilege owner"))?;
-                    let namespace = words.next().ok_or(CheckpointSetupError::Corrupt("default privilege namespace missing"))?;
-                    let schema = if namespace == "-" { None } else {
-                        let created_at: u64 = parse_field(Some(namespace), "default privilege namespace")?;
-                        Some(crate::storage::SchemaIdentity::parse(created_at)
-                            .ok_or(CheckpointSetupError::Corrupt("invalid default privilege namespace"))?)
+                    let owner = crate::storage::RoleOid::parse(owner).ok_or(
+                        CheckpointSetupError::Corrupt("invalid default privilege owner"),
+                    )?;
+                    let namespace = words.next().ok_or(CheckpointSetupError::Corrupt(
+                        "default privilege namespace missing",
+                    ))?;
+                    let schema = if namespace == "-" {
+                        None
+                    } else {
+                        let created_at: u64 =
+                            parse_field(Some(namespace), "default privilege namespace")?;
+                        Some(crate::storage::SchemaIdentity::parse(created_at).ok_or(
+                            CheckpointSetupError::Corrupt("invalid default privilege namespace"),
+                        )?)
                     };
-                    let grantee = words.next().ok_or(CheckpointSetupError::Corrupt("default privilege grantee missing"))?;
-                    let grantee = if grantee == "PUBLIC" { None } else {
+                    let grantee = words.next().ok_or(CheckpointSetupError::Corrupt(
+                        "default privilege grantee missing",
+                    ))?;
+                    let grantee = if grantee == "PUBLIC" {
+                        None
+                    } else {
                         let oid: i32 = parse_field(Some(grantee), "default privilege grantee")?;
-                        Some(crate::storage::RoleOid::parse(oid)
-                            .ok_or(CheckpointSetupError::Corrupt("invalid default privilege grantee"))?)
+                        Some(crate::storage::RoleOid::parse(oid).ok_or(
+                            CheckpointSetupError::Corrupt("invalid default privilege grantee"),
+                        )?)
                     };
                     let class: u8 = parse_field(words.next(), "default privilege class")?;
-                    let class = crate::storage::DefaultPrivilegeClass::from_u8(class)
-                        .ok_or(CheckpointSetupError::Corrupt("invalid default privilege class"))?;
+                    let class = crate::storage::DefaultPrivilegeClass::from_u8(class).ok_or(
+                        CheckpointSetupError::Corrupt("invalid default privilege class"),
+                    )?;
                     let privileges: u16 = parse_field(words.next(), "default privileges")?;
                     let grant_options: u16 = parse_field(words.next(), "default grant options")?;
-                    if words.next().is_some() || privileges & !class.all_privileges().0 != 0
-                        || grant_options & !privileges != 0 || slot == u16::MAX {
-                        return Err(CheckpointSetupError::Corrupt("invalid default privilege record"));
+                    if words.next().is_some()
+                        || privileges & !class.all_privileges().0 != 0
+                        || grant_options & !privileges != 0
+                        || slot == u16::MAX
+                    {
+                        return Err(CheckpointSetupError::Corrupt(
+                            "invalid default privilege record",
+                        ));
                     }
-                    storage.install_default_acl_image(usize::from(slot), None, Some(crate::storage::DefaultAclGrantImage {
-                        identity: crate::storage::DefaultAclIdentity { creation, owner, schema, class },
-                        grantee,
-                        privileges: crate::storage::PrivilegeSet(privileges),
-                        grant_options: crate::storage::PrivilegeSet(grant_options),
-                    }), 0).map_err(|error| CheckpointSetupError::ObjectStore(format!(
-                        "manifest default privilege rejected: {}", error.message.as_str())))?;
+                    storage
+                        .install_default_acl_image(
+                            usize::from(slot),
+                            None,
+                            Some(crate::storage::DefaultAclGrantImage {
+                                identity: crate::storage::DefaultAclIdentity {
+                                    creation,
+                                    owner,
+                                    schema,
+                                    class,
+                                },
+                                grantee,
+                                privileges: crate::storage::PrivilegeSet(privileges),
+                                grant_options: crate::storage::PrivilegeSet(grant_options),
+                            }),
+                            0,
+                        )
+                        .map_err(|error| {
+                            CheckpointSetupError::ObjectStore(format!(
+                                "manifest default privilege rejected: {}",
+                                error.message.as_str()
+                            ))
+                        })?;
                 }
                 Some("pacl") => {
                     finish_pending(storage, &mut slot_of, &mut pending_def)?;
@@ -12868,24 +12904,41 @@ impl Checkpointer {
             )?;
         }
         for (slot, acl) in storage.checkpoint_default_acls() {
-            write_database_context(&mut self.manifest_output, &mut database_context, acl.database)?;
+            write_database_context(
+                &mut self.manifest_output,
+                &mut database_context,
+                acl.database,
+            )?;
             use core::fmt::Write;
-            let image = acl.committed.expect("checkpoint default privileges are present");
+            let image = acl
+                .committed
+                .expect("checkpoint default privileges are present");
             let mut schema = StackStr::<32>::new();
             match image.identity.schema {
                 Some(identity) => write!(&mut schema, "{}", identity.created_at()),
                 None => write!(&mut schema, "-"),
-            }.expect("default privilege namespace fits its exact decimal width");
+            }
+            .expect("default privilege namespace fits its exact decimal width");
             let mut grantee = StackStr::<32>::new();
             match image.grantee {
                 Some(role) => write!(&mut grantee, "{}", role.get()),
                 None => write!(&mut grantee, "PUBLIC"),
-            }.expect("default privilege grantee fits its exact decimal width");
-            write_manifest(&mut self.manifest_output, format_args!(
-                "dacl {} {} {} {} {} {} {} {}", slot, image.identity.creation.created_at(),
-                image.identity.owner.get(), schema.as_str(), grantee.as_str(), image.identity.class as u8,
-                image.privileges.0, image.grant_options.0,
-            ))?;
+            }
+            .expect("default privilege grantee fits its exact decimal width");
+            write_manifest(
+                &mut self.manifest_output,
+                format_args!(
+                    "dacl {} {} {} {} {} {} {} {}",
+                    slot,
+                    image.identity.creation.created_at(),
+                    image.identity.owner.get(),
+                    schema.as_str(),
+                    grantee.as_str(),
+                    image.identity.class as u8,
+                    image.privileges.0,
+                    image.grant_options.0,
+                ),
+            )?;
         }
         for row in storage.parameter_acl_rows_visible(0) {
             self.parameter_acl_arena.reset();

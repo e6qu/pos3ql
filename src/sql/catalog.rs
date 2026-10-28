@@ -10542,13 +10542,21 @@ fn pg_default_acl<'a>(
 
     let definition = schema::require("pg_default_acl", false);
     let images = storage.snapshot_default_acl_grants(txid, arena)?;
-    let group_key = |image: &crate::storage::DefaultAclGrantImage| (
-        image.identity.owner.get(), image.identity.schema.map_or(0, |schema| schema.oid()),
-        image.identity.class as u8,
-    );
-    let groups = images.iter().enumerate().filter(|(index, image)|
-        *index == 0 || group_key(image) != group_key(&images[*index - 1])).count();
-    let rows = arena.alloc_slice_with(groups, |_| &[] as &[Datum]).map_err(|_| arena_full())?;
+    let group_key = |image: &crate::storage::DefaultAclGrantImage| {
+        (
+            image.identity.owner.get(),
+            image.identity.schema.map_or(0, |schema| schema.oid()),
+            image.identity.class as u8,
+        )
+    };
+    let groups = images
+        .iter()
+        .enumerate()
+        .filter(|(index, image)| *index == 0 || group_key(image) != group_key(&images[*index - 1]))
+        .count();
+    let rows = arena
+        .alloc_slice_with(groups, |_| &[] as &[Datum])
+        .map_err(|_| arena_full())?;
     let mut position = 0;
     let mut row_count = 0;
     while position < images.len() {
@@ -10556,8 +10564,12 @@ fn pg_default_acl<'a>(
         let start = position;
         while position < images.len() && group_key(&images[position]) == group_key(&first) {
             if images[position].identity != first.identity
-                || (position > start && images[position].grantee == images[position - 1].grantee) {
-                return Err(sql_err!(sqlstate::DATA_EXCEPTION, "default privilege group identity is inconsistent"));
+                || (position > start && images[position].grantee == images[position - 1].grantee)
+            {
+                return Err(sql_err!(
+                    sqlstate::DATA_EXCEPTION,
+                    "default privilege group identity is inconsistent"
+                ));
             }
             position += 1;
         }
@@ -10566,15 +10578,22 @@ fn pg_default_acl<'a>(
         let implicit_owner = first.identity.schema.is_none()
             && !selected.iter().any(|image| image.grantee == Some(owner));
         let public = first.identity.class.default_public_privileges();
-        let implicit_public = first.identity.schema.is_none() && public != PrivilegeSet::NONE
+        let implicit_public = first.identity.schema.is_none()
+            && public != PrivilegeSet::NONE
             && !selected.iter().any(|image| image.grantee.is_none());
-        let grants = arena.alloc_slice_with(
-            selected.len() + usize::from(implicit_owner) + usize::from(implicit_public),
-            |_| (None, PrivilegeSet::NONE, PrivilegeSet::NONE),
-        ).map_err(|_| arena_full())?;
+        let grants = arena
+            .alloc_slice_with(
+                selected.len() + usize::from(implicit_owner) + usize::from(implicit_public),
+                |_| (None, PrivilegeSet::NONE, PrivilegeSet::NONE),
+            )
+            .map_err(|_| arena_full())?;
         let mut count = 0;
         if implicit_owner {
-            grants[count] = (Some(owner), first.identity.class.all_privileges(), PrivilegeSet::NONE);
+            grants[count] = (
+                Some(owner),
+                first.identity.class.all_privileges(),
+                PrivilegeSet::NONE,
+            );
             count += 1;
         }
         if implicit_public {
@@ -10589,10 +10608,16 @@ fn pg_default_acl<'a>(
         }
         // PostgreSQL sorts default-permission items by grantee identifier;
         // role slots are reusable and cannot determine that order.
-        grants[..count].sort_unstable_by_key(|(grantee, _, _)| grantee.map_or(0, |role| role.get() as u32));
-        let values = arena.alloc_slice_with(count, |_| Datum::Null).map_err(|_| arena_full())?;
+        grants[..count]
+            .sort_unstable_by_key(|(grantee, _, _)| grantee.map_or(0, |role| role.get() as u32));
+        let values = arena
+            .alloc_slice_with(count, |_| Datum::Null)
+            .map_err(|_| arena_full())?;
         let owner_name = storage.role_name_by_oid(owner, txid).ok_or_else(|| {
-            sql_err!(sqlstate::DATA_EXCEPTION, "default privilege owner identity is unavailable")
+            sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "default privilege owner identity is unavailable"
+            )
         })?;
         let owner_acl_name = super::types::acl_identifier(owner_name.as_str());
         for (index, &(grantee, privileges, options)) in grants[..count].iter().enumerate() {
@@ -10600,41 +10625,66 @@ fn pg_default_acl<'a>(
                 None => None,
                 Some(role) if role == owner => Some(owner_name),
                 Some(role) => Some(storage.role_name_by_oid(role, txid).ok_or_else(|| {
-                    sql_err!(sqlstate::DATA_EXCEPTION, "default privilege grantee identity is unavailable")
+                    sql_err!(
+                        sqlstate::DATA_EXCEPTION,
+                        "default privilege grantee identity is unavailable"
+                    )
                 })?),
             };
             let name = super::types::acl_identifier(name.as_ref().map_or("", SqlName::as_str));
             // Two quoted role identifiers, eight optional grant stars and =/.
             let mut rendered = StackStr::<{ 2 * 130 + 16 + 2 }>::new();
-            write!(rendered, "{}=", name.as_str()).expect("a quoted ACL grantee fits the exact item bound");
+            write!(rendered, "{}=", name.as_str())
+                .expect("a quoted ACL grantee fits the exact item bound");
             for (privilege, letter) in [
-                (PrivilegeSet::INSERT, 'a'), (PrivilegeSet::SELECT, 'r'),
-                (PrivilegeSet::UPDATE, 'w'), (PrivilegeSet::DELETE, 'd'),
-                (PrivilegeSet::TRUNCATE, 'D'), (PrivilegeSet::REFERENCES, 'x'),
-                (PrivilegeSet::TRIGGER, 't'), (PrivilegeSet::MAINTAIN, 'm'),
-                (PrivilegeSet::USAGE, 'U'), (PrivilegeSet::CREATE, 'C'),
+                (PrivilegeSet::INSERT, 'a'),
+                (PrivilegeSet::SELECT, 'r'),
+                (PrivilegeSet::UPDATE, 'w'),
+                (PrivilegeSet::DELETE, 'd'),
+                (PrivilegeSet::TRUNCATE, 'D'),
+                (PrivilegeSet::REFERENCES, 'x'),
+                (PrivilegeSet::TRIGGER, 't'),
+                (PrivilegeSet::MAINTAIN, 'm'),
+                (PrivilegeSet::USAGE, 'U'),
+                (PrivilegeSet::CREATE, 'C'),
                 (PrivilegeSet::EXECUTE, 'X'),
             ] {
                 if privileges.contains(privilege) {
-                    rendered.write_char(letter).expect("default ACL privileges fit the exact item bound");
+                    rendered
+                        .write_char(letter)
+                        .expect("default ACL privileges fit the exact item bound");
                     if options.contains(privilege) {
-                        rendered.write_char('*').expect("default ACL grant stars fit the exact item bound");
+                        rendered
+                            .write_char('*')
+                            .expect("default ACL grant stars fit the exact item bound");
                     }
                 }
             }
-            write!(rendered, "/{}", owner_acl_name.as_str()).expect("a quoted ACL owner fits the exact item bound");
+            write!(rendered, "/{}", owner_acl_name.as_str())
+                .expect("a quoted ACL owner fits the exact item bound");
             values[index] = text(rendered.as_str(), arena)?;
         }
         let object_type = match first.identity.class {
-            DefaultPrivilegeClass::Table => "r", DefaultPrivilegeClass::Sequence => "S",
-            DefaultPrivilegeClass::Function => "f", DefaultPrivilegeClass::Type => "T",
+            DefaultPrivilegeClass::Table => "r",
+            DefaultPrivilegeClass::Sequence => "S",
+            DefaultPrivilegeClass::Function => "f",
+            DefaultPrivilegeClass::Type => "T",
             DefaultPrivilegeClass::Schema => "n",
         };
-        rows[row_count] = row(&[
-            Datum::Int4(first.identity.oid()), Datum::Int4(826), Datum::Int4(owner.get()),
-            Datum::Int4(first.identity.schema.map_or(0, |schema| schema.oid())), text(object_type, arena)?,
-            Datum::Array { element: super::types::ArrElem::AclItem, raw: super::array::build(values, arena)? },
-        ], arena)?;
+        rows[row_count] = row(
+            &[
+                Datum::Int4(first.identity.oid()),
+                Datum::Int4(826),
+                Datum::Int4(owner.get()),
+                Datum::Int4(first.identity.schema.map_or(0, |schema| schema.oid())),
+                text(object_type, arena)?,
+                Datum::Array {
+                    element: super::types::ArrElem::AclItem,
+                    raw: super::array::build(values, arena)?,
+                },
+            ],
+            arena,
+        )?;
         row_count += 1;
     }
     finish(definition, rows, arena)

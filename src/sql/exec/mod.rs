@@ -7455,7 +7455,9 @@ fn stage_role_membership(
         txn.txid,
         lsn,
         &WalOp::UpsertRoleMembership {
-            identity: storage.role_membership(membership).position(membership, txn.txid),
+            identity: storage
+                .role_membership(membership)
+                .position(membership, txn.txid),
             role: role_name.as_str(),
             member: member_name.as_str(),
             grantor: grantor_name.as_str(),
@@ -8031,7 +8033,9 @@ pub fn drop_role(
                 txn.txid,
                 lsn,
                 &WalOp::DropRoleMembership {
-                    identity: storage.role_membership(changed_slot).position(changed_slot, txn.txid),
+                    identity: storage
+                        .role_membership(changed_slot)
+                        .position(changed_slot, txn.txid),
                     role: role_name.as_str(),
                     member: member_name.as_str(),
                 },
@@ -8470,7 +8474,8 @@ pub fn revoke_role(
                 ));
             };
             let grantor = selected_grantor.unwrap_or(current_slot);
-            let Some(existing) = storage.find_role_membership_visible(role, member, grantor, txn.txid)
+            let Some(existing) =
+                storage.find_role_membership_visible(role, member, grantor, txn.txid)
             else {
                 responder.notice(
                     sqlstate::WARNING_PRIVILEGE_NOT_GRANTED,
@@ -8954,7 +8959,9 @@ pub fn alter_default_privileges(
                 ) {
                     Ok(change) => change,
                     Err(error) => return sql_fail(error),
-                }) else { continue };
+                }) else {
+                    continue;
+                };
                 if let Err(error) = txn.record_ddl(super::txn::DdlUndo::DefaultAclChanged {
                     slot: slot as u32,
                     prior,
@@ -9624,7 +9631,10 @@ fn drop_owned_privileges(
             PrivilegeSet::NONE,
             PrivilegeSet::NONE,
             txn.txid,
-        )? else { continue };
+        )?
+        else {
+            continue;
+        };
         if let Err(error) = txn.record_ddl(super::txn::DdlUndo::DefaultAclChanged {
             slot: changed as u32,
             prior,
@@ -13925,21 +13935,32 @@ pub(crate) fn drop_schema(
         for default_slot in 0..storage.default_acl_entry_count() {
             let entry = storage.default_acl_entry(default_slot);
             if entry.database != storage.current_database_oid()
-                || usize::from(entry.schema) != slot || entry.image_to(txn.txid).is_none() {
+                || usize::from(entry.schema) != slot
+                || entry.image_to(txn.txid).is_none()
+            {
                 continue;
             }
             let change = match storage.change_default_acl(
                 crate::storage::DefaultAclKey {
-                    owner: entry.owner, schema: entry.schema, class: entry.class, grantee: entry.grantee,
-                }, false, crate::storage::PrivilegeSet::NONE, crate::storage::PrivilegeSet::NONE, txn.txid,
+                    owner: entry.owner,
+                    schema: entry.schema,
+                    class: entry.class,
+                    grantee: entry.grantee,
+                },
+                false,
+                crate::storage::PrivilegeSet::NONE,
+                crate::storage::PrivilegeSet::NONE,
+                txn.txid,
             ) {
                 Ok(change) => change,
                 Err(error) => return sql_fail(error),
             };
             if let Some((changed, prior)) = change
                 && let Err(error) = txn.record_ddl(super::txn::DdlUndo::DefaultAclChanged {
-                    slot: changed as u32, prior,
-                }) {
+                    slot: changed as u32,
+                    prior,
+                })
+            {
                 storage.restore_default_acl_pending(changed, prior);
                 return sql_fail(error);
             }

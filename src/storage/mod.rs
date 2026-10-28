@@ -12617,15 +12617,24 @@ pub(crate) struct DefaultAclGrantImage {
 
 impl DefaultAclGrantImage {
     pub(crate) fn validate(self) -> Result<(), SqlError> {
-        let baseline = if self.identity.schema.is_some() { PrivilegeSet::NONE }
-            else if self.grantee == Some(self.identity.owner) { self.identity.class.all_privileges() }
-            else if self.grantee.is_none() { self.identity.class.default_public_privileges() }
-            else { PrivilegeSet::NONE };
+        let baseline = if self.identity.schema.is_some() {
+            PrivilegeSet::NONE
+        } else if self.grantee == Some(self.identity.owner) {
+            self.identity.class.all_privileges()
+        } else if self.grantee.is_none() {
+            self.identity.class.default_public_privileges()
+        } else {
+            PrivilegeSet::NONE
+        };
         if (self.identity.class == DefaultPrivilegeClass::Schema && self.identity.schema.is_some())
             || self.privileges.0 & !self.identity.class.all_privileges().0 != 0
             || self.grant_options.0 & !self.privileges.0 != 0
-            || (self.privileges == baseline && self.grant_options == PrivilegeSet::NONE) {
-            return Err(sql_err!(sqlstate::DATA_EXCEPTION, "stored default privilege image is invalid"));
+            || (self.privileges == baseline && self.grant_options == PrivilegeSet::NONE)
+        {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "stored default privilege image is invalid"
+            ));
         }
         Ok(())
     }
@@ -12673,7 +12682,8 @@ impl DefaultAclEntry {
     };
 
     pub(crate) fn image_to(self, txid: u32) -> Option<DefaultAclGrantImage> {
-        self.pending.filter(|pending| pending.txid == txid)
+        self.pending
+            .filter(|pending| pending.txid == txid)
             .map_or(self.committed, |pending| pending.image)
     }
 }
@@ -12791,9 +12801,9 @@ impl Iterator for DefaultAclIter<'_> {
             let slot = self.next_slot;
             self.next_slot += 1;
             let entry = catalog.defaults[slot];
-            let include = self
-                .database
-                .map_or(entry.committed.is_some(), |database| entry.database == database);
+            let include = self.database.map_or(entry.committed.is_some(), |database| {
+                entry.database == database
+            });
             if include {
                 return Some((slot, entry));
             }
@@ -12965,7 +12975,8 @@ pub struct RoleMembership {
 
 impl RoleMembership {
     pub(crate) fn creation_to(self, txid: u32) -> CatalogIdentity {
-        let created_at = self.pending
+        let created_at = self
+            .pending
             .filter(|pending| pending.txid == txid)
             .map_or(self.created_at, |pending| pending.created_at);
         CatalogIdentity::parse(created_at)
@@ -12994,8 +13005,6 @@ impl RoleMembership {
             _ => self.options,
         }
     }
-
-
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -22969,14 +22978,27 @@ impl Storage {
             }
             for source_slot in 0..self.default_acl_entry_count() {
                 let entry = self.default_acl_entry(source_slot);
-                if entry.database != source { continue; }
-                let Some(image) = entry.committed else { continue; };
+                if entry.database != source {
+                    continue;
+                }
+                let Some(image) = entry.committed else {
+                    continue;
+                };
                 let target_slot = {
                     let catalog = self.acl_catalog.lock().expect("ACL catalog lock poisoned");
-                    allocation.select(DatabaseCloneKind::DefaultAcl, image.clone_key(),
-                        catalog.defaults.iter().enumerate().filter_map(|(slot, entry)|
-                            (entry.committed.is_none() && entry.pending.is_none()).then_some(slot))
-                            .chain(catalog.defaults.len()..catalog.defaults.capacity()))?
+                    allocation.select(
+                        DatabaseCloneKind::DefaultAcl,
+                        image.clone_key(),
+                        catalog
+                            .defaults
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(slot, entry)| {
+                                (entry.committed.is_none() && entry.pending.is_none())
+                                    .then_some(slot)
+                            })
+                            .chain(catalog.defaults.len()..catalog.defaults.capacity()),
+                    )?
                 };
                 self.install_default_acl_image(target_slot, None, Some(image), txid)?;
             }
@@ -24021,8 +24043,14 @@ impl Storage {
     }
 
     pub(crate) fn role_name_by_oid(&self, oid: RoleOid, txid: u32) -> Option<SqlName> {
-        let catalog = self.role_catalog.lock().expect("role catalog lock poisoned");
-        catalog.roles.iter().find(|role| role.visible_to(txid) && role.lifetime == Some(oid))
+        let catalog = self
+            .role_catalog
+            .lock()
+            .expect("role catalog lock poisoned");
+        catalog
+            .roles
+            .iter()
+            .find(|role| role.visible_to(txid) && role.lifetime == Some(oid))
             .map(|role| role.name_to(txid))
     }
 
@@ -27975,7 +28003,7 @@ impl Storage {
                     || membership.grantor as usize == slot
                 {
                     *membership = RoleMembership {
-                    created_at: 0,
+                        created_at: 0,
                         role: 0,
                         member: 0,
                         grantor: 0,
@@ -28131,7 +28159,8 @@ impl Storage {
         }
         let prior = catalog.memberships[slot].pending;
         let created_at = if exists && !catalog.memberships[slot].visible_to(txid) {
-            self.catalog_sequence.next_bounded(MAX_CATALOG_CREATION, "role membership")?
+            self.catalog_sequence
+                .next_bounded(MAX_CATALOG_CREATION, "role membership")?
         } else {
             catalog.memberships[slot].creation_to(txid).created_at()
         };
@@ -28232,21 +28261,41 @@ impl Storage {
             })?;
         let slot = identity.slot();
         if slot >= catalog.memberships.len() {
-            return Err(sql_err!(sqlstate::DATA_EXCEPTION, "stored role membership position is out of range"));
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "stored role membership position is out of range"
+            ));
         }
-        if catalog.memberships.iter().enumerate().any(|(other, entry)| {
-            other != slot && entry.live
-                && ((entry.role as usize == role && entry.member as usize == member && entry.grantor as usize == grantor)
-                    || entry.created_at == identity.created_at())
-        }) {
-            return Err(sql_err!(sqlstate::DATA_EXCEPTION, "stored role membership identity is duplicated"));
+        if catalog
+            .memberships
+            .iter()
+            .enumerate()
+            .any(|(other, entry)| {
+                other != slot
+                    && entry.live
+                    && ((entry.role as usize == role
+                        && entry.member as usize == member
+                        && entry.grantor as usize == grantor)
+                        || entry.created_at == identity.created_at())
+            })
+        {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "stored role membership identity is duplicated"
+            ));
         }
         let occupied = catalog.memberships[slot];
-        if occupied.pending.is_some() || (occupied.live
-            && (occupied.created_at != identity.created_at()
-                || occupied.role as usize != role || occupied.member as usize != member
-                || occupied.grantor as usize != grantor)) {
-            return Err(sql_err!(sqlstate::DATA_EXCEPTION, "stored role membership identity is unavailable"));
+        if occupied.pending.is_some()
+            || (occupied.live
+                && (occupied.created_at != identity.created_at()
+                    || occupied.role as usize != role
+                    || occupied.member as usize != member
+                    || occupied.grantor as usize != grantor))
+        {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "stored role membership identity is unavailable"
+            ));
         }
         catalog.memberships[slot] = RoleMembership {
             created_at: identity.created_at(),
@@ -28557,14 +28606,30 @@ impl Storage {
         member_name: &str,
     ) -> Result<(), SqlError> {
         CatalogIdentity::require(identity.created_at())?;
-        let mut catalog = self.role_catalog.lock().expect("role catalog lock poisoned");
-        let entry = catalog.memberships.get(identity.slot()).copied().ok_or_else(|| {
-            sql_err!(sqlstate::DATA_EXCEPTION, "stored role membership position is out of range")
-        })?;
-        if !entry.live || entry.pending.is_some() || entry.created_at != identity.created_at()
+        let mut catalog = self
+            .role_catalog
+            .lock()
+            .expect("role catalog lock poisoned");
+        let entry = catalog
+            .memberships
+            .get(identity.slot())
+            .copied()
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::DATA_EXCEPTION,
+                    "stored role membership position is out of range"
+                )
+            })?;
+        if !entry.live
+            || entry.pending.is_some()
+            || entry.created_at != identity.created_at()
             || catalog.roles[usize::from(entry.role)].name.as_str() != role_name
-            || catalog.roles[usize::from(entry.member)].name.as_str() != member_name {
-            return Err(sql_err!(sqlstate::DATA_EXCEPTION, "stored role membership removal selects a different lifetime"));
+            || catalog.roles[usize::from(entry.member)].name.as_str() != member_name
+        {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "stored role membership removal selects a different lifetime"
+            ));
         }
         catalog.memberships[identity.slot()].live = false;
         Ok(())

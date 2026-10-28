@@ -2812,46 +2812,73 @@ fn default_acl_image_len(image: crate::storage::DefaultAclGrantImage) -> usize {
     14 + usize::from(image.identity.schema.is_some()) * 8 + usize::from(image.grantee.is_some()) * 4
 }
 
-fn append_default_acl_image(buffer: &mut crate::mem::FixedBuf, image: crate::storage::DefaultAclGrantImage) -> bool {
-    let flags = u8::from(image.identity.schema.is_some()) | (u8::from(image.grantee.is_some()) << 1);
+fn append_default_acl_image(
+    buffer: &mut crate::mem::FixedBuf,
+    image: crate::storage::DefaultAclGrantImage,
+) -> bool {
+    let flags =
+        u8::from(image.identity.schema.is_some()) | (u8::from(image.grantee.is_some()) << 1);
     let mut ok = buffer.append(&image.identity.creation.get().to_le_bytes())
         && buffer.append(&image.identity.owner.get().to_le_bytes())
         && buffer.append(&[image.identity.class as u8, flags]);
-    if let Some(schema) = image.identity.schema { ok &= buffer.append(&schema.created_at().to_le_bytes()); }
-    if let Some(grantee) = image.grantee { ok &= buffer.append(&grantee.get().to_le_bytes()); }
-    ok && buffer.append(&image.privileges.0.to_le_bytes()) && buffer.append(&image.grant_options.0.to_le_bytes())
+    if let Some(schema) = image.identity.schema {
+        ok &= buffer.append(&schema.created_at().to_le_bytes());
+    }
+    if let Some(grantee) = image.grantee {
+        ok &= buffer.append(&grantee.get().to_le_bytes());
+    }
+    ok && buffer.append(&image.privileges.0.to_le_bytes())
+        && buffer.append(&image.grant_options.0.to_le_bytes())
 }
 
-fn take_default_acl_image(payload: &[u8], at: &mut usize) -> Option<crate::storage::DefaultAclGrantImage> {
-    let creation = u32::from_le_bytes(payload.get(*at..*at+4)?.try_into().ok()?);
+fn take_default_acl_image(
+    payload: &[u8],
+    at: &mut usize,
+) -> Option<crate::storage::DefaultAclGrantImage> {
+    let creation = u32::from_le_bytes(payload.get(*at..*at + 4)?.try_into().ok()?);
     *at += 4;
     let creation = crate::storage::CatalogIdentity::parse(u64::from(creation))?;
-    let owner = i32::from_le_bytes(payload.get(*at..*at+4)?.try_into().ok()?);
+    let owner = i32::from_le_bytes(payload.get(*at..*at + 4)?.try_into().ok()?);
     *at += 4;
     let owner = crate::storage::RoleOid::parse(owner)?;
     let class = crate::storage::DefaultPrivilegeClass::from_u8(*payload.get(*at)?)?;
     *at += 1;
     let flags = *payload.get(*at)?;
     *at += 1;
-    if flags & !3 != 0 { return None; }
+    if flags & !3 != 0 {
+        return None;
+    }
     let schema = if flags & 1 != 0 {
-        let creation = u64::from_le_bytes(payload.get(*at..*at+8)?.try_into().ok()?);
+        let creation = u64::from_le_bytes(payload.get(*at..*at + 8)?.try_into().ok()?);
         *at += 8;
         Some(crate::storage::SchemaIdentity::parse(creation)?)
-    } else { None };
+    } else {
+        None
+    };
     let grantee = if flags & 2 != 0 {
-        let oid = i32::from_le_bytes(payload.get(*at..*at+4)?.try_into().ok()?);
+        let oid = i32::from_le_bytes(payload.get(*at..*at + 4)?.try_into().ok()?);
         *at += 4;
         Some(crate::storage::RoleOid::parse(oid)?)
-    } else { None };
-    let privileges = u16::from_le_bytes(payload.get(*at..*at+2)?.try_into().ok()?);
+    } else {
+        None
+    };
+    let privileges = u16::from_le_bytes(payload.get(*at..*at + 2)?.try_into().ok()?);
     *at += 2;
-    let grant_options = u16::from_le_bytes(payload.get(*at..*at+2)?.try_into().ok()?);
+    let grant_options = u16::from_le_bytes(payload.get(*at..*at + 2)?.try_into().ok()?);
     *at += 2;
-    if privileges & !class.all_privileges().0 != 0 || grant_options & !privileges != 0 { return None; }
+    if privileges & !class.all_privileges().0 != 0 || grant_options & !privileges != 0 {
+        return None;
+    }
     let image = crate::storage::DefaultAclGrantImage {
-        identity: crate::storage::DefaultAclIdentity { creation, owner, schema, class }, grantee,
-        privileges: crate::storage::PrivilegeSet(privileges), grant_options: crate::storage::PrivilegeSet(grant_options),
+        identity: crate::storage::DefaultAclIdentity {
+            creation,
+            owner,
+            schema,
+            class,
+        },
+        grantee,
+        privileges: crate::storage::PrivilegeSet(privileges),
+        grant_options: crate::storage::PrivilegeSet(grant_options),
     };
     image.validate().ok()?;
     Some(image)
@@ -4027,8 +4054,19 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             member,
             grantor,
             ..
-        } => crate::storage::CatalogPosition::ENCODED_BYTES + 1 + role.len() + 1 + member.len() + 1 + grantor.len() + 1,
-        WalOp::DropRoleMembership { role, member, .. } => crate::storage::CatalogPosition::ENCODED_BYTES + 1 + role.len() + 1 + member.len(),
+        } => {
+            crate::storage::CatalogPosition::ENCODED_BYTES
+                + 1
+                + role.len()
+                + 1
+                + member.len()
+                + 1
+                + grantor.len()
+                + 1
+        }
+        WalOp::DropRoleMembership { role, member, .. } => {
+            crate::storage::CatalogPosition::ENCODED_BYTES + 1 + role.len() + 1 + member.len()
+        }
         WalOp::SetRoleSetting {
             role,
             database,
@@ -4086,9 +4124,9 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             ..
         } => 1 + 1 + schema.len() + 1 + name.len() + 2 + 1 + grantee.len() + 1 + grantor.len() + 4,
         WalOp::ReserveCatalogSequence(_) => 8,
-        WalOp::SetDefaultAcl { expected, image, .. } => {
-            3 + expected.map_or(0, default_acl_image_len) + image.map_or(0, default_acl_image_len)
-        }
+        WalOp::SetDefaultAcl {
+            expected, image, ..
+        } => 3 + expected.map_or(0, default_acl_image_len) + image.map_or(0, default_acl_image_len),
         WalOp::SetParameterAcl {
             parameter, image, ..
         } => {
@@ -6355,8 +6393,14 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 && name_bytes(buffer, grantor)
                 && buffer.append(&[flags])
         }
-        WalOp::DropRoleMembership { identity, role, member } => {
-            buffer.append(&identity.encode()) && name_bytes(buffer, role) && name_bytes(buffer, member)
+        WalOp::DropRoleMembership {
+            identity,
+            role,
+            member,
+        } => {
+            buffer.append(&identity.encode())
+                && name_bytes(buffer, role)
+                && name_bytes(buffer, member)
         }
         WalOp::SetRoleSetting {
             role,
@@ -6438,12 +6482,23 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 && buffer.append(&grant_options.0.to_le_bytes())
         }
         WalOp::ReserveCatalogSequence(value) => buffer.append(&value.get().to_le_bytes()),
-        WalOp::SetDefaultAcl { slot, expected, image } => {
-            assert_ne!(expected, image, "journal default privilege changes have an effect");
+        WalOp::SetDefaultAcl {
+            slot,
+            expected,
+            image,
+        } => {
+            assert_ne!(
+                expected, image,
+                "journal default privilege changes have an effect"
+            );
             let flags = u8::from(expected.is_some()) | (u8::from(image.is_some()) << 1);
             let mut ok = buffer.append(&slot.to_le_bytes()) && buffer.append(&[flags]);
-            if let Some(expected) = expected { ok &= append_default_acl_image(buffer, *expected); }
-            if let Some(image) = image { ok &= append_default_acl_image(buffer, *image); }
+            if let Some(expected) = expected {
+                ok &= append_default_acl_image(buffer, *expected);
+            }
+            if let Some(image) = image {
+                ok &= append_default_acl_image(buffer, *image);
+            }
             ok
         }
         WalOp::SetParameterAcl {
@@ -11555,7 +11610,11 @@ fn decode_op_inner<'a>(
             let identity = take_catalog_position(payload, &mut at)?;
             let role = take_name(&mut at)?;
             let member = take_name(&mut at)?;
-            (at == payload.len()).then_some(WalOp::DropRoleMembership { identity, role, member })
+            (at == payload.len()).then_some(WalOp::DropRoleMembership {
+                identity,
+                role,
+                member,
+            })
         }),
         KIND_SET_ROLE_SETTING => decode_large_op(|| {
             let flags = *payload.get(at)?;
@@ -11714,18 +11773,36 @@ fn decode_op_inner<'a>(
         }),
         KIND_CATALOG_RESERVATION => decode_large_op(|| {
             let value = u64::from_le_bytes(payload.try_into().ok()?);
-            Some(WalOp::ReserveCatalogSequence(core::num::NonZeroU64::new(value)?))
+            Some(WalOp::ReserveCatalogSequence(core::num::NonZeroU64::new(
+                value,
+            )?))
         }),
         KIND_SET_DEFAULT_ACL => decode_large_op(|| {
-            let slot = u16::from_le_bytes(payload.get(at..at+2)?.try_into().ok()?);
+            let slot = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
             at += 2;
-            if slot == u16::MAX { return None; }
+            if slot == u16::MAX {
+                return None;
+            }
             let flags = *payload.get(at)?;
             at += 1;
-            if flags == 0 || flags & !3 != 0 { return None; }
-            let expected = if flags & 1 != 0 { Some(take_default_acl_image(payload, &mut at)?) } else { None };
-            let image = if flags & 2 != 0 { Some(take_default_acl_image(payload, &mut at)?) } else { None };
-            (at == payload.len() && expected != image).then_some(WalOp::SetDefaultAcl { slot, expected, image })
+            if flags == 0 || flags & !3 != 0 {
+                return None;
+            }
+            let expected = if flags & 1 != 0 {
+                Some(take_default_acl_image(payload, &mut at)?)
+            } else {
+                None
+            };
+            let image = if flags & 2 != 0 {
+                Some(take_default_acl_image(payload, &mut at)?)
+            } else {
+                None
+            };
+            (at == payload.len() && expected != image).then_some(WalOp::SetDefaultAcl {
+                slot,
+                expected,
+                image,
+            })
         }),
         KIND_SET_RELATION_INDEX_HINT => decode_large_op(|| {
             let position = crate::storage::CatalogPosition::decode(payload.get(..10)?)?;

@@ -543,7 +543,13 @@ impl Storage {
             let catalog = self.acl_catalog.lock().expect("ACL catalog lock poisoned");
             for (slot, entry) in catalog.defaults.iter().enumerate() {
                 if let Some(image) = entry.committed {
-                    object(DatabaseCloneKind::DefaultAcl, slot, image.clone_key(), entry.database, CatalogDdlState::Present);
+                    object(
+                        DatabaseCloneKind::DefaultAcl,
+                        slot,
+                        image.clone_key(),
+                        entry.database,
+                        CatalogDdlState::Present,
+                    );
                 }
             }
         }

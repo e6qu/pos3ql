@@ -1810,7 +1810,7 @@ fn privilege_partition_inventory(
     session: &mut ConfiguredTransactionSession,
 ) -> Vec<String> {
     let output = session.success(engine,
-        "SELECT oid, roleid, member, grantor FROM pg_auth_members WHERE roleid='lifetime_member_group'::regrole; SELECT oid, defaclacl FROM pg_default_acl WHERE defaclnamespace='lifetime_privileges'::regnamespace; SELECT oid, tgparentid, tgenabled FROM pg_trigger WHERE tgname='lifetime_partition_hook'", true);
+        "SELECT oid, roleid, member, grantor FROM pg_auth_members WHERE roleid='lifetime_member_group'::regrole; SELECT oid, defaclacl FROM pg_default_acl WHERE defaclnamespace='lifetime_privileges'::regnamespace; SELECT oid, tgparentid, tgenabled FROM pg_trigger WHERE tgname='lifetime_partition_hook'; SELECT 'function', oid FROM pg_proc WHERE proname='lifetime_query'; SELECT 'policy', oid FROM pg_policy WHERE polname='lifetime_row_policy'; SELECT 'rule', oid FROM pg_rewrite WHERE rulename='lifetime_rewrite'", true);
     // Compare catalogs as sets. SQL ORDER BY uploads temporary sorter blocks;
     // the simulator's remote objects allocate outside the guarded client path.
     let mut rows = data_rows(&output);
@@ -1859,7 +1859,7 @@ fn catalog_lifetime_privileges_and_partition_triggers_survive_copies_and_empty_d
                     }
                 }
                 source_inventory = privilege_partition_inventory(&mut engine, &mut session);
-                assert_eq!(source_inventory.len(), 5);
+                assert_eq!(source_inventory.len(), 8);
                 session.success(&mut engine, "BEGIN; SAVEPOINT lifetime_before; REVOKE lifetime_member_group FROM lifetime_member_second; ALTER DEFAULT PRIVILEGES IN SCHEMA lifetime_privileges REVOKE SELECT ON TABLES FROM lifetime_member_first; ALTER TABLE lifetime_partition_root DETACH PARTITION lifetime_partition_child; ROLLBACK TO lifetime_before; COMMIT", false);
                 assert_eq!(
                     privilege_partition_inventory(&mut engine, &mut session),

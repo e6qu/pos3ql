@@ -860,6 +860,7 @@ impl Storage {
                     )
                 })?,
             RoutineIdentity::Preserve { position, .. } => {
+                super::CatalogIdentity::require(position.created_at())?;
                 if routines
                     .get(position.slot())
                     .is_none_or(|routine| routine.ddl_state != CatalogDdlState::Absent)
@@ -879,7 +880,8 @@ impl Storage {
         };
         let (created_at, ownership) = match identity {
             RoutineIdentity::Allocate => (
-                self.catalog_sequence.next()?,
+                self.catalog_sequence
+                    .next_bounded(super::MAX_CATALOG_CREATION, "routine")?,
                 allocated_ownership.expect("allocated routine ownership was prepared"),
             ),
             RoutineIdentity::Preserve {

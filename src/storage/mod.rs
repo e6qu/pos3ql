@@ -4396,7 +4396,8 @@ impl StoredDependencyIdentity {
             }
             Self::RoutineOid(oid) => {
                 class == DependencyClass::Routine
-                    && (ROUTINE_OID_BASE..TRIGGER_OID_BASE).contains(&oid)
+                    && (ROUTINE_OID_BASE + 1..=ROUTINE_OID_BASE + MAX_CATALOG_CREATION as i32)
+                        .contains(&oid)
             }
             Self::OperatorOid(oid) => {
                 class == DependencyClass::Operator
@@ -5225,7 +5226,10 @@ impl RuleDef {
     }
 
     pub(crate) fn oid(self) -> i32 {
-        catalog_object_oid(26_000, self.created_at)
+        880_000_000
+            + CatalogIdentity::parse(self.created_at)
+                .expect("admitted rewrite rule has a checked identity")
+                .get() as i32
     }
 }
 
@@ -7091,11 +7095,6 @@ pub(crate) const ACCESS_METHOD_OID_BASE: i32 = 800_000_000;
 /// Operators and support functions each follow the parser's bounded DDL list.
 pub(crate) const MAX_OPERATOR_FAMILY_MEMBERS: usize = MAX_DEFINITION_ITEMS;
 pub(crate) const MAX_ACCESS_METHODS: usize = 32;
-
-fn catalog_object_oid(base: i32, created_at: u64) -> i32 {
-    base.checked_add(i32::try_from(created_at).expect("catalog OID range exhausted"))
-        .expect("catalog OID range exhausted")
-}
 
 /// Stable identity of a user-defined table access method. Slots are reused
 /// after DROP, while table definitions and WAL retain this OID.
@@ -22614,8 +22613,6 @@ impl Storage {
                 trigger_catalog.definitions[target_slot] = definition;
             }
 
-            self.copy_partition_trigger_images(source, txid)?;
-
             let extended_statistics_capacity = self.extended_statistics_count();
             for source_slot in 0..extended_statistics_capacity {
                 let mut definition = self.extended_statistics(source_slot);
@@ -22999,8 +22996,8 @@ impl Storage {
                 comments.entries[target_slot] = entry;
             }
 
-            // Partition links are runtime table slots. Rebind them only after
-            // every target relation exists; names are the durable identity.
+            // Rebind partition parents by their preserved lifetimes after all
+            // target relations exist, before installing inherited triggers.
             for target_slot in 0..self.tables.len() {
                 if self.tables[target_slot].database() != target
                     || self.tables[target_slot].existence()
@@ -23012,16 +23009,16 @@ impl Storage {
                 else {
                     continue;
                 };
-                let (parent_schema, parent_name) = {
-                    let source_parent = self.tables[usize::from(attachment.parent)].definition();
-                    (source_parent.schema, source_parent.name)
-                };
-                let target_parent = self
-                    .find_visible(parent_schema.as_str(), parent_name.as_str(), txid)
+                let parent_created_at = self.tables[usize::from(attachment.parent)].created_at();
+                let target_parent = (0..self.table_count())
+                    .find(|slot| {
+                        self.table_slot_visible_to(*slot, txid)
+                            && self.table(*slot).created_at() == parent_created_at
+                    })
                     .ok_or_else(|| {
                         sql_err!(
-                            sqlstate::INTERNAL_ERROR,
-                            "template partition parent was not cloned"
+                            sqlstate::DATA_EXCEPTION,
+                            "template partition parent lifetime was not cloned"
                         )
                     })?;
                 let revision = self.reserve_table_definition_revision()?;
@@ -23038,6 +23035,7 @@ impl Storage {
             self.rebind_routine_types_to(txid)?;
             self.rebind_cast_and_operator_types(txid)?;
             self.rebind_all_stored_query_dependencies_to(txid, Some(source))?;
+            self.copy_partition_trigger_images(source, txid)?;
             allocation.validate(self, target)
         })();
         crate::sql::set_execution_database_oid(prior_database);
@@ -44015,6 +44013,11 @@ impl Storage {
         }
     }
 
+    pub(crate) fn policy_position(&self, slot: usize) -> CatalogPosition {
+        CatalogPosition::new(slot, self.policy(slot).created_at)
+            .expect("admitted policy has a checked position")
+    }
+
     pub(crate) fn policy_role_capacity(&self) -> usize {
         self.policy_roles_per_image
     }
@@ -44138,7 +44141,9 @@ impl Storage {
                 catalog.definitions.len()
             ));
         };
-        let created_at = self.catalog_sequence.next()?;
+        let created_at = self
+            .catalog_sequence
+            .next_bounded(MAX_CATALOG_CREATION, "row-security policy")?;
         owners.write_query_image(
             self,
             self.committed_dependency_image(StoredQueryDependencyOwner::Policy(slot as u16)),
@@ -44373,10 +44378,12 @@ impl Storage {
 
     pub(crate) fn replay_set_policy<'a>(
         &mut self,
+        identity: CatalogPosition,
         spec: RecoveredPolicySpec,
         roles: impl ExactSizeIterator<Item = &'a str>,
         dependencies: StoredQueryDependencies,
     ) -> Result<usize, SqlError> {
+        CatalogIdentity::require(identity.created_at())?;
         let role_count = roles.len();
         if role_count == 0 || role_count > self.policy_roles_per_image {
             return Err(sql_err!(
@@ -44445,30 +44452,38 @@ impl Storage {
         );
         owners.validate_target(0, type_contracts::QueryTargetUse::Read)?;
         let catalog = &mut owners.catalog;
-        let existing = catalog.definitions.iter().position(|policy| {
-            policy.database == current_database()
-                && policy.visible_to(0)
-                && policy.table == table
-                && policy.name == spec.name
-        });
-        let slot = existing
-            .or_else(|| {
-                catalog
-                    .definitions
-                    .iter()
-                    .position(|policy| policy.ddl_state == CatalogDdlState::Absent)
-            })
-            .ok_or_else(|| {
-                sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "row-security policy catalog is full (limit {})",
-                    catalog.definitions.len()
-                )
-            })?;
-        let created_at = match existing {
-            Some(slot) => catalog.definitions[slot].created_at,
-            None => self.catalog_sequence.next()?,
+        let slot = identity.slot();
+        let Some(current) = catalog.definitions.get(slot).copied() else {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "stored row-security policy position is out of range"
+            ));
         };
+        if (current.ddl_state != CatalogDdlState::Absent
+            && (current.database != current_database()
+                || current.created_at != identity.created_at()
+                || current.ddl_state != CatalogDdlState::Present
+                || current.pending_definition.is_some()
+                || current.table != table
+                || current.name != spec.name))
+            || catalog
+                .definitions
+                .iter()
+                .enumerate()
+                .any(|(other, policy)| {
+                    other != slot
+                        && policy.database == current_database()
+                        && policy.ddl_state != CatalogDdlState::Absent
+                        && (policy.created_at == identity.created_at()
+                            || (policy.table == table && policy.name == spec.name))
+                })
+        {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "stored row-security policy selects another lifetime"
+            ));
+        }
+        let created_at = identity.created_at();
         owners.write_query_image(
             self,
             self.committed_dependency_image(StoredQueryDependencyOwner::Policy(slot as u16)),
@@ -44492,31 +44507,8 @@ impl Storage {
             pending_definition: None,
             ddl_state: CatalogDdlState::Present,
         };
-        Ok(slot)
-    }
-
-    pub(crate) fn replay_drop_policy(&mut self, table: usize, name: &str) {
-        if let Some(slot) = self.policy_slot_on(table, name, 0) {
-            self.drop_policy(slot, 0);
-            self.commit_policy_drop(slot);
-        }
-    }
-
-    pub(crate) fn restore_policy<'a>(
-        &mut self,
-        created_at: u64,
-        spec: RecoveredPolicySpec,
-        roles: impl ExactSizeIterator<Item = &'a str>,
-        dependencies: StoredQueryDependencies,
-    ) -> Result<(), SqlError> {
-        let slot = self.replay_set_policy(spec, roles, dependencies)?;
-        self.policy_catalog
-            .lock()
-            .expect("policy catalog lock poisoned")
-            .definitions[slot]
-            .created_at = created_at;
         self.catalog_sequence.observe(created_at);
-        Ok(())
+        Ok(slot)
     }
 
     pub(crate) fn triggers_for_table(
@@ -45193,6 +45185,7 @@ impl Storage {
         dependencies: StoredQueryDependencies,
         transaction: u32,
     ) -> Result<RoutineChange, SqlError> {
+        CatalogIdentity::require(position.created_at())?;
         if definition.created_at != position.created_at() || position.slot() >= self.routine_count()
         {
             return Err(sql_err!(
@@ -51077,7 +51070,9 @@ impl Storage {
                     self.rule_count()
                 )
             })?;
-        let created_at = self.catalog_sequence.next()?;
+        let created_at = self
+            .catalog_sequence
+            .next_bounded(MAX_CATALOG_CREATION, "rewrite rule")?;
         owners.write_query_image(
             self,
             self.committed_dependency_image(StoredQueryDependencyOwner::Rule(slot as u16)),
@@ -51360,6 +51355,7 @@ impl Storage {
         definition: RuleDefinition,
         dependencies: StoredQueryDependencies,
     ) -> Result<(), SqlError> {
+        CatalogIdentity::require(created_at)?;
         if slot >= self.rule_count() {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,

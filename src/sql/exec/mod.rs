@@ -28506,6 +28506,7 @@ pub fn create_policy(
             txn.txid,
             lsn,
             &WalOp::SetPolicy {
+                identity: storage.policy_position(slot),
                 schema: table_schema.as_str(),
                 table: table_name.as_str(),
                 name: policy.name,
@@ -28626,6 +28627,7 @@ pub fn alter_policy(
             txn.txid,
             lsn,
             &WalOp::SetPolicy {
+                identity: storage.policy_position(slot),
                 schema: table_schema.as_str(),
                 table: table_name.as_str(),
                 name: policy.name.as_str(),
@@ -28731,6 +28733,7 @@ fn drop_policy_slot(
             txn.txid,
             lsn,
             &WalOp::DropPolicy {
+                identity: storage.policy_position(slot),
                 schema: table_schema.as_str(),
                 table: table_name.as_str(),
                 name: policy.name.as_str(),
@@ -46548,6 +46551,7 @@ fn rewrite_table_policy_column_references(
             txn.txid,
             lsn,
             &WalOp::SetPolicy {
+                identity: storage.policy_position(slot),
                 schema: table_schema.as_str(),
                 table: table_name.as_str(),
                 name: policy.name.as_str(),

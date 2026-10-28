@@ -233,14 +233,74 @@ SELECT saved.oid <> current_trigger.oid
   WHERE current_trigger.tgrelid = 'lifetime_partition_child'::regclass
     AND current_trigger.tgname = 'lifetime_partition_hook';
 
+CREATE FUNCTION lifetime_query(value integer) RETURNS integer LANGUAGE sql
+  AS 'SELECT $1';
+
+CREATE POLICY lifetime_row_policy ON lifetime_saved_defaults USING (true);
+
+CREATE RULE lifetime_rewrite AS ON UPDATE TO lifetime_saved_defaults
+  DO INSTEAD NOTHING;
+
+CREATE TABLE lifetime_saved_definitions AS
+  SELECT 'function'::text AS kind, oid FROM pg_proc WHERE proname = 'lifetime_query'
+  UNION ALL SELECT 'policy'::text, oid FROM pg_policy WHERE polname = 'lifetime_row_policy'
+  UNION ALL SELECT 'rule'::text, oid FROM pg_rewrite WHERE rulename = 'lifetime_rewrite';
+
+CREATE OR REPLACE FUNCTION lifetime_query(value integer) RETURNS integer LANGUAGE sql
+  AS 'SELECT $1 + 1';
+
+ALTER POLICY lifetime_row_policy ON lifetime_saved_defaults USING (false);
+
+ALTER TABLE lifetime_saved_defaults DISABLE RULE lifetime_rewrite;
+
+SELECT saved.oid = current_definition.oid
+  FROM lifetime_saved_definitions saved, pg_proc current_definition
+  WHERE saved.kind = 'function' AND current_definition.proname = 'lifetime_query';
+
+SELECT saved.oid = current_definition.oid
+  FROM lifetime_saved_definitions saved, pg_policy current_definition
+  WHERE saved.kind = 'policy' AND current_definition.polname = 'lifetime_row_policy';
+
+SELECT saved.oid = current_definition.oid
+  FROM lifetime_saved_definitions saved, pg_rewrite current_definition
+  WHERE saved.kind = 'rule' AND current_definition.rulename = 'lifetime_rewrite';
+
+DROP FUNCTION lifetime_query(integer);
+
+CREATE FUNCTION lifetime_query(value integer) RETURNS integer LANGUAGE sql
+  AS 'SELECT $1 + 2';
+
+DROP POLICY lifetime_row_policy ON lifetime_saved_defaults;
+
+CREATE POLICY lifetime_row_policy ON lifetime_saved_defaults USING (true);
+
+DROP RULE lifetime_rewrite ON lifetime_saved_defaults;
+
+CREATE RULE lifetime_rewrite AS ON UPDATE TO lifetime_saved_defaults
+  DO INSTEAD NOTHING;
+
+SELECT saved.oid <> current_definition.oid
+  FROM lifetime_saved_definitions saved, pg_proc current_definition
+  WHERE saved.kind = 'function' AND current_definition.proname = 'lifetime_query';
+
+SELECT saved.oid <> current_definition.oid
+  FROM lifetime_saved_definitions saved, pg_policy current_definition
+  WHERE saved.kind = 'policy' AND current_definition.polname = 'lifetime_row_policy';
+
+SELECT saved.oid <> current_definition.oid
+  FROM lifetime_saved_definitions saved, pg_rewrite current_definition
+  WHERE saved.kind = 'rule' AND current_definition.rulename = 'lifetime_rewrite';
+
 -- cleanup
 
 DROP TABLE lifetime_partition_root CASCADE;
 
 DROP FUNCTION lifetime_partition_hook();
 
+DROP FUNCTION lifetime_query(integer);
+
 DROP TABLE lifetime_saved_membership, lifetime_saved_secondary_membership, lifetime_saved_defaults,
-  lifetime_saved_partition_trigger, lifetime_saved_reattachment;
+  lifetime_saved_partition_trigger, lifetime_saved_reattachment, lifetime_saved_definitions;
 
 ALTER DEFAULT PRIVILEGES IN SCHEMA lifetime_privileges
   REVOKE SELECT ON TABLES FROM lifetime_member_first;

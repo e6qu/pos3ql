@@ -175,6 +175,12 @@ impl Storage {
             .lock()
             .expect("role catalog lock poisoned");
         let defaults = self.acl_catalog.lock().expect("ACL catalog lock poisoned");
+        let rules = self.view_rule_catalog();
+        let routines = self.routines.lock().expect("routine catalog lock poisoned");
+        let policies = self
+            .policy_catalog
+            .lock()
+            .expect("policy catalog lock poisoned");
         let triggers = self
             .trigger_catalog
             .lock()
@@ -239,6 +245,27 @@ impl Storage {
                     }
                 }
                 if database.is_some() {
+                    for definition in rules.rules.iter() {
+                        check(
+                            definition.database,
+                            definition.ddl_state,
+                            definition.created_at,
+                        )?;
+                    }
+                    for definition in routines.iter() {
+                        check(
+                            definition.database,
+                            definition.ddl_state,
+                            definition.created_at,
+                        )?;
+                    }
+                    for definition in policies.definitions.iter() {
+                        check(
+                            definition.database,
+                            definition.ddl_state,
+                            definition.created_at,
+                        )?;
+                    }
                     for definition in triggers.definitions.iter() {
                         check(
                             definition.database,
@@ -420,6 +447,9 @@ impl Storage {
                 }
             }
         }
+        drop(policies);
+        drop(routines);
+        drop(rules);
         drop(triggers);
         drop(defaults);
         drop(roles);

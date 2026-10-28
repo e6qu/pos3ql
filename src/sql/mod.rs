@@ -21852,6 +21852,7 @@ fn apply_wal_op(
             storage.apply_replication_slot_advance(advance);
         }
         WalOp::SetPolicy {
+            identity,
             schema,
             table,
             name,
@@ -21876,6 +21877,7 @@ fn apply_wal_op(
             let dependencies =
                 storage.rebind_stored_query_dependencies(dependencies.materialize()?, 0)?;
             storage.replay_set_policy(
+                identity,
                 crate::storage::RecoveredPolicySpec {
                     name: crate::storage::SqlName::parse(name)?,
                     table: table_slot,
@@ -21900,15 +21902,40 @@ fn apply_wal_op(
             )?;
         }
         WalOp::DropPolicy {
+            identity,
             schema,
             table,
             name,
         } => {
-            if let Some(crate::storage::ResolvedRelation::Table(table_slot)) =
+            let Some(crate::storage::ResolvedRelation::Table(table_slot)) =
                 storage.resolve_relation(Some(schema), table, 0)
-            {
-                storage.replay_drop_policy(table_slot, name);
+            else {
+                return Err(sql_err!(
+                    sqlstate::DATA_EXCEPTION,
+                    "journal policy table is unavailable"
+                ));
+            };
+            let slot = identity.slot();
+            if slot >= storage.policy_count() {
+                return Err(sql_err!(
+                    sqlstate::DATA_EXCEPTION,
+                    "journal policy position is out of range"
+                ));
             }
+            let policy = storage.policy(slot);
+            if policy.database != storage.current_database_oid()
+                || !policy.visible_to(0)
+                || policy.created_at != identity.created_at()
+                || usize::from(policy.table) != table_slot
+                || policy.name.as_str() != name
+            {
+                return Err(sql_err!(
+                    sqlstate::DATA_EXCEPTION,
+                    "journal policy removal selects another lifetime"
+                ));
+            }
+            storage.drop_policy(slot, 0);
+            storage.commit_policy_drop(slot);
         }
         WalOp::CreateTrigger {
             identity,

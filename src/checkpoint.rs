@@ -12092,7 +12092,8 @@ impl Checkpointer {
             // policy definition to select its committed image.
             write!(
                 &mut self.manifest_output,
-                "pol {} {} {} {} {} {} {}{}",
+                "pol {} {} {} {} {} {} {} {}{}",
+                slot,
                 policy.created_at,
                 policy.command.code(),
                 u8::from(policy.permissive),
@@ -17716,7 +17717,10 @@ fn load_policy(storage: &mut Storage, line: &str) -> Result<(), CheckpointSetupE
     if words.next() != Some("pol") {
         return Err(CheckpointSetupError::Corrupt("policy record"));
     }
+    let slot = parse_field(words.next(), "policy position")?;
     let created_at = parse_field(words.next(), "policy created_at")?;
+    let identity = crate::storage::CatalogPosition::new(slot, created_at)
+        .map_err(|_| CheckpointSetupError::Corrupt("policy position"))?;
     let command =
         crate::storage::PolicyCommandKind::from_code(parse_field(words.next(), "policy command")?)
             .ok_or(CheckpointSetupError::Corrupt("policy command"))?;
@@ -17773,8 +17777,8 @@ fn load_policy(storage: &mut Storage, line: &str) -> Result<(), CheckpointSetupE
         _ => return Err(CheckpointSetupError::Corrupt("policy table does not exist")),
     };
     storage
-        .restore_policy(
-            created_at,
+        .replay_set_policy(
+            identity,
             crate::storage::RecoveredPolicySpec {
                 name,
                 table,

@@ -1684,6 +1684,7 @@ mod tests {
                 assert_eq!(
                     storage
                         .replay_set_policy(
+                            storage.policy_position(policy_slot),
                             RecoveredPolicySpec {
                                 name: policy.name,
                                 table: related,

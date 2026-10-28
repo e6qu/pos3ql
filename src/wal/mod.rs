@@ -1211,6 +1211,7 @@ pub(crate) enum WalOp<'a> {
         enabled: u8,
     },
     SetPolicy {
+        identity: crate::storage::CatalogPosition,
         schema: &'a str,
         table: &'a str,
         name: &'a str,
@@ -1222,6 +1223,7 @@ pub(crate) enum WalOp<'a> {
         dependencies: WalStoredQueryDependencies<'a>,
     },
     DropPolicy {
+        identity: crate::storage::CatalogPosition,
         schema: &'a str,
         table: &'a str,
         name: &'a str,
@@ -3364,7 +3366,9 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             dependencies,
             ..
         } => {
-            1 + schema.len()
+            crate::storage::CatalogPosition::ENCODED_BYTES
+                + 1
+                + schema.len()
                 + 1
                 + table.len()
                 + 1
@@ -3381,7 +3385,16 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             schema,
             table,
             name,
-        } => 1 + schema.len() + 1 + table.len() + 1 + name.len(),
+            ..
+        } => {
+            crate::storage::CatalogPosition::ENCODED_BYTES
+                + 1
+                + schema.len()
+                + 1
+                + table.len()
+                + 1
+                + name.len()
+        }
         WalOp::Commit { committed_at, .. } => 5 + usize::from(committed_at.is_some()) * 8,
         WalOp::PrepareTransaction { gid, .. } => 4 + 4 + 4 + 8 + 1 + gid.len(),
         WalOp::PreparedLocks { encoded, .. } => 4 + 4 + encoded.len(),
@@ -6738,6 +6751,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 && buffer.append(&[*enabled])
         }
         WalOp::SetPolicy {
+            identity,
             schema,
             table,
             name,
@@ -6753,7 +6767,8 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 buffer.append(&length.to_le_bytes())
                     && value.is_none_or(|source| buffer.append(source.as_bytes()))
             };
-            name_bytes(buffer, schema)
+            buffer.append(&identity.encode())
+                && name_bytes(buffer, schema)
                 && name_bytes(buffer, table)
                 && name_bytes(buffer, name)
                 && buffer.append(&[*command, u8::from(*permissive)])
@@ -6766,10 +6781,16 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 && dependencies.append(buffer)
         }
         WalOp::DropPolicy {
+            identity,
             schema,
             table,
             name,
-        } => name_bytes(buffer, schema) && name_bytes(buffer, table) && name_bytes(buffer, name),
+        } => {
+            buffer.append(&identity.encode())
+                && name_bytes(buffer, schema)
+                && name_bytes(buffer, table)
+                && name_bytes(buffer, name)
+        }
     }
 }
 
@@ -9202,6 +9223,8 @@ fn decode_op_inner<'a>(
             })
         }),
         KIND_SET_POLICY | KIND_SET_POLICY_V2 => decode_large_op(|| {
+            let identity = take_catalog_position(payload, &mut at)?;
+            crate::storage::CatalogIdentity::parse(identity.created_at())?;
             let schema = take_name(&mut at)?;
             let table = take_name(&mut at)?;
             let name = take_name(&mut at)?;
@@ -9252,6 +9275,7 @@ fn decode_op_inner<'a>(
             decode_stored_query_dependencies(encoded)?;
             at = payload.len();
             (at == payload.len()).then_some(WalOp::SetPolicy {
+                identity,
                 schema,
                 table,
                 name,
@@ -9264,10 +9288,13 @@ fn decode_op_inner<'a>(
             })
         }),
         KIND_DROP_POLICY => decode_large_op(|| {
+            let identity = take_catalog_position(payload, &mut at)?;
+            crate::storage::CatalogIdentity::parse(identity.created_at())?;
             let schema = take_name(&mut at)?;
             let table = take_name(&mut at)?;
             let name = take_name(&mut at)?;
             (at == payload.len()).then_some(WalOp::DropPolicy {
+                identity,
                 schema,
                 table,
                 name,
@@ -15306,6 +15333,7 @@ mod tests {
         assert!(append_payload(
             &mut payload,
             &WalOp::SetPolicy {
+                identity: crate::storage::CatalogPosition::new(3, 41).unwrap(),
                 schema: "public",
                 table: "protected",
                 name: "reader_rows",
@@ -15341,6 +15369,13 @@ mod tests {
         };
         let using = "tenant = 'reader'";
         let with_check = "tenant = current_user";
+        assert!(
+            payload.append(
+                &crate::storage::CatalogPosition::new(3, 41)
+                    .unwrap()
+                    .encode()
+            )
+        );
         assert!(
             append_name(&mut payload, "public")
                 && append_name(&mut payload, "protected")

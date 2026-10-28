@@ -107,6 +107,9 @@ pass indefinitely. Later checkpoints queue the latest requested cutoff, while
 a more conservative retention decision cancels the pending deletion work.
 Journal and physical-file cleanup share the configured per-turn deletion limit,
 including when releasing a reader makes another file-cleanup pass necessary.
+If a checkpoint has already written new files, a finishing reader queues file
+cleanup until that checkpoint publishes. Its unfinished files remain owned;
+they are not abandoned objects that cleanup may delete.
 
 **User example:** a slow response while deleting last week's obsolete journal
 must not delay reading a cached order or saving new orders to free cache space.

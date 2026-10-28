@@ -9470,6 +9470,12 @@ impl Checkpointer {
     }
 
     fn observe_retained_root_release(&mut self, storage: &Storage) {
+        // A sweep owns newly written files that its manifest has not named yet.
+        // Starting reader-release garbage collection here would delete those
+        // files as orphans. Publication schedules collection at the safe boundary.
+        if self.sweeping {
+            return;
+        }
         if !self.block_garbage_pending && storage.take_retained_file_reclamation() {
             self.block_garbage_pending = true;
             self.published_lsn_pending_maintenance
@@ -20382,6 +20388,100 @@ mod stored_dependency_tests {
                 .is_some()
         );
         drop(checkpointer);
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    }
+
+    #[test]
+    fn maintenance_metadata_reader_release_cannot_sweep_unpublished_checkpoint_files() {
+        let (mut checkpoint, mut storage, table, config) =
+            index_gc_fixture("reader-release-unpublished-files", 32);
+        let mut saved = Vec::with_capacity(2);
+        for (rowid, value) in [(1, b"old".as_slice()), (2, b"new".as_slice())] {
+            checkpoint.slice_writer.reset();
+            let mut blocks = checkpoint.blocks.lock().unwrap();
+            checkpoint
+                .slice_writer
+                .append(&mut *blocks, rowid, value)
+                .unwrap();
+            saved.push(PrevSst {
+                handle: checkpoint
+                    .slice_writer
+                    .finish(&mut *blocks)
+                    .unwrap()
+                    .unwrap(),
+                count: 1,
+                crc: 0,
+            });
+        }
+        let old = saved[0];
+        let new = saved[1];
+        let reservation = storage
+            .reserve_spill_generation(
+                table,
+                storage.table(table).created_at(),
+                storage.table(table).rewrite_generation(),
+            )
+            .unwrap();
+        storage
+            .append_spill_through(&reservation, old.handle, 0)
+            .unwrap();
+        assert!(checkpoint.prev_ssts[table].push(old));
+        checkpoint.sweeping = true;
+        checkpoint.sliced_this_sweep[table] = true;
+        checkpoint.sliced_generation[table] = storage.table(table).generation();
+        checkpoint.sliced_layout[table] = SliceLayout::from_storage(&storage, table);
+        assert!(checkpoint.prev_scratch[table].push(old));
+        assert!(checkpoint.prev_scratch[table].push(new));
+        checkpoint.pending_installs.push((
+            table,
+            SlotInstall::Append {
+                reservation: storage
+                    .reserve_spill_generation(
+                        table,
+                        storage.table(table).created_at(),
+                        storage.table(table).rewrite_generation(),
+                    )
+                    .unwrap(),
+                handle: new.handle,
+                through_lsn: 0,
+            },
+        ));
+        let mut retained = Vec::with_capacity(1);
+        crate::mem::guard::forbid_alloc(|| {
+            let reader = storage.row_scan(table).unwrap();
+            storage
+                .copy_retained_spill_roots(true, &mut retained)
+                .unwrap();
+            assert_eq!(retained, [old.handle]);
+            drop(reader);
+            assert!(storage.retained_file_reclamation_pending());
+            checkpoint.observe_retained_root_release(&storage);
+            assert!(
+                !checkpoint.published_maintenance_pending(),
+                "reader release must not interrupt a sweep with unpublished files"
+            );
+            assert!(storage.retained_file_reclamation_pending());
+        });
+        let mut published = false;
+        for _ in 0..128 {
+            if matches!(
+                checkpoint.checkpoint_step(&mut storage).unwrap(),
+                CheckpointStep::Published { .. }
+            ) {
+                published = true;
+                break;
+            }
+        }
+        assert!(published);
+        checkpoint.finish_maintenance(&storage).unwrap();
+        assert!(!storage.retained_file_reclamation_pending());
+        let key = format!("blocks/{}", index_gc_hex(new.handle.roster));
+        checkpoint.client.get(&key, None).unwrap();
+        let manifest = core::str::from_utf8(checkpoint.manifest_output.readable()).unwrap();
+        assert!(manifest.contains(&index_gc_hex(new.handle.roster)));
+        assert_eq!(storage.table(table).spill_generations().len(), 2);
+        drop(checkpoint);
+        drop(storage);
         crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     }
 

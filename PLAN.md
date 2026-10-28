@@ -38,6 +38,8 @@ A waiting schema edit must never attach itself to a new object that reused a nam
   must stay private to their transaction. Preserve repeated dependency rows.
 - Keep older rows, indexes and saved files until readers and backups finish.
   Remove obsolete versions in limited batches so other queries keep moving.
+  Files written by an unfinished checkpoint remain owned until its publication
+  resolves; a reader finishing must not cause them to be collected as orphans.
 - Let remaining checkpoint capture, table/index merge and block-cleanup
   downloads pause without occupying the SQL worker. Save enough state to resume
   within the fixed memory budget, as journal cleanup does for backup listings,

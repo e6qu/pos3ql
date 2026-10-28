@@ -8,10 +8,9 @@ retain repaired-defect evidence in the fixing PR. See [CONTRIBUTING.md](CONTRIBU
 
 Unfinished features and their verification criteria belong in [PLAN.md](PLAN.md).
 Current guarantees belong in the [behavior guide](docs/implemented-baseline.md),
-[architecture and physical limits](docs/architecture.md) and
-[storage format guide](docs/durable-format.md). Journal cleanup keeps its
-retention decision and deletion position across object-store waits and failures,
-without blocking the checkpoints that free row-cache space.
+[architecture and physical limits](docs/architecture.md),
+[object-storage behavior](docs/object-storage.md) and
+[storage format guide](docs/durable-format.md).
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

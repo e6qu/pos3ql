@@ -38,7 +38,10 @@ these reservations; it is not the entire operating-system RSS, kernel socket
 memory or the memory used by an independently operated object-storage service.
 
 A reactor waits for sockets and deadlines, then advances ready connections and
-maintenance. SQL CPU work currently runs on one worker. An eligible read that
+maintenance. After each maintenance turn and any queries it wakes, the loop
+registers newly opened storage sockets before sleeping. Cleanup therefore keeps
+moving on an idle server without requiring another query to wake it.
+SQL CPU work currently runs on one worker. An eligible read that
 needs a download yields with its original data owners and command deadline;
 another connection can run cached work. Adding connections or
 `query_workspace_slots` does not add CPU execution workers.

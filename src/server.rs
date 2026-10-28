@@ -1385,12 +1385,6 @@ impl Server {
             if self.block_read_fds.iter().all(Option::is_none) {
                 self.engine.enable_async_block_reads();
             }
-            // Enabling queued reads may open their non-blocking GET sockets.
-            // Reconcile after it does so every pending read has reactor
-            // interest before this loop can block again.
-            self.sync_block_read_interest()?;
-            self.sync_background_io_interest()?;
-            self.sync_writer_probe_interest()?;
             // Active checkpoint and compaction work advances even on an
             // idle server — a trigger must not wait for the next client
             // message to finish what it started, and a merge owes its beats
@@ -1419,6 +1413,11 @@ impl Server {
                     self.finish_response_batch(publication_error.as_ref());
                 }
             }
+            // Maintenance and its awakened queries can open new requests.
+            // Register their final sockets before the next blocking wait.
+            self.sync_block_read_interest()?;
+            self.sync_background_io_interest()?;
+            self.sync_writer_probe_interest()?;
         }
         self.shutdown();
         Ok(())

@@ -81712,7 +81712,7 @@ fn automatic_checkpoint_deletes_at_most_one_configured_object_per_beat() {
             .unwrap()
             .client
             .put(
-                &format!("blocks/paced-orphan-{index}"),
+                &format!("blocks/{index:064x}"),
                 b"obsolete",
                 crate::object_store::Precondition::IfNoneMatchAny,
             )
@@ -81752,11 +81752,30 @@ fn automatic_checkpoint_deletes_at_most_one_configured_object_per_beat() {
             .list("sst/paced-orphan-", |_| legacy_objects += 1)
             .unwrap();
         ckpt.client
-            .list("blocks/paced-orphan-", |_| block_objects += 1)
+            .list("blocks/", |key| {
+                block_objects +=
+                    usize::from((0..3).any(|index| key == format!("blocks/{index:064x}")));
+            })
             .unwrap();
         commit_objects.saturating_sub(2) + legacy_objects + block_objects
     }
 
+    let mut block_count = 0usize;
+    engine
+        .ckpt
+        .as_mut()
+        .unwrap()
+        .client
+        .list("blocks/", |_| block_count += 1)
+        .unwrap();
+    let block_pages = block_count.div_ceil(
+        config
+            .checkpoint_garbage_batch_objects
+            .min(crate::object_store::MAX_LIST_PAGE_KEYS),
+    );
+    // A metadata read and a deletion can each require their own turn. Include
+    // the collector's fixed phase transitions without changing request deadlines.
+    let max_beats = 2 * namespace.borrow().object_count() + 16;
     let mut remaining = obsolete_objects(&mut engine);
     assert!(remaining > config.checkpoint_delete_objects_per_beat);
     let mut beats = 0usize;
@@ -81779,13 +81798,17 @@ fn automatic_checkpoint_deletes_at_most_one_configured_object_per_beat() {
         );
         remaining = after;
         beats += 1;
-        assert!(beats < 32, "paced maintenance stopped making progress");
+        assert!(
+            beats <= max_beats,
+            "paced maintenance stopped making progress"
+        );
     }
     assert_eq!(remaining, 0);
     assert!(beats > 1, "maintenance was not paced across dispatch beats");
     assert_eq!(
-        maintenance_lists, 5,
-        "independent journal/block backup rosters and each garbage prefix scan once"
+        maintenance_lists,
+        4 + block_pages as u64,
+        "independent backup rosters, journal and legacy scans, and bounded block pages"
     );
 
     drop(engine);
@@ -83371,7 +83394,10 @@ fn published_checkpoint_maintenance_retries_without_fencing_reads() {
     );
 
     namespace.borrow_mut().faults.transient_per_mille = 0;
-    for _ in 0..8 {
+    // Resumption now separates inventory reads, listing and deletion. Bound
+    // turns by fixture size while retaining the original network deadlines.
+    let max_turns = 2 * namespace.borrow().object_count() + 16;
+    for _ in 0..max_turns {
         if !engine.checkpoint_work_pending() {
             break;
         }

@@ -15693,10 +15693,8 @@ fn retain_row_roster_blocks(
             "invalid saved row roster type or length"
         ));
     }
-    for bytes in scratch[..length].chunks_exact(32) {
-        let mut id = [0u8; 32];
-        id.copy_from_slice(bytes);
-        retain_block(keep, BlockId(id))?;
+    for bytes in scratch[..length].as_chunks::<32>().0 {
+        retain_block(keep, BlockId(*bytes))?;
     }
     Ok(())
 }

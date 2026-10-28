@@ -9387,7 +9387,7 @@ impl Engine {
         // Flush committed records before capture. A covered upload stays
         // pending until its publication retry reconciles the durable root.
         self.wal.commit();
-        if ckpt.block_reads_busy() {
+        if ckpt.block_reads_busy() || !ckpt.merge_reads_ready() {
             return Err(sql_err!(
                 sqlstate::INTERNAL_IO_WAIT,
                 "durable block reads in progress"
@@ -10133,6 +10133,14 @@ impl Engine {
         {
             return self.local_cleanup.is_some() || self.storage.history_cleanup_pending();
         }
+        if let Some(checkpointer) = self.ckpt.as_ref() {
+            if checkpointer.independent_merge_ready() {
+                return true;
+            }
+            if !checkpointer.merge_reads_ready() {
+                return self.local_cleanup.is_some() || self.storage.history_cleanup_pending();
+            }
+        }
         let output_ready = self.ckpt.as_ref().is_none_or(|checkpointer| {
             checkpointer.physical_output_ready(std::time::Instant::now())
                 || checkpointer.physical_output_stale(&self.storage)
@@ -10280,10 +10288,14 @@ impl Engine {
         let journal_pending = self.unpromoted_commits != 0
             || (self.commit_progress == CommitProgressMode::Reactor
                 && self.durable_retry_pending());
-        if journal_pending
+        let independent_merge = self
+            .ckpt
+            .as_ref()
+            .is_some_and(Checkpointer::independent_merge_ready);
+        if (journal_pending || independent_merge)
             && !credential_draining
             && self.local_cleanup.is_none()
-            && !self.block_reads_pending()
+            && (!self.block_reads_pending() || independent_merge)
             && let Some(checkpointer) = self.ckpt.as_mut()
             && checkpointer.retained_output_ready()
         {
@@ -10292,10 +10304,9 @@ impl Engine {
                     .storage
                     .advance_history_cleanup(core::num::NonZeroUsize::new(64).unwrap());
             }
-            let atomic_reads = checkpointer.atomic_block_read_scope();
             let result = checkpointer.advance_retained_output(&self.storage);
-            drop(atomic_reads);
             return match result {
+                Ok(()) if !checkpointer.merge_reads_ready() => CheckpointBeat::WaitingForReads,
                 Ok(()) => CheckpointBeat::Advanced,
                 Err(error) => {
                     self.remember_checkpoint_failure(&error);
@@ -10310,8 +10321,13 @@ impl Engine {
         let file_cleanup_waiting = self.ckpt.as_ref().is_some_and(|checkpointer| {
             checkpointer.published_maintenance_pending() && !checkpointer.file_io_ready()
         });
+        let merge_waiting = self
+            .ckpt
+            .as_ref()
+            .is_some_and(|checkpointer| !checkpointer.merge_reads_ready());
         let reads_pending = credential_draining
             || file_cleanup_waiting
+            || merge_waiting
             || self.block_reads_pending()
             || self
                 .ckpt
@@ -10459,13 +10475,8 @@ impl Engine {
         if ckpt.block_reads_busy() {
             return CheckpointBeat::WaitingForReads;
         }
-        // Capture and merge still include transitions that cannot be replayed
-        // after yielding. Their block reads remain synchronous; file cleanup
-        // uses its own resumable client.
-        let atomic_reads = ckpt.atomic_block_read_scope();
         let remote_maintenance_was_pending = ckpt.published_maintenance_pending();
         let checkpoint = ckpt.checkpoint_step(&mut self.storage);
-        drop(atomic_reads);
         let remote_maintenance_finished =
             remote_maintenance_was_pending && !ckpt.published_maintenance_pending();
         match checkpoint {
@@ -10490,7 +10501,7 @@ impl Engine {
             Ok(CheckpointStep::Working) => {
                 if retried_upload || remote_maintenance_finished {
                     CheckpointBeat::Durable
-                } else if !ckpt.file_io_ready() {
+                } else if !ckpt.file_io_ready() || !ckpt.merge_reads_ready() {
                     CheckpointBeat::WaitingForReads
                 } else {
                     CheckpointBeat::Advanced

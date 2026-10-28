@@ -10,6 +10,7 @@
 //! bounds are checked independently; index addressability alone is not a usable
 //! database-size guarantee.
 
+#[cfg(test)]
 use crate::mem::arena::Arena;
 use crate::sql::types::ColType;
 use crate::storage::rowenc::{self, MAX_COLUMNS};
@@ -134,6 +135,7 @@ impl SstKey {
         Self { rowid, commit_lsn }
     }
 
+    #[cfg(test)]
     fn successor(self) -> Option<Self> {
         if self.commit_lsn > 0 {
             Some(Self::at(self.rowid, self.commit_lsn - 1))
@@ -1239,10 +1241,6 @@ impl SstMetadataCursor {
         }
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "caller-owned fixed scratch survives waiting reads"
-    )]
     pub(crate) fn step(
         &mut self,
         store: &mut dyn BlockStore,
@@ -1287,6 +1285,13 @@ impl SstMetadataCursor {
                 self.select_leaf(count as usize);
             }
             MetadataReadStage::Data { position, count } => {
+                prefetch_data_window(
+                    store,
+                    index,
+                    position + 1,
+                    count,
+                    self.handle.uses_packed_references(),
+                )?;
                 let reference = block_ref_at(index, position, self.handle.uses_packed_references());
                 let (length, kind) = read_data_block_raw_ref(store, reference, raw, range)?;
                 match (self.handle.format, kind) {
@@ -2500,6 +2505,7 @@ impl<'a> SstReader<'a> {
             .map(|reference| (reference, self.decoded_len))
     }
 
+    #[cfg(test)]
     pub(crate) fn new(arena: &'a Arena) -> Result<Self, SstError> {
         let index_scratch = arena
             .alloc_slice_with(MAX_PAYLOAD, |_| 0u8)
@@ -3571,10 +3577,8 @@ fn assemble_chain(
             written: entry.head.len(),
         };
     }
-    for id_bytes in entry.chain.chunks_exact(32).skip(progress.chunk) {
-        let mut id = [0u8; 32];
-        id.copy_from_slice(id_bytes);
-        let (n, kind) = store.get(&BlockId(id), &mut into[progress.written..entry.total_len])?;
+    for id in entry.chain.as_chunks::<32>().0.iter().skip(progress.chunk) {
+        let (n, kind) = store.get(&BlockId(*id), &mut into[progress.written..entry.total_len])?;
         if kind != BlockType::SstData || n == 0 {
             return Err(SstError::Store(StoreError::Corrupt(
                 super::BlockError::Payload,

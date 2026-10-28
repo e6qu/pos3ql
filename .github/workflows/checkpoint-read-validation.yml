@@ -23,5 +23,6 @@ jobs:
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: >-
           cargo test --lib --locked --features checkpoint-profile --
-          store::sst::tests:: checkpoint_budget maintenance_metadata_
+          store::sst::tests:: checkpoint_reads_ checkpoint_budget maintenance_metadata_
+          parallel_physical_ atomic_block_reads_nested_scope
           --test-threads=1

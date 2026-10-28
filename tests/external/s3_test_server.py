@@ -37,6 +37,8 @@ class S3TestServer(http.server.BaseHTTPRequestHandler):
     page_size = 1000
     mutation_lock = threading.Lock()
     metrics_lock = threading.Lock()
+    list_cursor_lock = threading.Lock()
+    list_cursors = {}
     metrics_file = None
     latency_seconds = 0.0
     writer_probe_gate_file = None
@@ -329,19 +331,19 @@ class S3TestServer(http.server.BaseHTTPRequestHandler):
         if query.get("encoding-type") != ["url"]:
             return self.error(400, "InvalidArgument", "encoding-type must be url")
         prefix = query.get("prefix", [""])[0]
-        token = query.get("continuation-token", ["0"])[0]
+        token = query.get("continuation-token", [None])[0]
+        start_after = query.get("start-after", [""])[0]
+        if token is not None:
+            with self.list_cursor_lock:
+                retained = self.list_cursors.get(token)
+            if retained is None or retained[:2] != (self.bucket, prefix) or start_after:
+                return self.error(400, "InvalidToken", "invalid continuation token")
+            start_after = retained[2]
         try:
-            if ":" in token:
-                encoded_offset, encoded_after = token.split(":", 1)
-                offset = int(encoded_offset)
-                start_after = bytes.fromhex(encoded_after).decode()
-            else:
-                offset = int(token)
-                start_after = query.get("start-after", [""])[0]
             max_keys = int(query.get("max-keys", [str(self.page_size)])[0])
-        except (UnicodeDecodeError, ValueError):
-            return self.error(400, "InvalidToken", "invalid continuation token")
-        if offset < 0 or max_keys < 1:
+        except ValueError:
+            return self.error(400, "InvalidArgument", "invalid list bound")
+        if not 1 <= max_keys <= 1000 or (start_after and not start_after.startswith(prefix)):
             return self.error(400, "InvalidArgument", "invalid list bound")
         directory = self.root / self.bucket
         keys = [] if not directory.exists() else sorted(
@@ -353,18 +355,21 @@ class S3TestServer(http.server.BaseHTTPRequestHandler):
         if start_after:
             keys = [key for key in keys if key > start_after]
         page_limit = min(self.page_size, max_keys)
-        page = keys[offset : offset + page_limit]
-        next_offset = offset + len(page)
-        truncated = next_offset < len(keys)
+        page = keys[:page_limit]
+        truncated = len(page) < len(keys)
         contents = "".join(
             f"<Contents><Key>{urllib.parse.quote(key, safe='')}</Key></Contents>"
             for key in page
         )
-        next_token = (
-            f"<NextContinuationToken>{next_offset}:{start_after.encode().hex()}</NextContinuationToken>"
-            if truncated
-            else ""
-        )
+        next_token = ""
+        if truncated:
+            # Deleting a returned page or inserting an earlier key cannot move
+            # an opaque cursor backwards or make it skip unseen keys.
+            boundary = (self.bucket, prefix, page[-1])
+            opaque = hashlib.sha256(json.dumps(boundary).encode()).hexdigest()
+            with self.list_cursor_lock:
+                self.list_cursors[opaque] = boundary
+            next_token = f"<NextContinuationToken>{opaque}</NextContinuationToken>"
         body = (
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
             "<ListBucketResult>"
@@ -414,6 +419,8 @@ def main():
     parser.add_argument("--writer-probe-gate-file")
     parser.add_argument("--audit-file")
     args = parser.parse_args()
+    if not 1 <= args.page_size <= 1000:
+        parser.error("--page-size must be between 1 and 1000")
     S3TestServer.root = pathlib.Path(args.root).resolve()
     S3TestServer.bucket = args.bucket
     S3TestServer.region = args.region

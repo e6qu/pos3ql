@@ -81621,7 +81621,7 @@ fn checkpoint_garbage_is_drained_in_configured_batches_before_success() {
             .unwrap()
             .client
             .put(
-                &format!("blocks/orphan-{index}"),
+                &format!("blocks/{index:064x}"),
                 b"orphan",
                 crate::object_store::Precondition::IfNoneMatchAny,
             )
@@ -81642,7 +81642,9 @@ fn checkpoint_garbage_is_drained_in_configured_batches_before_success() {
         .as_mut()
         .unwrap()
         .client
-        .list("blocks/orphan-", |_| obsolete += 1)
+        .list("blocks/", |key| {
+            obsolete += usize::from((0..5).any(|index| key == format!("blocks/{index:064x}")));
+        })
         .unwrap();
     assert_eq!(obsolete, 0, "successful checkpoint must drain every batch");
     drop(engine);
@@ -81710,7 +81712,7 @@ fn automatic_checkpoint_deletes_at_most_one_configured_object_per_beat() {
             .unwrap()
             .client
             .put(
-                &format!("blocks/paced-orphan-{index}"),
+                &format!("blocks/{index:064x}"),
                 b"obsolete",
                 crate::object_store::Precondition::IfNoneMatchAny,
             )
@@ -81750,11 +81752,30 @@ fn automatic_checkpoint_deletes_at_most_one_configured_object_per_beat() {
             .list("sst/paced-orphan-", |_| legacy_objects += 1)
             .unwrap();
         ckpt.client
-            .list("blocks/paced-orphan-", |_| block_objects += 1)
+            .list("blocks/", |key| {
+                block_objects +=
+                    usize::from((0..3).any(|index| key == format!("blocks/{index:064x}")));
+            })
             .unwrap();
         commit_objects.saturating_sub(2) + legacy_objects + block_objects
     }
 
+    let mut block_count = 0usize;
+    engine
+        .ckpt
+        .as_mut()
+        .unwrap()
+        .client
+        .list("blocks/", |_| block_count += 1)
+        .unwrap();
+    let block_pages = block_count.div_ceil(
+        config
+            .checkpoint_garbage_batch_objects
+            .min(crate::object_store::MAX_LIST_PAGE_KEYS),
+    );
+    // A metadata read and a deletion can each require their own turn. Include
+    // the collector's fixed phase transitions without changing request deadlines.
+    let max_beats = 2 * namespace.borrow().object_count() + 16;
     let mut remaining = obsolete_objects(&mut engine);
     assert!(remaining > config.checkpoint_delete_objects_per_beat);
     let mut beats = 0usize;
@@ -81777,13 +81798,17 @@ fn automatic_checkpoint_deletes_at_most_one_configured_object_per_beat() {
         );
         remaining = after;
         beats += 1;
-        assert!(beats < 32, "paced maintenance stopped making progress");
+        assert!(
+            beats <= max_beats,
+            "paced maintenance stopped making progress"
+        );
     }
     assert_eq!(remaining, 0);
     assert!(beats > 1, "maintenance was not paced across dispatch beats");
     assert_eq!(
-        maintenance_lists, 5,
-        "independent journal/block backup rosters and each garbage prefix scan once"
+        maintenance_lists,
+        4 + block_pages as u64,
+        "independent backup rosters, journal and legacy scans, and bounded block pages"
     );
 
     drop(engine);
@@ -83369,7 +83394,10 @@ fn published_checkpoint_maintenance_retries_without_fencing_reads() {
     );
 
     namespace.borrow_mut().faults.transient_per_mille = 0;
-    for _ in 0..8 {
+    // Resumption now separates inventory reads, listing and deletion. Bound
+    // turns by fixture size while retaining the original network deadlines.
+    let max_turns = 2 * namespace.borrow().object_count() + 16;
+    for _ in 0..max_turns {
         if !engine.checkpoint_work_pending() {
             break;
         }
@@ -93526,6 +93554,146 @@ fn maintenance_metadata_waits_leave_cached_sql_runnable_through_log_deletion() {
 }
 
 #[test]
+fn maintenance_metadata_waits_leave_cached_sql_runnable_through_file_deletion() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::time::{Duration, Instant};
+
+    let (mut engine, mut budget, mut config) =
+        sliced_cleanup_fixture("file-cleanup-cached-orders", false);
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    for _ in 0..64 {
+        if !engine.storage.history_cleanup_pending() {
+            break;
+        }
+        assert!(!engine.checkpoint_beat().failed());
+    }
+    assert!(!engine.storage.history_cleanup_pending());
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    config.object_store_on = true;
+    config.object_store_sim = false;
+    config.object_store_endpoint = listener.local_addr().unwrap().to_string();
+    config.object_store_access_key = "test-access".to_owned();
+    config.object_store_secret_key = "test-secret".to_owned();
+    config.block_cache_bytes = 0;
+    config.disk_cache_bytes = 0;
+    let mut io_budget = Budget::new(crate::checkpoint::Checkpointer::budget_bytes(&config));
+    let mut checkpointer = crate::checkpoint::Checkpointer::new(&config, &mut io_budget).unwrap();
+    checkpointer.schedule_file_cleanup_for_test(0);
+    engine.ckpt = Some(checkpointer);
+    let empty = "<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>";
+    let orphan = format!(
+        "<ListBucketResult><IsTruncated>false</IsTruncated><Contents><Key>{}blocks/0000000000000000000000000000000000000000000000000000000000000000</Key></Contents></ListBucketResult>",
+        config.object_store_prefix
+    );
+    let mut stream = None;
+    for (method, response) in [("GET ", empty), ("GET ", orphan.as_str()), ("DELETE ", "")] {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "cleanup did not start its request"
+            );
+            assert!(!crate::mem::guard::forbid_alloc(|| engine.checkpoint_beat()).failed());
+            if !engine.checkpoint_can_progress() {
+                break;
+            }
+        }
+        if stream.is_none() {
+            let (accepted, _) = loop {
+                engine
+                    .advance_wal_publication(Instant::now(), CommitProgressMode::Reactor)
+                    .unwrap();
+                match listener.accept() {
+                    Ok(connection) => break connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "metadata request did not connect"
+                        );
+                        std::thread::yield_now();
+                    }
+                    Err(error) => panic!("accept metadata request: {error}"),
+                }
+            };
+            accepted.set_nonblocking(false).unwrap();
+            accepted
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            stream = Some(accepted);
+        }
+        let stream = stream.as_mut().unwrap();
+        engine
+            .advance_wal_publication(Instant::now(), CommitProgressMode::Reactor)
+            .unwrap();
+        let mut request = Vec::new();
+        while !request.ends_with(b"\r\n\r\n") {
+            let mut byte = [0];
+            stream.read_exact(&mut byte).unwrap();
+            request.push(byte[0]);
+        }
+        assert!(request.starts_with(method.as_bytes()));
+        for _ in 0..3 {
+            let output = session.success(
+                &mut engine,
+                "SELECT count(*) = 80 AND min(id) = 1 AND max(id) = 80 FROM cleanup_orders",
+                true,
+            );
+            assert_eq!(data_rows(&output), ["t"]);
+            // Releasing a statement reader may queue CPU-only history cleanup.
+            // It must finish in bounded turns without polling the held socket.
+            for _ in 0..64 {
+                assert!(!engine.ckpt.as_ref().unwrap().file_io_ready());
+                let history = engine.storage.history_cleanup_pending();
+                let beat = crate::mem::guard::forbid_alloc(|| engine.checkpoint_beat());
+                if beat == CheckpointBeat::WaitingForReads {
+                    break;
+                }
+                assert_eq!(beat, CheckpointBeat::Advanced);
+                assert!(history, "only local reader-history work may advance here");
+            }
+            assert!(!engine.checkpoint_can_progress());
+        }
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n{response}",
+            response.len()
+        )
+        .unwrap();
+        while !engine.checkpoint_can_progress() {
+            assert!(
+                Instant::now() < deadline,
+                "cleanup did not wake after its response"
+            );
+            crate::mem::guard::forbid_alloc(|| {
+                engine.advance_wal_publication(Instant::now(), CommitProgressMode::Reactor)
+            })
+            .unwrap();
+            std::thread::yield_now();
+        }
+    }
+    for _ in 0..4 {
+        if !engine
+            .ckpt
+            .as_ref()
+            .unwrap()
+            .published_maintenance_pending()
+        {
+            break;
+        }
+        assert!(!crate::mem::guard::forbid_alloc(|| engine.checkpoint_beat()).failed());
+    }
+    assert!(
+        !engine
+            .ckpt
+            .as_ref()
+            .unwrap()
+            .published_maintenance_pending()
+    );
+}
+
+#[test]
 fn maintenance_metadata_reader_release_shares_the_configured_deletion_limit() {
     use crate::object_store::Precondition;
     let mut config = test_config("journal-reader-release-pacing");
@@ -93590,7 +93758,7 @@ fn maintenance_metadata_reader_release_shares_the_configured_deletion_limit() {
         .unwrap()
         .client
         .put(
-            "blocks/released-reader-orphan",
+            "blocks/ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
             b"obsolete block",
             Precondition::IfNoneMatchAny,
         )
@@ -93607,17 +93775,25 @@ fn maintenance_metadata_reader_release_shares_the_configured_deletion_limit() {
         assert!(engine.storage.retained_file_reclamation_pending());
     });
     let before = namespace.borrow().object_count();
-    assert!(!crate::mem::guard::forbid_alloc(|| engine.checkpoint_beat()).failed());
-    assert_eq!(
-        namespace.borrow().object_count(),
-        before - 1,
-        "a reader release must not add a second deletion batch to a journal turn"
-    );
+    let mut previous = before;
+    for _ in 0..64 {
+        assert!(!crate::mem::guard::forbid_alloc(|| engine.checkpoint_beat()).failed());
+        let count = namespace.borrow().object_count();
+        assert!(
+            previous - count <= 1,
+            "one turn exceeded the shared deletion allowance"
+        );
+        previous = count;
+        if count < before {
+            break;
+        }
+    }
+    assert_eq!(previous, before - 1);
     assert!(
         namespace
             .borrow()
             .object_bytes(&format!(
-                "{}blocks/released-reader-orphan",
+                "{}blocks/ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
                 config.object_store_prefix
             ))
             .is_none()
@@ -93650,7 +93826,7 @@ fn maintenance_metadata_reader_release_shares_the_configured_deletion_limit() {
 }
 
 #[test]
-fn bounded_cache_admission_waits_before_sequences_and_triggers_in_both_protocols() {
+fn maintenance_metadata_cache_admission_waits_before_sequences_and_triggers_in_both_protocols() {
     fn execute(
         engine: &mut Engine,
         session: &mut ConfiguredTransactionSession,
@@ -93676,120 +93852,141 @@ fn bounded_cache_admission_waits_before_sequences_and_triggers_in_both_protocols
             }
         })
     }
-    for (extended, fail) in [(false, false), (true, false), (false, true), (true, true)] {
-        let (mut engine, mut budget, config) = sliced_cleanup_fixture(
-            if extended {
-                "cache-admission-extended"
-            } else {
-                "cache-admission-simple"
-            },
-            false,
-        );
-        let mut writer =
-            ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(11);
-        let mut reader =
-            ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(12);
-        writer.success(&mut engine, "CREATE SEQUENCE admission_sequence; CREATE TABLE admission_audit(id integer); \
+    for physical_cleanup in [false, true] {
+        for (extended, fail) in [(false, false), (true, false), (false, true), (true, true)] {
+            let label = format!(
+                "cache-admission-{}-{}",
+                if physical_cleanup { "files" } else { "heap" },
+                if extended { "extended" } else { "simple" }
+            );
+            let (mut engine, mut budget, config) = sliced_cleanup_fixture(&label, physical_cleanup);
+            let mut writer =
+                ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(11);
+            let mut reader =
+                ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(12);
+            writer.success(&mut engine, "CREATE SEQUENCE admission_sequence; CREATE TABLE admission_audit(id integer); \
             CREATE FUNCTION admission_trigger() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN INSERT INTO admission_audit VALUES (NEW.id); RETURN NEW; END $$; \
             CREATE TRIGGER admission_insert AFTER INSERT ON cleanup_orders FOR EACH ROW EXECUTE FUNCTION admission_trigger()", true);
-        writer.success(&mut engine, "SET statement_timeout = '10s'", true);
-        writer.send.clear();
-        crate::mem::guard::forbid_alloc(|| {
-            let garbage = [0u8; 8192];
-            while engine.storage.heap.used() * 100 < engine.storage.heap.capacity() * 85 {
-                engine.storage.heap.append_bytes(&garbage).unwrap();
+            writer.success(&mut engine, "SET statement_timeout = '10s'", true);
+            writer.send.clear();
+            if physical_cleanup {
+                engine.checkpoint().unwrap();
             }
-        });
-        let lsn = engine.storage.lsn();
-        start_sliced_cleanup(&mut engine, lsn);
-        // A recovered storage failure must not poison a later request when
-        // that request first reaches the heap-pressure admission boundary.
-        engine.remember_checkpoint_failure(&sql_err!(sqlstate::IO_ERROR, "old storage failure"));
-        let skip = usize::from(!extended);
-        assert!(matches!(execute(&mut engine, &mut writer, extended, 0),
+            crate::mem::guard::forbid_alloc(|| {
+                let garbage = [0u8; 8192];
+                while engine.storage.heap.used() * 100 < engine.storage.heap.capacity() * 85 {
+                    engine.storage.heap.append_bytes(&garbage).unwrap();
+                }
+            });
+            let lsn = engine.storage.lsn();
+            if physical_cleanup {
+                let checkpointer = engine.ckpt.as_mut().unwrap();
+                checkpointer.schedule_file_cleanup_for_test(lsn);
+                assert!(!checkpointer.sweep_active());
+                assert!(!checkpointer.manifest_publication_pending());
+                assert!(engine.local_cleanup.is_none());
+            } else {
+                start_sliced_cleanup(&mut engine, lsn);
+            }
+            // A recovered storage failure must not poison a later request when
+            // that request first reaches the heap-pressure admission boundary.
+            engine
+                .remember_checkpoint_failure(&sql_err!(sqlstate::IO_ERROR, "old storage failure"));
+            let skip = usize::from(!extended);
+            assert!(matches!(execute(&mut engine, &mut writer, extended, 0),
             ExecutionStatus::Blocked { completed_statements, wait: StatementWait::CacheCapacity, .. }
                 if completed_statements == skip));
-        let mut prefix = writer.send.readable().to_vec();
-        let deadline = writer.transaction.suspended_statement_deadline().unwrap();
-        let clock = datetime::statement_micros();
-        let journal = engine.journal_lsn();
-        for _ in 0..2 {
-            assert!(matches!(
-                execute(&mut engine, &mut writer, extended, skip),
-                ExecutionStatus::Blocked {
-                    wait: StatementWait::CacheCapacity,
-                    ..
-                }
-            ));
-            assert_eq!(writer.send.readable(), prefix);
-            assert_eq!(engine.journal_lsn(), journal);
-            assert_eq!(
-                writer.transaction.suspended_statement_deadline(),
-                Some(deadline)
-            );
-            assert_eq!(datetime::statement_micros(), clock);
-        }
-        if fail {
-            engine
-                .remember_checkpoint_failure(&sql_err!(sqlstate::IO_ERROR, "new storage failure"));
-            assert_eq!(
-                execute(&mut engine, &mut writer, extended, skip),
-                ExecutionStatus::Complete
-            );
-            assert!(
-                writer
-                    .send
-                    .readable()
-                    .windows(b"new storage failure".len())
-                    .any(|bytes| bytes == b"new storage failure")
-            );
-            assert!(writer.transaction.cache_capacity_wait.is_none());
-            assert!(writer.transaction.suspended_statement_deadline().is_none());
-            writer.send.clear();
-            assert!(matches!(
-                execute(&mut engine, &mut writer, extended, 0),
-                ExecutionStatus::Blocked {
-                    wait: StatementWait::CacheCapacity,
-                    ..
-                }
-            ));
-            prefix = writer.send.readable().to_vec();
-        }
-        let report = reader.success(
+            let mut prefix = writer.send.readable().to_vec();
+            let deadline = writer.transaction.suspended_statement_deadline().unwrap();
+            let clock = datetime::statement_micros();
+            let journal = engine.journal_lsn();
+            for _ in 0..2 {
+                assert!(matches!(
+                    execute(&mut engine, &mut writer, extended, skip),
+                    ExecutionStatus::Blocked {
+                        wait: StatementWait::CacheCapacity,
+                        ..
+                    }
+                ));
+                assert_eq!(writer.send.readable(), prefix);
+                assert_eq!(engine.journal_lsn(), journal);
+                assert_eq!(
+                    writer.transaction.suspended_statement_deadline(),
+                    Some(deadline)
+                );
+                assert_eq!(datetime::statement_micros(), clock);
+            }
+            if fail {
+                engine.remember_checkpoint_failure(&sql_err!(
+                    sqlstate::IO_ERROR,
+                    "new storage failure"
+                ));
+                assert_eq!(
+                    execute(&mut engine, &mut writer, extended, skip),
+                    ExecutionStatus::Complete
+                );
+                assert!(
+                    writer
+                        .send
+                        .readable()
+                        .windows(b"new storage failure".len())
+                        .any(|bytes| bytes == b"new storage failure")
+                );
+                assert!(writer.transaction.cache_capacity_wait.is_none());
+                assert!(writer.transaction.suspended_statement_deadline().is_none());
+                writer.send.clear();
+                assert!(matches!(
+                    execute(&mut engine, &mut writer, extended, 0),
+                    ExecutionStatus::Blocked {
+                        wait: StatementWait::CacheCapacity,
+                        ..
+                    }
+                ));
+                prefix = writer.send.readable().to_vec();
+            }
+            let report = reader.success(
             &mut engine,
             "SELECT count(*), sum(id) FROM cleanup_orders; SELECT count(*) FROM admission_audit",
             true,
         );
-        assert_eq!(data_rows(&report), ["80|3240", "0"]);
-        let prepared_report = reader.success(&mut engine,
+            assert_eq!(data_rows(&report), ["80|3240", "0"]);
+            let prepared_report = reader.success(&mut engine,
             "PREPARE admission_report AS SELECT count(*) FROM cleanup_orders; EXECUTE admission_report", true);
-        assert_eq!(data_rows(&prepared_report), ["80"]);
-        assert!(engine.compact_scratch.active());
-        assert!(finish_sliced_cleanup(&mut engine) > 1);
-        assert_eq!(
-            execute(&mut engine, &mut writer, extended, skip),
-            ExecutionStatus::Complete
-        );
-        if extended {
-            crate::mem::guard::forbid_alloc(|| {
-                engine.commit_txn(&mut writer.transaction, &writer.guc)
-            })
-            .unwrap();
+            assert_eq!(data_rows(&prepared_report), ["80"]);
+            assert_eq!(engine.compact_scratch.active(), !physical_cleanup);
+            if physical_cleanup {
+                // Simulated PUTs grow fixture storage. Persist and reclaim outside
+                // the allocation guard; statement execution remains guarded.
+                engine.ckpt.as_mut().unwrap().request_checkpoint().unwrap();
+                assert!(engine.checkpoint().unwrap());
+            } else {
+                assert!(finish_sliced_cleanup(&mut engine) > 1);
+            }
+            assert_eq!(
+                execute(&mut engine, &mut writer, extended, skip),
+                ExecutionStatus::Complete
+            );
+            if extended {
+                crate::mem::guard::forbid_alloc(|| {
+                    engine.commit_txn(&mut writer.transaction, &writer.guc)
+                })
+                .unwrap();
+            }
+            let (expected, sequence) = match (extended, fail) {
+                (true, _) => ("1001", "1"),
+                (false, false) => ("1002", "2"),
+                (false, true) => ("1003", "3"),
+            };
+            assert!(!message_types(writer.send.readable()).contains(&b'E'));
+            assert!(writer.send.readable().starts_with(&prefix));
+            assert!(writer.transaction.cache_capacity_wait.is_none());
+            let report = reader.success(
+                &mut engine,
+                "SELECT id FROM admission_audit; SELECT last_value FROM admission_sequence",
+                true,
+            );
+            assert_eq!(data_rows(&report), [expected, sequence]);
         }
-        let (expected, sequence) = match (extended, fail) {
-            (true, _) => ("1001", "1"),
-            (false, false) => ("1002", "2"),
-            (false, true) => ("1003", "3"),
-        };
-        assert!(!message_types(writer.send.readable()).contains(&b'E'));
-        assert!(writer.send.readable().starts_with(&prefix));
-        assert!(writer.transaction.cache_capacity_wait.is_none());
-        let report = reader.success(
-            &mut engine,
-            "SELECT id FROM admission_audit; SELECT last_value FROM admission_sequence",
-            true,
-        );
-        assert_eq!(data_rows(&report), [expected, sequence]);
     }
 }
 

@@ -1,7 +1,7 @@
 //! Object-resident secondary-index generations.
 //!
-//! A generation is an immutable sequence of data blocks plus one
-//! roster block naming them. Each entry carries the equality hash, encoded
+//! A generation owns immutable data blocks through chained rosters or
+//! navigation trees with bounded depth. Each entry carries the equality hash, encoded
 //! key tuple, optional included-column payload, row identity, and commit LSN.
 //! Readers can therefore reject an equality miss and satisfy a covering scan
 //! without fetching a row; every candidate is still checked against the
@@ -468,73 +468,147 @@ fn roster_ref<'a>(
     Ok((BlockId(id), filter, bounds))
 }
 
-/// Walks every roster node and data-block identity with its physical type.
-/// Returning false from `visit` stops before caller-owned scratch overflows.
+/// One retained generation walk. Each step reads at most one roster node.
+/// Navigation state survives a waiting read; chained rosters advance only after
+/// their complete payload has been checked and retained.
+pub(crate) struct ValueRosterWalk {
+    next: Option<BlockId>,
+    navigation: Option<NavigationCursor>,
+    navigation_kind: Option<BlockType>,
+}
+
+pub(crate) enum ValueRosterStep {
+    Pending,
+    Done,
+    Full,
+}
+
+impl ValueRosterWalk {
+    pub(crate) fn new(root: BlockId) -> Self {
+        Self {
+            next: Some(root),
+            navigation: None,
+            navigation_kind: None,
+        }
+    }
+
+    pub(crate) fn step(
+        &mut self,
+        read: &mut impl FnMut(&BlockId, &mut [u8]) -> Result<(usize, BlockType), StoreError>,
+        scratch: &mut [u8],
+        visit: &mut impl FnMut(BlockId, BlockType) -> bool,
+    ) -> Result<ValueRosterStep, ValueIndexError> {
+        if let Some(cursor) = &mut self.navigation {
+            return Self::navigation_step(
+                cursor,
+                self.navigation_kind.expect("loaded navigation kind"),
+                read,
+                scratch,
+                visit,
+            );
+        }
+        let Some(roster) = self.next else {
+            return Ok(ValueRosterStep::Done);
+        };
+        let (len, kind) = read(&roster, scratch)?;
+        if matches!(
+            kind,
+            BlockType::ValueIndexNavigationV1 | BlockType::ValueIndexPostingV1
+        ) {
+            self.navigation_kind = Some(kind);
+            let cursor = self.navigation.insert(NavigationCursor::for_gc(roster));
+            // The root has already been verified into scratch. Consume it now
+            // without downloading it twice or reserving a second payload.
+            return Self::navigation_step(
+                cursor,
+                kind,
+                &mut |id, _| {
+                    if *id == roster {
+                        Ok((len, kind))
+                    } else {
+                        Err(StoreError::NotReady)
+                    }
+                },
+                scratch,
+                visit,
+            );
+        }
+        if kind != BlockType::ValueIndexRoster || len < ROSTER_HEADER {
+            return Err(ValueIndexError::Corrupt);
+        }
+        if !visit(roster, BlockType::ValueIndexRoster) {
+            return Ok(ValueRosterStep::Full);
+        }
+        let raw_count = u32::from_le_bytes(scratch[..4].try_into().unwrap());
+        let (count, format, _) = roster_layout(raw_count, len)?;
+        let next = if scratch[4..36].iter().any(|byte| *byte != 0) {
+            Some(BlockId(scratch[4..36].try_into().unwrap()))
+        } else {
+            None
+        };
+        let mut position = ROSTER_HEADER;
+        for _ in 0..count {
+            let (id, _, _) = roster_ref(&scratch[..len], format, &mut position)?;
+            if !visit(id, BlockType::ValueIndexData) {
+                return Ok(ValueRosterStep::Full);
+            }
+        }
+        if position != len {
+            return Err(ValueIndexError::Corrupt);
+        }
+        self.next = next;
+        Ok(if next.is_some() {
+            ValueRosterStep::Pending
+        } else {
+            ValueRosterStep::Done
+        })
+    }
+
+    fn navigation_step(
+        cursor: &mut NavigationCursor,
+        kind: BlockType,
+        read: &mut impl FnMut(&BlockId, &mut [u8]) -> Result<(usize, BlockType), StoreError>,
+        scratch: &mut [u8],
+        visit: &mut impl FnMut(BlockId, BlockType) -> bool,
+    ) -> Result<ValueRosterStep, ValueIndexError> {
+        let mut full = false;
+        let step = cursor.next_gc(read, scratch, &mut |id| {
+            let kept = visit(id, kind);
+            full |= !kept;
+            kept
+        })?;
+        if full {
+            return Ok(ValueRosterStep::Full);
+        }
+        Ok(match step {
+            NavigationCursorStep::Done => ValueRosterStep::Done,
+            NavigationCursorStep::Pending => ValueRosterStep::Pending,
+            NavigationCursorStep::Leaf(id, _, _) => {
+                if visit(id, BlockType::ValueIndexData) {
+                    ValueRosterStep::Pending
+                } else {
+                    ValueRosterStep::Full
+                }
+            }
+        })
+    }
+}
+
+/// Walks a complete generation for exclusive startup and administrative callers.
 pub(crate) fn walk_value_roster(
     store: &mut dyn BlockStore,
     root: BlockId,
     scratch: &mut [u8],
     mut visit: impl FnMut(BlockId, BlockType) -> bool,
 ) -> Result<bool, ValueIndexError> {
-    let first_roster = store.get(&root, scratch)?;
-    let root_kind = first_roster.1;
-    if matches!(
-        root_kind,
-        BlockType::ValueIndexNavigationV1 | BlockType::ValueIndexPostingV1
-    ) {
-        let mut cursor = NavigationCursor::for_gc(root);
-        let mut stopped = false;
-        loop {
-            let leaf = cursor.next(store, scratch, &mut |_, _| true, &mut |id| {
-                let keep_going = visit(id, root_kind);
-                stopped |= !keep_going;
-                keep_going
-            })?;
-            if stopped {
-                return Ok(false);
-            }
-            let Some((id, _, _)) = leaf else {
-                return Ok(true);
-            };
-            if !visit(id, BlockType::ValueIndexData) {
-                return Ok(false);
-            }
+    let mut walk = ValueRosterWalk::new(root);
+    loop {
+        match walk.step(&mut |id, into| store.get(id, into), scratch, &mut visit)? {
+            ValueRosterStep::Pending => {}
+            ValueRosterStep::Done => return Ok(true),
+            ValueRosterStep::Full => return Ok(false),
         }
     }
-    let mut next = Some(root);
-    while let Some(roster) = next {
-        if !visit(roster, BlockType::ValueIndexRoster) {
-            return Ok(false);
-        }
-        let (roster_len, kind) = if roster == root {
-            first_roster
-        } else {
-            store.get(&roster, scratch)?
-        };
-        if kind != BlockType::ValueIndexRoster || roster_len < 4 {
-            return Err(ValueIndexError::Corrupt);
-        }
-        let raw_count = u32::from_le_bytes(scratch[..4].try_into().unwrap());
-        let (block_count, format, _) = roster_layout(raw_count, roster_len)?;
-        next = if scratch[4..36].iter().any(|byte| *byte != 0) {
-            let mut id = [0; 32];
-            id.copy_from_slice(&scratch[4..36]);
-            Some(BlockId(id))
-        } else {
-            None
-        };
-        let mut cursor = ROSTER_HEADER;
-        for _ in 0..block_count {
-            let (id, _, _) = roster_ref(&scratch[..roster_len], format, &mut cursor)?;
-            if !visit(id, BlockType::ValueIndexData) {
-                return Ok(false);
-            }
-        }
-        if cursor != roster_len {
-            return Err(ValueIndexError::Corrupt);
-        }
-    }
-    Ok(true)
 }
 
 /// Startup-owned verified bytes. Mutable scratch access invalidates their identity
@@ -1907,6 +1981,86 @@ mod tests {
                 )
                 .unwrap_err(),
             ValueIndexError::Corrupt
+        );
+    }
+
+    #[test]
+    fn maintenance_metadata_navigation_walk_resumes_every_node_without_restarting() {
+        let mut budget = Budget::new(16 << 20);
+        let mut store =
+            crate::store::MemoryBlockStore::new(&mut budget, "resumed navigation", 8 << 20, 2048)
+                .unwrap();
+        let mut writer = NavigationWriter::new();
+        writer.reset(0, false, false);
+        for value in 0u64..1057 {
+            let id = store
+                .put(&value.to_le_bytes(), BlockType::ValueIndexData, 0)
+                .unwrap();
+            writer
+                .append(
+                    &mut store,
+                    id,
+                    1,
+                    SpatialBounds::new(value as f64, 0.0, value as f64, 0.0),
+                )
+                .unwrap();
+        }
+        let root = writer.finish(&mut store).unwrap();
+        let mut scratch = vec![0u8; MAX_PAYLOAD];
+        let mut expected = Vec::new();
+        walk_value_roster(&mut store, root, &mut scratch, |id, kind| {
+            expected.push((id, kind));
+            true
+        })
+        .unwrap();
+        let mut walk = ValueRosterWalk::new(root);
+        let mut seen = Vec::with_capacity(expected.len() * 2);
+        let mut pending = None;
+        let mut successful_reads = 0;
+        let mut done = false;
+        crate::mem::guard::forbid_alloc(|| {
+            for _ in 0..4096 {
+                let result = walk.step(
+                    &mut |id, into| {
+                        if pending != Some(*id) {
+                            pending = Some(*id);
+                            return Err(StoreError::NotReady);
+                        }
+                        pending = None;
+                        successful_reads += 1;
+                        store.get(id, into)
+                    },
+                    &mut scratch,
+                    &mut |id, kind| {
+                        seen.push((id, kind));
+                        true
+                    },
+                );
+                match result {
+                    Ok(ValueRosterStep::Done) => {
+                        done = true;
+                        break;
+                    }
+                    Ok(ValueRosterStep::Pending)
+                    | Err(ValueIndexError::Store(StoreError::NotReady)) => {}
+                    _ => panic!("navigation walk lost its saved position"),
+                }
+            }
+        });
+        assert!(done);
+        // A node can be offered before its GET waits; keep-set insertion is
+        // idempotent. Successful downloads and leaf visits must stay singular.
+        seen.sort_unstable();
+        seen.dedup();
+        expected.sort_unstable();
+        expected.dedup();
+        assert_eq!(seen, expected);
+        assert_eq!(
+            successful_reads,
+            expected
+                .iter()
+                .filter(|(_, kind)| *kind != BlockType::ValueIndexData)
+                .count()
         );
     }
 

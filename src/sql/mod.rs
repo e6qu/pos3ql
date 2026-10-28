@@ -9698,7 +9698,9 @@ impl Engine {
         // working set after the current maintenance task has completed.
         let active = self.local_cleanup.is_some()
             || self.ckpt.as_ref().is_some_and(|checkpointer| {
-                checkpointer.sweep_active() || checkpointer.manifest_publication_pending()
+                checkpointer.sweep_active()
+                    || checkpointer.manifest_publication_pending()
+                    || checkpointer.physical_maintenance_pending(&self.storage)
             });
         if active && txn.cache_capacity_wait.is_none() {
             if let Some(deadline) = txn.suspended_statement_deadline() {
@@ -10125,6 +10127,12 @@ impl Engine {
                     && (checkpointer.physical_output_ready(std::time::Instant::now())
                         || checkpointer.physical_output_stale(&self.storage)));
         }
+        if let Some(checkpointer) = self.ckpt.as_ref()
+            && checkpointer.published_maintenance_pending()
+            && !checkpointer.file_io_ready()
+        {
+            return self.local_cleanup.is_some() || self.storage.history_cleanup_pending();
+        }
         let output_ready = self.ckpt.as_ref().is_none_or(|checkpointer| {
             checkpointer.physical_output_ready(std::time::Instant::now())
                 || checkpointer.physical_output_stale(&self.storage)
@@ -10299,7 +10307,11 @@ impl Engine {
                 }
             };
         }
+        let file_cleanup_waiting = self.ckpt.as_ref().is_some_and(|checkpointer| {
+            checkpointer.published_maintenance_pending() && !checkpointer.file_io_ready()
+        });
         let reads_pending = credential_draining
+            || file_cleanup_waiting
             || self.block_reads_pending()
             || self
                 .ckpt
@@ -10447,9 +10459,9 @@ impl Engine {
         if ckpt.block_reads_busy() {
             return CheckpointBeat::WaitingForReads;
         }
-        // A checkpoint beat advances publication state that cannot be replayed
-        // after yielding. Its block reads therefore own the store
-        // synchronously, just as an explicit CHECKPOINT does.
+        // Capture and merge still include transitions that cannot be replayed
+        // after yielding. Their block reads remain synchronous; file cleanup
+        // uses its own resumable client.
         let atomic_reads = ckpt.atomic_block_read_scope();
         let remote_maintenance_was_pending = ckpt.published_maintenance_pending();
         let checkpoint = ckpt.checkpoint_step(&mut self.storage);
@@ -10478,6 +10490,8 @@ impl Engine {
             Ok(CheckpointStep::Working) => {
                 if retried_upload || remote_maintenance_finished {
                     CheckpointBeat::Durable
+                } else if !ckpt.file_io_ready() {
+                    CheckpointBeat::WaitingForReads
                 } else {
                     CheckpointBeat::Advanced
                 }

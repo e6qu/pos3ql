@@ -1,25 +1,13 @@
-//! The disk tier: a fixed-size cache file between RAM and the bucket.
+//! A fixed disk cache between RAM frames and the durable block store.
 //!
-//! One preallocated file of equal-sized slots, an in-RAM index from block
-//! identity to slot, and CLOCK eviction over the slots — the same discipline as
-//! the WAL journal (a file sized once at startup, never grown) and the same
-//! eviction as the RAM cache, one tier down. A read that missed the RAM frames
-//! lands here before it has to cross the network.
+//! Startup reserves a file of equal-sized slots and an in-memory identity
+//! index. CLOCK eviction reuses slots without growing either reservation.
+//! Slots contain complete framed blocks; reads verify their checksum and
+//! identity, and writes must finish before a slot enters the index.
 //!
-//! The file is pure cache. Every block in it is re-fetchable from the store
-//! behind, so a slot that reads back wrong — a torn write from a crash
-//! mid-update, a bit rot on the platter — is a miss, never data loss: the block
-//! is dropped and re-fetched. That is what lets the slot header be small and the
-//! write be a single positioned write with no fsync. A store could not reason
-//! this way; a cache can, because losing a block here costs only the round trip
-//! to fetch it again.
-//!
-//! A slot holds a framed block, header and all, exactly as [`super::encode`]
-//! produced it. The block's own checksum and identity are what a read is
-//! validated against, so a slot needs no integrity metadata of its own — the
-//! block already carries it, and the identity is what proves the slot holds the
-//! block the index thinks it does rather than a stale one a torn write left
-//! behind.
+//! No cache write needs fsync: the backing store already owns the durable copy.
+//! Damaged or missing cache bytes become a cache miss. Maintenance probes do not
+//! start a remote request or consume a query's pending read.
 
 use std::fs::File;
 use std::os::unix::fs::FileExt;
@@ -164,7 +152,10 @@ impl<S: BlockStore> DiskCache<S> {
     /// Frames `payload` and writes it to a slot. A write failure drops the block
     /// from the cache rather than raising: the block is already safe in the
     /// store, so a cache that could not keep a copy has only lost the reuse.
-    fn admit(&mut self, id: BlockId, block_type: BlockType, lsn: u64, payload: &[u8]) {
+    pub(super) fn admit(&mut self, id: BlockId, block_type: BlockType, lsn: u64, payload: &[u8]) {
+        if self.index.get(&id).is_some() {
+            return;
+        }
         if payload.len() > MAX_PAYLOAD {
             return;
         }
@@ -223,6 +214,42 @@ impl std::fmt::Display for DiskError {
 
 impl std::error::Error for DiskError {}
 
+impl<S: BlockStore> DiskCache<S> {
+    /// Probe verified disk bytes without touching remote read ownership.
+    pub(crate) fn get_cached(
+        &mut self,
+        id: &BlockId,
+        into: &mut [u8],
+    ) -> Result<Option<(usize, BlockType)>, StoreError> {
+        if let Some(&slot) = self.index.get(id) {
+            let len = self.slots[slot].len;
+            if self
+                .file
+                .read_exact_at(&mut self.scratch[..len], (slot * SLOT_SIZE) as u64)
+                .is_ok()
+            {
+                // Verified, because the bytes came off a disk that a crash may
+                // have torn. A mismatch is treated as a miss, not an error.
+                if let Ok(block) = decode(&self.scratch[..len], true)
+                    && block.id == *id
+                {
+                    if into.len() < block.payload.len() {
+                        return Err(StoreError::BufferTooSmall);
+                    }
+                    into[..block.payload.len()].copy_from_slice(block.payload);
+                    self.slots[slot].referenced = true;
+                    self.stats.hits += 1;
+                    return Ok(Some((block.payload.len(), block.block_type)));
+                }
+            }
+            // Torn, rotted, or holding some other block: drop it and fall
+            // through to the store, which still has the real one.
+            self.drop_corrupt(id, slot);
+        }
+        Ok(None)
+    }
+}
+
 impl<S: BlockStore> BlockStore for DiskCache<S> {
     fn put(
         &mut self,
@@ -239,31 +266,9 @@ impl<S: BlockStore> BlockStore for DiskCache<S> {
     }
 
     fn get(&mut self, id: &BlockId, into: &mut [u8]) -> Result<(usize, BlockType), StoreError> {
-        if let Some(&slot) = self.index.get(id) {
-            let len = self.slots[slot].len;
-            if self
-                .file
-                .read_at(&mut self.scratch[..len], (slot * SLOT_SIZE) as u64)
-                .is_ok()
-            {
-                // Verified, because the bytes came off a disk that a crash may
-                // have torn. A mismatch is treated as a miss, not an error.
-                if let Ok(block) = decode(&self.scratch[..len], true)
-                    && block.id == *id
-                {
-                    if into.len() < block.payload.len() {
-                        return Err(StoreError::BufferTooSmall);
-                    }
-                    into[..block.payload.len()].copy_from_slice(block.payload);
-                    self.slots[slot].referenced = true;
-                    self.stats.hits += 1;
-                    self.inner.release_read(id);
-                    return Ok((block.payload.len(), block.block_type));
-                }
-            }
-            // Torn, rotted, or holding some other block: drop it and fall
-            // through to the store, which still has the real one.
-            self.drop_corrupt(id, slot);
+        if let Some(block) = self.get_cached(id, into)? {
+            self.inner.release_read(id);
+            return Ok(block);
         }
         self.stats.misses += 1;
         let (len, block_type) = self.inner.get(id, into)?;

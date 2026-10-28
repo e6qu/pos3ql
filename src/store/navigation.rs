@@ -521,7 +521,14 @@ impl NavigationCursor {
         intersects: &mut impl FnMut(u8, NavigationSummary) -> bool,
         visit_node: &mut impl FnMut(BlockId) -> bool,
     ) -> Result<Option<(BlockId, u64, bool)>, ValueIndexError> {
-        match self.next_inner(store, scratch, intersects, visit_node, None, None)? {
+        match self.next_inner(
+            &mut |id, into| store.get(id, into),
+            scratch,
+            intersects,
+            visit_node,
+            None,
+            None,
+        )? {
             NavigationCursorStep::Leaf(id, entries, covering) => Ok(Some((id, entries, covering))),
             NavigationCursorStep::Done => Ok(None),
             NavigationCursorStep::Pending => unreachable!("unbounded navigation walk"),
@@ -535,7 +542,7 @@ impl NavigationCursor {
         max_node_reads: usize,
     ) -> Result<NavigationCursorStep, ValueIndexError> {
         self.next_inner(
-            store,
+            &mut |id, into| store.get(id, into),
             scratch,
             &mut |_, _| true,
             &mut |_| true,
@@ -557,16 +564,32 @@ impl NavigationCursor {
         visit_node: &mut impl FnMut(BlockId) -> bool,
         priority: &mut impl FnMut(u8, NavigationSummary) -> f64,
     ) -> Result<Option<(BlockId, u64, bool)>, ValueIndexError> {
-        match self.next_inner(store, scratch, intersects, visit_node, Some(priority), None)? {
+        match self.next_inner(
+            &mut |id, into| store.get(id, into),
+            scratch,
+            intersects,
+            visit_node,
+            Some(priority),
+            None,
+        )? {
             NavigationCursorStep::Leaf(id, entries, covering) => Ok(Some((id, entries, covering))),
             NavigationCursorStep::Done => Ok(None),
             NavigationCursorStep::Pending => unreachable!("unbounded ranked navigation walk"),
         }
     }
 
+    pub(super) fn next_gc(
+        &mut self,
+        read: &mut impl FnMut(&BlockId, &mut [u8]) -> Result<(usize, BlockType), super::StoreError>,
+        scratch: &mut [u8],
+        visit: &mut impl FnMut(BlockId) -> bool,
+    ) -> Result<NavigationCursorStep, ValueIndexError> {
+        self.next_inner(read, scratch, &mut |_, _| true, visit, None, Some(1))
+    }
+
     fn next_inner(
         &mut self,
-        store: &mut dyn BlockStore,
+        read: &mut impl FnMut(&BlockId, &mut [u8]) -> Result<(usize, BlockType), super::StoreError>,
         scratch: &mut [u8],
         intersects: &mut impl FnMut(u8, NavigationSummary) -> bool,
         visit_node: &mut impl FnMut(BlockId) -> bool,
@@ -598,7 +621,15 @@ impl NavigationCursor {
             if !visit_node(pending.reference.id) {
                 return Ok(NavigationCursorStep::Done);
             }
-            let (len, kind) = store.get(&pending.reference.id, scratch)?;
+            let (len, kind) = match read(&pending.reference.id, scratch) {
+                Ok(block) => block,
+                Err(error) => {
+                    // A waiting or failed read has not consumed this node.
+                    self.pending[self.count] = pending;
+                    self.count += 1;
+                    return Err(error.into());
+                }
+            };
             node_reads += 1;
             if !matches!(
                 kind,

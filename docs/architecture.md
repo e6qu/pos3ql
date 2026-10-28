@@ -38,7 +38,10 @@ these reservations; it is not the entire operating-system RSS, kernel socket
 memory or the memory used by an independently operated object-storage service.
 
 A reactor waits for sockets and deadlines, then advances ready connections and
-maintenance. SQL CPU work currently runs on one worker. An eligible read that
+maintenance. After each maintenance turn and any queries it wakes, the loop
+registers newly opened storage sockets before sleeping. Cleanup therefore keeps
+moving on an idle server without requiring another query to wake it.
+SQL CPU work currently runs on one worker. An eligible read that
 needs a download yields with its original data owners and command deadline;
 another connection can run cached work. Adding connections or
 `query_workspace_slots` does not add CPU execution workers.
@@ -218,8 +221,12 @@ foreground block reads and journal uploads wait. It has its own fixed backup
 list and deletion queue, so checkpoints can publish and free row-cache space
 while obsolete-log requests wait. A pass has a fixed cutoff; newer checkpoints
 queue the latest next cutoff instead of restarting the active pass.
-Checkpoint capture, block
-garbage collection and table/index merge reads still have synchronous paths.
+Saved-file cleanup uses a second fixed client and retains its backup, manifest,
+row-roster, index-tree and deletion positions across waits. Its cache probes
+preserve query read owners. It validates the complete keep-set before deleting
+files, then continues each listing from its saved cursor. Durable file writers
+remain paused while that decision drains; foreground RAM edits can continue.
+Checkpoint capture and table/index merge reads still have synchronous paths.
 
 The remaining order is coherent shared row/catalog publication and bounded
 maintenance, startup-reserved CPU workers, then representative performance and

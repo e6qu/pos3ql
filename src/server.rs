@@ -775,7 +775,7 @@ impl Server {
                 .object_store_put_slots
                 .saturating_add(config.object_store_block_put_slots)
                 .saturating_add(crate::checkpoint::MANIFEST_UPLOAD_SLOTS)
-                .saturating_add(1) // background metadata request
+                .saturating_add(2) // independent journal and file-cleanup requests
                 .saturating_add(if config.object_store_credentials_file.is_empty() {
                     0
                 } else {
@@ -873,7 +873,7 @@ impl Server {
                 "object request slots",
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
-                    "object_store_get_slots, object_store_put_slots, object_store_block_put_slots, manifest and credential clients and max_subscriptions exceed reactor token capacity",
+                    "object_store_get_slots, object_store_put_slots, object_store_block_put_slots, manifest, cleanup and credential clients and max_subscriptions exceed reactor token capacity",
                 ),
             ));
         }
@@ -1385,12 +1385,6 @@ impl Server {
             if self.block_read_fds.iter().all(Option::is_none) {
                 self.engine.enable_async_block_reads();
             }
-            // Enabling queued reads may open their non-blocking GET sockets.
-            // Reconcile after it does so every pending read has reactor
-            // interest before this loop can block again.
-            self.sync_block_read_interest()?;
-            self.sync_background_io_interest()?;
-            self.sync_writer_probe_interest()?;
             // Active checkpoint and compaction work advances even on an
             // idle server — a trigger must not wait for the next client
             // message to finish what it started, and a merge owes its beats
@@ -1419,6 +1413,11 @@ impl Server {
                     self.finish_response_batch(publication_error.as_ref());
                 }
             }
+            // Maintenance and its awakened queries can open new requests.
+            // Register their final sockets before the next blocking wait.
+            self.sync_block_read_interest()?;
+            self.sync_background_io_interest()?;
+            self.sync_writer_probe_interest()?;
         }
         self.shutdown();
         Ok(())

@@ -1,20 +1,12 @@
-//! The RAM tier: a fixed set of frames in front of a slower block store.
+//! A fixed RAM cache of verified immutable block payloads.
 //!
-//! This is where `block_cache_bytes` finally means something. A read asks the
-//! cache first and only reaches the store it wraps on a miss, so a working set
-//! that fits here is served without a round trip while one that does not still
-//! answers — slower, from whatever the cache sits in front of.
+//! Ordinary writes reach the backing store before admission. Maintenance can
+//! also admit a verified download without repeating its upload. Frames are
+//! never dirty; eviction loses only the reusable copy.
 //!
-//! Eviction is CLOCK, as TigerBeetle's grid cache has it: one referenced bit
-//! per frame and a hand that sweeps, clearing bits until it meets a frame that
-//! has not been touched since the last pass. It approximates least-recently-used
-//! closely enough for this and costs one bit and one pointer, where true LRU
-//! costs a list whose links must be maintained on every hit.
-//!
-//! Being a cache rather than a store is what lets it evict at all: every block
-//! here is re-fetchable from the layer behind, so dropping one loses nothing but
-//! time. That is also why a frame is never dirty — writes go through to the
-//! store first, and the cache only remembers what the store already accepted.
+//! CLOCK eviction uses one reference bit per frame and a bounded hand sweep.
+//! Design reference: TigerBeetle's grid cache. Frame storage and the identity
+//! index are reserved at startup and never grow.
 
 use crate::mem::budget::{Budget, BudgetError};
 use crate::mem::fixed_map::FixedMap;
@@ -122,6 +114,25 @@ impl<S: BlockStore> BlockCache<S> {
         self.index.get(id).is_some()
     }
 
+    /// Probe RAM without consuming another owner's remote read.
+    pub(crate) fn get_cached(
+        &mut self,
+        id: &BlockId,
+        into: &mut [u8],
+    ) -> Result<Option<(usize, BlockType)>, StoreError> {
+        if let Some(&frame) = self.index.get(id) {
+            let len = self.frames[frame].len;
+            if into.len() < len {
+                return Err(StoreError::BufferTooSmall);
+            }
+            into[..len].copy_from_slice(&self.slot(frame)[..len]);
+            self.frames[frame].referenced = true;
+            self.stats.hits += 1;
+            return Ok(Some((len, self.frames[frame].block_type)));
+        }
+        Ok(None)
+    }
+
     fn slot(&self, frame: usize) -> &[u8] {
         &self.slots[frame * MAX_PAYLOAD..(frame + 1) * MAX_PAYLOAD]
     }
@@ -145,7 +156,10 @@ impl<S: BlockStore> BlockCache<S> {
         }
     }
 
-    fn admit(&mut self, id: BlockId, block_type: BlockType, payload: &[u8]) {
+    pub(super) fn admit(&mut self, id: BlockId, block_type: BlockType, payload: &[u8]) {
+        if self.index.get(&id).is_some() {
+            return;
+        }
         // A payload too large for a frame is simply not cached; it still
         // reached the caller from the store, so nothing is lost but the reuse.
         if payload.len() > MAX_PAYLOAD {
@@ -187,16 +201,9 @@ impl<S: BlockStore> BlockStore for BlockCache<S> {
     }
 
     fn get(&mut self, id: &BlockId, into: &mut [u8]) -> Result<(usize, BlockType), StoreError> {
-        if let Some(&frame) = self.index.get(id) {
-            let len = self.frames[frame].len;
-            if into.len() < len {
-                return Err(StoreError::BufferTooSmall);
-            }
-            into[..len].copy_from_slice(&self.slot(frame)[..len]);
-            self.frames[frame].referenced = true;
-            self.stats.hits += 1;
+        if let Some(block) = self.get_cached(id, into)? {
             self.inner.release_read(id);
-            return Ok((len, self.frames[frame].block_type));
+            return Ok(block);
         }
         self.stats.misses += 1;
         let (len, block_type) = self.inner.get(id, into)?;

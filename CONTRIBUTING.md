@@ -97,6 +97,11 @@ ordered `object-audit.jsonl` of writes, deletions and recovery roots. The audit
 omits credentials and subscription connection strings. Use these records to
 trace a missing block to its publication and deletion; keep the failing seed
 and request deadlines when fixing it.
+The synthetic S3 server retains a filename boundary behind each opaque listing
+token. Deleting a returned page or inserting an earlier filename must not repeat
+or skip later files; client-side ordering validation remains strict.
+The ingestion job also retains its object-store fixture, server logs and mutation
+audit as `ingest-failure`. Retention works without a crash-only SQL output file.
 The second crash job builds once and repeats its seed with explicit 0, 1 and
 5 ms object-store delays. Each case keeps its own `latency-N` fixture, so a
 timing-dependent failure can be compared with completed cases from that job.
@@ -123,7 +128,9 @@ checksum, source and cache key together when changing this fixture dependency.
 Use the existing fixtures and allocation guard for changed runtime behavior.
 Set accepted mock sockets' blocking mode explicitly. Wait for socket readiness
 using the original deadline; a mock server reporting a completed write does not
-guarantee that its client can read the bytes yet.
+guarantee that its client can read the bytes yet. Cleanup regressions should hold
+backup, manifest, roster, listing and deletion responses separately, check that
+cached SQL remains runnable, and verify retention before deleting any file.
 Verify the invariant or external contract, not a test that merely restates the
 implementation. Boundary changes generally need accepted/rejected capacity,
 rollback, failure cleanup, WAL/checkpoint, and empty-cache recovery coverage.

@@ -1958,7 +1958,8 @@ fn catalog_lifetime_privileges_and_partition_triggers_keep_prepared_changes_priv
                     session.success(&mut engine, "BEGIN; REVOKE lifetime_member_group FROM lifetime_member_second; GRANT lifetime_member_group TO lifetime_member_second; ALTER DEFAULT PRIVILEGES IN SCHEMA lifetime_privileges REVOKE SELECT ON TABLES FROM lifetime_member_first; ALTER DEFAULT PRIVILEGES IN SCHEMA lifetime_privileges GRANT SELECT ON TABLES TO lifetime_member_first; ALTER TABLE lifetime_partition_root DETACH PARTITION lifetime_partition_child; ALTER TABLE lifetime_partition_root ATTACH PARTITION lifetime_partition_child FOR VALUES FROM (0) TO (10); ALTER TABLE lifetime_partition_child DISABLE TRIGGER lifetime_partition_hook", false);
                     after = data_rows(&session.success(&mut engine, INVENTORY, true));
                     assert_ne!(before, after);
-                    let mut observer = ConfiguredTransactionSession::new(&config, &mut budget);
+                    let mut observer = ConfiguredTransactionSession::new(&config, &mut budget)
+                        .with_connection_id(2);
                     assert_eq!(
                         data_rows(&observer.success(&mut engine, INVENTORY, true)),
                         before

@@ -4,6 +4,78 @@
 use super::*;
 
 impl Storage {
+    pub(super) fn validate_default_acl_images(&self) -> Result<(), SqlError> {
+        let roles = self
+            .role_catalog
+            .lock()
+            .expect("role catalog lock poisoned");
+        let schemas = self.schemas.lock().expect("schema catalog lock poisoned");
+        let catalog = self.acl_catalog.lock().expect("ACL catalog lock poisoned");
+        for txid in core::iter::once(0).chain(
+            catalog
+                .defaults
+                .iter()
+                .filter_map(|entry| entry.pending.map(|pending| pending.txid)),
+        ) {
+            for (slot, entry) in catalog.defaults.iter().enumerate() {
+                let Some(image) = entry.image_to(txid) else {
+                    continue;
+                };
+                image.validate()?;
+                let role_matches = |slot: u16, oid: RoleOid| {
+                    roles
+                        .roles
+                        .get(usize::from(slot))
+                        .is_some_and(|role| role.visible_to(txid) && role.oid() == oid)
+                };
+                if !role_matches(entry.owner, image.identity.owner)
+                    || match image.grantee {
+                        Some(oid) => !role_matches(entry.grantee, oid),
+                        None => entry.grantee != PUBLIC_ROLE,
+                    }
+                    || entry.class != image.identity.class
+                    || match image.identity.schema {
+                        None => entry.schema != DEFAULT_ACL_ALL_SCHEMAS,
+                        Some(identity) => {
+                            schemas.get(usize::from(entry.schema)).is_none_or(|schema| {
+                                schema.database != entry.database
+                                    || !schema.ddl_state.visible_to(txid)
+                                    || schema.identity() != Some(identity)
+                            })
+                        }
+                    }
+                {
+                    return Err(sql_err!(
+                        sqlstate::DATA_EXCEPTION,
+                        "stored default privilege references a replaced owner, recipient or schema"
+                    ));
+                }
+                for other in catalog.defaults[..slot]
+                    .iter()
+                    .filter(|other| other.database == entry.database)
+                {
+                    let Some(other) = other.image_to(txid) else {
+                        continue;
+                    };
+                    let same_group = other.identity.owner == image.identity.owner
+                        && other.identity.schema == image.identity.schema
+                        && other.identity.class == image.identity.class;
+                    if (same_group && other.identity != image.identity)
+                        || (other.identity.creation == image.identity.creation
+                            && other.identity != image.identity)
+                        || (same_group && other.grantee == image.grantee)
+                    {
+                        return Err(sql_err!(
+                            sqlstate::DATA_EXCEPTION,
+                            "stored default privilege group has inconsistent or duplicate grants"
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn snapshot_default_acl_grants<'a>(
         &self,
         txid: u32,

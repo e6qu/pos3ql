@@ -43,7 +43,7 @@ jobs:
           path = Path(os.environ['RUNNER_TEMP'], 'catalog-reference')
           output = path.joinpath('output.txt').read_text()
           observations = [line for line in output.splitlines() if line in ('t', 'f')]
-          assert len(observations) == 18 and all(value == 't' for value in observations), output
+          assert len(observations) == 22 and all(value == 't' for value in observations), output
           print(path.joinpath('version.txt').read_text().strip())
           print(f'PostgreSQL: {len(observations)} true observations')
           PY
@@ -84,4 +84,4 @@ jobs:
       - name: Compile and lint all targets
         run: cargo clippy --all-targets --locked -- -D warnings
       - name: Catalog lifetime regressions
-        run: cargo test --lib --locked -- catalog_lifetime_privileges_and_partition_triggers --test-threads=1
+        run: python3 tools/test_command.py cargo test --lib --locked -- catalog_lifetime_privileges_and_partition_triggers --test-threads=1

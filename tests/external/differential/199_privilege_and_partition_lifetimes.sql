@@ -61,6 +61,47 @@ SELECT count(*) = 1 AND min(oid) = (SELECT oid FROM lifetime_saved_secondary_mem
   WHERE roleid = 'lifetime_member_group'::regrole
     AND member = 'lifetime_member_second'::regrole;
 
+GRANT lifetime_member_first TO lifetime_member_second;
+
+SET ROLE lifetime_member_second;
+
+GRANT lifetime_member_group TO lifetime_member_second;
+
+SELECT count(*) = 2 FROM pg_auth_members
+  WHERE roleid = 'lifetime_member_group'::regrole
+    AND member = 'lifetime_member_second'::regrole;
+
+SELECT count(*) = 1 FROM pg_auth_members
+  WHERE roleid = 'lifetime_member_group'::regrole
+    AND member = 'lifetime_member_second'::regrole
+    AND grantor = 'lifetime_member_first'::regrole;
+
+REVOKE lifetime_member_group FROM lifetime_member_second;
+
+SELECT count(*) = 1 AND min(oid) = (SELECT oid FROM lifetime_saved_secondary_membership)
+  FROM pg_auth_members
+  WHERE roleid = 'lifetime_member_group'::regrole
+    AND member = 'lifetime_member_second'::regrole;
+
+RESET ROLE;
+
+REVOKE lifetime_member_first FROM lifetime_member_second;
+
+ALTER ROLE lifetime_member_second SUPERUSER;
+
+SET ROLE lifetime_member_second;
+
+GRANT lifetime_member_group TO lifetime_member_second;
+
+SELECT count(*) = 1 AND min(oid) = (SELECT oid FROM lifetime_saved_secondary_membership)
+  FROM pg_auth_members
+  WHERE roleid = 'lifetime_member_group'::regrole
+    AND member = 'lifetime_member_second'::regrole;
+
+RESET ROLE;
+
+ALTER ROLE lifetime_member_second NOSUPERUSER;
+
 ALTER DEFAULT PRIVILEGES IN SCHEMA lifetime_privileges
   GRANT SELECT ON TABLES TO lifetime_member_first;
 

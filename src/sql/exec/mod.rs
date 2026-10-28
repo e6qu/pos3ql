@@ -8265,7 +8265,7 @@ pub fn grant_role(
         ));
     };
     let current_superuser = storage.role(current_slot).attributes_to(txn.txid).superuser;
-    let grantor = if let Some(written) = written_grantor {
+    let selected_grantor = if let Some(written) = written_grantor {
         let resolved = resolve_role_name(written);
         let Some(slot) = storage.find_role_visible(resolved.as_str(), txn.txid) else {
             return sql_fail(sql_err!(
@@ -8274,19 +8274,18 @@ pub fn grant_role(
                 resolved.as_str()
             ));
         };
-        if !current_superuser && !storage.role_is_member_of(current_slot, slot, txn.txid) {
+        if !current_superuser && !storage.role_has_privileges_of(current_slot, slot, txn.txid) {
             return sql_fail(sql_err!(
                 sqlstate::INSUFFICIENT_PRIVILEGE,
                 "permission denied to grant privileges as role \"{}\"",
                 resolved.as_str()
             ));
         }
-        slot
+        Some(slot)
     } else {
-        current_slot
+        None
     };
-    let grantor_superuser = storage.role(grantor).attributes_to(txn.txid).superuser;
-    let role_slots = match arena.alloc_slice_with(roles.len(), |_| 0usize) {
+    let role_slots = match arena.alloc_slice_with(roles.len(), |_| (0usize, 0usize)) {
         Ok(slots) => slots,
         Err(_) => return sql_fail(super::query::arena_full_pub()),
     };
@@ -8303,14 +8302,36 @@ pub fn grant_role(
                 resolved.as_str()
             ));
         };
-        if !grantor_superuser && !storage.role_can_admin(grantor, slot, txn.txid) {
+        if !current_superuser && !storage.role_can_admin(current_slot, slot, txn.txid) {
             return sql_fail(sql_err!(
                 sqlstate::INSUFFICIENT_PRIVILEGE,
                 "admin option for role \"{}\" is required",
                 resolved.as_str()
             ));
         }
-        role_slots[index] = slot;
+        let grantor = if let Some(grantor) = selected_grantor {
+            let direct_admin = (0..storage.role_membership_count()).any(|membership| {
+                let membership = storage.role_membership(membership);
+                membership.visible_to(txn.txid)
+                    && usize::from(membership.role) == slot
+                    && usize::from(membership.member) == grantor
+                    && membership.options_to(txn.txid).admin
+            });
+            if grantor != 0 && !direct_admin {
+                return sql_fail(sql_err!(
+                    sqlstate::INSUFFICIENT_PRIVILEGE,
+                    "permission denied to grant privileges as role \"{}\"",
+                    storage.role_name(grantor, txn.txid).as_str()
+                ));
+            }
+            grantor
+        } else {
+            match storage.role_membership_grantor(current_slot, slot, txn.txid, arena) {
+                Ok(grantor) => grantor,
+                Err(error) => return sql_fail(error),
+            }
+        };
+        role_slots[index] = (slot, grantor);
     }
     for (index, written) in members.iter().enumerate() {
         let resolved = resolve_role_name(written);
@@ -8323,7 +8344,7 @@ pub fn grant_role(
         };
         member_slots[index] = slot;
     }
-    for &role in &*role_slots {
+    for &(role, grantor) in &*role_slots {
         for &member in &*member_slots {
             if role == member || storage.role_is_member_of(role, member, txn.txid) {
                 return sql_fail(sql_err!(
@@ -8437,7 +8458,7 @@ pub fn revoke_role(
                 resolved.as_str()
             ));
         };
-        if !current_superuser && !storage.role_is_member_of(current_slot, slot, txn.txid) {
+        if !current_superuser && !storage.role_has_privileges_of(current_slot, slot, txn.txid) {
             return sql_fail(sql_err!(
                 sqlstate::INSUFFICIENT_PRIVILEGE,
                 "permission denied to revoke privileges granted by role \"{}\"",
@@ -8473,17 +8494,26 @@ pub fn revoke_role(
                     member_name.as_str()
                 ));
             };
-            let grantor = selected_grantor.unwrap_or(current_slot);
+            let grantor = match selected_grantor {
+                Some(grantor) => grantor,
+                None => {
+                    match storage.role_membership_grantor(current_slot, role, txn.txid, arena) {
+                        Ok(grantor) => grantor,
+                        Err(error) => return sql_fail(error),
+                    }
+                }
+            };
             let Some(existing) =
                 storage.find_role_membership_visible(role, member, grantor, txn.txid)
             else {
                 responder.notice(
                     sqlstate::WARNING_PRIVILEGE_NOT_GRANTED,
                     stack_format!(
-                        160,
-                        "role \"{}\" is not a member of role \"{}\"",
+                        256,
+                        "role \"{}\" has not been granted membership in role \"{}\" by role \"{}\"",
                         member_name.as_str(),
-                        role_name.as_str()
+                        role_name.as_str(),
+                        storage.role_name(grantor, txn.txid).as_str()
                     )
                     .as_str(),
                 )?;

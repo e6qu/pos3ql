@@ -28624,6 +28624,70 @@ impl Storage {
         visited.get(target).copied().unwrap_or(false)
     }
 
+    pub(crate) fn role_membership_grantor(
+        &self,
+        member: usize,
+        target: usize,
+        txid: u32,
+        arena: &Arena,
+    ) -> Result<usize, SqlError> {
+        let catalog = self
+            .role_catalog
+            .lock()
+            .expect("role catalog lock poisoned");
+        if catalog.roles[member].attributes_to(txid).superuser {
+            return Ok(0);
+        }
+        let distance = arena
+            .alloc_slice_with(catalog.roles.len(), |_| usize::MAX)
+            .map_err(|_| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "role membership traversal exceeds SQL arena"
+                )
+            })?;
+        distance[member] = 0;
+        loop {
+            let mut changed = false;
+            for membership in catalog
+                .memberships
+                .iter()
+                .filter(|membership| membership.visible_to(txid))
+            {
+                if !membership.options_to(txid).inherit {
+                    continue;
+                }
+                let hops = distance[usize::from(membership.member)];
+                let destination = &mut distance[usize::from(membership.role)];
+                if hops != usize::MAX && hops + 1 < *destination {
+                    *destination = hops + 1;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        catalog
+            .memberships
+            .iter()
+            .filter(|membership| {
+                membership.visible_to(txid)
+                    && usize::from(membership.role) == target
+                    && membership.options_to(txid).admin
+                    && distance[usize::from(membership.member)] != usize::MAX
+            })
+            .map(|membership| usize::from(membership.member))
+            .min_by_key(|slot| (distance[*slot], catalog.roles[*slot].oid().get()))
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INSUFFICIENT_PRIVILEGE,
+                    "admin option for role \"{}\" is required",
+                    catalog.roles[target].name_to(txid).as_str()
+                )
+            })
+    }
+
     pub fn role_can_admin(&self, member: usize, target: usize, txid: u32) -> bool {
         RoleMembershipIter {
             catalog: &self.role_catalog,

@@ -432,6 +432,7 @@ impl Storage {
         drop(foreign);
         drop(publications);
         drop(subscriptions);
+        self.validate_default_acl_images()?;
         for table in self.tables.iter().take(self.table_count()) {
             let state = table.definition.read();
             if state.identity.existence == CatalogDdlState::Absent {

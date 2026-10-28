@@ -23993,12 +23993,8 @@ fn apply_wal_op(
         } => {
             storage.install_role_membership(identity, role, member, grantor, options)?;
         }
-        WalOp::DropRoleMembership {
-            identity,
-            role,
-            member,
-        } => {
-            storage.remove_role_membership(identity, role, member)?;
+        WalOp::DropRoleMembership { identity } => {
+            storage.remove_role_membership(identity)?;
         }
         WalOp::SetRoleSetting {
             role,

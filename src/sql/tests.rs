@@ -2162,6 +2162,134 @@ fn catalog_lifetime_privileges_and_partition_triggers_reserve_exhausted_ids_thro
 }
 
 #[test]
+fn catalog_lifetime_membership_grantors_reject_cycles_and_match_wire_diagnostics() {
+    let fixture =
+        include_str!("../../tests/external/differential_exact/33_membership_grantors.sql");
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let config = catalog_lifetime_config(&format!("membership-diagnostics-{mode:?}"), mode);
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        let mut errors = Vec::new();
+        let mut notices = Vec::new();
+        let mut observations = 0;
+        for sql in fixture.split("\n\n").filter(|sql| !sql.trim().is_empty()) {
+            let output = session.execute(&mut engine, sql, true);
+            let states = error_sqlstates(&output);
+            if !states.is_empty() {
+                assert!(
+                    String::from_utf8_lossy(&output)
+                        .contains("ADMIN option cannot be granted back to your own grantor"),
+                    "{sql}: {}",
+                    String::from_utf8_lossy(&output)
+                );
+                assert!(command_tags(&output).is_empty());
+            }
+            errors.extend(states.into_iter().map(str::to_owned));
+            let rows = data_rows(&output);
+            assert!(rows.iter().all(|row| row == "t"), "{sql}: {rows:?}");
+            observations += rows.len();
+            let mut offset = 0;
+            while offset < output.len() {
+                let length =
+                    u32::from_be_bytes(output[offset + 1..offset + 5].try_into().unwrap()) as usize;
+                if output[offset] == b'N' {
+                    let payload = &output[offset + 5..offset + 1 + length];
+                    let field = |key| {
+                        let value = payload
+                            .split(|byte| *byte == 0)
+                            .find(|value| value.first() == Some(&key))
+                            .unwrap();
+                        std::str::from_utf8(&value[1..]).unwrap().to_owned()
+                    };
+                    notices.push((field(b'S'), field(b'C'), field(b'M')));
+                }
+                offset += 1 + length;
+            }
+        }
+        assert_eq!(errors, ["0LP01", "0LP01"]);
+        assert_eq!(observations, 2);
+        assert_eq!(notices, [
+            ("NOTICE".to_owned(), "00000".to_owned(), "role \"grant_chain_first\" has already been granted membership in role \"grant_chain_group\" by role \"grant_chain_second\"".to_owned()),
+            ("WARNING".to_owned(), "01000".to_owned(), "role \"grant_chain_first\" has not been granted membership in role \"grant_chain_group\" by role \"grant_chain_second\"".to_owned()),
+        ]);
+    }
+}
+
+#[test]
+fn catalog_lifetime_membership_locks_keep_other_roles_moving_through_prepared_recovery() {
+    for checkpoint in [false, true] {
+        for mode in [
+            crate::config::TransactionMode::Mvcc,
+            crate::config::TransactionMode::Locking,
+        ] {
+            let name = format!("membership-locks-{checkpoint}-{mode:?}");
+            let mut config = catalog_lifetime_config(&name, mode);
+            config.max_prepared_transactions = 1;
+            config.object_store_on = true;
+            config.object_store_sim = true;
+            config.wal_upload = true;
+            config.wal_upload_sync = true;
+            config.object_store_bucket = format!("{name}-{}", std::process::id());
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+            {
+                let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+                let mut engine = Engine::new(&config, &mut budget).unwrap();
+                let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+                session.success(&mut engine, "CREATE ROLE locked_memberships; CREATE ROLE independent_memberships; CREATE ROLE membership_recipient; GRANT locked_memberships TO membership_recipient; BEGIN; GRANT locked_memberships TO membership_recipient; PREPARE TRANSACTION 'membership-locks'", false);
+                if checkpoint {
+                    assert!(engine.checkpoint().unwrap());
+                }
+                engine.commit_wal().unwrap();
+            }
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+            {
+                let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+                let mut engine = Engine::new(&config, &mut budget).unwrap();
+                let mut resolver = ConfiguredTransactionSession::new(&config, &mut budget);
+                let mut waiter =
+                    ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+                waiter.success(&mut engine, "BEGIN; SELECT 1", true);
+                let locked = engine
+                    .storage
+                    .find_role_visible("locked_memberships", 0)
+                    .unwrap();
+                let independent = engine
+                    .storage
+                    .find_role_visible("independent_memberships", 0)
+                    .unwrap();
+                let transaction = waiter.transaction.txid;
+                crate::mem::guard::forbid_alloc(|| {
+                    assert_eq!(
+                        engine
+                            .storage
+                            .lock_role_memberships(locked, transaction)
+                            .unwrap_err()
+                            .sqlstate,
+                        sqlstate::INTERNAL_LOCK_WAIT
+                    );
+                    engine
+                        .storage
+                        .lock_role_memberships(independent, transaction)
+                        .unwrap();
+                });
+                resolver.success(&mut engine, "COMMIT PREPARED 'membership-locks'", false);
+                crate::mem::guard::forbid_alloc(|| {
+                    engine.storage.lock_role_memberships(locked, transaction)
+                })
+                .unwrap();
+                waiter.success(&mut engine, "ROLLBACK", true);
+            }
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        }
+    }
+}
+
+#[test]
 fn event_trigger_failures_keep_notices_without_success_command_tags() {
     for mode in [
         crate::config::TransactionMode::Mvcc,

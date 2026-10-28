@@ -537,9 +537,11 @@ Each entry starts with a kind byte: 0 for a stored table, 1 for a row, 2 for an
 advisory lock, 3 for a view, and 4 for an account. Table and view entries retain
 the mode and qualified relation name; recovery resolves the current catalog slot.
 Account entries store the durable role identifier in the eight-byte identity
-field, with empty schema and name fields. Only AccessShare (mode 0) and
-AccessExclusive (mode 7) are valid for accounts. Zero, reserved identifiers,
-the protected bootstrap account, identifiers above `i32::MAX`, nonempty names,
+field, with empty schema and name fields. AccessShare (mode 0) protects a role
+reference, ShareUpdateExclusive (mode 3) serializes membership edits for one
+role, and AccessExclusive (mode 7) protects role deletion. The bootstrap account
+can have membership mode 3; reference and deletion modes for it are rejected.
+Zero, reserved identifiers, identifiers above `i32::MAX`, nonempty names,
 unknown kinds and invalid modes stop recovery explicitly.
 
 For example, a prepared transaction that created a type keeps its owner from
@@ -791,7 +793,11 @@ so displayed permission lists do not follow reusable account-slot order.
 
 Membership and default-privilege identifiers add their checked creation stamp
 (1–9,999,999) to 860,000,000 and 840,000,000 respectively. Manifest `rmem` records
-begin with physical position and creation stamp. Manifest `dacl` records store
+begin with physical position, creation stamp, three numeric role identifiers
+(role, member, grantor) and option flags. Membership journal images contain the
+ten-byte position, three four-byte identifiers and one flags byte; removal
+contains only the checked position. Mutable account names never select the
+restored membership. Manifest `dacl` records store
 physical position, group creation stamp, owner role identifier, schema creation
 stamp (`-` for global), recipient identifier (`PUBLIC` for everyone), object class,
 privileges and grant options. Default grants retain numeric role/schema lifetimes,

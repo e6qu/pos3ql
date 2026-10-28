@@ -4764,13 +4764,15 @@ impl Checkpointer {
                 Some("rmem") => {
                     finish_pending(storage, &mut slot_of, &mut pending_def)?;
                     let identity = parse_catalog_position(&mut words, metadata.catalog_sequence)?;
-                    let decode = |word: Option<&str>, missing: &'static str| {
-                        word.ok_or(CheckpointSetupError::Corrupt(missing))
-                            .and_then(decode_hex_name)
-                    };
-                    let role = decode(words.next(), "rmem role missing")?;
-                    let member = decode(words.next(), "rmem member missing")?;
-                    let grantor = decode(words.next(), "rmem grantor missing")?;
+                    let role_oid =
+                        |word, name| -> Result<crate::storage::RoleOid, CheckpointSetupError> {
+                            crate::storage::RoleOid::parse(parse_field(word, name)?).ok_or(
+                                CheckpointSetupError::Corrupt("invalid membership role identifier"),
+                            )
+                        };
+                    let role = role_oid(words.next(), "rmem role missing")?;
+                    let member = role_oid(words.next(), "rmem member missing")?;
+                    let grantor = role_oid(words.next(), "rmem grantor missing")?;
                     let flags: u8 = parse_field(words.next(), "rmem flags")?;
                     if words.next().is_some() || flags & !0x07 != 0 {
                         return Err(CheckpointSetupError::Corrupt("invalid rmem record"));
@@ -4778,9 +4780,9 @@ impl Checkpointer {
                     storage
                         .install_role_membership(
                             identity,
-                            &role,
-                            &member,
-                            &grantor,
+                            role,
+                            member,
+                            grantor,
                             crate::storage::RoleMembershipOptions {
                                 admin: flags & 1 != 0,
                                 inherit: flags & 2 != 0,
@@ -9727,34 +9729,6 @@ impl Checkpointer {
             )?;
         }
         for (slot, membership) in storage.live_role_memberships() {
-            use core::fmt::Write;
-            let mut role = StackStr::<130>::new();
-            let mut member = StackStr::<130>::new();
-            let mut grantor = StackStr::<130>::new();
-            for byte in storage
-                .role(membership.role as usize)
-                .name
-                .as_str()
-                .as_bytes()
-            {
-                let _ = write!(role, "{byte:02x}");
-            }
-            for byte in storage
-                .role(membership.member as usize)
-                .name
-                .as_str()
-                .as_bytes()
-            {
-                let _ = write!(member, "{byte:02x}");
-            }
-            for byte in storage
-                .role(membership.grantor as usize)
-                .name
-                .as_str()
-                .as_bytes()
-            {
-                let _ = write!(grantor, "{byte:02x}");
-            }
             let flags = u8::from(membership.options.admin)
                 | (u8::from(membership.options.inherit) << 1)
                 | (u8::from(membership.options.set) << 2);
@@ -9764,9 +9738,9 @@ impl Checkpointer {
                     "rmem {} {} {} {} {} {}",
                     slot,
                     membership.created_at,
-                    role.as_str(),
-                    member.as_str(),
-                    grantor.as_str(),
+                    storage.role(usize::from(membership.role)).oid().get(),
+                    storage.role(usize::from(membership.member)).oid().get(),
+                    storage.role(usize::from(membership.grantor)).oid().get(),
                     flags
                 ),
             )?;

@@ -286,6 +286,31 @@ impl Storage {
         Ok(())
     }
 
+    pub(crate) fn lock_role_memberships(
+        &self,
+        slot: usize,
+        transaction: u32,
+    ) -> Result<(), SqlError> {
+        self.role_reference_ready(slot, transaction)?;
+        if transaction != 0 {
+            let source = self.role(slot).oid();
+            self.lock_object(
+                transaction,
+                ObjectLockTarget::Role(source),
+                crate::sql::ast::TableLockMode::ShareUpdateExclusive,
+                false,
+            )?;
+            let role = self.role(slot);
+            if !role.visible_to(transaction) || role.oid() != source {
+                return Err(crate::sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "role selected for membership changes no longer exists"
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn lock_role_for_drop(&self, slot: usize, transaction: u32) -> Result<(), SqlError> {
         let source = self.role(slot).oid();
         if source == RoleOid::BOOTSTRAP {

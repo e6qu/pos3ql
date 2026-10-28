@@ -1730,15 +1730,13 @@ pub(crate) enum WalOp<'a> {
     },
     UpsertRoleMembership {
         identity: crate::storage::CatalogPosition,
-        role: &'a str,
-        member: &'a str,
-        grantor: &'a str,
+        role: crate::storage::RoleOid,
+        member: crate::storage::RoleOid,
+        grantor: crate::storage::RoleOid,
         options: crate::storage::RoleMembershipOptions,
     },
     DropRoleMembership {
         identity: crate::storage::CatalogPosition,
-        role: &'a str,
-        member: &'a str,
     },
     SetRoleSetting {
         role: Option<&'a str>,
@@ -4095,24 +4093,8 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
         }
         WalOp::DropRole { name } => 1 + name.len(),
         WalOp::RenameRole { name, new_name } => 1 + name.len() + 1 + new_name.len(),
-        WalOp::UpsertRoleMembership {
-            role,
-            member,
-            grantor,
-            ..
-        } => {
-            crate::storage::CatalogPosition::ENCODED_BYTES
-                + 1
-                + role.len()
-                + 1
-                + member.len()
-                + 1
-                + grantor.len()
-                + 1
-        }
-        WalOp::DropRoleMembership { role, member, .. } => {
-            crate::storage::CatalogPosition::ENCODED_BYTES + 1 + role.len() + 1 + member.len()
-        }
+        WalOp::UpsertRoleMembership { .. } => crate::storage::CatalogPosition::ENCODED_BYTES + 13,
+        WalOp::DropRoleMembership { .. } => crate::storage::CatalogPosition::ENCODED_BYTES,
         WalOp::SetRoleSetting {
             role,
             database,
@@ -6437,20 +6419,12 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 | (u8::from(options.inherit) << 1)
                 | (u8::from(options.set) << 2);
             buffer.append(&identity.encode())
-                && name_bytes(buffer, role)
-                && name_bytes(buffer, member)
-                && name_bytes(buffer, grantor)
+                && buffer.append(&role.get().to_le_bytes())
+                && buffer.append(&member.get().to_le_bytes())
+                && buffer.append(&grantor.get().to_le_bytes())
                 && buffer.append(&[flags])
         }
-        WalOp::DropRoleMembership {
-            identity,
-            role,
-            member,
-        } => {
-            buffer.append(&identity.encode())
-                && name_bytes(buffer, role)
-                && name_bytes(buffer, member)
-        }
+        WalOp::DropRoleMembership { identity } => buffer.append(&identity.encode()),
         WalOp::SetRoleSetting {
             role,
             database,
@@ -11679,9 +11653,17 @@ fn decode_op_inner<'a>(
         }),
         KIND_UPSERT_ROLE_MEMBERSHIP => decode_large_op(|| {
             let identity = take_catalog_position(payload, &mut at)?;
-            let role = take_name(&mut at)?;
-            let member = take_name(&mut at)?;
-            let grantor = take_name(&mut at)?;
+            crate::storage::CatalogIdentity::parse(identity.created_at())?;
+            let mut take_role = || {
+                let oid = crate::storage::RoleOid::parse(i32::from_le_bytes(
+                    payload.get(at..at + 4)?.try_into().ok()?,
+                ))?;
+                at += 4;
+                Some(oid)
+            };
+            let role = take_role()?;
+            let member = take_role()?;
+            let grantor = take_role()?;
             let flags = *payload.get(at)?;
             at += 1;
             if at != payload.len() || flags & !0x07 != 0 {
@@ -11701,13 +11683,8 @@ fn decode_op_inner<'a>(
         }),
         KIND_DROP_ROLE_MEMBERSHIP => decode_large_op(|| {
             let identity = take_catalog_position(payload, &mut at)?;
-            let role = take_name(&mut at)?;
-            let member = take_name(&mut at)?;
-            (at == payload.len()).then_some(WalOp::DropRoleMembership {
-                identity,
-                role,
-                member,
-            })
+            crate::storage::CatalogIdentity::parse(identity.created_at())?;
+            (at == payload.len()).then_some(WalOp::DropRoleMembership { identity })
         }),
         KIND_SET_ROLE_SETTING => decode_large_op(|| {
             let flags = *payload.get(at)?;
@@ -15240,7 +15217,37 @@ mod tests {
         roundtrip(WalOp::ReserveCatalogSequence(
             core::num::NonZeroU64::new(43).unwrap(),
         ));
+        let membership = CatalogPosition::new(3, 43).unwrap();
+        roundtrip(WalOp::UpsertRoleMembership {
+            identity: membership,
+            role: RoleOid::BOOTSTRAP,
+            member: RoleOid::parse(16_400).unwrap(),
+            grantor: RoleOid::BOOTSTRAP,
+            options: crate::storage::RoleMembershipOptions::DEFAULT,
+        });
+        roundtrip(WalOp::DropRoleMembership {
+            identity: membership,
+        });
         assert!(decode_op(KIND_CATALOG_RESERVATION, &[0; 8]).is_none());
+        payload.clear();
+        assert!(append_payload(
+            &mut payload,
+            &WalOp::UpsertRoleMembership {
+                identity: membership,
+                role: RoleOid::BOOTSTRAP,
+                member: RoleOid::parse(16_400).unwrap(),
+                grantor: RoleOid::BOOTSTRAP,
+                options: crate::storage::RoleMembershipOptions::DEFAULT,
+            }
+        ));
+        let valid = payload.readable().to_vec();
+        for oid in [0i32, 11, 16_384, -1] {
+            for offset in [10, 14, 18] {
+                let mut corrupt = valid.clone();
+                corrupt[offset..offset + 4].copy_from_slice(&oid.to_le_bytes());
+                assert!(decode_op(KIND_UPSERT_ROLE_MEMBERSHIP, &corrupt).is_none());
+            }
+        }
         payload.clear();
         assert!(append_payload(
             &mut payload,

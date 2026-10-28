@@ -9,7 +9,7 @@ CREATE ROLE lifetime_member_second;
 GRANT lifetime_member_group TO lifetime_member_first WITH ADMIN OPTION;
 
 CREATE TABLE lifetime_saved_membership AS
-  SELECT oid FROM pg_auth_members
+  SELECT oid, member AS recipient FROM pg_auth_members
   WHERE roleid = 'lifetime_member_group'::regrole
     AND member = 'lifetime_member_first'::regrole;
 
@@ -107,6 +107,22 @@ SELECT count(*) = 1 AND min(oid) = (SELECT oid FROM lifetime_saved_secondary_mem
 RESET ROLE;
 
 ALTER ROLE lifetime_member_second NOSUPERUSER;
+
+ALTER ROLE lifetime_member_first RENAME TO lifetime_member_renamed;
+
+CREATE ROLE lifetime_member_first;
+
+SELECT recipient <> 'lifetime_member_first'::regrole FROM lifetime_saved_membership;
+
+GRANT lifetime_member_group TO lifetime_member_first;
+
+REVOKE lifetime_member_group FROM lifetime_member_first;
+
+DROP ROLE lifetime_member_first;
+
+ALTER ROLE lifetime_member_renamed RENAME TO lifetime_member_first;
+
+SELECT recipient = 'lifetime_member_first'::regrole FROM lifetime_saved_membership;
 
 ALTER DEFAULT PRIVILEGES IN SCHEMA lifetime_privileges
   GRANT SELECT ON TABLES TO lifetime_member_first;

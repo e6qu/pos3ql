@@ -28087,6 +28087,7 @@ impl Storage {
         exists: bool,
         txid: u32,
     ) -> Result<(usize, Option<PendingRoleMembership>), SqlError> {
+        self.lock_role_memberships(role, txid)?;
         for source in [role, member, grantor] {
             self.role_reference_ready(source, txid)?;
         }
@@ -28189,9 +28190,9 @@ impl Storage {
     pub(crate) fn install_role_membership(
         &self,
         identity: CatalogPosition,
-        role_name: &str,
-        member_name: &str,
-        grantor_name: &str,
+        role_oid: RoleOid,
+        member_oid: RoleOid,
+        grantor_oid: RoleOid,
         options: RoleMembershipOptions,
     ) -> Result<usize, SqlError> {
         CatalogIdentity::require(identity.created_at())?;
@@ -28202,34 +28203,34 @@ impl Storage {
         let role = catalog
             .roles
             .iter()
-            .position(|role| role.live && role.name.as_str() == role_name)
+            .position(|role| role.live && role.oid() == role_oid)
             .ok_or_else(|| {
                 sql_err!(
-                    sqlstate::UNDEFINED_OBJECT,
-                    "membership role \"{}\" does not exist",
-                    role_name
+                    sqlstate::DATA_EXCEPTION,
+                    "stored membership role identifier {} is unavailable",
+                    role_oid.get()
                 )
             })?;
         let member = catalog
             .roles
             .iter()
-            .position(|role| role.live && role.name.as_str() == member_name)
+            .position(|role| role.live && role.oid() == member_oid)
             .ok_or_else(|| {
                 sql_err!(
-                    sqlstate::UNDEFINED_OBJECT,
-                    "membership member \"{}\" does not exist",
-                    member_name
+                    sqlstate::DATA_EXCEPTION,
+                    "stored membership member identifier {} is unavailable",
+                    member_oid.get()
                 )
             })?;
         let grantor = catalog
             .roles
             .iter()
-            .position(|role| role.live && role.name.as_str() == grantor_name)
+            .position(|role| role.live && role.oid() == grantor_oid)
             .ok_or_else(|| {
                 sql_err!(
-                    sqlstate::UNDEFINED_OBJECT,
-                    "membership grantor \"{}\" does not exist",
-                    grantor_name
+                    sqlstate::DATA_EXCEPTION,
+                    "stored membership grantor identifier {} is unavailable",
+                    grantor_oid.get()
                 )
             })?;
         let slot = identity.slot();
@@ -28572,12 +28573,7 @@ impl Storage {
         Ok(())
     }
 
-    pub(crate) fn remove_role_membership(
-        &self,
-        identity: CatalogPosition,
-        role_name: &str,
-        member_name: &str,
-    ) -> Result<(), SqlError> {
+    pub(crate) fn remove_role_membership(&self, identity: CatalogPosition) -> Result<(), SqlError> {
         CatalogIdentity::require(identity.created_at())?;
         let mut catalog = self
             .role_catalog
@@ -28593,12 +28589,7 @@ impl Storage {
                     "stored role membership position is out of range"
                 )
             })?;
-        if !entry.live
-            || entry.pending.is_some()
-            || entry.created_at != identity.created_at()
-            || catalog.roles[usize::from(entry.role)].name.as_str() != role_name
-            || catalog.roles[usize::from(entry.member)].name.as_str() != member_name
-        {
+        if !entry.live || entry.pending.is_some() || entry.created_at != identity.created_at() {
             return Err(sql_err!(
                 sqlstate::DATA_EXCEPTION,
                 "stored role membership removal selects a different lifetime"
@@ -28625,6 +28616,88 @@ impl Storage {
         let mut visited = self.role_graph_scratch();
         self.reachable_roles(member, txid, false, require_set, &mut visited);
         visited.get(target).copied().unwrap_or(false)
+    }
+
+    pub(crate) fn validate_role_admin_grants(
+        &self,
+        role: usize,
+        grantor: usize,
+        members: &[usize],
+        txid: u32,
+        arena: &Arena,
+    ) -> Result<(), SqlError> {
+        if grantor == 0 {
+            return Ok(());
+        }
+        let catalog = self
+            .role_catalog
+            .lock()
+            .expect("role catalog lock poisoned");
+        let removed = arena
+            .alloc_slice_with(catalog.memberships.len(), |slot| {
+                let membership = catalog.memberships[slot];
+                membership.visible_to(txid)
+                    && usize::from(membership.role) == role
+                    && members.contains(&usize::from(membership.member))
+            })
+            .map_err(|_| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "role grant dependency traversal exceeds SQL arena"
+                )
+            })?;
+        // Every surviving grant must still lead to an administrator whose own
+        // grant survives removing the proposed recipients, ending at bootstrap.
+        loop {
+            let mut changed = false;
+            for (slot, membership) in catalog.memberships.iter().enumerate() {
+                if removed[slot]
+                    || !membership.visible_to(txid)
+                    || usize::from(membership.role) != role
+                    || membership.grantor == 0
+                {
+                    continue;
+                }
+                let supported =
+                    catalog
+                        .memberships
+                        .iter()
+                        .enumerate()
+                        .any(|(support, candidate)| {
+                            !removed[support]
+                                && candidate.visible_to(txid)
+                                && usize::from(candidate.role) == role
+                                && candidate.member == membership.grantor
+                                && candidate.options_to(txid).admin
+                        });
+                if !supported {
+                    removed[slot] = true;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        if members.contains(&0)
+            || !catalog
+                .memberships
+                .iter()
+                .enumerate()
+                .any(|(slot, membership)| {
+                    !removed[slot]
+                        && membership.visible_to(txid)
+                        && usize::from(membership.role) == role
+                        && usize::from(membership.member) == grantor
+                        && membership.options_to(txid).admin
+                })
+        {
+            return Err(sql_err!(
+                sqlstate::INVALID_GRANT_OPERATION,
+                "ADMIN option cannot be granted back to your own grantor"
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) fn role_membership_grantor(
@@ -48443,7 +48516,9 @@ impl Storage {
         if matches!(relation, ObjectLockTarget::Role(_))
             && !matches!(
                 mode,
-                TableLockMode::AccessShare | TableLockMode::AccessExclusive
+                TableLockMode::AccessShare
+                    | TableLockMode::ShareUpdateExclusive
+                    | TableLockMode::AccessExclusive
             )
         {
             return Err(sql_err!(
@@ -48890,7 +48965,6 @@ impl Storage {
                     let source = i32::try_from(rowid)
                         .ok()
                         .and_then(RoleOid::parse)
-                        .filter(|source| *source != RoleOid::BOOTSTRAP)
                         .filter(|_| schema.is_empty() && table.is_empty())
                         .ok_or_else(|| {
                             sql_err!(
@@ -48900,6 +48974,7 @@ impl Storage {
                         })?;
                     let mode = match mode {
                         0 => crate::sql::ast::TableLockMode::AccessShare,
+                        3 => crate::sql::ast::TableLockMode::ShareUpdateExclusive,
                         7 => crate::sql::ast::TableLockMode::AccessExclusive,
                         _ => {
                             return Err(sql_err!(
@@ -48908,6 +48983,14 @@ impl Storage {
                             ));
                         }
                     };
+                    if source == RoleOid::BOOTSTRAP
+                        && mode != crate::sql::ast::TableLockMode::ShareUpdateExclusive
+                    {
+                        return Err(sql_err!(
+                            sqlstate::DATA_EXCEPTION,
+                            "prepared lock WAL has an invalid bootstrap role-lock mode"
+                        ));
+                    }
                     self.observe_role_oid(source);
                     self.lock_object(txid, ObjectLockTarget::Role(source), mode, false)?;
                 }
@@ -53731,6 +53814,37 @@ mod tests {
         assert_eq!(unchanged.read_snapshot, 7);
         assert_eq!(unchanged.commit_snapshot, 13);
         replace_execution_visibility(prior);
+    }
+
+    #[test]
+    fn catalog_lifetime_routine_dependencies_use_their_complete_creation_range() {
+        crate::mem::guard::forbid_alloc(|| {
+            for birth in [1, 40_000, 40_001, MAX_CATALOG_CREATION] {
+                let identity =
+                    StoredDependencyIdentity::RoutineOid(ROUTINE_OID_BASE + birth as i32);
+                assert!(identity.valid_for(DependencyClass::Routine));
+                assert!(!identity.valid_for(DependencyClass::Operator));
+                assert_eq!(
+                    StoredDependencyIdentity::from_storage(
+                        DependencyClass::Routine,
+                        identity.storage_key().as_str()
+                    ),
+                    Some(identity)
+                );
+            }
+            for birth in [0, MAX_CATALOG_CREATION + 1] {
+                let identity =
+                    StoredDependencyIdentity::RoutineOid(ROUTINE_OID_BASE + birth as i32);
+                assert!(!identity.valid_for(DependencyClass::Routine));
+                assert!(
+                    StoredDependencyIdentity::from_storage(
+                        DependencyClass::Routine,
+                        identity.storage_key().as_str()
+                    )
+                    .is_none()
+                );
+            }
+        });
     }
 
     #[test]

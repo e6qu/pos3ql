@@ -7447,9 +7447,7 @@ fn stage_role_membership(
     }
     let (membership, prior) =
         storage.change_role_membership(role, member, grantor, options, true, txn.txid)?;
-    let role_name = storage.role_name(role, txn.txid);
-    let member_name = storage.role_name(member, txn.txid);
-    let grantor_name = storage.role_name(grantor, txn.txid);
+
     let lsn = storage.bump_lsn();
     if let Err(error) = wal.stage_reserved(
         txn.txid,
@@ -7458,9 +7456,9 @@ fn stage_role_membership(
             identity: storage
                 .role_membership(membership)
                 .position(membership, txn.txid),
-            role: role_name.as_str(),
-            member: member_name.as_str(),
-            grantor: grantor_name.as_str(),
+            role: storage.role(role).oid(),
+            member: storage.role(member).oid(),
+            grantor: storage.role(grantor).oid(),
             options,
         },
     ) {
@@ -8015,8 +8013,7 @@ pub fn drop_role(
             {
                 continue;
             }
-            let role_name = storage.role_name(membership.role as usize, txn.txid);
-            let member_name = storage.role_name(membership.member as usize, txn.txid);
+
             let (changed_slot, prior) = match storage.change_role_membership(
                 membership.role as usize,
                 membership.member as usize,
@@ -8036,8 +8033,6 @@ pub fn drop_role(
                     identity: storage
                         .role_membership(changed_slot)
                         .position(changed_slot, txn.txid),
-                    role: role_name.as_str(),
-                    member: member_name.as_str(),
                 },
             ) {
                 storage.rollback_role_membership_change(changed_slot, prior);
@@ -8345,6 +8340,9 @@ pub fn grant_role(
         member_slots[index] = slot;
     }
     for &(role, grantor) in &*role_slots {
+        if let Err(error) = storage.lock_role_memberships(role, txn.txid) {
+            return sql_fail(error);
+        }
         for &member in &*member_slots {
             if role == member || storage.role_is_member_of(role, member, txn.txid) {
                 return sql_fail(sql_err!(
@@ -8354,21 +8352,35 @@ pub fn grant_role(
                     storage.role_name(member, txn.txid).as_str()
                 ));
             }
-            let base = storage
-                .find_role_membership_visible(role, member, grantor, txn.txid)
-                .map_or_else(
-                    || crate::storage::RoleMembershipOptions {
-                        admin: false,
-                        inherit: storage.role(member).attributes_to(txn.txid).inherit,
-                        set: true,
-                    },
-                    |slot| storage.role_membership(slot).options_to(txn.txid),
-                );
+        }
+        if options.admin == Some(true)
+            && let Err(error) =
+                storage.validate_role_admin_grants(role, grantor, member_slots, txn.txid, arena)
+        {
+            return sql_fail(error);
+        }
+        for &member in &*member_slots {
+            let existing = storage.find_role_membership_visible(role, member, grantor, txn.txid);
+            let base = existing.map_or_else(
+                || crate::storage::RoleMembershipOptions {
+                    admin: false,
+                    inherit: storage.role(member).attributes_to(txn.txid).inherit,
+                    set: true,
+                },
+                |slot| storage.role_membership(slot).options_to(txn.txid),
+            );
             let membership_options = crate::storage::RoleMembershipOptions {
                 admin: options.admin.unwrap_or(base.admin),
                 inherit: options.inherit.unwrap_or(base.inherit),
                 set: options.set.unwrap_or(base.set),
             };
+            if existing.is_some() && membership_options == base {
+                responder.notice(sqlstate::SUCCESSFUL_COMPLETION, stack_format!(320,
+                    "role \"{}\" has already been granted membership in role \"{}\" by role \"{}\"",
+                    storage.role_name(member, txn.txid).as_str(), storage.role_name(role, txn.txid).as_str(),
+                    storage.role_name(grantor, txn.txid).as_str()).as_str())?;
+                continue;
+            }
             let (slot, prior) = match storage.change_role_membership(
                 role,
                 member,
@@ -8381,14 +8393,12 @@ pub fn grant_role(
                 Err(error) => return sql_fail(error),
             };
             let lsn = storage.bump_lsn();
-            let role_name = storage.role_name(role, txn.txid);
-            let member_name = storage.role_name(member, txn.txid);
-            let grantor_name = storage.role_name(grantor, txn.txid);
+
             let operation = WalOp::UpsertRoleMembership {
                 identity: storage.role_membership(slot).position(slot, txn.txid),
-                role: role_name.as_str(),
-                member: member_name.as_str(),
-                grantor: grantor_name.as_str(),
+                role: storage.role(role).oid(),
+                member: storage.role(member).oid(),
+                grantor: storage.role(grantor).oid(),
                 options: membership_options,
             };
             if let Err(error) = wal.stage_reserved(txn.txid, lsn, &operation) {
@@ -8478,6 +8488,9 @@ pub fn revoke_role(
                 role_name.as_str()
             ));
         };
+        if let Err(error) = storage.lock_role_memberships(role, txn.txid) {
+            return sql_fail(error);
+        }
         if !current_superuser && !storage.role_can_admin(current_slot, role, txn.txid) {
             return sql_fail(sql_err!(
                 sqlstate::INSUFFICIENT_PRIVILEGE,
@@ -8506,10 +8519,10 @@ pub fn revoke_role(
             let Some(existing) =
                 storage.find_role_membership_visible(role, member, grantor, txn.txid)
             else {
-                responder.notice(
-                    sqlstate::WARNING_PRIVILEGE_NOT_GRANTED,
+                responder.warning(
+                    sqlstate::WARNING,
                     stack_format!(
-                        256,
+                        320,
                         "role \"{}\" has not been granted membership in role \"{}\" by role \"{}\"",
                         member_name.as_str(),
                         role_name.as_str(),
@@ -8566,22 +8579,18 @@ pub fn revoke_role(
                 Err(error) => return sql_fail(error),
             };
             let lsn = storage.bump_lsn();
-            let role_name = storage.role_name(role, txn.txid);
-            let member_name = storage.role_name(member, txn.txid);
-            let grantor_name = storage.role_name(row_grantor, txn.txid);
+
             let operation = if exists {
                 WalOp::UpsertRoleMembership {
                     identity: storage.role_membership(slot).position(slot, txn.txid),
-                    role: role_name.as_str(),
-                    member: member_name.as_str(),
-                    grantor: grantor_name.as_str(),
+                    role: storage.role(role).oid(),
+                    member: storage.role(member).oid(),
+                    grantor: storage.role(row_grantor).oid(),
                     options,
                 }
             } else {
                 WalOp::DropRoleMembership {
                     identity: storage.role_membership(slot).position(slot, txn.txid),
-                    role: role_name.as_str(),
-                    member: member_name.as_str(),
                 }
             };
             if let Err(error) = wal.stage_reserved(txn.txid, lsn, &operation) {
@@ -8655,16 +8664,13 @@ fn cascade_role_membership_grants(
                 options.admin && !storage.role_can_admin_excluding(member, role, slot, txn.txid);
             let (changed, prior) =
                 storage.change_role_membership(role, member, grantor, options, false, txn.txid)?;
-            let role_name = storage.role_name(role, txn.txid);
-            let member_name = storage.role_name(member, txn.txid);
+
             let lsn = storage.bump_lsn();
             if let Err(error) = wal.stage_reserved(
                 txn.txid,
                 lsn,
                 &WalOp::DropRoleMembership {
                     identity: storage.role_membership(changed).position(changed, txn.txid),
-                    role: role_name.as_str(),
-                    member: member_name.as_str(),
                 },
             ) {
                 storage.rollback_role_membership_change(changed, prior);
@@ -64699,10 +64705,8 @@ fn validate_relation_persistence_change(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn stage_partition_trigger_mode(
     storage: &mut Storage,
-    _wal: &mut Wal,
     txn: &mut TxnState,
     trigger_slot: usize,
     table: usize,
@@ -64777,18 +64781,18 @@ fn alter_table_trigger_enabled(
                 {
                     if recurse {
                         if let Err(error) =
-                            stage_partition_trigger_mode(storage, wal, txn, slot, descendant, mode)
+                            stage_partition_trigger_mode(storage, txn, slot, descendant, mode)
                         {
                             return sql_fail(error);
                         }
-                    } else if let Err(error) = stage_partition_trigger_mode(
-                        storage, wal, txn, slot, descendant, prior_mode,
-                    ) {
+                    } else if let Err(error) =
+                        stage_partition_trigger_mode(storage, txn, slot, descendant, prior_mode)
+                    {
                         return sql_fail(error);
                     }
                 }
             }
-            if let Err(error) = stage_partition_trigger_mode(storage, wal, txn, slot, table, mode) {
+            if let Err(error) = stage_partition_trigger_mode(storage, txn, slot, table, mode) {
                 return sql_fail(error);
             }
             continue;
@@ -64805,14 +64809,9 @@ fn alter_table_trigger_enabled(
                 } else {
                     storage.partition_trigger_enabled_to(slot, descendant, txn.txid)
                 };
-                if let Err(error) = stage_partition_trigger_mode(
-                    storage,
-                    wal,
-                    txn,
-                    slot,
-                    descendant,
-                    descendant_mode,
-                ) {
+                if let Err(error) =
+                    stage_partition_trigger_mode(storage, txn, slot, descendant, descendant_mode)
+                {
                     return sql_fail(error);
                 }
             }
@@ -65980,14 +65979,8 @@ fn alter_partition_attachment(
                 if storage.table(candidate).visible_to(txn.txid)
                     && (candidate == child
                         || storage.partition_descends_from(candidate, child, txn.txid))
-                    && let Err(error) = stage_partition_trigger_mode(
-                        storage,
-                        wal,
-                        txn,
-                        trigger_slot,
-                        candidate,
-                        mode,
-                    )
+                    && let Err(error) =
+                        stage_partition_trigger_mode(storage, txn, trigger_slot, candidate, mode)
                 {
                     return sql_fail(error);
                 }

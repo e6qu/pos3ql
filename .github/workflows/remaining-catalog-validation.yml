@@ -35,15 +35,21 @@ jobs:
           mkdir -p "$RUNNER_TEMP/catalog-reference"
           psql -XAt -v ON_ERROR_STOP=1 -c 'SELECT version()' > "$RUNNER_TEMP/catalog-reference/version.txt"
           docker inspect --format '{{.Image}}' "$REFERENCE_CONTAINER" > "$RUNNER_TEMP/catalog-reference/image.txt"
-          sha256sum tests/external/differential/199_privilege_and_partition_lifetimes.sql > "$RUNNER_TEMP/catalog-reference/fixture.sha256"
+          sha256sum tests/external/differential/199_privilege_and_partition_lifetimes.sql tests/external/differential_exact/33_membership_grantors.sql > "$RUNNER_TEMP/catalog-reference/fixture.sha256"
           psql -XAt -v ON_ERROR_STOP=1 -f tests/external/differential/199_privilege_and_partition_lifetimes.sql > "$RUNNER_TEMP/catalog-reference/output.txt" 2> "$RUNNER_TEMP/catalog-reference/diagnostics.txt"
+          psql -XAt -v ON_ERROR_STOP=0 -v VERBOSITY=verbose -f tests/external/differential_exact/33_membership_grantors.sql > "$RUNNER_TEMP/catalog-reference/grantor-output.txt" 2> "$RUNNER_TEMP/catalog-reference/grantor-diagnostics.txt"
           python3 - <<'PY'
           import os
+          import re
           from pathlib import Path
           path = Path(os.environ['RUNNER_TEMP'], 'catalog-reference')
           output = path.joinpath('output.txt').read_text()
           observations = [line for line in output.splitlines() if line in ('t', 'f')]
-          assert len(observations) == 28 and all(value == 't' for value in observations), output
+          assert len(observations) == 30 and all(value == 't' for value in observations), output
+          diagnostics = path.joinpath('grantor-diagnostics.txt').read_text()
+          codes = re.findall(r'(ERROR|NOTICE|WARNING):\s+([0-9A-Z]{5}):', diagnostics)
+          assert codes == [('ERROR', '0LP01'), ('ERROR', '0LP01'), ('NOTICE', '00000'), ('WARNING', '01000')], diagnostics
+          assert [line for line in path.joinpath('grantor-output.txt').read_text().splitlines() if line in ('t', 'f')] == ['t', 't']
           print(path.joinpath('version.txt').read_text().strip())
           print(f'PostgreSQL: {len(observations)} true observations')
           PY

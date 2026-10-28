@@ -114,6 +114,10 @@ account's grant keeps the others. Changing ADMIN, INHERIT or SET options keeps
 the membership identifier; revoking and recreating a membership gives it a new
 identifier. Superusers' implicit grants are recorded under the bootstrap
 administrator; inherited administrators grant under the account that holds ADMIN.
+Circular administrator grants are rejected. Membership edits for the same role
+wait for its transaction, including a prepared transaction after recovery;
+other roles and catalog readers can proceed. Repeated grants emit a NOTICE,
+while revoking a missing grant emits a WARNING, matching PostgreSQL's fields.
 
 Default privileges describe what new objects receive. Their catalog identifier
 belongs to the owner, schema and object class, while their permission list is

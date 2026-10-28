@@ -97358,6 +97358,363 @@ fn parallel_physical_merge_source_failures_retry_the_same_pair_without_losing_ro
 }
 
 #[test]
+fn checkpoint_reads_held_merge_keeps_cached_queries_and_foreground_read_owners() {
+    use crate::store::{BlockStore, OwnedObjectStore, StackPlan};
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::time::{Duration, Instant};
+
+    fn advance(engine: &mut Engine) {
+        for slot in 0..engine.ckpt.as_ref().unwrap().block_read_slots() {
+            if engine.pending_block_read_fd(slot).is_some() {
+                crate::mem::guard::forbid_alloc(|| engine.advance_pending_block_read(slot))
+                    .unwrap();
+            }
+        }
+    }
+
+    fn accept(engine: &mut Engine, listener: &TcpListener) -> (TcpStream, String) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut stream = loop {
+            advance(engine);
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "merge GET did not connect");
+                    std::thread::yield_now();
+                }
+                Err(error) => panic!("accept merge GET: {error}"),
+            }
+        };
+        let request = read_request(engine, &mut stream);
+        (stream, request)
+    }
+
+    fn read_request(engine: &mut Engine, stream: &mut TcpStream) -> String {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        stream.set_nonblocking(true).unwrap();
+        let mut request = [0; 8192];
+        let mut used = 0;
+        loop {
+            advance(engine);
+            match stream.read(&mut request[used..]) {
+                Ok(0) => panic!("merge GET ended before its headers"),
+                Ok(count) => used += count,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("read merge GET: {error}"),
+            }
+            if request[..used].windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                break;
+            }
+            assert!(
+                used < request.len() && Instant::now() < deadline,
+                "merge GET headers did not finish"
+            );
+            std::thread::yield_now();
+        }
+        stream.set_nonblocking(false).unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        core::str::from_utf8(&request[..used]).unwrap().to_owned()
+    }
+
+    fn reply(stream: &mut TcpStream, request: &str, body: &[u8]) {
+        let range = request.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("Range").then_some(value.trim())
+        });
+        if let Some(range) = range {
+            let (first, last) = range
+                .strip_prefix("bytes=")
+                .unwrap()
+                .split_once('-')
+                .unwrap();
+            let first: usize = first.parse().unwrap();
+            let last: usize = last.parse().unwrap();
+            write!(stream, "HTTP/1.1 206 Partial Content\r\nETag: \"fixture\"\r\nContent-Length: {}\r\nContent-Range: bytes {first}-{last}/{}\r\nConnection: close\r\n\r\n", last-first+1, body.len()).unwrap();
+            stream.write_all(&body[first..=last]).unwrap();
+        } else {
+            write!(stream, "HTTP/1.1 200 OK\r\nETag: \"fixture\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
+            stream.write_all(body).unwrap();
+        }
+    }
+
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        for phase in ["schedule", "columns"] {
+            let label = format!("merge-held-{mode:?}-{phase}");
+            let mut config = test_config(&label);
+            config.transaction_mode = mode;
+            config.object_store_on = true;
+            config.object_store_sim = true;
+            config.object_store_bucket = format!("{label}-{}", std::process::id()).to_lowercase();
+            config.object_store_get_slots = 2;
+            config.object_store_hedge_after_ms = 0;
+            config.block_cache_bytes = 0;
+            config.disk_cache_bytes = 0;
+            config.max_tables = 4;
+            config.table_rows = 32;
+            config.max_spill_generations_per_table = 2;
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+            let namespace =
+                crate::object_store::sim::open_namespace(&config.object_store_bucket, 223);
+            let mut budget = test_engine_budget(&config, 1 << 29);
+            let mut engine = Engine::new(&config, &mut budget).unwrap();
+            let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+            session.success(
+                &mut engine,
+                "CREATE TABLE merge_wait(id integer, qty integer); \
+                INSERT INTO merge_wait SELECT i,i FROM generate_series(1,16) AS source(i)",
+                false,
+            );
+            assert!(engine.checkpoint().unwrap());
+            session.success(&mut engine, "INSERT INTO merge_wait VALUES(17,17)", false);
+            assert!(engine.checkpoint().unwrap());
+            session.success(
+                &mut engine,
+                "CREATE TABLE cached_order(id integer); \
+                INSERT INTO cached_order VALUES(42); UPDATE merge_wait SET qty=qty+1000 WHERE id=7",
+                false,
+            );
+            for _ in 0..64 {
+                let checkpoint = engine.ckpt.as_ref().unwrap();
+                if checkpoint.retained_output_pending()
+                    && (phase == "schedule" || checkpoint.merge_source_read_ready())
+                {
+                    break;
+                }
+                assert!(!engine.checkpoint_beat().failed());
+            }
+            assert!(engine.ckpt.as_ref().unwrap().retained_output_pending());
+            if phase == "columns" {
+                assert!(engine.ckpt.as_ref().unwrap().merge_source_read_ready());
+            }
+            let table = engine.storage.find_table("public", "merge_wait").unwrap();
+            let foreground = engine
+                .storage
+                .table(table)
+                .spill_generations()
+                .handle(0)
+                .unwrap()
+                .filter;
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let mut network = config.clone();
+            network.object_store_sim = false;
+            network.object_store_endpoint = listener.local_addr().unwrap().to_string();
+            network.object_store_access_key = "test-access".to_owned();
+            network.object_store_secret_key = "test-secret".to_owned();
+            let blocks = engine.ckpt.as_ref().unwrap().block_stack();
+            let mut io_budget = Budget::new(OwnedObjectStore::budget_bytes(&network));
+            let store = OwnedObjectStore::new(&network, &mut io_budget, "blocks/").unwrap();
+            *blocks.lock().unwrap() = crate::store::build_tiers(
+                &mut io_budget,
+                store,
+                StackPlan::resolve(0, 0),
+                std::path::Path::new(&config.data_dir),
+            )
+            .unwrap();
+            assert_eq!(io_budget.remaining(), 0);
+            engine.enable_async_block_reads();
+            let prefix = format!("/{}/", config.object_store_bucket);
+            let mut held = None;
+            for _ in 0..32 {
+                if engine.checkpoint_can_progress() {
+                    assert!(!crate::mem::guard::forbid_alloc(|| engine.checkpoint_beat()).failed());
+                }
+                let (mut stream, request) = accept(&mut engine, &listener);
+                let key = request
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap()
+                    .strip_prefix(&prefix)
+                    .unwrap();
+                let body = namespace.borrow().object_bytes(key).unwrap().to_vec();
+                let range = request
+                    .lines()
+                    .any(|line| line.to_ascii_lowercase().starts_with("range:"));
+                if phase == "schedule"
+                    || (!range
+                        && crate::store::decode(&body, true).unwrap().block_type
+                            == crate::store::BlockType::SstPackedContainerV1)
+                {
+                    held = Some((stream, request, body));
+                    break;
+                }
+                reply(&mut stream, &request, &body);
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while engine.block_reads_pending() {
+                    advance(&mut engine);
+                    assert!(Instant::now() < deadline, "merge response did not finish");
+                    std::thread::yield_now();
+                }
+            }
+            let (mut stream, request, body) =
+                held.expect("fixture must hold the selected merge phase");
+            assert_eq!(
+                blocks.lock().unwrap().base_mut().read_owner(),
+                engine.read_owner
+            );
+            assert!(!engine.checkpoint_can_progress());
+            let mut foreground_bytes = [0; crate::store::MAX_PAYLOAD];
+            assert_eq!(
+                crate::mem::guard::forbid_alloc(|| blocks
+                    .lock()
+                    .unwrap()
+                    .get(&foreground, &mut foreground_bytes)),
+                Err(crate::store::StoreError::NotReady)
+            );
+            let (mut foreground_stream, foreground_request) = accept(&mut engine, &listener);
+            let foreground_key = foreground_request
+                .lines()
+                .next()
+                .unwrap()
+                .split_whitespace()
+                .nth(1)
+                .unwrap()
+                .strip_prefix(&prefix)
+                .unwrap();
+            let foreground_body = namespace
+                .borrow()
+                .object_bytes(foreground_key)
+                .unwrap()
+                .to_vec();
+            let fds = [
+                engine.pending_block_read_fd(0),
+                engine.pending_block_read_fd(1),
+            ];
+            assert!(fds.iter().all(Option::is_some));
+            assert_eq!(
+                data_rows(&session.success(&mut engine, "SELECT id FROM cached_order", true)),
+                ["42"]
+            );
+            assert_eq!(
+                blocks.lock().unwrap().base_mut().read_owner(),
+                engine.read_owner
+            );
+            crate::mem::guard::forbid_alloc(|| {
+                for _ in 0..3 {
+                    assert_eq!(engine.checkpoint_beat(), CheckpointBeat::WaitingForReads);
+                    assert!(!engine.checkpoint_can_progress());
+                    assert_eq!(
+                        [
+                            engine.pending_block_read_fd(0),
+                            engine.pending_block_read_fd(1)
+                        ],
+                        fds
+                    );
+                }
+            });
+            reply(
+                &mut foreground_stream,
+                &foreground_request,
+                &foreground_body,
+            );
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                advance(&mut engine);
+                match crate::mem::guard::forbid_alloc(|| {
+                    blocks
+                        .lock()
+                        .unwrap()
+                        .get(&foreground, &mut foreground_bytes)
+                }) {
+                    Ok(_) => break,
+                    Err(crate::store::StoreError::NotReady) => {}
+                    Err(error) => panic!("foreground read failed: {error:?}"),
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "foreground response did not finish"
+                );
+                std::thread::yield_now();
+            }
+            assert!(engine.checkpoint_can_progress());
+            assert_eq!(
+                crate::mem::guard::forbid_alloc(|| engine.checkpoint_beat()),
+                CheckpointBeat::WaitingForReads
+            );
+            assert!(!engine.checkpoint_can_progress());
+            reply(&mut stream, &request, &body);
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while engine.ckpt.as_ref().unwrap().retained_output_pending() {
+                advance(&mut engine);
+                if !engine.ckpt.as_ref().unwrap().retained_output_pending() {
+                    break;
+                }
+                if engine.checkpoint_can_progress() {
+                    let beat = if engine.ckpt.as_ref().unwrap().physical_output_pending() {
+                        // Simulator uploads grow fixture inventories outside the runtime guard.
+                        engine.checkpoint_beat()
+                    } else {
+                        crate::mem::guard::forbid_alloc(|| engine.checkpoint_beat())
+                    };
+                    assert!(!beat.failed());
+                }
+                match listener.accept() {
+                    Ok((mut pending, _)) => {
+                        let headers = read_request(&mut engine, &mut pending);
+                        let key = headers
+                            .lines()
+                            .next()
+                            .unwrap()
+                            .split_whitespace()
+                            .nth(1)
+                            .unwrap()
+                            .strip_prefix(&prefix)
+                            .unwrap();
+                        reply(
+                            &mut pending,
+                            &headers,
+                            namespace.borrow().object_bytes(key).unwrap(),
+                        );
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(error) => panic!("accept merge resumption: {error}"),
+                }
+                assert!(Instant::now() < deadline, "merge did not resume");
+                std::thread::yield_now();
+            }
+            assert!(!engine.ckpt.as_ref().unwrap().retained_output_pending());
+            assert!(!engine.block_reads_pending());
+            let mut restore_budget = Budget::new(OwnedObjectStore::budget_bytes(&config));
+            let store = OwnedObjectStore::new(&config, &mut restore_budget, "blocks/").unwrap();
+            *blocks.lock().unwrap() = crate::store::build_tiers(
+                &mut restore_budget,
+                store,
+                StackPlan::resolve(0, 0),
+                std::path::Path::new(&config.data_dir),
+            )
+            .unwrap();
+            engine.enable_async_block_reads();
+            assert!(engine.checkpoint().unwrap());
+            let query = "SELECT count(*),sum(qty) FROM merge_wait; SELECT qty FROM merge_wait WHERE id=7; SELECT id FROM cached_order";
+            assert_eq!(
+                data_rows(&session.success(&mut engine, query, true)),
+                ["17|1153", "1007", "42"]
+            );
+            drop((session, engine, blocks));
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+            let mut recovered_budget = test_engine_budget(&config, 1 << 29);
+            let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+            assert_eq!(
+                data_rows(&run_with(&mut recovered, &mut recovered_budget, query)),
+                ["17|1153", "1007", "42"]
+            );
+            drop(recovered);
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        }
+    }
+}
+
+#[test]
 fn parallel_physical_index_changes_cancel_unready_uploads_in_both_modes() {
     for mode in [
         crate::config::TransactionMode::Mvcc,

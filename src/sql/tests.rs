@@ -97627,10 +97627,10 @@ fn checkpoint_reads_held_merge_keeps_cached_queries_and_foreground_read_owners()
             assert_eq!(
                 data_rows(&session.success(
                     &mut engine,
-                    "SELECT id FROM cached_order ORDER BY id",
+                    "SELECT count(*),sum(id) FROM cached_order",
                     true,
                 )),
-                ["42", "43"]
+                ["2|85"]
             );
             assert_eq!(
                 blocks.lock().unwrap().base_mut().read_owner(),
@@ -97757,8 +97757,9 @@ fn checkpoint_reads_held_merge_keeps_cached_queries_and_foreground_read_owners()
             engine.enable_async_block_reads();
             assert!(engine.checkpoint().unwrap());
             let query = "SELECT count(*),sum(qty) FROM merge_wait; SELECT qty FROM merge_wait WHERE id=7; SELECT id FROM cached_order ORDER BY id";
+            // Ordered query runs update the simulator's object inventory.
             assert_eq!(
-                data_rows(&session.success(&mut engine, query, true)),
+                data_rows(&session.success(&mut engine, query, false)),
                 ["17|1153", "1007", "42", "43"]
             );
             drop((session, engine, blocks));

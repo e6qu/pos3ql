@@ -37,6 +37,9 @@ until the statement finishes, including reads after a routine returns. For
 example, a function can prepare a query and then read an uncached invoice
 without preparing the same query twice. Pure reads keep their concurrent path.
 
+Cached inputs do not make every query cache-only: `ORDER BY` can write and
+read temporary sorting runs. Request counters include that storage traffic.
+
 `object_store_put_slots` reserves upload clients and immutable request bodies.
 A log batch has two independent objects: transaction bytes and a descriptor.
 Those uploads can complete out of order. The commit-head update starts only

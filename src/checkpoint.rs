@@ -17795,6 +17795,7 @@ fn load_policy(storage: &mut Storage, line: &str) -> Result<(), CheckpointSetupE
                 error.message.as_str()
             ))
         })
+        .map(|_| ())
 }
 
 fn load_trigger(storage: &mut Storage, line: &str) -> Result<(), CheckpointSetupError> {

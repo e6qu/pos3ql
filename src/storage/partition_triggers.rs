@@ -45,6 +45,81 @@ impl PartitionTriggerState {
 }
 
 impl Storage {
+    pub(super) fn validate_partition_trigger_images(&self) -> Result<(), SqlError> {
+        let catalog = self
+            .trigger_catalog
+            .lock()
+            .expect("trigger catalog lock poisoned");
+        for txid in core::iter::once(0).chain(
+            catalog
+                .partition_states
+                .iter()
+                .filter_map(|state| state.pending.map(|pending| pending.txid)),
+        ) {
+            for (slot, state) in catalog.partition_states.iter().enumerate() {
+                let Some(image) = state.image_to(txid) else {
+                    continue;
+                };
+                let trigger = catalog
+                    .definitions
+                    .get(image.trigger.slot())
+                    .copied()
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::DATA_EXCEPTION,
+                            "stored inherited trigger parent position is out of range"
+                        )
+                    })?;
+                if image.table.slot() >= self.table_count()
+                    || slot
+                        != self
+                            .partition_trigger_state_slot(image.trigger.slot(), image.table.slot())
+                    || trigger.database != state.database
+                    || !trigger.visible_to(txid)
+                    || trigger.created_at != image.trigger.created_at()
+                    || self.table(image.table.slot()).database() != state.database
+                    || !self.table(image.table.slot()).visible_to(txid)
+                    || self.table_position(image.table.slot()) != image.table
+                    || !matches!(trigger.level, crate::sql::ast::TriggerLevel::Row)
+                    || !matches!(trigger.target, TriggerTarget::Table(parent) if self.partition_descends_from(image.table.slot(), usize::from(parent), txid))
+                {
+                    return Err(sql_err!(
+                        sqlstate::DATA_EXCEPTION,
+                        "stored inherited trigger references a replaced or unrelated object"
+                    ));
+                }
+            }
+            for (slot, trigger) in catalog
+                .definitions
+                .iter()
+                .enumerate()
+                .filter(|(_, trigger)| trigger.visible_to(txid))
+            {
+                let TriggerTarget::Table(parent) = trigger.target else {
+                    continue;
+                };
+                if !matches!(trigger.level, crate::sql::ast::TriggerLevel::Row) {
+                    continue;
+                }
+                for table in 0..self.table_count() {
+                    if self.table(table).database() == trigger.database
+                        && self.table(table).visible_to(txid)
+                        && self.partition_descends_from(table, usize::from(parent), txid)
+                        && catalog.partition_states[self.partition_trigger_state_slot(slot, table)]
+                            .image_to(txid)
+                            .is_none()
+                    {
+                        return Err(sql_err!(
+                            sqlstate::DATA_EXCEPTION,
+                            "stored partition is missing its inherited trigger identity"
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn partition_trigger_state_slot(&self, trigger: usize, table: usize) -> usize {
         trigger * self.table_count() + table
     }

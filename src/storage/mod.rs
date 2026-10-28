@@ -33931,16 +33931,25 @@ impl Storage {
     }
 
     /// Whether `table` is a physical descendant of `ancestor` in the catalog
-    /// snapshot. Attachment slots are typed and acyclic at DDL time, so this
-    /// walk cannot reinterpret an unrelated table as part of the hierarchy.
+    /// snapshot. Bound corrupt stored cycles before walking their attachments.
     pub(crate) fn partition_descends_from(
         &self,
         mut table: usize,
         ancestor: usize,
         txid: u32,
     ) -> bool {
-        while let Some(attachment) = self.table_def(table, txid).partition.attachment {
+        if table >= self.table_count() || ancestor >= self.table_count() || table == ancestor {
+            return false;
+        }
+        let database = self.table(table).database();
+        for _ in 0..self.table_count() {
+            let Some(attachment) = self.table_def(table, txid).partition.attachment else {
+                return false;
+            };
             table = usize::from(attachment.parent);
+            if table >= self.table_count() || self.table(table).database() != database {
+                return false;
+            }
             if table == ancestor {
                 return true;
             }

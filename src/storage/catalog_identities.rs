@@ -463,6 +463,7 @@ impl Storage {
         drop(publications);
         drop(subscriptions);
         self.validate_default_acl_images()?;
+        self.validate_partition_trigger_images()?;
         for table in self.tables.iter().take(self.table_count()) {
             let state = table.definition.read();
             if state.identity.existence == CatalogDdlState::Absent {

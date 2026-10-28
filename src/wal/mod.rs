@@ -15160,6 +15160,124 @@ mod tests {
     }
 
     #[test]
+    fn catalog_lifetime_privileges_and_partition_triggers_journal_rejects_corrupt_images() {
+        use crate::storage::{
+            CatalogIdentity, CatalogPosition, DefaultAclGrantImage, DefaultAclIdentity,
+            DefaultPrivilegeClass, PartitionTriggerImage, PrivilegeSet, RoleOid, SchemaIdentity,
+            TriggerEnabled,
+        };
+        let mut budget = Budget::new(4096);
+        let mut payload = FixedBuf::new(&mut budget, "catalog image payload", 2048).unwrap();
+        let mut restored = FixedBuf::new(&mut budget, "catalog image roundtrip", 2048).unwrap();
+        let default = DefaultAclGrantImage {
+            identity: DefaultAclIdentity {
+                creation: CatalogIdentity::parse(41).unwrap(),
+                owner: RoleOid::BOOTSTRAP,
+                schema: Some(SchemaIdentity::parse(17).unwrap()),
+                class: DefaultPrivilegeClass::Table,
+            },
+            grantee: Some(RoleOid::parse(16_400).unwrap()),
+            privileges: PrivilegeSet::SELECT,
+            grant_options: PrivilegeSet::NONE,
+        };
+        let trigger = PartitionTriggerImage {
+            creation: CatalogIdentity::parse(42).unwrap(),
+            trigger: CatalogPosition::new(3, 18).unwrap(),
+            table: CatalogPosition::new(5, 19).unwrap(),
+            enabled: TriggerEnabled::Replica,
+        };
+        let mut roundtrip = |operation: WalOp| {
+            payload.clear();
+            restored.clear();
+            let kind = op_kind(&operation);
+            crate::mem::guard::forbid_alloc(|| {
+                assert!(append_payload(&mut payload, &operation));
+                assert_eq!(payload.len(), encoded_payload_len(&operation));
+                let decoded =
+                    decode_op(kind, payload.readable()).expect("valid saved catalog image");
+                assert!(append_payload(&mut restored, &decoded));
+                assert_eq!(payload.readable(), restored.readable());
+                for truncated in 0..payload.len() {
+                    assert!(decode_op(kind, &payload.readable()[..truncated]).is_none());
+                }
+                assert!(payload.append(&[0]));
+                assert!(decode_op(kind, payload.readable()).is_none());
+            });
+        };
+        roundtrip(WalOp::SetDefaultAcl {
+            slot: 3,
+            expected: None,
+            image: Some(default),
+        });
+        roundtrip(WalOp::SetDefaultAcl {
+            slot: 3,
+            expected: Some(default),
+            image: None,
+        });
+        roundtrip(WalOp::SetDefaultAcl {
+            slot: 3,
+            expected: Some(default),
+            image: Some(DefaultAclGrantImage {
+                privileges: PrivilegeSet::INSERT,
+                ..default
+            }),
+        });
+        roundtrip(WalOp::SetPartitionTrigger {
+            expected: None,
+            image: Some(trigger),
+        });
+        roundtrip(WalOp::SetPartitionTrigger {
+            expected: Some(trigger),
+            image: None,
+        });
+        roundtrip(WalOp::SetPartitionTrigger {
+            expected: Some(trigger),
+            image: Some(PartitionTriggerImage {
+                enabled: TriggerEnabled::Disabled,
+                ..trigger
+            }),
+        });
+        roundtrip(WalOp::ReserveCatalogSequence(
+            core::num::NonZeroU64::new(43).unwrap(),
+        ));
+        assert!(decode_op(KIND_CATALOG_RESERVATION, &[0; 8]).is_none());
+        payload.clear();
+        assert!(append_payload(
+            &mut payload,
+            &WalOp::SetPartitionTrigger {
+                expected: None,
+                image: Some(trigger)
+            }
+        ));
+        let valid = payload.readable().to_vec();
+        for (offset, replacement) in [(0, 0), (0, 4), (25, b'?')] {
+            let mut corrupt = valid.clone();
+            corrupt[offset] = replacement;
+            assert!(decode_op(KIND_SET_PARTITION_TRIGGER, &corrupt).is_none());
+        }
+        for birth in [0u32, 10_000_000, u32::MAX] {
+            let mut corrupt = valid.clone();
+            corrupt[1..5].copy_from_slice(&birth.to_le_bytes());
+            assert!(decode_op(KIND_SET_PARTITION_TRIGGER, &corrupt).is_none());
+        }
+        payload.clear();
+        assert!(append_payload(
+            &mut payload,
+            &WalOp::SetDefaultAcl {
+                slot: 3,
+                expected: None,
+                image: Some(default)
+            }
+        ));
+        let valid = payload.readable().to_vec();
+        for (offset, replacement) in [(2, 0), (2, 4), (11, 255), (12, 4)] {
+            let mut corrupt = valid.clone();
+            corrupt[offset] = replacement;
+            assert!(decode_op(KIND_SET_DEFAULT_ACL, &corrupt).is_none());
+        }
+    }
+
+    #[test]
     fn create_trigger_payload_requires_typed_qualification() {
         let mut budget = Budget::new(1024);
         let mut payload = FixedBuf::new(&mut budget, "trigger payload", 1024).unwrap();

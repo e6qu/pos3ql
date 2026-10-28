@@ -226,7 +226,14 @@ row-roster, index-tree and deletion positions across waits. Its cache probes
 preserve query read owners. It validates the complete keep-set before deleting
 files, then continues each listing from its saved cursor. Durable file writers
 remain paused while that decision drains; foreground RAM edits can continue.
-Checkpoint capture and table/index merge reads still have synchronous paths.
+Row-file merges retain index descent, source-row scheduling, column downloads
+and large-row fragments while a request waits. Scheduling reads row descriptors
+without fetching PAX column values. Completed groups stay in the existing source
+buffers; checksums and output positions advance only after their rows finish.
+The fixed read pool reserves one maintenance owner alongside connections and
+subscription workers. A waiting merge releases the SQL worker and shares no
+mutable decoder state with foreground queries. Table capture and index-building
+reads still have synchronous paths.
 
 The remaining order is coherent shared row/catalog publication and bounded
 maintenance, startup-reserved CPU workers, then representative performance and

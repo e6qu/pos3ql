@@ -17,10 +17,11 @@ Its commit history must retain durable order. Reads, independent uploads and SQL
 CPU execution do not all need to be serialized to preserve that order.
 
 Today, object-store I/O overlaps and batches requests, while SQL CPU work uses
-one worker. Journal and saved-file cleanup retain their progress and yield
-while object-store responses wait. Journal cleanup does not prevent checkpoints
-from freeing row-cache space. Some state-changing, checkpoint capture and
-table/index merge reads still wait synchronously. Same-host MinIO and SeaweedFS checks establish portability;
+one worker. Journal cleanup, saved-file cleanup and row-file merges retain
+their progress and yield while object-store responses wait. Journal cleanup
+does not prevent checkpoints from freeing row-cache space. Some state-changing
+commands, table capture and index-building reads still wait synchronously.
+Same-host MinIO and SeaweedFS checks establish portability;
 they do not establish production performance. The owning guides describe
 [current behavior](docs/implemented-baseline.md), [physical limits](docs/architecture.md#memory-and-physical-size)
 and [what has actually been measured](docs/performance.md).
@@ -42,13 +43,14 @@ A waiting schema edit must never attach itself to a new object that reused a nam
   resolves; a reader finishing must not cause them to be collected as orphans.
   Switching output producers cannot cancel another job's immutable files;
   durable manifests never name output that has not finished uploading.
-- Let remaining checkpoint capture and table/index merge downloads pause
+- Let remaining table capture and index-building downloads pause
   without occupying the SQL worker. Save enough state to resume within the
   fixed memory budget, as journal and saved-file cleanup do for backup listings,
   retention manifests, file inventories and obsolete-object deletions.
-  Retain completed column and large-row fragments across waits, including with
-  disabled caches. Advance source positions and output checksums only after the
-  corresponding row or group finishes; retries must not skip or repeat data.
+  Apply the same retained column and large-row progress to these paths,
+  including with disabled caches. Advance source positions and output checksums
+  only after the corresponding row or group finishes; retries must not skip or
+  repeat data.
   Recovery can keep exclusive startup access; ordinary operation must allow
   unrelated work to progress.
 

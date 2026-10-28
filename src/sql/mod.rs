@@ -10091,8 +10091,8 @@ impl Engine {
             || self.storage.history_pressure()
     }
 
-    /// Heap and history cleanup use no object client. Publication and merge
-    /// work still wait for statement-owned block reads to finish.
+    /// Heap and history cleanup use no object client. Retained merges have
+    /// separate read ownership; capture still waits for foreground block reads.
     pub(crate) fn checkpoint_can_progress(&self) -> bool {
         if self.fatal_commit_failure.is_some() {
             return false;

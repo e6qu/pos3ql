@@ -35,8 +35,6 @@ use crate::storage::{
     PartitionDef, PartitionStrategy, RowCleanup, RowCleanupTarget, RowCleanupTask, RowHome,
     SerializedStoredQueryDependency, SqlName, Storage, TableDef, TransactionIdentityRecord,
 };
-#[cfg(test)]
-use crate::store::SstReader;
 use crate::store::{
     BlockId, BlockStore, BlockType, BlockWriter, MAX_ASSEMBLED, MAX_INLINE_ROW, OwnedObjectStore,
     RowSstFormat, SstCursor, SstHandle, SstKey, SstMetadataCursor, SstMetadataStep,
@@ -9660,7 +9658,7 @@ impl Checkpointer {
     /// Advances captured table/index output, manifest publication or cleanup.
     /// Changed tables need a current slice before manifest capture. Upload and
     /// local installation then retain that capture's identity across turns.
-    /// Some capture and table/index merge reads still wait synchronously.
+    /// Some table capture and index-building reads still wait synchronously.
     ///
     /// Failures retain a retryable position or restart the same immutable job.
     /// Repeated PUTs keep the same block identity but still cost requests and

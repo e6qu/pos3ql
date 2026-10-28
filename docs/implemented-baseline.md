@@ -401,6 +401,15 @@ wait. Separate fixed queues prevent either task from changing the other's
 pending deletions, and new commits cannot extend an old cleanup pass forever.
 Explicit CHECKPOINT, shutdown and some atomic reads still have synchronous work.
 
+Combining saved row files also yields while downloads wait. It retains index,
+column and large-row positions in startup-reserved state, including with both
+caches disabled. A cached order query can finish while a merge and another
+connection's download are waiting. Other connections keep their read ownership;
+a completion or freed slot makes the merge runnable again.
+Rows enter its checksum and output count once. A genuine source error restarts
+the same immutable pair with empty output; capture and index-building reads can
+still occupy the SQL worker.
+
 At 85% heap use, eligible top-level writes can wait before effects when an active
 maintenance task can free space, including saved-file cleanup that must finish
 before the next checkpoint. They preserve their command, timestamp and

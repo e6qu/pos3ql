@@ -1209,8 +1209,9 @@ pub(crate) struct SstCursor {
     done: bool,
 }
 
-/// Retained metadata-only scan for merge scheduling. One step reads at most
-/// one index or row descriptor; PAX column extents are never downloaded here.
+/// Retained metadata-only scan for merge scheduling. One step consumes one
+/// index or row descriptor; bounded direct-block lookahead uses read slots.
+/// PAX column extents are never downloaded here.
 pub(crate) struct SstMetadataCursor {
     handle: SstHandle,
     leaf: usize,

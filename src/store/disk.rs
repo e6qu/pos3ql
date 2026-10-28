@@ -223,6 +223,42 @@ impl std::fmt::Display for DiskError {
 
 impl std::error::Error for DiskError {}
 
+impl<S: BlockStore> DiskCache<S> {
+    /// Probe verified disk bytes without touching remote read ownership.
+    pub(crate) fn get_cached(
+        &mut self,
+        id: &BlockId,
+        into: &mut [u8],
+    ) -> Result<Option<(usize, BlockType)>, StoreError> {
+        if let Some(&slot) = self.index.get(id) {
+            let len = self.slots[slot].len;
+            if self
+                .file
+                .read_exact_at(&mut self.scratch[..len], (slot * SLOT_SIZE) as u64)
+                .is_ok()
+            {
+                // Verified, because the bytes came off a disk that a crash may
+                // have torn. A mismatch is treated as a miss, not an error.
+                if let Ok(block) = decode(&self.scratch[..len], true)
+                    && block.id == *id
+                {
+                    if into.len() < block.payload.len() {
+                        return Err(StoreError::BufferTooSmall);
+                    }
+                    into[..block.payload.len()].copy_from_slice(block.payload);
+                    self.slots[slot].referenced = true;
+                    self.stats.hits += 1;
+                    return Ok(Some((block.payload.len(), block.block_type)));
+                }
+            }
+            // Torn, rotted, or holding some other block: drop it and fall
+            // through to the store, which still has the real one.
+            self.drop_corrupt(id, slot);
+        }
+        Ok(None)
+    }
+}
+
 impl<S: BlockStore> BlockStore for DiskCache<S> {
     fn put(
         &mut self,
@@ -239,31 +275,9 @@ impl<S: BlockStore> BlockStore for DiskCache<S> {
     }
 
     fn get(&mut self, id: &BlockId, into: &mut [u8]) -> Result<(usize, BlockType), StoreError> {
-        if let Some(&slot) = self.index.get(id) {
-            let len = self.slots[slot].len;
-            if self
-                .file
-                .read_at(&mut self.scratch[..len], (slot * SLOT_SIZE) as u64)
-                .is_ok()
-            {
-                // Verified, because the bytes came off a disk that a crash may
-                // have torn. A mismatch is treated as a miss, not an error.
-                if let Ok(block) = decode(&self.scratch[..len], true)
-                    && block.id == *id
-                {
-                    if into.len() < block.payload.len() {
-                        return Err(StoreError::BufferTooSmall);
-                    }
-                    into[..block.payload.len()].copy_from_slice(block.payload);
-                    self.slots[slot].referenced = true;
-                    self.stats.hits += 1;
-                    self.inner.release_read(id);
-                    return Ok((block.payload.len(), block.block_type));
-                }
-            }
-            // Torn, rotted, or holding some other block: drop it and fall
-            // through to the store, which still has the real one.
-            self.drop_corrupt(id, slot);
+        if let Some(block) = self.get_cached(id, into)? {
+            self.inner.release_read(id);
+            return Ok(block);
         }
         self.stats.misses += 1;
         let (len, block_type) = self.inner.get(id, into)?;

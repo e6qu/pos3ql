@@ -122,6 +122,25 @@ impl<S: BlockStore> BlockCache<S> {
         self.index.get(id).is_some()
     }
 
+    /// Probe RAM without consuming another owner's remote read.
+    pub(crate) fn get_cached(
+        &mut self,
+        id: &BlockId,
+        into: &mut [u8],
+    ) -> Result<Option<(usize, BlockType)>, StoreError> {
+        if let Some(&frame) = self.index.get(id) {
+            let len = self.frames[frame].len;
+            if into.len() < len {
+                return Err(StoreError::BufferTooSmall);
+            }
+            into[..len].copy_from_slice(&self.slot(frame)[..len]);
+            self.frames[frame].referenced = true;
+            self.stats.hits += 1;
+            return Ok(Some((len, self.frames[frame].block_type)));
+        }
+        Ok(None)
+    }
+
     fn slot(&self, frame: usize) -> &[u8] {
         &self.slots[frame * MAX_PAYLOAD..(frame + 1) * MAX_PAYLOAD]
     }
@@ -187,16 +206,9 @@ impl<S: BlockStore> BlockStore for BlockCache<S> {
     }
 
     fn get(&mut self, id: &BlockId, into: &mut [u8]) -> Result<(usize, BlockType), StoreError> {
-        if let Some(&frame) = self.index.get(id) {
-            let len = self.frames[frame].len;
-            if into.len() < len {
-                return Err(StoreError::BufferTooSmall);
-            }
-            into[..len].copy_from_slice(&self.slot(frame)[..len]);
-            self.frames[frame].referenced = true;
-            self.stats.hits += 1;
+        if let Some(block) = self.get_cached(id, into)? {
             self.inner.release_read(id);
-            return Ok((len, self.frames[frame].block_type));
+            return Ok(block);
         }
         self.stats.misses += 1;
         let (len, block_type) = self.inner.get(id, into)?;

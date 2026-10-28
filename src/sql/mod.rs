@@ -10125,6 +10125,12 @@ impl Engine {
                     && (checkpointer.physical_output_ready(std::time::Instant::now())
                         || checkpointer.physical_output_stale(&self.storage)));
         }
+        if let Some(checkpointer) = self.ckpt.as_ref()
+            && checkpointer.published_maintenance_pending()
+            && !checkpointer.file_io_ready()
+        {
+            return self.local_cleanup.is_some() || self.storage.history_cleanup_pending();
+        }
         let output_ready = self.ckpt.as_ref().is_none_or(|checkpointer| {
             checkpointer.physical_output_ready(std::time::Instant::now())
                 || checkpointer.physical_output_stale(&self.storage)
@@ -10299,7 +10305,11 @@ impl Engine {
                 }
             };
         }
+        let file_cleanup_waiting = self.ckpt.as_ref().is_some_and(|checkpointer| {
+            checkpointer.published_maintenance_pending() && !checkpointer.file_io_ready()
+        });
         let reads_pending = credential_draining
+            || file_cleanup_waiting
             || self.block_reads_pending()
             || self
                 .ckpt
@@ -10478,6 +10488,8 @@ impl Engine {
             Ok(CheckpointStep::Working) => {
                 if retried_upload || remote_maintenance_finished {
                     CheckpointBeat::Durable
+                } else if !ckpt.file_io_ready() {
+                    CheckpointBeat::WaitingForReads
                 } else {
                     CheckpointBeat::Advanced
                 }

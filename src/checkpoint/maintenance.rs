@@ -25,6 +25,7 @@ enum Operation {
     List {
         prefix: StackStr<128>,
         cursor: ListCursor,
+        limit: usize,
     },
 }
 
@@ -149,11 +150,19 @@ impl MetadataIo {
         &mut self,
         prefix: &str,
         cursor: ListCursor,
+        limit: usize,
         mut each: impl FnMut(&str),
     ) -> Result<Poll<Option<ListCursor>>, SqlError> {
+        if limit == 0 || limit > PAGE_KEYS {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "maintenance list page exceeds its fixed key capacity"
+            ));
+        }
         match self.poll(Operation::List {
             prefix: Self::key(prefix)?,
             cursor,
+            limit,
         })? {
             Poll::Ready(Response::List(next)) => {
                 for key in self.keys.iter() {
@@ -188,11 +197,15 @@ impl MetadataIo {
                     .client
                     .delete_nonblocking(key.as_str())
                     .map(|()| Response::Delete),
-                Operation::List { prefix, cursor } => {
+                Operation::List {
+                    prefix,
+                    cursor,
+                    limit,
+                } => {
                     self.keys.clear();
                     let keys = &mut self.keys;
                     self.client
-                        .list_page(prefix.as_str(), cursor, PAGE_KEYS, |key| {
+                        .list_page(prefix.as_str(), cursor, limit, |key| {
                             keys.push(StackStr::from_str(key))
                                 .expect("validated page key limit");
                         })
@@ -345,9 +358,12 @@ mod tests {
         let (mut io, listener) = network();
         let mut observed = Vec::new();
         assert!(
-            crate::mem::guard::forbid_alloc(
-                || io.list("commits/", ListCursor::START, |_| panic!("unfinished page"))
-            )
+            crate::mem::guard::forbid_alloc(|| io.list(
+                "commits/",
+                ListCursor::START,
+                PAGE_KEYS,
+                |_| panic!("unfinished page")
+            ))
             .unwrap()
             .is_pending()
         );
@@ -370,14 +386,16 @@ mod tests {
         crate::mem::guard::forbid_alloc(|| io.advance(Instant::now()));
         assert!(!io.ready());
         assert!(
-            io.list("commits/", ListCursor::START, |_| panic!("partial page"))
-                .unwrap()
-                .is_pending()
+            io.list("commits/", ListCursor::START, PAGE_KEYS, |_| panic!(
+                "partial page"
+            ))
+            .unwrap()
+            .is_pending()
         );
         stream.write_all(&body.as_bytes()[30..]).unwrap();
         finish(&mut io);
         let Poll::Ready(Some(cursor)) = io
-            .list("commits/", ListCursor::START, |key| {
+            .list("commits/", ListCursor::START, PAGE_KEYS, |key| {
                 observed.push(key.to_owned())
             })
             .unwrap()
@@ -389,9 +407,11 @@ mod tests {
         assert_eq!(cursor.after.as_str(), "commits/a.head");
         assert!(!io.busy());
         assert!(
-            io.list("commits/", cursor, |_| panic!("unfinished second page"))
-                .unwrap()
-                .is_pending()
+            io.list("commits/", cursor, PAGE_KEYS, |_| panic!(
+                "unfinished second page"
+            ))
+            .unwrap()
+            .is_pending()
         );
         let mut request = Vec::new();
         while !request.ends_with(b"\r\n\r\n") {
@@ -415,7 +435,7 @@ mod tests {
         finish(&mut io);
         let mut count = 0;
         assert_eq!(
-            crate::mem::guard::forbid_alloc(|| io.list("commits/", cursor, |key| {
+            crate::mem::guard::forbid_alloc(|| io.list("commits/", cursor, PAGE_KEYS, |key| {
                 assert_eq!(key, "commits/b.batch");
                 count += 1;
             }))

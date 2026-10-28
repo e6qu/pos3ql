@@ -324,6 +324,28 @@ pub(crate) enum TieredStore<S: BlockStore> {
 }
 
 impl<S: BlockStore> TieredStore<S> {
+    /// Maintenance uses its own network request on a miss. A cache hit must
+    /// not release or attach to a statement's pending object read.
+    pub(crate) fn get_cached(
+        &mut self,
+        id: &super::BlockId,
+        into: &mut [u8],
+    ) -> Result<Option<(usize, super::BlockType)>, super::StoreError> {
+        let layer = match self {
+            Self::WithRam(cache) => {
+                if let Some(block) = cache.get_cached(id, into)? {
+                    return Ok(Some(block));
+                }
+                cache.inner_mut()
+            }
+            Self::WithoutRam(layer) => layer,
+        };
+        match layer {
+            Layer::Base(_) => Ok(None),
+            Layer::Disk(cache) => cache.get_cached(id, into),
+        }
+    }
+
     pub(crate) fn base_mut(&mut self) -> &mut S {
         match self {
             Self::WithRam(cache) => cache.inner_mut().base_mut(),

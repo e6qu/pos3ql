@@ -1374,7 +1374,6 @@ pub(crate) struct Checkpointer {
     /// Pre-reserved scratch for cold commit replay and object deletion batches.
     commit_scratch: Vec<StackStr<64>>,
     backup_scratch: Vec<StackStr<BACKUP_NAME_BYTES>>,
-    backup_roster_loaded: bool,
     file_backup_scratch: Vec<StackStr<BACKUP_NAME_BYTES>>,
     file_backup_roster_loaded: bool,
     garbage_scratch: Vec<StackStr<64>>,
@@ -1605,7 +1604,13 @@ impl Checkpointer {
         // Administrative and background metadata requests have independent
         // owners. Cache tiers draw their own startup budget.
         ObjectStore::budget_bytes(config)
-            + 2 * MetadataIo::budget_bytes(config)
+            + MetadataIo::budget_bytes(config, maintenance::JOURNAL_PAGE_KEYS)
+            + MetadataIo::budget_bytes(
+                config,
+                config
+                    .checkpoint_garbage_batch_objects
+                    .min(crate::object_store::MAX_LIST_PAGE_KEYS),
+            )
             + crate::object_store::upload::Uploads::budget_bytes(
                 config,
                 config.object_store_put_slots,
@@ -2298,8 +2303,14 @@ impl Checkpointer {
         Ok(Self {
             client: ObjectStore::new(config, budget)
                 .map_err(|error| CheckpointSetupError::ObjectStore(error.to_string()))?,
-            metadata_io: MetadataIo::new(config, budget)?,
-            file_io: MetadataIo::new(config, budget)?,
+            metadata_io: MetadataIo::new(config, budget, maintenance::JOURNAL_PAGE_KEYS)?,
+            file_io: MetadataIo::new(
+                config,
+                budget,
+                config
+                    .checkpoint_garbage_batch_objects
+                    .min(crate::object_store::MAX_LIST_PAGE_KEYS),
+            )?,
             file_gc: FileGcProgress::Unloaded,
             file_index_walk: None,
             uploads: crate::object_store::upload::Uploads::new(
@@ -2409,7 +2420,6 @@ impl Checkpointer {
             slice_scratch: SlotList::new(config.max_spill_generations_per_table),
             commit_scratch: Vec::with_capacity(config.checkpoint_commit_batches),
             backup_scratch: Vec::with_capacity(config.max_backups),
-            backup_roster_loaded: false,
             file_backup_scratch: Vec::with_capacity(config.max_backups),
             file_backup_roster_loaded: false,
             garbage_scratch: Vec::with_capacity(config.checkpoint_garbage_batch_objects),
@@ -3570,7 +3580,6 @@ impl Checkpointer {
     }
 
     fn load_backup_names(&mut self) -> Result<(), SqlError> {
-        self.backup_roster_loaded = false;
         self.backup_scratch.clear();
         let names = &mut self.backup_scratch;
         let mut overflow = false;
@@ -3604,12 +3613,10 @@ impl Checkpointer {
                 self.backup_scratch.capacity()
             ));
         }
-        self.backup_roster_loaded = true;
         Ok(())
     }
 
     fn invalidate_backup_roster(&mut self) {
-        self.backup_roster_loaded = false;
         self.prune_backup_roster_loaded = false;
         self.reset_file_gc();
         if !matches!(self.commit_prune, CommitPruneProgress::Unloaded) {
@@ -3684,23 +3691,24 @@ impl Checkpointer {
             CommitPruneProgress::Backups { cursor } => {
                 let names = &mut self.prune_backup_scratch;
                 let mut invalid = false;
-                let Poll::Ready(next) =
-                    self.metadata_io
-                        .list("backups/", cursor, maintenance::PAGE_KEYS, |key| {
-                            let Some(name) = key
-                                .strip_prefix("backups/")
-                                .and_then(|key| key.strip_suffix("/manifest"))
-                            else {
-                                return;
-                            };
-                            if validate_backup_name(name).is_err()
-                                || names.len() == names.capacity()
-                            {
-                                invalid = true;
-                            } else {
-                                names.push(StackStr::from_str(name));
-                            }
-                        })?
+                let Poll::Ready(next) = self.metadata_io.list(
+                    "backups/",
+                    cursor,
+                    maintenance::JOURNAL_PAGE_KEYS,
+                    |key| {
+                        let Some(name) = key
+                            .strip_prefix("backups/")
+                            .and_then(|key| key.strip_suffix("/manifest"))
+                        else {
+                            return;
+                        };
+                        if validate_backup_name(name).is_err() || names.len() == names.capacity() {
+                            invalid = true;
+                        } else {
+                            names.push(StackStr::from_str(name));
+                        }
+                    },
+                )?
                 else {
                     return Ok(false);
                 };
@@ -3804,24 +3812,27 @@ impl Checkpointer {
                 let last_candidate = stack_format!(64, "commits/{floor:020}-ffffffff.head");
                 let mut past_floor = false;
                 let doomed = &mut self.commit_garbage_scratch;
-                let Poll::Ready(next) =
-                    self.metadata_io
-                        .list("commits/", cursor, maintenance::PAGE_KEYS, |key| {
-                            if key > last_candidate.as_str() {
-                                past_floor = true;
-                                return;
+                let Poll::Ready(next) = self.metadata_io.list(
+                    "commits/",
+                    cursor,
+                    maintenance::JOURNAL_PAGE_KEYS,
+                    |key| {
+                        if key > last_candidate.as_str() {
+                            past_floor = true;
+                            return;
+                        }
+                        let is_doomed = commit_object_identity(key).is_some_and(|identity| {
+                            identity.first_lsn <= floor && Some(identity) != boundary
+                        });
+                        if is_doomed {
+                            if doomed.len() < doomed.capacity() {
+                                doomed.push(stack_format!(64, "{}", key));
+                            } else {
+                                overflow = true;
                             }
-                            let is_doomed = commit_object_identity(key).is_some_and(|identity| {
-                                identity.first_lsn <= floor && Some(identity) != boundary
-                            });
-                            if is_doomed {
-                                if doomed.len() < doomed.capacity() {
-                                    doomed.push(stack_format!(64, "{}", key));
-                                } else {
-                                    overflow = true;
-                                }
-                            }
-                        })?
+                        }
+                    },
+                )?
                 else {
                     return Ok(false);
                 };
@@ -15161,7 +15172,7 @@ impl Checkpointer {
             self.garbage_scratch.clear();
             let doomed = &mut self.garbage_scratch;
             let mut overflow = false;
-            let limit = maintenance::PAGE_KEYS.min(doomed.capacity());
+            let limit = self.file_io.page_keys().min(doomed.capacity());
             let Poll::Ready(next) = self.file_io.list("sst/", ListCursor::START, limit, |key| {
                 if key.len() > 64 {
                     overflow = true;
@@ -20473,8 +20484,12 @@ mod stored_dependency_tests {
             network.object_store_endpoint = listener.local_addr().unwrap().to_string();
             network.object_store_access_key = "test-access".to_owned();
             network.object_store_secret_key = "test-secret".to_owned();
-            let mut budget = Budget::new(MetadataIo::budget_bytes(&network));
-            checkpoint.file_io = MetadataIo::new(&network, &mut budget).unwrap();
+            let mut budget = Budget::new(MetadataIo::budget_bytes(
+                &network,
+                maintenance::JOURNAL_PAGE_KEYS,
+            ));
+            checkpoint.file_io =
+                MetadataIo::new(&network, &mut budget, maintenance::JOURNAL_PAGE_KEYS).unwrap();
             assert_eq!(budget.remaining(), 0);
             checkpoint.published_lsn_pending_maintenance = Some(0);
             checkpoint.block_garbage_pending = true;
@@ -20611,54 +20626,59 @@ mod stored_dependency_tests {
 
     #[test]
     fn maintenance_metadata_file_cleanup_pages_once_and_deletes_in_bounded_turns() {
-        let (mut checkpoint, storage, _, config) = index_gc_fixture("gc-many-pages", 256);
-        checkpoint.delete_objects_per_beat = 2;
-        let mut keys = Vec::new();
-        for value in 0u64..137 {
-            let id = checkpoint
-                .blocks
-                .lock()
-                .unwrap()
-                .put(&value.to_le_bytes(), BlockType::SstData, 0)
-                .unwrap();
-            keys.push(format!(
-                "{}blocks/{}",
-                config.object_store_prefix,
-                index_gc_hex(id)
-            ));
-        }
-        let namespace = crate::object_store::sim::open_namespace(&config.object_store_bucket, 0);
-        let lists_before = namespace.borrow().list_count;
-        let mut previous = keys.len();
-        let mut done = false;
-        for _ in 0..256 {
-            done = crate::mem::guard::forbid_alloc(|| {
-                checkpoint.collect_block_garbage_batch(&storage)
-            })
-            .unwrap();
-            let left = keys
-                .iter()
-                .filter(|key| namespace.borrow().object_bytes(key).is_some())
-                .count();
-            assert!(
-                previous - left <= 2,
-                "one turn exceeded its delete allowance"
-            );
-            previous = left;
-            if done {
-                break;
+        for (queue, objects) in [(3usize, 11u64), (64, 137), (1000, 1001)] {
+            let label = format!("gc-pages-{queue}");
+            let (mut checkpoint, storage, _, config) = index_gc_fixture(&label, 256);
+            checkpoint.doomed_blocks = Vec::with_capacity(queue);
+            checkpoint.delete_objects_per_beat = 2;
+            let mut keys = Vec::new();
+            for value in 0u64..objects {
+                let id = checkpoint
+                    .blocks
+                    .lock()
+                    .unwrap()
+                    .put(&value.to_le_bytes(), BlockType::SstData, 0)
+                    .unwrap();
+                keys.push(format!(
+                    "{}blocks/{}",
+                    config.object_store_prefix,
+                    index_gc_hex(id)
+                ));
             }
+            let namespace =
+                crate::object_store::sim::open_namespace(&config.object_store_bucket, 0);
+            let lists_before = namespace.borrow().list_count;
+            let mut previous = keys.len();
+            let mut done = false;
+            for _ in 0..4096 {
+                done = crate::mem::guard::forbid_alloc(|| {
+                    checkpoint.collect_block_garbage_batch(&storage)
+                })
+                .unwrap();
+                let left = keys
+                    .iter()
+                    .filter(|key| namespace.borrow().object_bytes(key).is_some())
+                    .count();
+                assert!(
+                    previous - left <= 2,
+                    "one turn exceeded its delete allowance"
+                );
+                previous = left;
+                if done {
+                    break;
+                }
+            }
+            assert!(done);
+            assert_eq!(previous, 0);
+            assert_eq!(
+                namespace.borrow().list_count - lists_before,
+                1 + objects.div_ceil(queue as u64),
+                "one backup listing and one request per bounded block page"
+            );
+            drop(checkpoint);
+            drop(storage);
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
         }
-        assert!(done);
-        assert_eq!(previous, 0);
-        assert_eq!(
-            namespace.borrow().list_count - lists_before,
-            4,
-            "one backup listing and three block pages; live prefixes must not be rescanned"
-        );
-        drop(checkpoint);
-        drop(storage);
-        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     }
 
     #[test]
@@ -20688,6 +20708,7 @@ mod stored_dependency_tests {
     fn maintenance_metadata_failed_backup_preflight_cannot_replace_a_partial_file_inventory() {
         let (_, storage, _, mut config) = index_gc_fixture("gc-backup-preflight", 32);
         config.max_backups = 65;
+        config.checkpoint_garbage_batch_objects = 64;
         let mut budget = Budget::new(Checkpointer::budget_bytes(&config));
         let mut checkpoint = Checkpointer::new(&config, &mut budget).unwrap();
         assert_eq!(budget.remaining(), 0);
@@ -20740,8 +20761,16 @@ mod stored_dependency_tests {
         metadata_config.object_store_endpoint = listener.local_addr().unwrap().to_string();
         metadata_config.object_store_access_key = "test-access".to_owned();
         metadata_config.object_store_secret_key = "test-secret".to_owned();
-        let mut budget = Budget::new(MetadataIo::budget_bytes(&metadata_config));
-        checkpoint.metadata_io = MetadataIo::new(&metadata_config, &mut budget).unwrap();
+        let mut budget = Budget::new(MetadataIo::budget_bytes(
+            &metadata_config,
+            maintenance::JOURNAL_PAGE_KEYS,
+        ));
+        checkpoint.metadata_io = MetadataIo::new(
+            &metadata_config,
+            &mut budget,
+            maintenance::JOURNAL_PAGE_KEYS,
+        )
+        .unwrap();
         checkpoint.schedule_commit_prune(0);
         assert!(!crate::mem::guard::forbid_alloc(|| checkpoint.advance_commit_cleanup()).unwrap());
         assert!(!checkpoint.metadata_io_ready());
@@ -20809,7 +20838,6 @@ mod stored_dependency_tests {
         checkpoint.load_backup_names().unwrap();
         assert_eq!(checkpoint.commit_garbage_scratch, queued);
         assert!(checkpoint.garbage_scratch.is_empty());
-        assert!(checkpoint.backup_roster_loaded);
         let mut complete = false;
         for _ in 0..4 {
             complete =
@@ -21346,6 +21374,28 @@ mod stored_dependency_tests {
             .join();
         if let Err(panic) = result {
             std::panic::resume_unwind(panic);
+        }
+    }
+
+    #[test]
+    fn maintenance_metadata_file_page_budget_tracks_queue_to_provider_limit() {
+        for size in [3usize, 64, 999, 1000, 1001] {
+            let mut config = Config::default_dev();
+            config.checkpoint_garbage_batch_objects = size;
+            config.checkpoint_delete_objects_per_beat = 2;
+            let before = Checkpointer::budget_bytes(&config);
+            config.checkpoint_garbage_batch_objects += 1;
+            let queue_entry =
+                core::mem::size_of::<StackStr<80>>() + 2 * core::mem::size_of::<StackStr<64>>();
+            let key_entry = if size < crate::object_store::MAX_LIST_PAGE_KEYS {
+                core::mem::size_of::<StackStr<{ crate::object_store::MAX_OBJECT_KEY_BYTES }>>()
+            } else {
+                0
+            };
+            assert_eq!(
+                Checkpointer::budget_bytes(&config) - before,
+                queue_entry + key_entry
+            );
         }
     }
 

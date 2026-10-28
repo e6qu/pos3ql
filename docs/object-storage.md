@@ -120,8 +120,8 @@ all required immutable uploads before publication.
 Saved-file cleanup has its own startup-reserved client, separate from journal
 cleanup and foreground reads. It retains backup listings, manifest reads, row-file
 inventories and index-tree traversal across responses. Each turn reads at most
-one manifest or roster node, lists at most 64 keys (also bounded by the configured
-delete queue), or deletes the configured batch. A listing continues from its
+one manifest or roster node, lists up to 1,000 keys within
+`checkpoint_garbage_batch_objects`, or deletes the configured per-turn batch. A listing continues from its
 saved provider cursor instead of rescanning all live files for each batch.
 
 Cleanup keeps installed table files and active merge inputs even when a
@@ -161,7 +161,7 @@ requests and resumes the same position with the new credentials.
 | Credential validation | One conditional upload client with a 128-byte body when `object_store_credentials_file` is configured. The candidate must also read back the result. |
 | Operational ownership check | One fixed client and one receipt slot per `operations_max_connections` when the operational listener and object storage are enabled. Shares the explicit TLS budget. |
 | `checkpoint_manifest_bytes` | Bytes in each of three fixed buffers: metadata scratch, retained manifest, and manifest upload body. |
-| Background metadata | Two independent clients, for journal and saved-file cleanup. Each reserves `object_store_head_bytes`, `object_store_response_bytes`, request state, 64 fixed 1,024-byte key strings and one reactor descriptor. File traversal state and deduplication entries are charged to checkpoint startup memory. No runtime growth. |
+| Background metadata | Two independent clients, for journal and saved-file cleanup. Each reserves `object_store_head_bytes`, `object_store_response_bytes`, request state and one reactor descriptor. Key strings reserve 1,024 bytes each: 64 for journal cleanup, and `min(checkpoint_garbage_batch_objects, 1000)` for file cleanup. File traversal state and deduplication entries are charged to checkpoint startup memory. No runtime growth. |
 | `checkpoint_write_entries` | Committed versions retained by one table output schedule; SQLSTATE 54000 names exhaustion before publication. |
 | `commit_queue_slots` | Complete transaction and session-context buffers retained through asynchronous publication; at least 1 in object-store mode. |
 

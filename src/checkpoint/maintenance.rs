@@ -11,7 +11,7 @@ use crate::sql::eval::{SqlError, sqlstate};
 use crate::sql_err;
 use crate::util::StackStr;
 
-pub(super) const PAGE_KEYS: usize = 64;
+pub(super) const JOURNAL_PAGE_KEYS: usize = 64;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -65,10 +65,10 @@ pub(super) struct MetadataIo {
 }
 
 impl MetadataIo {
-    pub(super) fn budget_bytes(config: &Config) -> usize {
+    pub(super) fn budget_bytes(config: &Config, page_keys: usize) -> usize {
         Client::budget_bytes(config)
             + Self::state_budget_bytes()
-            + PAGE_KEYS * core::mem::size_of::<StackStr<MAX_OBJECT_KEY_BYTES>>()
+            + page_keys * core::mem::size_of::<StackStr<MAX_OBJECT_KEY_BYTES>>()
     }
 
     fn state_budget_bytes() -> usize {
@@ -88,7 +88,13 @@ impl MetadataIo {
     pub(super) fn new(
         config: &Config,
         budget: &mut Budget,
+        page_keys: usize,
     ) -> Result<Self, super::CheckpointSetupError> {
+        if !(1..=crate::object_store::MAX_LIST_PAGE_KEYS).contains(&page_keys) {
+            return Err(super::CheckpointSetupError::ObjectStore(
+                "maintenance page capacity must be between 1 and 1000 keys".to_owned(),
+            ));
+        }
         budget
             .draw(Self::state_budget_bytes(), "maintenance request state")
             .map_err(super::CheckpointSetupError::Budget)?;
@@ -98,7 +104,7 @@ impl MetadataIo {
         Ok(Self {
             client,
             state: State::Idle,
-            keys: FixedVec::new(budget, "maintenance page keys", PAGE_KEYS)
+            keys: FixedVec::new(budget, "maintenance page keys", page_keys)
                 .map_err(super::CheckpointSetupError::Budget)?,
             admission: crate::object_store::RequestAdmission::Open,
             #[cfg(feature = "checkpoint-profile")]
@@ -170,6 +176,10 @@ impl MetadataIo {
         }
     }
 
+    pub(super) fn page_keys(&self) -> usize {
+        self.keys.capacity()
+    }
+
     pub(super) fn list(
         &mut self,
         prefix: &str,
@@ -177,7 +187,7 @@ impl MetadataIo {
         limit: usize,
         mut each: impl FnMut(&str),
     ) -> Result<Poll<Option<ListCursor>>, SqlError> {
-        if limit == 0 || limit > PAGE_KEYS {
+        if limit == 0 || limit > self.keys.capacity() {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "maintenance list page exceeds its fixed key capacity"
@@ -328,8 +338,8 @@ pub(super) mod tests {
         config.object_store_prefix = "db space/".to_owned();
         config.object_store_access_key = "test-access".to_owned();
         config.object_store_secret_key = "test-secret".to_owned();
-        let mut budget = Budget::new(MetadataIo::budget_bytes(&config));
-        let io = MetadataIo::new(&config, &mut budget).unwrap();
+        let mut budget = Budget::new(MetadataIo::budget_bytes(&config, JOURNAL_PAGE_KEYS));
+        let io = MetadataIo::new(&config, &mut budget, JOURNAL_PAGE_KEYS).unwrap();
         assert_eq!(budget.remaining(), 0);
         (io, listener)
     }
@@ -381,9 +391,25 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn maintenance_metadata_invalid_page_reservations_fail_before_drawing_budget() {
+        let config = Config::default_dev();
+        for page_keys in [0, crate::object_store::MAX_LIST_PAGE_KEYS + 1] {
+            let mut budget = Budget::new(0);
+            let error = MetadataIo::new(&config, &mut budget, page_keys)
+                .err()
+                .expect("invalid page reservation");
+            assert!(matches!(
+                error,
+                super::super::CheckpointSetupError::ObjectStore(_)
+            ));
+            assert_eq!(budget.remaining(), 0);
+        }
+    }
+
+    #[test]
     fn maintenance_metadata_page_limits_fail_before_request_admission() {
         let (mut io, listener) = network();
-        for limit in [0, PAGE_KEYS + 1] {
+        for limit in [0, JOURNAL_PAGE_KEYS + 1] {
             let error = crate::mem::guard::forbid_alloc(|| {
                 io.list("blocks/", ListCursor::START, limit, |_| {
                     panic!("invalid page cannot publish keys")
@@ -407,7 +433,7 @@ pub(super) mod tests {
             crate::mem::guard::forbid_alloc(|| io.list(
                 "commits/",
                 ListCursor::START,
-                PAGE_KEYS,
+                JOURNAL_PAGE_KEYS,
                 |_| panic!("unfinished page")
             ))
             .unwrap()
@@ -432,16 +458,19 @@ pub(super) mod tests {
         crate::mem::guard::forbid_alloc(|| io.advance(Instant::now()));
         assert!(!io.ready());
         assert!(
-            io.list("commits/", ListCursor::START, PAGE_KEYS, |_| panic!(
-                "partial page"
-            ))
+            io.list(
+                "commits/",
+                ListCursor::START,
+                JOURNAL_PAGE_KEYS,
+                |_| panic!("partial page")
+            )
             .unwrap()
             .is_pending()
         );
         stream.write_all(&body.as_bytes()[30..]).unwrap();
         finish(&mut io);
         let Poll::Ready(Some(cursor)) = io
-            .list("commits/", ListCursor::START, PAGE_KEYS, |key| {
+            .list("commits/", ListCursor::START, JOURNAL_PAGE_KEYS, |key| {
                 observed.push(key.to_owned())
             })
             .unwrap()
@@ -453,7 +482,7 @@ pub(super) mod tests {
         assert_eq!(cursor.after.as_str(), "commits/a.head");
         assert!(!io.busy());
         assert!(
-            io.list("commits/", cursor, PAGE_KEYS, |_| panic!(
+            io.list("commits/", cursor, JOURNAL_PAGE_KEYS, |_| panic!(
                 "unfinished second page"
             ))
             .unwrap()
@@ -481,10 +510,15 @@ pub(super) mod tests {
         finish(&mut io);
         let mut count = 0;
         assert_eq!(
-            crate::mem::guard::forbid_alloc(|| io.list("commits/", cursor, PAGE_KEYS, |key| {
-                assert_eq!(key, "commits/b.batch");
-                count += 1;
-            }))
+            crate::mem::guard::forbid_alloc(|| io.list(
+                "commits/",
+                cursor,
+                JOURNAL_PAGE_KEYS,
+                |key| {
+                    assert_eq!(key, "commits/b.batch");
+                    count += 1;
+                }
+            ))
             .unwrap(),
             Poll::Ready(None)
         );

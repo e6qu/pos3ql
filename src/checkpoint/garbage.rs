@@ -199,7 +199,7 @@ impl Checkpointer {
                 let mut invalid = false;
                 let Poll::Ready(next) =
                     self.file_io
-                        .list("backups/", cursor, maintenance::PAGE_KEYS, |key| {
+                        .list("backups/", cursor, self.file_io.page_keys(), |key| {
                             let Some(name) = key
                                 .strip_prefix("backups/")
                                 .and_then(|rest| rest.strip_suffix("/manifest"))
@@ -358,7 +358,7 @@ impl Checkpointer {
             FileGcProgress::List { cursor } => {
                 let keep = &self.roster_scratch;
                 let doomed = &mut self.doomed_blocks;
-                let limit = maintenance::PAGE_KEYS.min(doomed.capacity());
+                let limit = self.file_io.page_keys().min(doomed.capacity());
                 let mut invalid = false;
                 let Poll::Ready(next) = self.file_io.list("blocks/", cursor, limit, |key| {
                     let Some(id) = key

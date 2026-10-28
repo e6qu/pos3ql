@@ -177,11 +177,11 @@ cleanup() {
     wait "$S3_TEST_PID" 2>/dev/null || true
   fi
   release_test_ports
-  if [[ $FAIL -ne 0 && -n "${POS3QL_FAILURE_ARTIFACTS:-}" ]]; then
-    mkdir -p "$POS3QL_FAILURE_ARTIFACTS"
+  if [[ -n "${POS3QL_TEST_ARTIFACTS:-}" ]]; then
+    mkdir -p "$POS3QL_TEST_ARTIFACTS"
     cp "$WORK/server.log" "$WORK/torture.out" "$WORK/object-audit.jsonl" \
-      "$POS3QL_FAILURE_ARTIFACTS/"
-    cp -R "$WORK/object-store" "$POS3QL_FAILURE_ARTIFACTS/"
+      "$POS3QL_TEST_ARTIFACTS/"
+    cp -R "$WORK/object-store" "$POS3QL_TEST_ARTIFACTS/"
   fi
   if [[ "$KEEP" == "--keep" ]]; then
     printf 'work dir kept: %s\n' "$WORK"
@@ -205,6 +205,7 @@ python3 "$EXT/s3_test_server.py" --root "$WORK/object-store" --port "$S3_TEST_PO
   --credentials-file "$SERVER_CREDENTIALS_FILE" --page-size 7 \
   --writer-probe-gate-file "$WRITER_PROBE_GATE_FILE" \
   --audit-file "$WORK/object-audit.jsonl" \
+  --latency-ms "${POS3QL_TEST_S3_LATENCY_MS:-0}" \
   > "$WORK/object-store.log" 2>&1 &
 S3_TEST_PID=$!
 for _ in {1..50}; do

@@ -42,14 +42,20 @@ jobs:
           POS3QL_REFERENCE_PG_PORT: "5432"
           POS3QL_TORTURE_ROUNDS: "6"
           POS3QL_TORTURE_SEED: ${{ matrix.seed }}
-          COVERAGE_SHARD: runtest:torture
-          POS3QL_FAILURE_ARTIFACTS: ${{ runner.temp }}/crash-failure
-        run: sh tools/coverage.sh
+        run: |
+          set -eu
+          cargo build --release --locked
+          for latency in 0 1 5; do
+            POS3QL_TEST_ARTIFACTS="$RUNNER_TEMP/crash-investigation/latency-$latency" \
+            POS3QL_TEST_S3_LATENCY_MS="$latency" \
+            POS3QL_RUN_GROUPS=torture POS3QL_BIN="$PWD/target/release/pos3ql" \
+              bash tests/external/run.sh
+          done
       - uses: actions/upload-artifact@v6
-        if: failure()
+        if: always()
         with:
-          name: crash-failure-${{ matrix.name }}
-          path: ${{ runner.temp }}/crash-failure/
-          if-no-files-found: error
+          name: crash-investigation
+          path: ${{ runner.temp }}/crash-investigation/
+          if-no-files-found: warn
           retention-days: 7
 

@@ -930,10 +930,21 @@ impl S3Client {
     ) -> Result<Option<ListCursor>, S3Error> {
         let xml = core::str::from_utf8(self.body.readable())
             .map_err(|_| S3Error::Protocol("list response is not UTF-8"))?;
+        if !xml.trim_end().ends_with("</ListBucketResult>")
+            || xml.matches("<IsTruncated>").count() != 1
+            || xml.matches("</IsTruncated>").count() != 1
+            || xml.matches("<Key>").count() != xml.matches("</Key>").count()
+            || xml.matches("<NextContinuationToken>").count() > 1
+            || xml.matches("<NextContinuationToken>").count()
+                != xml.matches("</NextContinuationToken>").count()
+        {
+            return Err(S3Error::Protocol("malformed list page"));
+        }
         let truncated = match extract_xml_text(xml, "IsTruncated") {
             Some("true") => true,
             Some("false") => false,
-            _ => return Err(S3Error::Protocol("invalid or missing IsTruncated")),
+            Some(_) => return Err(S3Error::Protocol("invalid IsTruncated value")),
+            None => return Err(S3Error::Protocol("list response missing IsTruncated")),
         };
         let token = extract_xml_text(xml, "NextContinuationToken")
             .map(decode_xml_text::<1024>)
@@ -1068,58 +1079,28 @@ impl S3Client {
                 Precondition::None,
                 None,
             )?;
-            let xml = core::str::from_utf8(self.body.readable())
-                .map_err(|_| S3Error::Protocol("list response is not UTF-8"))?;
-            let truncated = match extract_xml_text(xml, "IsTruncated") {
-                Some("true") => true,
-                Some("false") => false,
-                Some(_) => return Err(S3Error::Protocol("invalid IsTruncated value")),
-                None => return Err(S3Error::Protocol("list response missing IsTruncated")),
-            };
-            let next = extract_xml_text(xml, "NextContinuationToken")
-                .map(decode_xml_text::<1024>)
-                .transpose()?;
-            let mut rest = xml;
-            while let Some(encoded_key) = extract_xml_text(rest, "Key") {
-                let key = percent_decode::<MAX_OBJECT_KEY_BYTES>(encoded_key)?;
-                let logical = key
-                    .as_str()
-                    .strip_prefix(self.key_prefix.as_str())
-                    .ok_or(S3Error::Protocol("listed key outside configured prefix"))?;
-                if !logical.starts_with(prefix) {
-                    return Err(S3Error::Protocol("listed key outside requested prefix"));
-                }
-                if last_key
-                    .as_ref()
-                    .is_some_and(|previous| logical <= previous.as_str())
-                {
-                    return Err(S3Error::Protocol("listed keys are not strictly ordered"));
-                }
-                if limit.is_some_and(|limit| count == limit) {
-                    return Ok(count);
-                }
-                each(logical);
-                last_key = Some(StackStr::from_str(logical));
-                count += 1;
-                let after = rest
-                    .find("</Key>")
-                    .ok_or(S3Error::Protocol("unterminated list key"))?
-                    + 6;
-                rest = &rest[after..];
-            }
+            let page_limit =
+                limit.map_or(LIST_MAX_KEYS, |limit| (limit - count).min(LIST_MAX_KEYS));
+            let next = self.visit_list_page(
+                prefix,
+                ListCursor {
+                    token: continuation,
+                    after: last_key.unwrap_or(StackStr::new()),
+                },
+                page_limit,
+                |key| {
+                    each(key);
+                    count += 1;
+                },
+            )?;
             if limit.is_some_and(|limit| count == limit) {
                 return Ok(count);
             }
-            if !truncated {
+            let Some(next) = next else {
                 return Ok(count);
-            }
-            let next = next.ok_or(S3Error::Protocol(
-                "truncated list without continuation token",
-            ))?;
-            if continuation.as_ref() == Some(&next) {
-                return Err(S3Error::Protocol("list continuation token did not advance"));
-            }
-            continuation = Some(next);
+            };
+            last_key = Some(next.after);
+            continuation = next.token;
         }
     }
 
@@ -2305,6 +2286,48 @@ mod tests {
                 .unwrap()
                 .as_str(),
             "page&/two"
+        );
+    }
+
+    #[test]
+    fn maintenance_metadata_list_pages_validate_before_callbacks() {
+        let config = test_config(1);
+        let mut budget = Budget::new(S3Client::budget_bytes(&config));
+        let mut client = S3Client::new(&config, &mut budget).unwrap();
+        for body in [
+            "<ListBucketResult><IsTruncated>false</IsTruncated><Key>p/b</Key><Key>p/a</Key></ListBucketResult>",
+            "<ListBucketResult><IsTruncated>false</IsTruncated><Key>p/a</Key><Key>outside/b</Key></ListBucketResult>",
+            "<ListBucketResult><IsTruncated>false</IsTruncated><Key>p/a</Key><Key>p/%GG</Key></ListBucketResult>",
+            "<ListBucketResult><IsTruncated>false</IsTruncated><Key>p/a</Key><Key>p/b</Key></ListBucketResult>",
+            "<ListBucketResult><IsTruncated>false</IsTruncated><Key>p/a</Key><Key>p/b</ListBucketResult>",
+            "<ListBucketResult><IsTruncated>false</IsTruncated><IsTruncated>true</IsTruncated><Key>p/a</Key></ListBucketResult>",
+            "<ListBucketResult><IsTruncated>true</IsTruncated><Key>p/a</Key></ListBucketResult>",
+            "<ListBucketResult><IsTruncated>true</IsTruncated><NextContinuationToken></NextContinuationToken><Key>p/a</Key></ListBucketResult>",
+            "<ListBucketResult><IsTruncated>false</IsTruncated><Key>p/a</Key>",
+        ] {
+            client.body.clear();
+            assert!(client.body.append(body.as_bytes()));
+            let error = crate::mem::guard::forbid_alloc(|| {
+                client.visit_list_page("p/", ListCursor::START, 1, |_| {
+                    panic!("invalid page emitted a key")
+                })
+            });
+            assert!(error.is_err(), "{body}");
+        }
+        client.body.clear();
+        assert!(client.body.append(b"<ListBucketResult><IsTruncated>true</IsTruncated><NextContinuationToken>same</NextContinuationToken><Key>p/b</Key></ListBucketResult>"));
+        let cursor = ListCursor {
+            token: Some(StackStr::from_str("same")),
+            after: StackStr::from_str("p/a"),
+        };
+        assert!(
+            crate::mem::guard::forbid_alloc(|| client.visit_list_page(
+                "p/",
+                cursor,
+                1,
+                |_| panic!("repeated cursor emitted a key")
+            ))
+            .is_err()
         );
     }
 

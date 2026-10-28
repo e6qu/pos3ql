@@ -92,16 +92,24 @@ diff_driver partition-move partition_move_probe
 
 # --- pgJDBC (Java) ---------------------------------------------------------
 JDBC_VER=42.7.4
-JAR="$WORK/postgresql-$JDBC_VER.jar"
+JDBC_SHA256=188976721ead8e8627eb6d8389d500dccc0c9bebd885268a3047180274a6031e
+JDBC_URL="https://repo.maven.apache.org/maven2/org/postgresql/postgresql/$JDBC_VER/postgresql-$JDBC_VER.jar"
+JAR="$DRV/.artifacts/postgresql-$JDBC_VER.jar"
+verify_jdbc() {
+  printf '%s  %s\n' "$JDBC_SHA256" "$1" | shasum -a 256 --check --status \
+    && jar tf "$1" >/dev/null
+}
 if command -v javac >/dev/null; then
-  # A failed Maven response used to be treated as a Java classpath entry,
-  # making two different "No suitable driver" strings look like a protocol
-  # mismatch. Retry the one canonical artifact URL, then verify the archive
-  # before declaring the mandatory driver check runnable.
-  if curl --fail --silent --show-error --location --retry 2 --retry-all-errors \
-      --connect-timeout 10 --max-time 30 -o "$JAR" \
-      "https://repo1.maven.org/maven2/org/postgresql/postgresql/$JDBC_VER/postgresql-$JDBC_VER.jar" \
-      && jar tf "$JAR" >/dev/null; then
+  # Publish only verified bytes to the CI cache; every restored artifact is
+  # checked again. Failed responses never become Java classpath entries.
+  if [[ ! -e "$JAR" ]]; then
+    if curl --fail --silent --show-error --location --retry 2 --retry-all-errors \
+        --connect-timeout 10 --max-time 30 -o "$WORK/jdbc.jar" "$JDBC_URL" \
+        && verify_jdbc "$WORK/jdbc.jar"; then
+      mkdir -p "$DRV/.artifacts" && mv "$WORK/jdbc.jar" "$JAR"
+    fi
+  fi
+  if [[ -f "$JAR" ]] && verify_jdbc "$JAR"; then
     if javac -cp "$JAR" -d "$WORK" "$DRV/JdbcTest.java"; then
       jdbc() { java -cp "$WORK:$JAR" JdbcTest "$2" "$3" > "$1" 2>&1; }
       diff_driver jdbc jdbc

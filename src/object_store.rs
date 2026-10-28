@@ -584,7 +584,7 @@ impl Client {
                     each(key);
                 })?;
                 Ok((count == limit).then_some(ListCursor {
-                    token: Some(StackStr::from_str("simulated-page")),
+                    token: Some(after),
                     after,
                 }))
             }

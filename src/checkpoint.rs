@@ -1184,6 +1184,28 @@ enum CommitPruneProgress {
     },
 }
 
+/// Only names emitted by the journal writer can enter the fixed deletion queue.
+fn commit_object_identity(key: &str) -> Option<CommitBatchId> {
+    let name = key.strip_prefix("commits/")?;
+    let stem = name
+        .strip_suffix(".head")
+        .or_else(|| name.strip_suffix(".batch"))?;
+    let bytes = stem.as_bytes();
+    if bytes.len() != 29
+        || bytes[20] != b'-'
+        || !bytes[..20].iter().all(u8::is_ascii_digit)
+        || !bytes[21..]
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+    {
+        return None;
+    }
+    Some(CommitBatchId {
+        first_lsn: stem[..20].parse().ok()?,
+        digest: u32::from_str_radix(&stem[21..], 16).ok()?,
+    })
+}
+
 /// Restores the caller's mode after errors and nested atomic execution.
 #[must_use]
 pub(crate) struct AtomicBlockReadScope {
@@ -3623,6 +3645,8 @@ impl Checkpointer {
                 if let Some(cursor) = next {
                     self.commit_prune = CommitPruneProgress::Backups { cursor };
                 } else {
+                    self.backup_scratch
+                        .sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
                     self.backup_roster_loaded = true;
                     if self.backup_scratch.is_empty() {
                         self.begin_prune_boundary(up_to_lsn, None);
@@ -3702,26 +3726,12 @@ impl Checkpointer {
                 boundary,
                 cursor,
             } => {
-                let boundary_name = boundary
-                    .map(|batch| stack_format!(64, "{:020}-{:08x}", batch.first_lsn, batch.digest));
                 let mut overflow = false;
                 let doomed = &mut self.garbage_scratch;
                 let Poll::Ready(next) = self.metadata_io.list("commits/", cursor, |key| {
-                    let stem = key.strip_prefix("commits/").and_then(|name| {
-                        name.strip_suffix(".batch")
-                            .or_else(|| name.strip_suffix(".head"))
+                    let is_doomed = commit_object_identity(key).is_some_and(|identity| {
+                        identity.first_lsn <= floor && Some(identity) != boundary
                     });
-                    let is_doomed = stem
-                        .and_then(|stem| stem.split_once('-').map(|(first, _)| (stem, first)))
-                        .and_then(|(stem, first)| {
-                            first.parse::<u64>().ok().map(|first| (stem, first))
-                        })
-                        .is_some_and(|(stem, first)| {
-                            first <= floor
-                                && boundary_name
-                                    .as_ref()
-                                    .is_none_or(|boundary| stem != boundary.as_str())
-                        });
                     if is_doomed {
                         if doomed.len() < doomed.capacity() {
                             doomed.push(stack_format!(64, "{}", key));
@@ -9442,6 +9452,12 @@ impl Checkpointer {
     /// Explicit `CHECKPOINT` and shutdown use this after applying their local
     /// publication transition; ordinary event-loop beats use the paced path.
     pub(crate) fn finish_maintenance(&mut self, storage: &Storage) -> Result<(), SqlError> {
+        if self.credential_install_pending() {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_IO_WAIT,
+                "maintenance waits for validated credential installation"
+            ));
+        }
         self.observe_retained_root_release(storage);
         while self.published_lsn_pending_maintenance.is_some() {
             self.metadata_io.wait_ready()?;
@@ -20221,6 +20237,236 @@ mod stored_dependency_tests {
             assert!(blocks.lock().unwrap().async_gets_enabled());
         });
         crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    }
+
+    #[test]
+    fn maintenance_metadata_pruning_pages_backups_and_retains_the_oldest_required_commit() {
+        let mut config = Config::default_dev();
+        config.object_store_on = true;
+        config.object_store_sim = true;
+        config.object_store_bucket = format!("metadata-prune-pages-{}", std::process::id());
+        config.data_dir = std::env::temp_dir()
+            .join(&config.object_store_bucket)
+            .to_str()
+            .unwrap()
+            .to_owned();
+        config.remove_test_data_dir_on_drop();
+        config.max_backups = 70;
+        config.checkpoint_garbage_batch_objects = 3;
+        config.checkpoint_delete_objects_per_beat = 2;
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        let namespace = crate::object_store::sim::open_namespace(&config.object_store_bucket, 0);
+        let mut budget = Budget::new(Checkpointer::budget_bytes(&config));
+        let mut checkpointer = Checkpointer::new(&config, &mut budget).unwrap();
+        let mut batches = Vec::new();
+        for first in 1..=9 {
+            checkpointer
+                .publish_commit_batch(first, b"opaque committed bytes")
+                .unwrap();
+            batches.push(checkpointer.commit_head.unwrap());
+        }
+        for index in 0..70 {
+            let prepared = if index == 69 {
+                "ptx 7 5 50 0 5 10 78\n"
+            } else {
+                ""
+            };
+            let manifest = format!(
+                "{MANIFEST_HEADER}\nlsn 8\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\n{prepared}types_end\nend\n"
+            );
+            for (suffix, bytes) in [
+                ("manifest", manifest.as_bytes()),
+                ("complete", b"receipt".as_slice()),
+                ("commit-head", b"head".as_slice()),
+            ] {
+                checkpointer
+                    .client
+                    .put(
+                        &format!("backups/b{index:02}/{suffix}"),
+                        bytes,
+                        Precondition::IfNoneMatchAny,
+                    )
+                    .unwrap();
+            }
+        }
+        let lookalike = format!("commits/{:020}-{}.batch", 0, "a".repeat(80));
+        checkpointer
+            .client
+            .put(
+                &lookalike,
+                b"not a writer-generated journal name",
+                Precondition::IfNoneMatchAny,
+            )
+            .unwrap();
+        assert!(!checkpointer.prune_commit_batch(8).unwrap());
+        let cursor = match checkpointer.commit_prune {
+            CommitPruneProgress::Backups { cursor } => cursor,
+            _ => panic!("backup inventory must span several bounded pages"),
+        };
+        let names = checkpointer.backup_scratch.len();
+        assert!(names > 0 && names < 70);
+        namespace.borrow_mut().faults.fail_from_op = Some(0);
+        assert_eq!(
+            crate::mem::guard::forbid_alloc(|| checkpointer.prune_commit_batch(8))
+                .unwrap_err()
+                .sqlstate,
+            sqlstate::IO_ERROR
+        );
+        assert_eq!(checkpointer.backup_scratch.len(), names);
+        assert!(matches!(checkpointer.commit_prune,
+            CommitPruneProgress::Backups { cursor: retained } if retained == cursor));
+        namespace.borrow_mut().faults.fail_from_op = None;
+        for turn in 0..80 {
+            if matches!(
+                checkpointer.commit_prune,
+                CommitPruneProgress::FindBoundary { floor: 4, .. }
+            ) {
+                break;
+            }
+            let before = namespace.borrow().op_count;
+            assert!(
+                !crate::mem::guard::forbid_alloc(|| checkpointer.prune_commit_batch(8)).unwrap()
+            );
+            assert!(
+                namespace.borrow().op_count - before <= 1,
+                "turn {turn} exceeded one metadata read"
+            );
+        }
+        assert_eq!(checkpointer.backup_scratch.len(), 70);
+        assert!(matches!(
+            checkpointer.commit_prune,
+            CommitPruneProgress::FindBoundary { floor: 4, .. }
+        ));
+        let mut complete = false;
+        for _ in 0..80 {
+            complete =
+                crate::mem::guard::forbid_alloc(|| checkpointer.prune_commit_batch(8)).unwrap();
+            if complete {
+                break;
+            }
+        }
+        assert!(complete);
+        for batch in batches {
+            for suffix in ["head", "batch"] {
+                let key = format!(
+                    "{}commits/{:020}-{:08x}.{suffix}",
+                    config.object_store_prefix, batch.first_lsn, batch.digest
+                );
+                assert_eq!(
+                    namespace.borrow().object_bytes(&key).is_some(),
+                    batch.first_lsn >= 4
+                );
+            }
+        }
+        assert!(
+            namespace
+                .borrow()
+                .object_bytes(&format!("{}{lookalike}", config.object_store_prefix))
+                .is_some()
+        );
+        drop(checkpointer);
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    }
+
+    #[test]
+    fn maintenance_metadata_backup_capacity_and_changes_restart_retention_safely() {
+        let mut config = Config::default_dev();
+        config.object_store_on = true;
+        config.object_store_sim = true;
+        config.max_backups = 2;
+        config.object_store_bucket = format!("metadata-backup-limit-{}", std::process::id());
+        config.data_dir = std::env::temp_dir()
+            .join(&config.object_store_bucket)
+            .to_str()
+            .unwrap()
+            .to_owned();
+        config.remove_test_data_dir_on_drop();
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        let mut budget = Budget::new(Checkpointer::budget_bytes(&config));
+        let mut checkpointer = Checkpointer::new(&config, &mut budget).unwrap();
+        for (name, floor) in [("a", 3), ("a-", 4), ("old", 1)] {
+            let manifest = format!(
+                "{MANIFEST_HEADER}\nlsn {floor}\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\ntypes_end\nend\n"
+            );
+            checkpointer
+                .client
+                .put(
+                    &format!("backups/{name}/manifest"),
+                    manifest.as_bytes(),
+                    Precondition::IfNoneMatchAny,
+                )
+                .unwrap();
+        }
+        let error =
+            crate::mem::guard::forbid_alloc(|| checkpointer.prune_commit_batch(8)).unwrap_err();
+        assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+        assert!(error.message.as_str().contains("max_backups (2)"));
+        assert!(!checkpointer.backup_roster_loaded);
+        assert!(checkpointer.backup_scratch.is_empty());
+        assert!(checkpointer.garbage_scratch.is_empty());
+        assert!(checkpointer.delete_backup("old").unwrap());
+        assert!(!checkpointer.prune_commit_batch(8).unwrap());
+        assert_eq!(
+            checkpointer
+                .backup_scratch
+                .iter()
+                .map(StackStr::as_str)
+                .collect::<Vec<_>>(),
+            ["a", "a-"]
+        );
+        assert!(matches!(
+            checkpointer.commit_prune,
+            CommitPruneProgress::BackupFloors {
+                index: 0,
+                oldest: None
+            }
+        ));
+        assert!(!checkpointer.prune_commit_batch(8).unwrap());
+        assert!(matches!(
+            checkpointer.commit_prune,
+            CommitPruneProgress::BackupFloors {
+                index: 1,
+                oldest: Some(3)
+            }
+        ));
+        assert!(checkpointer.delete_backup("a").unwrap());
+        assert!(matches!(
+            checkpointer.commit_prune,
+            CommitPruneProgress::Unloaded
+        ));
+        assert!(!checkpointer.backup_roster_loaded);
+        assert!(!checkpointer.prune_commit_batch(8).unwrap());
+        assert!(!checkpointer.prune_commit_batch(8).unwrap());
+        assert!(matches!(
+            checkpointer.commit_prune,
+            CommitPruneProgress::FindBoundary { floor: 4, .. }
+        ));
+        drop(checkpointer);
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    }
+
+    #[test]
+    fn maintenance_metadata_commit_names_reject_truncation_and_noncanonical_identifiers() {
+        crate::mem::guard::forbid_alloc(|| {
+            assert_eq!(
+                commit_object_identity("commits/00000000000000000004-abcdef01.batch"),
+                Some(CommitBatchId {
+                    first_lsn: 4,
+                    digest: 0xabcdef01
+                })
+            );
+            for key in [
+                "commits/4-abcdef01.batch",
+                "commits/00000000000000000004-ABCDEF01.head",
+                "commits/000000000000000000004-abcdef01.batch",
+                "commits/00000000000000000004-abcdef01.batch.extra",
+                "commits/18446744073709551616-abcdef01.head",
+                "commits/é0000000000000000004-abcdef01.head",
+                "other/00000000000000000004-abcdef01.batch",
+            ] {
+                assert!(commit_object_identity(key).is_none(), "{key}");
+            }
+        });
     }
 
     #[test]

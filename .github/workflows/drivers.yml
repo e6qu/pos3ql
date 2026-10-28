@@ -7,7 +7,7 @@ name: Drivers
 
 on:
   push:
-    branches: [main]
+    branches: [main, catalog-reader-consistency]
   pull_request:
 
 concurrency:
@@ -76,6 +76,12 @@ jobs:
         with:
           distribution: temurin
           java-version: "21"
+
+      - name: Cache the verified PostgreSQL JDBC artifact
+        uses: actions/cache@v5
+        with:
+          path: tests/external/drivers/.artifacts/postgresql-42.7.4.jar
+          key: pgjdbc-42.7.4-188976721ead8e8627eb6d8389d500dccc0c9bebd885268a3047180274a6031e
 
       - uses: actions/setup-go@v6
         with:

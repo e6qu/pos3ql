@@ -103,6 +103,13 @@ include them in commits, PR bodies, logs, or retained evidence.
 
 ## Verification
 
+The driver gate pins pgJDBC 42.7.4 from [Maven Central](https://repo.maven.apache.org/maven2/org/postgresql/postgresql/42.7.4/).
+Its SHA-256 is `188976721ead8e8627eb6d8389d500dccc0c9bebd885268a3047180274a6031e`
+(artifact retrieved 2026-10-28; the repository's SHA-1 is
+`264310fd7b2cd76738787dc0b9f7ea2e3b11adc1`). The script verifies the checksum
+and jar structure on fresh downloads and CI cache restores. Keep the version,
+checksum, source and cache key together when changing this fixture dependency.
+
 Use the existing fixtures and allocation guard for changed runtime behavior.
 Verify the invariant or external contract, not a test that merely restates the
 implementation. Boundary changes generally need accepted/rejected capacity,

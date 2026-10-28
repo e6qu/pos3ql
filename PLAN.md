@@ -49,14 +49,14 @@ an object for current use. After `orders` becomes `sales`, an older report can
 still list `orders` while `to_regclass('sales')` resolves the current name.
 Freezing all lookups at the report's position would be incorrect.
 
-Acceptance: every confirmed transaction reappears as a whole after recovery.
-Reusing a name or slot never redirects an old reader to replacement data;
-cleanup respects readers and backups. Cover
-rollback, savepoints, prepared transactions, conflicting membership waits,
-declared versus inherited trigger execution, fixed-capacity exhaustion and
-recovery after deleting local caches. Reject corrupt or stale restored state
-before writer promotion. Resumption preserves effects once, including triggers
-and issued sequence values. Lost commit replies resolve to all changes or none.
+Acceptance: while reads, schema edits, publication and maintenance overlap,
+readers keep their selected objects and values, and new reads see whole commits.
+Reusing a name or slot never redirects a reader to replacement data. Cleanup
+respects readers and backups. Preserve the existing rollback, savepoint,
+prepared-transaction, capacity and empty-cache recovery checks throughout this
+conversion. Corrupt or stale restored state must fail before writer promotion.
+Resumption preserves effects once, including triggers and issued sequence values.
+Lost commit replies resolve to all changes or none.
 
 ### Run independent SQL commands on several CPU workers
 

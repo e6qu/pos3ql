@@ -94,8 +94,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { name: a, seed: 20260723 }
-          - { name: b, seed: 20260725 }
+          - { name: a, seed: 20260723, storage_delays_ms: "0" }
+          - { name: b, seed: 20260725, storage_delays_ms: "0 1 5" }
     services:
       postgres:
         image: mirror.gcr.io/library/postgres:18@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336
@@ -122,8 +122,23 @@ jobs:
           POS3QL_REFERENCE_PG_PORT: "5432"
           POS3QL_TORTURE_ROUNDS: "6"
           POS3QL_TORTURE_SEED: ${{ matrix.seed }}
-          COVERAGE_SHARD: runtest:torture
-        run: sh tools/coverage.sh
+          POS3QL_TORTURE_STORAGE_DELAYS_MS: ${{ matrix.storage_delays_ms }}
+        run: |
+          set -eu
+          cargo build --release --locked
+          for latency in $POS3QL_TORTURE_STORAGE_DELAYS_MS; do
+            POS3QL_TEST_ARTIFACTS="$RUNNER_TEMP/crash-failure/latency-$latency" \
+            POS3QL_TEST_S3_LATENCY_MS="$latency" \
+            POS3QL_RUN_GROUPS=torture POS3QL_BIN="$PWD/target/release/pos3ql" \
+              bash tests/external/run.sh
+          done
+      - uses: actions/upload-artifact@v6
+        if: failure()
+        with:
+          name: crash-failure-${{ matrix.name }}
+          path: ${{ runner.temp }}/crash-failure/
+          if-no-files-found: error
+          retention-days: 7
 
   subscription:
     name: shard subscription

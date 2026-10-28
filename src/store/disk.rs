@@ -174,7 +174,7 @@ impl<S: BlockStore> DiskCache<S> {
         let slot = self.claim_slot();
         if self
             .file
-            .write_at(&self.scratch[..n], (slot * SLOT_SIZE) as u64)
+            .write_all_at(&self.scratch[..n], (slot * SLOT_SIZE) as u64)
             .is_err()
         {
             // The slot is left empty; nothing points at a half-written block.

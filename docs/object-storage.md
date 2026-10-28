@@ -94,6 +94,40 @@ Metadata capture and other atomic maintenance reads can still wait
 synchronously. Rows larger than one block use bounded overflow chains in the
 same generation; reading such a row requires its complete chain.
 
+Background journal cleanup has a separate startup-reserved metadata client.
+Backup and commit listings visit at most 64 keys per response, retaining the
+provider's continuation token and checking key order. One turn reads at most one
+backup manifest or commit-chain descriptor, or deletes the configured batch of
+obsolete journal objects. Waiting for any of these responses releases the SQL
+worker, including when foreground block reads or commit uploads are active.
+Checkpoints can publish and free row-cache space while journal cleanup waits.
+The two tasks have separate startup-reserved backup lists and deletion queues.
+Each journal pass stops at its captured cutoff; new commits cannot extend that
+pass indefinitely. Later checkpoints queue the latest requested cutoff, while
+a more conservative retention decision cancels the pending deletion work.
+Journal and physical-file cleanup share the configured per-turn deletion limit,
+including when releasing a reader makes another file-cleanup pass necessary.
+If a checkpoint has already written new files, a finishing reader queues file
+cleanup until that checkpoint publishes. Its unfinished files remain owned;
+they are not abandoned objects that cleanup may delete.
+Every physical output batch records whether it belongs to a table, merge,
+index preparation or index writer. Changing producers requires the previous
+batch to finish. An index task ending without output cannot cause a later
+merge's files to be discarded as obsolete index work. The manifest waits for
+all required immutable uploads before publication.
+Cleanup retains installed table files and active merge inputs even when a
+different captured file list has published. It validates each saved row-file
+inventory's block type and length before using it to decide what to delete.
+
+**User example:** a slow response while deleting last week's obsolete journal
+must not delay reading a cached order or saving new orders to free cache space.
+Cleanup retains its exact request and
+position. A failed deletion does not advance that position; retrying the same
+DELETE is safe even if its response was lost. Each request keeps the existing
+30-second deadline. Errors reach waiting checkpoint commands and use the normal
+maintenance retry cadence. Credential installation cancels these repeatable
+requests and resumes the same position with the new credentials.
+
 
 | Setting | Reservation or rejection |
 |---|---|
@@ -104,6 +138,7 @@ same generation; reading such a row requires its complete chain.
 | Credential validation | One conditional upload client with a 128-byte body when `object_store_credentials_file` is configured. The candidate must also read back the result. |
 | Operational ownership check | One fixed client and one receipt slot per `operations_max_connections` when the operational listener and object storage are enabled. Shares the explicit TLS budget. |
 | `checkpoint_manifest_bytes` | Bytes in each of three fixed buffers: metadata scratch, retained manifest, and manifest upload body. |
+| Background metadata | One separate client with `object_store_head_bytes` and `object_store_response_bytes`, request state, 64 fixed 1,024-byte key strings and one reactor descriptor. No runtime growth. |
 | `checkpoint_write_entries` | Committed versions retained by one table output schedule; SQLSTATE 54000 names exhaustion before publication. |
 | `commit_queue_slots` | Complete transaction and session-context buffers retained through asynchronous publication; at least 1 in object-store mode. |
 

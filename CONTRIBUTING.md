@@ -91,6 +91,16 @@ aggregate RSS with a 180-second deadline. Use the workspace's provided resource
 guard for local checks. If it refuses or a limit is reached,
 move the workload to CI; do not bypass the guard or raise limits automatically.
 
+Failed crash-recovery jobs retain `crash-failure-a` or `crash-failure-b` artifacts.
+They include the generated object-store fixture, server and SQL logs, and an
+ordered `object-audit.jsonl` of writes, deletions and recovery roots. The audit
+omits credentials and subscription connection strings. Use these records to
+trace a missing block to its publication and deletion; keep the failing seed
+and request deadlines when fixing it.
+The second crash job builds once and repeats its seed with explicit 0, 1 and
+5 ms object-store delays. Each case keeps its own `latency-N` fixture, so a
+timing-dependent failure can be compared with completed cases from that job.
+
 On a suitable dedicated runner, a focused regression can be selected with:
 
 ```sh
@@ -103,14 +113,27 @@ include them in commits, PR bodies, logs, or retained evidence.
 
 ## Verification
 
+The driver gate pins pgJDBC 42.7.4 from [Maven Central](https://repo.maven.apache.org/maven2/org/postgresql/postgresql/42.7.4/).
+Its SHA-256 is `188976721ead8e8627eb6d8389d500dccc0c9bebd885268a3047180274a6031e`
+(artifact retrieved 2026-10-28; the repository's SHA-1 is
+`264310fd7b2cd76738787dc0b9f7ea2e3b11adc1`). The script verifies the checksum
+and jar structure on fresh downloads and CI cache restores. Keep the version,
+checksum, source and cache key together when changing this fixture dependency.
+
 Use the existing fixtures and allocation guard for changed runtime behavior.
+Set accepted mock sockets' blocking mode explicitly. Wait for socket readiness
+using the original deadline; a mock server reporting a completed write does not
+guarantee that its client can read the bytes yet.
 Verify the invariant or external contract, not a test that merely restates the
 implementation. Boundary changes generally need accepted/rejected capacity,
 rollback, failure cleanup, WAL/checkpoint, and empty-cache recovery coverage.
 SQL and wire behavior needs comparison with actual PostgreSQL, including
 SQLSTATEs, types, result shape, and values. SQLSTATE-only and exact-message
 corpora share the same reference connection settings, including UTC and the
-test extension directory; diagnostic style must not change fixture availability.
+test extension directory. Both capture verbose diagnostics, preserving primary
+messages for failure reports; the normalizer explicitly selects the fields to
+compare. A mismatch prints both raw diagnostic streams. Comparison style must
+not change fixture availability.
 Corpus comparisons echo each sent SQL command and retain its results and command
 tags in stdout. COPY errors retain their command's source position even when
 psql drains input before reporting the error; other diagnostic positions stay

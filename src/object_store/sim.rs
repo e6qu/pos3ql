@@ -3,8 +3,8 @@
 //! VOPR's seam.
 //!
 //! `object_store = sim` routes every object operation here instead of a socket. The
-//! namespace is plain memory shared by every client opened on the same name
-//! (the checkpointer holds two, exactly as it holds two real clients), and
+//! namespace is plain memory shared by every client opened on the same name,
+//! matching the separate request clients that use one real bucket, and
 //! every fault it injects is drawn from a PCG stream, so a failing run
 //! reproduces exactly from its seed. The faults are the ones a real bucket
 //! serves up: transient request failures, the ambiguous PUT that landed but

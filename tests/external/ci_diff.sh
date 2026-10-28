@@ -1446,10 +1446,10 @@ run_corpus() { # host port outfile file diagnostics
   if [[ "$1" == "$PGHOST" && "$2" == "$PGPORT" ]]; then
     PGOPTIONS="-c timezone=UTC -c extension_control_path=$REFERENCE_EXTENSION_CONTROL_ROOT" \
       psql -h "$1" -p "$2" -U "$PGUSER" -d postgres -X -e -P pager=off \
-        -v VERBOSITY="$diagnostics" -f "$4" > "$3.stdout" 2> "$3.stderr" || status=$?
+        -v VERBOSITY=verbose -f "$4" > "$3.stdout" 2> "$3.stderr" || status=$?
   else
     psql -h "$1" -p "$2" -U "$PGUSER" -d postgres -X -e -P pager=off \
-      -v VERBOSITY="$diagnostics" -f "$4" > "$3.stdout" 2> "$3.stderr" || status=$?
+      -v VERBOSITY=verbose -f "$4" > "$3.stdout" 2> "$3.stderr" || status=$?
   fi
   if [[ "$2" == "$P3_PORT" ]] && ! server_alive "$P3_PID"; then
     echo "pos3ql exited while running $(basename "$4")"
@@ -1462,7 +1462,7 @@ run_corpus() { # host port outfile file diagnostics
     return 1
   fi
   python3 "$EXT/differential_diagnostics.py" --source "$4" --stdout "$3.stdout" \
-    --stderr "$3.stderr" --diagnostics "$diagnostics" > "$3" || return 1
+    --stderr "$3.stderr" --input-diagnostics verbose --diagnostics "$diagnostics" > "$3" || return 1
 }
 reset_user_extensions() { # host port
   psql -h "$1" -p "$2" -U "$PGUSER" -d postgres -X -A -t -q \
@@ -1521,7 +1521,14 @@ for f in "$EXT"/differential/*.sql; do
   run_corpus "$PGHOST" "$PGPORT" "$WORK/$n.pg" "$f" sqlstate || exit 1
   run_corpus 127.0.0.1 "$P3_PORT" "$WORK/$n.p3" "$f" sqlstate || exit 1
   if diff -u "$WORK/$n.pg" "$WORK/$n.p3" > "$WORK/$n.diff"; then ok "corpus: $n"
-  else bad "corpus: $n"; head -40 "$WORK/$n.diff"; fi
+  else
+    bad "corpus: $n"
+    head -40 "$WORK/$n.diff"
+    printf '%s\n' 'PostgreSQL diagnostics:'
+    cat "$WORK/$n.pg.stderr"
+    printf '%s\n' 'pos3ql diagnostics:'
+    cat "$WORK/$n.p3.stderr"
+  fi
   reset_corpus_pair
   corpus_ordinal=$((corpus_ordinal + 1))
 done
@@ -1561,7 +1568,14 @@ for f in "$EXT"/differential_exact/*.sql; do
   run_corpus "$PGHOST" "$PGPORT" "$WORK/$n.pg" "$f" verbose || exit 1
   run_corpus 127.0.0.1 "$P3_PORT" "$WORK/$n.p3" "$f" verbose || exit 1
   if diff -u "$WORK/$n.pg" "$WORK/$n.p3" > "$WORK/$n.diff"; then ok "exact errors: $n"
-  else bad "exact errors: $n"; head -40 "$WORK/$n.diff"; fi
+  else
+    bad "exact errors: $n"
+    head -40 "$WORK/$n.diff"
+    printf '%s\n' 'PostgreSQL diagnostics:'
+    cat "$WORK/$n.pg.stderr"
+    printf '%s\n' 'pos3ql diagnostics:'
+    cat "$WORK/$n.p3.stderr"
+  fi
 done
 fi
 

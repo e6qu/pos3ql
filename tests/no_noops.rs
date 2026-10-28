@@ -29,8 +29,10 @@ fn jdbc_differential_never_compares_missing_driver_failures() {
         "the mandatory JDBC artifact fetch must fail loudly after bounded retries"
     );
     assert!(
-        source.contains("jar tf \"$JAR\" >/dev/null"),
-        "the JDBC artifact must be verified before a transcript is compared"
+        source.contains("shasum -a 256 --check --status")
+            && source.contains("jar tf \"$1\" >/dev/null")
+            && source.contains("if [[ -f \"$JAR\" ]] && verify_jdbc \"$JAR\"; then"),
+        "the downloaded or cached JDBC artifact must pass digest and archive checks"
     );
     assert!(
         source.contains("jdbc (driver artifact unavailable or invalid)"),

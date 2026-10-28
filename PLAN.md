@@ -17,7 +17,9 @@ Its commit history must retain durable order. Reads, independent uploads and SQL
 CPU execution do not all need to be serialized to preserve that order.
 
 Today, object-store I/O overlaps and batches requests, while SQL CPU work uses
-one worker. Some state-changing, metadata and maintenance reads still wait
+one worker. Journal cleanup yields while its metadata requests wait and does
+not prevent checkpoints from freeing row-cache space; some
+state-changing, checkpoint capture and block-cleanup reads still wait
 synchronously. Same-host MinIO and SeaweedFS checks establish portability;
 they do not establish production performance. The owning guides describe
 [current behavior](docs/implemented-baseline.md), [physical limits](docs/architecture.md#memory-and-physical-size)
@@ -36,8 +38,14 @@ A waiting schema edit must never attach itself to a new object that reused a nam
   must stay private to their transaction. Preserve repeated dependency rows.
 - Keep older rows, indexes and saved files until readers and backups finish.
   Remove obsolete versions in limited batches so other queries keep moving.
-- Let remaining metadata and maintenance downloads pause without occupying the
-  SQL worker. Save enough state to resume within the fixed memory budget.
+  Files written by an unfinished checkpoint remain owned until its publication
+  resolves; a reader finishing must not cause them to be collected as orphans.
+  Switching output producers cannot cancel another job's immutable files;
+  durable manifests never name output that has not finished uploading.
+- Let remaining checkpoint capture, table/index merge and block-cleanup
+  downloads pause without occupying the SQL worker. Save enough state to resume
+  within the fixed memory budget, as journal cleanup does for backup listings,
+  retention manifests, commit-chain descriptors and obsolete-log deletions.
   Recovery can keep exclusive startup access; ordinary operation must allow
   unrelated work to progress.
 
@@ -46,14 +54,14 @@ an object for current use. After `orders` becomes `sales`, an older report can
 still list `orders` while `to_regclass('sales')` resolves the current name.
 Freezing all lookups at the report's position would be incorrect.
 
-Acceptance: every confirmed transaction reappears as a whole after recovery.
-Reusing a name or slot never redirects an old reader to replacement data;
-cleanup respects readers and backups. Cover
-rollback, savepoints, prepared transactions, conflicting membership waits,
-declared versus inherited trigger execution, fixed-capacity exhaustion and
-recovery after deleting local caches. Reject corrupt or stale restored state
-before writer promotion. Resumption preserves effects once, including triggers
-and issued sequence values. Lost commit replies resolve to all changes or none.
+Acceptance: while reads, schema edits, publication and maintenance overlap,
+readers keep their selected objects and values, and new reads see whole commits.
+Reusing a name or slot never redirects a reader to replacement data. Cleanup
+respects readers and backups. Preserve the existing rollback, savepoint,
+prepared-transaction, capacity and empty-cache recovery checks throughout this
+conversion. Corrupt or stale restored state must fail before writer promotion.
+Resumption preserves effects once, including triggers and issued sequence values.
+Lost commit replies resolve to all changes or none.
 
 ### Run independent SQL commands on several CPU workers
 

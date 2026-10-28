@@ -41,6 +41,7 @@ class S3TestServer(http.server.BaseHTTPRequestHandler):
     latency_seconds = 0.0
     writer_probe_gate_file = None
     writer_probe_gate_lock = threading.Lock()
+    audit_file = None
     metrics = {
         "schema_version": 1,
         "requests": {"put": 0, "get": 0, "range_get": 0, "list": 0, "delete": 0},
@@ -51,6 +52,23 @@ class S3TestServer(http.server.BaseHTTPRequestHandler):
 
     def log_message(self, *_):
         pass
+
+    def audit_mutation(self, operation, key, body, existed):
+        if self.audit_file is None:
+            return
+        event = {"time_ns": time.time_ns(), "operation": operation,
+                 "key": key, "bytes": len(body), "existed": existed}
+        if operation == "put" and "/blocks/" in "/" + key and len(body) >= 5:
+            event["block_type"] = body[4]
+        if key.rsplit("/", 1)[-1] == "manifest":
+            event["roots"] = [line.decode("ascii", "backslashreplace")
+                              for line in body.splitlines()
+                              if line.startswith((b"lsn ", b"writer ", b"dsst ", b"vix "))]
+        if key.rsplit("/", 1)[-1] in ("writer-fence", "commit-head"):
+            event["value_hex"] = body.hex()
+        # Callers hold mutation_lock: file order is the actual mutation order.
+        with self.audit_file.open("a", encoding="utf-8") as output:
+            output.write(json.dumps(event, sort_keys=True) + "\n")
 
     @classmethod
     def record(cls, operation, request_bytes=0, response_bytes=0, error=False):
@@ -259,6 +277,7 @@ class S3TestServer(http.server.BaseHTTPRequestHandler):
                 temporary.parent.mkdir(parents=True, exist_ok=True)
                 temporary.write_bytes(body)
                 os.replace(temporary, path)
+                self.audit_mutation("put", key, body, exists)
             self.record("put", request_bytes=len(body))
             self.send_response(200)
             self.send_header("etag", self.etag(body))
@@ -365,7 +384,9 @@ class S3TestServer(http.server.BaseHTTPRequestHandler):
             self.delay()
             path = self.object_path(key)
             with self.mutation_lock:
+                existed = path.exists()
                 path.unlink(missing_ok=True)
+                self.audit_mutation("delete", key, b"", existed)
             self.record("delete")
             self.send_response(204)
             self.end_headers()
@@ -391,6 +412,7 @@ def main():
     parser.add_argument("--metrics-file")
     parser.add_argument("--latency-ms", type=float, default=0.0)
     parser.add_argument("--writer-probe-gate-file")
+    parser.add_argument("--audit-file")
     args = parser.parse_args()
     S3TestServer.root = pathlib.Path(args.root).resolve()
     S3TestServer.bucket = args.bucket
@@ -398,6 +420,9 @@ def main():
     S3TestServer.access_key = args.access_key
     S3TestServer.secret_key = args.secret_key
     S3TestServer.session_token = args.session_token
+    if args.audit_file:
+        S3TestServer.audit_file = pathlib.Path(args.audit_file).resolve()
+        S3TestServer.audit_file.parent.mkdir(parents=True, exist_ok=True)
     if args.credentials_file:
         S3TestServer.credentials_file = pathlib.Path(args.credentials_file).resolve()
     S3TestServer.page_size = args.page_size

@@ -212,6 +212,15 @@ images at commit. Checkpoint and journal readers restore saved positions and
 reject references to replacement objects. Database copies rebind parent links
 within the new database before installing inherited triggers.
 
+Journal cleanup uses a separate fixed metadata client and retains its listing,
+backup-retention and deletion positions across socket waits. It can run while
+foreground block reads and journal uploads wait. It has its own fixed backup
+list and deletion queue, so checkpoints can publish and free row-cache space
+while obsolete-log requests wait. A pass has a fixed cutoff; newer checkpoints
+queue the latest next cutoff instead of restarting the active pass.
+Checkpoint capture, block
+garbage collection and table/index merge reads still have synchronous paths.
+
 The remaining order is coherent shared row/catalog publication and bounded
 maintenance, startup-reserved CPU workers, then representative performance and
 multi-host recovery/failover qualification. Current [behavior](implemented-baseline.md),

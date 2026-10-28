@@ -17,7 +17,8 @@ use crate::crypto::sha256::{HexDigest, sha256};
 use crate::mem::budget::{Budget, BudgetError};
 use crate::mem::buffer::FixedBuf;
 use crate::object_store::{
-    ByteRange, Credentials, EntityTag, Error, GetResult, MAX_OBJECT_KEY_BYTES, Precondition,
+    ByteRange, Credentials, EntityTag, Error, GetResult, ListCursor,
+    MAX_LIST_PAGE_KEYS as LIST_MAX_KEYS, MAX_OBJECT_KEY_BYTES, Precondition,
 };
 use crate::stack_format;
 use crate::util::StackStr;
@@ -27,7 +28,6 @@ use super::signature_v4::{SigningInput, format_timestamp, sign, signed_headers, 
 type S3Error = Error;
 
 const MAX_ATTEMPTS: u32 = 3;
-const LIST_MAX_KEYS: usize = 1000;
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
 const EMPTY_SHA256_HEX: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
@@ -171,6 +171,8 @@ pub struct S3Client {
 enum PendingMethod {
     Get,
     Put,
+    List,
+    Delete,
 }
 
 enum PendingRequest {
@@ -424,7 +426,7 @@ impl S3Client {
                     .ok_or(S3Error::Protocol("GET response missing ETag"))?,
             });
         }
-        self.begin_nonblocking(PendingMethod::Get, key, &[], Precondition::None, range)?;
+        self.begin_nonblocking(PendingMethod::Get, key, "", &[], Precondition::None, range)?;
         self.advance_pending()
     }
 
@@ -435,7 +437,7 @@ impl S3Client {
         body: &[u8],
         precondition: Precondition<'_>,
     ) -> Result<EntityTag, S3Error> {
-        self.begin_nonblocking(PendingMethod::Put, key, body, precondition, None)?;
+        self.begin_nonblocking(PendingMethod::Put, key, "", body, precondition, None)?;
         self.advance_put(body)
     }
 
@@ -464,6 +466,7 @@ impl S3Client {
         &mut self,
         method: PendingMethod,
         key: &str,
+        query: &str,
         body: &[u8],
         precondition: Precondition<'_>,
         range: Option<ByteRange>,
@@ -473,13 +476,13 @@ impl S3Client {
         }
         let payload_hash = HexDigest::of(&sha256(body));
         self.build_head(
-            if method == PendingMethod::Get {
-                "GET"
-            } else {
-                "PUT"
+            match method {
+                PendingMethod::Get | PendingMethod::List => "GET",
+                PendingMethod::Put => "PUT",
+                PendingMethod::Delete => "DELETE",
             },
             key,
-            "",
+            query,
             body.len() as u64,
             payload_hash.as_str(),
             precondition,
@@ -832,6 +835,163 @@ impl S3Client {
         self.body.capacity()
     }
 
+    pub(crate) fn delete_nonblocking(&mut self, key: &str) -> Result<(), S3Error> {
+        match self.pending.as_ref().map(PendingRequest::method) {
+            None => self.begin_nonblocking(
+                PendingMethod::Delete,
+                key,
+                "",
+                &[],
+                Precondition::None,
+                None,
+            )?,
+            Some(PendingMethod::Delete) => {}
+            Some(_) => return Err(S3Error::Protocol("pending request is not DELETE")),
+        }
+        match self.advance_request(&[]) {
+            Ok(_) => Ok(()),
+            Err(error) if error.is_not_found() => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// A single response never runs callbacks before all its keys and cursor
+    /// validate. The caller retains this exact cursor while the socket waits.
+    pub(crate) fn list_page(
+        &mut self,
+        prefix: &str,
+        cursor: ListCursor,
+        limit: usize,
+        each: impl FnMut(&str),
+    ) -> Result<Option<ListCursor>, S3Error> {
+        let query = self.list_query(prefix, cursor, limit)?;
+        match self.pending.as_ref().map(PendingRequest::method) {
+            None => self.begin_nonblocking(
+                PendingMethod::List,
+                "",
+                query.as_str(),
+                &[],
+                Precondition::None,
+                None,
+            )?,
+            Some(PendingMethod::List) => {}
+            Some(_) => return Err(S3Error::Protocol("pending request is not LIST")),
+        }
+        self.advance_request(&[])?;
+        self.visit_list_page(prefix, cursor, limit, each)
+    }
+
+    fn list_query(
+        &self,
+        prefix: &str,
+        cursor: ListCursor,
+        limit: usize,
+    ) -> Result<StackStr<6400>, S3Error> {
+        if limit == 0
+            || limit > LIST_MAX_KEYS
+            || (!cursor.after.is_empty() && !cursor.after.as_str().starts_with(prefix))
+            || self.key_prefix.len() + prefix.len() > MAX_OBJECT_KEY_BYTES
+            || self.key_prefix.len() + cursor.after.len() > MAX_OBJECT_KEY_BYTES
+        {
+            return Err(S3Error::Protocol("invalid list page range"));
+        }
+        use core::fmt::Write as _;
+        let mut query = StackStr::<6400>::new();
+        if let Some(token) = cursor.token {
+            let _ = query.write_str("continuation-token=");
+            let _ = uri_encode(&mut query, token.as_str(), false);
+            let _ = query.write_char('&');
+        }
+        let _ = write!(
+            query,
+            "encoding-type=url&list-type=2&max-keys={limit}&prefix="
+        );
+        let _ = uri_encode(&mut query, &self.key_prefix, false);
+        let _ = uri_encode(&mut query, prefix, false);
+        if cursor.token.is_none() && !cursor.after.is_empty() {
+            let _ = query.write_str("&start-after=");
+            let _ = uri_encode(&mut query, &self.key_prefix, false);
+            let _ = uri_encode(&mut query, cursor.after.as_str(), false);
+        }
+        if query.is_truncated() {
+            return Err(S3Error::Protocol("list query overflow"));
+        }
+        Ok(query)
+    }
+
+    fn visit_list_page(
+        &self,
+        prefix: &str,
+        cursor: ListCursor,
+        limit: usize,
+        mut each: impl FnMut(&str),
+    ) -> Result<Option<ListCursor>, S3Error> {
+        let xml = core::str::from_utf8(self.body.readable())
+            .map_err(|_| S3Error::Protocol("list response is not UTF-8"))?;
+        if !xml.trim_end().ends_with("</ListBucketResult>")
+            || xml.matches("<IsTruncated>").count() != 1
+            || xml.matches("</IsTruncated>").count() != 1
+            || xml.matches("<Key>").count() != xml.matches("</Key>").count()
+            || xml.matches("<NextContinuationToken>").count() > 1
+            || xml.matches("<NextContinuationToken>").count()
+                != xml.matches("</NextContinuationToken>").count()
+        {
+            return Err(S3Error::Protocol("malformed list page"));
+        }
+        let truncated = match extract_xml_text(xml, "IsTruncated") {
+            Some("true") => true,
+            Some("false") => false,
+            Some(_) => return Err(S3Error::Protocol("invalid IsTruncated value")),
+            None => return Err(S3Error::Protocol("list response missing IsTruncated")),
+        };
+        let token = extract_xml_text(xml, "NextContinuationToken")
+            .map(decode_xml_text::<1024>)
+            .transpose()?;
+        if truncated
+            && (token.is_none()
+                || token.as_ref().is_some_and(|next| next.is_empty())
+                || token == cursor.token)
+        {
+            return Err(S3Error::Protocol("list continuation token did not advance"));
+        }
+        let mut last = cursor.after;
+        // Validation precedes every callback, including for a malformed later key.
+        for emit in [false, true] {
+            let mut rest = xml;
+            let mut count = 0;
+            if emit {
+                last = cursor.after;
+            }
+            while let Some(encoded_key) = extract_xml_text(rest, "Key") {
+                let key = percent_decode::<MAX_OBJECT_KEY_BYTES>(encoded_key)?;
+                let logical = key
+                    .as_str()
+                    .strip_prefix(self.key_prefix.as_str())
+                    .ok_or(S3Error::Protocol("listed key outside configured prefix"))?;
+                if !logical.starts_with(prefix) {
+                    return Err(S3Error::Protocol("listed key outside requested prefix"));
+                }
+                if !last.is_empty() && logical <= last.as_str() {
+                    return Err(S3Error::Protocol("listed keys are not strictly ordered"));
+                }
+                count += 1;
+                if count > limit {
+                    return Err(S3Error::Protocol("list page exceeds requested key count"));
+                }
+                if emit {
+                    each(logical);
+                }
+                last = StackStr::from_str(logical);
+                let end = rest
+                    .find("</Key>")
+                    .ok_or(S3Error::Protocol("unterminated list key"))?
+                    + 6;
+                rest = &rest[end..];
+            }
+        }
+        Ok(truncated.then_some(ListCursor { token, after: last }))
+    }
+
     pub fn delete(&mut self, key: &str) -> Result<(), S3Error> {
         match self.request(
             "DELETE",
@@ -881,8 +1041,7 @@ impl S3Client {
         }
         let mut count = 0;
         let mut continuation: Option<StackStr<1024>> = None;
-        let mut last_key =
-            (!after.is_empty()).then(|| StackStr::<MAX_OBJECT_KEY_BYTES>::from_str(after));
+        let mut last_key = StackStr::<MAX_OBJECT_KEY_BYTES>::from_str(after);
         loop {
             let mut query = StackStr::<6400>::new();
             {
@@ -917,58 +1076,28 @@ impl S3Client {
                 Precondition::None,
                 None,
             )?;
-            let xml = core::str::from_utf8(self.body.readable())
-                .map_err(|_| S3Error::Protocol("list response is not UTF-8"))?;
-            let truncated = match extract_xml_text(xml, "IsTruncated") {
-                Some("true") => true,
-                Some("false") => false,
-                Some(_) => return Err(S3Error::Protocol("invalid IsTruncated value")),
-                None => return Err(S3Error::Protocol("list response missing IsTruncated")),
-            };
-            let next = extract_xml_text(xml, "NextContinuationToken")
-                .map(decode_xml_text::<1024>)
-                .transpose()?;
-            let mut rest = xml;
-            while let Some(encoded_key) = extract_xml_text(rest, "Key") {
-                let key = percent_decode::<MAX_OBJECT_KEY_BYTES>(encoded_key)?;
-                let logical = key
-                    .as_str()
-                    .strip_prefix(self.key_prefix.as_str())
-                    .ok_or(S3Error::Protocol("listed key outside configured prefix"))?;
-                if !logical.starts_with(prefix) {
-                    return Err(S3Error::Protocol("listed key outside requested prefix"));
-                }
-                if last_key
-                    .as_ref()
-                    .is_some_and(|previous| logical <= previous.as_str())
-                {
-                    return Err(S3Error::Protocol("listed keys are not strictly ordered"));
-                }
-                if limit.is_some_and(|limit| count == limit) {
-                    return Ok(count);
-                }
-                each(logical);
-                last_key = Some(StackStr::from_str(logical));
-                count += 1;
-                let after = rest
-                    .find("</Key>")
-                    .ok_or(S3Error::Protocol("unterminated list key"))?
-                    + 6;
-                rest = &rest[after..];
-            }
+            let page_limit =
+                limit.map_or(LIST_MAX_KEYS, |limit| (limit - count).min(LIST_MAX_KEYS));
+            let next = self.visit_list_page(
+                prefix,
+                ListCursor {
+                    token: continuation,
+                    after: last_key,
+                },
+                page_limit,
+                |key| {
+                    each(key);
+                    count += 1;
+                },
+            )?;
             if limit.is_some_and(|limit| count == limit) {
                 return Ok(count);
             }
-            if !truncated {
+            let Some(next) = next else {
                 return Ok(count);
-            }
-            let next = next.ok_or(S3Error::Protocol(
-                "truncated list without continuation token",
-            ))?;
-            if continuation.as_ref() == Some(&next) {
-                return Err(S3Error::Protocol("list continuation token did not advance"));
-            }
-            continuation = Some(next);
+            };
+            last_key = next.after;
+            continuation = next.token;
         }
     }
 
@@ -2158,6 +2287,48 @@ mod tests {
     }
 
     #[test]
+    fn maintenance_metadata_list_pages_validate_before_callbacks() {
+        let config = test_config(1);
+        let mut budget = Budget::new(S3Client::budget_bytes(&config));
+        let mut client = S3Client::new(&config, &mut budget).unwrap();
+        for body in [
+            "<ListBucketResult><IsTruncated>false</IsTruncated><Key>p/b</Key><Key>p/a</Key></ListBucketResult>",
+            "<ListBucketResult><IsTruncated>false</IsTruncated><Key>p/a</Key><Key>outside/b</Key></ListBucketResult>",
+            "<ListBucketResult><IsTruncated>false</IsTruncated><Key>p/a</Key><Key>p/%GG</Key></ListBucketResult>",
+            "<ListBucketResult><IsTruncated>false</IsTruncated><Key>p/a</Key><Key>p/b</Key></ListBucketResult>",
+            "<ListBucketResult><IsTruncated>false</IsTruncated><Key>p/a</Key><Key>p/b</ListBucketResult>",
+            "<ListBucketResult><IsTruncated>false</IsTruncated><IsTruncated>true</IsTruncated><Key>p/a</Key></ListBucketResult>",
+            "<ListBucketResult><IsTruncated>true</IsTruncated><Key>p/a</Key></ListBucketResult>",
+            "<ListBucketResult><IsTruncated>true</IsTruncated><NextContinuationToken></NextContinuationToken><Key>p/a</Key></ListBucketResult>",
+            "<ListBucketResult><IsTruncated>false</IsTruncated><Key>p/a</Key>",
+        ] {
+            client.body.clear();
+            assert!(client.body.append(body.as_bytes()));
+            let error = crate::mem::guard::forbid_alloc(|| {
+                client.visit_list_page("p/", ListCursor::START, 1, |_| {
+                    panic!("invalid page emitted a key")
+                })
+            });
+            assert!(error.is_err(), "{body}");
+        }
+        client.body.clear();
+        assert!(client.body.append(b"<ListBucketResult><IsTruncated>true</IsTruncated><NextContinuationToken>same</NextContinuationToken><Key>p/b</Key></ListBucketResult>"));
+        let cursor = ListCursor {
+            token: Some(StackStr::from_str("same")),
+            after: StackStr::from_str("p/a"),
+        };
+        assert!(
+            crate::mem::guard::forbid_alloc(|| client.visit_list_page(
+                "p/",
+                cursor,
+                1,
+                |_| panic!("repeated cursor emitted a key")
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
     fn malformed_list_truncation_is_rejected() {
         let (port, server) = mock_server(
             "HTTP/1.1 200 OK\r\ncontent-length: 69\r\n\r\n<ListBucketResult><IsTruncated>maybe</IsTruncated></ListBucketResult>",
@@ -2465,13 +2636,28 @@ mod tests {
             assert!(matches!(client.advance_pending(), Err(S3Error::WouldBlock)));
             std::thread::yield_now();
         }
+        let mut reactor = crate::io::Reactor::new(&mut budget, 1).unwrap();
+        reactor
+            .register_read(client.pending_fd().expect("pending chunked GET"), 1)
+            .unwrap();
         for index in 0..8 {
             assert_eq!(
                 received.recv_timeout(Duration::from_secs(5)).unwrap(),
                 index
             );
-            let result = crate::mem::guard::forbid_alloc(|| client.advance_pending());
+            let mut result = crate::mem::guard::forbid_alloc(|| client.advance_pending());
             if index == 7 {
+                // The sender's notification does not establish socket readiness.
+                // Keep the original deadline while the last bytes reach the peer.
+                while matches!(result, Err(S3Error::WouldBlock)) {
+                    let remaining =
+                        send_deadline.saturating_duration_since(std::time::Instant::now());
+                    assert!(!remaining.is_zero(), "final chunk did not arrive");
+                    result = crate::mem::guard::forbid_alloc(|| {
+                        assert!(reactor.poll(Some(remaining)).unwrap() > 0);
+                        client.advance_pending()
+                    });
+                }
                 assert_eq!(result.unwrap().len, 5);
             } else {
                 assert!(matches!(result, Err(S3Error::WouldBlock)));

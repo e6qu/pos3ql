@@ -388,6 +388,14 @@ visit at most 64 stable row slots per ordinary turn. Heap preparation/copying
 has a separate work allowance; a slot quota is not a wall-time guarantee.
 Owner contention retries on the existing one-second cadence. Completion
 preserves newer writes, active readers, prepared changes and backup roots.
+Journal cleanup retains backup-list pages, retention manifests, commit-chain
+positions and pending deletions while their requests wait. Those waits release
+the SQL worker; listing, retention checks and deletion stay within their fixed
+startup reservations. Replacing a backup invalidates the pending retention
+decision before cleanup resumes.
+Checkpoints can save new rows and free cache space while obsolete-log requests
+wait. Separate fixed queues prevent either task from changing the other's
+pending deletions, and new commits cannot extend an old cleanup pass forever.
 Explicit CHECKPOINT, shutdown and some atomic reads still have synchronous work.
 
 At 85% heap use, eligible top-level writes can wait before effects when an active

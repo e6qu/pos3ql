@@ -9701,6 +9701,7 @@ impl Engine {
                 checkpointer.sweep_active()
                     || checkpointer.manifest_publication_pending()
                     || checkpointer.physical_maintenance_pending(&self.storage)
+                    || checkpointer.merge_work_pending(&self.storage)
             });
         if active && txn.cache_capacity_wait.is_none() {
             if let Some(deadline) = txn.suspended_statement_deadline() {

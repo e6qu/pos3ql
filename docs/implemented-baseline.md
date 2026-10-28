@@ -411,8 +411,8 @@ the same immutable pair with empty output; capture and index-building reads can
 still occupy the SQL worker.
 
 At 85% heap use, eligible top-level writes can wait before effects when an active
-maintenance task can free space, including saved-file cleanup that must finish
-before the next checkpoint. They preserve their command, timestamp and
+maintenance task can free space, including saved-file cleanup or a row-file merge
+that must finish before the next checkpoint. They preserve their command, timestamp and
 deadline and appear as Extension/CacheCapacity waits. Reads and transaction
 completion remain runnable. A transaction does not wait for space that its own
 pending changes pin. When work cannot fit, it receives its named capacity error.

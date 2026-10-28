@@ -727,7 +727,6 @@ impl SstWriter {
         store: &mut W,
     ) -> Result<(), SstError> {
         if self.index_len == MAX_DATA_BLOCKS {
-            self.flush_packed(store)?;
             self.flush_index_leaf(store)?;
         }
         Ok(())
@@ -979,7 +978,7 @@ impl SstWriter {
                 self.pax_refs[column],
                 &mut output[at..at + PACKED_DATA_REF_BYTES],
                 true,
-            );
+            )?;
         }
         Ok(total)
     }
@@ -1024,6 +1023,8 @@ impl SstWriter {
         if self.leaves_len == MAX_LEAVES {
             return Err(SstError::TooManyBlocks);
         }
+        // An index cannot name a logical frame whose packed container is unsaved.
+        self.flush_packed(store)?;
         let packed_references = self.packed_references();
         let entry_size = if packed_references {
             PACKED_VERSIONED_INDEX_ENTRY
@@ -1040,7 +1041,7 @@ impl SstWriter {
                 *id,
                 &mut buffer[at + 16..at + entry_size],
                 packed_references,
-            );
+            )?;
         }
         let id = store.write_block(&self.compress_buf[..bytes], BlockType::SstIndexV2, 0)?;
         self.record(id)?;
@@ -1097,7 +1098,7 @@ impl SstWriter {
                     *id,
                     &mut buffer[at + 16..at + entry_size],
                     packed_references,
-                );
+                )?;
             }
             store.write_block(&buffer[..bytes], BlockType::SstIndexV2, 0)?
         } else {
@@ -3343,10 +3344,13 @@ fn index_entry_size(packed: bool) -> usize {
     }
 }
 
-fn write_data_ref(reference: DataBlockRef, into: &mut [u8], packed: bool) {
+fn write_data_ref(reference: DataBlockRef, into: &mut [u8], packed: bool) -> Result<(), SstError> {
     if !packed {
-        into[..32].copy_from_slice(&reference.id().0);
-        return;
+        let DataBlockRef::Direct(id) = reference else {
+            return Err(SstError::Encoding);
+        };
+        into[..32].copy_from_slice(&id.0);
+        return Ok(());
     }
     match reference {
         DataBlockRef::Direct(id) => {
@@ -3360,12 +3364,16 @@ fn write_data_ref(reference: DataBlockRef, into: &mut [u8], packed: bool) {
             length,
             id,
         } => {
+            if container.0 == [0; 32] || length < super::HEADER_LEN as u32 {
+                return Err(SstError::Encoding);
+            }
             into[..32].copy_from_slice(&container.0);
             into[32..36].copy_from_slice(&offset.to_le_bytes());
             into[36..40].copy_from_slice(&length.to_le_bytes());
             into[40..72].copy_from_slice(&id.0);
         }
     }
+    Ok(())
 }
 
 fn read_data_ref(bytes: &[u8], packed: bool) -> DataBlockRef {

@@ -93852,14 +93852,16 @@ fn maintenance_metadata_cache_admission_waits_before_sequences_and_triggers_in_b
             }
         })
     }
-    for physical_cleanup in [false, true] {
+    for maintenance in ["heap", "files", "merge"] {
+        let durable = maintenance != "heap";
+        let physical_cleanup = maintenance == "files";
         for (extended, fail) in [(false, false), (true, false), (false, true), (true, true)] {
             let label = format!(
                 "cache-admission-{}-{}",
-                if physical_cleanup { "files" } else { "heap" },
+                maintenance,
                 if extended { "extended" } else { "simple" }
             );
-            let (mut engine, mut budget, config) = sliced_cleanup_fixture(&label, physical_cleanup);
+            let (mut engine, mut budget, config) = sliced_cleanup_fixture(&label, durable);
             let mut writer =
                 ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(11);
             let mut reader =
@@ -93869,8 +93871,23 @@ fn maintenance_metadata_cache_admission_waits_before_sequences_and_triggers_in_b
             CREATE TRIGGER admission_insert AFTER INSERT ON cleanup_orders FOR EACH ROW EXECUTE FUNCTION admission_trigger()", true);
             writer.success(&mut engine, "SET statement_timeout = '10s'", true);
             writer.send.clear();
-            if physical_cleanup {
+            if durable {
                 engine.checkpoint().unwrap();
+            }
+            if maintenance == "merge" {
+                for _ in 0..3 {
+                    writer.success(
+                        &mut engine,
+                        "UPDATE cleanup_orders SET note=note || 'x' WHERE id=1",
+                        true,
+                    );
+                    assert!(engine.checkpoint().unwrap());
+                }
+                let checkpointer = engine.ckpt.as_ref().unwrap();
+                assert!(checkpointer.merge_work_pending(&engine.storage));
+                assert!(!checkpointer.sweep_active());
+                assert!(!checkpointer.manifest_publication_pending());
+                assert!(!checkpointer.physical_maintenance_pending(&engine.storage));
             }
             crate::mem::guard::forbid_alloc(|| {
                 let garbage = [0u8; 8192];
@@ -93885,7 +93902,7 @@ fn maintenance_metadata_cache_admission_waits_before_sequences_and_triggers_in_b
                 assert!(!checkpointer.sweep_active());
                 assert!(!checkpointer.manifest_publication_pending());
                 assert!(engine.local_cleanup.is_none());
-            } else {
+            } else if !durable {
                 start_sliced_cleanup(&mut engine, lsn);
             }
             // A recovered storage failure must not poison a later request when
@@ -93953,8 +93970,8 @@ fn maintenance_metadata_cache_admission_waits_before_sequences_and_triggers_in_b
             let prepared_report = reader.success(&mut engine,
             "PREPARE admission_report AS SELECT count(*) FROM cleanup_orders; EXECUTE admission_report", true);
             assert_eq!(data_rows(&prepared_report), ["80"]);
-            assert_eq!(engine.compact_scratch.active(), !physical_cleanup);
-            if physical_cleanup {
+            assert_eq!(engine.compact_scratch.active(), !durable);
+            if durable {
                 // Simulated PUTs grow fixture storage. Persist and reclaim outside
                 // the allocation guard; statement execution remains guarded.
                 engine.ckpt.as_mut().unwrap().request_checkpoint().unwrap();
@@ -97451,6 +97468,8 @@ fn checkpoint_reads_held_merge_keeps_cached_queries_and_foreground_read_owners()
             config.object_store_on = true;
             config.object_store_sim = true;
             config.object_store_bucket = format!("{label}-{}", std::process::id()).to_lowercase();
+            config.wal_upload = true;
+            config.wal_upload_sync = true;
             config.object_store_get_slots = 2;
             config.object_store_hedge_after_ms = 0;
             config.block_cache_bytes = 0;
@@ -97563,13 +97582,17 @@ fn checkpoint_reads_held_merge_keeps_cached_queries_and_foreground_read_owners()
             );
             assert!(!engine.checkpoint_can_progress());
             let mut foreground_bytes = [0; crate::store::MAX_PAYLOAD];
-            assert_eq!(
-                crate::mem::guard::forbid_alloc(|| blocks
+            let foreground_owner =
+                ExecutionIdentity::new(12, engine.execution_identity().database_oid).read_owner();
+            let prior = engine.replace_read_owner(Some(foreground_owner));
+            let started = crate::mem::guard::forbid_alloc(|| {
+                blocks
                     .lock()
                     .unwrap()
-                    .get(&foreground, &mut foreground_bytes)),
-                Err(crate::store::StoreError::NotReady)
-            );
+                    .get(&foreground, &mut foreground_bytes)
+            });
+            let _ = engine.replace_read_owner(prior);
+            assert_eq!(started, Err(crate::store::StoreError::NotReady));
             let (mut foreground_stream, foreground_request) = accept(&mut engine, &listener);
             let foreground_key = foreground_request
                 .lines()
@@ -97594,11 +97617,47 @@ fn checkpoint_reads_held_merge_keeps_cached_queries_and_foreground_read_owners()
                 data_rows(&session.success(&mut engine, "SELECT id FROM cached_order", true)),
                 ["42"]
             );
+            session.success(
+                &mut engine,
+                "BEGIN; INSERT INTO cached_order VALUES(43)",
+                true,
+            );
+            // Simulator publication grows its fixture inventory outside the runtime guard.
+            session.success(&mut engine, "COMMIT", false);
+            assert_eq!(
+                data_rows(&session.success(
+                    &mut engine,
+                    "SELECT id FROM cached_order ORDER BY id",
+                    true,
+                )),
+                ["42", "43"]
+            );
             assert_eq!(
                 blocks.lock().unwrap().base_mut().read_owner(),
                 engine.read_owner
             );
             crate::mem::guard::forbid_alloc(|| {
+                let mut waiting = false;
+                for _ in 0..64 {
+                    let beat = engine.checkpoint_beat();
+                    assert!(!beat.failed());
+                    assert_eq!(
+                        [
+                            engine.pending_block_read_fd(0),
+                            engine.pending_block_read_fd(1)
+                        ],
+                        fds
+                    );
+                    if beat == CheckpointBeat::WaitingForReads && !engine.checkpoint_can_progress()
+                    {
+                        waiting = true;
+                        break;
+                    }
+                }
+                assert!(
+                    waiting,
+                    "query-released history must finish while downloads wait"
+                );
                 for _ in 0..3 {
                     assert_eq!(engine.checkpoint_beat(), CheckpointBeat::WaitingForReads);
                     assert!(!engine.checkpoint_can_progress());
@@ -97619,12 +97678,15 @@ fn checkpoint_reads_held_merge_keeps_cached_queries_and_foreground_read_owners()
             let deadline = Instant::now() + Duration::from_secs(2);
             loop {
                 advance(&mut engine);
-                match crate::mem::guard::forbid_alloc(|| {
+                let prior = engine.replace_read_owner(Some(foreground_owner));
+                let result = crate::mem::guard::forbid_alloc(|| {
                     blocks
                         .lock()
                         .unwrap()
                         .get(&foreground, &mut foreground_bytes)
-                }) {
+                });
+                let _ = engine.replace_read_owner(prior);
+                match result {
                     Ok(_) => break,
                     Err(crate::store::StoreError::NotReady) => {}
                     Err(error) => panic!("foreground read failed: {error:?}"),
@@ -97694,10 +97756,10 @@ fn checkpoint_reads_held_merge_keeps_cached_queries_and_foreground_read_owners()
             .unwrap();
             engine.enable_async_block_reads();
             assert!(engine.checkpoint().unwrap());
-            let query = "SELECT count(*),sum(qty) FROM merge_wait; SELECT qty FROM merge_wait WHERE id=7; SELECT id FROM cached_order";
+            let query = "SELECT count(*),sum(qty) FROM merge_wait; SELECT qty FROM merge_wait WHERE id=7; SELECT id FROM cached_order ORDER BY id";
             assert_eq!(
                 data_rows(&session.success(&mut engine, query, true)),
-                ["17|1153", "1007", "42"]
+                ["17|1153", "1007", "42", "43"]
             );
             drop((session, engine, blocks));
             std::fs::remove_dir_all(&config.data_dir).unwrap();
@@ -97705,7 +97767,7 @@ fn checkpoint_reads_held_merge_keeps_cached_queries_and_foreground_read_owners()
             let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
             assert_eq!(
                 data_rows(&run_with(&mut recovered, &mut recovered_budget, query)),
-                ["17|1153", "1007", "42"]
+                ["17|1153", "1007", "42", "43"]
             );
             drop(recovered);
             std::fs::remove_dir_all(&config.data_dir).unwrap();

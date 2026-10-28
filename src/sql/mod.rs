@@ -9698,7 +9698,9 @@ impl Engine {
         // working set after the current maintenance task has completed.
         let active = self.local_cleanup.is_some()
             || self.ckpt.as_ref().is_some_and(|checkpointer| {
-                checkpointer.sweep_active() || checkpointer.manifest_publication_pending()
+                checkpointer.sweep_active()
+                    || checkpointer.manifest_publication_pending()
+                    || checkpointer.physical_maintenance_pending(&self.storage)
             });
         if active && txn.cache_capacity_wait.is_none() {
             if let Some(deadline) = txn.suspended_statement_deadline() {

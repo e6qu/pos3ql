@@ -179,9 +179,14 @@ cleanup() {
   release_test_ports
   if [[ -n "${POS3QL_TEST_ARTIFACTS:-}" ]]; then
     mkdir -p "$POS3QL_TEST_ARTIFACTS"
-    cp "$WORK/server.log" "$WORK/torture.out" "$WORK/object-audit.jsonl" \
-      "$POS3QL_TEST_ARTIFACTS/"
-    cp -R "$WORK/object-store" "$POS3QL_TEST_ARTIFACTS/"
+    for artifact in server.log object-store.log object-audit.jsonl torture.out; do
+      if [[ -f "$WORK/$artifact" ]]; then
+        cp "$WORK/$artifact" "$POS3QL_TEST_ARTIFACTS/"
+      fi
+    done
+    if [[ -d "$WORK/object-store" ]]; then
+      cp -R "$WORK/object-store" "$POS3QL_TEST_ARTIFACTS/"
+    fi
   fi
   if [[ "$KEEP" == "--keep" ]]; then
     printf 'work dir kept: %s\n' "$WORK"

@@ -97,6 +97,8 @@ ordered `object-audit.jsonl` of writes, deletions and recovery roots. The audit
 omits credentials and subscription connection strings. Use these records to
 trace a missing block to its publication and deletion; keep the failing seed
 and request deadlines when fixing it.
+The ingestion job also retains its object-store fixture, server logs and mutation
+audit as `ingest-failure`. Retention works without a crash-only SQL output file.
 The second crash job builds once and repeats its seed with explicit 0, 1 and
 5 ms object-store delays. Each case keeps its own `latency-N` fixture, so a
 timing-dependent failure can be compared with completed cases from that job.

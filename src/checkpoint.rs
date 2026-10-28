@@ -3223,10 +3223,13 @@ impl Checkpointer {
     }
 
     pub(crate) fn retained_output_ready(&self) -> bool {
-        self.block_output.is_empty() && self.retained_output_pending()
+        self.block_output.is_empty()
+            && !self.published_maintenance_pending()
+            && self.retained_output_pending()
     }
 
     /// Already-captured inputs can progress behind later journal uploads.
+    /// File cleanup pauses every producer until its captured keep-set drains.
     /// This path never starts a sweep or publishes a manifest.
     pub(crate) fn advance_retained_output(&mut self, storage: &Storage) -> Result<(), SqlError> {
         assert!(
@@ -20231,6 +20234,34 @@ mod stored_dependency_tests {
             count: 2,
             crc: merged_checksum,
         });
+        checkpoint.schedule_file_cleanup_for_test(storage.lsn());
+        // Capture the keep-set before the retained merge emits its final files.
+        assert!(
+            !crate::mem::guard::forbid_alloc(|| checkpoint.collect_block_garbage_batch(&storage))
+                .unwrap()
+        );
+        let mut collected = false;
+        for _ in 0..64 {
+            // This is the same producer admission used behind journal uploads.
+            if checkpoint.retained_output_ready() {
+                crate::mem::guard::forbid_alloc(|| checkpoint.advance_retained_output(&storage))
+                    .unwrap();
+            }
+            // Fixture uploads allocate; production transport guards cover PUTs.
+            while checkpoint.physical_output_pending() {
+                checkpoint.advance_physical_output(&storage).unwrap();
+            }
+            collected = crate::mem::guard::forbid_alloc(|| {
+                checkpoint.collect_block_garbage_batch(&storage)
+            })
+            .unwrap();
+            if collected {
+                break;
+            }
+        }
+        assert!(collected);
+        checkpoint.block_garbage_pending = false;
+        checkpoint.published_lsn_pending_maintenance = None;
         // Index completion can leave no bytes and no remaining index job.
         checkpoint.physical_output_owner = Some(PhysicalOutputOwner::Index);
         assert!(checkpoint.value_job.is_none());

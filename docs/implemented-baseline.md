@@ -402,7 +402,8 @@ pending deletions, and new commits cannot extend an old cleanup pass forever.
 Explicit CHECKPOINT, shutdown and some atomic reads still have synchronous work.
 
 At 85% heap use, eligible top-level writes can wait before effects when an active
-maintenance task can free space. They preserve their command, timestamp and
+maintenance task can free space, including saved-file cleanup that must finish
+before the next checkpoint. They preserve their command, timestamp and
 deadline and appear as Extension/CacheCapacity waits. Reads and transaction
 completion remain runnable. A transaction does not wait for space that its own
 pending changes pin. When work cannot fit, it receives its named capacity error.

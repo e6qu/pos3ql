@@ -13460,7 +13460,7 @@ pub fn trigger_def_text<'a>(
     arena: &'a Arena,
 ) -> Result<Option<&'a str>, SqlError> {
     let mut found = None;
-    for (_, trigger) in storage.triggers_with_slots_visible_to(txid) {
+    for (trigger_slot, trigger) in storage.triggers_with_slots_visible_to(txid) {
         if crate::storage::trigger_oid(&trigger) == oid {
             found = Some((trigger, trigger.target));
             break;
@@ -13474,7 +13474,11 @@ pub fn trigger_def_text<'a>(
         for child in 0..storage.table_count() {
             if storage.table_slot_visible_to(child, txid)
                 && storage.partition_descends_from(child, usize::from(parent), txid)
-                && storage.partition_trigger_oid_to(&trigger, child, txid)? == oid
+                && storage.partition_trigger_oid_to(
+                    trigger.position(trigger_slot),
+                    storage.table_position(child),
+                    txid,
+                )? == oid
             {
                 found = Some((trigger, crate::storage::TriggerTarget::Table(child as u16)));
                 break;
@@ -20540,7 +20544,7 @@ fn pg_constraint_values<'a>(
     }
     // User constraint triggers have a pg_constraint identity linked from
     // pg_trigger.tgconstraint. They do not own an index.
-    for (_, trigger) in storage.triggers_with_slots_visible_to(txid) {
+    for (trigger_slot, trigger) in storage.triggers_with_slots_visible_to(txid) {
         let crate::storage::TriggerKind::Constraint { timing, .. } = trigger.kind else {
             continue;
         };
@@ -20609,8 +20613,11 @@ fn pg_constraint_values<'a>(
             let mut clone = [Datum::Null; 29];
             clone.copy_from_slice(out[root_row]);
             clone[0] = Datum::Int4(
-                storage.partition_trigger_oid_to(&trigger, child, txid)?
-                    + crate::storage::TRIGGER_CONSTRAINT_OID_OFFSET,
+                storage.partition_trigger_oid_to(
+                    trigger.position(trigger_slot),
+                    storage.table_position(child),
+                    txid,
+                )? + crate::storage::TRIGGER_CONSTRAINT_OID_OFFSET,
             );
             clone[2] = Datum::Int4(user_table_oid(storage, child));
             clone[18] = Datum::Int4(namespace_oid(
@@ -21836,7 +21843,7 @@ fn pg_depend<'a>(
             )?;
         }
     }
-    for (_, trigger) in storage.triggers_with_slots_visible_to(txid) {
+    for (trigger_slot, trigger) in storage.triggers_with_slots_visible_to(txid) {
         let trigger_oid = crate::storage::trigger_oid(&trigger);
         let relation_oid = match trigger.target {
             crate::storage::TriggerTarget::Table(table) => {
@@ -21909,7 +21916,11 @@ fn pg_depend<'a>(
             {
                 continue;
             }
-            let clone_oid = storage.partition_trigger_oid_to(&trigger, child, txid)?;
+            let clone_oid = storage.partition_trigger_oid_to(
+                trigger.position(trigger_slot),
+                storage.table_position(child),
+                txid,
+            )?;
             let child_relation_oid = user_table_oid(storage, child);
             push(
                 2620,
@@ -21975,7 +21986,11 @@ fn pg_depend<'a>(
             let parent_oid = if direct_parent == parent_table {
                 trigger_oid
             } else {
-                storage.partition_trigger_oid_to(&trigger, direct_parent, txid)?
+                storage.partition_trigger_oid_to(
+                    trigger.position(trigger_slot),
+                    storage.table_position(direct_parent),
+                    txid,
+                )?
             };
             push(2620, clone_oid, 2620, parent_oid, 0, "P")?;
             push(2620, clone_oid, PG_CLASS_OID, child_relation_oid, 0, "S")?;
@@ -26273,9 +26288,17 @@ fn pg_trigger<'a>(
             let parent_oid = if direct_parent == parent_table {
                 crate::storage::trigger_oid(&trigger)
             } else {
-                storage.partition_trigger_oid_to(&trigger, direct_parent, txid)?
+                storage.partition_trigger_oid_to(
+                    trigger.position(trigger_slot),
+                    storage.table_position(direct_parent),
+                    txid,
+                )?
             };
-            let clone_oid = storage.partition_trigger_oid_to(&trigger, child, txid)?;
+            let clone_oid = storage.partition_trigger_oid_to(
+                trigger.position(trigger_slot),
+                storage.table_position(child),
+                txid,
+            )?;
             let mut clone = [Datum::Null; 20];
             clone.copy_from_slice(rows[root_row]);
             let parent_definition = storage.table_def(parent_table, txid);

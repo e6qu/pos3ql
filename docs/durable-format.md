@@ -23,7 +23,7 @@ they never select a guessed decoder.
 
 | Object | Identity | Read | Write | Migration |
 |---|---|---:|---:|---|
-| Checkpoint manifest | `pos3ql-manifest-v34` | yes | yes | Retains schema creation identities and database-owner roles, object-permission grant order, explicitly empty permission lists, index-presence hints, allocator counters, typed blocks, enum members, and exact table, view, rule, sequence, routine, declared-trigger and materialized-view positions and creation stamps. Publication records retain their creation stamps. |
+| Checkpoint manifest | `pos3ql-manifest-v34` | yes | yes | Retains schema creation identities and database-owner roles, object-permission grant order, explicitly empty permission lists, index-presence hints, allocator counters, typed blocks, enum members, and exact table, view, rule, sequence, routine, declared-trigger, row-security-policy and materialized-view positions and creation stamps. Publication records retain their creation stamps. |
 | Journal record | Version `22` at header byte 17; bytes 18–23 are zero | yes | yes | Schema create, drop and rename records retain creation identity. Catalog images retain declared types, hidden system-column positions, selected sources and permission grant order. Prepared comment roots rebind to restored sources. Parameter permissions retain complete replacement rows. Sequence restarts retain their transaction owner; materialized views retain the backing table identity. Older framing is rejected even when its checksum is valid. |
 | Immutable block | Header bytes 5–7: `01 00 00` | yes | yes | SHA-256 of `pos3ql:block:v1\0`, the one-byte block type, then payload; LSN is provenance, excluded from identity. |
 | Empty checkpoint root | `pos3ql-empty-manifest-v1` | yes | yes | Fences an as-yet unpublished manifest root. |
@@ -824,3 +824,15 @@ committed transactions that create and remove all their new permission or clone
 images. Recovery checks expected images rather than silently replacing another
 lifetime. Manifest v34 and journal v22 reject earlier framing; table payload v13
 is unchanged.
+
+Rewrite rules, routines and row-security policies also admit only checked
+creation stamps 1–9,999,999. Their identifier bases are 880,000,000, 100,000 and
+180,000. Routine dependency decoding accepts that full routine range; an
+unrelated trigger-family boundary does not shorten it. Existing edits preserve
+their identifier; fresh declarations reject exhaustion with `54000`.
+Manifest `pol` begins with physical position and creation stamp. Policy journal
+replacement and removal records begin with the shared ten-byte position.
+Checkpoint loading and journal replay restore that exact checked lifetime,
+without reserving and then overwriting a temporary identity or choosing a free
+slot. A saved partition-parent link is rebound by creation stamp within the
+copied database before inherited triggers are installed.

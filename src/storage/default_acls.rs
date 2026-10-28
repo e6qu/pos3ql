@@ -541,7 +541,7 @@ mod tests {
         ] {
             let config = test_config();
             let mut budget = test_budget(&config);
-            let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
+            let storage = Storage::new(&config, &mut budget, 0).unwrap();
             crate::mem::guard::forbid_alloc(|| {
                 storage
                     .install_default_acl_image(0, None, Some(public), 0)
@@ -565,7 +565,7 @@ mod tests {
         }
         let config = test_config();
         let mut budget = test_budget(&config);
-        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
+        let storage = Storage::new(&config, &mut budget, 0).unwrap();
         crate::mem::guard::forbid_alloc(|| {
             storage
                 .install_default_acl_image(0, None, Some(public), 0)

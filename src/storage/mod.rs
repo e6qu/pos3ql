@@ -9622,6 +9622,11 @@ pub(crate) struct RecoveredPolicySpec {
 }
 
 impl TriggerDef {
+    pub(crate) fn position(self, slot: usize) -> CatalogPosition {
+        CatalogPosition::new(slot, self.created_at)
+            .expect("admitted trigger has a checked position")
+    }
+
     pub(crate) const EMPTY: Self = Self {
         database: DatabaseOid::POSTGRES,
         created_at: 0,
@@ -44620,8 +44625,7 @@ impl Storage {
     }
 
     pub(crate) fn trigger_position(&self, slot: usize) -> CatalogPosition {
-        CatalogPosition::new(slot, self.trigger(slot).created_at)
-            .expect("admitted trigger has a checked position")
+        self.trigger(slot).position(slot)
     }
 
     pub(crate) fn trigger_capacity(&self) -> usize {

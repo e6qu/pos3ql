@@ -64,6 +64,7 @@ impl Storage {
                     .definitions
                     .get(image.trigger.slot())
                     .copied()
+                    .map(|trigger| trigger.effective_to(txid))
                     .ok_or_else(|| {
                         sql_err!(
                             sqlstate::DATA_EXCEPTION,
@@ -95,6 +96,7 @@ impl Storage {
                 .enumerate()
                 .filter(|(_, trigger)| trigger.visible_to(txid))
             {
+                let trigger = trigger.effective_to(txid);
                 let TriggerTarget::Table(parent) = trigger.target else {
                     continue;
                 };
@@ -137,7 +139,19 @@ impl Storage {
         table: usize,
         txid: u32,
     ) -> Option<PartitionTriggerImage> {
-        let state = self.partition_trigger_state(self.partition_trigger_state_slot(trigger, table));
+        if table >= self.table_count() {
+            return None;
+        }
+        let catalog = self
+            .trigger_catalog
+            .lock()
+            .expect("trigger catalog lock poisoned");
+        if trigger >= catalog.definitions.len() {
+            return None;
+        }
+        let state = *catalog
+            .partition_states
+            .get(self.partition_trigger_state_slot(trigger, table))?;
         (state.database == current_database())
             .then(|| state.image_to(txid))
             .flatten()
@@ -156,32 +170,19 @@ impl Storage {
 
     pub(crate) fn partition_trigger_oid_to(
         &self,
-        trigger: &TriggerDef,
-        table: usize,
+        trigger: CatalogPosition,
+        table: CatalogPosition,
         txid: u32,
     ) -> Result<i32, SqlError> {
-        let slot = self
-            .triggers_with_slots_visible_to(txid)
-            .find_map(|(slot, candidate)| {
-                (candidate.created_at == trigger.created_at).then_some(slot)
-            })
-            .ok_or_else(|| {
-                sql_err!(
-                    sqlstate::DATA_EXCEPTION,
-                    "inherited trigger parent is unavailable"
-                )
-            })?;
         let image = self
-            .partition_trigger_image_to(slot, table, txid)
+            .partition_trigger_image_to(trigger.slot(), table.slot(), txid)
             .ok_or_else(|| {
                 sql_err!(
                     sqlstate::DATA_EXCEPTION,
                     "inherited trigger identity is unavailable"
                 )
             })?;
-        if image.trigger.created_at() != trigger.created_at
-            || image.table != self.table_position(table)
-        {
+        if image.trigger != trigger || image.table != table {
             return Err(sql_err!(
                 sqlstate::DATA_EXCEPTION,
                 "inherited trigger selects a replaced object"

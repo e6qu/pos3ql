@@ -836,17 +836,17 @@ impl S3Client {
     }
 
     pub(crate) fn delete_nonblocking(&mut self, key: &str) -> Result<(), S3Error> {
-        if self.pending.is_none() {
-            self.begin_nonblocking(
+        match self.pending.as_ref().map(PendingRequest::method) {
+            None => self.begin_nonblocking(
                 PendingMethod::Delete,
                 key,
                 "",
                 &[],
                 Precondition::None,
                 None,
-            )?;
-        } else if self.pending.as_ref().unwrap().method() != PendingMethod::Delete {
-            return Err(S3Error::Protocol("pending request is not DELETE"));
+            )?,
+            Some(PendingMethod::Delete) => {}
+            Some(_) => return Err(S3Error::Protocol("pending request is not DELETE")),
         }
         match self.advance_request(&[]) {
             Ok(_) => Ok(()),
@@ -865,17 +865,17 @@ impl S3Client {
         each: impl FnMut(&str),
     ) -> Result<Option<ListCursor>, S3Error> {
         let query = self.list_query(prefix, cursor, limit)?;
-        if self.pending.is_none() {
-            self.begin_nonblocking(
+        match self.pending.as_ref().map(PendingRequest::method) {
+            None => self.begin_nonblocking(
                 PendingMethod::List,
                 "",
                 query.as_str(),
                 &[],
                 Precondition::None,
                 None,
-            )?;
-        } else if self.pending.as_ref().unwrap().method() != PendingMethod::List {
-            return Err(S3Error::Protocol("pending request is not LIST"));
+            )?,
+            Some(PendingMethod::List) => {}
+            Some(_) => return Err(S3Error::Protocol("pending request is not LIST")),
         }
         self.advance_request(&[])?;
         self.visit_list_page(prefix, cursor, limit, each)
@@ -1041,8 +1041,7 @@ impl S3Client {
         }
         let mut count = 0;
         let mut continuation: Option<StackStr<1024>> = None;
-        let mut last_key =
-            (!after.is_empty()).then(|| StackStr::<MAX_OBJECT_KEY_BYTES>::from_str(after));
+        let mut last_key = StackStr::<MAX_OBJECT_KEY_BYTES>::from_str(after);
         loop {
             let mut query = StackStr::<6400>::new();
             {
@@ -1083,10 +1082,7 @@ impl S3Client {
                 prefix,
                 ListCursor {
                     token: continuation,
-                    after: match last_key {
-                        Some(key) => key,
-                        None => StackStr::new(),
-                    },
+                    after: last_key,
                 },
                 page_limit,
                 |key| {
@@ -1100,7 +1096,7 @@ impl S3Client {
             let Some(next) = next else {
                 return Ok(count);
             };
-            last_key = Some(next.after);
+            last_key = next.after;
             continuation = next.token;
         }
     }
@@ -2640,13 +2636,28 @@ mod tests {
             assert!(matches!(client.advance_pending(), Err(S3Error::WouldBlock)));
             std::thread::yield_now();
         }
+        let mut reactor = crate::io::Reactor::new(&mut budget, 1).unwrap();
+        reactor
+            .register_read(client.pending_fd().expect("pending chunked GET"), 1)
+            .unwrap();
         for index in 0..8 {
             assert_eq!(
                 received.recv_timeout(Duration::from_secs(5)).unwrap(),
                 index
             );
-            let result = crate::mem::guard::forbid_alloc(|| client.advance_pending());
+            let mut result = crate::mem::guard::forbid_alloc(|| client.advance_pending());
             if index == 7 {
+                // The sender's notification does not establish socket readiness.
+                // Keep the original deadline while the last bytes reach the peer.
+                while matches!(result, Err(S3Error::WouldBlock)) {
+                    let remaining =
+                        send_deadline.saturating_duration_since(std::time::Instant::now());
+                    assert!(!remaining.is_zero(), "final chunk did not arrive");
+                    result = crate::mem::guard::forbid_alloc(|| {
+                        assert!(reactor.poll(Some(remaining)).unwrap() > 0);
+                        client.advance_pending()
+                    });
+                }
                 assert_eq!(result.unwrap().len, 5);
             } else {
                 assert!(matches!(result, Err(S3Error::WouldBlock)));

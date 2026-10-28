@@ -111,6 +111,9 @@ and jar structure on fresh downloads and CI cache restores. Keep the version,
 checksum, source and cache key together when changing this fixture dependency.
 
 Use the existing fixtures and allocation guard for changed runtime behavior.
+Set accepted mock sockets' blocking mode explicitly. Wait for socket readiness
+using the original deadline; a mock server reporting a completed write does not
+guarantee that its client can read the bytes yet.
 Verify the invariant or external contract, not a test that merely restates the
 implementation. Boundary changes generally need accepted/rejected capacity,
 rollback, failure cleanup, WAL/checkpoint, and empty-cache recovery coverage.

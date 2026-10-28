@@ -10085,6 +10085,14 @@ impl Engine {
             return false;
         }
         if let Some(checkpointer) = self.ckpt.as_ref()
+            && checkpointer.commit_cleanup_pending()
+            && !checkpointer.credential_install_pending()
+        {
+            return checkpointer.metadata_io_ready()
+                || self.local_cleanup.is_some()
+                || self.storage.history_cleanup_pending();
+        }
+        if let Some(checkpointer) = self.ckpt.as_ref()
             && checkpointer.manifest_publication_pending()
         {
             return checkpointer.manifest_publication_ready(std::time::Instant::now())
@@ -10210,6 +10218,28 @@ impl Engine {
             .ckpt
             .as_ref()
             .is_some_and(Checkpointer::credential_install_pending);
+        if !credential_draining
+            && self.local_cleanup.is_none()
+            && !self.storage.history_cleanup_pending()
+            && let Some(checkpointer) = self.ckpt.as_mut()
+            && checkpointer.commit_cleanup_pending()
+        {
+            if !checkpointer.metadata_io_ready() {
+                return CheckpointBeat::WaitingForReads;
+            }
+            return match checkpointer.advance_commit_cleanup() {
+                Ok(()) if !checkpointer.metadata_io_ready() => CheckpointBeat::WaitingForReads,
+                Ok(()) => CheckpointBeat::Advanced,
+                Err(error) => {
+                    self.remember_checkpoint_failure(&error);
+                    crate::logging::error_args(
+                        "checkpoint_commit_cleanup_failed",
+                        format_args!("{}: {}", error.sqlstate, error.message.as_str()),
+                    );
+                    CheckpointBeat::StorageFailure
+                }
+            };
+        }
         let journal_pending = self.unpromoted_commits != 0
             || (self.commit_progress == CommitProgressMode::Reactor
                 && self.durable_retry_pending());

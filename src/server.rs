@@ -775,6 +775,7 @@ impl Server {
                 .object_store_put_slots
                 .saturating_add(config.object_store_block_put_slots)
                 .saturating_add(crate::checkpoint::MANIFEST_UPLOAD_SLOTS)
+                .saturating_add(1) // background metadata request
                 .saturating_add(if config.object_store_credentials_file.is_empty() {
                     0
                 } else {

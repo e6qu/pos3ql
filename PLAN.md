@@ -17,7 +17,8 @@ Its commit history must retain durable order. Reads, independent uploads and SQL
 CPU execution do not all need to be serialized to preserve that order.
 
 Today, object-store I/O overlaps and batches requests, while SQL CPU work uses
-one worker. Some state-changing, metadata and maintenance reads still wait
+one worker. Journal cleanup yields while its metadata requests wait; some
+state-changing, checkpoint capture and block-cleanup reads still wait
 synchronously. Same-host MinIO and SeaweedFS checks establish portability;
 they do not establish production performance. The owning guides describe
 [current behavior](docs/implemented-baseline.md), [physical limits](docs/architecture.md#memory-and-physical-size)
@@ -36,8 +37,10 @@ A waiting schema edit must never attach itself to a new object that reused a nam
   must stay private to their transaction. Preserve repeated dependency rows.
 - Keep older rows, indexes and saved files until readers and backups finish.
   Remove obsolete versions in limited batches so other queries keep moving.
-- Let remaining metadata and maintenance downloads pause without occupying the
-  SQL worker. Save enough state to resume within the fixed memory budget.
+- Let remaining checkpoint capture, table/index merge and block-cleanup
+  downloads pause without occupying the SQL worker. Save enough state to resume
+  within the fixed memory budget, as journal cleanup does for backup listings,
+  retention manifests, commit-chain descriptors and obsolete-log deletions.
   Recovery can keep exclusive startup access; ordinary operation must allow
   unrelated work to progress.
 

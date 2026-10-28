@@ -17,7 +17,8 @@ use crate::crypto::sha256::{HexDigest, sha256};
 use crate::mem::budget::{Budget, BudgetError};
 use crate::mem::buffer::FixedBuf;
 use crate::object_store::{
-    ByteRange, Credentials, EntityTag, Error, GetResult, MAX_OBJECT_KEY_BYTES, Precondition,
+    ByteRange, Credentials, EntityTag, Error, GetResult, ListCursor, MAX_OBJECT_KEY_BYTES,
+    Precondition,
 };
 use crate::stack_format;
 use crate::util::StackStr;
@@ -171,6 +172,8 @@ pub struct S3Client {
 enum PendingMethod {
     Get,
     Put,
+    List,
+    Delete,
 }
 
 enum PendingRequest {
@@ -424,7 +427,7 @@ impl S3Client {
                     .ok_or(S3Error::Protocol("GET response missing ETag"))?,
             });
         }
-        self.begin_nonblocking(PendingMethod::Get, key, &[], Precondition::None, range)?;
+        self.begin_nonblocking(PendingMethod::Get, key, "", &[], Precondition::None, range)?;
         self.advance_pending()
     }
 
@@ -435,7 +438,7 @@ impl S3Client {
         body: &[u8],
         precondition: Precondition<'_>,
     ) -> Result<EntityTag, S3Error> {
-        self.begin_nonblocking(PendingMethod::Put, key, body, precondition, None)?;
+        self.begin_nonblocking(PendingMethod::Put, key, "", body, precondition, None)?;
         self.advance_put(body)
     }
 
@@ -460,10 +463,12 @@ impl S3Client {
                 .is_some_and(tls::Transport::wants_write)
     }
 
+    #[expect(clippy::too_many_arguments, reason = "explicit signed request fields")]
     fn begin_nonblocking(
         &mut self,
         method: PendingMethod,
         key: &str,
+        query: &str,
         body: &[u8],
         precondition: Precondition<'_>,
         range: Option<ByteRange>,
@@ -473,13 +478,13 @@ impl S3Client {
         }
         let payload_hash = HexDigest::of(&sha256(body));
         self.build_head(
-            if method == PendingMethod::Get {
-                "GET"
-            } else {
-                "PUT"
+            match method {
+                PendingMethod::Get | PendingMethod::List => "GET",
+                PendingMethod::Put => "PUT",
+                PendingMethod::Delete => "DELETE",
             },
             key,
-            "",
+            query,
             body.len() as u64,
             payload_hash.as_str(),
             precondition,
@@ -830,6 +835,152 @@ impl S3Client {
     /// themselves to it.
     pub fn response_capacity(&self) -> usize {
         self.body.capacity()
+    }
+
+    pub(crate) fn delete_nonblocking(&mut self, key: &str) -> Result<(), S3Error> {
+        if self.pending.is_none() {
+            self.begin_nonblocking(
+                PendingMethod::Delete,
+                key,
+                "",
+                &[],
+                Precondition::None,
+                None,
+            )?;
+        } else if self.pending.as_ref().unwrap().method() != PendingMethod::Delete {
+            return Err(S3Error::Protocol("pending request is not DELETE"));
+        }
+        match self.advance_request(&[]) {
+            Ok(_) => Ok(()),
+            Err(error) if error.is_not_found() => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// A single response never runs callbacks before all its keys and cursor
+    /// validate. The caller retains this exact cursor while the socket waits.
+    pub(crate) fn list_page(
+        &mut self,
+        prefix: &str,
+        cursor: ListCursor,
+        limit: usize,
+        each: impl FnMut(&str),
+    ) -> Result<Option<ListCursor>, S3Error> {
+        let query = self.list_query(prefix, cursor, limit)?;
+        if self.pending.is_none() {
+            self.begin_nonblocking(
+                PendingMethod::List,
+                "",
+                query.as_str(),
+                &[],
+                Precondition::None,
+                None,
+            )?;
+        } else if self.pending.as_ref().unwrap().method() != PendingMethod::List {
+            return Err(S3Error::Protocol("pending request is not LIST"));
+        }
+        self.advance_request(&[])?;
+        self.visit_list_page(prefix, cursor, limit, each)
+    }
+
+    fn list_query(
+        &self,
+        prefix: &str,
+        cursor: ListCursor,
+        limit: usize,
+    ) -> Result<StackStr<6400>, S3Error> {
+        if limit == 0
+            || limit > LIST_MAX_KEYS
+            || (!cursor.after.is_empty() && !cursor.after.as_str().starts_with(prefix))
+            || self.key_prefix.len() + prefix.len() > MAX_OBJECT_KEY_BYTES
+            || self.key_prefix.len() + cursor.after.len() > MAX_OBJECT_KEY_BYTES
+        {
+            return Err(S3Error::Protocol("invalid list page range"));
+        }
+        use core::fmt::Write as _;
+        let mut query = StackStr::<6400>::new();
+        if let Some(token) = cursor.token {
+            let _ = query.write_str("continuation-token=");
+            let _ = uri_encode(&mut query, token.as_str(), false);
+            let _ = query.write_char('&');
+        }
+        let _ = write!(
+            query,
+            "encoding-type=url&list-type=2&max-keys={limit}&prefix="
+        );
+        let _ = uri_encode(&mut query, &self.key_prefix, false);
+        let _ = uri_encode(&mut query, prefix, false);
+        if cursor.token.is_none() && !cursor.after.is_empty() {
+            let _ = query.write_str("&start-after=");
+            let _ = uri_encode(&mut query, &self.key_prefix, false);
+            let _ = uri_encode(&mut query, cursor.after.as_str(), false);
+        }
+        if query.is_truncated() {
+            return Err(S3Error::Protocol("list query overflow"));
+        }
+        Ok(query)
+    }
+
+    fn visit_list_page(
+        &self,
+        prefix: &str,
+        cursor: ListCursor,
+        limit: usize,
+        mut each: impl FnMut(&str),
+    ) -> Result<Option<ListCursor>, S3Error> {
+        let xml = core::str::from_utf8(self.body.readable())
+            .map_err(|_| S3Error::Protocol("list response is not UTF-8"))?;
+        let truncated = match extract_xml_text(xml, "IsTruncated") {
+            Some("true") => true,
+            Some("false") => false,
+            _ => return Err(S3Error::Protocol("invalid or missing IsTruncated")),
+        };
+        let token = extract_xml_text(xml, "NextContinuationToken")
+            .map(decode_xml_text::<1024>)
+            .transpose()?;
+        if truncated
+            && (token.is_none()
+                || token.as_ref().is_some_and(|next| next.is_empty())
+                || token == cursor.token)
+        {
+            return Err(S3Error::Protocol("list continuation token did not advance"));
+        }
+        let mut last = cursor.after;
+        // Validation precedes every callback, including for a malformed later key.
+        for emit in [false, true] {
+            let mut rest = xml;
+            let mut count = 0;
+            if emit {
+                last = cursor.after;
+            }
+            while let Some(encoded_key) = extract_xml_text(rest, "Key") {
+                let key = percent_decode::<MAX_OBJECT_KEY_BYTES>(encoded_key)?;
+                let logical = key
+                    .as_str()
+                    .strip_prefix(self.key_prefix.as_str())
+                    .ok_or(S3Error::Protocol("listed key outside configured prefix"))?;
+                if !logical.starts_with(prefix) {
+                    return Err(S3Error::Protocol("listed key outside requested prefix"));
+                }
+                if !last.is_empty() && logical <= last.as_str() {
+                    return Err(S3Error::Protocol("listed keys are not strictly ordered"));
+                }
+                count += 1;
+                if count > limit {
+                    return Err(S3Error::Protocol("list page exceeds requested key count"));
+                }
+                if emit {
+                    each(logical);
+                }
+                last = StackStr::from_str(logical);
+                let end = rest
+                    .find("</Key>")
+                    .ok_or(S3Error::Protocol("unterminated list key"))?
+                    + 6;
+                rest = &rest[end..];
+            }
+        }
+        Ok(truncated.then_some(ListCursor { token, after: last }))
     }
 
     pub fn delete(&mut self, key: &str) -> Result<(), S3Error> {

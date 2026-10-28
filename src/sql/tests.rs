@@ -93407,6 +93407,97 @@ fn finish_sliced_cleanup(engine: &mut Engine) -> usize {
 }
 
 #[test]
+fn maintenance_metadata_waits_leave_cached_sql_runnable_through_log_deletion() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::time::{Duration, Instant};
+
+    let (mut engine, mut budget, mut config) =
+        sliced_cleanup_fixture("metadata-cleanup-cached-orders", false);
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    while engine.storage.history_cleanup_pending() {
+        assert!(!engine.checkpoint_beat().failed());
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    config.object_store_on = true;
+    config.object_store_sim = false;
+    config.object_store_endpoint = listener.local_addr().unwrap().to_string();
+    config.object_store_access_key = "test-access".to_owned();
+    config.object_store_secret_key = "test-secret".to_owned();
+    let mut io_budget = Budget::new(crate::checkpoint::Checkpointer::budget_bytes(&config));
+    let mut checkpointer = crate::checkpoint::Checkpointer::new(&config, &mut io_budget).unwrap();
+    checkpointer.schedule_commit_prune(0);
+    engine.ckpt = Some(checkpointer);
+    let empty = "<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>";
+    let orphan = format!(
+        "<ListBucketResult><IsTruncated>false</IsTruncated><Contents><Key>{}commits/00000000000000000000-00000000.batch</Key></Contents></ListBucketResult>",
+        config.object_store_prefix
+    );
+    let mut stream = None;
+    for (method, response) in [("GET ", empty), ("GET ", orphan.as_str()), ("DELETE ", "")] {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "cleanup did not start its request"
+            );
+            assert!(!crate::mem::guard::forbid_alloc(|| engine.checkpoint_beat()).failed());
+            if !engine.checkpoint_can_progress() {
+                break;
+            }
+        }
+        if stream.is_none() {
+            let (accepted, _) = listener.accept().unwrap();
+            accepted
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            stream = Some(accepted);
+        }
+        let stream = stream.as_mut().unwrap();
+        let mut request = Vec::new();
+        while !request.ends_with(b"\r\n\r\n") {
+            let mut byte = [0];
+            stream.read_exact(&mut byte).unwrap();
+            request.push(byte[0]);
+        }
+        assert!(request.starts_with(method.as_bytes()));
+        for _ in 0..3 {
+            assert_eq!(
+                crate::mem::guard::forbid_alloc(|| engine.checkpoint_beat()),
+                CheckpointBeat::WaitingForReads
+            );
+            assert!(!engine.checkpoint_can_progress());
+            let output = session.success(
+                &mut engine,
+                "SELECT count(*) = 80 AND min(id) = 1 AND max(id) = 80 FROM cleanup_orders",
+                true,
+            );
+            assert_eq!(data_rows(&output), ["t"]);
+        }
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n{response}",
+            response.len()
+        )
+        .unwrap();
+        while !engine.checkpoint_can_progress() {
+            assert!(
+                Instant::now() < deadline,
+                "cleanup did not wake after its response"
+            );
+            crate::mem::guard::forbid_alloc(|| {
+                engine.advance_wal_publication(Instant::now(), CommitProgressMode::Reactor)
+            })
+            .unwrap();
+            std::thread::yield_now();
+        }
+    }
+    assert!(!crate::mem::guard::forbid_alloc(|| engine.checkpoint_beat()).failed());
+    assert!(!engine.ckpt.as_ref().unwrap().commit_cleanup_pending());
+}
+
+#[test]
 fn bounded_cache_admission_waits_before_sequences_and_triggers_in_both_protocols() {
     fn execute(
         engine: &mut Engine,

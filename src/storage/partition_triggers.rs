@@ -180,7 +180,22 @@ impl Storage {
     pub(crate) fn reconcile_partition_triggers(
         &mut self,
         txn: &mut crate::sql::txn::TxnState,
+        undo_mark: usize,
     ) -> Result<(), SqlError> {
+        use crate::sql::txn::DdlUndo;
+        if !txn.ddl()[undo_mark..].iter().any(|undo| {
+            matches!(
+                undo,
+                DdlUndo::Created(_)
+                    | DdlUndo::Dropped(_)
+                    | DdlUndo::TableAltered(_)
+                    | DdlUndo::TriggerCreated(_)
+                    | DdlUndo::TriggerDropped(_)
+                    | DdlUndo::TriggerAltered { .. }
+            )
+        }) {
+            return Ok(());
+        }
         for trigger_slot in 0..self.trigger_capacity() {
             let trigger = self.trigger_to(trigger_slot, txn.txid);
             for table in 0..self.table_count() {

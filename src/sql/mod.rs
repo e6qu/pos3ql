@@ -15227,7 +15227,9 @@ impl Engine {
         };
         if matches!(outcome, Ok(Ok(())))
             && event_tag.is_some()
-            && let Err(error) = self.storage.reconcile_partition_triggers(txn)
+            && let Err(error) = self
+                .storage
+                .reconcile_partition_triggers(txn, event_ddl_mark)
         {
             return Ok(Err(error));
         }
@@ -17844,7 +17846,9 @@ impl Engine {
         };
         if matches!(outcome, Ok(Ok(())))
             && event_tag.is_some()
-            && let Err(error) = self.storage.reconcile_partition_triggers(txn)
+            && let Err(error) = self
+                .storage
+                .reconcile_partition_triggers(txn, event_ddl_mark)
         {
             return Ok(Err(error));
         }

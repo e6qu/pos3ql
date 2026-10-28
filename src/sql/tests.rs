@@ -1920,6 +1920,94 @@ fn catalog_lifetime_privileges_and_partition_triggers_survive_copies_and_empty_d
 }
 
 #[test]
+fn catalog_lifetime_privileges_and_partition_triggers_keep_prepared_changes_private() {
+    let fixture =
+        include_str!("../../tests/external/differential/199_privilege_and_partition_lifetimes.sql");
+    const INVENTORY: &str = "SELECT oid, member, grantor FROM pg_auth_members WHERE roleid='lifetime_member_group'::regrole ORDER BY oid; SELECT oid, defaclacl FROM pg_default_acl WHERE defaclnamespace='lifetime_privileges'::regnamespace; SELECT oid, tgparentid, tgenabled FROM pg_trigger WHERE tgname='lifetime_partition_hook' ORDER BY oid";
+    for checkpoint in [false, true] {
+        for commit in [false, true] {
+            for mode in [
+                crate::config::TransactionMode::Mvcc,
+                crate::config::TransactionMode::Locking,
+            ] {
+                let name = format!("privilege-partition-prepared-{checkpoint}-{commit}-{mode:?}");
+                let mut config = catalog_lifetime_config(&name, mode);
+                config.max_prepared_transactions = 1;
+                config.object_store_on = true;
+                config.object_store_sim = true;
+                config.wal_upload = true;
+                config.wal_upload_sync = true;
+                config.object_store_bucket = format!("{name}-{}", std::process::id());
+                crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+                let before;
+                let after;
+                {
+                    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+                    let mut engine = Engine::new(&config, &mut budget).unwrap();
+                    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+                    for sql in fixture
+                        .split("-- cleanup")
+                        .next()
+                        .unwrap()
+                        .split("\n\n")
+                        .filter(|sql| !sql.trim().is_empty())
+                    {
+                        session.success(&mut engine, sql, false);
+                    }
+                    before = data_rows(&session.success(&mut engine, INVENTORY, true));
+                    session.success(&mut engine, "BEGIN; REVOKE lifetime_member_group FROM lifetime_member_second; GRANT lifetime_member_group TO lifetime_member_second; ALTER DEFAULT PRIVILEGES IN SCHEMA lifetime_privileges REVOKE SELECT ON TABLES FROM lifetime_member_first; ALTER DEFAULT PRIVILEGES IN SCHEMA lifetime_privileges GRANT SELECT ON TABLES TO lifetime_member_first; ALTER TABLE lifetime_partition_root DETACH PARTITION lifetime_partition_child; ALTER TABLE lifetime_partition_root ATTACH PARTITION lifetime_partition_child FOR VALUES FROM (0) TO (10); ALTER TABLE lifetime_partition_child DISABLE TRIGGER lifetime_partition_hook", false);
+                    after = data_rows(&session.success(&mut engine, INVENTORY, true));
+                    assert_ne!(before, after);
+                    let mut observer = ConfiguredTransactionSession::new(&config, &mut budget);
+                    assert_eq!(
+                        data_rows(&observer.success(&mut engine, INVENTORY, true)),
+                        before
+                    );
+                    session.success(
+                        &mut engine,
+                        "PREPARE TRANSACTION 'privilege-partition-pending'",
+                        false,
+                    );
+                    assert_eq!(
+                        data_rows(&observer.success(&mut engine, INVENTORY, true)),
+                        before
+                    );
+                    if checkpoint {
+                        assert!(engine.checkpoint().unwrap());
+                    }
+                    engine.commit_wal().unwrap();
+                }
+                std::fs::remove_dir_all(&config.data_dir).unwrap();
+                {
+                    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+                    let mut engine = Engine::new(&config, &mut budget).unwrap();
+                    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+                    assert_eq!(
+                        data_rows(&session.success(&mut engine, INVENTORY, true)),
+                        before
+                    );
+                    session.success(
+                        &mut engine,
+                        if commit {
+                            "COMMIT PREPARED 'privilege-partition-pending'"
+                        } else {
+                            "ROLLBACK PREPARED 'privilege-partition-pending'"
+                        },
+                        false,
+                    );
+                    assert_eq!(
+                        data_rows(&session.success(&mut engine, INVENTORY, true)),
+                        if commit { after } else { before }
+                    );
+                }
+                std::fs::remove_dir_all(&config.data_dir).unwrap();
+                crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+            }
+        }
+    }
+}
+
+#[test]
 fn event_trigger_failures_keep_notices_without_success_command_tags() {
     for mode in [
         crate::config::TransactionMode::Mvcc,

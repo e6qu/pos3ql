@@ -7,7 +7,7 @@ name: Drivers
 
 on:
   push:
-    branches: [main, catalog-reader-consistency]
+    branches: [main]
   pull_request:
 
 concurrency:

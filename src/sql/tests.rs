@@ -93425,6 +93425,8 @@ fn maintenance_metadata_waits_leave_cached_sql_runnable_through_log_deletion() {
     config.object_store_endpoint = listener.local_addr().unwrap().to_string();
     config.object_store_access_key = "test-access".to_owned();
     config.object_store_secret_key = "test-secret".to_owned();
+    config.block_cache_bytes = 0;
+    config.disk_cache_bytes = 0;
     let mut io_budget = Budget::new(crate::checkpoint::Checkpointer::budget_bytes(&config));
     let mut checkpointer = crate::checkpoint::Checkpointer::new(&config, &mut io_budget).unwrap();
     checkpointer.schedule_commit_prune(0);

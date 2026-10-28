@@ -20244,6 +20244,8 @@ mod stored_dependency_tests {
         let mut config = Config::default_dev();
         config.object_store_on = true;
         config.object_store_sim = true;
+        config.block_cache_bytes = 0;
+        config.disk_cache_bytes = 0;
         config.object_store_bucket = format!("metadata-prune-pages-{}", std::process::id());
         config.data_dir = std::env::temp_dir()
             .join(&config.object_store_bucket)
@@ -20373,6 +20375,8 @@ mod stored_dependency_tests {
         let mut config = Config::default_dev();
         config.object_store_on = true;
         config.object_store_sim = true;
+        config.block_cache_bytes = 0;
+        config.disk_cache_bytes = 0;
         config.max_backups = 2;
         config.object_store_bucket = format!("metadata-backup-limit-{}", std::process::id());
         config.data_dir = std::env::temp_dir()

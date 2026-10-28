@@ -15,6 +15,10 @@ pub(super) const PAGE_KEYS: usize = 64;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "request keys and cursors use fixed startup state"
+)]
 enum Operation {
     Get(StackStr<128>),
     Delete(StackStr<128>),
@@ -180,9 +184,13 @@ mod tests {
             request.push(byte[0]);
         }
         assert!(request.starts_with(b"DELETE /maintenance-network/db%20space/commits/b.batch "));
-        stream
-            .write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n")
-            .unwrap();
+        let missing = "<Error><Code>NoSuchKey</Code></Error>";
+        write!(
+            stream,
+            "HTTP/1.1 404 Not Found\r\ncontent-length: {}\r\n\r\n{missing}",
+            missing.len()
+        )
+        .unwrap();
         finish(&mut io);
         assert_eq!(
             crate::mem::guard::forbid_alloc(|| io.delete("commits/b.batch")).unwrap(),
@@ -227,6 +235,10 @@ mod tests {
     }
 }
 
+#[allow(
+    clippy::large_enum_variant,
+    reason = "completed page cursor stays in fixed request state"
+)]
 enum Response {
     Get,
     Delete,

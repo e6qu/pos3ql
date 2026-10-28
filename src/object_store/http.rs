@@ -463,7 +463,6 @@ impl S3Client {
                 .is_some_and(tls::Transport::wants_write)
     }
 
-    #[expect(clippy::too_many_arguments, reason = "explicit signed request fields")]
     fn begin_nonblocking(
         &mut self,
         method: PendingMethod,
@@ -1085,7 +1084,10 @@ impl S3Client {
                 prefix,
                 ListCursor {
                     token: continuation,
-                    after: last_key.unwrap_or(StackStr::new()),
+                    after: match last_key {
+                        Some(key) => key,
+                        None => StackStr::new(),
+                    },
                 },
                 page_limit,
                 |key| {

@@ -1,0 +1,55 @@
+name: Crash investigation
+on:
+  push:
+    branches: [catalog-reader-consistency]
+    paths: [.github/workflows/crash-investigation.yml]
+concurrency:
+  group: crash-investigation-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  torture:
+    name: crash investigation (${{ matrix.seed }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: b, seed: 20260725 }
+    services:
+      postgres:
+        image: mirror.gcr.io/library/postgres:18@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_INITDB_ARGS: "--lc-collate=C --lc-ctype=C --encoding=UTF8"
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Python venv for crash torture
+        uses: ./.github/actions/python-test-environment
+      - name: Run crash torture against the PostgreSQL 18 service
+        env:
+          POS3QL_VENV: ${{ github.workspace }}/venv
+          POS3QL_PSQL: psql
+          POS3QL_REFERENCE_PG_HOST: 127.0.0.1
+          POS3QL_REFERENCE_PG_PORT: "5432"
+          POS3QL_TORTURE_ROUNDS: "6"
+          POS3QL_TORTURE_SEED: ${{ matrix.seed }}
+          COVERAGE_SHARD: runtest:torture
+          POS3QL_FAILURE_ARTIFACTS: ${{ runner.temp }}/crash-failure
+        run: sh tools/coverage.sh
+      - uses: actions/upload-artifact@v6
+        if: failure()
+        with:
+          name: crash-failure-${{ matrix.name }}
+          path: ${{ runner.temp }}/crash-failure/
+          if-no-files-found: error
+          retention-days: 7
+

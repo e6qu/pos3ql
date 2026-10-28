@@ -177,6 +177,12 @@ cleanup() {
     wait "$S3_TEST_PID" 2>/dev/null || true
   fi
   release_test_ports
+  if [[ $FAIL -ne 0 && -n "${POS3QL_FAILURE_ARTIFACTS:-}" ]]; then
+    mkdir -p "$POS3QL_FAILURE_ARTIFACTS"
+    cp "$WORK/server.log" "$WORK/torture.out" "$WORK/object-audit.jsonl" \
+      "$POS3QL_FAILURE_ARTIFACTS/"
+    cp -R "$WORK/object-store" "$POS3QL_FAILURE_ARTIFACTS/"
+  fi
   if [[ "$KEEP" == "--keep" ]]; then
     printf 'work dir kept: %s\n' "$WORK"
   else
@@ -198,6 +204,7 @@ python3 "$EXT/s3_test_server.py" --root "$WORK/object-store" --port "$S3_TEST_PO
   --access-key "$S3_TEST_ACCESS_KEY" --secret-key "$S3_TEST_SECRET_KEY" \
   --credentials-file "$SERVER_CREDENTIALS_FILE" --page-size 7 \
   --writer-probe-gate-file "$WRITER_PROBE_GATE_FILE" \
+  --audit-file "$WORK/object-audit.jsonl" \
   > "$WORK/object-store.log" 2>&1 &
 S3_TEST_PID=$!
 for _ in {1..50}; do
@@ -854,6 +861,8 @@ if [[ -n "${POS3QL_VENV:-}" && -x "$POS3QL_VENV/bin/python" && ( -x "$TORTURE_PG
     tail -40 "$WORK/torture.out"
     printf '%s\n' '--- pos3ql server log after crash torture ---'
     tail -80 "$WORK/server.log"
+    printf '%s\n' '--- final object-store mutations ---'
+    tail -100 "$WORK/object-audit.jsonl"
   fi
   if [[ $TORTURE_OWNS_REFERENCE == true ]]; then
     "$TORTURE_PGBIN/pg_ctl" -D "$WORK/torture-pgdata" stop -m immediate >/dev/null 2>&1

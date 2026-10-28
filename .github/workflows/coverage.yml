@@ -123,7 +123,15 @@ jobs:
           POS3QL_TORTURE_ROUNDS: "6"
           POS3QL_TORTURE_SEED: ${{ matrix.seed }}
           COVERAGE_SHARD: runtest:torture
+          POS3QL_FAILURE_ARTIFACTS: ${{ runner.temp }}/crash-failure
         run: sh tools/coverage.sh
+      - uses: actions/upload-artifact@v6
+        if: failure()
+        with:
+          name: crash-failure-${{ matrix.name }}
+          path: ${{ runner.temp }}/crash-failure/
+          if-no-files-found: error
+          retention-days: 7
 
   subscription:
     name: shard subscription

@@ -91,6 +91,13 @@ aggregate RSS with a 180-second deadline. Use the workspace's provided resource
 guard for local checks. If it refuses or a limit is reached,
 move the workload to CI; do not bypass the guard or raise limits automatically.
 
+Failed crash-recovery jobs retain `crash-failure-a` or `crash-failure-b` artifacts.
+They include the generated object-store fixture, server and SQL logs, and an
+ordered `object-audit.jsonl` of writes, deletions and recovery roots. The audit
+omits credentials and subscription connection strings. Use these records to
+trace a missing block to its publication and deletion; keep the failing seed
+and request deadlines when fixing it.
+
 On a suitable dedicated runner, a focused regression can be selected with:
 
 ```sh

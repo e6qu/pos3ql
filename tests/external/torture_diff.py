@@ -140,6 +140,7 @@ def verify(p3cur, pgcur, context):
 def run(cur_pair, sql, params=None):
     """Run on pos3ql first; mirror to the reference only once acked."""
     p3, pg = cur_pair
+    print(f"SQL: {sql}", flush=True)
     p3.execute(sql, params)
     pg.execute(sql, params)
 
@@ -205,9 +206,11 @@ def main():
     total_kills = 0
     total_cold = 0
     for rnd in range(args.rounds):
+        print(f"TORTURE seed={args.seed} round={rnd} stage=live", flush=True)
         random_batch()
         # Sometimes force a checkpoint (beyond the automatic ones).
         if rng.random() < 0.6:
+            print("SQL: CHECKPOINT", flush=True)
             p3c.execute("CHECKPOINT")
         if not verify(p3c, pgc, f"(round {rnd}, live)"):
             sys.exit(1)
@@ -216,6 +219,7 @@ def main():
         if action < 0.45:
             continue  # no restart this round
         cold = action >= 0.8
+        print(f"TORTURE round={rnd} restart=cold:{cold}", flush=True)
         if cold:
             # Everything must be in the bucket before the disk is wiped: a
             # checkpoint publishes the manifest synchronously and prunes the

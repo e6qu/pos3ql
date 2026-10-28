@@ -10098,7 +10098,7 @@ impl Engine {
         if let Some(checkpointer) = self.ckpt.as_ref()
             && checkpointer.commit_cleanup_pending()
             && !checkpointer.credential_install_pending()
-            && !checkpointer.published_maintenance_pending()
+            && !checkpointer.physical_maintenance_pending(&self.storage)
         {
             if checkpointer.metadata_io_ready() {
                 return true;
@@ -10181,7 +10181,7 @@ impl Engine {
         let journal_progress = if let Some(checkpointer) = self.ckpt.as_mut()
             && checkpointer.commit_cleanup_pending()
             && !checkpointer.credential_install_pending()
-            && !checkpointer.published_maintenance_pending()
+            && !checkpointer.physical_maintenance_pending(&self.storage)
         {
             if !checkpointer.metadata_io_ready() {
                 CheckpointBeat::WaitingForReads

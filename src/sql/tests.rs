@@ -93526,6 +93526,130 @@ fn maintenance_metadata_waits_leave_cached_sql_runnable_through_log_deletion() {
 }
 
 #[test]
+fn maintenance_metadata_reader_release_shares_the_configured_deletion_limit() {
+    use crate::object_store::Precondition;
+    let mut config = test_config("journal-reader-release-pacing");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_bucket = format!("journal-reader-release-pacing-{}", std::process::id());
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.checkpoint_delete_objects_per_beat = 1;
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let mut budget = test_engine_budget(&config, (1 << 29) + (96 << 20));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE TABLE pacing_orders(id integer); INSERT INTO pacing_orders VALUES (1)",
+        false,
+    );
+    assert!(engine.checkpoint().unwrap());
+    let table = engine
+        .storage
+        .find_table("public", "pacing_orders")
+        .unwrap();
+    let namespace = crate::object_store::sim::open_namespace(&config.object_store_bucket, 0);
+    for digest in 1..=4 {
+        engine
+            .ckpt
+            .as_mut()
+            .unwrap()
+            .client
+            .put(
+                &format!("commits/00000000000000000000-{digest:08x}.batch"),
+                b"unpublished orphan",
+                Precondition::IfNoneMatchAny,
+            )
+            .unwrap();
+    }
+    engine
+        .ckpt
+        .as_mut()
+        .unwrap()
+        .schedule_commit_prune(engine.storage.lsn());
+    let before = namespace.borrow().object_count();
+    for _ in 0..64 {
+        assert!(!crate::mem::guard::forbid_alloc(|| engine.checkpoint_beat()).failed());
+        if namespace.borrow().object_count() < before {
+            break;
+        }
+    }
+    assert_eq!(namespace.borrow().object_count(), before - 1);
+    assert!(engine.ckpt.as_ref().unwrap().commit_cleanup_pending());
+    assert!(
+        !engine
+            .ckpt
+            .as_ref()
+            .unwrap()
+            .published_maintenance_pending()
+    );
+    engine
+        .ckpt
+        .as_mut()
+        .unwrap()
+        .client
+        .put(
+            "blocks/released-reader-orphan",
+            b"obsolete block",
+            Precondition::IfNoneMatchAny,
+        )
+        .unwrap();
+    let mut roots = Vec::with_capacity(1);
+    crate::mem::guard::forbid_alloc(|| {
+        let reader = engine.storage.row_scan(table).unwrap();
+        engine
+            .storage
+            .copy_retained_spill_roots(true, &mut roots)
+            .unwrap();
+        assert_eq!(roots.len(), 1);
+        drop(reader);
+        assert!(engine.storage.retained_file_reclamation_pending());
+    });
+    let before = namespace.borrow().object_count();
+    assert!(!crate::mem::guard::forbid_alloc(|| engine.checkpoint_beat()).failed());
+    assert_eq!(
+        namespace.borrow().object_count(),
+        before - 1,
+        "a reader release must not add a second deletion batch to a journal turn"
+    );
+    assert!(
+        namespace
+            .borrow()
+            .object_bytes(&format!(
+                "{}blocks/released-reader-orphan",
+                config.object_store_prefix
+            ))
+            .is_none()
+    );
+    for _ in 0..64 {
+        if !engine
+            .ckpt
+            .as_ref()
+            .unwrap()
+            .maintenance_pending(&engine.storage)
+        {
+            break;
+        }
+        assert!(!crate::mem::guard::forbid_alloc(|| engine.checkpoint_beat()).failed());
+    }
+    assert!(
+        !engine
+            .ckpt
+            .as_ref()
+            .unwrap()
+            .maintenance_pending(&engine.storage)
+    );
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "SELECT id FROM pacing_orders", true)),
+        ["1"]
+    );
+    drop(session);
+    drop(engine);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+}
+
+#[test]
 fn bounded_cache_admission_waits_before_sequences_and_triggers_in_both_protocols() {
     fn execute(
         engine: &mut Engine,

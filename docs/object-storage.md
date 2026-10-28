@@ -105,6 +105,8 @@ The two tasks have separate startup-reserved backup lists and deletion queues.
 Each journal pass stops at its captured cutoff; new commits cannot extend that
 pass indefinitely. Later checkpoints queue the latest requested cutoff, while
 a more conservative retention decision cancels the pending deletion work.
+Journal and physical-file cleanup share the configured per-turn deletion limit,
+including when releasing a reader makes another file-cleanup pass necessary.
 
 **User example:** a slow response while deleting last week's obsolete journal
 must not delay reading a cached order or saving new orders to free cache space.

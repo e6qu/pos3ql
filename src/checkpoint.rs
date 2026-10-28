@@ -1322,15 +1322,11 @@ pub(crate) struct Checkpointer {
     table_output: FixedVec<CheckpointVersion>,
     table_job: Option<TableSliceJob>,
     commit_publication: Option<CommitPublication>,
-    /// The block-grid path to the bucket: RAM frames over a disk slot file
-    /// over content-addressed block objects — `block_cache_bytes` and
-    /// `disk_cache_bytes` finally sized to something. SST reads and writes go
-    /// through here; writes populate the tiers on the way out, so a cold
-    /// start warms what a later read wants. Shared with the storage layer's
-    /// spilled-row reader. The engine has one owner today, and the mutex keeps
-    /// that ownership transferable to a worker without aliasing the stack.
+    /// Immutable table/index blocks through the startup-sized RAM/disk caches.
+    /// Storage's spilled-row reader shares this stack. Pending object requests
+    /// own their buffers after the short metadata guard ends.
     blocks: std::sync::Arc<Mutex<TieredStore<OwnedObjectStore>>>,
-    /// Scratch for SST writers and readers, reset per table.
+    /// Scratch shared by checkpoint, merge and garbage-collection turns.
     sst_arena: Arena,
     parameter_acl_arena: Arena,
     /// Spill-list updates computed during a checkpoint, applied to storage
@@ -2172,7 +2168,7 @@ impl Checkpointer {
         Ok(MergeBeatOutcome::Continue)
     }
 
-    /// Builds both clients and every fixed cache/checkpoint buffer at startup.
+    /// Builds the clients and fixed cache/checkpoint buffers at startup.
     /// Provider credentials and adapter selection terminate at
     /// [`crate::object_store`].
     pub(crate) fn new(config: &Config, budget: &mut Budget) -> Result<Self, CheckpointSetupError> {
@@ -3560,8 +3556,8 @@ impl Checkpointer {
         };
     }
 
-    /// Keep the published chain's covered boundary. Newer filenames may be
-    /// unpublished orphans. Follow one descriptor or delete one batch per turn.
+    /// Keep the published chain's covered boundary. Each turn advances a backup
+    /// or commit-list page, retention manifest, descriptor or deletion batch.
     fn prune_commit_batch(&mut self, up_to_lsn: u64) -> Result<bool, SqlError> {
         #[cfg(feature = "checkpoint-profile")]
         let started = checkpoint_profile_start();
@@ -9480,20 +9476,14 @@ impl Checkpointer {
         Ok(())
     }
 
-    /// One beat of the sliced checkpoint: write one table's SSTs, publish the
-    /// manifest once every slice is current, or delete one garbage batch after
-    /// publication. Between beats the engine serves statements, so a
-    /// checkpoint no longer stalls every connection for its whole duration;
-    /// consistency holds because a table that changes after its slice
-    /// ([`Table::mark_dirty`] bumps its generation) is re-sliced before the
-    /// publish. Root serialization captures only current slices; its upload
-    /// and local installation retain that captured identity across later beats.
+    /// Advances captured table/index output, manifest publication or cleanup.
+    /// Changed tables need a current slice before manifest capture. Upload and
+    /// local installation then retain that capture's identity across turns.
+    /// Some capture and block-cleanup reads still wait synchronously.
     ///
-    /// A failed beat (an object-store error) leaves the sweep state where it
-    /// stands; the next beat retries the same work — block writes are
-    /// content-addressed, so a retry re-uploading the same bytes is free,
-    /// and a crash mid-sweep leaves only orphan blocks for the next
-    /// publish's garbage sweep.
+    /// Failures retain a retryable position or restart the same immutable job.
+    /// Repeated PUTs keep the same block identity but still cost requests and
+    /// bandwidth. Unpublished blocks remain orphans for a later garbage sweep.
     pub(crate) fn checkpoint_step(
         &mut self,
         storage: &mut Storage,

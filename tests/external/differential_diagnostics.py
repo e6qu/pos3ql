@@ -30,9 +30,13 @@ def copy_line_positions(source, filename):
     }
 
 
-def normalize_diagnostics(stderr, diagnostics, copy_positions):
+def normalize_diagnostics(stderr, diagnostics, copy_positions, *, input_diagnostics):
     if diagnostics not in ("sqlstate", "verbose"):
         raise ValueError(f"unknown corpus diagnostics {diagnostics}")
+    if input_diagnostics not in ("sqlstate", "verbose"):
+        raise ValueError(f"unknown input diagnostics {input_diagnostics}")
+    if diagnostics == "verbose" and input_diagnostics != "verbose":
+        raise ValueError("verbose comparison requires verbose input diagnostics")
     result = []
     current = None
     auxiliary = False
@@ -56,14 +60,14 @@ def normalize_diagnostics(stderr, diagnostics, copy_positions):
             if severity in ("NOTICE", "WARNING"):
                 state = None
                 message = []
-            elif diagnostics == "sqlstate":
+            elif input_diagnostics == "sqlstate":
                 state = re.fullmatch(r"([0-9A-Z]{5})", body)
                 message = []
             else:
                 state = re.fullmatch(r"([0-9A-Z]{5}): (.*)", body)
                 message = [state[2]] if state else []
             if state is None and severity not in ("NOTICE", "WARNING"):
-                raise ValueError(f"malformed {diagnostics} diagnostic: {line}")
+                raise ValueError(f"malformed {input_diagnostics} diagnostic: {line}")
             current = {
                 "source": source,
                 "line": (copy_positions.get((source, int(number)), int(number))
@@ -88,8 +92,9 @@ def normalize_diagnostics(stderr, diagnostics, copy_positions):
     return result
 
 
-def write_transcript(stdout, byte_count, stderr, diagnostics, copy_positions, output):
-    records = normalize_diagnostics(stderr, diagnostics, copy_positions)
+def write_transcript(stdout, byte_count, stderr, diagnostics, copy_positions, output, *, input_diagnostics):
+    records = normalize_diagnostics(stderr, diagnostics, copy_positions,
+                                    input_diagnostics=input_diagnostics)
     # Length framing keeps data that resembles these markers unambiguous.
     output.write(f"STDOUT {byte_count} bytes\n".encode())
     copied = 0
@@ -109,6 +114,7 @@ def main():
     parser.add_argument("--stdout", type=Path, required=True)
     parser.add_argument("--stderr", type=Path, required=True)
     parser.add_argument("--diagnostics", choices=("sqlstate", "verbose"), required=True)
+    parser.add_argument("--input-diagnostics", choices=("sqlstate", "verbose"), required=True)
     arguments = parser.parse_args()
     try:
         with arguments.stdout.open("rb") as stdout:
@@ -122,6 +128,7 @@ def main():
                     arguments.source,
                 ),
                 sys.stdout.buffer,
+                input_diagnostics=arguments.input_diagnostics,
             )
     except (OSError, ValueError) as error:
         parser.exit(1, f"FAIL: corpus transcript: {error}\n")

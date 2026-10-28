@@ -22,7 +22,8 @@ SPEC.loader.exec_module(DIAGNOSTICS)
 class DifferentialDiagnosticsTests(unittest.TestCase):
     def render_transcript(self, stdout, stderr, diagnostics):
         output = io.BytesIO()
-        DIAGNOSTICS.write_transcript(io.BytesIO(stdout), len(stdout), stderr, diagnostics, {}, output)
+        DIAGNOSTICS.write_transcript(io.BytesIO(stdout), len(stdout), stderr, diagnostics, {}, output,
+                                     input_diagnostics=diagnostics)
         return output.getvalue()
 
     def test_stdout_streams_with_bounded_reads_and_rejects_a_changed_length(self):
@@ -35,14 +36,16 @@ class DifferentialDiagnosticsTests(unittest.TestCase):
         payload = b"x" * (128 * 1024 + 1)
         output = io.BytesIO()
         DIAGNOSTICS.write_transcript(
-            BoundedReader(payload), len(payload), "", "verbose", {}, output
+            BoundedReader(payload), len(payload), "", "verbose", {}, output,
+            input_diagnostics="verbose",
         )
         self.assertEqual(
             output.getvalue(), f"STDOUT {len(payload)} bytes\n".encode() + payload
             + b"\nDIAGNOSTICS\n",
         )
         with self.assertRaises(ValueError):
-            DIAGNOSTICS.write_transcript(io.BytesIO(b"x"), 2, "", "verbose", {}, io.BytesIO())
+            DIAGNOSTICS.write_transcript(io.BytesIO(b"x"), 2, "", "verbose", {}, io.BytesIO(),
+                                         input_diagnostics="verbose")
 
     def test_diagnostic_lookalikes_in_rows_are_preserved_verbatim(self):
         stdout = (
@@ -58,7 +61,8 @@ class DifferentialDiagnosticsTests(unittest.TestCase):
         self.assertTrue(result.startswith(
             f"STDOUT {len(stdout)} bytes\n".encode() + stdout + b"\nDIAGNOSTICS\n"
         ))
-        self.assertEqual(DIAGNOSTICS.normalize_diagnostics(stderr, "sqlstate", {}), [{
+        self.assertEqual(DIAGNOSTICS.normalize_diagnostics(stderr, "sqlstate", {},
+                         input_diagnostics="sqlstate"), [{
             "source": "corpus.sql", "line": 54, "severity": "ERROR", "sqlstate": "2BP01",
         }])
 
@@ -88,6 +92,7 @@ class DifferentialDiagnosticsTests(unittest.TestCase):
                     sys.executable, str(ROOT / "tests/external/differential_diagnostics.py"),
                     "--source", str(source), "--stdout", str(stdout), "--stderr", str(stderr),
                     "--diagnostics", "verbose",
+                    "--input-diagnostics", "verbose",
                 ],
                 capture_output=True, check=True,
             )
@@ -113,7 +118,7 @@ class DifferentialDiagnosticsTests(unittest.TestCase):
             "psql:corpus.sql:30: ERROR:  P0001:   first primary line\n"
             "second primary line\nCONTEXT:  function example()\n"
         )
-        records = DIAGNOSTICS.normalize_diagnostics(stderr, "verbose", {})
+        records = DIAGNOSTICS.normalize_diagnostics(stderr, "verbose", {}, input_diagnostics="verbose")
         self.assertEqual([record["line"] for record in records], [20, 30])
         self.assertEqual([record["message"] for record in records], [
             "cannot drop type child", "  first primary line\nsecond primary line",
@@ -144,7 +149,8 @@ class DifferentialDiagnosticsTests(unittest.TestCase):
 
     def test_client_failures_and_malformed_diagnostics_cannot_disappear(self):
         stderr = "psql: error: connection failed\nserver closed the connection\n"
-        self.assertEqual(DIAGNOSTICS.normalize_diagnostics(stderr, "verbose", {}), [
+        self.assertEqual(DIAGNOSTICS.normalize_diagnostics(stderr, "verbose", {},
+                         input_diagnostics="verbose"), [
             {"client": "psql: error: connection failed"},
             {"client": "server closed the connection"},
         ])
@@ -154,7 +160,7 @@ class DifferentialDiagnosticsTests(unittest.TestCase):
             ("unknown", ""),
         ):
             with self.subTest(style=style), self.assertRaises(ValueError):
-                DIAGNOSTICS.normalize_diagnostics(stderr, style, {})
+                DIAGNOSTICS.normalize_diagnostics(stderr, style, {}, input_diagnostics=style)
 
     def test_copy_errors_keep_the_command_position_while_input_is_drained(self):
         source = "SELECT 1;\nCOPY t\nFROM STDIN WITH (FORMAT csv); -- payload follows\n'not SQL\n\\.\n\nSELECT 2;\n"
@@ -163,19 +169,37 @@ class DifferentialDiagnosticsTests(unittest.TestCase):
         early = "psql:corpus.sql:3: ERROR:  42809\n"
         late = "psql:corpus.sql:5: ERROR:  42809\n"
         self.assertEqual(
-            DIAGNOSTICS.normalize_diagnostics(early, "sqlstate", positions),
-            DIAGNOSTICS.normalize_diagnostics(late, "sqlstate", positions),
+            DIAGNOSTICS.normalize_diagnostics(early, "sqlstate", positions, input_diagnostics="sqlstate"),
+            DIAGNOSTICS.normalize_diagnostics(late, "sqlstate", positions, input_diagnostics="sqlstate"),
         )
         for unrelated in (
             "psql:corpus.sql:7: ERROR:  42809\n",
             "psql:another.sql:5: ERROR:  42809\n",
         ):
             self.assertNotEqual(
-                DIAGNOSTICS.normalize_diagnostics(early, "sqlstate", positions),
-                DIAGNOSTICS.normalize_diagnostics(unrelated, "sqlstate", positions),
+                DIAGNOSTICS.normalize_diagnostics(early, "sqlstate", positions, input_diagnostics="sqlstate"),
+                DIAGNOSTICS.normalize_diagnostics(unrelated, "sqlstate", positions, input_diagnostics="sqlstate"),
             )
         with self.assertRaisesRegex(ValueError, "unterminated COPY data"):
             DIAGNOSTICS.copy_line_positions("COPY t FROM STDIN;\n", "corpus.sql")
+
+    def test_verbose_capture_keeps_state_comparison_separate_from_primary_text(self):
+        first = "psql:corpus.sql:8: ERROR:  54000: memtable exhausted\n"
+        changed = first.replace("memtable exhausted", "another primary message")
+        for mode, equal in (("sqlstate", True), ("verbose", False)):
+            rendered = []
+            for stderr in (first, changed):
+                output = io.BytesIO()
+                DIAGNOSTICS.write_transcript(io.BytesIO(b""), 0, stderr, mode, {}, output,
+                                             input_diagnostics="verbose")
+                rendered.append(output.getvalue())
+            self.assertEqual(rendered[0] == rendered[1], equal)
+        for input_mode in ("sqlstate", "unknown"):
+            with self.subTest(input_mode=input_mode), self.assertRaises(ValueError):
+                DIAGNOSTICS.normalize_diagnostics(first, "verbose", {}, input_diagnostics=input_mode)
+        with self.assertRaises(ValueError):
+            DIAGNOSTICS.normalize_diagnostics("psql:corpus.sql:8: ERROR:  54000\n",
+                "sqlstate", {}, input_diagnostics="verbose")
 
     def run_harness(self, harness, diagnostics, reference, client_status):
         source = (ROOT / "tests/external" / harness).read_text()
@@ -249,7 +273,7 @@ psql() {
                         self.assertIn("-e", rows)
                         self.assertNotIn("-a", rows)
                         self.assertNotIn("-q", rows)
-                        self.assertIn("VERBOSITY=" + diagnostics, rows)
+                        self.assertIn("VERBOSITY=verbose", rows)
                         self.assertEqual(rows[-2:], ["-f", input_path])
                         record = json.loads(records)
                         self.assertEqual(record["line"], 8)

@@ -120,7 +120,10 @@ rollback, failure cleanup, WAL/checkpoint, and empty-cache recovery coverage.
 SQL and wire behavior needs comparison with actual PostgreSQL, including
 SQLSTATEs, types, result shape, and values. SQLSTATE-only and exact-message
 corpora share the same reference connection settings, including UTC and the
-test extension directory; diagnostic style must not change fixture availability.
+test extension directory. Both capture verbose diagnostics, preserving primary
+messages for failure reports; the normalizer explicitly selects the fields to
+compare. A mismatch prints both raw diagnostic streams. Comparison style must
+not change fixture availability.
 Corpus comparisons echo each sent SQL command and retain its results and command
 tags in stdout. COPY errors retain their command's source position even when
 psql drains input before reporting the error; other diagnostic positions stay

@@ -251,10 +251,10 @@ run_corpus() { # port name file diagnostics
   if [[ "$1" == "$PG_PORT" ]]; then
     PGOPTIONS="-c timezone=UTC -c extension_control_path=$REFERENCE_EXTENSION_CONTROL_ROOT" \
       "$PSQL" -h 127.0.0.1 -p "$1" -U postgres -d "$REFERENCE_DATABASE" -X -e -P pager=off \
-        -v VERBOSITY="$diagnostics" -f "$3" > "$WORK/$2.stdout" 2> "$WORK/$2.stderr" || status=$?
+        -v VERBOSITY=verbose -f "$3" > "$WORK/$2.stdout" 2> "$WORK/$2.stderr" || status=$?
   else
     "$PSQL" -h 127.0.0.1 -p "$1" -U postgres -X -e -P pager=off \
-      -v VERBOSITY="$diagnostics" -f "$3" > "$WORK/$2.stdout" 2> "$WORK/$2.stderr" || status=$?
+      -v VERBOSITY=verbose -f "$3" > "$WORK/$2.stdout" 2> "$WORK/$2.stderr" || status=$?
   fi
   if [[ "$1" == "$P3_PORT" ]] && ! server_alive "$P3_PID"; then
     bad "pos3ql exited during $(basename "$3")"
@@ -273,7 +273,7 @@ run_corpus() { # port name file diagnostics
     return 1
   fi
   python3 "$EXT/differential_diagnostics.py" --source "$3" --stdout "$WORK/$2.stdout" \
-    --stderr "$WORK/$2.stderr" --diagnostics "$diagnostics" > "$WORK/$2" || return 1
+    --stderr "$WORK/$2.stderr" --input-diagnostics verbose --diagnostics "$diagnostics" > "$WORK/$2" || return 1
 }
 reset_user_extensions() { # port
   local database=postgres
@@ -353,6 +353,10 @@ if [[ "$CORPUS_SHARD_MODE" != none ]]; then
     else
       bad "differential: $name"
       head -30 "$WORK/$name.diff"
+      printf '%s\n' 'PostgreSQL diagnostics:'
+      cat "$WORK/$name.pg.stderr"
+      printf '%s\n' 'pos3ql diagnostics:'
+      cat "$WORK/$name.p3.stderr"
     fi
     reset_pair
     corpus_ordinal=$((corpus_ordinal + 1))
@@ -394,6 +398,10 @@ for f in $EXT/differential_exact/*.sql; do
   else
     bad "exact errors: $name"
     head -30 "$WORK/$name.diff"
+    printf '%s\n' 'PostgreSQL diagnostics:'
+    cat "$WORK/$name.pg.stderr"
+    printf '%s\n' 'pos3ql diagnostics:'
+    cat "$WORK/$name.p3.stderr"
   fi
   reset_pair
 done

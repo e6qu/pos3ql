@@ -242,7 +242,7 @@ CREATE RULE lifetime_rewrite AS ON UPDATE TO lifetime_saved_defaults
   DO INSTEAD NOTHING;
 
 CREATE TABLE lifetime_saved_definitions AS
-  SELECT 'function'::text AS kind, oid FROM pg_proc WHERE proname = 'lifetime_query'
+  SELECT 'function'::text AS kind, 'lifetime_query(integer)'::regprocedure::oid AS oid
   UNION ALL SELECT 'policy'::text, oid FROM pg_policy WHERE polname = 'lifetime_row_policy'
   UNION ALL SELECT 'rule'::text, oid FROM pg_rewrite WHERE rulename = 'lifetime_rewrite';
 
@@ -253,9 +253,9 @@ ALTER POLICY lifetime_row_policy ON lifetime_saved_defaults USING (false);
 
 ALTER TABLE lifetime_saved_defaults DISABLE RULE lifetime_rewrite;
 
-SELECT saved.oid = current_definition.oid
-  FROM lifetime_saved_definitions saved, pg_proc current_definition
-  WHERE saved.kind = 'function' AND current_definition.proname = 'lifetime_query';
+SELECT saved.oid = 'lifetime_query(integer)'::regprocedure::oid
+  FROM lifetime_saved_definitions saved
+  WHERE saved.kind = 'function';
 
 SELECT saved.oid = current_definition.oid
   FROM lifetime_saved_definitions saved, pg_policy current_definition
@@ -279,9 +279,9 @@ DROP RULE lifetime_rewrite ON lifetime_saved_defaults;
 CREATE RULE lifetime_rewrite AS ON UPDATE TO lifetime_saved_defaults
   DO INSTEAD NOTHING;
 
-SELECT saved.oid <> current_definition.oid
-  FROM lifetime_saved_definitions saved, pg_proc current_definition
-  WHERE saved.kind = 'function' AND current_definition.proname = 'lifetime_query';
+SELECT saved.oid <> 'lifetime_query(integer)'::regprocedure::oid
+  FROM lifetime_saved_definitions saved
+  WHERE saved.kind = 'function';
 
 SELECT saved.oid <> current_definition.oid
   FROM lifetime_saved_definitions saved, pg_policy current_definition

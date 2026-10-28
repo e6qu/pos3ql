@@ -502,3 +502,97 @@ impl Storage {
             .pending = prior;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::tests::{test_budget, test_config};
+
+    #[test]
+    fn catalog_lifetime_privileges_and_partition_triggers_reject_stale_default_groups() {
+        let public = DefaultAclGrantImage {
+            identity: DefaultAclIdentity {
+                creation: CatalogIdentity::parse(41).unwrap(),
+                owner: RoleOid::BOOTSTRAP,
+                schema: None,
+                class: DefaultPrivilegeClass::Table,
+            },
+            grantee: None,
+            privileges: PrivilegeSet::SELECT,
+            grant_options: PrivilegeSet::NONE,
+        };
+        for second in [
+            DefaultAclGrantImage {
+                identity: DefaultAclIdentity {
+                    schema: Some(SchemaIdentity::parse(0).unwrap()),
+                    ..public.identity
+                },
+                ..public
+            },
+            DefaultAclGrantImage {
+                identity: DefaultAclIdentity {
+                    creation: CatalogIdentity::parse(42).unwrap(),
+                    ..public.identity
+                },
+                grantee: Some(RoleOid::BOOTSTRAP),
+                privileges: PrivilegeSet::NONE,
+                ..public
+            },
+        ] {
+            let config = test_config();
+            let mut budget = test_budget(&config);
+            let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
+            crate::mem::guard::forbid_alloc(|| {
+                storage
+                    .install_default_acl_image(0, None, Some(public), 0)
+                    .unwrap();
+                storage
+                    .install_default_acl_image(1, None, Some(second), 0)
+                    .unwrap();
+                assert_eq!(
+                    storage.validate_default_acl_images().unwrap_err().sqlstate,
+                    sqlstate::DATA_EXCEPTION
+                );
+                assert_eq!(
+                    storage
+                        .validate_restored_catalog_identities(42)
+                        .unwrap_err()
+                        .sqlstate,
+                    sqlstate::DATA_EXCEPTION
+                );
+                assert_eq!(storage.default_acl_entry(0).committed, Some(public));
+            });
+        }
+        let config = test_config();
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            storage
+                .install_default_acl_image(0, None, Some(public), 0)
+                .unwrap();
+            storage.validate_default_acl_images().unwrap();
+            assert_eq!(
+                storage
+                    .install_default_acl_image(1, None, Some(public), 0)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::DATA_EXCEPTION
+            );
+            let replaced = DefaultAclGrantImage {
+                identity: DefaultAclIdentity {
+                    creation: CatalogIdentity::parse(42).unwrap(),
+                    ..public.identity
+                },
+                ..public
+            };
+            assert_eq!(
+                storage
+                    .install_default_acl_image(0, Some(replaced), None, 0)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::DATA_EXCEPTION
+            );
+            assert_eq!(storage.default_acl_entry(0).committed, Some(public));
+        });
+    }
+}

@@ -1810,7 +1810,7 @@ fn privilege_partition_inventory(
     session: &mut ConfiguredTransactionSession,
 ) -> Vec<String> {
     let output = session.success(engine,
-        "SELECT oid, roleid, member, grantor FROM pg_auth_members WHERE roleid='lifetime_member_group'::regrole; SELECT oid, defaclacl FROM pg_default_acl WHERE defaclnamespace='lifetime_privileges'::regnamespace; SELECT oid, tgparentid, tgenabled FROM pg_trigger WHERE tgname='lifetime_partition_hook'; SELECT 'function', oid FROM pg_proc WHERE proname='lifetime_query'; SELECT 'policy', oid FROM pg_policy WHERE polname='lifetime_row_policy'; SELECT 'rule', oid FROM pg_rewrite WHERE rulename='lifetime_rewrite'", true);
+        "SELECT oid, roleid, member, grantor FROM pg_auth_members WHERE roleid='lifetime_member_group'::regrole; SELECT oid, defaclacl FROM pg_default_acl WHERE defaclnamespace='lifetime_privileges'::regnamespace; SELECT oid, tgparentid, tgenabled FROM pg_trigger WHERE tgname='lifetime_partition_hook'; SELECT 'function', 'lifetime_query(integer)'::regprocedure::oid; SELECT 'policy', oid FROM pg_policy WHERE polname='lifetime_row_policy'; SELECT 'rule', oid FROM pg_rewrite WHERE rulename='lifetime_rewrite'", true);
     // Compare catalogs as sets. SQL ORDER BY uploads temporary sorter blocks;
     // the simulator's remote objects allocate outside the guarded client path.
     let mut rows = data_rows(&output);
@@ -2015,6 +2015,114 @@ fn catalog_lifetime_privileges_and_partition_triggers_keep_prepared_changes_priv
                 std::fs::remove_dir_all(&config.data_dir).unwrap();
                 crate::object_store::sim::drop_namespace(&config.object_store_bucket);
             }
+        }
+    }
+}
+
+#[test]
+fn catalog_lifetime_privileges_and_partition_triggers_reserve_exhausted_ids_through_recovery() {
+    let fixture =
+        include_str!("../../tests/external/differential/199_privilege_and_partition_lifetimes.sql");
+    for checkpoint in [false, true] {
+        for mode in [
+            crate::config::TransactionMode::Mvcc,
+            crate::config::TransactionMode::Locking,
+        ] {
+            let name = format!("permission-reservation-{checkpoint}-{mode:?}");
+            let mut config = catalog_lifetime_config(&name, mode);
+            config.object_store_on = true;
+            config.object_store_sim = true;
+            config.wal_upload = true;
+            config.wal_upload_sync = true;
+            config.object_store_bucket = format!("{name}-{}", std::process::id());
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+            let before;
+            {
+                let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+                let mut engine = Engine::new(&config, &mut budget).unwrap();
+                let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+                for sql in fixture
+                    .split("-- cleanup")
+                    .next()
+                    .unwrap()
+                    .split("\n\n")
+                    .filter(|sql| !sql.trim().is_empty())
+                {
+                    session.success(&mut engine, sql, false);
+                }
+                before = privilege_partition_inventory(&mut engine, &mut session);
+                engine
+                    .storage
+                    .replace_catalog_sequence_for_test(crate::storage::MAX_CATALOG_CREATION - 1);
+                session.success(&mut engine, "BEGIN; ALTER DEFAULT PRIVILEGES REVOKE USAGE ON TYPES FROM PUBLIC; ALTER DEFAULT PRIVILEGES GRANT USAGE ON TYPES TO PUBLIC; COMMIT", false);
+                assert_eq!(
+                    engine.storage.catalog_identity_sequence(),
+                    crate::storage::MAX_CATALOG_CREATION
+                );
+                assert_eq!(
+                    privilege_partition_inventory(&mut engine, &mut session),
+                    before
+                );
+                for sql in [
+                    "GRANT lifetime_member_first TO lifetime_member_second",
+                    "ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC",
+                    "CREATE FUNCTION exhausted_query() RETURNS integer LANGUAGE sql AS 'SELECT 1'",
+                    "CREATE POLICY exhausted_policy ON lifetime_saved_defaults USING (true)",
+                    "CREATE RULE exhausted_rule AS ON UPDATE TO lifetime_saved_defaults DO INSTEAD NOTHING",
+                    "CREATE TRIGGER exhausted_trigger AFTER INSERT ON lifetime_partition_root FOR EACH ROW EXECUTE FUNCTION lifetime_partition_hook()",
+                ] {
+                    let output = session.execute(&mut engine, sql, false);
+                    assert_eq!(
+                        error_sqlstates(&output),
+                        ["54000"],
+                        "{sql}: {}",
+                        String::from_utf8_lossy(&output)
+                    );
+                    assert!(
+                        command_tags(&output).is_empty(),
+                        "failed creation reported success: {sql}"
+                    );
+                    assert_eq!(
+                        privilege_partition_inventory(&mut engine, &mut session),
+                        before
+                    );
+                }
+                if checkpoint {
+                    assert!(engine.checkpoint().unwrap());
+                }
+                engine.commit_wal().unwrap();
+            }
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+            {
+                let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+                let mut engine = Engine::new(&config, &mut budget).unwrap();
+                let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+                assert!(
+                    engine.storage.catalog_identity_sequence()
+                        >= crate::storage::MAX_CATALOG_CREATION
+                );
+                assert_eq!(
+                    privilege_partition_inventory(&mut engine, &mut session),
+                    before
+                );
+                let output = session.execute(
+                    &mut engine,
+                    "ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC",
+                    false,
+                );
+                assert_eq!(error_sqlstates(&output), ["54000"]);
+                session.success(
+                    &mut engine,
+                    "GRANT lifetime_member_group TO lifetime_member_second WITH ADMIN OPTION",
+                    false,
+                );
+                assert_eq!(
+                    privilege_partition_inventory(&mut engine, &mut session),
+                    before
+                );
+            }
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
         }
     }
 }

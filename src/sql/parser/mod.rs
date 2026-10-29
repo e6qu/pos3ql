@@ -817,7 +817,7 @@ impl<'a> Parser<'a> {
                     return Err(ParseError {
                         at: statement_start,
                         message: StackStr::from_str("cannot specify both SCROLL and NO SCROLL"),
-                        sqlstate: "42P11",
+                        sqlstate: sqlstate::INVALID_CURSOR_DEFINITION,
                     });
                 }
                 scroll = crate::sql::cursor::CursorScroll::Scroll;
@@ -827,7 +827,7 @@ impl<'a> Parser<'a> {
                     return Err(ParseError {
                         at: statement_start,
                         message: StackStr::from_str("cannot specify both SCROLL and NO SCROLL"),
-                        sqlstate: "42P11",
+                        sqlstate: sqlstate::INVALID_CURSOR_DEFINITION,
                     });
                 }
                 scroll = crate::sql::cursor::CursorScroll::NoScroll;
@@ -839,7 +839,7 @@ impl<'a> Parser<'a> {
             return Err(ParseError {
                 at: statement_start,
                 message: StackStr::from_str("cannot specify both ASENSITIVE and INSENSITIVE"),
-                sqlstate: "42P11",
+                sqlstate: sqlstate::INVALID_CURSOR_DEFINITION,
             });
         }
         self.expect_ident("cursor")?;
@@ -11306,10 +11306,13 @@ mod tests {
 
     #[test]
     fn syntax_errors_carry_position() {
-        with_parser("SELECT FROM", |p| {
-            let err = p.next_stmt().unwrap_err();
-            assert_eq!(err.at, 7);
-        });
+        for (sql, position) in [("SELECT FROM", 11), ("SELECT , 1", 7)] {
+            with_parser(sql, |parser| {
+                let error = parser.next_stmt().unwrap_err();
+                assert_eq!(error.sqlstate, sqlstate::SYNTAX_ERROR);
+                assert_eq!(error.at, position, "{sql}");
+            });
+        }
     }
 
     #[test]

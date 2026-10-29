@@ -9,6 +9,7 @@ Cursor checks also change rendering settings between declaration and fetch,
 including after commit, and assign fetched values to typed procedural variables.
 Nested arrays and records must use the same text formatter as scalar values.
 Cursor motion counts are checked at the SQL parse boundary before arithmetic.
+Cursor capacity errors distinguish saved rows from their column descriptions.
 Record an entry only with its reproducer, observed behavior and exact blocker;
 retain repaired-defect evidence in the fixing PR. See [CONTRIBUTING.md](CONTRIBUTING.md).
 

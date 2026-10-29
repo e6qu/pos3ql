@@ -2503,6 +2503,14 @@ fn cursor_result_too_large() -> SqlError {
     )
 }
 
+fn cursor_description_too_large() -> SqlError {
+    sql_err!(
+        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+        "cursor row description exceeds {} bytes; use fewer or shorter column names",
+        cursor::DESCRIPTION_BYTES
+    )
+}
+
 impl Engine {
     /// Selects one exclusively leased startup-reserved query workspace.
     pub(crate) fn select_query_workspace(&mut self, workspace: QueryWorkspaceId) {
@@ -19474,10 +19482,7 @@ impl Engine {
             }
             Err(WireFull) => {
                 cursors.abandon(at);
-                return Err(sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "cursor result exceeds cursor_bytes; raise it or narrow the query"
-                ));
+                return Err(cursor_description_too_large());
             }
         }
         if let Err(error) = cursors.seal(at) {
@@ -19520,7 +19525,7 @@ impl Engine {
             )?;
             capture
                 .row_description(&columns[..count])
-                .map_err(|_| cursor_result_too_large())?;
+                .map_err(|_| cursor_description_too_large())?;
             let sequence_state = sequence::SequenceReplayState::new(arena);
             let sequence = sequence::ReplaySeqEval::new(
                 sequence::SeqEval::new(&self.storage, guc.seq_session(), txn.txid),
@@ -19540,7 +19545,7 @@ impl Engine {
                     {
                         Ok(Ok(())) => {}
                         Ok(Err(error)) => return Err(error),
-                        Err(WireFull) => return Err(cursor_result_too_large()),
+                        Err(WireFull) => return Err(cursor_description_too_large()),
                     }
                     rows += 1;
                     Ok(())
@@ -19548,7 +19553,7 @@ impl Engine {
             )?;
             capture
                 .command_complete(stack_format!(32, "SELECT {}", rows).as_str())
-                .map_err(|_| cursor_result_too_large())?;
+                .map_err(|_| cursor_description_too_large())?;
             Ok(())
         })();
         if let Err(error) = result {

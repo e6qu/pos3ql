@@ -4704,14 +4704,14 @@ pub(crate) fn emit_data_row(
             Err(error) => return sql_fail(error),
         };
         let Some(total) = len.checked_add(4) else {
-            return Err(WireFull);
+            return sql_fail(super::cursor_result_too_large());
         };
         let Ok(length) = u32::try_from(len) else {
-            return Err(WireFull);
+            return sql_fail(super::cursor_result_too_large());
         };
         let out = rows.writable();
         if total > out.len() {
-            return Err(WireFull);
+            return sql_fail(super::cursor_result_too_large());
         }
         // Publish the row boundary only after every typed value is encoded.
         if let Err(error) = super::exec::encode_projected_into(values, &mut out[4..total]) {

@@ -43,6 +43,7 @@ pub struct CursorPool {
 }
 
 const CURSOR_STATEMENT_BYTES: usize = 4096;
+pub(crate) const DESCRIPTION_BYTES: usize = 1024;
 
 thread_local! {
     static ACTIVE_CURSORS: Cell<*const CursorPool> = const { Cell::new(core::ptr::null()) };
@@ -247,7 +248,7 @@ impl CursorPool {
         let row_capacity = cursor_row_capacity(config);
         config.max_cursors
             * (config.cursor_bytes
-                + 1024
+                + DESCRIPTION_BYTES
                 + core::mem::size_of::<CursorSlot>()
                 + row_capacity * core::mem::size_of::<(u32, u32)>())
             + row_capacity * core::mem::size_of::<u32>()
@@ -276,7 +277,7 @@ impl CursorPool {
                 hold: false,
                 binary: false,
                 tentative: false,
-                description: FixedBuf::new(budget, "cursor_description", 1024)?,
+                description: FixedBuf::new(budget, "cursor_description", DESCRIPTION_BYTES)?,
                 rows: FixedBuf::new(budget, "cursor_typed_rows", config.cursor_bytes)?,
                 spans: Vec::with_capacity(row_capacity),
                 position: 0,

@@ -123,7 +123,54 @@ fn cursor_typed_rows_use_exact_capacity_and_release_failed_declarations() {
             true,
         );
         assert_eq!(error_sqlstates(&failed), ["54000"]);
+        assert!(String::from_utf8_lossy(&failed).contains("cursor result exceeds cursor_bytes"));
         session.success(&mut engine, "ROLLBACK", true);
+    }
+}
+
+#[test]
+fn cursor_description_exhaustion_names_its_own_capacity_and_releases_the_slot() {
+    let alias = "a".repeat(63);
+    let projection = (0..20)
+        .map(|_| format!("1 AS {alias}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    for bytes in [128, 4096] {
+        let mut config = test_config("cursor-description-capacity");
+        config.max_cursors = 1;
+        config.cursor_bytes = bytes;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        session.success(
+            &mut engine,
+            &format!(
+                "CREATE FUNCTION wide_cursor_labels() RETURNS void LANGUAGE plpgsql AS $$ \
+                 DECLARE c refcursor; BEGIN OPEN c FOR SELECT {projection}; RETURN; END $$"
+            ),
+            true,
+        );
+        for statement in [
+            format!("DECLARE wide_labels CURSOR FOR SELECT {projection}"),
+            "SELECT wide_cursor_labels()".to_owned(),
+        ] {
+            session.success(&mut engine, "BEGIN", true);
+            let failed = session.execute(&mut engine, &statement, true);
+            assert_eq!(error_sqlstates(&failed), ["54000"]);
+            let diagnostic = String::from_utf8_lossy(&failed);
+            assert!(
+                diagnostic.contains("cursor row description exceeds 1024 bytes"),
+                "{diagnostic}"
+            );
+            assert!(!diagnostic.contains("cursor_bytes"), "{diagnostic}");
+            session.success(&mut engine, "ROLLBACK", true);
+            let output = session.success(
+                &mut engine,
+                "BEGIN; DECLARE reused CURSOR FOR SELECT 1; FETCH ALL FROM reused; COMMIT",
+                true,
+            );
+            assert_eq!(data_rows(&output), ["1"]);
+        }
     }
 }
 

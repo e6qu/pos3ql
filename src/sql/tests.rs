@@ -97472,8 +97472,10 @@ fn checkpoint_reads_held_maintenance_keeps_queries_commits_and_read_owners() {
             "index_merge",
             "index_write",
             "index_roster",
+            "index_cancel_source",
+            "index_cancel_write",
         ] {
-            let label = format!("merge-held-{mode:?}-{phase}");
+            let label = format!("maintenance-held-{mode:?}-{}", phase.replace('_', "-"));
             let mut config = test_config(&label);
             config.transaction_mode = mode;
             config.object_store_on = true;
@@ -97538,9 +97540,11 @@ fn checkpoint_reads_held_maintenance_keeps_queries_commits_and_read_owners() {
             let selected = |checkpoint: &Checkpointer| match phase {
                 "schedule" => checkpoint.retained_output_pending(),
                 "columns" => checkpoint.merge_source_read_ready(),
-                "index_source" | "index_roster" => checkpoint.value_index_job_active(),
+                "index_source" | "index_roster" | "index_cancel_source" => {
+                    checkpoint.value_index_job_active()
+                }
                 "index_merge" => checkpoint.value_index_schedule_merge_ready(),
-                "index_write" => checkpoint.value_index_output_job_active(),
+                "index_write" | "index_cancel_write" => checkpoint.value_index_output_job_active(),
                 _ => unreachable!(),
             };
             for _ in 0..128 {
@@ -97616,8 +97620,9 @@ fn checkpoint_reads_held_maintenance_keeps_queries_commits_and_read_owners() {
                     std::thread::yield_now();
                 }
             }
-            let (mut stream, request, body) =
-                held.expect("fixture must hold the selected merge phase");
+            let (stream, request, body) =
+                held.expect("fixture must hold the selected maintenance phase");
+            let mut stream = Some(stream);
             assert_eq!(
                 blocks.lock().unwrap().base_mut().read_owner(),
                 engine.read_owner
@@ -97712,6 +97717,39 @@ fn checkpoint_reads_held_maintenance_keeps_queries_commits_and_read_owners() {
                     );
                 }
             });
+            let canceled = phase.starts_with("index_cancel_");
+            if canceled {
+                session.success(&mut engine, "BEGIN; DROP INDEX indexed_wait_code", true);
+                // Simulator publication grows fixture inventory outside the runtime guard.
+                session.success(&mut engine, "COMMIT", false);
+                assert!(
+                    engine.checkpoint_can_progress(),
+                    "changed inputs must wake a waiting job"
+                );
+                for _ in 0..64 {
+                    if !engine.ckpt.as_ref().unwrap().value_index_job_active() {
+                        break;
+                    }
+                    assert!(!crate::mem::guard::forbid_alloc(|| engine.checkpoint_beat()).failed());
+                }
+                assert!(!engine.ckpt.as_ref().unwrap().value_index_job_active());
+                let remaining = [
+                    engine.pending_block_read_fd(0),
+                    engine.pending_block_read_fd(1),
+                ];
+                assert_eq!(
+                    remaining.iter().filter(|fd| fd.is_some()).count(),
+                    1,
+                    "abandoned index reads must release their slot before the server replies"
+                );
+                assert!(
+                    remaining
+                        .iter()
+                        .flatten()
+                        .all(|fd| fds.contains(&Some(*fd)))
+                );
+                drop(stream.take());
+            }
             reply(
                 &mut foreground_stream,
                 &foreground_request,
@@ -97739,13 +97777,17 @@ fn checkpoint_reads_held_maintenance_keeps_queries_commits_and_read_owners() {
                 );
                 std::thread::yield_now();
             }
-            assert!(engine.checkpoint_can_progress());
-            assert_eq!(
-                crate::mem::guard::forbid_alloc(|| engine.checkpoint_beat()),
-                CheckpointBeat::WaitingForReads
-            );
-            assert!(!engine.checkpoint_can_progress());
-            reply(&mut stream, &request, &body);
+            if canceled {
+                assert!(!engine.block_reads_pending());
+            } else {
+                assert!(engine.checkpoint_can_progress());
+                assert_eq!(
+                    crate::mem::guard::forbid_alloc(|| engine.checkpoint_beat()),
+                    CheckpointBeat::WaitingForReads
+                );
+                assert!(!engine.checkpoint_can_progress());
+                reply(stream.as_mut().unwrap(), &request, &body);
+            }
             let deadline = Instant::now() + Duration::from_secs(2);
             while engine.ckpt.as_ref().unwrap().retained_output_pending() {
                 advance(&mut engine);
@@ -97828,6 +97870,16 @@ fn checkpoint_reads_held_maintenance_keeps_queries_commits_and_read_owners() {
                 data_rows(&run_with(&mut recovered, &mut recovered_budget, query)),
                 ["17|1153", "1007", "42", "43"]
             );
+            if canceled {
+                assert_eq!(
+                    data_rows(&run_with(
+                        &mut recovered,
+                        &mut recovered_budget,
+                        "SELECT count(*) FROM pg_indexes WHERE indexname='indexed_wait_code'"
+                    )),
+                    ["0"]
+                );
+            }
             if phase.starts_with("index_") {
                 let query = if phase == "index_roster" {
                     "SELECT count(*),sum(id) FROM indexed_wait; SELECT id FROM indexed_wait WHERE code=repeat(md5('new'),640)"

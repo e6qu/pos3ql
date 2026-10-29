@@ -885,6 +885,7 @@ enum MergePhase {
 /// the checkpointer's dedicated merge writer.
 struct MergeJob {
     slot: usize,
+    layout: SliceLayout,
     at: usize,
     old0: PrevSst,
     old1: PrevSst,
@@ -1614,6 +1615,7 @@ impl Checkpointer {
             + core::mem::size_of::<Option<MaintenanceReadWait>>()
             + core::mem::size_of::<Option<ValueScheduleJob>>()
             + core::mem::size_of::<Option<ValueIndexJob>>()
+            + core::mem::size_of::<Option<MergeJob>>()
             + 2 * SstWriter::budget_bytes()
             + crate::storage::RowReadBuffers::budget_bytes()
             + ValueIndexWriter::budget_bytes()
@@ -1763,10 +1765,7 @@ impl Checkpointer {
         };
         // The published list must still hold the pair where the job left
         // it; a relation replacement also replaces the merge.
-        let valid = self
-            .prev_ssts
-            .get(job.slot)
-            .is_some_and(|list| pair_at(list, job.at) == Some((job.old0.handle, job.old1.handle)));
+        let valid = self.merge_job_is_current(storage, &job);
         if !valid {
             self.maintenance_read_wait = None;
             self.cancel_read_owner(MAINTENANCE_READ_OWNER);
@@ -1873,13 +1872,17 @@ impl Checkpointer {
         Ok(())
     }
 
-    /// The next pair worth merging: the first live table whose published
-    /// list is at the trigger, taking its cheapest adjacent pair — least
-    /// write amplification now, big settled members left to accrete —
-    /// skipping pairs the id scratch cannot hold and pairs whose scans
-    /// previously overflowed it. A dirty filled list is always considered,
-    /// even below the ordinary merge trigger: publication needs one free slot
-    /// and must not fall back to an unbounded full-table rewrite.
+    fn merge_job_is_current(&self, storage: &Storage, job: &MergeJob) -> bool {
+        job.slot < storage.physical_table_count()
+            && storage.table(job.slot).live()
+            && SliceLayout::from_storage(storage, job.slot) == job.layout
+            && self.prev_ssts.get(job.slot).is_some_and(|list| {
+                pair_at(list, job.at) == Some((job.old0.handle, job.old1.handle))
+            })
+    }
+
+    /// Selects adjacent saved files that fit the merge capacity. Dirty full
+    /// lists take priority so checkpoints can append another generation.
     fn merge_candidate(&self, storage: &Storage) -> Option<MergeJob> {
         if self.merge_job.is_some() {
             return None;
@@ -1934,6 +1937,7 @@ impl Checkpointer {
             }
             return Some(MergeJob {
                 slot,
+                layout: SliceLayout::from_storage(storage, slot),
                 at,
                 old0,
                 old1,
@@ -3343,8 +3347,35 @@ impl Checkpointer {
             .is_none_or(|wait| wait.generation != self.read_capacity_generation())
     }
 
-    pub(crate) fn independent_output_ready(&self) -> bool {
-        self.retained_output_ready() && self.maintenance_reads_ready()
+    pub(crate) fn independent_output_ready(&self, storage: &Storage) -> bool {
+        if !self.retained_output_ready() {
+            return false;
+        }
+        if self.maintenance_reads_ready() {
+            return true;
+        }
+        match self
+            .maintenance_read_wait
+            .expect("waiting maintenance read")
+            .producer
+        {
+            PhysicalOutputOwner::Table => self
+                .table_job
+                .as_ref()
+                .is_some_and(|job| !Self::table_slice_matches(storage, job)),
+            PhysicalOutputOwner::Merge => self
+                .merge_job
+                .as_ref()
+                .is_some_and(|job| !self.merge_job_is_current(storage, job)),
+            PhysicalOutputOwner::IndexSchedule => self
+                .value_schedule_job
+                .as_ref()
+                .is_some_and(|job| !Self::value_schedule_job_is_current(storage, job)),
+            PhysicalOutputOwner::Index => self
+                .value_job
+                .as_ref()
+                .is_some_and(|job| !Self::value_job_is_current(storage, job)),
+        }
     }
 
     /// Already-captured inputs can progress behind later journal uploads.
@@ -14138,9 +14169,9 @@ impl Checkpointer {
         })
     }
 
-    /// Starts one affected binding. Entry collection and external sorting are
-    /// one schedule beat; the immutable writer consumes the retained result
-    /// through bounded later beats.
+    /// Captures one affected binding without downloading its source. Its
+    /// retained job reads the old block list, collects and sorts entries, then
+    /// streams immutable output through bounded later turns.
     fn start_value_index_job(&mut self, storage: &Storage, slot: usize) -> Result<bool, SqlError> {
         self.pending_value_installs
             .retain(|install| Self::value_install_is_current(storage, install));
@@ -20301,6 +20332,7 @@ mod stored_dependency_tests {
             assert!(checkpoint.prev_ssts[table].push(old1));
             checkpoint.merge_job = Some(MergeJob {
                 slot: table,
+                layout: SliceLayout::from_storage(&storage, table),
                 at: 0,
                 old0,
                 old1,
@@ -20850,6 +20882,7 @@ mod stored_dependency_tests {
         assert!(checkpoint.prev_ssts[table].push(old1));
         checkpoint.merge_job = Some(MergeJob {
             slot: table,
+            layout: SliceLayout::from_storage(&storage, table),
             at: 0,
             old0,
             old1,

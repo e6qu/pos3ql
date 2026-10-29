@@ -10093,7 +10093,7 @@ impl Engine {
     }
 
     /// Heap and history cleanup use no object client. Retained output jobs have
-    /// separate read ownership; capture still waits for foreground block reads.
+    /// separate read ownership; starting a new capture waits for foreground reads.
     pub(crate) fn checkpoint_can_progress(&self) -> bool {
         if self.fatal_commit_failure.is_some() {
             return false;
@@ -10135,7 +10135,7 @@ impl Engine {
             return self.local_cleanup.is_some() || self.storage.history_cleanup_pending();
         }
         if let Some(checkpointer) = self.ckpt.as_ref() {
-            if checkpointer.independent_output_ready() {
+            if checkpointer.independent_output_ready(&self.storage) {
                 return true;
             }
             if !checkpointer.maintenance_reads_ready() {
@@ -10292,7 +10292,7 @@ impl Engine {
         let independent_output = self
             .ckpt
             .as_ref()
-            .is_some_and(Checkpointer::independent_output_ready);
+            .is_some_and(|checkpointer| checkpointer.independent_output_ready(&self.storage));
         if (journal_pending || independent_output)
             && !credential_draining
             && self.local_cleanup.is_none()
@@ -10324,13 +10324,13 @@ impl Engine {
         let file_cleanup_waiting = self.ckpt.as_ref().is_some_and(|checkpointer| {
             checkpointer.published_maintenance_pending() && !checkpointer.file_io_ready()
         });
-        let merge_waiting = self
+        let maintenance_waiting = self
             .ckpt
             .as_ref()
             .is_some_and(|checkpointer| !checkpointer.maintenance_reads_ready());
         let reads_pending = credential_draining
             || file_cleanup_waiting
-            || merge_waiting
+            || maintenance_waiting
             || self.block_reads_pending()
             || self
                 .ckpt

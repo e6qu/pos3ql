@@ -71,8 +71,8 @@ its uploads overlap; the new file handle stays private until every upload
 finishes. Table slices retain their selected bytes while later changes append
 another generation. Replacing a table or rewriting its row encodings discards
 the old capture. Index sort runs and final index handles remain private until
-their uploads finish; changed index inputs cancel abandoned uploads without
-waiting for socket readiness. Merge source failures restart the same immutable
+their uploads finish; changed index inputs cancel abandoned reads and uploads
+without waiting for socket readiness. Merge source failures restart the same immutable
 pair with cleared output and checksum state.
 
 Row-file merges keep their source index, column and large-row positions across

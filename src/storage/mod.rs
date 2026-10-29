@@ -15105,16 +15105,16 @@ struct CheckpointRowIdentity {
     suppress_spill: bool,
 }
 
-/// Logical position of one checkpoint value-index source walk. Block buffers
-/// remain in the shared scan context and are reloaded on a later beat; this
-/// state retains sorted row identities and immutable SST cursor positions.
+/// One retained checkpoint row source. Its private startup-reserved context
+/// keeps unfinished column and large-row bytes while foreground scans reuse
+/// their own buffers. Resident identities and immutable file roots stay fixed.
 pub(crate) struct CheckpointRowCursor {
     resident_position: usize,
     resident_rowids: Vec<CheckpointRowIdentity>,
     resident_initialized: bool,
     members: Box<[MemberCursor]>,
     generations: SpillGenerationSnapshot,
-    /// Stable owner identity for shared scan buffers across checkpoint beats.
+    /// Stable identity for the retained walk across checkpoint turns.
     spill_walk_id: u64,
     /// Member heads opened so far; opening a long generation list is paced.
     spill_initialized: usize,

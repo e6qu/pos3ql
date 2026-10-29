@@ -46,9 +46,9 @@ needs a download yields with its original data owners and command deadline;
 another connection can run cached work. Adding connections or
 `query_workspace_slots` does not add CPU execution workers.
 
-State-changing routines, procedure commit boundaries, some metadata capture,
-large-result reads after their first transport flush, and some maintenance
-reads still complete synchronously. A cold read on one
+State-changing routines, procedure commit boundaries, administrative work and
+large-result reads after their first transport flush still have synchronous
+reads. A cold read on one
 of these paths can occupy that worker. [PLAN.md](../PLAN.md) tracks their
 conversion and the later CPU worker pool separately.
 
@@ -232,9 +232,18 @@ and large-row fragments while a request waits. Scheduling reads row descriptors
 without fetching PAX column values. Completed groups stay in the existing source
 buffers; checksums and output positions advance only after their rows finish.
 The fixed read pool reserves one maintenance owner alongside connections and
-subscription workers. A waiting merge releases the SQL worker and shares no
-mutable decoder state with foreground queries. Table capture and index-building
-reads still have synchronous paths.
+subscription workers. Checkpoint row capture, row output, index input scans,
+sort-run merges and final index output use the same maintenance owner. Each
+retains its exact next input; a waiting job resumes before another job can
+reuse that owner's response. Private startup-reserved row and scan buffers keep
+partially read values separate from foreground queries. An emitted index row
+is consumed once even if fetching its successor has to wait.
+
+For example, while an index on saved `orders(customer_id)` waits for storage,
+a cached order lookup and another connection's durable commit can finish.
+The index becomes visible as a saved root only after its complete output uploads
+and the matching manifest publishes. Replacing its table or changing its inputs
+abandons the old job and releases its read request.
 
 The remaining order is coherent shared row/catalog publication and bounded
 maintenance, startup-reserved CPU workers, then representative performance and

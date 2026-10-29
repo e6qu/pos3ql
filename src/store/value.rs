@@ -594,8 +594,8 @@ impl ValueRosterWalk {
     }
 }
 
-/// Walks a complete generation for exclusive startup and administrative callers.
-pub(crate) fn walk_value_roster(
+#[cfg(test)]
+fn walk_value_roster(
     store: &mut dyn BlockStore,
     root: BlockId,
     scratch: &mut [u8],

@@ -114,7 +114,7 @@ pub(crate) use tiered::{StackPlan, build as build_tiers};
 pub(crate) use value::{
     RetainedBlockBuffer, VALUE_INDEX_KEY_MAX, VALUE_INDEX_TUPLE_MAX, ValueIndexError,
     ValueIndexHandle, ValueIndexPosition, ValueIndexReader, ValueIndexStream, ValueIndexStreamStep,
-    ValueIndexWriter, ValueRosterStep, ValueRosterWalk, walk_value_roster,
+    ValueIndexWriter, ValueRosterStep, ValueRosterWalk,
 };
 pub(crate) use write_batch::BlockWriteBatch;
 

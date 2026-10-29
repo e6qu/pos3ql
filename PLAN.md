@@ -18,9 +18,11 @@ CPU execution do not all need to be serialized to preserve that order.
 
 Today, object-store I/O overlaps and batches requests, while SQL CPU work uses
 one worker. Journal cleanup, saved-file cleanup and row-file merges retain
-their progress and yield while object-store responses wait. Journal cleanup
-does not prevent checkpoints from freeing row-cache space. Some state-changing
-commands, table capture and index-building reads still wait synchronously.
+their progress and yield while object-store responses wait. Checkpoint row
+capture and index construction also retain their input and output positions.
+Journal cleanup does not prevent checkpoints from freeing row-cache space.
+State-changing commands and reads after the first result flush still have
+synchronous paths.
 Same-host MinIO and SeaweedFS checks establish portability;
 they do not establish production performance. The owning guides describe
 [current behavior](docs/implemented-baseline.md), [physical limits](docs/architecture.md#memory-and-physical-size)
@@ -43,19 +45,6 @@ A waiting schema edit must never attach itself to a new object that reused a nam
   resolves; a reader finishing must not cause them to be collected as orphans.
   Switching output producers cannot cancel another job's immutable files;
   durable manifests never name output that has not finished uploading.
-- Let remaining table capture and index-building downloads pause
-  without occupying the SQL worker. Save enough state to resume within the
-  fixed memory budget, as journal and saved-file cleanup do for backup listings,
-  retention manifests, file inventories and obsolete-object deletions.
-  Apply the same retained column and large-row progress to these paths,
-  including with disabled caches. Advance source positions and output checksums
-  only after the corresponding row or group finishes; retries must not skip or
-  repeat data.
-  Retain unfinished index descent, selected columns and large-row fragments in
-  buffers owned by the checkpoint job. A foreground read must not overwrite
-  that progress, and replacing a caller's output buffer must not discard it.
-  Recovery can keep exclusive startup access; ordinary operation must allow
-  unrelated work to progress.
 - Retain the query's scan and output position after sending a result prefix.
   Today a large result finishes its remaining reads synchronously once bytes
   leave the connection buffer, because restarting would send a second result

@@ -84,8 +84,16 @@ column values and row fragments remain in the existing source buffers.
 Output counts and checksums advance after the corresponding rows finish.
 An unrelated completed request can wake a waiting merge, but cannot make it
 repeat output. If request capacity is full, the merge waits for a completion or
-released slot instead of spinning or growing the pool. Table capture and
-index-building downloads still have synchronous paths.
+released slot instead of spinning or growing the pool.
+
+Checkpoint row capture and index construction use that maintenance owner too.
+Row capture reads descriptors before fetching values; table output owns its
+partially assembled row. Index input scans own their column and large-row
+buffers, while saved sort runs retain their sparse-index descent and next row.
+Final index output records that a row was consumed before asking for its
+successor. Pausing any of these reads preserves exactly one copy of each output
+row. An index update can still take many turns and requests; yielding does not
+make that work disappear.
 
 A read can pause and restart while its result is still buffered. Once a large
 result fills the connection buffer and starts sending bytes, its remaining
@@ -114,9 +122,13 @@ first checkpoint cannot make the order reappear after that checkpoint.
 Cleanup removes only deletion markers covered by the saved file list. Finishing
 an older checkpoint must also preserve newer ANALYZE results and the journal
 work of an analysis another transaction has not committed.
-Metadata capture and other atomic maintenance reads can still wait
-synchronously. Rows larger than one block use bounded overflow chains in the
-same generation; reading such a row requires its complete chain.
+Full table capture reads at most 64 row descriptors per turn without fetching
+column values. A separate fixed row-source buffer and a private scan context
+preserve unfinished values when foreground queries reuse their own scratch.
+Rows larger than one block use bounded overflow chains in the same generation;
+reading such a row requires its complete chain, retained across download waits.
+Exclusive startup recovery and administrative operations can still wait
+synchronously.
 
 Background journal cleanup has a separate startup-reserved metadata client.
 Backup and commit listings visit at most 64 keys per response, retaining the

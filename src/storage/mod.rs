@@ -15137,71 +15137,6 @@ impl SpillWalkProgress {
     }
 }
 
-/// File positions are independent of byte buffers. A nested scan may reuse
-/// scratch after copying a row, then restore its own immutable member heads.
-struct SpillWalkPosition {
-    members: Box<[MemberCursor]>,
-    progress: SpillWalkProgress,
-}
-
-impl SpillWalkPosition {
-    fn allocation_bytes(max_spill_generations: usize) -> usize {
-        max_spill_generations * size_of::<MemberCursor>()
-    }
-
-    fn new(max_spill_generations: usize) -> Self {
-        Self {
-            members: vec![MemberCursor::EMPTY; max_spill_generations].into_boxed_slice(),
-            progress: SpillWalkProgress::START,
-        }
-    }
-
-    fn reset(&mut self) {
-        self.members.fill(MemberCursor::EMPTY);
-        self.progress = SpillWalkProgress::START;
-    }
-
-    fn resume<'a>(
-        &'a mut self,
-        context: &'a Mutex<ScanContext>,
-        max_rows: usize,
-        max_object_gets: u64,
-    ) -> SpillWalkResume<'a> {
-        self.progress
-            .resume(&mut self.members, context, max_rows, max_object_gets)
-    }
-}
-
-/// A maintenance producer owns its unfinished bytes across reactor turns.
-struct SpillWalkCursor {
-    position: SpillWalkPosition,
-    context: Mutex<ScanContext>,
-}
-
-impl SpillWalkCursor {
-    fn budget_bytes(max_spill_generations: usize) -> usize {
-        SpillWalkPosition::allocation_bytes(max_spill_generations)
-            + ScanContext::budget_bytes(max_spill_generations)
-            + size_of::<Option<u64>>()
-    }
-
-    fn new(max_spill_generations: usize) -> Self {
-        Self {
-            position: SpillWalkPosition::new(max_spill_generations),
-            context: Mutex::new(ScanContext::new(max_spill_generations)),
-        }
-    }
-
-    fn reset(&mut self) {
-        self.position.reset();
-    }
-
-    fn resume(&mut self, max_rows: usize, max_object_gets: u64) -> SpillWalkResume<'_> {
-        self.position
-            .resume(&self.context, max_rows, max_object_gets)
-    }
-}
-
 /// One retained checkpoint row source. Its private startup-reserved context
 /// keeps unfinished column and large-row bytes while foreground scans reuse
 /// their own buffers. Resident identities and immutable file roots stay fixed.
@@ -15209,7 +15144,9 @@ pub(crate) struct CheckpointRowCursor {
     resident_position: usize,
     resident_rowids: Vec<CheckpointRowIdentity>,
     resident_initialized: bool,
-    spill: SpillWalkCursor,
+    members: Box<[MemberCursor]>,
+    spill_progress: SpillWalkProgress,
+    scan_context: Mutex<ScanContext>,
     generations: SpillGenerationSnapshot,
     resident_done: bool,
     spill_done: bool,
@@ -15246,7 +15183,12 @@ impl CheckpointRowCursor {
             arena,
             true,
             SpillOverlayMode::CommittedCheckpoint(&self.resident_rowids),
-            Some(self.spill.resume(max_rows, max_object_gets)),
+            Some(self.spill_progress.resume(
+                &mut self.members,
+                &self.scan_context,
+                max_rows,
+                max_object_gets,
+            )),
             SpillWalkOutput::Metadata(&mut |rowid, version| {
                 let len = version.len.expect("metadata walk selects a live version");
                 each(
@@ -15263,7 +15205,9 @@ impl CheckpointRowCursor {
     }
 
     pub(crate) fn budget_bytes(max_spill_generations: usize, table_rows: usize) -> usize {
-        SpillWalkCursor::budget_bytes(max_spill_generations)
+        max_spill_generations * size_of::<MemberCursor>()
+            + ScanContext::budget_bytes(max_spill_generations)
+            + size_of::<Option<u64>>()
             + SpillGenerationSnapshot::budget_bytes(max_spill_generations)
             + table_rows * core::mem::size_of::<CheckpointRowIdentity>()
     }
@@ -15273,7 +15217,9 @@ impl CheckpointRowCursor {
             resident_position: 0,
             resident_rowids: Vec::with_capacity(table_rows),
             resident_initialized: false,
-            spill: SpillWalkCursor::new(max_spill_generations),
+            members: vec![MemberCursor::EMPTY; max_spill_generations].into_boxed_slice(),
+            spill_progress: SpillWalkProgress::START,
+            scan_context: Mutex::new(ScanContext::new(max_spill_generations)),
             generations: SpillGenerationSnapshot::new(max_spill_generations),
             resident_done: false,
             spill_done: false,
@@ -15284,7 +15230,8 @@ impl CheckpointRowCursor {
         self.resident_position = 0;
         self.resident_rowids.clear();
         self.resident_initialized = false;
-        self.spill.reset();
+        self.members.fill(MemberCursor::EMPTY);
+        self.spill_progress = SpillWalkProgress::START;
         self.generations.clear();
         self.resident_done = false;
         self.spill_done = false;
@@ -15328,7 +15275,12 @@ impl CheckpointRowCursor {
             arena,
             true,
             SpillOverlayMode::CommittedCheckpoint(&self.resident_rowids),
-            Some(self.spill.resume(max_rows, max_object_gets)),
+            Some(self.spill_progress.resume(
+                &mut self.members,
+                &self.scan_context,
+                max_rows,
+                max_object_gets,
+            )),
             SpillWalkOutput::Rows {
                 columns: decoded_columns,
                 coalesce_packed,

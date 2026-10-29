@@ -24,6 +24,10 @@ struct SliceHeader {
     borrowed: Cell<bool>,
 }
 
+fn slice_layout<T>(len: usize) -> Result<(Layout, usize), std::alloc::LayoutError> {
+    Layout::new::<SliceHeader>().extend(Layout::array::<T>(len)?)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ArenaSliceError {
     Stale,
@@ -67,6 +71,12 @@ impl<T> AsMut<[T]> for ArenaSliceMut<'_, T> {
 }
 
 impl Arena {
+    /// Upper bound including alignment when the preceding tail is unaligned.
+    pub(crate) fn retained_slice_capacity<T>(len: usize) -> Option<usize> {
+        let (layout, _) = slice_layout::<T>(len).ok()?;
+        layout.size().checked_add(layout.align() - 1)
+    }
+
     pub(crate) fn retain_slice_with<T: Copy>(
         &self,
         len: usize,
@@ -75,10 +85,7 @@ impl Arena {
         if self.retention_identity == 0 {
             return Err(self.full(usize::MAX));
         }
-        let values = Layout::array::<T>(len).map_err(|_| self.full(usize::MAX))?;
-        let (layout, data_offset) = Layout::new::<SliceHeader>()
-            .extend(values)
-            .map_err(|_| self.full(usize::MAX))?;
+        let (layout, data_offset) = slice_layout::<T>(len).map_err(|_| self.full(usize::MAX))?;
         let base = self.alloc_raw_tail(layout)?;
         // These disjoint bytes belong to this allocation and are unpublished
         // until every Copy value has been initialized successfully.

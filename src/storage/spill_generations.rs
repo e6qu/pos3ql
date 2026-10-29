@@ -3682,12 +3682,15 @@ mod tests {
         } = point_fixture("query-row-cursor");
         let mut config = test_config();
         config.max_spill_generations_per_table = 3;
-        let mut budget = Budget::new(RowCursorBuffers::allocation_bytes(&config) + 8192);
+        let position_bytes = 2 * RowCursor::position_bytes(0, 2).unwrap();
+        assert!(position_bytes <= config.sql_arena_bytes);
+        let mut budget = Budget::new(RowCursorBuffers::allocation_bytes(&config) + position_bytes);
         let mut old = RowCursor::closed();
         let mut current = RowCursor::closed();
         let mut buffers = RowCursorBuffers::new(&config, &mut budget).unwrap();
         let metadata =
-            crate::mem::arena::Arena::new(&mut budget, "query cursor positions", 8192).unwrap();
+            crate::mem::arena::Arena::new(&mut budget, "query cursor positions", position_bytes)
+                .unwrap();
         assert_eq!(budget.remaining(), 0);
         let _visibility = storage.nested_statement_snapshot(7);
         crate::mem::guard::forbid_alloc(|| old.open(&storage, table, 0, &metadata)).unwrap();

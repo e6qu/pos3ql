@@ -70,6 +70,11 @@ fn cursor_capacity() -> SqlError {
 }
 
 impl RowCursor {
+    pub(in crate::storage) fn position_bytes(rows: usize, members: usize) -> Option<usize> {
+        Arena::retained_slice_capacity::<CapturedRowRecord>(rows)?
+            .checked_add(Arena::retained_slice_capacity::<MemberCursor>(members)?)
+    }
+
     pub(in crate::storage) const fn closed() -> Self {
         Self { source: None }
     }
@@ -282,7 +287,7 @@ mod tests {
             .sqlstate,
             sqlstate::PROGRAM_LIMIT_EXCEEDED
         );
-        storage.drop_table(table);
+        storage.commit_drop(table);
         let replacement = storage
             .create_table(make_def("replacement", &[("n", ColType::Int4, true)]))
             .unwrap();

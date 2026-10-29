@@ -714,6 +714,7 @@ struct ValueScheduleJob {
     dirty_lsn: u64,
     through_lsn: u64,
     base: Option<ValueIndexHandle>,
+    roster_walk: Option<crate::store::ValueRosterWalk>,
     phase: ValueSchedulePhase,
     source_done: bool,
     pending: Option<PendingValueRow>,
@@ -2628,7 +2629,7 @@ impl Checkpointer {
     pub(crate) fn value_index_schedule_merge_ready(&self) -> bool {
         self.value_schedule_job
             .as_ref()
-            .is_some_and(|job| matches!(job.phase, ValueSchedulePhase::StartMerge { .. }))
+            .is_some_and(|job| matches!(job.phase, ValueSchedulePhase::LoadMerge { .. }))
     }
 
     #[cfg(test)]
@@ -14181,39 +14182,9 @@ impl Checkpointer {
         let base = storage
             .value_binding_handle(slot, binding)
             .filter(|_| !storage.value_binding_requires_rebuild(slot, binding));
-        self.sst_arena.reset();
-        let roster_read = self
-            .sst_arena
-            .alloc_slice_with(crate::store::MAX_PAYLOAD, |_| 0u8)
-            .map_err(|_| sql_err!(SQLSTATE_IO, "persistent value-index roster scratch"))?;
         self.roster_scratch.clear();
         self.value_changed_rowids.clear();
         let result = (|| {
-            if let Some(previous) = base {
-                let known = &mut self.roster_scratch;
-                let complete = crate::store::walk_value_roster(
-                    &mut *self.blocks.lock().expect("block store lock poisoned"),
-                    previous.roster,
-                    roster_read,
-                    |id, kind| {
-                        if known.len() == known.capacity() {
-                            return false;
-                        }
-                        known.push((id, Some(kind)));
-                        true
-                    },
-                )
-                .map_err(value_index_to_sql)?;
-                if !complete {
-                    return Err(sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "published value-index blocks exceed checkpoint_live_blocks ({})",
-                        self.roster_scratch.capacity()
-                    ));
-                }
-                self.roster_scratch.sort_unstable();
-                self.roster_scratch.dedup();
-            }
             self.source_cursor.reset();
             self.slice_writer.reset();
             let (columns, n_columns) = storage.value_binding_columns(slot, binding);
@@ -14230,6 +14201,7 @@ impl Checkpointer {
                 dirty_lsn,
                 through_lsn,
                 base,
+                roster_walk: base.map(|handle| crate::store::ValueRosterWalk::new(handle.roster)),
                 phase: ValueSchedulePhase::Collect,
                 source_done: false,
                 pending: None,
@@ -15004,29 +14976,75 @@ impl Checkpointer {
             .expect("block store lock poisoned")
             .io_stats();
         let phase = job.phase;
-        let result = match phase {
-            ValueSchedulePhase::Collect => self.value_collect_beat(storage, &mut job),
-            ValueSchedulePhase::WriteChunk { position } => self
-                .value_write_chunk_beat(&mut job, position)
-                .map(|()| None),
-            ValueSchedulePhase::StartMerge {
-                left,
-                right,
-                destination,
-            } => self
-                .start_value_merge(&mut job, left, right, destination)
-                .map(|()| None),
-            ValueSchedulePhase::LoadMerge { .. } => self.load_value_merge(&mut job).map(|()| None),
-            ValueSchedulePhase::Merge { .. } => self
-                .value_merge_beat(storage, &mut job, before)
-                .map(|()| None),
-            ValueSchedulePhase::Finish { accumulator, level } => {
-                Ok(self.value_finish_beat(&mut job, accumulator, level))
+        let result = (|| {
+            if let Some(walk) = &mut job.roster_walk {
+                self.sst_arena.reset();
+                let scratch = self
+                    .sst_arena
+                    .alloc_slice_with(crate::store::MAX_PAYLOAD, |_| 0u8)
+                    .map_err(|_| sql_err!(SQLSTATE_IO, "persistent value-index roster scratch"))?;
+                let known = &mut self.roster_scratch;
+                let step = walk
+                    .step(
+                        &mut |id, into| {
+                            self.blocks
+                                .lock()
+                                .expect("block store lock poisoned")
+                                .get(id, into)
+                        },
+                        scratch,
+                        &mut |id, kind| {
+                            if known.len() == known.capacity() {
+                                return false;
+                            }
+                            known.push((id, Some(kind)));
+                            true
+                        },
+                    )
+                    .map_err(value_index_to_sql)?;
+                match step {
+                    crate::store::ValueRosterStep::Full => {
+                        return Err(sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "published value-index blocks exceed checkpoint_live_blocks ({})",
+                            self.roster_scratch.capacity()
+                        ));
+                    }
+                    crate::store::ValueRosterStep::Pending => return Ok(None),
+                    crate::store::ValueRosterStep::Done => {
+                        self.roster_scratch.sort_unstable();
+                        self.roster_scratch.dedup();
+                        job.roster_walk = None;
+                        return Ok(None);
+                    }
+                }
             }
-            ValueSchedulePhase::CompleteRun { run, destination } => {
-                Self::install_value_run(&mut job, run, destination).map(|()| None)
+            match phase {
+                ValueSchedulePhase::Collect => self.value_collect_beat(storage, &mut job),
+                ValueSchedulePhase::WriteChunk { position } => self
+                    .value_write_chunk_beat(&mut job, position)
+                    .map(|()| None),
+                ValueSchedulePhase::StartMerge {
+                    left,
+                    right,
+                    destination,
+                } => self
+                    .start_value_merge(&mut job, left, right, destination)
+                    .map(|()| None),
+                ValueSchedulePhase::LoadMerge { .. } => {
+                    self.load_value_merge(&mut job).map(|()| None)
+                }
+                ValueSchedulePhase::Merge { .. } => self
+                    .value_merge_beat(storage, &mut job, before)
+                    .map(|()| None),
+                ValueSchedulePhase::Finish { accumulator, level } => {
+                    Ok(self.value_finish_beat(&mut job, accumulator, level))
+                }
+                ValueSchedulePhase::CompleteRun { run, destination } => {
+                    Self::install_value_run(&mut job, run, destination).map(|()| None)
+                }
             }
-        };
+        })();
         #[cfg(feature = "checkpoint-profile")]
         profile_checkpoint_phase(
             "value_index_schedule",
@@ -15067,6 +15085,10 @@ impl Checkpointer {
                 self.slice_writer.reset();
                 self.source_cursor.reset();
                 self.value_changed_rowids.clear();
+                self.roster_scratch.clear();
+                job.roster_walk = job
+                    .base
+                    .map(|handle| crate::store::ValueRosterWalk::new(handle.roster));
                 job.phase = ValueSchedulePhase::Collect;
                 job.source_done = false;
                 job.pending = None;

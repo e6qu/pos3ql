@@ -97375,7 +97375,7 @@ fn parallel_physical_merge_source_failures_retry_the_same_pair_without_losing_ro
 }
 
 #[test]
-fn checkpoint_reads_held_merge_keeps_cached_queries_and_foreground_read_owners() {
+fn checkpoint_reads_held_maintenance_keeps_queries_commits_and_read_owners() {
     use crate::store::{BlockStore, OwnedObjectStore, StackPlan};
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
@@ -97465,7 +97465,14 @@ fn checkpoint_reads_held_merge_keeps_cached_queries_and_foreground_read_owners()
         crate::config::TransactionMode::Mvcc,
         crate::config::TransactionMode::Locking,
     ] {
-        for phase in ["schedule", "columns"] {
+        for phase in [
+            "schedule",
+            "columns",
+            "index_source",
+            "index_merge",
+            "index_write",
+            "index_roster",
+        ] {
             let label = format!("merge-held-{mode:?}-{phase}");
             let mut config = test_config(&label);
             config.transaction_mode = mode;
@@ -97481,6 +97488,7 @@ fn checkpoint_reads_held_merge_keeps_cached_queries_and_foreground_read_owners()
             config.max_tables = 4;
             config.table_rows = 32;
             config.max_spill_generations_per_table = 2;
+            config.memtable_bytes = 8 << 20;
             crate::object_store::sim::drop_namespace(&config.object_store_bucket);
             let namespace =
                 crate::object_store::sim::open_namespace(&config.object_store_bucket, 223);
@@ -97502,19 +97510,44 @@ fn checkpoint_reads_held_merge_keeps_cached_queries_and_foreground_read_owners()
                 INSERT INTO cached_order VALUES(42); UPDATE merge_wait SET qty=qty+1000 WHERE id=7",
                 false,
             );
-            for _ in 0..64 {
-                let checkpoint = engine.ckpt.as_ref().unwrap();
-                if checkpoint.retained_output_pending()
-                    && (phase == "schedule" || checkpoint.merge_source_read_ready())
-                {
+            if phase.starts_with("index_") {
+                // More than one external-sort chunk, while retaining a small row count.
+                session.success(&mut engine,
+                    "CREATE TABLE indexed_wait(id integer, code text); \
+                     INSERT INTO indexed_wait SELECT i,repeat(md5(i::text),640) FROM generate_series(1,17) AS source(i)", false);
+                assert!(engine.checkpoint().unwrap());
+                session.success(
+                    &mut engine,
+                    "CREATE INDEX indexed_wait_code ON indexed_wait(code)",
+                    false,
+                );
+                if phase == "index_roster" {
+                    assert!(engine.checkpoint().unwrap());
+                    session.success(
+                        &mut engine,
+                        "UPDATE indexed_wait SET code=repeat(md5('new'),640) WHERE id=7",
+                        false,
+                    );
+                }
+            }
+            let selected = |checkpoint: &Checkpointer| match phase {
+                "schedule" => checkpoint.retained_output_pending(),
+                "columns" => checkpoint.merge_source_read_ready(),
+                "index_source" | "index_roster" => checkpoint.value_index_job_active(),
+                "index_merge" => checkpoint.value_index_schedule_merge_ready(),
+                "index_write" => checkpoint.value_index_output_job_active(),
+                _ => unreachable!(),
+            };
+            for _ in 0..128 {
+                if selected(engine.ckpt.as_ref().unwrap()) {
                     break;
                 }
                 assert!(!engine.checkpoint_beat().failed());
             }
-            assert!(engine.ckpt.as_ref().unwrap().retained_output_pending());
-            if phase == "columns" {
-                assert!(engine.ckpt.as_ref().unwrap().merge_source_read_ready());
-            }
+            assert!(
+                selected(engine.ckpt.as_ref().unwrap()),
+                "selected phase {phase} must be reached"
+            );
             let table = engine.storage.find_table("public", "merge_wait").unwrap();
             let foreground = engine
                 .storage
@@ -97562,7 +97595,7 @@ fn checkpoint_reads_held_merge_keeps_cached_queries_and_foreground_read_owners()
                 let range = request
                     .lines()
                     .any(|line| line.to_ascii_lowercase().starts_with("range:"));
-                if phase == "schedule"
+                if phase != "columns"
                     || (!range
                         && crate::store::decode(&body, true).unwrap().block_type
                             == crate::store::BlockType::SstPackedContainerV1)
@@ -97790,6 +97823,17 @@ fn checkpoint_reads_held_merge_keeps_cached_queries_and_foreground_read_owners()
                 data_rows(&run_with(&mut recovered, &mut recovered_budget, query)),
                 ["17|1153", "1007", "42", "43"]
             );
+            if phase.starts_with("index_") {
+                let query = if phase == "index_roster" {
+                    "SELECT count(*),sum(id) FROM indexed_wait; SELECT id FROM indexed_wait WHERE code=repeat(md5('new'),640)"
+                } else {
+                    "SELECT count(*),sum(id) FROM indexed_wait; SELECT id FROM indexed_wait WHERE code=repeat(md5('7'),640)"
+                };
+                assert_eq!(
+                    data_rows(&run_with(&mut recovered, &mut recovered_budget, query)),
+                    ["17|153", "7"]
+                );
+            }
             drop(recovered);
             std::fs::remove_dir_all(&config.data_dir).unwrap();
             crate::object_store::sim::drop_namespace(&config.object_store_bucket);

@@ -4859,6 +4859,96 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_reads_external_cursor_retains_sparse_descent_and_consumed_rows() {
+        struct WaitingStore {
+            inner: MemoryBlockStore,
+            pending: Option<BlockId>,
+            requests: usize,
+        }
+        impl BlockStore for WaitingStore {
+            fn put(
+                &mut self,
+                bytes: &[u8],
+                kind: BlockType,
+                lsn: u64,
+            ) -> Result<BlockId, StoreError> {
+                self.inner.put(bytes, kind, lsn)
+            }
+            fn get(
+                &mut self,
+                id: &BlockId,
+                into: &mut [u8],
+            ) -> Result<(usize, BlockType), StoreError> {
+                self.requests += 1;
+                if self.pending == Some(*id) {
+                    self.pending = None;
+                    self.inner.get(id, into)
+                } else {
+                    self.pending = Some(*id);
+                    into.fill(0xee);
+                    Err(StoreError::NotReady)
+                }
+            }
+        }
+        let (_budget, mut inner) = store();
+        let mut writer = SstWriter::new();
+        for group in 0..3 {
+            for rowid in group * 2 + 1..=group * 2 + 2 {
+                writer
+                    .append(&mut inner, rowid, &rowid.to_le_bytes())
+                    .unwrap();
+            }
+            writer.flush_data(&mut inner).unwrap();
+            writer.flush_index_leaf(&mut inner).unwrap();
+        }
+        let handle = writer.finish(&mut inner).unwrap().unwrap();
+        let mut store = WaitingStore {
+            inner,
+            pending: None,
+            requests: 0,
+        };
+        let mut cursor = SstCursor::new(handle);
+        let mut index = vec![0; MAX_PAYLOAD];
+        let mut data = vec![0; MAX_PAYLOAD];
+        let mut bounce = vec![0; MAX_PAYLOAD];
+        let mut output = [0; 8];
+        crate::mem::guard::forbid_alloc(|| {
+            let mut expected = 1u64;
+            let mut completed = false;
+            for _ in 0..128 {
+                match cursor.next_copy(&mut store, &mut index, &mut data, &mut bounce, &mut output)
+                {
+                    Err(SstError::Store(StoreError::NotReady)) => {}
+                    Ok(Some((rowid, len))) => {
+                        assert_eq!((rowid, len), (expected, 8));
+                        assert_eq!(u64::from_le_bytes(output), expected);
+                        expected += 1;
+                    }
+                    Ok(None) => {
+                        completed = true;
+                        break;
+                    }
+                    Err(error) => panic!("external cursor failed: {error:?}"),
+                }
+                cursor.detach_buffer();
+                index.fill(0);
+                data.fill(0);
+                bounce.fill(0);
+                output.fill(0xee);
+            }
+            assert!(
+                completed,
+                "each root, leaf and row read must finish after one wait"
+            );
+            assert_eq!(expected, 7);
+            assert!(
+                store.requests < 64,
+                "a completed sparse descent must not restart"
+            );
+        });
+    }
+
+    #[test]
     fn detached_cursor_reloads_its_current_block_at_the_saved_offset() {
         let (_budget, mut store) = store();
         let handle = build(

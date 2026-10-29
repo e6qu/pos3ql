@@ -32918,6 +32918,7 @@ impl Storage {
             let Some((key_len, payload_len, hash)) =
                 self.encode_value_binding_entry(table_slot, binding, rowid, home, output)?
             else {
+                changed_rowids.push(rowid);
                 cursor.resident_position += 1;
                 continue;
             };
@@ -32939,8 +32940,8 @@ impl Storage {
     }
 
     /// Resumes a complete checkpoint value-index source walk for at most
-    /// `max_rows` physical rowids. The cursor advances before `each` may stop
-    /// the batch, so a later beat never revisits an emitted row.
+    /// `max_rows` physical rowids. The cursor advances after successful encoding and consumption,
+    /// including a consumer-requested stop, so a waiting read cannot skip a row.
     #[expect(clippy::too_many_arguments, reason = "checkpoint row stream boundary")]
     pub(crate) fn for_each_value_binding_entry_batch(
         &self,

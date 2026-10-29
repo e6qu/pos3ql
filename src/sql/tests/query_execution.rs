@@ -80,7 +80,7 @@ fn held_query_read(mode: crate::config::TransactionMode, saved: SavedRows, cance
                 .wrapping_add(1442695040888963407);
             insert.push(char::from(b'a' + ((random >> 32) % 26) as u8));
         }
-        expected.push(checksum(insert[start..].as_bytes()));
+        expected.push(checksum(&insert.as_bytes()[start..]));
         insert.push_str("')");
     }
     session.success(&mut engine, &insert, false);
@@ -319,7 +319,10 @@ fn held_query_read(mode: crate::config::TransactionMode, saved: SavedRows, cance
             }
         }
     }
-    assert!(cold_read_before_first_row, "saved input must be fetched from object storage");
+    assert!(
+        cold_read_before_first_row,
+        "saved input must be fetched from object storage"
+    );
     assert!(
         tested_wait,
         "fixture must wait after returning a result prefix"

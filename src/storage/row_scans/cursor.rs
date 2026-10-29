@@ -8,7 +8,7 @@ use crate::storage::{
     MemberCursor, RowReadBuffers, SpillWalkProgress, SpilledRow, SpilledRowRepresentation,
 };
 
-pub(in crate::storage) struct RowCursor {
+pub(crate) struct RowCursor {
     source: Option<RowScanSource>,
 }
 
@@ -22,20 +22,20 @@ struct RowScanSource {
     spill: SpillWalkProgress,
 }
 
-pub(in crate::storage) struct RowCursorBuffers {
+pub(crate) struct RowCursorBuffers {
     scan: crate::mem::mutex::Mutex<crate::storage::ScanContext>,
     row: RowReadBuffers,
 }
 
 impl RowCursorBuffers {
-    pub(in crate::storage) fn allocation_bytes(config: &Config) -> usize {
+    pub(crate) fn allocation_bytes(config: &Config) -> usize {
         crate::storage::ScanContext::budget_bytes(config.max_spill_generations_per_table)
             - core::mem::size_of::<crate::mem::mutex::Mutex<crate::storage::ScanContext>>()
             + RowReadBuffers::budget_bytes()
             - core::mem::size_of::<RowReadBuffers>()
     }
 
-    pub(in crate::storage) fn new(
+    pub(crate) fn new(
         config: &Config,
         budget: &mut Budget,
     ) -> Result<Self, BudgetError> {
@@ -70,21 +70,21 @@ fn cursor_capacity() -> SqlError {
 }
 
 impl RowCursor {
-    pub(in crate::storage) fn position_bytes(rows: usize, members: usize) -> Option<usize> {
+    pub(crate) fn position_bytes(rows: usize, members: usize) -> Option<usize> {
         Arena::retained_slice_capacity::<CapturedRowRecord>(rows)?
             .checked_add(Arena::retained_slice_capacity::<MemberCursor>(members)?)
     }
 
-    pub(in crate::storage) const fn closed() -> Self {
+    pub(crate) const fn closed() -> Self {
         Self { source: None }
     }
 
-    pub(in crate::storage) fn close(&mut self) {
+    pub(crate) fn close(&mut self) {
         self.source = None;
     }
 
     /// Capturing row identities and owners performs no object-store reads.
-    pub(in crate::storage) fn open(
+    pub(crate) fn open(
         &mut self,
         storage: &Storage,
         table: usize,
@@ -128,7 +128,7 @@ impl RowCursor {
         Ok(())
     }
 
-    pub(in crate::storage) fn rewind(&mut self, arena: &Arena) -> Result<(), SqlError> {
+    pub(crate) fn rewind(&mut self, arena: &Arena) -> Result<(), SqlError> {
         let source = self.source.as_mut().ok_or_else(|| {
             sql_err!(
                 sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
@@ -145,7 +145,7 @@ impl RowCursor {
         Ok(())
     }
 
-    pub(in crate::storage) fn next<'arena>(
+    pub(crate) fn next<'arena>(
         &mut self,
         buffers: &mut RowCursorBuffers,
         state_arena: &Arena,

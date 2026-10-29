@@ -97548,6 +97548,7 @@ fn checkpoint_reads_held_maintenance_keeps_queries_commits_and_read_owners() {
                 _ => unreachable!(),
             };
             for _ in 0..128 {
+                advance(&mut engine);
                 if selected(engine.ckpt.as_ref().unwrap()) {
                     break;
                 }

@@ -15901,8 +15901,24 @@ fn temporary_store_to_sql(error: crate::store::StoreError) -> SqlError {
     }
 }
 
-fn value_index_to_sql(error: impl core::fmt::Debug) -> SqlError {
-    sql_err!(SQLSTATE_IO, "persistent value-index write: {:?}", error)
+fn value_index_to_sql(error: crate::store::ValueIndexError) -> SqlError {
+    match error {
+        crate::store::ValueIndexError::Store(StoreError::NotReady) => sql_err!(
+            sqlstate::INTERNAL_IO_WAIT,
+            "persistent value-index read in progress"
+        ),
+        crate::store::ValueIndexError::Store(
+            StoreError::WriteBatchBytesExhausted | StoreError::WriteBatchObjectsExhausted,
+        ) => sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "physical output emission exceeds its startup reservation"
+        ),
+        crate::store::ValueIndexError::Store(StoreError::ReadOwnersExhausted) => sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "object read consumers exceed max_connections and max_subscriptions"
+        ),
+        other => sql_err!(SQLSTATE_IO, "persistent value-index write: {:?}", other),
+    }
 }
 
 fn manifest_full() -> SqlError {

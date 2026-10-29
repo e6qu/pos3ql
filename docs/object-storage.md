@@ -71,8 +71,8 @@ its uploads overlap; the new file handle stays private until every upload
 finishes. Table slices retain their selected bytes while later changes append
 another generation. Replacing a table or rewriting its row encodings discards
 the old capture. Index sort runs and final index handles remain private until
-their uploads finish; changed index inputs cancel abandoned uploads without
-waiting for socket readiness. Merge source failures restart the same immutable
+their uploads finish; changed index inputs cancel abandoned reads and uploads
+without waiting for socket readiness. Merge source failures restart the same immutable
 pair with cleared output and checksum state.
 
 Row-file merges keep their source index, column and large-row positions across
@@ -84,8 +84,16 @@ column values and row fragments remain in the existing source buffers.
 Output counts and checksums advance after the corresponding rows finish.
 An unrelated completed request can wake a waiting merge, but cannot make it
 repeat output. If request capacity is full, the merge waits for a completion or
-released slot instead of spinning or growing the pool. Table capture and
-index-building downloads still have synchronous paths.
+released slot instead of spinning or growing the pool.
+
+Checkpoint row capture and index construction use that maintenance owner too.
+Row capture reads descriptors before fetching values; table output owns its
+partially assembled row. Index input scans own their column and large-row
+buffers, while saved sort runs retain their sparse-index descent and next row.
+Final index output records that a row was consumed before asking for its
+successor. Pausing any of these reads preserves exactly one copy of each output
+row. An index update can still take many turns and requests; yielding does not
+make that work disappear.
 
 A read can pause and restart while its result is still buffered. Once a large
 result fills the connection buffer and starts sending bytes, its remaining
@@ -114,9 +122,13 @@ first checkpoint cannot make the order reappear after that checkpoint.
 Cleanup removes only deletion markers covered by the saved file list. Finishing
 an older checkpoint must also preserve newer ANALYZE results and the journal
 work of an analysis another transaction has not committed.
-Metadata capture and other atomic maintenance reads can still wait
-synchronously. Rows larger than one block use bounded overflow chains in the
-same generation; reading such a row requires its complete chain.
+Full table capture reads at most 64 row descriptors per turn without fetching
+column values. A separate fixed row-source buffer and a private scan context
+preserve unfinished values when foreground queries reuse their own scratch.
+Rows larger than one block use bounded overflow chains in the same generation;
+reading such a row requires its complete chain, retained across download waits.
+Exclusive startup recovery and administrative operations can still wait
+synchronously.
 
 Background journal cleanup has a separate startup-reserved metadata client.
 Backup and commit listings visit at most 64 keys per response, retaining the
@@ -186,7 +198,8 @@ requests and resumes the same position with the new credentials.
 | Operational ownership check | One fixed client and one receipt slot per `operations_max_connections` when the operational listener and object storage are enabled. Shares the explicit TLS budget. |
 | `checkpoint_manifest_bytes` | Bytes in each of three fixed buffers: metadata scratch, retained manifest, and manifest upload body. |
 | Background metadata | Two independent clients, for journal and saved-file cleanup. Each reserves `object_store_head_bytes`, `object_store_response_bytes`, request state and one reactor descriptor. Key buffers hold up to 1,024 bytes each: 64 for journal cleanup, and `min(checkpoint_garbage_batch_objects, 1000)` for file cleanup. File traversal state and deduplication entries are charged to checkpoint startup memory. No runtime growth. |
-| Row-file merge reads | Two source cursors retain index, column and large-row progress; two metadata cursors retain source scheduling. Their state and wait position are charged to checkpoint startup memory. The existing source buffers and `object_store_get_slots` serve downloads; each request reserves one maintenance consumer in addition to `max_connections` and `max_subscriptions`. |
+| Row-file merge reads | Two source cursors retain index, column and large-row progress; two metadata cursors retain source scheduling. Their state and wait position are charged to checkpoint startup memory. The existing source buffers and `object_store_get_slots` serve downloads; the pool reserves one maintenance consumer in addition to `max_connections` and `max_subscriptions`. |
+| Table and index source reads | One private row source reserves four block-payload buffers and one maximum assembled row, plus its fixed decoder state. One private scan context reserves member frames, column scratch and a maximum assembled row; the ordinary scan context also reserves its own assembled-row buffer. Source identities, sparse descent, pending input advances and index block-list navigation are included in startup accounting. No extra request clients or dynamically growing buffers. |
 | `checkpoint_write_entries` | Committed versions retained by one table output schedule; SQLSTATE 54000 names exhaustion before publication. |
 | `commit_queue_slots` | Complete transaction and session-context buffers retained through asynchronous publication; at least 1 in object-store mode. |
 

@@ -79779,7 +79779,7 @@ fn checkpoint_retained_rows_preserve_sst_partition_after_eviction_between_beats(
         .find_table("public", "retained_checkpoint")
         .unwrap();
     engine.storage.set_commit_snapshot(0);
-    let mut cursor = crate::storage::CheckpointValueCursor::new(
+    let mut cursor = crate::storage::CheckpointRowCursor::new(
         config.max_spill_generations_per_table,
         config.table_rows,
     );
@@ -79888,7 +79888,7 @@ fn checkpoint_retained_rows_preserve_sst_partition_after_eviction_between_beats(
 }
 
 fn retained_sst_next(
-    cursor: &mut crate::storage::CheckpointValueCursor,
+    cursor: &mut crate::storage::CheckpointRowCursor,
     arena: &mut crate::mem::arena::Arena,
     seen: &mut Vec<i32>,
 ) -> bool {
@@ -80022,7 +80022,7 @@ fn retained_sst_durable_reader_survives_retirement_and_releases_garbage() {
         RowCleanupTask::SavedEntries(EntryCleanup::AllSaved),
         RowCleanupTarget::Table(slot),
     );
-    let mut cursor = crate::storage::CheckpointValueCursor::new(
+    let mut cursor = crate::storage::CheckpointRowCursor::new(
         config.max_spill_generations_per_table,
         config.table_rows,
     );
@@ -80110,7 +80110,7 @@ fn retained_sst_temporary_reader_survives_retirement_and_releases_blocks() {
     else {
         panic!("missing temporary table")
     };
-    let mut cursor = crate::storage::CheckpointValueCursor::new(
+    let mut cursor = crate::storage::CheckpointRowCursor::new(
         config.max_spill_generations_per_table,
         config.table_rows,
     );
@@ -97374,8 +97374,7 @@ fn parallel_physical_merge_source_failures_retry_the_same_pair_without_losing_ro
     }
 }
 
-#[test]
-fn checkpoint_reads_held_merge_keeps_cached_queries_and_foreground_read_owners() {
+fn held_maintenance_read(mode: crate::config::TransactionMode, phase: &str) {
     use crate::store::{BlockStore, OwnedObjectStore, StackPlan};
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
@@ -97401,10 +97400,10 @@ fn checkpoint_reads_held_merge_keeps_cached_queries_and_foreground_read_owners()
             match listener.accept() {
                 Ok((stream, _)) => break stream,
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    assert!(Instant::now() < deadline, "merge GET did not connect");
+                    assert!(Instant::now() < deadline, "maintenance GET did not connect");
                     std::thread::yield_now();
                 }
-                Err(error) => panic!("accept merge GET: {error}"),
+                Err(error) => panic!("accept maintenance GET: {error}"),
             }
         };
         let request = read_request(engine, &mut stream);
@@ -97419,17 +97418,17 @@ fn checkpoint_reads_held_merge_keeps_cached_queries_and_foreground_read_owners()
         loop {
             advance(engine);
             match stream.read(&mut request[used..]) {
-                Ok(0) => panic!("merge GET ended before its headers"),
+                Ok(0) => panic!("maintenance GET ended before its headers"),
                 Ok(count) => used += count,
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(error) => panic!("read merge GET: {error}"),
+                Err(error) => panic!("read maintenance GET: {error}"),
             }
             if request[..used].windows(4).any(|bytes| bytes == b"\r\n\r\n") {
                 break;
             }
             assert!(
                 used < request.len() && Instant::now() < deadline,
-                "merge GET headers did not finish"
+                "maintenance GET headers did not finish"
             );
             std::thread::yield_now();
         }
@@ -97461,95 +97460,359 @@ fn checkpoint_reads_held_merge_keeps_cached_queries_and_foreground_read_owners()
         }
     }
 
-    for mode in [
-        crate::config::TransactionMode::Mvcc,
-        crate::config::TransactionMode::Locking,
-    ] {
-        for phase in ["schedule", "columns"] {
-            let label = format!("merge-held-{mode:?}-{phase}");
-            let mut config = test_config(&label);
-            config.transaction_mode = mode;
-            config.object_store_on = true;
-            config.object_store_sim = true;
-            config.object_store_bucket = format!("{label}-{}", std::process::id()).to_lowercase();
-            config.wal_upload = true;
-            config.wal_upload_sync = true;
-            config.object_store_get_slots = 2;
-            config.object_store_hedge_after_ms = 0;
-            config.block_cache_bytes = 0;
-            config.disk_cache_bytes = 0;
-            config.max_tables = 4;
-            config.table_rows = 32;
-            config.max_spill_generations_per_table = 2;
-            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
-            let namespace =
-                crate::object_store::sim::open_namespace(&config.object_store_bucket, 223);
-            let mut budget = test_engine_budget(&config, 1 << 29);
-            let mut engine = Engine::new(&config, &mut budget).unwrap();
-            let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    let label = format!("maintenance-held-{mode:?}-{}", phase.replace('_', "-"));
+    let mut config = test_config(&label);
+    config.transaction_mode = mode;
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_bucket = format!("{label}-{}", std::process::id()).to_lowercase();
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_get_slots = 2;
+    config.object_store_hedge_after_ms = 0;
+    config.block_cache_bytes = 0;
+    config.disk_cache_bytes = 0;
+    config.max_tables = 4;
+    config.table_rows = if phase.starts_with("index_") { 512 } else { 32 };
+    config.max_spill_generations_per_table = 2;
+    config.memtable_bytes = 8 << 20;
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let namespace = crate::object_store::sim::open_namespace(&config.object_store_bucket, 223);
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE TABLE merge_wait(id integer, qty integer); \
+        INSERT INTO merge_wait SELECT i,i FROM generate_series(1,16) AS source(i)",
+        false,
+    );
+    assert!(engine.checkpoint().unwrap());
+    session.success(&mut engine, "INSERT INTO merge_wait VALUES(17,17)", false);
+    assert!(engine.checkpoint().unwrap());
+    session.success(
+        &mut engine,
+        "UPDATE merge_wait SET qty=qty+1000 WHERE id=7",
+        false,
+    );
+    if phase.starts_with("index_") {
+        // Multiple sort chunks with keys inside the fixed collation workspace.
+        session.success(&mut engine,
+            "CREATE TABLE indexed_wait(id integer, code text); \
+             INSERT INTO indexed_wait SELECT i,repeat(md5(i::text),32) FROM generate_series(1,320) AS source(i)", false);
+        assert!(engine.checkpoint().unwrap());
+        session.success(
+            &mut engine,
+            "CREATE INDEX indexed_wait_code ON indexed_wait(code)",
+            false,
+        );
+        if phase == "index_roster" {
+            assert!(engine.checkpoint().unwrap());
             session.success(
                 &mut engine,
-                "CREATE TABLE merge_wait(id integer, qty integer); \
-                INSERT INTO merge_wait SELECT i,i FROM generate_series(1,16) AS source(i)",
+                "UPDATE indexed_wait SET code=repeat(md5('new'),32) WHERE id=7",
                 false,
             );
-            assert!(engine.checkpoint().unwrap());
-            session.success(&mut engine, "INSERT INTO merge_wait VALUES(17,17)", false);
-            assert!(engine.checkpoint().unwrap());
-            session.success(
-                &mut engine,
-                "CREATE TABLE cached_order(id integer); \
-                INSERT INTO cached_order VALUES(42); UPDATE merge_wait SET qty=qty+1000 WHERE id=7",
-                false,
-            );
-            for _ in 0..64 {
-                let checkpoint = engine.ckpt.as_ref().unwrap();
-                if checkpoint.retained_output_pending()
-                    && (phase == "schedule" || checkpoint.merge_source_read_ready())
-                {
-                    break;
-                }
-                assert!(!engine.checkpoint_beat().failed());
-            }
-            assert!(engine.ckpt.as_ref().unwrap().retained_output_pending());
-            if phase == "columns" {
-                assert!(engine.ckpt.as_ref().unwrap().merge_source_read_ready());
-            }
-            let table = engine.storage.find_table("public", "merge_wait").unwrap();
-            let foreground = engine
-                .storage
-                .table(table)
-                .spill_generations()
-                .handle(0)
-                .unwrap()
-                .filter;
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            listener.set_nonblocking(true).unwrap();
-            let mut network = config.clone();
-            network.object_store_sim = false;
-            network.object_store_endpoint = listener.local_addr().unwrap().to_string();
-            network.object_store_access_key = "test-access".to_owned();
-            network.object_store_secret_key = "test-secret".to_owned();
-            let blocks = engine.ckpt.as_ref().unwrap().block_stack();
-            let mut io_budget = Budget::new(OwnedObjectStore::budget_bytes(&network));
-            let store = OwnedObjectStore::new(&network, &mut io_budget, "blocks/").unwrap();
-            *blocks.lock().unwrap() = crate::store::build_tiers(
-                &mut io_budget,
-                store,
-                StackPlan::resolve(0, 0),
-                std::path::Path::new(&config.data_dir),
-            )
+        }
+    }
+    session.success(
+        &mut engine,
+        "CREATE TABLE cached_order(id integer); INSERT INTO cached_order VALUES(42)",
+        false,
+    );
+    engine.ckpt.as_mut().unwrap().request_checkpoint().unwrap();
+    let selected = |checkpoint: &Checkpointer| match phase {
+        "schedule" => checkpoint.retained_output_pending(),
+        "columns" => checkpoint.merge_source_read_ready(),
+        "index_source" | "index_roster" | "index_cancel_source" => {
+            checkpoint.value_index_job_active()
+        }
+        "index_merge" => checkpoint.value_index_schedule_merge_ready(),
+        "index_write" | "index_cancel_write" => checkpoint.value_index_output_job_active(),
+        _ => unreachable!(),
+    };
+    for _ in 0..128 {
+        advance(&mut engine);
+        if selected(engine.ckpt.as_ref().unwrap()) {
+            break;
+        }
+        assert!(!engine.checkpoint_beat().failed());
+    }
+    assert!(
+        selected(engine.ckpt.as_ref().unwrap()),
+        "selected phase {phase} must be reached"
+    );
+    let table = engine.storage.find_table("public", "merge_wait").unwrap();
+    let foreground = engine
+        .storage
+        .table(table)
+        .spill_generations()
+        .handle(0)
+        .unwrap()
+        .filter;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let mut network = config.clone();
+    network.object_store_sim = false;
+    network.object_store_endpoint = listener.local_addr().unwrap().to_string();
+    network.object_store_access_key = "test-access".to_owned();
+    network.object_store_secret_key = "test-secret".to_owned();
+    let blocks = engine.ckpt.as_ref().unwrap().block_stack();
+    let mut io_budget = Budget::new(OwnedObjectStore::budget_bytes(&network));
+    let store = OwnedObjectStore::new(&network, &mut io_budget, "blocks/").unwrap();
+    *blocks.lock().unwrap() = crate::store::build_tiers(
+        &mut io_budget,
+        store,
+        StackPlan::resolve(0, 0),
+        std::path::Path::new(&config.data_dir),
+    )
+    .unwrap();
+    assert_eq!(io_budget.remaining(), 0);
+    engine.enable_async_block_reads();
+    let prefix = format!("/{}/", config.object_store_bucket);
+    let mut held = None;
+    for _ in 0..32 {
+        if engine.checkpoint_can_progress() {
+            assert!(!crate::mem::guard::forbid_alloc(|| engine.checkpoint_beat()).failed());
+        }
+        let (mut stream, request) = accept(&mut engine, &listener);
+        let key = request
+            .lines()
+            .next()
+            .unwrap()
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .strip_prefix(&prefix)
             .unwrap();
-            assert_eq!(io_budget.remaining(), 0);
-            engine.enable_async_block_reads();
-            let prefix = format!("/{}/", config.object_store_bucket);
-            let mut held = None;
-            for _ in 0..32 {
-                if engine.checkpoint_can_progress() {
-                    assert!(!crate::mem::guard::forbid_alloc(|| engine.checkpoint_beat()).failed());
-                }
-                let (mut stream, request) = accept(&mut engine, &listener);
-                let key = request
+        let body = namespace.borrow().object_bytes(key).unwrap().to_vec();
+        let range = request
+            .lines()
+            .any(|line| line.to_ascii_lowercase().starts_with("range:"));
+        if phase != "columns"
+            || (!range
+                && crate::store::decode(&body, true).unwrap().block_type
+                    == crate::store::BlockType::SstPackedContainerV1)
+        {
+            held = Some((stream, request, body));
+            break;
+        }
+        reply(&mut stream, &request, &body);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while engine.block_reads_pending() {
+            advance(&mut engine);
+            assert!(
+                Instant::now() < deadline,
+                "maintenance response did not finish"
+            );
+            std::thread::yield_now();
+        }
+    }
+    let (stream, request, body) = held.expect("fixture must hold the selected maintenance phase");
+    let mut stream = Some(stream);
+    assert_eq!(
+        blocks.lock().unwrap().base_mut().read_owner(),
+        engine.read_owner
+    );
+    let maintenance_fds = [
+        engine.pending_block_read_fd(0),
+        engine.pending_block_read_fd(1),
+    ];
+    crate::mem::guard::forbid_alloc(|| {
+        for _ in 0..64 {
+            if !engine.checkpoint_can_progress() {
+                break;
+            }
+            assert!(!engine.checkpoint_beat().failed());
+            assert_eq!(
+                [
+                    engine.pending_block_read_fd(0),
+                    engine.pending_block_read_fd(1)
+                ],
+                maintenance_fds,
+                "local cleanup must preserve the held maintenance request"
+            );
+        }
+    });
+    assert!(!engine.checkpoint_can_progress());
+    let mut foreground_bytes = [0; crate::store::MAX_PAYLOAD];
+    let foreground_owner =
+        ExecutionIdentity::new(12, engine.execution_identity().database_oid).read_owner();
+    let prior = engine.replace_read_owner(Some(foreground_owner));
+    let started = crate::mem::guard::forbid_alloc(|| {
+        blocks
+            .lock()
+            .unwrap()
+            .get(&foreground, &mut foreground_bytes)
+    });
+    let _ = engine.replace_read_owner(prior);
+    assert_eq!(started, Err(crate::store::StoreError::NotReady));
+    let (mut foreground_stream, foreground_request) = accept(&mut engine, &listener);
+    let foreground_key = foreground_request
+        .lines()
+        .next()
+        .unwrap()
+        .split_whitespace()
+        .nth(1)
+        .unwrap()
+        .strip_prefix(&prefix)
+        .unwrap();
+    let foreground_body = namespace
+        .borrow()
+        .object_bytes(foreground_key)
+        .unwrap()
+        .to_vec();
+    let fds = [
+        engine.pending_block_read_fd(0),
+        engine.pending_block_read_fd(1),
+    ];
+    assert!(fds.iter().all(Option::is_some));
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "SELECT id FROM cached_order", true)),
+        ["42"]
+    );
+    session.success(
+        &mut engine,
+        "BEGIN; INSERT INTO cached_order VALUES(43)",
+        true,
+    );
+    // Simulator publication grows its fixture inventory outside the runtime guard.
+    session.success(&mut engine, "COMMIT", false);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT count(*),sum(id) FROM cached_order",
+            true,
+        )),
+        ["2|85"]
+    );
+    assert_eq!(
+        blocks.lock().unwrap().base_mut().read_owner(),
+        engine.read_owner
+    );
+    crate::mem::guard::forbid_alloc(|| {
+        let mut waiting = false;
+        for _ in 0..64 {
+            let beat = engine.checkpoint_beat();
+            assert!(!beat.failed());
+            assert_eq!(
+                [
+                    engine.pending_block_read_fd(0),
+                    engine.pending_block_read_fd(1)
+                ],
+                fds
+            );
+            if beat == CheckpointBeat::WaitingForReads && !engine.checkpoint_can_progress() {
+                waiting = true;
+                break;
+            }
+        }
+        assert!(
+            waiting,
+            "query-released history must finish while downloads wait"
+        );
+        for _ in 0..3 {
+            assert_eq!(engine.checkpoint_beat(), CheckpointBeat::WaitingForReads);
+            assert!(!engine.checkpoint_can_progress());
+            assert_eq!(
+                [
+                    engine.pending_block_read_fd(0),
+                    engine.pending_block_read_fd(1)
+                ],
+                fds
+            );
+        }
+    });
+    let canceled = phase.starts_with("index_cancel_");
+    if canceled {
+        session.success(&mut engine, "BEGIN; DROP INDEX indexed_wait_code", true);
+        // Simulator publication grows fixture inventory outside the runtime guard.
+        session.success(&mut engine, "COMMIT", false);
+        assert!(
+            engine.checkpoint_can_progress(),
+            "changed inputs must wake a waiting job"
+        );
+        for _ in 0..64 {
+            if !engine.ckpt.as_ref().unwrap().value_index_job_active() {
+                break;
+            }
+            assert!(!crate::mem::guard::forbid_alloc(|| engine.checkpoint_beat()).failed());
+        }
+        assert!(!engine.ckpt.as_ref().unwrap().value_index_job_active());
+        let remaining = [
+            engine.pending_block_read_fd(0),
+            engine.pending_block_read_fd(1),
+        ];
+        assert_eq!(
+            remaining.iter().filter(|fd| fd.is_some()).count(),
+            1,
+            "abandoned index reads must release their slot before the server replies"
+        );
+        assert!(
+            remaining
+                .iter()
+                .flatten()
+                .all(|fd| fds.contains(&Some(*fd)))
+        );
+        drop(stream.take());
+    }
+    reply(
+        &mut foreground_stream,
+        &foreground_request,
+        &foreground_body,
+    );
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        advance(&mut engine);
+        let prior = engine.replace_read_owner(Some(foreground_owner));
+        let result = crate::mem::guard::forbid_alloc(|| {
+            blocks
+                .lock()
+                .unwrap()
+                .get(&foreground, &mut foreground_bytes)
+        });
+        let _ = engine.replace_read_owner(prior);
+        match result {
+            Ok(_) => break,
+            Err(crate::store::StoreError::NotReady) => {}
+            Err(error) => panic!("foreground read failed: {error:?}"),
+        }
+        assert!(
+            Instant::now() < deadline,
+            "foreground response did not finish"
+        );
+        std::thread::yield_now();
+    }
+    if canceled {
+        assert!(!engine.block_reads_pending());
+    } else {
+        assert!(engine.checkpoint_can_progress());
+        assert_eq!(
+            crate::mem::guard::forbid_alloc(|| engine.checkpoint_beat()),
+            CheckpointBeat::WaitingForReads
+        );
+        assert!(!engine.checkpoint_can_progress());
+        reply(stream.as_mut().unwrap(), &request, &body);
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while engine.ckpt.as_ref().unwrap().retained_output_pending() {
+        advance(&mut engine);
+        if !engine.ckpt.as_ref().unwrap().retained_output_pending() {
+            break;
+        }
+        if engine.checkpoint_can_progress() {
+            let beat = if engine.ckpt.as_ref().unwrap().physical_output_pending() {
+                // Simulator uploads grow fixture inventories outside the runtime guard.
+                engine.checkpoint_beat()
+            } else {
+                crate::mem::guard::forbid_alloc(|| engine.checkpoint_beat())
+            };
+            assert!(!beat.failed());
+        }
+        match listener.accept() {
+            Ok((mut pending, _)) => {
+                let headers = read_request(&mut engine, &mut pending);
+                let key = headers
                     .lines()
                     .next()
                     .unwrap()
@@ -97558,243 +97821,171 @@ fn checkpoint_reads_held_merge_keeps_cached_queries_and_foreground_read_owners()
                     .unwrap()
                     .strip_prefix(&prefix)
                     .unwrap();
-                let body = namespace.borrow().object_bytes(key).unwrap().to_vec();
-                let range = request
-                    .lines()
-                    .any(|line| line.to_ascii_lowercase().starts_with("range:"));
-                if phase == "schedule"
-                    || (!range
-                        && crate::store::decode(&body, true).unwrap().block_type
-                            == crate::store::BlockType::SstPackedContainerV1)
-                {
-                    held = Some((stream, request, body));
-                    break;
-                }
-                reply(&mut stream, &request, &body);
-                let deadline = Instant::now() + Duration::from_secs(2);
-                while engine.block_reads_pending() {
-                    advance(&mut engine);
-                    assert!(Instant::now() < deadline, "merge response did not finish");
-                    std::thread::yield_now();
-                }
-            }
-            let (mut stream, request, body) =
-                held.expect("fixture must hold the selected merge phase");
-            assert_eq!(
-                blocks.lock().unwrap().base_mut().read_owner(),
-                engine.read_owner
-            );
-            assert!(!engine.checkpoint_can_progress());
-            let mut foreground_bytes = [0; crate::store::MAX_PAYLOAD];
-            let foreground_owner =
-                ExecutionIdentity::new(12, engine.execution_identity().database_oid).read_owner();
-            let prior = engine.replace_read_owner(Some(foreground_owner));
-            let started = crate::mem::guard::forbid_alloc(|| {
-                blocks
-                    .lock()
-                    .unwrap()
-                    .get(&foreground, &mut foreground_bytes)
-            });
-            let _ = engine.replace_read_owner(prior);
-            assert_eq!(started, Err(crate::store::StoreError::NotReady));
-            let (mut foreground_stream, foreground_request) = accept(&mut engine, &listener);
-            let foreground_key = foreground_request
-                .lines()
-                .next()
-                .unwrap()
-                .split_whitespace()
-                .nth(1)
-                .unwrap()
-                .strip_prefix(&prefix)
-                .unwrap();
-            let foreground_body = namespace
-                .borrow()
-                .object_bytes(foreground_key)
-                .unwrap()
-                .to_vec();
-            let fds = [
-                engine.pending_block_read_fd(0),
-                engine.pending_block_read_fd(1),
-            ];
-            assert!(fds.iter().all(Option::is_some));
-            assert_eq!(
-                data_rows(&session.success(&mut engine, "SELECT id FROM cached_order", true)),
-                ["42"]
-            );
-            session.success(
-                &mut engine,
-                "BEGIN; INSERT INTO cached_order VALUES(43)",
-                true,
-            );
-            // Simulator publication grows its fixture inventory outside the runtime guard.
-            session.success(&mut engine, "COMMIT", false);
-            assert_eq!(
-                data_rows(&session.success(
-                    &mut engine,
-                    "SELECT count(*),sum(id) FROM cached_order",
-                    true,
-                )),
-                ["2|85"]
-            );
-            assert_eq!(
-                blocks.lock().unwrap().base_mut().read_owner(),
-                engine.read_owner
-            );
-            crate::mem::guard::forbid_alloc(|| {
-                let mut waiting = false;
-                for _ in 0..64 {
-                    let beat = engine.checkpoint_beat();
-                    assert!(!beat.failed());
-                    assert_eq!(
-                        [
-                            engine.pending_block_read_fd(0),
-                            engine.pending_block_read_fd(1)
-                        ],
-                        fds
-                    );
-                    if beat == CheckpointBeat::WaitingForReads && !engine.checkpoint_can_progress()
-                    {
-                        waiting = true;
-                        break;
-                    }
-                }
-                assert!(
-                    waiting,
-                    "query-released history must finish while downloads wait"
+                reply(
+                    &mut pending,
+                    &headers,
+                    namespace.borrow().object_bytes(key).unwrap(),
                 );
-                for _ in 0..3 {
-                    assert_eq!(engine.checkpoint_beat(), CheckpointBeat::WaitingForReads);
-                    assert!(!engine.checkpoint_can_progress());
-                    assert_eq!(
-                        [
-                            engine.pending_block_read_fd(0),
-                            engine.pending_block_read_fd(1)
-                        ],
-                        fds
-                    );
-                }
-            });
-            reply(
-                &mut foreground_stream,
-                &foreground_request,
-                &foreground_body,
-            );
-            let deadline = Instant::now() + Duration::from_secs(2);
-            loop {
-                advance(&mut engine);
-                let prior = engine.replace_read_owner(Some(foreground_owner));
-                let result = crate::mem::guard::forbid_alloc(|| {
-                    blocks
-                        .lock()
-                        .unwrap()
-                        .get(&foreground, &mut foreground_bytes)
-                });
-                let _ = engine.replace_read_owner(prior);
-                match result {
-                    Ok(_) => break,
-                    Err(crate::store::StoreError::NotReady) => {}
-                    Err(error) => panic!("foreground read failed: {error:?}"),
-                }
-                assert!(
-                    Instant::now() < deadline,
-                    "foreground response did not finish"
-                );
-                std::thread::yield_now();
             }
-            assert!(engine.checkpoint_can_progress());
-            assert_eq!(
-                crate::mem::guard::forbid_alloc(|| engine.checkpoint_beat()),
-                CheckpointBeat::WaitingForReads
-            );
-            assert!(!engine.checkpoint_can_progress());
-            reply(&mut stream, &request, &body);
-            let deadline = Instant::now() + Duration::from_secs(2);
-            while engine.ckpt.as_ref().unwrap().retained_output_pending() {
-                advance(&mut engine);
-                if !engine.ckpt.as_ref().unwrap().retained_output_pending() {
-                    break;
-                }
-                if engine.checkpoint_can_progress() {
-                    let beat = if engine.ckpt.as_ref().unwrap().physical_output_pending() {
-                        // Simulator uploads grow fixture inventories outside the runtime guard.
-                        engine.checkpoint_beat()
-                    } else {
-                        crate::mem::guard::forbid_alloc(|| engine.checkpoint_beat())
-                    };
-                    assert!(!beat.failed());
-                }
-                match listener.accept() {
-                    Ok((mut pending, _)) => {
-                        let headers = read_request(&mut engine, &mut pending);
-                        let key = headers
-                            .lines()
-                            .next()
-                            .unwrap()
-                            .split_whitespace()
-                            .nth(1)
-                            .unwrap()
-                            .strip_prefix(&prefix)
-                            .unwrap();
-                        reply(
-                            &mut pending,
-                            &headers,
-                            namespace.borrow().object_bytes(key).unwrap(),
-                        );
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                    Err(error) => panic!("accept merge resumption: {error}"),
-                }
-                assert!(
-                    Instant::now() < deadline,
-                    "merge did not resume: runnable={}, output={}, output_ready={}, reads_ready={}, read_generation={}, sockets={:?}",
-                    engine.checkpoint_can_progress(),
-                    engine.ckpt.as_ref().unwrap().physical_output_pending(),
-                    engine
-                        .ckpt
-                        .as_ref()
-                        .unwrap()
-                        .physical_output_ready(Instant::now()),
-                    engine.ckpt.as_ref().unwrap().merge_reads_ready(),
-                    engine.read_capacity_generation(),
-                    [
-                        engine.pending_block_read_fd(0),
-                        engine.pending_block_read_fd(1)
-                    ],
-                );
-                std::thread::yield_now();
-            }
-            assert!(!engine.ckpt.as_ref().unwrap().retained_output_pending());
-            assert!(!engine.block_reads_pending());
-            let mut restore_budget = Budget::new(OwnedObjectStore::budget_bytes(&config));
-            let store = OwnedObjectStore::new(&config, &mut restore_budget, "blocks/").unwrap();
-            *blocks.lock().unwrap() = crate::store::build_tiers(
-                &mut restore_budget,
-                store,
-                StackPlan::resolve(0, 0),
-                std::path::Path::new(&config.data_dir),
-            )
-            .unwrap();
-            engine.enable_async_block_reads();
-            assert!(engine.checkpoint().unwrap());
-            let query = "SELECT count(*),sum(qty) FROM merge_wait; SELECT qty FROM merge_wait WHERE id=7; SELECT id FROM cached_order ORDER BY id";
-            // Ordered query runs update the simulator's object inventory.
-            assert_eq!(
-                data_rows(&session.success(&mut engine, query, false)),
-                ["17|1153", "1007", "42", "43"]
-            );
-            drop((session, engine, blocks));
-            std::fs::remove_dir_all(&config.data_dir).unwrap();
-            let mut recovered_budget = test_engine_budget(&config, 1 << 29);
-            let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
-            assert_eq!(
-                data_rows(&run_with(&mut recovered, &mut recovered_budget, query)),
-                ["17|1153", "1007", "42", "43"]
-            );
-            drop(recovered);
-            std::fs::remove_dir_all(&config.data_dir).unwrap();
-            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) => panic!("accept maintenance resumption: {error}"),
         }
+        assert!(
+            Instant::now() < deadline,
+            "maintenance did not resume: runnable={}, output={}, output_ready={}, reads_ready={}, read_generation={}, sockets={:?}",
+            engine.checkpoint_can_progress(),
+            engine.ckpt.as_ref().unwrap().physical_output_pending(),
+            engine
+                .ckpt
+                .as_ref()
+                .unwrap()
+                .physical_output_ready(Instant::now()),
+            engine.ckpt.as_ref().unwrap().maintenance_reads_ready(),
+            engine.read_capacity_generation(),
+            [
+                engine.pending_block_read_fd(0),
+                engine.pending_block_read_fd(1)
+            ],
+        );
+        std::thread::yield_now();
     }
+    assert!(!engine.ckpt.as_ref().unwrap().retained_output_pending());
+    assert!(!engine.block_reads_pending());
+    let mut restore_budget = Budget::new(OwnedObjectStore::budget_bytes(&config));
+    let store = OwnedObjectStore::new(&config, &mut restore_budget, "blocks/").unwrap();
+    *blocks.lock().unwrap() = crate::store::build_tiers(
+        &mut restore_budget,
+        store,
+        StackPlan::resolve(0, 0),
+        std::path::Path::new(&config.data_dir),
+    )
+    .unwrap();
+    engine.enable_async_block_reads();
+    assert!(engine.checkpoint().unwrap());
+    let query = "SELECT count(*),sum(qty) FROM merge_wait; SELECT qty FROM merge_wait WHERE id=7; SELECT id FROM cached_order ORDER BY id";
+    // Ordered query runs update the simulator's object inventory.
+    assert_eq!(
+        data_rows(&session.success(&mut engine, query, false)),
+        ["17|1153", "1007", "42", "43"]
+    );
+    drop((session, engine, blocks));
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut recovered_budget = test_engine_budget(&config, 1 << 29);
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(&mut recovered, &mut recovered_budget, query)),
+        ["17|1153", "1007", "42", "43"]
+    );
+    if canceled {
+        assert_eq!(
+            data_rows(&run_with(
+                &mut recovered,
+                &mut recovered_budget,
+                "SELECT count(*) FROM pg_indexes WHERE indexname='indexed_wait_code'"
+            )),
+            ["0"]
+        );
+    }
+    if phase.starts_with("index_") {
+        let query = if phase == "index_roster" {
+            "SELECT count(*),sum(id) FROM indexed_wait; SELECT id FROM indexed_wait WHERE code=repeat(md5('new'),32)"
+        } else {
+            "SELECT count(*),sum(id) FROM indexed_wait; SELECT id FROM indexed_wait WHERE code=repeat(md5('7'),32)"
+        };
+        assert_eq!(
+            data_rows(&run_with(&mut recovered, &mut recovered_budget, query)),
+            ["320|51360", "7"]
+        );
+    }
+    drop(recovered);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+}
+
+#[test]
+fn checkpoint_reads_held_mvcc_schedule() {
+    held_maintenance_read(crate::config::TransactionMode::Mvcc, "schedule");
+}
+
+#[test]
+fn checkpoint_reads_held_mvcc_columns() {
+    held_maintenance_read(crate::config::TransactionMode::Mvcc, "columns");
+}
+
+#[test]
+fn checkpoint_reads_held_mvcc_index_source() {
+    held_maintenance_read(crate::config::TransactionMode::Mvcc, "index_source");
+}
+
+#[test]
+fn checkpoint_reads_held_mvcc_index_merge() {
+    held_maintenance_read(crate::config::TransactionMode::Mvcc, "index_merge");
+}
+
+#[test]
+fn checkpoint_reads_held_mvcc_index_write() {
+    held_maintenance_read(crate::config::TransactionMode::Mvcc, "index_write");
+}
+
+#[test]
+fn checkpoint_reads_held_mvcc_index_roster() {
+    held_maintenance_read(crate::config::TransactionMode::Mvcc, "index_roster");
+}
+
+#[test]
+fn checkpoint_reads_held_mvcc_index_cancel_source() {
+    held_maintenance_read(crate::config::TransactionMode::Mvcc, "index_cancel_source");
+}
+
+#[test]
+fn checkpoint_reads_held_mvcc_index_cancel_write() {
+    held_maintenance_read(crate::config::TransactionMode::Mvcc, "index_cancel_write");
+}
+
+#[test]
+fn checkpoint_reads_held_locking_schedule() {
+    held_maintenance_read(crate::config::TransactionMode::Locking, "schedule");
+}
+
+#[test]
+fn checkpoint_reads_held_locking_columns() {
+    held_maintenance_read(crate::config::TransactionMode::Locking, "columns");
+}
+
+#[test]
+fn checkpoint_reads_held_locking_index_source() {
+    held_maintenance_read(crate::config::TransactionMode::Locking, "index_source");
+}
+
+#[test]
+fn checkpoint_reads_held_locking_index_merge() {
+    held_maintenance_read(crate::config::TransactionMode::Locking, "index_merge");
+}
+
+#[test]
+fn checkpoint_reads_held_locking_index_write() {
+    held_maintenance_read(crate::config::TransactionMode::Locking, "index_write");
+}
+
+#[test]
+fn checkpoint_reads_held_locking_index_roster() {
+    held_maintenance_read(crate::config::TransactionMode::Locking, "index_roster");
+}
+
+#[test]
+fn checkpoint_reads_held_locking_index_cancel_source() {
+    held_maintenance_read(
+        crate::config::TransactionMode::Locking,
+        "index_cancel_source",
+    );
+}
+
+#[test]
+fn checkpoint_reads_held_locking_index_cancel_write() {
+    held_maintenance_read(
+        crate::config::TransactionMode::Locking,
+        "index_cancel_write",
+    );
 }
 
 #[test]
@@ -98629,6 +98820,8 @@ fn parallel_checkpoint_failures_reach_waiters_and_do_not_poison_new_or_cancelled
             sqlstate::INTERNAL_IO_WAIT
         );
     }
+    assert_eq!(engine.checkpoint_beat(), CheckpointBeat::Advanced);
+    assert!(engine.ckpt.as_ref().unwrap().value_index_job_active());
     namespace.borrow_mut().faults.transient_per_mille = 1000;
     assert_eq!(
         engine.checkpoint_beat(),

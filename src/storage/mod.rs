@@ -14860,7 +14860,7 @@ pub(crate) struct SpillReader {
     /// Two scratch sets so one consume-in-place fetch may nest inside another
     /// (a validation scan holding one row while checking it against the
     /// rest). Deeper nesting is a loud error, not a deadlock.
-    scratch: [Mutex<SpillScratch>; 2],
+    scratch: [Mutex<RowReadBuffers>; 2],
     /// Merged walks share startup-owned frames keyed by immutable source and
     /// block position. Nested callbacks release the context lock; frame reuse
     /// invalidates a cursor's residency claim, never its logical position.
@@ -14977,11 +14977,15 @@ struct ScanContext {
     pax_extent_buf: Box<[u8]>,
     pax_row_buf: Box<[u8]>,
     index_buf: Box<[u8]>,
+    chain_buf: Box<[u8]>,
+    chain_source: Option<crate::store::DataBlockRef>,
+    chain_progress: crate::store::ChainReadProgress,
 }
 
 impl ScanContext {
     fn budget_bytes(capacity: usize) -> usize {
         (2 * capacity + 4) * crate::store::MAX_PAYLOAD
+            + crate::store::MAX_ASSEMBLED
             + capacity
                 * (2 * size_of::<Box<[u8]>>()
                     + size_of::<Option<ScanBlockImage>>()
@@ -15006,6 +15010,9 @@ impl ScanContext {
             pax_extent_buf: vec![0; crate::store::MAX_PAYLOAD].into_boxed_slice(),
             pax_row_buf: vec![0; crate::store::MAX_PAYLOAD].into_boxed_slice(),
             index_buf: vec![0; crate::store::MAX_PAYLOAD].into_boxed_slice(),
+            chain_buf: vec![0; crate::store::MAX_ASSEMBLED].into_boxed_slice(),
+            chain_source: None,
+            chain_progress: crate::store::ChainReadProgress::default(),
         }
     }
 
@@ -15064,6 +15071,32 @@ struct MemberCursor {
     /// The head entry, parsed as one immutable row-version key.
     head: Option<(crate::store::SstKey, bool, u32)>,
     done: bool,
+    lookup: crate::store::SstDataLookup,
+}
+
+struct SpillWalkResume<'a> {
+    members: &'a mut [MemberCursor],
+    identity: &'a mut u64,
+    initialized: &'a mut usize,
+    pending_advance: &'a mut Option<u64>,
+    context: &'a Mutex<ScanContext>,
+    max_rows: usize,
+    max_object_gets: u64,
+}
+
+enum SpillWalkOutput<'callback, 'arena> {
+    Metadata(
+        &'callback mut dyn FnMut(u64, SpillVersion) -> Result<core::ops::ControlFlow<()>, SqlError>,
+    ),
+    Rows {
+        columns: Option<&'callback [bool; MAX_COLUMNS]>,
+        coalesce_packed: bool,
+        emit: &'callback mut dyn FnMut(
+            u64,
+            u64,
+            SpilledRowRepresentation<'arena>,
+        ) -> Result<core::ops::ControlFlow<()>, SqlError>,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -15072,26 +15105,84 @@ struct CheckpointRowIdentity {
     suppress_spill: bool,
 }
 
-/// Logical position of one checkpoint value-index source walk. Block buffers
-/// remain in the shared scan context and are reloaded on a later beat; this
-/// state retains sorted row identities and immutable SST cursor positions.
-pub(crate) struct CheckpointValueCursor {
+/// One retained checkpoint row source. Its private startup-reserved context
+/// keeps unfinished column and large-row bytes while foreground scans reuse
+/// their own buffers. Resident identities and immutable file roots stay fixed.
+pub(crate) struct CheckpointRowCursor {
     resident_position: usize,
     resident_rowids: Vec<CheckpointRowIdentity>,
     resident_initialized: bool,
     members: Box<[MemberCursor]>,
     generations: SpillGenerationSnapshot,
-    /// Stable owner identity for shared scan buffers across checkpoint beats.
+    /// Stable identity for the retained walk across checkpoint turns.
     spill_walk_id: u64,
     /// Member heads opened so far; opening a long generation list is paced.
     spill_initialized: usize,
     resident_done: bool,
     spill_done: bool,
+    pending_advance: Option<u64>,
+    scan_context: Mutex<ScanContext>,
 }
 
-impl CheckpointValueCursor {
+impl CheckpointRowCursor {
+    pub(crate) fn walk_spilled_metadata(
+        &mut self,
+        arena: &Arena,
+        max_rows: usize,
+        max_object_gets: u64,
+        each: &mut dyn FnMut(u64, u64, RowHome) -> Result<core::ops::ControlFlow<()>, SqlError>,
+    ) -> Result<bool, SqlError> {
+        if !self.resident_initialized {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "checkpoint SST source has not been retained"
+            ));
+        }
+        let relation = self.generations.relation();
+        if relation.len() == 0 {
+            return Ok(true);
+        }
+        let reader = self.generations.reader.as_ref().ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "retained SST roots have no reader owner"
+            )
+        })?;
+        Storage::walk_spill_bytes(
+            reader,
+            &relation,
+            self.generations.commit_lsn,
+            arena,
+            true,
+            SpillOverlayMode::CommittedCheckpoint(&self.resident_rowids),
+            Some(SpillWalkResume {
+                members: &mut self.members,
+                identity: &mut self.spill_walk_id,
+                initialized: &mut self.spill_initialized,
+                pending_advance: &mut self.pending_advance,
+                context: &self.scan_context,
+                max_rows,
+                max_object_gets,
+            }),
+            SpillWalkOutput::Metadata(&mut |rowid, version| {
+                let len = version.len.expect("metadata walk selects a live version");
+                each(
+                    rowid,
+                    version.commit_lsn,
+                    RowHome::Spilled {
+                        len,
+                        sst: version.generation,
+                        commit_lsn: version.commit_lsn,
+                    },
+                )
+            }),
+        )
+    }
+
     pub(crate) fn budget_bytes(max_spill_generations: usize, table_rows: usize) -> usize {
         max_spill_generations * core::mem::size_of::<MemberCursor>()
+            + ScanContext::budget_bytes(max_spill_generations)
+            + core::mem::size_of::<Option<u64>>()
             + SpillGenerationSnapshot::budget_bytes(max_spill_generations)
             + table_rows * core::mem::size_of::<CheckpointRowIdentity>()
     }
@@ -15107,6 +15198,8 @@ impl CheckpointValueCursor {
             spill_initialized: 0,
             resident_done: false,
             spill_done: false,
+            pending_advance: None,
+            scan_context: Mutex::new(ScanContext::new(max_spill_generations)),
         }
     }
 
@@ -15118,12 +15211,13 @@ impl CheckpointValueCursor {
         self.generations.clear();
         self.spill_walk_id = 0;
         self.spill_initialized = 0;
+        self.pending_advance = None;
         self.resident_done = false;
         self.spill_done = false;
     }
 }
 
-impl CheckpointValueCursor {
+impl CheckpointRowCursor {
     pub(crate) fn walk_spilled_rows<'arena>(
         &mut self,
         arena: &'arena Arena,
@@ -15159,17 +15253,21 @@ impl CheckpointValueCursor {
             self.generations.commit_lsn,
             arena,
             true,
-            decoded_columns,
-            coalesce_packed,
             SpillOverlayMode::CommittedCheckpoint(&self.resident_rowids),
-            Some((
-                &mut self.members,
-                &mut self.spill_walk_id,
-                &mut self.spill_initialized,
+            Some(SpillWalkResume {
+                members: &mut self.members,
+                identity: &mut self.spill_walk_id,
+                initialized: &mut self.spill_initialized,
+                pending_advance: &mut self.pending_advance,
+                context: &self.scan_context,
                 max_rows,
                 max_object_gets,
-            )),
-            each,
+            }),
+            SpillWalkOutput::Rows {
+                columns: decoded_columns,
+                coalesce_packed,
+                emit: each,
+            },
         )
     }
 }
@@ -15192,6 +15290,7 @@ impl MemberCursor {
         prefetched_data: None,
         head: None,
         done: false,
+        lookup: crate::store::SstDataLookup::new(),
     };
 }
 
@@ -15212,17 +15311,38 @@ enum SpillOverlayMode<'scan> {
 
 /// The reader's owned block buffers (index, data, physical column, chain
 /// assembly, and packed-range staging).
-struct SpillScratch {
+pub(crate) struct RowReadBuffers {
     source: Option<crate::store::BlockId>,
     index_buf: Box<[u8]>,
     data_buf: Box<[u8]>,
     decoded_buf: Box<[u8]>,
     column_buf: Box<[u8]>,
     assembly_buf: Box<[u8]>,
-    bounce_buf: Box<[u8]>,
+    partial: crate::store::SstReadProgress,
     decoded_data_ref: Option<(crate::store::SstHandle, crate::store::DataBlockRef, usize)>,
     point_read: crate::store::SstPointReadProgress,
     index_leaf: Option<crate::store::SstIndexLeaf>,
+}
+
+impl RowReadBuffers {
+    pub(crate) fn budget_bytes() -> usize {
+        size_of::<Self>() + 4 * crate::store::MAX_PAYLOAD + crate::store::MAX_ASSEMBLED
+    }
+
+    pub(crate) fn new() -> Self {
+        Self {
+            source: None,
+            index_buf: vec![0; crate::store::MAX_PAYLOAD].into_boxed_slice(),
+            data_buf: vec![0; crate::store::MAX_PAYLOAD].into_boxed_slice(),
+            decoded_buf: vec![0; crate::store::MAX_PAYLOAD].into_boxed_slice(),
+            column_buf: vec![0; crate::store::MAX_PAYLOAD].into_boxed_slice(),
+            assembly_buf: vec![0; crate::store::MAX_ASSEMBLED].into_boxed_slice(),
+            partial: crate::store::SstReadProgress::new(),
+            decoded_data_ref: None,
+            point_read: crate::store::SstPointReadProgress::default(),
+            index_leaf: None,
+        }
+    }
 }
 
 struct ValueIndexScratch {
@@ -15235,7 +15355,7 @@ trait ReadScratch {
     fn source(&mut self) -> &mut Option<crate::store::BlockId>;
 }
 
-impl ReadScratch for SpillScratch {
+impl ReadScratch for RowReadBuffers {
     fn source(&mut self) -> &mut Option<crate::store::BlockId> {
         &mut self.source
     }
@@ -15304,7 +15424,7 @@ impl SpillReader {
         let durable = blocks.is_some();
         budget.draw(Self::owner_bytes(), "shared spill reader owner")?;
         budget.draw(
-            2 * (5 * crate::store::MAX_PAYLOAD + crate::store::MAX_ASSEMBLED),
+            2 * (4 * crate::store::MAX_PAYLOAD + crate::store::MAX_ASSEMBLED),
             "spill reader",
         )?;
         budget.draw(
@@ -15350,20 +15470,7 @@ impl SpillReader {
         } else {
             Vec::new().into_boxed_slice().into()
         };
-        let fresh = || {
-            Mutex::new(SpillScratch {
-                source: None,
-                index_buf: vec![0u8; crate::store::MAX_PAYLOAD].into_boxed_slice(),
-                data_buf: vec![0u8; crate::store::MAX_PAYLOAD].into_boxed_slice(),
-                decoded_buf: vec![0u8; crate::store::MAX_PAYLOAD].into_boxed_slice(),
-                column_buf: vec![0u8; crate::store::MAX_PAYLOAD].into_boxed_slice(),
-                assembly_buf: vec![0u8; crate::store::MAX_ASSEMBLED].into_boxed_slice(),
-                bounce_buf: vec![0u8; crate::store::MAX_PAYLOAD].into_boxed_slice(),
-                decoded_data_ref: None,
-                point_read: crate::store::SstPointReadProgress::default(),
-                index_leaf: None,
-            })
-        };
+        let fresh = || Mutex::new(RowReadBuffers::new());
         let context = || Mutex::new(ScanContext::new(max_spill_generations));
         let value = || {
             Mutex::new(ValueIndexScratch {
@@ -15398,7 +15505,7 @@ impl SpillReader {
     /// The budget the contexts and scratch draw, for memory-plan estimates.
     pub(crate) fn budget_bytes(durable: bool, max_spill_generations: usize) -> usize {
         let row_reader = Self::owner_bytes()
-            + 2 * (5 * crate::store::MAX_PAYLOAD + crate::store::MAX_ASSEMBLED)
+            + 2 * (4 * crate::store::MAX_PAYLOAD + crate::store::MAX_ASSEMBLED)
             + SCAN_CONTEXTS * ScanContext::budget_bytes(max_spill_generations)
             + MAX_ROW_WALK_NESTING
                 * (max_spill_generations * core::mem::size_of::<MemberCursor>()
@@ -15467,12 +15574,13 @@ impl SpillReader {
             ));
         };
         let mut blocks = self.relation_blocks_for(persistence);
-        let SpillScratch {
+        let RowReadBuffers {
             index_buf,
             data_buf,
             decoded_buf,
             column_buf,
             assembly_buf,
+            partial,
             decoded_data_ref,
             point_read,
             index_leaf,
@@ -15484,6 +15592,7 @@ impl SpillReader {
             decoded_buf,
             column_buf,
             assembly_buf,
+            partial,
         );
         reader.restore_point_read(*point_read);
         reader.restore_cached_index_leaf(index_leaf.take());
@@ -15533,71 +15642,91 @@ impl SpillReader {
                 "spill row scratch exhausted (maximum nested fetches 2)"
             ));
         };
-        let SpillScratch {
+        self.with_row_bytes_in(
+            persistence,
+            handle,
+            crate::store::SstKey::at(rowid, commit_lsn),
+            len,
+            &mut scratch,
+            f,
+        )
+    }
+
+    fn with_row_bytes_in<R>(
+        &self,
+        persistence: RelationPersistence,
+        handle: crate::store::SstHandle,
+        key: crate::store::SstKey,
+        len: u32,
+        scratch: &mut RowReadBuffers,
+        f: impl FnOnce(&[u8]) -> Result<R, SqlError>,
+    ) -> Result<R, SqlError> {
+        let rowid = key.rowid;
+        let commit_lsn = key.commit_lsn;
+        let RowReadBuffers {
             index_buf,
             data_buf,
             decoded_buf,
             column_buf,
             assembly_buf,
-            bounce_buf,
+            partial,
             decoded_data_ref,
             point_read,
             index_leaf,
             ..
-        } = &mut *scratch;
-        // The assembly buffer doubles as the row destination: `get`
-        // assembles a chained row into the caller buffer directly, so
-        // the two uses never overlap. The reader's own staging slot is
-        // the bounce buffer (a compressed data block decompresses
-        // through it).
+        } = scratch;
         let capacity = assembly_buf.len();
-        let row_buf = assembly_buf.get_mut(..len as usize).ok_or_else(|| {
-            sql_err!(
+        if len as usize > capacity {
+            return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "spilled row exceeds startup row scratch ({})",
                 capacity
-            )
-        })?;
-        let got = {
-            let mut blocks = self.relation_blocks_for(persistence);
-            let mut reader = crate::store::SstReader::over(
-                index_buf,
-                data_buf,
-                decoded_buf,
-                column_buf,
-                bounce_buf,
-            );
-            reader.restore_point_read(*point_read);
-            reader.restore_cached_index_leaf(index_leaf.take());
-            reader.restore_cached_data_block(
-                handle.format,
-                decoded_data_ref
-                    .take()
-                    .and_then(|(cached_handle, reference, cached_len)| {
-                        (cached_handle == handle).then_some((reference, cached_len))
-                    }),
-            );
-            let got = reader.get_at(&mut *blocks, &handle, rowid, commit_lsn, row_buf);
-            *point_read = reader.point_read_progress();
-            *index_leaf = reader.cached_index_leaf();
-            *decoded_data_ref = reader
-                .cached_data_block()
-                .map(|(reference, cached_len)| (handle, reference, cached_len));
-            got.map_err(spill_read_error)?
-        };
-        match got {
-            Some(probe) if probe.key.commit_lsn == commit_lsn && probe.len == Some(len) => {
-                f(&row_buf[..len as usize])
+            ));
+        }
+        let mut blocks = self.relation_blocks_for(persistence);
+        let mut reader = crate::store::SstReader::over(
+            index_buf,
+            data_buf,
+            decoded_buf,
+            column_buf,
+            assembly_buf,
+            partial,
+        );
+        reader.restore_point_read(*point_read);
+        reader.restore_cached_index_leaf(index_leaf.take());
+        reader.restore_cached_data_block(
+            handle.format,
+            decoded_data_ref
+                .take()
+                .and_then(|(cached_handle, reference, cached_len)| {
+                    (cached_handle == handle).then_some((reference, cached_len))
+                }),
+        );
+        let got = reader.row_at(&mut *blocks, &handle, rowid, commit_lsn);
+        // Row bytes remain in the leased buffers; callbacks may issue other I/O.
+        drop(blocks);
+        let result = match got {
+            Ok(Some((probe, bytes)))
+                if probe.key.commit_lsn == commit_lsn && probe.len == Some(len) =>
+            {
+                f(bytes)
             }
-            Some(_) => Err(sql_err!(
+            Ok(Some(_)) => Err(sql_err!(
                 sqlstate::INTERNAL_ERROR,
                 "spilled row version mismatch"
             )),
-            None => Err(sql_err!(
+            Ok(None) => Err(sql_err!(
                 sqlstate::INTERNAL_ERROR,
                 "spilled row missing from its SST"
             )),
-        }
+            Err(error) => Err(spill_read_error(error)),
+        };
+        *point_read = reader.point_read_progress();
+        *index_leaf = reader.cached_index_leaf();
+        *decoded_data_ref = reader
+            .cached_data_block()
+            .map(|(reference, cached_len)| (handle, reference, cached_len));
+        result
     }
 
     fn relation_blocks_for(&self, persistence: RelationPersistence) -> RelationBlockStore<'_> {
@@ -31598,7 +31727,7 @@ impl Storage {
         decoded_columns: Option<&[bool; MAX_COLUMNS]>,
         coalesce_packed: bool,
         overlay_mode: SpillOverlayMode<'_>,
-        resume: Option<(&mut [MemberCursor], &mut u64, &mut usize, usize, u64)>,
+        resume: Option<SpillWalkResume<'_>>,
         emit: &mut dyn FnMut(
             u64,
             u64,
@@ -31620,11 +31749,13 @@ impl Storage {
                     source.commit_lsn(),
                     arena,
                     recycle_rows,
-                    decoded_columns,
-                    coalesce_packed,
                     overlay_mode,
                     resume,
-                    emit,
+                    SpillWalkOutput::Rows {
+                        columns: decoded_columns,
+                        coalesce_packed,
+                        emit,
+                    },
                 )
             })
             .map(|completed| completed.unwrap_or(true))
@@ -31637,22 +31768,26 @@ impl Storage {
         commit_snapshot: u64,
         arena: &'a crate::mem::arena::Arena,
         recycle_rows: bool,
-        decoded_columns: Option<&[bool; MAX_COLUMNS]>,
-        coalesce_packed: bool,
         overlay_mode: SpillOverlayMode<'_>,
-        resume: Option<(&mut [MemberCursor], &mut u64, &mut usize, usize, u64)>,
-        emit: &mut dyn FnMut(
-            u64,
-            u64,
-            SpilledRowRepresentation<'a>,
-        ) -> Result<core::ops::ControlFlow<()>, SqlError>,
+        resume: Option<SpillWalkResume<'_>>,
+        mut output: SpillWalkOutput<'_, 'a>,
     ) -> Result<bool, SqlError> {
         let n = relation.len();
         let mut cursor_lease;
         let mut local_walk_id = 0;
         let mut local_initialized = 0;
-        let (cursors, walk_id, initialized, max_rows, max_object_gets) =
-            if let Some((cursors, walk_id, initialized, max_rows, max_object_gets)) = resume {
+        let mut local_pending_advance = None;
+        let (cursors, walk_id, initialized, pending_advance, contexts, max_rows, max_object_gets) =
+            if let Some(resume) = resume {
+                let SpillWalkResume {
+                    members: cursors,
+                    identity: walk_id,
+                    initialized,
+                    pending_advance,
+                    context,
+                    max_rows,
+                    max_object_gets,
+                } = resume;
                 if cursors.len() < n {
                     return Err(sql_err!(
                         sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -31661,7 +31796,15 @@ impl Storage {
                         n
                     ));
                 }
-                (cursors, walk_id, initialized, max_rows, max_object_gets)
+                (
+                    cursors,
+                    walk_id,
+                    initialized,
+                    pending_advance,
+                    core::slice::from_ref(context),
+                    max_rows,
+                    max_object_gets,
+                )
             } else {
                 cursor_lease = Some(
                     try_mutex_pool(&spill.cursor_contexts, "spill cursor").ok_or_else(|| {
@@ -31675,6 +31818,8 @@ impl Storage {
                     &mut ***cursor_lease.as_mut().expect("installed cursor lease"),
                     &mut local_walk_id,
                     &mut local_initialized,
+                    &mut local_pending_advance,
+                    &spill.scan_contexts[..],
                     usize::MAX,
                     u64::MAX,
                 )
@@ -31686,8 +31831,7 @@ impl Storage {
         }
         let io_before = spill.io_stats();
         if *initialized < n {
-            let Some(mut context) = try_mutex_pool(&spill.scan_contexts, "spill scan context")
-            else {
+            let Some(mut context) = try_mutex_pool(contexts, "spill scan context") else {
                 return Err(sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
                     "row-state block context is already in use"
@@ -31713,6 +31857,21 @@ impl Storage {
             if walked == max_rows {
                 return Ok(false);
             }
+            if let Some(rowid) = *pending_advance {
+                let mut context =
+                    try_mutex_pool(contexts, "spill scan context").ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "row-state block context is already in use"
+                        )
+                    })?;
+                for (member, cursor) in cursors[..n].iter_mut().enumerate() {
+                    while cursor.head.is_some_and(|(key, ..)| key.rowid == rowid) {
+                        Self::cursor_advance(spill, relation, member, cursor, &mut context)?;
+                    }
+                }
+                *pending_advance = None;
+            }
             let mark = recycle_rows.then(|| arena.mark());
             let mut min: Option<u64> = None;
             for cursor in cursors[..n].iter() {
@@ -31722,8 +31881,7 @@ impl Storage {
             }
             let Some(rowid) = min else { return Ok(true) };
             walked += 1;
-            let Some(mut context) = try_mutex_pool(&spill.scan_contexts, "spill scan context")
-            else {
+            let Some(mut context) = try_mutex_pool(contexts, "spill scan context") else {
                 return Err(sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
                     "row-state block context is already in use"
@@ -31759,107 +31917,131 @@ impl Storage {
                     });
                 }
             }
-            let representation = if let Some(SpillVersion {
-                len: Some(len),
-                member,
-                commit_lsn,
-                ..
-            }) = verdict
+            let emitted = if let Some(
+                version @ SpillVersion {
+                    len: Some(len),
+                    member,
+                    commit_lsn,
+                    ..
+                },
+            ) = verdict
                 && match overlay_mode {
                     SpillOverlayMode::VisibleScan(rowids) => !rowids.contains(rowid),
                     SpillOverlayMode::CommittedCheckpoint(rowids) => rowids
                         .binary_search_by_key(&rowid, |entry| entry.rowid)
                         .map_or(true, |position| !rowids[position].suppress_spill),
                 } {
-                let cursor = &mut cursors[member as usize];
-                let (key, tombstone, _copied) = cursor.head.ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::INTERNAL_ERROR,
-                        "selected spill version has no resident cursor head"
-                    )
-                })?;
-                if !context.cursor_loaded(relation.handle(member as usize), cursor) {
-                    let expected = cursor.head;
-                    cursor.offset = cursor.head_offset;
-                    cursor.raw_row = cursor.head_raw_row;
-                    cursor.head = None;
-                    Self::cursor_advance(spill, relation, member as usize, cursor, &mut context)?;
-                    if cursor.head != expected {
-                        return Err(sql_err!(
-                            sqlstate::INTERNAL_ERROR,
-                            "reloaded spill cursor head does not match its retained version"
-                        ));
+                match &mut output {
+                    SpillWalkOutput::Metadata(emit) => {
+                        drop(context);
+                        emit(rowid, version)
                     }
-                }
-                let slot = cursor.buffer_slot.expect("selected scan image has a frame");
-                let representation = if cursor.loaded_type
-                    == Some(crate::store::BlockType::SstDataPaxV2)
-                {
-                    let layout = cursor.pax_layout.ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::INTERNAL_ERROR,
-                            "PAX descriptor has no validated layout"
-                        )
-                    })?;
-                    {
-                        let ScanContext {
-                            member_blocks,
-                            member_raw_blocks,
-                            pax_column_buf,
-                            pax_extent_buf,
-                            member_extents,
-                            pax_row_buf,
-                            ..
-                        } = &mut *context;
-                        let pax_value_extents = &mut member_extents[slot];
-                        let mut block_guard = None;
-                        // Completed columns belong to this immutable block, not
-                        // to a walk attempt. Keep them when a later GET yields.
-                        let mut at = pax_value_extents
-                            .iter()
-                            .flatten()
-                            .map(|(_, end)| *end)
-                            .max()
-                            .unwrap_or(0);
-                        let mut loaded_container = None;
-                        let mut pending_columns = false;
-                        for column in 0..layout.columns() {
-                            if decoded_columns.is_some_and(|columns| !columns[column])
-                                || pax_value_extents[column].is_some()
-                            {
-                                continue;
+                    SpillWalkOutput::Rows {
+                        columns,
+                        coalesce_packed,
+                        emit,
+                    } => {
+                        let decoded_columns = *columns;
+                        let coalesce_packed = *coalesce_packed;
+                        let cursor = &mut cursors[member as usize];
+                        let (key, tombstone, _copied) = cursor.head.ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::INTERNAL_ERROR,
+                                "selected spill version has no resident cursor head"
+                            )
+                        })?;
+                        if !context.cursor_loaded(relation.handle(member as usize), cursor) {
+                            let expected = cursor.head;
+                            cursor.offset = cursor.head_offset;
+                            cursor.raw_row = cursor.head_raw_row;
+                            Self::cursor_advance(
+                                spill,
+                                relation,
+                                member as usize,
+                                cursor,
+                                &mut context,
+                            )?;
+                            if cursor.head != expected {
+                                return Err(sql_err!(
+                                    sqlstate::INTERNAL_ERROR,
+                                    "reloaded spill cursor head does not match its retained version"
+                                ));
                             }
-                            let reference = layout
-                                .column_ref(&member_raw_blocks[slot][..cursor.raw_len], column)
-                                .map_err(spill_read_error)?;
-                            let blocks = block_guard.get_or_insert_with(|| {
-                                spill.relation_blocks_for(relation.persistence)
-                            });
-                            // Start every missing selected column before yielding.
-                            // Completed extents remain attached to this immutable
-                            // descriptor, including when another request waits.
-                            let read: Result<_, SqlError> = (|| {
-                                Ok(match reference {
-                                    crate::store::DataBlockRef::Packed {
-                                        container,
-                                        offset,
-                                        length,
-                                        id,
-                                    } if coalesce_packed => {
-                                        let container_len = if let Some((loaded, len)) =
-                                            loaded_container
-                                            && loaded == container
-                                        {
-                                            len
-                                        } else {
-                                            let (len, block_type) = blocks
-                                                .get(&container, pax_column_buf)
-                                                .map_err(|error| {
-                                                    spill_read_error(crate::store::SstError::Store(
-                                                        error,
-                                                    ))
-                                                })?;
-                                            if block_type
+                        }
+                        let slot = cursor.buffer_slot.expect("selected scan image has a frame");
+                        let representation = if cursor.loaded_type
+                            == Some(crate::store::BlockType::SstDataPaxV2)
+                        {
+                            let layout = cursor.pax_layout.ok_or_else(|| {
+                                sql_err!(
+                                    sqlstate::INTERNAL_ERROR,
+                                    "PAX descriptor has no validated layout"
+                                )
+                            })?;
+                            {
+                                let ScanContext {
+                                    member_blocks,
+                                    member_raw_blocks,
+                                    pax_column_buf,
+                                    pax_extent_buf,
+                                    member_extents,
+                                    pax_row_buf,
+                                    ..
+                                } = &mut *context;
+                                let pax_value_extents = &mut member_extents[slot];
+                                let mut block_guard = None;
+                                // Completed columns belong to this immutable block, not
+                                // to a walk attempt. Keep them when a later GET yields.
+                                let mut at = pax_value_extents
+                                    .iter()
+                                    .flatten()
+                                    .map(|(_, end)| *end)
+                                    .max()
+                                    .unwrap_or(0);
+                                let mut loaded_container = None;
+                                let mut pending_columns = false;
+                                for column in 0..layout.columns() {
+                                    if decoded_columns.is_some_and(|columns| !columns[column])
+                                        || pax_value_extents[column].is_some()
+                                    {
+                                        continue;
+                                    }
+                                    let reference = layout
+                                        .column_ref(
+                                            &member_raw_blocks[slot][..cursor.raw_len],
+                                            column,
+                                        )
+                                        .map_err(spill_read_error)?;
+                                    let blocks = block_guard.get_or_insert_with(|| {
+                                        spill.relation_blocks_for(relation.persistence)
+                                    });
+                                    // Start every missing selected column before yielding.
+                                    // Completed extents remain attached to this immutable
+                                    // descriptor, including when another request waits.
+                                    let read: Result<_, SqlError> = (|| {
+                                        Ok(match reference {
+                                            crate::store::DataBlockRef::Packed {
+                                                container,
+                                                offset,
+                                                length,
+                                                id,
+                                            } if coalesce_packed => {
+                                                let container_len = if let Some((loaded, len)) =
+                                                    loaded_container
+                                                    && loaded == container
+                                                {
+                                                    len
+                                                } else {
+                                                    let (len, block_type) = blocks
+                                                        .get(&container, pax_column_buf)
+                                                        .map_err(|error| {
+                                                            spill_read_error(
+                                                                crate::store::SstError::Store(
+                                                                    error,
+                                                                ),
+                                                            )
+                                                        })?;
+                                                    if block_type
                                                 != crate::store::BlockType::SstPackedContainerV1
                                             {
                                                 return Err(sql_err!(
@@ -31867,108 +32049,113 @@ impl Storage {
                                                     "PAX column container has the wrong block type"
                                                 ));
                                             }
-                                            loaded_container = Some((container, len));
-                                            len
-                                        };
-                                        crate::store::decode_packed_extent(
-                                            &pax_column_buf[..container_len],
-                                            offset as usize,
-                                            length as usize,
-                                            &id,
-                                            pax_extent_buf,
-                                        )
-                                        .map_err(
-                                            |error| {
-                                                spill_read_error(crate::store::SstError::Store(
-                                                    error,
-                                                ))
-                                            },
-                                        )?
+                                                    loaded_container = Some((container, len));
+                                                    len
+                                                };
+                                                crate::store::decode_packed_extent(
+                                                    &pax_column_buf[..container_len],
+                                                    offset as usize,
+                                                    length as usize,
+                                                    &id,
+                                                    pax_extent_buf,
+                                                )
+                                                .map_err(|error| {
+                                                    spill_read_error(crate::store::SstError::Store(
+                                                        error,
+                                                    ))
+                                                })?
+                                            }
+                                            _ => crate::store::read_data_block_raw_ref(
+                                                &mut **blocks,
+                                                reference,
+                                                pax_extent_buf,
+                                                pax_column_buf,
+                                            )
+                                            .map_err(spill_read_error)?,
+                                        })
+                                    })(
+                                    );
+                                    let (len, block_type) = match read {
+                                        Ok(result) => result,
+                                        Err(error)
+                                            if error.sqlstate == sqlstate::INTERNAL_IO_WAIT =>
+                                        {
+                                            pending_columns = true;
+                                            continue;
+                                        }
+                                        Err(error) => return Err(error),
+                                    };
+                                    if block_type != crate::store::BlockType::SstDataPaxColumnV1 {
+                                        return Err(sql_err!(
+                                            sqlstate::INTERNAL_ERROR,
+                                            "PAX descriptor column reference has the wrong block type"
+                                        ));
                                     }
-                                    _ => crate::store::read_data_block_raw_ref(
-                                        &mut **blocks,
-                                        reference,
-                                        pax_extent_buf,
-                                        pax_column_buf,
-                                    )
-                                    .map_err(spill_read_error)?,
-                                })
-                            })();
-                            let (len, block_type) = match read {
-                                Ok(result) => result,
-                                Err(error) if error.sqlstate == sqlstate::INTERNAL_IO_WAIT => {
-                                    pending_columns = true;
-                                    continue;
+                                    let end = at.checked_add(len).ok_or_else(|| {
+                                        sql_err!(
+                                            sqlstate::INTERNAL_ERROR,
+                                            "PAX extent length overflows"
+                                        )
+                                    })?;
+                                    if end > member_blocks[slot].len() {
+                                        return Err(sql_err!(
+                                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                            "PAX column extents exceed the fixed scan vector buffer"
+                                        ));
+                                    }
+                                    member_blocks[slot][at..end]
+                                        .copy_from_slice(&pax_extent_buf[..len]);
+                                    pax_value_extents[column] = Some((at, end));
+                                    at = end;
                                 }
-                                Err(error) => return Err(error),
+                                if pending_columns {
+                                    return Err(sql_err!(
+                                        sqlstate::INTERNAL_IO_WAIT,
+                                        "selected column reads in progress"
+                                    ));
+                                }
+                                let _ = (member_raw_blocks, pax_row_buf);
+                            }
+                            let encoded_len = {
+                                let ScanContext {
+                                    member_raw_blocks,
+                                    member_blocks,
+                                    member_extents,
+                                    pax_row_buf,
+                                    ..
+                                } = &mut *context;
+                                crate::store::copy_pax_v2_row_from_extents(
+                                    &layout,
+                                    &member_raw_blocks[slot][..cursor.raw_len],
+                                    cursor.head_raw_row,
+                                    decoded_columns,
+                                    &member_blocks[slot],
+                                    &member_extents[slot],
+                                    pax_row_buf,
+                                )
+                                .map_err(spill_read_error)?
                             };
-                            if block_type != crate::store::BlockType::SstDataPaxColumnV1 {
+                            if decoded_columns.is_none() && encoded_len != len as usize {
                                 return Err(sql_err!(
                                     sqlstate::INTERNAL_ERROR,
-                                    "PAX descriptor column reference has the wrong block type"
+                                    "PAX descriptor row length does not match its cursor header"
                                 ));
                             }
-                            let end = at.checked_add(len).ok_or_else(|| {
-                                sql_err!(sqlstate::INTERNAL_ERROR, "PAX extent length overflows")
-                            })?;
-                            if end > member_blocks[slot].len() {
+                            let schema = &relation.schema[..relation.n_columns];
+                            if layout.columns() > schema.len() {
                                 return Err(sql_err!(
-                                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                                    "PAX column extents exceed the fixed scan vector buffer"
+                                    sqlstate::INTERNAL_ERROR,
+                                    "SST columns exceed the retained schema"
                                 ));
                             }
-                            member_blocks[slot][at..end].copy_from_slice(&pax_extent_buf[..len]);
-                            pax_value_extents[column] = Some((at, end));
-                            at = end;
-                        }
-                        if pending_columns {
-                            return Err(sql_err!(
-                                sqlstate::INTERNAL_IO_WAIT,
-                                "selected column reads in progress"
-                            ));
-                        }
-                        let _ = (member_raw_blocks, pax_row_buf);
-                    }
-                    let encoded_len = {
-                        let ScanContext {
-                            member_raw_blocks,
-                            member_blocks,
-                            member_extents,
-                            pax_row_buf,
-                            ..
-                        } = &mut *context;
-                        crate::store::copy_pax_v2_row_from_extents(
-                            &layout,
-                            &member_raw_blocks[slot][..cursor.raw_len],
-                            cursor.head_raw_row,
-                            decoded_columns,
-                            &member_blocks[slot],
-                            &member_extents[slot],
-                            pax_row_buf,
-                        )
-                        .map_err(spill_read_error)?
-                    };
-                    if decoded_columns.is_none() && encoded_len != len as usize {
-                        return Err(sql_err!(
-                            sqlstate::INTERNAL_ERROR,
-                            "PAX descriptor row length does not match its cursor header"
-                        ));
-                    }
-                    let schema = &relation.schema[..relation.n_columns];
-                    if layout.columns() > schema.len() {
-                        return Err(sql_err!(
-                            sqlstate::INTERNAL_ERROR,
-                            "SST columns exceed the retained schema"
-                        ));
-                    }
-                    let encoded = arena.alloc_slice_with(encoded_len, |_| 0u8).map_err(|_| {
+                            let encoded = arena.alloc_slice_with(encoded_len, |_| 0u8).map_err(|_| {
                         sql_err!(
                             sqlstate::PROGRAM_LIMIT_EXCEEDED,
                             "spilled PAX rows exceed the statement arena; raise work_arena_bytes"
                         )
                     })?;
-                    encoded.copy_from_slice(&context.pax_row_buf[..encoded_len]);
-                    let values = arena
+                            encoded.copy_from_slice(&context.pax_row_buf[..encoded_len]);
+                            let values = arena
                         .alloc_slice_with(layout.columns(), |_| Datum::Null)
                         .map_err(|_| {
                             sql_err!(
@@ -31976,68 +32163,102 @@ impl Storage {
                                 "spilled PAX values exceed the statement arena; raise work_arena_bytes"
                             )
                         })?;
-                    rowenc::decode(encoded, &schema[..layout.columns()], values).map_err(
-                        |error| SqlError {
-                            sqlstate: error.sqlstate,
-                            message: stack_format!(
-                                192,
-                                "spilled PAX row {} failed to decode: {}",
-                                rowid,
-                                error.message.as_str()
-                            ),
-                        },
-                    )?;
-                    SpilledRowRepresentation::Values(&*values)
-                } else {
-                    let output = arena.alloc_slice_with(len as usize, |_| 0u8).map_err(|_| {
-                        sql_err!(
-                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                            "spilled scan rows exceed the statement arena; raise work_arena_bytes"
-                        )
-                    })?;
-                    let (copied_key, copied_tombstone, copied) = {
-                        let mut blocks = spill.relation_blocks_for(relation.persistence);
-                        crate::store::copy_block_entry_at(
-                            &mut *blocks,
-                            &context.member_blocks[slot][..cursor.loaded_len],
-                            cursor.head_offset,
-                            output,
-                        )
-                        .map_err(spill_read_error)?
-                    };
-                    if copied_key != key || copied_tombstone != tombstone {
-                        return Err(sql_err!(
-                            sqlstate::INTERNAL_ERROR,
-                            "merged spill cursor payload does not match its selected version"
-                        ));
+                            rowenc::decode(encoded, &schema[..layout.columns()], values).map_err(
+                                |error| SqlError {
+                                    sqlstate: error.sqlstate,
+                                    message: stack_format!(
+                                        192,
+                                        "spilled PAX row {} failed to decode: {}",
+                                        rowid,
+                                        error.message.as_str()
+                                    ),
+                                },
+                            )?;
+                            SpilledRowRepresentation::Values(&*values)
+                        } else {
+                            let allocate = || {
+                                arena.alloc_slice_with(len as usize, |_| 0u8).map_err(|_| {
+                        sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "spilled scan rows exceed the statement arena; raise work_arena_bytes")
+                    })
+                            };
+                            let (copied_key, copied_tombstone, copied, output) = {
+                                let mut blocks = spill.relation_blocks_for(relation.persistence);
+                                let source = context.member_images[slot]
+                                    .expect("loaded scan image")
+                                    .reference;
+                                let ScanContext {
+                                    member_blocks,
+                                    chain_buf,
+                                    chain_source,
+                                    chain_progress,
+                                    ..
+                                } = &mut *context;
+                                if len as usize > crate::store::MAX_INLINE_ROW {
+                                    if *chain_source != Some(source) {
+                                        *chain_source = Some(source);
+                                        *chain_progress =
+                                            crate::store::ChainReadProgress::default();
+                                    }
+                                    let capacity = chain_buf.len();
+                                    let staged =
+                                        chain_buf.get_mut(..len as usize).ok_or_else(|| {
+                                            sql_err!(
+                                                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                                "spilled row exceeds startup chain scratch ({})",
+                                                capacity
+                                            )
+                                        })?;
+                                    let result = crate::store::copy_block_entry_at(
+                                        &mut *blocks,
+                                        &member_blocks[slot][..cursor.loaded_len],
+                                        cursor.head_offset,
+                                        staged,
+                                        chain_progress,
+                                    )
+                                    .map_err(spill_read_error)?;
+                                    let output = allocate()?;
+                                    output.copy_from_slice(staged);
+                                    (result.0, result.1, result.2, output)
+                                } else {
+                                    let output = allocate()?;
+                                    let result = crate::store::copy_block_entry_at(
+                                        &mut *blocks,
+                                        &member_blocks[slot][..cursor.loaded_len],
+                                        cursor.head_offset,
+                                        output,
+                                        chain_progress,
+                                    )
+                                    .map_err(spill_read_error)?;
+                                    (result.0, result.1, result.2, output)
+                                }
+                            };
+                            if copied_key != key || copied_tombstone != tombstone {
+                                return Err(sql_err!(
+                                    sqlstate::INTERNAL_ERROR,
+                                    "merged spill cursor payload does not match its selected version"
+                                ));
+                            }
+                            if copied != len as usize {
+                                return Err(sql_err!(
+                                    sqlstate::INTERNAL_ERROR,
+                                    "merged spill cursor payload length does not match its selected version"
+                                ));
+                            }
+                            SpilledRowRepresentation::Encoded(&*output)
+                        };
+                        if tombstone || key.rowid != rowid || key.commit_lsn != commit_lsn {
+                            return Err(sql_err!(
+                                sqlstate::INTERNAL_ERROR,
+                                "merged spill cursor payload does not match its selected version"
+                            ));
+                        }
+                        drop(context);
+                        emit(rowid, commit_lsn, representation)
                     }
-                    if copied != len as usize {
-                        return Err(sql_err!(
-                            sqlstate::INTERNAL_ERROR,
-                            "merged spill cursor payload length does not match its selected version"
-                        ));
-                    }
-                    SpilledRowRepresentation::Encoded(&*output)
-                };
-                if tombstone || key.rowid != rowid || key.commit_lsn != commit_lsn {
-                    return Err(sql_err!(
-                        sqlstate::INTERNAL_ERROR,
-                        "merged spill cursor payload does not match its selected version"
-                    ));
                 }
-                Some((commit_lsn, representation))
             } else {
-                None
-            };
-            for (member, cursor) in cursors[..n].iter_mut().enumerate() {
-                while cursor.head.is_some_and(|(key, ..)| key.rowid == rowid) {
-                    Self::cursor_advance(spill, relation, member, cursor, &mut context)?;
-                }
-            }
-            drop(context);
-            let emitted = if let Some((commit_lsn, representation)) = representation {
-                emit(rowid, commit_lsn, representation)
-            } else {
+                drop(context);
                 Ok(core::ops::ControlFlow::Continue(()))
             };
             if let Some(mark) = mark {
@@ -32045,7 +32266,9 @@ impl Storage {
                 // values derived from it synchronously in `emit`.
                 unsafe { arena.rewind_to(mark) };
             }
-            if emitted?.is_break() {
+            let emitted = emitted?;
+            *pending_advance = Some(rowid);
+            if emitted.is_break() {
                 return Ok(false);
             }
             if spill.io_stats().saturating_sub(io_before).object_gets >= max_object_gets {
@@ -32183,200 +32406,213 @@ impl Storage {
         cursor: &mut MemberCursor,
         context: &mut ScanContext,
     ) -> Result<(), SqlError> {
-        cursor.head = None;
-        if cursor.done {
-            return Ok(());
-        }
-        let handle = relation.handle(member);
-        loop {
-            if let Some((ordinal, leaf)) = cursor.prefetched_leaf {
-                let mut blocks = spill.relation_blocks_for(relation.persistence);
-                if let Some(reference) = crate::store::take_prefetched_index_first_data(
-                    &mut *blocks,
-                    &leaf,
-                    &mut context.index_buf,
-                    handle.uses_packed_references(),
-                )
-                .map_err(spill_read_error)?
-                {
-                    cursor.prefetched_leaf = None;
-                    if let crate::store::DataBlockRef::Direct(id) = reference {
-                        crate::store::prefetch_data_block(&mut *blocks, Some(id))
-                            .map_err(spill_read_error)?;
-                        cursor.prefetched_data = Some((ordinal, reference));
-                    }
-                }
-            }
-            if !context.cursor_loaded(handle, cursor) {
-                let resuming = cursor.loaded.is_none() || cursor.loaded == Some(cursor.ordinal);
-                let resume_offset = if resuming { cursor.offset } else { 0 };
-                let resume_raw_row = if resuming { cursor.raw_row } else { 0 };
-                let slot = if let Some(slot) = context.find_image(handle, cursor.ordinal) {
-                    slot
-                } else {
-                    let (reference, successor) = {
-                        let mut blocks = spill.relation_blocks_for(relation.persistence);
-                        if let Some((ordinal, reference)) = cursor.prefetched_data
-                            && ordinal == cursor.ordinal
-                        {
-                            cursor.prefetched_data = None;
-                            (reference, ScanSuccessor::Unknown)
-                        } else {
-                            let Some((reference, next)) =
-                                crate::store::locate_data_block_with_next(
-                                    &mut *blocks,
-                                    &handle,
-                                    &mut context.index_buf,
-                                    cursor.ordinal,
-                                )
-                                .map_err(spill_read_error)?
-                            else {
-                                cursor.done = true;
-                                return Ok(());
-                            };
-                            (
-                                reference,
-                                next.map_or(ScanSuccessor::End, ScanSuccessor::Next),
-                            )
-                        }
-                    };
-                    context.reserve_image(ScanBlockImage {
-                        handle,
-                        ordinal: cursor.ordinal,
-                        reference,
-                        successor,
-                        bytes: None,
-                    })
-                };
-                cursor.buffer_slot = Some(slot);
-                let image = context.member_images[slot].expect("reserved scan image");
-                match image.successor {
-                    ScanSuccessor::Next(crate::store::DataBlockLookahead::Data(next)) => {
-                        if context.find_image(handle, cursor.ordinal + 1).is_none()
-                            && let crate::store::DataBlockRef::Direct(next_id) = next
-                        {
-                            let mut blocks = spill.relation_blocks_for(relation.persistence);
-                            crate::store::prefetch_data_block(&mut *blocks, Some(next_id))
-                                .map_err(spill_read_error)?;
-                        }
-                        cursor.prefetched_data = Some((cursor.ordinal + 1, next));
-                    }
-                    ScanSuccessor::Next(crate::store::DataBlockLookahead::Leaf(leaf)) => {
-                        let mut blocks = spill.relation_blocks_for(relation.persistence);
-                        crate::store::BlockStore::prefetch(&mut *blocks, &leaf).map_err(
-                            |error| spill_read_error(crate::store::SstError::Store(error)),
-                        )?;
-                        cursor.prefetched_leaf = Some((cursor.ordinal + 1, leaf));
-                    }
-                    ScanSuccessor::Unknown | ScanSuccessor::End => {}
-                }
-                let bytes = if let Some(bytes) = image.bytes {
-                    bytes
-                } else {
-                    let mut blocks = spill.relation_blocks_for(relation.persistence);
-                    let (raw_len, kind) = crate::store::read_data_block_raw_ref(
-                        &mut *blocks,
-                        image.reference,
-                        &mut context.member_raw_blocks[slot],
-                        &mut context.member_blocks[slot],
-                    )
-                    .map_err(spill_read_error)?;
-                    let decoded_len = if kind == crate::store::BlockType::SstDataPaxV2 {
-                        crate::store::pax_layout(&context.member_raw_blocks[slot][..raw_len])
-                            .map_err(spill_read_error)?;
-                        0
-                    } else {
-                        crate::store::decode_data_block(
-                            &context.member_raw_blocks[slot][..raw_len],
-                            kind,
-                            &mut context.member_blocks[slot],
-                        )
-                        .map_err(spill_read_error)?
-                    };
-                    let bytes = ScanBlockBytes {
-                        raw_len,
-                        decoded_len,
-                        kind,
-                    };
-                    context.member_images[slot]
-                        .as_mut()
-                        .expect("reserved scan image")
-                        .bytes = Some(bytes);
-                    bytes
-                };
-                cursor.loaded_len = bytes.decoded_len;
-                cursor.raw_len = bytes.raw_len;
-                cursor.raw_row = resume_raw_row;
-                cursor.pax_layout = (bytes.kind == crate::store::BlockType::SstDataPaxV2)
-                    .then(|| {
-                        crate::store::pax_layout(&context.member_raw_blocks[slot][..bytes.raw_len])
-                    })
-                    .transpose()
-                    .map_err(spill_read_error)?;
-                cursor.loaded_type = Some(bytes.kind);
-                cursor.loaded = Some(cursor.ordinal);
-                cursor.last_block = matches!(image.successor, ScanSuccessor::End);
-                cursor.offset = resume_offset;
-            }
-            let slot = cursor.buffer_slot.expect("loaded scan image has a frame");
-            if cursor.loaded_type == Some(crate::store::BlockType::SstDataPaxV2) {
-                let layout = cursor.pax_layout.as_ref().ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::INTERNAL_ERROR,
-                        "PAX block has no validated layout"
-                    )
-                })?;
-                if cursor.raw_row == layout.rows() {
-                    if cursor.last_block {
-                        cursor.done = true;
-                        return Ok(());
-                    }
-                    cursor.ordinal += 1;
-                    continue;
-                }
-                let row = cursor.raw_row;
-                let (key, tombstone) = layout
-                    .row_key(&context.member_raw_blocks[slot][..cursor.raw_len], row)
-                    .map_err(spill_read_error)?;
-                let len = if tombstone {
-                    0
-                } else {
-                    layout
-                        .row_len(&context.member_raw_blocks[slot][..cursor.raw_len], row)
-                        .map_err(spill_read_error)?
-                };
-                cursor.head_raw_row = row;
-                cursor.raw_row += 1;
-                cursor.head_offset = 0;
-                cursor.head = Some((key, tombstone, len));
+        let previous_head = cursor.head;
+        let result = (|| {
+            cursor.head = None;
+            if cursor.done {
                 return Ok(());
             }
-            let head_offset = cursor.offset;
-            if cursor.loaded_type.is_none() || cursor.raw_len == 0 {
-                return Err(sql_err!(
-                    sqlstate::INTERNAL_ERROR,
-                    "spill cursor advanced without a complete loaded block state"
-                ));
-            }
-            match crate::store::block_keys_at(
-                &context.member_blocks[slot][..cursor.loaded_len],
-                head_offset,
-            ) {
-                Some((key, tombstone, len, next)) => {
-                    cursor.offset = next;
-                    cursor.head_offset = head_offset;
+            let handle = relation.handle(member);
+            loop {
+                if let Some((ordinal, leaf)) = cursor.prefetched_leaf {
+                    let mut blocks = spill.relation_blocks_for(relation.persistence);
+                    if let Some(reference) = crate::store::take_prefetched_index_first_data(
+                        &mut *blocks,
+                        &leaf,
+                        &mut context.index_buf,
+                        handle.uses_packed_references(),
+                    )
+                    .map_err(spill_read_error)?
+                    {
+                        cursor.prefetched_leaf = None;
+                        if let crate::store::DataBlockRef::Direct(id) = reference {
+                            crate::store::prefetch_data_block(&mut *blocks, Some(id))
+                                .map_err(spill_read_error)?;
+                            cursor.prefetched_data = Some((ordinal, reference));
+                        }
+                    }
+                }
+                if !context.cursor_loaded(handle, cursor) {
+                    let resuming = cursor.loaded.is_none() || cursor.loaded == Some(cursor.ordinal);
+                    let resume_offset = if resuming { cursor.offset } else { 0 };
+                    let resume_raw_row = if resuming { cursor.raw_row } else { 0 };
+                    let slot = if let Some(slot) = context.find_image(handle, cursor.ordinal) {
+                        slot
+                    } else {
+                        let (reference, successor) = {
+                            let mut blocks = spill.relation_blocks_for(relation.persistence);
+                            if let Some((ordinal, reference)) = cursor.prefetched_data
+                                && ordinal == cursor.ordinal
+                            {
+                                cursor.prefetched_data = None;
+                                (reference, ScanSuccessor::Unknown)
+                            } else {
+                                let Some((reference, next)) =
+                                    crate::store::locate_data_block_with_next(
+                                        &mut *blocks,
+                                        &handle,
+                                        &mut context.index_buf,
+                                        cursor.ordinal,
+                                        &mut cursor.lookup,
+                                    )
+                                    .map_err(spill_read_error)?
+                                else {
+                                    cursor.done = true;
+                                    return Ok(());
+                                };
+                                (
+                                    reference,
+                                    next.map_or(ScanSuccessor::End, ScanSuccessor::Next),
+                                )
+                            }
+                        };
+                        context.reserve_image(ScanBlockImage {
+                            handle,
+                            ordinal: cursor.ordinal,
+                            reference,
+                            successor,
+                            bytes: None,
+                        })
+                    };
+                    cursor.buffer_slot = Some(slot);
+                    let image = context.member_images[slot].expect("reserved scan image");
+                    match image.successor {
+                        ScanSuccessor::Next(crate::store::DataBlockLookahead::Data(next)) => {
+                            if context.find_image(handle, cursor.ordinal + 1).is_none()
+                                && let crate::store::DataBlockRef::Direct(next_id) = next
+                            {
+                                let mut blocks = spill.relation_blocks_for(relation.persistence);
+                                crate::store::prefetch_data_block(&mut *blocks, Some(next_id))
+                                    .map_err(spill_read_error)?;
+                            }
+                            cursor.prefetched_data = Some((cursor.ordinal + 1, next));
+                        }
+                        ScanSuccessor::Next(crate::store::DataBlockLookahead::Leaf(leaf)) => {
+                            let mut blocks = spill.relation_blocks_for(relation.persistence);
+                            crate::store::BlockStore::prefetch(&mut *blocks, &leaf).map_err(
+                                |error| spill_read_error(crate::store::SstError::Store(error)),
+                            )?;
+                            cursor.prefetched_leaf = Some((cursor.ordinal + 1, leaf));
+                        }
+                        ScanSuccessor::Unknown | ScanSuccessor::End => {}
+                    }
+                    let bytes = if let Some(bytes) = image.bytes {
+                        bytes
+                    } else {
+                        let mut blocks = spill.relation_blocks_for(relation.persistence);
+                        let (raw_len, kind) = crate::store::read_data_block_raw_ref(
+                            &mut *blocks,
+                            image.reference,
+                            &mut context.member_raw_blocks[slot],
+                            &mut context.member_blocks[slot],
+                        )
+                        .map_err(spill_read_error)?;
+                        let decoded_len = if kind == crate::store::BlockType::SstDataPaxV2 {
+                            crate::store::pax_layout(&context.member_raw_blocks[slot][..raw_len])
+                                .map_err(spill_read_error)?;
+                            0
+                        } else {
+                            crate::store::decode_data_block(
+                                &context.member_raw_blocks[slot][..raw_len],
+                                kind,
+                                &mut context.member_blocks[slot],
+                            )
+                            .map_err(spill_read_error)?
+                        };
+                        let bytes = ScanBlockBytes {
+                            raw_len,
+                            decoded_len,
+                            kind,
+                        };
+                        context.member_images[slot]
+                            .as_mut()
+                            .expect("reserved scan image")
+                            .bytes = Some(bytes);
+                        bytes
+                    };
+                    cursor.loaded_len = bytes.decoded_len;
+                    cursor.raw_len = bytes.raw_len;
+                    cursor.raw_row = resume_raw_row;
+                    cursor.pax_layout = (bytes.kind == crate::store::BlockType::SstDataPaxV2)
+                        .then(|| {
+                            crate::store::pax_layout(
+                                &context.member_raw_blocks[slot][..bytes.raw_len],
+                            )
+                        })
+                        .transpose()
+                        .map_err(spill_read_error)?;
+                    cursor.loaded_type = Some(bytes.kind);
+                    cursor.loaded = Some(cursor.ordinal);
+                    cursor.last_block = matches!(image.successor, ScanSuccessor::End);
+                    cursor.offset = resume_offset;
+                }
+                let slot = cursor.buffer_slot.expect("loaded scan image has a frame");
+                if cursor.loaded_type == Some(crate::store::BlockType::SstDataPaxV2) {
+                    let layout = cursor.pax_layout.as_ref().ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "PAX block has no validated layout"
+                        )
+                    })?;
+                    if cursor.raw_row == layout.rows() {
+                        if cursor.last_block {
+                            cursor.done = true;
+                            return Ok(());
+                        }
+                        cursor.ordinal += 1;
+                        continue;
+                    }
+                    let row = cursor.raw_row;
+                    let (key, tombstone) = layout
+                        .row_key(&context.member_raw_blocks[slot][..cursor.raw_len], row)
+                        .map_err(spill_read_error)?;
+                    let len = if tombstone {
+                        0
+                    } else {
+                        layout
+                            .row_len(&context.member_raw_blocks[slot][..cursor.raw_len], row)
+                            .map_err(spill_read_error)?
+                    };
+                    cursor.head_raw_row = row;
+                    cursor.raw_row += 1;
+                    cursor.head_offset = 0;
                     cursor.head = Some((key, tombstone, len));
                     return Ok(());
                 }
-                None => {
-                    if cursor.last_block {
-                        cursor.done = true;
+                let head_offset = cursor.offset;
+                if cursor.loaded_type.is_none() || cursor.raw_len == 0 {
+                    return Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "spill cursor advanced without a complete loaded block state"
+                    ));
+                }
+                match crate::store::block_keys_at(
+                    &context.member_blocks[slot][..cursor.loaded_len],
+                    head_offset,
+                ) {
+                    Some((key, tombstone, len, next)) => {
+                        cursor.offset = next;
+                        cursor.head_offset = head_offset;
+                        cursor.head = Some((key, tombstone, len));
                         return Ok(());
                     }
-                    cursor.ordinal += 1;
+                    None => {
+                        if cursor.last_block {
+                            cursor.done = true;
+                            return Ok(());
+                        }
+                        cursor.ordinal += 1;
+                    }
                 }
             }
+        })();
+        if result
+            .as_ref()
+            .is_err_and(|error| error.sqlstate == sqlstate::INTERNAL_IO_WAIT)
+        {
+            cursor.head = previous_head;
         }
+        result
     }
 
     fn probe_spill_snapshot(
@@ -32417,12 +32653,13 @@ impl Storage {
         let mut best: Option<SpillVersion> = None;
         for member in 0..relation.len() {
             let handle = relation.handle(member);
-            let SpillScratch {
+            let RowReadBuffers {
                 index_buf,
                 data_buf,
                 decoded_buf,
                 column_buf,
                 assembly_buf,
+                partial,
                 decoded_data_ref,
                 point_read,
                 index_leaf,
@@ -32434,6 +32671,7 @@ impl Storage {
                 decoded_buf,
                 column_buf,
                 assembly_buf,
+                partial,
             );
             reader.restore_point_read(*point_read);
             reader.restore_cached_index_leaf(index_leaf.take());
@@ -32561,7 +32799,7 @@ impl Storage {
     fn retain_checkpoint_rowids(
         &self,
         table_slot: usize,
-        cursor: &mut CheckpointValueCursor,
+        cursor: &mut CheckpointRowCursor,
         include_spilled: bool,
     ) -> Result<(), SqlError> {
         if cursor.resident_initialized {
@@ -32599,6 +32837,18 @@ impl Storage {
         Ok(())
     }
 
+    pub(crate) fn retain_checkpoint_capture(
+        &self,
+        table_slot: usize,
+        cursor: &mut CheckpointRowCursor,
+    ) -> Result<(), SqlError> {
+        self.retain_checkpoint_rowids(table_slot, cursor, true)?;
+        for row in &mut cursor.resident_rowids {
+            row.suppress_spill = true;
+        }
+        Ok(())
+    }
+
     /// Resumes resident rows changed after one published value-index base and
     /// records the exact row identities represented by the delta. Heap rows
     /// contribute replacement entries and tombstones only suppress the base.
@@ -32610,7 +32860,7 @@ impl Storage {
         table_slot: usize,
         binding: usize,
         after_lsn: u64,
-        cursor: &mut CheckpointValueCursor,
+        cursor: &mut CheckpointRowCursor,
         changed_rowids: &mut Vec<u64>,
         output: &mut [u8],
         max_rows: usize,
@@ -32622,11 +32872,12 @@ impl Storage {
         let mut walked = 0usize;
         while cursor.resident_position < cursor.resident_rowids.len() && walked < max_rows {
             let rowid = cursor.resident_rowids[cursor.resident_position].rowid;
-            cursor.resident_position += 1;
             let Some(state) = self.resident_row_state(table_slot, rowid)? else {
+                cursor.resident_position += 1;
                 continue;
             };
             if state.committed_lsn <= after_lsn {
+                cursor.resident_position += 1;
                 continue;
             }
             walked += 1;
@@ -32642,13 +32893,17 @@ impl Storage {
                         ));
                     }
                     changed_rowids.push(rowid);
+                    cursor.resident_position += 1;
                     continue;
                 }
                 // A spilled image was already captured by a successful row
                 // checkpoint. If this binding stayed clean, its base entry
                 // remains current; a binding-changing row cannot spill until
                 // the matching value generation publishes.
-                Some(RowHome::Spilled { .. }) => continue,
+                Some(RowHome::Spilled { .. }) => {
+                    cursor.resident_position += 1;
+                    continue;
+                }
             }
             if changed_rowids.len() == changed_rowids.capacity() {
                 return Err(sql_err!(
@@ -32657,25 +32912,27 @@ impl Storage {
                     changed_rowids.capacity()
                 ));
             }
-            changed_rowids.push(rowid);
             let home = self
                 .committed_row_home(table_slot, rowid, state)?
                 .expect("committed heap image");
             let Some((key_len, payload_len, hash)) =
                 self.encode_value_binding_entry(table_slot, binding, rowid, home, output)?
             else {
+                changed_rowids.push(rowid);
+                cursor.resident_position += 1;
                 continue;
             };
+            changed_rowids.push(rowid);
             let (key, payload) = output[..key_len + payload_len].split_at(key_len);
-            if each(CheckpointValueEntry {
+            let flow = each(CheckpointValueEntry {
                 rowid,
                 commit_lsn: committed_lsn,
                 hash,
                 key,
                 payload,
-            })?
-            .is_break()
-            {
+            })?;
+            cursor.resident_position += 1;
+            if flow.is_break() {
                 return Ok(false);
             }
         }
@@ -32683,14 +32940,14 @@ impl Storage {
     }
 
     /// Resumes a complete checkpoint value-index source walk for at most
-    /// `max_rows` physical rowids. The cursor advances before `each` may stop
-    /// the batch, so a later beat never revisits an emitted row.
+    /// `max_rows` physical rowids. The cursor advances after successful encoding and consumption,
+    /// including a consumer-requested stop, so a waiting read cannot skip a row.
     #[expect(clippy::too_many_arguments, reason = "checkpoint row stream boundary")]
     pub(crate) fn for_each_value_binding_entry_batch(
         &self,
         table_slot: usize,
         binding: usize,
-        cursor: &mut CheckpointValueCursor,
+        cursor: &mut CheckpointRowCursor,
         arena: &crate::mem::arena::Arena,
         output: &mut [u8],
         max_rows: usize,
@@ -32704,19 +32961,21 @@ impl Storage {
         if !cursor.resident_done {
             while cursor.resident_position < cursor.resident_rowids.len() && walked < max_rows {
                 let rowid = cursor.resident_rowids[cursor.resident_position].rowid;
-                cursor.resident_position += 1;
                 walked += 1;
                 // Unprocessed evicted rows belong to the paced SST stream,
                 // avoiding one object-store point lookup per captured row.
                 let Some(state) = self.resident_row_state(table_slot, rowid)? else {
+                    cursor.resident_position += 1;
                     continue;
                 };
                 if matches!(state.committed, Some(RowHome::Spilled { .. })) {
+                    cursor.resident_position += 1;
                     continue;
                 }
-                cursor.resident_rowids[cursor.resident_position - 1].suppress_spill = true;
+                cursor.resident_rowids[cursor.resident_position].suppress_spill = true;
                 let committed_lsn = state.committed_lsn;
                 let Some(home) = self.committed_row_home(table_slot, rowid, state)? else {
+                    cursor.resident_position += 1;
                     continue;
                 };
                 let Some((key_len, payload_len, hash)) = self
@@ -32731,18 +32990,19 @@ impl Storage {
                         ),
                     })?
                 else {
+                    cursor.resident_position += 1;
                     continue;
                 };
                 let (key, payload) = output[..key_len + payload_len].split_at(key_len);
-                if each(CheckpointValueEntry {
+                let flow = each(CheckpointValueEntry {
                     rowid,
                     commit_lsn: committed_lsn,
                     hash,
                     key,
                     payload,
-                })?
-                .is_break()
-                {
+                })?;
+                cursor.resident_position += 1;
+                if flow.is_break() {
                     return Ok(false);
                 }
             }

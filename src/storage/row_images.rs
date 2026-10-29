@@ -198,6 +198,7 @@ impl<'arena> TableRowSnapshot<'arena> {
         &self,
         rowid: u64,
         home: RowHome,
+        buffers: &mut super::RowReadBuffers,
         read: impl FnOnce(&[u8]) -> Result<R, SqlError>,
     ) -> Result<R, SqlError> {
         match home {
@@ -221,7 +222,8 @@ impl<'arena> TableRowSnapshot<'arena> {
                         "checkpoint capture has no saved-file source"
                     )
                 })?;
-                SpilledRowRead::new(roots, rowid, len, sst, commit_lsn)?.with_bytes(read)
+                SpilledRowRead::new(roots, rowid, len, sst, commit_lsn)?
+                    .with_bytes_in(buffers, read)
             }
         }
     }

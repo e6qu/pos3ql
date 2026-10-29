@@ -142,8 +142,14 @@ impl ExternalRunReader {
         store: &mut dyn BlockStore,
         run: ExternalRun,
     ) -> Result<(), SqlError> {
+        self.prepare(run);
+        self.advance(store)
+    }
+
+    pub(crate) fn prepare(&mut self, run: ExternalRun) {
         self.previous_len = 0;
-        self.reader.start(run, store).map_err(run_error)
+        self.reader.current_len = 0;
+        self.reader.cursor = Some(run.cursor());
     }
 
     pub(crate) fn row(&self) -> Option<&[u8]> {

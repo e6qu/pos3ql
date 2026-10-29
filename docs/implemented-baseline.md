@@ -411,8 +411,13 @@ caches disabled. A cached order query can finish while a merge and another
 connection's download are waiting. Other connections keep their read ownership;
 a completion or freed slot makes the merge runnable again.
 Rows enter its checksum and output count once. A genuine source error restarts
-the same immutable pair with empty output; capture and index-building reads can
-still occupy the SQL worker.
+the same immutable pair with empty output. Checkpoint row capture and index
+construction also yield: their private source buffers retain partial columns,
+large rows and saved-run navigation. Output positions advance only after a row
+has been consumed, so a waiting successor read cannot repeat that row. Index
+block-list setup is retained too. For example, building an index on saved
+orders can wait for storage while a cached lookup and a durable commit finish.
+Changing the captured table or index inputs abandons that job before publication.
 
 At 85% heap use, eligible top-level writes can wait before effects when an active
 maintenance task can free space, including saved-file cleanup or a row-file merge

@@ -2572,8 +2572,9 @@ impl<'a> SstReader<'a> {
             .alloc_slice_with(MAX_ASSEMBLED, |_| 0u8)
             .map_err(|_| SstError::Store(StoreError::Unavailable))?;
         let partial = arena
-            .alloc(SstReadProgress::new())
+            .alloc_slice_with(1, |_| SstReadProgress::new())
             .map_err(|_| SstError::Store(StoreError::Unavailable))?;
+        let partial = &mut partial[0];
         Ok(Self {
             index_scratch,
             data_scratch,

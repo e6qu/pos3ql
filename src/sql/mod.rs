@@ -9387,7 +9387,7 @@ impl Engine {
         // Flush committed records before capture. A covered upload stays
         // pending until its publication retry reconciles the durable root.
         self.wal.commit();
-        if ckpt.block_reads_busy() || !ckpt.merge_reads_ready() {
+        if ckpt.block_reads_busy() || !ckpt.maintenance_reads_ready() {
             return Err(sql_err!(
                 sqlstate::INTERNAL_IO_WAIT,
                 "durable block reads in progress"
@@ -10092,7 +10092,7 @@ impl Engine {
             || self.storage.history_pressure()
     }
 
-    /// Heap and history cleanup use no object client. Retained merges have
+    /// Heap and history cleanup use no object client. Retained output jobs have
     /// separate read ownership; capture still waits for foreground block reads.
     pub(crate) fn checkpoint_can_progress(&self) -> bool {
         if self.fatal_commit_failure.is_some() {
@@ -10135,10 +10135,10 @@ impl Engine {
             return self.local_cleanup.is_some() || self.storage.history_cleanup_pending();
         }
         if let Some(checkpointer) = self.ckpt.as_ref() {
-            if checkpointer.independent_merge_ready() {
+            if checkpointer.independent_output_ready() {
                 return true;
             }
-            if !checkpointer.merge_reads_ready() {
+            if !checkpointer.maintenance_reads_ready() {
                 return self.local_cleanup.is_some() || self.storage.history_cleanup_pending();
             }
         }
@@ -10289,14 +10289,14 @@ impl Engine {
         let journal_pending = self.unpromoted_commits != 0
             || (self.commit_progress == CommitProgressMode::Reactor
                 && self.durable_retry_pending());
-        let independent_merge = self
+        let independent_output = self
             .ckpt
             .as_ref()
-            .is_some_and(Checkpointer::independent_merge_ready);
-        if (journal_pending || independent_merge)
+            .is_some_and(Checkpointer::independent_output_ready);
+        if (journal_pending || independent_output)
             && !credential_draining
             && self.local_cleanup.is_none()
-            && (!self.block_reads_pending() || independent_merge)
+            && (!self.block_reads_pending() || independent_output)
             && let Some(checkpointer) = self.ckpt.as_mut()
             && checkpointer.retained_output_ready()
         {
@@ -10307,7 +10307,9 @@ impl Engine {
             }
             let result = checkpointer.advance_retained_output(&self.storage);
             return match result {
-                Ok(()) if !checkpointer.merge_reads_ready() => CheckpointBeat::WaitingForReads,
+                Ok(()) if !checkpointer.maintenance_reads_ready() => {
+                    CheckpointBeat::WaitingForReads
+                }
                 Ok(()) => CheckpointBeat::Advanced,
                 Err(error) => {
                     self.remember_checkpoint_failure(&error);
@@ -10325,7 +10327,7 @@ impl Engine {
         let merge_waiting = self
             .ckpt
             .as_ref()
-            .is_some_and(|checkpointer| !checkpointer.merge_reads_ready());
+            .is_some_and(|checkpointer| !checkpointer.maintenance_reads_ready());
         let reads_pending = credential_draining
             || file_cleanup_waiting
             || merge_waiting
@@ -10502,7 +10504,7 @@ impl Engine {
             Ok(CheckpointStep::Working) => {
                 if retried_upload || remote_maintenance_finished {
                     CheckpointBeat::Durable
-                } else if !ckpt.file_io_ready() || !ckpt.merge_reads_ready() {
+                } else if !ckpt.file_io_ready() || !ckpt.maintenance_reads_ready() {
                     CheckpointBeat::WaitingForReads
                 } else {
                     CheckpointBeat::Advanced

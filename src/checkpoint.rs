@@ -891,14 +891,35 @@ enum MergeBeatOutcome {
     Finished(Option<PrevSst>),
 }
 
-const MERGE_READ_OWNER: crate::store::ReadOwner = crate::store::ReadOwner(3u128 << 96);
+const MAINTENANCE_READ_OWNER: crate::store::ReadOwner = crate::store::ReadOwner(3u128 << 96);
 
-struct MergeReadScope {
+struct MaintenanceReadScope {
     blocks: std::sync::Arc<Mutex<TieredStore<OwnedObjectStore>>>,
     previous: Option<crate::store::ReadOwner>,
 }
 
-impl Drop for MergeReadScope {
+impl MaintenanceReadScope {
+    fn enter(blocks: &std::sync::Arc<Mutex<TieredStore<OwnedObjectStore>>>) -> Self {
+        let previous = {
+            let mut store = blocks.lock().expect("block store lock poisoned");
+            let previous = store.base_mut().read_owner();
+            store.set_read_owner(Some(MAINTENANCE_READ_OWNER));
+            previous
+        };
+        Self {
+            blocks: std::sync::Arc::clone(blocks),
+            previous,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct MaintenanceReadWait {
+    producer: PhysicalOutputOwner,
+    generation: u64,
+}
+
+impl Drop for MaintenanceReadScope {
     fn drop(&mut self) {
         self.blocks
             .lock()
@@ -1425,13 +1446,14 @@ pub(crate) struct Checkpointer {
     /// a half-written SST across beats — the reason the writer owns its
     /// state instead of borrowing an arena.
     slice_writer: SstWriter,
+    row_source_buffers: crate::storage::RowReadBuffers,
     merge_writer: SstWriter,
     /// The two merge inputs retain their physical position and decoded data
     /// block across beats. Transient index/PAX decode buffers are shared
     /// because only one source advances at a time.
     merge_source_cursors: [Option<SstVersionCursor>; 2],
     merge_metadata_cursors: [Option<SstMetadataCursor>; 2],
-    merge_read_wait: Option<u64>,
+    maintenance_read_wait: Option<MaintenanceReadWait>,
     merge_source_decoded: Box<[u8]>,
     merge_source_index: Box<[u8]>,
     merge_source_raw: Box<[u8]>,
@@ -1563,8 +1585,9 @@ impl Checkpointer {
             + core::mem::size_of::<Option<u64>>()
             + 2 * core::mem::size_of::<Option<SstVersionCursor>>()
             + 2 * core::mem::size_of::<Option<SstMetadataCursor>>()
-            + core::mem::size_of::<Option<u64>>()
+            + core::mem::size_of::<Option<MaintenanceReadWait>>()
             + 2 * SstWriter::budget_bytes()
+            + crate::storage::RowReadBuffers::budget_bytes()
             + ValueIndexWriter::budget_bytes()
             + table_bookkeeping
             + table_capacity.saturating_mul(crate::storage::MAX_VALUE_ENFORCERS)
@@ -1694,7 +1717,7 @@ impl Checkpointer {
     fn merge_beat(&mut self, storage: &Storage) -> Result<(), SqlError> {
         self.claim_physical_output(PhysicalOutputOwner::Merge)?;
         let Some(mut job) = self.merge_job.take() else {
-            self.merge_read_wait = None;
+            self.maintenance_read_wait = None;
             if let Some(job) = self.merge_candidate(storage) {
                 self.merge_scratch.clear();
                 self.reset_merge_writer(storage, job.slot)?;
@@ -1717,15 +1740,17 @@ impl Checkpointer {
             .get(job.slot)
             .is_some_and(|list| pair_at(list, job.at) == Some((job.old0.handle, job.old1.handle)));
         if !valid {
-            self.merge_read_wait = None;
-            self.cancel_read_owner(MERGE_READ_OWNER);
+            self.maintenance_read_wait = None;
+            self.cancel_read_owner(MAINTENANCE_READ_OWNER);
             self.block_output
                 .discard(&mut self.block_uploads)
                 .map_err(upload_to_sql)?;
             self.merge_writer.reset();
             return Ok(());
         }
-        if self.merge_read_wait == Some(self.read_capacity_generation())
+        if self
+            .maintenance_read_wait
+            .is_some_and(|wait| wait.generation == self.read_capacity_generation())
             && self
                 .blocks
                 .lock()
@@ -1735,17 +1760,8 @@ impl Checkpointer {
             self.merge_job = Some(job);
             return Ok(());
         }
-        self.merge_read_wait = None;
-        let previous = {
-            let mut blocks = self.blocks.lock().expect("block store lock poisoned");
-            let previous = blocks.base_mut().read_owner();
-            blocks.set_read_owner(Some(MERGE_READ_OWNER));
-            previous
-        };
-        let _read_owner = MergeReadScope {
-            blocks: std::sync::Arc::clone(&self.blocks),
-            previous,
-        };
+        self.maintenance_read_wait = None;
+        let _read_owner = MaintenanceReadScope::enter(&self.blocks);
         #[cfg(feature = "checkpoint-profile")]
         let (phase, started, before) = (
             match &job.phase {
@@ -1767,12 +1783,15 @@ impl Checkpointer {
         let outcome = match outcome {
             Ok(outcome) => outcome,
             Err(error) if error.sqlstate == sqlstate::INTERNAL_IO_WAIT => {
-                self.merge_read_wait = Some(self.read_capacity_generation());
+                self.maintenance_read_wait = Some(MaintenanceReadWait {
+                    producer: PhysicalOutputOwner::Merge,
+                    generation: self.read_capacity_generation(),
+                });
                 self.merge_job = Some(job);
                 return Ok(());
             }
             Err(error) => {
-                self.cancel_read_owner(MERGE_READ_OWNER);
+                self.cancel_read_owner(MAINTENANCE_READ_OWNER);
                 // A read can fail after cursors, checksum or writer state changed.
                 // Retry the same immutable pair with one coherent empty output.
                 self.block_output
@@ -1812,9 +1831,9 @@ impl Checkpointer {
         );
         match outcome {
             MergeBeatOutcome::Continue => self.merge_job = Some(job),
-            MergeBeatOutcome::Cancel => self.cancel_read_owner(MERGE_READ_OWNER),
+            MergeBeatOutcome::Cancel => self.cancel_read_owner(MAINTENANCE_READ_OWNER),
             MergeBeatOutcome::Finished(merged) => {
-                self.cancel_read_owner(MERGE_READ_OWNER);
+                self.cancel_read_owner(MAINTENANCE_READ_OWNER);
                 self.merge_done[job.slot] = Some(CompletedMerge {
                     at: job.at,
                     old0: job.old0,
@@ -2500,10 +2519,11 @@ impl Checkpointer {
             checkpoint_deletions: (0..table_capacity).map(|_| None).collect(),
             checkpoint_statistics: (0..table_capacity).map(|_| None).collect(),
             slice_writer: SstWriter::new(),
+            row_source_buffers: crate::storage::RowReadBuffers::new(),
             merge_writer: SstWriter::new(),
             merge_source_cursors: [None, None],
             merge_metadata_cursors: [None, None],
-            merge_read_wait: None,
+            maintenance_read_wait: None,
             merge_source_decoded: vec![0; 2 * crate::store::MAX_PAYLOAD].into_boxed_slice(),
             merge_source_index: vec![0; crate::store::MAX_PAYLOAD].into_boxed_slice(),
             merge_source_raw: vec![0; crate::store::MAX_PAYLOAD].into_boxed_slice(),
@@ -3286,15 +3306,13 @@ impl Checkpointer {
             && self.retained_output_pending()
     }
 
-    pub(crate) fn merge_reads_ready(&self) -> bool {
-        self.merge_read_wait != Some(self.read_capacity_generation())
+    pub(crate) fn maintenance_reads_ready(&self) -> bool {
+        self.maintenance_read_wait
+            .is_none_or(|wait| wait.generation != self.read_capacity_generation())
     }
 
-    pub(crate) fn independent_merge_ready(&self) -> bool {
-        self.merge_job.is_some()
-            && self.table_job.is_none()
-            && self.retained_output_ready()
-            && self.merge_reads_ready()
+    pub(crate) fn independent_output_ready(&self) -> bool {
+        self.retained_output_ready() && self.maintenance_reads_ready()
     }
 
     /// Already-captured inputs can progress behind later journal uploads.
@@ -3305,6 +3323,15 @@ impl Checkpointer {
             self.retained_output_ready(),
             "retained producer must wait for its previous emission"
         );
+        if let Some(wait) = self.maintenance_read_wait {
+            return match wait.producer {
+                PhysicalOutputOwner::Table => self.advance_table_slice(storage),
+                PhysicalOutputOwner::Merge => self.merge_beat(storage),
+                PhysicalOutputOwner::Index | PhysicalOutputOwner::IndexSchedule => {
+                    unreachable!("index reads are not retained output")
+                }
+            };
+        }
         if self.table_job.is_some() && !(self.merge_turn && self.merge_job.is_some()) {
             self.merge_turn = true;
             self.advance_table_slice(storage)
@@ -13745,10 +13772,11 @@ impl Checkpointer {
     }
 
     fn advance_table_slice(&mut self, storage: &Storage) -> Result<(), SqlError> {
-        let _atomic_reads = self.atomic_block_read_scope();
         self.claim_physical_output(PhysicalOutputOwner::Table)?;
         let mut job = self.table_job.take().expect("scheduled table output");
         if !Self::table_slice_matches(storage, &job) {
+            self.maintenance_read_wait = None;
+            self.cancel_read_owner(MAINTENANCE_READ_OWNER);
             self.block_output
                 .discard(&mut self.block_uploads)
                 .map_err(upload_to_sql)?;
@@ -13756,10 +13784,24 @@ impl Checkpointer {
             self.slice_writer.reset();
             return Ok(());
         }
+        if self.maintenance_read_wait.is_some()
+            && !self.maintenance_reads_ready()
+            && self
+                .blocks
+                .lock()
+                .expect("block store lock poisoned")
+                .async_gets_enabled()
+        {
+            self.table_job = Some(job);
+            return Ok(());
+        }
+        self.maintenance_read_wait = None;
+        let _read_owner = MaintenanceReadScope::enter(&self.blocks);
         if matches!(
             job.phase,
             TableSlicePhase::Finish(_) | TableSlicePhase::Clean
         ) {
+            self.cancel_read_owner(MAINTENANCE_READ_OWNER);
             return self.complete_table_slice(storage, job);
         }
         #[cfg(feature = "checkpoint-profile")]
@@ -13801,18 +13843,23 @@ impl Checkpointer {
                         .to_le_bytes(),
                 );
                 let appended = if let Some(home) = entry.home {
-                    source.with_physical_row_bytes(entry.key.rowid, home, |row| {
-                        let appended = self.slice_writer.append_version(
-                            &mut self.block_output,
-                            entry.key,
-                            row,
-                        );
-                        if appended.is_ok() {
-                            job.crc.update(&header);
-                            job.crc.update(row);
-                        }
-                        Ok(appended)
-                    })?
+                    source.with_physical_row_bytes(
+                        entry.key.rowid,
+                        home,
+                        &mut self.row_source_buffers,
+                        |row| {
+                            let appended = self.slice_writer.append_version(
+                                &mut self.block_output,
+                                entry.key,
+                                row,
+                            );
+                            if appended.is_ok() {
+                                job.crc.update(&header);
+                                job.crc.update(row);
+                            }
+                            Ok(appended)
+                        },
+                    )?
                 } else {
                     let appended = self
                         .slice_writer
@@ -13854,6 +13901,20 @@ impl Checkpointer {
                 .io_stats(),
             0,
         );
+        if result
+            .as_ref()
+            .is_err_and(|error| error.sqlstate == sqlstate::INTERNAL_IO_WAIT)
+        {
+            self.maintenance_read_wait = Some(MaintenanceReadWait {
+                producer: PhysicalOutputOwner::Table,
+                generation: self.read_capacity_generation(),
+            });
+            self.table_job = Some(job);
+            return Ok(());
+        }
+        if result.is_err() {
+            self.cancel_read_owner(MAINTENANCE_READ_OWNER);
+        }
         if writer_failed {
             self.block_output
                 .discard(&mut self.block_uploads)

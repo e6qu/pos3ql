@@ -97754,7 +97754,7 @@ fn checkpoint_reads_held_merge_keeps_cached_queries_and_foreground_read_owners()
                         .as_ref()
                         .unwrap()
                         .physical_output_ready(Instant::now()),
-                    engine.ckpt.as_ref().unwrap().merge_reads_ready(),
+                    engine.ckpt.as_ref().unwrap().maintenance_reads_ready(),
                     engine.read_capacity_generation(),
                     [
                         engine.pending_block_read_fd(0),

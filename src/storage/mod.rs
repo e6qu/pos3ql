@@ -14860,7 +14860,7 @@ pub(crate) struct SpillReader {
     /// Two scratch sets so one consume-in-place fetch may nest inside another
     /// (a validation scan holding one row while checking it against the
     /// rest). Deeper nesting is a loud error, not a deadlock.
-    scratch: [Mutex<SpillScratch>; 2],
+    scratch: [Mutex<RowReadBuffers>; 2],
     /// Merged walks share startup-owned frames keyed by immutable source and
     /// block position. Nested callbacks release the context lock; frame reuse
     /// invalidates a cursor's residency claim, never its logical position.
@@ -15212,7 +15212,7 @@ enum SpillOverlayMode<'scan> {
 
 /// The reader's owned block buffers (index, data, physical column, chain
 /// assembly, and packed-range staging).
-struct SpillScratch {
+pub(crate) struct RowReadBuffers {
     source: Option<crate::store::BlockId>,
     index_buf: Box<[u8]>,
     data_buf: Box<[u8]>,
@@ -15225,6 +15225,27 @@ struct SpillScratch {
     index_leaf: Option<crate::store::SstIndexLeaf>,
 }
 
+impl RowReadBuffers {
+    pub(crate) fn budget_bytes() -> usize {
+        size_of::<Self>() + 4 * crate::store::MAX_PAYLOAD + crate::store::MAX_ASSEMBLED
+    }
+
+    pub(crate) fn new() -> Self {
+        Self {
+            source: None,
+            index_buf: vec![0; crate::store::MAX_PAYLOAD].into_boxed_slice(),
+            data_buf: vec![0; crate::store::MAX_PAYLOAD].into_boxed_slice(),
+            decoded_buf: vec![0; crate::store::MAX_PAYLOAD].into_boxed_slice(),
+            column_buf: vec![0; crate::store::MAX_PAYLOAD].into_boxed_slice(),
+            assembly_buf: vec![0; crate::store::MAX_ASSEMBLED].into_boxed_slice(),
+            partial: crate::store::SstReadProgress::new(),
+            decoded_data_ref: None,
+            point_read: crate::store::SstPointReadProgress::default(),
+            index_leaf: None,
+        }
+    }
+}
+
 struct ValueIndexScratch {
     source: Option<crate::store::BlockId>,
     roster: crate::store::RetainedBlockBuffer,
@@ -15235,7 +15256,7 @@ trait ReadScratch {
     fn source(&mut self) -> &mut Option<crate::store::BlockId>;
 }
 
-impl ReadScratch for SpillScratch {
+impl ReadScratch for RowReadBuffers {
     fn source(&mut self) -> &mut Option<crate::store::BlockId> {
         &mut self.source
     }
@@ -15350,20 +15371,7 @@ impl SpillReader {
         } else {
             Vec::new().into_boxed_slice().into()
         };
-        let fresh = || {
-            Mutex::new(SpillScratch {
-                source: None,
-                index_buf: vec![0u8; crate::store::MAX_PAYLOAD].into_boxed_slice(),
-                data_buf: vec![0u8; crate::store::MAX_PAYLOAD].into_boxed_slice(),
-                decoded_buf: vec![0u8; crate::store::MAX_PAYLOAD].into_boxed_slice(),
-                column_buf: vec![0u8; crate::store::MAX_PAYLOAD].into_boxed_slice(),
-                assembly_buf: vec![0u8; crate::store::MAX_ASSEMBLED].into_boxed_slice(),
-                partial: crate::store::SstReadProgress::new(),
-                decoded_data_ref: None,
-                point_read: crate::store::SstPointReadProgress::default(),
-                index_leaf: None,
-            })
-        };
+        let fresh = || Mutex::new(RowReadBuffers::new());
         let context = || Mutex::new(ScanContext::new(max_spill_generations));
         let value = || {
             Mutex::new(ValueIndexScratch {
@@ -15467,7 +15475,7 @@ impl SpillReader {
             ));
         };
         let mut blocks = self.relation_blocks_for(persistence);
-        let SpillScratch {
+        let RowReadBuffers {
             index_buf,
             data_buf,
             decoded_buf,
@@ -15535,7 +15543,20 @@ impl SpillReader {
                 "spill row scratch exhausted (maximum nested fetches 2)"
             ));
         };
-        let SpillScratch {
+        self.with_row_bytes_in(persistence, handle, rowid, len, commit_lsn, &mut scratch, f)
+    }
+
+    fn with_row_bytes_in<R>(
+        &self,
+        persistence: RelationPersistence,
+        handle: crate::store::SstHandle,
+        rowid: u64,
+        len: u32,
+        commit_lsn: u64,
+        scratch: &mut RowReadBuffers,
+        f: impl FnOnce(&[u8]) -> Result<R, SqlError>,
+    ) -> Result<R, SqlError> {
+        let RowReadBuffers {
             index_buf,
             data_buf,
             decoded_buf,
@@ -15546,7 +15567,7 @@ impl SpillReader {
             point_read,
             index_leaf,
             ..
-        } = &mut *scratch;
+        } = scratch;
         let capacity = assembly_buf.len();
         if len as usize > capacity {
             return Err(sql_err!(
@@ -32418,7 +32439,7 @@ impl Storage {
         let mut best: Option<SpillVersion> = None;
         for member in 0..relation.len() {
             let handle = relation.handle(member);
-            let SpillScratch {
+            let RowReadBuffers {
                 index_buf,
                 data_buf,
                 decoded_buf,

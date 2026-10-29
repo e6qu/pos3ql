@@ -1860,6 +1860,31 @@ impl SpilledRowRead {
             )
         })
     }
+
+    pub(super) fn with_bytes_in<R>(
+        &self,
+        buffers: &mut super::RowReadBuffers,
+        consume: impl FnOnce(&[u8]) -> Result<R, SqlError>,
+    ) -> Result<R, SqlError> {
+        self.roots.with_snapshot(|source| {
+            let reader = source.reader.as_ref().ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "retained object row has no reader"
+                )
+            })?;
+            let handle = source.handle_for_generation(self.member)?;
+            reader.with_row_bytes_in(
+                source.persistence,
+                handle,
+                self.rowid,
+                self.len,
+                self.commit_lsn,
+                buffers,
+                consume,
+            )
+        })
+    }
 }
 
 #[derive(Clone, Copy)]

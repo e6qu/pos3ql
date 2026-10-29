@@ -97,7 +97,8 @@ pub(crate) use object::OwnedObjectStore;
 pub(crate) use shared::SharedBlockStore;
 pub(crate) use sst::copy_pax_v2_row_from_extents;
 pub(crate) use sst::{
-    ChainReadProgress, MAX_ASSEMBLED, MAX_INLINE_ROW, SstError, SstReadProgress, SstWriter,
+    ChainReadProgress, MAX_ASSEMBLED, MAX_INLINE_ROW, SstDataLookup, SstError, SstReadProgress,
+    SstWriter,
 };
 pub(crate) use sst::{
     DataBlockLookahead, DataBlockRef, PaxLayout, RowSstFormat, SstCursor, SstHandle, SstIndexLeaf,

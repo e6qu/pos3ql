@@ -1255,6 +1255,34 @@ pub(crate) struct SstCursor {
     prefetched_leaf: Option<(usize, BlockId)>,
     prefetched_data: Option<(usize, DataBlockRef)>,
     done: bool,
+    lookup: SstDataLookup,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct SstDataLookup {
+    request: Option<(SstHandle, usize)>,
+    stage: SstDataLookupStage,
+}
+
+#[derive(Clone, Copy)]
+enum SstDataLookupStage {
+    Root,
+    Leaf {
+        id: BlockId,
+        ordinal: usize,
+        count: usize,
+        next_leaf: Option<BlockId>,
+    },
+    Ready(Option<(DataBlockRef, Option<DataBlockLookahead>)>),
+}
+
+impl SstDataLookup {
+    pub(crate) const fn new() -> Self {
+        Self {
+            request: None,
+            stage: SstDataLookupStage::Root,
+        }
+    }
 }
 
 /// Retained metadata-only scan for merge scheduling. One step consumes one
@@ -1735,6 +1763,7 @@ impl SstCursor {
             prefetched_leaf: None,
             prefetched_data: None,
             done: false,
+            lookup: SstDataLookup::new(),
         }
     }
 
@@ -1775,6 +1804,7 @@ impl SstCursor {
                         &self.handle,
                         index,
                         self.block_ordinal,
+                        &mut self.lookup,
                     )?
                     else {
                         self.done = true;
@@ -1828,7 +1858,11 @@ impl SstCursor {
     /// byte position. The next advance reloads the same immutable block.
     pub(crate) fn detach_buffer(&mut self) {
         if self.loaded {
-            self.block_ordinal = self.block_ordinal.saturating_sub(1);
+            if self.offset < self.data_len {
+                self.block_ordinal = self.block_ordinal.saturating_sub(1);
+            } else {
+                self.offset = 0;
+            }
             self.loaded = false;
         }
     }
@@ -3333,8 +3367,10 @@ pub(crate) fn locate_data_block(
     buf: &mut [u8],
     ordinal: usize,
 ) -> Result<Option<BlockId>, SstError> {
-    Ok(locate_data_block_with_next(store, handle, buf, ordinal)?
-        .map(|(reference, _)| reference.id()))
+    Ok(
+        locate_data_block_with_next(store, handle, buf, ordinal, &mut SstDataLookup::new())?
+            .map(|(reference, _)| reference.id()),
+    )
 }
 
 pub(crate) fn locate_data_block_ref(
@@ -3343,7 +3379,10 @@ pub(crate) fn locate_data_block_ref(
     buf: &mut [u8],
     ordinal: usize,
 ) -> Result<Option<DataBlockRef>, SstError> {
-    Ok(locate_data_block_with_next(store, handle, buf, ordinal)?.map(|(reference, _)| reference))
+    Ok(
+        locate_data_block_with_next(store, handle, buf, ordinal, &mut SstDataLookup::new())?
+            .map(|(reference, _)| reference),
+    )
 }
 
 /// Resolves one data-block ordinal and, when it shares an index leaf with a
@@ -3354,61 +3393,91 @@ pub(crate) fn locate_data_block_with_next(
     handle: &SstHandle,
     buf: &mut [u8],
     ordinal: usize,
+    lookup: &mut SstDataLookup,
 ) -> Result<Option<(DataBlockRef, Option<DataBlockLookahead>)>, SstError> {
-    load_index(store, &handle.index, buf)?;
-    let head = u32::from_le_bytes(buf[0..4].try_into().unwrap());
-    if head != INDEX_ROOT_MAGIC {
-        let count = head as usize;
-        if ordinal >= count {
-            return Ok(None);
-        }
-        let next = (ordinal + 1 < count).then(|| {
-            DataBlockLookahead::Data(block_ref_at(
-                buf,
-                ordinal + 1,
-                handle.uses_packed_references(),
-            ))
-        });
-        return Ok(Some((
-            block_ref_at(buf, ordinal, handle.uses_packed_references()),
-            next,
-        )));
+    if lookup.request != Some((*handle, ordinal)) {
+        lookup.request = Some((*handle, ordinal));
+        lookup.stage = SstDataLookupStage::Root;
     }
-    let leaves = u32::from_le_bytes(buf[4..8].try_into().unwrap()) as usize;
-    let entry_size = VERSIONED_ROOT_ENTRY;
-    let key_bytes = 16;
-    let mut remaining = ordinal;
-    for leaf in 0..leaves {
-        let at = 8 + leaf * entry_size;
-        let count = u32::from_le_bytes(buf[at + key_bytes..at + key_bytes + 4].try_into().unwrap())
-            as usize;
-        if remaining < count {
-            let next_leaf = (leaf + 1 < leaves).then(|| {
-                let next_at = 8 + (leaf + 1) * entry_size;
-                let mut id = [0u8; 32];
-                id.copy_from_slice(&buf[next_at + key_bytes + 4..next_at + entry_size]);
-                BlockId(id)
-            });
-            let mut id = [0u8; 32];
-            id.copy_from_slice(&buf[at + key_bytes + 4..at + entry_size]);
-            load_index(store, &BlockId(id), buf)?;
-            let next = if remaining + 1 < count {
-                Some(DataBlockLookahead::Data(block_ref_at(
-                    buf,
-                    remaining + 1,
-                    handle.uses_packed_references(),
-                )))
-            } else {
-                next_leaf.map(DataBlockLookahead::Leaf)
-            };
-            return Ok(Some((
-                block_ref_at(buf, remaining, handle.uses_packed_references()),
-                next,
-            )));
+    loop {
+        match lookup.stage {
+            SstDataLookupStage::Ready(result) => return Ok(result),
+            SstDataLookupStage::Root => {
+                load_index(store, &handle.index, buf)?;
+                let head = u32::from_le_bytes(buf[..4].try_into().unwrap());
+                if head != INDEX_ROOT_MAGIC {
+                    let count = head as usize;
+                    lookup.stage = SstDataLookupStage::Ready((ordinal < count).then(|| {
+                        let next = (ordinal + 1 < count).then(|| {
+                            DataBlockLookahead::Data(block_ref_at(
+                                buf,
+                                ordinal + 1,
+                                handle.uses_packed_references(),
+                            ))
+                        });
+                        (
+                            block_ref_at(buf, ordinal, handle.uses_packed_references()),
+                            next,
+                        )
+                    }));
+                    continue;
+                }
+                let leaves = u32::from_le_bytes(buf[4..8].try_into().unwrap()) as usize;
+                let mut remaining = ordinal;
+                lookup.stage = SstDataLookupStage::Ready(None);
+                for leaf in 0..leaves {
+                    let at = 8 + leaf * VERSIONED_ROOT_ENTRY;
+                    let count =
+                        u32::from_le_bytes(buf[at + 16..at + 20].try_into().unwrap()) as usize;
+                    if remaining < count {
+                        let next_leaf = (leaf + 1 < leaves).then(|| {
+                            let at = at + VERSIONED_ROOT_ENTRY;
+                            let mut id = [0; 32];
+                            id.copy_from_slice(&buf[at + 20..at + VERSIONED_ROOT_ENTRY]);
+                            BlockId(id)
+                        });
+                        let mut id = [0; 32];
+                        id.copy_from_slice(&buf[at + 20..at + VERSIONED_ROOT_ENTRY]);
+                        lookup.stage = SstDataLookupStage::Leaf {
+                            id: BlockId(id),
+                            ordinal: remaining,
+                            count,
+                            next_leaf,
+                        };
+                        break;
+                    }
+                    remaining -= count;
+                }
+            }
+            SstDataLookupStage::Leaf {
+                id,
+                ordinal,
+                count,
+                next_leaf,
+            } => {
+                load_index(store, &id, buf)?;
+                let actual = u32::from_le_bytes(buf[..4].try_into().unwrap()) as usize;
+                if actual != count {
+                    return Err(SstError::Store(StoreError::Corrupt(
+                        super::BlockError::Payload,
+                    )));
+                }
+                let next = if ordinal + 1 < count {
+                    Some(DataBlockLookahead::Data(block_ref_at(
+                        buf,
+                        ordinal + 1,
+                        handle.uses_packed_references(),
+                    )))
+                } else {
+                    next_leaf.map(DataBlockLookahead::Leaf)
+                };
+                lookup.stage = SstDataLookupStage::Ready(Some((
+                    block_ref_at(buf, ordinal, handle.uses_packed_references()),
+                    next,
+                )));
+            }
         }
-        remaining -= count;
     }
-    Ok(None)
 }
 
 /// Total data blocks under an SST's index root of either shape.
@@ -4906,10 +4975,16 @@ mod tests {
             .unwrap();
         let handle = writer.finish(&mut store).unwrap().unwrap();
         let mut index = [0; MAX_PAYLOAD];
-        let reference = locate_data_block_with_next(&mut store, &handle, &mut index, 0)
-            .unwrap()
-            .unwrap()
-            .0;
+        let reference = locate_data_block_with_next(
+            &mut store,
+            &handle,
+            &mut index,
+            0,
+            &mut SstDataLookup::new(),
+        )
+        .unwrap()
+        .unwrap()
+        .0;
         let mut data = [0; MAX_PAYLOAD];
         let mut scratch = [0; MAX_PAYLOAD];
         let (_, block_type) =
@@ -4967,10 +5042,16 @@ mod tests {
             .unwrap();
         let handle = writer.finish(&mut store).unwrap().unwrap();
         let mut index = [0; MAX_PAYLOAD];
-        let reference = locate_data_block_with_next(&mut store, &handle, &mut index, 0)
-            .unwrap()
-            .unwrap()
-            .0;
+        let reference = locate_data_block_with_next(
+            &mut store,
+            &handle,
+            &mut index,
+            0,
+            &mut SstDataLookup::new(),
+        )
+        .unwrap()
+        .unwrap()
+        .0;
         let mut raw = [0; MAX_PAYLOAD];
         let mut scratch = [0; MAX_PAYLOAD];
         let (length, kind) =

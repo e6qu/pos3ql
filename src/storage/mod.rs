@@ -15071,6 +15071,7 @@ struct MemberCursor {
     /// The head entry, parsed as one immutable row-version key.
     head: Option<(crate::store::SstKey, bool, u32)>,
     done: bool,
+    lookup: crate::store::SstDataLookup,
 }
 
 struct SpillWalkResume<'a> {
@@ -15289,6 +15290,7 @@ impl MemberCursor {
         prefetched_data: None,
         head: None,
         done: false,
+        lookup: crate::store::SstDataLookup::new(),
     };
 }
 
@@ -15422,7 +15424,7 @@ impl SpillReader {
         let durable = blocks.is_some();
         budget.draw(Self::owner_bytes(), "shared spill reader owner")?;
         budget.draw(
-            2 * (5 * crate::store::MAX_PAYLOAD + crate::store::MAX_ASSEMBLED),
+            2 * (4 * crate::store::MAX_PAYLOAD + crate::store::MAX_ASSEMBLED),
             "spill reader",
         )?;
         budget.draw(
@@ -32451,6 +32453,7 @@ impl Storage {
                                         &handle,
                                         &mut context.index_buf,
                                         cursor.ordinal,
+                                        &mut cursor.lookup,
                                     )
                                     .map_err(spill_read_error)?
                                 else {
@@ -32869,11 +32872,12 @@ impl Storage {
         let mut walked = 0usize;
         while cursor.resident_position < cursor.resident_rowids.len() && walked < max_rows {
             let rowid = cursor.resident_rowids[cursor.resident_position].rowid;
-            cursor.resident_position += 1;
             let Some(state) = self.resident_row_state(table_slot, rowid)? else {
+                cursor.resident_position += 1;
                 continue;
             };
             if state.committed_lsn <= after_lsn {
+                cursor.resident_position += 1;
                 continue;
             }
             walked += 1;
@@ -32889,13 +32893,17 @@ impl Storage {
                         ));
                     }
                     changed_rowids.push(rowid);
+                    cursor.resident_position += 1;
                     continue;
                 }
                 // A spilled image was already captured by a successful row
                 // checkpoint. If this binding stayed clean, its base entry
                 // remains current; a binding-changing row cannot spill until
                 // the matching value generation publishes.
-                Some(RowHome::Spilled { .. }) => continue,
+                Some(RowHome::Spilled { .. }) => {
+                    cursor.resident_position += 1;
+                    continue;
+                }
             }
             if changed_rowids.len() == changed_rowids.capacity() {
                 return Err(sql_err!(
@@ -32904,25 +32912,26 @@ impl Storage {
                     changed_rowids.capacity()
                 ));
             }
-            changed_rowids.push(rowid);
             let home = self
                 .committed_row_home(table_slot, rowid, state)?
                 .expect("committed heap image");
             let Some((key_len, payload_len, hash)) =
                 self.encode_value_binding_entry(table_slot, binding, rowid, home, output)?
             else {
+                cursor.resident_position += 1;
                 continue;
             };
+            changed_rowids.push(rowid);
             let (key, payload) = output[..key_len + payload_len].split_at(key_len);
-            if each(CheckpointValueEntry {
+            let flow = each(CheckpointValueEntry {
                 rowid,
                 commit_lsn: committed_lsn,
                 hash,
                 key,
                 payload,
-            })?
-            .is_break()
-            {
+            })?;
+            cursor.resident_position += 1;
+            if flow.is_break() {
                 return Ok(false);
             }
         }
@@ -32951,19 +32960,21 @@ impl Storage {
         if !cursor.resident_done {
             while cursor.resident_position < cursor.resident_rowids.len() && walked < max_rows {
                 let rowid = cursor.resident_rowids[cursor.resident_position].rowid;
-                cursor.resident_position += 1;
                 walked += 1;
                 // Unprocessed evicted rows belong to the paced SST stream,
                 // avoiding one object-store point lookup per captured row.
                 let Some(state) = self.resident_row_state(table_slot, rowid)? else {
+                    cursor.resident_position += 1;
                     continue;
                 };
                 if matches!(state.committed, Some(RowHome::Spilled { .. })) {
+                    cursor.resident_position += 1;
                     continue;
                 }
-                cursor.resident_rowids[cursor.resident_position - 1].suppress_spill = true;
+                cursor.resident_rowids[cursor.resident_position].suppress_spill = true;
                 let committed_lsn = state.committed_lsn;
                 let Some(home) = self.committed_row_home(table_slot, rowid, state)? else {
+                    cursor.resident_position += 1;
                     continue;
                 };
                 let Some((key_len, payload_len, hash)) = self
@@ -32978,18 +32989,19 @@ impl Storage {
                         ),
                     })?
                 else {
+                    cursor.resident_position += 1;
                     continue;
                 };
                 let (key, payload) = output[..key_len + payload_len].split_at(key_len);
-                if each(CheckpointValueEntry {
+                let flow = each(CheckpointValueEntry {
                     rowid,
                     commit_lsn: committed_lsn,
                     hash,
                     key,
                     payload,
-                })?
-                .is_break()
-                {
+                })?;
+                cursor.resident_position += 1;
+                if flow.is_break() {
                     return Ok(false);
                 }
             }

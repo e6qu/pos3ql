@@ -619,8 +619,22 @@ struct ValueInstall {
 
 #[derive(Clone, Copy)]
 enum ValueIndexSource {
-    InMemory { rows: usize, position: usize },
-    External { run: ExternalRun, started: bool },
+    InMemory {
+        rows: usize,
+        position: usize,
+    },
+    External {
+        run: ExternalRun,
+        state: ValueRunState,
+    },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ValueRunState {
+    Unstarted,
+    Loading,
+    Ready,
+    AdvancePending,
 }
 
 #[derive(Clone, Copy)]
@@ -652,6 +666,7 @@ enum ValueMergeDestination {
     Finish(usize),
 }
 
+#[derive(Clone, Copy)]
 enum ValueSchedulePhase {
     Collect,
     WriteChunk {
@@ -662,12 +677,19 @@ enum ValueSchedulePhase {
         right: ExternalRun,
         destination: ValueMergeDestination,
     },
+    LoadMerge {
+        destination: ValueMergeDestination,
+        right_cursor: SstCursor,
+        rows: u64,
+        left_ready: bool,
+    },
     Merge {
         destination: ValueMergeDestination,
         right_cursor: SstCursor,
         right_len: usize,
         rows: u64,
         output: u64,
+        pending: Option<(bool, usize)>,
     },
     Finish {
         accumulator: Option<ExternalRun>,
@@ -3301,7 +3323,10 @@ impl Checkpointer {
     }
 
     pub(crate) fn retained_output_pending(&self) -> bool {
-        self.table_job.is_some() || self.merge_job.is_some()
+        self.table_job.is_some()
+            || self.merge_job.is_some()
+            || self.value_schedule_job.is_some()
+            || self.value_job.is_some()
     }
 
     pub(crate) fn retained_output_ready(&self) -> bool {
@@ -3331,10 +3356,15 @@ impl Checkpointer {
             return match wait.producer {
                 PhysicalOutputOwner::Table => self.advance_table_slice(storage),
                 PhysicalOutputOwner::Merge => self.merge_beat(storage),
-                PhysicalOutputOwner::Index | PhysicalOutputOwner::IndexSchedule => {
-                    unreachable!("index reads are not retained output")
-                }
+                PhysicalOutputOwner::Index => self.value_index_write_beat(storage),
+                PhysicalOutputOwner::IndexSchedule => self.value_index_schedule_beat(storage),
             };
+        }
+        if self.value_schedule_job.is_some() {
+            return self.value_index_schedule_beat(storage);
+        }
+        if self.value_job.is_some() {
+            return self.value_index_write_beat(storage);
         }
         if self.table_job.is_some() && !(self.merge_turn && self.merge_job.is_some()) {
             self.merge_turn = true;
@@ -9689,7 +9719,7 @@ impl Checkpointer {
     /// Advances captured table/index output, manifest publication or cleanup.
     /// Changed tables need a current slice before manifest capture. Upload and
     /// local installation then retain that capture's identity across turns.
-    /// Some table capture and index-building reads still wait synchronously.
+    /// Captured row and index inputs retain their positions while reads wait.
     ///
     /// Failures retain a retryable position or restart the same immutable job.
     /// Repeated PUTs keep the same block identity but still cost requests and
@@ -9704,7 +9734,8 @@ impl Checkpointer {
         if !self.advance_physical_output(storage)? {
             return Ok(CheckpointStep::Working);
         }
-        if self.table_job.is_some() {
+        if self.table_job.is_some() || self.value_schedule_job.is_some() || self.value_job.is_some()
+        {
             self.advance_retained_output(storage)?;
             return Ok(CheckpointStep::Working);
         }
@@ -9773,9 +9804,6 @@ impl Checkpointer {
         if !sweep_due {
             return Ok(CheckpointStep::Idle);
         }
-        // Capture callbacks cannot yet be replayed. Retained merges run before
-        // this scope and keep their own source positions through a waiting GET.
-        let _atomic_reads = self.atomic_block_read_scope();
         if !self.sweeping {
             self.sweeping = true;
             self.sliced_generation.iter_mut().for_each(|g| *g = 0);
@@ -14654,63 +14682,99 @@ impl Checkpointer {
         right: ExternalRun,
         destination: ValueMergeDestination,
     ) -> Result<(), SqlError> {
-        self.value_sort_reader.start(
-            &mut *self.blocks.lock().expect("block store lock poisoned"),
-            left,
-        )?;
-        self.sst_arena.reset();
-        let index = self
-            .sst_arena
-            .alloc_slice_with(crate::store::MAX_PAYLOAD, |_| 0u8)
-            .map_err(|_| sql_err!(SQLSTATE_IO, "value-index merge index scratch"))?;
-        let data = self
-            .sst_arena
-            .alloc_slice_with(crate::store::MAX_PAYLOAD, |_| 0u8)
-            .map_err(|_| sql_err!(SQLSTATE_IO, "value-index merge data scratch"))?;
-        let bounce = self
-            .sst_arena
-            .alloc_slice_with(crate::store::MAX_PAYLOAD, |_| 0u8)
-            .map_err(|_| sql_err!(SQLSTATE_IO, "value-index merge bounce scratch"))?;
-        let mut right_cursor = right.cursor();
-        let right_len = right_cursor
-            .next_copy(
-                &mut *self.blocks.lock().expect("block store lock poisoned"),
-                index,
-                data,
-                bounce,
-                &mut self.value_entry,
-            )
-            .map_err(sst_to_sql)?
-            .map_or(0, |(_, length)| length);
-        right_cursor.detach_buffer();
+        self.value_sort_reader.prepare(left);
         self.slice_writer.reset();
-        job.phase = ValueSchedulePhase::Merge {
+        job.phase = ValueSchedulePhase::LoadMerge {
             destination,
-            right_cursor,
-            right_len,
+            right_cursor: right.cursor(),
             rows: left.rows().checked_add(right.rows()).ok_or_else(|| {
                 sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
                     "external query row count exhausted"
                 )
             })?,
-            output: 1,
+            left_ready: false,
         };
         Ok(())
     }
 
-    #[expect(clippy::too_many_arguments, reason = "retained merge cursor state")]
+    fn load_value_merge(&mut self, job: &mut ValueScheduleJob) -> Result<(), SqlError> {
+        let ValueSchedulePhase::LoadMerge {
+            destination,
+            mut right_cursor,
+            rows,
+            mut left_ready,
+        } = job.phase
+        else {
+            unreachable!("merge loading phase")
+        };
+        let result = (|| {
+            if !left_ready {
+                self.value_sort_reader
+                    .advance(&mut *self.blocks.lock().expect("block store lock poisoned"))?;
+                left_ready = true;
+            }
+            self.sst_arena.reset();
+            let index = self
+                .sst_arena
+                .alloc_slice_with(crate::store::MAX_PAYLOAD, |_| 0u8)
+                .map_err(|_| sql_err!(SQLSTATE_IO, "value-index merge index scratch"))?;
+            let data = self
+                .sst_arena
+                .alloc_slice_with(crate::store::MAX_PAYLOAD, |_| 0u8)
+                .map_err(|_| sql_err!(SQLSTATE_IO, "value-index merge data scratch"))?;
+            let bounce = self
+                .sst_arena
+                .alloc_slice_with(crate::store::MAX_PAYLOAD, |_| 0u8)
+                .map_err(|_| sql_err!(SQLSTATE_IO, "value-index merge bounce scratch"))?;
+            right_cursor
+                .next_copy(
+                    &mut *self.blocks.lock().expect("block store lock poisoned"),
+                    index,
+                    data,
+                    bounce,
+                    &mut self.value_entry,
+                )
+                .map_err(sst_to_sql)
+                .map(|row| row.map_or(0, |(_, len)| len))
+        })();
+        right_cursor.detach_buffer();
+        job.phase = match result {
+            Ok(right_len) => ValueSchedulePhase::Merge {
+                destination,
+                right_cursor,
+                right_len,
+                rows,
+                output: 1,
+                pending: None,
+            },
+            Err(_) => ValueSchedulePhase::LoadMerge {
+                destination,
+                right_cursor,
+                rows,
+                left_ready,
+            },
+        };
+        result.map(|_| ())
+    }
+
     fn value_merge_beat(
         &mut self,
         storage: &Storage,
         job: &mut ValueScheduleJob,
-        destination: ValueMergeDestination,
-        mut right_cursor: SstCursor,
-        mut right_len: usize,
-        rows: u64,
-        mut output: u64,
         before: crate::store::BlockIoStats,
     ) -> Result<(), SqlError> {
+        let ValueSchedulePhase::Merge {
+            destination,
+            mut right_cursor,
+            mut right_len,
+            rows,
+            mut output,
+            mut pending,
+        } = job.phase
+        else {
+            unreachable!("active merge phase")
+        };
         self.sst_arena.reset();
         let index = self
             .sst_arena
@@ -14724,75 +14788,91 @@ impl Checkpointer {
             .sst_arena
             .alloc_slice_with(crate::store::MAX_PAYLOAD, |_| 0u8)
             .map_err(|_| sql_err!(SQLSTATE_IO, "value-index merge bounce scratch"))?;
-        let mut processed = 0usize;
-        loop {
-            let left = self.value_sort_reader.prefixed_row();
-            let right = (right_len != 0).then_some(&self.value_entry[..right_len]);
-            let choose_left = match (left, right) {
-                (Some(_), None) => true,
-                (None, Some(_)) => false,
-                (Some(left), Some(right)) => {
-                    let order =
-                        Self::compare_value_sort_entries(storage, job, &left[8..], &right[8..])?
+        let result = (|| -> Result<bool, SqlError> {
+            let mut processed = 0usize;
+            loop {
+                if pending.is_none() {
+                    let left = self.value_sort_reader.prefixed_row();
+                    let right = (right_len != 0).then_some(&self.value_entry[..right_len]);
+                    let choose_left = match (left, right) {
+                        (Some(_), None) => true,
+                        (None, Some(_)) => false,
+                        (Some(left), Some(right)) => {
+                            let order = Self::compare_value_sort_entries(
+                                storage,
+                                job,
+                                &left[8..],
+                                &right[8..],
+                            )?
                             .then_with(|| {
                                 u64::from_le_bytes(left[..8].try_into().unwrap())
                                     .cmp(&u64::from_le_bytes(right[..8].try_into().unwrap()))
                             });
-                    !order.is_gt()
+                            !order.is_gt()
+                        }
+                        (None, None) => return Ok(true),
+                    };
+                    let row = if choose_left {
+                        self.value_sort_reader
+                            .prefixed_row()
+                            .expect("chosen left row")
+                    } else {
+                        &self.value_entry[..right_len]
+                    };
+                    self.value_base_entry[..row.len()].copy_from_slice(row);
+                    pending = Some((choose_left, row.len()));
                 }
-                (None, None) => break,
-            };
-            if choose_left {
-                let row = self
-                    .value_sort_reader
-                    .prefixed_row()
-                    .expect("chosen left row");
-                self.slice_writer
-                    .append(&mut self.block_output, output, row)
-                    .map_err(sst_to_sql)?;
-                self.value_sort_reader
-                    .advance(&mut *self.blocks.lock().expect("block store lock poisoned"))?;
-            } else {
+                let (choose_left, len) = pending.expect("staged merge row");
+                if choose_left {
+                    self.value_sort_reader
+                        .advance(&mut *self.blocks.lock().expect("block store lock poisoned"))?;
+                } else {
+                    right_len = right_cursor
+                        .next_copy(
+                            &mut *self.blocks.lock().expect("block store lock poisoned"),
+                            index,
+                            data,
+                            bounce,
+                            &mut self.value_entry,
+                        )
+                        .map_err(sst_to_sql)?
+                        .map_or(0, |(_, len)| len);
+                }
                 self.slice_writer
                     .append(
                         &mut self.block_output,
                         output,
-                        &self.value_entry[..right_len],
+                        &self.value_base_entry[..len],
                     )
                     .map_err(sst_to_sql)?;
-                right_len = right_cursor
-                    .next_copy(
-                        &mut *self.blocks.lock().expect("block store lock poisoned"),
-                        index,
-                        data,
-                        bounce,
-                        &mut self.value_entry,
-                    )
-                    .map_err(sst_to_sql)?
-                    .map_or(0, |(_, length)| length);
+                pending = None;
+                processed += 1;
+                output += 1;
+                let io = self
+                    .blocks
+                    .lock()
+                    .expect("block store lock poisoned")
+                    .io_stats()
+                    .saturating_sub(before);
+                if processed >= VALUE_INDEX_WRITE_BEAT_ENTRIES
+                    || !self.block_output.is_empty()
+                    || io.object_gets >= VALUE_INDEX_SCHEDULE_BEAT_READS
+                {
+                    return Ok(false);
+                }
             }
-            processed += 1;
-            output += 1;
-            let io = self
-                .blocks
-                .lock()
-                .expect("block store lock poisoned")
-                .io_stats()
-                .saturating_sub(before);
-            if processed >= VALUE_INDEX_WRITE_BEAT_ENTRIES
-                || !self.block_output.is_empty()
-                || io.object_gets >= VALUE_INDEX_SCHEDULE_BEAT_READS
-            {
-                right_cursor.detach_buffer();
-                job.phase = ValueSchedulePhase::Merge {
-                    destination,
-                    right_cursor,
-                    right_len,
-                    rows,
-                    output,
-                };
-                return Ok(());
-            }
+        })();
+        right_cursor.detach_buffer();
+        job.phase = ValueSchedulePhase::Merge {
+            destination,
+            right_cursor,
+            right_len,
+            rows,
+            output,
+            pending,
+        };
+        if !result? {
+            return Ok(());
         }
         if !self.block_output.is_empty()
             || self
@@ -14804,14 +14884,6 @@ impl Checkpointer {
                 .object_gets
                 != 0
         {
-            right_cursor.detach_buffer();
-            job.phase = ValueSchedulePhase::Merge {
-                destination,
-                right_cursor,
-                right_len,
-                rows,
-                output,
-            };
             return Ok(());
         }
         let handle = self
@@ -14851,7 +14923,7 @@ impl Checkpointer {
         Some(match accumulator {
             Some(run) => ValueIndexSource::External {
                 run,
-                started: false,
+                state: ValueRunState::Unstarted,
             },
             None => ValueIndexSource::InMemory {
                 rows: 0,
@@ -14903,12 +14975,27 @@ impl Checkpointer {
             .take()
             .expect("checked by checkpoint scheduler");
         if !Self::value_schedule_job_is_current(storage, &job) {
+            self.maintenance_read_wait = None;
+            self.cancel_read_owner(MAINTENANCE_READ_OWNER);
             self.slice_writer.reset();
             self.source_cursor.reset();
             self.roster_scratch.clear();
             self.value_changed_rowids.clear();
             return Ok(());
         }
+        if self.maintenance_read_wait.is_some()
+            && !self.maintenance_reads_ready()
+            && self
+                .blocks
+                .lock()
+                .expect("block store lock poisoned")
+                .async_gets_enabled()
+        {
+            self.value_schedule_job = Some(job);
+            return Ok(());
+        }
+        self.maintenance_read_wait = None;
+        let _read_owner = MaintenanceReadScope::enter(&self.blocks);
         #[cfg(feature = "checkpoint-profile")]
         let started = checkpoint_profile_start();
         let before = self
@@ -14916,7 +15003,7 @@ impl Checkpointer {
             .lock()
             .expect("block store lock poisoned")
             .io_stats();
-        let phase = core::mem::replace(&mut job.phase, ValueSchedulePhase::Collect);
+        let phase = job.phase;
         let result = match phase {
             ValueSchedulePhase::Collect => self.value_collect_beat(storage, &mut job),
             ValueSchedulePhase::WriteChunk { position } => self
@@ -14929,23 +15016,9 @@ impl Checkpointer {
             } => self
                 .start_value_merge(&mut job, left, right, destination)
                 .map(|()| None),
-            ValueSchedulePhase::Merge {
-                destination,
-                right_cursor,
-                right_len,
-                rows,
-                output,
-            } => self
-                .value_merge_beat(
-                    storage,
-                    &mut job,
-                    destination,
-                    right_cursor,
-                    right_len,
-                    rows,
-                    output,
-                    before,
-                )
+            ValueSchedulePhase::LoadMerge { .. } => self.load_value_merge(&mut job).map(|()| None),
+            ValueSchedulePhase::Merge { .. } => self
+                .value_merge_beat(storage, &mut job, before)
                 .map(|()| None),
             ValueSchedulePhase::Finish { accumulator, level } => {
                 Ok(self.value_finish_beat(&mut job, accumulator, level))
@@ -14967,8 +15040,25 @@ impl Checkpointer {
                 .io_stats(),
             0,
         );
+        if result
+            .as_ref()
+            .is_err_and(|error| error.sqlstate == sqlstate::INTERNAL_IO_WAIT)
+        {
+            self.maintenance_read_wait = Some(MaintenanceReadWait {
+                producer: PhysicalOutputOwner::IndexSchedule,
+                generation: self.read_capacity_generation(),
+            });
+            self.value_schedule_job = Some(job);
+            return Ok(());
+        }
+        if result.is_err() {
+            self.cancel_read_owner(MAINTENANCE_READ_OWNER);
+        }
         match result {
-            Ok(Some(source)) => self.finish_value_schedule(job, source),
+            Ok(Some(source)) => {
+                self.cancel_read_owner(MAINTENANCE_READ_OWNER);
+                self.finish_value_schedule(job, source);
+            }
             Ok(None) => self.value_schedule_job = Some(job),
             Err(error) => {
                 self.block_output
@@ -15023,7 +15113,7 @@ impl Checkpointer {
         job.previous_posting = None;
         match &mut job.source {
             ValueIndexSource::InMemory { position, .. } => *position = 0,
-            ValueIndexSource::External { started, .. } => *started = false,
+            ValueIndexSource::External { state, .. } => *state = ValueRunState::Unstarted,
         }
         job.base_len = 0;
         job.base_done = job.base.is_none();
@@ -15039,11 +15129,26 @@ impl Checkpointer {
         self.claim_physical_output(PhysicalOutputOwner::Index)?;
         let mut job = self.value_job.take().expect("checked by caller");
         if !Self::value_job_is_current(storage, &job) {
+            self.maintenance_read_wait = None;
+            self.cancel_read_owner(MAINTENANCE_READ_OWNER);
             self.value_writer.reset();
             self.roster_scratch.clear();
             self.value_changed_rowids.clear();
             return Ok(());
         }
+        if self.maintenance_read_wait.is_some()
+            && !self.maintenance_reads_ready()
+            && self
+                .blocks
+                .lock()
+                .expect("block store lock poisoned")
+                .async_gets_enabled()
+        {
+            self.value_job = Some(job);
+            return Ok(());
+        }
+        self.maintenance_read_wait = None;
+        let _read_owner = MaintenanceReadScope::enter(&self.blocks);
         #[cfg(feature = "checkpoint-profile")]
         let started = checkpoint_profile_start();
         let before = self
@@ -15065,8 +15170,23 @@ impl Checkpointer {
                 .io_stats(),
             0,
         );
+        if result
+            .as_ref()
+            .is_err_and(|error| error.sqlstate == sqlstate::INTERNAL_IO_WAIT)
+        {
+            self.maintenance_read_wait = Some(MaintenanceReadWait {
+                producer: PhysicalOutputOwner::Index,
+                generation: self.read_capacity_generation(),
+            });
+            self.value_job = Some(job);
+            return Ok(());
+        }
+        if result.is_err() {
+            self.cancel_read_owner(MAINTENANCE_READ_OWNER);
+        }
         match result {
             Ok(Some(handle)) => {
+                self.cancel_read_owner(MAINTENANCE_READ_OWNER);
                 if self.pending_value_installs.len() == self.pending_value_installs.capacity() {
                     self.reset_value_index_output(&mut job);
                     self.value_job = Some(job);
@@ -15113,17 +15233,22 @@ impl Checkpointer {
         if let ValueIndexPhase::Finish(handle) = job.phase {
             return Ok(Some(handle));
         }
-        if let ValueIndexSource::External { run, started } = &mut job.source
-            && !*started
-        {
-            self.value_sort_reader.start(
-                &mut *self.blocks.lock().expect("block store lock poisoned"),
-                *run,
-            )?;
-            *started = true;
-        }
         let mut processed = 0usize;
         loop {
+            if let ValueIndexSource::External { run, state } = &mut job.source {
+                if *state == ValueRunState::Unstarted {
+                    self.value_sort_reader.prepare(*run);
+                    *state = ValueRunState::Loading;
+                }
+                if matches!(
+                    *state,
+                    ValueRunState::Loading | ValueRunState::AdvancePending
+                ) {
+                    self.value_sort_reader
+                        .advance(&mut *self.blocks.lock().expect("block store lock poisoned"))?;
+                    *state = ValueRunState::Ready;
+                }
+            }
             let delta_len = match &job.source {
                 ValueIndexSource::InMemory { rows, position } if position < rows => {
                     let row = self.value_sort_rows[*position];
@@ -15318,9 +15443,9 @@ impl Checkpointer {
             } else {
                 match &mut job.source {
                     ValueIndexSource::InMemory { position, .. } => *position += 1,
-                    ValueIndexSource::External { .. } => self
-                        .value_sort_reader
-                        .advance(&mut *self.blocks.lock().expect("block store lock poisoned"))?,
+                    ValueIndexSource::External { state, .. } => {
+                        *state = ValueRunState::AdvancePending;
+                    }
                 }
             }
             processed += 1;

@@ -518,7 +518,11 @@ impl CursorPool {
                 slot.position = 0;
             }
             FetchMotion::Absolute(k) => {
-                let target = if k >= 0 { i64::from(k) } else { n + 1 + i64::from(k) };
+                let target = if k >= 0 {
+                    i64::from(k)
+                } else {
+                    n + 1 + i64::from(k)
+                };
                 slot.position = target.clamp(0, n + 1);
                 push_row(slot.position, out_rows);
             }

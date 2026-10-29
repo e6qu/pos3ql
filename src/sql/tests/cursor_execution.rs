@@ -185,8 +185,10 @@ fn cursor_motion_counts_match_postgresql_integer_grammar() {
     let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
     let mut rows = Vec::new();
     let mut errors = Vec::new();
-    for sql in include_str!("../../../tests/external/differential_exact/37_cursor_motion_counts.sql")
-        .split(';').filter(|sql| !sql.trim().is_empty())
+    for sql in
+        include_str!("../../../tests/external/differential_exact/37_cursor_motion_counts.sql")
+            .split(';')
+            .filter(|sql| !sql.trim().is_empty())
     {
         let output = session.execute(&mut engine, sql, true);
         rows.extend(data_rows(&output));

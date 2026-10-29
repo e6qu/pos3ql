@@ -713,7 +713,18 @@ enum ValueIndexStreamState {
     RosterCollect(Option<BlockId>),
     RosterBlocks(usize),
     Navigation,
+    Data {
+        id: BlockId,
+        covering: bool,
+        source: ValueIndexDataSource,
+    },
     Done,
+}
+
+#[derive(Clone, Copy)]
+enum ValueIndexDataSource {
+    Roster { remaining: usize },
+    Navigation { entries: u64 },
 }
 
 /// Restartable ordered walk over one immutable value-index generation.
@@ -905,13 +916,13 @@ impl ValueIndexStream {
                     if max_gets == 0 {
                         return Ok(ValueIndexStreamStep::Pending);
                     }
-                    *position -= 1;
-                    let (id, covering) = self.blocks[*position];
-                    self.load_data(store, id, covering, None)?;
-                    if self.data_len == 0 {
-                        return Err(ValueIndexError::Corrupt);
-                    }
-                    return self.copy_entry(output).map(ValueIndexStreamStep::Entry);
+                    let remaining = *position - 1;
+                    let (id, covering) = self.blocks[remaining];
+                    self.state = ValueIndexStreamState::Data {
+                        id,
+                        covering,
+                        source: ValueIndexDataSource::Roster { remaining },
+                    };
                 }
                 ValueIndexStreamState::Navigation => {
                     if max_gets == 0 {
@@ -933,13 +944,40 @@ impl ValueIndexStream {
                             return Ok(ValueIndexStreamStep::Done);
                         }
                         NavigationCursorStep::Leaf(id, entries, covering) => {
-                            self.load_data(store, id, covering, Some(entries))?;
-                            if self.data_len == 0 {
-                                return Err(ValueIndexError::Corrupt);
-                            }
-                            return self.copy_entry(output).map(ValueIndexStreamStep::Entry);
+                            self.state = ValueIndexStreamState::Data {
+                                id,
+                                covering,
+                                source: ValueIndexDataSource::Navigation { entries },
+                            };
                         }
                     }
+                }
+                ValueIndexStreamState::Data {
+                    id,
+                    covering,
+                    source,
+                } => {
+                    if max_gets == 0 {
+                        return Ok(ValueIndexStreamStep::Pending);
+                    }
+                    let (id, covering, source) = (*id, *covering, *source);
+                    let expected = match source {
+                        ValueIndexDataSource::Roster { .. } => None,
+                        ValueIndexDataSource::Navigation { entries } => Some(entries),
+                    };
+                    self.load_data(store, id, covering, expected)?;
+                    if self.data_len == 0 {
+                        return Err(ValueIndexError::Corrupt);
+                    }
+                    self.state = match source {
+                        ValueIndexDataSource::Roster { remaining } => {
+                            ValueIndexStreamState::RosterBlocks(remaining)
+                        }
+                        ValueIndexDataSource::Navigation { .. } => {
+                            ValueIndexStreamState::Navigation
+                        }
+                    };
+                    return self.copy_entry(output).map(ValueIndexStreamStep::Entry);
                 }
                 ValueIndexStreamState::Done => return Ok(ValueIndexStreamStep::Done),
             }
@@ -1982,6 +2020,154 @@ mod tests {
                 .unwrap_err(),
             ValueIndexError::Corrupt
         );
+    }
+
+    #[test]
+    fn checkpoint_reads_value_stream_keeps_each_pending_data_block() {
+        struct WaitingStore {
+            inner: super::super::MemoryBlockStore,
+            pending: Option<BlockId>,
+            requests: usize,
+            completed: usize,
+        }
+        impl BlockStore for WaitingStore {
+            fn put(
+                &mut self,
+                bytes: &[u8],
+                kind: BlockType,
+                lsn: u64,
+            ) -> Result<BlockId, StoreError> {
+                self.inner.put(bytes, kind, lsn)
+            }
+            fn get(
+                &mut self,
+                id: &BlockId,
+                into: &mut [u8],
+            ) -> Result<(usize, BlockType), StoreError> {
+                self.requests += 1;
+                if self.pending == Some(*id) {
+                    self.pending = None;
+                    let result = self.inner.get(id, into)?;
+                    self.completed += 1;
+                    Ok(result)
+                } else {
+                    self.pending = Some(*id);
+                    into.fill(0xee);
+                    Err(StoreError::NotReady)
+                }
+            }
+        }
+        for navigation in [false, true] {
+            for covering in [false, true] {
+                let mut budget = Budget::new(16 << 20);
+                let mut inner = super::super::MemoryBlockStore::new(
+                    &mut budget,
+                    "retained value stream",
+                    8 << 20,
+                    2048,
+                )
+                .unwrap();
+                let mut writer = ValueIndexWriter::new();
+                if navigation {
+                    writer.reset_navigation(0, NavigationKind::Spatial, covering);
+                }
+                let mut key = [b'k'; 512];
+                let payload = [b'p'; 64];
+                for rowid in 1u64..=1024 {
+                    key[..8].copy_from_slice(&rowid.to_be_bytes());
+                    if navigation {
+                        writer
+                            .append_navigation(
+                                &mut inner,
+                                (rowid, rowid, 7),
+                                &key,
+                                covering.then_some(payload.as_slice()),
+                                SpatialBounds::new(rowid as f64, 0.0, rowid as f64, 0.0),
+                                &mut |left, right| left.cmp(right),
+                            )
+                            .unwrap();
+                    } else if covering {
+                        writer
+                            .append_covering(
+                                &mut inner,
+                                (rowid, rowid, 7),
+                                &key,
+                                &payload,
+                                &mut |left, right| left.cmp(right),
+                            )
+                            .unwrap();
+                    } else {
+                        writer
+                            .append(&mut inner, rowid, rowid, 7, &key, &mut |left, right| {
+                                left.cmp(right)
+                            })
+                            .unwrap();
+                    }
+                }
+                let handle = writer.finish(&mut inner, 8).unwrap().unwrap();
+                let mut store = WaitingStore {
+                    inner,
+                    pending: None,
+                    requests: 0,
+                    completed: 0,
+                };
+                let mut stream = ValueIndexStream::new(64);
+                stream.reset(handle, navigation);
+                let mut output = vec![0; MAX_PAYLOAD];
+                crate::mem::guard::forbid_alloc(|| {
+                    let mut expected = 1u64;
+                    let mut done = false;
+                    for _ in 0..4096 {
+                        output.fill(0xcc);
+                        match stream.next_copy(&mut store, 1, &mut output) {
+                            Ok(ValueIndexStreamStep::Pending)
+                            | Err(ValueIndexError::Store(StoreError::NotReady)) => {}
+                            Ok(ValueIndexStreamStep::Entry(len)) => {
+                                assert_eq!(
+                                    u64::from_le_bytes(output[..8].try_into().unwrap()),
+                                    expected
+                                );
+                                assert_eq!(
+                                    u64::from_le_bytes(output[8..16].try_into().unwrap()),
+                                    expected
+                                );
+                                assert_eq!(
+                                    u64::from_le_bytes(output[16..24].try_into().unwrap()),
+                                    7
+                                );
+                                assert_eq!(
+                                    u32::from_le_bytes(output[24..28].try_into().unwrap()),
+                                    key.len() as u32
+                                );
+                                assert_eq!(
+                                    u32::from_le_bytes(output[28..32].try_into().unwrap()),
+                                    if covering { 64 } else { 0 }
+                                );
+                                assert_eq!(
+                                    u64::from_be_bytes(output[32..40].try_into().unwrap()),
+                                    expected
+                                );
+                                assert!(output[40..544].iter().all(|&byte| byte == b'k'));
+                                assert_eq!(len, 544 + if covering { 64 } else { 0 });
+                                if covering {
+                                    assert_eq!(&output[544..len], payload);
+                                }
+                                expected += 1;
+                            }
+                            Ok(ValueIndexStreamStep::Done) => {
+                                done = true;
+                                break;
+                            }
+                            Err(error) => panic!("value stream failed: {error:?}"),
+                        }
+                    }
+                    assert!(done, "every waited-for block must retain its position");
+                    assert_eq!(expected, 1025);
+                    assert!(store.completed > 1);
+                    assert_eq!(store.requests, 2 * store.completed);
+                });
+            }
+        }
     }
 
     #[test]

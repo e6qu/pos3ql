@@ -32,6 +32,18 @@ SET DateStyle = 'German';
 SET TimeZone = 'UTC';
 FETCH NEXT FROM rendering;
 CLOSE rendering;
+CREATE FUNCTION fetch_typed_cursor_date() RETURNS date LANGUAGE plpgsql AS $$
+DECLARE c refcursor; d date;
+BEGIN
+  OPEN c FOR SELECT DATE '2020-01-02';
+  SET DateStyle = 'SQL, DMY';
+  FETCH NEXT FROM c INTO d;
+  CLOSE c;
+  RESET DateStyle;
+  RETURN d;
+END $$;
+SELECT fetch_typed_cursor_date() = DATE '2020-01-02';
+DROP FUNCTION fetch_typed_cursor_date();
 SET DateStyle = 'ISO, MDY';
 SET bytea_output = 'hex';
 SET extra_float_digits = 3;

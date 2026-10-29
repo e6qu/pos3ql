@@ -191,6 +191,30 @@ fn write_wire_text(
             b'0' + (byte & 7),
         ]),
         Datum::Xml(text) => crate::sql::xml::write_output(text, |part| out(part.as_bytes())),
+        Datum::Bytea(bytes) => {
+            if render.bytea_escape {
+                for byte in *bytes {
+                    match byte {
+                        b'\\' => out(b"\\\\"),
+                        0x20..=0x7e => out(&[*byte]),
+                        _ => out(&[b'\\', b'0' + (byte >> 6), b'0' + ((byte >> 3) & 7), b'0' + (byte & 7)]),
+                    }
+                }
+            } else {
+                out(b"\\x");
+                const HEX: &[u8; 16] = b"0123456789abcdef";
+                for byte in *bytes {
+                    out(&[HEX[(byte >> 4) as usize], HEX[(byte & 15) as usize]]);
+                }
+            }
+        }
+        Datum::Date(date) => out(crate::sql::datetime::format_date_styled(*date, render.datestyle).as_str().as_bytes()),
+        Datum::Timestamp(timestamp) | Datum::Timestamptz(timestamp) => out(
+            crate::sql::datetime::format_timestamp_styled(*timestamp,
+                matches!(value, Datum::Timestamptz(_)), render.datestyle, render.parsed_timezone)
+                .as_str().as_bytes()),
+        Datum::Interval(interval) => out(crate::sql::datetime::format_interval_styled(
+            *interval, render.intervalstyle).as_str().as_bytes()),
         Datum::Float4(value) => {
             use core::fmt::Write as _;
             let _ = write!(
@@ -1085,176 +1109,16 @@ impl<'b> Responder<'b> {
     }
 
     pub(crate) fn encode_value_text(
-        m: &mut MsgOut,
-        v: &Datum,
+        message: &mut MsgOut,
+        value: &Datum,
         render: crate::sql::guc::RenderContext,
     ) {
-        {
-            match v {
-                Datum::Null => {
-                    m.i32(-1);
-                }
-                Datum::Text(s)
-                | Datum::Bpchar(s)
-                | Datum::Regtype { name: s, .. }
-                | Datum::RegObject { name: s, .. } => {
-                    m.i32(s.len() as i32);
-                    m.bytes(s.as_bytes());
-                }
-                Datum::Char(byte) => {
-                    let length = match byte {
-                        0 => 0,
-                        0x20..=0x7e => 1,
-                        _ => 4,
-                    };
-                    m.i32(length);
-                    match byte {
-                        0 => {}
-                        0x20..=0x7e => {
-                            m.u8(*byte);
-                        }
-                        _ => {
-                            m.bytes(&[
-                                b'\\',
-                                b'0' + (byte >> 6),
-                                b'0' + ((byte >> 3) & 7),
-                                b'0' + (byte & 7),
-                            ]);
-                        }
-                    }
-                }
-                Datum::Xml(_) => {
-                    m.field(|m| {
-                        write_wire_text(v, render, &mut |bytes| {
-                            m.bytes(bytes);
-                        })
-                    });
-                }
-                Datum::Array { .. } | Datum::Record(_) | Datum::Composite { .. } => {
-                    m.field(|m| {
-                        write_wire_text(v, render, &mut |bytes| {
-                            m.bytes(bytes);
-                        })
-                    });
-                }
-                Datum::Bytea(b) => {
-                    if render.bytea_escape {
-                        // bytea_output = escape: printable ASCII verbatim,
-                        // backslash doubled, everything else \nnn octal.
-                        let escaped_len: usize = b
-                            .iter()
-                            .map(|&byte| match byte {
-                                b'\\' => 2,
-                                0x20..=0x7e => 1,
-                                _ => 4,
-                            })
-                            .sum();
-                        m.i32(escaped_len as i32);
-                        for &byte in *b {
-                            match byte {
-                                b'\\' => {
-                                    m.bytes(b"\\\\");
-                                }
-                                0x20..=0x7e => {
-                                    m.bytes(&[byte]);
-                                }
-                                _ => {
-                                    m.bytes(&[
-                                        b'\\',
-                                        b'0' + (byte >> 6),
-                                        b'0' + ((byte >> 3) & 7),
-                                        b'0' + (byte & 7),
-                                    ]);
-                                }
-                            }
-                        }
-                    } else {
-                        // \x hex, streamed straight into the send buffer.
-                        m.i32((2 + b.len() * 2) as i32);
-                        m.bytes(b"\\x");
-                        const HEX: &[u8; 16] = b"0123456789abcdef";
-                        for byte in *b {
-                            m.bytes(&[HEX[(byte >> 4) as usize], HEX[(byte & 0xf) as usize]]);
-                        }
-                    }
-                }
-                Datum::Numeric(nm) => {
-                    // Numeric text can be long (up to MAX_NDIGITS*4 digits);
-                    // render into a bounded stack buffer.
-                    let text = stack_format!(4200, "{}", nm);
-                    debug_assert!(!text.is_truncated());
-                    m.i32(text.as_str().len() as i32);
-                    m.bytes(text.as_str().as_bytes());
-                }
-                Datum::Float4(value) => {
-                    let text = stack_format!(
-                        32,
-                        "{}",
-                        crate::sql::types::PgFloat4Rendered(*value, render.extra_float_digits,)
-                    );
-                    m.i32(text.len() as i32);
-                    m.bytes(text.as_str().as_bytes());
-                }
-                Datum::Float8(value) => {
-                    let text = stack_format!(
-                        32,
-                        "{}",
-                        crate::sql::types::PgFloat8Rendered(*value, render.extra_float_digits,)
-                    );
-                    m.i32(text.len() as i32);
-                    m.bytes(text.as_str().as_bytes());
-                }
-                // Date/time output honors the session DateStyle and time zone.
-                Datum::Date(d) => {
-                    let text = crate::sql::datetime::format_date_styled(*d, render.datestyle);
-                    m.i32(text.as_str().len() as i32);
-                    m.bytes(text.as_str().as_bytes());
-                }
-                Datum::Timestamp(t) | Datum::Timestamptz(t) => {
-                    let with_timezone = matches!(v, Datum::Timestamptz(_));
-                    let text = crate::sql::datetime::format_timestamp_styled(
-                        *t,
-                        with_timezone,
-                        render.datestyle,
-                        render.parsed_timezone,
-                    );
-                    m.i32(text.as_str().len() as i32);
-                    m.bytes(text.as_str().as_bytes());
-                }
-                Datum::Interval(interval) => {
-                    let text = crate::sql::datetime::format_interval_styled(
-                        *interval,
-                        render.intervalstyle,
-                    );
-                    m.i32(text.as_str().len() as i32);
-                    m.bytes(text.as_str().as_bytes());
-                }
-                // Records, JSON, ranges, multiranges, bit strings — anything
-                // whose text can be arbitrarily wide: count the length, emit it,
-                // then stream Display straight to the send buffer (no fixed-size
-                // scratch that would silently truncate a long value).
-                other => {
-                    use core::fmt::Write as _;
-                    struct Counter(usize);
-                    impl core::fmt::Write for Counter {
-                        fn write_str(&mut self, s: &str) -> core::fmt::Result {
-                            self.0 += s.len();
-                            Ok(())
-                        }
-                    }
-                    struct MsgWriter<'w, 'b>(&'w mut MsgOut<'b>);
-                    impl core::fmt::Write for MsgWriter<'_, '_> {
-                        fn write_str(&mut self, s: &str) -> core::fmt::Result {
-                            self.0.bytes(s.as_bytes());
-                            Ok(())
-                        }
-                    }
-                    let mut counter = Counter(0);
-                    let _ = write!(counter, "{other}");
-                    m.i32(counter.0 as i32);
-                    let _ = write!(MsgWriter(m), "{other}");
-                }
-            }
+        if value.is_null() {
+            message.i32(-1);
+        } else {
+            message.field(|message| write_wire_text(value, render, &mut |bytes| {
+                message.bytes(bytes);
+            }));
         }
     }
 
@@ -1279,120 +1143,22 @@ impl<'b> Responder<'b> {
             Datum::Null => return Ok(None),
             Datum::PgNodeTree(node) => node.as_str().as_bytes(),
             Datum::PgDdlCommand => {
-                return Err(crate::sql_err!(
-                    sqlstate::FEATURE_NOT_SUPPORTED,
-                    "cannot display a value of type pg_ddl_command"
-                ));
+                return Err(crate::sql_err!(sqlstate::FEATURE_NOT_SUPPORTED,
+                    "cannot display a value of type pg_ddl_command"));
             }
-            Datum::Char(0) => &[],
-            Datum::Char(byte @ 0x20..=0x7e) => {
-                arena.alloc_slice_copy(&[*byte]).map_err(|_| full())?
-            }
-            Datum::Char(byte) => arena
-                .alloc_slice_copy(&[
-                    b'\\',
-                    b'0' + (byte >> 6),
-                    b'0' + ((byte >> 3) & 7),
-                    b'0' + (byte & 7),
-                ])
-                .map_err(|_| full())?,
-            Datum::Array { .. } | Datum::Record(_) | Datum::Composite { .. } => {
-                let len = wire_text_len(v, render);
-                let bytes = arena.alloc_slice_with(len, |_| 0u8).map_err(|_| full())?;
-                let mut at = 0;
-                write_wire_text(v, render, &mut |part| {
+            Datum::Text(text) | Datum::Bpchar(text)
+            | Datum::Regtype { name: text, .. } | Datum::RegObject { name: text, .. } => text.as_bytes(),
+            value => {
+                let length = wire_text_len(value, render);
+                let bytes = arena.alloc_slice_with(length, |_| 0u8).map_err(|_| full())?;
+                let mut at = 0usize;
+                write_wire_text(value, render, &mut |part| {
                     bytes[at..at + part.len()].copy_from_slice(part);
                     at += part.len();
                 });
+                debug_assert_eq!(at, length);
                 &*bytes
             }
-            Datum::Xml(_) => {
-                let len = wire_text_len(v, render);
-                let bytes = arena.alloc_slice_with(len, |_| 0u8).map_err(|_| full())?;
-                let mut at = 0;
-                write_wire_text(v, render, &mut |part| {
-                    bytes[at..at + part.len()].copy_from_slice(part);
-                    at += part.len();
-                });
-                &*bytes
-            }
-            Datum::Text(s) | Datum::Bpchar(s) => s.as_bytes(),
-            Datum::Bytea(b) if render.bytea_escape => {
-                let escaped_len: usize = b
-                    .iter()
-                    .map(|&byte| match byte {
-                        b'\\' => 2,
-                        0x20..=0x7e => 1,
-                        _ => 4,
-                    })
-                    .sum();
-                let out = arena
-                    .alloc_slice_with(escaped_len, |_| 0u8)
-                    .map_err(|_| full())?;
-                let mut at = 0;
-                for &byte in b.iter() {
-                    match byte {
-                        b'\\' => {
-                            out[at..at + 2].copy_from_slice(b"\\\\");
-                            at += 2;
-                        }
-                        0x20..=0x7e => {
-                            out[at] = byte;
-                            at += 1;
-                        }
-                        _ => {
-                            out[at] = b'\\';
-                            out[at + 1] = b'0' + (byte >> 6);
-                            out[at + 2] = b'0' + ((byte >> 3) & 7);
-                            out[at + 3] = b'0' + (byte & 7);
-                            at += 4;
-                        }
-                    }
-                }
-                &*out
-            }
-            Datum::Date(d) => arena
-                .alloc_str(crate::sql::datetime::format_date_styled(*d, render.datestyle).as_str())
-                .map_err(|_| full())?
-                .as_bytes(),
-            Datum::Timestamp(t) | Datum::Timestamptz(t) => {
-                let with_timezone = matches!(v, Datum::Timestamptz(_));
-                let text = crate::sql::datetime::format_timestamp_styled(
-                    *t,
-                    with_timezone,
-                    render.datestyle,
-                    render.parsed_timezone,
-                );
-                arena
-                    .alloc_str(text.as_str())
-                    .map_err(|_| full())?
-                    .as_bytes()
-            }
-            Datum::Interval(interval) => arena
-                .alloc_str(
-                    crate::sql::datetime::format_interval_styled(*interval, render.intervalstyle)
-                        .as_str(),
-                )
-                .map_err(|_| full())?
-                .as_bytes(),
-            Datum::Float4(value) => arena
-                .alloc_str_display(crate::sql::types::PgFloat4Rendered(
-                    *value,
-                    render.extra_float_digits,
-                ))
-                .map_err(|_| full())?
-                .as_bytes(),
-            Datum::Float8(value) => arena
-                .alloc_str_display(crate::sql::types::PgFloat8Rendered(
-                    *value,
-                    render.extra_float_digits,
-                ))
-                .map_err(|_| full())?
-                .as_bytes(),
-            other => arena
-                .alloc_str_display(other)
-                .map_err(|_| full())?
-                .as_bytes(),
         }))
     }
 

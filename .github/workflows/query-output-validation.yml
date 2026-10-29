@@ -30,7 +30,7 @@ jobs:
       - run: cargo fmt --check
       - run: >-
           cargo test --lib --locked -- cursor_declaration_ query_row_cursor_ arena_retained_slices_ query_reads_held_ checkpoint_reads_held_
-          captured_resident_byte_scans_ retained_checkpoint_ store::sst::tests::
+          captured_resident_byte_scans_ retained_checkpoint_ store::sst::tests:: pg::respond::tests:: procedural_static_utility_
           --nocapture --test-threads=1
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --lib --locked cursor -- --nocapture --test-threads=1
@@ -85,12 +85,19 @@ jobs:
           key: ${{ runner.os }}-cargo-query-output-binary-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
       - run: cargo build --bin pos3ql --locked
+      - name: Install PostgreSQL extension fixtures
+        env:
+          POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
+        run: |
+          docker exec "$POSTGRES_CONTAINER" mkdir -p /tmp/pos3ql-extensions
+          docker cp tests/external/extensions/. "$POSTGRES_CONTAINER":/tmp/pos3ql-extensions/
       - name: Compare exact SQL behavior with PostgreSQL
         env:
           POS3QL_VENV: venv
           PGHOST: 127.0.0.1
           PGPORT: 5432
           PGUSER: postgres
+          POS3QL_REFERENCE_EXTENSION_CONTROL_PATH: /tmp/pos3ql-extensions
           RUN_CORE: "0"
           RUN_CORPUS: "0"
           RUN_AUX: "1"

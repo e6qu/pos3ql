@@ -1137,8 +1137,11 @@ pub(crate) fn decode_projected_row_into<'a>(
 ) -> Result<usize, SqlError> {
     let width = projected_row_width(bytes);
     if width > output.len() {
-        return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "projected row has more than {} columns", output.len()));
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "projected row has more than {} columns",
+            output.len()
+        ));
     }
     let mut at = 2usize;
     for value in &mut output[..width] {
@@ -1163,9 +1166,9 @@ fn restore_projected_record<'a>(
         return decode_record_tail(bytes, at + 4 + text_len, arena);
     }
     if tag == 202 {
-        let slot = crate::storage::TypeCreation::from_le_bytes(
-            bytes[at..at + 4].try_into().unwrap(),
-        ).expect("projected composite creation");
+        let slot =
+            crate::storage::TypeCreation::from_le_bytes(bytes[at..at + 4].try_into().unwrap())
+                .expect("projected composite creation");
         let text_len = u32::from_le_bytes(bytes[at + 4..at + 8].try_into().unwrap()) as usize;
         let Datum::Record(fields) = decode_record_tail(bytes, at + 8 + text_len, arena)? else {
             unreachable!()

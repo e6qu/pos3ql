@@ -719,8 +719,9 @@ pub(crate) use describe::{enter_bound_parameter_types, enter_routine_parameter_t
 
 mod projected;
 pub(crate) use projected::{
-    compare_projected_prefix, decode_projected_row_into, encode_projected_by_into, encode_projected_into,
-    encode_projected_persistent_pub, projected_row_len, projected_row_len_by, projected_row_width,
+    compare_projected_prefix, decode_projected_row_into, encode_projected_by_into,
+    encode_projected_into, encode_projected_persistent_pub, projected_row_len,
+    projected_row_len_by, projected_row_width,
 };
 pub use projected::{
     decode_projected_col_record, decode_projected_pub, decode_projected_value,
@@ -18945,9 +18946,11 @@ fn parse_trigger_statement<'a>(
     {
         return Ok(TriggerStatement::Dml(parse_trigger_dml(segment, arena)?));
     }
-    if ["create", "alter", "drop", "comment", "grant", "revoke", "set", "reset"]
-        .iter()
-        .any(|keyword| strip_trigger_keyword(segment, keyword).is_some())
+    if [
+        "create", "alter", "drop", "comment", "grant", "revoke", "set", "reset",
+    ]
+    .iter()
+    .any(|keyword| strip_trigger_keyword(segment, keyword).is_some())
     {
         use crate::sql::lexer::{Lexer, Tok};
         let mut lexer = Lexer::new(segment, arena);

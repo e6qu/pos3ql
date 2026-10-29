@@ -422,7 +422,7 @@ def test_aclitem_array_wire_identity():
         "WHERE attrelid = 'wire_acl_target'::regclass AND attname = 'visible'",
     )
     check(
-        "aclitem cursor: text-and-binary capture does not reject DECLARE",
+        "aclitem cursor: typed capture does not reject DECLARE",
         not any(kind == b"E" for kind, _ in declared),
         declared,
     )
@@ -595,7 +595,7 @@ def test_binary_cursor_fetches_binary_rows():
     out = simple_query(
         s,
         "BEGIN; DECLARE binary_probe BINARY CURSOR FOR SELECT 42::int4 AS answer; "
-        "FETCH ALL FROM binary_probe; COMMIT",
+        "FETCH ALL FROM binary_probe; SELECT 43::int4 AS ordinary; COMMIT",
     )
     description = next((payload for kind, payload in out if kind == b"T"), None)
     row = next((payload for kind, payload in out if kind == b"D"), None)
@@ -610,6 +610,15 @@ def test_binary_cursor_fetches_binary_rows():
         "binary cursor: FETCH returns network-order int4",
         row == b"\x00\x01\x00\x00\x00\x04\x00\x00\x00*",
         row,
+    )
+    descriptions = [payload for kind, payload in out if kind == b"T"]
+    rows = [payload for kind, payload in out if kind == b"D"]
+    check(
+        "binary cursor: later statements retain text output",
+        len(descriptions) == 2
+        and row_description_formats(descriptions[1]) == [0]
+        and rows == [row, b"\x00\x01\x00\x00\x00\x0243"],
+        out,
     )
     s.close()
 

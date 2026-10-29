@@ -133,9 +133,12 @@ fn cursor_binary_fetch_does_not_change_later_statement_formats() {
     let mut budget = test_engine_budget(&config, 1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
-    let output = session.success(&mut engine,
+    let output = session.success(
+        &mut engine,
         "BEGIN; DECLARE binary_values BINARY CURSOR FOR SELECT 17; \
-         FETCH NEXT FROM binary_values; SELECT 42; COMMIT", true);
+         FETCH NEXT FROM binary_values; SELECT 42; COMMIT",
+        true,
+    );
     let rows = data_rows(&output);
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0].as_bytes(), 17i32.to_be_bytes());
@@ -159,7 +162,11 @@ fn cursor_empty_select_lists_preserve_row_counts_and_required_target_lists() {
         let output = session.success(&mut engine, sql, true);
         assert_eq!(data_rows(&output), vec![""; count], "{sql}");
     }
-    session.success(&mut engine, "CREATE TABLE empty_returning_check(n integer)", true);
+    session.success(
+        &mut engine,
+        "CREATE TABLE empty_returning_check(n integer)",
+        true,
+    );
     for sql in [
         "SELECT DISTINCT",
         "SELECT DISTINCT ON (1)",

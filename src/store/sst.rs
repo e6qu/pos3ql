@@ -1170,6 +1170,11 @@ enum SstPointReadStage {
     #[default]
     Filter,
     Index,
+    Leaf {
+        id: BlockId,
+        lower: Option<SstKey>,
+        upper: Option<SstKey>,
+    },
     Data(Option<DataBlockRef>),
 }
 
@@ -1189,6 +1194,48 @@ pub(crate) struct SstReader<'a> {
     /// Scratch a range scan assembles a chained row into (a point lookup
     /// assembles straight into the caller's buffer instead).
     assembly: &'a mut [u8],
+    partial: &'a mut SstReadProgress,
+}
+
+/// Partial transfers belong to the buffers, independently of a borrowed reader.
+pub(crate) struct SstReadProgress {
+    source: Option<(RowSstFormat, DataBlockRef)>,
+    stage: SstDataReadStage,
+    pax: PaxDecodeProgress,
+    chain: ChainReadProgress,
+}
+
+#[derive(Clone, Copy)]
+enum SstDataReadStage {
+    Raw,
+    Columns { raw_len: usize },
+}
+
+#[derive(Clone, Copy)]
+enum SstRowLocation {
+    Tombstone,
+    Inline { offset: usize, len: usize },
+    Chain { len: usize },
+}
+
+impl SstReadProgress {
+    pub(crate) fn new() -> Self {
+        Self {
+            source: None,
+            stage: SstDataReadStage::Raw,
+            pax: PaxDecodeProgress::new(),
+            chain: ChainReadProgress::default(),
+        }
+    }
+
+    fn select(&mut self, format: RowSstFormat, reference: DataBlockRef) {
+        if self.source != Some((format, reference)) {
+            self.source = Some((format, reference));
+            self.stage = SstDataReadStage::Raw;
+            self.pax.clear();
+            self.chain = ChainReadProgress::default();
+        }
+    }
 }
 
 /// Allocation-free, suspendable traversal of one SST in key order.
@@ -2524,6 +2571,9 @@ impl<'a> SstReader<'a> {
         let assembly = arena
             .alloc_slice_with(MAX_ASSEMBLED, |_| 0u8)
             .map_err(|_| SstError::Store(StoreError::Unavailable))?;
+        let partial = arena
+            .alloc(SstReadProgress::new())
+            .map_err(|_| SstError::Store(StoreError::Unavailable))?;
         Ok(Self {
             index_scratch,
             data_scratch,
@@ -2535,6 +2585,7 @@ impl<'a> SstReader<'a> {
             loaded_format: None,
             decoded_len: 0,
             assembly,
+            partial,
         })
     }
 
@@ -2548,6 +2599,7 @@ impl<'a> SstReader<'a> {
         decoded: &'a mut [u8],
         column: &'a mut [u8],
         assembly: &'a mut [u8],
+        partial: &'a mut SstReadProgress,
     ) -> Self {
         Self {
             index_scratch: index,
@@ -2560,6 +2612,7 @@ impl<'a> SstReader<'a> {
             loaded_format: None,
             decoded_len: 0,
             assembly,
+            partial,
         }
     }
 
@@ -2579,8 +2632,21 @@ impl<'a> SstReader<'a> {
             return Ok(self.decoded_len);
         }
         self.invalidate_data_block();
-        let (raw_len, block_type) =
-            read_data_block_raw_ref(store, reference, self.data_scratch, self.assembly)?;
+        self.partial.select(format, reference);
+        let (raw_len, block_type) = match self.partial.stage {
+            SstDataReadStage::Raw => {
+                let result =
+                    read_data_block_raw_ref(store, reference, self.data_scratch, self.assembly)?;
+                if matches!(format, RowSstFormat::PackedPaxV3 | RowSstFormat::PackedV4)
+                    && result.1 == BlockType::SstDataPaxV2
+                {
+                    self.partial.pax.clear();
+                    self.partial.stage = SstDataReadStage::Columns { raw_len: result.0 };
+                }
+                result
+            }
+            SstDataReadStage::Columns { raw_len } => (raw_len, BlockType::SstDataPaxV2),
+        };
         let decoded_len = match (format, block_type) {
             (RowSstFormat::PackedPaxV3 | RowSstFormat::PackedV4, BlockType::SstDataPaxV2) => {
                 decode_pax_v2(
@@ -2589,7 +2655,7 @@ impl<'a> SstReader<'a> {
                     self.decoded_scratch,
                     self.column_scratch,
                     self.assembly,
-                    &mut PaxDecodeProgress::new(),
+                    &mut self.partial.pax,
                 )?
             }
             (
@@ -2609,6 +2675,8 @@ impl<'a> SstReader<'a> {
         self.loaded_ref = Some(reference);
         self.loaded_format = Some(format);
         self.decoded_len = decoded_len;
+        self.partial.source = None;
+        self.partial.stage = SstDataReadStage::Raw;
         Ok(decoded_len)
     }
 
@@ -2668,7 +2736,10 @@ impl<'a> SstReader<'a> {
             }
             self.point_read.stage = SstPointReadStage::Index;
         }
-        if matches!(self.point_read.stage, SstPointReadStage::Index) {
+        if matches!(
+            self.point_read.stage,
+            SstPointReadStage::Index | SstPointReadStage::Leaf { .. }
+        ) {
             let count = self.load_covering_leaf(store, handle, target)?;
             let reference = block_containing(
                 self.index_scratch,
@@ -2720,19 +2791,61 @@ impl<'a> SstReader<'a> {
         snapshot: u64,
         into: &mut [u8],
     ) -> Result<Option<SstProbe>, SstError> {
-        let result = self.get_at_inner(store, handle, rowid, snapshot, into);
-        self.finish_point_read(&result);
-        result
+        let Some((probe, location)) =
+            self.read_point_row(store, handle, rowid, snapshot, into.len())?
+        else {
+            return Ok(None);
+        };
+        let bytes = self.row_bytes(location);
+        into[..bytes.len()].copy_from_slice(bytes);
+        Ok(Some(probe))
     }
 
-    fn get_at_inner(
+    /// The row remains in startup-owned buffers until this reader is reused.
+    pub(crate) fn row_at(
         &mut self,
         store: &mut dyn BlockStore,
         handle: &SstHandle,
         rowid: u64,
         snapshot: u64,
-        into: &mut [u8],
-    ) -> Result<Option<SstProbe>, SstError> {
+    ) -> Result<Option<(SstProbe, &[u8])>, SstError> {
+        let Some((probe, location)) =
+            self.read_point_row(store, handle, rowid, snapshot, self.assembly.len())?
+        else {
+            return Ok(None);
+        };
+        Ok(Some((probe, self.row_bytes(location))))
+    }
+
+    fn row_bytes(&self, location: SstRowLocation) -> &[u8] {
+        match location {
+            SstRowLocation::Tombstone => &[],
+            SstRowLocation::Inline { offset, len } => &self.decoded_scratch[offset..offset + len],
+            SstRowLocation::Chain { len } => &self.assembly[..len],
+        }
+    }
+
+    fn read_point_row(
+        &mut self,
+        store: &mut dyn BlockStore,
+        handle: &SstHandle,
+        rowid: u64,
+        snapshot: u64,
+        capacity: usize,
+    ) -> Result<Option<(SstProbe, SstRowLocation)>, SstError> {
+        let result = self.read_point_row_inner(store, handle, rowid, snapshot, capacity);
+        self.finish_point_read(&result.map(|selected| selected.map(|(probe, _)| probe)));
+        result
+    }
+
+    fn read_point_row_inner(
+        &mut self,
+        store: &mut dyn BlockStore,
+        handle: &SstHandle,
+        rowid: u64,
+        snapshot: u64,
+        capacity: usize,
+    ) -> Result<Option<(SstProbe, SstRowLocation)>, SstError> {
         let Some(block_ref) = self.point_reference(store, handle, rowid, snapshot)? else {
             return Ok(None);
         };
@@ -2741,28 +2854,41 @@ impl<'a> SstReader<'a> {
         // so a linear scan of it is the read the sparse index traded for not
         // indexing every row.
         let data_len = self.load_data_block(store, handle.format, block_ref)?;
-        for entry in (DataBlock {
+        let mut entries = DataBlock {
             bytes: &self.decoded_scratch[..data_len],
-        }) {
+        };
+        while let Some(entry) = entries.next() {
             if entry.key.rowid == rowid && entry.key.commit_lsn <= snapshot {
                 if entry.tombstone {
-                    return Ok(Some(SstProbe {
-                        key: entry.key,
-                        len: None,
-                    }));
+                    return Ok(Some((
+                        SstProbe {
+                            key: entry.key,
+                            len: None,
+                        },
+                        SstRowLocation::Tombstone,
+                    )));
                 }
-                if entry.is_chained() {
-                    assemble_chain(store, &entry, into, &mut ChainReadProgress::default())?;
-                } else {
-                    if into.len() < entry.total_len {
-                        return Err(SstError::Store(StoreError::BufferTooSmall));
+                if capacity < entry.total_len {
+                    return Err(SstError::Store(StoreError::BufferTooSmall));
+                }
+                let location = if entry.is_chained() {
+                    assemble_chain(store, &entry, self.assembly, &mut self.partial.chain)?;
+                    SstRowLocation::Chain {
+                        len: entry.total_len,
                     }
-                    into[..entry.total_len].copy_from_slice(entry.head);
-                }
-                return Ok(Some(SstProbe {
-                    key: entry.key,
-                    len: Some(entry.total_len as u32),
-                }));
+                } else {
+                    SstRowLocation::Inline {
+                        offset: data_len - entries.bytes.len() - entry.total_len,
+                        len: entry.total_len,
+                    }
+                };
+                return Ok(Some((
+                    SstProbe {
+                        key: entry.key,
+                        len: Some(entry.total_len as u32),
+                    },
+                    location,
+                )));
             }
             if entry.key.rowid > rowid {
                 break;
@@ -3106,6 +3232,17 @@ impl<'a> SstReader<'a> {
         handle: &SstHandle,
         key: SstKey,
     ) -> Result<usize, SstError> {
+        if let SstPointReadStage::Leaf { id, lower, upper } = self.point_read.stage {
+            load_index(store, &id, self.index_scratch)?;
+            let count = u32::from_le_bytes(self.index_scratch[..4].try_into().unwrap()) as usize;
+            self.index_leaf = Some(SstIndexLeaf {
+                handle: *handle,
+                count,
+                lower,
+                upper,
+            });
+            return Ok(count);
+        }
         self.index_leaf = None;
         load_index(store, &handle.index, self.index_scratch)?;
         let head = u32::from_le_bytes(self.index_scratch[0..4].try_into().unwrap());
@@ -3137,6 +3274,11 @@ impl<'a> SstReader<'a> {
         let at = 8 + leaf * VERSIONED_ROOT_ENTRY;
         let mut id = [0u8; 32];
         id.copy_from_slice(&self.index_scratch[at + 16 + 4..at + VERSIONED_ROOT_ENTRY]);
+        self.point_read.stage = SstPointReadStage::Leaf {
+            id: BlockId(id),
+            lower,
+            upper,
+        };
         load_index(store, &BlockId(id), self.index_scratch)?;
         let count = u32::from_le_bytes(self.index_scratch[0..4].try_into().unwrap()) as usize;
         self.index_leaf = Some(SstIndexLeaf {
@@ -3686,6 +3828,7 @@ mod tests {
         let mut assembly = vec![0; MAX_ASSEMBLED];
         let mut leaf = None;
         let mut cached_data = None;
+        let mut partial = SstReadProgress::new();
         let mut output = [0; 16];
         crate::mem::guard::forbid_alloc(|| {
             for (handle, rowid, snapshot, expected, reads) in [
@@ -3703,6 +3846,7 @@ mod tests {
                     &mut decoded,
                     &mut column,
                     &mut assembly,
+                    &mut partial,
                 );
                 reader.restore_cached_index_leaf(leaf.take());
                 reader.restore_cached_data_block(handle.format, cached_data.take());
@@ -3804,40 +3948,50 @@ mod tests {
                 }
             }
         }
-        let (_budget, mut inner) = store();
-        let arena = arena();
-        let mut writer = SstWriter::new();
-        writer
-            .append_version(&mut inner, SstKey::at(1, 7), b"order")
-            .unwrap();
-        let handle = writer.finish(&mut inner).unwrap().unwrap();
-        let mut store = WaitingStore {
-            inner,
-            pending: None,
-            requests: 0,
-        };
-        let mut progress = SstPointReadProgress::default();
-        let mut output = [0; 32];
-        crate::mem::guard::forbid_alloc(|| {
-            for attempt in 0..4 {
-                // Scratch and the reader can be rebuilt; the selected source
-                // and completed lookup steps are owned values across waits.
-                let mut reader = SstReader::new(&arena).unwrap();
-                reader.restore_point_read(progress);
-                let result = reader.get_at(&mut store, &handle, 1, 7, &mut output);
-                progress = reader.point_read_progress();
-                if attempt < 3 {
-                    assert!(matches!(result, Err(SstError::Store(StoreError::NotReady))));
-                } else {
-                    let probe = result.unwrap().unwrap();
-                    assert_eq!(probe.key, SstKey::at(1, 7));
-                    assert_eq!(probe.len, Some(5));
-                    assert_eq!(&output[..5], b"order");
-                    assert!(progress.request.is_none());
-                }
+        for two_levels in [false, true] {
+            let (_budget, mut inner) = store();
+            let arena = arena();
+            let mut writer = SstWriter::new();
+            writer
+                .append_version(&mut inner, SstKey::at(1, 7), b"order")
+                .unwrap();
+            if two_levels {
+                writer.flush_data(&mut inner).unwrap();
+                writer.flush_index_leaf(&mut inner).unwrap();
+                writer
+                    .append_version(&mut inner, SstKey::at(2, 8), b"other")
+                    .unwrap();
             }
-            assert_eq!(store.requests, 6);
-        });
+            let handle = writer.finish(&mut inner).unwrap().unwrap();
+            let mut store = WaitingStore {
+                inner,
+                pending: None,
+                requests: 0,
+            };
+            let mut progress = SstPointReadProgress::default();
+            let mut output = [0; 32];
+            let waits = if two_levels { 4 } else { 3 };
+            crate::mem::guard::forbid_alloc(|| {
+                for attempt in 0..=waits {
+                    // A rebuilt reader retains completed metadata descent even
+                    // when the root and its leaf each wait with empty caches.
+                    let mut reader = SstReader::new(&arena).unwrap();
+                    reader.restore_point_read(progress);
+                    let result = reader.get_at(&mut store, &handle, 1, 7, &mut output);
+                    progress = reader.point_read_progress();
+                    if attempt < waits {
+                        assert!(matches!(result, Err(SstError::Store(StoreError::NotReady))));
+                    } else {
+                        let probe = result.unwrap().unwrap();
+                        assert_eq!(probe.key, SstKey::at(1, 7));
+                        assert_eq!(probe.len, Some(5));
+                        assert_eq!(&output[..5], b"order");
+                        assert!(progress.request.is_none());
+                    }
+                }
+                assert_eq!(store.requests, 2 * waits);
+            });
+        }
     }
 
     #[test]
@@ -4139,6 +4293,8 @@ mod tests {
         let mut decoded = vec![0; MAX_PAYLOAD];
         let mut column = vec![0; MAX_PAYLOAD];
         let mut out = vec![0; MAX_ASSEMBLED];
+        let mut assembly = vec![0; MAX_ASSEMBLED];
+        let mut partial = SstReadProgress::new();
         crate::mem::guard::forbid_alloc(|| {
             assert_eq!(
                 cursor.copy_exact(
@@ -4177,6 +4333,38 @@ mod tests {
             assert_eq!(
                 store.overflow_requests, 6,
                 "completed fragments must not be fetched again"
+            );
+            store.overflow_requests = 0;
+            let mut point = SstPointReadProgress::default();
+            let mut leaf = None;
+            let mut cached = None;
+            for attempt in 0..4 {
+                out.fill(0xcc);
+                let mut reader = SstReader::over(
+                    &mut index,
+                    &mut raw,
+                    &mut decoded,
+                    &mut column,
+                    &mut assembly,
+                    &mut partial,
+                );
+                reader.restore_point_read(point);
+                reader.restore_cached_index_leaf(leaf);
+                reader.restore_cached_data_block(handle.format, cached);
+                let result = reader.get_at(&mut store, &handle, 1, 9, &mut out);
+                point = reader.point_read_progress();
+                leaf = reader.cached_index_leaf();
+                cached = reader.cached_data_block();
+                if attempt < 3 {
+                    assert_eq!(result, Err(SstError::Store(StoreError::NotReady)));
+                } else {
+                    assert_eq!(result.unwrap().unwrap().len, Some(row.len() as u32));
+                    assert_eq!(&out[..row.len()], row);
+                }
+            }
+            assert_eq!(
+                store.overflow_requests, 6,
+                "caller output is never fragment storage"
             );
         });
     }
@@ -4309,6 +4497,8 @@ mod tests {
         let mut decoded = vec![0; MAX_PAYLOAD];
         let mut column = vec![0; MAX_PAYLOAD];
         let mut out = vec![0; MAX_ASSEMBLED];
+        let mut assembly = vec![0; MAX_ASSEMBLED];
+        let mut partial = SstReadProgress::new();
         crate::mem::guard::forbid_alloc(|| {
             let mut completed = false;
             for _ in 0..32 {
@@ -4359,6 +4549,43 @@ mod tests {
                 store.requests, reads,
                 "the next row reuses its completed group"
             );
+            store.root_requests = 0;
+            let mut point = SstPointReadProgress::default();
+            let mut leaf = None;
+            let mut cached = None;
+            let mut completed = false;
+            for _ in 0..32 {
+                out.fill(0xcc);
+                let mut reader = SstReader::over(
+                    &mut index,
+                    &mut raw,
+                    &mut decoded,
+                    &mut column,
+                    &mut assembly,
+                    &mut partial,
+                );
+                reader.restore_point_read(point);
+                reader.restore_cached_index_leaf(leaf);
+                reader.restore_cached_data_block(handle.format, cached);
+                let result = reader.get_at(&mut store, &handle, 1, 9, &mut out);
+                point = reader.point_read_progress();
+                leaf = reader.cached_index_leaf();
+                cached = reader.cached_data_block();
+                match result {
+                    Err(SstError::Store(StoreError::NotReady)) => {}
+                    result => {
+                        assert_eq!(result.unwrap().unwrap().len, Some(row.len() as u32));
+                        assert_eq!(&out[..row.len()], row);
+                        completed = true;
+                        break;
+                    }
+                }
+            }
+            assert!(
+                completed,
+                "column progress survives borrowed reader reconstruction"
+            );
+            assert_eq!(store.root_requests, 2);
         });
     }
 

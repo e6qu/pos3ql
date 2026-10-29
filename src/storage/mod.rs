@@ -15219,7 +15219,7 @@ struct SpillScratch {
     decoded_buf: Box<[u8]>,
     column_buf: Box<[u8]>,
     assembly_buf: Box<[u8]>,
-    bounce_buf: Box<[u8]>,
+    partial: crate::store::SstReadProgress,
     decoded_data_ref: Option<(crate::store::SstHandle, crate::store::DataBlockRef, usize)>,
     point_read: crate::store::SstPointReadProgress,
     index_leaf: Option<crate::store::SstIndexLeaf>,
@@ -15358,7 +15358,7 @@ impl SpillReader {
                 decoded_buf: vec![0u8; crate::store::MAX_PAYLOAD].into_boxed_slice(),
                 column_buf: vec![0u8; crate::store::MAX_PAYLOAD].into_boxed_slice(),
                 assembly_buf: vec![0u8; crate::store::MAX_ASSEMBLED].into_boxed_slice(),
-                bounce_buf: vec![0u8; crate::store::MAX_PAYLOAD].into_boxed_slice(),
+                partial: crate::store::SstReadProgress::new(),
                 decoded_data_ref: None,
                 point_read: crate::store::SstPointReadProgress::default(),
                 index_leaf: None,
@@ -15398,7 +15398,7 @@ impl SpillReader {
     /// The budget the contexts and scratch draw, for memory-plan estimates.
     pub(crate) fn budget_bytes(durable: bool, max_spill_generations: usize) -> usize {
         let row_reader = Self::owner_bytes()
-            + 2 * (5 * crate::store::MAX_PAYLOAD + crate::store::MAX_ASSEMBLED)
+            + 2 * (4 * crate::store::MAX_PAYLOAD + crate::store::MAX_ASSEMBLED)
             + SCAN_CONTEXTS * ScanContext::budget_bytes(max_spill_generations)
             + MAX_ROW_WALK_NESTING
                 * (max_spill_generations * core::mem::size_of::<MemberCursor>()
@@ -15473,6 +15473,7 @@ impl SpillReader {
             decoded_buf,
             column_buf,
             assembly_buf,
+            partial,
             decoded_data_ref,
             point_read,
             index_leaf,
@@ -15484,6 +15485,7 @@ impl SpillReader {
             decoded_buf,
             column_buf,
             assembly_buf,
+            partial,
         );
         reader.restore_point_read(*point_read);
         reader.restore_cached_index_leaf(index_leaf.take());
@@ -15539,65 +15541,64 @@ impl SpillReader {
             decoded_buf,
             column_buf,
             assembly_buf,
-            bounce_buf,
+            partial,
             decoded_data_ref,
             point_read,
             index_leaf,
             ..
         } = &mut *scratch;
-        // The assembly buffer doubles as the row destination: `get`
-        // assembles a chained row into the caller buffer directly, so
-        // the two uses never overlap. The reader's own staging slot is
-        // the bounce buffer (a compressed data block decompresses
-        // through it).
         let capacity = assembly_buf.len();
-        let row_buf = assembly_buf.get_mut(..len as usize).ok_or_else(|| {
-            sql_err!(
+        if len as usize > capacity {
+            return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "spilled row exceeds startup row scratch ({})",
                 capacity
-            )
-        })?;
-        let got = {
-            let mut blocks = self.relation_blocks_for(persistence);
-            let mut reader = crate::store::SstReader::over(
-                index_buf,
-                data_buf,
-                decoded_buf,
-                column_buf,
-                bounce_buf,
-            );
-            reader.restore_point_read(*point_read);
-            reader.restore_cached_index_leaf(index_leaf.take());
-            reader.restore_cached_data_block(
-                handle.format,
-                decoded_data_ref
-                    .take()
-                    .and_then(|(cached_handle, reference, cached_len)| {
-                        (cached_handle == handle).then_some((reference, cached_len))
-                    }),
-            );
-            let got = reader.get_at(&mut *blocks, &handle, rowid, commit_lsn, row_buf);
-            *point_read = reader.point_read_progress();
-            *index_leaf = reader.cached_index_leaf();
-            *decoded_data_ref = reader
-                .cached_data_block()
-                .map(|(reference, cached_len)| (handle, reference, cached_len));
-            got.map_err(spill_read_error)?
-        };
-        match got {
-            Some(probe) if probe.key.commit_lsn == commit_lsn && probe.len == Some(len) => {
-                f(&row_buf[..len as usize])
+            ));
+        }
+        let mut blocks = self.relation_blocks_for(persistence);
+        let mut reader = crate::store::SstReader::over(
+            index_buf,
+            data_buf,
+            decoded_buf,
+            column_buf,
+            assembly_buf,
+            partial,
+        );
+        reader.restore_point_read(*point_read);
+        reader.restore_cached_index_leaf(index_leaf.take());
+        reader.restore_cached_data_block(
+            handle.format,
+            decoded_data_ref
+                .take()
+                .and_then(|(cached_handle, reference, cached_len)| {
+                    (cached_handle == handle).then_some((reference, cached_len))
+                }),
+        );
+        let got = reader.row_at(&mut *blocks, &handle, rowid, commit_lsn);
+        // Row bytes remain in the leased buffers; callbacks may issue other I/O.
+        drop(blocks);
+        let result = match got {
+            Ok(Some((probe, bytes)))
+                if probe.key.commit_lsn == commit_lsn && probe.len == Some(len) =>
+            {
+                f(bytes)
             }
-            Some(_) => Err(sql_err!(
+            Ok(Some(_)) => Err(sql_err!(
                 sqlstate::INTERNAL_ERROR,
                 "spilled row version mismatch"
             )),
-            None => Err(sql_err!(
+            Ok(None) => Err(sql_err!(
                 sqlstate::INTERNAL_ERROR,
                 "spilled row missing from its SST"
             )),
-        }
+            Err(error) => Err(spill_read_error(error)),
+        };
+        *point_read = reader.point_read_progress();
+        *index_leaf = reader.cached_index_leaf();
+        *decoded_data_ref = reader
+            .cached_data_block()
+            .map(|(reference, cached_len)| (handle, reference, cached_len));
+        result
     }
 
     fn relation_blocks_for(&self, persistence: RelationPersistence) -> RelationBlockStore<'_> {
@@ -32423,6 +32424,7 @@ impl Storage {
                 decoded_buf,
                 column_buf,
                 assembly_buf,
+                partial,
                 decoded_data_ref,
                 point_read,
                 index_leaf,
@@ -32434,6 +32436,7 @@ impl Storage {
                 decoded_buf,
                 column_buf,
                 assembly_buf,
+                partial,
             );
             reader.restore_point_read(*point_read);
             reader.restore_cached_index_leaf(index_leaf.take());

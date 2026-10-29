@@ -51,6 +51,9 @@ A waiting schema edit must never attach itself to a new object that reused a nam
   including with disabled caches. Advance source positions and output checksums
   only after the corresponding row or group finishes; retries must not skip or
   repeat data.
+  Retain unfinished index descent, selected columns and large-row fragments in
+  buffers owned by the checkpoint job. A foreground read must not overwrite
+  that progress, and replacing a caller's output buffer must not discard it.
   Recovery can keep exclusive startup access; ordinary operation must allow
   unrelated work to progress.
 - Retain the query's scan and output position after sending a result prefix.

@@ -20042,6 +20042,59 @@ mod stored_dependency_tests {
     }
 
     #[test]
+    fn atomic_block_reads_streamed_prefix_prevents_read_replay() {
+        use std::io::Read;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+
+        let (mut checkpointer, config) = atomic_scope_fixture("streamed-prefix");
+        checkpointer.enable_async_block_reads();
+        let blocks = checkpointer.block_stack();
+        let (socket, mut peer) = UnixStream::pair().unwrap();
+        let mut budget = Budget::new(32);
+        let mut buffer =
+            crate::mem::buffer::FixedBuf::new(&mut budget, "stream output", 32).unwrap();
+        for streaming in [false, true] {
+            buffer.clear();
+            crate::mem::guard::forbid_alloc(|| {
+                let reads = checkpointer.deferred_atomic_block_read_scope();
+                let effects = crate::sql::query::enter_statement_read_effect_scope(Some(&reads));
+                let mut responder = crate::pg::respond::Responder::new(&mut buffer);
+                if streaming {
+                    responder = responder.with_flush(socket.as_raw_fd());
+                }
+                for value in [1, 2] {
+                    responder
+                        .data_row(&[crate::sql::types::Datum::Int4(value)])
+                        .unwrap();
+                }
+                assert!(blocks.lock().unwrap().async_gets_enabled());
+                let third = responder.data_row(&[crate::sql::types::Datum::Int4(3)]);
+                if streaming {
+                    third.unwrap();
+                    assert!(!blocks.lock().unwrap().async_gets_enabled());
+                    let mut sent = [0u8; 24];
+                    peer.read_exact(&mut sent).unwrap();
+                    assert_eq!(sent[0], b'D');
+                    assert_eq!(sent[12], b'D');
+                    assert_eq!(responder.buffer.readable().len(), 12);
+                    let nested = checkpointer.atomic_block_read_scope();
+                    drop(nested);
+                    assert!(!blocks.lock().unwrap().async_gets_enabled());
+                } else {
+                    assert!(third.is_err());
+                    assert!(blocks.lock().unwrap().async_gets_enabled());
+                }
+                drop(effects);
+                drop(reads);
+                assert!(blocks.lock().unwrap().async_gets_enabled());
+            });
+        }
+        drop(checkpointer);
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    }
+
+    #[test]
     fn atomic_block_reads_nested_scope_restores_outer_mode_after_an_error() {
         let (mut checkpointer, config) = atomic_scope_fixture("atomic-scope-nested");
         let blocks = checkpointer.block_stack();

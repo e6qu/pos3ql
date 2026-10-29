@@ -53,6 +53,11 @@ A waiting schema edit must never attach itself to a new object that reused a nam
   repeat data.
   Recovery can keep exclusive startup access; ordinary operation must allow
   unrelated work to progress.
+- Retain the query's scan and output position after sending a result prefix.
+  Today a large result finishes its remaining reads synchronously once bytes
+  leave the connection buffer, because restarting would send a second result
+  header and repeat already-delivered rows. Resumption must preserve one header,
+  every row once and one completion without occupying the worker during a wait.
 
 Follow PostgreSQL's distinction between listing an old catalog row and resolving
 an object for current use. After `orders` becomes `sales`, an older report can

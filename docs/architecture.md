@@ -46,8 +46,9 @@ needs a download yields with its original data owners and command deadline;
 another connection can run cached work. Adding connections or
 `query_workspace_slots` does not add CPU execution workers.
 
-State-changing routines, procedure commit boundaries, some metadata capture
-and some maintenance reads still complete synchronously. A cold read on one
+State-changing routines, procedure commit boundaries, some metadata capture,
+large-result reads after their first transport flush, and some maintenance
+reads still complete synchronously. A cold read on one
 of these paths can occupy that worker. [PLAN.md](../PLAN.md) tracks their
 conversion and the later CPU worker pool separately.
 

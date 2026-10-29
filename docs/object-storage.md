@@ -87,6 +87,14 @@ repeat output. If request capacity is full, the merge waits for a completion or
 released slot instead of spinning or growing the pool. Table capture and
 index-building downloads still have synchronous paths.
 
+A read can pause and restart while its result is still buffered. Once a large
+result fills the connection buffer and starts sending bytes, its remaining
+reads finish synchronously under the statement's existing effect guard.
+The server cannot withdraw a sent prefix: restarting would send another result
+header and repeat rows. For example, a 3,003-row report must arrive as one
+complete result even when later saved-file reads miss the cache. Keeping the
+query's output position across those waits remains work in [the plan](../PLAN.md).
+
 A separate startup-reserved client and metadata buffer upload the manifest,
 the metadata naming the saved files. Its exact bytes survive retries, including a lost response.
 Completion installs matching table and index identities and preserves newer

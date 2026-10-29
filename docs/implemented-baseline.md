@@ -142,6 +142,10 @@ and saved files across suspension. Removing a table, recycling an internal slot,
 replacing a file list or moving the row heap cannot redirect that selection to
 replacement data. Downloads and callbacks run after short metadata guards end.
 Scans capture resident row choices once; saved rows continue streaming.
+Large results use one result header and one completion. After their first
+transport flush, remaining reads finish synchronously to avoid replaying a
+prefix already delivered to the client; [the plan](../PLAN.md) tracks retaining
+the output position across waits.
 
 **Example:** a report pauses after reading one order. Another connection updates
 an unread order and maintenance replaces saved files. Resuming the report still

@@ -97506,8 +97506,7 @@ fn checkpoint_reads_held_maintenance_keeps_queries_commits_and_read_owners() {
             assert!(engine.checkpoint().unwrap());
             session.success(
                 &mut engine,
-                "CREATE TABLE cached_order(id integer); \
-                INSERT INTO cached_order VALUES(42); UPDATE merge_wait SET qty=qty+1000 WHERE id=7",
+                "UPDATE merge_wait SET qty=qty+1000 WHERE id=7",
                 false,
             );
             if phase.starts_with("index_") {
@@ -97530,6 +97529,11 @@ fn checkpoint_reads_held_maintenance_keeps_queries_commits_and_read_owners() {
                     );
                 }
             }
+            session.success(
+                &mut engine,
+                "CREATE TABLE cached_order(id integer); INSERT INTO cached_order VALUES(42)",
+                false,
+            );
             let selected = |checkpoint: &Checkpointer| match phase {
                 "schedule" => checkpoint.retained_output_pending(),
                 "columns" => checkpoint.merge_source_read_ready(),

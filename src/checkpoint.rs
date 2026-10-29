@@ -14184,34 +14184,31 @@ impl Checkpointer {
             .filter(|_| !storage.value_binding_requires_rebuild(slot, binding));
         self.roster_scratch.clear();
         self.value_changed_rowids.clear();
-        let result = (|| {
-            self.source_cursor.reset();
-            self.slice_writer.reset();
-            let (columns, n_columns) = storage.value_binding_columns(slot, binding);
-            self.value_schedule_job = Some(ValueScheduleJob {
-                slot,
-                table_created_at: storage.table(slot).created_at(),
-                table_generation: storage.table(slot).generation(),
-                binding,
-                columns,
-                n_columns,
-                index_created_at: storage.value_binding_created_at(slot, binding),
-                include_mask: storage.value_binding_include_mask(slot, binding),
-                navigation: storage.value_binding_navigation(slot, binding),
-                dirty_lsn,
-                through_lsn,
-                base,
-                roster_walk: base.map(|handle| crate::store::ValueRosterWalk::new(handle.roster)),
-                phase: ValueSchedulePhase::Collect,
-                source_done: false,
-                pending: None,
-                chunk_len: 0,
-                row_count: 0,
-                next_ordinal: 0,
-                levels: [None; 64],
-            });
-            Ok(())
-        })();
+        self.source_cursor.reset();
+        self.slice_writer.reset();
+        let (columns, n_columns) = storage.value_binding_columns(slot, binding);
+        self.value_schedule_job = Some(ValueScheduleJob {
+            slot,
+            table_created_at: storage.table(slot).created_at(),
+            table_generation: storage.table(slot).generation(),
+            binding,
+            columns,
+            n_columns,
+            index_created_at: storage.value_binding_created_at(slot, binding),
+            include_mask: storage.value_binding_include_mask(slot, binding),
+            navigation: storage.value_binding_navigation(slot, binding),
+            dirty_lsn,
+            through_lsn,
+            base,
+            roster_walk: base.map(|handle| crate::store::ValueRosterWalk::new(handle.roster)),
+            phase: ValueSchedulePhase::Collect,
+            source_done: false,
+            pending: None,
+            chunk_len: 0,
+            row_count: 0,
+            next_ordinal: 0,
+            levels: [None; 64],
+        });
         #[cfg(feature = "checkpoint-profile")]
         profile_checkpoint_phase(
             "value_index_schedule",
@@ -14225,11 +14222,6 @@ impl Checkpointer {
                 .io_stats(),
             0,
         );
-        if result.is_err() {
-            self.roster_scratch.clear();
-            self.slice_writer.reset();
-        }
-        result?;
         Ok(true)
     }
 

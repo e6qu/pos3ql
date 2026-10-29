@@ -199,35 +199,36 @@ impl RowCursor {
         let mut members = state_arena
             .retained_slice_mut(source.members)
             .map_err(state_error)?;
-        let mut row = None;
-        let complete = Storage::spill_merged_walk_bytes(
-            source.snapshot.roots(),
-            arena,
-            false,
-            decoded_columns,
-            true,
-            crate::storage::SpillOverlayMode::VisibleScan(&RowScanIds::Captured(&rows)),
-            Some(
-                source
-                    .spill
-                    .resume(&mut members, &buffers.scan, 1, u64::MAX),
-            ),
-            &mut |rowid, _, representation| {
-                row = Some(SpilledRow {
-                    rowid,
-                    representation,
-                });
-                Ok(ControlFlow::Break(()))
-            },
-        )?;
-        source.done = complete;
-        if row.is_none() && !complete {
-            return Err(sql_err!(
-                sqlstate::INTERNAL_ERROR,
-                "query row cursor stopped without a row or storage wait"
-            ));
+        // The bounded walk can consume a tombstone or a shadowed saved row
+        // without producing a visible row. Keep its progress and ask again.
+        loop {
+            crate::sql::query::check_timeout()?;
+            let mut row = None;
+            let complete = Storage::spill_merged_walk_bytes(
+                source.snapshot.roots(),
+                arena,
+                false,
+                decoded_columns,
+                true,
+                crate::storage::SpillOverlayMode::VisibleScan(&RowScanIds::Captured(&rows)),
+                Some(
+                    source
+                        .spill
+                        .resume(&mut members, &buffers.scan, 1, u64::MAX),
+                ),
+                &mut |rowid, _, representation| {
+                    row = Some(SpilledRow {
+                        rowid,
+                        representation,
+                    });
+                    Ok(ControlFlow::Break(()))
+                },
+            )?;
+            source.done = complete;
+            if row.is_some() || complete {
+                return Ok(row);
+            }
         }
-        Ok(row)
     }
 }
 

@@ -19,6 +19,14 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-library-tests-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
+      - name: Format proposal for local application
+        run: |
+          cargo fmt
+          git diff --binary > "$RUNNER_TEMP/query-format.patch"
+      - uses: actions/upload-artifact@v5
+        with:
+          name: query-format-${{ github.sha }}
+          path: ${{ runner.temp }}/query-format.patch
       - run: cargo fmt --check
       - run: >-
           cargo test --lib --locked -- cursor_declaration_ query_row_cursor_ arena_retained_slices_

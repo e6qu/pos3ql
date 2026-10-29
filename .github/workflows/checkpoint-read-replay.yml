@@ -6,6 +6,43 @@ permissions:
   contents: read
   actions: read
 jobs:
+  torture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: mirror.gcr.io/library/postgres:18@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/python-test-environment
+      - name: Repeat the failing crash seed with result diagnostics
+        env:
+          POS3QL_VENV: ${{ github.workspace }}/venv
+          POS3QL_PSQL: psql
+          POS3QL_REFERENCE_PG_HOST: 127.0.0.1
+          POS3QL_REFERENCE_PG_PORT: "5432"
+          POS3QL_TORTURE_ROUNDS: "6"
+          POS3QL_TORTURE_SEED: "20260725"
+          POS3QL_TEST_S3_LATENCY_MS: "0"
+          POS3QL_TEST_ARTIFACTS: ${{ runner.temp }}/crash-failure
+        run: |
+          cargo build --release --locked
+          POS3QL_RUN_GROUPS=torture POS3QL_BIN="$PWD/target/release/pos3ql" bash tests/external/run.sh
+      - uses: actions/upload-artifact@v6
+        if: failure()
+        with:
+          name: repeated-crash-failure
+          path: ${{ runner.temp }}/crash-failure/
   replay:
     runs-on: ubuntu-latest
     timeout-minutes: 5

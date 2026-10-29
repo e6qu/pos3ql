@@ -1,9 +1,6 @@
-//! SQL cursors (DECLARE / FETCH / MOVE / CLOSE). A cursor materializes its
-//! whole result at DECLARE into a fixed per-connection pool — which is
-//! exactly PostgreSQL's *insensitive* cursor semantics: the rows are a
-//! snapshot as of DECLARE, blind to later changes, and a materialized buffer
-//! serves SCROLL (backward, absolute) positioning trivially. A non-SCROLL
-//! cursor still refuses backward motion, as PostgreSQL does.
+//! SQL cursor positions and startup-reserved result storage. Snapshot retention
+//! and execution timing are separate: an insensitive cursor keeps its selected
+//! row versions, while FETCH determines when expressions run and rows lock.
 
 use crate::config::Config;
 use crate::mem::budget::{Budget, BudgetError};

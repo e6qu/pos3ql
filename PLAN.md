@@ -50,6 +50,11 @@ A waiting schema edit must never attach itself to a new object that reused a nam
   leave the connection buffer, because restarting would send a second result
   header and repeat already-delivered rows. Resumption must preserve one header,
   every row once and one completion without occupying the worker during a wait.
+  SQL cursors must use the same retained execution positions: `DECLARE` binds
+  the query and its snapshot; `FETCH` advances it. For example, declaring a
+  cursor over `nextval('order_numbers')` must not issue numbers for rows that
+  have not been fetched. Row locks follow fetched rows. Holding a cursor across
+  commit saves the required result before releasing its transaction.
 
 Follow PostgreSQL's distinction between listing an old catalog row and resolving
 an object for current use. After `orders` becomes `sales`, an older report can

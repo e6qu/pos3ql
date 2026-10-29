@@ -803,19 +803,44 @@ impl<'a> Parser<'a> {
         let name = self.col_ident("cursor name")?;
         let mut binary = false;
         let mut scroll = crate::sql::cursor::CursorScroll::Default;
+        let mut insensitive = false;
+        let mut asensitive = false;
         loop {
             if self.eat_ident("binary")? {
                 binary = true;
-            } else if self.eat_ident("insensitive")? || self.eat_ident("asensitive")? {
-                // Materialization makes every cursor insensitive.
+            } else if self.eat_ident("insensitive")? {
+                insensitive = true;
+            } else if self.eat_ident("asensitive")? {
+                asensitive = true;
             } else if self.eat_ident("scroll")? {
+                if scroll == crate::sql::cursor::CursorScroll::NoScroll {
+                    return Err(ParseError {
+                        at: statement_start,
+                        message: StackStr::from_str("cannot specify both SCROLL and NO SCROLL"),
+                        sqlstate: "42P11",
+                    });
+                }
                 scroll = crate::sql::cursor::CursorScroll::Scroll;
             } else if self.eat_ident("no")? {
                 self.expect_ident("scroll")?;
+                if scroll == crate::sql::cursor::CursorScroll::Scroll {
+                    return Err(ParseError {
+                        at: statement_start,
+                        message: StackStr::from_str("cannot specify both SCROLL and NO SCROLL"),
+                        sqlstate: "42P11",
+                    });
+                }
                 scroll = crate::sql::cursor::CursorScroll::NoScroll;
             } else {
                 break;
             }
+        }
+        if insensitive && asensitive {
+            return Err(ParseError {
+                at: statement_start,
+                message: StackStr::from_str("cannot specify both ASENSITIVE and INSENSITIVE"),
+                sqlstate: "42P11",
+            });
         }
         self.expect_ident("cursor")?;
         let hold = if self.eat_ident("with")? {
@@ -830,7 +855,48 @@ impl<'a> Parser<'a> {
         self.expect_ident("for")?;
         // Capture the raw SELECT text; validated by parsing it now.
         let start = self.peek_at;
-        let _ = self.query_select()?;
+        let query = self.query_select()?;
+        if query.with.iter().any(|cte| cte.dml.is_some()) {
+            return Err(ParseError {
+                at: statement_start,
+                message: StackStr::from_str(
+                    "DECLARE CURSOR must not contain data-modifying statements in WITH",
+                ),
+                sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+            });
+        }
+        if let Some(clause) = query.locking.first() {
+            let restriction = if hold {
+                Some((
+                    "DECLARE CURSOR WITH HOLD",
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "not supported",
+                ))
+            } else if scroll == crate::sql::cursor::CursorScroll::Scroll {
+                Some((
+                    "DECLARE SCROLL CURSOR",
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "not supported",
+                ))
+            } else if insensitive {
+                Some(("DECLARE INSENSITIVE CURSOR", "42P11", "not valid"))
+            } else {
+                None
+            };
+            if let Some((prefix, state, reason)) = restriction {
+                return Err(ParseError {
+                    at: statement_start,
+                    message: stack_format!(
+                        96,
+                        "{} ... {} is {}",
+                        prefix,
+                        clause.strength.keyword(),
+                        reason,
+                    ),
+                    sqlstate: state,
+                });
+            }
+        }
         let end = self.peek_at;
         let sql = self.text[start..end].trim();
         let statement = self.text[statement_start..end].trim();

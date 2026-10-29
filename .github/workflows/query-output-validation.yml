@@ -1,0 +1,27 @@
+name: Query output validation
+on:
+  push:
+    branches: [resumable-query-output]
+concurrency:
+  group: query-output-validation
+  cancel-in-progress: true
+jobs:
+  focused:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-library-tests-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+      - run: cargo fmt --check
+      - run: cargo test --lib --locked cursor_declaration_ -- --nocapture --test-threads=1
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --lib --locked cursor -- --nocapture --test-threads=1
+      - run: python3 tools/check-docs.py
+      - run: bash tools/check-bugs.sh

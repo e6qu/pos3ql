@@ -45,9 +45,11 @@ with (root / "s3.log").open("wb") as s3_log, (root / "pos3ql.log").open("wb") as
         with connection:
             for attempt in range(3):
                 for query in [
+                    "SELECT count(*), coalesce(sum(id), 0), coalesce(sum(length(pad)), 0) FROM ta",
+                    "SELECT id, md5(pad) FROM ta ORDER BY id",
                     "SELECT count(*), sum(id), sum(length(pad)) FROM tb",
-                    "SELECT id, md5(pad) FROM tb",
                     "SELECT id, md5(pad) FROM tb ORDER BY id",
+                    "SELECT id, md5(pad) FROM tb",
                     "SELECT id FROM tb WHERE id BETWEEN 1520 AND 1550 ORDER BY id",
                 ]:
                     rows = connection.execute(query).fetchall()

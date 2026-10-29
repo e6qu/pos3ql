@@ -35,10 +35,7 @@ impl RowCursorBuffers {
             - core::mem::size_of::<RowReadBuffers>()
     }
 
-    pub(crate) fn new(
-        config: &Config,
-        budget: &mut Budget,
-    ) -> Result<Self, BudgetError> {
+    pub(crate) fn new(config: &Config, budget: &mut Budget) -> Result<Self, BudgetError> {
         budget.draw(Self::allocation_bytes(config), "query cursor byte buffers")?;
         Ok(Self {
             scan: crate::mem::mutex::Mutex::new(crate::storage::ScanContext::new(

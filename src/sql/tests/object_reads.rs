@@ -12,8 +12,7 @@ pub(super) fn advance(engine: &mut Engine) {
         .unwrap();
     for slot in 0..engine.ckpt.as_ref().unwrap().block_read_slots() {
         if engine.pending_block_read_fd(slot).is_some() {
-            crate::mem::guard::forbid_alloc(|| engine.advance_pending_block_read(slot))
-                .unwrap();
+            crate::mem::guard::forbid_alloc(|| engine.advance_pending_block_read(slot)).unwrap();
         }
     }
 }
@@ -85,7 +84,6 @@ pub(super) fn reply(stream: &mut TcpStream, request: &str, body: &[u8]) {
     }
 }
 
-
 pub(super) fn replace_uncached_blocks(engine: &mut Engine, config: &Config) {
     use crate::store::{OwnedObjectStore, StackPlan};
     let blocks = engine.ckpt.as_ref().unwrap().block_stack();
@@ -96,7 +94,8 @@ pub(super) fn replace_uncached_blocks(engine: &mut Engine, config: &Config) {
         provider,
         StackPlan::resolve(0, 0),
         std::path::Path::new(&config.data_dir),
-    ).unwrap();
+    )
+    .unwrap();
     assert_eq!(budget.remaining(), 0);
     engine.enable_async_block_reads();
 }

@@ -214,6 +214,11 @@ file plus a fixed in-memory slot directory, index and one 256 KiB scratch buffer
 The file size is reported separately from RAM. Disabled tiers reserve no memory;
 with object storage off, neither object-store cache tier is constructed.
 
+Setting both caches to zero does not evict rows already in memory. For example,
+an `INSERT` followed by `SELECT` can return the new row without downloading it.
+To test reads with empty caches, first make the setup writes durable, then
+restart in object-store mode with an empty local data directory.
+
 TLS has a separate startup ceiling. `tls_pool_bytes` supplies the object-store
 base; startup adds 128 KiB for each of the two transports per subscription
 worker, plus 128 KiB per server connection when server TLS is enabled. Choose

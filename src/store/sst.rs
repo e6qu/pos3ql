@@ -603,7 +603,7 @@ impl SstWriter {
         }
         let layout = pax_layout(descriptor)?;
         if layout.columns() != self.pax_columns
-            || layout.schema() != &self.pax_schema[..self.pax_columns]
+            || !layout.schema().eq(self.pax_schema[..self.pax_columns].iter().copied())
             || layout.rows() == 0
         {
             return Err(SstError::Encoding);
@@ -2082,7 +2082,7 @@ pub(crate) struct PaxLayout {
     row_header: usize,
     bitmap_base: usize,
     bitmap_bytes: usize,
-    schema: [ColType; MAX_COLUMNS],
+    schema: [u8; MAX_COLUMNS],
     refs_base: usize,
 }
 
@@ -2095,8 +2095,13 @@ impl PaxLayout {
         self.columns
     }
 
-    pub(crate) fn schema(&self) -> &[ColType] {
-        &self.schema[..self.columns]
+    pub(crate) fn schema(&self) -> impl ExactSizeIterator<Item = ColType> + '_ {
+        (0..self.columns).map(|column| self.column_type(column))
+    }
+
+    fn column_type(&self, column: usize) -> ColType {
+        // pax_layout validates each stored code before constructing this value.
+        ColType::from_code(self.schema[column]).expect("validated PAX column type")
     }
 
     pub(crate) fn column_ref(&self, input: &[u8], column: usize) -> Result<DataBlockRef, SstError> {
@@ -2184,9 +2189,11 @@ pub(crate) fn pax_layout(input: &[u8]) -> Result<PaxLayout, SstError> {
     if values_base > input.len() {
         return Err(corrupt());
     }
-    let mut schema = [ColType::Bool; MAX_COLUMNS];
+    let mut schema = [ColType::Bool.code(); MAX_COLUMNS];
     for column in 0..columns {
-        schema[column] = ColType::from_code(input[8 + column]).ok_or_else(corrupt)?;
+        let code = input[8 + column];
+        ColType::from_code(code).ok_or_else(corrupt)?;
+        schema[column] = code;
     }
     let refs_end = values_base
         .checked_add(
@@ -2368,6 +2375,7 @@ pub(crate) fn copy_pax_v2_row_demand(
             output[2 + column / 8] |= 1 << (column % 8);
             continue;
         }
+        let ctype = layout.column_type(column);
         let reference = layout.column_ref(input, column)?;
         let (column_len, block_type) =
             read_data_block_raw_ref(store, reference, scratch.column, scratch.range)?;
@@ -2377,7 +2385,7 @@ pub(crate) fn copy_pax_v2_row_demand(
         if u32::from_le_bytes(scratch.column[..4].try_into().unwrap()) != PAX_COLUMN_MAGIC
             || u16::from_le_bytes(scratch.column[4..6].try_into().unwrap()) as usize
                 != layout.rows()
-            || ColType::from_code(scratch.column[6]) != Some(layout.schema[column])
+            || ColType::from_code(scratch.column[6]) != Some(ctype)
             || scratch.column[7] != 0
         {
             return Err(corrupt());
@@ -2389,7 +2397,7 @@ pub(crate) fn copy_pax_v2_row_demand(
                 continue;
             }
             let length =
-                rowenc::encoded_value_len(&scratch.column[at..column_len], layout.schema[column])
+                rowenc::encoded_value_len(&scratch.column[at..column_len], ctype)
                     .map_err(|_| corrupt())?;
             at = at.checked_add(length).ok_or_else(corrupt)?;
             if at > column_len {
@@ -2397,7 +2405,7 @@ pub(crate) fn copy_pax_v2_row_demand(
             }
         }
         let length =
-            rowenc::encoded_value_len(&scratch.column[at..column_len], layout.schema[column])
+            rowenc::encoded_value_len(&scratch.column[at..column_len], ctype)
                 .map_err(|_| corrupt())?;
         let end = at.checked_add(length).ok_or_else(corrupt)?;
         let next = written.checked_add(length).ok_or_else(corrupt)?;
@@ -2442,12 +2450,13 @@ pub(crate) fn copy_pax_v2_row_from_extents(
             output[2 + column / 8] |= 1 << (column % 8);
             continue;
         }
+        let ctype = layout.column_type(column);
         let (start, end) = extents[column].ok_or_else(corrupt)?;
         let bytes = extent_bytes.get(start..end).ok_or_else(corrupt)?;
         if bytes.len() < 8
             || u32::from_le_bytes(bytes[..4].try_into().unwrap()) != PAX_COLUMN_MAGIC
             || u16::from_le_bytes(bytes[4..6].try_into().unwrap()) as usize != layout.rows()
-            || ColType::from_code(bytes[6]) != Some(layout.schema[column])
+            || ColType::from_code(bytes[6]) != Some(ctype)
             || bytes[7] != 0
         {
             return Err(corrupt());
@@ -2458,14 +2467,14 @@ pub(crate) fn copy_pax_v2_row_from_extents(
             if preceding_tombstone || layout.column_is_null(input, preceding, column)? {
                 continue;
             }
-            let length = rowenc::encoded_value_len(&bytes[at..], layout.schema[column])
+            let length = rowenc::encoded_value_len(&bytes[at..], ctype)
                 .map_err(|_| corrupt())?;
             at = at.checked_add(length).ok_or_else(corrupt)?;
             if at > bytes.len() {
                 return Err(corrupt());
             }
         }
-        let length = rowenc::encoded_value_len(&bytes[at..], layout.schema[column])
+        let length = rowenc::encoded_value_len(&bytes[at..], ctype)
             .map_err(|_| corrupt())?;
         let end = at.checked_add(length).ok_or_else(corrupt)?;
         let next = written.checked_add(length).ok_or_else(corrupt)?;
@@ -5142,6 +5151,18 @@ mod tests {
             read_data_block_raw_ref(&mut store, reference, &mut raw, &mut scratch).unwrap();
         assert_eq!(kind, BlockType::SstDataPaxV2);
         let layout = pax_layout(&raw[..length]).unwrap();
+        assert!(layout.schema().eq(schema));
+        assert!(size_of::<PaxLayout>() <= 2048, "retained column-group metadata must fit 2 KiB");
+        println!(
+            "column_layout_bytes={} previous_type_array_bytes={} stored_type_array_bytes={}",
+            size_of::<PaxLayout>(),
+            size_of::<[ColType; MAX_COLUMNS]>(),
+            size_of::<[u8; MAX_COLUMNS]>(),
+        );
+        let invalid_code = (0..=u8::MAX).find(|code| ColType::from_code(*code).is_none()).unwrap();
+        let mut invalid_type = raw[..length].to_vec();
+        invalid_type[8] = invalid_code;
+        assert!(matches!(pax_layout(&invalid_type), Err(SstError::Store(StoreError::Corrupt(_)))));
         let mut oversized_row = raw[..length].to_vec();
         let row_length = 8 + layout.columns() + PAX_ROW_HEADER;
         oversized_row[row_length..row_length + 4]

@@ -30,7 +30,7 @@ jobs:
       - run: cargo fmt --check
       - run: >-
           cargo test --lib --locked -- cursor_declaration_ query_row_cursor_ arena_retained_slices_ query_reads_held_ checkpoint_reads_held_
-          captured_resident_byte_scans_ retained_checkpoint_
+          captured_resident_byte_scans_ retained_checkpoint_ store::sst::tests::
           --nocapture --test-threads=1
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --lib --locked cursor -- --nocapture --test-threads=1

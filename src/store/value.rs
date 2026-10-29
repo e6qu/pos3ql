@@ -928,10 +928,11 @@ impl ValueIndexStream {
                     if max_gets == 0 {
                         return Ok(ValueIndexStreamStep::Pending);
                     }
-                    match self
-                        .navigation
-                        .next_bounded(store, &mut self.roster, max_gets - 1)?
-                    {
+                    match self.navigation.next_bounded(
+                        store,
+                        &mut self.roster,
+                        (max_gets - 1).max(1),
+                    )? {
                         NavigationCursorStep::Pending => {
                             return Ok(ValueIndexStreamStep::Pending);
                         }
@@ -949,6 +950,9 @@ impl ValueIndexStream {
                                 covering,
                                 source: ValueIndexDataSource::Navigation { entries },
                             };
+                            if max_gets == 1 {
+                                return Ok(ValueIndexStreamStep::Pending);
+                            }
                         }
                     }
                 }
@@ -2161,7 +2165,11 @@ mod tests {
                             Err(error) => panic!("value stream failed: {error:?}"),
                         }
                     }
-                    assert!(done, "every waited-for block must retain its position");
+                    assert!(
+                        done,
+                        "value stream must progress: navigation={navigation}, covering={covering}, next={expected}, requests={}",
+                        store.requests
+                    );
                     assert_eq!(expected, 1025);
                     assert!(store.completed > 1);
                     assert_eq!(store.requests, 2 * store.completed);

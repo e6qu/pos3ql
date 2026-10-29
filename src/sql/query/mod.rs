@@ -8675,7 +8675,7 @@ pub fn describe_scope_items<'q>(
                     && ctype.is_collatable()
                 {
                     (out[n].collation, out[n].collation_derivation) =
-                        scope.described_expression_collation(expression)?;
+                        scope.described_expression_collation(storage, arena, expression)?;
                     if out[n].collation_derivation == super::types::CollationDerivation::None {
                         out[n].collation = super::ast::Collation::Default;
                         out[n].collation_derivation = super::types::CollationDerivation::Implicit;

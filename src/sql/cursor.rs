@@ -1,6 +1,6 @@
 //! SQL cursor positions and startup-reserved result storage. Snapshot retention
 //! and execution timing are separate: an insensitive cursor keeps its selected
-//! row versions, while FETCH determines when expressions run and rows lock.
+//! row versions; when expressions run and rows lock depends on execution.
 
 use crate::config::Config;
 use crate::mem::budget::{Budget, BudgetError};

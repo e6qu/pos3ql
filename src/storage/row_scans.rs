@@ -130,24 +130,17 @@ impl Storage {
         })
     }
 
-    fn capture_byte_partition<'roots, 'records>(
+    fn capture_byte_partition<'roots, Records: AsMut<[CapturedRowRecord]>>(
         &self,
         table_slot: usize,
         txid: u32,
         command: u32,
         commit: u64,
         roots_arena: Option<&'roots Arena>,
-        allocate: impl FnOnce(usize) -> Result<&'records mut [CapturedRowRecord], SqlError>,
-    ) -> Result<
-        (
-            TableRowSnapshot<'roots>,
-            &'records mut [CapturedRowRecord],
-            u64,
-        ),
-        SqlError,
-    > {
+        allocate: impl FnOnce(usize) -> Result<Records, SqlError>,
+    ) -> Result<(TableRowSnapshot<'roots>, Records, u64), SqlError> {
         crate::sql::query::check_timeout()?;
-        let (source, records, generation) = {
+        let (source, mut records, generation) = {
             let table = &self.tables[table_slot];
             // A contended table releases every earlier owner before waiting.
             // No byte lookup or visitor runs during acquisition.
@@ -181,7 +174,9 @@ impl Storage {
                 .iter()
                 .filter(|(_, state)| !Self::redundant_spilled_row_state(state))
                 .count();
-            let records = allocate(count)?;
+            let mut records = allocate(count)?;
+            let output = records.as_mut();
+            debug_assert_eq!(output.len(), count);
             let mut at = 0;
             for (&rowid, &state) in rows.iter() {
                 crate::sql::query::check_timeout()?;
@@ -195,12 +190,12 @@ impl Storage {
                     publication.row_layout,
                 )
                 .visible_version_at(txid, command, commit);
-                records[at] = source.capture_selection(rowid, selected)?;
+                output[at] = source.capture_selection(rowid, selected)?;
                 at += 1;
             }
             (source, records, publication.generation)
         };
-        records.sort_unstable_by_key(|record| record.rowid);
+        records.as_mut().sort_unstable_by_key(|record| record.rowid);
         Ok((source, records, generation))
     }
 }

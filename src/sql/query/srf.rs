@@ -2007,7 +2007,8 @@ pub(crate) fn describe_derived_definition<'a>(
                             slot += record_star_width(base, &ss)?;
                         }
                         SelectItem::Expr { expression, .. } => {
-                            output_collations[slot] = ss.expression_collation(expression)?;
+                            output_collations[slot] =
+                                ss.expression_collation(storage, arena, expression)?;
                             slot += 1;
                         }
                     }

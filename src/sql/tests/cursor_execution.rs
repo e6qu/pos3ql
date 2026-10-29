@@ -13,7 +13,7 @@ fn cursor_declaration_rejects_conflicting_options_and_write_effects() {
         .filter(|sql| !sql.trim().is_empty())
     {
         let output = session.execute(&mut engine, sql, true);
-        errors.extend(error_sqlstates(&output));
+        errors.extend(error_sqlstates(&output).into_iter().map(str::to_owned));
         rows.extend(data_rows(&output));
     }
     assert_eq!(

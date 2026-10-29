@@ -21,7 +21,7 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-
       - run: cargo fmt --check
       - run: >-
-          cargo test --lib --locked -- cursor_declaration_ query_row_cursor_
+          cargo test --lib --locked -- cursor_declaration_ query_row_cursor_ arena_retained_slices_
           captured_resident_byte_scans_ retained_checkpoint_
           --nocapture --test-threads=1
       - run: cargo clippy --all-targets -- -D warnings

@@ -3682,17 +3682,17 @@ mod tests {
         } = point_fixture("query-row-cursor");
         let mut config = test_config();
         config.max_spill_generations_per_table = 3;
-        let mut budget = Budget::new(
-            2 * RowCursor::allocation_bytes(&config) + RowCursorBuffers::allocation_bytes(&config),
-        );
-        let mut old = RowCursor::new(&config, &mut budget).unwrap();
-        let mut current = RowCursor::new(&config, &mut budget).unwrap();
+        let mut budget = Budget::new(RowCursorBuffers::allocation_bytes(&config) + 8192);
+        let mut old = RowCursor::closed();
+        let mut current = RowCursor::closed();
         let mut buffers = RowCursorBuffers::new(&config, &mut budget).unwrap();
+        let metadata =
+            crate::mem::arena::Arena::new(&mut budget, "query cursor positions", 8192).unwrap();
         assert_eq!(budget.remaining(), 0);
-        storage.set_commit_snapshot(7);
-        crate::mem::guard::forbid_alloc(|| old.open(&storage, table, 0)).unwrap();
+        let _visibility = storage.nested_statement_snapshot(7);
+        crate::mem::guard::forbid_alloc(|| old.open(&storage, table, 0, &metadata)).unwrap();
         storage.set_commit_snapshot(9);
-        crate::mem::guard::forbid_alloc(|| current.open(&storage, table, 0)).unwrap();
+        crate::mem::guard::forbid_alloc(|| current.open(&storage, table, 0, &metadata)).unwrap();
         storage.commit_drop(table);
         assert_eq!(
             storage
@@ -3708,9 +3708,11 @@ mod tests {
         {
             let reader = if is_old { &mut old } else { &mut current };
             arena.reset();
-            let row = crate::mem::guard::forbid_alloc(|| reader.next(&mut buffers, &arena, None))
-                .unwrap()
-                .unwrap();
+            let row = crate::mem::guard::forbid_alloc(|| {
+                reader.next(&mut buffers, &metadata, &arena, None)
+            })
+            .unwrap()
+            .unwrap();
             assert_eq!(row.rowid, expected_row);
             let mut values = [Datum::Null];
             match row.representation {
@@ -3722,12 +3724,12 @@ mod tests {
             assert_eq!(values, [Datum::Int4(expected_value)]);
         }
         assert!(
-            crate::mem::guard::forbid_alloc(|| current.next(&mut buffers, &arena, None))
+            crate::mem::guard::forbid_alloc(|| current.next(&mut buffers, &metadata, &arena, None))
                 .unwrap()
                 .is_none()
         );
         assert!(
-            crate::mem::guard::forbid_alloc(|| old.next(&mut buffers, &arena, None))
+            crate::mem::guard::forbid_alloc(|| old.next(&mut buffers, &metadata, &arena, None))
                 .unwrap()
                 .is_none()
         );

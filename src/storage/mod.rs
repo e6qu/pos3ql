@@ -15105,13 +15105,43 @@ struct CheckpointRowIdentity {
     suppress_spill: bool,
 }
 
+struct SpillWalkProgress {
+    identity: u64,
+    initialized: usize,
+    pending_advance: Option<u64>,
+}
+
+impl SpillWalkProgress {
+    const START: Self = Self {
+        identity: 0,
+        initialized: 0,
+        pending_advance: None,
+    };
+
+    fn resume<'a>(
+        &'a mut self,
+        members: &'a mut [MemberCursor],
+        context: &'a Mutex<ScanContext>,
+        max_rows: usize,
+        max_object_gets: u64,
+    ) -> SpillWalkResume<'a> {
+        SpillWalkResume {
+            members,
+            identity: &mut self.identity,
+            initialized: &mut self.initialized,
+            pending_advance: &mut self.pending_advance,
+            context,
+            max_rows,
+            max_object_gets,
+        }
+    }
+}
+
 /// File positions are independent of byte buffers. A nested scan may reuse
 /// scratch after copying a row, then restore its own immutable member heads.
 struct SpillWalkPosition {
     members: Box<[MemberCursor]>,
-    identity: u64,
-    initialized: usize,
-    pending_advance: Option<u64>,
+    progress: SpillWalkProgress,
 }
 
 impl SpillWalkPosition {
@@ -15122,17 +15152,13 @@ impl SpillWalkPosition {
     fn new(max_spill_generations: usize) -> Self {
         Self {
             members: vec![MemberCursor::EMPTY; max_spill_generations].into_boxed_slice(),
-            identity: 0,
-            initialized: 0,
-            pending_advance: None,
+            progress: SpillWalkProgress::START,
         }
     }
 
     fn reset(&mut self) {
         self.members.fill(MemberCursor::EMPTY);
-        self.identity = 0;
-        self.initialized = 0;
-        self.pending_advance = None;
+        self.progress = SpillWalkProgress::START;
     }
 
     fn resume<'a>(
@@ -15141,15 +15167,8 @@ impl SpillWalkPosition {
         max_rows: usize,
         max_object_gets: u64,
     ) -> SpillWalkResume<'a> {
-        SpillWalkResume {
-            members: &mut self.members,
-            identity: &mut self.identity,
-            initialized: &mut self.initialized,
-            pending_advance: &mut self.pending_advance,
-            context,
-            max_rows,
-            max_object_gets,
-        }
+        self.progress
+            .resume(&mut self.members, context, max_rows, max_object_gets)
     }
 }
 

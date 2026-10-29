@@ -3669,6 +3669,77 @@ mod tests {
     }
 
     #[test]
+    fn query_row_cursor_alternates_sources_and_keeps_retired_saved_files() {
+        use crate::sql::types::Datum;
+        use crate::storage::SpilledRowRepresentation;
+        use crate::storage::row_scans::cursor::{RowCursor, RowCursorBuffers};
+        let PointFixture {
+            mut storage,
+            table,
+            roots,
+            mut arena,
+            path,
+        } = point_fixture("query-row-cursor");
+        let mut config = test_config();
+        config.max_spill_generations_per_table = 3;
+        let mut budget = Budget::new(
+            2 * RowCursor::allocation_bytes(&config) + RowCursorBuffers::allocation_bytes(&config),
+        );
+        let mut old = RowCursor::new(&config, &mut budget).unwrap();
+        let mut current = RowCursor::new(&config, &mut budget).unwrap();
+        let mut buffers = RowCursorBuffers::new(&config, &mut budget).unwrap();
+        assert_eq!(budget.remaining(), 0);
+        storage.set_commit_snapshot(7);
+        crate::mem::guard::forbid_alloc(|| old.open(&storage, table, 0)).unwrap();
+        storage.set_commit_snapshot(9);
+        crate::mem::guard::forbid_alloc(|| current.open(&storage, table, 0)).unwrap();
+        storage.commit_drop(table);
+        assert_eq!(
+            storage
+                .create_table(make_def(
+                    "query_cursor_replacement",
+                    &[("id", ColType::Text, true)]
+                ))
+                .unwrap(),
+            table
+        );
+        storage.set_spill_list(table, &roots[2..]);
+        for (is_old, expected_row, expected_value) in [(true, 1, 41), (false, 1, 88), (true, 2, 17)]
+        {
+            let reader = if is_old { &mut old } else { &mut current };
+            arena.reset();
+            let row = crate::mem::guard::forbid_alloc(|| reader.next(&mut buffers, &arena, None))
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.rowid, expected_row);
+            let mut values = [Datum::Null];
+            match row.representation {
+                SpilledRowRepresentation::Encoded(bytes) => {
+                    crate::storage::rowenc::decode(bytes, &[ColType::Int4], &mut values).unwrap()
+                }
+                SpilledRowRepresentation::Values(source) => values.copy_from_slice(source),
+            }
+            assert_eq!(values, [Datum::Int4(expected_value)]);
+        }
+        assert!(
+            crate::mem::guard::forbid_alloc(|| current.next(&mut buffers, &arena, None))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            crate::mem::guard::forbid_alloc(|| old.next(&mut buffers, &arena, None))
+                .unwrap()
+                .is_none()
+        );
+        old.close();
+        current.close();
+        drop(old);
+        drop(current);
+        drop(storage);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn statement_files_keep_real_scan_roots_after_walks_and_arena_are_released() {
         let PointFixture {
             mut storage,

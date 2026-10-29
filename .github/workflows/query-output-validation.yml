@@ -20,7 +20,10 @@ jobs:
           key: ${{ runner.os }}-cargo-library-tests-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
       - run: cargo fmt --check
-      - run: cargo test --lib --locked cursor_declaration_ -- --nocapture --test-threads=1
+      - run: >-
+          cargo test --lib --locked -- cursor_declaration_ query_row_cursor_
+          captured_resident_byte_scans_ retained_checkpoint_
+          --nocapture --test-threads=1
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --lib --locked cursor -- --nocapture --test-threads=1
       - run: python3 tools/check-docs.py

@@ -634,6 +634,10 @@ impl<'b> Responder<'b> {
     /// Drains the whole send buffer to the flush sink, blocking. Returns
     /// whether it fully drained (false = the sink errored or there is none).
     fn drain(&mut self) -> bool {
+        if !self.buffer.is_empty() && !matches!(self.flush, FlushSink::None) {
+            // A sent prefix cannot be rolled back by a statement retry.
+            crate::sql::query::protect_statement_effects();
+        }
         match &mut self.flush {
             FlushSink::None => false,
             FlushSink::Fd(fd) => {

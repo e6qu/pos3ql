@@ -142,6 +142,10 @@ and saved files across suspension. Removing a table, recycling an internal slot,
 replacing a file list or moving the row heap cannot redirect that selection to
 replacement data. Downloads and callbacks run after short metadata guards end.
 Scans capture resident row choices once; saved rows continue streaming.
+Large results use one result header and one completion. After their first
+transport flush, remaining reads finish synchronously to avoid replaying a
+prefix already delivered to the client; [the plan](../PLAN.md) tracks retaining
+the output position across waits.
 
 **Example:** a report pauses after reading one order. Another connection updates
 an unread order and maintenance replaces saved files. Resuming the report still
@@ -401,9 +405,18 @@ wait. Separate fixed queues prevent either task from changing the other's
 pending deletions, and new commits cannot extend an old cleanup pass forever.
 Explicit CHECKPOINT, shutdown and some atomic reads still have synchronous work.
 
+Combining saved row files also yields while downloads wait. It retains index,
+column and large-row positions in startup-reserved state, including with both
+caches disabled. A cached order query can finish while a merge and another
+connection's download are waiting. Other connections keep their read ownership;
+a completion or freed slot makes the merge runnable again.
+Rows enter its checksum and output count once. A genuine source error restarts
+the same immutable pair with empty output; capture and index-building reads can
+still occupy the SQL worker.
+
 At 85% heap use, eligible top-level writes can wait before effects when an active
-maintenance task can free space, including saved-file cleanup that must finish
-before the next checkpoint. They preserve their command, timestamp and
+maintenance task can free space, including saved-file cleanup or a row-file merge
+that must finish before the next checkpoint. They preserve their command, timestamp and
 deadline and appear as Extension/CacheCapacity waits. Reads and transaction
 completion remain runnable. A transaction does not wait for space that its own
 pending changes pin. When work cannot fit, it receives its named capacity error.

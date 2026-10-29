@@ -37,9 +37,9 @@ use crate::storage::{
 };
 use crate::store::{
     BlockId, BlockStore, BlockType, BlockWriter, MAX_ASSEMBLED, MAX_INLINE_ROW, OwnedObjectStore,
-    RowSstFormat, SstCursor, SstHandle, SstKey, SstReader, SstVersionCursor, SstWriter, StackPlan,
-    StoreError, TieredStore, ValueIndexHandle, ValueIndexStream, ValueIndexStreamStep,
-    ValueIndexWriter, block_keys_at, copy_block_entry_at,
+    RowSstFormat, SstCursor, SstHandle, SstKey, SstMetadataCursor, SstMetadataStep,
+    SstVersionCursor, SstWriter, StackPlan, StoreError, TieredStore, ValueIndexHandle,
+    ValueIndexStream, ValueIndexStreamStep, ValueIndexWriter, block_keys_at, copy_block_entry_at,
 };
 use crate::util::StackStr;
 use crate::wal::crc32c::Crc32c;
@@ -846,8 +846,8 @@ impl SlotList {
 
 /// Where a paced merge stands between beats.
 enum MergePhase {
-    /// Building the id schedule: member `rank`'s scan resumes at `resume_lo`.
-    Schedule { rank: u8, resume_lo: SstKey },
+    /// The selected member retains its metadata cursor between turns.
+    Schedule { rank: u8 },
     /// Streaming scheduled entries into the merged SST from `cursor`.
     Write { cursor: usize },
     /// The handle is private until its last output emission is durable.
@@ -889,6 +889,22 @@ enum MergeBeatOutcome {
     Continue,
     Cancel,
     Finished(Option<PrevSst>),
+}
+
+const MERGE_READ_OWNER: crate::store::ReadOwner = crate::store::ReadOwner(3u128 << 96);
+
+struct MergeReadScope {
+    blocks: std::sync::Arc<Mutex<TieredStore<OwnedObjectStore>>>,
+    previous: Option<crate::store::ReadOwner>,
+}
+
+impl Drop for MergeReadScope {
+    fn drop(&mut self) {
+        self.blocks
+            .lock()
+            .expect("block store lock poisoned")
+            .set_read_owner(self.previous);
+    }
 }
 
 /// The adjacent pair's handles at position `at`, if both exist.
@@ -1414,6 +1430,8 @@ pub(crate) struct Checkpointer {
     /// block across beats. Transient index/PAX decode buffers are shared
     /// because only one source advances at a time.
     merge_source_cursors: [Option<SstVersionCursor>; 2],
+    merge_metadata_cursors: [Option<SstMetadataCursor>; 2],
+    merge_read_wait: Option<u64>,
     merge_source_decoded: Box<[u8]>,
     merge_source_index: Box<[u8]>,
     merge_source_raw: Box<[u8]>,
@@ -1480,7 +1498,7 @@ const MERGE_TRIGGER: usize = 4;
 /// per write beat, and a cheap-entry cap so a tombstone-heavy stretch (which
 /// emits no blocks) still bounds its walking and checksum work. One row can
 /// cross the read budget because its PAX columns are one indivisible image.
-const MERGE_SCHEDULE_BEAT_BLOCKS: usize = 8;
+const MERGE_SCHEDULE_BEAT_NODES: usize = 8;
 const MERGE_WRITE_BEAT_BLOCKS: usize = 4;
 const MERGE_WRITE_BEAT_READS: u64 = 8;
 const MERGE_BEAT_ENTRIES: usize = 64 * 1024;
@@ -1542,6 +1560,9 @@ impl Checkpointer {
         core::mem::size_of::<CommitPruneProgress>()
             + core::mem::size_of::<FileGcProgress>()
             + core::mem::size_of::<Option<crate::store::ValueRosterWalk>>()
+            + core::mem::size_of::<Option<u64>>()
+            + 2 * core::mem::size_of::<Option<SstVersionCursor>>()
+            + 2 * core::mem::size_of::<Option<SstMetadataCursor>>()
             + core::mem::size_of::<Option<u64>>()
             + 2 * SstWriter::budget_bytes()
             + ValueIndexWriter::budget_bytes()
@@ -1673,12 +1694,17 @@ impl Checkpointer {
     fn merge_beat(&mut self, storage: &Storage) -> Result<(), SqlError> {
         self.claim_physical_output(PhysicalOutputOwner::Merge)?;
         let Some(mut job) = self.merge_job.take() else {
+            self.merge_read_wait = None;
             if let Some(job) = self.merge_candidate(storage) {
                 self.merge_scratch.clear();
                 self.reset_merge_writer(storage, job.slot)?;
                 self.merge_source_cursors = [
                     Some(SstVersionCursor::new(job.old0.handle)),
                     Some(SstVersionCursor::new(job.old1.handle)),
+                ];
+                self.merge_metadata_cursors = [
+                    Some(SstMetadataCursor::new(job.old0.handle)),
+                    Some(SstMetadataCursor::new(job.old1.handle)),
                 ];
                 self.merge_job = Some(job);
             }
@@ -1691,12 +1717,35 @@ impl Checkpointer {
             .get(job.slot)
             .is_some_and(|list| pair_at(list, job.at) == Some((job.old0.handle, job.old1.handle)));
         if !valid {
+            self.merge_read_wait = None;
+            self.cancel_read_owner(MERGE_READ_OWNER);
             self.block_output
                 .discard(&mut self.block_uploads)
                 .map_err(upload_to_sql)?;
             self.merge_writer.reset();
             return Ok(());
         }
+        if self.merge_read_wait == Some(self.read_capacity_generation())
+            && self
+                .blocks
+                .lock()
+                .expect("block store lock poisoned")
+                .async_gets_enabled()
+        {
+            self.merge_job = Some(job);
+            return Ok(());
+        }
+        self.merge_read_wait = None;
+        let previous = {
+            let mut blocks = self.blocks.lock().expect("block store lock poisoned");
+            let previous = blocks.base_mut().read_owner();
+            blocks.set_read_owner(Some(MERGE_READ_OWNER));
+            previous
+        };
+        let _read_owner = MergeReadScope {
+            blocks: std::sync::Arc::clone(&self.blocks),
+            previous,
+        };
         #[cfg(feature = "checkpoint-profile")]
         let (phase, started, before) = (
             match &job.phase {
@@ -1711,15 +1760,19 @@ impl Checkpointer {
                 .io_stats(),
         );
         let outcome = match job.phase {
-            MergePhase::Schedule { rank, resume_lo } => {
-                self.merge_schedule_beat(&mut job, rank, resume_lo)
-            }
+            MergePhase::Schedule { rank } => self.merge_schedule_beat(&mut job, rank),
             MergePhase::Write { cursor } => self.merge_write_beat(&mut job, cursor),
             MergePhase::Finish { merged } => Ok(MergeBeatOutcome::Finished(merged)),
         };
         let outcome = match outcome {
             Ok(outcome) => outcome,
+            Err(error) if error.sqlstate == sqlstate::INTERNAL_IO_WAIT => {
+                self.merge_read_wait = Some(self.read_capacity_generation());
+                self.merge_job = Some(job);
+                return Ok(());
+            }
             Err(error) => {
+                self.cancel_read_owner(MERGE_READ_OWNER);
                 // A read can fail after cursors, checksum or writer state changed.
                 // Retry the same immutable pair with one coherent empty output.
                 self.block_output
@@ -1731,10 +1784,11 @@ impl Checkpointer {
                     Some(SstVersionCursor::new(job.old0.handle)),
                     Some(SstVersionCursor::new(job.old1.handle)),
                 ];
-                job.phase = MergePhase::Schedule {
-                    rank: 0,
-                    resume_lo: SstKey::MIN,
-                };
+                self.merge_metadata_cursors = [
+                    Some(SstMetadataCursor::new(job.old0.handle)),
+                    Some(SstMetadataCursor::new(job.old1.handle)),
+                ];
+                job.phase = MergePhase::Schedule { rank: 0 };
                 job.schedule_len = 0;
                 job.count = 0;
                 job.crc = Crc32c::new();
@@ -1758,8 +1812,9 @@ impl Checkpointer {
         );
         match outcome {
             MergeBeatOutcome::Continue => self.merge_job = Some(job),
-            MergeBeatOutcome::Cancel => {}
+            MergeBeatOutcome::Cancel => self.cancel_read_owner(MERGE_READ_OWNER),
             MergeBeatOutcome::Finished(merged) => {
+                self.cancel_read_owner(MERGE_READ_OWNER);
                 self.merge_done[job.slot] = Some(CompletedMerge {
                     at: job.at,
                     old0: job.old0,
@@ -1837,10 +1892,7 @@ impl Checkpointer {
                 old1,
                 drop_tombstones: at == 0 && !storage.has_active_snapshots(),
                 oldest_snapshot: storage.oldest_snapshot(),
-                phase: MergePhase::Schedule {
-                    rank: 0,
-                    resume_lo: SstKey::MIN,
-                },
+                phase: MergePhase::Schedule { rank: 0 },
                 schedule_len: 0,
                 count: 0,
                 crc: Crc32c::new(),
@@ -1896,29 +1948,34 @@ impl Checkpointer {
         &mut self,
         job: &mut MergeJob,
         rank: u8,
-        resume_lo: SstKey,
     ) -> Result<MergeBeatOutcome, SqlError> {
-        self.sst_arena.reset();
-        let mut reader = SstReader::new(&self.sst_arena).map_err(sst_to_sql)?;
-        let member = if rank == 0 { &job.old0 } else { &job.old1 };
         let scratch = &mut self.merge_scratch;
-        let blocks = &self.blocks;
         let mut overflow = false;
-        let next = reader
-            .scan_versions_bounded(
-                &mut *blocks.lock().expect("block store lock poisoned"),
-                &member.handle,
-                resume_lo,
-                MERGE_SCHEDULE_BEAT_BLOCKS,
-                &mut |key, tombstone| {
-                    if scratch.len() == scratch.capacity() {
-                        overflow = true;
-                        return;
-                    }
-                    scratch.push((key, rank | (u8::from(tombstone) << 1)));
-                },
-            )
-            .map_err(sst_to_sql)?;
+        let mut done = false;
+        for _ in 0..MERGE_SCHEDULE_BEAT_NODES {
+            let step = self.merge_metadata_cursors[usize::from(rank)]
+                .as_mut()
+                .expect("merge metadata cursor initialized with the job")
+                .step(
+                    &mut *self.blocks.lock().expect("block store lock poisoned"),
+                    &mut self.merge_source_index,
+                    &mut self.merge_source_raw,
+                    &mut self.merge_source_decoded[..crate::store::MAX_PAYLOAD],
+                    &mut self.merge_source_column,
+                    &mut |key, tombstone| {
+                        if scratch.len() == scratch.capacity() {
+                            overflow = true;
+                            return;
+                        }
+                        scratch.push((key, rank | (u8::from(tombstone) << 1)));
+                    },
+                )
+                .map_err(sst_to_sql)?;
+            if matches!(step, SstMetadataStep::Done) {
+                done = true;
+                break;
+            }
+        }
         if overflow {
             // The pair's counts under-reported its entries (corruption would
             // show elsewhere); remember it so the scheduler stops proposing
@@ -1929,16 +1986,10 @@ impl Checkpointer {
             }
             return Ok(MergeBeatOutcome::Cancel);
         }
-        job.phase = match (next, rank) {
-            (Some(lo), _) => MergePhase::Schedule {
-                rank,
-                resume_lo: lo,
-            },
-            (None, 0) => MergePhase::Schedule {
-                rank: 1,
-                resume_lo: SstKey::MIN,
-            },
-            (None, _) => {
+        job.phase = match (done, rank) {
+            (false, _) => MergePhase::Schedule { rank },
+            (true, 0) => MergePhase::Schedule { rank: 1 },
+            (true, _) => {
                 // Exact duplicates choose the newer list member.
                 self.merge_scratch
                     .sort_unstable_by_key(|&(key, kind)| (key, kind & 1));
@@ -2118,11 +2169,10 @@ impl Checkpointer {
                     cursor += entries;
                     processed += entries;
                     job.count += entries as u64;
+                    job.phase = MergePhase::Write { cursor };
                     continue;
                 }
             }
-            cursor += 1;
-            processed += 1;
             if kind & 2 != 0 {
                 // A tombstone: its within-pair row (if any) lost the dedup.
                 // At the list head nothing older remains to suppress — drop
@@ -2139,6 +2189,9 @@ impl Checkpointer {
                         .map_err(sst_to_sql)?;
                     job.count += 1;
                 }
+                cursor += 1;
+                processed += 1;
+                job.phase = MergePhase::Write { cursor };
                 continue;
             }
             let len = self.merge_source_cursors[rank]
@@ -2173,6 +2226,9 @@ impl Checkpointer {
                 .append_version(output, key, &self.merge_row[..len])
                 .map_err(sst_to_sql)?;
             job.count += 1;
+            cursor += 1;
+            processed += 1;
+            job.phase = MergePhase::Write { cursor };
         }
         if !output.is_empty() {
             job.phase = MergePhase::Write { cursor };
@@ -2446,6 +2502,8 @@ impl Checkpointer {
             slice_writer: SstWriter::new(),
             merge_writer: SstWriter::new(),
             merge_source_cursors: [None, None],
+            merge_metadata_cursors: [None, None],
+            merge_read_wait: None,
             merge_source_decoded: vec![0; 2 * crate::store::MAX_PAYLOAD].into_boxed_slice(),
             merge_source_index: vec![0; crate::store::MAX_PAYLOAD].into_boxed_slice(),
             merge_source_raw: vec![0; crate::store::MAX_PAYLOAD].into_boxed_slice(),
@@ -3226,6 +3284,17 @@ impl Checkpointer {
         self.block_output.is_empty()
             && !self.published_maintenance_pending()
             && self.retained_output_pending()
+    }
+
+    pub(crate) fn merge_reads_ready(&self) -> bool {
+        self.merge_read_wait != Some(self.read_capacity_generation())
+    }
+
+    pub(crate) fn independent_merge_ready(&self) -> bool {
+        self.merge_job.is_some()
+            && self.table_job.is_none()
+            && self.retained_output_ready()
+            && self.merge_reads_ready()
     }
 
     /// Already-captured inputs can progress behind later journal uploads.
@@ -9509,6 +9578,7 @@ impl Checkpointer {
     /// garbage maintenance remains pending and is either paced by later beats
     /// or drained explicitly by [`Self::finish_maintenance`].
     pub(crate) fn checkpoint(&mut self, storage: &mut Storage) -> Result<Option<u64>, SqlError> {
+        let _atomic_reads = self.atomic_block_read_scope();
         if self.credential_install_pending() {
             return Err(sql_err!(
                 sqlstate::INTERNAL_IO_WAIT,
@@ -9588,7 +9658,7 @@ impl Checkpointer {
     /// Advances captured table/index output, manifest publication or cleanup.
     /// Changed tables need a current slice before manifest capture. Upload and
     /// local installation then retain that capture's identity across turns.
-    /// Some capture and table/index merge reads still wait synchronously.
+    /// Some table capture and index-building reads still wait synchronously.
     ///
     /// Failures retain a retryable position or restart the same immutable job.
     /// Repeated PUTs keep the same block identity but still cost requests and
@@ -9672,6 +9742,9 @@ impl Checkpointer {
         if !sweep_due {
             return Ok(CheckpointStep::Idle);
         }
+        // Capture callbacks cannot yet be replayed. Retained merges run before
+        // this scope and keep their own source positions through a waiting GET.
+        let _atomic_reads = self.atomic_block_read_scope();
         if !self.sweeping {
             self.sweeping = true;
             self.sliced_generation.iter_mut().for_each(|g| *g = 0);
@@ -13294,6 +13367,7 @@ impl Checkpointer {
         &mut self,
         storage: &mut Storage,
     ) -> Result<CheckpointStep, SqlError> {
+        let _atomic_reads = self.atomic_block_read_scope();
         let publication = self
             .manifest_publication
             .take()
@@ -13671,6 +13745,7 @@ impl Checkpointer {
     }
 
     fn advance_table_slice(&mut self, storage: &Storage) -> Result<(), SqlError> {
+        let _atomic_reads = self.atomic_block_read_scope();
         self.claim_physical_output(PhysicalOutputOwner::Table)?;
         let mut job = self.table_job.take().expect("scheduled table output");
         if !Self::table_slice_matches(storage, &job) {
@@ -19964,6 +20039,59 @@ mod stored_dependency_tests {
         let mut budget = Budget::new(Checkpointer::budget_bytes(&config) + (4 << 20));
         let checkpointer = Checkpointer::new(&config, &mut budget).unwrap();
         (checkpointer, config)
+    }
+
+    #[test]
+    fn atomic_block_reads_streamed_prefix_prevents_read_replay() {
+        use std::io::Read;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+
+        let (mut checkpointer, config) = atomic_scope_fixture("streamed-prefix");
+        checkpointer.enable_async_block_reads();
+        let blocks = checkpointer.block_stack();
+        let (socket, mut peer) = UnixStream::pair().unwrap();
+        let mut budget = Budget::new(32);
+        let mut buffer =
+            crate::mem::buffer::FixedBuf::new(&mut budget, "stream output", 32).unwrap();
+        for streaming in [false, true] {
+            buffer.clear();
+            crate::mem::guard::forbid_alloc(|| {
+                let reads = checkpointer.deferred_atomic_block_read_scope();
+                let effects = crate::sql::query::enter_statement_read_effect_scope(Some(&reads));
+                let mut responder = crate::pg::respond::Responder::new(&mut buffer);
+                if streaming {
+                    responder = responder.with_flush(socket.as_raw_fd());
+                }
+                for value in [1, 2] {
+                    responder
+                        .data_row(&[crate::sql::types::Datum::Int4(value)])
+                        .unwrap();
+                }
+                assert!(blocks.lock().unwrap().async_gets_enabled());
+                let third = responder.data_row(&[crate::sql::types::Datum::Int4(3)]);
+                if streaming {
+                    third.unwrap();
+                    assert!(!blocks.lock().unwrap().async_gets_enabled());
+                    let mut sent = [0u8; 24];
+                    peer.read_exact(&mut sent).unwrap();
+                    assert_eq!(sent[0], b'D');
+                    assert_eq!(sent[12], b'D');
+                    assert_eq!(responder.buffer.readable().len(), 12);
+                    let nested = checkpointer.atomic_block_read_scope();
+                    drop(nested);
+                    assert!(!blocks.lock().unwrap().async_gets_enabled());
+                } else {
+                    assert!(third.is_err());
+                    assert!(blocks.lock().unwrap().async_gets_enabled());
+                }
+                drop(effects);
+                drop(reads);
+                assert!(blocks.lock().unwrap().async_gets_enabled());
+            });
+        }
+        drop(checkpointer);
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     }
 
     #[test]

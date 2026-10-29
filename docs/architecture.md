@@ -46,8 +46,9 @@ needs a download yields with its original data owners and command deadline;
 another connection can run cached work. Adding connections or
 `query_workspace_slots` does not add CPU execution workers.
 
-State-changing routines, procedure commit boundaries, some metadata capture
-and some maintenance reads still complete synchronously. A cold read on one
+State-changing routines, procedure commit boundaries, some metadata capture,
+large-result reads after their first transport flush, and some maintenance
+reads still complete synchronously. A cold read on one
 of these paths can occupy that worker. [PLAN.md](../PLAN.md) tracks their
 conversion and the later CPU worker pool separately.
 
@@ -226,7 +227,14 @@ row-roster, index-tree and deletion positions across waits. Its cache probes
 preserve query read owners. It validates the complete keep-set before deleting
 files, then continues each listing from its saved cursor. Durable file writers
 remain paused while that decision drains; foreground RAM edits can continue.
-Checkpoint capture and table/index merge reads still have synchronous paths.
+Row-file merges retain index descent, source-row scheduling, column downloads
+and large-row fragments while a request waits. Scheduling reads row descriptors
+without fetching PAX column values. Completed groups stay in the existing source
+buffers; checksums and output positions advance only after their rows finish.
+The fixed read pool reserves one maintenance owner alongside connections and
+subscription workers. A waiting merge releases the SQL worker and shares no
+mutable decoder state with foreground queries. Table capture and index-building
+reads still have synchronous paths.
 
 The remaining order is coherent shared row/catalog publication and bounded
 maintenance, startup-reserved CPU workers, then representative performance and

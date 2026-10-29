@@ -195,6 +195,10 @@ struct ObjectReadSlot {
 }
 
 impl OwnedObjectStore {
+    pub(crate) fn read_owner(&self) -> Option<ReadOwner> {
+        self.read_owner
+    }
+
     pub(crate) fn budget_bytes(config: &crate::config::Config) -> usize {
         config
             .object_store_get_slots
@@ -209,6 +213,7 @@ impl OwnedObjectStore {
     }
 
     fn owner_capacity(config: &crate::config::Config) -> usize {
+        // One retained merge shares responses with foreground and replication readers.
         (config.max_connections as usize)
             .saturating_add(config.max_subscriptions)
             .saturating_add(1)

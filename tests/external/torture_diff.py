@@ -115,7 +115,7 @@ def table_digest(cur, table):
     )
     summary = cur.fetchone()
     cur.execute(f"SELECT id, md5(pad) FROM {table} ORDER BY id")
-    return (summary, cur.fetchall())
+    return (summary, cur.fetchall(), cur.statusmessage)
 
 
 def verify(p3cur, pgcur, context):
@@ -127,12 +127,19 @@ def verify(p3cur, pgcur, context):
             print(f"  pos3ql summary:   {got[0]}", file=sys.stderr)
             print(f"  postgres summary: {want[0]}", file=sys.stderr)
             g, w = dict(got[1]), dict(want[1])
-            missing = sorted(set(w) - set(g))[:10]
+            missing = sorted(set(w) - set(g))
             extra = sorted(set(g) - set(w))[:10]
             changed = sorted(k for k in set(g) & set(w) if g[k] != w[k])[:10]
-            print(f"  missing ids: {missing}", file=sys.stderr)
+            print(f"  ordered row counts: {len(got[1])} / {len(want[1])}", file=sys.stderr)
+            print(f"  completion tags: {got[2]} / {want[2]}", file=sys.stderr)
+            print(f"  missing ids ({len(missing)}): {missing[:20]} ... {missing[-20:]}", file=sys.stderr)
             print(f"  extra ids:   {extra}", file=sys.stderr)
             print(f"  changed ids: {changed}", file=sys.stderr)
+            for suffix in ("", " ORDER BY id"):
+                p3cur.execute(f"SELECT id, md5(pad) FROM {t}{suffix}")
+                repeated = dict(p3cur.fetchall())
+                absent = sorted(set(w) - set(repeated))
+                print(f"  repeated {suffix or 'plain'} rows={len(repeated)} missing={len(absent)} first={absent[:20]}", file=sys.stderr)
             return False
     return True
 

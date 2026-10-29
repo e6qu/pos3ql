@@ -1877,9 +1877,8 @@ impl SpilledRowRead {
             reader.with_row_bytes_in(
                 source.persistence,
                 handle,
-                self.rowid,
+                crate::store::SstKey::at(self.rowid, self.commit_lsn),
                 self.len,
-                self.commit_lsn,
                 buffers,
                 consume,
             )

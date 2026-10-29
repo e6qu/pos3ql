@@ -2175,6 +2175,7 @@ impl Checkpointer {
                                 &decoded[..group.data_len()],
                                 at,
                                 &mut self.merge_row[..len],
+                                &mut crate::store::ChainReadProgress::default(),
                             )
                             .map_err(sst_to_sql)?;
                             job.crc.update(&self.merge_row[..len]);

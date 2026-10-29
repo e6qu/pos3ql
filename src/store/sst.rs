@@ -1456,7 +1456,7 @@ impl PaxDecodeProgress {
 }
 
 #[derive(Clone, Copy, Default)]
-struct ChainReadProgress {
+pub(crate) struct ChainReadProgress {
     key: Option<SstKey>,
     chunk: usize,
     written: usize,
@@ -2555,7 +2555,10 @@ impl<'a> SstReader<'a> {
     }
 
     #[cfg(test)]
-    pub(crate) fn new(arena: &'a Arena) -> Result<Self, SstError> {
+    pub(crate) fn new(
+        arena: &'a Arena,
+        partial: &'a mut SstReadProgress,
+    ) -> Result<Self, SstError> {
         let index_scratch = arena
             .alloc_slice_with(MAX_PAYLOAD, |_| 0u8)
             .map_err(|_| SstError::Store(StoreError::Unavailable))?;
@@ -2571,10 +2574,6 @@ impl<'a> SstReader<'a> {
         let assembly = arena
             .alloc_slice_with(MAX_ASSEMBLED, |_| 0u8)
             .map_err(|_| SstError::Store(StoreError::Unavailable))?;
-        let partial = arena
-            .alloc_slice_with(1, |_| SstReadProgress::new())
-            .map_err(|_| SstError::Store(StoreError::Unavailable))?;
-        let partial = &mut partial[0];
         Ok(Self {
             index_scratch,
             data_scratch,
@@ -3688,6 +3687,7 @@ pub(crate) fn copy_block_entry_at(
     block: &[u8],
     at: usize,
     out: &mut [u8],
+    progress: &mut ChainReadProgress,
 ) -> Result<(SstKey, bool, usize), SstError> {
     let remaining = block.get(at..).ok_or(SstError::Store(StoreError::Corrupt(
         super::BlockError::Truncated,
@@ -3703,7 +3703,7 @@ pub(crate) fn copy_block_entry_at(
         return Err(SstError::Store(StoreError::BufferTooSmall));
     }
     if entry.is_chained() {
-        assemble_chain(store, &entry, out, &mut ChainReadProgress::default())?;
+        assemble_chain(store, &entry, out, progress)?;
     } else {
         out.copy_from_slice(entry.head);
     }
@@ -3781,7 +3781,8 @@ mod tests {
             .unwrap();
         let second = writer.finish(&mut store).unwrap().unwrap();
         let arena = arena();
-        let mut reader = SstReader::new(&arena).unwrap();
+        let mut reader_partial = SstReadProgress::new();
+        let mut reader = SstReader::new(&arena, &mut reader_partial).unwrap();
         let mut output = [0; 16];
         crate::mem::guard::forbid_alloc(|| {
             reader
@@ -3894,7 +3895,8 @@ mod tests {
         writer.flush_index_leaf(&mut store).unwrap();
         let handle = writer.finish(&mut store).unwrap().unwrap();
         let arena = arena();
-        let mut reader = SstReader::new(&arena).unwrap();
+        let mut reader_partial = SstReadProgress::new();
+        let mut reader = SstReader::new(&arena, &mut reader_partial).unwrap();
         let mut output = [0; 16];
         crate::mem::guard::forbid_alloc(|| {
             for (rowid, snapshot, expected, reads) in [
@@ -3976,7 +3978,8 @@ mod tests {
                 for attempt in 0..=waits {
                     // A rebuilt reader retains completed metadata descent even
                     // when the root and its leaf each wait with empty caches.
-                    let mut reader = SstReader::new(&arena).unwrap();
+                    let mut reader_partial = SstReadProgress::new();
+                    let mut reader = SstReader::new(&arena, &mut reader_partial).unwrap();
                     reader.restore_point_read(progress);
                     let result = reader.get_at(&mut store, &handle, 1, 7, &mut output);
                     progress = reader.point_read_progress();
@@ -3999,7 +4002,8 @@ mod tests {
     fn atomic_block_reads_failed_decode_releases_the_previous_buffer_identity() {
         let (_budget, mut store) = store();
         let arena = arena();
-        let mut reader = SstReader::new(&arena).unwrap();
+        let mut reader_partial = SstReadProgress::new();
+        let mut reader = SstReader::new(&arena, &mut reader_partial).unwrap();
         let valid = store
             .put(b"previous rows", BlockType::SstDataV2, 0)
             .unwrap();
@@ -4062,7 +4066,8 @@ mod tests {
         let (_b, mut s) = store();
         let a = arena();
         let root = build(&mut s, &[(1, b"only row".to_vec())]).expect("has a root");
-        let mut r = SstReader::new(&a).unwrap();
+        let mut reader_partial = SstReadProgress::new();
+        let mut r = SstReader::new(&a, &mut reader_partial).unwrap();
         assert_eq!(
             get(&mut r, &mut s, &root, 1).as_deref(),
             Some(&b"only row"[..])
@@ -4109,7 +4114,9 @@ mod tests {
         assert_eq!(packed.format.manifest_id(), "v4");
         assert_eq!(delta.format, RowSstFormat::PackedV4);
 
-        let mut reader = SstReader::new(&arena).unwrap();
+        let mut reader_partial = SstReadProgress::new();
+
+        let mut reader = SstReader::new(&arena, &mut reader_partial).unwrap();
         assert_eq!(get(&mut reader, &mut store, &direct, 1), Some(direct_row));
         assert_eq!(
             get(&mut reader, &mut store, &legacy_pax, 2),
@@ -4148,7 +4155,8 @@ mod tests {
             "one packed row container plus filter, index, and roster"
         );
         let scratch = arena();
-        let mut reader = SstReader::new(&scratch).unwrap();
+        let mut reader_partial = SstReadProgress::new();
+        let mut reader = SstReader::new(&scratch, &mut reader_partial).unwrap();
         assert_eq!(
             get(&mut reader, &mut store, &handle, 64),
             Some(vec![b'x'; 256])
@@ -4190,7 +4198,8 @@ mod tests {
             pax_store.len()
         );
         let scratch = arena();
-        let mut reader = SstReader::new(&scratch).unwrap();
+        let mut reader_partial = SstReadProgress::new();
+        let mut reader = SstReader::new(&scratch, &mut reader_partial).unwrap();
         assert_eq!(
             get(&mut reader, &mut row_store, &packed_handle, 512),
             Some(row)
@@ -4218,7 +4227,8 @@ mod tests {
         };
         let before = store.reads();
         let scratch = arena();
-        let mut reader = SstReader::new(&scratch).unwrap();
+        let mut reader_partial = SstReadProgress::new();
+        let mut reader = SstReader::new(&scratch, &mut reader_partial).unwrap();
         let mut seen = 0usize;
         assert_eq!(
             reader
@@ -4872,7 +4882,8 @@ mod tests {
             .append_version(&mut store, SstKey::at(3, 20), &second_bytes)
             .unwrap();
         let handle = writer.finish(&mut store).unwrap().unwrap();
-        let mut reader = SstReader::new(&arena).unwrap();
+        let mut reader_partial = SstReadProgress::new();
+        let mut reader = SstReader::new(&arena, &mut reader_partial).unwrap();
         assert_eq!(get(&mut reader, &mut store, &handle, 1), Some(first_bytes));
         assert_eq!(get(&mut reader, &mut store, &handle, 2), None);
         let before_second_live_row = store.reads();
@@ -5187,7 +5198,8 @@ mod tests {
             .map(|i| (i * 2 + 1, vec![i as u8; 400]))
             .collect();
         let root = build(&mut s, &rows).expect("has a root");
-        let mut r = SstReader::new(&a).unwrap();
+        let mut reader_partial = SstReadProgress::new();
+        let mut r = SstReader::new(&a, &mut reader_partial).unwrap();
         for (rowid, row) in &rows {
             assert_eq!(
                 get(&mut r, &mut s, &root, *rowid).as_ref(),
@@ -5209,7 +5221,8 @@ mod tests {
         let a = arena();
         let rows: Vec<_> = (0..3000u64).map(|i| (i + 1, vec![7u8; 500])).collect();
         let root = build(&mut s, &rows).expect("has a root");
-        let mut r = SstReader::new(&a).unwrap();
+        let mut reader_partial = SstReadProgress::new();
+        let mut r = SstReader::new(&a, &mut reader_partial).unwrap();
         let before = s.reads();
         let _ = get(&mut r, &mut s, &root, 2500);
         assert_eq!(s.reads() - before, 3, "filter, index, and one data block");
@@ -5227,7 +5240,8 @@ mod tests {
         // requires that most cost a single read.
         let rows: Vec<_> = (0..3000u64).map(|i| (i * 2, vec![7u8; 500])).collect();
         let root = build(&mut s, &rows).expect("has a root");
-        let mut r = SstReader::new(&a).unwrap();
+        let mut reader_partial = SstReadProgress::new();
+        let mut r = SstReader::new(&a, &mut reader_partial).unwrap();
         let mut single_read = 0;
         for probe in (1..200u64).step_by(2) {
             let before = s.reads();
@@ -5276,7 +5290,8 @@ mod tests {
         w.append(&mut s, 2, &huge).unwrap();
         w.append(&mut s, 3, &[8u8; 40]).unwrap();
         let root = w.finish(&mut s).unwrap().expect("root");
-        let mut r = SstReader::new(&a).unwrap();
+        let mut reader_partial = SstReadProgress::new();
+        let mut r = SstReader::new(&a, &mut reader_partial).unwrap();
         let mut out = vec![0u8; MAX_ASSEMBLED];
         let n = r.get(&mut s, &root, 2, &mut out).unwrap().expect("found");
         assert_eq!(&out[..n], &huge[..], "chained row round-trips by get");
@@ -5304,7 +5319,8 @@ mod tests {
         w.append_tombstone(&mut s, 2).unwrap();
         w.append(&mut s, 3, &[9u8; 8]).unwrap();
         let root = w.finish(&mut s).unwrap().expect("root");
-        let mut r = SstReader::new(&a).unwrap();
+        let mut reader_partial = SstReadProgress::new();
+        let mut r = SstReader::new(&a, &mut reader_partial).unwrap();
         let mut out = [0u8; 64];
         assert_eq!(
             r.get(&mut s, &root, 2, &mut out).unwrap(),
@@ -5335,7 +5351,8 @@ mod tests {
             .unwrap();
         let handle = writer.finish(&mut store).unwrap().unwrap();
         let arena = arena();
-        let mut reader = SstReader::new(&arena).unwrap();
+        let mut reader_partial = SstReadProgress::new();
+        let mut reader = SstReader::new(&arena, &mut reader_partial).unwrap();
         let mut out = [0u8; 32];
 
         let newest = reader
@@ -5380,7 +5397,8 @@ mod tests {
         }
         let handle = writer.finish(&mut store).unwrap().unwrap();
         let arena = arena();
-        let mut reader = SstReader::new(&arena).unwrap();
+        let mut reader_partial = SstReadProgress::new();
+        let mut reader = SstReader::new(&arena, &mut reader_partial).unwrap();
         let mut out = vec![0u8; row.len()];
         for snapshot in 1..=6 {
             let probe = reader
@@ -5408,7 +5426,8 @@ mod tests {
         let (_b, mut s) = store();
         let a = arena();
         let root = build(&mut s, &[(1, vec![9u8; 100])]).expect("root");
-        let mut r = SstReader::new(&a).unwrap();
+        let mut reader_partial = SstReadProgress::new();
+        let mut r = SstReader::new(&a, &mut reader_partial).unwrap();
         let mut small = [0u8; 10];
         assert_eq!(
             r.get(&mut s, &root, 1, &mut small).err(),
@@ -5507,7 +5526,8 @@ mod tests {
             prefetched: Vec::new(),
         };
         let arena = arena();
-        let mut reader = SstReader::new(&arena).unwrap();
+        let mut reader_partial = SstReadProgress::new();
+        let mut reader = SstReader::new(&arena, &mut reader_partial).unwrap();
         let mut rows = 0;
         reader
             .scan(&mut store, &handle, 1, 3, &mut |_, _| rows += 1)
@@ -5550,7 +5570,8 @@ mod tests {
             prefetched: Vec::new(),
         };
         let arena = arena();
-        let mut reader = SstReader::new(&arena).unwrap();
+        let mut reader_partial = SstReadProgress::new();
+        let mut reader = SstReader::new(&arena, &mut reader_partial).unwrap();
         reader
             .scan(&mut store, &handle, 1, 5, &mut |_, _| {})
             .unwrap();
@@ -5569,7 +5590,8 @@ mod tests {
         let a = arena();
         let rows: Vec<_> = (1..=50u64).map(|i| (i, vec![i as u8; 20])).collect();
         let root = build(&mut s, &rows).expect("root");
-        let mut r = SstReader::new(&a).unwrap();
+        let mut reader_partial = SstReadProgress::new();
+        let mut r = SstReader::new(&a, &mut reader_partial).unwrap();
         let got = scan(&mut r, &mut s, &root, 10, 20);
         assert_eq!(got.len(), 11);
         assert_eq!(got.first().unwrap().0, 10);
@@ -5590,7 +5612,8 @@ mod tests {
             .map(|i| (i, vec![(i % 251) as u8; 400]))
             .collect();
         let root = build(&mut s, &rows).expect("root");
-        let mut r = SstReader::new(&a).unwrap();
+        let mut reader_partial = SstReadProgress::new();
+        let mut r = SstReader::new(&a, &mut reader_partial).unwrap();
         let got = scan(&mut r, &mut s, &root, 1000, 2999);
         assert_eq!(got.len(), 2000);
         for (expected, (key, row)) in (1000u64..).zip(got.iter()) {
@@ -5605,7 +5628,8 @@ mod tests {
         let a = arena();
         let rows: Vec<_> = (10..=30u64).map(|i| (i, vec![i as u8; 8])).collect();
         let root = build(&mut s, &rows).expect("root");
-        let mut r = SstReader::new(&a).unwrap();
+        let mut reader_partial = SstReadProgress::new();
+        let mut r = SstReader::new(&a, &mut reader_partial).unwrap();
         // Below, above, and straddling both ends.
         assert_eq!(
             scan(&mut r, &mut s, &root, 0, 5).len(),
@@ -5640,7 +5664,8 @@ mod tests {
         let a = arena();
         let rows: Vec<_> = (1..=40u64).map(|i| (i * 3, vec![i as u8; 16])).collect();
         let root = build(&mut s, &rows).expect("root");
-        let mut r = SstReader::new(&a).unwrap();
+        let mut reader_partial = SstReadProgress::new();
+        let mut r = SstReader::new(&a, &mut reader_partial).unwrap();
         assert_eq!(
             scan(&mut r, &mut s, &root, 30, 30),
             vec![(30, vec![10u8; 16])]
@@ -5655,7 +5680,8 @@ mod tests {
         let a = arena();
         let rows: Vec<_> = (1..=10u64).map(|i| (i, vec![i as u8; 4])).collect();
         let root = build(&mut s, &rows).expect("root");
-        let mut r = SstReader::new(&a).unwrap();
+        let mut reader_partial = SstReadProgress::new();
+        let mut r = SstReader::new(&a, &mut reader_partial).unwrap();
         assert_eq!(
             scan(&mut r, &mut s, &root, 8, 3),
             vec![],
@@ -5672,7 +5698,8 @@ mod tests {
         let a = arena();
         let rows: Vec<_> = (0..3000u64).map(|i| (i, vec![9u8; 500])).collect();
         let root = build(&mut s, &rows).expect("root");
-        let mut r = SstReader::new(&a).unwrap();
+        let mut reader_partial = SstReadProgress::new();
+        let mut r = SstReader::new(&a, &mut reader_partial).unwrap();
         let before = s.reads();
         let got = scan(&mut r, &mut s, &root, 2500, 2510);
         assert_eq!(got.len(), 11);
@@ -5707,7 +5734,9 @@ mod tests {
         }
         let handle = w.finish(&mut s).unwrap().expect("root");
 
-        let mut r = SstReader::new(&a).unwrap();
+        let mut reader_partial = SstReadProgress::new();
+
+        let mut r = SstReader::new(&a, &mut reader_partial).unwrap();
         // The root really is two-level.
         let mut buf = vec![0u8; MAX_PAYLOAD];
         let (_, _) = s.get(&handle.index, &mut buf).unwrap();
@@ -5840,7 +5869,8 @@ mod tests {
             "{} bytes stored for {raw_total} raw",
             s.used()
         );
-        let mut r = SstReader::new(&a).unwrap();
+        let mut reader_partial = SstReadProgress::new();
+        let mut r = SstReader::new(&a, &mut reader_partial).unwrap();
         for (rowid, row) in &rows {
             assert_eq!(
                 get(&mut r, &mut s, &root, *rowid).as_ref(),
@@ -5858,7 +5888,8 @@ mod tests {
             .map(|i| (i, vec![i as u8; (i * 3) as usize]))
             .collect();
         let root = build(&mut s, &rows).expect("root");
-        let mut r = SstReader::new(&a).unwrap();
+        let mut reader_partial = SstReadProgress::new();
+        let mut r = SstReader::new(&a, &mut reader_partial).unwrap();
         for (rowid, row) in &rows {
             assert_eq!(
                 get(&mut r, &mut s, &root, *rowid).as_ref(),

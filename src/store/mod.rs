@@ -97,10 +97,12 @@ pub(crate) use object::OwnedObjectStore;
 pub(crate) use shared::SharedBlockStore;
 pub(crate) use sst::copy_pax_v2_row_from_extents;
 pub(crate) use sst::{
+    ChainReadProgress, MAX_ASSEMBLED, MAX_INLINE_ROW, SstError, SstReadProgress, SstWriter,
+};
+pub(crate) use sst::{
     DataBlockLookahead, DataBlockRef, PaxLayout, RowSstFormat, SstCursor, SstHandle, SstIndexLeaf,
     SstKey, SstMetadataCursor, SstMetadataStep, SstPointReadProgress, SstReader, SstVersionCursor,
 };
-pub(crate) use sst::{MAX_ASSEMBLED, MAX_INLINE_ROW, SstError, SstReadProgress, SstWriter};
 pub(crate) use sst::{
     block_keys_at, copy_block_entry_at, data_block_total, decode_data_block, locate_data_block_ref,
     locate_data_block_with_next, pax_layout, prefetch_data_block, read_data_block_raw_ref,

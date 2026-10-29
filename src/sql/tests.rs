@@ -97534,6 +97534,7 @@ fn checkpoint_reads_held_maintenance_keeps_queries_commits_and_read_owners() {
                 "CREATE TABLE cached_order(id integer); INSERT INTO cached_order VALUES(42)",
                 false,
             );
+            engine.ckpt.as_mut().unwrap().request_checkpoint().unwrap();
             let selected = |checkpoint: &Checkpointer| match phase {
                 "schedule" => checkpoint.retained_output_pending(),
                 "columns" => checkpoint.merge_source_read_ready(),
@@ -98677,6 +98678,8 @@ fn parallel_checkpoint_failures_reach_waiters_and_do_not_poison_new_or_cancelled
             sqlstate::INTERNAL_IO_WAIT
         );
     }
+    assert_eq!(engine.checkpoint_beat(), CheckpointBeat::Advanced);
+    assert!(engine.ckpt.as_ref().unwrap().value_index_job_active());
     namespace.borrow_mut().faults.transient_per_mille = 1000;
     assert_eq!(
         engine.checkpoint_beat(),

@@ -2555,13 +2555,7 @@ pub(crate) fn take_prefetched_index_first_data(
 ) -> Result<Option<DataBlockRef>, SstError> {
     let (_, block_type) = match store.take_prefetch(id, into)? {
         Some(result) => result,
-        // Lookahead is optional: a saturated pool or a reclaimed speculative
-        // response must still let the demanded leaf start its own read.
-        None => match store.get(id, into) {
-            Ok(result) => result,
-            Err(StoreError::NotReady) => return Ok(None),
-            Err(error) => return Err(SstError::Store(error)),
-        },
+        None => return Ok(None),
     };
     validate_index_type(block_type)?;
     Ok(Some(block_ref_at(into, 0, packed)))

@@ -1612,6 +1612,8 @@ impl Checkpointer {
             + 2 * core::mem::size_of::<Option<SstVersionCursor>>()
             + 2 * core::mem::size_of::<Option<SstMetadataCursor>>()
             + core::mem::size_of::<Option<MaintenanceReadWait>>()
+            + core::mem::size_of::<Option<ValueScheduleJob>>()
+            + core::mem::size_of::<Option<ValueIndexJob>>()
             + 2 * SstWriter::budget_bytes()
             + crate::storage::RowReadBuffers::budget_bytes()
             + ValueIndexWriter::budget_bytes()
@@ -9822,14 +9824,6 @@ impl Checkpointer {
             self.value_job = None;
             self.value_changed_rowids.clear();
             self.value_writer.reset();
-        }
-        if self.value_schedule_job.is_some() {
-            self.value_index_schedule_beat(storage)?;
-            return Ok(CheckpointStep::Working);
-        }
-        if self.value_job.is_some() {
-            self.value_index_write_beat(storage)?;
-            return Ok(CheckpointStep::Working);
         }
         let mut wrote_slice = false;
         for slot in 0..storage.physical_table_count() {
@@ -19729,6 +19723,263 @@ mod stored_dependency_tests {
     }
 
     #[test]
+    fn checkpoint_reads_full_table_capture_and_large_row_output_resume_once() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        };
+        use std::time::{Duration, Instant};
+
+        for writing in [false, true] {
+            let (mut checkpoint, mut storage, _, config) =
+                index_gc_fixture(&format!("table-source-wait-{writing}"), 64);
+            let mut definition = TableDef {
+                schema: SqlName::parse("public").unwrap(),
+                name: SqlName::parse("orders").unwrap(),
+                n_columns: 2,
+                ..TableDef::empty()
+            };
+            definition.columns[0] = ColumnMeta {
+                name: SqlName::parse("id").unwrap(),
+                ctype: ColType::Int4,
+                ..ColumnMeta::EMPTY
+            };
+            definition.columns[1] = ColumnMeta {
+                name: SqlName::parse("payload").unwrap(),
+                ctype: ColType::Text,
+                ..ColumnMeta::EMPTY
+            };
+            let table = storage.create_table(definition).unwrap();
+            storage.set_lsn(7);
+            let payload = "x".repeat(300_000);
+            let mut rows = Vec::new();
+            let mut expected_crc = Crc32c::new();
+            let mut writer = SstWriter::new();
+            writer
+                .set_pax_schema(&[ColType::Int4, ColType::Text])
+                .unwrap();
+            for rowid in 1u64..=2 {
+                let values = [
+                    crate::sql::types::Datum::Int4(rowid as i32),
+                    crate::sql::types::Datum::Text(&payload),
+                ];
+                let mut row = vec![0; crate::storage::rowenc::encoded_len(&values)];
+                crate::storage::rowenc::encode(&values, &mut row);
+                writer
+                    .append_version(
+                        &mut *checkpoint.blocks.lock().unwrap(),
+                        SstKey::at(rowid, 7),
+                        &row,
+                    )
+                    .unwrap();
+                let mut header = [0; VERSIONED_SST_ENTRY_HEADER];
+                header[..8].copy_from_slice(&rowid.to_le_bytes());
+                header[8..16].copy_from_slice(&7u64.to_le_bytes());
+                header[16..20].copy_from_slice(&(row.len() as u32).to_le_bytes());
+                expected_crc.update(&header);
+                expected_crc.update(&row);
+                rows.push(row);
+            }
+            let source = writer
+                .finish(&mut *checkpoint.blocks.lock().unwrap())
+                .unwrap()
+                .unwrap();
+            let reservation = storage
+                .reserve_spill_generation(
+                    table,
+                    storage.table(table).created_at(),
+                    storage.table(table).rewrite_generation(),
+                )
+                .unwrap();
+            storage
+                .append_spill_through(&reservation, source, 7)
+                .unwrap();
+            assert!(!checkpoint.begin_table_slice(&storage, table).unwrap());
+            assert!(matches!(
+                checkpoint.table_job.as_ref().unwrap().phase,
+                TableSlicePhase::Capture { .. }
+            ));
+            if writing {
+                while matches!(
+                    checkpoint.table_job.as_ref().unwrap().phase,
+                    TableSlicePhase::Capture { .. }
+                ) {
+                    crate::mem::guard::forbid_alloc(|| checkpoint.advance_table_slice(&storage))
+                        .unwrap();
+                }
+            }
+            let namespace =
+                crate::object_store::sim::open_namespace(&config.object_store_bucket, 0);
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let mut network = config.clone();
+            network.object_store_sim = false;
+            network.object_store_endpoint = listener.local_addr().unwrap().to_string();
+            network.object_store_access_key = "test-access".to_owned();
+            network.object_store_secret_key = "test-secret".to_owned();
+            let mut network_budget = Budget::new(OwnedObjectStore::budget_bytes(&network));
+            let store = OwnedObjectStore::new(&network, &mut network_budget, "blocks/").unwrap();
+            *checkpoint.blocks.lock().unwrap() = crate::store::build_tiers(
+                &mut network_budget,
+                store,
+                StackPlan::resolve(0, 0),
+                std::path::Path::new(&config.data_dir),
+            )
+            .unwrap();
+            assert_eq!(network_budget.remaining(), 0);
+            let release = Arc::new(AtomicBool::new(false));
+            let stop = Arc::new(AtomicBool::new(false));
+            let requests = Arc::new(AtomicUsize::new(0));
+            let server_release = Arc::clone(&release);
+            let server_stop = Arc::clone(&stop);
+            let server_requests = Arc::clone(&requests);
+            let server_namespace = namespace.clone();
+            let prefix = format!("/{}/", config.object_store_bucket);
+            let server = std::thread::spawn(move || {
+                while !server_stop.load(Ordering::Acquire) {
+                    let (mut socket, _) = match listener.accept() {
+                        Ok(socket) => socket,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(1));
+                            continue;
+                        }
+                        Err(error) => panic!("accept saved-row read: {error}"),
+                    };
+                    socket
+                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    socket
+                        .set_write_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    let mut bytes = Vec::new();
+                    while !bytes.windows(4).any(|part| part == b"\r\n\r\n") {
+                        let mut part = [0; 4096];
+                        let n = socket.read(&mut part).unwrap();
+                        assert_ne!(n, 0);
+                        bytes.extend_from_slice(&part[..n]);
+                    }
+                    let headers = core::str::from_utf8(&bytes).unwrap();
+                    assert!(headers.starts_with("GET "));
+                    let path = headers
+                        .lines()
+                        .next()
+                        .unwrap()
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap();
+                    let body = server_namespace
+                        .borrow()
+                        .object_bytes(path.strip_prefix(&prefix).unwrap())
+                        .unwrap()
+                        .to_vec();
+                    server_requests.fetch_add(1, Ordering::Release);
+                    while !server_release.load(Ordering::Acquire)
+                        && !server_stop.load(Ordering::Acquire)
+                    {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    let range = headers.lines().find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("range").then_some(value.trim())
+                    });
+                    if let Some(range) = range {
+                        let (first, last) = range
+                            .strip_prefix("bytes=")
+                            .unwrap()
+                            .split_once('-')
+                            .unwrap();
+                        let first: usize = first.parse().unwrap();
+                        let last: usize = last.parse().unwrap();
+                        write!(socket, "HTTP/1.1 206 Partial Content\r\nETag: \"fixture\"\r\nContent-Length: {}\r\nContent-Range: bytes {first}-{last}/{}\r\nConnection: close\r\n\r\n", last-first+1, body.len()).unwrap();
+                        socket.write_all(&body[first..=last]).unwrap();
+                    } else {
+                        write!(socket, "HTTP/1.1 200 OK\r\nETag: \"fixture\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
+                        socket.write_all(&body).unwrap();
+                    }
+                }
+            });
+            checkpoint.enable_async_block_reads();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while requests.load(Ordering::Acquire) == 0 {
+                for slot in 0..checkpoint.block_read_slots() {
+                    crate::mem::guard::forbid_alloc(|| checkpoint.advance_pending_block_read(slot))
+                        .unwrap();
+                }
+                if checkpoint.maintenance_reads_ready() {
+                    crate::mem::guard::forbid_alloc(|| checkpoint.advance_table_slice(&storage))
+                        .unwrap();
+                }
+                assert!(Instant::now() < deadline, "saved-row request did not start");
+                std::thread::yield_now();
+            }
+            assert!(!checkpoint.maintenance_reads_ready());
+            let count = checkpoint.table_job.as_ref().unwrap().count;
+            let captured = checkpoint.table_output.len();
+            for _ in 0..3 {
+                crate::mem::guard::forbid_alloc(|| checkpoint.advance_table_slice(&storage))
+                    .unwrap();
+                assert_eq!(checkpoint.table_job.as_ref().unwrap().count, count);
+                assert_eq!(checkpoint.table_output.len(), captured);
+            }
+            release.store(true, Ordering::Release);
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while checkpoint.table_job.is_some() {
+                for slot in 0..checkpoint.block_read_slots() {
+                    crate::mem::guard::forbid_alloc(|| checkpoint.advance_pending_block_read(slot))
+                        .unwrap();
+                }
+                if checkpoint.physical_output_pending() {
+                    // Simulated uploads allocate their fixture inventory.
+                    checkpoint.advance_physical_output(&storage).unwrap();
+                } else if checkpoint.maintenance_reads_ready() {
+                    crate::mem::guard::forbid_alloc(|| checkpoint.advance_table_slice(&storage))
+                        .unwrap();
+                }
+                assert!(Instant::now() < deadline, "saved-row output did not resume");
+                std::thread::yield_now();
+            }
+            assert!(!checkpoint.block_reads_busy());
+            stop.store(true, Ordering::Release);
+            server.join().unwrap();
+            let mut restore_budget = Budget::new(OwnedObjectStore::budget_bytes(&config));
+            let store = OwnedObjectStore::new(&config, &mut restore_budget, "blocks/").unwrap();
+            *checkpoint.blocks.lock().unwrap() = crate::store::build_tiers(
+                &mut restore_budget,
+                store,
+                StackPlan::resolve(0, 0),
+                std::path::Path::new(&config.data_dir),
+            )
+            .unwrap();
+            let saved = checkpoint.prev_scratch[table].ssts[0].unwrap();
+            assert_eq!(saved.count, 2);
+            assert_eq!(saved.crc, expected_crc.finish());
+            let mut read_budget = Budget::new(8 << 20);
+            let arena = Arena::new(&mut read_budget, "saved rows", 8 << 20).unwrap();
+            let mut progress = crate::store::SstReadProgress::new();
+            let mut reader = crate::store::SstReader::new(&arena, &mut progress).unwrap();
+            let mut output = vec![0; crate::store::MAX_ASSEMBLED];
+            for (index, row) in rows.iter().enumerate() {
+                let found = reader
+                    .get_at(
+                        &mut *checkpoint.blocks.lock().unwrap(),
+                        &saved.handle,
+                        (index + 1) as u64,
+                        7,
+                        &mut output,
+                    )
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(found.len, Some(row.len() as u32));
+                assert_eq!(&output[..row.len()], row);
+            }
+            drop((checkpoint, storage));
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        }
+    }
+
+    #[test]
     fn parallel_physical_manifest_retry_preserves_bytes_while_backup_uses_scratch() {
         use std::time::{Duration, Instant};
         let (mut checkpoint, mut storage, _table, config) =
@@ -21853,6 +22104,7 @@ mod stored_dependency_tests {
         assert_eq!(
             Checkpointer::budget_bytes(&table_rows) - base_bytes,
             core::mem::size_of::<u64>() + CheckpointRowCursor::budget_bytes(0, 1)
+                - CheckpointRowCursor::budget_bytes(0, 0)
         );
 
         let mut garbage = base.clone();

@@ -1,0 +1,35 @@
+name: Checkpoint read replay
+on:
+  push:
+    branches: [resumable-checkpoint-reads]
+permissions:
+  contents: read
+  actions: read
+jobs:
+  replay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v8
+        with:
+          name: crash-failure-b
+          run-id: 40790231160
+          github-token: ${{ github.token }}
+          path: replay
+      - uses: actions/download-artifact@v8
+        with:
+          name: differential-release-b537c7bd5bb76eec2d3edb94e3d931f84801394b
+          run-id: 40790231261
+          github-token: ${{ github.token }}
+          path: replay-bin
+      - uses: ./.github/actions/python-test-environment
+      - name: Replay retained cold storage
+        run: |
+          chmod +x replay-bin/pos3ql
+          venv/bin/python tests/external/checkpoint_read_replay.py
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: checkpoint-read-replay
+          path: replay/*.log

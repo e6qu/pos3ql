@@ -407,6 +407,8 @@ struct MaterializationPlan<'a> {
 }
 
 fn projected_collations<'a>(
+    storage: &Storage,
+    arena: &Arena,
     statement: &Select<'a>,
     scope: &QueryScope<'a>,
 ) -> Result<[Collation; MAX_PROJ], SqlError> {
@@ -698,7 +700,7 @@ pub(crate) fn materialized_rows<'a>(
     rank_window: Option<usize>,
 ) -> Result<MaterializedSelect<'a>, SqlError> {
     let plan = prepare_materialization(storage, txid, statement, scope, correlated, arena)?;
-    let visible_collations = projected_collations(statement, scope)?;
+    let visible_collations = projected_collations(storage, arena, statement, scope)?;
     let pax_columns = materialization_pax_columns(statement, scope, from, &plan);
     let MaterializationPlan {
         n_order,

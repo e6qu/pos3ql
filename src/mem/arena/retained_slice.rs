@@ -192,4 +192,23 @@ mod tests {
         let empty = arena.retain_slice_with(0, |_| 0u64).unwrap();
         assert!(arena.retained_slice_mut(empty).unwrap().is_empty());
     }
+
+    #[test]
+    fn arena_retained_slices_recycle_temporary_rows_without_losing_positions() {
+        let mut budget = Budget::new(512);
+        let mut arena =
+            Arena::new(&mut budget, "retained positions and temporary rows", 512).unwrap();
+        let positions = arena.retain_slice_with(4, |_| 0u64).unwrap();
+        let persistent_bytes = arena.used();
+        crate::mem::guard::forbid_alloc(|| {
+            for turn in 0..32u8 {
+                arena.recycle_front();
+                let row = arena.alloc_slice_with(256, |_| turn).unwrap();
+                arena.retained_slice_mut(positions).unwrap()[turn as usize % 4] += row.len() as u64;
+            }
+            arena.recycle_front();
+            assert_eq!(arena.used(), persistent_bytes);
+            assert_eq!(&*arena.retained_slice_mut(positions).unwrap(), &[2048; 4]);
+        });
+    }
 }

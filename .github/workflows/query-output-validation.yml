@@ -28,3 +28,13 @@ jobs:
       - run: cargo test --lib --locked cursor -- --nocapture --test-threads=1
       - run: python3 tools/check-docs.py
       - run: bash tools/check-bugs.sh
+  arena-aliasing:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - run: cargo miri setup
+      - run: cargo miri test --lib --locked arena_retained_slices_ -- --test-threads=1

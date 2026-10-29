@@ -85,10 +85,8 @@ pub enum FlushSink<'b> {
 
 pub struct Responder<'b> {
     pub buffer: &'b mut FixedBuf,
-    /// SQL cursor materialization captures both representations during one
-    /// evaluation so FETCH can honor its own result-format codes.
-    alternate_buffer: Option<&'b mut FixedBuf>,
-    alternate_formats: ResultFmt,
+    /// SQL cursors retain typed rows; FETCH chooses formats and rendering.
+    cursor_rows: Option<&'b mut FixedBuf>,
     /// Extended-protocol Execute must not resend RowDescription (the
     /// client got it from Describe).
     suppress_row_description: bool,
@@ -120,6 +118,31 @@ pub struct Responder<'b> {
     discard_serialize: ExplainSerialize,
     serialized_bytes: u64,
     serialization_micros: u64,
+}
+
+pub(crate) struct ResultFormatScope<'scope, 'buffer> {
+    responder: &'scope mut Responder<'buffer>,
+    previous: ResultFmt,
+}
+
+impl<'buffer> core::ops::Deref for ResultFormatScope<'_, 'buffer> {
+    type Target = Responder<'buffer>;
+
+    fn deref(&self) -> &Self::Target {
+        self.responder
+    }
+}
+
+impl core::ops::DerefMut for ResultFormatScope<'_, '_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.responder
+    }
+}
+
+impl Drop for ResultFormatScope<'_, '_> {
+    fn drop(&mut self) {
+        self.responder.formats = self.previous;
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -495,8 +518,7 @@ impl<'b> Responder<'b> {
     pub fn new(buffer: &'b mut FixedBuf) -> Self {
         Self {
             buffer,
-            alternate_buffer: None,
-            alternate_formats: ResultFmt::ALL_TEXT,
+            cursor_rows: None,
             suppress_row_description: false,
             formats: ResultFmt::ALL_TEXT,
             result_type_oids: [0; MAX_RESULT_COLS],
@@ -517,8 +539,7 @@ impl<'b> Responder<'b> {
     pub fn for_execute(buffer: &'b mut FixedBuf, formats: ResultFmt) -> Self {
         Self {
             buffer,
-            alternate_buffer: None,
-            alternate_formats: ResultFmt::ALL_TEXT,
+            cursor_rows: None,
             suppress_row_description: true,
             formats,
             result_type_oids: [0; MAX_RESULT_COLS],
@@ -536,12 +557,11 @@ impl<'b> Responder<'b> {
         }
     }
 
-    /// Captures text and binary SQL-cursor rows from one execution.
-    pub fn for_cursor(text: &'b mut FixedBuf, binary: &'b mut FixedBuf) -> Self {
+    /// Captures the description and typed values without rendering them.
+    pub fn for_cursor(description: &'b mut FixedBuf, rows: &'b mut FixedBuf) -> Self {
         Self {
-            buffer: text,
-            alternate_buffer: Some(binary),
-            alternate_formats: ResultFmt::ALL_BINARY,
+            buffer: description,
+            cursor_rows: Some(rows),
             suppress_row_description: false,
             formats: ResultFmt::ALL_TEXT,
             result_type_oids: [0; MAX_RESULT_COLS],
@@ -549,7 +569,7 @@ impl<'b> Responder<'b> {
             flush: FlushSink::None,
             render: crate::sql::guc::RenderContext::default(),
             discard_query_output: false,
-            suppress_command_complete: false,
+            suppress_command_complete: true,
             last_command_completion: None,
             affected_rows: None,
             discarded_rows: 0,
@@ -564,8 +584,7 @@ impl<'b> Responder<'b> {
     pub fn for_describe(buffer: &'b mut FixedBuf, formats: ResultFmt) -> Self {
         Self {
             buffer,
-            alternate_buffer: None,
-            alternate_formats: ResultFmt::ALL_TEXT,
+            cursor_rows: None,
             suppress_row_description: false,
             formats,
             result_type_oids: [0; MAX_RESULT_COLS],
@@ -842,21 +861,6 @@ impl<'b> Responder<'b> {
             }
             m.finish()
         })?;
-        if let Some(buffer) = self.alternate_buffer.as_deref_mut() {
-            let formats = self.alternate_formats;
-            let mut m = MsgOut::begin(buffer, wire::MSG_ROW_DESCRIPTION);
-            m.i16(columns.len() as i16);
-            for (i, c) in columns.iter().enumerate() {
-                m.cstr(c.name);
-                m.i32(0);
-                m.i16(0);
-                m.i32(c.type_oid);
-                m.i16(c.typlen);
-                m.i32(c.type_mod);
-                m.i16(if formats.is_binary(i) { 1 } else { 0 });
-            }
-            m.finish()?;
-        }
         Ok(())
     }
 
@@ -1004,32 +1008,22 @@ impl<'b> Responder<'b> {
         })
     }
 
-    pub(crate) fn data_row_prepared_alternate(
-        &mut self,
-        values: &[Datum],
-        write: &dyn Fn(&mut MsgOut),
-    ) -> Result<(), WireFull> {
-        let Some(buffer) = self.alternate_buffer.as_deref_mut() else {
-            return Ok(());
-        };
-        let mut message = MsgOut::begin(buffer, wire::MSG_DATA_ROW);
-        message.i16(values.len() as i16);
-        write(&mut message);
-        message.finish()
+    pub(crate) fn cursor_row_buffer(&mut self) -> Option<&mut FixedBuf> {
+        self.cursor_rows.as_deref_mut()
     }
 
     pub(crate) fn result_formats(&self) -> ResultFmt {
         self.formats
     }
 
-    pub(crate) fn result_type_oid(&self, index: usize) -> Option<i32> {
-        (index < self.result_columns).then(|| self.result_type_oids[index])
+    /// A binary SQL cursor must not change the next statement's wire format.
+    pub(crate) fn result_format_scope(&mut self, formats: ResultFmt) -> ResultFormatScope<'_, 'b> {
+        let previous = core::mem::replace(&mut self.formats, formats);
+        ResultFormatScope { responder: self, previous }
     }
 
-    pub(crate) fn alternate_result_formats(&self) -> Option<ResultFmt> {
-        self.alternate_buffer
-            .as_ref()
-            .map(|_| self.alternate_formats)
+    pub(crate) fn result_type_oid(&self, index: usize) -> Option<i32> {
+        (index < self.result_columns).then(|| self.result_type_oids[index])
     }
 
     /// Rewrites a captured SQL-cursor RowDescription for this FETCH's result
@@ -1039,11 +1033,19 @@ impl<'b> Responder<'b> {
         captured: &[u8],
         formats: ResultFmt,
     ) -> Result<(), WireFull> {
+        let payload = &captured[5..];
+        let count = i16::from_be_bytes(payload[..2].try_into().unwrap()) as usize;
+        self.result_columns = count;
+        let mut at = 2usize;
+        for column in 0..count {
+            let name_end = payload[at..].iter().position(|byte| *byte == 0).unwrap() + at + 1;
+            self.result_type_oids[column] =
+                i32::from_be_bytes(payload[name_end + 6..name_end + 10].try_into().unwrap());
+            at = name_end + 18;
+        }
         if self.suppress_row_description || self.discard_query_output {
             return Ok(());
         }
-        let payload = &captured[5..];
-        let count = i16::from_be_bytes(payload[..2].try_into().unwrap()) as usize;
         self.with_retry(|buffer| {
             let mut message = MsgOut::begin(buffer, wire::MSG_ROW_DESCRIPTION);
             message.i16(count as i16);
@@ -1055,47 +1057,6 @@ impl<'b> Responder<'b> {
                 at = name_end + 18;
             }
             message.finish()
-        })
-    }
-
-    /// Builds one FETCH DataRow from the text and binary representations
-    /// captured during DECLARE, including mixed per-column formats.
-    pub(crate) fn cursor_data_row(
-        &mut self,
-        text: &[u8],
-        binary: &[u8],
-        formats: ResultFmt,
-    ) -> Result<(), WireFull> {
-        fn payload(message: &[u8]) -> (&[u8], usize) {
-            let payload = &message[5..];
-            let count = i16::from_be_bytes(payload[..2].try_into().unwrap()) as usize;
-            (payload, count)
-        }
-        let (text, count) = payload(text);
-        let (binary, binary_count) = payload(binary);
-        debug_assert_eq!(count, binary_count);
-        self.with_retry(|buffer| {
-            let mut output = MsgOut::begin(buffer, wire::MSG_DATA_ROW);
-            output.i16(count as i16);
-            let mut text_at = 2usize;
-            let mut binary_at = 2usize;
-            for column in 0..count {
-                let text_len = i32::from_be_bytes(text[text_at..text_at + 4].try_into().unwrap());
-                let binary_len =
-                    i32::from_be_bytes(binary[binary_at..binary_at + 4].try_into().unwrap());
-                let (source, at, len) = if formats.is_binary(column) {
-                    (binary, binary_at, binary_len)
-                } else {
-                    (text, text_at, text_len)
-                };
-                output.i32(len);
-                if len >= 0 {
-                    output.bytes(&source[at + 4..at + 4 + len as usize]);
-                }
-                text_at += 4 + text_len.max(0) as usize;
-                binary_at += 4 + binary_len.max(0) as usize;
-            }
-            output.finish()
         })
     }
 

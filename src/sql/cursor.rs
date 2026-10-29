@@ -13,6 +13,8 @@ use crate::util::StackStr;
 use core::cell::Cell;
 
 use super::eval::{SqlError, sqlstate};
+use crate::mem::arena::Arena;
+use super::types::Datum;
 
 /// One FETCH/MOVE motion, normalized by the parser: positive counts move
 /// forward, negative backward (`NEXT` is `Count(1)`, `PRIOR` is `Count(-1)`,
@@ -31,15 +33,6 @@ pub enum CursorScroll {
     Default,
     Scroll,
     NoScroll,
-}
-
-pub struct CursorWireParts<'a> {
-    pub description: &'a [u8],
-    pub text: &'a [u8],
-    pub text_spans: &'a [(u32, u32)],
-    pub binary: &'a [u8],
-    pub binary_spans: &'a [(u32, u32)],
-    pub declared_binary: bool,
 }
 
 pub struct CursorPool {
@@ -103,141 +96,82 @@ struct CursorSlot {
     /// Created in the still-open transaction: a rollback closes it even WITH
     /// HOLD (holdability begins at commit, as PostgreSQL has it).
     tentative: bool,
-    description_text: FixedBuf,
-    description_binary: FixedBuf,
-    rows_text: FixedBuf,
-    rows_binary: FixedBuf,
-    spans_text: Vec<(u32, u32)>,
-    spans_binary: Vec<(u32, u32)>,
+    description: FixedBuf,
+    rows: FixedBuf,
+    spans: Vec<(u32, u32)>,
     /// PostgreSQL's cursor position: 0 before the first row, `1..=n` on a
     /// row, `n + 1` after the last.
     position: i64,
 }
 
-// A PostgreSQL DataRow has a type byte, four-byte message length, and two-byte
-// field count even when it has no columns. Deriving the index capacity from
-// the byte buffer keeps one startup budget as the only cursor-width limit.
-const MIN_DATA_ROW_BYTES: usize = 7;
+// Each saved row has a four-byte length and a two-byte column count.
+const MIN_CURSOR_ROW_BYTES: usize = 6;
 
 const fn cursor_row_capacity(config: &Config) -> usize {
-    config.cursor_bytes / MIN_DATA_ROW_BYTES
+    config.cursor_bytes / MIN_CURSOR_ROW_BYTES
 }
 
-fn seal_capture(
+fn seal_description(description: &mut FixedBuf) -> Result<usize, SqlError> {
+    let malformed = || sql_err!(sqlstate::INTERNAL_ERROR, "cursor captured a torn description");
+    let bytes = description.readable();
+    let mut at = 0usize;
+    let mut captured = None;
+    while at < bytes.len() {
+        let header = bytes.get(at..at.saturating_add(5)).ok_or_else(malformed)?;
+        let length = u32::from_be_bytes(header[1..5].try_into().unwrap()) as usize;
+        if length < 4 {
+            return Err(malformed());
+        }
+        let end = at.checked_add(1).and_then(|at| at.checked_add(length)).ok_or_else(malformed)?;
+        if end > bytes.len() {
+            return Err(malformed());
+        }
+        if header[0] == b'T' {
+            if captured.is_some() {
+                return Err(sql_err!(sqlstate::INTERNAL_ERROR, "cursor captured two descriptions"));
+            }
+            captured = Some((at, end));
+        }
+        at = end;
+    }
+    let (start, end) = captured.ok_or_else(|| {
+        sql_err!(sqlstate::INTERNAL_ERROR, "cursor did not capture a description")
+    })?;
+    let mut types = [0; crate::pg::respond::MAX_RESULT_COLS];
+    let columns = description_type_oids(&bytes[start..end], &mut types)?;
+    description.filled_mut().copy_within(start..end, 0);
+    description.truncate_to(end - start);
+    Ok(columns)
+}
+
+fn seal_rows(
     rows: &FixedBuf,
-    description: &mut FixedBuf,
+    columns: usize,
     spans: &mut Vec<(u32, u32)>,
 ) -> Result<(), SqlError> {
+    let malformed = || sql_err!(sqlstate::INTERNAL_ERROR, "cursor captured a torn typed row");
     let bytes = rows.readable();
-    let row_capacity = rows.capacity() / MIN_DATA_ROW_BYTES;
-    let mut cursor = 0usize;
-    let mut captured_description: Option<(usize, usize)> = None;
-    while cursor + 5 <= bytes.len() {
-        let kind = bytes[cursor];
-        let len = u32::from_be_bytes(bytes[cursor + 1..cursor + 5].try_into().unwrap()) as usize;
-        let total = 1 + len;
-        if cursor + total > bytes.len() {
+    let mut at = 0usize;
+    while at < bytes.len() {
+        let header = bytes.get(at..at.saturating_add(4)).ok_or_else(malformed)?;
+        let length = u32::from_le_bytes(header.try_into().unwrap()) as usize;
+        let start = at.checked_add(4).ok_or_else(malformed)?;
+        let end = start.checked_add(length).ok_or_else(malformed)?;
+        let row = bytes.get(start..end).ok_or_else(malformed)?;
+        if row.len() < 2 || super::exec::projected_row_width(row) != columns {
+            return Err(malformed());
+        }
+        if spans.len() == spans.capacity() {
             return Err(sql_err!(
-                sqlstate::INTERNAL_ERROR,
-                "cursor captured a torn wire message"
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "cursor row index exceeds cursor_bytes-derived capacity of {} rows",
+                spans.capacity()
             ));
         }
-        match kind {
-            b'T' => captured_description = Some((cursor, total)),
-            b'D' => {
-                if spans.len() == row_capacity {
-                    return Err(sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "cursor row index exceeds cursor_bytes-derived capacity of {} rows",
-                        row_capacity
-                    ));
-                }
-                spans.push((cursor as u32, total as u32));
-            }
-            _ => {}
-        }
-        cursor += total;
-    }
-    if cursor != bytes.len() {
-        return Err(sql_err!(
-            sqlstate::INTERNAL_ERROR,
-            "cursor captured a torn wire message"
-        ));
-    }
-    if let Some((offset, total)) = captured_description
-        && (total > description.capacity() || !description.append(&bytes[offset..offset + total]))
-    {
-        return Err(sql_err!(
-            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "cursor row description exceeds its buffer"
-        ));
+        spans.push((start as u32, length as u32));
+        at = end;
     }
     Ok(())
-}
-
-fn decode_text_row<'a>(row: &'a [u8], fields: &mut [Option<&'a str>]) -> Result<usize, SqlError> {
-    if row.len() < 7 || row[0] != b'D' {
-        return Err(sql_err!(
-            sqlstate::INTERNAL_ERROR,
-            "cursor row is not a complete DataRow message"
-        ));
-    }
-    let declared = u32::from_be_bytes(row[1..5].try_into().unwrap()) as usize;
-    if declared + 1 != row.len() {
-        return Err(sql_err!(
-            sqlstate::INTERNAL_ERROR,
-            "cursor row has an invalid DataRow length"
-        ));
-    }
-    let count = u16::from_be_bytes(row[5..7].try_into().unwrap()) as usize;
-    if count > fields.len() {
-        return Err(sql_err!(
-            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "cursor row has more than {} columns",
-            fields.len()
-        ));
-    }
-    let mut at = 7usize;
-    for field in fields.iter_mut().take(count) {
-        if at + 4 > row.len() {
-            return Err(sql_err!(
-                sqlstate::INTERNAL_ERROR,
-                "cursor row has a truncated field length"
-            ));
-        }
-        let length = i32::from_be_bytes(row[at..at + 4].try_into().unwrap());
-        at += 4;
-        if length == -1 {
-            *field = None;
-            continue;
-        }
-        let length = usize::try_from(length).map_err(|_| {
-            sql_err!(
-                sqlstate::INTERNAL_ERROR,
-                "cursor row has an invalid field length"
-            )
-        })?;
-        let Some(value) = row.get(at..at + length) else {
-            return Err(sql_err!(
-                sqlstate::INTERNAL_ERROR,
-                "cursor row has a truncated field"
-            ));
-        };
-        *field = Some(core::str::from_utf8(value).map_err(|_| {
-            sql_err!(
-                sqlstate::INTERNAL_ERROR,
-                "cursor text row contains invalid UTF-8"
-            )
-        })?);
-        at += length;
-    }
-    if at != row.len() {
-        return Err(sql_err!(
-            sqlstate::INTERNAL_ERROR,
-            "cursor row has trailing bytes"
-        ));
-    }
-    Ok(count)
 }
 
 /// Extracts type OIDs from one captured RowDescription. FETCH uses this at
@@ -298,52 +232,14 @@ pub(crate) fn description_columns<'a>(
     Ok(count)
 }
 
-/// Reports whether one field in a captured binary DataRow is NULL. Cursor
-/// capture writes a zero-length placeholder for non-NULL values whose send
-/// function is unavailable, so FETCH can fail only when PostgreSQL would
-/// actually invoke an array element send function.
-pub(crate) fn binary_row_field_is_null(row: &[u8], target: usize) -> Result<bool, SqlError> {
-    let corrupt = || sql_err!(sqlstate::INTERNAL_ERROR, "cursor binary row is malformed");
-    if row.len() < 7 || row[0] != b'D' {
-        return Err(corrupt());
-    }
-    let declared = u32::from_be_bytes(row[1..5].try_into().unwrap()) as usize;
-    if declared + 1 != row.len() {
-        return Err(corrupt());
-    }
-    let count = u16::from_be_bytes(row[5..7].try_into().unwrap()) as usize;
-    if target >= count {
-        return Err(corrupt());
-    }
-    let mut at = 7usize;
-    for index in 0..count {
-        let length =
-            i32::from_be_bytes(row.get(at..at + 4).ok_or_else(corrupt)?.try_into().unwrap());
-        at += 4;
-        if length < -1 {
-            return Err(corrupt());
-        }
-        if index == target {
-            return Ok(length == -1);
-        }
-        if length >= 0 {
-            at = at
-                .checked_add(length as usize)
-                .filter(|end| *end <= row.len())
-                .ok_or_else(corrupt)?;
-        }
-    }
-    Err(corrupt())
-}
-
 impl CursorPool {
     pub fn budget_bytes(config: &Config) -> usize {
         let row_capacity = cursor_row_capacity(config);
         config.max_cursors
-            * (config.cursor_bytes * 2
-                + 2048
+            * (config.cursor_bytes
+                + 1024
                 + core::mem::size_of::<CursorSlot>()
-                + row_capacity * 2 * core::mem::size_of::<(u32, u32)>())
+                + row_capacity * core::mem::size_of::<(u32, u32)>())
             + row_capacity * core::mem::size_of::<u32>()
     }
 
@@ -358,7 +254,7 @@ impl CursorPool {
         for _ in 0..config.max_cursors {
             budget.draw_array(
                 row_capacity,
-                2 * core::mem::size_of::<(u32, u32)>(),
+                core::mem::size_of::<(u32, u32)>(),
                 "cursor_row_spans",
             )?;
             slots.push(CursorSlot {
@@ -370,12 +266,9 @@ impl CursorPool {
                 hold: false,
                 binary: false,
                 tentative: false,
-                description_text: FixedBuf::new(budget, "cursor_text_description", 1024)?,
-                description_binary: FixedBuf::new(budget, "cursor_binary_description", 1024)?,
-                rows_text: FixedBuf::new(budget, "cursor_text_rows", config.cursor_bytes)?,
-                rows_binary: FixedBuf::new(budget, "cursor_binary_rows", config.cursor_bytes)?,
-                spans_text: Vec::with_capacity(row_capacity),
-                spans_binary: Vec::with_capacity(row_capacity),
+                description: FixedBuf::new(budget, "cursor_description", 1024)?,
+                rows: FixedBuf::new(budget, "cursor_typed_rows", config.cursor_bytes)?,
+                spans: Vec::with_capacity(row_capacity),
                 position: 0,
             });
         }
@@ -442,44 +335,24 @@ impl CursorPool {
         slot.hold = hold;
         slot.binary = binary;
         slot.tentative = true;
-        slot.description_text.clear();
-        slot.description_binary.clear();
-        slot.rows_text.clear();
-        slot.rows_binary.clear();
-        slot.spans_text.clear();
-        slot.spans_binary.clear();
+        slot.description.clear();
+        slot.rows.clear();
+        slot.spans.clear();
         slot.position = 0;
         Ok(at)
     }
 
-    /// The result buffer of a slot being filled at DECLARE.
+    /// Description and typed-row storage for the cursor producer.
     pub fn result_buffers(&mut self, at: usize) -> (&mut FixedBuf, &mut FixedBuf) {
         let slot = &mut self.slots[at];
-        (&mut slot.rows_text, &mut slot.rows_binary)
+        (&mut slot.description, &mut slot.rows)
     }
 
-    /// Splits the captured wire output into the description and per-row
-    /// spans, activating the cursor. The buffer holds whole messages
-    /// (RowDescription, DataRows, CommandComplete); anything else is a
-    /// protocol invariant violation and errors loudly.
+    /// Validates the description and indexes complete typed rows.
     pub fn seal(&mut self, at: usize) -> Result<(), SqlError> {
         let slot = &mut self.slots[at];
-        seal_capture(
-            &slot.rows_text,
-            &mut slot.description_text,
-            &mut slot.spans_text,
-        )?;
-        seal_capture(
-            &slot.rows_binary,
-            &mut slot.description_binary,
-            &mut slot.spans_binary,
-        )?;
-        if slot.spans_text.len() != slot.spans_binary.len() {
-            return Err(sql_err!(
-                sqlstate::INTERNAL_ERROR,
-                "cursor wire representations have different row counts"
-            ));
-        }
+        let columns = seal_description(&mut slot.description)?;
+        seal_rows(&slot.rows, columns, &mut slot.spans)?;
         slot.active = true;
         Ok(())
     }
@@ -540,11 +413,7 @@ impl CursorPool {
     pub fn description(&self, name: &str) -> Option<&[u8]> {
         let at = self.find(name)?;
         let slot = &self.slots[at];
-        Some(if slot.binary {
-            slot.description_binary.readable()
-        } else {
-            slot.description_text.readable()
-        })
+        Some(slot.description.readable())
     }
 
     pub fn fetch_description(
@@ -559,7 +428,7 @@ impl CursorPool {
         } else {
             requested
         };
-        Some((slot.description_text.readable(), formats))
+        Some((slot.description.readable(), formats))
     }
 
     /// Applies one FETCH/MOVE motion: returns the spans of the rows to emit
@@ -575,7 +444,7 @@ impl CursorPool {
             ));
         };
         let slot = &mut self.slots[at];
-        let n = slot.spans_text.len() as i64;
+        let n = slot.spans.len() as i64;
         let target = match motion {
             FetchMotion::Absolute(k) if k >= 0 => k.clamp(0, n + 1),
             FetchMotion::Absolute(k) => (n + 1 + k).clamp(0, n + 1),
@@ -656,44 +525,32 @@ impl CursorPool {
         &self.emit
     }
 
-    /// Decodes one emitted text row at the cursor boundary. Values remain text
-    /// until the procedural target's typed assignment casts them.
-    pub fn emitted_text_row<'a>(
-        &'a self,
+    /// Copies typed values into the caller's arena so they outlive pool access.
+    pub(crate) fn copy_row<'arena>(
+        &self,
         name: &str,
         row: u32,
-        fields: &mut [Option<&'a str>],
+        arena: &'arena Arena,
+        values: &mut [Datum<'arena>],
     ) -> Result<usize, SqlError> {
-        let Some(at) = self.find(name) else {
-            return Err(sql_err!(
-                sqlstate::UNDEFINED_CURSOR,
-                "cursor \"{}\" does not exist",
-                name
-            ));
-        };
+        let at = self.find(name).ok_or_else(|| {
+            sql_err!(sqlstate::UNDEFINED_CURSOR, "cursor \"{}\" does not exist", name)
+        })?;
         let slot = &self.slots[at];
-        let (offset, length) = *slot
-            .spans_text
-            .get(row as usize)
-            .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "cursor row index is invalid"))?;
-        decode_text_row(
-            &slot.rows_text.readable()[offset as usize..(offset + length) as usize],
-            fields,
-        )
-    }
-
-    /// The stored representations used to assemble FETCH output.
-    pub fn wire_parts(&self, name: &str) -> Option<CursorWireParts<'_>> {
-        let at = self.find(name)?;
-        let slot = &self.slots[at];
-        Some(CursorWireParts {
-            description: slot.description_text.readable(),
-            text: slot.rows_text.readable(),
-            text_spans: &slot.spans_text,
-            binary: slot.rows_binary.readable(),
-            binary_spans: &slot.spans_binary,
-            declared_binary: slot.binary,
-        })
+        let (offset, length) = *slot.spans.get(row as usize).ok_or_else(|| {
+            sql_err!(sqlstate::INTERNAL_ERROR, "cursor row index is invalid")
+        })?;
+        let bytes = &slot.rows.readable()[offset as usize..offset as usize + length as usize];
+        let width = super::exec::projected_row_width(bytes);
+        if width > values.len() {
+            return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "cursor row has more than {} columns", values.len()));
+        }
+        let bytes = arena.alloc_slice_copy(bytes).map_err(|_| super::query::arena_full_pub())?;
+        for (column, value) in values[..width].iter_mut().enumerate() {
+            *value = super::exec::decode_projected_col_record(bytes, column, arena)?;
+        }
+        Ok(width)
     }
 
     /// CLOSE name — false when no such cursor exists.
@@ -764,8 +621,7 @@ mod tests {
                 assert_eq!(pool.slots.len(), max_cursors);
                 assert_eq!(pool.emit.capacity(), cursor_row_capacity(&config));
                 for slot in &pool.slots {
-                    assert_eq!(slot.spans_text.capacity(), cursor_row_capacity(&config));
-                    assert_eq!(slot.spans_binary.capacity(), cursor_row_capacity(&config));
+                    assert_eq!(slot.spans.capacity(), cursor_row_capacity(&config));
                 }
                 if cursor_row_capacity(&config) != 0 {
                     let mut short = Budget::new(bytes - 1);

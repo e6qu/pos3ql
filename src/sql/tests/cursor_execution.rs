@@ -25,3 +25,74 @@ fn cursor_declaration_rejects_conflicting_options_and_write_effects() {
     );
     assert_eq!(rows, ["2|3", "1|f"]);
 }
+
+#[test]
+fn cursor_fetch_renders_saved_values_with_current_session_settings() {
+    let config = test_config("cursor-fetch-rendering");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    let values = "DATE '2020-01-02', ARRAY[DATE '2020-01-02'], \
+        ROW(DATE '2020-01-02', TIMESTAMPTZ '2020-01-02 03:04:05+00'), \
+        '\\x5c00'::bytea, 1.234567891234567::float8";
+    for hold in [false, true] {
+        session.success(&mut engine, "SET DateStyle = 'ISO, MDY'; SET TimeZone = 'UTC'; \
+            SET bytea_output = 'hex'; SET extra_float_digits = 3; BEGIN", true);
+        session.success(&mut engine, &format!(
+            "DECLARE rendered SCROLL CURSOR {} FOR SELECT {values} FROM generate_series(1,3)",
+            if hold { "WITH HOLD" } else { "" },
+        ), true);
+        if hold {
+            session.success(&mut engine, "COMMIT", true);
+        }
+        for setting in [
+            "SET DateStyle = 'ISO, MDY'",
+            "SET DateStyle = 'SQL, DMY'; SET TimeZone = 'Europe/Bucharest'; \
+                SET bytea_output = 'escape'; SET extra_float_digits = 0",
+            "SET DateStyle = 'German'; SET TimeZone = 'UTC'",
+        ] {
+            session.success(&mut engine, setting, true);
+            let expected = session.success(&mut engine, &format!("SELECT {values}"), true);
+            let fetched = session.success(&mut engine, "FETCH NEXT FROM rendered", true);
+            assert_eq!(data_rows(&fetched), data_rows(&expected), "hold={hold}, {setting}");
+            assert_eq!(row_description_type_oids(&fetched), row_description_type_oids(&expected));
+        }
+        session.success(&mut engine, "CLOSE rendered", true);
+        if !hold {
+            session.success(&mut engine, "COMMIT", true);
+        }
+    }
+}
+
+#[test]
+fn cursor_fetch_into_keeps_dates_typed_after_date_order_changes() {
+    let config = test_config("cursor-fetch-typed-assignment");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(&mut engine, "CREATE FUNCTION fetch_typed_date() RETURNS date \
+        LANGUAGE plpgsql AS $$ DECLARE c refcursor; d date; BEGIN \
+          OPEN c FOR SELECT DATE '2020-01-02'; \
+          SET DateStyle = 'SQL, DMY'; FETCH NEXT FROM c INTO d; CLOSE c; RETURN d; \
+        END $$", true);
+    let output = session.success(&mut engine,
+        "SET DateStyle = 'ISO, MDY'; SELECT fetch_typed_date() = DATE '2020-01-02'", true);
+    assert_eq!(data_rows(&output), ["t"]);
+}
+
+#[test]
+fn cursor_typed_rows_use_exact_capacity_and_release_failed_declarations() {
+    let mut config = test_config("cursor-typed-capacity");
+    config.max_cursors = 1;
+    // One zero-column row needs four length bytes and two column-count bytes.
+    config.cursor_bytes = 6;
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    for _ in 0..2 {
+        session.success(&mut engine, "BEGIN; DECLARE fits CURSOR FOR SELECT; FETCH ALL FROM fits; COMMIT", true);
+        let failed = session.execute(&mut engine, "BEGIN; DECLARE too_wide CURSOR FOR SELECT 1", true);
+        assert_eq!(error_sqlstates(&failed), ["54000"]);
+        session.success(&mut engine, "ROLLBACK", true);
+    }
+}

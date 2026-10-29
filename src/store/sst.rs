@@ -603,7 +603,9 @@ impl SstWriter {
         }
         let layout = pax_layout(descriptor)?;
         if layout.columns() != self.pax_columns
-            || !layout.schema().eq(self.pax_schema[..self.pax_columns].iter().copied())
+            || !layout
+                .schema()
+                .eq(self.pax_schema[..self.pax_columns].iter().copied())
             || layout.rows() == 0
         {
             return Err(SstError::Encoding);
@@ -2396,17 +2398,15 @@ pub(crate) fn copy_pax_v2_row_demand(
             if preceding_tombstone || layout.column_is_null(input, preceding, column)? {
                 continue;
             }
-            let length =
-                rowenc::encoded_value_len(&scratch.column[at..column_len], ctype)
-                    .map_err(|_| corrupt())?;
+            let length = rowenc::encoded_value_len(&scratch.column[at..column_len], ctype)
+                .map_err(|_| corrupt())?;
             at = at.checked_add(length).ok_or_else(corrupt)?;
             if at > column_len {
                 return Err(corrupt());
             }
         }
-        let length =
-            rowenc::encoded_value_len(&scratch.column[at..column_len], ctype)
-                .map_err(|_| corrupt())?;
+        let length = rowenc::encoded_value_len(&scratch.column[at..column_len], ctype)
+            .map_err(|_| corrupt())?;
         let end = at.checked_add(length).ok_or_else(corrupt)?;
         let next = written.checked_add(length).ok_or_else(corrupt)?;
         if end > column_len || next > output.len() {
@@ -2467,15 +2467,13 @@ pub(crate) fn copy_pax_v2_row_from_extents(
             if preceding_tombstone || layout.column_is_null(input, preceding, column)? {
                 continue;
             }
-            let length = rowenc::encoded_value_len(&bytes[at..], ctype)
-                .map_err(|_| corrupt())?;
+            let length = rowenc::encoded_value_len(&bytes[at..], ctype).map_err(|_| corrupt())?;
             at = at.checked_add(length).ok_or_else(corrupt)?;
             if at > bytes.len() {
                 return Err(corrupt());
             }
         }
-        let length = rowenc::encoded_value_len(&bytes[at..], ctype)
-            .map_err(|_| corrupt())?;
+        let length = rowenc::encoded_value_len(&bytes[at..], ctype).map_err(|_| corrupt())?;
         let end = at.checked_add(length).ok_or_else(corrupt)?;
         let next = written.checked_add(length).ok_or_else(corrupt)?;
         if end > bytes.len() || next > output.len() {
@@ -5152,17 +5150,25 @@ mod tests {
         assert_eq!(kind, BlockType::SstDataPaxV2);
         let layout = pax_layout(&raw[..length]).unwrap();
         assert!(layout.schema().eq(schema));
-        assert!(size_of::<PaxLayout>() <= 2048, "retained column-group metadata must fit 2 KiB");
+        assert!(
+            size_of::<PaxLayout>() <= 2048,
+            "retained column-group metadata must fit 2 KiB"
+        );
         println!(
             "column_layout_bytes={} previous_type_array_bytes={} stored_type_array_bytes={}",
             size_of::<PaxLayout>(),
             size_of::<[ColType; MAX_COLUMNS]>(),
             size_of::<[u8; MAX_COLUMNS]>(),
         );
-        let invalid_code = (0..=u8::MAX).find(|code| ColType::from_code(*code).is_none()).unwrap();
+        let invalid_code = (0..=u8::MAX)
+            .find(|code| ColType::from_code(*code).is_none())
+            .unwrap();
         let mut invalid_type = raw[..length].to_vec();
         invalid_type[8] = invalid_code;
-        assert!(matches!(pax_layout(&invalid_type), Err(SstError::Store(StoreError::Corrupt(_)))));
+        assert!(matches!(
+            pax_layout(&invalid_type),
+            Err(SstError::Store(StoreError::Corrupt(_)))
+        ));
         let mut oversized_row = raw[..length].to_vec();
         let row_length = 8 + layout.columns() + PAX_ROW_HEADER;
         oversized_row[row_length..row_length + 4]

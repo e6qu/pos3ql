@@ -17,7 +17,6 @@ Env: P3_BIN, P3_CONF, P3_PORT, P3_DATADIR (pos3ql control);
 
 import argparse
 import os
-from pathlib import Path
 import random
 import signal
 import socket
@@ -77,11 +76,6 @@ class P3Server:
         self.log = open(log, "ab")
         self.proc = None
         self.initial_pid = initial_pid
-        trace_path = os.environ.get("POS3QL_TORTURE_TRACE_FILE")
-        self.trace = None
-        if trace_path:
-            Path(trace_path).parent.mkdir(parents=True, exist_ok=True)
-            self.trace = open(trace_path, "ab")
 
     def start(self):
         self.proc = subprocess.Popen(
@@ -90,10 +84,7 @@ class P3Server:
 
     def connect(self):
         try:
-            connection = connect_p3(self.port)
-            if self.trace is not None:
-                connection.pgconn.trace(self.trace.fileno())
-            return connection
+            return connect_p3(self.port)
         except Exception:
             self.log.flush()
             print("pos3ql log after failed restart:", file=sys.stderr)

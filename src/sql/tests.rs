@@ -97488,7 +97488,7 @@ fn checkpoint_reads_held_maintenance_keeps_queries_commits_and_read_owners() {
             config.block_cache_bytes = 0;
             config.disk_cache_bytes = 0;
             config.max_tables = 4;
-            config.table_rows = 32;
+            config.table_rows = if phase.starts_with("index_") { 512 } else { 32 };
             config.max_spill_generations_per_table = 2;
             config.memtable_bytes = 8 << 20;
             crate::object_store::sim::drop_namespace(&config.object_store_bucket);
@@ -97512,10 +97512,10 @@ fn checkpoint_reads_held_maintenance_keeps_queries_commits_and_read_owners() {
                 false,
             );
             if phase.starts_with("index_") {
-                // More than one external-sort chunk, while retaining a small row count.
+                // Multiple sort chunks with keys inside the fixed collation workspace.
                 session.success(&mut engine,
                     "CREATE TABLE indexed_wait(id integer, code text); \
-                     INSERT INTO indexed_wait SELECT i,repeat(md5(i::text),640) FROM generate_series(1,17) AS source(i)", false);
+                     INSERT INTO indexed_wait SELECT i,repeat(md5(i::text),32) FROM generate_series(1,320) AS source(i)", false);
                 assert!(engine.checkpoint().unwrap());
                 session.success(
                     &mut engine,
@@ -97526,7 +97526,7 @@ fn checkpoint_reads_held_maintenance_keeps_queries_commits_and_read_owners() {
                     assert!(engine.checkpoint().unwrap());
                     session.success(
                         &mut engine,
-                        "UPDATE indexed_wait SET code=repeat(md5('new'),640) WHERE id=7",
+                        "UPDATE indexed_wait SET code=repeat(md5('new'),32) WHERE id=7",
                         false,
                     );
                 }
@@ -97882,13 +97882,13 @@ fn checkpoint_reads_held_maintenance_keeps_queries_commits_and_read_owners() {
             }
             if phase.starts_with("index_") {
                 let query = if phase == "index_roster" {
-                    "SELECT count(*),sum(id) FROM indexed_wait; SELECT id FROM indexed_wait WHERE code=repeat(md5('new'),640)"
+                    "SELECT count(*),sum(id) FROM indexed_wait; SELECT id FROM indexed_wait WHERE code=repeat(md5('new'),32)"
                 } else {
-                    "SELECT count(*),sum(id) FROM indexed_wait; SELECT id FROM indexed_wait WHERE code=repeat(md5('7'),640)"
+                    "SELECT count(*),sum(id) FROM indexed_wait; SELECT id FROM indexed_wait WHERE code=repeat(md5('7'),32)"
                 };
                 assert_eq!(
                     data_rows(&run_with(&mut recovered, &mut recovered_budget, query)),
-                    ["17|153", "7"]
+                    ["320|51360", "7"]
                 );
             }
             drop(recovered);

@@ -97628,6 +97628,26 @@ fn checkpoint_reads_held_maintenance_keeps_queries_commits_and_read_owners() {
                 blocks.lock().unwrap().base_mut().read_owner(),
                 engine.read_owner
             );
+            let maintenance_fds = [
+                engine.pending_block_read_fd(0),
+                engine.pending_block_read_fd(1),
+            ];
+            crate::mem::guard::forbid_alloc(|| {
+                for _ in 0..64 {
+                    if !engine.checkpoint_can_progress() {
+                        break;
+                    }
+                    assert!(!engine.checkpoint_beat().failed());
+                    assert_eq!(
+                        [
+                            engine.pending_block_read_fd(0),
+                            engine.pending_block_read_fd(1)
+                        ],
+                        maintenance_fds,
+                        "local cleanup must preserve the held maintenance request"
+                    );
+                }
+            });
             assert!(!engine.checkpoint_can_progress());
             let mut foreground_bytes = [0; crate::store::MAX_PAYLOAD];
             let foreground_owner =

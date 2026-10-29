@@ -176,3 +176,22 @@ fn cursor_empty_select_lists_preserve_row_counts_and_required_target_lists() {
         assert_eq!(error_sqlstates(&output), ["42601"], "{sql}");
     }
 }
+
+#[test]
+fn cursor_motion_counts_match_postgresql_integer_grammar() {
+    let config = test_config("cursor-motion-counts");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    let mut rows = Vec::new();
+    let mut errors = Vec::new();
+    for sql in include_str!("../../../tests/external/differential_exact/37_cursor_motion_counts.sql")
+        .split(';').filter(|sql| !sql.trim().is_empty())
+    {
+        let output = session.execute(&mut engine, sql, true);
+        rows.extend(data_rows(&output));
+        errors.extend(error_sqlstates(&output).into_iter().map(str::to_owned));
+    }
+    assert_eq!(rows, ["1", "2", "1", "2", "3", "3", "2", "1"]);
+    assert_eq!(errors, ["42601"; 5]);
+}

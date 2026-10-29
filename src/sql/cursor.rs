@@ -21,11 +21,11 @@ use crate::mem::arena::Arena;
 /// `FIRST` is `Absolute(1)`, `LAST` is `Absolute(-1)`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FetchMotion {
-    Count(i64),
+    Count(i32),
     All,
     BackwardAll,
-    Absolute(i64),
-    Relative(i64),
+    Absolute(i32),
+    Relative(i32),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -456,9 +456,9 @@ impl CursorPool {
         let slot = &mut self.slots[at];
         let n = slot.spans.len() as i64;
         let target = match motion {
-            FetchMotion::Absolute(k) if k >= 0 => k.clamp(0, n + 1),
-            FetchMotion::Absolute(k) => (n + 1 + k).clamp(0, n + 1),
-            FetchMotion::Relative(k) => (slot.position + k).clamp(0, n + 1),
+            FetchMotion::Absolute(k) if k >= 0 => i64::from(k).clamp(0, n + 1),
+            FetchMotion::Absolute(k) => (n + 1 + i64::from(k)).clamp(0, n + 1),
+            FetchMotion::Relative(k) => (slot.position + i64::from(k)).clamp(0, n + 1),
             _ => slot.position,
         };
         let backward = matches!(motion, FetchMotion::Count(k) if k < 0)
@@ -494,7 +494,7 @@ impl CursorPool {
                 slot.position = slot.position.min(n + 1);
             }
             FetchMotion::Count(k) => {
-                for _ in 0..-k {
+                for _ in 0..-i64::from(k) {
                     if slot.position < 1 {
                         break;
                     }
@@ -518,12 +518,12 @@ impl CursorPool {
                 slot.position = 0;
             }
             FetchMotion::Absolute(k) => {
-                let target = if k >= 0 { k } else { n + 1 + k };
+                let target = if k >= 0 { i64::from(k) } else { n + 1 + i64::from(k) };
                 slot.position = target.clamp(0, n + 1);
                 push_row(slot.position, out_rows);
             }
             FetchMotion::Relative(k) => {
-                slot.position = (slot.position + k).clamp(0, n + 1);
+                slot.position = (slot.position + i64::from(k)).clamp(0, n + 1);
                 push_row(slot.position, out_rows);
             }
         }

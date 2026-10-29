@@ -1,0 +1,17 @@
+-- PostgreSQL 18 gram.y uses SignedIconst (int32 magnitude) for FETCH/MOVE.
+BEGIN;
+DECLARE motion_values SCROLL CURSOR FOR SELECT g FROM generate_series(1, 3) AS g;
+FETCH FORWARD +1 FROM motion_values;
+FETCH RELATIVE +1 FROM motion_values;
+MOVE ABSOLUTE 2147483647 FROM motion_values;
+FETCH BACKWARD -2147483647 FROM motion_values;
+FETCH ABSOLUTE -2147483647 FROM motion_values;
+FETCH FORWARD 2147483647 FROM motion_values;
+FETCH BACKWARD ALL FROM motion_values;
+CLOSE motion_values;
+COMMIT;
+FETCH FORWARD 2147483648 FROM missing_cursor;
+FETCH ABSOLUTE -2147483648 FROM missing_cursor;
+FETCH RELATIVE 9223372036854775807 FROM missing_cursor;
+MOVE BACKWARD -9223372036854775808 FROM missing_cursor;
+FETCH FORWARD 1.0 FROM missing_cursor;

@@ -197,7 +197,12 @@ fn write_wire_text(
                     match byte {
                         b'\\' => out(b"\\\\"),
                         0x20..=0x7e => out(&[*byte]),
-                        _ => out(&[b'\\', b'0' + (byte >> 6), b'0' + ((byte >> 3) & 7), b'0' + (byte & 7)]),
+                        _ => out(&[
+                            b'\\',
+                            b'0' + (byte >> 6),
+                            b'0' + ((byte >> 3) & 7),
+                            b'0' + (byte & 7),
+                        ]),
                     }
                 }
             } else {
@@ -208,13 +213,27 @@ fn write_wire_text(
                 }
             }
         }
-        Datum::Date(date) => out(crate::sql::datetime::format_date_styled(*date, render.datestyle).as_str().as_bytes()),
-        Datum::Timestamp(timestamp) | Datum::Timestamptz(timestamp) => out(
-            crate::sql::datetime::format_timestamp_styled(*timestamp,
-                matches!(value, Datum::Timestamptz(_)), render.datestyle, render.parsed_timezone)
-                .as_str().as_bytes()),
+        Datum::Date(date) => out(
+            crate::sql::datetime::format_date_styled(*date, render.datestyle)
+                .as_str()
+                .as_bytes(),
+        ),
+        Datum::Timestamp(timestamp) | Datum::Timestamptz(timestamp) => {
+            out(crate::sql::datetime::format_timestamp_styled(
+                *timestamp,
+                matches!(value, Datum::Timestamptz(_)),
+                render.datestyle,
+                render.parsed_timezone,
+            )
+            .as_str()
+            .as_bytes())
+        }
         Datum::Interval(interval) => out(crate::sql::datetime::format_interval_styled(
-            *interval, render.intervalstyle).as_str().as_bytes()),
+            *interval,
+            render.intervalstyle,
+        )
+        .as_str()
+        .as_bytes()),
         Datum::Float4(value) => {
             use core::fmt::Write as _;
             let _ = write!(
@@ -1116,9 +1135,11 @@ impl<'b> Responder<'b> {
         if value.is_null() {
             message.i32(-1);
         } else {
-            message.field(|message| write_wire_text(value, render, &mut |bytes| {
-                message.bytes(bytes);
-            }));
+            message.field(|message| {
+                write_wire_text(value, render, &mut |bytes| {
+                    message.bytes(bytes);
+                })
+            });
         }
     }
 
@@ -1143,14 +1164,20 @@ impl<'b> Responder<'b> {
             Datum::Null => return Ok(None),
             Datum::PgNodeTree(node) => node.as_str().as_bytes(),
             Datum::PgDdlCommand => {
-                return Err(crate::sql_err!(sqlstate::FEATURE_NOT_SUPPORTED,
-                    "cannot display a value of type pg_ddl_command"));
+                return Err(crate::sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "cannot display a value of type pg_ddl_command"
+                ));
             }
-            Datum::Text(text) | Datum::Bpchar(text)
-            | Datum::Regtype { name: text, .. } | Datum::RegObject { name: text, .. } => text.as_bytes(),
+            Datum::Text(text)
+            | Datum::Bpchar(text)
+            | Datum::Regtype { name: text, .. }
+            | Datum::RegObject { name: text, .. } => text.as_bytes(),
             value => {
                 let length = wire_text_len(value, render);
-                let bytes = arena.alloc_slice_with(length, |_| 0u8).map_err(|_| full())?;
+                let bytes = arena
+                    .alloc_slice_with(length, |_| 0u8)
+                    .map_err(|_| full())?;
                 let mut at = 0usize;
                 write_wire_text(value, render, &mut |part| {
                     bytes[at..at + part.len()].copy_from_slice(part);

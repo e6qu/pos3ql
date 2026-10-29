@@ -914,13 +914,19 @@ impl<'a> Parser<'a> {
     fn fetch_cursor(&mut self, move_only: bool) -> Result<Stmt<'a>, ParseError> {
         use crate::sql::cursor::FetchMotion;
         self.advance()?; // fetch | move
-        let signed_count = |p: &mut Self| -> Result<i64, ParseError> {
+        let signed_count = |p: &mut Self| -> Result<i32, ParseError> {
             let negative = p.eat_op("-")?;
+            if !negative {
+                let _ = p.eat_op("+")?;
+            }
             match p.peeked {
                 Tok::Num(text) => {
-                    let v: i64 = text
-                        .parse()
-                        .map_err(|_| p.unexpected("expected a row count"))?;
+                    // PostgreSQL's SignedIconst requires an int32 magnitude.
+                    let v: i32 = text.parse().map_err(|_| ParseError {
+                        at: p.peek_at,
+                        message: stack_format!(96, "syntax error at or near \"{}\"", text),
+                        sqlstate: sqlstate::SYNTAX_ERROR,
+                    })?;
                     p.advance()?;
                     Ok(if negative { -v } else { v })
                 }
@@ -942,7 +948,7 @@ impl<'a> Parser<'a> {
         } else if self.eat_ident("forward")? {
             if self.eat_ident("all")? {
                 FetchMotion::All
-            } else if matches!(self.peeked, Tok::Num(_)) || self.peeked == Tok::Op("-") {
+            } else if matches!(self.peeked, Tok::Num(_) | Tok::Op("-" | "+")) {
                 FetchMotion::Count(signed_count(self)?)
             } else {
                 FetchMotion::Count(1)
@@ -950,14 +956,14 @@ impl<'a> Parser<'a> {
         } else if self.eat_ident("backward")? {
             if self.eat_ident("all")? {
                 FetchMotion::BackwardAll
-            } else if matches!(self.peeked, Tok::Num(_)) || self.peeked == Tok::Op("-") {
+            } else if matches!(self.peeked, Tok::Num(_) | Tok::Op("-" | "+")) {
                 FetchMotion::Count(-signed_count(self)?)
             } else {
                 FetchMotion::Count(-1)
             }
         } else if self.eat_ident("all")? {
             FetchMotion::All
-        } else if matches!(self.peeked, Tok::Num(_)) || self.peeked == Tok::Op("-") {
+        } else if matches!(self.peeked, Tok::Num(_) | Tok::Op("-" | "+")) {
             FetchMotion::Count(signed_count(self)?)
         } else {
             FetchMotion::Count(1)

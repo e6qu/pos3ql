@@ -76,3 +76,30 @@ jobs:
         with:
           name: cursor-reference-${{ github.sha }}
           path: ${{ runner.temp }}/cursor-reference.json
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-query-output-binary-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+      - run: cargo build --bin pos3ql --locked
+      - name: Compare exact SQL behavior with PostgreSQL
+        env:
+          POS3QL_VENV: venv
+          PGHOST: 127.0.0.1
+          PGPORT: 5432
+          PGUSER: postgres
+          RUN_CORE: "0"
+          RUN_CORPUS: "0"
+          RUN_AUX: "1"
+          AUXILIARY_PHASE: exact
+          RUN_SLT: "0"
+          RUN_FUZZ: "0"
+        run: bash tests/external/ci_diff.sh "$PWD/target/debug/pos3ql" "$RUNNER_TEMP/query-exact"
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: query-exact-${{ github.sha }}
+          path: ${{ runner.temp }}/query-exact/

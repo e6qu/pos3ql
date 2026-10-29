@@ -19628,12 +19628,17 @@ impl Engine {
                             exec::BinaryOutputCapability::Supported
                             | exec::BinaryOutputCapability::MissingAclItemElementSend => {}
                             exec::BinaryOutputCapability::MissingAclItemSend => {
-                                return Ok(Err(sql_err!(eval::sqlstate::UNDEFINED_FUNCTION,
-                                    "no binary output function available for type aclitem")));
+                                return Ok(Err(sql_err!(
+                                    eval::sqlstate::UNDEFINED_FUNCTION,
+                                    "no binary output function available for type aclitem"
+                                )));
                             }
                             exec::BinaryOutputCapability::Unsupported => {
-                                return Ok(Err(sql_err!(eval::sqlstate::FEATURE_NOT_SUPPORTED,
-                                    "binary output is not supported for type oid {}", oid)));
+                                return Ok(Err(sql_err!(
+                                    eval::sqlstate::FEATURE_NOT_SUPPORTED,
+                                    "binary output is not supported for type oid {}",
+                                    oid
+                                )));
                             }
                         }
                     }
@@ -19643,7 +19648,12 @@ impl Engine {
                             let mut values = [Datum::Null; crate::pg::respond::MAX_RESULT_COLS];
                             match cursors.copy_row(name, row, arena, &mut values) {
                                 Ok(width) => query::emit_data_row(
-                                    &self.storage, txn.txid, arena, responder, &values[..width]),
+                                    &self.storage,
+                                    txn.txid,
+                                    arena,
+                                    responder,
+                                    &values[..width],
+                                ),
                                 Err(error) => Ok(Err(error)),
                             }
                         };

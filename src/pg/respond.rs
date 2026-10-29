@@ -1019,7 +1019,10 @@ impl<'b> Responder<'b> {
     /// A binary SQL cursor must not change the next statement's wire format.
     pub(crate) fn result_format_scope(&mut self, formats: ResultFmt) -> ResultFormatScope<'_, 'b> {
         let previous = core::mem::replace(&mut self.formats, formats);
-        ResultFormatScope { responder: self, previous }
+        ResultFormatScope {
+            responder: self,
+            previous,
+        }
     }
 
     pub(crate) fn result_type_oid(&self, index: usize) -> Option<i32> {
@@ -1868,8 +1871,7 @@ impl<'b> Responder<'b> {
         }
     }
 
-    /// Forwards pre-encoded wire message bytes verbatim (cursor FETCH replays
-    /// captured RowDescription/DataRow messages).
+    /// Forwards complete pre-encoded wire messages.
     pub fn raw(&mut self, bytes: &[u8]) -> Result<(), WireFull> {
         if self.buffer.append(bytes) {
             Ok(())

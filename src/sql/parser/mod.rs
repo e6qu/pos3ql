@@ -1911,7 +1911,14 @@ impl<'a> Parser<'a> {
             let _ = self.eat_ident("all")?;
             false
         };
-        let items = self.select_items()?;
+        // PostgreSQL permits an empty SELECT list, including before FROM.
+        // DISTINCT requires a nonempty list; RETURNING uses select_items directly.
+        let empty_list = !distinct && matches!(self.peeked,
+            Tok::Eof | Tok::Op(";" | ")") |
+            Tok::Ident("into" | "from" | "where" | "group" | "having" | "window" |
+                "union" | "intersect" | "except" | "order" | "limit" | "offset" |
+                "fetch" | "for"));
+        let items = if empty_list { &[][..] } else { self.select_items()? };
 
         // `SELECT ... INTO [TABLE] name ...` — a CREATE TABLE AS spelled the
         // old way. Legal only at the top level; a subquery / CTE / set-op branch

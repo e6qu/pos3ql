@@ -13,8 +13,8 @@ use crate::util::StackStr;
 use core::cell::Cell;
 
 use super::eval::{SqlError, sqlstate};
-use crate::mem::arena::Arena;
 use super::types::Datum;
+use crate::mem::arena::Arena;
 
 /// One FETCH/MOVE motion, normalized by the parser: positive counts move
 /// forward, negative backward (`NEXT` is `Count(1)`, `PRIOR` is `Count(-1)`,
@@ -112,7 +112,12 @@ const fn cursor_row_capacity(config: &Config) -> usize {
 }
 
 fn seal_description(description: &mut FixedBuf) -> Result<usize, SqlError> {
-    let malformed = || sql_err!(sqlstate::INTERNAL_ERROR, "cursor captured a torn description");
+    let malformed = || {
+        sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "cursor captured a torn description"
+        )
+    };
     let bytes = description.readable();
     let mut at = 0usize;
     let mut captured = None;
@@ -122,20 +127,29 @@ fn seal_description(description: &mut FixedBuf) -> Result<usize, SqlError> {
         if length < 4 {
             return Err(malformed());
         }
-        let end = at.checked_add(1).and_then(|at| at.checked_add(length)).ok_or_else(malformed)?;
+        let end = at
+            .checked_add(1)
+            .and_then(|at| at.checked_add(length))
+            .ok_or_else(malformed)?;
         if end > bytes.len() {
             return Err(malformed());
         }
         if header[0] == b'T' {
             if captured.is_some() {
-                return Err(sql_err!(sqlstate::INTERNAL_ERROR, "cursor captured two descriptions"));
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "cursor captured two descriptions"
+                ));
             }
             captured = Some((at, end));
         }
         at = end;
     }
     let (start, end) = captured.ok_or_else(|| {
-        sql_err!(sqlstate::INTERNAL_ERROR, "cursor did not capture a description")
+        sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "cursor did not capture a description"
+        )
     })?;
     let mut types = [0; crate::pg::respond::MAX_RESULT_COLS];
     let columns = description_type_oids(&bytes[start..end], &mut types)?;
@@ -144,11 +158,7 @@ fn seal_description(description: &mut FixedBuf) -> Result<usize, SqlError> {
     Ok(columns)
 }
 
-fn seal_rows(
-    rows: &FixedBuf,
-    columns: usize,
-    spans: &mut Vec<(u32, u32)>,
-) -> Result<(), SqlError> {
+fn seal_rows(rows: &FixedBuf, columns: usize, spans: &mut Vec<(u32, u32)>) -> Result<(), SqlError> {
     let malformed = || sql_err!(sqlstate::INTERNAL_ERROR, "cursor captured a torn typed row");
     let bytes = rows.readable();
     let mut at = 0usize;
@@ -534,23 +544,30 @@ impl CursorPool {
         values: &mut [Datum<'arena>],
     ) -> Result<usize, SqlError> {
         let at = self.find(name).ok_or_else(|| {
-            sql_err!(sqlstate::UNDEFINED_CURSOR, "cursor \"{}\" does not exist", name)
+            sql_err!(
+                sqlstate::UNDEFINED_CURSOR,
+                "cursor \"{}\" does not exist",
+                name
+            )
         })?;
         let slot = &self.slots[at];
-        let (offset, length) = *slot.spans.get(row as usize).ok_or_else(|| {
-            sql_err!(sqlstate::INTERNAL_ERROR, "cursor row index is invalid")
-        })?;
+        let (offset, length) = *slot
+            .spans
+            .get(row as usize)
+            .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "cursor row index is invalid"))?;
         let bytes = &slot.rows.readable()[offset as usize..offset as usize + length as usize];
         let width = super::exec::projected_row_width(bytes);
         if width > values.len() {
-            return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "cursor row has more than {} columns", values.len()));
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "cursor row has more than {} columns",
+                values.len()
+            ));
         }
-        let bytes = arena.alloc_slice_copy(bytes).map_err(|_| super::query::arena_full_pub())?;
-        for (column, value) in values[..width].iter_mut().enumerate() {
-            *value = super::exec::decode_projected_col_record(bytes, column, arena)?;
-        }
-        Ok(width)
+        let bytes = arena
+            .alloc_slice_copy(bytes)
+            .map_err(|_| super::query::arena_full_pub())?;
+        super::exec::decode_projected_row_into(bytes, arena, values)
     }
 
     /// CLOSE name — false when no such cursor exists.

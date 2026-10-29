@@ -3183,9 +3183,10 @@ impl Conn {
                     });
                 if protocol_portal.is_none() {
                     // SQL cursors expose their declaration's text/binary format.
-                    if let Some((description, formats)) = self.cursors.fetch_description(
-                        name, crate::pg::respond::ResultFmt::ALL_TEXT,
-                    ) {
+                    if let Some((description, formats)) = self
+                        .cursors
+                        .fetch_description(name, crate::pg::respond::ResultFmt::ALL_TEXT)
+                    {
                         let mut responder = Responder::new(&mut self.send);
                         return match responder.cursor_row_description(description, formats) {
                             Ok(()) => Step::Continue,

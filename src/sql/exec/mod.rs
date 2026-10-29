@@ -719,7 +719,7 @@ pub(crate) use describe::{enter_bound_parameter_types, enter_routine_parameter_t
 
 mod projected;
 pub(crate) use projected::{
-    compare_projected_prefix, encode_projected_by_into, encode_projected_into,
+    compare_projected_prefix, decode_projected_row_into, encode_projected_by_into, encode_projected_into,
     encode_projected_persistent_pub, projected_row_len, projected_row_len_by, projected_row_width,
 };
 pub use projected::{
@@ -18945,7 +18945,7 @@ fn parse_trigger_statement<'a>(
     {
         return Ok(TriggerStatement::Dml(parse_trigger_dml(segment, arena)?));
     }
-    if ["create", "alter", "drop", "comment", "grant", "revoke"]
+    if ["create", "alter", "drop", "comment", "grant", "revoke", "set", "reset"]
         .iter()
         .any(|keyword| strip_trigger_keyword(segment, keyword).is_some())
     {
@@ -72674,7 +72674,7 @@ mod tests {
     use crate::mem::budget::Budget;
 
     #[test]
-    fn event_trigger_static_utility_parse_preserves_lexical_errors() {
+    fn procedural_static_utility_parse_preserves_lexical_errors_and_assignments() {
         for (sql, capacity, message) in [
             (
                 "CREATE TABLE orders(id integer)",
@@ -72699,17 +72699,20 @@ mod tests {
         }
         let mut budget = Budget::new(8192);
         let arena = Arena::new(&mut budget, "procedural assignment parsing", 4096).unwrap();
-        let statement = crate::mem::guard::forbid_alloc(|| {
-            parse_trigger_statement(
-                "alter := 1",
-                &arena,
-                &[],
-                false,
-                PlpgsqlProgramKind::Anonymous,
-            )
-            .unwrap()
-        });
-        assert!(matches!(statement, TriggerStatement::LocalAssign(_)));
+        for sql in ["alter := 1", "set := 1", "reset := 1"] {
+            let statement = crate::mem::guard::forbid_alloc(|| {
+                parse_trigger_statement(sql, &arena, &[], false, PlpgsqlProgramKind::Anonymous)
+                    .unwrap()
+            });
+            assert!(matches!(statement, TriggerStatement::LocalAssign(_)));
+        }
+        for sql in ["SET DateStyle = 'SQL, DMY'", "RESET DateStyle", "RESET ALL"] {
+            let statement = crate::mem::guard::forbid_alloc(|| {
+                parse_trigger_statement(sql, &arena, &[], false, PlpgsqlProgramKind::Anonymous)
+                    .unwrap()
+            });
+            assert!(matches!(statement, TriggerStatement::Utility { .. }));
+        }
     }
 
     #[test]

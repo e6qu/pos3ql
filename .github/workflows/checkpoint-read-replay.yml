@@ -35,6 +35,7 @@ jobs:
           POS3QL_TORTURE_SEED: "20260725"
           POS3QL_TEST_S3_LATENCY_MS: "0"
           POS3QL_TEST_ARTIFACTS: ${{ runner.temp }}/crash-failure
+          POS3QL_TORTURE_TRACE_FILE: ${{ runner.temp }}/crash-failure/wire.log
         run: |
           cargo build --release --locked
           POS3QL_RUN_GROUPS=torture POS3QL_BIN="$PWD/target/release/pos3ql" bash tests/external/run.sh

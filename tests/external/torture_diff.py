@@ -17,6 +17,7 @@ Env: P3_BIN, P3_CONF, P3_PORT, P3_DATADIR (pos3ql control);
 
 import argparse
 import os
+from pathlib import Path
 import random
 import signal
 import socket
@@ -76,6 +77,11 @@ class P3Server:
         self.log = open(log, "ab")
         self.proc = None
         self.initial_pid = initial_pid
+        trace_path = os.environ.get("POS3QL_TORTURE_TRACE_FILE")
+        self.trace = None
+        if trace_path:
+            Path(trace_path).parent.mkdir(parents=True, exist_ok=True)
+            self.trace = open(trace_path, "ab")
 
     def start(self):
         self.proc = subprocess.Popen(
@@ -84,7 +90,10 @@ class P3Server:
 
     def connect(self):
         try:
-            return connect_p3(self.port)
+            connection = connect_p3(self.port)
+            if self.trace is not None:
+                connection.pgconn.trace(self.trace.fileno())
+            return connection
         except Exception:
             self.log.flush()
             print("pos3ql log after failed restart:", file=sys.stderr)
@@ -115,7 +124,7 @@ def table_digest(cur, table):
     )
     summary = cur.fetchone()
     cur.execute(f"SELECT id, md5(pad) FROM {table} ORDER BY id")
-    return (summary, cur.fetchall())
+    return (summary, cur.fetchall(), cur.statusmessage)
 
 
 def verify(p3cur, pgcur, context):
@@ -131,6 +140,7 @@ def verify(p3cur, pgcur, context):
             extra = sorted(set(g) - set(w))[:10]
             changed = sorted(k for k in set(g) & set(w) if g[k] != w[k])[:10]
             print(f"  ordered row counts: {len(got[1])} / {len(want[1])}", file=sys.stderr)
+            print(f"  completion tags: {got[2]} / {want[2]}", file=sys.stderr)
             print(f"  missing ids ({len(missing)}): {missing[:20]} ... {missing[-20:]}", file=sys.stderr)
             print(f"  extra ids:   {extra}", file=sys.stderr)
             print(f"  changed ids: {changed}", file=sys.stderr)

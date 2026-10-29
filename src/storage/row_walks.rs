@@ -1130,7 +1130,7 @@ mod tests {
         let undone = storage
             .write_pending(table, 3, 7, 1, Some(location))
             .unwrap();
-        let mut cursor = super::super::CheckpointValueCursor::new(1, 128);
+        let mut cursor = super::super::CheckpointRowCursor::new(1, 128);
         let mut budget = Budget::new(4096);
         let arena = crate::mem::arena::Arena::new(&mut budget, "checkpoint test", 4096).unwrap();
         let mut output = [0u8; 128];
@@ -1197,7 +1197,7 @@ mod tests {
         deleted.committed = None;
         deleted.committed_lsn = 9;
         storage.tables[table].rows.insert(3, deleted).unwrap();
-        let mut cursor = super::super::CheckpointValueCursor::new(1, 128);
+        let mut cursor = super::super::CheckpointRowCursor::new(1, 128);
         let mut changed = Vec::with_capacity(128);
         let mut output = [0u8; 128];
         crate::mem::guard::forbid_alloc(|| {
@@ -1240,7 +1240,7 @@ mod tests {
     #[test]
     fn checkpoint_retained_rows_capacity_and_error_reset_are_allocation_free() {
         let (storage, table) = checkpoint_fixture();
-        let mut cursor = super::super::CheckpointValueCursor::new(1, 1);
+        let mut cursor = super::super::CheckpointRowCursor::new(1, 1);
         let mut changed = Vec::with_capacity(128);
         let mut output = [0u8; 128];
         crate::mem::guard::forbid_alloc(|| {
@@ -1267,7 +1267,7 @@ mod tests {
             assert!(!cursor.resident_initialized);
             assert!(storage.tables[table].rows.test_write().is_ok());
         });
-        let mut cursor = super::super::CheckpointValueCursor::new(1, 128);
+        let mut cursor = super::super::CheckpointRowCursor::new(1, 128);
         crate::mem::guard::forbid_alloc(|| {
             let error = storage
                 .for_each_value_binding_delta_entry_batch(

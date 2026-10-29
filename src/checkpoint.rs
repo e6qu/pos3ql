@@ -30,7 +30,7 @@ use crate::sql::types::ColType;
 use crate::sql_err;
 use crate::stack_format;
 use crate::storage::{
-    CheckpointValueCursor, ColumnDefault, ColumnMeta, MAX_COLUMNS, MAX_RELATION_COLUMNS,
+    CheckpointRowCursor, ColumnDefault, ColumnMeta, MAX_COLUMNS, MAX_RELATION_COLUMNS,
     MaintenanceMode, MaintenanceStep, OwnedDatum, PartitionBound, PartitionBoundValue,
     PartitionDef, PartitionStrategy, RowCleanup, RowCleanupTarget, RowCleanupTask, RowHome,
     SerializedStoredQueryDependency, SqlName, Storage, TableDef, TransactionIdentityRecord,
@@ -755,6 +755,9 @@ struct CheckpointVersion {
 
 enum TableSlicePhase {
     Clean,
+    Capture {
+        source: crate::storage::TableRowSnapshot<'static>,
+    },
     Write {
         source: crate::storage::TableRowSnapshot<'static>,
         position: usize,
@@ -1465,7 +1468,7 @@ pub(crate) struct Checkpointer {
     /// immutable run, so the leased producer is free for foreground work.
     value_source: Box<[u8]>,
     value_sort_rows: Box<[BufferedValueRow]>,
-    value_source_cursor: CheckpointValueCursor,
+    source_cursor: CheckpointRowCursor,
     value_sort_reader: ExternalRunReader,
     value_changed_rowids: Vec<u64>,
     value_base_stream: ValueIndexStream,
@@ -1675,7 +1678,7 @@ impl Checkpointer {
             + VALUE_SORT_ROWS_PER_CHUNK * core::mem::size_of::<BufferedValueRow>()
             + garbage_sst_root_capacity(config) * core::mem::size_of::<SstHandle>()
             + garbage_index_root_capacity(config) * core::mem::size_of::<BlockId>()
-            + CheckpointValueCursor::budget_bytes(
+            + CheckpointRowCursor::budget_bytes(
                 config.max_spill_generations_per_table,
                 config.table_rows,
             )
@@ -2347,7 +2350,7 @@ impl Checkpointer {
             .draw(
                 2 * crate::store::MAX_PAYLOAD
                     + VALUE_SORT_ROWS_PER_CHUNK * core::mem::size_of::<BufferedValueRow>()
-                    + CheckpointValueCursor::budget_bytes(
+                    + CheckpointRowCursor::budget_bytes(
                         config.max_spill_generations_per_table,
                         config.table_rows,
                     )
@@ -2534,7 +2537,7 @@ impl Checkpointer {
             value_source: vec![0; crate::store::MAX_PAYLOAD].into_boxed_slice(),
             value_sort_rows: vec![EMPTY_BUFFERED_VALUE_ROW; VALUE_SORT_ROWS_PER_CHUNK]
                 .into_boxed_slice(),
-            value_source_cursor: CheckpointValueCursor::new(
+            source_cursor: CheckpointRowCursor::new(
                 config.max_spill_generations_per_table,
                 config.table_rows,
             ),
@@ -13719,11 +13722,7 @@ impl Checkpointer {
             }
             Ok(ControlFlow::Continue(()))
         };
-        if delta {
-            let _ = storage.for_each_resident_row_state(slot, &mut collect)?;
-        } else {
-            storage.for_each_row_state(slot, &mut collect)?;
-        }
+        let _ = storage.for_each_resident_row_state(slot, &mut collect)?;
         self.table_output
             .as_mut_slice()
             .sort_unstable_by_key(|entry| entry.key);
@@ -13740,9 +13739,15 @@ impl Checkpointer {
         self.slice_writer
             .set_packed_fillfactor(storage.table(slot).definition().storage_options.fillfactor)
             .map_err(sst_to_sql)?;
-        job.phase = TableSlicePhase::Write {
-            source,
-            position: 0,
+        job.phase = if delta {
+            TableSlicePhase::Write {
+                source,
+                position: 0,
+            }
+        } else {
+            self.source_cursor.reset();
+            storage.retain_checkpoint_capture(slot, &mut self.source_cursor)?;
+            TableSlicePhase::Capture { source }
         };
         #[cfg(feature = "checkpoint-profile")]
         profile_checkpoint_phase(
@@ -13783,6 +13788,7 @@ impl Checkpointer {
                 .map_err(upload_to_sql)?;
             self.table_output.clear();
             self.slice_writer.reset();
+            self.source_cursor.reset();
             return Ok(());
         }
         if self.maintenance_read_wait.is_some()
@@ -13822,6 +13828,45 @@ impl Checkpointer {
         );
         let mut writer_failed = false;
         let result = (|| -> Result<(), SqlError> {
+            if matches!(job.phase, TableSlicePhase::Capture { .. }) {
+                let entries = &mut self.table_output;
+                let done = self.source_cursor.walk_spilled_metadata(
+                    &self.sst_arena,
+                    64,
+                    MERGE_WRITE_BEAT_READS,
+                    &mut |rowid, commit_lsn, home| {
+                        entries
+                            .push(CheckpointVersion {
+                                key: SstKey::at(rowid, commit_lsn),
+                                home: Some(home),
+                            })
+                            .map_err(|_| {
+                                sql_err!(
+                                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                    "checkpoint_write_entries exhausted ({})",
+                                    entries.capacity()
+                                )
+                            })?;
+                        Ok(core::ops::ControlFlow::Continue(()))
+                    },
+                )?;
+                if done {
+                    entries
+                        .as_mut_slice()
+                        .sort_unstable_by_key(|entry| entry.key);
+                    let TableSlicePhase::Capture { source } =
+                        core::mem::replace(&mut job.phase, TableSlicePhase::Clean)
+                    else {
+                        unreachable!("captured table source")
+                    };
+                    job.phase = TableSlicePhase::Write {
+                        source,
+                        position: 0,
+                    };
+                    self.source_cursor.reset();
+                }
+                return Ok(());
+            }
             let TableSlicePhase::Write { source, position } = &mut job.phase else {
                 unreachable!("checked table output phase");
             };
@@ -13922,6 +13967,7 @@ impl Checkpointer {
                 .map_err(upload_to_sql)?;
             self.table_output.clear();
             self.slice_writer.reset();
+            self.source_cursor.reset();
         } else {
             self.table_job = Some(job);
         }
@@ -13998,7 +14044,7 @@ impl Checkpointer {
                 }
             }
             TableSlicePhase::Clean => {}
-            TableSlicePhase::Write { .. } => {
+            TableSlicePhase::Capture { .. } | TableSlicePhase::Write { .. } => {
                 unreachable!("table output must finish before installation")
             }
         }
@@ -14140,7 +14186,7 @@ impl Checkpointer {
                 self.roster_scratch.sort_unstable();
                 self.roster_scratch.dedup();
             }
-            self.value_source_cursor.reset();
+            self.source_cursor.reset();
             self.slice_writer.reset();
             let (columns, n_columns) = storage.value_binding_columns(slot, binding);
             self.value_schedule_job = Some(ValueScheduleJob {
@@ -14459,7 +14505,7 @@ impl Checkpointer {
                     slot,
                     binding,
                     base.published_lsn,
-                    &mut self.value_source_cursor,
+                    &mut self.source_cursor,
                     &mut self.value_changed_rowids,
                     key_output,
                     VALUE_INDEX_SCHEDULE_BEAT_ROWS,
@@ -14469,7 +14515,7 @@ impl Checkpointer {
                 storage.for_each_value_binding_entry_batch(
                     slot,
                     binding,
-                    &mut self.value_source_cursor,
+                    &mut self.source_cursor,
                     &self.sst_arena,
                     key_output,
                     VALUE_INDEX_SCHEDULE_BEAT_ROWS,
@@ -14815,7 +14861,7 @@ impl Checkpointer {
     }
 
     fn finish_value_schedule(&mut self, job: ValueScheduleJob, source: ValueIndexSource) {
-        self.value_source_cursor.reset();
+        self.source_cursor.reset();
         self.value_changed_rowids.sort_unstable();
         self.value_changed_rowids.dedup();
         if let Some(spec) = job.navigation {
@@ -14858,7 +14904,7 @@ impl Checkpointer {
             .expect("checked by checkpoint scheduler");
         if !Self::value_schedule_job_is_current(storage, &job) {
             self.slice_writer.reset();
-            self.value_source_cursor.reset();
+            self.source_cursor.reset();
             self.roster_scratch.clear();
             self.value_changed_rowids.clear();
             return Ok(());
@@ -14929,7 +14975,7 @@ impl Checkpointer {
                     .discard(&mut self.block_uploads)
                     .map_err(upload_to_sql)?;
                 self.slice_writer.reset();
-                self.value_source_cursor.reset();
+                self.source_cursor.reset();
                 self.value_changed_rowids.clear();
                 job.phase = ValueSchedulePhase::Collect;
                 job.source_done = false;
@@ -21667,7 +21713,7 @@ mod stored_dependency_tests {
         table_rows.table_rows += 1;
         assert_eq!(
             Checkpointer::budget_bytes(&table_rows) - base_bytes,
-            core::mem::size_of::<u64>() + CheckpointValueCursor::budget_bytes(0, 1)
+            core::mem::size_of::<u64>() + CheckpointRowCursor::budget_bytes(0, 1)
         );
 
         let mut garbage = base.clone();

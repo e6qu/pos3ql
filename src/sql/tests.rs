@@ -79779,7 +79779,7 @@ fn checkpoint_retained_rows_preserve_sst_partition_after_eviction_between_beats(
         .find_table("public", "retained_checkpoint")
         .unwrap();
     engine.storage.set_commit_snapshot(0);
-    let mut cursor = crate::storage::CheckpointValueCursor::new(
+    let mut cursor = crate::storage::CheckpointRowCursor::new(
         config.max_spill_generations_per_table,
         config.table_rows,
     );
@@ -79888,7 +79888,7 @@ fn checkpoint_retained_rows_preserve_sst_partition_after_eviction_between_beats(
 }
 
 fn retained_sst_next(
-    cursor: &mut crate::storage::CheckpointValueCursor,
+    cursor: &mut crate::storage::CheckpointRowCursor,
     arena: &mut crate::mem::arena::Arena,
     seen: &mut Vec<i32>,
 ) -> bool {
@@ -80022,7 +80022,7 @@ fn retained_sst_durable_reader_survives_retirement_and_releases_garbage() {
         RowCleanupTask::SavedEntries(EntryCleanup::AllSaved),
         RowCleanupTarget::Table(slot),
     );
-    let mut cursor = crate::storage::CheckpointValueCursor::new(
+    let mut cursor = crate::storage::CheckpointRowCursor::new(
         config.max_spill_generations_per_table,
         config.table_rows,
     );
@@ -80110,7 +80110,7 @@ fn retained_sst_temporary_reader_survives_retirement_and_releases_blocks() {
     else {
         panic!("missing temporary table")
     };
-    let mut cursor = crate::storage::CheckpointValueCursor::new(
+    let mut cursor = crate::storage::CheckpointRowCursor::new(
         config.max_spill_generations_per_table,
         config.table_rows,
     );

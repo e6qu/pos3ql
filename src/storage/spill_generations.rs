@@ -5768,27 +5768,29 @@ mod tests {
                         snapshot.commit_lsn,
                         &arena,
                         true,
-                        None,
-                        true,
                         SpillOverlayMode::VisibleScan(&RowScanIds::Statement(&[])),
                         None,
-                        &mut |rowid, lsn, representation| {
-                            assert_eq!((rowid, lsn), (1, 7));
-                            let mut decoded = [Datum::Null; MAX_COLUMNS];
-                            let values = match representation {
-                                SpilledRowRepresentation::Encoded(bytes) => {
-                                    rowenc::decode(
-                                        bytes,
-                                        &relation.schema[..relation.n_columns],
-                                        &mut decoded,
-                                    )?;
-                                    &decoded[..relation.n_columns]
-                                }
-                                SpilledRowRepresentation::Values(values) => values,
-                            };
-                            assert_eq!(values, [Datum::Int4(41)]);
-                            count += 1;
-                            Ok(core::ops::ControlFlow::Continue(()))
+                        crate::storage::SpillWalkOutput::Rows {
+                            columns: None,
+                            coalesce_packed: true,
+                            emit: &mut |rowid, lsn, representation| {
+                                assert_eq!((rowid, lsn), (1, 7));
+                                let mut decoded = [Datum::Null; MAX_COLUMNS];
+                                let values = match representation {
+                                    SpilledRowRepresentation::Encoded(bytes) => {
+                                        rowenc::decode(
+                                            bytes,
+                                            &relation.schema[..relation.n_columns],
+                                            &mut decoded,
+                                        )?;
+                                        &decoded[..relation.n_columns]
+                                    }
+                                    SpilledRowRepresentation::Values(values) => values,
+                                };
+                                assert_eq!(values, [Datum::Int4(41)]);
+                                count += 1;
+                                Ok(core::ops::ControlFlow::Continue(()))
+                            },
                         },
                     )?;
                     Ok(())

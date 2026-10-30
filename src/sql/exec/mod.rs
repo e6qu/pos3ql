@@ -21273,7 +21273,7 @@ impl PlpgsqlExecHost<'_> {
                 // The procedure stack cannot be replayed after transaction
                 // control. Drain this explicit boundary, promoting all earlier
                 // commits in log order before continuing the same invocation.
-                match engine.commit_txn_with_triggers(txn, guc, arena, responder) {
+                match engine.commit_txn_with_triggers(txn, guc, Some(cursors), arena, responder) {
                     Err(error)
                         if error.sqlstate == sqlstate::INTERNAL_IO_WAIT
                             && txn.staged_commit().is_some() => {}

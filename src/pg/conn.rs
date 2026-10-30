@@ -1842,6 +1842,7 @@ impl Conn {
                     && let Err(error) = engine.commit_txn_with_triggers(
                         &mut self.txn,
                         &self.guc,
+                        Some(&mut self.cursors),
                         &self.arena,
                         &mut responder,
                     )
@@ -2654,6 +2655,7 @@ impl Conn {
                         &copy.setup,
                         &mut self.txn,
                         &self.guc,
+                        Some(&mut self.cursors),
                         &mut responder,
                         &self.copy_transition_scratch,
                         if extended {
@@ -2679,6 +2681,9 @@ impl Conn {
         self.copy_transition_scratch.clear();
         self.finish_lock_wait();
         let failed = outcome.is_err();
+        if failed && !self.txn.is_active() {
+            self.cursors.on_rollback();
+        }
         engine.finish_backend_statement(&self.txn, self.id);
         let mut responder = Responder::new(&mut self.send);
         let sent = match outcome {

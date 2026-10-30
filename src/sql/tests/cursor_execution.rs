@@ -383,6 +383,165 @@ fn cursor_retained_filters_advance_input_without_saving_rejected_rows() {
 }
 
 #[test]
+fn cursor_retained_hold_saves_unread_rows_at_commit_and_preserves_position() {
+    use crate::sql::cursor::FetchMotion;
+    for scroll in ["NO SCROLL", "SCROLL"] {
+        let config = test_config("cursor-retained-hold");
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        session.success(&mut engine, &format!(
+            "CREATE TABLE hold_input(id integer); INSERT INTO hold_input VALUES (1),(2),(3),(4); \
+             BEGIN; DECLARE held {scroll} CURSOR WITH HOLD FOR SELECT id*10 FROM hold_input"), true);
+        let (slot, _) = session
+            .cursors
+            .read_request("held", FetchMotion::Count(1), false)
+            .unwrap()
+            .expect("retained held reader before commit");
+        assert_eq!(session.cursors.produced_rows(slot), 0);
+        assert_eq!(
+            data_rows(&session.success(&mut engine, "FETCH NEXT FROM held", true)),
+            ["10"]
+        );
+        session.success(&mut engine, "COMMIT; DROP TABLE hold_input", true);
+        assert!(
+            session
+                .cursors
+                .read_request("held", FetchMotion::Count(1), false)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            data_rows(&session.success(&mut engine, "FETCH NEXT FROM held", true)),
+            ["20"]
+        );
+        session.success(&mut engine, "BEGIN", true);
+        assert_eq!(
+            data_rows(&session.success(&mut engine, "FETCH NEXT FROM held", true)),
+            ["30"]
+        );
+        session.success(&mut engine, "ROLLBACK", true);
+        assert_eq!(
+            data_rows(&session.success(&mut engine, "FETCH NEXT FROM held", true)),
+            ["40"]
+        );
+        if scroll == "SCROLL" {
+            assert_eq!(
+                data_rows(&session.success(&mut engine, "FETCH FIRST FROM held", true)),
+                ["10"]
+            );
+        }
+        session.success(&mut engine, "CLOSE held", true);
+        session.success(
+            &mut engine,
+            &format!(
+                "BEGIN; CREATE TEMPORARY TABLE temporary_hold_input(id integer) ON COMMIT DROP; \
+             INSERT INTO temporary_hold_input VALUES (7); \
+             DECLARE held {scroll} CURSOR WITH HOLD FOR SELECT id FROM temporary_hold_input; COMMIT"
+            ),
+            true,
+        );
+        assert_eq!(
+            data_rows(&session.success(&mut engine, "FETCH ALL FROM held; CLOSE held", true)),
+            ["7"]
+        );
+    }
+}
+
+#[test]
+fn cursor_retained_autocommit_hold_survives_later_rollback_and_failed_query_message() {
+    let config = test_config("cursor-retained-autocommit-hold");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE TABLE automatic_hold_input(id integer); \
+        INSERT INTO automatic_hold_input VALUES (1),(2); \
+        DECLARE permanent NO SCROLL CURSOR WITH HOLD FOR SELECT id FROM automatic_hold_input",
+        true,
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "BEGIN; FETCH NEXT FROM permanent; ROLLBACK",
+            true
+        )),
+        ["1"]
+    );
+    let failed = session.execute(&mut engine,
+        "DECLARE discarded NO SCROLL CURSOR WITH HOLD FOR SELECT id FROM automatic_hold_input; SELECT 1/0", true);
+    assert_eq!(error_sqlstates(&failed), ["22012"]);
+    assert!(!session.cursors.exists("discarded"));
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "FETCH NEXT FROM permanent", true)),
+        ["2"]
+    );
+    session.success(&mut engine, "CLOSE permanent", true);
+}
+
+#[test]
+fn cursor_retained_hold_commit_errors_close_new_cursors_and_rollback() {
+    let mut config = test_config("cursor-retained-hold-commit-error");
+    config.cursor_bytes = 32;
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE TABLE hold_error(id integer); INSERT INTO hold_error VALUES (1),(0); \
+        BEGIN; DECLARE held NO SCROLL CURSOR WITH HOLD FOR SELECT 100/id FROM hold_error",
+        true,
+    );
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "FETCH NEXT FROM held", true)),
+        ["100"]
+    );
+    assert_eq!(
+        error_sqlstates(&session.execute(&mut engine, "COMMIT", true)),
+        ["22012"]
+    );
+    assert!(!session.transaction.is_active());
+    assert!(!session.cursors.exists("held"));
+    session.success(&mut engine, "TRUNCATE hold_error; INSERT INTO hold_error SELECT g FROM generate_series(1,8) AS g; \
+        BEGIN; INSERT INTO hold_error VALUES (9); \
+        DECLARE held NO SCROLL CURSOR WITH HOLD FOR SELECT id FROM hold_error; FETCH NEXT FROM held", true);
+    assert_eq!(
+        error_sqlstates(&session.execute(&mut engine, "COMMIT", true)),
+        ["54000"]
+    );
+    assert!(!session.transaction.is_active());
+    assert!(!session.cursors.exists("held"));
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "SELECT count(*) FROM hold_error", true)),
+        ["8"]
+    );
+}
+
+#[test]
+fn cursor_retained_hold_runs_deferred_triggers_before_saving_unread_results() {
+    let config = test_config("cursor-retained-hold-trigger-order");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(&mut engine, "CREATE TABLE hold_trigger_input(id integer); INSERT INTO hold_trigger_input VALUES (0); \
+        CREATE TABLE hold_trigger_gate(id integer); \
+        CREATE FUNCTION hold_trigger_failure() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'deferred gate'; END $$; \
+        CREATE CONSTRAINT TRIGGER hold_gate AFTER INSERT ON hold_trigger_gate DEFERRABLE INITIALLY DEFERRED \
+        FOR EACH ROW EXECUTE FUNCTION hold_trigger_failure(); \
+        BEGIN; DECLARE held NO SCROLL CURSOR WITH HOLD FOR SELECT 100/id FROM hold_trigger_input; \
+        INSERT INTO hold_trigger_gate VALUES (1)", true);
+    let failed = session.execute(&mut engine, "COMMIT", true);
+    assert_eq!(error_sqlstates(&failed), ["P0001"]);
+    assert!(String::from_utf8_lossy(&failed).contains("deferred gate"));
+    assert!(!session.cursors.exists("held"));
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "SELECT count(*) FROM hold_trigger_gate", true)),
+        ["0"]
+    );
+}
+
+#[test]
 fn cursor_retained_scroll_reuses_history_and_extends_only_when_needed() {
     use crate::sql::cursor::FetchMotion;
     let config = test_config("cursor-retained-scroll");

@@ -1216,6 +1216,44 @@ def test_bind_rejects_mismatched_result_format_count():
     s.close()
 
 
+def test_cursor_hold_commits_at_message_and_sync_boundaries():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    setup = simple_query(s, "CREATE TABLE wire_hold_input(id integer); INSERT INTO wire_hold_input VALUES (1),(2),(3)")
+    failed = simple_query(s, "DECLARE discarded NO SCROLL CURSOR WITH HOLD FOR SELECT id FROM wire_hold_input; SELECT 1/0")
+    removed = simple_query(s, "SELECT count(*) FROM pg_cursors WHERE name='discarded'")
+    check("hold cursor: failed implicit query closes its new cursor",
+          not any(kind == b"E" for kind, _ in setup)
+          and any(kind == b"E" and b"C22012\x00" in payload for kind, payload in failed)
+          and failed[-1] == (b"Z", b"I") and first_text_row(removed) == "0", failed + removed)
+    declared = simple_query(s, "DECLARE held NO SCROLL CURSOR WITH HOLD FOR SELECT id FROM wire_hold_input LIMIT 2")
+    first = simple_query(s, "BEGIN; FETCH NEXT FROM held; ROLLBACK")
+    second = simple_query(s, "FETCH NEXT FROM held")
+    simple_query(s, "CLOSE held")
+    check("hold cursor: autocommit saves rows and a later rollback keeps position",
+          not any(kind == b"E" for messages in (declared, first, second) for kind, _ in messages)
+          and declared[-1] == (b"Z", b"I")
+          and first_text_row(first) == "1" and first_text_row(second) == "2", declared + first + second)
+    parse = frontend_message(b"P", b"hold_statement\x00DECLARE held SCROLL CURSOR WITH HOLD FOR SELECT id FROM wire_hold_input\x00\x00\x00")
+    bind = frontend_message(b"B", b"\x00hold_statement\x00" + struct.pack("!hhh", 0, 0, 0))
+    s.sendall(parse + bind + frontend_message(b"E", b"\x00" + struct.pack("!i", 0)) + frontend_message(b"S"))
+    declared = []
+    while True:
+        item = read_message(s)
+        declared.append(item)
+        if item[0] == b"Z":
+            break
+    first = simple_query(s, "BEGIN; FETCH NEXT FROM held; ROLLBACK")
+    last = simple_query(s, "FETCH LAST FROM held")
+    cleanup = simple_query(s, "CLOSE held; DROP TABLE wire_hold_input")
+    check("hold cursor: Sync commits the extended-protocol declaration",
+          not any(kind == b"E" for messages in (declared, first, last, cleanup) for kind, _ in messages)
+          and declared[-1] == (b"Z", b"I")
+          and first_text_row(first) == "1" and first_text_row(last) == "3", declared + first + last + cleanup)
+    s.close()
+
+
 def test_cursor_preserves_declared_null_parameter_after_first_hundred():
     s = connect()
     s.sendall(startup_payload(0))

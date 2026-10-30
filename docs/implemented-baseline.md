@@ -198,8 +198,20 @@ They save visited results so `FETCH PRIOR`, `FETCH 0` and forward jumps within
 that history need no new input reads. `FETCH LAST` first consumes the remaining
 input. Unlike forward-only cursors, their accumulated history must fit
 `cursor_bytes`; exhaustion returns `54000`, releases input owners and leaves
-the cursor failed until closed. Holdable cursors and the implicit scroll mode
-still use the eager executor.
+the cursor failed until closed. The implicit scroll mode still uses the eager executor.
+
+For these explicit modes, `WITH HOLD` saves the unread result during commit
+and keeps the current position. It also works without `BEGIN`: the declaration's
+implicit transaction saves the result before completing. Fetching from a held
+cursor inside a later transaction and rolling that transaction back does not
+rewind or close it. A commit-time result error rolls back and closes new cursors;
+already-held cursors survive. For example, an unread row with `id=0` makes
+`SELECT 100/id` fail during `COMMIT` if the cursor has `WITH HOLD`.
+Unread results must fit `cursor_bytes`; scrolling also retains its prior history.
+Deferred constraint triggers run before saving results, and input owners are
+released before temporary tables' commit actions. Commit-time saving currently
+uses the synchronous commit path; yielding during these storage reads remains
+part of the plan.
 Resident rows keep their immutable byte owner instead of copying a wide row
 into cursor memory just to return a small column. For example, selecting `id`
 does not copy an unselected 128 KiB text field into `cursor_query_bytes`.

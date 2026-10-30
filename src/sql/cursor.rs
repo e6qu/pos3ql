@@ -809,6 +809,18 @@ impl CursorPool {
         }
     }
 
+    pub(crate) fn next_hold_source(&self) -> Option<usize> {
+        self.slots.iter().position(|slot| {
+            slot.active && slot.tentative && slot.hold && slot.query.retained.is_some()
+        })
+    }
+
+    pub(crate) fn finish_hold_source(&mut self, at: usize) {
+        let slot = &mut self.slots[at];
+        slot.query.clear();
+        slot.request = None;
+    }
+
     pub(crate) fn has_uncommitted_hold_cursor(&self) -> bool {
         self.slots
             .iter()

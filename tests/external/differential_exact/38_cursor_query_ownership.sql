@@ -292,6 +292,62 @@ CLOSE scrolling;
 ROLLBACK;
 DROP TABLE cursor_scroll_input;
 
+CREATE TABLE cursor_hold_input(id integer);
+INSERT INTO cursor_hold_input VALUES (1),(2),(3),(4);
+BEGIN;
+DECLARE held NO SCROLL CURSOR WITH HOLD FOR SELECT id*10 AS scaled FROM cursor_hold_input;
+FETCH NEXT FROM held;
+COMMIT;
+DROP TABLE cursor_hold_input;
+FETCH NEXT FROM held;
+BEGIN;
+FETCH NEXT FROM held;
+ROLLBACK;
+FETCH NEXT FROM held;
+CLOSE held;
+BEGIN;
+CREATE TEMPORARY TABLE temporary_hold_input(id integer) ON COMMIT DROP;
+INSERT INTO temporary_hold_input VALUES (7);
+DECLARE held SCROLL CURSOR WITH HOLD FOR SELECT id FROM temporary_hold_input;
+COMMIT;
+FETCH ALL FROM held;
+FETCH FIRST FROM held;
+CLOSE held;
+
+CREATE TABLE cursor_hold_error(id integer);
+INSERT INTO cursor_hold_error VALUES (1),(0);
+BEGIN;
+DECLARE held NO SCROLL CURSOR WITH HOLD FOR SELECT 100/id AS quotient FROM cursor_hold_error;
+FETCH NEXT FROM held;
+COMMIT;
+FETCH NEXT FROM held;
+DROP TABLE cursor_hold_error;
+
+CREATE TABLE automatic_hold_input(id integer);
+INSERT INTO automatic_hold_input VALUES (1),(2);
+DECLARE automatic_hold NO SCROLL CURSOR WITH HOLD FOR SELECT id FROM automatic_hold_input;
+BEGIN;
+FETCH NEXT FROM automatic_hold;
+ROLLBACK;
+FETCH NEXT FROM automatic_hold;
+CLOSE automatic_hold;
+DROP TABLE automatic_hold_input;
+
+CREATE TABLE hold_trigger_input(id integer);
+INSERT INTO hold_trigger_input VALUES (0);
+CREATE TABLE hold_trigger_gate(id integer);
+CREATE FUNCTION hold_trigger_failure() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'deferred gate'; END $$;
+CREATE CONSTRAINT TRIGGER hold_gate AFTER INSERT ON hold_trigger_gate DEFERRABLE INITIALLY DEFERRED
+FOR EACH ROW EXECUTE FUNCTION hold_trigger_failure();
+BEGIN;
+DECLARE held NO SCROLL CURSOR WITH HOLD FOR SELECT 100/id AS quotient FROM hold_trigger_input;
+INSERT INTO hold_trigger_gate VALUES (1);
+COMMIT;
+FETCH NEXT FROM held;
+SELECT count(*) FROM hold_trigger_gate;
+DROP TABLE hold_trigger_input,hold_trigger_gate;
+DROP FUNCTION hold_trigger_failure();
+
 -- Name resolution at DECLARE survives a new operator on the same search path.
 CREATE SCHEMA cursor_ops;
 SET search_path=cursor_ops,pg_catalog;

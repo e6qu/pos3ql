@@ -7535,16 +7535,22 @@ impl Engine {
         Ok(())
     }
 
+    // Subscription apply has no SQL cursor pool; connection callers supply it.
     pub(crate) fn commit_txn_with_triggers(
         &mut self,
         txn: &mut TxnState,
         guc: &GucState,
+        mut cursors: Option<&mut cursor::CursorPool>,
         arena: &Arena,
         responder: &mut Responder,
     ) -> Result<(), SqlError> {
         let _atomic_reads = self.atomic_block_read_scope();
         if txn.staged_commit().is_some() {
-            return self.complete_staged_commit(txn, guc);
+            self.complete_staged_commit(txn, guc)?;
+            if let Some(cursors) = cursors {
+                cursors.on_commit();
+            }
+            return Ok(());
         }
         if let Err(error) = self.fire_constraint_trigger_boundary(
             txn,
@@ -7553,24 +7559,46 @@ impl Engine {
             responder,
             exec::TriggerQueueBoundary::Transaction,
         ) {
+            if let Some(cursors) = &mut cursors {
+                cursors.on_rollback();
+            }
             self.rollback_txn(txn, guc);
             return Err(error);
         }
-        self.commit_txn(txn, guc)
+        if let Some(cursors) = &mut cursors
+            && let Err(error) = self.save_hold_cursors(txn.txid, cursors)
+        {
+            cursors.on_rollback();
+            self.rollback_txn(txn, guc);
+            return Err(error);
+        }
+        let result = self.commit_txn(txn, guc);
+        if let Some(cursors) = cursors {
+            if result.is_ok() {
+                cursors.on_commit();
+            } else if !txn.is_active() {
+                cursors.on_rollback();
+            }
+        }
+        result
     }
 
     fn commit_partition_detach_phase(
         &mut self,
         txn: &mut TxnState,
         guc: &GucState,
+        cursors: &mut cursor::CursorPool,
         arena: &Arena,
         responder: &mut Responder,
     ) -> Result<(), SqlError> {
         let result = if txn.staged_commit().is_some() {
             self.finish_staged_transaction(txn, guc)
         } else {
-            self.commit_txn_with_triggers(txn, guc, arena, responder)
+            self.commit_txn_with_triggers(txn, guc, Some(cursors), arena, responder)
         };
+        if result.is_ok() {
+            cursors.on_commit();
+        }
         if matches!(&result, Err(error) if error.sqlstate == sqlstate::INTERNAL_IO_WAIT)
             && txn.staged_commit().is_some()
         {
@@ -9960,18 +9988,27 @@ impl Engine {
     /// Ends a successful COPY FROM: an implicit transaction commits here
     /// (this was the statement's end); an explicit one stays open, exactly
     /// as INSERT inside BEGIN would.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "COPY completion includes connection cursor lifecycle"
+    )]
     pub(crate) fn copy_finish(
         &mut self,
         setup: &exec::CopySetup,
         txn: &mut TxnState,
         guc: &GucState,
+        cursors: Option<&mut cursor::CursorPool>,
         responder: &mut Responder,
         inserted: &exec::CopyTransitionRows,
         finish: CopyFinishMode,
     ) -> Result<(), SqlError> {
         let _atomic_reads = self.atomic_block_read_scope();
         if txn.staged_commit().is_some() {
-            return self.complete_staged_commit(txn, guc);
+            self.complete_staged_commit(txn, guc)?;
+            if let Some(cursors) = cursors {
+                cursors.on_commit();
+            }
+            return Ok(());
         }
         let transaction_boundary =
             txn.mode == TxnMode::Implicit && matches!(finish, CopyFinishMode::ImplicitTransaction);
@@ -9994,10 +10031,23 @@ impl Engine {
         );
         setup.release_snapshot();
         if let Err(error) = result {
+            if transaction_boundary && let Some(cursors) = cursors {
+                cursors.on_rollback();
+            }
             self.copy_abort(txn, guc);
             return Err(error);
         }
         if transaction_boundary {
+            if let Some(cursors) = cursors {
+                if let Err(error) = self.save_hold_cursors(txn.txid, cursors) {
+                    cursors.on_rollback();
+                    self.copy_abort(txn, guc);
+                    return Err(error);
+                }
+                self.commit_txn(txn, guc)?;
+                cursors.on_commit();
+                return Ok(());
+            }
             return self.commit_txn(txn, guc);
         }
         Ok(())
@@ -10628,7 +10678,8 @@ impl Engine {
         self.bind_query_connection(conn_id);
         if txn.concurrent_partition_detach_pending()
             && txn.staged_commit().is_some()
-            && let Err(error) = self.commit_partition_detach_phase(txn, guc, arena, responder)
+            && let Err(error) =
+                self.commit_partition_detach_phase(txn, guc, cursors, arena, responder)
         {
             if error.sqlstate == sqlstate::INTERNAL_IO_WAIT && txn.staged_commit().is_some() {
                 return Ok(ExecutionStatus::Blocked {
@@ -10677,6 +10728,7 @@ impl Engine {
                 if txn.is_explicit() {
                     txn.failed = true;
                 } else {
+                    cursors.on_rollback();
                     self.rollback_txn(txn, guc);
                 }
                 responder.error(error.sqlstate, error.message.as_str())?;
@@ -10696,6 +10748,7 @@ impl Engine {
                     if txn.is_explicit() {
                         txn.failed = true;
                     } else {
+                        cursors.on_rollback();
                         self.rollback_txn(txn, guc);
                     }
                     report_parse_error(responder, &error)?;
@@ -10730,7 +10783,8 @@ impl Engine {
             }
             if matches!(statement, Stmt::Begin(_))
                 && txn.mode == TxnMode::Implicit
-                && let Err(error) = self.commit_txn_with_triggers(txn, guc, arena, responder)
+                && let Err(error) =
+                    self.commit_txn_with_triggers(txn, guc, Some(cursors), arena, responder)
             {
                 if error.sqlstate == sqlstate::INTERNAL_IO_WAIT && txn.staged_commit().is_some() {
                     return Ok(ExecutionStatus::Blocked {
@@ -10763,6 +10817,7 @@ impl Engine {
                     if txn.is_explicit() {
                         txn.failed = true;
                     } else {
+                        cursors.on_rollback();
                         self.rollback_txn(txn, guc);
                     }
                     responder.error(error.sqlstate, error.message.as_str())?;
@@ -10875,13 +10930,16 @@ impl Engine {
                 } else if txn.is_explicit() {
                     txn.failed = true;
                 } else {
+                    cursors.on_rollback();
                     self.rollback_txn(txn, guc);
                 }
                 responder.error(e.sqlstate, e.message.as_str())?;
                 return Ok(ExecutionStatus::Complete);
             }
             if txn.take_concurrent_partition_detach() {
-                if let Err(error) = self.commit_partition_detach_phase(txn, guc, arena, responder) {
+                if let Err(error) =
+                    self.commit_partition_detach_phase(txn, guc, cursors, arena, responder)
+                {
                     if error.sqlstate == sqlstate::INTERNAL_IO_WAIT && txn.staged_commit().is_some()
                     {
                         return Ok(ExecutionStatus::Blocked {
@@ -10908,7 +10966,7 @@ impl Engine {
         // FROM in flight, whose statement does not end until CopyDone.
         if txn.mode == TxnMode::Implicit
             && self.pending_copy.is_none()
-            && let Err(e) = self.commit_txn_with_triggers(txn, guc, arena, responder)
+            && let Err(e) = self.commit_txn_with_triggers(txn, guc, Some(cursors), arena, responder)
         {
             if e.sqlstate == sqlstate::INTERNAL_IO_WAIT && txn.staged_commit().is_some() {
                 return Ok(ExecutionStatus::Blocked {
@@ -10980,7 +11038,8 @@ impl Engine {
             self.bind_query_connection(conn_id);
             if txn.concurrent_partition_detach_pending()
                 && txn.staged_commit().is_some()
-                && let Err(error) = self.commit_partition_detach_phase(txn, guc, arena, responder)
+                && let Err(error) =
+                    self.commit_partition_detach_phase(txn, guc, cursors, arena, responder)
             {
                 if error.sqlstate == sqlstate::INTERNAL_IO_WAIT && txn.staged_commit().is_some() {
                     return Ok(ExtendedExecutionStatus::Blocked {
@@ -11060,6 +11119,7 @@ impl Engine {
                     if txn.is_explicit() {
                         txn.failed = true;
                     } else {
+                        cursors.on_rollback();
                         self.rollback_txn(txn, guc);
                     }
                     responder.error(error.sqlstate, error.message.as_str())?;
@@ -11093,6 +11153,7 @@ impl Engine {
                             if txn.is_explicit() {
                                 txn.failed = true;
                             } else {
+                                cursors.on_rollback();
                                 self.rollback_txn(txn, guc);
                             }
                             responder.replace_with_overflow_error(output_mark)?;
@@ -11120,7 +11181,7 @@ impl Engine {
                 Ok(()) => {
                     if txn.take_concurrent_partition_detach() {
                         if let Err(error) =
-                            self.commit_partition_detach_phase(txn, guc, arena, responder)
+                            self.commit_partition_detach_phase(txn, guc, cursors, arena, responder)
                         {
                             if error.sqlstate == sqlstate::INTERNAL_IO_WAIT
                                 && txn.staged_commit().is_some()
@@ -11199,6 +11260,7 @@ impl Engine {
                     } else if txn.is_explicit() {
                         txn.failed = true;
                     } else {
+                        cursors.on_rollback();
                         self.rollback_txn(txn, guc);
                     }
                     responder.error(e.sqlstate, e.message.as_str())?;
@@ -11273,6 +11335,7 @@ impl Engine {
                     if txn.is_explicit() {
                         txn.failed = true;
                     } else {
+                        cursors.on_rollback();
                         self.rollback_txn(txn, guc);
                     }
                     responder.error(error.sqlstate, error.message.as_str())?;
@@ -11322,6 +11385,7 @@ impl Engine {
                     if txn.is_explicit() {
                         txn.failed = true;
                     } else {
+                        cursors.on_rollback();
                         self.rollback_txn(txn, guc);
                     }
                     responder.error(error.sqlstate, error.message.as_str())?;
@@ -11333,7 +11397,8 @@ impl Engine {
             let response_mark = responder.buffer.mark();
             responder.function_call_response(&value, binary_result)?;
             if txn.mode == TxnMode::Implicit
-                && let Err(error) = self.commit_txn_with_triggers(txn, guc, arena, responder)
+                && let Err(error) =
+                    self.commit_txn_with_triggers(txn, guc, Some(cursors), arena, responder)
             {
                 if error.sqlstate == sqlstate::INTERNAL_IO_WAIT && txn.staged_commit().is_some() {
                     return Ok(ExtendedExecutionStatus::Blocked {
@@ -15017,7 +15082,7 @@ impl Engine {
                     responder,
                 },
             )?;
-            self.commit_txn_with_triggers(txn, guc, arena, responder)?;
+            self.commit_txn_with_triggers(txn, guc, Some(cursors), arena, responder)?;
             if self.commit_progress == CommitProgressMode::Inline {
                 self.commit_wal()?;
             }
@@ -17552,10 +17617,11 @@ impl Engine {
                     self.rollback_txn(txn, guc);
                     cursors.on_rollback();
                 } else {
-                    if let Err(e) = self.commit_txn_with_triggers(txn, guc, arena, responder) {
+                    if let Err(e) =
+                        self.commit_txn_with_triggers(txn, guc, Some(cursors), arena, responder)
+                    {
                         return Ok(Err(e));
                     }
-                    cursors.on_commit();
                 }
                 responder.command_complete(tag)?;
                 // Later statements in this message get a fresh implicit txn.
@@ -19428,7 +19494,7 @@ impl Engine {
             cursors.abandon(at);
             return Err(error);
         }
-        if scroll != cursor::CursorScroll::Default && !hold {
+        if scroll != cursor::CursorScroll::Default {
             let prepared = {
                 let (query, description, rows) = cursors.execution_parts(at);
                 let mut capture = Responder::for_cursor(
@@ -19534,6 +19600,42 @@ impl Engine {
         Ok(())
     }
 
+    fn save_hold_cursors(
+        &mut self,
+        txid: u32,
+        cursors: &mut cursor::CursorPool,
+    ) -> Result<(), SqlError> {
+        while let Some(at) = cursors.next_hold_source() {
+            cursors.begin_fetch(at, cursor::FetchMotion::All, false)?;
+            let (work, buffers) = self.work.cursor_parts();
+            loop {
+                let mark = work.mark();
+                let advanced = {
+                    let (query, description, rows) = cursors.execution_parts(at);
+                    let mut capture = Responder::for_cursor(
+                        description,
+                        crate::pg::respond::CursorRowOutput::Save(rows),
+                    );
+                    query.advance_source(
+                        &self.storage,
+                        txid,
+                        datetime::now_micros(),
+                        work,
+                        buffers,
+                        &mut capture,
+                    )
+                };
+                unsafe { work.rewind_to(mark) };
+                if !advanced? {
+                    break;
+                }
+                cursors.record_row(at, true)?;
+            }
+            cursors.finish_hold_source(at);
+        }
+        Ok(())
+    }
+
     pub(crate) fn fetch_cursor(
         &mut self,
         name: &str,
@@ -19617,7 +19719,7 @@ impl Engine {
                 statement,
                 sql,
             } => {
-                if !txn.is_explicit() {
+                if !txn.is_explicit() && !*hold {
                     return Ok(Err(sql_err!(
                         crate::sql::eval::sqlstate::NO_ACTIVE_SQL_TRANSACTION,
                         "DECLARE CURSOR can only be used in transaction blocks"

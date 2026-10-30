@@ -1797,13 +1797,21 @@ impl<'d> QueryScope<'d> {
             // A composed qualifier whose table name matches some entry is an
             // *invalid* reference (wrong schema or an alias); one matching
             // nothing is *missing* — PostgreSQL's two wordings.
-            Some((schema, table)) if self.names[..self.n].contains(&table)
-                || (0..self.n).any(|index| self.defs.get(index).is_some_and(|definition|
-                    definition.schema.as_str() == schema && definition.name.as_str() == table)) => sql_err!(
-                sqlstate::UNDEFINED_TABLE,
-                "invalid reference to FROM-clause entry for table \"{}\"",
-                table
-            ),
+            Some((schema, table))
+                if self.names[..self.n].contains(&table)
+                    || (0..self.n).any(|index| {
+                        self.defs.get(index).is_some_and(|definition| {
+                            definition.schema.as_str() == schema
+                                && definition.name.as_str() == table
+                        })
+                    }) =>
+            {
+                sql_err!(
+                    sqlstate::UNDEFINED_TABLE,
+                    "invalid reference to FROM-clause entry for table \"{}\"",
+                    table
+                )
+            }
             Some((_, table)) => sql_err!(
                 sqlstate::UNDEFINED_TABLE,
                 "missing FROM-clause entry for table \"{}\"",

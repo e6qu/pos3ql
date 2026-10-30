@@ -2500,10 +2500,12 @@ pub(crate) fn coerce_comparison_text<'a>(
     right_unknown: bool,
     arena: &'a Arena,
 ) -> Result<(Datum<'a>, Datum<'a>), SqlError> {
-    if (matches!(left, Datum::Char(_)) && !right_unknown
+    if (matches!(left, Datum::Char(_))
+        && !right_unknown
         && matches!(right, Datum::Text(_) | Datum::Bpchar(_)))
-        || (matches!(right, Datum::Char(_)) && !left_unknown
-        && matches!(left, Datum::Text(_) | Datum::Bpchar(_)))
+        || (matches!(right, Datum::Char(_))
+            && !left_unknown
+            && matches!(left, Datum::Text(_) | Datum::Bpchar(_)))
     {
         left = cast_to(left, ColType::Text, arena)?;
         right = cast_to(right, ColType::Text, arena)?;

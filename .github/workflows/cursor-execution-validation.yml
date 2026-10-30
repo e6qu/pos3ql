@@ -152,7 +152,7 @@ jobs:
           object_pid=$!
           server_pid=
           trap 'if [[ -n "$server_pid" ]]; then kill "$server_pid" 2>/dev/null || true; fi; kill "$object_pid" 2>/dev/null || true' EXIT
-          for attempt in $(seq 1 50); do
+          for _attempt in $(seq 1 50); do
             kill -0 "$object_pid"
             if nc -z 127.0.0.1 19311; then break; fi
             sleep 0.1
@@ -181,7 +181,7 @@ jobs:
           EOF
           target/debug/pos3ql --config "$evidence/server.conf" > "$evidence/server.log" 2>&1 &
           server_pid=$!
-          for attempt in $(seq 1 100); do
+          for _attempt in $(seq 1 100); do
             kill -0 "$server_pid"
             if grep -q 'accepting connections$' "$evidence/server.log"; then break; fi
             sleep 0.1

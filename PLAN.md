@@ -40,6 +40,8 @@ maximum row history independently for every possible table.
 Audit PostgreSQL 18 built-ins by signature and executable behavior. Catalog
 presence alone is not support. Compare values, declared result types, nulls,
 errors and argument effects with PostgreSQL, including seeded hashes.
+Registered routine identities, aggregate kinds and null-call properties must
+match the live reference catalog even while missing routines are being added.
 Run real SQLAlchemy, Alembic and psycopg2 workflows against both servers.
 Measure startup reservations and actual resident memory for empty and populated
 embedded databases; report the per-table contribution separately. Remove
@@ -47,6 +49,8 @@ avoidable per-table row/history reservations through shared startup-owned
 capacity, preserving stable reader identities, rollback and named exhaustion.
 Reserve needed row history before the durable commit boundary; a smaller shared
 pool must never fail for capacity after the commit is already durable.
+Include the current execution-stack requirement in embedded measurements and
+reduce avoidable wide construction frames alongside table and history metadata.
 
 ### Finish transaction visibility and keep maintenance moving
 

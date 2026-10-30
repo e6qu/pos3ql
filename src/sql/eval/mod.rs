@@ -4185,7 +4185,11 @@ fn expression_collation<'a>(
                         .is_some_and(ColType::is_collatable),
             }))
         }
-        Expr::SchemaColumn { schema, table, name } => {
+        Expr::SchemaColumn {
+            schema,
+            table,
+            name,
+        } => {
             let qualifier = crate::stack_format!(130, "{}.{}", schema, table);
             let value = row.collation(Some(qualifier.as_str()), name);
             Ok(Some(DerivedCollation {
@@ -5851,7 +5855,11 @@ fn static_type<'a>(e: &Expr<'a>, row: &impl ColumnLookup<'a>) -> Option<ColType>
         Expr::Str(_) => Some(ColType::Text),
         Expr::BitLit(_) => Some(ColType::Bit { varying: false }),
         Expr::Column { qualifier, name } => row.col_type(*qualifier, name),
-        Expr::SchemaColumn { schema, table, name } => {
+        Expr::SchemaColumn {
+            schema,
+            table,
+            name,
+        } => {
             let qualifier = crate::stack_format!(130, "{}.{}", schema, table);
             row.col_type(Some(qualifier.as_str()), name)
         }

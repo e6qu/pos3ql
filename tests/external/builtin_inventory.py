@@ -56,6 +56,8 @@ def main():
     checksum = hashlib.sha256(args.output.read_bytes()).hexdigest()
     print(f"Built-in catalog inventory: reference={len(expected)}, candidate={len(actual)}, "
           f"missing={len(missing)}, metadata differences={len(differences)}; SHA256={checksum}")
+    if differences:
+        raise SystemExit("Registered built-in signatures or properties differ from PostgreSQL; see the retained inventory")
 
 
 if __name__ == "__main__":

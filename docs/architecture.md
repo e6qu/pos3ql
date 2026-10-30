@@ -151,6 +151,10 @@ peak resident memory and startup time. CI records 1, 8 and 32 configured tables
 with both transaction modes and the same explicit memory settings. These are
 empty-engine measurements, separate from a server's connection buffers, query
 workloads and production throughput.
+The helper uses the same explicit 128 MiB virtual stack reservation as the
+server and native tests; ordinary operating-system thread defaults are not the
+current execution contract. Peak resident memory includes the pages actually
+touched. The debug-build helper records this stack size with each sample.
 
 Capacity is the smallest applicable bound, not just the size of the bucket:
 

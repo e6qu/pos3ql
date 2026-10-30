@@ -73,11 +73,16 @@ fn cursor_catalog_columns_keep_schema_qualification() {
     let mut budget = test_engine_budget(&config, 1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
-    assert_eq!(data_rows(&session.success(&mut engine,
-        "SELECT 'r'::\"char\"=ANY(ARRAY['r','p']), 'r'::\"char\"=ALL(ARRAY['r','r']), \
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT 'r'::\"char\"=ANY(ARRAY['r','p']), 'r'::\"char\"=ALL(ARRAY['r','r']), \
         'a'::\"char\"='ab'::text, 'a'::\"char\"='ab', 'a'::text='a'::\"char\", \
-        ascii(chr(1)::\"char\"::text),ascii(chr(127)::\"char\"::text)", true)),
-        ["t|t|f|t|t|1|127"]);
+        ascii(chr(1)::\"char\"::text),ascii(chr(127)::\"char\"::text)",
+            true
+        )),
+        ["t|t|f|t|t|1|127"]
+    );
     for sql in [
         "SELECT pg_catalog.pg_class.relname FROM pg_catalog.pg_class WHERE oid=1259",
         "SELECT pg_catalog.pg_class.relname FROM pg_class WHERE oid=1259",

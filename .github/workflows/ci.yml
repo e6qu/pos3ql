@@ -13,11 +13,30 @@ concurrency:
 
 jobs:
   reactor-ownership:
-    name: macOS readiness ownership
-    runs-on: macos-latest
+    name: native build (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: Linux arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - platform: macOS arm64
+            runner: macos-15
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Verify native compiler target
+        env:
+          EXPECTED_TARGET: ${{ matrix.target }}
+        run: test "$(rustc -vV | sed -n 's/^host: //p')" = "$EXPECTED_TARGET"
 
       - name: Cache Rust dependencies
         uses: actions/cache@v5
@@ -25,17 +44,21 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: macOS-reactor-dependencies-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-native-dependencies-${{ hashFiles('Cargo.lock') }}
+
+      - name: Build all native targets
+        run: cargo build --all-targets --locked --target '${{ matrix.target }}'
 
       - name: Socket readiness and allocation-free catalog publication
         run: >-
-          cargo test --lib --locked -- io:: mem::mutex::tests type_ domain_ enum_ composite_ table_name catalog_creation_
+          cargo test --lib --locked --target '${{ matrix.target }}' -- io:: mem::mutex::tests type_ domain_ enum_ composite_ table_name catalog_creation_
           timezone_abbreviation_ fixed_default_abbreviations_ degree_special_and_random_math_
           maintenance_metadata_ cleanup_download_overlap_ object_store::http::tests::
+          reader_scratch_is_synchronized_and_startup_bounded database_default_collation_is_bounded_
           --test-threads=1
 
-      - name: macOS allocation-free mutex boundary
-        run: cargo clippy --all-targets -- -D warnings
+      - name: Native allocation-free boundaries
+        run: cargo clippy --all-targets --locked --target '${{ matrix.target }}' -- -D warnings
 
   macos-lock-ownership:
     name: macOS mutex ownership
@@ -157,10 +180,13 @@ jobs:
           path: ${{ runner.temp }}/dist/
 
   build-and-check:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
+
+      - name: Verify Linux amd64 compiler target
+        run: test "$(rustc -vV | sed -n 's/^host: //p')" = x86_64-unknown-linux-gnu
 
       - name: Cache Rust build
         uses: actions/cache@v5

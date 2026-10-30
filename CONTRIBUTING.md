@@ -193,6 +193,11 @@ temporary validation workflows before the final PR head. Fix failures on the
 same PR branch and rerun the affected gates; merge only when every required
 check passes on that head.
 
+CI builds all targets and runs Clippy natively on Linux amd64, Linux arm64 and
+macOS arm64. The jobs verify their compiler host before building; the arm64 jobs
+also exercise socket readiness, mutexes and libc collation. Use libc's platform
+types at C boundaries: `c_char` need not have the same signedness on every target.
+
 PostgreSQL comparison shards share one release binary built from their checkout.
 Each shard verifies its recorded revision and checksum before use. The CI harness
 takes an explicit executable path and never compiles during a comparison run.

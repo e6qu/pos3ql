@@ -14751,9 +14751,9 @@ impl CollationRuntime {
                 "database_collation_locale is not a valid locale name"
             ));
         }
-        let mut name = [0i8; LOCALE_NAME_LIMIT];
+        let mut name = [0 as libc::c_char; LOCALE_NAME_LIMIT];
         for (index, byte) in bytes.iter().enumerate() {
-            name[index] = *byte as i8;
+            name[index] = *byte as libc::c_char;
         }
         // SAFETY: `name` is NUL-terminated and the returned locale is owned
         // by this runtime until Drop. No process-global locale is changed.

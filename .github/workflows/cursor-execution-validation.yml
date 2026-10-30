@@ -1,9 +1,9 @@
-name: Query output validation
+name: Cursor execution validation
 on:
   push:
-    branches: [resumable-query-output]
+    branches: [cursor-fetch-execution]
 concurrency:
-  group: query-output-validation
+  group: cursor-execution-validation
   cancel-in-progress: true
 jobs:
   focused:
@@ -30,7 +30,7 @@ jobs:
       - run: cargo fmt --check
       - run: cargo test --test sqlstate_gate --locked
       - run: >-
-          cargo test --lib --locked -- cursor_declaration_ query_row_cursor_ arena_retained_slices_ query_reads_held_ checkpoint_reads_held_
+          cargo test --lib --locked -- cursor_declaration_ cursor_owned_query_ cursor_query_memory_ query_row_cursor_ arena_retained_slices_ query_reads_held_ checkpoint_reads_held_
           captured_resident_byte_scans_ retained_checkpoint_ store::sst::tests:: pg::respond::tests:: procedural_static_utility_ sql::parser::tests::
           --nocapture --test-threads=1
       - run: cargo clippy --all-targets -- -D warnings
@@ -46,7 +46,7 @@ jobs:
         with:
           components: miri
       - run: cargo miri setup
-      - run: cargo miri test --lib --locked arena_retained_slices_ -- --test-threads=1
+      - run: cargo miri test --lib --locked -- arena_retained_slices_ cursor_owned_query_ --test-threads=1
   postgres-reference:
     runs-on: ubuntu-latest
     timeout-minutes: 15

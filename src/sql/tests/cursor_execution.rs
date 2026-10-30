@@ -1,6 +1,32 @@
 use super::*;
 
 #[test]
+fn cursor_dynamic_open_rejects_multiple_commands_before_issuing_sequence_values() {
+    let config = test_config("cursor-open-command-count");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE SEQUENCE cursor_open_calls; \
+        CREATE FUNCTION cursor_extra_commands() RETURNS void LANGUAGE plpgsql AS $$ \
+        DECLARE c refcursor; BEGIN \
+          OPEN c FOR EXECUTE 'SELECT nextval(''cursor_open_calls''); SELECT 2'; \
+          RETURN; END $$",
+        true,
+    );
+    let output = session.execute(&mut engine, "SELECT cursor_extra_commands()", true);
+    assert_eq!(error_sqlstates(&output), ["42P11"]);
+    assert!(String::from_utf8_lossy(&output).contains("cannot open multi-query plan as cursor"));
+    let output = session.success(
+        &mut engine,
+        "SELECT last_value, is_called FROM cursor_open_calls",
+        true,
+    );
+    assert_eq!(data_rows(&output), ["1|f"]);
+}
+
+#[test]
 fn cursor_declaration_rejects_conflicting_options_and_write_effects() {
     let config = test_config("cursor-declaration-errors");
     let mut budget = test_engine_budget(&config, 1 << 29);

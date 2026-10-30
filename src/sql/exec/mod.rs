@@ -24603,7 +24603,6 @@ fn execute_trigger_block<'a>(
                         statement.scroll,
                         false,
                         false,
-                        context.arena,
                         arguments,
                         context.txn,
                         cursors,

@@ -16,6 +16,9 @@ use super::eval::{SqlError, sqlstate};
 use super::types::Datum;
 use crate::mem::arena::Arena;
 
+mod query;
+pub(crate) use query::{CursorQuery, CursorStatement};
+
 /// One FETCH/MOVE motion, normalized by the parser: positive counts move
 /// forward, negative backward (`NEXT` is `Count(1)`, `PRIOR` is `Count(-1)`,
 /// `FIRST` is `Absolute(1)`, `LAST` is `Absolute(-1)`).
@@ -97,6 +100,7 @@ struct CursorSlot {
     /// Created in the still-open transaction: a rollback closes it even WITH
     /// HOLD (holdability begins at commit, as PostgreSQL has it).
     tentative: bool,
+    query: CursorQuery,
     description: FixedBuf,
     rows: FixedBuf,
     spans: Vec<(u32, u32)>,
@@ -248,6 +252,7 @@ impl CursorPool {
         let row_capacity = cursor_row_capacity(config);
         config.max_cursors
             * (config.cursor_bytes
+                + config.cursor_query_bytes
                 + DESCRIPTION_BYTES
                 + core::mem::size_of::<CursorSlot>()
                 + row_capacity * core::mem::size_of::<(u32, u32)>())
@@ -277,6 +282,7 @@ impl CursorPool {
                 hold: false,
                 binary: false,
                 tentative: false,
+                query: CursorQuery::new(budget, config.cursor_query_bytes)?,
                 description: FixedBuf::new(budget, "cursor_description", DESCRIPTION_BYTES)?,
                 rows: FixedBuf::new(budget, "cursor_typed_rows", config.cursor_bytes)?,
                 spans: Vec::with_capacity(row_capacity),
@@ -295,6 +301,7 @@ impl CursorPool {
     /// client so no cursor leaks across sessions.
     pub fn clear(&mut self) {
         for s in &mut self.slots {
+            s.query.clear();
             s.active = false;
         }
         self.emit.clear();
@@ -346,6 +353,7 @@ impl CursorPool {
         slot.hold = hold;
         slot.binary = binary;
         slot.tentative = true;
+        slot.query.clear();
         slot.description.clear();
         slot.rows.clear();
         slot.spans.clear();
@@ -359,6 +367,23 @@ impl CursorPool {
         (&mut slot.description, &mut slot.rows)
     }
 
+    pub(crate) fn bind_query(
+        &mut self,
+        at: usize,
+        sql: &str,
+        params: &[Datum],
+    ) -> Result<(), SqlError> {
+        self.slots[at].query.bind(sql, params)
+    }
+
+    pub(crate) fn execution_parts(
+        &mut self,
+        at: usize,
+    ) -> (&CursorQuery, &mut FixedBuf, &mut FixedBuf) {
+        let slot = &mut self.slots[at];
+        (&slot.query, &mut slot.description, &mut slot.rows)
+    }
+
     /// Validates the description and indexes complete typed rows.
     pub fn seal(&mut self, at: usize) -> Result<(), SqlError> {
         let slot = &mut self.slots[at];
@@ -370,6 +395,7 @@ impl CursorPool {
 
     /// Drops a half-built slot after a failed DECLARE.
     pub fn abandon(&mut self, at: usize) {
+        self.slots[at].query.clear();
         self.slots[at].active = false;
         self.slots[at].tentative = false;
     }
@@ -579,6 +605,7 @@ impl CursorPool {
     pub fn close(&mut self, name: &str) -> bool {
         match self.find(name) {
             Some(at) => {
+                self.slots[at].query.clear();
                 self.slots[at].active = false;
                 self.slots[at].tentative = false;
                 true
@@ -590,6 +617,7 @@ impl CursorPool {
     /// CLOSE ALL.
     pub fn close_all(&mut self) {
         for s in &mut self.slots {
+            s.query.clear();
             s.active = false;
             s.tentative = false;
         }
@@ -608,6 +636,7 @@ impl CursorPool {
                 if s.hold {
                     s.tentative = false;
                 } else {
+                    s.query.clear();
                     s.active = false;
                 }
             }
@@ -619,6 +648,7 @@ impl CursorPool {
     pub fn on_rollback(&mut self) {
         for s in &mut self.slots {
             if s.active && (s.tentative || !s.hold) {
+                s.query.clear();
                 s.active = false;
             }
         }

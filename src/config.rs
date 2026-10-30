@@ -245,6 +245,8 @@ pub struct Config {
     pub max_cursors: usize,
     /// Typed row bytes per SQL cursor, including each row's six-byte header.
     pub cursor_bytes: usize,
+    /// Query, captured parameters and execution positions per SQL cursor.
+    pub cursor_query_bytes: usize,
     /// Per-table rowid-map capacity (rows resident in the memtable).
     pub table_rows: usize,
     /// Entries retained by each in-RAM value-index acceleration cache before it
@@ -472,6 +474,7 @@ impl Config {
             subscription_tls_ca_file: String::new(),
             max_cursors: 4,
             cursor_bytes: 256 * 1024,
+            cursor_query_bytes: 256 * KIB,
             table_rows: 8192,
             value_index_rows: 8192,
             max_value_indexes: 16,
@@ -988,6 +991,10 @@ impl Config {
                     config.cursor_bytes =
                         parse_size(value).map_err(|m| ConfigError::at(line_no, m))?
                 }
+                "cursor_query_bytes" => {
+                    config.cursor_query_bytes =
+                        parse_size(value).map_err(|m| ConfigError::at(line_no, m))?
+                }
                 "table_rows" => {
                     config.table_rows =
                         parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
@@ -1415,6 +1422,12 @@ impl Config {
             return Err(ConfigError::at(
                 0,
                 "cursor_bytes must fit the cursor wire-offset representation".to_string(),
+            ));
+        }
+        if config.max_cursors != 0 && config.cursor_query_bytes == 0 {
+            return Err(ConfigError::at(
+                0,
+                "cursor_query_bytes must be greater than zero when cursors are enabled".to_string(),
             ));
         }
         if config.checkpoint_manifest_bytes == 0 {
@@ -2880,6 +2893,25 @@ sql_arena_bytes = 4096
                 .to_string()
                 .contains("cursor_bytes must fit the cursor wire-offset representation")
         );
+    }
+
+    #[test]
+    fn cursor_query_memory_is_explicitly_sized_and_zero_requires_disabled_cursors() {
+        let config = Config::parse(
+            "cursor_query_bytes = 32KiB\ntransaction_mode = mvcc\ncatalog_history_bytes = 16MiB\n",
+        )
+        .unwrap();
+        assert_eq!(config.cursor_query_bytes, 32 * KIB);
+        let error = Config::parse(
+            "cursor_query_bytes = 0\ntransaction_mode = mvcc\ncatalog_history_bytes = 16MiB\n",
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cursor_query_bytes must be greater than zero")
+        );
+        Config::parse("max_cursors = 0\ncursor_query_bytes = 0\ntransaction_mode = mvcc\ncatalog_history_bytes = 16MiB\n").unwrap();
     }
 
     #[test]

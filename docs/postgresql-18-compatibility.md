@@ -200,7 +200,8 @@ use 32-bit addresses; `memtable_bytes` must not exceed `u32::MAX`. Startup reser
 two heap buffers of that size, including one for relocation while readers retain
 old bytes. Reclamation returns `54000` while both buffers are retained. Effective search paths use
 the accepted GUC byte representation. Each cursor reserves `cursor_bytes`
-for typed rows, a 1,024-byte description and `floor(cursor_bytes / 6)` row
+for typed rows, `cursor_query_bytes` for its query and copied parameters,
+a 1,024-byte description and `floor(cursor_bytes / 6)` row
 positions; the connection reserves the same number of fetch-selection positions.
 Each saved row includes a four-byte length and a two-byte column count.
 Long column names can fill the description even when the rows fit. That error

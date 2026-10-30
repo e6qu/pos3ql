@@ -76,6 +76,7 @@ jobs:
             arena_owned_list_
             arena_retained_handles_
             arena_retained_slices_
+            cursor_owned_query_
             sequence::tests::statement_replay_
             shared_heap_relocation_heap_
             row_lock_owners_heap_

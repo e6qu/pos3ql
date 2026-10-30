@@ -19383,96 +19383,78 @@ impl Engine {
         scroll: cursor::CursorScroll,
         hold: bool,
         binary: bool,
-        arena: &Arena,
         params: &[Datum],
         txn: &TxnState,
         cursors: &mut cursor::CursorPool,
         guc: &GucState,
     ) -> Result<(), SqlError> {
         let at = cursors.open(name, statement, scroll, hold, binary)?;
+        if let Err(error) = cursors.bind_query(at, sql, params) {
+            cursors.abandon(at);
+            return Err(error);
+        }
         let out = {
-            let mut parser = match Parser::new(sql, arena) {
-                Ok(parser) => parser,
-                Err(error) => {
-                    cursors.abandon(at);
-                    return Err(SqlError {
-                        sqlstate: SqlState::known(error.sqlstate),
-                        message: stack_format!(192, "{}", error.message.as_str()),
-                    });
-                }
-            };
-            let parsed = match parser.next_stmt() {
-                Ok(Some(statement)) => statement,
-                _ => {
-                    cursors.abandon(at);
-                    return Err(sql_err!(sqlstate::SYNTAX_ERROR, "OPEN requires a SELECT"));
-                }
-            };
-            let (description, rows) = cursors.result_buffers(at);
+            let (query, description, rows) = cursors.execution_parts(at);
             let mut capture = Responder::for_cursor(description, rows);
             capture.set_render(guc.render());
-            let sequence_state = sequence::SequenceReplayState::new(arena);
-            let sequence = sequence::ReplaySeqEval::new(
-                sequence::SeqEval::new(&self.storage, guc.seq_session(), txn.txid),
-                &sequence_state,
-            );
-            match &parsed {
-                Stmt::Select(select) => {
-                    let select = match query::expand_ctes_exec(
-                        select,
+            query.with_query(|parsed, params, arena| {
+                let sequence_state = sequence::SequenceReplayState::new(arena);
+                let sequence = sequence::ReplaySeqEval::new(
+                    sequence::SeqEval::new(&self.storage, guc.seq_session(), txn.txid),
+                    &sequence_state,
+                );
+                match parsed {
+                    cursor::CursorStatement::Select(select) => {
+                        let select = match query::expand_ctes_exec(
+                            select,
+                            &self.storage,
+                            txn.txid,
+                            &self.work,
+                            params,
+                            &[],
+                            Some(&sequence),
+                        ) {
+                            Ok(select) => select,
+                            Err(error) => {
+                                return Ok(Err(error));
+                            }
+                        };
+                        if let Err(error) = query::validate_locking(select) {
+                            return Ok(Err(error));
+                        }
+                        if select.from.is_none() {
+                            query::constant_select(
+                                &self.storage,
+                                txn.txid,
+                                select,
+                                &self.work,
+                                params,
+                                Some(&sequence),
+                                &mut capture,
+                            )
+                        } else {
+                            query::select_query(
+                                &self.storage,
+                                txn.txid,
+                                select,
+                                &self.work,
+                                params,
+                                Some(&sequence),
+                                &mut capture,
+                            )
+                        }
+                    }
+                    cursor::CursorStatement::SetQuery(query) => query::set_query(
                         &self.storage,
                         txn.txid,
+                        query,
                         &self.work,
                         params,
-                        &[],
                         Some(&sequence),
-                    ) {
-                        Ok(select) => select,
-                        Err(error) => {
-                            cursors.abandon(at);
-                            return Err(error);
-                        }
-                    };
-                    if let Err(error) = query::validate_locking(select) {
-                        cursors.abandon(at);
-                        return Err(error);
-                    }
-                    if select.from.is_none() {
-                        query::constant_select(
-                            &self.storage,
-                            txn.txid,
-                            select,
-                            &self.work,
-                            params,
-                            Some(&sequence),
-                            &mut capture,
-                        )
-                    } else {
-                        query::select_query(
-                            &self.storage,
-                            txn.txid,
-                            select,
-                            &self.work,
-                            params,
-                            Some(&sequence),
-                            &mut capture,
-                        )
-                    }
+                        &mut capture,
+                    ),
                 }
-                Stmt::SetQuery(query) => query::set_query(
-                    &self.storage,
-                    txn.txid,
-                    query,
-                    &self.work,
-                    params,
-                    Some(&sequence),
-                    &mut capture,
-                ),
-                _ => {
-                    cursors.abandon(at);
-                    return Err(sql_err!(sqlstate::SYNTAX_ERROR, "OPEN requires a SELECT"));
-                }
-            }
+            })?
         };
         match out {
             Ok(Ok(())) => {}
@@ -19596,7 +19578,7 @@ impl Engine {
                     )));
                 }
                 if let Err(error) = self.materialize_cursor(
-                    name, statement, sql, *scroll, *hold, *binary, arena, params, txn, cursors, guc,
+                    name, statement, sql, *scroll, *hold, *binary, params, txn, cursors, guc,
                 ) {
                     return Ok(Err(error));
                 }

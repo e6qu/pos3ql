@@ -1840,37 +1840,64 @@ pub(super) fn preserve_projection_type_identities(
     descriptors: &[ColDesc<'_>],
     type_oids: &mut [i32],
 ) -> Result<(), SqlError> {
+    let shape_error = || sql_err!(sqlstate::INTERNAL_ERROR, "projection type identities do not match its described columns");
+    let type_oids = type_oids.get_mut(..descriptors.len()).ok_or_else(shape_error)?;
     for (output, description) in type_oids.iter_mut().zip(descriptors) {
         *output = description.type_oid;
     }
+    let column_oid = |scope: &QueryScope<'_>, entry| -> Result<i32, SqlError> {
+        match entry {
+            super::ResolvedColumn::Table(table, column) => resolver.column_meta(
+                Some(scope.names[table]), scope.defs.column_name(table, column),
+            ).map(|metadata| metadata.type_oid).ok_or_else(shape_error),
+            super::ResolvedColumn::Merged(_) => Ok(scope.output_type(entry).oid()),
+        }
+    };
     let mut output = 0usize;
     for item in items {
         match item {
             SelectItem::Wildcard => {
-                output += scope.map_or(0, QueryScope::star_columns);
+                let scope = scope.ok_or_else(shape_error)?;
+                for index in 0..scope.star_columns() {
+                    *type_oids.get_mut(output).ok_or_else(shape_error)? = column_oid(scope, scope.star_entry(index))?;
+                    output += 1;
+                }
             }
             SelectItem::TableWildcard(name) => {
-                output += match scope {
-                    Some(scope) => scope.qualified_star_columns(name)?,
-                    None => 0,
-                };
+                let scope = scope.ok_or_else(shape_error)?;
+                for index in 0..scope.qualified_star_columns(name)? {
+                    *type_oids.get_mut(output).ok_or_else(shape_error)? = column_oid(scope, scope.qualified_star_entry(name, index)?)?;
+                    output += 1;
+                }
             }
             SelectItem::RecordStar(base) => {
-                output += scope
-                    .map(|scope| record_star_width(base, scope))
-                    .transpose()?
-                    .unwrap_or(1);
+                let mut overflow = false;
+                crate::sql::exec::record_shape_metadata(base, resolver, |_, metadata| {
+                    if let Some(type_oid) = type_oids.get_mut(output) {
+                        if metadata.type_oid != crate::sql::types::oid::UNKNOWN {
+                            *type_oid = metadata.type_oid;
+                        }
+                    } else {
+                        overflow = true;
+                    }
+                    output += 1;
+                })?.ok_or_else(shape_error)?;
+                if overflow {
+                    return Err(shape_error());
+                }
             }
             SelectItem::Expr { expression, .. } => {
                 let semantic = crate::sql::exec::infer_routine_argument_oid(expression, resolver)?;
-                if semantic != crate::sql::types::oid::UNKNOWN
-                    && let Some(type_oid) = type_oids.get_mut(output)
-                {
+                let type_oid = type_oids.get_mut(output).ok_or_else(shape_error)?;
+                if semantic != crate::sql::types::oid::UNKNOWN {
                     *type_oid = semantic;
                 }
                 output += 1;
             }
         }
+    }
+    if output != descriptors.len() {
+        return Err(shape_error());
     }
     Ok(())
 }

@@ -711,7 +711,7 @@ pub use describe::{
 };
 pub(crate) use describe::{
     StaticTypeMeta, builtin_record_srf_field_pub, coltype_of_oid, infer_routine_argument_oid,
-    infer_type_catalog, intrinsic_record_field_meta, record_shape_pool_bytes,
+    infer_type_catalog, intrinsic_record_field_meta, record_shape_metadata, record_shape_pool_bytes,
     routine_result_metadata, unify_numeric_tower,
 };
 pub(crate) use describe::{

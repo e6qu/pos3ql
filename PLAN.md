@@ -66,6 +66,8 @@ A waiting schema edit must never attach itself to a new object that reused a nam
   representation; combining values must not silently erase a domain type.
   Wide and nested record values must retain every field through capture and
   saved results, including records with more than 255 fields.
+  Expanding a record must keep following columns aligned and preserve the
+  declared types of both record fields and `table.*` columns.
   Keep saved results as typed values: `SET DateStyle = 'SQL, DMY'` before
   `FETCH` must change how a saved date is displayed without changing its value.
 

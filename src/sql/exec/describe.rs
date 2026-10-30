@@ -2232,7 +2232,7 @@ pub fn register_shape_for(
     let mut n = 0usize;
     match expr {
         Expr::Call { name, .. } if name.eq_ignore_ascii_case("row") => {
-            record_shape_metadata(expr, columns, |name, meta| {
+            let count = record_shape_metadata(expr, columns, |name, meta| {
                 if n < MAX_SHAPE_FIELDS {
                     fields[n] = RecordShapeField {
                         name: crate::util::StackStr::from_str(name),
@@ -2246,6 +2246,11 @@ pub fn register_shape_for(
                 }
             })?
             .ok_or_else(|| could_not_identify("*"))?;
+            if count > MAX_SHAPE_FIELDS {
+                // The value is representable without a cached anonymous shape.
+                // Never publish a descriptor containing only its first fields.
+                return Ok(None);
+            }
         }
         Expr::Call { name, args, .. } if name.eq_ignore_ascii_case("_pg_expandarray") => {
             let Some(element) = expand_array_element_metadata(args, columns) else {
@@ -2335,13 +2340,44 @@ pub fn register_shape_for(
 
 /// Static field names PostgreSQL assigns an anonymous record (`ROW(...)`):
 /// `f1`, `f2`, … Indexed 1-based by the caller.
-pub const RECORD_FIELD_NAMES: [&str; 64] = [
-    "f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9", "f10", "f11", "f12", "f13", "f14", "f15",
-    "f16", "f17", "f18", "f19", "f20", "f21", "f22", "f23", "f24", "f25", "f26", "f27", "f28",
-    "f29", "f30", "f31", "f32", "f33", "f34", "f35", "f36", "f37", "f38", "f39", "f40", "f41",
-    "f42", "f43", "f44", "f45", "f46", "f47", "f48", "f49", "f50", "f51", "f52", "f53", "f54",
-    "f55", "f56", "f57", "f58", "f59", "f60", "f61", "f62", "f63", "f64",
-];
+const RECORD_FIELD_NAME_BYTES: [[u8; 6]; MAX_PROJ] = {
+    assert!(MAX_PROJ < 10_000);
+    let mut names = [[0; 6]; MAX_PROJ];
+    let mut index = 0;
+    while index < MAX_PROJ {
+        let mut value = index + 1;
+        let mut digits = 1;
+        let mut remaining = value;
+        while remaining >= 10 {
+            digits += 1;
+            remaining /= 10;
+        }
+        names[index][0] = b'f';
+        names[index][5] = (digits + 1) as u8;
+        let mut at = digits;
+        while at > 0 {
+            names[index][at] = b'0' + (value % 10) as u8;
+            value /= 10;
+            at -= 1;
+        }
+        index += 1;
+    }
+    names
+};
+
+pub const RECORD_FIELD_NAMES: [&str; MAX_PROJ] = {
+    let mut names = [""; MAX_PROJ];
+    let mut index = 0;
+    while index < MAX_PROJ {
+        let bytes = &RECORD_FIELD_NAME_BYTES[index];
+        names[index] = match core::str::from_utf8(bytes.split_at(bytes[5] as usize).0) {
+            Ok(name) => name,
+            Err(_) => panic!("generated record field names are ASCII"),
+        };
+        index += 1;
+    }
+    names
+};
 
 /// The value type of `json_each`-family output's `value` column.
 fn json_each_value_type(name: &str) -> Option<ColType> {
@@ -2450,7 +2486,7 @@ pub fn record_shape(
     record_shape_metadata(base, columns, |name, meta| visit(name, meta.ctype))
 }
 
-fn record_shape_metadata(
+pub(crate) fn record_shape_metadata(
     base: &Expr,
     columns: &dyn ColTypeResolver,
     mut visit: impl FnMut(&str, StaticTypeMeta),

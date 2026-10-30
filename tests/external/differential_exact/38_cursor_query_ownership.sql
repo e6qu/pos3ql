@@ -172,6 +172,8 @@ COMMIT;
 
 CREATE TABLE cursor_wide_input(id integer, payload text);
 INSERT INTO cursor_wide_input VALUES(7,repeat('x',131072));
+-- Keep the old wide row in saved storage while its replacement fits the small spill fixture.
+CHECKPOINT;
 BEGIN;
 DECLARE narrow_input NO SCROLL CURSOR FOR SELECT id FROM cursor_wide_input;
 UPDATE cursor_wide_input SET id=9;

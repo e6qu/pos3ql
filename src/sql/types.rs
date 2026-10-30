@@ -25,6 +25,7 @@ pub(crate) fn builtin_implicit_cast(actual: ColType, expected: ColType) -> bool 
         | (oid::NUMERIC, oid::FLOAT4 | oid::FLOAT8)
         | (oid::FLOAT4, oid::FLOAT8)
         // PostgreSQL string-category binary and function casts.
+        | (oid::CHAR, oid::TEXT)
         | (oid::BPCHAR, oid::VARCHAR | oid::NAME | oid::TEXT)
         | (oid::VARCHAR, oid::BPCHAR | oid::NAME | oid::TEXT | oid::REGCLASS)
         | (oid::TEXT, oid::BPCHAR | oid::VARCHAR | oid::NAME | oid::REGCLASS)
@@ -5134,7 +5135,7 @@ impl fmt::Display for Datum<'_> {
             Datum::Float4(v) => write_pg_float4(f, *v),
             Datum::Float8(v) => write_pg_float8(f, *v),
             Datum::Char(0) => Ok(()),
-            Datum::Char(value @ 0x20..=0x7e) => f.write_char(char::from(*value)),
+            Datum::Char(value @ 0x01..=0x7f) => f.write_char(char::from(*value)),
             Datum::Char(value) => write!(f, "\\{value:03o}"),
             // The output function emits the padding — psql shows `hi   `.
             Datum::Text(s)

@@ -45,6 +45,8 @@ Measure startup reservations and actual resident memory for empty and populated
 embedded databases; report the per-table contribution separately. Remove
 avoidable per-table row/history reservations through shared startup-owned
 capacity, preserving stable reader identities, rollback and named exhaustion.
+Reserve needed row history before the durable commit boundary; a smaller shared
+pool must never fail for capacity after the commit is already durable.
 
 ### Finish transaction visibility and keep maintenance moving
 
@@ -57,6 +59,8 @@ A waiting schema edit must never attach itself to a new object that reused a nam
   must stay private to their transaction. Preserve repeated dependency rows.
   Catalog sources must retain their real schema in planning and execution;
   `SELECT pg_catalog.pg_class.relname FROM pg_catalog.pg_class` must resolve.
+  Preserve schema-qualified outer references and PostgreSQL's internal-character
+  to text comparison used by application schema inspection.
 - Keep older rows, indexes and saved files until readers and backups finish.
   Remove obsolete versions in limited batches so other queries keep moving.
   Files written by an unfinished checkpoint remain owned until its publication

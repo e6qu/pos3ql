@@ -69,7 +69,6 @@ pub(crate) fn describe(
     })())
 }
 
-#[expect(clippy::too_many_arguments, reason = "explicit SQL execution context")]
 pub(crate) fn dispatch<'a>(
     name: &str,
     args: &[&Expr<'a>],

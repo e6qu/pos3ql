@@ -1743,7 +1743,12 @@ fn expr_has_outer_ref<'a>(
 ) -> Result<bool, SqlError> {
     match expression {
         Expr::Column { qualifier, name } => Ok(!chain.resolves(*qualifier, name)),
-        Expr::Subquery(s) | Expr::Exists(s) => {
+        Expr::SchemaColumn { schema, table, name } => {
+            let qualifier = crate::stack_format!(130, "{}.{}", schema, table);
+            Ok(!chain.resolves(Some(qualifier.as_str()), name))
+        }
+        Expr::Subquery(s) | Expr::RowSubquery { select: s, .. }
+        | Expr::Exists(s) | Expr::ArraySubquery(s) => {
             let sscope = s
                 .from
                 .as_ref()

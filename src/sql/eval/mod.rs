@@ -2273,6 +2273,11 @@ fn eval_binary_expression<'a>(
         r = cast_to(r, ColType::Name, arena)?;
     }
     let (l, r) = coerce_enum_literal(l, r, left_unknown, right_unknown, hooks, arena)?;
+    let (l, r) = if comparison_collation.is_some() {
+        operators::coerce_comparison_text(l, r, left_unknown, right_unknown, arena)?
+    } else {
+        (l, r)
+    };
     if let Some(collation) = comparison_collation
         && matches!(
             (&l, &r),
@@ -3786,6 +3791,7 @@ fn eval_full_inner<'a>(
             array,
             all,
         } => {
+            let collation = resolve_comparison_collation(operand, array, row, hooks.catalog)?;
             let lhs = eval_full(operand, arena, params, row, hooks)?;
             let mut array = eval_full(array, arena, params, row, hooks)?;
             array = match array {
@@ -3815,7 +3821,7 @@ fn eval_full_inner<'a>(
             for el in super::array::elements(raw, element) {
                 let (left, right) =
                     coerce_enum_literal(lhs, el, is_unknown_literal(operand), false, hooks, arena)?;
-                match binary(operator, left, right, false, false, arena)? {
+                match quantified_scalar(operator, left, right, collation, hooks.catalog, arena)? {
                     Datum::Bool(true) if !all => return Ok(Datum::Bool(true)),
                     Datum::Bool(false) if all => return Ok(Datum::Bool(false)),
                     Datum::Null => saw_null = true,
@@ -3915,6 +3921,7 @@ fn quantified_scalar<'a>(
     catalog: Option<&dyn CatalogAccess>,
     arena: &'a Arena,
 ) -> Result<Datum<'a>, SqlError> {
+    let (left, right) = operators::coerce_comparison_text(left, right, false, false, arena)?;
     if matches!(
         (&left, &right),
         (
@@ -4178,14 +4185,15 @@ fn expression_collation<'a>(
                         .is_some_and(ColType::is_collatable),
             }))
         }
-        Expr::SchemaColumn { table, name, .. } => {
-            let value = row.collation(Some(table), name);
+        Expr::SchemaColumn { schema, table, name } => {
+            let qualifier = crate::stack_format!(130, "{}.{}", schema, table);
+            let value = row.collation(Some(qualifier.as_str()), name);
             Ok(Some(DerivedCollation {
                 value,
                 explicit: false,
                 indeterminate: value == crate::sql::ast::Collation::None
                     && row
-                        .col_type(Some(table), name)
+                        .col_type(Some(qualifier.as_str()), name)
                         .is_some_and(ColType::is_collatable),
             }))
         }
@@ -5843,7 +5851,10 @@ fn static_type<'a>(e: &Expr<'a>, row: &impl ColumnLookup<'a>) -> Option<ColType>
         Expr::Str(_) => Some(ColType::Text),
         Expr::BitLit(_) => Some(ColType::Bit { varying: false }),
         Expr::Column { qualifier, name } => row.col_type(*qualifier, name),
-        Expr::SchemaColumn { table, name, .. } => row.col_type(Some(table), name),
+        Expr::SchemaColumn { schema, table, name } => {
+            let qualifier = crate::stack_format!(130, "{}.{}", schema, table);
+            row.col_type(Some(qualifier.as_str()), name)
+        }
         Expr::Cast { type_name, .. } => ColType::from_sql_name(type_name),
         Expr::Collate { operand, .. } => static_type(operand, row),
         Expr::Array(items) => {

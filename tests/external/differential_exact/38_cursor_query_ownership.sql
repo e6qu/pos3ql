@@ -1,4 +1,7 @@
 -- Synthesized catalogs have their actual schema in both planning and execution.
+SELECT 'r'::"char"=ANY(ARRAY['r','p']),'r'::"char"=ALL(ARRAY['r','r']),
+       'a'::"char"='ab'::text,'a'::"char"='ab','a'::text='a'::"char",
+       ascii(chr(1)::"char"::text),ascii(chr(127)::"char"::text);
 SELECT pg_catalog.pg_class.relname FROM pg_catalog.pg_class WHERE oid=1259;
 SELECT pg_catalog.pg_class.relname FROM pg_class WHERE oid=1259;
 SELECT c.relname FROM pg_catalog.pg_class AS c WHERE c.oid=1259;

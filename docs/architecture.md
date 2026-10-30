@@ -137,6 +137,21 @@ and [backup rules](backup-restore.md) before scheduling an offline backup comman
 
 ## Memory and physical size
 
+An empty engine still reserves metadata for configured table slots. Row lookup
+positions scale with `max_tables × table_rows`; the shared committed-row history
+currently reserves `(max_tables × table_rows + large_object_pages) ×
+max_row_versions_per_row` slots in MVCC mode. Locking mode reserves no committed
+row history. This can make many small embedded tables expensive even before
+inserting data. Reducing it requires reserving needed history before a commit
+becomes durable; changing the size alone would allow a capacity failure too late.
+
+The [embedded memory measurement](../examples/embedded-memory.rs) starts one empty
+engine per process and reports the configured reservation, startup budget drawn,
+peak resident memory and startup time. CI records 1, 8 and 32 configured tables
+with both transaction modes and the same explicit memory settings. These are
+empty-engine measurements, separate from a server's connection buffers, query
+workloads and production throughput.
+
 Capacity is the smallest applicable bound, not just the size of the bucket:
 
 | Boundary | Current bound and practical meaning |

@@ -2491,6 +2491,26 @@ fn mac_bitwise<'a>(operator: BinaryOp, l: Datum<'a>, r: Datum<'a>) -> Result<Dat
     }
 }
 
+/// Internal catalog characters coerce to text for a typed text comparison.
+/// Unknown literals instead resolve to the character overload.
+pub(crate) fn coerce_comparison_text<'a>(
+    mut left: Datum<'a>,
+    mut right: Datum<'a>,
+    left_unknown: bool,
+    right_unknown: bool,
+    arena: &'a Arena,
+) -> Result<(Datum<'a>, Datum<'a>), SqlError> {
+    if (matches!(left, Datum::Char(_)) && !right_unknown
+        && matches!(right, Datum::Text(_) | Datum::Bpchar(_)))
+        || (matches!(right, Datum::Char(_)) && !left_unknown
+        && matches!(left, Datum::Text(_) | Datum::Bpchar(_)))
+    {
+        left = cast_to(left, ColType::Text, arena)?;
+        right = cast_to(right, ColType::Text, arena)?;
+    }
+    Ok((left, right))
+}
+
 pub(crate) fn binary<'a>(
     operator: BinaryOp,
     l: Datum<'a>,

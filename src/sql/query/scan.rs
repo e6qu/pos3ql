@@ -4953,6 +4953,9 @@ fn hash_join_keys<'a>(
         };
         let pt = scope.defs.get(probe_t).expect("resolved").columns[probe_col].ctype;
         let bt = scope.defs.get(build_t).expect("resolved").columns[build_col].ctype;
+        if !join_key_types_compatible(pt, bt) {
+            continue;
+        }
         let probe_collation =
             scope.defs.get(probe_t).expect("resolved").columns[probe_col].collation;
         let build_collation =
@@ -4965,7 +4968,7 @@ fn hash_join_keys<'a>(
                 build_collation.name()
             ));
         }
-        if join_key_types_compatible(pt, bt) && npairs < pairs.len() {
+        if npairs < pairs.len() {
             pairs[npairs] = (probe_col, build_col);
             npairs += 1;
         }

@@ -3269,7 +3269,7 @@ fn comparable(a: ColType, b: ColType) -> bool {
     let datetime = |t: ColType| matches!(t, Date | Timestamp | Timestamptz);
     let timeofday = |t: ColType| matches!(t, Time | Timetz);
     let bit = |t: ColType| matches!(t, Bit { .. });
-    let stringy = |t: ColType| matches!(t, Text | Varchar | Bpchar | Name);
+    let stringy = |t: ColType| matches!(t, Text | Varchar | Bpchar | Name | Char);
     let catalog_object = |t: ColType| t == ColType::Regtype || t.is_reg_object();
     let oid_integer = |t: ColType| matches!(t, Int2 | Int4 | Oid | Int8);
     (numeric(a) && numeric(b))

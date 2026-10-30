@@ -203,7 +203,9 @@ def alembic_workflow(args, driver):
             command.downgrade(config, "001")
             assert connection.execute(sa.text(f"SELECT display_name FROM {schema}.accounts")).all() == [("first",)]
             config.attributes["target_metadata"] = alembic_metadata(1)
-            command.check(config)
+            # `command.check` requires the database to be at the script head.
+            # Compare the actual downgraded schema against its own metadata.
+            assert compare_metadata(context, config.attributes["target_metadata"]) == []
             command.downgrade(config, "base")
             assert "accounts" not in sa.inspect(connection).get_table_names(schema=schema)
         print(f"Alembic {driver} upgrade, autogeneration, drift and downgrade: ok")

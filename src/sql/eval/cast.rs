@@ -1112,7 +1112,7 @@ pub(crate) fn parse_bytea<'a>(s: &str, arena: &'a Arena) -> Result<&'a [u8], Sql
 pub(crate) fn cast_to_text<'a>(v: Datum<'a>, arena: &'a Arena) -> Result<&'a str, SqlError> {
     match v {
         Datum::Char(0) => Ok(""),
-        Datum::Char(byte @ 0x20..=0x7e) => {
+        Datum::Char(byte @ 0x01..=0x7f) => {
             let bytes = arena.alloc_slice_copy(&[byte]).map_err(|_| arena_full())?;
             Ok(unsafe { core::str::from_utf8_unchecked(bytes) })
         }

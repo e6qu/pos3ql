@@ -39,6 +39,27 @@ jobs:
           --nocapture --test-threads=1
       - run: python3 tools/check-docs.py
       - run: bash tools/check-bugs.sh
+      - name: Measure empty embedded engine reservations and peak memory
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          cargo build --example embedded-memory --locked
+          mkdir -p "$RUNNER_TEMP/embedded-memory"
+          git rev-parse HEAD > "$RUNNER_TEMP/embedded-memory/revision.txt"
+          rustc -vV > "$RUNNER_TEMP/embedded-memory/compiler.txt"
+          for mode in mvcc locking; do
+            for tables in 1 8 32; do
+              target/debug/examples/embedded-memory --tables "$tables" --table-rows 8192 \
+                --mode "$mode" --data-dir "$RUNNER_TEMP/embedded-memory/$mode-$tables" \
+                --budget-limit-bytes 2147483648 | tee -a "$RUNNER_TEMP/embedded-memory/samples.jsonl"
+            done
+          done
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: embedded-memory-${{ github.sha }}
+          path: ${{ runner.temp }}/embedded-memory/
+          if-no-files-found: error
   arena-aliasing:
     runs-on: ubuntu-latest
     timeout-minutes: 15

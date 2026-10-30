@@ -31,7 +31,7 @@ jobs:
       - run: cargo test --test sqlstate_gate --locked
       - run: >-
           cargo test --lib --locked -- cursor_declaration_ cursor_owned_query_ cursor_query_memory_ query_row_cursor_ arena_retained_slices_ query_reads_held_ checkpoint_reads_held_
-          captured_resident_byte_scans_ retained_checkpoint_ store::sst::tests:: pg::respond::tests:: procedural_static_utility_ sql::parser::tests::
+          captured_resident_byte_scans_ retained_checkpoint_ store::sst::tests:: pg::respond::tests:: procedural_static_utility_ sql::parser::tests:: exec::projected::tests::
           --nocapture --test-threads=1
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --lib --locked cursor -- --nocapture --test-threads=1
@@ -72,6 +72,11 @@ jobs:
           venv/bin/python tests/external/cursor_execution.py --host 127.0.0.1
           --port 5432 --user postgres --database postgres
           --output "$RUNNER_TEMP/cursor-reference.json"
+      - name: Check declared null parameters over PostgreSQL wire protocol
+        env:
+          POS3QL_PORT: "5432"
+          POS3QL_WIRE_PROBE: test_cursor_preserves_declared_null_parameter_after_first_hundred
+        run: python3 tests/external/wire_probe.py
       - uses: actions/upload-artifact@v5
         if: always()
         with:

@@ -3238,19 +3238,21 @@ impl Conn {
         if kind == b'S' && responder.parameter_description(param_oids).is_err() {
             return Step::Close;
         }
-        crate::sql::exec::with_bound_parameter_types(param_oids, || match engine.describe(
-            text,
-            &self.arena,
-            &self.txn,
-            Some(&self.cursors),
-            &mut responder,
-        ) {
-            Ok(true) => Step::Continue,
-            Ok(false) => {
-                self.phase = Phase::SkipToSync;
-                Step::Continue
+        crate::sql::exec::with_bound_parameter_types(param_oids, || {
+            match engine.describe(
+                text,
+                &self.arena,
+                &self.txn,
+                Some(&self.cursors),
+                &mut responder,
+            ) {
+                Ok(true) => Step::Continue,
+                Ok(false) => {
+                    self.phase = Phase::SkipToSync;
+                    Step::Continue
+                }
+                Err(WireFull) => Step::Close,
             }
-            Err(WireFull) => Step::Close,
         })
     }
 

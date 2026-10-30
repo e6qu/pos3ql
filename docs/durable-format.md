@@ -157,10 +157,18 @@ filters and exact result checks can need more data.
 Catalog vectors retain their signed lower bounds in rows, projected values, and
 constant defaults. Each stored vector adds four bytes for this bound; writers
 and readers use manifest v34, journal v22, and table-definition payload v13.
+
 The codec retains these bounds independently of SQL input conversion; SQL
 array-to-vector casts are rejected. Recovery tests cover text-created vectors,
 checkpointing, and recovery with empty local caches.
 Existing startup buffers remain fixed; exhaustion fails explicitly.
+
+Saved query values use tagged records. Tags `19` and `202` carry one-byte field
+counts and name lengths; wide record tags `51` and `204` use two-byte lengths.
+The named forms (`202`, `204`) also retain the four-byte type creation identity.
+Nested records select their own tag. Record array elements use this same encoding
+inside the `AR01` array payload, so a record with 256 fields keeps all its fields
+after it is saved and read again. Query and array memory budgets still apply.
 
 Table columns and domains store their NOT NULL constraint names. Renaming
 `orders` to `sales` preserves `orders_id_not_null`; recovery keeps that same

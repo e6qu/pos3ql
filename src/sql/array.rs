@@ -204,7 +204,7 @@ pub fn build_shaped<'a>(
     let mut total = header;
     for item in items {
         let length = if matches!(item, Datum::Record(_)) {
-            2 + crate::sql::exec::projected_value_len(item)
+            2 + crate::sql::exec::projected_value_len(item)?
         } else {
             rowenc::encoded_len(core::slice::from_ref(item))
         };
@@ -225,7 +225,7 @@ pub fn build_shaped<'a>(
     for item in items {
         let record = matches!(item, Datum::Record(_));
         let length = if record {
-            2 + crate::sql::exec::projected_value_len(item)
+            2 + crate::sql::exec::projected_value_len(item)?
         } else {
             rowenc::encoded_len(core::slice::from_ref(item))
         };

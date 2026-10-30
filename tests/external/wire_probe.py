@@ -1216,6 +1216,53 @@ def test_bind_rejects_mismatched_result_format_count():
     s.close()
 
 
+def test_cursor_preserves_declared_null_parameter_after_first_hundred():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    simple_query(s, "BEGIN")
+    query = (
+        "DECLARE wire_typed_cursor NO SCROLL CURSOR FOR "
+        "SELECT pg_typeof($101)::text AS kind, $101 AS value"
+    )
+    parameter_count = 101
+    parse = frontend_message(
+        b"P", b"wire_typed_statement\x00" + query.encode() + b"\x00"
+        + struct.pack("!h", parameter_count) + struct.pack("!i", 1082) * parameter_count,
+    )
+    bind = frontend_message(
+        b"B", b"\x00wire_typed_statement\x00" + struct.pack("!hh", 0, parameter_count)
+        + struct.pack("!i", -1) * parameter_count + struct.pack("!h", 0),
+    )
+    s.sendall(
+        parse + bind + frontend_message(b"E", b"\x00" + struct.pack("!i", 0))
+        + frontend_message(b"S")
+    )
+    opened = []
+    while True:
+        item = read_message(s)
+        opened.append(item)
+        if item[0] == b"Z":
+            break
+    check(
+        "cursor captures all declared null parameter types",
+        not any(kind == b"E" for kind, _ in opened)
+        and (b"C", b"DECLARE CURSOR\x00") in opened,
+        opened,
+    )
+    fetched = simple_query(s, "FETCH NEXT FROM wire_typed_cursor")
+    description = next((payload for kind, payload in fetched if kind == b"T"), None)
+    row = next((payload for kind, payload in fetched if kind == b"D"), None)
+    check(
+        "cursor retains date type for null $101 after opening command ends",
+        description is not None and row_description_type_oids(description) == [25, 1082]
+        and row == struct.pack("!hi", 2, 4) + b"date" + struct.pack("!i", -1),
+        fetched,
+    )
+    simple_query(s, "ROLLBACK")
+    s.close()
+
+
 def test_routine_contract_infers_untyped_parse_parameter():
     s = connect()
     s.sendall(startup_payload(0))

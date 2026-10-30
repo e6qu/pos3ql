@@ -16,6 +16,8 @@ Check declared types after the opening command ends, including `NULL` values
 and parameter numbers beyond the separate SQL routine argument limit.
 Procedural ownership checks cover copied records, declared types of null locals,
 and saved function status and exception values.
+Record encoding checks cover the 255/256-field boundary, nested named records,
+following columns, record arrays and the full supported SELECT width.
 Record an entry only with its reproducer, observed behavior and exact blocker;
 retain repaired-defect evidence in the fixing PR. See [CONTRIBUTING.md](CONTRIBUTING.md).
 

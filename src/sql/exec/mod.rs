@@ -714,10 +714,10 @@ pub(crate) use describe::{
     infer_type_catalog, intrinsic_record_field_meta, record_shape_pool_bytes,
     routine_result_metadata, unify_numeric_tower,
 };
-pub(crate) use describe::{describe_data_modification_columns, describe_returning_items};
 pub(crate) use describe::{
     bound_parameter_type_oid, enter_routine_parameter_types, with_bound_parameter_types,
 };
+pub(crate) use describe::{describe_data_modification_columns, describe_returning_items};
 
 mod projected;
 pub(crate) use projected::{
@@ -20659,41 +20659,63 @@ impl<'a> TriggerLocalScope<'_, 'a> {
             .position(|local| local.name.as_str().eq_ignore_ascii_case(name))
     }
 
-    fn cursor_locals(&self, arena: &'a Arena) -> Result<&'a [super::cursor::CursorLocal<'a>], SqlError> {
+    fn cursor_locals(
+        &self,
+        arena: &'a Arena,
+    ) -> Result<&'a [super::cursor::CursorLocal<'a>], SqlError> {
         let context_names = [
-            "found", "sqlstate", "sqlerrm", "tg_name", "tg_when", "tg_level",
-            "tg_op", "tg_relid", "tg_relname", "tg_table_name", "tg_table_schema",
-            "tg_tablespace", "tg_nargs", "tg_argv", "tg_event", "tg_tag",
+            "found",
+            "sqlstate",
+            "sqlerrm",
+            "tg_name",
+            "tg_when",
+            "tg_level",
+            "tg_op",
+            "tg_relid",
+            "tg_relname",
+            "tg_table_name",
+            "tg_table_schema",
+            "tg_tablespace",
+            "tg_nargs",
+            "tg_argv",
+            "tg_event",
+            "tg_tag",
         ];
-        let context_names = || context_names.iter().copied().filter(|name| {
-            TriggerStatusVariable::parse(name).is_some()
-                || (TriggerExceptionVariable::parse(name).is_some() && self.invocation.exception.is_some())
-                || plpgsql_context_field(self.invocation.program_kind, name).is_some()
-        });
-        let captured = arena.alloc_slice_with(self.locals.len() + context_names().count(), |index| {
-            if let Some(local) = self.locals.get(index) {
-                super::cursor::CursorLocal {
-                    name: local.name,
-                    ctype: local.ctype,
-                    user_type: local.user_type,
-                    value: self.values[index],
+        let context_names = || {
+            context_names.iter().copied().filter(|name| {
+                TriggerStatusVariable::parse(name).is_some()
+                    || (TriggerExceptionVariable::parse(name).is_some()
+                        && self.invocation.exception.is_some())
+                    || plpgsql_context_field(self.invocation.program_kind, name).is_some()
+            })
+        };
+        let captured = arena
+            .alloc_slice_with(self.locals.len() + context_names().count(), |index| {
+                if let Some(local) = self.locals.get(index) {
+                    super::cursor::CursorLocal {
+                        name: local.name,
+                        ctype: local.ctype,
+                        user_type: local.user_type,
+                        value: self.values[index],
+                    }
+                } else {
+                    let name = context_names()
+                        .nth(index - self.locals.len())
+                        .expect("counted context name");
+                    super::cursor::CursorLocal {
+                        name: SqlName::parse(name).expect("static context name"),
+                        ctype: self.col_type(None, name).expect("declared context type"),
+                        user_type: None,
+                        value: Datum::Null,
+                    }
                 }
-            } else {
-                let name = context_names().nth(index - self.locals.len()).expect("counted context name");
-                super::cursor::CursorLocal {
-                    name: SqlName::parse(name).expect("static context name"),
-                    ctype: self.col_type(None, name).expect("declared context type"),
-                    user_type: None,
-                    value: Datum::Null,
-                }
-            }
-        }).map_err(|_| super::query::arena_full_pub())?;
+            })
+            .map_err(|_| super::query::arena_full_pub())?;
         for local in &mut captured[self.locals.len()..] {
             local.value = self.lookup(None, local.name.as_str())?;
         }
         Ok(captured)
     }
-
 }
 
 impl<'t, 'stored, 'value> ColumnLookup<'value> for TriggerLocalScope<'t, 'stored>

@@ -3469,6 +3469,334 @@ fn validate_declared_enum_comparison(
     Ok(None)
 }
 
+pub(crate) fn builtin_binary_type(
+    operator: &crate::sql::ast::BinaryOp,
+    lo: i32,
+    ro: i32,
+) -> Result<(i32, i16), SqlError> {
+    use crate::sql::ast::BinaryOp::*;
+    let of = |t: ColType| (t.oid(), t.typlen());
+    let is_bit = |o: i32| matches!(o, oid::BIT | oid::VARBIT);
+    Ok(match operator {
+        Eq | NotEq | Lt | LtEq | Gt | GtEq => {
+            // Unknown coerces; two concrete types must be comparable.
+            if lo != oid::UNKNOWN
+                && ro != oid::UNKNOWN
+                && let (Some(a), Some(b)) = (coltype_of_oid(lo), coltype_of_oid(ro))
+                && (!comparable(a, b)
+                    || (a == ColType::Cid && b == ColType::Cid && *operator != Eq)
+                    || (matches!(a, ColType::Array(crate::sql::types::ArrElem::Cid))
+                        && matches!(b, ColType::Array(crate::sql::types::ArrElem::Cid))
+                        && !matches!(*operator, Eq | NotEq)))
+            {
+                let sym = match operator {
+                    Eq => "=",
+                    NotEq => "<>",
+                    Lt => "<",
+                    LtEq => "<=",
+                    Gt => ">",
+                    _ => ">=",
+                };
+                return Err(operator_undefined(a, sym, b));
+            }
+            of(ColType::Bool)
+        }
+        PatternLt | PatternLtEq | PatternGt | PatternGtEq | StartsWith => {
+            let text_like = |oid| matches!(oid, oid::UNKNOWN | oid::TEXT | oid::VARCHAR);
+            if !text_like(lo) || !text_like(ro) {
+                let left = coltype_of_oid(lo).unwrap_or(ColType::Text);
+                let right = coltype_of_oid(ro).unwrap_or(ColType::Text);
+                return Err(operator_undefined(
+                    left,
+                    operator.operator_name().unwrap(),
+                    right,
+                ));
+            }
+            of(ColType::Bool)
+        }
+        And | Or | Like | ILike => of(ColType::Bool),
+        TextSearchMatch => of(ColType::Bool),
+        TextSearchPhrase => of(ColType::TsQuery),
+        Overlaps if lo == oid::TSQUERY || ro == oid::TSQUERY => of(ColType::TsQuery),
+        Contains | ContainedBy | Overlaps | NotRightOf | NotLeftOf | Adjacent => of(ColType::Bool),
+        Same | Below | Above | NotAbove | NotBelow | BelowPoint | AbovePoint => of(ColType::Bool),
+        // Network containment predicates.
+        NetContainedEq | NetContainsEq => of(ColType::Bool),
+        Shl | Shr if is_network_oid(lo) || is_network_oid(ro) => of(ColType::Bool),
+        // `inet & inet` / `inet | inet` return inet.
+        BitAnd | BitOr if is_network_oid(lo) || is_network_oid(ro) => (oid::INET, -1),
+        // MAC bitwise operators preserve their concrete width.
+        BitAnd | BitOr if is_mac_oid(lo) || is_mac_oid(ro) => {
+            if lo != ro {
+                let left = coltype_of_oid(lo).unwrap_or(ColType::Text);
+                let right = coltype_of_oid(ro).unwrap_or(ColType::Text);
+                return Err(operator_undefined(
+                    left,
+                    operator.operator_name().unwrap(),
+                    right,
+                ));
+            }
+            (lo, coltype_of_oid(lo).map_or(-1, ColType::typlen))
+        }
+        // `inet - inet` is int8; `inet ± integer` is inet.
+        Sub if is_network_oid(lo) && is_network_oid(ro) => of(ColType::Int8),
+        Add | Sub if is_network_oid(lo) || is_network_oid(ro) => (oid::INET, -1),
+        // Multirange set operators (`+`/`-`/`*`) return a multirange of
+        // the same subtype.
+        Add | Sub | Mul if is_multirange_oid(lo) || is_multirange_oid(ro) => {
+            (if is_multirange_oid(lo) { lo } else { ro }, -1)
+        }
+        // Range set operators (`+`/`-`/`*` on ranges) return a range of
+        // the same type; shifts on ranges (`<<`/`>>`) return boolean.
+        Add | Sub | Mul if is_range_oid(lo) || is_range_oid(ro) => {
+            (if is_range_oid(lo) { lo } else { ro }, -1)
+        }
+        Shl | Shr if is_range_oid(lo) || is_range_oid(ro) => of(ColType::Bool),
+        // `jsonb - key/keys/index` deletes and returns jsonb.
+        Sub if lo == oid::JSONB => (oid::JSONB, -1),
+        // `||` concatenates arrays when either side is an array (the
+        // array type is preserved), otherwise it is text concatenation.
+        Concat if coltype_of_oid(lo).is_some_and(|t| matches!(t, ColType::Array(_))) => (lo, -1),
+        Concat if coltype_of_oid(ro).is_some_and(|t| matches!(t, ColType::Array(_))) => (ro, -1),
+        // `^` stays numeric when an operand is numeric (and none is a
+        // float); otherwise it is double precision.
+        Pow => {
+            if (lo == oid::NUMERIC || ro == oid::NUMERIC)
+                && lo != oid::FLOAT8
+                && ro != oid::FLOAT8
+                && lo != oid::FLOAT4
+                && ro != oid::FLOAT4
+            {
+                of(ColType::Numeric)
+            } else {
+                of(ColType::Float8)
+            }
+        }
+        // Bit-string concatenation yields varbit; otherwise text.
+        Concat => {
+            if lo == oid::TSQUERY || ro == oid::TSQUERY {
+                of(ColType::TsQuery)
+            } else if lo == oid::TSVECTOR || ro == oid::TSVECTOR {
+                of(ColType::TsVector)
+            } else if lo == oid::JSONB || ro == oid::JSONB {
+                (oid::JSONB, -1)
+            } else if is_bit(lo) || is_bit(ro) {
+                (oid::VARBIT, -1)
+            } else if lo == oid::BYTEA && ro == oid::BYTEA {
+                (oid::BYTEA, -1)
+            } else {
+                (oid::TEXT, -1)
+            }
+        }
+        // `json -> k` keeps the json/jsonb type; `->>` yields text.
+        JsonGet | JsonPath => (
+            if lo == oid::JSONB {
+                oid::JSONB
+            } else {
+                oid::JSON
+            },
+            -1,
+        ),
+        JsonGetText | JsonPathText => (oid::TEXT, -1),
+        JsonDeletePath => (oid::JSONB, -1),
+        JsonExists | JsonExistsAny | JsonExistsAll | JsonPathExists => of(ColType::Bool),
+        // On bit strings the bitwise/shift operators return a bit
+        // string; on integers they keep the wider integer width.
+        BitAnd | BitOr | BitXor | Shl | Shr => {
+            if is_bit(lo) || is_bit(ro) {
+                (
+                    if lo == oid::VARBIT || ro == oid::VARBIT {
+                        oid::VARBIT
+                    } else {
+                        oid::BIT
+                    },
+                    -1,
+                )
+            } else if matches!(operator, Shl | Shr) {
+                // A shift keeps its left operand's type.
+                match lo {
+                    oid::INT2 => of(ColType::Int2),
+                    oid::INT8 => of(ColType::Int8),
+                    _ => of(ColType::Int4),
+                }
+            } else if lo == oid::INT8 || ro == oid::INT8 {
+                of(ColType::Int8)
+            } else if lo == oid::INT2 && ro == oid::INT2 {
+                of(ColType::Int2)
+            } else {
+                of(ColType::Int4)
+            }
+        }
+        Add | Sub | Mul | Div | Mod => {
+            if matches!(operator, Add | Sub) && lo == oid::ACLITEM_ARRAY && ro == oid::ACLITEM {
+                return Ok((oid::ACLITEM_ARRAY, -1));
+            }
+            let numeric = |o: i32| {
+                matches!(
+                    o,
+                    oid::INT2 | oid::INT4 | oid::INT8 | oid::NUMERIC | oid::FLOAT4 | oid::FLOAT8
+                )
+            };
+            let int_like = |o: i32| matches!(o, oid::INT2 | oid::INT4 | oid::INT8 | oid::UNKNOWN);
+            let lsn_offset = |o: i32| matches!(o, oid::INT2 | oid::INT4 | oid::INT8 | oid::NUMERIC);
+            if matches!(operator, Sub) && lo == oid::PG_LSN && ro == oid::PG_LSN {
+                return Ok(of(ColType::Numeric));
+            }
+            if matches!(operator, Add | Sub) && lo == oid::PG_LSN && lsn_offset(ro)
+                || matches!(operator, Add) && lsn_offset(lo) && ro == oid::PG_LSN
+            {
+                return Ok(of(ColType::PgLsn));
+            }
+            if lo == oid::MONEY || ro == oid::MONEY {
+                let result = match (operator, lo, ro) {
+                    (Add | Sub, oid::MONEY, oid::MONEY) => Some(ColType::Money),
+                    (Div, oid::MONEY, oid::MONEY) => Some(ColType::Float8),
+                    (Mul | Div, oid::MONEY, oid::INT2 | oid::INT4 | oid::INT8)
+                    | (Mul | Div, oid::MONEY, oid::FLOAT4 | oid::FLOAT8)
+                    | (Mul, oid::INT2 | oid::INT4 | oid::INT8, oid::MONEY)
+                    | (Mul, oid::FLOAT4 | oid::FLOAT8, oid::MONEY) => Some(ColType::Money),
+                    _ => None,
+                };
+                return result.map(of).ok_or_else(|| {
+                    operator_undefined(
+                        coltype_of_oid(lo).unwrap_or(ColType::Money),
+                        match operator {
+                            Add => "+",
+                            Sub => "-",
+                            Mul => "*",
+                            Div => "/",
+                            _ => "%",
+                        },
+                        coltype_of_oid(ro).unwrap_or(ColType::Money),
+                    )
+                });
+            }
+            // Date arithmetic: date - date -> int4; date +/- int -> date;
+            // int + date -> date.
+            if lo == oid::DATE && ro == oid::DATE && matches!(operator, Sub) {
+                return Ok(of(ColType::Int4));
+            }
+            // timestamp - timestamp -> interval.
+            if matches!(operator, Sub)
+                && (lo == oid::TIMESTAMP && ro == oid::TIMESTAMP
+                    || lo == oid::TIMESTAMPTZ && ro == oid::TIMESTAMPTZ)
+            {
+                return Ok(of(ColType::Interval));
+            }
+            if lo == oid::DATE && matches!(operator, Add | Sub) && int_like(ro) {
+                return Ok(of(ColType::Date));
+            }
+            if ro == oid::DATE && matches!(operator, Add) && int_like(lo) {
+                return Ok(of(ColType::Date));
+            }
+            if matches!(operator, Sub) && lo == oid::TIME && ro == oid::TIME {
+                return Ok(of(ColType::Interval));
+            }
+            if matches!(operator, Add)
+                && ((lo == oid::DATE && ro == oid::TIME) || (lo == oid::TIME && ro == oid::DATE))
+            {
+                return Ok(of(ColType::Timestamp));
+            }
+            if matches!(operator, Add)
+                && ((lo == oid::DATE && ro == oid::TIMETZ)
+                    || (lo == oid::TIMETZ && ro == oid::DATE))
+            {
+                return Ok(of(ColType::Timestamptz));
+            }
+            // Interval arithmetic: date/timestamp ± interval -> the
+            // timestamp type; interval ± interval -> interval.
+            let is_dt = |o: i32| matches!(o, oid::DATE | oid::TIMESTAMP | oid::TIMESTAMPTZ);
+            if matches!(operator, Add | Sub) {
+                if lo == oid::INTERVAL && ro == oid::INTERVAL {
+                    return Ok(of(ColType::Interval));
+                }
+                if is_dt(lo) && ro == oid::INTERVAL {
+                    return Ok(of(if lo == oid::TIMESTAMPTZ {
+                        ColType::Timestamptz
+                    } else {
+                        ColType::Timestamp
+                    }));
+                }
+                if matches!(operator, Add) && lo == oid::INTERVAL && is_dt(ro) {
+                    return Ok(of(if ro == oid::TIMESTAMPTZ {
+                        ColType::Timestamptz
+                    } else {
+                        ColType::Timestamp
+                    }));
+                }
+                // A time of day keeps its own type, and its zone; the
+                // result wraps within the day.
+                let time_of_day = |o: i32| matches!(o, oid::TIME | oid::TIMETZ);
+                if time_of_day(lo) && ro == oid::INTERVAL {
+                    return Ok(of(if lo == oid::TIMETZ {
+                        ColType::Timetz
+                    } else {
+                        ColType::Time
+                    }));
+                }
+                if matches!(operator, Add) && lo == oid::INTERVAL && time_of_day(ro) {
+                    return Ok(of(if ro == oid::TIMETZ {
+                        ColType::Timetz
+                    } else {
+                        ColType::Time
+                    }));
+                }
+            }
+            // interval * number / number * interval / interval / number.
+            if (matches!(operator, Mul) && lo == oid::INTERVAL && numeric(ro))
+                || (matches!(operator, Mul) && numeric(lo) && ro == oid::INTERVAL)
+                || (matches!(operator, Div) && lo == oid::INTERVAL && numeric(ro))
+            {
+                return Ok(of(ColType::Interval));
+            }
+            let l_ok = lo == oid::UNKNOWN || numeric(lo);
+            let r_ok = ro == oid::UNKNOWN || numeric(ro);
+            // PostgreSQL defines no modulo for the floating types, so
+            // `real % …` and `float8 % …` are undefined even between two
+            // otherwise-numeric operands.
+            let is_float = |o: i32| matches!(o, oid::FLOAT4 | oid::FLOAT8);
+            let mod_on_float = matches!(operator, Mod) && (is_float(lo) || is_float(ro));
+            if (!l_ok || !r_ok || mod_on_float)
+                && let (Some(a), Some(b)) = (coltype_of_oid(lo), coltype_of_oid(ro))
+            {
+                let sym = match operator {
+                    Add => "+",
+                    Sub => "-",
+                    Mul => "*",
+                    Div => "/",
+                    _ => "%",
+                };
+                return Err(operator_undefined(a, sym, b));
+            }
+            // Promotion: float8 > real > numeric > int8 > int4; unknown
+            // is absorbed by the concrete side. real op real stays real;
+            // real mixed with int/numeric widens to double precision.
+            if lo == oid::FLOAT8 || ro == oid::FLOAT8 {
+                of(ColType::Float8)
+            } else if lo == oid::FLOAT4 && ro == oid::FLOAT4 {
+                of(ColType::Float4)
+            } else if lo == oid::FLOAT4 || ro == oid::FLOAT4 {
+                of(ColType::Float8)
+            } else if lo == oid::NUMERIC || ro == oid::NUMERIC {
+                of(ColType::Numeric)
+            } else if lo == oid::INT8 || ro == oid::INT8 {
+                of(ColType::Int8)
+            } else if lo == oid::UNKNOWN && ro == oid::UNKNOWN {
+                of(ColType::Numeric)
+            } else if lo == oid::UNKNOWN {
+                (ro, coltype_of_oid(ro).map(|t| t.typlen()).unwrap_or(-1))
+            } else if ro == oid::UNKNOWN {
+                (lo, coltype_of_oid(lo).map(|t| t.typlen()).unwrap_or(-1))
+            } else if lo == oid::INT2 && ro == oid::INT2 {
+                // smallint op smallint stays smallint.
+                of(ColType::Int2)
+            } else {
+                of(ColType::Int4)
+            }
+        }
+    })
+}
+
 pub fn infer_type_res(
     expression: &Expr,
     columns: &dyn ColTypeResolver,
@@ -3643,344 +3971,7 @@ pub fn infer_type_res(
             {
                 return Ok((result.type_oid, result.ctype.typlen()));
             }
-            let is_bit = |o: i32| matches!(o, oid::BIT | oid::VARBIT);
-            match operator {
-                Eq | NotEq | Lt | LtEq | Gt | GtEq => {
-                    // Unknown coerces; two concrete types must be comparable.
-                    if lo != oid::UNKNOWN
-                        && ro != oid::UNKNOWN
-                        && let (Some(a), Some(b)) = (coltype_of_oid(lo), coltype_of_oid(ro))
-                        && (!comparable(a, b)
-                            || (a == ColType::Cid && b == ColType::Cid && *operator != Eq)
-                            || (matches!(a, ColType::Array(crate::sql::types::ArrElem::Cid))
-                                && matches!(b, ColType::Array(crate::sql::types::ArrElem::Cid))
-                                && !matches!(*operator, Eq | NotEq)))
-                    {
-                        let sym = match operator {
-                            Eq => "=",
-                            NotEq => "<>",
-                            Lt => "<",
-                            LtEq => "<=",
-                            Gt => ">",
-                            _ => ">=",
-                        };
-                        return Err(operator_undefined(a, sym, b));
-                    }
-                    of(ColType::Bool)
-                }
-                PatternLt | PatternLtEq | PatternGt | PatternGtEq | StartsWith => {
-                    let text_like = |oid| matches!(oid, oid::UNKNOWN | oid::TEXT | oid::VARCHAR);
-                    if !text_like(lo) || !text_like(ro) {
-                        let left = coltype_of_oid(lo).unwrap_or(ColType::Text);
-                        let right = coltype_of_oid(ro).unwrap_or(ColType::Text);
-                        return Err(operator_undefined(
-                            left,
-                            operator.operator_name().unwrap(),
-                            right,
-                        ));
-                    }
-                    of(ColType::Bool)
-                }
-                And | Or | Like | ILike => of(ColType::Bool),
-                TextSearchMatch => of(ColType::Bool),
-                TextSearchPhrase => of(ColType::TsQuery),
-                Overlaps if lo == oid::TSQUERY || ro == oid::TSQUERY => of(ColType::TsQuery),
-                Contains | ContainedBy | Overlaps | NotRightOf | NotLeftOf | Adjacent => {
-                    of(ColType::Bool)
-                }
-                Same | Below | Above | NotAbove | NotBelow | BelowPoint | AbovePoint => {
-                    of(ColType::Bool)
-                }
-                // Network containment predicates.
-                NetContainedEq | NetContainsEq => of(ColType::Bool),
-                Shl | Shr if is_network_oid(lo) || is_network_oid(ro) => of(ColType::Bool),
-                // `inet & inet` / `inet | inet` return inet.
-                BitAnd | BitOr if is_network_oid(lo) || is_network_oid(ro) => (oid::INET, -1),
-                // MAC bitwise operators preserve their concrete width.
-                BitAnd | BitOr if is_mac_oid(lo) || is_mac_oid(ro) => {
-                    if lo != ro {
-                        let left = coltype_of_oid(lo).unwrap_or(ColType::Text);
-                        let right = coltype_of_oid(ro).unwrap_or(ColType::Text);
-                        return Err(operator_undefined(
-                            left,
-                            operator.operator_name().unwrap(),
-                            right,
-                        ));
-                    }
-                    (lo, coltype_of_oid(lo).map_or(-1, ColType::typlen))
-                }
-                // `inet - inet` is int8; `inet ± integer` is inet.
-                Sub if is_network_oid(lo) && is_network_oid(ro) => of(ColType::Int8),
-                Add | Sub if is_network_oid(lo) || is_network_oid(ro) => (oid::INET, -1),
-                // Multirange set operators (`+`/`-`/`*`) return a multirange of
-                // the same subtype.
-                Add | Sub | Mul if is_multirange_oid(lo) || is_multirange_oid(ro) => {
-                    (if is_multirange_oid(lo) { lo } else { ro }, -1)
-                }
-                // Range set operators (`+`/`-`/`*` on ranges) return a range of
-                // the same type; shifts on ranges (`<<`/`>>`) return boolean.
-                Add | Sub | Mul if is_range_oid(lo) || is_range_oid(ro) => {
-                    (if is_range_oid(lo) { lo } else { ro }, -1)
-                }
-                Shl | Shr if is_range_oid(lo) || is_range_oid(ro) => of(ColType::Bool),
-                // `jsonb - key/keys/index` deletes and returns jsonb.
-                Sub if lo == oid::JSONB => (oid::JSONB, -1),
-                // `||` concatenates arrays when either side is an array (the
-                // array type is preserved), otherwise it is text concatenation.
-                Concat if coltype_of_oid(lo).is_some_and(|t| matches!(t, ColType::Array(_))) => {
-                    (lo, -1)
-                }
-                Concat if coltype_of_oid(ro).is_some_and(|t| matches!(t, ColType::Array(_))) => {
-                    (ro, -1)
-                }
-                // `^` stays numeric when an operand is numeric (and none is a
-                // float); otherwise it is double precision.
-                Pow => {
-                    if (lo == oid::NUMERIC || ro == oid::NUMERIC)
-                        && lo != oid::FLOAT8
-                        && ro != oid::FLOAT8
-                        && lo != oid::FLOAT4
-                        && ro != oid::FLOAT4
-                    {
-                        of(ColType::Numeric)
-                    } else {
-                        of(ColType::Float8)
-                    }
-                }
-                // Bit-string concatenation yields varbit; otherwise text.
-                Concat => {
-                    if lo == oid::TSQUERY || ro == oid::TSQUERY {
-                        of(ColType::TsQuery)
-                    } else if lo == oid::TSVECTOR || ro == oid::TSVECTOR {
-                        of(ColType::TsVector)
-                    } else if lo == oid::JSONB || ro == oid::JSONB {
-                        (oid::JSONB, -1)
-                    } else if is_bit(lo) || is_bit(ro) {
-                        (oid::VARBIT, -1)
-                    } else if lo == oid::BYTEA && ro == oid::BYTEA {
-                        (oid::BYTEA, -1)
-                    } else {
-                        (oid::TEXT, -1)
-                    }
-                }
-                // `json -> k` keeps the json/jsonb type; `->>` yields text.
-                JsonGet | JsonPath => (
-                    if lo == oid::JSONB {
-                        oid::JSONB
-                    } else {
-                        oid::JSON
-                    },
-                    -1,
-                ),
-                JsonGetText | JsonPathText => (oid::TEXT, -1),
-                JsonDeletePath => (oid::JSONB, -1),
-                JsonExists | JsonExistsAny | JsonExistsAll | JsonPathExists => of(ColType::Bool),
-                // On bit strings the bitwise/shift operators return a bit
-                // string; on integers they keep the wider integer width.
-                BitAnd | BitOr | BitXor | Shl | Shr => {
-                    if is_bit(lo) || is_bit(ro) {
-                        (
-                            if lo == oid::VARBIT || ro == oid::VARBIT {
-                                oid::VARBIT
-                            } else {
-                                oid::BIT
-                            },
-                            -1,
-                        )
-                    } else if matches!(operator, Shl | Shr) {
-                        // A shift keeps its left operand's type.
-                        match lo {
-                            oid::INT2 => of(ColType::Int2),
-                            oid::INT8 => of(ColType::Int8),
-                            _ => of(ColType::Int4),
-                        }
-                    } else if lo == oid::INT8 || ro == oid::INT8 {
-                        of(ColType::Int8)
-                    } else if lo == oid::INT2 && ro == oid::INT2 {
-                        of(ColType::Int2)
-                    } else {
-                        of(ColType::Int4)
-                    }
-                }
-                Add | Sub | Mul | Div | Mod => {
-                    if matches!(operator, Add | Sub)
-                        && lo == oid::ACLITEM_ARRAY
-                        && ro == oid::ACLITEM
-                    {
-                        return Ok((oid::ACLITEM_ARRAY, -1));
-                    }
-                    let numeric = |o: i32| {
-                        matches!(
-                            o,
-                            oid::INT2
-                                | oid::INT4
-                                | oid::INT8
-                                | oid::NUMERIC
-                                | oid::FLOAT4
-                                | oid::FLOAT8
-                        )
-                    };
-                    let int_like =
-                        |o: i32| matches!(o, oid::INT2 | oid::INT4 | oid::INT8 | oid::UNKNOWN);
-                    let lsn_offset =
-                        |o: i32| matches!(o, oid::INT2 | oid::INT4 | oid::INT8 | oid::NUMERIC);
-                    if matches!(operator, Sub) && lo == oid::PG_LSN && ro == oid::PG_LSN {
-                        return Ok(of(ColType::Numeric));
-                    }
-                    if matches!(operator, Add | Sub) && lo == oid::PG_LSN && lsn_offset(ro)
-                        || matches!(operator, Add) && lsn_offset(lo) && ro == oid::PG_LSN
-                    {
-                        return Ok(of(ColType::PgLsn));
-                    }
-                    if lo == oid::MONEY || ro == oid::MONEY {
-                        let result = match (operator, lo, ro) {
-                            (Add | Sub, oid::MONEY, oid::MONEY) => Some(ColType::Money),
-                            (Div, oid::MONEY, oid::MONEY) => Some(ColType::Float8),
-                            (Mul | Div, oid::MONEY, oid::INT2 | oid::INT4 | oid::INT8)
-                            | (Mul | Div, oid::MONEY, oid::FLOAT4 | oid::FLOAT8)
-                            | (Mul, oid::INT2 | oid::INT4 | oid::INT8, oid::MONEY)
-                            | (Mul, oid::FLOAT4 | oid::FLOAT8, oid::MONEY) => Some(ColType::Money),
-                            _ => None,
-                        };
-                        return result.map(of).ok_or_else(|| {
-                            operator_undefined(
-                                coltype_of_oid(lo).unwrap_or(ColType::Money),
-                                match operator {
-                                    Add => "+",
-                                    Sub => "-",
-                                    Mul => "*",
-                                    Div => "/",
-                                    _ => "%",
-                                },
-                                coltype_of_oid(ro).unwrap_or(ColType::Money),
-                            )
-                        });
-                    }
-                    // Date arithmetic: date - date -> int4; date +/- int -> date;
-                    // int + date -> date.
-                    if lo == oid::DATE && ro == oid::DATE && matches!(operator, Sub) {
-                        return Ok(of(ColType::Int4));
-                    }
-                    // timestamp - timestamp -> interval.
-                    if matches!(operator, Sub)
-                        && (lo == oid::TIMESTAMP && ro == oid::TIMESTAMP
-                            || lo == oid::TIMESTAMPTZ && ro == oid::TIMESTAMPTZ)
-                    {
-                        return Ok(of(ColType::Interval));
-                    }
-                    if lo == oid::DATE && matches!(operator, Add | Sub) && int_like(ro) {
-                        return Ok(of(ColType::Date));
-                    }
-                    if ro == oid::DATE && matches!(operator, Add) && int_like(lo) {
-                        return Ok(of(ColType::Date));
-                    }
-                    if matches!(operator, Sub) && lo == oid::TIME && ro == oid::TIME {
-                        return Ok(of(ColType::Interval));
-                    }
-                    if matches!(operator, Add)
-                        && ((lo == oid::DATE && ro == oid::TIME)
-                            || (lo == oid::TIME && ro == oid::DATE))
-                    {
-                        return Ok(of(ColType::Timestamp));
-                    }
-                    if matches!(operator, Add)
-                        && ((lo == oid::DATE && ro == oid::TIMETZ)
-                            || (lo == oid::TIMETZ && ro == oid::DATE))
-                    {
-                        return Ok(of(ColType::Timestamptz));
-                    }
-                    // Interval arithmetic: date/timestamp ± interval -> the
-                    // timestamp type; interval ± interval -> interval.
-                    let is_dt = |o: i32| matches!(o, oid::DATE | oid::TIMESTAMP | oid::TIMESTAMPTZ);
-                    if matches!(operator, Add | Sub) {
-                        if lo == oid::INTERVAL && ro == oid::INTERVAL {
-                            return Ok(of(ColType::Interval));
-                        }
-                        if is_dt(lo) && ro == oid::INTERVAL {
-                            return Ok(of(if lo == oid::TIMESTAMPTZ {
-                                ColType::Timestamptz
-                            } else {
-                                ColType::Timestamp
-                            }));
-                        }
-                        if matches!(operator, Add) && lo == oid::INTERVAL && is_dt(ro) {
-                            return Ok(of(if ro == oid::TIMESTAMPTZ {
-                                ColType::Timestamptz
-                            } else {
-                                ColType::Timestamp
-                            }));
-                        }
-                        // A time of day keeps its own type, and its zone; the
-                        // result wraps within the day.
-                        let time_of_day = |o: i32| matches!(o, oid::TIME | oid::TIMETZ);
-                        if time_of_day(lo) && ro == oid::INTERVAL {
-                            return Ok(of(if lo == oid::TIMETZ {
-                                ColType::Timetz
-                            } else {
-                                ColType::Time
-                            }));
-                        }
-                        if matches!(operator, Add) && lo == oid::INTERVAL && time_of_day(ro) {
-                            return Ok(of(if ro == oid::TIMETZ {
-                                ColType::Timetz
-                            } else {
-                                ColType::Time
-                            }));
-                        }
-                    }
-                    // interval * number / number * interval / interval / number.
-                    if (matches!(operator, Mul) && lo == oid::INTERVAL && numeric(ro))
-                        || (matches!(operator, Mul) && numeric(lo) && ro == oid::INTERVAL)
-                        || (matches!(operator, Div) && lo == oid::INTERVAL && numeric(ro))
-                    {
-                        return Ok(of(ColType::Interval));
-                    }
-                    let l_ok = lo == oid::UNKNOWN || numeric(lo);
-                    let r_ok = ro == oid::UNKNOWN || numeric(ro);
-                    // PostgreSQL defines no modulo for the floating types, so
-                    // `real % …` and `float8 % …` are undefined even between two
-                    // otherwise-numeric operands.
-                    let is_float = |o: i32| matches!(o, oid::FLOAT4 | oid::FLOAT8);
-                    let mod_on_float = matches!(operator, Mod) && (is_float(lo) || is_float(ro));
-                    if (!l_ok || !r_ok || mod_on_float)
-                        && let (Some(a), Some(b)) = (coltype_of_oid(lo), coltype_of_oid(ro))
-                    {
-                        let sym = match operator {
-                            Add => "+",
-                            Sub => "-",
-                            Mul => "*",
-                            Div => "/",
-                            _ => "%",
-                        };
-                        return Err(operator_undefined(a, sym, b));
-                    }
-                    // Promotion: float8 > real > numeric > int8 > int4; unknown
-                    // is absorbed by the concrete side. real op real stays real;
-                    // real mixed with int/numeric widens to double precision.
-                    if lo == oid::FLOAT8 || ro == oid::FLOAT8 {
-                        of(ColType::Float8)
-                    } else if lo == oid::FLOAT4 && ro == oid::FLOAT4 {
-                        of(ColType::Float4)
-                    } else if lo == oid::FLOAT4 || ro == oid::FLOAT4 {
-                        of(ColType::Float8)
-                    } else if lo == oid::NUMERIC || ro == oid::NUMERIC {
-                        of(ColType::Numeric)
-                    } else if lo == oid::INT8 || ro == oid::INT8 {
-                        of(ColType::Int8)
-                    } else if lo == oid::UNKNOWN && ro == oid::UNKNOWN {
-                        of(ColType::Numeric)
-                    } else if lo == oid::UNKNOWN {
-                        (ro, coltype_of_oid(ro).map(|t| t.typlen()).unwrap_or(-1))
-                    } else if ro == oid::UNKNOWN {
-                        (lo, coltype_of_oid(lo).map(|t| t.typlen()).unwrap_or(-1))
-                    } else if lo == oid::INT2 && ro == oid::INT2 {
-                        // smallint op smallint stays smallint.
-                        of(ColType::Int2)
-                    } else {
-                        of(ColType::Int4)
-                    }
-                }
-            }
+            builtin_binary_type(operator, lo, ro)?
         }
         Expr::Collate { operand, .. } => infer_type_res(operand, columns)?,
         Expr::Cast {

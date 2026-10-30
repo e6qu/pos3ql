@@ -1,6 +1,62 @@
 use super::*;
 
 #[test]
+fn cursor_retained_case_preserves_operator_types_and_defers_selected_row_errors() {
+    use crate::sql::cursor::FetchMotion;
+    let config = test_config("cursor-retained-case-types");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(&mut engine, "CREATE TABLE conditional_input(id integer, day date, start_day date, at timestamp, start_at timestamp); \
+        INSERT INTO conditional_input VALUES \
+        (1,DATE '2026-10-03',DATE '2026-10-01',TIMESTAMP '2026-10-03',TIMESTAMP '2026-10-01'), \
+        (2,DATE '2026-10-06',DATE '2026-10-01',TIMESTAMP '2026-10-06',TIMESTAMP '2026-10-01'); \
+        BEGIN; DECLARE formulas NO SCROLL CURSOR FOR \
+        SELECT (day-start_day)+id AS elapsed, CASE WHEN id%2=0 THEN id*10 ELSE 2147483648 END AS chosen, \
+        CASE WHEN id=1 THEN at-start_at ELSE NULL END AS span FROM conditional_input \
+        WHERE CASE WHEN id>0 THEN TRUE ELSE FALSE END", true);
+    session
+        .cursors
+        .read_request("formulas", FetchMotion::Count(1), false)
+        .unwrap()
+        .expect("retained conditional plan");
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "FETCH NEXT FROM formulas", true)),
+        ["3|2147483648|2 days"]
+    );
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "FETCH NEXT FROM formulas", true)),
+        ["7|20|NULL"]
+    );
+    let mut values = [Datum::Null; 3];
+    crate::mem::guard::forbid_alloc(|| {
+        let count = session
+            .cursors
+            .copy_row(
+                "formulas",
+                session.cursors.emitted()[0],
+                &session.arena,
+                &mut values,
+            )
+            .unwrap();
+        assert_eq!(count, 3);
+        assert_eq!(values[0], Datum::Int4(7));
+        assert_eq!(values[1], Datum::Int8(20));
+    });
+    session.success(&mut engine, "CLOSE formulas; \
+        DECLARE conditional_failure NO SCROLL CURSOR FOR SELECT CASE WHEN id=2 THEN 100/(id-2) ELSE id END FROM conditional_input", true);
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "FETCH NEXT FROM conditional_failure", true)),
+        ["1"]
+    );
+    assert_eq!(
+        error_sqlstates(&session.execute(&mut engine, "FETCH NEXT FROM conditional_failure", true)),
+        ["22012"]
+    );
+    session.success(&mut engine, "ROLLBACK", true);
+}
+
+#[test]
 fn cursor_view_planning_preserves_sources_and_pattern_boolean_types() {
     let config = test_config("cursor-view-pattern-types");
     let mut budget = test_engine_budget(&config, 1 << 29);

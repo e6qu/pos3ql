@@ -74,6 +74,16 @@ fn retained_expression(
                 && retained_expression(left, catalog)
                 && retained_expression(right, catalog)
         }
+        Expr::Case {
+            operand: None,
+            whens,
+            otherwise,
+            ..
+        } => {
+            whens.iter().all(|(condition, value)| {
+                retained_expression(condition, catalog) && retained_expression(value, catalog)
+            }) && otherwise.is_none_or(|value| retained_expression(value, catalog))
+        }
         _ => false,
     }
 }
@@ -99,6 +109,16 @@ fn row_independent(expression: &Expr<'_>, scope: &QueryScope<'_>) -> bool {
         }
         Expr::Binary { left, right, .. } => {
             row_independent(left, scope) && row_independent(right, scope)
+        }
+        Expr::Case {
+            operand: None,
+            whens,
+            otherwise,
+            ..
+        } => {
+            whens.iter().all(|(condition, value)| {
+                row_independent(condition, scope) && row_independent(value, scope)
+            }) && otherwise.is_none_or(|value| row_independent(value, scope))
         }
         _ => false,
     }
@@ -174,6 +194,26 @@ fn bind_expression<'a>(
                     left,
                     right,
                 }
+            }
+        }
+        Expr::Case {
+            operand: None,
+            whens,
+            otherwise,
+            synthetic,
+        } => {
+            let whens = arena.alloc_slice_copy(whens).map_err(|_| full())?;
+            for (condition, value) in whens.iter_mut() {
+                *condition = bind_expression(condition, arena)?;
+                *value = bind_expression(value, arena)?;
+            }
+            Expr::Case {
+                operand: None,
+                whens,
+                otherwise: otherwise
+                    .map(|value| bind_expression(value, arena))
+                    .transpose()?,
+                synthetic: *synthetic,
             }
         }
         _ => return Ok(expression),

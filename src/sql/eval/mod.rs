@@ -5530,6 +5530,18 @@ pub(crate) fn static_type_pub<'a>(e: &Expr<'a>, row: &impl ColumnLookup<'a>) -> 
 }
 
 fn static_type<'a>(e: &Expr<'a>, row: &impl ColumnLookup<'a>) -> Option<ColType> {
+    if let Expr::Call { name, args, .. } = e
+        && let Some((Some("pg_catalog"), operator)) = super::ast::catalog_operator_call(name)
+        && let [left, right] = *args
+    {
+        return super::query::builtin_operator_result(
+            operator,
+            &[
+                static_type(left, row)?.oid(),
+                static_type(right, row)?.oid(),
+            ],
+        );
+    }
     match e {
         Expr::Null | Expr::Param(_) => None,
         Expr::Bool(_) => Some(ColType::Bool),

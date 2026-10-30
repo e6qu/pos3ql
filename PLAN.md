@@ -56,8 +56,8 @@ A waiting schema edit must never attach itself to a new object that reused a nam
   have not been fetched. Row locks follow fetched rows. Holding a cursor across
   commit saves the required result before releasing its transaction.
   Simple cursors over one physical table retain their reader,
-  built-in arithmetic/comparisons, boolean filters, integer row limits/offsets
-  and captured parameters.
+  built-in arithmetic/comparisons, `CASE WHEN` expressions, boolean filters,
+  integer row limits/offsets and captured parameters.
   Forward-only cursors reuse memory per fetch; scrolling cursors retain visited
   results. Omitted scroll options follow the bound plan’s backward-read support.
   Operator choices and row-independent filters stay fixed after declaration.

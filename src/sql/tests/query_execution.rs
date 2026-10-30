@@ -85,6 +85,19 @@ fn cursor_retained_cold_default_mode_resumes_and_scrolls() {
     );
 }
 
+#[test]
+fn cursor_retained_cold_case_resumes_conditions_and_selected_values() {
+    cold_cursor_fetch(
+        "SELECT CASE WHEN id>0 THEN id ELSE 0 END, \
+         CASE WHEN id%2=0 THEN code ELSE 'unused' END FROM cold_orders \
+         WHERE CASE WHEN id%2=0 THEN id>0 ELSE FALSE END LIMIT 70 OFFSET 10",
+        2,
+        10,
+        70,
+        CursorScroll::NoScroll,
+    );
+}
+
 fn cold_cursor_fetch(select: &str, stride: i32, skip: i32, take: i32, mode: CursorScroll) {
     use crate::sql::cursor::FetchMotion;
 

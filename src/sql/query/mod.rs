@@ -1439,39 +1439,9 @@ pub(crate) fn builtin_operator_result(name: &str, arguments: &[i32]) -> Option<C
         return None;
     }
     let operator = super::ast::BinaryOp::from_operator_name(name)?;
-    if matches!(
-        operator,
-        super::ast::BinaryOp::Eq
-            | super::ast::BinaryOp::NotEq
-            | super::ast::BinaryOp::Lt
-            | super::ast::BinaryOp::LtEq
-            | super::ast::BinaryOp::Gt
-            | super::ast::BinaryOp::GtEq
-            | super::ast::BinaryOp::PatternLt
-            | super::ast::BinaryOp::PatternLtEq
-            | super::ast::BinaryOp::PatternGt
-            | super::ast::BinaryOp::PatternGtEq
-            | super::ast::BinaryOp::Contains
-            | super::ast::BinaryOp::ContainedBy
-            | super::ast::BinaryOp::Overlaps
-            | super::ast::BinaryOp::NotRightOf
-            | super::ast::BinaryOp::NotLeftOf
-            | super::ast::BinaryOp::Adjacent
-            | super::ast::BinaryOp::NetContainedEq
-            | super::ast::BinaryOp::NetContainsEq
-            | super::ast::BinaryOp::JsonExists
-            | super::ast::BinaryOp::JsonExistsAny
-            | super::ast::BinaryOp::JsonExistsAll
-            | super::ast::BinaryOp::StartsWith
-    ) {
-        return Some(ColType::Bool);
-    }
-    let left = ColType::from_oid(arguments[0])?;
-    let right = ColType::from_oid(arguments[1])?;
-    if left == right {
-        return Some(left);
-    }
-    Some(super::exec::unify_numeric_tower(left, right))
+    super::exec::builtin_binary_type(&operator, arguments[0], arguments[1])
+        .ok()
+        .and_then(|(oid, _)| ColType::from_oid(oid))
 }
 
 impl StorageCatalog<'_, '_, '_, '_> {

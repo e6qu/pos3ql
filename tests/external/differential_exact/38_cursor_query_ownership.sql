@@ -56,6 +56,30 @@ BEGIN
 END $$;
 SELECT cursor_retained_native();
 DROP FUNCTION cursor_retained_native();
+SELECT pg_typeof(DATE '2026-10-03' OPERATOR(pg_catalog.-) DATE '2026-10-01'),
+       (DATE '2026-10-03' OPERATOR(pg_catalog.-) DATE '2026-10-01') + 1;
+CREATE TABLE conditional_input(id integer, day date, start_day date, at timestamp, start_at timestamp);
+INSERT INTO conditional_input VALUES
+(1,DATE '2026-10-03',DATE '2026-10-01',TIMESTAMP '2026-10-03',TIMESTAMP '2026-10-01'),
+(2,DATE '2026-10-06',DATE '2026-10-01',TIMESTAMP '2026-10-06',TIMESTAMP '2026-10-01');
+BEGIN;
+DECLARE formulas NO SCROLL CURSOR FOR
+SELECT (day-start_day)+id AS elapsed,
+       CASE WHEN id%2=0 THEN id*10 ELSE 2147483648 END AS chosen,
+       CASE WHEN id=1 THEN at-start_at ELSE NULL END AS span
+FROM conditional_input WHERE CASE WHEN id>0 THEN TRUE ELSE FALSE END;
+FETCH NEXT FROM formulas;
+FETCH NEXT FROM formulas;
+CLOSE formulas;
+DECLARE conditional_failure NO SCROLL CURSOR FOR
+SELECT CASE WHEN id=2 THEN 100/(id-2) ELSE id END FROM conditional_input;
+FETCH NEXT FROM conditional_failure;
+SAVEPOINT before_conditional_failure;
+FETCH NEXT FROM conditional_failure;
+ROLLBACK TO SAVEPOINT before_conditional_failure;
+CLOSE conditional_failure;
+COMMIT;
+DROP TABLE conditional_input;
 CREATE TABLE expression_input(id integer);
 INSERT INTO expression_input VALUES (1),(2);
 CREATE FUNCTION expression_value(wanted integer) RETURNS integer LANGUAGE plpgsql AS $$

@@ -164,6 +164,13 @@ SQL cursors save typed values and format each fetched row using the session's
 current settings. For example, a saved `DATE '2020-01-02'` displays as
 `02/01/2020` after `SET DateStyle = 'SQL, DMY'`, including for a cursor kept
 across commit. Procedural `FETCH INTO` assigns the typed value directly.
+Opening a procedural cursor captures its input values and types. For example,
+changing `label` after `OPEN c FOR SELECT label` does not change the saved input.
+A null date remains a date even when the caller's first parameter is an integer.
+Dynamic command strings use only the explicit `USING` arguments; a local variable
+name does not become a SQL column inside the string. Exact rules and reservations
+are in [compatibility](postgresql-18-compatibility.md#capacity-boundaries).
+
 Cursor queries still execute during declaration; deferring expressions and
 row locks until fetch remains part of the [plan](../PLAN.md).
 

@@ -55,27 +55,11 @@ A waiting schema edit must never attach itself to a new object that reused a nam
   cursor over `nextval('order_numbers')` must not issue numbers for rows that
   have not been fetched. Row locks follow fetched rows. Holding a cursor across
   commit saves the required result before releasing its transaction.
-  Retain the parsed query, copied parameter values and declared parameter types
-  (including `NULL` parameters) in the cursor's own
-  startup reservation; closing or rolling back must release that state.
-  Dynamic SQL must use only its explicit `USING` values and their expression
-  types, including null dates and domains, independently of enclosing routine
-  arguments. SQL utility `EXECUTE prepared_statement(...)` must reject `$1`
-  arguments before evaluating any argument, matching PostgreSQL.
-  Preserve domain argument identities internally while describing their base
-  representation to clients, including the base type's declared size limit.
-  Static procedural cursors also capture local values and their declared types
-  at `OPEN`; changing a variable afterward must not change the cursor's input.
-  Use the shared executor for table projections, set queries and captured
-  record fields; SQL routine arguments keep their own declared type scope.
-  Keep declared types inside a query independently of their client wire
-  representation; combining values must not silently erase a domain type.
-  Wide and nested record values must retain every field through capture and
-  saved results, including records with more than 255 fields.
-  Expanding a record must keep following columns aligned and preserve the
-  declared types of both record fields and `table.*` columns.
-  Keep saved results as typed values: `SET DateStyle = 'SQL, DMY'` before
-  `FETCH` must change how a saved date is displayed without changing its value.
+  Preserve the existing [cursor input, type and capacity rules](docs/postgresql-18-compatibility.md#capacity-boundaries)
+  while adding execution positions. Later variable assignments must not change
+  captured inputs. Preserve rollback, cleanup and PostgreSQL's errors for
+  invalid fields and utility parameters. Saved dates must still use the
+  settings chosen before `FETCH`, including after commit.
 
 Follow PostgreSQL's distinction between listing an old catalog row and resolving
 an object for current use. After `orders` becomes `sales`, an older report can

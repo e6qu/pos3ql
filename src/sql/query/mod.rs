@@ -8695,15 +8695,22 @@ pub fn describe_catalog_items_as<'q>(
     let mut count = 0;
     let mut item_width = [0usize; MAX_PROJ];
     for (item_index, item) in items.iter().enumerate() {
-        if let SelectItem::Expr { expression: Expr::Cast { operand, .. }, .. } = item {
-            super::exec::infer_type_res(operand, &super::exec::CatalogCols {
-                definition,
-                alias,
-                output_aliases: &[],
-                storage,
-                txid,
-                arena,
-            })?;
+        if let SelectItem::Expr {
+            expression: Expr::Cast { operand, .. },
+            ..
+        } = item
+        {
+            super::exec::infer_type_res(
+                operand,
+                &super::exec::CatalogCols {
+                    definition,
+                    alias,
+                    output_aliases: &[],
+                    storage,
+                    txid,
+                    arena,
+                },
+            )?;
         }
         if let SelectItem::Expr { expression, alias } = item
             && let Some(description) = user_type_expression_description(

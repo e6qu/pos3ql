@@ -659,12 +659,12 @@ mod tests {
                         if fields == crate::sql::MAX_PROJ {
                             let error = result.unwrap_err();
                             assert_eq!(error.sqlstate, sqlstate::TOO_MANY_COLUMNS);
-                        let error = crate::sql::exec::infer_type_res(
-                            expression,
-                            &crate::sql::exec::NoCols,
-                        )
-                        .unwrap_err();
-                        assert_eq!(error.sqlstate, sqlstate::TOO_MANY_COLUMNS);
+                            let error = crate::sql::exec::infer_type_res(
+                                expression,
+                                &crate::sql::exec::NoCols,
+                            )
+                            .unwrap_err();
+                            assert_eq!(error.sqlstate, sqlstate::TOO_MANY_COLUMNS);
                             assert_eq!(
                                 error.message.as_str(),
                                 "ROW expressions can have at most 1664 entries"

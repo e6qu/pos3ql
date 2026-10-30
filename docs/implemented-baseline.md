@@ -179,11 +179,15 @@ the unread source. Fetching another batch reuses the result buffer: a long
 cursor can use repeated small fetches without retaining earlier batches.
 `MOVE` advances without saving output; a forward jump saves its target row.
 This path accepts columns, wildcards, constants, captured parameters, built-in
-binary operators, negation, boolean logic, null tests, `CASE WHEN` expressions
-and filters composed from them. For example, `SELECT 100/id FROM orders WHERE id<>0` tests
+binary operators, negation, boolean logic, null tests, `CASE WHEN` expressions,
+array construction, element access, slices and filters composed from them.
+For example, `SELECT 100/id FROM orders WHERE id<>0` tests
 each input as fetching advances; it does not divide by an unread row's `id`.
 `CASE WHEN id<>0 THEN 100/id ELSE NULL END` evaluates only the selected branch
 for each fetched row. Its result type stays the same across fetches.
+`ARRAY[id,id+1]`, `amounts[id]` and `amounts[2:3]` also evaluate as fetching
+advances. An array captured from a procedure keeps its opening values even if
+the procedure later changes its variable.
 Built-in operator choices stay fixed after declaration. A later operator or
 search-path change does not change the open cursor. Type errors and constant
 errors such as `1/0` are checked during declaration, including for empty input.

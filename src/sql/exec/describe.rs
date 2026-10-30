@@ -3802,6 +3802,17 @@ pub fn infer_type_res(
     columns: &dyn ColTypeResolver,
 ) -> Result<(i32, i16), SqlError> {
     let of = |t: ColType| (t.oid(), t.typlen());
+    if let Expr::Call { name, args, .. } = expression
+        && let Some((Some("pg_catalog"), symbol)) = crate::sql::ast::catalog_operator_call(name)
+        && let [left, right] = *args
+        && let Some(operator) = crate::sql::ast::BinaryOp::from_operator_name(symbol)
+    {
+        return builtin_binary_type(
+            &operator,
+            infer_type_res(left, columns)?.0,
+            infer_type_res(right, columns)?.0,
+        );
+    }
     if let Some(result) = routine_result_metadata(expression, columns) {
         return Ok((result.type_oid, result.ctype.typlen()));
     }
@@ -3977,8 +3988,26 @@ pub fn infer_type_res(
         Expr::Cast {
             operand, type_name, ..
         } => {
-            // A target type does not make an invalid source expression valid.
-            infer_type_res(operand, columns)?;
+            // Explicit array casts supply element types even to ARRAY[]. Other
+            // casts must still validate their source expression first.
+            let target = columns
+                .named_type_oid(type_name)
+                .and_then(|oid| {
+                    super::super::eval::constructor_type_from_oid(oid, &|oid| {
+                        columns.domain_base_type(oid)
+                    })
+                })
+                .or_else(|| ColType::from_sql_name(type_name));
+            if let (Expr::Array(items), Some(ColType::Array(element))) = (*operand, target) {
+                super::super::eval::array_constructor_type(
+                    items,
+                    Some(element),
+                    &|item| infer_routine_argument_oid(item, columns),
+                    &|oid| columns.domain_base_type(oid),
+                )?;
+            } else {
+                infer_type_res(operand, columns)?;
+            }
             if let Some(target @ (ColType::Int2 | ColType::Int2Vector | ColType::OidVector)) =
                 ColType::from_sql_name(type_name)
             {
@@ -4074,25 +4103,49 @@ pub fn infer_type_res(
                 }
             }
             let mut acc: Option<ColType> = None;
+            let mut first_oid = None;
+            let mut identical = true;
             let mut consider = |e: &Expr| -> Result<(), SqlError> {
-                let (o, _) = infer_type_res(e, columns)?;
-                if let Some(t) = coltype_of_oid(o) {
-                    acc = Some(match acc {
-                        None => t,
-                        Some(prev) => unify_numeric_tower(prev, t),
-                    });
+                let type_oid = infer_routine_argument_oid(e, columns)?;
+                if let Some(first) = first_oid {
+                    identical &= first == type_oid;
+                } else {
+                    first_oid = Some(type_oid);
+                }
+                if type_oid != oid::UNKNOWN {
+                    let t = super::super::eval::constructor_type_from_oid(type_oid, &|oid| {
+                        columns.domain_base_type(oid)
+                    })
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::FEATURE_NOT_SUPPORTED,
+                            "CASE result type with OID {} is not supported",
+                            type_oid
+                        )
+                    })?;
+                    acc =
+                        Some(match acc {
+                            None => t,
+                            Some(prev) => crate::sql::types::common_builtin_type(prev, t).map_err(
+                                |error| super::super::eval::common_type_error(error, "CASE"),
+                            )?,
+                        });
                 }
                 Ok(())
             };
+            if let Some(e) = otherwise {
+                consider(e)?;
+            } else {
+                consider(&Expr::Null)?;
+            }
             for (_, result) in whens.iter() {
                 consider(result)?;
             }
-            if let Some(e) = otherwise {
-                consider(e)?;
-            }
-            match acc {
-                Some(t) => of(t),
-                None => (oid::UNKNOWN, -2),
+            let ctype = acc.unwrap_or(ColType::Text);
+            if identical && let Some(type_oid) = first_oid.filter(|oid| *oid != oid::UNKNOWN) {
+                (type_oid, ctype.typlen())
+            } else {
+                of(ctype)
             }
         }
         Expr::DefaultMarker => (oid::UNKNOWN, -2),
@@ -4153,21 +4206,15 @@ pub fn infer_type_res(
             }
             of(ColType::Bool)
         }
-        Expr::Array(items) => {
-            // An unknown-typed element (a bare string literal) makes the array
-            // text[], as PostgreSQL coerces it; only a concrete element type
-            // narrows it further.
-            let element = items
-                .first()
-                .and_then(|e| infer_type_res(e, columns).ok())
-                .and_then(|(o, _)| coltype_of_oid(o))
-                .and_then(|ctype| match ctype {
-                    ColType::Array(element) => Some(element),
-                    scalar => crate::sql::types::ArrElem::from_coltype(scalar),
-                })
-                .unwrap_or(crate::sql::types::ArrElem::Text);
-            of(ColType::Array(element))
-        }
+        Expr::Array(items) => of(ColType::Array(
+            super::super::eval::array_constructor_type(
+                items,
+                None,
+                &|item| infer_routine_argument_oid(item, columns),
+                &|oid| columns.domain_base_type(oid),
+            )?
+            .element,
+        )),
         Expr::Subscript { base, .. } => {
             // A catalog-backed column retains its array element identity here:
             // a domain element has a structural base `ColType`, but its Result

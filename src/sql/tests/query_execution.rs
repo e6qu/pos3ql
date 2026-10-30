@@ -98,6 +98,18 @@ fn cursor_retained_cold_case_resumes_conditions_and_selected_values() {
     );
 }
 
+#[test]
+fn cursor_retained_cold_arrays_resume_values_and_filters() {
+    cold_cursor_fetch(
+        "SELECT (ARRAY[id,0])[1],code FROM cold_orders \
+         WHERE (ARRAY[id%2,1])[1]=0 LIMIT 69 OFFSET 11",
+        2,
+        11,
+        69,
+        CursorScroll::NoScroll,
+    );
+}
+
 fn cold_cursor_fetch(select: &str, stride: i32, skip: i32, take: i32, mode: CursorScroll) {
     use crate::sql::cursor::FetchMotion;
 

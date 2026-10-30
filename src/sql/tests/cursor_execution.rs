@@ -1,6 +1,180 @@
 use super::*;
 
 #[test]
+fn cursor_array_constructors_preserve_common_types_and_fixed_arena_limits() {
+    use crate::sql::cursor::FetchMotion;
+    use crate::sql::types::ArrElem;
+    let config = test_config("cursor-array-common-types");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE TABLE typed_arrays(id integer, vals integer[]); \
+        INSERT INTO typed_arrays VALUES(1,ARRAY[10,20]),(2,ARRAY[30,40]); \
+        BEGIN; DECLARE typed NO SCROLL CURSOR FOR SELECT \
+        CASE WHEN id=1 THEN ARRAY[id,2147483648] ELSE ARRAY[id,id+1] END, \
+        CASE WHEN id=1 THEN vals[1:2] ELSE ARRAY[2147483648] END, \
+        ARRAY[ARRAY[id],ARRAY[2147483648]] FROM typed_arrays",
+        true,
+    );
+    session
+        .cursors
+        .read_request("typed", FetchMotion::Count(1), false)
+        .unwrap()
+        .expect("retained typed array plan");
+    for expected in [
+        "{1,2147483648}|{10,20}|{{1},{2147483648}}",
+        "{2,3}|{2147483648}|{{2},{2147483648}}",
+    ] {
+        assert_eq!(
+            data_rows(&session.success(&mut engine, "FETCH NEXT FROM typed", true)),
+            [expected]
+        );
+        let mut values = [Datum::Null; 3];
+        crate::mem::guard::forbid_alloc(|| {
+            session
+                .cursors
+                .copy_row(
+                    "typed",
+                    session.cursors.emitted()[0],
+                    &session.arena,
+                    &mut values,
+                )
+                .unwrap();
+            for value in values {
+                assert!(matches!(
+                    value,
+                    Datum::Array {
+                        element: ArrElem::Int8,
+                        ..
+                    }
+                ));
+            }
+        });
+    }
+    session.success(&mut engine, "COMMIT", true);
+    let members = (0..300)
+        .map(|index| format!("id+{index}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    session.success(&mut engine, &format!("BEGIN; DECLARE wide_array NO SCROLL CURSOR FOR SELECT (ARRAY[{members}])[300] FROM typed_arrays"), true);
+    session
+        .cursors
+        .read_request("wide_array", FetchMotion::Count(1), false)
+        .unwrap()
+        .expect("retained 300-element constructor");
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "FETCH ALL FROM wide_array; COMMIT", true)),
+        ["300", "301"]
+    );
+    assert_eq!(data_rows(&session.success(&mut engine, "SELECT pg_typeof(ARRAY[1::smallint,2]), \
+        pg_typeof(ARRAY[1::real,2::numeric]), pg_typeof(ARRAY[DATE '2026-10-01',TIMESTAMP '2026-10-02']), \
+        ARRAY[]::integer[],ARRAY[ARRAY[]::integer[],NULL::integer[]]", true)),
+        ["integer[]|real[]|timestamp without time zone[]|{}|{}"]);
+    for (sql, state) in [
+        ("SELECT ARRAY[]", "42P18"),
+        ("SELECT ARRAY[1,TRUE]", "42804"),
+        ("SELECT ARRAY[1::money,2]", "42846"),
+        ("SELECT ARRAY[ARRAY[1],NULL::integer[]]", "2202E"),
+    ] {
+        assert_eq!(
+            error_sqlstates(&session.execute(&mut engine, sql, true)),
+            [state]
+        );
+    }
+    session.success(&mut engine, "CREATE DOMAIN array_day AS date; \
+        CREATE FUNCTION captured_null_array(input array_day) RETURNS refcursor LANGUAGE plpgsql AS $$ \
+        DECLARE c refcursor := 'saved_null_array'; BEGIN \
+        OPEN c NO SCROLL FOR SELECT ARRAY[input] FROM typed_arrays; input := DATE '2026-10-30'; RETURN c; END $$; \
+        BEGIN; SELECT captured_null_array(NULL)", true);
+    session
+        .cursors
+        .read_request("saved_null_array", FetchMotion::Count(1), false)
+        .unwrap()
+        .expect("captured typed NULL array plan");
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "FETCH NEXT FROM saved_null_array", true)),
+        ["{NULL}"]
+    );
+    let mut values = [Datum::Null; 1];
+    crate::mem::guard::forbid_alloc(|| {
+        session
+            .cursors
+            .copy_row(
+                "saved_null_array",
+                session.cursors.emitted()[0],
+                &session.arena,
+                &mut values,
+            )
+            .unwrap();
+        assert!(matches!(
+            values[0],
+            Datum::Array {
+                element: ArrElem::Domain { .. },
+                ..
+            }
+        ));
+    });
+    session.success(&mut engine, "COMMIT", true);
+}
+
+#[test]
+fn cursor_retained_arrays_keep_captured_inputs_and_defer_index_errors() {
+    use crate::sql::cursor::FetchMotion;
+    let config = test_config("cursor-retained-arrays");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE TABLE array_input(id integer, vals integer[]); \
+        INSERT INTO array_input VALUES(1,ARRAY[10,20,30]),(2,ARRAY[40,50,60]),(3,NULL); \
+        BEGIN; DECLARE arrays NO SCROLL CURSOR FOR SELECT vals[id],(ARRAY[id,id+1])[2],vals[2:3] \
+        FROM array_input WHERE (ARRAY[id,0])[1]>0",
+        true,
+    );
+    session
+        .cursors
+        .read_request("arrays", FetchMotion::Count(1), false)
+        .unwrap()
+        .expect("retained array plan");
+    session.success(
+        &mut engine,
+        "UPDATE array_input SET vals=ARRAY[99,99,99] WHERE id=2",
+        true,
+    );
+    for expected in ["10|2|{20,30}", "50|3|{50,60}", "NULL|4|NULL"] {
+        assert_eq!(
+            data_rows(&session.success(&mut engine, "FETCH NEXT FROM arrays", true)),
+            [expected]
+        );
+    }
+    session.success(&mut engine, "CLOSE arrays; DECLARE index_failure NO SCROLL CURSOR FOR SELECT vals[1/(id-2)] FROM array_input", true);
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "FETCH NEXT FROM index_failure", true)),
+        ["NULL"]
+    );
+    assert_eq!(
+        error_sqlstates(&session.execute(&mut engine, "FETCH NEXT FROM index_failure", true)),
+        ["22012"]
+    );
+    session.success(&mut engine, "ROLLBACK; CREATE FUNCTION captured_array(input integer[]) RETURNS refcursor LANGUAGE plpgsql AS $$ \
+        DECLARE c refcursor := 'saved_array'; BEGIN OPEN c NO SCROLL FOR SELECT input[id] FROM array_input; \
+        input := ARRAY[99,99,99]; RETURN c; END $$; BEGIN; SELECT captured_array(ARRAY[7,8,9])", true);
+    session
+        .cursors
+        .read_request("saved_array", FetchMotion::Count(1), false)
+        .unwrap()
+        .expect("retained captured array");
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "FETCH ALL FROM saved_array", true)),
+        ["7", "8", "9"]
+    );
+    session.success(&mut engine, "COMMIT", true);
+}
+
+#[test]
 fn cursor_retained_case_preserves_operator_types_and_defers_selected_row_errors() {
     use crate::sql::cursor::FetchMotion;
     let config = test_config("cursor-retained-case-types");

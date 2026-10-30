@@ -229,6 +229,7 @@ pub mod sqlstate {
     pub const WRONG_OBJECT_TYPE: &str = "42809";
     pub const INVALID_COLUMN_REFERENCE: &str = "42P10";
     pub const COLLATION_MISMATCH: &str = "42P21";
+    pub const INDETERMINATE_DATATYPE: &str = "42P18";
     pub const INDETERMINATE_COLLATION: &str = "42P22";
     pub const INVALID_FUNCTION_DEFINITION: &str = "42P13";
     pub const FUNCTION_EXECUTED_NO_RETURN_STATEMENT: &str = "2F005";
@@ -437,22 +438,6 @@ impl ExpressionTypeIdentity {
     }
 }
 
-fn catalog_user_type_oid<'a>(
-    identity: crate::storage::UserTypeName,
-    is_array: bool,
-    hooks: &EvalHooks<'_, 'a>,
-) -> Result<i32, SqlError> {
-    hooks
-        .catalog
-        .and_then(|catalog| catalog.user_type_identity_oid(identity, is_array))
-        .ok_or_else(|| {
-            sql_err!(
-                sqlstate::INTERNAL_ERROR,
-                "evaluated user-defined type has no catalog identity"
-            )
-        })
-}
-
 pub(crate) fn expression_type_identity<'a>(
     expression: &Expr<'a>,
     row: &dyn ColumnLookup<'a>,
@@ -502,29 +487,27 @@ pub(crate) fn expression_type_identity<'a>(
     {
         return expression_type_identity(argument, row, hooks);
     }
-    if let Expr::Array(elements) = expression
-        && let Some(first) = elements.first()
+    if let Expr::Array(elements) = expression {
+        let plan = array_constructor_type(
+            elements,
+            None,
+            &|item| Ok(expression_type_identity(item, row, hooks)?.record_field_oid()),
+            &|oid| {
+                hooks
+                    .catalog
+                    .and_then(|catalog| catalog.domain_base_type(oid))
+            },
+        )?;
+        return Ok(ExpressionTypeIdentity::Known(plan.element.array_oid()));
+    }
+    if let Expr::Subquery(_) = expression
+        && let Some(values) = hooks.subs
+        && let Some((_, _, witness)) = values
+            .scalars
+            .iter()
+            .find(|(node, _, _)| core::ptr::eq(*node, expression as *const _))
     {
-        if let Expr::Cast { type_name, .. } = first
-            && super::types::ColType::from_sql_name(type_name).is_none()
-        {
-            let array_name = stack_format!(128, "{}[]", type_name);
-            return hooks
-                .catalog
-                .and_then(|catalog| catalog.user_type_oid(array_name.as_str()))
-                .map(ExpressionTypeIdentity::Known)
-                .ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::INTERNAL_ERROR,
-                        "evaluated user-type array has no catalog identity"
-                    )
-                });
-        }
-        if let Expr::Column { qualifier, name } = first
-            && let Some(identity) = row.column_user_type(*qualifier, name)
-        {
-            return catalog_user_type_oid(identity, true, hooks).map(ExpressionTypeIdentity::Known);
-        }
+        return Ok(ExpressionTypeIdentity::Known(witness.type_oid()));
     }
     // ROW() determines the anonymous record identity from its constructor,
     // including `record.*` arguments whose individual expressions are not
@@ -627,6 +610,25 @@ impl crate::sql::exec::ColTypeResolver for RuntimeColumnTypes<'_, '_> {
         self.catalog
             .and_then(|catalog| catalog.user_type_oid(type_name))
             .or_else(|| super::types::ColType::from_sql_name(type_name).map(|ctype| ctype.oid()))
+    }
+
+    fn routine_result(
+        &self,
+        name: &str,
+        argument_names: &[Option<&str>],
+        variadic: bool,
+        arguments: &[i32],
+    ) -> Option<crate::sql::exec::StaticTypeMeta> {
+        let type_oid =
+            self.catalog?
+                .routine_result_oid(name, argument_names, variadic, arguments)?;
+        let ctype = ColType::from_oid(type_oid).or_else(|| self.domain_base_type(type_oid))?;
+        Some(crate::sql::exec::StaticTypeMeta {
+            type_oid,
+            ctype,
+            type_mod: -1,
+            collation: crate::sql::ast::Collation::Default,
+        })
     }
 }
 
@@ -2600,11 +2602,29 @@ fn eval_full_inner<'a>(
             type_name,
             type_mod,
         } => {
-            let mut v = eval_full(operand, arena, params, row, hooks)?;
+            let array_target = ColType::from_sql_name(type_name).or_else(|| {
+                let catalog = hooks.catalog?;
+                constructor_type_from_oid(catalog.user_type_oid(type_name)?, &|oid| {
+                    catalog.domain_base_type(oid)
+                })
+            });
+            let constructor_element = match (operand, array_target) {
+                (Expr::Array(_), Some(ColType::Array(element))) => Some(element),
+                _ => None,
+            };
+            let mut v = if let (Expr::Array(items), Some(element)) = (operand, constructor_element)
+            {
+                eval_array_constructor(items, Some(element), arena, params, row, hooks)?
+            } else {
+                eval_full(operand, arena, params, row, hooks)?
+            };
+            let source_identity = || match constructor_element {
+                Some(element) => Ok(ExpressionTypeIdentity::Known(element.array_oid())),
+                None => expression_type_identity(operand, row, hooks),
+            };
             if ColType::from_sql_name(type_name) == Some(ColType::PgNodeTree)
                 && !v.is_null()
-                && expression_type_identity(operand, row, hooks)?.routine_argument_oid(&v)
-                    != super::types::oid::PG_NODE_TREE
+                && source_identity()?.routine_argument_oid(&v) != super::types::oid::PG_NODE_TREE
             {
                 return Err(sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
@@ -2612,8 +2632,7 @@ fn eval_full_inner<'a>(
                 ));
             }
             if let Some(catalog) = hooks.catalog {
-                let source_oid =
-                    expression_type_identity(operand, row, hooks)?.routine_argument_oid(&v);
+                let source_oid = source_identity()?.routine_argument_oid(&v);
                 let target_oid = ColType::from_sql_name(type_name)
                     .map(ColType::oid)
                     .or_else(|| catalog.user_type_oid(type_name));
@@ -2638,8 +2657,7 @@ fn eval_full_inner<'a>(
             if let Some(target @ (ColType::Int2 | ColType::Int2Vector | ColType::OidVector)) =
                 ColType::from_sql_name(type_name)
             {
-                let source_oid =
-                    expression_type_identity(operand, row, hooks)?.routine_argument_oid(&v);
+                let source_oid = source_identity()?.routine_argument_oid(&v);
                 validate_catalog_reference_cast(source_oid, target)?;
             }
             let catalog_text = matches!(v, Datum::CompositeText { .. })
@@ -3303,146 +3321,7 @@ fn eval_full_inner<'a>(
                 "EXISTS is not allowed in this context"
             ))
         }
-        Expr::Array(items) => {
-            // A nested constructor adds one rectangular dimension; scalar members
-            // form the final dimension.
-            let mut vals = [Datum::Null; 256];
-            if items.len() > vals.len() {
-                return Err(sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "array constructor too large"
-                ));
-            }
-            let mut element: Option<super::types::ArrElem> = None;
-            for (i, e) in items.iter().enumerate() {
-                let v = eval_full(e, arena, params, row, hooks)?;
-                // `unknown` literals adopt the array's resolved common type;
-                // they must not force a typed range/enum/etc. constructor to
-                // text merely because their runtime carrier is `Datum::Text`.
-                if !is_unknown_literal(e) {
-                    let inferred = static_type(e, row)
-                        .and_then(super::types::ArrElem::from_coltype)
-                        .or_else(|| super::types::ArrElem::from_datum(&v));
-                    if let Some(el) = inferred {
-                        element = Some(element.map_or(el, |acc| unify_arr_elem(acc, el)));
-                    }
-                }
-                vals[i] = v;
-            }
-            let array_domain_type = items.first().and_then(|expression| {
-                let Expr::Cast { type_name, .. } = expression else {
-                    return None;
-                };
-                hooks.catalog.and_then(|catalog| {
-                    catalog
-                        .array_domain_element(type_name)
-                        .map(|element| (type_name, element))
-                })
-            });
-            if let Some((type_name, element)) = array_domain_type {
-                if vals[..items.len()]
-                    .iter()
-                    .any(|value| !value.is_null() && !matches!(value, Datum::Array { .. }))
-                {
-                    return Err(sql_err!(
-                        sqlstate::DATATYPE_MISMATCH,
-                        "ARRAY could not convert type to {}",
-                        element.array_name()
-                    ));
-                }
-                let catalog = hooks
-                    .catalog
-                    .expect("domain array identity requires catalog");
-                for value in vals.iter_mut().take(items.len()) {
-                    *value = catalog
-                        .cast_user_type(type_name, *value, arena)?
-                        .expect("domain array identity resolves a live domain");
-                }
-                return Ok(Datum::Array {
-                    element,
-                    raw: super::array::build(&vals[..items.len()], arena)?,
-                });
-            }
-            if let Some(Datum::Array { element, raw }) = vals.first().copied() {
-                let child = super::array::shape(raw).expect("array datum invariant");
-                if child.dimension_count() == super::array::MAX_DIMENSIONS {
-                    return Err(sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "array has too many dimensions"
-                    ));
-                }
-                let result_shape = child.with_first(items.len(), 1)?;
-                let flattened = super::array::alloc_items(arena, result_shape.element_count())?;
-                let mut count = 0usize;
-                for value in vals.iter().take(items.len()) {
-                    let Datum::Array {
-                        element: member_element,
-                        raw: member_raw,
-                    } = *value
-                    else {
-                        return Err(sql_err!(
-                            sqlstate::DATATYPE_MISMATCH,
-                            "ARRAY could not convert type {} to {}[]",
-                            type_name_of(value),
-                            element.array_name()
-                        ));
-                    };
-                    let member_shape =
-                        super::array::shape(member_raw).expect("array datum invariant");
-                    if member_element != element || member_shape != child {
-                        return Err(sql_err!(
-                            sqlstate::ARRAY_SUBSCRIPT_ERROR,
-                            "multidimensional arrays must have array expressions with matching dimensions"
-                        ));
-                    }
-                    count = load_array(
-                        member_raw,
-                        member_element,
-                        element,
-                        &mut *flattened,
-                        count,
-                        arena,
-                    )?;
-                }
-                return Ok(Datum::Array {
-                    element,
-                    raw: super::array::build_shaped(&flattened[..count], result_shape, arena)?,
-                });
-            }
-            let element = element.unwrap_or_else(|| {
-                if items.iter().any(|item| is_unknown_literal(item)) {
-                    super::types::ArrElem::Text
-                } else {
-                    super::types::ArrElem::Int4
-                }
-            });
-            // Coerce each element to the unified type.
-            let ct = element.to_coltype();
-            for v in vals.iter_mut().take(items.len()) {
-                if !v.is_null() {
-                    *v = match *v {
-                        // A bpchar element keeps its padding in the array
-                        // value, as PostgreSQL's array_out shows it.
-                        Datum::Bpchar(s) => Datum::Text(s),
-                        Datum::Composite { slot, .. } if matches!(element, super::types::ArrElem::Composite(expected) if expected == Some(slot)) => {
-                            Datum::CompositeText {
-                                slot,
-                                physical_fields: 0,
-                                text: arena.alloc_str_display(*v).map_err(|_| arena_full())?,
-                            }
-                        }
-                        value @ Datum::CompositeText { slot, .. } if matches!(element, super::types::ArrElem::Composite(expected) if expected == Some(slot)) => {
-                            value
-                        }
-                        other => cast_to(other, ct, arena)?,
-                    };
-                }
-            }
-            Ok(Datum::Array {
-                element,
-                raw: super::array::build(&vals[..items.len()], arena)?,
-            })
-        }
+        Expr::Array(items) => eval_array_constructor(items, None, arena, params, row, hooks),
         Expr::Subscript { base, index } => {
             let b = eval_full(base, arena, params, row, hooks)?;
             let i = eval_full(index, arena, params, row, hooks)?;
@@ -4389,17 +4268,282 @@ fn collation_preserving_call(name: &str) -> bool {
     .any(|candidate| name.eq_ignore_ascii_case(candidate))
 }
 
-/// The wider of two array element types (for `ARRAY[...]` type unification).
-fn unify_arr_elem(a: super::types::ArrElem, b: super::types::ArrElem) -> super::types::ArrElem {
-    use super::types::ArrElem::*;
-    match (a, b) {
-        (x, y) if x == y => x,
-        (Float8, _) | (_, Float8) => Float8,
-        (Numeric, _) | (_, Numeric) => Numeric,
-        (Int8, _) | (_, Int8) => Int8,
-        (Text, _) | (_, Text) => Text,
-        _ => a,
+pub(crate) fn common_type_error(error: super::types::CommonTypeError, context: &str) -> SqlError {
+    match error {
+        super::types::CommonTypeError::Category { left, right } => sql_err!(
+            sqlstate::DATATYPE_MISMATCH,
+            "{} types {} and {} cannot be matched",
+            context,
+            left.name(),
+            right.name()
+        ),
+        super::types::CommonTypeError::Conversion { from, to } => sql_err!(
+            sqlstate::CANNOT_COERCE,
+            "{} could not convert type {} to {}",
+            context,
+            from.name(),
+            to.name()
+        ),
     }
+}
+
+pub(crate) fn unify_arr_elem(
+    a: super::types::ArrElem,
+    b: super::types::ArrElem,
+) -> Result<super::types::ArrElem, SqlError> {
+    super::types::common_array_element(a, b).map_err(|error| common_type_error(error, "ARRAY"))
+}
+
+fn eval_array_constructor<'a>(
+    items: &[&Expr<'a>],
+    expected: Option<ArrElem>,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    row: &impl ColumnLookup<'a>,
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<Datum<'a>, SqlError> {
+    let plan = array_constructor_type(
+        items,
+        expected,
+        &|item| Ok(expression_type_identity(item, row, hooks)?.record_field_oid()),
+        &|oid| {
+            hooks
+                .catalog
+                .and_then(|catalog| catalog.domain_base_type(oid))
+        },
+    )?;
+    let element = plan.element;
+    let vals = super::array::alloc_items(arena, items.len())?;
+    for (target, expression) in vals.iter_mut().zip(items) {
+        *target = if let Expr::Array(children) = expression {
+            eval_array_constructor(children, expected, arena, params, row, hooks)?
+        } else {
+            eval_full(expression, arena, params, row, hooks)?
+        };
+    }
+    if plan.multidimensional {
+        let mut child_shape = None;
+        let mut empty = false;
+        for value in vals.iter() {
+            let shape = match *value {
+                Datum::Null => {
+                    empty = true;
+                    continue;
+                }
+                Datum::Array { raw, .. } => {
+                    super::array::shape(raw).expect("array datum invariant")
+                }
+                _ => {
+                    return Err(sql_err!(
+                        sqlstate::DATATYPE_MISMATCH,
+                        "cannot merge incompatible arrays"
+                    ));
+                }
+            };
+            if shape.dimension_count() == 0 {
+                empty = true;
+            } else if child_shape.is_some_and(|child| child != shape) {
+                return Err(array_constructor_shape_error());
+            } else {
+                child_shape = Some(shape);
+            }
+        }
+        let Some(child) = child_shape else {
+            return Ok(Datum::Array {
+                element,
+                raw: super::array::EMPTY,
+            });
+        };
+        if empty {
+            return Err(array_constructor_shape_error());
+        }
+        if child.dimension_count() == super::array::MAX_DIMENSIONS {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "number of array dimensions ({}) exceeds the maximum allowed ({})",
+                child.dimension_count() + 1,
+                super::array::MAX_DIMENSIONS
+            ));
+        }
+        let shape = child.with_first(items.len(), 1)?;
+        let flattened = super::array::alloc_items(arena, shape.element_count())?;
+        let mut count = 0;
+        for value in vals.iter() {
+            let Datum::Array {
+                element: member,
+                raw,
+            } = *value
+            else {
+                unreachable!("validated nonempty child arrays");
+            };
+            count = load_array(raw, member, element, &mut *flattened, count, arena)?;
+        }
+        return Ok(Datum::Array {
+            element,
+            raw: super::array::build_shaped(flattened, shape, arena)?,
+        });
+    }
+    // Coerce each element to the unified type.
+    let ct = element.to_coltype();
+    for v in vals.iter_mut().take(items.len()) {
+        if !v.is_null() {
+            *v = match *v {
+                // A bpchar element keeps its padding in the array
+                // value, as PostgreSQL's array_out shows it.
+                Datum::Bpchar(s) => Datum::Text(s),
+                Datum::Composite { slot, .. } if matches!(element, super::types::ArrElem::Composite(expected) if expected == Some(slot)) => {
+                    Datum::CompositeText {
+                        slot,
+                        physical_fields: 0,
+                        text: arena.alloc_str_display(*v).map_err(|_| arena_full())?,
+                    }
+                }
+                value @ Datum::CompositeText { slot, .. } if matches!(element, super::types::ArrElem::Composite(expected) if expected == Some(slot)) => {
+                    value
+                }
+                other => cast_to(other, ct, arena)?,
+            };
+        }
+    }
+    Ok(Datum::Array {
+        element,
+        raw: super::array::build(&vals[..items.len()], arena)?,
+    })
+}
+
+fn array_constructor_shape_error() -> SqlError {
+    sql_err!(
+        sqlstate::ARRAY_SUBSCRIPT_ERROR,
+        "multidimensional arrays must have array expressions with matching dimensions"
+    )
+}
+
+pub(crate) struct ArrayConstructorType {
+    pub element: ArrElem,
+    pub multidimensional: bool,
+}
+
+pub(crate) fn constructor_type_from_oid(
+    type_oid: i32,
+    domain_base: &impl Fn(i32) -> Option<ColType>,
+) -> Option<ColType> {
+    if let Some((crate::storage::NamedTypeKind::Domain, creation, array)) =
+        crate::storage::NamedTypeKind::from_oid(type_oid)
+    {
+        let base = domain_base(super::types::oid::domain_oid(creation))?;
+        return if array {
+            ArrElem::domain(creation, base).map(ColType::Array)
+        } else {
+            Some(base)
+        };
+    }
+    ColType::from_oid(type_oid)
+}
+
+/// Resolve declarations before evaluating values. Identical domains survive;
+/// mixed declarations use their base types, including typed NULL members.
+pub(crate) fn array_constructor_type<'a>(
+    items: &[&Expr<'a>],
+    expected: Option<ArrElem>,
+    resolve: &impl Fn(&Expr<'a>) -> Result<i32, SqlError>,
+    domain_base: &impl Fn(i32) -> Option<ColType>,
+) -> Result<ArrayConstructorType, SqlError> {
+    if items.is_empty() {
+        return expected
+            .map(|element| ArrayConstructorType {
+                element,
+                multidimensional: false,
+            })
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INDETERMINATE_DATATYPE,
+                    "cannot determine type of empty array"
+                )
+            });
+    }
+    let mut candidate = None;
+    let mut first_oid = None;
+    let mut identical = true;
+    let mut multidimensional = false;
+    for item in items {
+        let type_oid = match item {
+            Expr::Array(children) => ColType::Array(
+                array_constructor_type(children, expected, resolve, domain_base)?.element,
+            )
+            .oid(),
+            other => resolve(other)?,
+        };
+        if let Some(first) = first_oid {
+            identical &= first == type_oid;
+        } else {
+            first_oid = Some(type_oid);
+        }
+        if type_oid == super::types::oid::UNKNOWN {
+            continue;
+        }
+        let physical = constructor_type_from_oid(type_oid, domain_base).ok_or_else(|| {
+            sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "array element type with OID {} is not supported",
+                type_oid
+            )
+        })?;
+        // Domains over arrays are scalar elements until differing input types
+        // require stripping their domain identity.
+        let is_domain = matches!(
+            crate::storage::NamedTypeKind::from_oid(type_oid),
+            Some((crate::storage::NamedTypeKind::Domain, _, false))
+        );
+        multidimensional |= matches!(physical, ColType::Array(_)) && !is_domain;
+        if expected.is_none() {
+            candidate = Some(match candidate {
+                None => physical,
+                Some(prior) => super::types::common_builtin_type(prior, physical)
+                    .map_err(|error| common_type_error(error, "ARRAY"))?,
+            });
+        }
+    }
+    if let Some(element) = expected {
+        return Ok(ArrayConstructorType {
+            element,
+            multidimensional,
+        });
+    }
+    if identical
+        && let Some((crate::storage::NamedTypeKind::Domain, creation, array)) =
+            first_oid.and_then(crate::storage::NamedTypeKind::from_oid)
+    {
+        let base = domain_base(super::types::oid::domain_oid(creation))
+            .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "array domain has no base type"))?;
+        let element = ArrElem::domain(creation, base).ok_or_else(|| {
+            sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "array domain base type is not supported"
+            )
+        })?;
+        return Ok(ArrayConstructorType {
+            element,
+            multidimensional: array,
+        });
+    }
+    let candidate = candidate.unwrap_or(ColType::Text);
+    let element = match candidate {
+        ColType::Array(element) => {
+            multidimensional = true;
+            element
+        }
+        scalar => ArrElem::from_coltype(scalar).ok_or_else(|| {
+            sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "array element type {} is not supported",
+                scalar.name()
+            )
+        })?,
+    };
+    Ok(ArrayConstructorType {
+        element,
+        multidimensional,
+    })
 }
 
 /// PostgreSQL names the argument types a call was made with, so that the
@@ -5471,9 +5615,8 @@ fn call<'a>(
     }
 }
 
-/// The common type of all CASE branch results (+ ELSE), by PostgreSQL's
-/// numeric-tower preference. Returns None when the branches are all
-/// unknown or of a single non-unifiable class (leave values as-is).
+/// Best-effort common CASE result type. ELSE participates first, and unknown
+/// literals adopt the typed branches rather than their text datum carrier.
 fn case_result_type<'a>(
     whens: &[(&Expr<'a>, &Expr<'a>)],
     otherwise: &Option<&Expr<'a>>,
@@ -5481,7 +5624,11 @@ fn case_result_type<'a>(
 ) -> Option<ColType> {
     let mut acc: Option<ColType> = None;
     let mut mixed = false;
+    let mut unresolved = false;
     let mut consider = |e: &Expr<'a>| {
+        if matches!(e, Expr::Str(_) | Expr::Null) {
+            return;
+        }
         if let Some(t) = static_type(e, row) {
             acc = Some(match acc {
                 None => t,
@@ -5493,35 +5640,26 @@ fn case_result_type<'a>(
                     }
                 },
             });
+        } else {
+            unresolved = true;
         }
     };
-    for (_, result) in whens {
-        consider(result);
-    }
     if let Some(e) = otherwise {
         consider(e);
     }
-    if mixed { None } else { acc }
+    for (_, result) in whens {
+        consider(result);
+    }
+    if mixed || unresolved {
+        None
+    } else {
+        acc.or(Some(ColType::Text))
+    }
 }
 
-/// Numeric-tower unification (int4 < int8 < numeric < float8); same type
-/// unifies to itself; text unifies with text. Otherwise None.
+/// Common builtin type for best-effort expression metadata.
 fn unify_types(a: ColType, b: ColType) -> Option<ColType> {
-    use ColType::*;
-    if a == b {
-        return Some(a);
-    }
-    let rank = |t: ColType| match t {
-        Int4 => Some(1),
-        Int8 => Some(2),
-        Numeric => Some(3),
-        Float8 => Some(4),
-        _ => None,
-    };
-    match (rank(a), rank(b)) {
-        (Some(ra), Some(rb)) => Some(if ra >= rb { a } else { b }),
-        _ => None,
-    }
+    super::types::common_builtin_type(a, b).ok()
 }
 
 /// Best-effort static type of an expression for CASE unification.
@@ -5543,7 +5681,15 @@ fn static_type<'a>(e: &Expr<'a>, row: &impl ColumnLookup<'a>) -> Option<ColType>
         );
     }
     match e {
-        Expr::Null | Expr::Param(_) => None,
+        Expr::Null => None,
+        Expr::Param(index) => {
+            super::exec::bound_parameter_type_oid(*index).and_then(ColType::from_oid)
+        }
+        Expr::RoutineParam { .. } => {
+            super::exec::infer_type_res(e, &RuntimeColumnTypes { row, catalog: None })
+                .ok()
+                .and_then(|(oid, _)| ColType::from_oid(oid))
+        }
         Expr::Bool(_) => Some(ColType::Bool),
         Expr::Int(v) => Some(if i32::try_from(*v).is_ok() {
             ColType::Int4
@@ -5558,13 +5704,31 @@ fn static_type<'a>(e: &Expr<'a>, row: &impl ColumnLookup<'a>) -> Option<ColType>
         Expr::SchemaColumn { table, name, .. } => row.col_type(Some(table), name),
         Expr::Cast { type_name, .. } => ColType::from_sql_name(type_name),
         Expr::Collate { operand, .. } => static_type(operand, row),
-        Expr::Array(items) => items
-            .first()
-            .and_then(|item| static_type(item, row))
-            .and_then(|ctype| match ctype {
-                ColType::Array(element) => Some(ColType::Array(element)),
-                scalar => super::types::ArrElem::from_coltype(scalar).map(ColType::Array),
-            }),
+        Expr::Array(items) => {
+            let mut element = None;
+            for item in *items {
+                if matches!(item, Expr::Str(_) | Expr::Null) {
+                    continue;
+                }
+                let ctype = static_type(item, row)?;
+                let next = match ctype {
+                    ColType::Array(element) => element,
+                    scalar => super::types::ArrElem::from_coltype(scalar)?,
+                };
+                element = Some(match element {
+                    Some(prior) => unify_arr_elem(prior, next).ok()?,
+                    None => next,
+                });
+            }
+            Some(ColType::Array(
+                element.unwrap_or(super::types::ArrElem::Text),
+            ))
+        }
+        Expr::Slice { base, .. } => static_type(base, row),
+        Expr::Subscript { base, .. } => match static_type(base, row)? {
+            ColType::Array(element) => Some(element.to_coltype()),
+            _ => None,
+        },
         Expr::Unary {
             operator: UnaryOp::Neg,
             operand,
@@ -5592,28 +5756,13 @@ fn static_type<'a>(e: &Expr<'a>, row: &impl ColumnLookup<'a>) -> Option<ColType>
             operator,
             left,
             right,
-        } => match operator {
-            BinaryOp::Eq
-            | BinaryOp::NotEq
-            | BinaryOp::Lt
-            | BinaryOp::LtEq
-            | BinaryOp::Gt
-            | BinaryOp::GtEq
-            | BinaryOp::And
-            | BinaryOp::Or => Some(ColType::Bool),
-            BinaryOp::Concat => match (static_type(left, row), static_type(right, row)) {
-                (Some(ColType::Bytea), Some(ColType::Bytea)) => Some(ColType::Bytea),
-                (Some(ColType::Bit { .. }), Some(ColType::Bit { .. })) => {
-                    Some(ColType::Bit { varying: true })
-                }
-                _ => Some(ColType::Text),
-            },
-            _ => {
-                let l = static_type(left, row)?;
-                let r = static_type(right, row)?;
-                unify_types(l, r)
-            }
-        },
+        } => super::exec::builtin_binary_type(
+            operator,
+            static_type(left, row)?.oid(),
+            static_type(right, row)?.oid(),
+        )
+        .ok()
+        .and_then(|(oid, _)| ColType::from_oid(oid)),
         Expr::Case {
             whens, otherwise, ..
         } => case_result_type(whens, otherwise, row),
@@ -6819,12 +6968,25 @@ fn concat<'a>(
 /// Concatenates two operands where at least one is an array, following
 /// PostgreSQL's `array || array`, `array || element`, and `element || array`.
 fn array_concat<'a>(l: Datum<'a>, r: Datum<'a>, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
+    let invalid = || {
+        sql_err!(
+            sqlstate::UNDEFINED_FUNCTION,
+            "operator does not exist: {} || {}",
+            type_name_of(&l),
+            type_name_of(&r)
+        )
+    };
     let element = match (&l, &r) {
         (Datum::Array { element: left, .. }, Datum::Array { element: right, .. }) => {
-            unify_arr_elem(*left, *right)
+            super::types::common_array_element(*left, *right).map_err(|_| invalid())?
         }
         (Datum::Array { element, .. }, scalar) | (scalar, Datum::Array { element, .. }) => {
-            ArrElem::from_datum(scalar).map_or(*element, |scalar| unify_arr_elem(*element, scalar))
+            match ArrElem::from_datum(scalar) {
+                Some(scalar) => {
+                    super::types::common_array_element(*element, scalar).map_err(|_| invalid())?
+                }
+                None => *element,
+            }
         }
         _ => unreachable!("caller ensures one side is an array"),
     };

@@ -44185,46 +44185,7 @@ impl Storage {
             return true;
         }
 
-        matches!(
-            (actual_oid, expected_oid),
-            // Numeric widening casts from pg_cast.castcontext = 'i'.
-            (oid::INT2, oid::INT4 | oid::INT8 | oid::NUMERIC | oid::FLOAT4 | oid::FLOAT8)
-                | (oid::INT4, oid::INT8 | oid::NUMERIC | oid::FLOAT4 | oid::FLOAT8)
-                | (oid::INT8, oid::NUMERIC | oid::FLOAT4 | oid::FLOAT8)
-                | (oid::NUMERIC, oid::FLOAT4 | oid::FLOAT8)
-                | (oid::FLOAT4, oid::FLOAT8)
-                // PostgreSQL string-category binary and function casts.
-                | (oid::BPCHAR, oid::VARCHAR | oid::NAME | oid::TEXT)
-                | (oid::VARCHAR, oid::BPCHAR | oid::NAME | oid::TEXT | oid::REGCLASS)
-                | (oid::TEXT, oid::BPCHAR | oid::VARCHAR | oid::NAME | oid::REGCLASS)
-                | (oid::NAME, oid::TEXT)
-                | (oid::BIT, oid::VARBIT)
-                | (oid::VARBIT, oid::BIT)
-                // Date/time and network casts accepted implicitly by PG18.
-                | (oid::DATE, oid::TIMESTAMP | oid::TIMESTAMPTZ)
-                | (oid::TIMESTAMP, oid::TIMESTAMPTZ)
-                | (oid::TIME, oid::TIMETZ | oid::INTERVAL)
-                | (oid::CIDR, oid::INET)
-                | (oid::MACADDR, oid::MACADDR8)
-                | (oid::MACADDR8, oid::MACADDR)
-                // OID alias types are binary-coercible in both directions;
-                // integer casts to OID aliases follow PostgreSQL's pg_cast.
-                | (oid::INT2 | oid::INT4 | oid::INT8, oid::OID)
-                | (oid::INT2 | oid::INT4 | oid::INT8, oid::REGPROC)
-                | (oid::INT2 | oid::INT4 | oid::INT8, oid::REGPROCEDURE)
-                | (oid::INT2 | oid::INT4 | oid::INT8, oid::REGOPER)
-                | (oid::INT2 | oid::INT4 | oid::INT8, oid::REGOPERATOR)
-                | (oid::INT2 | oid::INT4 | oid::INT8, oid::REGCLASS)
-                | (oid::INT2 | oid::INT4 | oid::INT8, oid::REGTYPE)
-                | (oid::INT2 | oid::INT4 | oid::INT8, oid::REGNAMESPACE)
-                | (oid::INT2 | oid::INT4 | oid::INT8, oid::REGROLE)
-                | (oid::OID, oid::REGPROC | oid::REGPROCEDURE | oid::REGOPER | oid::REGOPERATOR | oid::REGCLASS | oid::REGTYPE | oid::REGNAMESPACE | oid::REGROLE)
-                | (oid::REGPROC | oid::REGPROCEDURE | oid::REGOPER | oid::REGOPERATOR | oid::REGCLASS | oid::REGTYPE | oid::REGNAMESPACE | oid::REGROLE, oid::OID)
-                | (oid::REGPROC, oid::REGPROCEDURE)
-                | (oid::REGPROCEDURE, oid::REGPROC)
-                | (oid::REGOPER, oid::REGOPERATOR)
-                | (oid::REGOPERATOR, oid::REGOPER)
-        )
+        crate::sql::types::builtin_implicit_cast(actual.ctype, expected.ctype)
     }
 
     pub(crate) fn domain_base_type_for_oid(&self, type_oid: i32, txid: u32) -> Option<ColType> {

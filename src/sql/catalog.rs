@@ -29512,54 +29512,7 @@ fn pg_type<'a>(
         ColType::Geometry(super::types::GeometryKind::Circle),
         ColType::Record,
     ];
-    let category = |t: &ColType| match t {
-        ColType::Void | ColType::Internal | ColType::PgDdlCommand | ColType::Record => "P",
-        ColType::Bool => "B",
-        ColType::Int2
-        | ColType::Int4
-        | ColType::Oid
-        | ColType::Int8
-        | ColType::Float4
-        | ColType::Float8
-        | ColType::Numeric
-        | ColType::Money
-        | ColType::Regtype
-        | ColType::Regproc
-        | ColType::Regprocedure
-        | ColType::Regoper
-        | ColType::Regoperator
-        | ColType::Regclass
-        | ColType::Regnamespace
-        | ColType::Regrole
-        | ColType::Regconfig
-        | ColType::Regdictionary
-        | ColType::Regcollation => "N",
-        ColType::Date | ColType::Time | ColType::Timestamp | ColType::Timestamptz => "D",
-        ColType::Interval => "T",
-        ColType::Xid
-        | ColType::Xid8
-        | ColType::Tid
-        | ColType::Cid
-        | ColType::PgSnapshot
-        | ColType::TxidSnapshot
-        | ColType::PgLsn
-        | ColType::AclItem
-        | ColType::Refcursor
-        | ColType::Uuid
-        | ColType::Bytea
-        | ColType::TsVector
-        | ColType::TsQuery
-        | ColType::Xml
-        | ColType::Jsonpath => "U",
-        ColType::PgNodeTree
-        | ColType::PgNdistinct
-        | ColType::PgDependencies
-        | ColType::PgMcvList => "Z",
-        // Network address types are PostgreSQL typcategory 'I'.
-        ColType::Inet | ColType::Cidr | ColType::Macaddr | ColType::Macaddr8 => "I",
-        ColType::Geometry(_) => "G",
-        _ => "S",
-    };
+    let category = |t: &ColType| super::types::type_category(*t);
     let visible_domains = (0..storage.domain_count())
         .filter(|&slot| storage.domain_slot_visible_to(slot, txid))
         .count();

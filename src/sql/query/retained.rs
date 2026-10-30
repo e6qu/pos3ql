@@ -84,6 +84,15 @@ fn retained_expression(
                 retained_expression(condition, catalog) && retained_expression(value, catalog)
             }) && otherwise.is_none_or(|value| retained_expression(value, catalog))
         }
+        Expr::Array(items) => items.iter().all(|item| retained_expression(item, catalog)),
+        Expr::Subscript { base, index } => {
+            retained_expression(base, catalog) && retained_expression(index, catalog)
+        }
+        Expr::Slice { base, lower, upper } => {
+            retained_expression(base, catalog)
+                && lower.is_none_or(|bound| retained_expression(bound, catalog))
+                && upper.is_none_or(|bound| retained_expression(bound, catalog))
+        }
         _ => false,
     }
 }
@@ -119,6 +128,15 @@ fn row_independent(expression: &Expr<'_>, scope: &QueryScope<'_>) -> bool {
             whens.iter().all(|(condition, value)| {
                 row_independent(condition, scope) && row_independent(value, scope)
             }) && otherwise.is_none_or(|value| row_independent(value, scope))
+        }
+        Expr::Array(items) => items.iter().all(|item| row_independent(item, scope)),
+        Expr::Subscript { base, index } => {
+            row_independent(base, scope) && row_independent(index, scope)
+        }
+        Expr::Slice { base, lower, upper } => {
+            row_independent(base, scope)
+                && lower.is_none_or(|bound| row_independent(bound, scope))
+                && upper.is_none_or(|bound| row_independent(bound, scope))
         }
         _ => false,
     }
@@ -216,6 +234,26 @@ fn bind_expression<'a>(
                 synthetic: *synthetic,
             }
         }
+        Expr::Array(items) => {
+            let items = arena.alloc_slice_copy(items).map_err(|_| full())?;
+            for item in items.iter_mut() {
+                *item = bind_expression(item, arena)?;
+            }
+            Expr::Array(items)
+        }
+        Expr::Subscript { base, index } => Expr::Subscript {
+            base: bind_expression(base, arena)?,
+            index: bind_expression(index, arena)?,
+        },
+        Expr::Slice { base, lower, upper } => Expr::Slice {
+            base: bind_expression(base, arena)?,
+            lower: lower
+                .map(|value| bind_expression(value, arena))
+                .transpose()?,
+            upper: upper
+                .map(|value| bind_expression(value, arena))
+                .transpose()?,
+        },
         _ => return Ok(expression),
     };
     Ok(arena.alloc(bound).map_err(|_| full())?)

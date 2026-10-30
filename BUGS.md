@@ -5,7 +5,8 @@ No known defects are blocked by an external dependency or an intractable problem
 Fix every reproducible defect in the PR that finds it. Record an entry only
 with its reproducer, observed behavior and exact external blocker or reason it
 cannot be repaired. Keep reproductions, regression checks and PostgreSQL
-comparisons in the fixing PR, including result types and when errors occur.
+comparisons in the fixing PR, including result types, input lifetimes and
+when errors occur.
 Preserve failed outputs and diagnostics before removing temporary fixtures.
 See [CONTRIBUTING.md](CONTRIBUTING.md).
 

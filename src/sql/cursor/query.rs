@@ -158,12 +158,17 @@ fn query_full() -> SqlError {
 
 fn copy_values<'a>(arena: &'a Arena, values: &[Datum]) -> Result<&'a [Datum<'a>], SqlError> {
     let length = crate::sql::exec::projected_row_len(values)?;
-    let encoded = arena.alloc_slice_with(length, |_| 0u8).map_err(|_| query_full())?;
+    let encoded = arena
+        .alloc_slice_with(length, |_| 0u8)
+        .map_err(|_| query_full())?;
     crate::sql::exec::encode_projected_into(values, encoded)?;
-    let copied = arena.alloc_slice_with(values.len(), |_| Datum::Null).map_err(|_| query_full())?;
+    let copied = arena
+        .alloc_slice_with(values.len(), |_| Datum::Null)
+        .map_err(|_| query_full())?;
     // Width and tags were written above; the remaining decode failure is
     // insufficient arena space for a nested record's field descriptors.
-    crate::sql::exec::decode_projected_row_into(encoded, arena, copied).map_err(|_| query_full())?;
+    crate::sql::exec::decode_projected_row_into(encoded, arena, copied)
+        .map_err(|_| query_full())?;
     Ok(copied)
 }
 
@@ -430,19 +435,42 @@ mod tests {
         let mut query = CursorQuery::new(&mut budget, 256 << 10).unwrap();
         let names: Vec<_> = (0..256).map(|index| format!("field{index}")).collect();
         let mut text = String::from("opening value");
-        let fields: Vec<_> = names.iter().map(|name| RecordField { name, type_oid: oid::TEXT, value: Datum::Text(&text) }).collect();
-        let local = CursorLocal { name: SqlName::parse("r").unwrap(), ctype: ColType::Record, user_type: None, value: Datum::Record(&fields) };
-        crate::mem::guard::forbid_alloc(|| query.bind("SELECT $1, r.field255", &[Datum::Record(&fields)], &[local])).unwrap();
+        let fields: Vec<_> = names
+            .iter()
+            .map(|name| RecordField {
+                name,
+                type_oid: oid::TEXT,
+                value: Datum::Text(&text),
+            })
+            .collect();
+        let local = CursorLocal {
+            name: SqlName::parse("r").unwrap(),
+            ctype: ColType::Record,
+            user_type: None,
+            value: Datum::Record(&fields),
+        };
+        crate::mem::guard::forbid_alloc(|| {
+            query.bind("SELECT $1, r.field255", &[Datum::Record(&fields)], &[local])
+        })
+        .unwrap();
         drop(fields);
         drop(names);
         text.clear();
-        crate::mem::guard::forbid_alloc(|| query.with_query(|_, params, locals, _| {
-            let Datum::Record(fields) = params[0] else { panic!("record parameter") };
-            assert_eq!(fields.len(), 256);
-            assert_eq!(fields[255].name, "field255");
-            assert_eq!(fields[255].value, Datum::Text("opening value"));
-            assert_eq!(locals.lookup(Some("r"), "field255").unwrap(), Datum::Text("opening value"));
-        })).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            query.with_query(|_, params, locals, _| {
+                let Datum::Record(fields) = params[0] else {
+                    panic!("record parameter")
+                };
+                assert_eq!(fields.len(), 256);
+                assert_eq!(fields[255].name, "field255");
+                assert_eq!(fields[255].value, Datum::Text("opening value"));
+                assert_eq!(
+                    locals.lookup(Some("r"), "field255").unwrap(),
+                    Datum::Text("opening value")
+                );
+            })
+        })
+        .unwrap();
     }
 
     #[test]
@@ -460,7 +488,9 @@ mod tests {
         let error = crate::mem::guard::forbid_alloc(|| query.bind(&wide, &[], &[])).unwrap_err();
         assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
         assert!(error.message.as_str().contains("cursor_query_bytes"));
-        let error = crate::mem::guard::forbid_alloc(|| query.bind("SELECT $1", &[Datum::Text(&wide)], &[])).unwrap_err();
+        let error =
+            crate::mem::guard::forbid_alloc(|| query.bind("SELECT $1", &[Datum::Text(&wide)], &[]))
+                .unwrap_err();
         assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
         assert!(error.message.as_str().contains("cursor_query_bytes"));
         crate::mem::guard::forbid_alloc(|| query.bind("SELECT 1", &[], &[])).unwrap();

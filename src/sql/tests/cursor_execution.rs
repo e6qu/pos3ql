@@ -1,6 +1,31 @@
 use super::*;
 
 #[test]
+fn cursor_array_domain_defaults_encode_their_composite_base() {
+    let config = test_config("cursor-array-composite-domain-default");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(&mut engine, "CREATE TYPE cursor_pair AS (id integer,note text); \
+        CREATE DOMAIN approved_pair AS cursor_pair CHECK ((VALUE).id>0); \
+        CREATE TABLE pair_arrays(items approved_pair[] DEFAULT ARRAY[ROW(7,'saved')::approved_pair]); \
+        INSERT INTO pair_arrays DEFAULT VALUES; BEGIN; \
+        DECLARE pairs NO SCROLL CURSOR FOR SELECT items[1] FROM pair_arrays", true);
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "FETCH ALL FROM pairs; COMMIT", true)),
+        ["(7,saved)"]
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT (items[1]).id,(items[1]).note,pg_typeof(items) FROM pair_arrays",
+            true
+        )),
+        ["7|saved|approved_pair[]"]
+    );
+}
+
+#[test]
 fn cursor_array_constructors_preserve_common_types_and_fixed_arena_limits() {
     use crate::sql::cursor::FetchMotion;
     use crate::sql::types::ArrElem;
@@ -15,7 +40,7 @@ fn cursor_array_constructors_preserve_common_types_and_fixed_arena_limits() {
         BEGIN; DECLARE typed NO SCROLL CURSOR FOR SELECT \
         CASE WHEN id=1 THEN ARRAY[id,2147483648] ELSE ARRAY[id,id+1] END, \
         CASE WHEN id=1 THEN vals[1:2] ELSE ARRAY[2147483648] END, \
-        ARRAY[ARRAY[id],ARRAY[2147483648]] FROM typed_arrays",
+        ARRAY[ARRAY[id],ARRAY[2147483648]], ARRAY[id]||ARRAY[2147483648] FROM typed_arrays",
         true,
     );
     session
@@ -24,14 +49,14 @@ fn cursor_array_constructors_preserve_common_types_and_fixed_arena_limits() {
         .unwrap()
         .expect("retained typed array plan");
     for expected in [
-        "{1,2147483648}|{10,20}|{{1},{2147483648}}",
-        "{2,3}|{2147483648}|{{2},{2147483648}}",
+        "{1,2147483648}|{10,20}|{{1},{2147483648}}|{1,2147483648}",
+        "{2,3}|{2147483648}|{{2},{2147483648}}|{2,2147483648}",
     ] {
         assert_eq!(
             data_rows(&session.success(&mut engine, "FETCH NEXT FROM typed", true)),
             [expected]
         );
-        let mut values = [Datum::Null; 3];
+        let mut values = [Datum::Null; 4];
         crate::mem::guard::forbid_alloc(|| {
             session
                 .cursors

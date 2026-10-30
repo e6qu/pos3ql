@@ -122,6 +122,11 @@ SELECT ARRAY[1::money,2];
 SELECT ARRAY[ARRAY[1],NULL::integer[]];
 SELECT ARRAY[NULL::integer[],NULL::integer[]];
 SELECT ARRAY[ARRAY[1::smallint],ARRAY[2147483648]],ARRAY[NULL,DATE '2026-10-01'];
+SELECT ARRAY[ARRAY[1],ARRAY[TRUE]];
+SELECT ARRAY[ARRAY[NULL],ARRAY[1]];
+SELECT pg_typeof(ARRAY[1]||ARRAY[2147483648]),pg_typeof(ARRAY[1::real]||ARRAY[2::numeric]),
+       ARRAY[1]||ARRAY[2147483648],ARRAY[1::smallint]||2,3||ARRAY[4::smallint];
+SELECT ARRAY[1]||ARRAY[TRUE];
 SELECT typname,typcategory FROM pg_type WHERE typname IN ('timetz','char','bit','varbit','json','jsonb') ORDER BY typname;
 BEGIN;
 DECLARE typed_arrays NO SCROLL CURSOR FOR SELECT

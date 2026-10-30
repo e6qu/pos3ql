@@ -3554,10 +3554,38 @@ pub(crate) fn builtin_binary_type(
         Shl | Shr if is_range_oid(lo) || is_range_oid(ro) => of(ColType::Bool),
         // `jsonb - key/keys/index` deletes and returns jsonb.
         Sub if lo == oid::JSONB => (oid::JSONB, -1),
-        // `||` concatenates arrays when either side is an array (the
-        // array type is preserved), otherwise it is text concatenation.
-        Concat if coltype_of_oid(lo).is_some_and(|t| matches!(t, ColType::Array(_))) => (lo, -1),
-        Concat if coltype_of_oid(ro).is_some_and(|t| matches!(t, ColType::Array(_))) => (ro, -1),
+        Concat
+            if [lo, ro]
+                .iter()
+                .any(|oid| matches!(coltype_of_oid(*oid), Some(ColType::Array(_)))) =>
+        {
+            let left = coltype_of_oid(lo);
+            let right = coltype_of_oid(ro);
+            let (array, other) = match (left, right) {
+                (Some(ColType::Array(element)), other) => (element, other),
+                (other, Some(ColType::Array(element))) => (element, other),
+                _ => unreachable!("one operand is an array"),
+            };
+            let element = match other {
+                None => Ok(array),
+                Some(ColType::Array(element)) => {
+                    crate::sql::types::common_array_element(array, element)
+                }
+                Some(scalar) => crate::sql::types::ArrElem::from_coltype(scalar)
+                    .ok_or(crate::sql::types::CommonTypeError::Conversion {
+                        from: scalar,
+                        to: array.to_coltype(),
+                    })
+                    .and_then(|element| crate::sql::types::common_array_element(array, element)),
+            };
+            of(ColType::Array(element.map_err(|_| {
+                operator_undefined(
+                    left.unwrap_or(ColType::Text),
+                    "||",
+                    right.unwrap_or(ColType::Text),
+                )
+            })?))
+        }
         // `^` stays numeric when an operand is numeric (and none is a
         // float); otherwise it is double precision.
         Pow => {

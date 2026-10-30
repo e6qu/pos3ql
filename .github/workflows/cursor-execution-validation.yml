@@ -110,6 +110,76 @@ jobs:
           RUN_SLT: "0"
           RUN_FUZZ: "0"
         run: bash tests/external/ci_diff.sh "$PWD/target/debug/pos3ql" "$RUNNER_TEMP/query-exact"
+      - name: Compare cursor ownership with PostgreSQL under forced spilling
+        env:
+          PGHOST: 127.0.0.1
+          PGPORT: "5432"
+          PGUSER: postgres
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/cursor-spill"
+          mkdir -p "$evidence"
+          python3 tests/external/s3_test_server.py --root "$evidence/objects" --port 19311 \
+            --bucket cursor-validation --region test-region --access-key test-access \
+            --secret-key test-secret --page-size 7 --latency-ms 1 \
+            --audit-file "$evidence/object-audit.jsonl" > "$evidence/object-store.log" 2>&1 &
+          object_pid=$!
+          server_pid=
+          trap 'if [[ -n "$server_pid" ]]; then kill "$server_pid" 2>/dev/null || true; fi; kill "$object_pid" 2>/dev/null || true' EXIT
+          for attempt in $(seq 1 50); do
+            kill -0 "$object_pid"
+            if nc -z 127.0.0.1 19311; then break; fi
+            sleep 0.1
+          done
+          nc -z 127.0.0.1 19311
+          cat tests/external/differential-capacities.conf > "$evidence/server.conf"
+          cat >> "$evidence/server.conf" <<EOF
+          listen_addr = 127.0.0.1:15598
+          data_dir = $evidence/data
+          object_store = on
+          object_store_endpoint = 127.0.0.1:19311
+          object_store_bucket = cursor-validation
+          object_store_region = test-region
+          object_store_access_key = test-access
+          object_store_secret_key = test-secret
+          object_store_prefix = cursors/
+          wal_upload = on
+          wal_upload_sync = on
+          memtable_bytes = 256KiB
+          work_arena_bytes = 192MiB
+          max_tables = 64
+          table_rows = 8192
+          max_value_indexes = 64
+          max_prepared_transactions = 8
+          extension_control_path = $PWD/tests/external/extensions
+          EOF
+          target/debug/pos3ql --config "$evidence/server.conf" > "$evidence/server.log" 2>&1 &
+          server_pid=$!
+          for attempt in $(seq 1 100); do
+            kill -0 "$server_pid"
+            if rg -q 'accepting connections$' "$evidence/server.log"; then break; fi
+            sleep 0.1
+          done
+          rg -q 'accepting connections$' "$evidence/server.log"
+          source=tests/external/differential_exact/38_cursor_query_ownership.sql
+          for port in 5432 15598; do
+            if [[ "$port" == 5432 ]]; then
+              export PGOPTIONS='-c timezone=UTC -c extension_control_path=/tmp/pos3ql-extensions'
+            else
+              unset PGOPTIONS
+            fi
+            psql -h 127.0.0.1 -p "$port" -U postgres -d postgres -X -e -P pager=off \
+                -v VERBOSITY=verbose -f "$source" > "$evidence/$port.stdout" 2> "$evidence/$port.stderr"
+            python3 tests/external/differential_diagnostics.py --source "$source" \
+              --stdout "$evidence/$port.stdout" --stderr "$evidence/$port.stderr" \
+              --input-diagnostics verbose --diagnostics verbose > "$evidence/$port.normalized"
+          done
+          diff -u "$evidence/5432.normalized" "$evidence/15598.normalized"
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: cursor-spill-${{ github.sha }}
+          path: ${{ runner.temp }}/cursor-spill/
       - uses: actions/upload-artifact@v5
         if: always()
         with:

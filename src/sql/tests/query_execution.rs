@@ -38,6 +38,7 @@ fn cursor_retained_cold_fetch_resumes_after_delivered_rows() {
         0,
         320,
         CursorScroll::NoScroll,
+        17,
     );
 }
 
@@ -49,6 +50,7 @@ fn cursor_retained_cold_filter_resumes_after_rejected_and_delivered_rows() {
         0,
         160,
         CursorScroll::NoScroll,
+        17,
     );
 }
 
@@ -60,6 +62,7 @@ fn cursor_retained_cold_row_bounds_resume_skips_and_stop_early() {
         9,
         71,
         CursorScroll::NoScroll,
+        17,
     );
 }
 
@@ -71,6 +74,7 @@ fn cursor_retained_cold_scroll_reuses_history_after_storage_waits() {
         9,
         71,
         CursorScroll::Scroll,
+        17,
     );
 }
 
@@ -82,6 +86,7 @@ fn cursor_retained_cold_default_mode_resumes_and_scrolls() {
         9,
         71,
         CursorScroll::Default,
+        17,
     );
 }
 
@@ -95,6 +100,7 @@ fn cursor_retained_cold_case_resumes_conditions_and_selected_values() {
         10,
         70,
         CursorScroll::NoScroll,
+        17,
     );
 }
 
@@ -107,10 +113,18 @@ fn cursor_retained_cold_arrays_resume_values_and_filters() {
         11,
         69,
         CursorScroll::NoScroll,
+        23,
     );
 }
 
-fn cold_cursor_fetch(select: &str, stride: i32, skip: i32, take: i32, mode: CursorScroll) {
+fn cold_cursor_fetch(
+    select: &str,
+    stride: i32,
+    skip: i32,
+    take: i32,
+    mode: CursorScroll,
+    batch: i32,
+) {
     use crate::sql::cursor::FetchMotion;
 
     let (scroll, scrollable, mode_name) = match mode {
@@ -205,6 +219,8 @@ fn cold_cursor_fetch(select: &str, stride: i32, skip: i32, take: i32, mode: Curs
     let mut count = 0;
     let mut waited_after_prefix = false;
     let mut waited_inside_fetch = false;
+    let mut wait_positions = Vec::new();
+    let fetch = format!("FETCH FORWARD {batch} FROM cold");
     let mut deadline = Instant::now() + Duration::from_secs(2);
     session.send.clear();
     session.arena.reset();
@@ -213,7 +229,7 @@ fn cold_cursor_fetch(select: &str, stride: i32, skip: i32, take: i32, mode: Curs
         let previous = engine.replace_read_owner(Some(owner));
         let result = crate::mem::guard::forbid_alloc(|| {
             engine.execute_simple_from(
-                "FETCH FORWARD 17 FROM cold",
+                &fetch,
                 0,
                 &session.arena,
                 &mut session.transaction,
@@ -239,7 +255,7 @@ fn cold_cursor_fetch(select: &str, stride: i32, skip: i32, take: i32, mode: Curs
                     assert_eq!(command_tags(session.send.readable()), ["FETCH 0"]);
                     break;
                 }
-                let rows = (take - count).min(17);
+                let rows = (take - count).min(batch);
                 assert_eq!(fetched.len(), rows as usize);
                 assert_eq!(
                     command_tags(session.send.readable()),
@@ -271,6 +287,10 @@ fn cold_cursor_fetch(select: &str, stride: i32, skip: i32, take: i32, mode: Curs
                     "a suspended FETCH must not emit a partial response"
                 );
                 waited_after_prefix |= count != 0;
+                let position = (count, session.cursors.produced_rows(slot));
+                if wait_positions.last() != Some(&position) {
+                    wait_positions.push(position);
+                }
                 if session.cursors.produced_rows(slot) > count as usize && !waited_inside_fetch {
                     waited_inside_fetch = true;
                     assert_eq!(
@@ -301,7 +321,7 @@ fn cold_cursor_fetch(select: &str, stride: i32, skip: i32, take: i32, mode: Curs
     assert_eq!(count, take);
     assert!(
         waited_inside_fetch,
-        "a fetch must retain buffered rows while another connection runs"
+        "a fetch must retain buffered rows while another connection runs: {wait_positions:?}"
     );
     assert!(
         waited_after_prefix,

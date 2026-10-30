@@ -39915,7 +39915,7 @@ pub fn create_table_as(
         let live_sequence = crate::sql::sequence::ReplaySeqEval::new(
             crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid),
             &replay_state,
-                    arena,
+            arena,
         );
         let sel = match super::query::expand_ctes_exec(
             sel,
@@ -40159,7 +40159,7 @@ pub fn refresh_materialized_view(
     let live_sequence = crate::sql::sequence::ReplaySeqEval::new(
         crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid),
         &replay_state,
-                    arena,
+        arena,
     );
     let dependencies = match storage.snapshot_matview_dependencies(slot, txn.txid, arena) {
         Ok(dependencies) => dependencies,

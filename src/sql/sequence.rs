@@ -221,15 +221,32 @@ fn statement_call(
 /// while waiting for a mutable SQL routine. Sequence calls are replayed in
 /// logical call order, never advanced again by a retry.
 pub struct SequenceReplayState {
-    first: Cell<Option<ArenaHandle<SequenceReplayValue>>>,
-    last: Cell<Option<ArenaHandle<SequenceReplayValue>>>,
-    next: Cell<Option<ArenaHandle<SequenceReplayValue>>>,
+    first: Cell<Option<ArenaHandle<SequenceReplayChunk>>>,
+    last: Cell<Option<ArenaHandle<SequenceReplayChunk>>>,
+    next: Cell<Option<SequenceReplayPosition>>,
 }
 
 #[derive(Clone, Copy)]
-struct SequenceReplayValue {
-    value: i64,
-    next: Option<ArenaHandle<SequenceReplayValue>>,
+struct SequenceReplayPosition {
+    chunk: ArenaHandle<SequenceReplayChunk>,
+    index: usize,
+}
+
+const SEQUENCE_VALUES_PER_CHUNK: usize = 16;
+
+#[derive(Clone, Copy)]
+struct SequenceReplayChunk {
+    values: [i64; SEQUENCE_VALUES_PER_CHUNK],
+    len: usize,
+    next: Option<ArenaHandle<SequenceReplayChunk>>,
+}
+
+impl SequenceReplayChunk {
+    const EMPTY: Self = Self {
+        values: [0; SEQUENCE_VALUES_PER_CHUNK],
+        len: 0,
+        next: None,
+    };
 }
 
 impl SequenceReplayState {
@@ -242,33 +259,84 @@ impl SequenceReplayState {
     }
 
     pub fn begin_attempt(&self) {
-        self.next.set(self.first.get());
+        self.next.set(
+            self.first
+                .get()
+                .map(|chunk| SequenceReplayPosition { chunk, index: 0 }),
+        );
     }
 
-    fn invoke(&self, arena: &Arena, action: impl FnOnce() -> Result<i64, SqlError>) -> Result<i64, SqlError> {
-        let stale = || sql_err!(sqlstate::SERIALIZATION_FAILURE, "volatile sequence replay state was reset or replaced");
-        if let Some(handle) = self.next.get() {
-            let recorded = arena.retained(handle).ok_or_else(stale)?;
-            self.next.set(recorded.next);
-            return Ok(recorded.value);
+    fn invoke(
+        &self,
+        arena: &Arena,
+        action: impl FnOnce() -> Result<i64, SqlError>,
+    ) -> Result<i64, SqlError> {
+        let stale = || {
+            sql_err!(
+                sqlstate::SERIALIZATION_FAILURE,
+                "volatile sequence replay state was reset or replaced"
+            )
+        };
+        if let Some(position) = self.next.get() {
+            let recorded = arena.retained(position.chunk).ok_or_else(stale)?;
+            if position.index >= recorded.len {
+                return Err(stale());
+            }
+            let value = recorded.values[position.index];
+            self.next.set(if position.index + 1 < recorded.len {
+                Some(SequenceReplayPosition {
+                    index: position.index + 1,
+                    ..position
+                })
+            } else {
+                recorded
+                    .next
+                    .map(|chunk| SequenceReplayPosition { chunk, index: 0 })
+            });
+            return Ok(value);
         }
-        let previous = self.last.get().map(|handle| {
-            let recorded = arena.retained(handle).ok_or_else(stale)?;
-            Ok::<_, SqlError>((handle, recorded))
-        }).transpose()?;
-        // Reserve the record before issuing an irreversible sequence value.
-        // Handles name the allocation, so moving the state or arena is safe.
-        let handle = arena.retain(SequenceReplayValue { value: 0, next: None }).map_err(|_| {
-            sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "volatile sequence replay exceeds statement memory")
-        })?;
+        let previous = self
+            .last
+            .get()
+            .map(|handle| {
+                let recorded = arena.retained(handle).ok_or_else(stale)?;
+                Ok::<_, SqlError>((handle, recorded))
+            })
+            .transpose()?;
+        // Fixed chunks keep values contiguous without copying a growing list.
+        // Reserve their space before issuing an irreversible sequence value.
+        let (handle, mut recorded, appended) = match previous {
+            Some((handle, recorded)) if recorded.len < SEQUENCE_VALUES_PER_CHUNK => {
+                (handle, recorded, false)
+            }
+            _ => {
+                let handle = arena.retain(SequenceReplayChunk::EMPTY).map_err(|_| {
+                    sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "volatile sequence replay exceeds statement memory"
+                    )
+                })?;
+                (handle, SequenceReplayChunk::EMPTY, true)
+            }
+        };
         let value = action()?;
-        assert!(arena.replace_retained(handle, SequenceReplayValue { value, next: None }));
-        if let Some((last, recorded)) = previous {
-            assert!(arena.replace_retained(last, SequenceReplayValue { next: Some(handle), ..recorded }));
-        } else {
-            self.first.set(Some(handle));
+        recorded.values[recorded.len] = value;
+        recorded.len += 1;
+        assert!(arena.replace_retained(handle, recorded));
+        if appended {
+            if let Some((last, recorded)) = previous {
+                assert!(arena.replace_retained(
+                    last,
+                    SequenceReplayChunk {
+                        next: Some(handle),
+                        ..recorded
+                    }
+                ));
+            } else {
+                self.first.set(Some(handle));
+            }
+            self.last.set(Some(handle));
         }
-        self.last.set(Some(handle));
         Ok(value)
     }
 }
@@ -291,7 +359,11 @@ pub struct ReplaySeqEval<'base, 'state, 'arena> {
 }
 
 impl<'base, 'state, 'arena> ReplaySeqEval<'base, 'state, 'arena> {
-    pub fn new(base: SeqEval<'base>, state: &'state SequenceReplayState, arena: &'arena Arena) -> Self {
+    pub fn new(
+        base: SeqEval<'base>,
+        state: &'state SequenceReplayState,
+        arena: &'arena Arena,
+    ) -> Self {
         Self { base, state, arena }
     }
 }
@@ -731,13 +803,16 @@ mod tests {
     #[test]
     fn replay_state_reports_statement_memory_exhaustion() {
         let mut budget = Budget::new(1024);
-        let arena = Arena::new(&mut budget, "small sequence replay", 64).unwrap();
+        let arena = Arena::new(&mut budget, "small sequence replay", 256).unwrap();
         let replay = SequenceReplayState::empty();
         let calls = Cell::new(0i64);
         crate::mem::guard::forbid_alloc(|| {
             loop {
                 let before = calls.get();
-                match replay.invoke(&arena, || { calls.set(before + 1); Ok(before) }) {
+                match replay.invoke(&arena, || {
+                    calls.set(before + 1);
+                    Ok(before)
+                }) {
                     Ok(value) => assert_eq!(value, before),
                     Err(error) => {
                         assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
@@ -750,7 +825,12 @@ mod tests {
             assert!(calls.get() > 0);
             replay.begin_attempt();
             for expected in 0..calls.get() {
-                assert_eq!(replay.invoke(&arena, || panic!("replay must not issue another value")).unwrap(), expected);
+                assert_eq!(
+                    replay
+                        .invoke(&arena, || panic!("replay must not issue another value"))
+                        .unwrap(),
+                    expected
+                );
             }
         });
     }
@@ -759,29 +839,79 @@ mod tests {
         let mut budget = Budget::new(32 << 10);
         let mut query = crate::sql::cursor::CursorQuery::new(&mut budget, 16 << 10).unwrap();
         let calls = Cell::new(0);
+        let prefix = SEQUENCE_VALUES_PER_CHUNK as i64 + 3;
         crate::mem::guard::forbid_alloc(|| {
-            query.bind("SELECT $1", &[crate::sql::types::Datum::Null], &[]).unwrap();
-            query.with_query(|_, _, arena| {
-                for expected in 1..=3 {
-                    let value = query.sequence_replay.invoke(arena, || { calls.set(calls.get() + 1); Ok(calls.get()) }).unwrap();
-                    assert_eq!(value, expected);
-                }
-            }).unwrap();
+            query
+                .bind("SELECT $1", &[crate::sql::types::Datum::Null], &[])
+                .unwrap();
+            query
+                .with_query(|_, _, arena| {
+                    for expected in 1..=prefix {
+                        let value = query
+                            .sequence_replay
+                            .invoke(arena, || {
+                                calls.set(calls.get() + 1);
+                                Ok(calls.get())
+                            })
+                            .unwrap();
+                        assert_eq!(value, expected);
+                    }
+                })
+                .unwrap();
         });
         let mut moved = query;
         crate::mem::guard::forbid_alloc(|| {
             moved.sequence_replay.begin_attempt();
-            moved.with_query(|_, _, arena| {
-                for expected in 1..=3 {
-                    assert_eq!(moved.sequence_replay.invoke(arena, || panic!("issued value must not repeat")).unwrap(), expected);
-                }
-            }).unwrap();
-            assert_eq!(calls.get(), 3);
+            moved
+                .with_query(|_, _, arena| {
+                    for expected in 1..=prefix {
+                        assert_eq!(
+                            moved
+                                .sequence_replay
+                                .invoke(arena, || panic!("issued value must not repeat"))
+                                .unwrap(),
+                            expected
+                        );
+                    }
+                    assert_eq!(
+                        moved
+                            .sequence_replay
+                            .invoke(arena, || {
+                                calls.set(calls.get() + 1);
+                                Ok(calls.get())
+                            })
+                            .unwrap(),
+                        prefix + 1
+                    );
+                    moved.sequence_replay.begin_attempt();
+                    for expected in 1..=prefix + 1 {
+                        assert_eq!(
+                            moved
+                                .sequence_replay
+                                .invoke(arena, || panic!("resumed values must not repeat"))
+                                .unwrap(),
+                            expected
+                        );
+                    }
+                })
+                .unwrap();
+            assert_eq!(calls.get(), prefix + 1);
             moved.clear();
             moved.bind("SELECT 1", &[], &[]).unwrap();
-            moved.with_query(|_, _, arena| {
-                assert_eq!(moved.sequence_replay.invoke(arena, || { calls.set(calls.get() + 1); Ok(calls.get()) }).unwrap(), 4);
-            }).unwrap();
+            moved
+                .with_query(|_, _, arena| {
+                    assert_eq!(
+                        moved
+                            .sequence_replay
+                            .invoke(arena, || {
+                                calls.set(calls.get() + 1);
+                                Ok(calls.get())
+                            })
+                            .unwrap(),
+                        prefix + 2
+                    );
+                })
+                .unwrap();
         });
     }
 
@@ -794,15 +924,23 @@ mod tests {
         crate::mem::guard::forbid_alloc(|| {
             replay.invoke(&arena, || Ok(1)).unwrap();
             replay.begin_attempt();
-            let error = replay.invoke(&other, || panic!("wrong arena must be rejected")).unwrap_err();
+            let error = replay
+                .invoke(&other, || panic!("wrong arena must be rejected"))
+                .unwrap_err();
             assert_eq!(error.sqlstate, sqlstate::SERIALIZATION_FAILURE);
             let mut moved = arena;
-            assert_eq!(replay.invoke(&moved, || panic!("a move keeps issued values")).unwrap(), 1);
+            assert_eq!(
+                replay
+                    .invoke(&moved, || panic!("a move keeps issued values"))
+                    .unwrap(),
+                1
+            );
             replay.begin_attempt();
             moved.reset();
-            let error = replay.invoke(&moved, || panic!("reset must be rejected")).unwrap_err();
+            let error = replay
+                .invoke(&moved, || panic!("reset must be rejected"))
+                .unwrap_err();
             assert_eq!(error.sqlstate, sqlstate::SERIALIZATION_FAILURE);
         });
     }
-
 }

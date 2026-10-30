@@ -214,7 +214,12 @@ For example, `OPEN c FOR SELECT label UNION ALL SELECT label` captures `label`
 when opened, including its type when the value is null. A variable name that
 also names a source column raises `42702`; qualify the table column or rename
 the variable. A caller's wire parameter types do not replace a function's own
-parameter declarations. These bindings do not yet defer cursor execution to FETCH.
+parameter declarations, including a domain's own identity rather than its base
+representation. Dynamic SQL takes parameters only from `USING`: for example,
+`OPEN c FOR EXECUTE 'SELECT $1' USING d` captures a null date as a date, even
+inside a function whose first argument is an integer. Local names do not become
+columns inside the command string. These bindings do not yet defer cursor
+execution to FETCH.
 JSON/path and XML/XPath limits are specified in [SQL/JSON](sql-json.md) and
 [SQL/XML](sql-xml.md). Inspect the memory plan for the chosen configuration;
 accepted width can still exhaust its named statement or startup budget.

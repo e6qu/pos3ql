@@ -1841,7 +1841,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
                 "PL/pgSQL functions require a resumable query executor"
             ));
         }
-        let _formal_scope = super::exec::enter_routine_parameter_types(routine.arguments());
+        let _formal_scope = super::exec::enter_routine_parameter_types(routine.arguments(), Some(self))?;
         let function_program = parse_stored_routine_function_program(
             routine.body_kind,
             routine.body.as_str(),
@@ -8650,6 +8650,7 @@ pub fn describe_scope_items<'q>(
                 } else if let Some(meta) = field_meta {
                     out[n].collation = meta.collation;
                 }
+                out[n] = super::exec::wire_column_description(out[n], storage, txid)?;
                 n += 1;
             }
         }

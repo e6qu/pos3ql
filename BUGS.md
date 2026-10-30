@@ -4,7 +4,8 @@ No known defects are blocked by an external dependency or an intractable problem
 
 Fix every reproducible defect in the PR that finds it. Record an entry only
 with its reproducer, observed behavior and exact external blocker or reason it
-cannot be repaired. Keep repaired-defect evidence and PostgreSQL comparisons in the fixing PR.
+cannot be repaired. Keep repaired-defect evidence, ownership checks and PostgreSQL comparisons in
+the fixing PR.
 See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 Unfinished features and their verification criteria belong in [PLAN.md](PLAN.md).

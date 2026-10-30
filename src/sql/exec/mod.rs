@@ -713,6 +713,7 @@ pub(crate) use describe::{
     StaticTypeMeta, builtin_record_srf_field_pub, coltype_of_oid, infer_routine_argument_oid,
     infer_type_catalog, intrinsic_record_field_meta, record_shape_metadata,
     record_shape_pool_bytes, routine_result_metadata, unify_numeric_tower,
+    wire_column_description,
 };
 pub(crate) use describe::{
     bound_parameter_type_oid, enter_routine_parameter_types, with_bound_parameter_types,
@@ -19897,7 +19898,9 @@ pub(crate) fn execute_plpgsql_procedure<'a>(
     responder: &mut Responder<'_>,
     outputs: &mut [Datum<'a>; crate::storage::MAX_ROUTINE_ARGUMENTS],
 ) -> Result<usize, SqlError> {
-    let _formal_scope = enter_routine_parameter_types(routine.arguments());
+    let _formal_scope = enter_routine_parameter_types(
+        routine.arguments(), Some(&super::query::storage_catalog(&engine.storage, arena, txn.txid)),
+    )?;
     let source = arena
         .alloc_str(routine.body.as_str())
         .map_err(|_| super::query::arena_full_pub())?;
@@ -20052,7 +20055,9 @@ pub(crate) fn execute_plpgsql_function<'a>(
     arena: &'a Arena,
     responder: &mut Responder<'_>,
 ) -> Result<Datum<'a>, SqlError> {
-    let _formal_scope = enter_routine_parameter_types(routine.arguments());
+    let _formal_scope = enter_routine_parameter_types(
+        routine.arguments(), Some(&super::query::storage_catalog(&engine.storage, arena, txn.txid)),
+    )?;
     let source = arena
         .alloc_str(routine.body.as_str())
         .map_err(|_| super::query::arena_full_pub())?;
@@ -20920,7 +20925,7 @@ fn materialize_trigger_insert_source<'result, 'query>(
     result_arena: &'result Arena,
     txid: u32,
     execution: TriggerQueryExecution<'_, '_, 'result>,
-    scope: Option<&dyn ColumnLookup<'result>>,
+    scope: Option<&dyn ColumnLookup<'query>>,
 ) -> Result<&'result [&'result [u8]], SqlError>
 where
     'result: 'query,
@@ -21384,7 +21389,7 @@ fn bind_plpgsql_dynamic_query<'a>(
         parameter_types[index] = match super::eval::expression_type_identity(expression, scope, &hooks)? {
             super::eval::ExpressionTypeIdentity::Known(oid) => oid,
             // A USING expression is a standalone PL/pgSQL SELECT target.
-            super::eval::ExpressionTypeIdentity::Unresolved => oid::TEXT,
+            super::eval::ExpressionTypeIdentity::Unresolved => super::types::oid::TEXT,
         };
         arguments[index] = detached_trigger_datum(
             eval_trigger_expression(context, expression, scope)?,
@@ -24112,6 +24117,8 @@ fn materialize_plpgsql_dynamic_for_query<'a>(
     record_target: bool,
 ) -> Result<&'a [Datum<'a>], SqlError> {
     let query = bind_plpgsql_dynamic_query(context, query, scope, DynamicCommandKind::Statement)?;
+    let query = resolve_plpgsql_dynamic_prepared(context, query)?;
+    with_bound_parameter_types(query.parameter_types, || {
     let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
     let width = match query.statement {
         Stmt::Select(select) => super::query::describe_select(
@@ -24142,7 +24149,7 @@ fn materialize_plpgsql_dynamic_for_query<'a>(
         context.seq_session(),
         context.txn.txid,
     );
-    execute_bound_plpgsql_dynamic_query(context, query, scope, &dry, &mut |values| {
+    execute_bound_plpgsql_dynamic_query(context, query, &dry, &mut |values| {
         if values.len() != width {
             return Err(sql_err!(
                 sqlstate::INTERNAL_ERROR,
@@ -24162,7 +24169,7 @@ fn materialize_plpgsql_dynamic_for_query<'a>(
         context.txn.txid,
     );
     let mut at = 0usize;
-    execute_bound_plpgsql_dynamic_query(context, query, scope, &live, &mut |values| {
+    execute_bound_plpgsql_dynamic_query(context, query, &live, &mut |values| {
         if values.len() != width {
             return Err(sql_err!(
                 sqlstate::INTERNAL_ERROR,
@@ -24197,6 +24204,7 @@ fn materialize_plpgsql_dynamic_for_query<'a>(
         Ok(())
     })?;
     Ok(&*rows)
+    })
 }
 
 fn materialize_trigger_for_record_query<'result, 'query>(
@@ -33525,7 +33533,12 @@ pub fn create_routine(
         Err(error) => return sql_fail(error),
     };
     let mut creation_path = StackStr::<128>::new();
-    let _formal_scope = enter_routine_parameter_types(&arguments[..argument_count]);
+    let _formal_scope = match enter_routine_parameter_types(
+        &arguments[..argument_count], Some(&super::query::storage_catalog(storage, arena, txn.txid)),
+    ) {
+        Ok(scope) => scope,
+        Err(error) => return sql_fail(error),
+    };
     match kind {
         crate::storage::RoutineKind::Function { result } => {
             if routine.language == RoutineLanguage::PlPgSql {

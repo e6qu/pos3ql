@@ -61,6 +61,8 @@ A waiting schema edit must never attach itself to a new object that reused a nam
   Dynamic SQL must use only its explicit `USING` values and their expression
   types, including null dates and domains, independently of enclosing routine
   arguments. Nested `EXECUTE prepared_statement($1)` binds `$1` to those values.
+  Preserve domain argument identities internally while describing their base
+  representation to clients, including the base type's declared size limit.
   Static procedural cursors also capture local values and their declared types
   at `OPEN`; changing a variable afterward must not change the cursor's input.
   Use the shared executor for table projections, set queries and captured

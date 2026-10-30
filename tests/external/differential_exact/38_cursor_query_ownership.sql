@@ -179,3 +179,35 @@ END $$;
 SELECT cursor_dynamic_execute(17);
 DROP FUNCTION cursor_dynamic_execute(integer);
 DEALLOCATE cursor_dynamic_prepared;
+
+CREATE DOMAIN cursor_argument_day AS date;
+CREATE FUNCTION cursor_domain_sql(cursor_argument_day) RETURNS text LANGUAGE sql AS $$
+  SELECT pg_typeof($1)::text
+$$;
+SELECT cursor_domain_sql(NULL::cursor_argument_day);
+DROP FUNCTION cursor_domain_sql(cursor_argument_day);
+CREATE FUNCTION cursor_domain_argument(cursor_argument_day) RETURNS refcursor LANGUAGE plpgsql AS $$
+DECLARE c refcursor := 'domain_argument';
+BEGIN
+  OPEN c FOR SELECT pg_typeof($1)::text AS kind, $1 AS day;
+  RETURN c;
+END $$;
+BEGIN;
+SELECT cursor_domain_argument(NULL::cursor_argument_day);
+FETCH ALL FROM domain_argument;
+CLOSE domain_argument;
+COMMIT;
+DROP FUNCTION cursor_domain_argument(cursor_argument_day);
+CREATE FUNCTION cursor_dynamic_domain(p cursor_argument_day) RETURNS refcursor LANGUAGE plpgsql AS $$
+DECLARE c refcursor := 'dynamic_domain';
+BEGIN
+  OPEN c FOR EXECUTE 'SELECT pg_typeof($1)::text AS kind, $1 AS day' USING p;
+  RETURN c;
+END $$;
+BEGIN;
+SELECT cursor_dynamic_domain(NULL::cursor_argument_day);
+FETCH ALL FROM dynamic_domain;
+CLOSE dynamic_domain;
+COMMIT;
+DROP FUNCTION cursor_dynamic_domain(cursor_argument_day);
+DROP DOMAIN cursor_argument_day;

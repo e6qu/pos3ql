@@ -400,7 +400,7 @@ mod tests {
             user_type: None,
         }];
         crate::mem::guard::forbid_alloc(|| {
-            let _formal_scope = crate::sql::exec::enter_routine_parameter_types(&formal);
+            let _formal_scope = crate::sql::exec::enter_routine_parameter_types(&formal, None).unwrap();
             assert_eq!(
                 crate::sql::exec::bound_parameter_type_oid(1),
                 Some(oid::INT4)
@@ -466,7 +466,7 @@ mod tests {
         }];
         with_bound_parameter_types(&[oid::DATE], || {
             {
-                let _formal_scope = enter_routine_parameter_types(&formal);
+                let _formal_scope = enter_routine_parameter_types(&formal, None).unwrap();
                 assert_eq!(bound_parameter_type_oid(1), Some(oid::INT4));
                 with_bound_parameter_types(&[oid::TEXT], || {
                     assert_eq!(bound_parameter_type_oid(1), Some(oid::TEXT))
@@ -477,7 +477,7 @@ mod tests {
         });
         let source = vec![oid::DATE];
         let escaped =
-            with_bound_parameter_types(&source, || enter_routine_parameter_types(&formal));
+            with_bound_parameter_types(&source, || enter_routine_parameter_types(&formal, None).unwrap());
         drop(source);
         drop(escaped);
         assert_eq!(bound_parameter_type_oid(1), None);
@@ -505,4 +505,51 @@ mod tests {
         assert!(error.message.as_str().contains("cursor_query_bytes"));
         crate::mem::guard::forbid_alloc(|| query.bind("SELECT 1", &[], &[])).unwrap();
     }
+    #[test]
+    fn cursor_owned_query_retains_domain_parameter_identity_without_borrowing_catalog() {
+        use crate::sql::exec::{bound_parameter_type_oid, enter_routine_parameter_types, with_bound_parameter_types};
+        use crate::sql::types::{ColType, oid};
+        struct DomainCatalog;
+        impl crate::sql::eval::CatalogAccess for DomainCatalog {
+            fn declared_user_type_oid(&self, ctype: ColType, identity: crate::storage::UserTypeName) -> Option<i32> {
+                assert_eq!(ctype, ColType::Date);
+                assert_eq!(identity.name.as_str(), "cursor_day");
+                Some(123456)
+            }
+        }
+        let formal = [crate::storage::RoutineArgumentDef {
+            name: SqlName::parse("p").unwrap(),
+            ctype: ColType::Date,
+            user_type: Some(crate::storage::UserTypeName::declaration(
+                SqlName::parse("public").unwrap(), SqlName::parse("cursor_day").unwrap(),
+            )),
+        }];
+        let mut budget = Budget::new(16 << 10);
+        let mut query = CursorQuery::new(&mut budget, 16 << 10).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            with_bound_parameter_types(&[oid::INT4], || {
+                let scope = {
+                    let catalog = DomainCatalog;
+                    enter_routine_parameter_types(&formal, Some(&catalog)).unwrap()
+                };
+                assert_eq!(bound_parameter_type_oid(1), Some(123456));
+                query.bind("SELECT $1", &[Datum::Null], &[]).unwrap();
+                drop(scope);
+                assert_eq!(bound_parameter_type_oid(1), Some(oid::INT4));
+                let error = enter_routine_parameter_types(&formal, None).err().expect("missing declared type");
+                assert_eq!(error.sqlstate, sqlstate::UNDEFINED_OBJECT);
+                assert_eq!(bound_parameter_type_oid(1), Some(oid::INT4));
+                let too_many = [formal[0]; 101];
+                let error = enter_routine_parameter_types(&too_many, Some(&DomainCatalog)).err().expect("argument limit");
+                assert_eq!(error.sqlstate, sqlstate::TOO_MANY_ARGUMENTS);
+                assert_eq!(bound_parameter_type_oid(1), Some(oid::INT4));
+            });
+            query.with_query(|_, params, _| {
+                assert_eq!(params[0], Datum::Null);
+                assert_eq!(bound_parameter_type_oid(1), Some(123456));
+            }).unwrap();
+        });
+        assert_eq!(bound_parameter_type_oid(1), None);
+    }
+
 }

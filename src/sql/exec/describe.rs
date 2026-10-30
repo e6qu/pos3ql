@@ -46,6 +46,30 @@ fn describe_column<'a>(
         .with_collation(column.collation))
 }
 
+/// RowDescription exposes a scalar domain's base representation. Expression
+/// inference keeps the domain OID so operators and pg_typeof see its identity.
+pub(crate) fn wire_column_description<'a>(
+    mut description: ColDesc<'a>,
+    storage: &crate::storage::Storage,
+    txid: u32,
+) -> Result<ColDesc<'a>, SqlError> {
+    let Some((crate::storage::NamedTypeKind::Domain, creation, false)) =
+        crate::storage::NamedTypeKind::from_oid(description.type_oid)
+    else {
+        return Ok(description);
+    };
+    let target = crate::storage::TypeDefinitionTarget::by_creation(
+        storage, crate::storage::NamedTypeKind::Domain, creation,
+    )?;
+    let domain = storage.read_domain_definition(target, txid)?.ok_or_else(|| {
+        sql_err!(sqlstate::UNDEFINED_OBJECT, "output domain type no longer exists")
+    })?;
+    description.type_oid = domain.base.oid();
+    description.typlen = domain.base.typlen();
+    description.type_mod = domain.base_type_mod;
+    Ok(description)
+}
+
 pub fn describe_items<'q>(
     items: &[SelectItem<'q>],
     def: Option<&TableDef>,
@@ -305,7 +329,10 @@ fn describe_items_with_output_aliases<'q>(
                     description.collation = crate::sql::ast::Collation::Default;
                     description.collation_derivation = CollationDerivation::Implicit;
                 }
-                push(description)?;
+                push(match storage {
+                    Some(storage) => wire_column_description(description, storage, txid)?,
+                    None => description,
+                })?;
             }
         }
     }
@@ -1679,7 +1706,7 @@ pub trait ColTypeResolver {
 /// degrading `$n` to `unknown`.
 #[derive(Clone, Copy)]
 struct RoutineParameterTypes {
-    types: [Option<ColType>; MAX_ROUTINE_ARGUMENTS],
+    types: [Option<(i32, i16)>; MAX_ROUTINE_ARGUMENTS],
 }
 
 #[derive(Clone, Copy)]
@@ -1740,7 +1767,7 @@ pub(crate) fn with_bound_parameter_types<R>(oids: &[i32], run: impl FnOnce() -> 
 
 pub(crate) fn bound_parameter_type_oid(index: u32) -> Option<i32> {
     if matches!(PARAMETER_CONTEXT.with(Cell::get), ParameterContext::Routine) {
-        return routine_parameter_type(index).map(ColType::oid);
+        return routine_parameter_type(index).map(|metadata| metadata.0);
     }
     let index = index.checked_sub(1)? as usize;
     BOUND_PARAMETER_TYPES.with(|types| {
@@ -1761,16 +1788,25 @@ pub(crate) struct RoutineParameterScope(RoutineParameterTypes, ParameterContext)
 
 pub(crate) fn enter_routine_parameter_types(
     arguments: &[RoutineArgumentDef],
-) -> RoutineParameterScope {
+    catalog: Option<&dyn crate::sql::eval::CatalogAccess>,
+) -> Result<RoutineParameterScope, SqlError> {
     let mut current = RoutineParameterTypes::EMPTY;
+    if arguments.len() > current.types.len() {
+        return Err(sql_err!(sqlstate::TOO_MANY_ARGUMENTS, "functions cannot have more than 100 arguments"));
+    }
     for (slot, argument) in arguments.iter().enumerate() {
-        current.types[slot] = Some(argument.ctype);
+        let type_oid = match argument.user_type {
+            Some(identity) => catalog.and_then(|catalog| catalog.declared_user_type_oid(argument.ctype, identity))
+                .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "routine parameter type no longer exists"))?,
+            None => argument.ctype.oid(),
+        };
+        current.types[slot] = Some((type_oid, argument.ctype.typlen()));
     }
     let prior = ROUTINE_PARAMETER_TYPES.with(|slot| slot.replace(current));
-    RoutineParameterScope(
+    Ok(RoutineParameterScope(
         prior,
         PARAMETER_CONTEXT.with(|slot| slot.replace(ParameterContext::Routine)),
-    )
+    ))
 }
 
 impl Drop for RoutineParameterScope {
@@ -1780,7 +1816,7 @@ impl Drop for RoutineParameterScope {
     }
 }
 
-fn routine_parameter_type(index: u32) -> Option<ColType> {
+fn routine_parameter_type(index: u32) -> Option<(i32, i16)> {
     index.checked_sub(1).and_then(|index| {
         ROUTINE_PARAMETER_TYPES
             .with(|types| types.get().types.get(index as usize).copied().flatten())
@@ -3433,7 +3469,7 @@ pub fn infer_type_res(
         Expr::Null | Expr::Str(_) => (oid::UNKNOWN, -2),
         Expr::Param(index) => bound_parameter_type_oid(*index)
             .map(|oid| (oid, coltype_of_oid(oid).map_or(-1, ColType::typlen)))
-            .or_else(|| routine_parameter_type(*index).map(of))
+            .or_else(|| routine_parameter_type(*index))
             .unwrap_or((oid::UNKNOWN, -2)),
         Expr::RoutineParam {
             qualifier,
@@ -3457,7 +3493,7 @@ pub fn infer_type_res(
             {
                 match source {
                     crate::sql::ast::ParameterSource::SqlRoutine => {
-                        routine_parameter_type(*index).map(of)
+                        routine_parameter_type(*index)
                     }
                     crate::sql::ast::ParameterSource::PlpgsqlCursor => {
                         bound_parameter_type_oid(*index)

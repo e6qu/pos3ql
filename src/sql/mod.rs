@@ -13406,7 +13406,12 @@ impl Engine {
             Ok(scope) => scope,
             Err(error) => return Ok(Err(error)),
         };
-        let _formal_scope = exec::enter_routine_parameter_types(routine.arguments());
+        let _formal_scope = match exec::enter_routine_parameter_types(
+            routine.arguments(), Some(&query::storage_catalog(&self.storage, arena, txn.txid)),
+        ) {
+            Ok(scope) => scope,
+            Err(error) => return Ok(Err(error)),
+        };
         let nested_invocations = query::RoutineInvocationState::new(arena);
         nested_invocations.begin_attempt();
         let _routine_invocation_scope = query::enter_routine_invocation_scope(Some(
@@ -13820,7 +13825,12 @@ impl Engine {
                     )));
                 }
             };
-            let _formal_scope = exec::enter_routine_parameter_types(routine.arguments());
+            let _formal_scope = match exec::enter_routine_parameter_types(
+            routine.arguments(), Some(&query::storage_catalog(&self.storage, arena, txn.txid)),
+        ) {
+            Ok(scope) => scope,
+            Err(error) => return Ok(Err(error)),
+        };
             return Ok(exec::execute_plpgsql_table_function(
                 self, txn, sqlprep, cursors, guc, &routine, &*inputs, arena, responder,
             ));
@@ -13869,7 +13879,12 @@ impl Engine {
         {
             *argument = exec::decode_projected_pub(pending.arguments, index);
         }
-        let _formal_scope = exec::enter_routine_parameter_types(routine.arguments());
+        let _formal_scope = match exec::enter_routine_parameter_types(
+            routine.arguments(), Some(&query::storage_catalog(&self.storage, arena, txn.txid)),
+        ) {
+            Ok(scope) => scope,
+            Err(error) => return Ok(Err(error)),
+        };
         let nested_invocations = query::RoutineInvocationState::new(arena);
         nested_invocations.begin_attempt();
         let _routine_invocation_scope = query::enter_routine_invocation_scope(Some(
@@ -14666,7 +14681,12 @@ impl Engine {
             )));
         }
         let body = routine.body;
-        let _formal_scope = exec::enter_routine_parameter_types(routine.arguments());
+        let _formal_scope = match exec::enter_routine_parameter_types(
+            routine.arguments(), Some(&query::storage_catalog(&self.storage, arena, txn.txid)),
+        ) {
+            Ok(scope) => scope,
+            Err(error) => return Ok(Err(error)),
+        };
         let mut parser = match Parser::new(body.as_str(), arena).and_then(|parser| {
             parser.with_routine_parameters(routine.name.as_str(), routine.arguments())
         }) {

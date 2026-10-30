@@ -1273,12 +1273,21 @@ def test_nested_function_parameters_keep_their_declaration_over_wire_types():
         "AS 'SELECT pg_typeof($1)::text'; "
         "CREATE FUNCTION wire_positional_cursor(date) RETURNS refcursor LANGUAGE plpgsql AS $$ "
         "DECLARE c refcursor := 'wire_positional'; BEGIN "
-        "OPEN c FOR SELECT pg_typeof($1)::text AS kind, $1 AS value; RETURN c; END $$",
+        "OPEN c FOR SELECT pg_typeof($1)::text AS kind, $1 AS value; RETURN c; END $$; "
+        "CREATE DOMAIN wire_argument_day AS date; "
+        "CREATE FUNCTION wire_positional_domain(wire_argument_day) RETURNS refcursor LANGUAGE plpgsql AS $$ "
+        "DECLARE c refcursor := 'wire_domain'; BEGIN "
+        "OPEN c FOR SELECT pg_typeof($1)::text AS kind, $1 AS value; RETURN c; END $$; "
+        "CREATE FUNCTION wire_dynamic_cursor(integer) RETURNS refcursor LANGUAGE plpgsql AS $$ "
+        "DECLARE c refcursor := 'wire_dynamic'; d date; BEGIN "
+        "OPEN c FOR EXECUTE 'SELECT pg_typeof($1)::text AS kind, $1 AS value' USING d; RETURN c; END $$",
     )
     check("nested parameter type fixture succeeds", not any(kind == b"E" for kind, _ in setup), setup)
-    for query, input_oid, expected in [
-        ("SELECT wire_parameter_scope($1::integer)", 20, "integer"),
-        ("SELECT wire_positional_cursor($1::date)", 25, "wire_positional"),
+    for query, input_oid, expected, cursor_kind in [
+        ("SELECT wire_parameter_scope($1::integer)", 20, "integer", None),
+        ("SELECT wire_positional_cursor($1::date)", 25, "wire_positional", "date"),
+        ("SELECT wire_positional_domain($1::wire_argument_day)", 25, "wire_domain", "wire_argument_day"),
+        ("SELECT wire_dynamic_cursor($1::integer)", 20, "wire_dynamic", "date"),
     ]:
         simple_query(s, "BEGIN")
         parse = frontend_message(b"P", b"\x00" + query.encode() + b"\x00" + struct.pack("!hi", 1, input_oid))
@@ -1291,18 +1300,20 @@ def test_nested_function_parameters_keep_their_declaration_over_wire_types():
             if item[0] == b"Z":
                 break
         check("callee parameter declaration overrides caller Bind type", first_text_row(output) == expected, output)
-        if expected == "wire_positional":
-            output = simple_query(s, "FETCH NEXT FROM wire_positional")
+        if cursor_kind is not None:
+            output = simple_query(s, "FETCH NEXT FROM " + expected)
             description = next((payload for kind, payload in output if kind == b"T"), None)
             row = next((payload for kind, payload in output if kind == b"D"), None)
             check(
-                "cursor captures the function's positional null date",
+                "cursor preserves the declared null type and exposes its wire representation",
                 description is not None and row_description_type_oids(description) == [25, 1082]
-                and row == struct.pack("!hi", 2, 4) + b"date" + struct.pack("!i", -1),
+                and row == struct.pack("!hi", 2, len(cursor_kind)) + cursor_kind.encode() + struct.pack("!i", -1),
                 output,
             )
         simple_query(s, "ROLLBACK")
-    simple_query(s, "DROP FUNCTION wire_parameter_scope(integer); DROP FUNCTION wire_positional_cursor(date)")
+    simple_query(s, "DROP FUNCTION wire_parameter_scope(integer); DROP FUNCTION wire_positional_cursor(date); "
+                 "DROP FUNCTION wire_positional_domain(wire_argument_day); DROP FUNCTION wire_dynamic_cursor(integer); "
+                 "DROP DOMAIN wire_argument_day")
     s.close()
 
 

@@ -4839,6 +4839,12 @@ fn call<'a>(
         return result;
     }
     if argument_names.is_empty()
+        && !variadic
+        && let Some(result) = funcs::hashing::dispatch(name, args, star, arena, params, row, hooks)
+    {
+        return result;
+    }
+    if argument_names.is_empty()
         && let Some(result) = funcs::bytea::dispatch(name, args, star, arena, params, row, hooks)
     {
         return result;
@@ -5903,6 +5909,13 @@ fn static_type<'a>(e: &Expr<'a>, row: &impl ColumnLookup<'a>) -> Option<ColType>
         // cannot fall through to the text overload merely because it is not a
         // column or cast.
         Expr::Call { name, args, .. } => match *name {
+            name if funcs::hashing::signature(name).is_some() => Some(
+                if funcs::hashing::signature(name).expect("recognized hash").1 {
+                    ColType::Int8
+                } else {
+                    ColType::Int4
+                },
+            ),
             "sha224" | "sha256" | "sha384" | "sha512" | "decode" | "set_byte" | "convert_to"
             | "convert" | "byteacat" | "byteasend" | "float8send" | "bytea_larger"
             | "bytea_smaller" | "byteain" | "bit_send" | "varbit_send" | "bytea" | "inet_send"

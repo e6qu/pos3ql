@@ -30,6 +30,22 @@ and [what has actually been measured](docs/performance.md).
 
 ## Remaining work
 
+### Close application compatibility and embedded memory gaps
+
+**Examples:** an application can call `hashtextextended('order-42', 0)`, use
+SQLAlchemy models and psycopg2 cursors, and upgrade or reverse its schema with
+Alembic. An embedded database with many small tables should not reserve the
+maximum row history independently for every possible table.
+
+Audit PostgreSQL 18 built-ins by signature and executable behavior. Catalog
+presence alone is not support. Compare values, declared result types, nulls,
+errors and argument effects with PostgreSQL, including seeded hashes.
+Run real SQLAlchemy, Alembic and psycopg2 workflows against both servers.
+Measure startup reservations and actual resident memory for empty and populated
+embedded databases; report the per-table contribution separately. Remove
+avoidable per-table row/history reservations through shared startup-owned
+capacity, preserving stable reader identities, rollback and named exhaustion.
+
 ### Finish transaction visibility and keep maintenance moving
 
 **Example:** a report must finish using the rows and definitions it selected,
@@ -39,6 +55,8 @@ A waiting schema edit must never attach itself to a new object that reused a nam
 - When a report lists an object's saved name, its later column, index, comment
   and dependency reads must still refer to that same object. Unfinished edits
   must stay private to their transaction. Preserve repeated dependency rows.
+  Catalog sources must retain their real schema in planning and execution;
+  `SELECT pg_catalog.pg_class.relname FROM pg_catalog.pg_class` must resolve.
 - Keep older rows, indexes and saved files until readers and backups finish.
   Remove obsolete versions in limited batches so other queries keep moving.
   Files written by an unfinished checkpoint remain owned until its publication

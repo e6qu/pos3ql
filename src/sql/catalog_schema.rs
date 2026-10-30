@@ -1651,6 +1651,11 @@ pub(super) fn definition(name: &str, information_schema: bool) -> Option<SynthDe
         })
         .flatten();
     Some(SynthDef {
+        schema: if information_schema {
+            "information_schema"
+        } else {
+            "pg_catalog"
+        },
         name,
         columns,
         relation,

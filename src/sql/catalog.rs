@@ -194,6 +194,30 @@ macro_rules! intrinsic {
 }
 
 const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
+    // PostgreSQL 18.6 scalar hash identities and signatures.
+    // https://github.com/postgres/postgres/blob/REL_18_6/src/include/catalog/pg_proc.dat
+    intrinsic!(449, "hashint2", 23, "21", 1, "i"),
+    intrinsic!(441, "hashint2extended", 20, "21 20", 2, "i"),
+    intrinsic!(450, "hashint4", 23, "23", 1, "i"),
+    intrinsic!(425, "hashint4extended", 20, "23 20", 2, "i"),
+    intrinsic!(949, "hashint8", 23, "20", 1, "i"),
+    intrinsic!(442, "hashint8extended", 20, "20 20", 2, "i"),
+    intrinsic!(451, "hashfloat4", 23, "700", 1, "i"),
+    intrinsic!(443, "hashfloat4extended", 20, "700 20", 2, "i"),
+    intrinsic!(452, "hashfloat8", 23, "701", 1, "i"),
+    intrinsic!(444, "hashfloat8extended", 20, "701 20", 2, "i"),
+    intrinsic!(453, "hashoid", 23, "26", 1, "i"),
+    intrinsic!(445, "hashoidextended", 20, "26 20", 2, "i"),
+    intrinsic!(454, "hashchar", 23, "18", 1, "i"),
+    intrinsic!(446, "hashcharextended", 20, "18 20", 2, "i"),
+    intrinsic!(455, "hashname", 23, "19", 1, "i"),
+    intrinsic!(447, "hashnameextended", 20, "19 20", 2, "i"),
+    intrinsic!(400, "hashtext", 23, "25", 1, "i"),
+    intrinsic!(448, "hashtextextended", 20, "25 20", 2, "i"),
+    intrinsic!(6417, "hashbool", 23, "16", 1, "i"),
+    intrinsic!(6418, "hashboolextended", 20, "16 20", 2, "i"),
+    intrinsic!(1080, "hashbpchar", 23, "1042", 1, "i"),
+    intrinsic!(972, "hashbpcharextended", 20, "1042 20", 2, "i"),
     // PostgreSQL 18.6 GiST support routines, exposed so pg_amproc joins to
     // pg_proc with the same built-in identities as a vanilla server.
     intrinsic!(1030, "gist_point_compress", 2281, "2281", 1, "i"),
@@ -16385,6 +16409,7 @@ fn index_expression_display<'a>(
 
 #[derive(Clone, Copy)]
 struct SynthDef<'a> {
+    schema: &'static str,
     name: &'a str,
     columns: &'a [(&'a str, ColType)],
     relation: Option<core::num::NonZeroU32>,
@@ -16392,6 +16417,7 @@ struct SynthDef<'a> {
 
 fn materialize_def(specification: SynthDef<'_>) -> TableDef {
     let mut definition = TableDef {
+        schema: SqlName::parse(specification.schema).expect("catalog schema fits"),
         name: SqlName::parse(specification.name).expect("catalog name fits"),
         columns: [ColumnMeta::EMPTY; MAX_COLUMNS],
         n_columns: specification

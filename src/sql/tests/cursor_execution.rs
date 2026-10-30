@@ -1,6 +1,120 @@
 use super::*;
 
 #[test]
+fn cursor_builtin_hashes_preserve_types_lengths_seeds_and_argument_effects() {
+    let config = test_config("cursor-builtin-hashes");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    let empty = session.success(
+        &mut engine,
+        "SELECT hashtext(''),hashtextextended(NULL::text,0), \
+        pg_typeof(hashtext(NULL::text)),pg_typeof(hashtextextended(NULL::text,0))",
+        true,
+    );
+    assert_eq!(data_rows(&empty), ["-1477818771|NULL|integer|bigint"]);
+    assert_eq!(row_description_type_oids(&empty), [23, 20, 2206, 2206]);
+    for length in 0..=60 {
+        let sql = format!(
+            "SELECT hashtext(repeat('a',{length}))=hashbytea(convert_to(repeat('a',{length}),'UTF8')), \
+            hashtextextended(repeat('a',{length}),123)=hashbyteaextended(convert_to(repeat('a',{length}),'UTF8'),123)"
+        );
+        assert_eq!(
+            data_rows(&session.success(&mut engine, &sql, true)),
+            ["t|t"],
+            "length {length}"
+        );
+    }
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT hashint2(-1::smallint)=hashint4(-1),hashint4(-1)=hashint8(-1), \
+        hashint2extended(-1::smallint,-1)=hashint8extended(-1,-1), \
+        hashfloat4(1.5::real)=hashfloat8(1.5::float8), \
+        hashfloat4('NaN')=hashfloat8('NaN'),hashfloat8('-0')=0,hashfloat8extended('-0',123)=123, \
+        hashbpchar('x  ')=hashbpchar('x'),hashname(repeat('x',64))=hashname(repeat('x',63)), \
+        hashchar('a')=hashint4(97),hashbool(true)=hashint4(1),hashoid(42::oid)=hashint4(42)",
+            true
+        )),
+        ["t|t|t|t|t|t|t|t|t|t|t|t"]
+    );
+    session.success(&mut engine, "CREATE SEQUENCE hash_calls START 10", true);
+    assert_eq!(data_rows(&session.success(&mut engine,
+        "SELECT hashtextextended(NULL::text,nextval('hash_calls')); SELECT last_value,is_called FROM hash_calls", true)),
+        ["NULL","10|f"]);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "CREATE TABLE hash_inputs(value text); INSERT INTO hash_inputs VALUES(NULL); \
+        SELECT hashtextextended(value,nextval('hash_calls')) FROM hash_inputs; \
+        SELECT last_value,is_called FROM hash_calls",
+            true
+        )),
+        ["NULL", "10|t"]
+    );
+    for sql in [
+        "SELECT hashtext(1)",
+        "SELECT hashint2(1)",
+        "SELECT hashtextextended('x',1::numeric)",
+        "SELECT hashtext(NULL::date)",
+        "SELECT hashtext()",
+    ] {
+        assert_eq!(
+            error_sqlstates(&session.execute(&mut engine, sql, true)),
+            ["42883"],
+            "{sql}"
+        );
+    }
+}
+
+#[test]
+fn cursor_catalog_columns_keep_schema_qualification() {
+    let config = test_config("cursor-catalog-column-qualification");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    for sql in [
+        "SELECT pg_catalog.pg_class.relname FROM pg_catalog.pg_class WHERE oid=1259",
+        "SELECT pg_catalog.pg_class.relname FROM pg_class WHERE oid=1259",
+        "SELECT c.relname FROM pg_catalog.pg_class AS c WHERE c.oid=1259",
+        "SELECT (SELECT pg_catalog.pg_class.relname) FROM pg_catalog.pg_class WHERE oid=1259",
+    ] {
+        assert_eq!(
+            data_rows(&session.success(&mut engine, sql, true)),
+            ["pg_class"],
+            "{sql}"
+        );
+    }
+    let described = session.success(
+        &mut engine,
+        "PREPARE catalog_qualified(oid) AS SELECT pg_catalog.pg_class.relname \
+        FROM pg_catalog.pg_class WHERE pg_catalog.pg_class.oid=$1; EXECUTE catalog_qualified(1259)",
+        true,
+    );
+    assert_eq!(data_rows(&described), ["pg_class"]);
+    assert_eq!(row_description_type_oids(&described), [19]);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT information_schema.schemata.schema_name FROM information_schema.schemata \
+        WHERE information_schema.schemata.schema_name='public'",
+            true
+        )),
+        ["public"]
+    );
+    for sql in [
+        "SELECT pg_catalog.pg_class.relname FROM pg_catalog.pg_class AS c",
+        "SELECT public.pg_class.relname FROM pg_catalog.pg_class",
+    ] {
+        assert_eq!(
+            error_sqlstates(&session.execute(&mut engine, sql, true)),
+            ["42P01"],
+            "{sql}"
+        );
+    }
+}
+
+#[test]
 fn cursor_between_comparisons_preserve_nulls_and_repeated_effects() {
     let config = test_config("cursor-between-comparisons");
     let mut budget = test_engine_budget(&config, 1 << 29);
@@ -14,7 +128,7 @@ fn cursor_between_comparisons_preserve_nulls_and_repeated_effects() {
         1 BETWEEN NULL AND 2,1 NOT BETWEEN NULL AND 2",
             true
         )),
-        ["f|t|f|t||"]
+        ["f|t|f|t|NULL|NULL"]
     );
     assert_eq!(
         data_rows(&session.success(
@@ -23,7 +137,7 @@ fn cursor_between_comparisons_preserve_nulls_and_repeated_effects() {
         1 BETWEEN SYMMETRIC NULL AND 0,1 NOT BETWEEN SYMMETRIC NULL AND NULL",
             true
         )),
-        ["t|f||"]
+        ["t|f|NULL|NULL"]
     );
     session.success(&mut engine, "CREATE SEQUENCE between_calls START 10", true);
     for (expression, result, last) in [

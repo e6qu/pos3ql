@@ -3835,6 +3835,13 @@ pub fn infer_type_res(
     columns: &dyn ColTypeResolver,
 ) -> Result<(i32, i16), SqlError> {
     let of = |t: ColType| (t.oid(), t.typlen());
+    if let Expr::Call {
+        name, args, star, ..
+    } = expression
+        && let Some(result) = crate::sql::eval::funcs::hashing::describe(name, args, *star, columns)
+    {
+        return result;
+    }
     if let Expr::Call { name, args, .. } = expression
         && let Some((Some("pg_catalog"), symbol)) = crate::sql::ast::catalog_operator_call(name)
         && let [left, right] = *args

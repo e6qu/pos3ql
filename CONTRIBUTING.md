@@ -184,7 +184,7 @@ Required PR workflows are:
 |---|---|
 | CI | Architecture/bug/vendor guards, tool tests, all-target build, formatting, lint, library shards, object-store qualification, recovery/fault simulation, release install, and performance smoke |
 | Differential | PostgreSQL comparisons, vendored SQLLogicTest/regression slices, generated queries, and external execution paths |
-| Drivers | Actual client transcripts against PostgreSQL and pos3ql |
+| Drivers | JDBC, pgx, node-postgres, psycopg2, SQLAlchemy and Alembic against PostgreSQL and pos3ql |
 | coverage | Instrumented library/external shards and merged coverage gate |
 
 The workflow files define exact commands and supported environments. A focused
@@ -197,6 +197,13 @@ CI builds all targets and runs Clippy natively on Linux amd64, Linux arm64 and
 macOS arm64. The jobs verify their compiler host before building; the arm64 jobs
 also exercise socket readiness, mutexes and libc collation. Use libc's platform
 types at C boundaries: `c_char` need not have the same signedness on every target.
+
+Python client dependencies and their wheel hashes are pinned in
+`tests/external/requirements.lock`. SQLAlchemy and Alembic run with both psycopg2
+and psycopg 3. The same fixtures check ORM changes, returned identities, savepoints,
+type conversion, reflection, streaming, migration upgrades/downgrades and schema
+drift against both servers. Drivers retains transcripts, package versions and
+server logs even when an application operation fails.
 
 PostgreSQL comparison shards share one release binary built from their checkout.
 Each shard verifies its recorded revision and checksum before use. The CI harness

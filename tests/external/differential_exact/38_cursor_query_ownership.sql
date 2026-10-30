@@ -1,3 +1,17 @@
+-- Synthesized catalogs have their actual schema in both planning and execution.
+SELECT pg_catalog.pg_class.relname FROM pg_catalog.pg_class WHERE oid=1259;
+SELECT pg_catalog.pg_class.relname FROM pg_class WHERE oid=1259;
+SELECT c.relname FROM pg_catalog.pg_class AS c WHERE c.oid=1259;
+SELECT (SELECT pg_catalog.pg_class.relname) FROM pg_catalog.pg_class WHERE oid=1259;
+PREPARE catalog_qualified(oid) AS SELECT pg_catalog.pg_class.relname
+FROM pg_catalog.pg_class WHERE pg_catalog.pg_class.oid=$1;
+EXECUTE catalog_qualified(1259);
+DEALLOCATE catalog_qualified;
+SELECT information_schema.schemata.schema_name FROM information_schema.schemata
+WHERE information_schema.schemata.schema_name='public';
+SELECT pg_catalog.pg_class.relname FROM pg_catalog.pg_class AS c;
+SELECT public.pg_class.relname FROM pg_catalog.pg_class;
+
 -- BETWEEN expands to ordinary comparisons, including repeated operands.
 -- https://github.com/postgres/postgres/blob/REL_18_6/src/backend/parser/parse_expr.c#L1252
 SELECT 1 BETWEEN 2 AND NULL,1 NOT BETWEEN 2 AND NULL,

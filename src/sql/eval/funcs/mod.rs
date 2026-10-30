@@ -15,6 +15,7 @@ pub(super) mod conditional;
 pub(super) mod datetime;
 pub(super) mod full_text;
 pub(crate) mod geometry;
+pub(crate) mod hashing;
 pub(super) mod identity;
 pub(crate) mod json;
 pub(crate) mod lsn;

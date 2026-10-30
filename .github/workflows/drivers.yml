@@ -1,6 +1,6 @@
 name: Drivers
 
-# Runs real PostgreSQL client drivers (pgJDBC, jackc/pgx, node-postgres)
+# Runs PostgreSQL clients, SQLAlchemy and Alembic
 # against a real PostgreSQL 18 and against pos3ql, and diffs each driver's
 # transcript. This guards the wire-protocol and catalog-introspection surface
 # those drivers depend on — the compatibility the unit tests cannot cover.
@@ -36,6 +36,10 @@ jobs:
 
     steps:
       - uses: actions/checkout@v5
+
+      - uses: ./.github/actions/python-test-environment
+        with:
+          venv: venv
 
       - name: Enable PostgreSQL prepared transactions and logical replication
         run: |
@@ -93,10 +97,20 @@ jobs:
           node-version: "24"
           package-manager-cache: false
 
-      - name: Driver conformance (pgJDBC / pgx / node-postgres vs real PostgreSQL)
+      - name: Client and migration conformance against PostgreSQL
         env:
           PGHOST: 127.0.0.1
           PGPORT: "5432"
           PGUSER: postgres
           P3_PORT: "15599"
+          POS3QL_VENV: venv
+          POS3QL_DRIVER_EVIDENCE: ${{ runner.temp }}/driver-evidence
         run: bash tests/external/ci_drivers.sh
+
+      - name: Retain client transcripts and server diagnostics
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: driver-evidence-${{ github.sha }}
+          path: ${{ runner.temp }}/driver-evidence/
+          if-no-files-found: error

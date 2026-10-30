@@ -14234,6 +14234,8 @@ impl RelationCumulativeStatistics {
 pub(crate) struct RelationTransactionStatistics {
     txid: u32,
     table: u32,
+    database: DatabaseOid,
+    created_at: u64,
     nest_level: usize,
     pub(crate) seq_scan: u64,
     last_seq_scan: Option<i64>,
@@ -14252,10 +14254,18 @@ pub(crate) struct RelationTransactionStatistics {
 }
 
 impl RelationTransactionStatistics {
-    const fn new(txid: u32, table: usize, nest_level: usize) -> Self {
+    const fn new(
+        txid: u32,
+        table: usize,
+        nest_level: usize,
+        database: DatabaseOid,
+        created_at: u64,
+    ) -> Self {
         Self {
             txid,
             table: table as u32,
+            database,
+            created_at,
             nest_level,
             seq_scan: 0,
             last_seq_scan: None,
@@ -16485,6 +16495,7 @@ impl Storage {
         if txid == 0 || table == self.large_object_page_table as usize {
             return Ok(());
         }
+        let identity = self.tables[table].identity();
         let mut cumulative = self.cumulative_statistics();
         let nest_level = cumulative
             .transaction_nesting
@@ -16493,12 +16504,22 @@ impl Storage {
             .map_or(1, |(_, nest_level)| *nest_level);
         let statistics = &mut cumulative.relation_transactions;
         let position = if let Some(position) = statistics.iter().position(|entry| {
-            entry.txid == txid && entry.table as usize == table && entry.nest_level == nest_level
+            entry.txid == txid
+                && entry.table as usize == table
+                && entry.database == identity.database
+                && entry.created_at == identity.created_at
+                && entry.nest_level == nest_level
         }) {
             position
         } else {
             statistics
-                .push(RelationTransactionStatistics::new(txid, table, nest_level))
+                .push(RelationTransactionStatistics::new(
+                    txid,
+                    table,
+                    nest_level,
+                    identity.database,
+                    identity.created_at,
+                ))
                 .map_err(|_| {
                     sql_err!(
                         sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -16694,72 +16715,54 @@ impl Storage {
             while let Some(position) = transactions.iter().position(|statistics| {
                 statistics.txid == txid && statistics.nest_level == nest_level
             }) {
-                let mut transaction = transactions.swap_remove(position);
+                let transaction = transactions.swap_remove(position);
                 let table = transaction.table as usize;
                 if table >= relations.len() || table >= self.tables.len() {
                     continue;
                 }
-                let relation = &mut relations[table];
-                relation.seq_scan = relation.seq_scan.saturating_add(transaction.seq_scan);
-                relation.last_seq_scan = match (relation.last_seq_scan, transaction.last_seq_scan) {
+                let parent_nest_level = nest_level - 1;
+                let parent_position = if let Some(position) =
+                    transactions.iter().position(|parent| {
+                        parent.txid == txid
+                            && parent.table == transaction.table
+                            && parent.database == transaction.database
+                            && parent.created_at == transaction.created_at
+                            && parent.nest_level == parent_nest_level
+                    }) {
+                    position
+                } else {
+                    transactions
+                        .push(RelationTransactionStatistics::new(
+                            txid,
+                            table,
+                            parent_nest_level,
+                            transaction.database,
+                            transaction.created_at,
+                        ))
+                        .expect("removing a subtransaction leaves room for its parent");
+                    transactions.len() - 1
+                };
+                // Reading is observable work even when a savepoint is rolled back.
+                // Keep it in this transaction until its top-level completion.
+                let parent = &mut transactions[parent_position];
+                parent.seq_scan = parent.seq_scan.saturating_add(transaction.seq_scan);
+                parent.last_seq_scan = match (parent.last_seq_scan, transaction.last_seq_scan) {
                     (Some(left), Some(right)) => Some(left.max(right)),
                     (None, right) => right,
                     (left, None) => left,
                 };
-                relation.seq_tup_read = relation
-                    .seq_tup_read
-                    .saturating_add(transaction.seq_tup_read);
-                relation.idx_scan = relation.idx_scan.saturating_add(transaction.idx_scan);
-                relation.last_idx_scan = match (relation.last_idx_scan, transaction.last_idx_scan) {
+                parent.seq_tup_read = parent.seq_tup_read.saturating_add(transaction.seq_tup_read);
+                parent.idx_scan = parent.idx_scan.saturating_add(transaction.idx_scan);
+                parent.last_idx_scan = match (parent.last_idx_scan, transaction.last_idx_scan) {
                     (Some(left), Some(right)) => Some(left.max(right)),
                     (None, right) => right,
                     (left, None) => left,
                 };
-                relation.idx_tup_fetch = relation
+                parent.idx_tup_read = parent.idx_tup_read.saturating_add(transaction.idx_tup_read);
+                parent.idx_tup_fetch = parent
                     .idx_tup_fetch
                     .saturating_add(transaction.idx_tup_fetch);
-                if let Some(database_slot) = self
-                    .database_catalog()
-                    .definitions
-                    .iter()
-                    .position(|database| database.oid == self.tables[table].database())
-                {
-                    let database = &mut databases[database_slot];
-                    database.tup_returned = database
-                        .tup_returned
-                        .saturating_add(transaction.seq_tup_read)
-                        .saturating_add(transaction.idx_tup_read);
-                    database.tup_fetched = database
-                        .tup_fetched
-                        .saturating_add(transaction.idx_tup_fetch);
-                }
-                transaction.seq_scan = 0;
-                transaction.last_seq_scan = None;
-                transaction.seq_tup_read = 0;
-                transaction.idx_scan = 0;
-                transaction.last_idx_scan = None;
-                transaction.idx_tup_read = 0;
-                transaction.idx_tup_fetch = 0;
                 if committed {
-                    let parent_nest_level = nest_level - 1;
-                    let parent_position = if let Some(position) =
-                        transactions.iter().position(|parent| {
-                            parent.txid == txid
-                                && parent.table == transaction.table
-                                && parent.nest_level == parent_nest_level
-                        }) {
-                        position
-                    } else {
-                        transactions
-                            .push(RelationTransactionStatistics::new(
-                                txid,
-                                table,
-                                parent_nest_level,
-                            ))
-                            .expect("removing a subtransaction leaves room for its parent");
-                        transactions.len() - 1
-                    };
-                    let parent = &mut transactions[parent_position];
                     if transaction.truncated {
                         if !parent.truncated {
                             parent.pre_truncate_n_tup_ins = parent.n_tup_ins;
@@ -16789,6 +16792,25 @@ impl Storage {
                             transaction.n_tup_del,
                         )
                     };
+                    if let Some(database_slot) = self
+                        .database_catalog()
+                        .definitions
+                        .iter()
+                        .position(|database| database.oid == transaction.database)
+                    {
+                        let database = &mut databases[database_slot];
+                        database.tup_inserted = database.tup_inserted.saturating_add(n_tup_ins);
+                        database.tup_updated = database.tup_updated.saturating_add(n_tup_upd);
+                        database.tup_deleted = database.tup_deleted.saturating_add(n_tup_del);
+                    }
+                    let identity = self.tables[table].identity();
+                    if identity.database != transaction.database
+                        || identity.created_at != transaction.created_at
+                        || identity.existence == CatalogDdlState::Absent
+                    {
+                        continue;
+                    }
+                    let relation = &mut relations[table];
                     relation.n_tup_ins = relation.n_tup_ins.saturating_add(n_tup_ins);
                     relation.n_tup_upd = relation.n_tup_upd.saturating_add(n_tup_upd);
                     relation.n_tup_del = relation.n_tup_del.saturating_add(n_tup_del);
@@ -16798,17 +16820,6 @@ impl Storage {
                         .saturating_add(n_tup_upd);
                     relation.n_ins_since_vacuum =
                         relation.n_ins_since_vacuum.saturating_add(n_tup_ins);
-                    if let Some(database_slot) = self
-                        .database_catalog()
-                        .definitions
-                        .iter()
-                        .position(|database| database.oid == self.tables[table].database())
-                    {
-                        let database = &mut databases[database_slot];
-                        database.tup_inserted = database.tup_inserted.saturating_add(n_tup_ins);
-                        database.tup_updated = database.tup_updated.saturating_add(n_tup_upd);
-                        database.tup_deleted = database.tup_deleted.saturating_add(n_tup_del);
-                    }
                 }
             }
         }
@@ -16852,6 +16863,31 @@ impl Storage {
                     transaction.n_tup_del,
                 )
             };
+            if let Some(database_slot) = self
+                .database_catalog()
+                .definitions
+                .iter()
+                .position(|database| database.oid == transaction.database)
+            {
+                let database = &mut databases[database_slot];
+                database.tup_returned = database
+                    .tup_returned
+                    .saturating_add(transaction.seq_tup_read)
+                    .saturating_add(transaction.idx_tup_read);
+                database.tup_fetched = database
+                    .tup_fetched
+                    .saturating_add(transaction.idx_tup_fetch);
+                database.tup_inserted = database.tup_inserted.saturating_add(n_tup_ins);
+                database.tup_updated = database.tup_updated.saturating_add(n_tup_upd);
+                database.tup_deleted = database.tup_deleted.saturating_add(n_tup_del);
+            }
+            let identity = self.tables[table].identity();
+            if identity.database != transaction.database
+                || identity.created_at != transaction.created_at
+                || identity.existence == CatalogDdlState::Absent
+            {
+                continue;
+            }
             let relation = &mut relations[table];
             relation.seq_scan = relation.seq_scan.saturating_add(transaction.seq_scan);
             relation.last_seq_scan = match (relation.last_seq_scan, transaction.last_seq_scan) {
@@ -16895,24 +16931,6 @@ impl Storage {
                     .saturating_add(n_tup_ins)
                     .saturating_add(n_tup_upd)
                     .saturating_add(n_tup_del);
-            }
-            if let Some(database_slot) = self
-                .database_catalog()
-                .definitions
-                .iter()
-                .position(|database| database.oid == self.tables[table].database())
-            {
-                let database = &mut databases[database_slot];
-                database.tup_returned = database
-                    .tup_returned
-                    .saturating_add(transaction.seq_tup_read)
-                    .saturating_add(transaction.idx_tup_read);
-                database.tup_fetched = database
-                    .tup_fetched
-                    .saturating_add(transaction.idx_tup_fetch);
-                database.tup_inserted = database.tup_inserted.saturating_add(n_tup_ins);
-                database.tup_updated = database.tup_updated.saturating_add(n_tup_upd);
-                database.tup_deleted = database.tup_deleted.saturating_add(n_tup_del);
             }
         }
         if let Some(database_slot) = self.database_slot_by_oid(current_database(), 0) {
@@ -17129,12 +17147,24 @@ impl Storage {
         txid: u32,
         table: usize,
     ) -> RelationTransactionStatistics {
-        let mut total = RelationTransactionStatistics::new(txid, table, 1);
+        let identity = self.tables[table].identity();
+        let mut total = RelationTransactionStatistics::new(
+            txid,
+            table,
+            1,
+            identity.database,
+            identity.created_at,
+        );
         for statistics in self
             .cumulative_statistics()
             .relation_transactions
             .iter()
-            .filter(|entry| entry.txid == txid && entry.table as usize == table)
+            .filter(|entry| {
+                entry.txid == txid
+                    && entry.table as usize == table
+                    && entry.database == identity.database
+                    && entry.created_at == identity.created_at
+            })
         {
             total.seq_scan = total.seq_scan.saturating_add(statistics.seq_scan);
             total.last_seq_scan = match (total.last_seq_scan, statistics.last_seq_scan) {
@@ -53756,7 +53786,13 @@ mod tests {
             {
                 statistics
                     .relation_transactions
-                    .push(RelationTransactionStatistics::new(8, table, 1))
+                    .push(RelationTransactionStatistics::new(
+                        8,
+                        table,
+                        1,
+                        storage.tables[table].database(),
+                        storage.tables[table].identity().created_at,
+                    ))
                     .unwrap();
             }
         }
@@ -58597,6 +58633,109 @@ mod tests {
                 .transactions
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn cursor_read_statistics_survive_nested_savepoints_without_double_counting() {
+        for release_inner in [false, true] {
+            for release_outer in [false, true] {
+                for commit in [false, true] {
+                    let config = test_config();
+                    let mut budget = test_budget(&config);
+                    let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
+                    let mut definition =
+                        make_def("cursor_statistics", &[("id", ColType::Int4, true)]);
+                    definition.columns[0].primary = true;
+                    let table = storage.create_table(definition).unwrap();
+                    let index = storage
+                        .table_def(table, 0)
+                        .column_index_identity(0)
+                        .unwrap()
+                        .oid();
+                    let database = storage.database_slot_by_oid(current_database(), 0).unwrap();
+                    crate::mem::guard::forbid_alloc(|| {
+                        for level in [2, 3] {
+                            storage.set_cumulative_transaction_nest_level(7, level);
+                            storage
+                                .record_relation_scan(7, table, None, 0, level as i64)
+                                .unwrap();
+                            storage.record_relation_tuple_read(7, table, None).unwrap();
+                            storage
+                                .record_relation_scan(7, table, Some(index), 3, level as i64)
+                                .unwrap();
+                            storage
+                                .record_relation_tuple_read(7, table, Some(index))
+                                .unwrap();
+                        }
+                        storage.finish_cumulative_subtransactions(7, 3, release_inner);
+                        storage.finish_cumulative_subtransactions(7, 2, release_outer);
+                        // Finishing an already-finished savepoint must not add its reads again.
+                        storage.finish_cumulative_subtransactions(7, 2, release_outer);
+                        let transaction = storage.relation_transaction_statistics(7, table);
+                        assert_eq!(transaction.seq_scan, 2);
+                        assert_eq!(transaction.seq_tup_read, 2);
+                        assert_eq!(transaction.idx_scan, 2);
+                        assert_eq!(transaction.idx_tup_read, 6);
+                        assert_eq!(transaction.idx_tup_fetch, 2);
+                        assert_eq!(transaction.last_seq_scan, Some(3));
+                        assert_eq!(transaction.last_idx_scan, Some(3));
+                        assert_eq!(storage.relation_cumulative_statistics(table).seq_scan, 0);
+                        storage.finish_cumulative_transaction(7, commit);
+                        assert_eq!(
+                            storage.relation_transaction_statistics(7, table).seq_scan,
+                            0
+                        );
+                        let total = storage.relation_cumulative_statistics(table);
+                        assert_eq!(total.seq_scan, 2);
+                        assert_eq!(total.seq_tup_read, 2);
+                        assert_eq!(total.idx_scan, 2);
+                        assert_eq!(total.idx_tup_fetch, 2);
+                        assert_eq!(total.last_seq_scan, Some(3));
+                        assert_eq!(total.last_idx_scan, Some(3));
+                        let cumulative = storage.cumulative_statistics();
+                        assert_eq!(cumulative.databases[database].tup_returned, 8);
+                        assert_eq!(cumulative.databases[database].tup_fetched, 2);
+                    });
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cursor_read_statistics_never_follow_a_reused_table_slot() {
+        let config = test_config();
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
+        let old = storage
+            .create_table(make_def("old_statistics", &[("id", ColType::Int4, true)]))
+            .unwrap();
+        storage.set_cumulative_transaction_nest_level(7, 3);
+        storage.record_relation_scan(7, old, None, 0, 1).unwrap();
+        storage.record_relation_tuple_read(7, old, None).unwrap();
+        storage.record_relation_write(7, old, false, true).unwrap();
+        storage.rollback_create(old);
+        let new = storage
+            .create_table(make_def("new_statistics", &[("id", ColType::Int4, true)]))
+            .unwrap();
+        assert_eq!(old, new, "the regression must exercise slot reuse");
+        assert_eq!(storage.relation_transaction_statistics(7, new).seq_scan, 0);
+        storage.record_relation_scan(7, new, None, 0, 2).unwrap();
+        storage.record_relation_tuple_read(7, new, None).unwrap();
+        storage.finish_cumulative_subtransactions(7, 3, false);
+        storage.finish_cumulative_subtransactions(7, 2, true);
+        let transaction = storage.relation_transaction_statistics(7, new);
+        assert_eq!(transaction.seq_scan, 1);
+        assert_eq!(transaction.seq_tup_read, 1);
+        storage.finish_cumulative_transaction(7, true);
+        let total = storage.relation_cumulative_statistics(new);
+        assert_eq!(total.seq_scan, 1);
+        assert_eq!(total.seq_tup_read, 1);
+        assert_eq!(total.n_tup_ins, 0);
+        assert_eq!(total.n_dead_tup, 0);
+        let database = storage.database_slot_by_oid(current_database(), 0).unwrap();
+        let cumulative = storage.cumulative_statistics();
+        assert_eq!(cumulative.databases[database].tup_returned, 2);
+        assert_eq!(cumulative.databases[database].tup_inserted, 1);
     }
 
     #[test]

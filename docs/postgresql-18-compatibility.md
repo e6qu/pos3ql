@@ -246,7 +246,10 @@ fails remains failed after rolling back to a savepoint: further fetches raise
 `MOVE BACKWARD ALL` before the first row returns zero. A negative absolute
 position first consumes the remaining forward input and then fails on its
 backward step. Scan statistics begin with the first requested input, including
-input consumed by `MOVE` or a forward jump.
+input consumed by `MOVE` or a forward jump. Read counters in
+`pg_stat_xact_user_tables` survive savepoint rollback and release: reading two
+rows and rolling back the savepoint still reports two rows read. A replacement
+table starts with its own counters, even if it reuses internal storage slots.
 JSON/path and XML/XPath limits are specified in [SQL/JSON](sql-json.md) and
 [SQL/XML](sql-xml.md). Inspect the memory plan for the chosen configuration;
 accepted width can still exhaust its named statement or startup budget.

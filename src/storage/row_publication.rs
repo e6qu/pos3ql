@@ -2020,7 +2020,13 @@ mod tests {
         while statistics.relation_transactions.len() < statistics.relation_transactions.capacity() {
             statistics
                 .relation_transactions
-                .push(RelationTransactionStatistics::new(8, table, 1))
+                .push(RelationTransactionStatistics::new(
+                    8,
+                    table,
+                    1,
+                    storage.tables[table].database(),
+                    storage.tables[table].identity().created_at,
+                ))
                 .unwrap();
         }
         std::thread::scope(|scope| {

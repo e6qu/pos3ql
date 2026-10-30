@@ -59,6 +59,8 @@ A waiting schema edit must never attach itself to a new object that reused a nam
   physical table now retain their reader and use bounded memory per fetch.
   Extend this to expressions, filters, joins, ordering, row locks and holdable
   cursors, then reuse the positions for ordinary results after their first flush.
+  Keep read counts through savepoint rollback and release; never transfer a
+  retired table’s pending counters to a replacement that reuses its slot.
   Preserve relation ownership, failed-fetch cleanup, scan statistics and
   PostgreSQL's distinction between fetching, skipping and moving rows.
   Preserve the existing [cursor input, type and capacity rules](docs/postgresql-18-compatibility.md#capacity-boundaries)

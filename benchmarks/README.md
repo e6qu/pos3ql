@@ -31,6 +31,7 @@ and bandwidth calculations do not update these historical reports.
 | 2026-09-21 | [Paired checkpoint overlap with PostgreSQL 18, 1,000 rows](https://github.com/e6qu/pos3ql/blob/708d5b475845492bdaa29dd573a6f508770acc62/benchmarks/baselines/2026-09-21-postgresql18-checkpoint-1000/README.md) |
 | 2026-09-23 | [10,000-row object-store matrix](https://github.com/e6qu/pos3ql/blob/708d5b475845492bdaa29dd573a6f508770acc62/benchmarks/baselines/2026-09-23-object-store-matrix-10000/README.md) |
 | 2026-09-23 | [10,000-row resource-matched PostgreSQL matrix](https://github.com/e6qu/pos3ql/blob/708d5b475845492bdaa29dd573a6f508770acc62/benchmarks/baselines/2026-09-23-resource-matched-postgresql-10000/README.md) |
+| 2026-10-30 | [Empty embedded engine startup budget and resident memory](baselines/2026-10-30-embedded-startup/README.md) |
 
 Follow each run's README for qualifications and raw artifact locations. Preserve
 these files during documentation cleanup; do not regenerate a report against

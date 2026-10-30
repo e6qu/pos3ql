@@ -38,15 +38,12 @@ fn row_history_exhaustion_rejects_before_durable_publication_and_recovers() {
             "UPDATE history_orders SET value=1 WHERE id=2",
             true,
         );
-        writer.success(
-            &mut engine,
-            "BEGIN; UPDATE history_orders SET value=value+1",
-            true,
-        );
+        writer.success(&mut engine, "BEGIN", true);
         let durable_before = engine.replication_identity().1;
-        let error = writer.execute(&mut engine, "COMMIT", true);
+        let error = writer.execute(&mut engine, "UPDATE history_orders SET value=value+1", true);
         assert_eq!(error_sqlstates(&error), ["54000"]);
         assert!(String::from_utf8_lossy(&error).contains("max_row_versions_per_row"));
+        writer.success(&mut engine, "COMMIT", true);
         assert_eq!(
             engine.replication_identity().1,
             durable_before,

@@ -151,6 +151,9 @@ peak resident memory and startup time. CI records 1, 8 and 32 configured tables
 with both transaction modes and the same explicit memory settings. These are
 empty-engine measurements, separate from a server's connection buffers, query
 workloads and production throughput.
+The retained [empty-engine baseline](../benchmarks/baselines/2026-10-30-embedded-startup/README.md)
+includes raw measurements and their revision; its resident costs must not be
+mistaken for configured byte reservations or a production minimum.
 The helper uses the same explicit 128 MiB virtual stack reservation as the
 server and native tests; ordinary operating-system thread defaults are not the
 current execution contract. Peak resident memory includes the pages actually

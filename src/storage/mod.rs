@@ -34653,7 +34653,8 @@ impl Storage {
             let oldest = snapshots
                 .retains_for(txid)
                 .then(|| snapshots.oldest())
-                .flatten();
+                .flatten()
+                .filter(|snapshot| *snapshot < state.committed_lsn);
             if prune_committed_history(
                 &mut versions.committed_row_versions,
                 &mut state.history,

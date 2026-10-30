@@ -57,6 +57,9 @@ Reject per-row history exhaustion before writing the commit too; a multirow
 transaction must leave every row unchanged and keep the server usable on error.
 Include the current execution-stack requirement in embedded measurements and
 reduce avoidable wide construction frames alongside table and history metadata.
+The retained [empty-engine measurements](benchmarks/baselines/2026-10-30-embedded-startup/README.md)
+establish a debug-build starting point; repeat them after memory repairs and add
+populated-table and client-session workloads before claiming an embedded minimum.
 
 ### Finish transaction visibility and keep maintenance moving
 

@@ -22,7 +22,9 @@ references, including their types, collations and alias errors.
 Keep catalog-vector array functions, relation-name round trips and quantified
 pattern matching in the reference comparisons used by actual applications.
 Memory comparisons must separate configured reservations, drawn startup budget
-and measured process memory; retain both transaction modes and the revision.
+and measured process memory; retain both transaction modes, raw named component
+charges, compiler identity and the revision. Keep evidence metadata separately
+from disposable empty database files.
 The live built-in inventory must reject wrong properties for registered routines;
 missing catalog entries remain an explicit completion gap in PLAN.md.
 Reproduce history exhaustion with an older reader and a multirow write; assert

@@ -19432,7 +19432,12 @@ impl Engine {
             let prepared = {
                 let (query, description, rows) = cursors.execution_parts(at);
                 let mut capture = Responder::for_cursor(description, rows);
-                query.prepare_source(&self.storage, txn.txid, &mut capture)
+                query.prepare_source(
+                    &self.storage,
+                    txn.txid,
+                    datetime::now_micros(),
+                    &mut capture,
+                )
             };
             match prepared {
                 Ok(true) => {
@@ -19691,7 +19696,7 @@ impl Engine {
                     }
                     Ok(Ok(()))
                 })();
-                if matches!(&outcome, Err(_))
+                if outcome.is_err()
                     || matches!(&outcome, Ok(Err(error))
                     if error.sqlstate != sqlstate::INTERNAL_IO_WAIT && error.sqlstate != sqlstate::INTERNAL_LOCK_WAIT)
                 {

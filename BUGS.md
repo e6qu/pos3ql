@@ -9,6 +9,8 @@ the fixing PR, including exhausted-memory behavior before irreversible effects
 and retained readers surviving command-arena resets and owner moves. Keep
 active-relation checks, failed-fetch cleanup and storage-wait retries in the same
 regression coverage.
+Failed PostgreSQL comparisons preserve their outputs and diagnostics before
+temporary files are removed.
 See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 Unfinished features and their verification criteria belong in [PLAN.md](PLAN.md).

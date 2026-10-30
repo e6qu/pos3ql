@@ -51,6 +51,7 @@ impl<'a> RetainedSelect<'a> {
         statement: &'a Select<'a>,
         params: &[Datum<'a>],
         arena: &'a Arena,
+        observed_at: i64,
         responder: &mut Responder<'_>,
     ) -> Result<Option<Self>, SqlError> {
         let Some(from) = statement.from.as_ref() else {
@@ -133,7 +134,7 @@ impl<'a> RetainedSelect<'a> {
             .map_err(|_| super::super::cursor_description_too_large())?;
         let mut source = RowCursor::closed();
         source.open(storage, table, txid, arena)?;
-        storage.record_relation_scan(txid, table, None, 0)?;
+        storage.record_relation_scan(txid, table, None, 0, observed_at)?;
         let decoded_columns = demand.selected_mask(0).map(|mask| {
             core::array::from_fn(|column| column < u64::BITS as usize && mask & (1 << column) != 0)
         });

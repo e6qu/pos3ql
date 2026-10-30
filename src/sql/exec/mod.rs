@@ -52550,6 +52550,13 @@ pub fn cluster(
         ) {
             return sql_fail(error);
         }
+        if let Err(error) = super::cursor::require_table_idle(
+            table,
+            storage.table_def(table, txn.txid).name.as_str(),
+            "CLUSTER",
+        ) {
+            return sql_fail(error);
+        }
         if let Err(error) = set_clustered_index(storage, wal, txn, table, Some(selected)) {
             return sql_fail(error);
         }
@@ -56001,7 +56008,7 @@ pub fn copy_out(
     let scan = storage.captured_row_scan_in(table, txid, arena)?;
     let mut schema = [ColType::Bool; MAX_COLUMNS];
     def.schema(&mut schema);
-    storage.record_relation_scan(txid, table, None, 0)?;
+    storage.record_relation_scan(txid, table, None, 0, crate::sql::datetime::now_micros())?;
     let mut visible = 0usize;
     let _ = scan.for_each_home(&mut |_, _| {
         visible = visible.checked_add(1).ok_or_else(|| {
@@ -57968,7 +57975,13 @@ pub(crate) fn merge<'a>(
         };
         let mut k = 0usize;
         for &leaf in leaves {
-            if let Err(error) = storage.record_relation_scan(txn.txid, leaf, None, 0) {
+            if let Err(error) = storage.record_relation_scan(
+                txn.txid,
+                leaf,
+                None,
+                0,
+                crate::sql::datetime::now_micros(),
+            ) {
                 return sql_fail(error);
             }
             if let Err(e) = storage.for_each_row_state(leaf, &mut |rowid, state| {
@@ -70248,6 +70261,7 @@ pub(super) fn collect_matches<'a>(
                 leaf,
                 access.map(|access| access.index_oid()),
                 access.map_or(0, |access| access.index_entries()),
+                crate::sql::datetime::now_micros(),
             )?;
         }
         let physical = *storage.table_def(leaf, txid);
@@ -70399,7 +70413,7 @@ fn collect_join_matches<'a>(
     }
     for &leaf in dml_leaf_slots(storage, table_index, txid, arena)? {
         storage.record_serializable_read(txid, leaf);
-        storage.record_relation_scan(txid, leaf, None, 0)?;
+        storage.record_relation_scan(txid, leaf, None, 0, crate::sql::datetime::now_micros())?;
         let physical = *storage.table_def(leaf, txid);
         let layout = images.capture_layout(leaf, def, &physical, capture, arena)?;
         let capture_bytes = capture.needs_bytes(storage, table_index, leaf, txid);
@@ -70565,7 +70579,7 @@ fn collect_join_matches_with_transition<'a>(
     }
     for &leaf in dml_leaf_slots(storage, table_index, txid, arena)? {
         storage.record_serializable_read(txid, leaf);
-        storage.record_relation_scan(txid, leaf, None, 0)?;
+        storage.record_relation_scan(txid, leaf, None, 0, crate::sql::datetime::now_micros())?;
         let physical = *storage.table_def(leaf, txid);
         let layout = images.capture_layout(leaf, def, &physical, capture, arena)?;
         let capture_bytes = capture.needs_bytes(storage, table_index, leaf, txid);

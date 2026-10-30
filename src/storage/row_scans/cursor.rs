@@ -59,10 +59,11 @@ fn state_error(error: ArenaSliceError) -> SqlError {
     }
 }
 
-fn cursor_capacity() -> SqlError {
+fn cursor_capacity(error: crate::mem::arena::ArenaFull) -> SqlError {
     sql_err!(
         sqlstate::PROGRAM_LIMIT_EXCEEDED,
-        "query cursor positions exceed the execution arena"
+        "query cursor memory exhausted: {}",
+        error
     )
 }
 
@@ -101,7 +102,7 @@ impl RowCursor {
             |count| {
                 let handle = arena
                     .retain_slice_with(count, |_| CapturedRowRecord::EMPTY)
-                    .map_err(|_| cursor_capacity())?;
+                    .map_err(cursor_capacity)?;
                 rows_handle = Some(handle);
                 arena.retained_slice_mut(handle).map_err(state_error)
             },
@@ -113,7 +114,7 @@ impl RowCursor {
             .unwrap_or(0);
         let members = arena
             .retain_slice_with(member_count, |_| MemberCursor::EMPTY)
-            .map_err(|_| cursor_capacity())?;
+            .map_err(cursor_capacity)?;
         self.source = Some(RowScanSource {
             snapshot,
             rows: rows_handle.expect("successful capture allocated its resident selections"),
@@ -175,12 +176,7 @@ impl RowCursor {
                 arena
                     .alloc_slice_copy(bytes)
                     .map(|bytes| &*bytes)
-                    .map_err(|_| {
-                        sql_err!(
-                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                            "query cursor row exceeds the statement arena"
-                        )
-                    })
+                    .map_err(cursor_capacity)
             };
             let bytes = match home.bytes {
                 crate::storage::row_images::VisibleRowBytes::Heap(bytes) => copy(&bytes)?,
@@ -244,7 +240,37 @@ mod tests {
         use crate::pg::respond::Responder;
         use crate::sql::cursor::CursorQuery;
 
-        let config = test_config();
+        // Exercise real catalog and row owners without constructing unused
+        // database features under Miri's interpreter.
+        let mut config = test_config();
+        config.memtable_bytes = 256;
+        config.max_tables = 2;
+        config.table_rows = 2;
+        config.txn_rows = 2;
+        config.max_catalog_versions_per_object = 1;
+        config.catalog_history_bytes = 4096;
+        config.max_spill_generations_per_table = 1;
+        config.max_views = 0;
+        config.max_materialized_views = 0;
+        config.max_routines = 0;
+        config.max_casts = 0;
+        config.max_operators = 0;
+        config.max_operator_families = 0;
+        config.max_operator_classes = 0;
+        config.max_composites = 0;
+        config.max_domains = 0;
+        config.max_enums = 0;
+        config.max_triggers = 0;
+        config.max_policies = 0;
+        config.max_publications = 0;
+        config.max_text_search_objects = 0;
+        config.max_large_objects = 0;
+        config.large_object_pages = 0;
+        config.max_extended_statistics = 0;
+        config.max_subscriptions = 0;
+        config.max_foreign_data_wrappers = 0;
+        config.max_foreign_servers = 0;
+        config.max_user_mappings = 0;
         let mut budget = test_budget(&config);
         let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let visibility = storage.nested_statement_snapshot(7);
@@ -274,6 +300,7 @@ mod tests {
                 query
                     .prepare_source(
                         &storage,
+                        0,
                         0,
                         &mut Responder::for_cursor(&mut description, &mut rows)
                     )

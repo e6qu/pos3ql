@@ -179,6 +179,7 @@ impl CursorQuery {
         &mut self,
         storage: &crate::storage::Storage,
         txid: u32,
+        observed_at: i64,
         responder: &mut crate::pg::respond::Responder<'_>,
     ) -> Result<bool, SqlError> {
         let bound = self.bound.as_ref().expect("bound cursor query");
@@ -193,6 +194,7 @@ impl CursorQuery {
                 statement,
                 bound.params,
                 &self.arena,
+                observed_at,
                 responder,
             )
         })?;

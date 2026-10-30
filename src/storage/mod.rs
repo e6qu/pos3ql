@@ -16517,17 +16517,17 @@ impl Storage {
         table: usize,
         index_oid: Option<i32>,
         index_entries: usize,
+        observed_at: i64,
     ) -> Result<(), SqlError> {
-        let now = crate::sql::datetime::now_micros();
         self.with_relation_transaction_statistics(txid, table, |statistics| {
             if index_oid.is_some() {
                 statistics.idx_scan = statistics.idx_scan.saturating_add(1);
-                statistics.last_idx_scan = Some(now);
+                statistics.last_idx_scan = Some(observed_at);
                 statistics.idx_tup_read =
                     statistics.idx_tup_read.saturating_add(index_entries as u64);
             } else {
                 statistics.seq_scan = statistics.seq_scan.saturating_add(1);
-                statistics.last_seq_scan = Some(now);
+                statistics.last_seq_scan = Some(observed_at);
             }
         })?;
         if let Some(oid) = index_oid {
@@ -16578,7 +16578,7 @@ impl Storage {
                 };
                 let statistics = &mut indexes[position];
                 statistics.idx_scan = statistics.idx_scan.saturating_add(1);
-                statistics.last_idx_scan = Some(now);
+                statistics.last_idx_scan = Some(observed_at);
                 statistics.idx_tup_read =
                     statistics.idx_tup_read.saturating_add(index_entries as u64);
                 break;
@@ -58615,7 +58615,13 @@ mod tests {
             .unwrap()
             .oid();
         storage
-            .record_relation_scan(1, table, Some(original), 1)
+            .record_relation_scan(
+                1,
+                table,
+                Some(original),
+                1,
+                crate::sql::datetime::now_micros(),
+            )
             .unwrap();
         storage
             .record_relation_tuple_read(1, table, Some(original))
@@ -58638,7 +58644,13 @@ mod tests {
             11
         );
         storage
-            .record_relation_scan(1, table, Some(original), 1)
+            .record_relation_scan(
+                1,
+                table,
+                Some(original),
+                1,
+                crate::sql::datetime::now_micros(),
+            )
             .unwrap();
         storage
             .record_relation_tuple_read(1, table, Some(original))
@@ -58661,7 +58673,13 @@ mod tests {
         };
         crate::mem::guard::forbid_alloc(|| {
             storage
-                .record_relation_scan(1, table, Some(original), 1)
+                .record_relation_scan(
+                    1,
+                    table,
+                    Some(original),
+                    1,
+                    crate::sql::datetime::now_micros(),
+                )
                 .unwrap();
             assert_eq!(
                 storage
@@ -58739,7 +58757,13 @@ mod tests {
                 .oid();
             assert_ne!(replacement, original);
             storage
-                .record_relation_scan(3, table, Some(replacement), 1)
+                .record_relation_scan(
+                    3,
+                    table,
+                    Some(replacement),
+                    1,
+                    crate::sql::datetime::now_micros(),
+                )
                 .unwrap();
             assert_eq!(storage.cumulative_statistics().indexes.len(), capacity);
             assert_eq!(
@@ -58769,7 +58793,13 @@ mod tests {
                 .unwrap()
                 .oid();
             storage
-                .record_relation_scan(4, table, Some(transient), 1)
+                .record_relation_scan(
+                    4,
+                    table,
+                    Some(transient),
+                    1,
+                    crate::sql::datetime::now_micros(),
+                )
                 .unwrap();
             let (target, mut next) = storage.select_table_definition(table, 4);
             next.columns[0].unique = false;
@@ -58796,7 +58826,7 @@ mod tests {
                 .unwrap()
                 .oid();
             storage
-                .record_relation_scan(5, table, Some(saved), 1)
+                .record_relation_scan(5, table, Some(saved), 1, crate::sql::datetime::now_micros())
                 .unwrap();
             {
                 let mut cumulative = storage.cumulative_statistics();
@@ -58823,7 +58853,13 @@ mod tests {
                 .unwrap()
                 .oid();
             storage
-                .record_relation_scan(5, table, Some(discarded), 1)
+                .record_relation_scan(
+                    5,
+                    table,
+                    Some(discarded),
+                    1,
+                    crate::sql::datetime::now_micros(),
+                )
                 .unwrap();
             assert_eq!(storage.cumulative_statistics().indexes.len(), capacity);
             storage.rollback_table_def(third);
@@ -58859,7 +58895,7 @@ mod tests {
             let slot = storage.create_index(explicit, 6).unwrap();
             let oid = crate::sql::catalog::explicit_index_oid(&storage.index(slot));
             storage
-                .record_relation_scan(6, table, Some(oid), 1)
+                .record_relation_scan(6, table, Some(oid), 1, crate::sql::datetime::now_micros())
                 .unwrap();
             assert_eq!(
                 storage.index_cumulative_statistics(database, oid).idx_scan,

@@ -5718,7 +5718,13 @@ fn scan_source_mode<'a>(
             } else if let Some(demand) = pax_demand.selected_mask(build_t)
                 && let Some(scan) = storage.immutable_row_scan_in(build_slot, arena)?
             {
-                storage.record_relation_scan(txid, build_slot, None, 0)?;
+                storage.record_relation_scan(
+                    txid,
+                    build_slot,
+                    None,
+                    0,
+                    crate::sql::datetime::now_micros(),
+                )?;
                 scan.for_each_spilled_row_batch(arena, false, Some(demand), &mut |rows| {
                     for spilled in rows {
                         storage.record_relation_tuple_read(txid, build_slot, None)?;
@@ -5735,7 +5741,13 @@ fn scan_source_mode<'a>(
                     Ok(ControlFlow::Continue(()))
                 })?;
             } else {
-                storage.record_relation_scan(txid, build_slot, None, 0)?;
+                storage.record_relation_scan(
+                    txid,
+                    build_slot,
+                    None,
+                    0,
+                    crate::sql::datetime::now_micros(),
+                )?;
                 storage.for_each_row_state(build_slot, &mut |rowid, state| {
                     let Some(home) = storage.visible_row_home(build_slot, rowid, state, txid)?
                     else {
@@ -5798,7 +5810,13 @@ fn scan_source_mode<'a>(
                 && let Some(demand) = pax_demand.selected_mask(probe_t)
                 && let Some(scan) = storage.immutable_row_scan_in(probe_slot, arena)?
             {
-                storage.record_relation_scan(txid, probe_slot, None, 0)?;
+                storage.record_relation_scan(
+                    txid,
+                    probe_slot,
+                    None,
+                    0,
+                    crate::sql::datetime::now_micros(),
+                )?;
                 let mut stopped = false;
                 scan.for_each_spilled_row_batch(arena, recycle_rows, Some(demand), &mut |rows| {
                     for spilled in rows {
@@ -6102,7 +6120,13 @@ fn scan_source_mode<'a>(
             } else {
                 // Collect and sort the probe table's visible rows to match the
                 // nested loop's output order.
-                storage.record_relation_scan(txid, probe_slot, None, 0)?;
+                storage.record_relation_scan(
+                    txid,
+                    probe_slot,
+                    None,
+                    0,
+                    crate::sql::datetime::now_micros(),
+                )?;
                 let probe_count = storage.visible_row_count(probe_slot, txid)?;
                 let probe_snapshot = storage.table_row_snapshot(probe_slot, Some(arena))?;
                 let probe_ordered = arena
@@ -6458,7 +6482,13 @@ fn scan_source_mode<'a>(
         }
         macro_rules! visit_sequential_physical_rows {
             ($slot:expr) => {{
-                storage.record_relation_scan(txid, $slot, None, 0)?;
+                storage.record_relation_scan(
+                    txid,
+                    $slot,
+                    None,
+                    0,
+                    crate::sql::datetime::now_micros(),
+                )?;
                 let scan = storage.captured_row_scan_in($slot, txid, arena)?;
                 let mut index = 0usize;
                 let mut aborted = false;
@@ -6627,6 +6657,7 @@ fn scan_source_mode<'a>(
                         slot,
                         Some(access.index_oid),
                         access.index_entries,
+                        crate::sql::datetime::now_micros(),
                     )?;
                 }
                 for (index, &rowid) in access.rowids.iter().enumerate() {
@@ -6692,7 +6723,13 @@ fn scan_source_mode<'a>(
                     .get(order[depth])
                     .expect("resolved logical relation");
                 for &leaf in &leaves[..n_leaves] {
-                    storage.record_relation_scan(txid, leaf, None, 0)?;
+                    storage.record_relation_scan(
+                        txid,
+                        leaf,
+                        None,
+                        0,
+                        crate::sql::datetime::now_micros(),
+                    )?;
                     let physical = definitions.definition(storage, leaf, txid)?;
                     let mapping = crate::storage::RelationColumnMap::new(logical, physical, arena)?;
                     let mut schema = [ColType::Bool; MAX_COLUMNS];
@@ -6761,6 +6798,7 @@ fn scan_source_mode<'a>(
                     slot,
                     access.map(|access| access.index_oid),
                     access.map_or(0, |access| access.index_entries),
+                    crate::sql::datetime::now_micros(),
                 )?;
             }
             // A key-carrying ordered candidate set can satisfy the scan

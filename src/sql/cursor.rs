@@ -591,12 +591,6 @@ impl CursorPool {
         let slot = &mut self.slots[at];
         slot.validate_motion(motion, move_only)?;
         let n = slot.spans.len() as i64;
-        let target = match motion {
-            FetchMotion::Absolute(k) if k >= 0 => i64::from(k).clamp(0, n + 1),
-            FetchMotion::Absolute(k) => (n + 1 + i64::from(k)).clamp(0, n + 1),
-            FetchMotion::Relative(k) => (slot.position + i64::from(k)).clamp(0, n + 1),
-            _ => slot.position,
-        };
         self.emit.clear();
         let out_rows = &mut self.emit;
         let push_row = |row: i64, out: &mut Vec<u32>| {

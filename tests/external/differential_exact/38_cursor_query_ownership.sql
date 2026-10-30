@@ -46,27 +46,30 @@ CLOSE retained_orders;
 COMMIT;
 
 CREATE FUNCTION cursor_retained_native() RETURNS text LANGUAGE plpgsql AS $$
-DECLARE c refcursor; saved text; n integer; label text := 'opening';
+DECLARE c refcursor; saved text; n integer; captured_label text := 'opening';
 BEGIN
-  OPEN c NO SCROLL FOR SELECT id,label FROM cursor_retained_orders;
-  label := 'changed';
+  OPEN c NO SCROLL FOR SELECT id,captured_label FROM cursor_retained_orders;
+  captured_label := 'changed';
   FETCH NEXT FROM c INTO n,saved;
   CLOSE c;
   RETURN saved;
 END $$;
 SELECT cursor_retained_native();
 DROP FUNCTION cursor_retained_native();
+CREATE INDEX cursor_retained_order_idx ON cursor_retained_orders(id);
 
 -- PostgreSQL CheckTableNotInUse keeps an open reader attached to its table.
 -- https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/commands/tablecmds.c
 BEGIN;
-DECLARE busy_orders NO SCROLL CURSOR FOR SELECT id FROM cursor_retained_orders;
+DECLARE busy_orders NO SCROLL CURSOR FOR SELECT 1 AS visible FROM cursor_retained_orders;
 SAVEPOINT busy_ddl;
 DROP TABLE cursor_retained_orders;
 ROLLBACK TO SAVEPOINT busy_ddl;
 TRUNCATE cursor_retained_orders;
 ROLLBACK TO SAVEPOINT busy_ddl;
 ALTER TABLE cursor_retained_orders ADD COLUMN extra integer;
+ROLLBACK TO SAVEPOINT busy_ddl;
+CLUSTER cursor_retained_orders USING cursor_retained_order_idx;
 ROLLBACK TO SAVEPOINT busy_ddl;
 ALTER TABLE cursor_retained_orders RENAME TO cursor_renamed_orders;
 FETCH ALL FROM busy_orders;

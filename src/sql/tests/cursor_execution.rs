@@ -93,7 +93,7 @@ fn cursor_retained_table_cannot_be_dropped_or_rewritten_until_close() {
     let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
     session.success(
         &mut engine,
-        "CREATE TABLE busy_orders(id integer); \
+        "CREATE TABLE busy_orders(id integer); CREATE INDEX busy_idx ON busy_orders(id); \
         INSERT INTO busy_orders VALUES(1),(2); BEGIN; \
         DECLARE busy NO SCROLL CURSOR FOR SELECT id FROM busy_orders; SAVEPOINT ddl",
         true,
@@ -102,6 +102,7 @@ fn cursor_retained_table_cannot_be_dropped_or_rewritten_until_close() {
         "DROP TABLE busy_orders",
         "TRUNCATE busy_orders",
         "ALTER TABLE busy_orders ADD COLUMN extra integer",
+        "CLUSTER busy_orders USING busy_idx",
     ] {
         let output = session.execute(&mut engine, sql, true);
         assert_eq!(error_sqlstates(&output), ["55006"], "{sql}");
@@ -187,6 +188,36 @@ fn cursor_retained_capacity_error_releases_its_reader_and_stays_failed() {
     session.success(
         &mut engine,
         "ROLLBACK TO SAVEPOINT before_fetch; CLOSE small; ROLLBACK",
+        true,
+    );
+}
+
+#[test]
+fn cursor_retained_input_capacity_names_its_budget_and_releases_failed_open() {
+    let mut config = test_config("cursor-retained-input-capacity");
+    config.max_cursors = 1;
+    config.cursor_query_bytes = 8192;
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE TABLE many_inputs(id integer); \
+        INSERT INTO many_inputs SELECT g FROM generate_series(1,512) AS g; BEGIN",
+        true,
+    );
+    let output = session.execute(
+        &mut engine,
+        "DECLARE too_many NO SCROLL CURSOR FOR SELECT id FROM many_inputs",
+        true,
+    );
+    assert_eq!(error_sqlstates(&output), ["54000"]);
+    assert!(String::from_utf8_lossy(&output).contains("cursor_query_bytes"));
+    assert!(!session.cursors.exists("too_many"));
+    session.success(
+        &mut engine,
+        "ROLLBACK; TRUNCATE many_inputs; BEGIN; \
+        DECLARE fits NO SCROLL CURSOR FOR SELECT id FROM many_inputs; FETCH ALL FROM fits; COMMIT",
         true,
     );
 }

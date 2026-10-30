@@ -20,6 +20,7 @@ pub(crate) struct CursorQuery {
     // Every reference in BoundQuery points into arena's allocation. Drop the
     // bound value before resetting or freeing that allocation.
     bound: Option<BoundQuery<'static>>,
+    pub(crate) sequence_replay: crate::sql::sequence::SequenceReplayState,
     arena: Arena,
 }
 
@@ -56,12 +57,14 @@ impl CursorQuery {
     pub(crate) fn new(budget: &mut Budget, bytes: usize) -> Result<Self, BudgetError> {
         Ok(Self {
             bound: None,
+            sequence_replay: crate::sql::sequence::SequenceReplayState::empty(),
             arena: Arena::new(budget, "cursor_query_bytes", bytes)?,
         })
     }
 
     pub(crate) fn clear(&mut self) {
         self.bound = None;
+        self.sequence_replay = crate::sql::sequence::SequenceReplayState::empty();
         self.arena.reset();
     }
 

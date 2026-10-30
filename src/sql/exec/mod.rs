@@ -39911,10 +39911,11 @@ pub fn create_table_as(
             Ok(s) => s,
             Err(e) => return sql_fail(e),
         };
-        let replay_state = crate::sql::sequence::SequenceReplayState::new(arena);
+        let replay_state = crate::sql::sequence::SequenceReplayState::empty();
         let live_sequence = crate::sql::sequence::ReplaySeqEval::new(
             crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid),
             &replay_state,
+                    arena,
         );
         let sel = match super::query::expand_ctes_exec(
             sel,
@@ -40154,10 +40155,11 @@ pub fn refresh_materialized_view(
         Ok(select) => select,
         Err(error) => return sql_fail(error),
     };
-    let replay_state = crate::sql::sequence::SequenceReplayState::new(arena);
+    let replay_state = crate::sql::sequence::SequenceReplayState::empty();
     let live_sequence = crate::sql::sequence::ReplaySeqEval::new(
         crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid),
         &replay_state,
+                    arena,
     );
     let dependencies = match storage.snapshot_matview_dependencies(slot, txn.txid, arena) {
         Ok(dependencies) => dependencies,

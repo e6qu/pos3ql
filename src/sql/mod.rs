@@ -13052,7 +13052,7 @@ impl Engine {
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
         let invocations = query::RoutineInvocationState::new(arena);
-        let sequence_state = sequence::SequenceReplayState::new(arena);
+        let sequence_state = sequence::SequenceReplayState::empty();
         let source_snapshot = txn.command_id().saturating_add(1);
         loop {
             self.work.reset();
@@ -13326,7 +13326,7 @@ impl Engine {
         };
         let base_sequence = sequence::SeqEval::new(&self.storage, guc.seq_session(), txn.txid);
         let replay_sequence =
-            sequence_state.map(|state| sequence::ReplaySeqEval::new(base_sequence, state));
+            sequence_state.map(|state| sequence::ReplaySeqEval::new(base_sequence, state, arena));
         let sequence: &dyn SequenceAccess = replay_sequence
             .as_ref()
             .map(|sequence| sequence as &dyn SequenceAccess)
@@ -13470,7 +13470,7 @@ impl Engine {
             }
             Ok(())
         };
-        let sequence_replay = sequence::SequenceReplayState::new(arena);
+        let sequence_replay = sequence::SequenceReplayState::empty();
         let outcome = match program.result {
             query::RoutineFunctionResult::Query(result_query) => loop {
                 self.work.reset();
@@ -13479,6 +13479,7 @@ impl Engine {
                 let sequence = sequence::ReplaySeqEval::new(
                     sequence::SeqEval::new(&self.storage, guc.seq_session(), txn.txid),
                     &sequence_replay,
+                    arena,
                 );
                 let outcome = query::execute_bound_routine_query(
                     result_query,
@@ -13988,7 +13989,7 @@ impl Engine {
             len.set(len.get() + 1);
             Ok(())
         };
-        let sequence_replay = sequence::SequenceReplayState::new(arena);
+        let sequence_replay = sequence::SequenceReplayState::empty();
         let outcome = match program.result {
             query::RoutineFunctionResult::Query(result) => loop {
                 self.work.reset();
@@ -13998,6 +13999,7 @@ impl Engine {
                 let sequence = sequence::ReplaySeqEval::new(
                     sequence::SeqEval::new(&self.storage, guc.seq_session(), txn.txid),
                     &sequence_replay,
+                    arena,
                 );
                 let outcome = query::execute_bound_routine_query(
                     result,
@@ -19424,10 +19426,10 @@ impl Engine {
             let mut capture = Responder::for_cursor(description, rows);
             capture.set_render(guc.render());
             query.with_query(|parsed, params, arena| {
-                let sequence_state = sequence::SequenceReplayState::new(arena);
                 let sequence = sequence::ReplaySeqEval::new(
                     sequence::SeqEval::new(&self.storage, guc.seq_session(), txn.txid),
-                    &sequence_state,
+                    &query.sequence_replay,
+                    arena,
                 );
                 match parsed {
                     cursor::CursorStatement::Select(select) => {

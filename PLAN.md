@@ -57,7 +57,8 @@ A waiting schema edit must never attach itself to a new object that reused a nam
   commit saves the required result before releasing its transaction.
   Preserve the existing [cursor input, type and capacity rules](docs/postgresql-18-compatibility.md#capacity-boundaries)
   while adding execution positions. Later variable assignments must not change
-  captured inputs. Preserve rollback, cleanup and PostgreSQL's errors for
+  captured inputs. Keep issued sequence values in the owned execution state so
+  retries cannot issue them again. Preserve rollback, cleanup and PostgreSQL's errors for
   invalid fields and utility parameters. Saved dates must still use the
   settings chosen before `FETCH`, including after commit.
 

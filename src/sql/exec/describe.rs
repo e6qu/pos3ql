@@ -8,8 +8,8 @@
 //! combinations have no operator at all, so a query that cannot work is refused
 //! here rather than part-way through a scan.
 
-use crate::sql::ast::{Expr, SelectItem};
 use crate::sql::MAX_PROJ;
+use crate::sql::ast::{Expr, SelectItem};
 use crate::sql::datetime;
 use crate::sql::eval::{ColumnLookup, SqlError, described_expression_collation, sqlstate};
 use crate::sql::types::{ColDesc, ColType, CollationDerivation, Datum, oid};
@@ -2366,7 +2366,7 @@ static RECORD_FIELD_NAME_BYTES: [[u8; 6]; MAX_PROJ] = {
     names
 };
 
-pub const RECORD_FIELD_NAMES: [&str; MAX_PROJ] = {
+pub static RECORD_FIELD_NAMES: [&str; MAX_PROJ] = {
     let mut names = [""; MAX_PROJ];
     let mut index = 0;
     while index < MAX_PROJ {

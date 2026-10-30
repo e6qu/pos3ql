@@ -372,8 +372,9 @@ mod tests {
         drop(names);
         text.clear();
         crate::mem::guard::forbid_alloc(|| {
-            query.with_query(|_, params, _| {
-                let Datum::Record(fields) = params[0] else {
+            query.with_query(|_, params, arena| {
+                let detached = crate::sql::exec::detach_routine_datum(params[0], arena).unwrap();
+                let Datum::Record(fields) = detached else {
                     panic!("record parameter")
                 };
                 assert_eq!(fields.len(), 256);

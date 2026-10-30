@@ -711,8 +711,8 @@ pub use describe::{
 };
 pub(crate) use describe::{
     StaticTypeMeta, builtin_record_srf_field_pub, coltype_of_oid, infer_routine_argument_oid,
-    infer_type_catalog, intrinsic_record_field_meta, record_shape_metadata, record_shape_pool_bytes,
-    routine_result_metadata, unify_numeric_tower,
+    infer_type_catalog, intrinsic_record_field_meta, record_shape_metadata,
+    record_shape_pool_bytes, routine_result_metadata, unify_numeric_tower,
 };
 pub(crate) use describe::{
     bound_parameter_type_oid, enter_routine_parameter_types, with_bound_parameter_types,
@@ -16298,6 +16298,7 @@ struct BoundPlpgsqlCommand<'a> {
     source: &'a str,
     statement: &'a Stmt<'a>,
     arguments: &'a [Datum<'a>],
+    parameter_types: &'a [i32],
 }
 
 #[derive(Clone, Copy)]
@@ -20919,7 +20920,7 @@ fn materialize_trigger_insert_source<'result, 'query>(
     result_arena: &'result Arena,
     txid: u32,
     execution: TriggerQueryExecution<'_, '_, 'result>,
-    scope: &TriggerLocalScope<'_, 'result>,
+    scope: Option<&dyn ColumnLookup<'result>>,
 ) -> Result<&'result [&'result [u8]], SqlError>
 where
     'result: 'query,
@@ -20934,7 +20935,7 @@ where
             select,
             query_arena,
             execution.params,
-            Some(scope),
+            scope,
             Some(&dry),
             &mut |_| {
                 count += 1;
@@ -20958,7 +20959,7 @@ where
             select,
             query_arena,
             execution.params,
-            Some(scope),
+            scope,
             Some(&live),
             &mut |values| {
                 rows[at] = encode_projected_pub(values, result_arena)?;
@@ -20970,74 +20971,16 @@ where
     Ok(&*rows)
 }
 
-/// Detaches a value into the statement arena without flattening record field
-/// metadata. Row encoding is deliberately scalar-oriented, while function
-/// records must keep names and type OIDs for later field selection.
+/// Copies through the shared typed-value format so nested records retain every
+/// field name, declared type and value after the caller's storage is released.
 pub(crate) fn detach_routine_datum<'a>(
     value: Datum<'_>,
     arena: &'a Arena,
 ) -> Result<Datum<'a>, SqlError> {
-    match value {
-        Datum::Record(fields) => {
-            let mut detached = [RecordField {
-                name: "",
-                type_oid: 0,
-                value: Datum::Null,
-            }; MAX_COLUMNS];
-            if fields.len() > detached.len() {
-                return Err(sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "record has too many fields"
-                ));
-            }
-            for (index, field) in fields.iter().copied().enumerate() {
-                detached[index] = RecordField {
-                    name: arena
-                        .alloc_str(field.name)
-                        .map_err(|_| super::query::arena_full_pub())?,
-                    type_oid: field.type_oid,
-                    value: detach_routine_datum(field.value, arena)?,
-                };
-            }
-            let fields = arena
-                .alloc_slice_copy(&detached[..fields.len()])
-                .map_err(|_| super::query::arena_full_pub())?;
-            Ok(Datum::Record(&*fields))
-        }
-        Datum::Composite { slot, fields } => {
-            let mut detached = [RecordField {
-                name: "",
-                type_oid: 0,
-                value: Datum::Null,
-            }; MAX_COLUMNS];
-            if fields.len() > detached.len() {
-                return Err(sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "composite has too many fields"
-                ));
-            }
-            for (index, field) in fields.iter().copied().enumerate() {
-                detached[index] = RecordField {
-                    name: arena
-                        .alloc_str(field.name)
-                        .map_err(|_| super::query::arena_full_pub())?,
-                    type_oid: field.type_oid,
-                    value: detach_routine_datum(field.value, arena)?,
-                };
-            }
-            let fields = arena
-                .alloc_slice_copy(&detached[..fields.len()])
-                .map_err(|_| super::query::arena_full_pub())?;
-            Ok(Datum::Composite {
-                slot,
-                fields: &*fields,
-            })
-        }
-        _ => {
-            let encoded = encode_projected_pub(&[value], arena)?;
-            Ok(decode_projected_pub(encoded, 0))
-        }
-    }
+    let encoded = encode_projected_pub(&[value], arena)?;
+    let mut detached = [Datum::Null];
+    projected::decode_projected_row_into(encoded, arena, &mut detached)?;
+    Ok(detached[0])
 }
 
 fn detached_trigger_datum<'a>(value: Datum<'_>, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
@@ -21431,7 +21374,18 @@ fn bind_plpgsql_dynamic_query<'a>(
         .arena
         .alloc_slice_with(query.arguments.len(), |_| Datum::Null)
         .map_err(|_| super::query::arena_full_pub())?;
+    let parameter_types = context
+        .arena
+        .alloc_slice_with(query.arguments.len(), |_| 0)
+        .map_err(|_| super::query::arena_full_pub())?;
+    let catalog = super::query::storage_catalog(context.storage(), context.arena, context.txn.txid);
+    let hooks = EvalHooks { catalog: Some(&catalog), ..NO_HOOKS };
     for (index, expression) in query.arguments.iter().copied().enumerate() {
+        parameter_types[index] = match super::eval::expression_type_identity(expression, scope, &hooks)? {
+            super::eval::ExpressionTypeIdentity::Known(oid) => oid,
+            // A USING expression is a standalone PL/pgSQL SELECT target.
+            super::eval::ExpressionTypeIdentity::Unresolved => oid::TEXT,
+        };
         arguments[index] = detached_trigger_datum(
             eval_trigger_expression(context, expression, scope)?,
             context.arena,
@@ -21448,13 +21402,13 @@ fn bind_plpgsql_dynamic_query<'a>(
             }
         },
         arguments: &*arguments,
+        parameter_types,
     })
 }
 
 fn resolve_plpgsql_dynamic_prepared<'a>(
     context: &TriggerExecContext<'_, 'a, '_>,
     query: BoundPlpgsqlCommand<'a>,
-    scope: &TriggerLocalScope<'_, 'a>,
 ) -> Result<BoundPlpgsqlCommand<'a>, SqlError> {
     let Stmt::ExecutePrepared { name, args } = query.statement else {
         return Ok(query);
@@ -21463,12 +21417,25 @@ fn resolve_plpgsql_dynamic_prepared<'a>(
         .arena
         .alloc_slice_with(args.len(), |_| Datum::Null)
         .map_err(|_| super::query::arena_full_pub())?;
-    for (index, argument) in args.iter().copied().enumerate() {
-        values[index] = detached_trigger_datum(
-            eval_trigger_expression(context, argument, scope)?,
-            context.arena,
-        )?;
-    }
+    let parameter_types = context
+        .arena
+        .alloc_slice_with(args.len(), |_| 0)
+        .map_err(|_| super::query::arena_full_pub())?;
+    with_bound_parameter_types(query.parameter_types, || -> Result<(), SqlError> {
+        let catalog = super::query::storage_catalog(context.storage(), context.arena, context.txn.txid);
+        let sequence = crate::sql::sequence::SeqEval::new(
+            context.storage(), context.seq_session(), context.txn.txid,
+        );
+        let hooks = EvalHooks { catalog: Some(&catalog), sequences: Some(&sequence), ..NO_HOOKS };
+        for (index, argument) in args.iter().copied().enumerate() {
+            parameter_types[index] = super::eval::expression_type_identity(argument, &NoColumns, &hooks)?.record_field_oid();
+            values[index] = detached_trigger_datum(
+                eval_full(argument, context.arena, query.arguments, &NoColumns, &hooks)?,
+                context.arena,
+            )?;
+        }
+        Ok(())
+    })?;
     let PlpgsqlExecHost::Routine { sqlprep, .. } = &context.host else {
         return Err(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
@@ -21496,6 +21463,7 @@ fn resolve_plpgsql_dynamic_prepared<'a>(
     }
     for (index, value) in values.iter_mut().enumerate() {
         if index < declared_count {
+            parameter_types[index] = declared[index].oid();
             *value = detached_trigger_datum(
                 crate::sql::eval::cast(*value, declared[index].internal_name(), context.arena)?,
                 context.arena,
@@ -21510,17 +21478,18 @@ fn resolve_plpgsql_dynamic_prepared<'a>(
         source: text,
         statement: super::parser::parse_stored_statement(text, context.arena)?,
         arguments: &*values,
+        parameter_types,
     })
 }
 
 fn execute_bound_plpgsql_dynamic_query<'a>(
     context: &TriggerExecContext<'_, 'a, '_>,
     query: BoundPlpgsqlCommand<'a>,
-    scope: &TriggerLocalScope<'_, 'a>,
     sequence: &dyn crate::sql::eval::SequenceAccess,
     emit: &mut dyn for<'row> FnMut(&[Datum<'row>]) -> Result<(), SqlError>,
 ) -> Result<(), SqlError> {
-    let query = resolve_plpgsql_dynamic_prepared(context, query, scope)?;
+    let query = resolve_plpgsql_dynamic_prepared(context, query)?;
+    with_bound_parameter_types(query.parameter_types, || {
     match query.statement {
         Stmt::Select(select) => super::query::select_into_rows(
             context.storage(),
@@ -21528,7 +21497,7 @@ fn execute_bound_plpgsql_dynamic_query<'a>(
             select,
             context.arena,
             query.arguments,
-            Some(scope),
+            None,
             Some(sequence),
             emit,
         ),
@@ -21546,6 +21515,7 @@ fn execute_bound_plpgsql_dynamic_query<'a>(
             "PL/pgSQL dynamic query must be SELECT, VALUES, or a set operation"
         )),
     }
+    })
 }
 
 fn execute_plpgsql_dynamic_query<'a>(
@@ -21556,7 +21526,7 @@ fn execute_plpgsql_dynamic_query<'a>(
     emit: &mut dyn for<'row> FnMut(&[Datum<'row>]) -> Result<(), SqlError>,
 ) -> Result<(), SqlError> {
     let query = bind_plpgsql_dynamic_query(context, query, scope, DynamicCommandKind::Statement)?;
-    execute_bound_plpgsql_dynamic_query(context, query, scope, sequence, emit)
+    execute_bound_plpgsql_dynamic_query(context, query, sequence, emit)
 }
 
 /// Executes a parsed dynamic data-modifying statement through the same
@@ -21567,7 +21537,6 @@ fn execute_plpgsql_dynamic_query<'a>(
 fn execute_bound_plpgsql_dynamic_dml<'a>(
     context: &mut TriggerExecContext<'_, 'a, '_>,
     query: BoundPlpgsqlCommand<'a>,
-    scope: &TriggerLocalScope<'_, 'a>,
     transition_relations: Option<&'a [(&'a str, &'a crate::sql::ast::MaterializedCte<'a>)]>,
     capture: Option<&mut dyn FnMut(&[Datum]) -> Result<(), SqlError>>,
 ) -> Result<u64, SqlError> {
@@ -21595,20 +21564,8 @@ fn execute_bound_plpgsql_dynamic_dml<'a>(
                         params: query.arguments,
                         seq_session: context.seq_session(),
                     },
-                    scope,
-                )?),
-                None => None,
-            };
-            let conflict_scope = match statement.on_conflict {
-                Some(_) => Some(snapshot_trigger_dml_scope(
-                    scope.transition.definition,
-                    scope.locals,
-                    scope.values,
-                    scope.invocation,
-                    scope.transition.old,
-                    scope.transition.new,
-                    context.arena,
-                )?),
+                    None,
+)?),
                 None => None,
             };
             let arena = context.arena;
@@ -21631,9 +21588,9 @@ fn execute_bound_plpgsql_dynamic_dml<'a>(
                     seq_session,
                     responder,
                     capture,
-                    Some(scope),
+                    None,
                     transition_relations,
-                    conflict_scope,
+                    None,
                     prepared_select
                         .map_or(InsertSource::Statement, InsertSource::MaterializedSelect),
                 )
@@ -21671,7 +21628,7 @@ fn execute_bound_plpgsql_dynamic_dml<'a>(
                     seq_session,
                     responder,
                     capture,
-                    Some(scope),
+                    None,
                 )
             });
             drop(command);
@@ -21715,7 +21672,7 @@ fn execute_bound_plpgsql_dynamic_dml<'a>(
                     seq_session,
                     responder,
                     capture,
-                    Some(scope),
+                    None,
                 )
             });
             drop(command);
@@ -21917,6 +21874,7 @@ fn execute_bound_plpgsql_utility<'a>(
                             source: "",
                             statement: requalified,
                             arguments: &[],
+                        parameter_types: &[],
                         },
                     )?;
                 }
@@ -23642,7 +23600,6 @@ fn execute_plpgsql_dynamic_explain(
     options: ExplainOptions,
     statement: &Stmt<'_>,
     arguments: &[Datum],
-    scope: &TriggerLocalScope<'_, '_>,
     emit: &mut dyn FnMut(&str) -> Result<(), SqlError>,
 ) -> Result<(), SqlError> {
     let planned = resolve_plpgsql_dynamic_prepared(
@@ -23651,9 +23608,12 @@ fn execute_plpgsql_dynamic_explain(
             source: "",
             statement,
             arguments,
+            parameter_types: context.arena.alloc_slice_with(arguments.len(), |index| {
+                bound_parameter_type_oid(index as u32 + 1).unwrap_or(0)
+            }).map_err(|_| super::query::arena_full_pub())?,
         },
-        scope,
-    )?;
+)?;
+    with_bound_parameter_types(planned.parameter_types, || {
     let settings = if options.settings {
         super::guc::active_planner_settings()
     } else {
@@ -23723,6 +23683,7 @@ fn execute_plpgsql_dynamic_explain(
         None
     };
     super::explain::visit_plan_rows(&plan, options, actual, &settings, emit)
+    })
 }
 
 fn rollback_trigger_subtransaction(context: &mut TriggerExecContext<'_, '_, '_>, index: usize) {
@@ -24633,11 +24594,11 @@ fn execute_trigger_block<'a>(
                     invocation,
                     transition: &transition,
                 };
-                let (source, arguments, capture_locals) = match statement.query {
+                let (source, arguments, capture_locals, parameter_types) = match statement.query {
                     PlpgsqlCursorQuery::Static(source) => {
                         let parsed = super::parser::parse_stored_statement(source, context.arena)?;
                         match parsed {
-                            Stmt::Select(_) | Stmt::SetQuery(_) => (source, context.params, true),
+                            Stmt::Select(_) | Stmt::SetQuery(_) => (source, context.params, true, None),
                             _ => {
                                 return Err(sql_err!(
                                     sqlstate::SYNTAX_ERROR,
@@ -24655,12 +24616,11 @@ fn execute_trigger_block<'a>(
                                 &scope,
                                 DynamicCommandKind::Cursor,
                             )?,
-                            &scope,
-                        )?;
+)?;
                         if !matches!(bound.statement, Stmt::Select(_) | Stmt::SetQuery(_)) {
                             return Err(sql_err!(sqlstate::SYNTAX_ERROR, "OPEN requires a SELECT"));
                         }
-                        (bound.source, bound.arguments, false)
+                        (bound.source, bound.arguments, false, Some(bound.parameter_types))
                     }
                 };
                 let captured = if capture_locals {
@@ -24680,7 +24640,7 @@ fn execute_trigger_block<'a>(
                         "SQL cursors are not available in trigger execution"
                     ));
                 };
-                engine.materialize_cursor(
+                let mut open = || engine.materialize_cursor(
                     name,
                     source,
                     source,
@@ -24692,7 +24652,11 @@ fn execute_trigger_block<'a>(
                     context.txn,
                     cursors,
                     guc,
-                )?;
+                );
+                match parameter_types {
+                    Some(types) => with_bound_parameter_types(types, open),
+                    None => open(),
+                }?;
                 assign_trigger_local(
                     context,
                     locals,
@@ -25093,8 +25057,8 @@ fn execute_trigger_block<'a>(
                         &scope,
                         DynamicCommandKind::Statement,
                     )?,
-                    &scope,
-                )?;
+)?;
+                with_bound_parameter_types(query.parameter_types, || {
                 let record_target = statement.targets.len() == 1
                     && matches!(
                         locals[targets[0]].ctype,
@@ -25184,7 +25148,6 @@ fn execute_trigger_block<'a>(
                             *options,
                             statement,
                             query.arguments,
-                            &scope,
                             &mut |line| {
                                 let line = arena
                                     .alloc_str(line)
@@ -25266,7 +25229,6 @@ fn execute_trigger_block<'a>(
                         execute_bound_plpgsql_dynamic_query(
                             context,
                             query,
-                            &scope,
                             &sequence,
                             &mut capture,
                         )?;
@@ -25275,7 +25237,6 @@ fn execute_trigger_block<'a>(
                         let affected = execute_bound_plpgsql_dynamic_dml(
                             context,
                             query,
-                            &scope,
                             transition_relations,
                             Some(&mut capture),
                         )?;
@@ -25317,6 +25278,7 @@ fn execute_trigger_block<'a>(
                 }
 
                 Ok(None)
+                })
             }),
             TriggerStatement::DynamicQuery(query) => execute_trigger_statement(|| {
                 let transition = TriggerTransition {
@@ -25339,8 +25301,8 @@ fn execute_trigger_block<'a>(
                         &scope,
                         DynamicCommandKind::Statement,
                     )?,
-                    &scope,
-                )?;
+)?;
+                with_bound_parameter_types(query.parameter_types, || {
                 let row_count = match query.statement {
                     Stmt::Select(_) | Stmt::SetQuery(_) => {
                         let sequence = crate::sql::sequence::SeqEval::new(
@@ -25352,7 +25314,6 @@ fn execute_trigger_block<'a>(
                         execute_bound_plpgsql_dynamic_query(
                             context,
                             query,
-                            &scope,
                             &sequence,
                             &mut |_| {
                                 rows = rows.checked_add(1).ok_or_else(|| {
@@ -25370,7 +25331,6 @@ fn execute_trigger_block<'a>(
                         execute_bound_plpgsql_dynamic_dml(
                             context,
                             query,
-                            &scope,
                             transition_relations,
                             None,
                         )?
@@ -25381,7 +25341,6 @@ fn execute_trigger_block<'a>(
                             *options,
                             statement,
                             query.arguments,
-                            &scope,
                             &mut |_| Ok(()),
                         )?;
                         0
@@ -25394,6 +25353,7 @@ fn execute_trigger_block<'a>(
                 status.set_row_count(row_count)?;
 
                 Ok(None)
+                })
             }),
             TriggerStatement::Utility { source, statement } => execute_trigger_statement(|| {
                 execute_bound_plpgsql_utility(
@@ -25402,6 +25362,7 @@ fn execute_trigger_block<'a>(
                         source,
                         statement,
                         arguments: &[],
+                        parameter_types: &[],
                     },
                 )?;
                 status.set_row_count(0)?;
@@ -25768,8 +25729,8 @@ fn execute_trigger_block<'a>(
                                     params: context.params,
                                     seq_session: context.seq_session(),
                                 },
-                                &scope,
-                            )?)
+                                Some(&scope),
+)?)
                         }
                         None => None,
                     };

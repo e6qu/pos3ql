@@ -130,3 +130,52 @@ CLOSE wide_record_field;
 COMMIT;
 DROP FUNCTION cursor_wide_record_field();
 SELECT (ROW(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65)).*;
+
+-- USING values carry the expression's type, including NULL, independently of
+-- the enclosing routine's arguments. Dynamic SQL cannot see its local names.
+CREATE FUNCTION cursor_dynamic_null(p integer) RETURNS refcursor LANGUAGE plpgsql AS $$
+DECLARE c refcursor := 'dynamic_null'; d date;
+BEGIN
+  OPEN c FOR EXECUTE 'SELECT pg_typeof($1)::text AS kind, $1 AS day' USING d;
+  RETURN c;
+END $$;
+BEGIN;
+SELECT cursor_dynamic_null(17);
+FETCH ALL FROM dynamic_null;
+CLOSE dynamic_null;
+COMMIT;
+DROP FUNCTION cursor_dynamic_null(integer);
+CREATE FUNCTION cursor_dynamic_record(p integer) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE d date; r record;
+BEGIN
+  EXECUTE 'SELECT pg_typeof($1)::text AS kind, $1 AS day' INTO r USING d;
+  RETURN r.kind || ':' || pg_typeof(r.day)::text;
+END $$;
+SELECT cursor_dynamic_record(17);
+DROP FUNCTION cursor_dynamic_record(integer);
+CREATE FUNCTION cursor_dynamic_literals() RETURNS text LANGUAGE plpgsql AS $$
+DECLARE r record;
+BEGIN
+  EXECUTE 'SELECT pg_typeof($1)::text AS kind' INTO r USING NULL;
+  RETURN r.kind;
+END $$;
+SELECT cursor_dynamic_literals();
+DROP FUNCTION cursor_dynamic_literals();
+CREATE FUNCTION cursor_dynamic_scope() RETURNS integer LANGUAGE plpgsql AS $$
+DECLARE hidden integer := 42; result integer;
+BEGIN
+  EXECUTE 'SELECT hidden' INTO result;
+  RETURN result;
+END $$;
+SELECT cursor_dynamic_scope();
+DROP FUNCTION cursor_dynamic_scope();
+PREPARE cursor_dynamic_prepared(date) AS SELECT pg_typeof($1)::text AS kind, $1 AS day;
+CREATE FUNCTION cursor_dynamic_execute(p integer) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE d date; r record;
+BEGIN
+  EXECUTE 'EXECUTE cursor_dynamic_prepared($1)' INTO r USING d;
+  RETURN r.kind || ':' || pg_typeof(r.day)::text;
+END $$;
+SELECT cursor_dynamic_execute(17);
+DROP FUNCTION cursor_dynamic_execute(integer);
+DEALLOCATE cursor_dynamic_prepared;

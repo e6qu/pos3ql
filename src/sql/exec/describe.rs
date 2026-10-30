@@ -9,6 +9,7 @@
 //! here rather than part-way through a scan.
 
 use crate::sql::ast::{Expr, SelectItem};
+use crate::sql::MAX_PROJ;
 use crate::sql::datetime;
 use crate::sql::eval::{ColumnLookup, SqlError, described_expression_collation, sqlstate};
 use crate::sql::types::{ColDesc, ColType, CollationDerivation, Datum, oid};
@@ -2340,7 +2341,7 @@ pub fn register_shape_for(
 
 /// Static field names PostgreSQL assigns an anonymous record (`ROW(...)`):
 /// `f1`, `f2`, … Indexed 1-based by the caller.
-const RECORD_FIELD_NAME_BYTES: [[u8; 6]; MAX_PROJ] = {
+static RECORD_FIELD_NAME_BYTES: [[u8; 6]; MAX_PROJ] = {
     assert!(MAX_PROJ < 10_000);
     let mut names = [[0; 6]; MAX_PROJ];
     let mut index = 0;

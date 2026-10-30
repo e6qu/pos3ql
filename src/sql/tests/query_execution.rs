@@ -45,7 +45,7 @@ fn cursor_retained_cold_fetch_resumes_after_delivered_rows() {
     config.disk_cache_bytes = 0;
     config.max_spill_generations_per_table = 2;
     config.memtable_bytes = 8 << 20;
-    config.cursor_bytes = 512 << 10;
+    config.cursor_bytes = 32 << 10;
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     let namespace = crate::object_store::sim::open_namespace(&config.object_store_bucket, 227);
     let mut budget = test_engine_budget(&config, 1 << 29);
@@ -82,6 +82,7 @@ fn cursor_retained_cold_fetch_resumes_after_delivered_rows() {
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut other = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
     listener.set_nonblocking(true).unwrap();
     let mut network = config.clone();
     network.object_store_sim = false;
@@ -103,11 +104,12 @@ fn cursor_retained_cold_fetch_resumes_after_delivered_rows() {
         .read_request("cold", FetchMotion::Count(1), false)
         .unwrap()
         .expect("retained physical plan");
-    assert_eq!(session.cursors.cached_rows(slot), 0);
+    assert_eq!(session.cursors.produced_rows(slot), 0);
     let prefix = format!("/{}/", config.object_store_bucket);
     let owner = ExecutionIdentity::new(1, engine.execution_identity().database_oid).read_owner();
     let mut count = 0;
     let mut waited_after_prefix = false;
+    let mut waited_inside_fetch = false;
     let mut deadline = Instant::now() + Duration::from_secs(2);
     session.send.clear();
     session.arena.reset();
@@ -116,7 +118,7 @@ fn cursor_retained_cold_fetch_resumes_after_delivered_rows() {
         let previous = engine.replace_read_owner(Some(owner));
         let result = crate::mem::guard::forbid_alloc(|| {
             engine.execute_simple_from(
-                "FETCH NEXT FROM cold",
+                "FETCH FORWARD 17 FROM cold",
                 0,
                 &session.arena,
                 &mut session.transaction,
@@ -142,13 +144,20 @@ fn cursor_retained_cold_fetch_resumes_after_delivered_rows() {
                     assert_eq!(command_tags(session.send.readable()), ["FETCH 0"]);
                     break;
                 }
-                assert_eq!(fetched.len(), 1);
-                assert_eq!(command_tags(session.send.readable()), ["FETCH 1"]);
-                let (id, code) = fetched[0].split_once('|').unwrap();
-                assert_eq!(id.parse::<i32>().unwrap(), count + 1);
-                assert_eq!(checksum(code.as_bytes()), expected[count as usize]);
-                count += 1;
-                assert_eq!(session.cursors.cached_rows(slot), count as usize);
+                let rows = (320 - count).min(17);
+                assert_eq!(fetched.len(), rows as usize);
+                assert_eq!(
+                    command_tags(session.send.readable()),
+                    [format!("FETCH {rows}")]
+                );
+                for fetched in &fetched {
+                    let (id, code) = fetched.split_once('|').unwrap();
+                    assert_eq!(id.parse::<i32>().unwrap(), count + 1);
+                    assert_eq!(checksum(code.as_bytes()), expected[count as usize]);
+                    count += 1;
+                }
+                assert_eq!(session.cursors.produced_rows(slot), count as usize);
+                assert_eq!(session.cursors.buffered_rows(slot), rows as usize);
                 session.send.clear();
                 session.arena.reset();
                 deadline = Instant::now() + Duration::from_secs(2);
@@ -163,6 +172,13 @@ fn cursor_retained_cold_fetch_resumes_after_delivered_rows() {
                     "a suspended FETCH must not emit a partial response"
                 );
                 waited_after_prefix |= count != 0;
+                if session.cursors.produced_rows(slot) > count as usize && !waited_inside_fetch {
+                    waited_inside_fetch = true;
+                    assert_eq!(
+                        data_rows(&other.success(&mut engine, "SELECT 42", true)),
+                        ["42"]
+                    );
+                }
                 match listener.accept() {
                     Ok((mut stream, _)) => {
                         let request = read_request(&mut engine, &mut stream);
@@ -184,6 +200,10 @@ fn cursor_retained_cold_fetch_resumes_after_delivered_rows() {
         }
     }
     assert_eq!(count, 320);
+    assert!(
+        waited_inside_fetch,
+        "a fetch must retain buffered rows while another connection runs"
+    );
     assert!(
         waited_after_prefix,
         "saved rows must wait after delivering a prefix"

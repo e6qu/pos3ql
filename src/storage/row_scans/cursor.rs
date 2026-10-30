@@ -295,12 +295,18 @@ mod tests {
         let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let visibility = storage.nested_statement_snapshot(7);
         let table = storage
-            .create_table(make_def("retained_plan", &[("n", ColType::Int4, true)]))
+            .create_table(make_def(
+                "retained_plan",
+                &[
+                    ("n", ColType::Int4, true),
+                    ("payload", ColType::Text, false),
+                ],
+            ))
             .unwrap();
         for rowid in 1..=2 {
             let location = storage
                 .heap
-                .append_row(&[Datum::Int4(rowid as i32)])
+                .append_row(&[Datum::Int4(rowid as i32), Datum::Text("value")])
                 .unwrap();
             storage.tables[table]
                 .rows
@@ -316,14 +322,18 @@ mod tests {
         let mut rows = FixedBuf::new(&mut read_budget, "retained rows", 1024).unwrap();
         let mut small_rows = FixedBuf::new(&mut read_budget, "small retained rows", 1).unwrap();
         crate::mem::guard::forbid_alloc(|| {
-            query.bind("SELECT n FROM retained_plan", &[], &[]).unwrap();
+            query
+                .bind("SELECT n,payload FROM retained_plan", &[], &[])
+                .unwrap();
             assert!(
                 query
                     .prepare_source(
                         &storage,
                         0,
-                        0,
-                        &mut Responder::for_cursor(&mut description, &mut rows)
+                        &mut Responder::for_cursor(
+                            &mut description,
+                            crate::pg::respond::CursorRowOutput::Save(&mut rows)
+                        )
                     )
                     .unwrap()
             );
@@ -333,9 +343,13 @@ mod tests {
             query.advance_source(
                 &storage,
                 0,
+                0,
                 &work,
                 &mut buffers,
-                &mut Responder::for_cursor(&mut description, &mut small_rows),
+                &mut Responder::for_cursor(
+                    &mut description,
+                    crate::pg::respond::CursorRowOutput::Save(&mut small_rows),
+                ),
             )
         })
         .unwrap_err();
@@ -355,9 +369,13 @@ mod tests {
                         .advance_source(
                             &storage,
                             0,
+                            0,
                             &work,
                             &mut buffers,
-                            &mut Responder::for_cursor(&mut description, &mut rows)
+                            &mut Responder::for_cursor(
+                                &mut description,
+                                crate::pg::respond::CursorRowOutput::Save(&mut rows)
+                            )
                         )
                         .unwrap()
                 )
@@ -365,18 +383,22 @@ mod tests {
             let bytes = rows.readable();
             let length = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
             assert_eq!(bytes.len(), length + 4);
-            let mut decoded = [Datum::Null];
+            let mut decoded = [Datum::Null; 2];
             crate::sql::exec::decode_projected_row_into(&bytes[4..], &work, &mut decoded).unwrap();
-            assert_eq!(decoded, [Datum::Int4(expected)]);
+            assert_eq!(decoded, [Datum::Int4(expected), Datum::Text("value")]);
         }
         assert!(
             !query
                 .advance_source(
                     &storage,
                     0,
+                    0,
                     &work,
                     &mut buffers,
-                    &mut Responder::for_cursor(&mut description, &mut rows)
+                    &mut Responder::for_cursor(
+                        &mut description,
+                        crate::pg::respond::CursorRowOutput::Save(&mut rows)
+                    )
                 )
                 .unwrap()
         );

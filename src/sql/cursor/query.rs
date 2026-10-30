@@ -179,7 +179,6 @@ impl CursorQuery {
         &mut self,
         storage: &crate::storage::Storage,
         txid: u32,
-        observed_at: i64,
         responder: &mut crate::pg::respond::Responder<'_>,
     ) -> Result<bool, SqlError> {
         let bound = self.bound.as_ref().expect("bound cursor query");
@@ -194,7 +193,6 @@ impl CursorQuery {
                 statement,
                 bound.params,
                 &self.arena,
-                observed_at,
                 responder,
             )
         })?;
@@ -223,6 +221,7 @@ impl CursorQuery {
         &mut self,
         storage: &crate::storage::Storage,
         txid: u32,
+        observed_at: i64,
         work: &Arena,
         buffers: &mut crate::storage::RowCursorBuffers,
         responder: &mut crate::pg::respond::Responder<'_>,
@@ -233,7 +232,16 @@ impl CursorQuery {
         // stores this temporary reference to the movable Arena object itself.
         let arena: &'static Arena = unsafe { &*(&self.arena as *const Arena) };
         crate::sql::exec::with_bound_parameter_types(bound.parameter_types, || {
-            source.advance(storage, txid, bound.params, arena, work, buffers, responder)
+            source.advance(
+                storage,
+                txid,
+                observed_at,
+                bound.params,
+                arena,
+                work,
+                buffers,
+                responder,
+            )
         })
     }
 

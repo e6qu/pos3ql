@@ -129,13 +129,23 @@ struct CursorSlot {
     description: FixedBuf,
     rows: FixedBuf,
     spans: Vec<(u32, u32)>,
+    /// Logical input rows before the first saved row of the current fetch.
+    row_base: usize,
+    produced: usize,
+    /// An I/O retry must keep the current fetch's saved rows.
+    request: Option<(FetchMotion, bool)>,
     /// PostgreSQL's cursor position: 0 before the first row, `1..=n` on a
     /// row, `n + 1` after the last.
     position: i64,
 }
 
 impl CursorSlot {
-    fn validate_motion(&self, motion: FetchMotion, move_only: bool) -> Result<(), SqlError> {
+    fn validate_motion(
+        &self,
+        motion: FetchMotion,
+        move_only: bool,
+        input_finished: bool,
+    ) -> Result<(), SqlError> {
         if self.failed {
             return Err(sql_err!(
                 sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
@@ -143,10 +153,13 @@ impl CursorSlot {
                 self.name.as_str()
             ));
         }
-        let on_row = self.position >= 1 && self.position <= self.spans.len() as i64;
+        let on_row = self.position >= 1 && self.position <= self.produced as i64;
         let backward = matches!(motion, FetchMotion::Count(k) | FetchMotion::Relative(k) if k < 0)
-            || matches!(motion, FetchMotion::BackwardAll)
-            || matches!(motion, FetchMotion::Absolute(k) if k < 0 || (i64::from(k) <= self.position && self.position != 0))
+            || (matches!(motion, FetchMotion::BackwardAll) && !(move_only && self.position == 0))
+            // A negative absolute position first consumes the forward input;
+            // its final backward step is rejected after that work.
+            || matches!(motion, FetchMotion::Absolute(k) if (k < 0 && input_finished)
+                || (k >= 0 && i64::from(k) <= self.position && self.position != 0))
             || (!move_only
                 && on_row
                 && matches!(motion, FetchMotion::Count(0) | FetchMotion::Relative(0)));
@@ -340,6 +353,9 @@ impl CursorPool {
                 description: FixedBuf::new(budget, "cursor_description", DESCRIPTION_BYTES)?,
                 rows: FixedBuf::new(budget, "cursor_typed_rows", config.cursor_bytes)?,
                 spans: Vec::with_capacity(row_capacity),
+                row_base: 0,
+                produced: 0,
+                request: None,
                 position: 0,
             });
         }
@@ -412,6 +428,9 @@ impl CursorPool {
         slot.description.clear();
         slot.rows.clear();
         slot.spans.clear();
+        slot.row_base = 0;
+        slot.produced = 0;
+        slot.request = None;
         slot.position = 0;
         Ok(at)
     }
@@ -445,6 +464,7 @@ impl CursorPool {
         let slot = &mut self.slots[at];
         let columns = seal_description(&mut slot.description)?;
         seal_rows(&slot.rows, columns, &mut slot.spans)?;
+        slot.produced = slot.spans.len();
         slot.active = true;
         Ok(())
     }
@@ -459,30 +479,80 @@ impl CursorPool {
             return Ok(None);
         };
         let slot = &self.slots[at];
-        slot.validate_motion(motion, move_only)?;
+        slot.validate_motion(motion, move_only, slot.query.retained.is_none())?;
         if slot.query.retained.is_none() {
             return Ok(None);
         }
         let needed = match motion {
             FetchMotion::All => usize::MAX,
+            FetchMotion::Absolute(k) if k < 0 => usize::MAX,
             FetchMotion::Count(k) | FetchMotion::Relative(k) => {
                 slot.position.saturating_add(i64::from(k)) as usize
             }
             FetchMotion::Absolute(k) => k as usize,
-            FetchMotion::BackwardAll => unreachable!("backward motion was rejected"),
+            FetchMotion::BackwardAll => 0,
         };
         Ok(Some((at, needed)))
     }
 
-    pub(crate) fn cached_rows(&self, at: usize) -> usize {
+    pub(crate) fn produced_rows(&self, at: usize) -> usize {
+        self.slots[at].produced
+    }
+
+    #[cfg(test)]
+    pub(crate) fn buffered_rows(&self, at: usize) -> usize {
         self.slots[at].spans.len()
     }
 
-    pub(crate) fn index_new_rows(&mut self, at: usize) -> Result<(), SqlError> {
+    pub(crate) fn begin_fetch(
+        &mut self,
+        at: usize,
+        motion: FetchMotion,
+        move_only: bool,
+    ) -> Result<(), SqlError> {
         let slot = &mut self.slots[at];
-        let mut types = [0; crate::pg::respond::MAX_RESULT_COLS];
-        let columns = description_type_oids(slot.description.readable(), &mut types)?;
-        seal_rows(&slot.rows, columns, &mut slot.spans)
+        if let Some(request) = slot.request {
+            if request != (motion, move_only) {
+                return Err(sql_err!(
+                    sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                    "cursor fetch changed while its input was waiting"
+                ));
+            }
+            return Ok(());
+        }
+        slot.rows.clear();
+        slot.spans.clear();
+        slot.row_base = slot.produced;
+        slot.request = Some((motion, move_only));
+        Ok(())
+    }
+
+    pub(crate) fn record_row(&mut self, at: usize, saved: bool) -> Result<(), SqlError> {
+        let slot = &mut self.slots[at];
+        if saved {
+            let mut types = [0; crate::pg::respond::MAX_RESULT_COLS];
+            let columns = description_type_oids(slot.description.readable(), &mut types)?;
+            seal_rows(&slot.rows, columns, &mut slot.spans)?;
+        } else if !slot.spans.is_empty() {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "cursor skipped input after saving its fetch result"
+            ));
+        }
+        slot.produced = slot
+            .produced
+            .checked_add(1)
+            .filter(|count| i64::try_from(*count).is_ok_and(|count| count < i64::MAX))
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "cursor row position exhausted"
+                )
+            })?;
+        if !saved {
+            slot.row_base = slot.produced;
+        }
+        Ok(())
     }
 
     pub(crate) fn fail(&mut self, name: &str) {
@@ -589,19 +659,35 @@ impl CursorPool {
             ));
         };
         let slot = &mut self.slots[at];
-        slot.validate_motion(motion, move_only)?;
-        let n = slot.spans.len() as i64;
+        slot.validate_motion(motion, move_only, true)?;
+        let n = slot.produced as i64;
         self.emit.clear();
         let out_rows = &mut self.emit;
-        let push_row = |row: i64, out: &mut Vec<u32>| {
+        let row_base = slot.row_base;
+        let buffered = slot.spans.len();
+        let mut count = 0usize;
+        let mut push_row = |row: i64, out: &mut Vec<u32>| -> Result<(), SqlError> {
             if row >= 1 && row <= n {
-                out.push((row - 1) as u32);
+                count += 1;
+                if !move_only {
+                    let local = (row as usize)
+                        .checked_sub(row_base + 1)
+                        .filter(|local| *local < buffered)
+                        .ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::INTERNAL_ERROR,
+                                "cursor result is outside its retained fetch"
+                            )
+                        })?;
+                    out.push(local as u32);
+                }
             }
+            Ok(())
         };
         match motion {
             FetchMotion::Count(0) => {
                 // Re-fetch the current row, position unchanged.
-                push_row(slot.position, out_rows);
+                push_row(slot.position, out_rows)?;
             }
             FetchMotion::Count(k) if k > 0 => {
                 for _ in 0..k {
@@ -609,7 +695,7 @@ impl CursorPool {
                         break;
                     }
                     slot.position += 1;
-                    push_row(slot.position, out_rows);
+                    push_row(slot.position, out_rows)?;
                 }
                 slot.position = slot.position.min(n + 1);
             }
@@ -619,21 +705,21 @@ impl CursorPool {
                         break;
                     }
                     slot.position -= 1;
-                    push_row(slot.position, out_rows);
+                    push_row(slot.position, out_rows)?;
                 }
                 slot.position = slot.position.max(0);
             }
             FetchMotion::All => {
                 while slot.position <= n {
                     slot.position += 1;
-                    push_row(slot.position, out_rows);
+                    push_row(slot.position, out_rows)?;
                 }
                 slot.position = n + 1;
             }
             FetchMotion::BackwardAll => {
                 while slot.position >= 1 {
                     slot.position -= 1;
-                    push_row(slot.position, out_rows);
+                    push_row(slot.position, out_rows)?;
                 }
                 slot.position = 0;
             }
@@ -644,14 +730,15 @@ impl CursorPool {
                     n + 1 + i64::from(k)
                 };
                 slot.position = target.clamp(0, n + 1);
-                push_row(slot.position, out_rows);
+                push_row(slot.position, out_rows)?;
             }
             FetchMotion::Relative(k) => {
                 slot.position = (slot.position + i64::from(k)).clamp(0, n + 1);
-                push_row(slot.position, out_rows);
+                push_row(slot.position, out_rows)?;
             }
         }
-        Ok(self.emit.len())
+        slot.request = None;
+        Ok(count)
     }
 
     /// The row indexes selected by the last [`Self::fetch`].

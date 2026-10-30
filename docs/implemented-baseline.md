@@ -175,7 +175,10 @@ A simple `NO SCROLL` cursor over one physical table retains its selected rows
 without reading their contents at declaration. For example, `DECLARE c NO SCROLL
 CURSOR FOR SELECT id, label FROM orders` followed by `FETCH 2 FROM c` reads and
 saves two rows; `FETCH 0` before the first row reads none. Closing it releases
-the unread source. This path currently accepts columns, wildcards, constants
+the unread source. Fetching another batch reuses the result buffer: a long
+cursor can use repeated small fetches without retaining earlier batches.
+`MOVE` advances without saving output; a forward jump saves its target row.
+This path currently accepts columns, wildcards, constants
 and captured parameters, without filters, ordering or row-level security.
 Resident rows keep their immutable byte owner instead of copying a wide row
 into cursor memory just to return a small column. For example, selecting `id`

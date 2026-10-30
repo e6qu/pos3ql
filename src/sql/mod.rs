@@ -19431,13 +19431,11 @@ impl Engine {
         if scroll == cursor::CursorScroll::NoScroll && !hold {
             let prepared = {
                 let (query, description, rows) = cursors.execution_parts(at);
-                let mut capture = Responder::for_cursor(description, rows);
-                query.prepare_source(
-                    &self.storage,
-                    txn.txid,
-                    datetime::now_micros(),
-                    &mut capture,
-                )
+                let mut capture = Responder::for_cursor(
+                    description,
+                    crate::pg::respond::CursorRowOutput::Save(rows),
+                );
+                query.prepare_source(&self.storage, txn.txid, &mut capture)
             };
             match prepared {
                 Ok(true) => {
@@ -19456,7 +19454,8 @@ impl Engine {
         }
         let out = {
             let (query, description, rows) = cursors.execution_parts(at);
-            let mut capture = Responder::for_cursor(description, rows);
+            let mut capture =
+                Responder::for_cursor(description, crate::pg::respond::CursorRowOutput::Save(rows));
             capture.set_render(guc.render());
             query.with_query(|parsed, params, arena| {
                 let sequence = sequence::ReplaySeqEval::new(
@@ -19545,14 +19544,34 @@ impl Engine {
     ) -> Result<usize, SqlError> {
         let result = (|| {
             if let Some((at, needed)) = cursors.read_request(name, motion, move_only)? {
+                cursors.begin_fetch(at, motion, move_only)?;
                 let storage = &self.storage;
                 let (work, buffers) = self.work.cursor_parts();
-                while cursors.cached_rows(at) < needed {
+                while cursors.produced_rows(at) < needed {
+                    let saved = !move_only
+                        && match motion {
+                            cursor::FetchMotion::Absolute(_) | cursor::FetchMotion::Relative(_) => {
+                                cursors.produced_rows(at) + 1 == needed
+                            }
+                            _ => true,
+                        };
                     let mark = work.mark();
                     let advanced = {
                         let (query, description, rows) = cursors.execution_parts(at);
-                        let mut capture = Responder::for_cursor(description, rows);
-                        query.advance_source(storage, txid, work, buffers, &mut capture)
+                        let output = if saved {
+                            crate::pg::respond::CursorRowOutput::Save(rows)
+                        } else {
+                            crate::pg::respond::CursorRowOutput::Discard
+                        };
+                        let mut capture = Responder::for_cursor(description, output);
+                        query.advance_source(
+                            storage,
+                            txid,
+                            datetime::now_micros(),
+                            work,
+                            buffers,
+                            &mut capture,
+                        )
                     };
                     // Projection values have either been copied into typed rows or
                     // discarded; pending input belongs to the cursor's own arena.
@@ -19560,7 +19579,7 @@ impl Engine {
                     if !advanced? {
                         break;
                     }
-                    cursors.index_new_rows(at)?;
+                    cursors.record_row(at, saved)?;
                 }
             }
             cursors.fetch(name, motion, move_only)

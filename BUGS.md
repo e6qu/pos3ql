@@ -4,13 +4,10 @@ No known defects are blocked by an external dependency or an intractable problem
 
 Fix every reproducible defect in the PR that finds it. Record an entry only
 with its reproducer, observed behavior and exact external blocker or reason it
-cannot be repaired. Keep repaired-defect evidence, ownership checks and PostgreSQL comparisons in
-the fixing PR, including exhausted-memory behavior before irreversible effects
-and retained readers surviving command-arena resets and owner moves. Keep
-active-relation checks, failed-fetch cleanup, wide-row projections and storage-wait retries in the same
-regression coverage.
-Failed PostgreSQL comparisons preserve their outputs and diagnostics before
-temporary files are removed.
+cannot be repaired. Keep repaired-defect evidence, ownership checks and
+PostgreSQL comparisons in the fixing PR. Cover exhausted memory before
+irreversible effects, owner moves, rollback and suspended queries. Preserve
+failed-comparison outputs and diagnostics before removing temporary files.
 See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 Unfinished features and their verification criteria belong in [PLAN.md](PLAN.md).

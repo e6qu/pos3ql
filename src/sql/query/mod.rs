@@ -4693,6 +4693,11 @@ pub(crate) fn emit_data_row(
     responder: &mut Responder,
     values: &[Datum],
 ) -> Outcome {
+    let rows = match responder.cursor_row_output() {
+        crate::pg::respond::CursorRowOutput::Wire => None,
+        crate::pg::respond::CursorRowOutput::Save(rows) => Some(rows),
+        crate::pg::respond::CursorRowOutput::Discard => return sql_ok(),
+    };
     if values
         .iter()
         .any(|value| matches!(value, Datum::PgDdlCommand))
@@ -4702,7 +4707,7 @@ pub(crate) fn emit_data_row(
             "cannot display a value of type pg_ddl_command"
         ));
     }
-    if let Some(rows) = responder.cursor_row_buffer() {
+    if let Some(rows) = rows {
         let len = match super::exec::projected_row_len(values) {
             Ok(len) => len,
             Err(error) => return sql_fail(error),

@@ -206,6 +206,11 @@ including local values and types captured by a static procedural `OPEN`,
 a 1,024-byte description and `floor(cursor_bytes / 6)` row
 positions; the connection reserves the same number of fetch-selection positions.
 Each saved row includes a four-byte length and a two-byte column count.
+For retained `NO SCROLL` cursors, `cursor_bytes` bounds one fetched batch;
+the next fetch reuses it. `MOVE` and rows skipped by forward `ABSOLUTE` or
+`RELATIVE` motions do not consume saved-row capacity. A suspended fetch keeps
+its already saved rows until it completes. Other cursor paths still save the
+whole result during opening.
 Long column names can fill the description even when the rows fit. That error
 names the description limit: use fewer or shorter labels. Increasing
 `cursor_bytes` only changes the row capacity.
@@ -238,6 +243,10 @@ reading it. `FETCH 0` before the first row returns no row; on a current row it
 raises `55000` because rereading would require a backward step. A fetch that
 fails remains failed after rolling back to a savepoint: further fetches raise
 `55000` with `portal "name" cannot be run`. Close and reopen the cursor.
+`MOVE BACKWARD ALL` before the first row returns zero. A negative absolute
+position first consumes the remaining forward input and then fails on its
+backward step. Scan statistics begin with the first requested input, including
+input consumed by `MOVE` or a forward jump.
 JSON/path and XML/XPath limits are specified in [SQL/JSON](sql-json.md) and
 [SQL/XML](sql-xml.md). Inspect the memory plan for the chosen configuration;
 accepted width can still exhaust its named statement or startup budget.

@@ -11,13 +11,19 @@ struct PendingRow<'a> {
     mark: ArenaMark,
 }
 
+enum ReaderState {
+    Unstarted,
+    Reading,
+    Complete,
+}
+
 pub(crate) struct RetainedSelect<'a> {
     statement: &'a Select<'a>,
     scope: QueryScope<'a>,
     source: RowCursor,
     decoded_columns: Option<[bool; MAX_COLUMNS]>,
     pending: Option<PendingRow<'a>>,
-    done: bool,
+    state: ReaderState,
 }
 
 fn projection_only(items: &[SelectItem<'_>]) -> bool {
@@ -52,7 +58,6 @@ impl<'a> RetainedSelect<'a> {
         statement: &'a Select<'a>,
         params: &[Datum<'a>],
         arena: &'a Arena,
-        observed_at: i64,
         responder: &mut Responder<'_>,
     ) -> Result<Option<Self>, SqlError> {
         let Some(from) = statement.from.as_ref() else {
@@ -135,7 +140,6 @@ impl<'a> RetainedSelect<'a> {
             .map_err(|_| super::super::cursor_description_too_large())?;
         let mut source = RowCursor::closed();
         source.open(storage, table, txid, arena)?;
-        storage.record_relation_scan(txid, table, None, 0, observed_at)?;
         let decoded_columns = demand.selected_mask(0).map(|mask| {
             core::array::from_fn(|column| column < u64::BITS as usize && mask & (1 << column) != 0)
         });
@@ -145,7 +149,7 @@ impl<'a> RetainedSelect<'a> {
             source,
             decoded_columns,
             pending: None,
-            done: false,
+            state: ReaderState::Unstarted,
         }))
     }
 
@@ -157,14 +161,20 @@ impl<'a> RetainedSelect<'a> {
         &mut self,
         storage: &'work Storage,
         txid: u32,
+        observed_at: i64,
         params: &[Datum<'work>],
         state_arena: &'a Arena,
         work: &'work Arena,
         buffers: &mut RowCursorBuffers,
         responder: &mut Responder<'_>,
     ) -> Result<bool, SqlError> {
-        if self.done {
-            return Ok(false);
+        match self.state {
+            ReaderState::Complete => return Ok(false),
+            ReaderState::Unstarted => {
+                storage.record_relation_scan(txid, self.scope.slots[0], None, 0, observed_at)?;
+                self.state = ReaderState::Reading;
+            }
+            ReaderState::Reading => {}
         }
         if self.pending.is_none() {
             let mark = state_arena.mark();
@@ -183,7 +193,7 @@ impl<'a> RetainedSelect<'a> {
             };
             let Some(row) = row else {
                 unsafe { state_arena.rewind_to(mark) };
-                self.done = true;
+                self.state = ReaderState::Complete;
                 self.source.close();
                 return Ok(false);
             };

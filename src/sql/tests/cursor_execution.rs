@@ -23,7 +23,7 @@ fn cursor_retained_fetch_advances_only_requested_rows_and_keeps_opening_values()
             .read_request("orders", FetchMotion::Count(1), false)
             .unwrap()
             .expect("retained physical plan");
-        assert_eq!(session.cursors.cached_rows(slot), 0);
+        assert_eq!(session.cursors.produced_rows(slot), 0);
         assert_eq!(
             session
                 .cursors
@@ -40,10 +40,10 @@ fn cursor_retained_fetch_advances_only_requested_rows_and_keeps_opening_values()
             ))
             .is_empty()
         );
-        assert_eq!(session.cursors.cached_rows(slot), 0);
+        assert_eq!(session.cursors.produced_rows(slot), 0);
         let output = session.success(&mut engine, "FETCH NEXT FROM orders", true);
         assert_eq!(data_rows(&output), ["1|first"]);
-        assert_eq!(session.cursors.cached_rows(slot), 1);
+        assert_eq!(session.cursors.produced_rows(slot), 1);
         session.success(
             &mut engine,
             "UPDATE retained_orders SET label='changed' WHERE id=2; \
@@ -52,14 +52,14 @@ fn cursor_retained_fetch_advances_only_requested_rows_and_keeps_opening_values()
         );
         let output = session.success(&mut engine, "FETCH FORWARD 1 FROM orders", true);
         assert_eq!(data_rows(&output), ["2|second"]);
-        assert_eq!(session.cursors.cached_rows(slot), 2);
+        assert_eq!(session.cursors.produced_rows(slot), 2);
         let output = session.success(
             &mut engine,
             "MOVE 0 FROM orders; FETCH ALL FROM orders; FETCH NEXT FROM orders",
             true,
         );
         assert_eq!(data_rows(&output), ["3|third"]);
-        assert_eq!(session.cursors.cached_rows(slot), 3);
+        assert_eq!(session.cursors.produced_rows(slot), 3);
         session.success(&mut engine, "CLOSE orders; COMMIT", true);
         assert!(!session.cursors.exists("orders"));
     }
@@ -251,6 +251,91 @@ fn cursor_retained_narrow_projection_borrows_wide_resident_rows() {
     let output = session.success(&mut engine, "FETCH ALL FROM narrow", true);
     assert_eq!(data_rows(&output), ["7"]);
     session.success(&mut engine, "CLOSE narrow; COMMIT", true);
+}
+
+#[test]
+fn cursor_retained_reuses_fetch_memory_and_discards_move_and_skipped_rows() {
+    use crate::sql::cursor::FetchMotion;
+    let mut config = test_config("cursor-retained-fetch-buffer");
+    config.max_cursors = 1;
+    config.cursor_bytes = 32;
+    config.cursor_query_bytes = 8192;
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE TABLE forward_input(id integer); \
+        INSERT INTO forward_input SELECT g FROM generate_series(1,128) AS g; BEGIN; \
+        DECLARE forward_rows NO SCROLL CURSOR FOR SELECT id FROM forward_input",
+        true,
+    );
+    let (slot, _) = session
+        .cursors
+        .read_request("forward_rows", FetchMotion::Count(1), false)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        command_tags(&session.success(&mut engine, "MOVE BACKWARD ALL FROM forward_rows", true)),
+        ["MOVE 0"]
+    );
+    for id in 1..=128 {
+        let output = session.success(&mut engine, "FETCH NEXT FROM forward_rows", true);
+        assert_eq!(data_rows(&output), [id.to_string()]);
+        assert_eq!(session.cursors.produced_rows(slot), id);
+        assert_eq!(session.cursors.buffered_rows(slot), 1);
+    }
+    session.success(
+        &mut engine,
+        "CLOSE forward_rows; \
+        DECLARE forward_rows NO SCROLL CURSOR FOR SELECT id FROM forward_input",
+        true,
+    );
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "FETCH ABSOLUTE 100 FROM forward_rows", true)),
+        ["100"]
+    );
+    assert_eq!(session.cursors.buffered_rows(slot), 1);
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "FETCH RELATIVE 10 FROM forward_rows", true)),
+        ["110"]
+    );
+    assert_eq!(session.cursors.buffered_rows(slot), 1);
+    assert_eq!(
+        command_tags(&session.success(&mut engine, "MOVE FORWARD 10 FROM forward_rows", true)),
+        ["MOVE 10"]
+    );
+    assert_eq!(session.cursors.buffered_rows(slot), 0);
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "FETCH NEXT FROM forward_rows", true)),
+        ["121"]
+    );
+    assert_eq!(
+        command_tags(&session.success(&mut engine, "MOVE ALL FROM forward_rows", true)),
+        ["MOVE 7"]
+    );
+    assert_eq!(session.cursors.buffered_rows(slot), 0);
+    session.success(
+        &mut engine,
+        "CLOSE forward_rows; \
+        DECLARE forward_rows NO SCROLL CURSOR FOR SELECT id FROM forward_input; SAVEPOINT last_row",
+        true,
+    );
+    assert_eq!(
+        error_sqlstates(&session.execute(&mut engine, "FETCH LAST FROM forward_rows", true)),
+        ["55000"]
+    );
+    assert_eq!(
+        session.cursors.produced_rows(slot),
+        128,
+        "LAST advances forward before its forbidden backward step"
+    );
+    assert_eq!(session.cursors.buffered_rows(slot), 0);
+    session.success(
+        &mut engine,
+        "ROLLBACK TO SAVEPOINT last_row; CLOSE forward_rows; COMMIT",
+        true,
+    );
 }
 
 #[test]

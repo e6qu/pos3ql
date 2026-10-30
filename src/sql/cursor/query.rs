@@ -19,6 +19,7 @@ pub(crate) struct CursorQuery {
 struct BoundQuery<'a> {
     statement: CursorStatement<'a>,
     params: &'a [Datum<'a>],
+    parameter_types: &'a [i32],
 }
 
 impl CursorQuery {
@@ -60,9 +61,16 @@ impl CursorQuery {
             .alloc_slice_with(params.len(), |_| Datum::Null)
             .map_err(|_| full())?;
         crate::sql::exec::decode_projected_row_into(encoded, &self.arena, values)?;
+        let parameter_types = self
+            .arena
+            .alloc_slice_with(params.len(), |index| {
+                crate::sql::exec::bound_parameter_type_oid((index + 1) as u32).unwrap_or(0)
+            })
+            .map_err(|_| full())?;
         let bound = BoundQuery {
             statement,
             params: values,
+            parameter_types,
         };
         // The parser only borrows the copied source and this private arena.
         // Parameter encoding and structural decoding copy every borrowed
@@ -83,7 +91,10 @@ impl CursorQuery {
                 "cursor query is not bound"
             )
         })?;
-        Ok(use_query(bound.statement, bound.params, &self.arena))
+        Ok(crate::sql::exec::with_bound_parameter_types(
+            bound.parameter_types,
+            || use_query(bound.statement, bound.params, &self.arena),
+        ))
     }
 }
 
@@ -132,6 +143,56 @@ mod tests {
         moved
             .with_query(|_, params, _| assert!(params.is_empty()))
             .unwrap();
+    }
+
+    #[test]
+    fn cursor_owned_query_preserves_null_types_beyond_routine_argument_limit() {
+        use crate::sql::exec::{bound_parameter_type_oid, with_bound_parameter_types};
+        use crate::sql::types::oid;
+
+        let mut budget = Budget::new(64 << 10);
+        let mut query = CursorQuery::new(&mut budget, 64 << 10).unwrap();
+        let types = [oid::DATE; 101];
+        let params = [Datum::Null; 101];
+        crate::mem::guard::forbid_alloc(|| {
+            with_bound_parameter_types(&types, || query.bind("SELECT $101", &params))
+        })
+        .unwrap();
+        assert_eq!(bound_parameter_type_oid(101), None);
+        let other_types = [oid::INT4; 101];
+        crate::mem::guard::forbid_alloc(|| {
+            with_bound_parameter_types(&other_types, || {
+                query
+                    .with_query(|_, params, _| {
+                        assert_eq!(params[100], Datum::Null);
+                        assert_eq!(bound_parameter_type_oid(101), Some(oid::DATE));
+                        assert_eq!(bound_parameter_type_oid(0), None);
+                        assert_eq!(bound_parameter_type_oid(102), None);
+                    })
+                    .unwrap();
+                assert_eq!(bound_parameter_type_oid(101), Some(oid::INT4));
+            });
+        });
+        assert_eq!(bound_parameter_type_oid(101), None);
+    }
+
+    #[test]
+    fn cursor_owned_query_parameter_types_restore_after_unwind() {
+        use crate::sql::exec::{bound_parameter_type_oid, with_bound_parameter_types};
+        use crate::sql::types::oid;
+
+        with_bound_parameter_types(&[oid::DATE, 0], || {
+            assert_eq!(bound_parameter_type_oid(2), None);
+            let result = std::panic::catch_unwind(|| {
+                with_bound_parameter_types(&[oid::INT4], || {
+                    assert_eq!(bound_parameter_type_oid(1), Some(oid::INT4));
+                    panic!("unwind the nested parameter context");
+                });
+            });
+            assert!(result.is_err());
+            assert_eq!(bound_parameter_type_oid(1), Some(oid::DATE));
+        });
+        assert_eq!(bound_parameter_type_oid(1), None);
     }
 
     #[test]

@@ -715,7 +715,9 @@ pub(crate) use describe::{
     routine_result_metadata, unify_numeric_tower,
 };
 pub(crate) use describe::{describe_data_modification_columns, describe_returning_items};
-pub(crate) use describe::{enter_bound_parameter_types, enter_routine_parameter_types};
+pub(crate) use describe::{
+    bound_parameter_type_oid, enter_routine_parameter_types, with_bound_parameter_types,
+};
 
 mod projected;
 pub(crate) use projected::{

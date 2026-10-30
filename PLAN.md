@@ -55,7 +55,8 @@ A waiting schema edit must never attach itself to a new object that reused a nam
   cursor over `nextval('order_numbers')` must not issue numbers for rows that
   have not been fetched. Row locks follow fetched rows. Holding a cursor across
   commit saves the required result before releasing its transaction.
-  Retain the parsed query and copied parameter values in the cursor's own
+  Retain the parsed query, copied parameter values and declared parameter types
+  (including `NULL` parameters) in the cursor's own
   startup reservation; closing or rolling back must release that state.
   Keep saved results as typed values: `SET DateStyle = 'SQL, DMY'` before
   `FETCH` must change how a saved date is displayed without changing its value.

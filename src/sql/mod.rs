@@ -10969,235 +10969,236 @@ impl Engine {
         conn_id: i32,
         lock_timeout_expired: bool,
     ) -> Result<ExtendedExecutionStatus, WireFull> {
-        let _parameter_types = exec::enter_bound_parameter_types(parameter_type_oids);
-        self.bind_query_connection(conn_id);
-        if txn.concurrent_partition_detach_pending()
-            && txn.staged_commit().is_some()
-            && let Err(error) = self.commit_partition_detach_phase(txn, guc, arena, responder)
-        {
-            if error.sqlstate == sqlstate::INTERNAL_IO_WAIT && txn.staged_commit().is_some() {
-                return Ok(ExtendedExecutionStatus::Blocked {
-                    wait: crate::sql::StatementWait::ObjectIo,
-                });
-            }
-            responder.error(error.sqlstate, error.message.as_str())?;
-            return Ok(ExtendedExecutionStatus::Complete(false));
-        }
-        let mut parser = match Parser::new(text, arena) {
-            Ok(p) => p,
-            Err(e) => {
-                report_parse_error(responder, &e)?;
-                return Ok(ExtendedExecutionStatus::Complete(false));
-            }
-        };
-        let statement = match parser.next_stmt() {
-            Ok(Some(statement)) => statement,
-            Ok(None) => {
-                responder.empty_query_response()?;
-                return Ok(ExtendedExecutionStatus::Complete(true));
-            }
-            Err(e) => {
-                if e.sqlstate == sqlstate::DEADLOCK_DETECTED {
-                    self.storage.record_deadlock();
-                }
-                if txn.is_explicit() && e.sqlstate == sqlstate::DEADLOCK_DETECTED {
-                    self.abort_explicit_txn(txn, guc);
-                } else if txn.is_explicit() {
-                    txn.failed = true;
-                }
-                report_parse_error(responder, &e)?;
-                return Ok(ExtendedExecutionStatus::Complete(false));
-            }
-        };
-        // Freeze this statement's clock before anything anchors a transaction
-        // to it, so `now()` and `statement_timestamp()` agree on a lone
-        // statement as they do in PostgreSQL.
-        txn.begin_statement_clock();
-        let routine_transaction_context = if txn.is_active() {
-            exec::PlpgsqlTransactionContext::Atomic
-        } else {
-            exec::PlpgsqlTransactionContext::NonAtomic
-        };
-        if let Err(error) = self.ensure_txn(txn, TxnMode::Implicit, guc) {
-            responder.error(error.sqlstate, error.message.as_str())?;
-            return Ok(ExtendedExecutionStatus::Complete(false));
-        }
-        let application_name = guc.get_owned("application_name").unwrap_or_default();
-        let backend_xid = self
-            .storage
-            .assigned_transaction_identity(txn.txid)
-            .map(|xid| xid as u32);
-        self.storage.begin_backend_statement(
-            conn_id,
-            text,
-            application_name.as_str(),
-            datetime::transaction_micros(),
-            backend_xid,
-        );
-        match self.wait_for_cache_capacity(
-            &statement,
-            txn,
-            sqlprep,
-            arena,
-            guc,
-            routine_transaction_context,
-        ) {
-            Ok(true) => {
-                return Ok(ExtendedExecutionStatus::Blocked {
-                    wait: StatementWait::CacheCapacity,
-                });
-            }
-            Ok(false) => {}
-            Err(error) => {
-                txn.release_suspended_statement();
-                if txn.is_explicit() {
-                    txn.failed = true;
-                } else {
-                    self.rollback_txn(txn, guc);
+        exec::with_bound_parameter_types(parameter_type_oids, || {
+            self.bind_query_connection(conn_id);
+            if txn.concurrent_partition_detach_pending()
+                && txn.staged_commit().is_some()
+                && let Err(error) = self.commit_partition_detach_phase(txn, guc, arena, responder)
+            {
+                if error.sqlstate == sqlstate::INTERNAL_IO_WAIT && txn.staged_commit().is_some() {
+                    return Ok(ExtendedExecutionStatus::Blocked {
+                        wait: crate::sql::StatementWait::ObjectIo,
+                    });
                 }
                 responder.error(error.sqlstate, error.message.as_str())?;
                 return Ok(ExtendedExecutionStatus::Complete(false));
             }
-        }
-        let sequence_scope = sequence::enter_statement(
-            arena,
-            guc.seq_session(),
-            txn.suspended_statement_context().is_some(),
-        );
-        let statement_mark =
-            txn.statement_mark(self.wal.stage_mark(txn.txid), self.storage.lock_mark());
-        emit_parse_warnings(&mut parser, responder)?;
-        let output_mark = responder.buffer.mark();
-        let outcome = match self.storage.begin_advisory_statement() {
-            Ok(()) => {
-                match self.execute_stmt(
-                    &statement,
-                    arena,
-                    params,
-                    txn,
-                    sqlprep,
-                    cursors,
-                    guc,
-                    routine_transaction_context,
-                    responder,
-                ) {
-                    Ok(outcome) => outcome,
-                    Err(WireFull) => {
-                        if txn.is_explicit() {
-                            txn.failed = true;
-                        } else {
-                            self.rollback_txn(txn, guc);
-                        }
-                        responder.replace_with_overflow_error(output_mark)?;
-                        return Ok(ExtendedExecutionStatus::Complete(false));
+            let mut parser = match Parser::new(text, arena) {
+                Ok(p) => p,
+                Err(e) => {
+                    report_parse_error(responder, &e)?;
+                    return Ok(ExtendedExecutionStatus::Complete(false));
+                }
+            };
+            let statement = match parser.next_stmt() {
+                Ok(Some(statement)) => statement,
+                Ok(None) => {
+                    responder.empty_query_response()?;
+                    return Ok(ExtendedExecutionStatus::Complete(true));
+                }
+                Err(e) => {
+                    if e.sqlstate == sqlstate::DEADLOCK_DETECTED {
+                        self.storage.record_deadlock();
                     }
+                    if txn.is_explicit() && e.sqlstate == sqlstate::DEADLOCK_DETECTED {
+                        self.abort_explicit_txn(txn, guc);
+                    } else if txn.is_explicit() {
+                        txn.failed = true;
+                    }
+                    report_parse_error(responder, &e)?;
+                    return Ok(ExtendedExecutionStatus::Complete(false));
+                }
+            };
+            // Freeze this statement's clock before anything anchors a transaction
+            // to it, so `now()` and `statement_timestamp()` agree on a lone
+            // statement as they do in PostgreSQL.
+            txn.begin_statement_clock();
+            let routine_transaction_context = if txn.is_active() {
+                exec::PlpgsqlTransactionContext::Atomic
+            } else {
+                exec::PlpgsqlTransactionContext::NonAtomic
+            };
+            if let Err(error) = self.ensure_txn(txn, TxnMode::Implicit, guc) {
+                responder.error(error.sqlstate, error.message.as_str())?;
+                return Ok(ExtendedExecutionStatus::Complete(false));
+            }
+            let application_name = guc.get_owned("application_name").unwrap_or_default();
+            let backend_xid = self
+                .storage
+                .assigned_transaction_identity(txn.txid)
+                .map(|xid| xid as u32);
+            self.storage.begin_backend_statement(
+                conn_id,
+                text,
+                application_name.as_str(),
+                datetime::transaction_micros(),
+                backend_xid,
+            );
+            match self.wait_for_cache_capacity(
+                &statement,
+                txn,
+                sqlprep,
+                arena,
+                guc,
+                routine_transaction_context,
+            ) {
+                Ok(true) => {
+                    return Ok(ExtendedExecutionStatus::Blocked {
+                        wait: StatementWait::CacheCapacity,
+                    });
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    txn.release_suspended_statement();
+                    if txn.is_explicit() {
+                        txn.failed = true;
+                    } else {
+                        self.rollback_txn(txn, guc);
+                    }
+                    responder.error(error.sqlstate, error.message.as_str())?;
+                    return Ok(ExtendedExecutionStatus::Complete(false));
                 }
             }
-            Err(error) => Err(error),
-        }
-        .and_then(|()| {
-            exec::constraints::validate_deferred_constraints(&self.storage, txn, true, arena)
-        })
-        .and_then(|()| {
-            self.fire_constraint_trigger_boundary(
-                txn,
-                guc,
+            let sequence_scope = sequence::enter_statement(
                 arena,
-                responder,
-                exec::TriggerQueueBoundary::Statement,
-            )
-        })
-        .and_then(|()| query::check_timeout())
-        .and_then(|()| sequence_scope.finish(guc.seq_session()));
-        match outcome {
-            Ok(()) => {
-                if txn.take_concurrent_partition_detach() {
-                    if let Err(error) =
-                        self.commit_partition_detach_phase(txn, guc, arena, responder)
-                    {
-                        if error.sqlstate == sqlstate::INTERNAL_IO_WAIT
-                            && txn.staged_commit().is_some()
+                guc.seq_session(),
+                txn.suspended_statement_context().is_some(),
+            );
+            let statement_mark =
+                txn.statement_mark(self.wal.stage_mark(txn.txid), self.storage.lock_mark());
+            emit_parse_warnings(&mut parser, responder)?;
+            let output_mark = responder.buffer.mark();
+            let outcome = match self.storage.begin_advisory_statement() {
+                Ok(()) => {
+                    match self.execute_stmt(
+                        &statement,
+                        arena,
+                        params,
+                        txn,
+                        sqlprep,
+                        cursors,
+                        guc,
+                        routine_transaction_context,
+                        responder,
+                    ) {
+                        Ok(outcome) => outcome,
+                        Err(WireFull) => {
+                            if txn.is_explicit() {
+                                txn.failed = true;
+                            } else {
+                                self.rollback_txn(txn, guc);
+                            }
+                            responder.replace_with_overflow_error(output_mark)?;
+                            return Ok(ExtendedExecutionStatus::Complete(false));
+                        }
+                    }
+                }
+                Err(error) => Err(error),
+            }
+            .and_then(|()| {
+                exec::constraints::validate_deferred_constraints(&self.storage, txn, true, arena)
+            })
+            .and_then(|()| {
+                self.fire_constraint_trigger_boundary(
+                    txn,
+                    guc,
+                    arena,
+                    responder,
+                    exec::TriggerQueueBoundary::Statement,
+                )
+            })
+            .and_then(|()| query::check_timeout())
+            .and_then(|()| sequence_scope.finish(guc.seq_session()));
+            match outcome {
+                Ok(()) => {
+                    if txn.take_concurrent_partition_detach() {
+                        if let Err(error) =
+                            self.commit_partition_detach_phase(txn, guc, arena, responder)
                         {
+                            if error.sqlstate == sqlstate::INTERNAL_IO_WAIT
+                                && txn.staged_commit().is_some()
+                            {
+                                return Ok(ExtendedExecutionStatus::Blocked {
+                                    wait: crate::sql::StatementWait::ObjectIo,
+                                });
+                            }
+                            responder.error(error.sqlstate, error.message.as_str())?;
+                            return Ok(ExtendedExecutionStatus::Complete(false));
+                        }
+                        return Ok(ExtendedExecutionStatus::Blocked {
+                            wait: crate::sql::StatementWait::Lock,
+                        });
+                    }
+                    txn.compact_completed_constraints();
+                    Ok(ExtendedExecutionStatus::Complete(true))
+                }
+                Err(mut e) => {
+                    if self.fatal_commit_failure.is_some() {
+                        responder.error(
+                            sqlstate::TRANSACTION_RESOLUTION_UNKNOWN,
+                            "commit completion requires recovery; connection must close",
+                        )?;
+                        return Ok(ExtendedExecutionStatus::Complete(false));
+                    }
+
+                    if e.sqlstate == sqlstate::INTERNAL_LOCK_WAIT
+                        || e.sqlstate == sqlstate::INTERNAL_IO_WAIT
+                    {
+                        if txn.staged_commit().is_some() {
+                            sequence_scope.discard(guc.seq_session());
                             return Ok(ExtendedExecutionStatus::Blocked {
                                 wait: crate::sql::StatementWait::ObjectIo,
                             });
                         }
-                        responder.error(error.sqlstate, error.message.as_str())?;
-                        return Ok(ExtendedExecutionStatus::Complete(false));
-                    }
-                    return Ok(ExtendedExecutionStatus::Blocked {
-                        wait: crate::sql::StatementWait::Lock,
-                    });
-                }
-                txn.compact_completed_constraints();
-                Ok(ExtendedExecutionStatus::Complete(true))
-            }
-            Err(mut e) => {
-                if self.fatal_commit_failure.is_some() {
-                    responder.error(
-                        sqlstate::TRANSACTION_RESOLUTION_UNKNOWN,
-                        "commit completion requires recovery; connection must close",
-                    )?;
-                    return Ok(ExtendedExecutionStatus::Complete(false));
-                }
-
-                if e.sqlstate == sqlstate::INTERNAL_LOCK_WAIT
-                    || e.sqlstate == sqlstate::INTERNAL_IO_WAIT
-                {
-                    if txn.staged_commit().is_some() {
-                        sequence_scope.discard(guc.seq_session());
-                        return Ok(ExtendedExecutionStatus::Blocked {
-                            wait: crate::sql::StatementWait::ObjectIo,
-                        });
-                    }
-                    if txn.owns_statement_mark(statement_mark) {
-                        if txn.suspended_statement_context().is_none() {
-                            txn.suspend_statement(
-                                None,
-                                datetime::statement_clock(),
-                                query::statement_deadline(),
-                                routine_transaction_context,
+                        if txn.owns_statement_mark(statement_mark) {
+                            if txn.suspended_statement_context().is_none() {
+                                txn.suspend_statement(
+                                    None,
+                                    datetime::statement_clock(),
+                                    query::statement_deadline(),
+                                    routine_transaction_context,
+                                );
+                            }
+                            self.storage.preserve_advisory_statement();
+                            self.rollback_waiting_statement(txn, statement_mark);
+                            if !lock_timeout_expired {
+                                return Ok(ExtendedExecutionStatus::Blocked {
+                                    wait: if e.sqlstate == sqlstate::INTERNAL_IO_WAIT {
+                                        StatementWait::ObjectIo
+                                    } else {
+                                        StatementWait::Lock
+                                    },
+                                });
+                            }
+                            self.storage
+                                .rollback_locks_to(txn.txid, statement_mark.lock);
+                            e = sql_err!(
+                                sqlstate::LOCK_NOT_AVAILABLE,
+                                "canceling statement due to lock timeout"
+                            );
+                        } else {
+                            e = sql_err!(
+                                sqlstate::FEATURE_NOT_SUPPORTED,
+                                "a non-atomic routine cannot suspend after transaction control"
                             );
                         }
-                        self.storage.preserve_advisory_statement();
-                        self.rollback_waiting_statement(txn, statement_mark);
-                        if !lock_timeout_expired {
-                            return Ok(ExtendedExecutionStatus::Blocked {
-                                wait: if e.sqlstate == sqlstate::INTERNAL_IO_WAIT {
-                                    StatementWait::ObjectIo
-                                } else {
-                                    StatementWait::Lock
-                                },
-                            });
-                        }
-                        self.storage
-                            .rollback_locks_to(txn.txid, statement_mark.lock);
-                        e = sql_err!(
-                            sqlstate::LOCK_NOT_AVAILABLE,
-                            "canceling statement due to lock timeout"
-                        );
-                    } else {
-                        e = sql_err!(
-                            sqlstate::FEATURE_NOT_SUPPORTED,
-                            "a non-atomic routine cannot suspend after transaction control"
-                        );
                     }
+                    if e.sqlstate == sqlstate::DEADLOCK_DETECTED {
+                        self.storage.record_deadlock();
+                    }
+                    sequence_scope.discard(guc.seq_session());
+                    if txn.is_explicit() && e.sqlstate == sqlstate::DEADLOCK_DETECTED {
+                        self.abort_explicit_txn(txn, guc);
+                    } else if txn.is_explicit() {
+                        txn.failed = true;
+                    } else {
+                        self.rollback_txn(txn, guc);
+                    }
+                    responder.error(e.sqlstate, e.message.as_str())?;
+                    Ok(ExtendedExecutionStatus::Complete(false))
                 }
-                if e.sqlstate == sqlstate::DEADLOCK_DETECTED {
-                    self.storage.record_deadlock();
-                }
-                sequence_scope.discard(guc.seq_session());
-                if txn.is_explicit() && e.sqlstate == sqlstate::DEADLOCK_DETECTED {
-                    self.abort_explicit_txn(txn, guc);
-                } else if txn.is_explicit() {
-                    txn.failed = true;
-                } else {
-                    self.rollback_txn(txn, guc);
-                }
-                responder.error(e.sqlstate, e.message.as_str())?;
-                Ok(ExtendedExecutionStatus::Complete(false))
             }
-        }
+        })
     }
 
     pub(crate) fn large_object_fast_path_signature(

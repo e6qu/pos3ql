@@ -1692,24 +1692,18 @@ std::thread_local! {
 
 #[derive(Clone, Copy)]
 struct BoundParameterTypes {
-    oids: [Option<i32>; MAX_ROUTINE_ARGUMENTS],
+    oids: *const i32,
+    len: usize,
 }
 
 impl BoundParameterTypes {
     const EMPTY: Self = Self {
-        oids: [None; MAX_ROUTINE_ARGUMENTS],
+        oids: core::ptr::null(),
+        len: 0,
     };
 }
 
-pub(crate) struct BoundParameterScope(BoundParameterTypes);
-
-pub(crate) fn enter_bound_parameter_types(oids: &[i32]) -> BoundParameterScope {
-    let mut current = BoundParameterTypes::EMPTY;
-    for (slot, oid) in oids.iter().copied().enumerate().take(MAX_ROUTINE_ARGUMENTS) {
-        current.oids[slot] = (oid != 0).then_some(oid);
-    }
-    BoundParameterScope(BOUND_PARAMETER_TYPES.with(|slot| slot.replace(current)))
-}
+struct BoundParameterScope(BoundParameterTypes);
 
 impl Drop for BoundParameterScope {
     fn drop(&mut self) {
@@ -1717,9 +1711,28 @@ impl Drop for BoundParameterScope {
     }
 }
 
+/// The closure boundary keeps the borrowed type slice live and prevents a
+/// caller from leaking or dropping the restoration guard out of order.
+pub(crate) fn with_bound_parameter_types<R>(oids: &[i32], run: impl FnOnce() -> R) -> R {
+    let current = BoundParameterTypes {
+        oids: oids.as_ptr(),
+        len: oids.len(),
+    };
+    let _scope = BoundParameterScope(BOUND_PARAMETER_TYPES.with(|slot| slot.replace(current)));
+    run()
+}
+
 pub(crate) fn bound_parameter_type_oid(index: u32) -> Option<i32> {
-    index.checked_sub(1).and_then(|index| {
-        BOUND_PARAMETER_TYPES.with(|types| types.get().oids.get(index as usize).copied().flatten())
+    let index = index.checked_sub(1)? as usize;
+    BOUND_PARAMETER_TYPES.with(|types| {
+        let current = types.get();
+        if index >= current.len {
+            return None;
+        }
+        // with_bound_parameter_types owns the only installation path. Its
+        // private guard restores the prior slice before the caller can free it.
+        let oid = unsafe { *current.oids.add(index) };
+        (oid != 0).then_some(oid)
     })
 }
 

@@ -3238,8 +3238,7 @@ impl Conn {
         if kind == b'S' && responder.parameter_description(param_oids).is_err() {
             return Step::Close;
         }
-        let _parameter_types = crate::sql::exec::enter_bound_parameter_types(param_oids);
-        match engine.describe(
+        crate::sql::exec::with_bound_parameter_types(param_oids, || match engine.describe(
             text,
             &self.arena,
             &self.txn,
@@ -3252,7 +3251,7 @@ impl Conn {
                 Step::Continue
             }
             Err(WireFull) => Step::Close,
-        }
+        })
     }
 
     fn handle_execute(&mut self, engine: &mut Engine, total: usize) -> Step {

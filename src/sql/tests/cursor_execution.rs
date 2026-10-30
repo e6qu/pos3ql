@@ -383,6 +383,146 @@ fn cursor_retained_filters_advance_input_without_saving_rejected_rows() {
 }
 
 #[test]
+fn cursor_retained_default_mode_defers_reads_and_matches_plan_scrollability() {
+    use crate::sql::cursor::FetchMotion;
+    let config = test_config("cursor-retained-default-mode");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE TABLE default_input(id integer); INSERT INTO default_input VALUES (1),(2),(3); \
+        BEGIN; DECLARE automatic CURSOR FOR SELECT id FROM default_input",
+        true,
+    );
+    let (slot, _) = session
+        .cursors
+        .read_request("automatic", FetchMotion::Count(1), false)
+        .unwrap()
+        .expect("retained default cursor");
+    assert_eq!(session.cursors.produced_rows(slot), 0);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT is_scrollable FROM pg_cursors WHERE name='automatic'",
+            true
+        )),
+        ["t"]
+    );
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "FETCH NEXT FROM automatic", true)),
+        ["1"]
+    );
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "FETCH LAST FROM automatic", true)),
+        ["3"]
+    );
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "FETCH FIRST FROM automatic", true)),
+        ["1"]
+    );
+    session.success(&mut engine, "CLOSE automatic; COMMIT", true);
+    for predicate in ["FALSE", "'f'", "NULL AND TRUE"] {
+        session.success(&mut engine, &format!("BEGIN; DECLARE empty_cursor CURSOR FOR SELECT id FROM default_input WHERE {predicate}"), true);
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "SELECT is_scrollable FROM pg_cursors WHERE name='empty_cursor'",
+                true
+            )),
+            ["f"]
+        );
+        assert_eq!(
+            command_tags(&session.success(&mut engine, "FETCH ALL FROM empty_cursor", true)),
+            ["FETCH 0"]
+        );
+        assert_eq!(data_rows(&session.success(&mut engine,
+            "SELECT seq_scan,seq_tup_read FROM pg_stat_xact_user_tables WHERE relname='default_input'", true)), ["0|0"]);
+        session.success(&mut engine, "CLOSE empty_cursor; COMMIT", true);
+    }
+}
+
+#[test]
+fn cursor_retained_declaration_and_empty_filter_do_not_mark_unread_tables_as_read() {
+    let config = test_config("cursor-retained-unread-serializable");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut reader = ConfiguredTransactionSession::new(&config, &mut budget);
+    let mut writer = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+    writer.success(
+        &mut engine,
+        "CREATE TABLE unread_cursor_input(id integer); INSERT INTO unread_cursor_input VALUES (1)",
+        true,
+    );
+    for query in [
+        "SELECT id FROM unread_cursor_input",
+        "SELECT id FROM unread_cursor_input WHERE FALSE",
+    ] {
+        reader.success(
+            &mut engine,
+            &format!("BEGIN ISOLATION LEVEL SERIALIZABLE; DECLARE unread CURSOR FOR {query}"),
+            true,
+        );
+        if query.ends_with("FALSE") {
+            reader.success(&mut engine, "FETCH ALL FROM unread", true);
+        }
+        writer.success(&mut engine, "UPDATE unread_cursor_input SET id=id+1", true);
+        reader.success(&mut engine, "COMMIT", true);
+    }
+}
+
+#[test]
+fn cursor_retained_type_analysis_precedes_execution_permissions() {
+    let config = test_config("cursor-retained-type-permission-order");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(&mut engine, "CREATE TABLE permission_input(id integer); CREATE ROLE cursor_denied; SET ROLE cursor_denied; BEGIN", true);
+    assert_eq!(
+        error_sqlstates(&session.execute(
+            &mut engine,
+            "DECLARE bad NO SCROLL CURSOR FOR SELECT id+TRUE FROM permission_input",
+            true
+        )),
+        ["42883"]
+    );
+    session.success(&mut engine, "ROLLBACK; BEGIN", true);
+    assert_eq!(
+        error_sqlstates(&session.execute(
+            &mut engine,
+            "DECLARE bad NO SCROLL CURSOR FOR SELECT id FROM permission_input",
+            true
+        )),
+        ["42501"]
+    );
+    session.success(&mut engine, "ROLLBACK; RESET ROLE", true);
+}
+
+#[test]
+fn cursor_retained_implicit_commit_triggers_can_inspect_the_connection_cursors() {
+    let config = test_config("cursor-retained-commit-cursor-catalog");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(&mut engine, "CREATE TABLE cursor_catalog_input(id integer); INSERT INTO cursor_catalog_input VALUES (1); \
+        CREATE TABLE cursor_catalog_gate(id integer); \
+        CREATE FUNCTION inspect_commit_cursor() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN \
+          IF (SELECT count(*) FROM pg_cursors WHERE name='held') <> 1 THEN RAISE EXCEPTION 'cursor missing'; END IF; \
+          RAISE EXCEPTION 'cursor visible'; END $$; \
+        CREATE CONSTRAINT TRIGGER inspect_commit_cursor AFTER INSERT ON cursor_catalog_gate DEFERRABLE INITIALLY DEFERRED \
+        FOR EACH ROW EXECUTE FUNCTION inspect_commit_cursor()", true);
+    let failed = session.execute(&mut engine,
+        "DECLARE held CURSOR WITH HOLD FOR SELECT id FROM cursor_catalog_input; INSERT INTO cursor_catalog_gate VALUES (1)", true);
+    assert_eq!(error_sqlstates(&failed), ["P0001"]);
+    assert!(
+        String::from_utf8_lossy(&failed).contains("cursor visible"),
+        "{}",
+        String::from_utf8_lossy(&failed)
+    );
+    assert!(!session.cursors.exists("held"));
+}
+
+#[test]
 fn cursor_retained_hold_saves_unread_rows_at_commit_and_preserves_position() {
     use crate::sql::cursor::FetchMotion;
     for scroll in ["NO SCROLL", "SCROLL"] {

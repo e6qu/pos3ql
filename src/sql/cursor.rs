@@ -465,6 +465,15 @@ impl CursorPool {
         let columns = seal_description(&mut slot.description)?;
         seal_rows(&slot.rows, columns, &mut slot.spans)?;
         slot.produced = slot.spans.len();
+        if slot.scroll == CursorScroll::Default
+            && let Some(source) = slot.query.retained.as_ref()
+        {
+            slot.scroll = if source.default_scrollable() {
+                CursorScroll::Scroll
+            } else {
+                CursorScroll::NoScroll
+            };
+        }
         slot.active = true;
         Ok(())
     }

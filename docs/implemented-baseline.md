@@ -190,7 +190,9 @@ waits. `LIMIT 2 OFFSET 3` skips three qualifying rows and returns at most two;
 `LIMIT 0` reads no rows. Negative bounds fail when fetching starts. Offset rows
 still evaluate the child projection, so a skipped division by zero can fail.
 Filters discard rejected rows and release their temporary memory before
-reading the next input. Scan counters include rejected and erroring input rows.
+reading the next input. Scan counters include rejected and erroring input rows. Serializable read
+tracking starts with the scan too: declaration or a provably empty result does
+not mark an unread table as read.
 Function calls, casts, user-defined operators, ordering and row-level security
 still use the eager path.
 With explicit `SCROLL`, the same query shapes also start without reading rows.
@@ -198,9 +200,12 @@ They save visited results so `FETCH PRIOR`, `FETCH 0` and forward jumps within
 that history need no new input reads. `FETCH LAST` first consumes the remaining
 input. Unlike forward-only cursors, their accumulated history must fit
 `cursor_bytes`; exhaustion returns `54000`, releases input owners and leaves
-the cursor failed until closed. The implicit scroll mode still uses the eager executor.
+the cursor failed until closed. When the scroll option is omitted, a physical
+scan permits scrolling; a provably empty result is forward-only. The matching
+`pg_cursors.is_scrollable` value is chosen at declaration. Constant false or
+null filters avoid input reads, including string boolean literals such as `'f'`.
 
-For these explicit modes, `WITH HOLD` saves the unread result during commit
+For these query shapes, `WITH HOLD` saves the unread result during commit
 and keeps the current position. It also works without `BEGIN`: the declaration's
 implicit transaction saves the result before completing. Fetching from a held
 cursor inside a later transaction and rolling that transaction back does not

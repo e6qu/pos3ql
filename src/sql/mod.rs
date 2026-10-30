@@ -7545,6 +7545,9 @@ impl Engine {
         responder: &mut Responder,
     ) -> Result<(), SqlError> {
         let _atomic_reads = self.atomic_block_read_scope();
+        let _active_cursors = cursors
+            .as_ref()
+            .map(|pool| cursor::enter_active(&**pool as *const _));
         if txn.staged_commit().is_some() {
             self.complete_staged_commit(txn, guc)?;
             if let Some(cursors) = cursors {
@@ -10003,6 +10006,9 @@ impl Engine {
         finish: CopyFinishMode,
     ) -> Result<(), SqlError> {
         let _atomic_reads = self.atomic_block_read_scope();
+        let _active_cursors = cursors
+            .as_ref()
+            .map(|pool| cursor::enter_active(&**pool as *const _));
         if txn.staged_commit().is_some() {
             self.complete_staged_commit(txn, guc)?;
             if let Some(cursors) = cursors {
@@ -19495,7 +19501,7 @@ impl Engine {
             cursors.abandon(at);
             return Err(error);
         }
-        if scroll != cursor::CursorScroll::Default {
+        {
             let prepared = {
                 let (query, description, rows) = cursors.execution_parts(at);
                 let mut capture = Responder::for_cursor(

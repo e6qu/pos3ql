@@ -55,11 +55,12 @@ A waiting schema edit must never attach itself to a new object that reused a nam
   cursor over `nextval('order_numbers')` must not issue numbers for rows that
   have not been fetched. Row locks follow fetched rows. Holding a cursor across
   commit saves the required result before releasing its transaction.
-  Explicit `NO SCROLL` and `SCROLL` cursors over one physical table retain their reader,
+  Simple cursors over one physical table retain their reader,
   built-in arithmetic/comparisons, boolean filters, integer row limits/offsets
   and captured parameters.
   Forward-only cursors reuse memory per fetch; scrolling cursors retain visited
-  results. Both keep operator choices from declaration.
+  results. Omitted scroll options follow the bound plan’s backward-read support.
+  Operator choices stay fixed after declaration.
   Holdable versions save unread results during commit and release their input
   owners across simple queries, extended-protocol Sync, COPY and large-object calls.
   Extend retained execution to function calls and effects, joins, ordering and

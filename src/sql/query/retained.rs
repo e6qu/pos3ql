@@ -156,6 +156,10 @@ fn bind_expression<'a>(
 }
 
 impl<'a> RetainedSelect<'a> {
+    pub(crate) fn default_scrollable(&self) -> bool {
+        !matches!(self.state, ReaderState::Eliminated)
+    }
+
     pub(crate) fn uses_table(&self, table: usize) -> bool {
         !matches!(self.state, ReaderState::Eliminated)
             && self.scope.slots[..self.scope.n].contains(&table)
@@ -251,17 +255,10 @@ impl<'a> RetainedSelect<'a> {
         if storage.row_security_applies(table, role, txid) {
             return Ok(None);
         }
-        let demand = streaming_pax_columns(&scope, from, statement.items, statement.where_clause);
-        scan::admit_sources(storage, &scope, txid, demand)?;
-        scan::validate_materialized_view_reads(
-            storage,
-            &scope,
-            statement.where_clause,
-            arena,
-            txid,
-        )?;
         check_select_types(statement, &scope, storage, txid, arena)?;
         check_select_constants(statement, arena, storage, txid)?;
+        let demand = streaming_pax_columns(&scope, from, statement.items, statement.where_clause);
+        scan::admit_sources(storage, &scope, txid, demand)?;
         let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
         let width = describe_scope_items(
             statement.items,
@@ -312,9 +309,23 @@ impl<'a> RetainedSelect<'a> {
                 reorder_qual(predicate, &scope, arena)
             })
             .transpose()?;
-        let eliminated = predicate.is_some_and(|predicate| {
-            matches!(predicate, Expr::Null) || plan_time_bool(predicate, arena) == Some(false)
-        });
+        let (predicate, eliminated) = match predicate {
+            Some(predicate) if predicate.is_constant() => {
+                let value = super::super::eval::eval(
+                    predicate,
+                    arena,
+                    &[],
+                    &super::super::eval::NoColumns,
+                )?;
+                let value = super::super::eval::boolean_argument(value, "WHERE")?;
+                (None, !matches!(value, Datum::Bool(true)))
+            }
+            Some(predicate) => (
+                Some(predicate),
+                plan_time_bool(predicate, arena) == Some(false),
+            ),
+            None => (None, false),
+        };
         let predicate = predicate
             .map(|predicate| bind_expression(predicate, arena))
             .transpose()?;
@@ -329,6 +340,7 @@ impl<'a> RetainedSelect<'a> {
                 .transpose()?,
         };
         if !eliminated {
+            scan::validate_materialized_view_reads(storage, &scope, None, arena, txid)?;
             source.open(storage, table, txid, arena)?;
         }
         Ok(Some(Self {

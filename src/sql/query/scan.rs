@@ -5249,7 +5249,6 @@ pub(super) fn admit_sources(
                 crate::sql::ast::TableLockMode::AccessShare,
                 false,
             )?;
-            storage.record_serializable_read(txid, scope.slots[table]);
         }
     }
     Ok(current_role)

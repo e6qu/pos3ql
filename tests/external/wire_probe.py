@@ -1277,6 +1277,19 @@ def test_cursor_hold_commits_at_message_and_sync_boundaries():
           not any(kind == b"E" for messages in (declared, first, second) for kind, _ in messages)
           and declared[-1] == (b"Z", b"I")
           and first_text_row(first) == "1" and first_text_row(second) == "2", declared + first + second)
+    setup = simple_query(s,
+        "CREATE TABLE wire_hold_gate(id integer); "
+        "CREATE FUNCTION wire_hold_check() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN "
+        "IF (SELECT count(*) FROM pg_cursors WHERE name='inspected') <> 1 THEN RAISE EXCEPTION 'cursor missing'; END IF; "
+        "RAISE EXCEPTION 'cursor visible'; END $$; "
+        "CREATE CONSTRAINT TRIGGER wire_hold_check AFTER INSERT ON wire_hold_gate DEFERRABLE INITIALLY DEFERRED "
+        "FOR EACH ROW EXECUTE FUNCTION wire_hold_check()")
+    inspected = simple_query(s, "DECLARE inspected CURSOR WITH HOLD FOR SELECT id FROM wire_hold_input; INSERT INTO wire_hold_gate VALUES (1)")
+    check("hold cursor: implicit commit triggers see the connection's cursor catalog",
+          not any(kind == b"E" for kind, _ in setup)
+          and any(kind == b"E" and b"CP0001\x00" in payload and b"Mcursor visible\x00" in payload for kind, payload in inspected)
+          and inspected[-1] == (b"Z", b"I"), setup + inspected)
+    simple_query(s, "DROP TABLE wire_hold_gate; DROP FUNCTION wire_hold_check()")
     parse = frontend_message(b"P", b"hold_statement\x00DECLARE held SCROLL CURSOR WITH HOLD FOR SELECT id FROM wire_hold_input\x00\x00\x00")
     bind = frontend_message(b"B", b"\x00hold_statement\x00" + struct.pack("!hhh", 0, 0, 0))
     s.sendall(parse + bind + frontend_message(b"E", b"\x00" + struct.pack("!i", 0)) + frontend_message(b"S"))

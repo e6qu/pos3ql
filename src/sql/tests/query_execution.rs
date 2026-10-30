@@ -74,21 +74,32 @@ fn cursor_retained_cold_scroll_reuses_history_after_storage_waits() {
     );
 }
 
+#[test]
+fn cursor_retained_cold_default_mode_resumes_and_scrolls() {
+    cold_cursor_fetch(
+        "SELECT id,code FROM cold_orders WHERE id%2=0 LIMIT 71 OFFSET 9",
+        2,
+        9,
+        71,
+        CursorScroll::Default,
+    );
+}
+
 fn cold_cursor_fetch(select: &str, stride: i32, skip: i32, take: i32, mode: CursorScroll) {
     use crate::sql::cursor::FetchMotion;
 
-    let (scroll, scrollable) = match mode {
-        CursorScroll::NoScroll => ("NO SCROLL", false),
-        CursorScroll::Scroll => ("SCROLL", true),
-        CursorScroll::Default => panic!("test must choose an explicit cursor mode"),
+    let (scroll, scrollable, mode_name) = match mode {
+        CursorScroll::NoScroll => ("NO SCROLL", false, "no-scroll"),
+        CursorScroll::Scroll => ("SCROLL", true, "scroll"),
+        CursorScroll::Default => ("", true, "default"),
     };
     let mut config = test_config(&format!(
-        "cursor-retained-cold-fetch-{stride}-{skip}-{take}-{scrollable}"
+        "cursor-retained-cold-fetch-{stride}-{skip}-{take}-{mode_name}"
     ));
     config.object_store_on = true;
     config.object_store_sim = true;
     config.object_store_bucket = format!(
-        "retained-cursor-{stride}-{skip}-{take}-{scrollable}-{}",
+        "retained-cursor-{stride}-{skip}-{take}-{mode_name}-{}",
         std::process::id()
     );
     config.wal_upload = true;

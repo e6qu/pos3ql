@@ -367,6 +367,56 @@ DROP TABLE trigger_return_input;
 DROP FUNCTION trigger_conditional_return();
 DROP FUNCTION trigger_missing_statement_return();
 
+CREATE TABLE default_cursor_input(id integer);
+INSERT INTO default_cursor_input VALUES (1),(2),(3);
+BEGIN;
+DECLARE automatic CURSOR FOR SELECT id FROM default_cursor_input;
+SELECT is_scrollable FROM pg_cursors WHERE name='automatic';
+FETCH NEXT FROM automatic;
+FETCH LAST FROM automatic;
+FETCH FIRST FROM automatic;
+CLOSE automatic;
+COMMIT;
+BEGIN;
+DECLARE empty_cursor CURSOR FOR SELECT id FROM default_cursor_input WHERE 'f';
+SELECT is_scrollable FROM pg_cursors WHERE name='empty_cursor';
+FETCH ALL FROM empty_cursor;
+CLOSE empty_cursor;
+COMMIT;
+BEGIN;
+DECLARE empty_cursor CURSOR FOR SELECT id FROM default_cursor_input WHERE NULL AND TRUE;
+SELECT is_scrollable FROM pg_cursors WHERE name='empty_cursor';
+FETCH ALL FROM empty_cursor;
+CLOSE empty_cursor;
+COMMIT;
+CREATE MATERIALIZED VIEW default_empty_view AS SELECT id FROM default_cursor_input WITH NO DATA;
+BEGIN;
+DECLARE empty_cursor CURSOR FOR SELECT id FROM default_empty_view WHERE 'f';
+FETCH ALL FROM empty_cursor;
+COMMIT;
+DROP MATERIALIZED VIEW default_empty_view;
+CREATE ROLE cursor_denied;
+SET ROLE cursor_denied;
+BEGIN;
+DECLARE bad NO SCROLL CURSOR FOR SELECT id+TRUE FROM default_cursor_input;
+ROLLBACK;
+BEGIN;
+DECLARE bad NO SCROLL CURSOR FOR SELECT id FROM default_cursor_input;
+ROLLBACK;
+RESET ROLE;
+DROP ROLE cursor_denied;
+CREATE FUNCTION default_parameter_cursor(keep boolean) RETURNS refcursor LANGUAGE plpgsql AS $$
+DECLARE c refcursor := 'parameter_default'; BEGIN
+  OPEN c FOR SELECT id FROM default_cursor_input WHERE keep; RETURN c;
+END $$;
+BEGIN;
+SELECT default_parameter_cursor(false);
+SELECT is_scrollable FROM pg_cursors WHERE name='parameter_default';
+FETCH ALL FROM parameter_default;
+COMMIT;
+DROP FUNCTION default_parameter_cursor(boolean);
+DROP TABLE default_cursor_input;
+
 -- Name resolution at DECLARE survives a new operator on the same search path.
 CREATE SCHEMA cursor_ops;
 SET search_path=cursor_ops,pg_catalog;

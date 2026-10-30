@@ -223,7 +223,7 @@ parameter declarations, including a domain's own identity rather than its base
 representation. Dynamic SQL takes parameters only from `USING`: for example,
 `OPEN c FOR EXECUTE 'SELECT $1' USING d` captures a null date as a date, even
 inside a function whose first argument is an integer. Local names do not become
-columns inside the command string. Non-holdable cursors with explicit `NO SCROLL` or `SCROLL` over
+columns inside the command string. Cursors over
 one local physical table defer row reads, built-in binary operators, negation,
 boolean logic, null tests and filters composed from those expressions to `FETCH`.
 Integer row limits and offsets also retain their counts. A zero limit avoids
@@ -234,7 +234,7 @@ constant and type errors still fail during declaration. Built-in operators
 bind before fetching, including when a later search-path edit or operator
 creation would select a different operator in a newly issued query.
 Joins, function calls, casts, user-defined operators, ordering, grouping,
-row-level security, inheritance expansion and implicit scroll mode still use the
+row-level security, inheritance expansion still use the
 eager executor. The retained reader's selected row identities, saved-file
 positions and copied saved-row input share `cursor_query_bytes`; exhaustion returns
 `54000`. Each query workspace also reserves fixed row and saved-file read
@@ -246,6 +246,10 @@ The cursor keeps its relation in use through end of input until `CLOSE`.
 Destructive table changes in the same session raise `55006`; a table rename
 does not change its saved definition or input. This follows PostgreSQL's
 [active-relation check](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/commands/tablecmds.c).
+Without a scroll option, a retained physical scan is scrollable; a plan with
+no input scan is forward-only. `pg_cursors.is_scrollable` reflects that choice.
+Constant false or null filters request no rows, including a string literal
+coerced to boolean. Type and constant errors precede execution permission checks.
 Holdable versions save unread results during commit, preserving the current
 position and releasing query/input owners before temporary-table commit actions.
 A forward-only held result must fit `cursor_bytes` for its unread suffix;

@@ -16540,6 +16540,7 @@ impl Storage {
         index_entries: usize,
         observed_at: i64,
     ) -> Result<(), SqlError> {
+        self.record_serializable_read(txid, table);
         self.with_relation_transaction_statistics(txid, table, |statistics| {
             if index_oid.is_some() {
                 statistics.idx_scan = statistics.idx_scan.saturating_add(1);

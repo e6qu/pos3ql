@@ -226,6 +226,9 @@ inside a function whose first argument is an integer. Local names do not become
 columns inside the command string. Simple non-holdable `NO SCROLL` cursors over
 one local physical table defer row reads, built-in binary operators, negation,
 boolean logic, null tests and filters composed from those expressions to `FETCH`.
+Integer row limits and offsets also retain their counts. A zero limit avoids
+row reads; negative counts fail on the first fetch. Offsets consume qualifying
+child results, including their projection errors.
 A row-dependent division by zero fails on the fetch that reaches that row;
 constant and type errors still fail during declaration. Built-in operators
 bind before fetching, including when a later search-path edit or operator

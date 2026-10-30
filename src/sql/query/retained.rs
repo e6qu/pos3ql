@@ -19,9 +19,21 @@ enum ReaderState {
     Eliminated,
 }
 
+enum RowBounds<'a> {
+    Unstarted {
+        limit: Option<&'a Expr<'a>>,
+        offset: Option<&'a Expr<'a>>,
+    },
+    Active {
+        skip: u64,
+        remaining: u64,
+    },
+}
+
 pub(crate) struct RetainedSelect<'a> {
     items: &'a [SelectItem<'a>],
     predicate: Option<&'a Expr<'a>>,
+    bounds: RowBounds<'a>,
     scope: QueryScope<'a>,
     source: RowCursor,
     decoded_columns: Option<[bool; MAX_COLUMNS]>,
@@ -61,6 +73,22 @@ fn retained_expression(
                 .is_none_or(|name| !catalog.has_operator_candidate(name))
                 && retained_expression(left, catalog)
                 && retained_expression(right, catalog)
+        }
+        _ => false,
+    }
+}
+
+fn retained_bound(expression: &Expr<'_>, catalog: &dyn super::super::eval::CatalogAccess) -> bool {
+    match expression {
+        Expr::Int(_) | Expr::Null | Expr::Param(_) | Expr::RoutineParam { .. } => true,
+        Expr::Unary {
+            operator: crate::sql::ast::UnaryOp::Neg,
+            operand,
+        } => retained_bound(operand, catalog),
+        Expr::Binary { left, right, .. } => {
+            retained_expression(expression, catalog)
+                && retained_bound(left, catalog)
+                && retained_bound(right, catalog)
         }
         _ => false,
     }
@@ -158,8 +186,6 @@ impl<'a> RetainedSelect<'a> {
             || statement.having.is_some()
             || !statement.order_by.is_empty()
             || !statement.locking.is_empty()
-            || statement.limit.is_some()
-            || statement.offset.is_some()
             || statement.with_ties
         {
             return Ok(None);
@@ -175,9 +201,36 @@ impl<'a> RetainedSelect<'a> {
         {
             return Ok(None);
         }
+        if [statement.limit, statement.offset]
+            .into_iter()
+            .flatten()
+            .any(|bound| !retained_bound(bound, &catalog))
+        {
+            return Ok(None);
+        }
         let scope = QueryScope::resolve_schema(storage, from, txid, arena)?;
         if scope.n != 1 || scope.derived[0].is_some() || scope.slots[0] == usize::MAX {
             return Ok(None);
+        }
+        let columns = CatalogScopeCols {
+            scope: &scope,
+            outer_scope: None,
+            storage,
+            txid,
+            arena,
+        };
+        for bound in [statement.limit, statement.offset].into_iter().flatten() {
+            let (oid, _) = super::super::exec::infer_type_res(bound, &columns)?;
+            if oid != super::super::types::oid::UNKNOWN
+                && !matches!(
+                    catalog
+                        .domain_base_type(oid)
+                        .or_else(|| ColType::from_oid(oid)),
+                    Some(ColType::Int2 | ColType::Int4 | ColType::Int8)
+                )
+            {
+                return Ok(None);
+            }
         }
         let table = scope.slots[0];
         let definition = scope.defs.get(0).expect("resolved physical source");
@@ -248,7 +301,7 @@ impl<'a> RetainedSelect<'a> {
         })?;
         for item in items.iter_mut() {
             if let SelectItem::Expr { expression, .. } = item {
-                *expression = bind_expression(*expression, arena)?;
+                *expression = bind_expression(expression, arena)?;
             }
         }
         let predicate = statement
@@ -265,12 +318,23 @@ impl<'a> RetainedSelect<'a> {
         let predicate = predicate
             .map(|predicate| bind_expression(predicate, arena))
             .transpose()?;
+        let bounds = RowBounds::Unstarted {
+            limit: statement
+                .limit
+                .map(|bound| bind_expression(bound, arena))
+                .transpose()?,
+            offset: statement
+                .offset
+                .map(|bound| bind_expression(bound, arena))
+                .transpose()?,
+        };
         if !eliminated {
             source.open(storage, table, txid, arena)?;
         }
         Ok(Some(Self {
             items,
             predicate,
+            bounds,
             scope,
             source,
             decoded_columns,
@@ -298,6 +362,18 @@ impl<'a> RetainedSelect<'a> {
         buffers: &mut RowCursorBuffers,
         responder: &mut Responder<'_>,
     ) -> Result<bool, SqlError> {
+        if let RowBounds::Unstarted { limit, offset } = self.bounds {
+            self.bounds = RowBounds::Active {
+                remaining: super::super::exec::eval_limit_pub(limit, work, params)?,
+                skip: super::super::exec::eval_offset_pub(offset, work, params)?,
+            };
+        }
+        if matches!(self.bounds, RowBounds::Active { remaining: 0, .. }) {
+            self.source.close();
+            if !matches!(self.state, ReaderState::Eliminated) {
+                self.state = ReaderState::Complete;
+            }
+        }
         match self.state {
             ReaderState::Complete | ReaderState::Eliminated => return Ok(false),
             ReaderState::Unstarted => {
@@ -394,8 +470,21 @@ impl<'a> RetainedSelect<'a> {
                 &mut projected,
                 None,
             )?;
+            let RowBounds::Active { skip, remaining } = &mut self.bounds else {
+                unreachable!("row bounds initialized before requesting input")
+            };
+            if *skip != 0 {
+                *skip -= 1;
+                let mark = self.pending.take().expect("skipped input row").mark;
+                unsafe {
+                    state_arena.rewind_to(mark);
+                    work.rewind_to(work_mark);
+                }
+                continue;
+            }
             emit_data_row(storage, txid, work, responder, &projected[..width])
                 .map_err(|_| super::super::cursor_result_too_large())??;
+            *remaining -= 1;
             let mark = self.pending.take().expect("consumed input row").mark;
             // The typed result is copied into the cursor buffer before this rewind.
             unsafe { state_arena.rewind_to(mark) };

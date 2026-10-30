@@ -6275,6 +6275,9 @@ pub fn check_select_constants<'a>(
     for ob in statement.order_by {
         super::eval::check_constant_errors(ob.expression, arena, Some(&catalog))?;
     }
+    for bound in [statement.limit, statement.offset].into_iter().flatten() {
+        super::eval::check_constant_errors(bound, arena, Some(&catalog))?;
+    }
     Ok(())
 }
 

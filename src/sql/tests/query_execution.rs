@@ -31,7 +31,7 @@ fn object_key<'a>(request: &'a str, prefix: &str) -> &'a str {
 
 #[test]
 fn cursor_retained_cold_fetch_resumes_after_delivered_rows() {
-    cold_cursor_fetch("SELECT id,code FROM cold_orders", 1);
+    cold_cursor_fetch("SELECT id,code FROM cold_orders", 1, 0, 320);
 }
 
 #[test]
@@ -39,16 +39,33 @@ fn cursor_retained_cold_filter_resumes_after_rejected_and_delivered_rows() {
     cold_cursor_fetch(
         "SELECT id*2/2,code FROM cold_orders WHERE id%2=0 AND code<>''",
         2,
+        0,
+        160,
     );
 }
 
-fn cold_cursor_fetch(select: &str, stride: i32) {
+#[test]
+fn cursor_retained_cold_row_bounds_resume_skips_and_stop_early() {
+    cold_cursor_fetch(
+        "SELECT id,code FROM cold_orders WHERE id%2=0 LIMIT 71 OFFSET 9",
+        2,
+        9,
+        71,
+    );
+}
+
+fn cold_cursor_fetch(select: &str, stride: i32, skip: i32, take: i32) {
     use crate::sql::cursor::FetchMotion;
 
-    let mut config = test_config(&format!("cursor-retained-cold-fetch-{stride}"));
+    let mut config = test_config(&format!(
+        "cursor-retained-cold-fetch-{stride}-{skip}-{take}"
+    ));
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_bucket = format!("retained-cursor-{stride}-{}", std::process::id());
+    config.object_store_bucket = format!(
+        "retained-cursor-{stride}-{skip}-{take}-{}",
+        std::process::id()
+    );
     config.wal_upload = true;
     config.wal_upload_sync = true;
     config.object_store_get_slots = 4;
@@ -161,7 +178,7 @@ fn cold_cursor_fetch(select: &str, stride: i32) {
                     assert_eq!(command_tags(session.send.readable()), ["FETCH 0"]);
                     break;
                 }
-                let rows = (320 / stride - count).min(17);
+                let rows = (take - count).min(17);
                 assert_eq!(fetched.len(), rows as usize);
                 assert_eq!(
                     command_tags(session.send.readable()),
@@ -170,7 +187,7 @@ fn cold_cursor_fetch(select: &str, stride: i32) {
                 for fetched in &fetched {
                     let (id, code) = fetched.split_once('|').unwrap();
                     let id = id.parse::<i32>().unwrap();
-                    assert_eq!(id, (count + 1) * stride);
+                    assert_eq!(id, (skip + count + 1) * stride);
                     assert_eq!(checksum(code.as_bytes()), expected[(id - 1) as usize]);
                     count += 1;
                 }
@@ -217,7 +234,7 @@ fn cold_cursor_fetch(select: &str, stride: i32) {
             }
         }
     }
-    assert_eq!(count, 320 / stride);
+    assert_eq!(count, take);
     assert!(
         waited_inside_fetch,
         "a fetch must retain buffered rows while another connection runs"
@@ -225,6 +242,15 @@ fn cold_cursor_fetch(select: &str, stride: i32) {
     assert!(
         waited_after_prefix,
         "saved rows must wait after delivering a prefix"
+    );
+    let statistics = session.success(
+        &mut engine,
+        "SELECT seq_scan,seq_tup_read FROM pg_stat_xact_user_tables WHERE relname='cold_orders'",
+        true,
+    );
+    assert_eq!(
+        data_rows(&statistics),
+        [format!("1|{}", (skip + take) * stride)]
     );
     session.success(&mut engine, "CLOSE cold; ROLLBACK", true);
 }

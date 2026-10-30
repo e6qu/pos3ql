@@ -185,6 +185,10 @@ each input as fetching advances; it does not divide by an unread row's `id`.
 Built-in operator choices stay fixed after declaration. A later operator or
 search-path change does not change the open cursor. Type errors and constant
 errors such as `1/0` are checked during declaration, including for empty input.
+Integer `LIMIT` and `OFFSET` expressions keep their counts through storage
+waits. `LIMIT 2 OFFSET 3` skips three qualifying rows and returns at most two;
+`LIMIT 0` reads no rows. Negative bounds fail when fetching starts. Offset rows
+still evaluate the child projection, so a skipped division by zero can fail.
 Filters discard rejected rows and release their temporary memory before
 reading the next input. Scan counters include rejected and erroring input rows.
 Function calls, casts, user-defined operators, ordering and row-level security

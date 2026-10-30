@@ -226,6 +226,51 @@ DROP TABLE cursor_empty_input;
 FETCH ALL FROM empty_filter;
 COMMIT;
 
+CREATE TABLE cursor_bounded_input(id integer);
+INSERT INTO cursor_bounded_input SELECT g FROM generate_series(1,8) AS g;
+BEGIN;
+DECLARE bounded NO SCROLL CURSOR FOR SELECT id FROM cursor_bounded_input LIMIT 1+1 OFFSET 2;
+FETCH NEXT FROM bounded;
+FETCH NEXT FROM bounded;
+FETCH ALL FROM bounded;
+SELECT seq_scan,seq_tup_read FROM pg_stat_xact_user_tables WHERE relname='cursor_bounded_input';
+COMMIT;
+SELECT pg_stat_force_next_flush();
+BEGIN;
+DECLARE bounded NO SCROLL CURSOR FOR SELECT id FROM cursor_bounded_input LIMIT 0 OFFSET 5;
+FETCH ALL FROM bounded;
+SELECT seq_scan,seq_tup_read FROM pg_stat_xact_user_tables WHERE relname='cursor_bounded_input';
+COMMIT;
+BEGIN;
+DECLARE bounded NO SCROLL CURSOR FOR SELECT id FROM cursor_bounded_input LIMIT NULL OFFSET NULL;
+FETCH ALL FROM bounded;
+COMMIT;
+BEGIN;
+DECLARE bounded NO SCROLL CURSOR FOR SELECT id FROM cursor_bounded_input LIMIT -1;
+FETCH NEXT FROM bounded;
+ROLLBACK;
+BEGIN;
+DECLARE bounded NO SCROLL CURSOR FOR SELECT id FROM cursor_bounded_input OFFSET -1;
+FETCH NEXT FROM bounded;
+ROLLBACK;
+BEGIN;
+DECLARE bounded NO SCROLL CURSOR FOR SELECT id FROM cursor_bounded_input WHERE FALSE LIMIT -1;
+FETCH NEXT FROM bounded;
+ROLLBACK;
+BEGIN;
+DECLARE bounded NO SCROLL CURSOR FOR SELECT id FROM cursor_bounded_input LIMIT 1/0;
+ROLLBACK;
+DROP TABLE cursor_bounded_input;
+
+-- OFFSET consumes child results, so an error in a skipped projection still fails.
+CREATE TABLE cursor_offset_error(id integer);
+INSERT INTO cursor_offset_error VALUES (0),(1);
+BEGIN;
+DECLARE skipped_error NO SCROLL CURSOR FOR SELECT 100/id FROM cursor_offset_error OFFSET 1;
+FETCH NEXT FROM skipped_error;
+ROLLBACK;
+DROP TABLE cursor_offset_error;
+
 -- Name resolution at DECLARE survives a new operator on the same search path.
 CREATE SCHEMA cursor_ops;
 SET search_path=cursor_ops,pg_catalog;

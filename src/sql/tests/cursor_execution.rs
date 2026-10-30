@@ -383,6 +383,71 @@ fn cursor_retained_filters_advance_input_without_saving_rejected_rows() {
 }
 
 #[test]
+fn cursor_retained_limit_and_offset_keep_progress_and_stop_input_reads() {
+    use crate::sql::cursor::FetchMotion;
+    let config = test_config("cursor-retained-row-bounds");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(&mut engine,
+        "CREATE TABLE bounded_input(id integer); INSERT INTO bounded_input SELECT g FROM generate_series(1,8) AS g; \
+         BEGIN; DECLARE bounded NO SCROLL CURSOR FOR SELECT id FROM bounded_input LIMIT 1+1 OFFSET 2", true);
+    assert!(
+        session
+            .cursors
+            .read_request("bounded", FetchMotion::Count(1), false)
+            .unwrap()
+            .is_some()
+    );
+    for (id, scanned) in [(3, 3), (4, 4)] {
+        assert_eq!(
+            data_rows(&session.success(&mut engine, "FETCH NEXT FROM bounded", true)),
+            [id.to_string()]
+        );
+        assert_eq!(data_rows(&session.success(&mut engine,
+            "SELECT seq_scan,seq_tup_read FROM pg_stat_xact_user_tables WHERE relname='bounded_input'", true)), [format!("1|{scanned}")]);
+    }
+    assert_eq!(
+        command_tags(&session.success(&mut engine, "FETCH ALL FROM bounded", true)),
+        ["FETCH 0"]
+    );
+    assert_eq!(data_rows(&session.success(&mut engine,
+        "SELECT seq_scan,seq_tup_read FROM pg_stat_xact_user_tables WHERE relname='bounded_input'", true)), ["1|4"]);
+    session.success(&mut engine, "CLOSE bounded; COMMIT; BEGIN; \
+        DECLARE bounded NO SCROLL CURSOR FOR SELECT id FROM bounded_input LIMIT 0 OFFSET 5; FETCH ALL FROM bounded", true);
+    assert_eq!(data_rows(&session.success(&mut engine,
+        "SELECT seq_scan,seq_tup_read FROM pg_stat_xact_user_tables WHERE relname='bounded_input'", true)), ["0|0"]);
+    session.success(&mut engine, "CLOSE bounded; COMMIT", true);
+    for (clause, state) in [
+        ("LIMIT -1", "2201W"),
+        ("OFFSET -1", "2201X"),
+        ("WHERE FALSE LIMIT -1", "2201W"),
+    ] {
+        session.success(
+            &mut engine,
+            &format!(
+                "BEGIN; DECLARE bounded NO SCROLL CURSOR FOR SELECT id FROM bounded_input {clause}"
+            ),
+            true,
+        );
+        assert_eq!(
+            error_sqlstates(&session.execute(&mut engine, "FETCH NEXT FROM bounded", true)),
+            [state]
+        );
+        session.success(&mut engine, "ROLLBACK", true);
+    }
+    session.success(&mut engine,
+        "CREATE FUNCTION bounded_cursor_input() RETURNS integer LANGUAGE plpgsql AS $$ \
+         DECLARE c refcursor; max_rows integer := 2; skipped_rows integer := 3; selected integer; BEGIN \
+           OPEN c NO SCROLL FOR SELECT id FROM bounded_input LIMIT max_rows OFFSET skipped_rows; \
+           max_rows := 0; skipped_rows := 0; FETCH NEXT FROM c INTO selected; CLOSE c; RETURN selected; END $$", true);
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "SELECT bounded_cursor_input()", true)),
+        ["4"]
+    );
+}
+
+#[test]
 fn cursor_retained_builtin_operators_keep_their_declared_identity() {
     use crate::sql::cursor::FetchMotion;
     let config = test_config("cursor-retained-operator-binding");

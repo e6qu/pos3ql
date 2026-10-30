@@ -1307,7 +1307,9 @@ fn agg_undefined(name: &str, arg_oid: i32) -> SqlError {
 /// name), or a CASE whose ELSE yields a name. `None` for anything unnamed.
 fn name_of<'a>(expression: &Expr<'a>) -> Option<&'a str> {
     match expression {
-        Expr::Column { name, .. } | Expr::RoutineParam { name, .. } | Expr::SchemaColumn { name, .. } => Some(name),
+        Expr::Column { name, .. }
+        | Expr::RoutineParam { name, .. }
+        | Expr::SchemaColumn { name, .. } => Some(name),
         // The desugarings of syntax-only constructs must not be labelled with
         // the internal name they carry: `SIMILAR TO` is an operator, so its
         // column is anonymous, while PostgreSQL does label OVERLAPS.
@@ -1764,7 +1766,10 @@ pub(crate) fn enter_routine_parameter_types(
         current.types[slot] = Some(argument.ctype);
     }
     let prior = ROUTINE_PARAMETER_TYPES.with(|slot| slot.replace(current));
-    RoutineParameterScope(prior, PARAMETER_CONTEXT.with(|slot| slot.replace(ParameterContext::Routine)))
+    RoutineParameterScope(
+        prior,
+        PARAMETER_CONTEXT.with(|slot| slot.replace(ParameterContext::Routine)),
+    )
 }
 
 impl Drop for RoutineParameterScope {

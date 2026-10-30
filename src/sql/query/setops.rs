@@ -1354,7 +1354,11 @@ pub(crate) fn describe_set_body<'a>(
     let mut identical_types: [Option<i32>; MAX_PROJ] = [None; MAX_PROJ];
     for (c, col) in columns[..n_cols].iter().enumerate() {
         let unknown = leaf_col_unknown(storage, leaf0, c, txid, arena);
-        identical_types[c] = Some(if unknown { crate::sql::types::oid::UNKNOWN } else { col.type_oid });
+        identical_types[c] = Some(if unknown {
+            crate::sql::types::oid::UNKNOWN
+        } else {
+            col.type_oid
+        });
         if !unknown {
             leaf_collations[c] = SetColumnCollation {
                 value: col.collation,
@@ -1390,7 +1394,11 @@ pub(crate) fn describe_set_body<'a>(
         let leaf_ref = *leaf;
         for c in 0..n_cols {
             let unknown = leaf_col_unknown(storage, leaf_ref, c, txid, arena);
-            let input_oid = if unknown { crate::sql::types::oid::UNKNOWN } else { lc[c].type_oid };
+            let input_oid = if unknown {
+                crate::sql::types::oid::UNKNOWN
+            } else {
+                lc[c].type_oid
+            };
             if identical_types[c] != Some(input_oid) {
                 identical_types[c] = None;
             }

@@ -394,45 +394,89 @@ mod tests {
         let mut query = CursorQuery::new(&mut budget, 16 << 10).unwrap();
         let arena = Arena::new(&mut budget, "routine parameter parsing", 4096).unwrap();
         let formal = [crate::storage::RoutineArgumentDef {
-            name: SqlName::parse("p").unwrap(), ctype: ColType::Int4, user_type: None,
+            name: SqlName::parse("p").unwrap(),
+            ctype: ColType::Int4,
+            user_type: None,
         }];
         crate::mem::guard::forbid_alloc(|| {
             let _formal_scope = crate::sql::exec::enter_routine_parameter_types(&formal);
-            assert_eq!(crate::sql::exec::bound_parameter_type_oid(1), Some(oid::INT4));
+            assert_eq!(
+                crate::sql::exec::bound_parameter_type_oid(1),
+                Some(oid::INT4)
+            );
             crate::sql::exec::with_bound_parameter_types(&[oid::DATE], || {
-                let mut parser = crate::sql::parser::Parser::new("SELECT p", &arena).unwrap()
-                    .with_routine_parameters("f", &formal).unwrap();
-                let Stmt::Select(select) = parser.next_stmt().unwrap().unwrap() else { panic!("SELECT") };
-                let SelectItem::Expr { expression, .. } = select.items[0] else { panic!("expression") };
-                assert_eq!(crate::sql::exec::infer_type_pub(expression, None).unwrap().0, oid::INT4);
+                let mut parser = crate::sql::parser::Parser::new("SELECT p", &arena)
+                    .unwrap()
+                    .with_routine_parameters("f", &formal)
+                    .unwrap();
+                let Stmt::Select(select) = parser.next_stmt().unwrap().unwrap() else {
+                    panic!("SELECT")
+                };
+                let SelectItem::Expr { expression, .. } = select.items[0] else {
+                    panic!("expression")
+                };
+                assert_eq!(
+                    crate::sql::exec::infer_type_pub(expression, None)
+                        .unwrap()
+                        .0,
+                    oid::INT4
+                );
             });
-            query.bind("SELECT p", &[], &[CursorLocal {
-                name: SqlName::parse("p").unwrap(), type_oid: oid::DATE, value: Datum::Null,
-            }]).unwrap();
-            query.with_query(|statement, _, _| {
-                let CursorStatement::Select(select) = statement else { panic!("SELECT") };
-                let SelectItem::Expr { expression, .. } = select.items[0] else { panic!("expression") };
-                assert_eq!(crate::sql::exec::infer_type_pub(expression, None).unwrap().0, oid::DATE);
-            }).unwrap();
+            query
+                .bind(
+                    "SELECT p",
+                    &[],
+                    &[CursorLocal {
+                        name: SqlName::parse("p").unwrap(),
+                        type_oid: oid::DATE,
+                        value: Datum::Null,
+                    }],
+                )
+                .unwrap();
+            query
+                .with_query(|statement, _, _| {
+                    let CursorStatement::Select(select) = statement else {
+                        panic!("SELECT")
+                    };
+                    let SelectItem::Expr { expression, .. } = select.items[0] else {
+                        panic!("expression")
+                    };
+                    assert_eq!(
+                        crate::sql::exec::infer_type_pub(expression, None)
+                            .unwrap()
+                            .0,
+                        oid::DATE
+                    );
+                })
+                .unwrap();
         });
     }
 
     #[test]
     fn cursor_owned_query_nested_parameter_scopes_restore_the_innermost_declaration() {
-        use crate::sql::exec::{bound_parameter_type_oid, enter_routine_parameter_types, with_bound_parameter_types};
+        use crate::sql::exec::{
+            bound_parameter_type_oid, enter_routine_parameter_types, with_bound_parameter_types,
+        };
         use crate::sql::types::{ColType, oid};
-        let formal = [crate::storage::RoutineArgumentDef { name: SqlName::parse("p").unwrap(), ctype: ColType::Int4, user_type: None }];
+        let formal = [crate::storage::RoutineArgumentDef {
+            name: SqlName::parse("p").unwrap(),
+            ctype: ColType::Int4,
+            user_type: None,
+        }];
         with_bound_parameter_types(&[oid::DATE], || {
             {
                 let _formal_scope = enter_routine_parameter_types(&formal);
                 assert_eq!(bound_parameter_type_oid(1), Some(oid::INT4));
-                with_bound_parameter_types(&[oid::TEXT], || assert_eq!(bound_parameter_type_oid(1), Some(oid::TEXT)));
+                with_bound_parameter_types(&[oid::TEXT], || {
+                    assert_eq!(bound_parameter_type_oid(1), Some(oid::TEXT))
+                });
                 assert_eq!(bound_parameter_type_oid(1), Some(oid::INT4));
             }
             assert_eq!(bound_parameter_type_oid(1), Some(oid::DATE));
         });
         let source = vec![oid::DATE];
-        let escaped = with_bound_parameter_types(&source, || enter_routine_parameter_types(&formal));
+        let escaped =
+            with_bound_parameter_types(&source, || enter_routine_parameter_types(&formal));
         drop(source);
         drop(escaped);
         assert_eq!(bound_parameter_type_oid(1), None);

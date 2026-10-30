@@ -20051,6 +20051,7 @@ pub(crate) fn execute_plpgsql_function<'a>(
     arena: &'a Arena,
     responder: &mut Responder<'_>,
 ) -> Result<Datum<'a>, SqlError> {
+    let _formal_scope = enter_routine_parameter_types(routine.arguments());
     let source = arena
         .alloc_str(routine.body.as_str())
         .map_err(|_| super::query::arena_full_pub())?;

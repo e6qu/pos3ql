@@ -1833,7 +1833,7 @@ pub(crate) fn synth_derived_def<'a>(
     synth_derived_def_outer(storage, sub, exposed, col_alias, txid, arena, None)
 }
 
-fn preserve_projection_type_identities(
+pub(super) fn preserve_projection_type_identities(
     items: &[SelectItem<'_>],
     scope: Option<&QueryScope<'_>>,
     resolver: &dyn crate::sql::exec::ColTypeResolver,
@@ -1908,11 +1908,7 @@ pub(crate) fn describe_derived_definition<'a>(
     let mut output_collations = [crate::sql::ast::Collation::None; MAX_PROJ];
     let n_cols = match sub.set_body {
         Some(tree) => {
-            let count = describe_set_body(storage, tree, txid, &mut descriptors, arena)?;
-            for (output, description) in type_oids[..count].iter_mut().zip(&descriptors[..count]) {
-                *output = description.type_oid;
-            }
-            count
+            describe_set_body(storage, tree, txid, &mut descriptors, arena, Some(&mut type_oids))?
         }
         None => match &sub.from {
             Some(f) => {

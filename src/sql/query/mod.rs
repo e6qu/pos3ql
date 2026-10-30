@@ -7609,7 +7609,7 @@ fn select_into_rows_mode<'a>(
         let columns_owned: Option<[crate::sql::types::ColDesc; MAX_PROJ]> =
             (!statement.order_by.is_empty()).then(|| {
                 let mut cols = [crate::sql::types::ColDesc::new("", 0, 0); MAX_PROJ];
-                setops::describe_set_body(storage, tree, txid, &mut cols, arena).ok();
+                setops::describe_set_body(storage, tree, txid, &mut cols, arena, None).ok();
                 cols
             });
         if let Some(ref cols) = columns_owned {

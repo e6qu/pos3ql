@@ -19428,7 +19428,7 @@ impl Engine {
             cursors.abandon(at);
             return Err(error);
         }
-        if scroll == cursor::CursorScroll::NoScroll && !hold {
+        if scroll != cursor::CursorScroll::Default && !hold {
             let prepared = {
                 let (query, description, rows) = cursors.execution_parts(at);
                 let mut capture = Responder::for_cursor(
@@ -19548,13 +19548,15 @@ impl Engine {
                 let storage = &self.storage;
                 let (work, buffers) = self.work.cursor_parts();
                 while cursors.produced_rows(at) < needed {
-                    let saved = !move_only
-                        && match motion {
-                            cursor::FetchMotion::Absolute(_) | cursor::FetchMotion::Relative(_) => {
-                                cursors.produced_rows(at) + 1 == needed
-                            }
-                            _ => true,
-                        };
+                    let saved = cursors.saves_history(at)
+                        || (!move_only
+                            && match motion {
+                                cursor::FetchMotion::Absolute(_)
+                                | cursor::FetchMotion::Relative(_) => {
+                                    cursors.produced_rows(at) + 1 == needed
+                                }
+                                _ => true,
+                            });
                     let mark = work.mark();
                     let advanced = {
                         let (query, description, rows) = cursors.execution_parts(at);

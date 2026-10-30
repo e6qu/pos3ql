@@ -383,6 +383,101 @@ fn cursor_retained_filters_advance_input_without_saving_rejected_rows() {
 }
 
 #[test]
+fn cursor_retained_scroll_reuses_history_and_extends_only_when_needed() {
+    use crate::sql::cursor::FetchMotion;
+    let config = test_config("cursor-retained-scroll");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(&mut engine,
+        "CREATE TABLE scroll_input(id integer); INSERT INTO scroll_input SELECT g FROM generate_series(1,8) AS g; \
+         BEGIN; DECLARE scrolling SCROLL CURSOR FOR SELECT id*10 FROM scroll_input WHERE id%2=0; \
+         UPDATE scroll_input SET id=id+100", true);
+    let (slot, _) = session
+        .cursors
+        .read_request("scrolling", FetchMotion::Count(1), false)
+        .unwrap()
+        .expect("retained scrolling plan");
+    assert_eq!(session.cursors.produced_rows(slot), 0);
+    assert_eq!(
+        command_tags(&session.success(&mut engine, "FETCH PRIOR FROM scrolling", true)),
+        ["FETCH 0"]
+    );
+    assert_eq!(session.cursors.produced_rows(slot), 0);
+    for (sql, expected, produced) in [
+        ("FETCH NEXT FROM scrolling", "20", 1),
+        ("FETCH 0 FROM scrolling", "20", 1),
+        ("FETCH NEXT FROM scrolling", "40", 2),
+        ("FETCH PRIOR FROM scrolling", "20", 2),
+    ] {
+        assert_eq!(
+            data_rows(&session.success(&mut engine, sql, true)),
+            [expected]
+        );
+        assert_eq!(session.cursors.produced_rows(slot), produced);
+        assert_eq!(session.cursors.buffered_rows(slot), produced);
+    }
+    assert_eq!(
+        command_tags(&session.success(&mut engine, "MOVE FORWARD 2 FROM scrolling", true)),
+        ["MOVE 2"]
+    );
+    assert_eq!(session.cursors.produced_rows(slot), 3);
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "FETCH 0 FROM scrolling", true)),
+        ["60"]
+    );
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "FETCH LAST FROM scrolling", true)),
+        ["80"]
+    );
+    assert_eq!(session.cursors.buffered_rows(slot), 4);
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "FETCH BACKWARD ALL FROM scrolling", true)),
+        ["60", "40", "20"]
+    );
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "FETCH FIRST FROM scrolling", true)),
+        ["20"]
+    );
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "FETCH ABSOLUTE -2 FROM scrolling", true)),
+        ["60"]
+    );
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "FETCH RELATIVE -1 FROM scrolling", true)),
+        ["40"]
+    );
+    session.success(&mut engine, "CLOSE scrolling; ROLLBACK", true);
+}
+
+#[test]
+fn cursor_retained_scroll_capacity_failure_releases_input_and_keeps_portal_failed() {
+    let mut config = test_config("cursor-retained-scroll-capacity");
+    config.cursor_bytes = 32;
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(&mut engine,
+        "CREATE TABLE scroll_capacity(id integer); INSERT INTO scroll_capacity SELECT g FROM generate_series(1,8) AS g; \
+         BEGIN; DECLARE scrolling SCROLL CURSOR FOR SELECT id FROM scroll_capacity; \
+         FETCH NEXT FROM scrolling; SAVEPOINT full_history", true);
+    assert_eq!(
+        error_sqlstates(&session.execute(&mut engine, "FETCH ALL FROM scrolling", true)),
+        ["54000"]
+    );
+    session.success(
+        &mut engine,
+        "ROLLBACK TO SAVEPOINT full_history; DROP TABLE scroll_capacity",
+        true,
+    );
+    assert_eq!(
+        error_sqlstates(&session.execute(&mut engine, "FETCH NEXT FROM scrolling", true)),
+        ["55000"]
+    );
+    session.success(&mut engine, "ROLLBACK", true);
+}
+
+#[test]
 fn cursor_retained_limit_and_offset_keep_progress_and_stop_input_reads() {
     use crate::sql::cursor::FetchMotion;
     let config = test_config("cursor-retained-row-bounds");

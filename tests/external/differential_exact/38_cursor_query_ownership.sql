@@ -271,6 +271,27 @@ FETCH NEXT FROM skipped_error;
 ROLLBACK;
 DROP TABLE cursor_offset_error;
 
+CREATE TABLE cursor_scroll_input(id integer);
+INSERT INTO cursor_scroll_input SELECT g FROM generate_series(1,8) AS g;
+BEGIN;
+DECLARE scrolling SCROLL CURSOR FOR SELECT id*10 AS scaled FROM cursor_scroll_input WHERE id%2=0;
+UPDATE cursor_scroll_input SET id=id+100;
+FETCH PRIOR FROM scrolling;
+FETCH NEXT FROM scrolling;
+FETCH 0 FROM scrolling;
+FETCH NEXT FROM scrolling;
+FETCH PRIOR FROM scrolling;
+MOVE FORWARD 2 FROM scrolling;
+FETCH 0 FROM scrolling;
+FETCH LAST FROM scrolling;
+FETCH BACKWARD ALL FROM scrolling;
+FETCH FIRST FROM scrolling;
+FETCH ABSOLUTE -2 FROM scrolling;
+FETCH RELATIVE -1 FROM scrolling;
+CLOSE scrolling;
+ROLLBACK;
+DROP TABLE cursor_scroll_input;
+
 -- Name resolution at DECLARE survives a new operator on the same search path.
 CREATE SCHEMA cursor_ops;
 SET search_path=cursor_ops,pg_catalog;

@@ -1,5 +1,6 @@
 use super::object_reads::{accept, advance, read_request, replace_uncached_blocks, reply};
 use super::*;
+use crate::sql::cursor::CursorScroll;
 use crate::storage::{RowCursor, RowCursorBuffers, SpilledRowRepresentation};
 use crate::store::{BlockStore, StoreError};
 use std::net::TcpListener;
@@ -31,7 +32,13 @@ fn object_key<'a>(request: &'a str, prefix: &str) -> &'a str {
 
 #[test]
 fn cursor_retained_cold_fetch_resumes_after_delivered_rows() {
-    cold_cursor_fetch("SELECT id,code FROM cold_orders", 1, 0, 320);
+    cold_cursor_fetch(
+        "SELECT id,code FROM cold_orders",
+        1,
+        0,
+        320,
+        CursorScroll::NoScroll,
+    );
 }
 
 #[test]
@@ -41,6 +48,7 @@ fn cursor_retained_cold_filter_resumes_after_rejected_and_delivered_rows() {
         2,
         0,
         160,
+        CursorScroll::NoScroll,
     );
 }
 
@@ -51,19 +59,36 @@ fn cursor_retained_cold_row_bounds_resume_skips_and_stop_early() {
         2,
         9,
         71,
+        CursorScroll::NoScroll,
     );
 }
 
-fn cold_cursor_fetch(select: &str, stride: i32, skip: i32, take: i32) {
+#[test]
+fn cursor_retained_cold_scroll_reuses_history_after_storage_waits() {
+    cold_cursor_fetch(
+        "SELECT id,code FROM cold_orders WHERE id%2=0 LIMIT 71 OFFSET 9",
+        2,
+        9,
+        71,
+        CursorScroll::Scroll,
+    );
+}
+
+fn cold_cursor_fetch(select: &str, stride: i32, skip: i32, take: i32, mode: CursorScroll) {
     use crate::sql::cursor::FetchMotion;
 
+    let (scroll, scrollable) = match mode {
+        CursorScroll::NoScroll => ("NO SCROLL", false),
+        CursorScroll::Scroll => ("SCROLL", true),
+        CursorScroll::Default => panic!("test must choose an explicit cursor mode"),
+    };
     let mut config = test_config(&format!(
-        "cursor-retained-cold-fetch-{stride}-{skip}-{take}"
+        "cursor-retained-cold-fetch-{stride}-{skip}-{take}-{scrollable}"
     ));
     config.object_store_on = true;
     config.object_store_sim = true;
     config.object_store_bucket = format!(
-        "retained-cursor-{stride}-{skip}-{take}-{}",
+        "retained-cursor-{stride}-{skip}-{take}-{scrollable}-{}",
         std::process::id()
     );
     config.wal_upload = true;
@@ -74,7 +99,7 @@ fn cold_cursor_fetch(select: &str, stride: i32, skip: i32, take: i32) {
     config.disk_cache_bytes = 0;
     config.max_spill_generations_per_table = 2;
     config.memtable_bytes = 8 << 20;
-    config.cursor_bytes = 32 << 10;
+    config.cursor_bytes = if scrollable { 512 << 10 } else { 32 << 10 };
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     let namespace = crate::object_store::sim::open_namespace(&config.object_store_bucket, 227);
     let mut budget = test_engine_budget(&config, 1 << 29);
@@ -125,7 +150,7 @@ fn cold_cursor_fetch(select: &str, stride: i32, skip: i32, take: i32) {
             "BEGIN; \
             DECLARE empty_cold NO SCROLL CURSOR FOR SELECT id FROM cold_orders WHERE FALSE; \
             FETCH ALL FROM empty_cold; CLOSE empty_cold; \
-            DECLARE cold NO SCROLL CURSOR FOR {select}"
+            DECLARE cold {scroll} CURSOR FOR {select}"
         ),
         true,
     );
@@ -192,7 +217,10 @@ fn cold_cursor_fetch(select: &str, stride: i32, skip: i32, take: i32) {
                     count += 1;
                 }
                 assert_eq!(session.cursors.produced_rows(slot), count as usize);
-                assert_eq!(session.cursors.buffered_rows(slot), rows as usize);
+                assert_eq!(
+                    session.cursors.buffered_rows(slot),
+                    if scrollable { count } else { rows } as usize
+                );
                 session.send.clear();
                 session.arena.reset();
                 deadline = Instant::now() + Duration::from_secs(2);
@@ -243,6 +271,19 @@ fn cold_cursor_fetch(select: &str, stride: i32, skip: i32, take: i32) {
         waited_after_prefix,
         "saved rows must wait after delivering a prefix"
     );
+    if scrollable {
+        for (motion, id) in [
+            ("LAST", (skip + take) * stride),
+            ("PRIOR", (skip + take - 1) * stride),
+        ] {
+            let fetched = session.success(&mut engine, &format!("FETCH {motion} FROM cold"), true);
+            let rows = data_rows(&fetched);
+            assert_eq!(rows.len(), 1);
+            let (number, code) = rows[0].split_once('|').unwrap();
+            assert_eq!(number, id.to_string());
+            assert_eq!(checksum(code.as_bytes()), expected[(id - 1) as usize]);
+        }
+    }
     let statistics = session.success(
         &mut engine,
         "SELECT seq_scan,seq_tup_read FROM pg_stat_xact_user_tables WHERE relname='cold_orders'",

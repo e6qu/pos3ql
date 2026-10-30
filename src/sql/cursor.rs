@@ -487,7 +487,7 @@ impl CursorPool {
             FetchMotion::All => usize::MAX,
             FetchMotion::Absolute(k) if k < 0 => usize::MAX,
             FetchMotion::Count(k) | FetchMotion::Relative(k) => {
-                slot.position.saturating_add(i64::from(k)) as usize
+                slot.position.saturating_add(i64::from(k)).max(0) as usize
             }
             FetchMotion::Absolute(k) => k as usize,
             FetchMotion::BackwardAll => 0,
@@ -497,6 +497,10 @@ impl CursorPool {
 
     pub(crate) fn produced_rows(&self, at: usize) -> usize {
         self.slots[at].produced
+    }
+
+    pub(crate) fn saves_history(&self, at: usize) -> bool {
+        self.slots[at].scroll == CursorScroll::Scroll
     }
 
     #[cfg(test)]
@@ -520,9 +524,11 @@ impl CursorPool {
             }
             return Ok(());
         }
-        slot.rows.clear();
-        slot.spans.clear();
-        slot.row_base = slot.produced;
+        if slot.scroll == CursorScroll::NoScroll {
+            slot.rows.clear();
+            slot.spans.clear();
+            slot.row_base = slot.produced;
+        }
         slot.request = Some((motion, move_only));
         Ok(())
     }

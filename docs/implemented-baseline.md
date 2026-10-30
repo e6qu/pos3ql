@@ -193,6 +193,13 @@ Filters discard rejected rows and release their temporary memory before
 reading the next input. Scan counters include rejected and erroring input rows.
 Function calls, casts, user-defined operators, ordering and row-level security
 still use the eager path.
+With explicit `SCROLL`, the same query shapes also start without reading rows.
+They save visited results so `FETCH PRIOR`, `FETCH 0` and forward jumps within
+that history need no new input reads. `FETCH LAST` first consumes the remaining
+input. Unlike forward-only cursors, their accumulated history must fit
+`cursor_bytes`; exhaustion returns `54000`, releases input owners and leaves
+the cursor failed until closed. Holdable cursors and the implicit scroll mode
+still use the eager executor.
 Resident rows keep their immutable byte owner instead of copying a wide row
 into cursor memory just to return a small column. For example, selecting `id`
 does not copy an unselected 128 KiB text field into `cursor_query_bytes`.

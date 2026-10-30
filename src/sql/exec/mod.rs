@@ -697,8 +697,8 @@ pub(super) use schema::rename as stage_schema_rename;
 
 mod describe;
 pub(crate) use describe::{
-    CatalogCols, builtin_binary_type, catalog_composite_field, visit_catalog_composite_fields,
-    visit_catalog_rowtype_fields,
+    CatalogCols, builtin_binary_type, catalog_composite_field, numeric_log_type,
+    visit_catalog_composite_fields, visit_catalog_rowtype_fields,
 };
 pub use describe::{
     ColTypeResolver, DefCols, NoCols, RECORD_FIELD_NAMES, check_row_field_types,
@@ -5284,6 +5284,11 @@ where
             txn.txid,
             arena,
             params,
+            Some(&crate::sql::sequence::SeqEval::new(
+                storage,
+                seq_session,
+                txn.txid,
+            )),
         )?;
         let catalog = super::query::storage_catalog(storage, arena, txn.txid);
         let sequences = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
@@ -56934,8 +56939,19 @@ fn eval_merge_expression<'a, R: ColumnLookup<'a>>(
 ) -> Result<Datum<'a>, SqlError> {
     let value = {
         let expressions = [Some(expression)];
-        let subs =
-            super::query::subquery_hooks_outer(&expressions, storage, txid, arena, params, row)?;
+        let subs = super::query::subquery_hooks_outer(
+            &expressions,
+            storage,
+            txid,
+            arena,
+            params,
+            row,
+            Some(&crate::sql::sequence::SeqEval::new(
+                storage,
+                seq_session,
+                txid,
+            )),
+        )?;
         let catalog = super::query::storage_catalog(storage, arena, txid);
         let sequences = crate::sql::sequence::SeqEval::new(storage, seq_session, txid);
         let hooks = EvalHooks {
@@ -58392,6 +58408,7 @@ pub(crate) fn merge<'a>(
                                 params,
                                 responder,
                                 &mut capture,
+                                seq_session,
                             ) {
                                 Ok(Ok(())) => {}
                                 Ok(Err(error)) => return sql_fail(error),
@@ -58851,6 +58868,7 @@ pub(crate) fn merge<'a>(
                                 params,
                                 responder,
                                 &mut capture,
+                                seq_session,
                             ) {
                                 Ok(Ok(())) => {}
                                 Ok(Err(error)) => return sql_fail(error),
@@ -58946,6 +58964,7 @@ pub(crate) fn merge<'a>(
                                         params,
                                         responder,
                                         &mut capture,
+                                        seq_session,
                                     ) {
                                         Ok(Ok(())) => {}
                                         Ok(Err(error)) => return sql_fail(error),
@@ -59565,6 +59584,7 @@ where
                                 params,
                                 responder,
                                 capture,
+                                seq_session,
                             )? {
                                 return Ok(Err(error));
                             }
@@ -59667,6 +59687,7 @@ where
                         params,
                         responder,
                         capture,
+                        seq_session,
                     )?
                 {
                     return Ok(Err(error));
@@ -60128,6 +60149,11 @@ pub(crate) fn instead_of_view_dml<'a>(
                             }
                             Ok(())
                         },
+                        Some(&crate::sql::sequence::SeqEval::new(
+                            storage,
+                            seq_session,
+                            txn.txid,
+                        )),
                     ) {
                         Ok(matched) => matched,
                         Err(error) => return sql_fail(error),
@@ -60208,6 +60234,7 @@ pub(crate) fn instead_of_view_dml<'a>(
                         params,
                         responder,
                         &mut capture,
+                        seq_session,
                     ) {
                         Ok(Ok(())) => {}
                         Ok(Err(error)) => return sql_fail(error),
@@ -60252,6 +60279,11 @@ pub(crate) fn instead_of_view_dml<'a>(
                         params,
                         &context,
                         &mut |_| Ok(()),
+                        Some(&crate::sql::sequence::SeqEval::new(
+                            storage,
+                            seq_session,
+                            txn.txid,
+                        )),
                     ) {
                         Ok(matched) => matched,
                         Err(error) => return sql_fail(error),
@@ -60310,6 +60342,7 @@ pub(crate) fn instead_of_view_dml<'a>(
                         params,
                         responder,
                         &mut capture,
+                        seq_session,
                     ) {
                         Ok(Ok(())) => {}
                         Ok(Err(error)) => return sql_fail(error),
@@ -60485,6 +60518,7 @@ fn finish_instead_of_view_new_row<'a>(
             params,
             responder,
             capture,
+            seq_session,
         ) {
             Ok(Ok(())) => {}
             Ok(Err(error)) => return Ok(Err(error)),
@@ -61128,6 +61162,11 @@ where
                 txn.txid,
                 arena,
                 params,
+                Some(&crate::sql::sequence::SeqEval::new(
+                    storage,
+                    seq_session,
+                    txn.txid,
+                )),
             ) {
                 Ok(subqueries) => subqueries,
                 Err(error) => return sql_fail(error),
@@ -61285,6 +61324,7 @@ fn emit_conflict_returning(
     params: &[Datum],
     responder: &mut Responder,
     capture: &mut Option<&mut dyn FnMut(&[Datum]) -> Result<(), SqlError>>,
+    seq_session: &crate::sql::guc::SeqSession,
 ) -> Result<Result<(), SqlError>, WireFull> {
     let mut schema = [ColType::Bool; MAX_COLUMNS];
     def.schema(&mut schema);
@@ -61305,6 +61345,7 @@ fn emit_conflict_returning(
         params,
         responder,
         capture,
+        seq_session,
     )
 }
 
@@ -61322,6 +61363,7 @@ fn emit_projected(
     params: &[Datum],
     responder: &mut Responder,
     capture: &mut Option<&mut dyn FnMut(&[Datum]) -> Result<(), SqlError>>,
+    seq_session: &crate::sql::guc::SeqSession,
 ) -> Result<Result<(), SqlError>, WireFull> {
     let txid = txn.txid;
     let _snapshot = storage.dml_expression_snapshot(txn.command_id());
@@ -61355,12 +61397,19 @@ fn emit_projected(
         arena,
         params,
         &context,
+        Some(&crate::sql::sequence::SeqEval::new(
+            storage,
+            seq_session,
+            txn.txid,
+        )),
     ) {
         Ok(subqueries) => subqueries,
         Err(error) => return Ok(Err(error)),
     };
     let catalog = super::query::storage_catalog(storage, arena, txid);
+    let returning_sequences = crate::sql::sequence::SeqEval::new(storage, seq_session, txid);
     let hooks = EvalHooks {
+        sequences: Some(&returning_sequences),
         subs: Some(&subqueries),
         catalog: Some(&catalog),
         ..NO_HOOKS
@@ -61470,6 +61519,7 @@ fn emit_merge_returning<'a>(
     params: &[Datum<'a>],
     responder: &mut Responder,
     capture: &mut Option<&mut dyn FnMut(&[Datum]) -> Result<(), SqlError>>,
+    seq_session: &crate::sql::guc::SeqSession,
 ) -> Result<Result<(), SqlError>, WireFull> {
     let lookup = MergeLookup {
         target_def,
@@ -61498,15 +61548,22 @@ fn emit_merge_returning<'a>(
         txid,
         arena,
         params,
+        Some(&crate::sql::sequence::SeqEval::new(
+            storage,
+            seq_session,
+            txid,
+        )),
     ) {
         Ok(subqueries) => subqueries,
         Err(error) => return Ok(Err(error)),
     };
     let catalog = super::query::storage_catalog(storage, arena, txid);
+    let effect_sequences = crate::sql::sequence::SeqEval::new(storage, seq_session, txid);
     let hooks = EvalHooks {
         subs: Some(&subqueries),
         catalog: Some(&catalog),
         merge_action: Some(action),
+        sequences: Some(&effect_sequences),
         ..NO_HOOKS
     };
     let mut projected = [Datum::Null; MAX_PROJ];
@@ -61912,11 +61969,17 @@ pub(crate) fn update<'a>(
         txn.txid,
         arena,
         params,
+        Some(&crate::sql::sequence::SeqEval::new(
+            storage,
+            seq_session,
+            txn.txid,
+        )),
     ) {
         Ok(s) => s,
         Err(e) => return sql_fail(e),
     };
     let catalog = super::query::storage_catalog(storage, arena, txn.txid);
+    let effect_sequences = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
     let hooks = super::eval::EvalHooks {
         group: None,
         aggs: None,
@@ -61926,7 +61989,7 @@ pub(crate) fn update<'a>(
         catalog: Some(&catalog),
         srf_index: None,
         project_sets: None,
-        sequences: None,
+        sequences: Some(&effect_sequences),
         merge_action: None,
     };
     let current_role = authorization_role;
@@ -62255,6 +62318,11 @@ pub(crate) fn update<'a>(
                                         arena,
                                         params,
                                         combined,
+                                        Some(&crate::sql::sequence::SeqEval::new(
+                                            storage,
+                                            seq_session,
+                                            txn.txid,
+                                        )),
                                     )?;
                                     &local_subs
                                 } else {
@@ -62289,6 +62357,11 @@ pub(crate) fn update<'a>(
                             }
                             Ok(())
                         },
+                        Some(&crate::sql::sequence::SeqEval::new(
+                            storage,
+                            seq_session,
+                            txn.txid,
+                        )),
                     );
                     match r {
                         Ok(matched) => matched,
@@ -62332,6 +62405,11 @@ pub(crate) fn update<'a>(
                             arena,
                             params,
                             &context,
+                            Some(&crate::sql::sequence::SeqEval::new(
+                                storage,
+                                seq_session,
+                                txn.txid,
+                            )),
                         ) {
                             Ok(subs) => subs,
                             Err(error) => return sql_fail(error),
@@ -62649,6 +62727,7 @@ pub(crate) fn update<'a>(
                     params,
                     responder,
                     &mut capture,
+                    seq_session,
                 )?
             {
                 return sql_fail(error);
@@ -62811,6 +62890,7 @@ pub(crate) fn update<'a>(
                 params,
                 responder,
                 &mut capture,
+                seq_session,
             )?
         {
             return sql_fail(error);
@@ -62959,11 +63039,17 @@ pub(crate) fn delete<'a>(
         txn.txid,
         arena,
         params,
+        Some(&crate::sql::sequence::SeqEval::new(
+            storage,
+            seq_session,
+            txn.txid,
+        )),
     ) {
         Ok(s) => s,
         Err(e) => return sql_fail(e),
     };
     let catalog = super::query::storage_catalog(storage, arena, txn.txid);
+    let effect_sequences = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
     let hooks = super::eval::EvalHooks {
         group: None,
         aggs: None,
@@ -62973,7 +63059,7 @@ pub(crate) fn delete<'a>(
         catalog: Some(&catalog),
         srf_index: None,
         project_sets: None,
-        sequences: None,
+        sequences: Some(&effect_sequences),
         merge_action: None,
     };
     let current_role = authorization_role;
@@ -63253,6 +63339,7 @@ pub(crate) fn delete<'a>(
                     params,
                     responder,
                     &mut capture,
+                    seq_session,
                 )?
             {
                 return sql_fail(error);
@@ -63385,6 +63472,7 @@ pub(crate) fn delete<'a>(
                 params,
                 responder,
                 &mut capture,
+                seq_session,
             )?
         {
             return sql_fail(error);
@@ -69879,15 +69967,16 @@ fn rename_flag_key(def: &mut TableDef, from: &str, new_name: SqlName) -> Result<
     Ok(false)
 }
 
-pub fn eval_offset_pub(
-    offset: Option<&Expr>,
-    arena: &Arena,
-    params: &[Datum],
+pub fn eval_offset_pub<'a>(
+    offset: Option<&Expr<'a>>,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    hooks: &EvalHooks<'_, 'a>,
 ) -> Result<u64, SqlError> {
     let Some(expression) = offset else {
         return Ok(0);
     };
-    match eval(expression, arena, params, &NoColumns)? {
+    match eval_full(expression, arena, params, &NoColumns, hooks)? {
         Datum::Null => Ok(0),
         Datum::Int2(v) if v >= 0 => Ok(v as u64),
         Datum::Int4(v) if v >= 0 => Ok(v as u64),
@@ -69954,15 +70043,16 @@ pub fn resolve_order_expr_pub<'a>(
     Ok(expression)
 }
 
-pub fn eval_limit_pub(
-    limit: Option<&Expr>,
-    arena: &Arena,
-    params: &[Datum],
+pub fn eval_limit_pub<'a>(
+    limit: Option<&Expr<'a>>,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    hooks: &EvalHooks<'_, 'a>,
 ) -> Result<u64, SqlError> {
     let Some(expression) = limit else {
         return Ok(u64::MAX);
     };
-    match eval(expression, arena, params, &NoColumns)? {
+    match eval_full(expression, arena, params, &NoColumns, hooks)? {
         Datum::Null => Ok(u64::MAX),
         Datum::Int2(v) if v >= 0 => Ok(v as u64),
         Datum::Int4(v) if v >= 0 => Ok(v as u64),
@@ -70398,6 +70488,7 @@ fn collect_join_matches<'a>(
                     params,
                     &context,
                     &mut |_| Ok(()),
+                    None,
                 )? {
                     scratch
                         .push(PhysicalRow::Foreign {
@@ -70464,6 +70555,7 @@ fn collect_join_matches<'a>(
                             params,
                             &context,
                             &mut |_| Ok(()),
+                            None,
                         )
                     })();
                     // SAFETY: joined predicates retain no decoded values or front scratch.
@@ -70564,6 +70656,7 @@ fn collect_join_matches_with_transition<'a>(
                     params,
                     &scope,
                     &mut |_| Ok(()),
+                    None,
                 )? {
                     scratch
                         .push(PhysicalRow::Foreign {
@@ -70632,6 +70725,7 @@ fn collect_join_matches_with_transition<'a>(
                             params,
                             &scope,
                             &mut |_| Ok(()),
+                            None,
                         )
                     })();
                     // SAFETY: joined predicates retain no decoded values or front scratch.

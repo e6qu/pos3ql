@@ -44,6 +44,15 @@ pub fn set_query<'a>(
     sequences: Option<&dyn SequenceAccess>,
     responder: &mut Responder,
 ) -> Outcome {
+    let bound_catalog = super::storage_catalog(storage, arena, txid);
+    let bound_queries = super::ProceduralSubqueries { storage, txid };
+    let bound_hooks = crate::sql::eval::EvalHooks {
+        catalog: Some(&bound_catalog),
+        subquery_executor: Some(&bound_queries),
+        sequences: sequences,
+        ..crate::sql::eval::NO_HOOKS
+    };
+
     // A row-locking clause can never apply to a set operation, matching
     // PostgreSQL's 0A000.
     if let Some(clause) = q.locking.first() {
@@ -112,12 +121,12 @@ pub fn set_query<'a>(
     if let Err(e) = sort_set_rows(storage, txid, arena, rows, q.order_by, &columns[..n_cols]) {
         return sql_fail(e);
     }
-    let limit = match exec::eval_limit_pub(q.limit, arena, params) {
-        Ok(l) => l,
+    let offset = match exec::eval_offset_pub(q.offset, arena, params, &bound_hooks) {
+        Ok(o) => o,
         Err(e) => return sql_fail(e),
     };
-    let offset = match exec::eval_offset_pub(q.offset, arena, params) {
-        Ok(o) => o,
+    let limit = match exec::eval_limit_pub(q.limit, arena, params, &bound_hooks) {
+        Ok(l) => l,
         Err(e) => return sql_fail(e),
     };
 
@@ -178,6 +187,15 @@ pub(crate) fn set_query_into_rows<'a>(
     sequences: Option<&dyn SequenceAccess>,
     emit: &mut dyn for<'row> FnMut(&[Datum<'row>]) -> Result<(), SqlError>,
 ) -> Result<(), SqlError> {
+    let bound_catalog = super::storage_catalog(storage, arena, txid);
+    let bound_queries = super::ProceduralSubqueries { storage, txid };
+    let bound_hooks = crate::sql::eval::EvalHooks {
+        catalog: Some(&bound_catalog),
+        subquery_executor: Some(&bound_queries),
+        sequences: sequences,
+        ..crate::sql::eval::NO_HOOKS
+    };
+
     if let Some(clause) = query.locking.first() {
         return Err(sql_err!(
             crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
@@ -237,8 +255,8 @@ pub(crate) fn set_query_into_rows<'a>(
         query.order_by,
         &columns[..column_count],
     )?;
-    let limit = exec::eval_limit_pub(query.limit, arena, params)?;
-    let offset = exec::eval_offset_pub(query.offset, arena, params)?;
+    let offset = exec::eval_offset_pub(query.offset, arena, params, &bound_hooks)?;
+    let limit = exec::eval_limit_pub(query.limit, arena, params, &bound_hooks)?;
     let start = (offset as usize).min(rows.len());
     let mut end = offset.saturating_add(limit).min(rows.len() as u64) as usize;
     if query.with_ties && limit > 0 && end < rows.len() && end > start {
@@ -662,6 +680,15 @@ pub(crate) fn external_set_body_into<'a>(
     sequences: Option<&dyn SequenceAccess>,
     emit: &mut dyn for<'row> FnMut(&[Datum<'row>]) -> Result<(), SqlError>,
 ) -> Result<(), SqlError> {
+    let bound_catalog = super::storage_catalog(storage, arena, txid);
+    let bound_queries = super::ProceduralSubqueries { storage, txid };
+    let bound_hooks = crate::sql::eval::EvalHooks {
+        catalog: Some(&bound_catalog),
+        subquery_executor: Some(&bound_queries),
+        sequences: sequences,
+        ..crate::sql::eval::NO_HOOKS
+    };
+
     let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
     let column_count = describe_set_body(storage, tree, txid, &mut columns, arena, None)?;
     let mut target = [ColType::Bool; MAX_PROJ];
@@ -692,8 +719,8 @@ pub(crate) fn external_set_body_into<'a>(
     else {
         return Ok(());
     };
-    let limit = exec::eval_limit_pub(limit, arena, params)?;
-    let offset = exec::eval_offset_pub(offset, arena, params)?;
+    let offset = exec::eval_offset_pub(offset, arena, params, &bound_hooks)?;
+    let limit = exec::eval_limit_pub(limit, arena, params, &bound_hooks)?;
     // A trailing ORDER BY needs one final provider-neutral sort. Set-operation
     // output without ORDER BY retains the multiset merge order.
     let run = if order_by.is_empty() {
@@ -775,6 +802,15 @@ fn external_set_query<'a>(
     columns: &[ColDesc<'a>],
     responder: &mut Responder,
 ) -> Outcome {
+    let bound_catalog = super::storage_catalog(storage, arena, txid);
+    let bound_queries = super::ProceduralSubqueries { storage, txid };
+    let bound_hooks = crate::sql::eval::EvalHooks {
+        catalog: Some(&bound_catalog),
+        subquery_executor: Some(&bound_queries),
+        sequences: sequences,
+        ..crate::sql::eval::NO_HOOKS
+    };
+
     let run = match external_set_tree(
         tree,
         ExternalSetContext {
@@ -790,12 +826,12 @@ fn external_set_query<'a>(
         Ok(run) => run,
         Err(error) => return sql_fail(error),
     };
-    let limit = match exec::eval_limit_pub(query.limit, arena, params) {
-        Ok(limit) => limit,
+    let offset = match exec::eval_offset_pub(query.offset, arena, params, &bound_hooks) {
+        Ok(offset) => offset,
         Err(error) => return sql_fail(error),
     };
-    let offset = match exec::eval_offset_pub(query.offset, arena, params) {
-        Ok(offset) => offset,
+    let limit = match exec::eval_limit_pub(query.limit, arena, params, &bound_hooks) {
+        Ok(limit) => limit,
         Err(error) => return sql_fail(error),
     };
     responder.row_description(columns)?;

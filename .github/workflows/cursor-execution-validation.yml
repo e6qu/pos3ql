@@ -28,12 +28,13 @@ jobs:
           name: query-format-${{ github.sha }}
           path: ${{ runner.temp }}/query-format.patch
       - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --test sqlstate_gate --locked
       - run: >-
           cargo test --lib --locked -- cursor_ arena_retained_slices_ query_reads_held_ checkpoint_reads_held_
           cursor_read_statistics_ captured_resident_byte_scans_ retained_checkpoint_ table_sources_survive_ subquery_execution_ store::sst::tests:: pg::respond::tests:: procedural_static_utility_ sql::parser::tests:: exec::projected::tests:: sequence::tests::
+          configured_user_type_capacities_ owned_enum_rewrite_sources_ type_reference_moves_ user_type_schema_identity_ user_defined_aggregate_resolves_
           --nocapture --test-threads=1
-      - run: cargo clippy --all-targets -- -D warnings
       - run: python3 tools/check-docs.py
       - run: bash tools/check-bugs.sh
   arena-aliasing:
@@ -89,7 +90,8 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-query-output-binary-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
-      - run: cargo build --bin pos3ql --locked
+      - id: cursor_binary
+        run: cargo build --bin pos3ql --locked
       - name: Install PostgreSQL extension fixtures
         env:
           POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
@@ -111,6 +113,7 @@ jobs:
           RUN_FUZZ: "0"
         run: bash tests/external/ci_diff.sh "$PWD/target/debug/pos3ql" "$RUNNER_TEMP/query-exact"
       - name: Compare cursor ownership with PostgreSQL under forced spilling
+        if: ${{ !cancelled() && steps.cursor_binary.outcome == 'success' }}
         env:
           PGHOST: 127.0.0.1
           PGPORT: "5432"

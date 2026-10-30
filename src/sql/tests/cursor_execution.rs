@@ -1,6 +1,130 @@
 use super::*;
 
 #[test]
+fn cursor_named_array_casts_and_function_metadata_use_declared_conversions() {
+    let config = test_config("cursor-named-array-conversions");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE TYPE array_mood AS ENUM('ready','done'); \
+        CREATE DOMAIN array_positive AS integer CHECK(VALUE>0); \
+        CREATE DOMAIN array_required AS integer NOT NULL",
+        true,
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT ARRAY['ready',NULL,'done']::array_mood[], \
+        ARRAY['1','2']::array_positive[],ARRAY['pg_class']::regclass[],ARRAY['integer']::regtype[]",
+            true
+        )),
+        ["{ready,NULL,done}|{1,2}|{pg_class}|{integer}"]
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT ARRAY['x'::character(3)]::text[],ARRAY['x'::character(3)]",
+            true
+        )),
+        ["{x}|{\"x  \"}"]
+    );
+    for (sql, state) in [
+        ("SELECT ARRAY['bad']::array_mood[]", "22P02"),
+        ("SELECT ARRAY[-1]::array_positive[]", "23514"),
+        ("SELECT ARRAY[NULL]::array_required[]", "23502"),
+    ] {
+        assert_eq!(
+            error_sqlstates(&session.execute(&mut engine, sql, true)),
+            [state]
+        );
+    }
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT pg_typeof(log(2,8)),pg_typeof(date_trunc('year',DATE '2020-02-03')); \
+        SELECT pg_typeof(bit_and(v)) FROM (VALUES(B'11'::varbit),(NULL::varbit)) AS t(v)",
+            true
+        )),
+        ["numeric|timestamp with time zone", "bit"]
+    );
+    assert_eq!(
+        error_sqlstates(&session.execute(&mut engine, "SELECT log(NULL::real,1::real)", true)),
+        ["42883"]
+    );
+}
+
+#[test]
+fn cursor_subquery_sequence_context_survives_query_shapes_and_row_changes() {
+    let config = test_config("cursor-subquery-sequence-context");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(&mut engine, "CREATE SEQUENCE effect_calls; CREATE TABLE effect_rows(id integer); INSERT INTO effect_rows VALUES(1),(2),(3)", true);
+    for (sql, expected) in [
+        ("SELECT (SELECT nextval('effect_calls'))", vec!["1"]),
+        (
+            "SELECT id,(SELECT nextval('effect_calls')) FROM effect_rows ORDER BY id",
+            vec!["1|2", "2|2", "3|2"],
+        ),
+        (
+            "SELECT id,(SELECT nextval('effect_calls')+id) FROM effect_rows ORDER BY id",
+            vec!["1|4", "2|6", "3|8"],
+        ),
+        (
+            "SELECT EXISTS(SELECT (SELECT nextval('effect_calls')) FROM effect_rows); SELECT last_value FROM effect_calls",
+            vec!["t", "5"],
+        ),
+        (
+            "SELECT sum(id)+(SELECT nextval('effect_calls')) FROM effect_rows",
+            vec!["12"],
+        ),
+        (
+            "SELECT id,sum(id) OVER()+(SELECT nextval('effect_calls')) FROM effect_rows ORDER BY id",
+            vec!["1|13", "2|13", "3|13"],
+        ),
+        (
+            "SELECT ARRAY(SELECT nextval('effect_calls') FROM effect_rows ORDER BY id)",
+            vec!["{8,9,10}"],
+        ),
+        (
+            "SELECT (SELECT nextval('effect_calls') UNION ALL SELECT 999 LIMIT 1)",
+            vec!["11"],
+        ),
+        (
+            "UPDATE effect_rows SET id=id WHERE id=1 RETURNING (SELECT nextval('effect_calls')+id)",
+            vec!["13"],
+        ),
+        (
+            "INSERT INTO effect_rows VALUES(4) RETURNING (SELECT nextval('effect_calls')+id)",
+            vec!["17"],
+        ),
+        (
+            "DELETE FROM effect_rows WHERE id=4 RETURNING (SELECT nextval('effect_calls')+id)",
+            vec!["18"],
+        ),
+        (
+            "MERGE INTO effect_rows AS t USING (VALUES(1)) AS x(id) ON t.id=x.id WHEN MATCHED THEN UPDATE SET id=t.id RETURNING (SELECT nextval('effect_calls')+t.id)",
+            vec!["16"],
+        ),
+    ] {
+        assert_eq!(
+            data_rows(&session.success(&mut engine, sql, true)),
+            expected,
+            "{sql}"
+        );
+    }
+    session.success(&mut engine, "CREATE SEQUENCE bound_calls", true);
+    assert_eq!(data_rows(&session.success(&mut engine, "SELECT id FROM effect_rows ORDER BY id OFFSET nextval('bound_calls') LIMIT nextval('bound_calls'); SELECT last_value FROM bound_calls", true)), ["2","3","2"]);
+    assert_eq!(data_rows(&session.success(&mut engine, "SELECT id FROM effect_rows UNION ALL SELECT 4 ORDER BY 1 OFFSET nextval('bound_calls') LIMIT nextval('bound_calls'); SELECT last_value FROM bound_calls", true)), ["4","4"]);
+    assert_eq!(
+        error_sqlstates(&session.execute(&mut engine, "SELECT 1 LIMIT -1 OFFSET -1", true)),
+        ["2201X"]
+    );
+}
+
+#[test]
 fn cursor_subquery_array_types_resolve_without_running_skipped_effects() {
     let config = test_config("cursor-subquery-array-types");
     let mut budget = test_engine_budget(&config, 1 << 29);

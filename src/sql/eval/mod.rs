@@ -1683,22 +1683,6 @@ pub trait CatalogAccess {
     ) -> Result<Option<Datum<'a>>, SqlError> {
         Ok(None)
     }
-    /// An array element identity for a domain whose base is itself an array.
-    /// This is distinct from PostgreSQL's ordinary multidimensional constructor:
-    /// `ARRAY[array_domain_value]` is an array of domain values, not one
-    /// flattened base array.
-    fn array_domain_element(&self, _type_name: &str) -> Option<crate::sql::types::ArrElem> {
-        None
-    }
-    /// The SQL name of a user-defined array element identity, for
-    /// `pg_typeof`. Built-in arrays do not consult the catalog.
-    fn user_array_name<'a>(
-        &self,
-        _element: crate::sql::types::ArrElem,
-        _arena: &'a Arena,
-    ) -> Result<Option<&'a str>, SqlError> {
-        Ok(None)
-    }
     /// Canonical visible name of a user-defined scalar or array type spelling.
     fn user_type_name<'a>(
         &self,
@@ -1840,6 +1824,7 @@ pub trait SubqueryExecution {
         arena: &'a Arena,
         params: &[Datum<'a>],
         outer: &dyn ColumnLookup<'a>,
+        sequences: Option<&dyn SequenceAccess>,
     ) -> Result<SubqueryResult<'a>, SqlError>;
 }
 
@@ -2458,7 +2443,7 @@ fn eval_full_inner<'a>(
                     .any(|list| core::ptr::eq(list.node, (expression as *const Expr).cast()))
         })
     {
-        let result = executor.evaluate(expression, arena, params, row)?;
+        let result = executor.evaluate(expression, arena, params, row, hooks.sequences)?;
         let mut scalars = [(expression as *const Expr, Datum::Null, Datum::Null)];
         let mut lists = [SubqueryList {
             node: core::ptr::null(),
@@ -2735,6 +2720,16 @@ fn eval_full_inner<'a>(
                 let target_oid = ColType::from_sql_name(type_name)
                     .map(ColType::oid)
                     .or_else(|| catalog.user_type_oid(type_name));
+                if constructor_element.is_some()
+                    && type_mod == -1
+                    && target_oid == Some(source_oid)
+                    && matches!(
+                        target_oid.and_then(crate::storage::NamedTypeKind::from_oid),
+                        Some((_, _, true))
+                    )
+                {
+                    return Ok(v);
+                }
                 if let Some(target_oid) = target_oid
                     && source_oid != target_oid
                     && let Some(value) = catalog.cast_defined(
@@ -4491,12 +4486,52 @@ fn eval_array_constructor<'a>(
     }
     // Coerce each element to the unified type.
     let ct = element.to_coltype();
-    for v in vals.iter_mut().take(items.len()) {
+    let mut named_type = None;
+    for (v, expression) in vals.iter_mut().zip(items) {
+        if element.is_named()
+            && expression_type_identity(expression, row, hooks)?.record_field_oid()
+                != element.element_oid()
+        {
+            let catalog = hooks.catalog.ok_or_else(|| {
+                sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "array constructor named type catalog access is unavailable"
+                )
+            })?;
+            let name = match named_type {
+                Some(name) => name,
+                None => {
+                    let name = catalog
+                        .type_name(element.element_oid(), arena)?
+                        .ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::INTERNAL_ERROR,
+                                "array element has no declared type name"
+                            )
+                        })?;
+                    named_type = Some(name);
+                    name
+                }
+            };
+            *v = catalog.cast_user_type(name, *v, arena)?.ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "array element type has no catalog conversion"
+                )
+            })?;
+        } else if element.is_catalog_reference() {
+            *v = if ct == ColType::Regtype {
+                regtype_cast(*v, hooks.catalog, arena)?
+            } else {
+                regobject_cast(*v, ct, hooks.catalog, arena)?
+            };
+            continue;
+        }
         if !v.is_null() {
             *v = match *v {
                 // A bpchar element keeps its padding in the array
                 // value, as PostgreSQL's array_out shows it.
-                Datum::Bpchar(s) => Datum::Text(s),
+                Datum::Bpchar(s) if ct == ColType::Bpchar => Datum::Text(s),
                 Datum::Composite { slot, .. } if matches!(ct, ColType::Composite(expected) if expected == Some(slot)) => {
                     Datum::CompositeText {
                         slot,
@@ -4568,6 +4603,7 @@ pub(crate) fn array_constructor_type<'a>(
             });
     }
     let mut candidate = None;
+    let mut needs_validation = false;
     let mut first_oid = None;
     let mut identical = true;
     let mut multidimensional = false;
@@ -4604,8 +4640,13 @@ pub(crate) fn array_constructor_type<'a>(
         if expected.is_none() {
             candidate = Some(match candidate {
                 None => physical,
-                Some(prior) => super::types::common_builtin_candidate(prior, physical)
-                    .map_err(|error| common_type_error(error, "ARRAY"))?,
+                Some(prior) => {
+                    let next = super::types::common_builtin_candidate(prior, physical)
+                        .map_err(|error| common_type_error(error, "ARRAY"))?;
+                    needs_validation |= !super::types::builtin_implicit_cast(prior, next)
+                        || !super::types::builtin_implicit_cast(physical, next);
+                    next
+                }
             });
         }
     }
@@ -4633,25 +4674,29 @@ pub(crate) fn array_constructor_type<'a>(
         });
     }
     let candidate = candidate.unwrap_or(ColType::Text);
-    for item in items {
-        let type_oid = match item {
-            Expr::Array(children) => ColType::Array(
-                array_constructor_type(children, expected, resolve, domain_base)?.element,
-            )
-            .oid(),
-            other => resolve(other)?,
-        };
-        if type_oid != super::types::oid::UNKNOWN {
-            let from = constructor_type_from_oid(type_oid, domain_base)
-                .expect("validated constructor declaration");
-            if !super::types::builtin_implicit_cast(from, candidate) {
-                return Err(common_type_error(
-                    super::types::CommonTypeError::Conversion {
-                        from,
-                        to: candidate,
-                    },
-                    "ARRAY",
-                ));
+    // Builtin candidate widening preserves prior implicit conversions. Revisit
+    // declarations only after a failed pair, once all categories are checked.
+    if needs_validation {
+        for item in items {
+            let type_oid = match item {
+                Expr::Array(children) => ColType::Array(
+                    array_constructor_type(children, expected, resolve, domain_base)?.element,
+                )
+                .oid(),
+                other => resolve(other)?,
+            };
+            if type_oid != super::types::oid::UNKNOWN {
+                let from = constructor_type_from_oid(type_oid, domain_base)
+                    .expect("validated constructor declaration");
+                if !super::types::builtin_implicit_cast(from, candidate) {
+                    return Err(common_type_error(
+                        super::types::CommonTypeError::Conversion {
+                            from,
+                            to: candidate,
+                        },
+                        "ARRAY",
+                    ));
+                }
             }
         }
     }
@@ -8242,6 +8287,39 @@ mod tests {
     }
 
     #[test]
+    fn cursor_array_type_analysis_visits_valid_nested_members_once() {
+        let mut sql = String::from("ARRAY[1::double precision]");
+        for _ in 0..24 {
+            sql = format!("ARRAY[{sql},ARRAY[1]]");
+        }
+        let mut budget = Budget::new(1 << 20);
+        let arena = Arena::new(&mut budget, "nested array types", 1 << 20).unwrap();
+        let calls = core::cell::Cell::new(0usize);
+        crate::mem::guard::forbid_alloc(|| {
+            let expression = crate::sql::parser::parse_expression(&sql, &arena).unwrap();
+            let Expr::Array(items) = expression else {
+                panic!("array constructor");
+            };
+            let plan = array_constructor_type(
+                items,
+                None,
+                &|item| {
+                    calls.set(calls.get() + 1);
+                    crate::sql::exec::infer_type_res(item, &crate::sql::exec::NoCols)
+                        .map(|result| result.0)
+                },
+                &|_| None,
+            )
+            .unwrap();
+            assert!(matches!(plan.element, ArrElem::Float8));
+            assert!(
+                calls.get() <= 64,
+                "nested declarations were repeatedly resolved"
+            );
+        });
+    }
+
+    #[test]
     fn subquery_execution_short_circuits_and_keeps_nested_result_frames() {
         use core::cell::Cell;
         struct Queries(Cell<usize>);
@@ -8252,6 +8330,7 @@ mod tests {
                 arena: &'a Arena,
                 _: &[Datum<'a>],
                 _: &dyn ColumnLookup<'a>,
+                _: Option<&dyn SequenceAccess>,
             ) -> Result<SubqueryResult<'a>, SqlError> {
                 self.0.set(self.0.get() + 1);
                 match expression {

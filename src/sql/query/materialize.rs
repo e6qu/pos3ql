@@ -166,6 +166,7 @@ fn for_each_materialized_projection<'a>(
             params,
             &mut *scalars,
             &mut *lists,
+            hooks.sequences,
         )?;
         owned_hooks = EvalHooks {
             group: None,

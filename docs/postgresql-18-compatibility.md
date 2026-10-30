@@ -38,6 +38,8 @@ and null values. For example, `ARRAY[(SELECT NULL::date)]` is `date[]`, and
 mixing integer and bigint members produces `bigint[]`. An empty constructor
 needs an explicit type, such as `ARRAY[]::integer[]`. Type inspection still
 evaluates its argument: `pg_typeof(nextval('order_numbers'))` issues one number.
+Reached subqueries share the caller's sequence session. Row bounds evaluate
+`OFFSET` before `LIMIT`; both can call supported functions or scalar subqueries.
 
 Arrays of domains over built-in arrays are supported. For example, a domain
 `integer_vector` over `integer[]` can be used as `integer_vector[]`.

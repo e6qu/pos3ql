@@ -25,7 +25,7 @@ use super::{
     fromless_aggregate_hooks, pax_column_demand, scan_source_with_pax_columns, select_into_rows,
     select_into_rows_recycling, where_passes,
 };
-use crate::sql::exec::{ColTypeResolver, MAX_PROJ};
+use crate::sql::exec::MAX_PROJ;
 
 pub(super) const fn empty_subquery_list<'a>() -> SubqueryList<'a> {
     SubqueryList {
@@ -361,6 +361,7 @@ fn external_list_subquery<'a>(
     row_witness: Option<Datum<'a>>,
     collations: &'a [Collation],
     outer: Option<&dyn ColumnLookup<'a>>,
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<SubqueryList<'a>, SqlError> {
     if depth == 0 {
         return Err(sql_err!(
@@ -429,7 +430,7 @@ fn external_list_subquery<'a>(
         arena,
         params,
         outer,
-        None,
+        sequences,
         &mut |values| {
             if values.len() != projected_columns {
                 return Err(sql_err!(
@@ -507,6 +508,7 @@ fn streaming_scalar_subquery<'a>(
     params: &[Datum<'a>],
     depth: u32,
     outer: Option<&dyn ColumnLookup<'a>>,
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<(Datum<'a>, Datum<'a>), SqlError> {
     if depth == 0 {
         return Err(sql_err!(
@@ -543,7 +545,7 @@ fn streaming_scalar_subquery<'a>(
         arena,
         params,
         outer,
-        None,
+        sequences,
         &mut |values| {
             if values.len() != 1 {
                 return Err(sql_err!(
@@ -600,6 +602,7 @@ fn streaming_array_subquery<'a>(
     params: &[Datum<'a>],
     depth: u32,
     outer: Option<&dyn ColumnLookup<'a>>,
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<(Datum<'a>, Datum<'a>), SqlError> {
     if depth == 0 {
         return Err(sql_err!(
@@ -636,7 +639,7 @@ fn streaming_array_subquery<'a>(
         arena,
         params,
         outer,
-        None,
+        sequences,
         &mut |values| {
             if values.len() != 1 {
                 return Err(sql_err!(
@@ -1226,12 +1229,22 @@ pub fn prepare_subqueries<'a>(
     params: &[Datum<'a>],
     depth: u32,
     outer: Option<&dyn ColumnLookup<'a>>,
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<SubqueryValues<'a, 'a>, SqlError> {
     let mut nodes = ArenaList::new(arena);
     for expression in exprs.iter().flatten() {
         collect_subqueries(expression, &mut nodes)?;
     }
-    eval_subquery_nodes(nodes.as_slice(), storage, txid, arena, params, depth, outer)
+    eval_subquery_nodes(
+        nodes.as_slice(),
+        storage,
+        txid,
+        arena,
+        params,
+        depth,
+        outer,
+        sequences,
+    )
 }
 
 /// Evaluates a set of already-collected subquery nodes (scalar, IN, or
@@ -1246,6 +1259,7 @@ fn eval_subquery_nodes<'a>(
     params: &[Datum<'a>],
     depth: u32,
     outer: Option<&dyn ColumnLookup<'a>>,
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<SubqueryValues<'a, 'a>, SqlError> {
     let n_list_nodes = nodes
         .iter()
@@ -1277,6 +1291,7 @@ fn eval_subquery_nodes<'a>(
                     depth,
                     outer,
                     *arity as usize,
+                    sequences,
                 )?;
                 if values.len() > 1 {
                     return Err(sql_err!(
@@ -1294,14 +1309,15 @@ fn eval_subquery_nodes<'a>(
             Expr::Subquery(select) => {
                 if storage.spill_attached() {
                     let (value, witness) = streaming_scalar_subquery(
-                        select, storage, txid, arena, params, depth, outer,
+                        select, storage, txid, arena, params, depth, outer, sequences,
                     )?;
                     scalars[n_scalars] = (*node as *const _, value, witness);
                     n_scalars += 1;
                     continue;
                 }
-                let (values, _, witness) =
-                    run_subquery(select, storage, txid, arena, params, depth, outer, 1)?;
+                let (values, _, witness) = run_subquery(
+                    select, storage, txid, arena, params, depth, outer, 1, sequences,
+                )?;
                 if values.len() > 1 {
                     return Err(sql_err!(
                         crate::sql::eval::sqlstate::CARDINALITY_VIOLATION,
@@ -1313,21 +1329,24 @@ fn eval_subquery_nodes<'a>(
                 n_scalars += 1;
             }
             Expr::Exists(select) => {
-                let found = subquery_exists(select, storage, txid, arena, params, depth, outer)?;
+                let found = subquery_exists(
+                    select, storage, txid, arena, params, depth, outer, sequences,
+                )?;
                 scalars[n_scalars] = (*node as *const _, Datum::Bool(found), Datum::Bool(false));
                 n_scalars += 1;
             }
             Expr::ArraySubquery(select) => {
                 if storage.spill_attached() {
                     let (v, witness) = streaming_array_subquery(
-                        select, storage, txid, arena, params, depth, outer,
+                        select, storage, txid, arena, params, depth, outer, sequences,
                     )?;
                     scalars[n_scalars] = (*node as *const _, v, witness);
                     n_scalars += 1;
                     continue;
                 }
-                let (values, _, witness) =
-                    run_subquery(select, storage, txid, arena, params, depth, outer, 1)?;
+                let (values, _, witness) = run_subquery(
+                    select, storage, txid, arena, params, depth, outer, 1, sequences,
+                )?;
                 let v = build_array_scalar(values, &witness, storage, txid, arena)?;
                 scalars[n_scalars] = (*node as *const _, v, v);
                 n_scalars += 1;
@@ -1357,12 +1376,14 @@ fn eval_subquery_nodes<'a>(
                         row_witness,
                         collations,
                         outer,
+                        sequences,
                     )?;
                     n_lists += 1;
                     continue;
                 }
-                let (values, saw_null, witness) =
-                    run_subquery(select, storage, txid, arena, params, depth, outer, arity)?;
+                let (values, saw_null, witness) = run_subquery(
+                    select, storage, txid, arena, params, depth, outer, arity, sequences,
+                )?;
                 lists[n_lists] = SubqueryList {
                     node: (*node as *const Expr).cast(),
                     values,
@@ -1392,6 +1413,7 @@ fn subquery_exists<'a>(
     params: &[Datum<'a>],
     depth: u32,
     outer: Option<&dyn ColumnLookup<'a>>,
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<bool, SqlError> {
     if depth == 0 {
         return Err(sql_err!(
@@ -1400,7 +1422,8 @@ fn subquery_exists<'a>(
         ));
     }
     if let Some(tree) = select.set_body {
-        let (vals, _, _) = run_set_subquery(tree, select, storage, txid, arena, params, 1)?;
+        let (vals, _, _) =
+            run_set_subquery(tree, select, storage, txid, arena, params, 1, sequences)?;
         return Ok(!vals.is_empty());
     }
     if !select.group_by.is_empty() || select.having.is_some() || select.distinct {
@@ -1414,7 +1437,7 @@ fn subquery_exists<'a>(
             arena,
             params,
             outer,
-            None,
+            sequences,
             &mut |_| {
                 found = true;
                 Ok(())
@@ -1422,30 +1445,29 @@ fn subquery_exists<'a>(
         )?;
         return Ok(found);
     }
-    // The projection list of EXISTS is irrelevant (only row presence matters),
-    // but its expressions may carry subqueries; prepare them for the scan.
+    // EXISTS consumes row presence. Preparing its discarded projection would
+    // issue effects from scalar subqueries whose values are never requested.
     let sample_capacity = select
         .from
         .as_ref()
         .map_or(0, |from| 2 * (from.joins.len() + 1));
     let item_exprs = arena
-        .alloc_slice_with(select.items.len() + 1 + sample_capacity, |_| {
-            Option::<&'a Expr<'a>>::None
-        })
+        .alloc_slice_with(1 + sample_capacity, |_| Option::<&'a Expr<'a>>::None)
         .map_err(|_| arena_full())?;
-    let mut n_items = 0;
-    for item in select.items {
-        if let SelectItem::Expr { expression, .. } = item {
-            item_exprs[n_items] = Some(expression);
-            n_items += 1;
-        }
-    }
-    item_exprs[n_items] = select.where_clause;
+    item_exprs[0] = select.where_clause;
     if let Some(from) = &select.from {
-        collect_table_sample_expressions(from, &mut item_exprs[n_items + 1..]);
+        collect_table_sample_expressions(from, &mut item_exprs[1..]);
     }
-    let inner_subs =
-        prepare_subqueries(item_exprs, storage, txid, arena, params, depth - 1, outer)?;
+    let inner_subs = prepare_subqueries(
+        item_exprs,
+        storage,
+        txid,
+        arena,
+        params,
+        depth - 1,
+        outer,
+        sequences,
+    )?;
     let catalog = super::storage_catalog(storage, arena, txid);
     let hooks = EvalHooks {
         group: None,
@@ -1456,7 +1478,7 @@ fn subquery_exists<'a>(
         catalog: Some(&catalog),
         srf_index: None,
         project_sets: None,
-        sequences: None,
+        sequences,
         merge_action: None,
     };
 
@@ -1801,6 +1823,7 @@ pub(super) fn prepare_outer_subqueries<'a>(
     txid: u32,
     arena: &'a Arena,
     params: &[Datum<'a>],
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<OuterSubs<'a>, SqlError> {
     let mut nodes = ArenaList::new(arena);
     for expression in exprs.iter().flatten() {
@@ -1823,6 +1846,7 @@ pub(super) fn prepare_outer_subqueries<'a>(
         params,
         SUBQUERY_DEPTH,
         None,
+        sequences,
     )?;
     Ok(OuterSubs {
         base,
@@ -1899,6 +1923,7 @@ pub(super) fn merge_correlated<'a, 'b>(
     params: &[Datum<'a>],
     scalars: &'b mut [(*const Expr<'a>, Datum<'a>, Datum<'a>)],
     lists: &'b mut [SubqueryList<'a>],
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<SubqueryValues<'b, 'a>, SqlError> {
     let mut ns = 0;
     for (p, v, w) in base.scalars {
@@ -1924,6 +1949,7 @@ pub(super) fn merge_correlated<'a, 'b>(
                     SUBQUERY_DEPTH,
                     Some(outer),
                     *arity as usize,
+                    sequences,
                 )?;
                 if values.len() > 1 {
                     return Err(sql_err!(
@@ -1948,6 +1974,7 @@ pub(super) fn merge_correlated<'a, 'b>(
                         params,
                         SUBQUERY_DEPTH,
                         Some(outer),
+                        sequences,
                     )?;
                     scalars[ns] = (*node as *const _, value, witness);
                     ns += 1;
@@ -1962,6 +1989,7 @@ pub(super) fn merge_correlated<'a, 'b>(
                     SUBQUERY_DEPTH,
                     Some(outer),
                     1,
+                    sequences,
                 )?;
                 if values.len() > 1 {
                     return Err(sql_err!(
@@ -1985,6 +2013,7 @@ pub(super) fn merge_correlated<'a, 'b>(
                     params,
                     SUBQUERY_DEPTH,
                     Some(outer),
+                    sequences,
                 )?;
                 scalars[ns] = (*node as *const _, Datum::Bool(found), Datum::Bool(false));
                 ns += 1;
@@ -1999,6 +2028,7 @@ pub(super) fn merge_correlated<'a, 'b>(
                         params,
                         SUBQUERY_DEPTH,
                         Some(outer),
+                        sequences,
                     )?;
                     scalars[ns] = (*node as *const _, v, witness);
                     ns += 1;
@@ -2013,6 +2043,7 @@ pub(super) fn merge_correlated<'a, 'b>(
                     SUBQUERY_DEPTH,
                     Some(outer),
                     1,
+                    sequences,
                 )?;
                 let v = build_array_scalar(values, &witness, storage, txid, arena)?;
                 scalars[ns] = (*node as *const _, v, v);
@@ -2046,6 +2077,7 @@ pub(super) fn merge_correlated<'a, 'b>(
                         row_witness,
                         collations,
                         Some(outer),
+                        sequences,
                     )?;
                     nl += 1;
                     continue;
@@ -2059,6 +2091,7 @@ pub(super) fn merge_correlated<'a, 'b>(
                     SUBQUERY_DEPTH,
                     Some(outer),
                     arity,
+                    sequences,
                 )?;
                 lists[nl] = SubqueryList {
                     node: (*node as *const Expr).cast(),
@@ -2100,7 +2133,7 @@ pub(super) fn correlated_where_passes<'a>(
         return Ok(true);
     };
     let values = merge_correlated(
-        correlated, base, row, storage, txid, arena, params, scalars, lists,
+        correlated, base, row, storage, txid, arena, params, scalars, lists, sequences,
     )?;
     let where_hooks = EvalHooks {
         subs: Some(&values),
@@ -2573,6 +2606,7 @@ fn run_scalar_record_subquery<'a>(
     params: &[Datum<'a>],
     outer: Option<&dyn ColumnLookup<'a>>,
     row_arity: usize,
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<(&'a [Datum<'a>], bool, Datum<'a>), SqlError> {
     let witness = row_subquery_witness(select, storage, txid, arena, outer)?;
     let Datum::Record(witness_fields) = witness else {
@@ -2598,7 +2632,7 @@ fn run_scalar_record_subquery<'a>(
         arena,
         params,
         outer,
-        None,
+        sequences,
         &mut |row| {
             if row.len() != row_arity {
                 return Err(sql_err!(
@@ -2647,6 +2681,7 @@ fn run_record_subquery<'a>(
     params: &[Datum<'a>],
     outer: Option<&dyn ColumnLookup<'a>>,
     row_arity: usize,
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<(&'a [Datum<'a>], bool, Datum<'a>), SqlError> {
     let witness = row_subquery_witness(select, storage, txid, arena, outer)?;
     let Datum::Record(witness_fields) = witness else {
@@ -2672,7 +2707,7 @@ fn run_record_subquery<'a>(
         arena,
         params,
         outer,
-        None,
+        sequences,
         &mut |values| {
             if values.len() != row_arity {
                 return Err(sql_err!(
@@ -2715,6 +2750,7 @@ fn run_row_subquery<'a>(
     depth: u32,
     outer: Option<&dyn ColumnLookup<'a>>,
     row_arity: usize,
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<(&'a [Datum<'a>], bool, Datum<'a>), SqlError> {
     if depth == 0 {
         return Err(sql_err!(
@@ -2723,8 +2759,9 @@ fn run_row_subquery<'a>(
         ));
     }
     if let Some(tree) = select.set_body {
-        let (values, saw_null, witness) =
-            run_set_subquery(tree, select, storage, txid, arena, params, row_arity)?;
+        let (values, saw_null, witness) = run_set_subquery(
+            tree, select, storage, txid, arena, params, row_arity, sequences,
+        )?;
         if values.len() > 1 {
             return Err(sql_err!(
                 sqlstate::CARDINALITY_VIOLATION,
@@ -2733,7 +2770,9 @@ fn run_row_subquery<'a>(
         }
         return Ok((values, saw_null, witness));
     }
-    run_scalar_record_subquery(select, storage, txid, arena, params, outer, row_arity)
+    run_scalar_record_subquery(
+        select, storage, txid, arena, params, outer, row_arity, sequences,
+    )
 }
 
 /// Executes a subquery to a value list: exactly one select item, full
@@ -2750,6 +2789,7 @@ fn run_subquery<'a>(
     depth: u32,
     outer: Option<&dyn ColumnLookup<'a>>,
     row_arity: usize,
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<(&'a [Datum<'a>], bool, Datum<'a>), SqlError> {
     if depth == 0 {
         return Err(sql_err!(
@@ -2758,10 +2798,14 @@ fn run_subquery<'a>(
         ));
     }
     if let Some(tree) = select.set_body {
-        return run_set_subquery(tree, select, storage, txid, arena, params, row_arity);
+        return run_set_subquery(
+            tree, select, storage, txid, arena, params, row_arity, sequences,
+        );
     }
     if row_arity > 1 {
-        return run_record_subquery(select, storage, txid, arena, params, outer, row_arity);
+        return run_record_subquery(
+            select, storage, txid, arena, params, outer, row_arity, sequences,
+        );
     }
     if select.items.len() != 1 {
         return Err(sql_err!(
@@ -2812,7 +2856,7 @@ fn run_subquery<'a>(
             arena,
             params,
             outer,
-            None,
+            sequences,
             &mut |vals| {
                 if vals.len() != 1 {
                     return Err(sql_err!(
@@ -2867,6 +2911,7 @@ fn run_subquery<'a>(
         params,
         depth - 1,
         outer,
+        sequences,
     )?;
     let catalog = super::storage_catalog(storage, arena, txid);
     let hooks = EvalHooks {
@@ -2878,7 +2923,7 @@ fn run_subquery<'a>(
         catalog: Some(&catalog),
         srf_index: None,
         project_sets: None,
-        sequences: None,
+        sequences,
         merge_action: None,
     };
 
@@ -3120,8 +3165,8 @@ fn run_subquery<'a>(
     }
 
     // Apply OFFSET/LIMIT over the ordered rows.
-    let offset = crate::sql::exec::eval_offset_pub(select.offset, arena, params)? as usize;
-    let limit = crate::sql::exec::eval_limit_pub(select.limit, arena, params)?;
+    let offset = crate::sql::exec::eval_offset_pub(select.offset, arena, params, &hooks)? as usize;
+    let limit = crate::sql::exec::eval_limit_pub(select.limit, arena, params, &hooks)?;
     let start = offset.min(count);
     let n = ((count - start) as u64).min(limit) as usize;
     let mut saw_null = false;
@@ -3155,8 +3200,19 @@ fn run_set_subquery<'a>(
     arena: &'a Arena,
     params: &[Datum<'a>],
     row_arity: usize,
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<(&'a [Datum<'a>], bool, Datum<'a>), SqlError> {
-    let (rows, target, n_cols) = materialize_set_body(storage, txid, tree, arena, params, None)?;
+    let bound_catalog = super::storage_catalog(storage, arena, txid);
+    let bound_queries = super::ProceduralSubqueries { storage, txid };
+    let bound_hooks = crate::sql::eval::EvalHooks {
+        catalog: Some(&bound_catalog),
+        subquery_executor: Some(&bound_queries),
+        sequences: sequences,
+        ..crate::sql::eval::NO_HOOKS
+    };
+
+    let (rows, target, n_cols) =
+        materialize_set_body(storage, txid, tree, arena, params, sequences)?;
     if n_cols != row_arity {
         return Err(sql_err!(
             sqlstate::SYNTAX_ERROR,
@@ -3164,9 +3220,16 @@ fn run_set_subquery<'a>(
         ));
     }
     if row_arity > 1 {
-        return set_record_rows(rows, &target[..n_cols], outer_select, arena, params);
+        return set_record_rows(
+            rows,
+            &target[..n_cols],
+            outer_select,
+            arena,
+            params,
+            &bound_hooks,
+        );
     }
-    let (start, n) = set_window(rows.len(), outer_select, arena, params)?;
+    let (start, n) = set_window(rows.len(), outer_select, arena, params, &bound_hooks)?;
     let mut saw_null = false;
     // The slice is reserved before any element decodes: a record column's
     // structural decode allocates its fields from the same arena, which must
@@ -3207,8 +3270,9 @@ fn set_record_rows<'a>(
     outer_select: &'a Select<'a>,
     arena: &'a Arena,
     params: &[Datum<'a>],
+    hooks: &EvalHooks<'_, 'a>,
 ) -> Result<(&'a [Datum<'a>], bool, Datum<'a>), SqlError> {
-    let (start, n) = set_window(rows.len(), outer_select, arena, params)?;
+    let (start, n) = set_window(rows.len(), outer_select, arena, params, hooks)?;
     let mut names = [""; MAX_PROJ];
     for (column, name) in names[..target.len()].iter_mut().enumerate() {
         let text = stack_format!(12, "f{}", column + 1);
@@ -3251,9 +3315,10 @@ fn set_window<'a>(
     outer_select: &'a Select<'a>,
     arena: &'a Arena,
     params: &[Datum<'a>],
+    hooks: &EvalHooks<'_, 'a>,
 ) -> Result<(usize, usize), SqlError> {
-    let offset = crate::sql::exec::eval_offset_pub(outer_select.offset, arena, params)?;
-    let limit = crate::sql::exec::eval_limit_pub(outer_select.limit, arena, params)?;
+    let offset = crate::sql::exec::eval_offset_pub(outer_select.offset, arena, params, hooks)?;
+    let limit = crate::sql::exec::eval_limit_pub(outer_select.limit, arena, params, hooks)?;
     let start = (offset as usize).min(total);
     Ok((start, ((total - start) as u64).min(limit) as usize))
 }
@@ -3334,8 +3399,9 @@ pub fn subquery_hooks<'a>(
     txid: u32,
     arena: &'a Arena,
     params: &[Datum<'a>],
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<SubqueryValues<'a, 'a>, SqlError> {
-    subquery_hooks_with_outer(exprs, storage, txid, arena, params, None)
+    subquery_hooks_with_outer(exprs, storage, txid, arena, params, None, sequences)
 }
 
 pub(crate) fn subquery_hooks_outer<'a>(
@@ -3345,8 +3411,9 @@ pub(crate) fn subquery_hooks_outer<'a>(
     arena: &'a Arena,
     params: &[Datum<'a>],
     outer: &dyn ColumnLookup<'a>,
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<SubqueryValues<'a, 'a>, SqlError> {
-    subquery_hooks_with_outer(exprs, storage, txid, arena, params, Some(outer))
+    subquery_hooks_with_outer(exprs, storage, txid, arena, params, Some(outer), sequences)
 }
 
 fn subquery_hooks_with_outer<'a>(
@@ -3356,6 +3423,7 @@ fn subquery_hooks_with_outer<'a>(
     arena: &'a Arena,
     params: &[Datum<'a>],
     outer: Option<&dyn ColumnLookup<'a>>,
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<SubqueryValues<'a, 'a>, SqlError> {
     // `prepare_subqueries` may return values borrowing relation bytes. This
     // adapter immediately round-trips every value through the arena codec, so
@@ -3371,6 +3439,7 @@ fn subquery_hooks_with_outer<'a>(
         params,
         SUBQUERY_DEPTH,
         outer,
+        sequences,
     )?;
     detach_subquery_values(borrowed, arena)
 }
@@ -3431,6 +3500,7 @@ impl super::super::eval::SubqueryExecution for ProceduralSubqueries<'_> {
         arena: &'a Arena,
         params: &[Datum<'a>],
         outer: &dyn ColumnLookup<'a>,
+        sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
     ) -> Result<super::super::eval::SubqueryResult<'a>, SqlError> {
         // SAFETY: storage remains immutable and live for this call; the
         // result is detached before the borrow can escape.
@@ -3443,6 +3513,7 @@ impl super::super::eval::SubqueryExecution for ProceduralSubqueries<'_> {
             params,
             SUBQUERY_DEPTH,
             Some(outer),
+            sequences,
         )?;
         let values = detach_subquery_values(borrowed, arena)?;
         match (values.scalars, values.lists) {

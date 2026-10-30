@@ -289,8 +289,15 @@ pub(crate) fn row_security_passes<'a>(
         {
             *output = Some(predicate.expression);
         }
-        let subqueries =
-            super::subquery::subquery_hooks_outer(expressions, storage, txid, arena, params, row)?;
+        let subqueries = super::subquery::subquery_hooks_outer(
+            expressions,
+            storage,
+            txid,
+            arena,
+            params,
+            row,
+            base_hooks.sequences,
+        )?;
         let hooks = EvalHooks {
             group: None,
             aggs: None,

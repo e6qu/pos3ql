@@ -76,7 +76,16 @@ pub(super) fn row_passes_correlated_where<'a>(
     };
     let base = hooks.subs.expect("outer subqueries prepared");
     let row_subs = merge_correlated(
-        correlated, base, row, storage, txid, arena, params, scalars, lists,
+        correlated,
+        base,
+        row,
+        storage,
+        txid,
+        arena,
+        params,
+        scalars,
+        lists,
+        hooks.sequences,
     )?;
     let h = EvalHooks {
         subs: Some(&row_subs),
@@ -206,6 +215,7 @@ pub(super) fn groups_for_mask<'a>(
                         params,
                         &mut *where_scalars,
                         &mut *where_lists,
+                        hooks.sequences,
                     )?;
                     row_hooks_store = EvalHooks {
                         subs: Some(&row_subs),
@@ -333,6 +343,7 @@ pub(super) fn groups_for_mask<'a>(
                             params,
                             &mut *where_scalars,
                             &mut *where_lists,
+                            hooks.sequences,
                         )?;
                         row_hooks_store = EvalHooks {
                             subs: Some(&row_subs),
@@ -511,6 +522,7 @@ pub(super) fn groups_for_mask<'a>(
                     params,
                     &mut *where_scalars,
                     &mut *where_lists,
+                    hooks.sequences,
                 )?;
                 row_hooks_store = EvalHooks {
                     subs: Some(&row_subs),
@@ -620,6 +632,7 @@ pub(super) fn groups_for_mask<'a>(
                 params,
                 &mut *group_scalars,
                 &mut *group_lists,
+                hooks.sequences,
             )?;
             Some(&merged_subs)
         };

@@ -1622,6 +1622,7 @@ pub(crate) fn project_window_rows<'a>(
                 params,
                 &mut *where_scalars,
                 &mut *where_lists,
+                hooks.sequences,
             )?;
             Some(&row_subs)
         };
@@ -2204,6 +2205,7 @@ pub(crate) fn external_window_into<'a>(
                     params,
                     &mut *where_scalars,
                     &mut *where_lists,
+                    hooks.sequences,
                 )?;
                 Some(&row_subs)
             };

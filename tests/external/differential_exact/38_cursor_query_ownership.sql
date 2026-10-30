@@ -189,6 +189,49 @@ DROP FUNCTION next_array_call(),native_array_choice(boolean),native_domain_array
 DROP SEQUENCE subquery_array_calls;
 DROP TABLE subquery_arrays;
 DROP DOMAIN subquery_day;
+CREATE TYPE array_mood AS ENUM('ready','done');
+CREATE DOMAIN array_positive AS integer CHECK(VALUE>0);
+CREATE DOMAIN array_required AS integer NOT NULL;
+SELECT ARRAY['ready',NULL,'done']::array_mood[],ARRAY['1','2']::array_positive[],
+       ARRAY['pg_class']::regclass[],ARRAY['integer']::regtype[];
+SELECT ARRAY['x'::character(3)]::text[],ARRAY['x'::character(3)];
+SELECT ARRAY['bad']::array_mood[];
+SELECT ARRAY[-1]::array_positive[];
+SELECT ARRAY[NULL]::array_required[];
+SELECT pg_typeof(log(2,8)),pg_typeof(date_trunc('year',DATE '2020-02-03'));
+SELECT pg_typeof(bit_and(v)) FROM (VALUES(B'11'::varbit),(NULL::varbit)) AS t(v);
+SELECT log(NULL::real,1::real);
+DROP TYPE array_mood;
+DROP DOMAIN array_positive,array_required;
+
+CREATE SEQUENCE effect_calls;
+CREATE TABLE effect_rows(id integer);
+INSERT INTO effect_rows VALUES(1),(2),(3);
+SELECT (SELECT nextval('effect_calls'));
+SELECT id,(SELECT nextval('effect_calls')) FROM effect_rows ORDER BY id;
+SELECT id,(SELECT nextval('effect_calls')+id) FROM effect_rows ORDER BY id;
+SELECT EXISTS(SELECT (SELECT nextval('effect_calls')) FROM effect_rows);
+SELECT last_value FROM effect_calls;
+SELECT sum(id)+(SELECT nextval('effect_calls')) FROM effect_rows;
+SELECT id,sum(id) OVER()+(SELECT nextval('effect_calls')) FROM effect_rows ORDER BY id;
+SELECT ARRAY(SELECT nextval('effect_calls') FROM effect_rows ORDER BY id);
+SELECT (SELECT nextval('effect_calls') UNION ALL SELECT 999 LIMIT 1);
+UPDATE effect_rows SET id=id WHERE id=1 RETURNING (SELECT nextval('effect_calls')+id);
+INSERT INTO effect_rows VALUES(4) RETURNING (SELECT nextval('effect_calls')+id);
+DELETE FROM effect_rows WHERE id=4 RETURNING (SELECT nextval('effect_calls')+id);
+MERGE INTO effect_rows AS t USING (VALUES(1)) AS x(id) ON t.id=x.id
+WHEN MATCHED THEN UPDATE SET id=t.id RETURNING (SELECT nextval('effect_calls')+t.id);
+CREATE SEQUENCE bound_calls;
+-- PostgreSQL evaluates OFFSET before LIMIT.
+-- https://github.com/postgres/postgres/blob/REL_18_6/src/backend/executor/nodeLimit.c#L339
+SELECT id FROM effect_rows ORDER BY id OFFSET nextval('bound_calls') LIMIT nextval('bound_calls');
+SELECT last_value FROM bound_calls;
+SELECT id FROM effect_rows UNION ALL SELECT 4 ORDER BY 1 OFFSET nextval('bound_calls') LIMIT nextval('bound_calls');
+SELECT last_value FROM bound_calls;
+SELECT 1 LIMIT -1 OFFSET -1;
+DROP TABLE effect_rows;
+DROP SEQUENCE effect_calls,bound_calls;
+
 
 BEGIN;
 DECLARE wide_array NO SCROLL CURSOR FOR SELECT (ARRAY[id+0,id+1,id+2,id+3,id+4,id+5,id+6,id+7,id+8,id+9,id+10,id+11,id+12,id+13,id+14,id+15,id+16,id+17,id+18,id+19,id+20,id+21,id+22,id+23,id+24,id+25,id+26,id+27,id+28,id+29,id+30,id+31,id+32,id+33,id+34,id+35,id+36,id+37,id+38,id+39,id+40,id+41,id+42,id+43,id+44,id+45,id+46,id+47,id+48,id+49,id+50,id+51,id+52,id+53,id+54,id+55,id+56,id+57,id+58,id+59,id+60,id+61,id+62,id+63,id+64,id+65,id+66,id+67,id+68,id+69,id+70,id+71,id+72,id+73,id+74,id+75,id+76,id+77,id+78,id+79,id+80,id+81,id+82,id+83,id+84,id+85,id+86,id+87,id+88,id+89,id+90,id+91,id+92,id+93,id+94,id+95,id+96,id+97,id+98,id+99,id+100,id+101,id+102,id+103,id+104,id+105,id+106,id+107,id+108,id+109,id+110,id+111,id+112,id+113,id+114,id+115,id+116,id+117,id+118,id+119,id+120,id+121,id+122,id+123,id+124,id+125,id+126,id+127,id+128,id+129,id+130,id+131,id+132,id+133,id+134,id+135,id+136,id+137,id+138,id+139,id+140,id+141,id+142,id+143,id+144,id+145,id+146,id+147,id+148,id+149,id+150,id+151,id+152,id+153,id+154,id+155,id+156,id+157,id+158,id+159,id+160,id+161,id+162,id+163,id+164,id+165,id+166,id+167,id+168,id+169,id+170,id+171,id+172,id+173,id+174,id+175,id+176,id+177,id+178,id+179,id+180,id+181,id+182,id+183,id+184,id+185,id+186,id+187,id+188,id+189,id+190,id+191,id+192,id+193,id+194,id+195,id+196,id+197,id+198,id+199,id+200,id+201,id+202,id+203,id+204,id+205,id+206,id+207,id+208,id+209,id+210,id+211,id+212,id+213,id+214,id+215,id+216,id+217,id+218,id+219,id+220,id+221,id+222,id+223,id+224,id+225,id+226,id+227,id+228,id+229,id+230,id+231,id+232,id+233,id+234,id+235,id+236,id+237,id+238,id+239,id+240,id+241,id+242,id+243,id+244,id+245,id+246,id+247,id+248,id+249,id+250,id+251,id+252,id+253,id+254,id+255,id+256,id+257,id+258,id+259,id+260,id+261,id+262,id+263,id+264,id+265,id+266,id+267,id+268,id+269,id+270,id+271,id+272,id+273,id+274,id+275,id+276,id+277,id+278,id+279,id+280,id+281,id+282,id+283,id+284,id+285,id+286,id+287,id+288,id+289,id+290,id+291,id+292,id+293,id+294,id+295,id+296,id+297,id+298,id+299])[300] FROM array_input;

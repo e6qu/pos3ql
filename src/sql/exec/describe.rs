@@ -3439,6 +3439,24 @@ fn validate_declared_enum_comparison(
     Ok(None)
 }
 
+pub(crate) fn numeric_log_type(left: i32, right: i32) -> Result<ColType, SqlError> {
+    let numeric = |oid| {
+        matches!(
+            oid,
+            oid::UNKNOWN | oid::INT2 | oid::INT4 | oid::INT8 | oid::NUMERIC
+        )
+    };
+    if numeric(left) && numeric(right) {
+        return Ok(ColType::Numeric);
+    }
+    Err(sql_err!(
+        sqlstate::UNDEFINED_FUNCTION,
+        "function log({}, {}) does not exist",
+        coltype_of_oid(left).map_or("unknown", ColType::name),
+        coltype_of_oid(right).map_or("unknown", ColType::name)
+    ))
+}
+
 pub(crate) fn builtin_binary_type(
     operator: &crate::sql::ast::BinaryOp,
     lo: i32,
@@ -4103,6 +4121,7 @@ pub fn infer_type_res(
             let mut acc: Option<ColType> = None;
             let mut first_oid = None;
             let mut identical = true;
+            let mut needs_validation = false;
             let mut consider = |e: &Expr| -> Result<(), SqlError> {
                 let type_oid = infer_routine_argument_oid(e, columns)?;
                 if let Some(first) = first_oid {
@@ -4123,10 +4142,16 @@ pub fn infer_type_res(
                     })?;
                     acc = Some(match acc {
                         None => t,
-                        Some(prev) => crate::sql::types::common_builtin_candidate(prev, t)
-                            .map_err(|error| {
-                                super::super::eval::common_type_error(error, "CASE")
-                            })?,
+                        Some(prev) => {
+                            let next = crate::sql::types::common_builtin_candidate(prev, t)
+                                .map_err(|error| {
+                                    super::super::eval::common_type_error(error, "CASE")
+                                })?;
+                            needs_validation |=
+                                !crate::sql::types::builtin_implicit_cast(prev, next)
+                                    || !crate::sql::types::builtin_implicit_cast(t, next);
+                            next
+                        }
                     });
                 }
                 Ok(())
@@ -4140,22 +4165,25 @@ pub fn infer_type_res(
                 consider(result)?;
             }
             let ctype = acc.unwrap_or(ColType::Text);
-            for result in otherwise
-                .iter()
-                .copied()
-                .chain(whens.iter().map(|(_, result)| *result))
-            {
-                let type_oid = infer_routine_argument_oid(result, columns)?;
-                if type_oid != oid::UNKNOWN {
-                    let from = super::super::eval::constructor_type_from_oid(type_oid, &|oid| {
-                        columns.domain_base_type(oid)
-                    })
-                    .expect("validated CASE declaration");
-                    if !crate::sql::types::builtin_implicit_cast(from, ctype) {
-                        return Err(super::super::eval::common_type_error(
-                            crate::sql::types::CommonTypeError::Conversion { from, to: ctype },
-                            "CASE",
-                        ));
+            if needs_validation {
+                for result in otherwise
+                    .iter()
+                    .copied()
+                    .chain(whens.iter().map(|(_, result)| *result))
+                {
+                    let type_oid = infer_routine_argument_oid(result, columns)?;
+                    if type_oid != oid::UNKNOWN {
+                        let from =
+                            super::super::eval::constructor_type_from_oid(type_oid, &|oid| {
+                                columns.domain_base_type(oid)
+                            })
+                            .expect("validated CASE declaration");
+                        if !crate::sql::types::builtin_implicit_cast(from, ctype) {
+                            return Err(super::super::eval::common_type_error(
+                                crate::sql::types::CommonTypeError::Conversion { from, to: ctype },
+                                "CASE",
+                            ));
+                        }
                     }
                 }
             }
@@ -4782,6 +4810,13 @@ pub fn infer_type_res(
             // no float argument outranking it), else double; floor/ceil/trunc/
             // round/sign are numeric for a numeric argument and double
             // otherwise; mod returns the integer type of its arguments.
+            "log" if args.len() == 2 => {
+                let base_oid = |argument| -> Result<i32, SqlError> {
+                    let oid = infer_type_res(argument, columns)?.0;
+                    Ok(columns.domain_base_type(oid).map_or(oid, ColType::oid))
+                };
+                of(numeric_log_type(base_oid(args[0])?, base_oid(args[1])?)?)
+            }
             "sqrt" | "exp" | "ln" | "power" | "pow" | "log" | "log10" => {
                 let mut numeric = false;
                 let mut float = false;
@@ -4953,12 +4988,20 @@ pub fn infer_type_res(
             | "erf" | "erfc" | "gamma" | "lgamma" | "random_normal" | "pi" => of(ColType::Float8),
             "setseed" => of(ColType::Void),
             "bool_and" | "bool_or" | "every" => of(ColType::Bool),
-            // Bitwise aggregates preserve the argument's (integer or bit) type.
-            "bit_and" | "bit_or" | "bit_xor" => args
-                .first()
-                .map(|a| infer_type_res(a, columns))
-                .transpose()?
-                .unwrap_or(of(ColType::Int4)),
+            // PostgreSQL's bit aggregate overload returns bit, including
+            // varbit inputs; integer overloads retain their integer width.
+            "bit_and" | "bit_or" | "bit_xor" => {
+                let input = args
+                    .first()
+                    .map(|a| infer_type_res(a, columns))
+                    .transpose()?
+                    .unwrap_or(of(ColType::Int4));
+                if matches!(input.0, oid::BIT | oid::VARBIT) {
+                    of(ColType::Bit { varying: false })
+                } else {
+                    input
+                }
+            }
             // Single-argument variance/stddev mirror the input class: numeric for
             // integer/numeric inputs, double precision for float8 (PostgreSQL's
             // aggregate signatures).
@@ -5371,14 +5414,15 @@ pub fn infer_type_res(
             // Sequence functions return bigint.
             "nextval" | "currval" | "lastval" | "setval" => of(ColType::Int8),
             "date_trunc" => {
-                // Returns the timestamp type of its second argument.
+                // A date resolves through PostgreSQL's preferred timestamptz
+                // overload; timestamp and interval keep their own families.
                 let a = args
                     .get(1)
                     .map(|a| infer_type_res(a, columns))
                     .transpose()?
                     .map(|t| t.0);
                 match a {
-                    Some(oid::TIMESTAMPTZ) => of(ColType::Timestamptz),
+                    Some(oid::DATE | oid::TIMESTAMPTZ) => of(ColType::Timestamptz),
                     Some(oid::INTERVAL) => of(ColType::Interval),
                     _ => of(ColType::Timestamp),
                 }

@@ -5429,6 +5429,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cursor_common_type_widening_preserves_prior_builtin_conversions() {
+        for prior in ArrElem::BUILTIN.map(ArrElem::to_coltype) {
+            for next in ArrElem::BUILTIN.map(ArrElem::to_coltype) {
+                if prior == next || common_builtin_candidate(prior, next).ok() != Some(next) {
+                    continue;
+                }
+                for earlier in ArrElem::BUILTIN.map(ArrElem::to_coltype) {
+                    assert!(
+                        !builtin_implicit_cast(earlier, prior)
+                            || builtin_implicit_cast(earlier, next),
+                        "candidate widening lost conversion from {earlier:?} through {prior:?} to {next:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn typemod_encodes_postgres_exact_values() {
         // The values PostgreSQL 18.4 stores in pg_attribute, byte for byte.
         assert_eq!(TypeMod::Length(5).encode(), 9); // varchar(5)

@@ -489,8 +489,18 @@ impl<'a> RetainedSelect<'a> {
     ) -> Result<bool, SqlError> {
         if let RowBounds::Unstarted { limit, offset } = self.bounds {
             self.bounds = RowBounds::Active {
-                remaining: super::super::exec::eval_limit_pub(limit, work, params)?,
-                skip: super::super::exec::eval_offset_pub(offset, work, params)?,
+                skip: super::super::exec::eval_offset_pub(
+                    offset,
+                    work,
+                    params,
+                    &crate::sql::eval::NO_HOOKS,
+                )?,
+                remaining: super::super::exec::eval_limit_pub(
+                    limit,
+                    work,
+                    params,
+                    &crate::sql::eval::NO_HOOKS,
+                )?,
             };
         }
         if matches!(self.bounds, RowBounds::Active { remaining: 0, .. }) {

@@ -59,11 +59,18 @@ pub(crate) fn wire_column_description<'a>(
         return Ok(description);
     };
     let target = crate::storage::TypeDefinitionTarget::by_creation(
-        storage, crate::storage::NamedTypeKind::Domain, creation,
+        storage,
+        crate::storage::NamedTypeKind::Domain,
+        creation,
     )?;
-    let domain = storage.read_domain_definition(target, txid)?.ok_or_else(|| {
-        sql_err!(sqlstate::UNDEFINED_OBJECT, "output domain type no longer exists")
-    })?;
+    let domain = storage
+        .read_domain_definition(target, txid)?
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "output domain type no longer exists"
+            )
+        })?;
     description.type_oid = domain.base.oid();
     description.typlen = domain.base.typlen();
     description.type_mod = domain.base_type_mod;
@@ -1792,12 +1799,21 @@ pub(crate) fn enter_routine_parameter_types(
 ) -> Result<RoutineParameterScope, SqlError> {
     let mut current = RoutineParameterTypes::EMPTY;
     if arguments.len() > current.types.len() {
-        return Err(sql_err!(sqlstate::TOO_MANY_ARGUMENTS, "functions cannot have more than 100 arguments"));
+        return Err(sql_err!(
+            sqlstate::TOO_MANY_ARGUMENTS,
+            "functions cannot have more than 100 arguments"
+        ));
     }
     for (slot, argument) in arguments.iter().enumerate() {
         let type_oid = match argument.user_type {
-            Some(identity) => catalog.and_then(|catalog| catalog.declared_user_type_oid(argument.ctype, identity))
-                .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "routine parameter type no longer exists"))?,
+            Some(identity) => catalog
+                .and_then(|catalog| catalog.declared_user_type_oid(argument.ctype, identity))
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "routine parameter type no longer exists"
+                    )
+                })?,
             None => argument.ctype.oid(),
         };
         current.types[slot] = Some((type_oid, argument.ctype.typlen()));
@@ -2546,18 +2562,24 @@ fn record_shape_metadata_dyn(
                     _ => None,
                 };
                 if let Some(base) = expansion {
+                    let mut overflow = false;
                     let mut append = |_: &str, meta| {
                         if count < RECORD_FIELD_NAMES.len() {
                             visit(RECORD_FIELD_NAMES[count], meta);
                             count += 1;
+                        } else {
+                            overflow = true;
                         }
                     };
                     if record_shape_metadata_dyn(base, columns, &mut append)?.is_none() {
                         return Ok(None);
                     }
+                    if overflow {
+                        return Err(sql_err!(sqlstate::TOO_MANY_COLUMNS, "ROW expressions can have at most 1664 entries"));
+                    }
                 } else {
                     if count == RECORD_FIELD_NAMES.len() {
-                        return Ok(None);
+                        return Err(sql_err!(sqlstate::TOO_MANY_COLUMNS, "ROW expressions can have at most 1664 entries"));
                     }
                     let Some(metadata) = expression_static_metadata(arg, columns) else {
                         return Ok(None);
@@ -3492,9 +3514,7 @@ pub fn infer_type_res(
                     || error.sqlstate == sqlstate::UNDEFINED_TABLE =>
             {
                 match source {
-                    crate::sql::ast::ParameterSource::SqlRoutine => {
-                        routine_parameter_type(*index)
-                    }
+                    crate::sql::ast::ParameterSource::SqlRoutine => routine_parameter_type(*index),
                     crate::sql::ast::ParameterSource::PlpgsqlCursor => {
                         bound_parameter_type_oid(*index)
                             .map(|oid| (oid, coltype_of_oid(oid).map_or(-1, ColType::typlen)))
@@ -3960,6 +3980,8 @@ pub fn infer_type_res(
         Expr::Cast {
             operand, type_name, ..
         } => {
+            // A target type does not make an invalid source expression valid.
+            infer_type_res(operand, columns)?;
             if let Some(target @ (ColType::Int2 | ColType::Int2Vector | ColType::OidVector)) =
                 ColType::from_sql_name(type_name)
             {

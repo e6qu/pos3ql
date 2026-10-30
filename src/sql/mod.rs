@@ -13407,7 +13407,8 @@ impl Engine {
             Err(error) => return Ok(Err(error)),
         };
         let _formal_scope = match exec::enter_routine_parameter_types(
-            routine.arguments(), Some(&query::storage_catalog(&self.storage, arena, txn.txid)),
+            routine.arguments(),
+            Some(&query::storage_catalog(&self.storage, arena, txn.txid)),
         ) {
             Ok(scope) => scope,
             Err(error) => return Ok(Err(error)),
@@ -13826,11 +13827,12 @@ impl Engine {
                 }
             };
             let _formal_scope = match exec::enter_routine_parameter_types(
-            routine.arguments(), Some(&query::storage_catalog(&self.storage, arena, txn.txid)),
-        ) {
-            Ok(scope) => scope,
-            Err(error) => return Ok(Err(error)),
-        };
+                routine.arguments(),
+                Some(&query::storage_catalog(&self.storage, arena, txn.txid)),
+            ) {
+                Ok(scope) => scope,
+                Err(error) => return Ok(Err(error)),
+            };
             return Ok(exec::execute_plpgsql_table_function(
                 self, txn, sqlprep, cursors, guc, &routine, &*inputs, arena, responder,
             ));
@@ -13880,7 +13882,8 @@ impl Engine {
             *argument = exec::decode_projected_pub(pending.arguments, index);
         }
         let _formal_scope = match exec::enter_routine_parameter_types(
-            routine.arguments(), Some(&query::storage_catalog(&self.storage, arena, txn.txid)),
+            routine.arguments(),
+            Some(&query::storage_catalog(&self.storage, arena, txn.txid)),
         ) {
             Ok(scope) => scope,
             Err(error) => return Ok(Err(error)),
@@ -14682,7 +14685,8 @@ impl Engine {
         }
         let body = routine.body;
         let _formal_scope = match exec::enter_routine_parameter_types(
-            routine.arguments(), Some(&query::storage_catalog(&self.storage, arena, txn.txid)),
+            routine.arguments(),
+            Some(&query::storage_catalog(&self.storage, arena, txn.txid)),
         ) {
             Ok(scope) => scope,
             Err(error) => return Ok(Err(error)),

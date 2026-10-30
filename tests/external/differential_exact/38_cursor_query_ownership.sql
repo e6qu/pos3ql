@@ -133,6 +133,7 @@ SELECT (ROW(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 2
 
 -- USING values carry the expression's type, including NULL, independently of
 -- the enclosing routine's arguments. Dynamic SQL cannot see its local names.
+-- Utility EXECUTE arguments do not accept SPI parameters (PostgreSQL 18.6).
 CREATE FUNCTION cursor_dynamic_null(p integer) RETURNS refcursor LANGUAGE plpgsql AS $$
 DECLARE c refcursor := 'dynamic_null'; d date;
 BEGIN
@@ -211,3 +212,5 @@ CLOSE dynamic_domain;
 COMMIT;
 DROP FUNCTION cursor_dynamic_domain(cursor_argument_day);
 DROP DOMAIN cursor_argument_day;
+
+SELECT (ROW(1)).missing::integer;

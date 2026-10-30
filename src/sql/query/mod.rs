@@ -1841,7 +1841,8 @@ impl StorageCatalog<'_, '_, '_, '_> {
                 "PL/pgSQL functions require a resumable query executor"
             ));
         }
-        let _formal_scope = super::exec::enter_routine_parameter_types(routine.arguments(), Some(self))?;
+        let _formal_scope =
+            super::exec::enter_routine_parameter_types(routine.arguments(), Some(self))?;
         let function_program = parse_stored_routine_function_program(
             routine.body_kind,
             routine.body.as_str(),

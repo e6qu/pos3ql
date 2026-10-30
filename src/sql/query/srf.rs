@@ -4983,7 +4983,8 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
             let value = crate::sql::eval::eval_full(expression, arena, params, columns, &hooks)?;
             routine_params[input_index] = crate::sql::eval::cast_to(value, parameter.ctype, arena)?;
         }
-        let _formal_scope = crate::sql::exec::enter_routine_parameter_types(routine.arguments(), hooks.catalog)?;
+        let _formal_scope =
+            crate::sql::exec::enter_routine_parameter_types(routine.arguments(), hooks.catalog)?;
         let owner = crate::storage::SessionIdentity::bound(
             storage.capture_role_slot(routine.ownership.owner_to(txid).into(), txid)?,
         );

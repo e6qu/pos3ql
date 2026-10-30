@@ -151,6 +151,7 @@ pub mod sqlstate {
     pub const INVALID_NAME: &str = "42602";
     pub const UNDEFINED_COLUMN: &str = "42703";
     pub const UNDEFINED_TABLE: &str = "42P01";
+    pub const UNDEFINED_PARAMETER: &str = "42P02";
     pub const DUPLICATE_TABLE: &str = "42P07";
     pub const DUPLICATE_SCHEMA: &str = "42P06";
     pub const INSUFFICIENT_PRIVILEGE: &str = "42501";
@@ -2420,7 +2421,7 @@ fn eval_full_inner<'a>(
             {
                 params.get(index as usize - 1).copied().ok_or_else(|| {
                     sql_err!(
-                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        sqlstate::UNDEFINED_PARAMETER,
                         "there is no parameter ${}",
                         index
                     )
@@ -2448,7 +2449,7 @@ fn eval_full_inner<'a>(
         } => row.recursive_state(qualifier, index as usize),
         Expr::Param(n) => params.get(n as usize - 1).copied().ok_or_else(|| {
             sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
+                sqlstate::UNDEFINED_PARAMETER,
                 "there is no parameter ${}",
                 n
             )

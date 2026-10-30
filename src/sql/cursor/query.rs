@@ -400,7 +400,8 @@ mod tests {
             user_type: None,
         }];
         crate::mem::guard::forbid_alloc(|| {
-            let _formal_scope = crate::sql::exec::enter_routine_parameter_types(&formal, None).unwrap();
+            let _formal_scope =
+                crate::sql::exec::enter_routine_parameter_types(&formal, None).unwrap();
             assert_eq!(
                 crate::sql::exec::bound_parameter_type_oid(1),
                 Some(oid::INT4)
@@ -476,8 +477,9 @@ mod tests {
             assert_eq!(bound_parameter_type_oid(1), Some(oid::DATE));
         });
         let source = vec![oid::DATE];
-        let escaped =
-            with_bound_parameter_types(&source, || enter_routine_parameter_types(&formal, None).unwrap());
+        let escaped = with_bound_parameter_types(&source, || {
+            enter_routine_parameter_types(&formal, None).unwrap()
+        });
         drop(source);
         drop(escaped);
         assert_eq!(bound_parameter_type_oid(1), None);
@@ -507,11 +509,62 @@ mod tests {
     }
     #[test]
     fn cursor_owned_query_retains_domain_parameter_identity_without_borrowing_catalog() {
-        use crate::sql::exec::{bound_parameter_type_oid, enter_routine_parameter_types, with_bound_parameter_types};
+        use crate::sql::exec::{
+            bound_parameter_type_oid, enter_routine_parameter_types, with_bound_parameter_types,
+        };
         use crate::sql::types::{ColType, oid};
         struct DomainCatalog;
         impl crate::sql::eval::CatalogAccess for DomainCatalog {
-            fn declared_user_type_oid(&self, ctype: ColType, identity: crate::storage::UserTypeName) -> Option<i32> {
+            fn relation_is_visible(&self, _: i32) -> Option<bool> {
+                unreachable!()
+            }
+
+            fn type_is_visible(&self, _: i32) -> Option<bool> {
+                unreachable!()
+            }
+
+            fn function_is_visible(&self, _: i32) -> Option<bool> {
+                unreachable!()
+            }
+
+            fn collation_is_visible(&self, _: i32) -> Option<bool> {
+                unreachable!()
+            }
+
+            fn relation_is_publishable(&self, _: i32) -> Option<bool> {
+                unreachable!()
+            }
+
+            fn index_def<'a>(&self, _: i32, _: i32, _: bool, _: &'a Arena) -> Result<Option<&'a str>, SqlError> {
+                unreachable!()
+            }
+
+            fn constraint_def<'a>(&self, _: i32, _: &'a Arena) -> Result<Option<&'a str>, SqlError> {
+                unreachable!()
+            }
+
+            fn partition_key_def<'a>(&self, _: i32, _: &'a Arena) -> Result<Option<&'a str>, SqlError> {
+                unreachable!()
+            }
+
+            fn relname<'a>(&self, _: i32, _: &'a Arena) -> Result<Option<&'a str>, SqlError> {
+                unreachable!()
+            }
+
+            fn reloid(&self, _: &str) -> Result<Option<i32>, SqlError> {
+                unreachable!()
+            }
+
+            fn comment<'a>(&self, _: crate::sql::eval::DescriptionTarget<'_>, _: u32, _: &'a Arena) -> Result<Option<&'a str>, SqlError> {
+                unreachable!()
+            }
+
+
+            fn declared_user_type_oid(
+                &self,
+                ctype: ColType,
+                identity: crate::storage::UserTypeName,
+            ) -> Option<i32> {
                 assert_eq!(ctype, ColType::Date);
                 assert_eq!(identity.name.as_str(), "cursor_day");
                 Some(123456)
@@ -521,7 +574,8 @@ mod tests {
             name: SqlName::parse("p").unwrap(),
             ctype: ColType::Date,
             user_type: Some(crate::storage::UserTypeName::declaration(
-                SqlName::parse("public").unwrap(), SqlName::parse("cursor_day").unwrap(),
+                SqlName::parse("public").unwrap(),
+                SqlName::parse("cursor_day").unwrap(),
             )),
         }];
         let mut budget = Budget::new(16 << 10);
@@ -536,20 +590,52 @@ mod tests {
                 query.bind("SELECT $1", &[Datum::Null], &[]).unwrap();
                 drop(scope);
                 assert_eq!(bound_parameter_type_oid(1), Some(oid::INT4));
-                let error = enter_routine_parameter_types(&formal, None).err().expect("missing declared type");
+                let error = enter_routine_parameter_types(&formal, None)
+                    .err()
+                    .expect("missing declared type");
                 assert_eq!(error.sqlstate, sqlstate::UNDEFINED_OBJECT);
                 assert_eq!(bound_parameter_type_oid(1), Some(oid::INT4));
                 let too_many = [formal[0]; 101];
-                let error = enter_routine_parameter_types(&too_many, Some(&DomainCatalog)).err().expect("argument limit");
+                let error = enter_routine_parameter_types(&too_many, Some(&DomainCatalog))
+                    .err()
+                    .expect("argument limit");
                 assert_eq!(error.sqlstate, sqlstate::TOO_MANY_ARGUMENTS);
                 assert_eq!(bound_parameter_type_oid(1), Some(oid::INT4));
             });
-            query.with_query(|_, params, _| {
-                assert_eq!(params[0], Datum::Null);
-                assert_eq!(bound_parameter_type_oid(1), Some(123456));
-            }).unwrap();
+            query
+                .with_query(|_, params, _| {
+                    assert_eq!(params[0], Datum::Null);
+                    assert_eq!(bound_parameter_type_oid(1), Some(123456));
+                })
+                .unwrap();
         });
         assert_eq!(bound_parameter_type_oid(1), None);
+    }
+    #[test]
+    fn cursor_owned_query_record_expansion_checks_the_complete_field_count() {
+        let mut budget = Budget::new(2 << 20);
+        let mut query = CursorQuery::new(&mut budget, 2 << 20).unwrap();
+        for fields in [crate::sql::MAX_PROJ - 1, crate::sql::MAX_PROJ] {
+            let values = vec!["1"; fields].join(",");
+            let sql = format!("SELECT ROW((ROW({values})).*, 1)");
+            crate::mem::guard::forbid_alloc(|| {
+                query.bind(&sql, &[], &[]).unwrap();
+                query.with_query(|statement, _, _| {
+                    let CursorStatement::Select(select) = statement else { panic!("SELECT") };
+                    let crate::sql::ast::SelectItem::Expr { expression, .. } = select.items[0] else { panic!("expression") };
+                    let mut visited = 0;
+                    let result = crate::sql::exec::record_shape_metadata(expression, &crate::sql::exec::NoCols, |_, _| { visited += 1; });
+                    assert_eq!(visited, crate::sql::MAX_PROJ);
+                    if fields == crate::sql::MAX_PROJ {
+                        let error = result.unwrap_err();
+                        assert_eq!(error.sqlstate, sqlstate::TOO_MANY_COLUMNS);
+                        assert_eq!(error.message.as_str(), "ROW expressions can have at most 1664 entries");
+                    } else {
+                        assert_eq!(result.unwrap(), Some(crate::sql::MAX_PROJ));
+                    }
+                }).unwrap();
+            });
+        }
     }
 
 }

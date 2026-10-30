@@ -57,6 +57,7 @@ fn measure() -> Result<(), Box<dyn std::error::Error>> {
     }
     std::fs::create_dir(&config.data_dir)?;
     let mut budget = Budget::new(reserved);
+    budget.observe_draws(|component, bytes| eprintln!("budget-draw\t{bytes}\t{component}"));
     let started = std::time::Instant::now();
     let engine = Engine::new(&config, &mut budget)?;
     let elapsed = started.elapsed().as_micros();

@@ -21,11 +21,47 @@ use super::{
     validate_bits,
 };
 
-/// Text comparison is a distinct choke point because byte ordering is correct
-/// only for bytewise collations. The default identity always delegates to the
-/// startup-owned comparator instead of the process-global locale.
+/// Only ordering and equality can enter the collated comparator. Quantified
+/// LIKE/ILIKE expressions use pattern evaluation instead.
+#[derive(Clone, Copy)]
+pub(crate) enum Comparison {
+    Equal,
+    NotEqual,
+    Less,
+    LessEqual,
+    Greater,
+    GreaterEqual,
+}
+
+impl Comparison {
+    pub(crate) fn from_binary(operator: BinaryOp) -> Option<Self> {
+        Some(match operator {
+            BinaryOp::Eq => Self::Equal,
+            BinaryOp::NotEq => Self::NotEqual,
+            BinaryOp::Lt => Self::Less,
+            BinaryOp::LtEq => Self::LessEqual,
+            BinaryOp::Gt => Self::Greater,
+            BinaryOp::GtEq => Self::GreaterEqual,
+            _ => return None,
+        })
+    }
+
+    fn binary(self) -> BinaryOp {
+        match self {
+            Self::Equal => BinaryOp::Eq,
+            Self::NotEqual => BinaryOp::NotEq,
+            Self::Less => BinaryOp::Lt,
+            Self::LessEqual => BinaryOp::LtEq,
+            Self::Greater => BinaryOp::Gt,
+            Self::GreaterEqual => BinaryOp::GtEq,
+        }
+    }
+}
+
+/// Byte ordering is correct only for bytewise collations. The default identity
+/// delegates to the startup-owned comparator, not the process-global locale.
 pub(crate) fn compare_text_collated<'a>(
-    operator: BinaryOp,
+    operator: Comparison,
     l: Datum<'a>,
     r: Datum<'a>,
     l_unknown: bool,
@@ -45,7 +81,7 @@ pub(crate) fn compare_text_collated<'a>(
         }
         (Datum::Bpchar(left), Datum::Text(right)) => (left.trim_end_matches(' '), right),
         (Datum::Text(left), Datum::Bpchar(right)) => (left, right.trim_end_matches(' ')),
-        _ => return compare(operator, l, r, false, false),
+        _ => return compare(operator.binary(), l, r, false, false),
     };
     let ordering = match collation {
         Collation::None
@@ -63,13 +99,12 @@ pub(crate) fn compare_text_collated<'a>(
             .compare_text(collation, left, right)?,
     };
     let out = match operator {
-        BinaryOp::Eq => ordering.is_eq(),
-        BinaryOp::NotEq => ordering.is_ne(),
-        BinaryOp::Lt => ordering.is_lt(),
-        BinaryOp::LtEq => ordering.is_le(),
-        BinaryOp::Gt => ordering.is_gt(),
-        BinaryOp::GtEq => ordering.is_ge(),
-        _ => unreachable!(),
+        Comparison::Equal => ordering.is_eq(),
+        Comparison::NotEqual => ordering.is_ne(),
+        Comparison::Less => ordering.is_lt(),
+        Comparison::LessEqual => ordering.is_le(),
+        Comparison::Greater => ordering.is_gt(),
+        Comparison::GreaterEqual => ordering.is_ge(),
     };
     Ok(Datum::Bool(out))
 }

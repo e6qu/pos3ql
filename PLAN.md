@@ -43,12 +43,18 @@ errors and argument effects with PostgreSQL, including seeded hashes.
 Registered routine identities, aggregate kinds and null-call properties must
 match the live reference catalog even while missing routines are being added.
 Run real SQLAlchemy, Alembic and psycopg2 workflows against both servers.
+Relation names converted through `regclass` must remain resolvable outside the
+search path, including quoted names and indexes. Catalog vectors must preserve
+their element types and zero-based bounds through array functions used by
+schema inspection. Quantified pattern matching must use pattern semantics.
 Measure startup reservations and actual resident memory for empty and populated
 embedded databases; report the per-table contribution separately. Remove
 avoidable per-table row/history reservations through shared startup-owned
 capacity, preserving stable reader identities, rollback and named exhaustion.
 Reserve needed row history before the durable commit boundary; a smaller shared
 pool must never fail for capacity after the commit is already durable.
+Reject per-row history exhaustion before writing the commit too; a multirow
+transaction must leave every row unchanged and keep the server usable on error.
 Include the current execution-stack requirement in embedded measurements and
 reduce avoidable wide construction frames alongside table and history metadata.
 

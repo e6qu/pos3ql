@@ -10,6 +10,7 @@ use std::fmt;
 pub struct Budget {
     total: usize,
     used: usize,
+    observer: Option<fn(&'static str, usize)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,7 +35,17 @@ impl std::error::Error for BudgetError {}
 
 impl Budget {
     pub fn new(total: usize) -> Self {
-        Self { total, used: 0 }
+        Self {
+            total,
+            used: 0,
+            observer: None,
+        }
+    }
+
+    /// Report successful startup reservations to an explicitly installed
+    /// observer. Rejected reservations emit no event.
+    pub fn observe_draws(&mut self, observer: fn(&'static str, usize)) {
+        self.observer = Some(observer);
     }
 
     /// Reserves `bytes` for the component named `what`.
@@ -49,6 +60,9 @@ impl Budget {
             });
         }
         self.used += bytes;
+        if let Some(observer) = self.observer {
+            observer(what, bytes);
+        }
         Ok(())
     }
 
@@ -112,5 +126,26 @@ mod tests {
         let mut b = Budget::new(100);
         let err = b.draw_array(usize::MAX, 2, "huge").unwrap_err();
         assert_eq!(err.what, "huge");
+    }
+
+    #[test]
+    fn observer_reports_only_successful_reservations() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static EVENTS: AtomicUsize = AtomicUsize::new(0);
+        static BYTES: AtomicUsize = AtomicUsize::new(0);
+        let mut budget = Budget::new(100);
+        budget.draw(10, "before observer").unwrap();
+        budget.observe_draws(|name, bytes| {
+            assert_eq!(name, "observed");
+            EVENTS.fetch_add(1, Ordering::Relaxed);
+            BYTES.fetch_add(bytes, Ordering::Relaxed);
+        });
+        budget.draw(60, "observed").unwrap();
+        assert!(budget.draw(31, "rejected").is_err());
+        assert!(budget.draw_array(usize::MAX, 2, "overflow").is_err());
+        budget.draw(30, "observed").unwrap();
+        assert_eq!(EVENTS.load(Ordering::Relaxed), 2);
+        assert_eq!(BYTES.load(Ordering::Relaxed), 90);
+        assert_eq!(budget.used(), 100);
     }
 }

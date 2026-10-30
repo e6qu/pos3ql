@@ -5521,6 +5521,15 @@ impl Engine {
             self.rollback_txn(txn, guc);
             return Err(error);
         }
+        if let Err(error) = self.storage.validate_row_history_publication(
+            txn.txid,
+            txn.touched()
+                .iter()
+                .map(|&(table, rowid, _)| (table as usize, rowid)),
+        ) {
+            self.rollback_txn(txn, guc);
+            return Err(error);
+        }
         let catalog_publication = if self.commit_progress == CommitProgressMode::Reactor
             || self.commit_queue.is_some()
             || matches!(target, txn::CommitTarget::Prepare { .. })

@@ -2211,15 +2211,8 @@ fn eval_binary_expression<'a>(
         right,
         search_catalog,
     } = expression;
-    let comparison_collation = if matches!(
-        operator,
-        BinaryOp::Eq
-            | BinaryOp::NotEq
-            | BinaryOp::Lt
-            | BinaryOp::LtEq
-            | BinaryOp::Gt
-            | BinaryOp::GtEq
-    ) {
+    let comparison = operators::Comparison::from_binary(operator);
+    let comparison_collation = if comparison.is_some() {
         Some(resolve_comparison_collation(
             left,
             right,
@@ -2278,7 +2271,7 @@ fn eval_binary_expression<'a>(
     } else {
         (l, r)
     };
-    if let Some(collation) = comparison_collation
+    if let (Some(comparison), Some(collation)) = (comparison, comparison_collation)
         && matches!(
             (&l, &r),
             (
@@ -2288,7 +2281,7 @@ fn eval_binary_expression<'a>(
         )
     {
         return compare_text_collated(
-            operator,
+            comparison,
             l,
             r,
             left_unknown,
@@ -3922,14 +3915,16 @@ fn quantified_scalar<'a>(
     arena: &'a Arena,
 ) -> Result<Datum<'a>, SqlError> {
     let (left, right) = operators::coerce_comparison_text(left, right, false, false, arena)?;
-    if matches!(
-        (&left, &right),
-        (
-            Datum::Text(_) | Datum::Bpchar(_),
-            Datum::Text(_) | Datum::Bpchar(_)
+    if let Some(comparison) = operators::Comparison::from_binary(operator)
+        && matches!(
+            (&left, &right),
+            (
+                Datum::Text(_) | Datum::Bpchar(_),
+                Datum::Text(_) | Datum::Bpchar(_)
+            )
         )
-    ) {
-        compare_text_collated(operator, left, right, false, false, collation, catalog)
+    {
+        compare_text_collated(comparison, left, right, false, false, collation, catalog)
     } else {
         binary(operator, left, right, false, false, arena)
     }
@@ -5107,10 +5102,10 @@ fn call<'a>(
                     "set-returning function called where not allowed"
                 )
             })?;
+            if let Some(input) = super::array::Input::from_datum(a) {
+                return Ok(input.get(k - 1).unwrap_or(Datum::Null));
+            }
             match a {
-                Datum::Array { element, raw } => {
-                    Ok(super::array::get(raw, element, k - 1).unwrap_or(Datum::Null))
-                }
                 Datum::Multirange { text, kind } => Ok(
                     if let Some(component) = crate::sql::range::component_at(text, k - 1)? {
                         Datum::Range {
@@ -5377,15 +5372,11 @@ fn call<'a>(
             if !(2..=3).contains(&args.len()) {
                 return Err(arity_err(name, args.len()));
             }
-            let raw = match eval_full(args[0], arena, params, row, hooks)? {
-                Datum::Array { raw, .. } => raw,
+            let input = match eval_full(args[0], arena, params, row, hooks)? {
                 Datum::Null => return Ok(Datum::Null),
-                other => {
-                    return Err(type_mismatch(
-                        "generate_subscripts requires an array",
-                        &other,
-                    ));
-                }
+                value => super::array::Input::from_datum(value).ok_or_else(|| {
+                    type_mismatch("generate_subscripts requires an array", &value)
+                })?,
             };
             let dim = match eval_full(args[1], arena, params, row, hooks)? {
                 Datum::Int2(v) => v as i64,
@@ -5420,11 +5411,10 @@ fn call<'a>(
                 false
             };
             let dimension = usize::try_from(dim).ok().and_then(|dim| dim.checked_sub(1));
-            let shape = super::array::shape(raw).expect("array datum invariant");
             let Some(dimension) = dimension else {
                 return Ok(Datum::Null);
             };
-            let Some(length) = shape.dimension(dimension) else {
+            let Some((length, lower, upper)) = input.bounds(dimension)? else {
                 return Ok(Datum::Null);
             };
             if k > length {
@@ -5432,9 +5422,9 @@ fn call<'a>(
             }
             let offset = i32::try_from(k - 1).expect("array dimension fits i32");
             let subscript = if reverse {
-                shape.upper_bound(dimension).expect("known dimension") - offset
+                upper - offset
             } else {
-                shape.lower_bound(dimension).expect("known dimension") + offset
+                lower + offset
             };
             Ok(Datum::Int4(subscript))
         }

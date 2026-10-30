@@ -13,10 +13,12 @@ concurrency:
 
 jobs:
   reactor-ownership:
-    name: native build (${{ matrix.platform }})
+    name: native ${{ matrix.check }} (${{ matrix.platform }})
     strategy:
       fail-fast: false
       matrix:
+        platform: [Linux arm64, macOS arm64]
+        check: [build and test, lint]
         include:
           - platform: Linux arm64
             runner: ubuntu-24.04-arm
@@ -26,6 +28,8 @@ jobs:
             target: aarch64-apple-darwin
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 15
+    env:
+      NATIVE_TARGET: ${{ matrix.target }}
     steps:
       - uses: actions/checkout@v5
 
@@ -35,7 +39,7 @@ jobs:
 
       - name: Verify native compiler target
         env:
-          EXPECTED_TARGET: ${{ matrix.target }}
+          EXPECTED_TARGET: ${{ env.NATIVE_TARGET }}
         run: |
           test "$(rustc -vV | sed -n 's/^host: //p')" = "$EXPECTED_TARGET"
 
@@ -48,18 +52,21 @@ jobs:
           key: ${{ runner.os }}-${{ runner.arch }}-native-dependencies-${{ hashFiles('Cargo.lock') }}
 
       - name: Build all native targets
-        run: cargo build --all-targets --locked --target '${{ matrix.target }}'
+        if: ${{ matrix.check == 'build and test' }}
+        run: cargo build --all-targets --locked --target "$NATIVE_TARGET"
 
       - name: Socket readiness and allocation-free catalog publication
+        if: ${{ matrix.check == 'build and test' }}
         run: >-
-          cargo test --lib --locked --target '${{ matrix.target }}' -- io:: mem::mutex::tests type_ domain_ enum_ composite_ table_name catalog_creation_
+          cargo test --lib --locked --target "$NATIVE_TARGET" -- io:: mem::mutex::tests type_ domain_ enum_ composite_ table_name catalog_creation_
           timezone_abbreviation_ fixed_default_abbreviations_ degree_special_and_random_math_
           maintenance_metadata_ cleanup_download_overlap_ object_store::http::tests::
           reader_scratch_is_synchronized_and_startup_bounded database_default_collation_is_bounded_
           --test-threads=1
 
       - name: Native allocation-free boundaries
-        run: cargo clippy --all-targets --locked --target '${{ matrix.target }}' -- -D warnings
+        if: ${{ matrix.check == 'lint' }}
+        run: cargo clippy --all-targets --locked --target "$NATIVE_TARGET" -- -D warnings
 
   macos-lock-ownership:
     name: macOS mutex ownership

@@ -155,6 +155,8 @@ The helper uses the same explicit 128 MiB virtual stack reservation as the
 server and native tests; ordinary operating-system thread defaults are not the
 current execution contract. Peak resident memory includes the pages actually
 touched. The debug-build helper records this stack size with each sample.
+It also records each successful named startup reservation, so a large fixed
+cost can be traced to its owning pool rather than inferred from total memory.
 
 Capacity is the smallest applicable bound, not just the size of the bucket:
 

@@ -17,6 +17,85 @@ const MAGIC: [u8; 4] = *b"AR01";
 const PREFIX: usize = 7;
 pub const EMPTY: &[u8] = b"AR01\x00\x00\x00";
 
+/// PostgreSQL's array inputs include catalog vectors with zero-based bounds.
+/// This view reads their native bytes without copying a vector per output row.
+#[derive(Clone, Copy)]
+pub(crate) enum Input<'a> {
+    Array { element: ArrElem, raw: &'a [u8] },
+    Int2Vector { raw: &'a [u8], lower: i32 },
+    OidVector { raw: &'a [u8], lower: i32 },
+}
+
+impl<'a> Input<'a> {
+    pub(crate) fn from_datum(value: Datum<'a>) -> Option<Self> {
+        match value {
+            Datum::Array { element, raw } => Some(Self::Array { element, raw }),
+            Datum::Int2Vector { raw, lower_bound } => Some(Self::Int2Vector {
+                raw,
+                lower: lower_bound,
+            }),
+            Datum::OidVector { raw, lower_bound } => Some(Self::OidVector {
+                raw,
+                lower: lower_bound,
+            }),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn element_count(self) -> usize {
+        match self {
+            Self::Array { raw, .. } => len(raw),
+            Self::Int2Vector { raw, .. } => raw.len() / 2,
+            Self::OidVector { raw, .. } => raw.len() / 4,
+        }
+    }
+
+    pub(crate) fn get(self, index: usize) -> Option<Datum<'a>> {
+        match self {
+            Self::Array { element, raw } => get(raw, element, index),
+            Self::Int2Vector { raw, .. } => {
+                let start = index.checked_mul(2)?;
+                Some(Datum::Int2(i16::from_le_bytes(
+                    raw.get(start..start.checked_add(2)?)?.try_into().ok()?,
+                )))
+            }
+            Self::OidVector { raw, .. } => {
+                let start = index.checked_mul(4)?;
+                Some(Datum::Oid(u32::from_le_bytes(
+                    raw.get(start..start.checked_add(4)?)?.try_into().ok()?,
+                )))
+            }
+        }
+    }
+
+    pub(crate) fn bounds(self, dimension: usize) -> Result<Option<(usize, i32, i32)>, SqlError> {
+        let lower = match self {
+            Self::Array { raw, .. } => {
+                let shape = shape(raw).ok_or_else(invalid_shape)?;
+                return Ok(shape.dimension(dimension).map(|length| {
+                    (
+                        length,
+                        shape.lower_bound(dimension).expect("known array dimension"),
+                        shape
+                            .upper_bound(dimension)
+                            .expect("validated array bounds"),
+                    )
+                }));
+            }
+            Self::Int2Vector { lower, .. } | Self::OidVector { lower, .. } if dimension == 0 => {
+                lower
+            }
+            _ => return Ok(None),
+        };
+        let length = self.element_count();
+        let upper = i32::try_from(length)
+            .ok()
+            .and_then(|length| lower.checked_add(length - 1))
+            .ok_or_else(array_too_large)?;
+        Ok(Some((length, lower, upper)))
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Shape {
     dimensions: [u16; MAX_DIMENSIONS],

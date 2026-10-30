@@ -7,10 +7,12 @@
 use super::*;
 use crate::mem::mutex::Mutex;
 
+mod client_catalog;
 mod cursor_execution;
 mod key_preparation;
 mod object_reads;
 mod query_execution;
+mod row_history;
 mod row_layout;
 mod table_publication;
 mod transaction_publication;

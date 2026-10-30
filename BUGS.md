@@ -19,10 +19,14 @@ Keep actual client-generated SQL and migration failures as regressions; preserve
 psycopg2, SQLAlchemy and Alembic transcripts against the PostgreSQL reference.
 Check catalog-character comparisons with text arrays and schema-qualified outer
 references, including their types, collations and alias errors.
+Keep catalog-vector array functions, relation-name round trips and quantified
+pattern matching in the reference comparisons used by actual applications.
 Memory comparisons must separate configured reservations, drawn startup budget
 and measured process memory; retain both transaction modes and the revision.
 The live built-in inventory must reject wrong properties for registered routines;
 missing catalog entries remain an explicit completion gap in PLAN.md.
+Reproduce history exhaustion with an older reader and a multirow write; assert
+that rejected commits do not advance durable state or partially change rows.
 Preserve failed outputs and diagnostics before removing temporary fixtures.
 Check native Linux amd64, Linux arm64 and macOS arm64 builds when changing C
 interfaces; a passing build on one target does not establish another's ABI.

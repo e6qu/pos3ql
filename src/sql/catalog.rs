@@ -11735,44 +11735,44 @@ pub fn relname_text<'a>(
     oid: i32,
     arena: &'a Arena,
 ) -> Result<Option<&'a str>, SqlError> {
+    let reference = |schema: &str, name: &str| {
+        let mut output = StackStr::<260>::new();
+        if relation_oid_for_name(storage, txid, None, name) != Some(oid) {
+            write_identifier(&mut output, schema);
+            let _ = output.write_char('.');
+        }
+        write_identifier(&mut output, name);
+        arena
+            .alloc_str(output.as_str())
+            .map(Some)
+            .map_err(|_| arena_full())
+    };
     if let Some(name) = catalog_relation_name(oid) {
-        return arena.alloc_str(name).map(Some).map_err(|_| arena_full());
+        return reference("pg_catalog", name);
     }
     if let Some(slot) = table_slot_by_oid(storage, txid, oid) {
-        return arena
-            .alloc_str(storage.table_def(slot, txid).name.as_str())
-            .map(Some)
-            .map_err(|_| arena_full());
+        let table = storage.table_def(slot, txid);
+        return reference(table.schema.as_str(), table.name.as_str());
     }
     if let Some(slot) = sequence_slot_by_oid(storage, txid, oid) {
-        return arena
-            .alloc_str(storage.sequence_for(slot, txid).name.as_str())
-            .map(Some)
-            .map_err(|_| arena_full());
+        let sequence = storage.sequence_for(slot, txid);
+        return reference(sequence.schema.as_str(), sequence.name.as_str());
     }
     if let Some(slot) = view_slot_by_oid(storage, txid, oid) {
-        return arena
-            .alloc_str(storage.view(slot).name_for(txid).as_str())
-            .map(Some)
-            .map_err(|_| arena_full());
+        let view = storage.view(slot);
+        return reference(view.schema_for(txid).as_str(), view.name_for(txid).as_str());
     }
     for (slot, composite) in storage.composites_with_slots_visible_to(txid) {
         if named_composite_relation_oid(storage, slot) == oid {
-            return arena
-                .alloc_str(composite.name.as_str())
-                .map(Some)
-                .map_err(|_| arena_full());
+            return reference(composite.schema.as_str(), composite.name.as_str());
         }
     }
     // Other relation families were resolved above. Index names are copied
     // directly, without constructing catalog rows.
     if oid >= crate::storage::FIRST_IMPLICIT_INDEX_OID
-        && let Some((_, name)) = index_identity_by_oid(storage, txid, oid)
+        && let Some((schema, name)) = index_identity_by_oid(storage, txid, oid)
     {
-        return arena
-            .alloc_str(name.as_str())
-            .map(Some)
-            .map_err(|_| arena_full());
+        return reference(schema.as_str(), name.as_str());
     }
     Ok(None)
 }

@@ -71,8 +71,8 @@ explicit policy decision and memory-accounting review.
 
 Use the Rust toolchain exercised by CI. PostgreSQL 18 supplies reference results;
 external suites also use Python 3, Docker, and the client tools installed by
-the workflow that owns the check. The release target is Linux x86-64; the event
-loop also contains macOS support. See `Cargo.toml`, `examples/dev.conf`, and
+the workflow that owns the check. Native build, lint and boundary checks cover
+Linux amd64, Linux arm64 and macOS arm64. See `Cargo.toml`, `examples/dev.conf`, and
 `.github/workflows/` for the actual build and environment definitions.
 
 SQL test harnesses prepare their Python clients with

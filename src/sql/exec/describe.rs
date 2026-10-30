@@ -5121,6 +5121,8 @@ pub fn infer_type_res(
                 {
                     Some(o) => match coltype_of_oid(o) {
                         Some(ColType::Array(element)) => of(element.to_coltype()),
+                        Some(ColType::Int2Vector) => of(ColType::Int2),
+                        Some(ColType::OidVector) => of(ColType::Oid),
                         Some(ColType::Multirange(kind)) => of(ColType::Range(kind)),
                         _ => of(ColType::Text),
                     },

@@ -1774,12 +1774,12 @@ fn srf_count_positional<'a, R: ColumnLookup<'a>>(
                 "generate_subscripts(...) argument count"
             ));
         }
-        let raw = match crate::sql::eval::text_view(eval_full(args[0], arena, params, row, hooks)?)
-        {
-            Datum::Array { raw, .. } => raw,
-            Datum::Null => return Ok(0),
-            _ => return Err(srf_signature_error(name)),
-        };
+        let input =
+            match crate::sql::eval::text_view(eval_full(args[0], arena, params, row, hooks)?) {
+                Datum::Null => return Ok(0),
+                value => crate::sql::array::Input::from_datum(value)
+                    .ok_or_else(|| srf_signature_error(name))?,
+            };
         let dim = match crate::sql::eval::text_view(eval_full(args[1], arena, params, row, hooks)?)
         {
             Datum::Int4(v) => v as i64,
@@ -1795,9 +1795,10 @@ fn srf_count_positional<'a, R: ColumnLookup<'a>>(
             }
         }
         let dimension = usize::try_from(dim).ok().and_then(|dim| dim.checked_sub(1));
-        Ok(dimension
-            .and_then(|dimension| crate::sql::array::shape(raw)?.dimension(dimension))
-            .unwrap_or(0))
+        Ok(match dimension {
+            Some(dimension) => input.bounds(dimension)?.map_or(0, |(length, _, _)| length),
+            None => 0,
+        })
     } else if name.eq_ignore_ascii_case("unnest") || name.eq_ignore_ascii_case("_pg_expandarray") {
         if args.len() != 1 {
             return Err(sql_err!(
@@ -3279,11 +3280,15 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
                     Some(ColType::Array(element)) => {
                         table_function_array_element_type(storage, txid, element)?
                     }
+                    Some(ColType::Int2Vector) => (ColType::Int2, None),
+                    Some(ColType::OidVector) => (ColType::Oid, None),
                     Some(ColType::Multirange(kind)) => (ColType::Range(kind), None),
                     _ => match crate::sql::eval::eval(argument, arena, params, columns)? {
                         Datum::Array { element, .. } => {
                             table_function_array_element_type(storage, txid, element)?
                         }
+                        Datum::Int2Vector { .. } => (ColType::Int2, None),
+                        Datum::OidVector { .. } => (ColType::Oid, None),
                         Datum::Multirange { kind, .. } => (ColType::Range(kind), None),
                         _ => (ColType::Text, None),
                     },
@@ -4538,10 +4543,10 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                 "generate_subscripts(...) argument count"
             ));
         }
-        let raw = match crate::sql::eval::text_view(eval_argument(args[0])?) {
-            Datum::Array { raw, .. } => raw,
+        let input = match crate::sql::eval::text_view(eval_argument(args[0])?) {
             Datum::Null => return Ok(&[]),
-            _ => return Err(srf_signature_error(tref.table)),
+            value => crate::sql::array::Input::from_datum(value)
+                .ok_or_else(|| srf_signature_error(tref.table))?,
         };
         let dim = match crate::sql::eval::text_view(eval_argument(args[1])?) {
             Datum::Int4(v) => v as i64,
@@ -4559,12 +4564,12 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
             false
         };
         let dimension = usize::try_from(dim).ok().and_then(|dim| dim.checked_sub(1));
-        let shape = crate::sql::array::shape(raw).expect("array datum invariant");
-        let count = dimension
-            .and_then(|dimension| shape.dimension(dimension))
-            .unwrap_or(0);
-        let lower = dimension.and_then(|dimension| shape.lower_bound(dimension));
-        let upper = dimension.and_then(|dimension| shape.upper_bound(dimension));
+        let Some((count, lower, upper)) = (match dimension {
+            Some(dimension) => input.bounds(dimension)?,
+            None => None,
+        }) else {
+            return Ok(&[]);
+        };
         const EMPTY: &[u8] = &[];
         let rows = arena
             .alloc_slice_with(count, |_| EMPTY)
@@ -4572,9 +4577,9 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
         for (i, slot) in rows.iter_mut().enumerate() {
             let offset = i32::try_from(i).expect("array dimension fits i32");
             let subscript = if reverse {
-                upper.expect("nonempty dimension") - offset
+                upper - offset
             } else {
-                lower.expect("nonempty dimension") + offset
+                lower + offset
             };
             *slot = crate::sql::exec::encode_projected_pub(&[Datum::Int4(subscript)], arena)?;
         }
@@ -4852,6 +4857,13 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
         for value in &arrays[..args.len()] {
             match *value {
                 Datum::Array { raw, .. } => count = count.max(crate::sql::array::len(raw)),
+                value @ (Datum::Int2Vector { .. } | Datum::OidVector { .. }) => {
+                    count = count.max(
+                        crate::sql::array::Input::from_datum(value)
+                            .expect("catalog vector")
+                            .element_count(),
+                    );
+                }
                 Datum::Multirange { text, .. } => {
                     count = count.max(crate::sql::range::component_count(text)?);
                 }
@@ -4883,6 +4895,12 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                         .as_mut()
                         .and_then(Iterator::next)
                         .unwrap_or(Datum::Null),
+                    value @ (Datum::Int2Vector { .. } | Datum::OidVector { .. }) => {
+                        crate::sql::array::Input::from_datum(value)
+                            .expect("catalog vector")
+                            .get(row_index)
+                            .unwrap_or(Datum::Null)
+                    }
                     Datum::Multirange { text, kind } => {
                         if let Some(component) = crate::sql::range::component_at(text, row_index)? {
                             Datum::Range {

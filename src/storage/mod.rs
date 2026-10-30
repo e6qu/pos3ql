@@ -34617,6 +34617,64 @@ impl Storage {
         Ok(())
     }
 
+    /// Check every touched row before durability. The transaction owns its
+    /// pending row heads, so another writer cannot increase these histories
+    /// while a staged commit waits. Later readers can require one old image;
+    /// they cannot require more than the slot checked here.
+    pub(crate) fn validate_row_history_publication(
+        &self,
+        txid: u32,
+        touched: impl Iterator<Item = (usize, u64)>,
+    ) -> Result<(), SqlError> {
+        if self.transaction_mode == crate::config::TransactionMode::Locking {
+            return Ok(());
+        }
+        for (table_index, rowid) in touched {
+            if self.pending_table_rows_rewritten(table_index, txid) {
+                continue;
+            }
+            let table = &self.tables[table_index];
+            let (snapshots, mut versions, mut rows) = row_ownership::acquire(|| {
+                Ok((
+                    row_ownership::try_mutex(&self.snapshots, "snapshot state lock poisoned")?,
+                    self.row_versions.try_write_for_batch()?,
+                    table.rows.try_write_for_batch()?,
+                ))
+            });
+            let Some(state) = rows.get_mut(&rowid) else {
+                continue;
+            };
+            if !state.has_committed_version()
+                || pending_last(&versions.pending_row_versions, state.pending)
+                    .is_none_or(|pending| pending.txid != txid)
+            {
+                continue;
+            }
+            let oldest = snapshots
+                .retains_for(txid)
+                .then(|| snapshots.oldest())
+                .flatten();
+            if prune_committed_history(
+                &mut versions.committed_row_versions,
+                &mut state.history,
+                oldest,
+            ) {
+                versions.history_pressure_changed = true;
+                self.row_versions
+                    .history_pressure
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+            if state.history.len() >= self.max_row_versions_per_row {
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "one row exceeds max_row_versions_per_row ({}) committed snapshot versions",
+                    self.max_row_versions_per_row
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// WAL durability precedes publication. Snapshot, table, version, row, and
     /// cache ownership are acquired in that order after encoding the new keys.
     pub fn commit_row(

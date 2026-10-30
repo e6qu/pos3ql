@@ -1,10 +1,11 @@
 //! Subqueries: evaluating a nested SELECT where a scalar, a row, or a set is
 //! expected.
 //!
-//! Two shapes, split by whether the inner query mentions the outer one. An
-//! uncorrelated subquery is evaluated once, before the outer scan starts, and
-//! its result substituted as a constant. A correlated one is re-evaluated per
-//! outer row, with the outer row's columns chained onto the inner scope.
+//! SQL scans prepare uncorrelated results once and correlated results per
+//! outer row. Procedural expressions execute only the subqueries they reach,
+//! preserving CASE and boolean short-circuit behavior. Outer columns and
+//! variables are chained onto the inner scope; returned bytes are detached
+//! before a procedural command can change their storage.
 
 use crate::mem::arena::{Arena, ArenaList};
 use crate::sql::ast::{BinaryOp, Collation, Expr, Select, SelectItem, SetTree};

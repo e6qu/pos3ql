@@ -1723,7 +1723,7 @@ pub struct SubqueryList<'a> {
     pub collations: &'a [Collation],
 }
 
-/// Pre-evaluated (uncorrelated) subquery results.
+/// Prepared subquery results, matched by expression-node identity.
 pub struct SubqueryValues<'h, 'a> {
     /// Scalar subqueries: (node address, value, type-witness datum — the
     /// result column's type even when the value is NULL, for describes).
@@ -7941,6 +7941,88 @@ mod tests {
         let mut budget = Budget::new(1 << 20);
         let arena = Arena::new(&mut budget, "test", 1 << 18).unwrap();
         f(&arena);
+    }
+
+    #[test]
+    fn subquery_execution_short_circuits_and_keeps_nested_result_frames() {
+        use core::cell::Cell;
+        struct Queries(Cell<usize>);
+        impl SubqueryExecution for Queries {
+            fn evaluate<'a>(
+                &self,
+                expression: &Expr<'a>,
+                arena: &'a Arena,
+                _: &[Datum<'a>],
+                _: &dyn ColumnLookup<'a>,
+            ) -> Result<SubqueryResult<'a>, SqlError> {
+                self.0.set(self.0.get() + 1);
+                match expression {
+                    Expr::Exists(_) => Ok(SubqueryResult::Scalar {
+                        value: Datum::Bool(true),
+                        witness: Datum::Bool(false),
+                    }),
+                    Expr::Subquery(_) => Ok(SubqueryResult::Scalar {
+                        value: Datum::Int4(1),
+                        witness: Datum::Int4(0),
+                    }),
+                    Expr::InSubquery { .. } => Ok(SubqueryResult::List(SubqueryList {
+                        node: core::ptr::null(),
+                        values: arena
+                            .alloc_slice_copy(&[Datum::Int4(1), Datum::Int4(2)])
+                            .map_err(|_| arena_full())?,
+                        probe: None,
+                        saw_null: false,
+                        witness: Datum::Int4(0),
+                        collations: &[],
+                    })),
+                    _ => panic!("unexpected subquery"),
+                }
+            }
+        }
+        let mut budget = Budget::new(1 << 16);
+        let arena = Arena::new(&mut budget, "subquery expression frames", 1 << 16).unwrap();
+        let queries = Queries(Cell::new(0));
+        let hooks = EvalHooks {
+            subquery_executor: Some(&queries),
+            ..NO_HOOKS
+        };
+        crate::mem::guard::forbid_alloc(|| {
+            for (sql, choose, expected, calls) in [
+                ("$1 OR EXISTS (SELECT 1)", true, Datum::Bool(true), 0),
+                ("$1 OR EXISTS (SELECT 1)", false, Datum::Bool(true), 1),
+                (
+                    "CASE WHEN $1 THEN 7 ELSE (SELECT 1) END",
+                    true,
+                    Datum::Int4(7),
+                    0,
+                ),
+                (
+                    "CASE WHEN $1 THEN 7 ELSE (SELECT 1) END",
+                    false,
+                    Datum::Int4(1),
+                    1,
+                ),
+                ("(SELECT 1) IN (SELECT 1)", false, Datum::Bool(true), 2),
+            ] {
+                queries.0.set(0);
+                let mark = arena.mark();
+                let expression = crate::sql::parser::parse_expression(sql, &arena).unwrap();
+                assert_eq!(
+                    eval_full(
+                        expression,
+                        &arena,
+                        &[Datum::Bool(choose)],
+                        &NoColumns,
+                        &hooks
+                    )
+                    .unwrap(),
+                    expected
+                );
+                assert_eq!(queries.0.get(), calls);
+                // Evaluation has consumed the parsed tree and every result frame.
+                unsafe { arena.rewind_to(mark) };
+            }
+        });
     }
 
     #[test]

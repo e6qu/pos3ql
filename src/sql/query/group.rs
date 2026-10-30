@@ -627,6 +627,7 @@ pub(super) fn groups_for_mask<'a>(
             group: Some((statement.group_by, &key_vals[..n_keys], mask)),
             aggs: Some((agg_ptrs, &agg_vals[..n_aggs])),
             subs: group_subs,
+            subquery_executor: hooks.subquery_executor,
             // Carry the catalog so a grouped projection resolves catalog-backed
             // output (e.g. `pg_typeof` of an enum group key names the enum type).
             windows: None,

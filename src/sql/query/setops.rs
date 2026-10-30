@@ -49,7 +49,7 @@ pub fn set_query<'a>(
     let bound_hooks = crate::sql::eval::EvalHooks {
         catalog: Some(&bound_catalog),
         subquery_executor: Some(&bound_queries),
-        sequences: sequences,
+        sequences,
         ..crate::sql::eval::NO_HOOKS
     };
 
@@ -192,7 +192,7 @@ pub(crate) fn set_query_into_rows<'a>(
     let bound_hooks = crate::sql::eval::EvalHooks {
         catalog: Some(&bound_catalog),
         subquery_executor: Some(&bound_queries),
-        sequences: sequences,
+        sequences,
         ..crate::sql::eval::NO_HOOKS
     };
 
@@ -685,7 +685,7 @@ pub(crate) fn external_set_body_into<'a>(
     let bound_hooks = crate::sql::eval::EvalHooks {
         catalog: Some(&bound_catalog),
         subquery_executor: Some(&bound_queries),
-        sequences: sequences,
+        sequences,
         ..crate::sql::eval::NO_HOOKS
     };
 
@@ -807,7 +807,7 @@ fn external_set_query<'a>(
     let bound_hooks = crate::sql::eval::EvalHooks {
         catalog: Some(&bound_catalog),
         subquery_executor: Some(&bound_queries),
-        sequences: sequences,
+        sequences,
         ..crate::sql::eval::NO_HOOKS
     };
 

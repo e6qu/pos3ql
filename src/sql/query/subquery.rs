@@ -2133,7 +2133,16 @@ pub(super) fn correlated_where_passes<'a>(
         return Ok(true);
     };
     let values = merge_correlated(
-        correlated, base, row, storage, txid, arena, params, scalars, lists, sequences,
+        correlated,
+        base,
+        row,
+        storage,
+        txid,
+        arena,
+        params,
+        scalars,
+        lists,
+        hooks.sequences,
     )?;
     let where_hooks = EvalHooks {
         subs: Some(&values),
@@ -3207,7 +3216,7 @@ fn run_set_subquery<'a>(
     let bound_hooks = crate::sql::eval::EvalHooks {
         catalog: Some(&bound_catalog),
         subquery_executor: Some(&bound_queries),
-        sequences: sequences,
+        sequences,
         ..crate::sql::eval::NO_HOOKS
     };
 

@@ -36,7 +36,7 @@ use super::ast::{
 };
 use super::eval::{
     ColumnLookup, EvalHooks, NO_HOOKS, NoColumns, SqlError, arena_full, cast_to, compare_datums,
-    compare_datums_collated, datum_to_text, eval, eval_full, sqlstate,
+    compare_datums_collated, datum_to_text, eval_full, sqlstate,
 };
 use super::types::{ArrElem, ColDesc, ColType, Datum, RecordField, TypeMod};
 

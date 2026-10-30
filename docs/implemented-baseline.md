@@ -338,7 +338,8 @@ returning, the command fails with `2F005` and rolls back its changes.
 Native procedural expressions can read subqueries using their current variables
 and trigger rows. For example, `IF EXISTS (SELECT 1 FROM orders WHERE id=NEW.id)`
 tests the inserted row's identifier. A scalar subquery with no rows returns
-NULL; more than one row fails with `21000`.
+NULL; more than one row fails with `21000`. A subquery in a skipped `CASE` or
+boolean branch does not run.
 
 DDL success follows its end-of-command event triggers. A hook that raises an
 error rolls the command back and keeps its notices, without sending a success

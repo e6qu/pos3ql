@@ -171,6 +171,7 @@ fn for_each_materialized_projection<'a>(
             group: None,
             aggs: None,
             subs: Some(&row_subqueries),
+            subquery_executor: hooks.subquery_executor,
             windows: None,
             catalog: hooks.catalog,
             srf_index: None,

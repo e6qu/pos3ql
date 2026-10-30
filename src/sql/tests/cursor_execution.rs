@@ -624,7 +624,7 @@ fn cursor_trigger_expressions_resolve_subqueries_with_locals_and_transition_rows
             "SELECT expression_value(1),expression_value(2),expression_value(3)",
             true
         )),
-        ["11|12|"]
+        ["11|12|NULL"]
     );
     session.success(
         &mut engine,
@@ -636,6 +636,27 @@ fn cursor_trigger_expressions_resolve_subqueries_with_locals_and_transition_rows
         error_sqlstates(&session.execute(&mut engine, "SELECT expression_many()", true)),
         ["21000"]
     );
+    session.success(&mut engine, "CREATE FUNCTION expression_lazy(choose boolean) RETURNS integer LANGUAGE plpgsql AS $$ BEGIN \
+        IF choose OR EXISTS (SELECT id FROM expression_input WHERE 10/(id-id)>0) THEN RETURN 7; END IF; RETURN 0; END $$; \
+        CREATE FUNCTION expression_choice(choose boolean) RETURNS integer LANGUAGE plpgsql AS $$ BEGIN \
+        RETURN CASE WHEN choose THEN 7 ELSE (SELECT 10/(id-id) FROM expression_input WHERE id=1) END; END $$", true);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT expression_lazy(true),expression_choice(true)",
+            true
+        )),
+        ["7|7"]
+    );
+    for query in [
+        "SELECT expression_lazy(false)",
+        "SELECT expression_choice(false)",
+    ] {
+        assert_eq!(
+            error_sqlstates(&session.execute(&mut engine, query, true)),
+            ["22012"]
+        );
+    }
     session.success(&mut engine, "CREATE TABLE expression_target(id integer); \
         CREATE FUNCTION expression_transition() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN \
           IF EXISTS (SELECT id FROM expression_input WHERE id=NEW.id) THEN NEW.id := NEW.id+10; END IF; RETURN NEW; END $$; \
@@ -647,6 +668,19 @@ fn cursor_trigger_expressions_resolve_subqueries_with_locals_and_transition_rows
             true
         )),
         ["11", "3"]
+    );
+    session.success(&mut engine, "CREATE FUNCTION expression_membership(wanted integer) RETURNS boolean LANGUAGE plpgsql AS $$ BEGIN \
+        RETURN (SELECT wanted) IN (SELECT id FROM expression_input); END $$; \
+        CREATE FUNCTION expression_quantified(wanted integer) RETURNS boolean LANGUAGE plpgsql AS $$ BEGIN \
+        RETURN wanted > ALL (SELECT id FROM expression_input); END $$", true);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT expression_membership(1),expression_membership(3),expression_membership(NULL), \
+        expression_quantified(3),expression_quantified(1)",
+            true
+        )),
+        ["t|f|NULL|t|f"]
     );
 }
 

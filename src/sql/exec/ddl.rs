@@ -458,6 +458,7 @@ pub(super) fn resolve_default(
             group: None,
             aggs: None,
             subs: None,
+            subquery_executor: None,
             windows: None,
             catalog: Some(&catalog),
             srf_index: None,

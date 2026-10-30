@@ -8,7 +8,7 @@ cannot be repaired. Keep repaired-defect evidence, ownership checks and
 PostgreSQL comparisons in the fixing PR. Cover deferred expression errors and
 row bounds, scroll-history exhaustion,
 holdable cursor cleanup at commit/implicit rollback and COPY completion,
-trigger return/error paths and subquery expressions, view cursor planning,
+trigger return/error paths and short-circuited subquery expressions, view cursor planning,
 pattern boolean types, default cursor modes, captured filters and commit-time
 cursor catalogs, frozen operator choices, savepoint read accounting and
 table-slot reuse, as well as exhausted memory before

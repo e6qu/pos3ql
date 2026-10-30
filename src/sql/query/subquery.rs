@@ -349,7 +349,7 @@ fn scope_record_witness<'a>(
 /// Probes stream it with bounded reader scratch.
 #[allow(clippy::too_many_arguments)]
 fn external_list_subquery<'a>(
-    node: &'a Expr<'a>,
+    node: &Expr<'a>,
     select: &'a Select<'a>,
     storage: &'a Storage,
     txid: u32,
@@ -1237,7 +1237,7 @@ pub fn prepare_subqueries<'a>(
 /// EXISTS results are stored as boolean scalars.
 #[allow(clippy::too_many_arguments)]
 fn eval_subquery_nodes<'a>(
-    nodes: &[&'a Expr<'a>],
+    nodes: &[&Expr<'a>],
     storage: &'a Storage,
     txid: u32,
     arena: &'a Arena,
@@ -1449,6 +1449,7 @@ fn subquery_exists<'a>(
         group: None,
         aggs: None,
         subs: Some(&inner_subs),
+        subquery_executor: None,
         windows: None,
         catalog: Some(&catalog),
         srf_index: None,
@@ -2670,6 +2671,7 @@ fn run_subquery<'a>(
         group: None,
         aggs: None,
         subs: Some(&inner_subs),
+        subquery_executor: None,
         windows: None,
         catalog: Some(&catalog),
         srf_index: None,
@@ -2816,6 +2818,7 @@ fn run_subquery<'a>(
             group: None,
             aggs: Some((&*ptrs, agg_values)),
             subs: hooks.subs,
+            subquery_executor: hooks.subquery_executor,
             windows: None,
             catalog: hooks.catalog,
             srf_index: None,
@@ -3167,6 +3170,13 @@ fn subquery_hooks_with_outer<'a>(
         SUBQUERY_DEPTH,
         outer,
     )?;
+    detach_subquery_values(borrowed, arena)
+}
+
+fn detach_subquery_values<'a>(
+    borrowed: SubqueryValues<'_, '_>,
+    arena: &'a Arena,
+) -> Result<SubqueryValues<'a, 'a>, SqlError> {
     let scalars = arena
         .alloc_slice_with(borrowed.scalars.len(), |_| {
             (core::ptr::null(), Datum::Null, Datum::Null)
@@ -3205,6 +3215,46 @@ fn subquery_hooks_with_outer<'a>(
         scalars: &*scalars,
         lists: &*lists,
     })
+}
+
+pub(crate) struct ProceduralSubqueries<'s> {
+    pub storage: &'s Storage,
+    pub txid: u32,
+}
+
+impl super::super::eval::SubqueryExecution for ProceduralSubqueries<'_> {
+    fn evaluate<'a>(
+        &self,
+        expression: &Expr<'a>,
+        arena: &'a Arena,
+        params: &[Datum<'a>],
+        outer: &dyn ColumnLookup<'a>,
+    ) -> Result<super::super::eval::SubqueryResult<'a>, SqlError> {
+        // SAFETY: storage remains immutable and live for this call; the
+        // result is detached before the borrow can escape.
+        let storage: &'a Storage = unsafe { &*(self.storage as *const Storage) };
+        let borrowed = eval_subquery_nodes(
+            &[expression],
+            storage,
+            self.txid,
+            arena,
+            params,
+            SUBQUERY_DEPTH,
+            Some(outer),
+        )?;
+        let values = detach_subquery_values(borrowed, arena)?;
+        match (values.scalars, values.lists) {
+            ([(_, value, witness)], []) => Ok(super::super::eval::SubqueryResult::Scalar {
+                value: *value,
+                witness: *witness,
+            }),
+            ([], [list]) => Ok(super::super::eval::SubqueryResult::List(*list)),
+            _ => Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "one subquery produced an invalid result shape"
+            )),
+        }
+    }
 }
 
 /// Detaches a subquery result before DML mutates storage. Records retain their

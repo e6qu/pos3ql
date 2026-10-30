@@ -295,6 +295,7 @@ pub(crate) fn row_security_passes<'a>(
             group: None,
             aggs: None,
             subs: Some(&subqueries),
+            subquery_executor: base_hooks.subquery_executor,
             windows: None,
             catalog: base_hooks.catalog,
             srf_index: None,

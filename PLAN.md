@@ -88,7 +88,8 @@ Reusing a name or slot never redirects a reader to replacement data. Cleanup
 respects readers and backups. Preserve the existing rollback, savepoint,
 prepared-transaction, capacity and empty-cache recovery checks throughout this
 conversion. Corrupt or stale restored state must fail before writer promotion.
-Resumption preserves effects once, including triggers and issued sequence values.
+Resumption preserves effects once, including triggers and issued sequence values;
+skipped expression branches must not run their queries or effects.
 Lost commit replies resolve to all changes or none.
 
 ### Run independent SQL commands on several CPU workers

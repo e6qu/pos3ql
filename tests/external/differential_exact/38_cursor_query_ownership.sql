@@ -70,6 +70,21 @@ SELECT expression_value(1),expression_value(2),expression_value(3);
 CREATE FUNCTION expression_many() RETURNS integer LANGUAGE plpgsql AS $$
 BEGIN RETURN (SELECT id FROM expression_input); END $$;
 SELECT expression_many();
+CREATE FUNCTION expression_lazy(choose boolean) RETURNS integer LANGUAGE plpgsql AS $$
+BEGIN
+  IF choose OR EXISTS (SELECT id FROM expression_input WHERE 10/(id-id)>0) THEN RETURN 7; END IF;
+  RETURN 0;
+END $$;
+CREATE FUNCTION expression_choice(choose boolean) RETURNS integer LANGUAGE plpgsql AS $$
+BEGIN RETURN CASE WHEN choose THEN 7 ELSE (SELECT 10/(id-id) FROM expression_input WHERE id=1) END; END $$;
+SELECT expression_lazy(true),expression_choice(true);
+SELECT expression_lazy(false);
+SELECT expression_choice(false);
+CREATE FUNCTION expression_membership(wanted integer) RETURNS boolean LANGUAGE plpgsql AS $$
+BEGIN RETURN (SELECT wanted) IN (SELECT id FROM expression_input); END $$;
+CREATE FUNCTION expression_quantified(wanted integer) RETURNS boolean LANGUAGE plpgsql AS $$
+BEGIN RETURN wanted > ALL (SELECT id FROM expression_input); END $$;
+SELECT expression_membership(1),expression_membership(3),expression_membership(NULL),expression_quantified(3),expression_quantified(1);
 CREATE TABLE expression_target(id integer);
 CREATE FUNCTION expression_transition() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
@@ -82,6 +97,10 @@ INSERT INTO expression_target VALUES (1),(3) RETURNING id;
 DROP TABLE expression_target;
 DROP FUNCTION expression_transition();
 DROP FUNCTION expression_many();
+DROP FUNCTION expression_lazy(boolean);
+DROP FUNCTION expression_choice(boolean);
+DROP FUNCTION expression_membership(integer);
+DROP FUNCTION expression_quantified(integer);
 DROP FUNCTION expression_value(integer);
 DROP TABLE expression_input;
 CREATE INDEX cursor_retained_order_idx ON cursor_retained_orders(id);

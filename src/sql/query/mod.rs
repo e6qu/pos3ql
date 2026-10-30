@@ -628,6 +628,7 @@ pub(crate) use plan::join_order;
 use plan::{postpone_cost, reorder_qual, simplify_qual, where_passes};
 
 mod subquery;
+pub(crate) use subquery::ProceduralSubqueries;
 use subquery::{
     correlated_in_expression, correlated_scan_conjuncts, correlated_where_passes, merge_correlated,
     prepare_outer_subqueries, subquery_witness,
@@ -4995,6 +4996,7 @@ fn correlated_row_hooks<'scratch, 'a>(
         group: None,
         aggs: None,
         subs: Some(subqueries),
+        subquery_executor: base.subquery_executor,
         windows: None,
         catalog: base.catalog,
         srf_index: None,
@@ -6612,6 +6614,7 @@ pub(crate) fn select_query_resumable<'a, 'statement>(
         group: None,
         aggs: None,
         subs: Some(&outer_subs.base),
+        subquery_executor: None,
         windows: None,
         catalog: Some(&catalog),
         srf_index: None,
@@ -7167,6 +7170,7 @@ pub(crate) fn constant_select_resumable<'a, 'statement>(
         group: None,
         aggs: None,
         subs: Some(&subs),
+        subquery_executor: None,
         windows: None,
         catalog: Some(&catalog),
         srf_index: None,
@@ -7755,6 +7759,7 @@ fn select_into_rows_mode<'a>(
                 aggs: None,
                 sequences: seq,
                 subs: Some(&subs),
+                subquery_executor: None,
                 windows: None,
                 catalog: Some(&catalog),
                 srf_index: None,
@@ -7848,6 +7853,7 @@ fn select_into_rows_mode<'a>(
             group: None,
             aggs: None,
             subs: Some(&outer_subs.base),
+            subquery_executor: None,
             windows: None,
             catalog: Some(&catalog),
             srf_index: None,
@@ -7942,6 +7948,7 @@ fn select_into_rows_mode<'a>(
             group: None,
             aggs: None,
             subs: Some(&subs),
+            subquery_executor: None,
             windows: None,
             catalog: Some(&catalog),
             srf_index: None,
@@ -8016,6 +8023,7 @@ fn select_into_rows_mode<'a>(
         group: None,
         aggs: None,
         subs: Some(&outer_subs.base),
+        subquery_executor: None,
         windows: None,
         catalog: Some(&catalog),
         srf_index: None,
@@ -10271,6 +10279,7 @@ pub fn first_from_match<'a>(
         group: None,
         aggs: None,
         subs: Some(&subs),
+        subquery_executor: None,
         windows: None,
         catalog: Some(&catalog),
         srf_index: None,

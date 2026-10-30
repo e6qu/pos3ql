@@ -734,6 +734,8 @@ pub struct EvalHooks<'h, 'a> {
     pub aggs: Option<(&'h [*const Expr<'h>], &'h [Datum<'a>])>,
     /// (subquery nodes by address, their pre-evaluated results).
     pub subs: Option<&'h SubqueryValues<'h, 'a>>,
+    /// Executes a reached subquery when this context has no prepared value.
+    pub subquery_executor: Option<&'h dyn SubqueryExecution>,
     /// (window-function call nodes by address, the current row's values).
     pub windows: Option<(&'h [*const Expr<'h>], &'h [Datum<'a>])>,
     /// Resolves catalog OIDs to reconstructed definition text for
@@ -1734,10 +1736,31 @@ pub struct SubqueryValues<'h, 'a> {
     pub lists: &'h [SubqueryList<'a>],
 }
 
+pub enum SubqueryResult<'a> {
+    Scalar {
+        value: Datum<'a>,
+        witness: Datum<'a>,
+    },
+    List(SubqueryList<'a>),
+}
+
+/// Runs one reached subquery. Returned values own arena-backed bytes or borrow
+/// static data; they never retain the executor's storage or outer-row borrow.
+pub trait SubqueryExecution {
+    fn evaluate<'a>(
+        &self,
+        expression: &Expr<'a>,
+        arena: &'a Arena,
+        params: &[Datum<'a>],
+        outer: &dyn ColumnLookup<'a>,
+    ) -> Result<SubqueryResult<'a>, SqlError>;
+}
+
 pub const NO_HOOKS: EvalHooks<'static, 'static> = EvalHooks {
     group: None,
     aggs: None,
     subs: None,
+    subquery_executor: None,
     windows: None,
     catalog: None,
     srf_index: None,
@@ -2313,6 +2336,68 @@ fn eval_full_inner<'a>(
     row: &impl ColumnLookup<'a>,
     hooks: &EvalHooks<'_, 'a>,
 ) -> Result<Datum<'a>, SqlError> {
+    if let Some(executor) = hooks.subquery_executor
+        && matches!(
+            expression,
+            Expr::Subquery(_)
+                | Expr::RowSubquery { .. }
+                | Expr::ArraySubquery(_)
+                | Expr::Exists(_)
+                | Expr::InSubquery { .. }
+                | Expr::QuantifiedSubquery { .. }
+        )
+        && hooks.subs.is_none_or(|subs| {
+            !subs
+                .scalars
+                .iter()
+                .any(|(node, _, _)| core::ptr::eq(*node, expression))
+                && !subs
+                    .lists
+                    .iter()
+                    .any(|list| core::ptr::eq(list.node, (expression as *const Expr).cast()))
+        })
+    {
+        let result = executor.evaluate(expression, arena, params, row)?;
+        let mut scalars = [(expression as *const Expr, Datum::Null, Datum::Null)];
+        let mut lists = [SubqueryList {
+            node: core::ptr::null(),
+            values: &[],
+            probe: None,
+            saw_null: false,
+            witness: Datum::Null,
+            collations: &[],
+        }];
+        let values = match result {
+            SubqueryResult::Scalar { value, witness } => {
+                scalars[0].1 = value;
+                scalars[0].2 = witness;
+                SubqueryValues {
+                    scalars: &scalars,
+                    lists: &[],
+                }
+            }
+            SubqueryResult::List(list) => {
+                lists[0] = SubqueryList {
+                    node: (expression as *const Expr).cast(),
+                    ..list
+                };
+                SubqueryValues {
+                    scalars: &[],
+                    lists: &lists,
+                }
+            }
+        };
+        return eval_full_inner(
+            expression,
+            arena,
+            params,
+            row,
+            &EvalHooks {
+                subs: Some(&values),
+                ..*hooks
+            },
+        );
+    }
     if let Some(set) = hooks.project_sets.and_then(|sets| {
         sets.iter()
             .find(|set| set.node == expression as *const Expr<'a> as *const ())

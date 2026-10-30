@@ -8610,8 +8610,8 @@ pub fn describe_scope_items<'q>(
                     txid,
                     arena,
                 };
-                if let Expr::Cast { operand, .. } = expression {
-                    super::exec::infer_type_res(operand, &resolver)?;
+                if let Expr::Cast { .. } = expression {
+                    super::exec::infer_type_res(expression, &resolver)?;
                 }
                 let user_type = user_type_expression_description(expression, name, storage, txid);
                 let (mut oid, mut typlen) = match user_type {
@@ -8706,12 +8706,12 @@ pub fn describe_catalog_items_as<'q>(
     let mut item_width = [0usize; MAX_PROJ];
     for (item_index, item) in items.iter().enumerate() {
         if let SelectItem::Expr {
-            expression: Expr::Cast { operand, .. },
+            expression: expression @ Expr::Cast { .. },
             ..
         } = item
         {
             super::exec::infer_type_res(
-                operand,
+                expression,
                 &super::exec::CatalogCols {
                     definition,
                     alias,
@@ -9402,7 +9402,7 @@ fn user_type_array_description<'q>(
         let domain_name = type_name.strip_suffix("[]").unwrap_or(type_name);
         if let Some(slot) = storage.resolve_domain_slot(domain_name, txid)
             && elements.iter().all(|element| match element {
-                Expr::Null => true,
+                Expr::Null => false,
                 Expr::Cast {
                     type_name: candidate,
                     ..

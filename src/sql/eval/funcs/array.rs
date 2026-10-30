@@ -306,7 +306,7 @@ pub(crate) fn dispatch<'a>(
                 // The result element type promotes to hold both the array's elements
                 // and the new one (PostgreSQL's polymorphic anyarray/anyelement).
                 let element = match ArrElem::from_datum(&elem) {
-                    Some(e) => unify_arr_elem(source, e),
+                    Some(e) => unify_arr_elem(source, e)?,
                     None => source,
                 };
                 let source_count = raw.map_or(0, array::len);
@@ -397,7 +397,7 @@ pub(crate) fn dispatch<'a>(
                     let to = eval_full(args[2], arena, params, row, hooks)?;
                     // The result promotes to hold both the kept and replaced values.
                     let element = match ArrElem::from_datum(&to) {
-                        Some(e) => unify_arr_elem(source, e),
+                        Some(e) => unify_arr_elem(source, e)?,
                         None => source,
                     };
                     let replacement = if to.is_null() {

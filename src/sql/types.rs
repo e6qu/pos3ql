@@ -96,9 +96,6 @@ pub(crate) fn common_builtin_type(
     if left == right {
         return Ok(left);
     }
-    if let (ColType::Array(left), ColType::Array(right)) = (left, right) {
-        return common_array_element(left, right).map(ColType::Array);
-    }
     if type_category(left) != type_category(right) {
         return Err(CommonTypeError::Category { left, right });
     }

@@ -1806,11 +1806,25 @@ fn catalog_cast_evaluation(
             catalog: Some(catalog),
             ..NO_HOOKS
         };
-        let source = expression_type_identity(operand, &NoColumns, &hooks)?
-            .routine_argument_oid(&Datum::Null);
         let target = ColType::from_sql_name(type_name)
             .map(ColType::oid)
             .or_else(|| catalog.user_type_oid(type_name));
+        let source = if let Expr::Array(items) = operand
+            && let Some(ColType::Array(element)) = target.and_then(|oid| {
+                constructor_type_from_oid(oid, &|oid| catalog.domain_base_type(oid))
+            }) {
+            array_constructor_type(
+                items,
+                Some(element),
+                &|item| Ok(expression_type_identity(item, &NoColumns, &hooks)?.record_field_oid()),
+                &|oid| catalog.domain_base_type(oid),
+            )?
+            .element
+            .array_oid()
+        } else {
+            expression_type_identity(operand, &NoColumns, &hooks)?
+                .routine_argument_oid(&Datum::Null)
+        };
         if let Some(target) = target
             && let Some(evaluation) = catalog.cast_evaluation(source, target)?
         {
@@ -5725,10 +5739,6 @@ fn static_type<'a>(e: &Expr<'a>, row: &impl ColumnLookup<'a>) -> Option<ColType>
             ))
         }
         Expr::Slice { base, .. } => static_type(base, row),
-        Expr::Subscript { base, .. } => match static_type(base, row)? {
-            ColType::Array(element) => Some(element.to_coltype()),
-            _ => None,
-        },
         Expr::Unary {
             operator: UnaryOp::Neg,
             operand,

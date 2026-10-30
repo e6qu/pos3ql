@@ -224,8 +224,13 @@ representation. Dynamic SQL takes parameters only from `USING`: for example,
 `OPEN c FOR EXECUTE 'SELECT $1' USING d` captures a null date as a date, even
 inside a function whose first argument is an integer. Local names do not become
 columns inside the command string. Simple non-holdable `NO SCROLL` cursors over
-one local physical table defer row reads and pure projections to `FETCH`.
-Filters, joins, expressions with operations or calls, ordering, grouping,
+one local physical table defer row reads, built-in binary operators, negation,
+boolean logic, null tests and filters composed from those expressions to `FETCH`.
+A row-dependent division by zero fails on the fetch that reaches that row;
+constant and type errors still fail during declaration. Built-in operators
+bind before fetching, including when a later search-path edit or operator
+creation would select a different operator in a newly issued query.
+Joins, function calls, casts, user-defined operators, ordering, grouping,
 row-level security, inheritance expansion and other cursor modes still use the
 eager executor. The retained reader's selected row identities, saved-file
 positions and copied saved-row input share `cursor_query_bytes`; exhaustion returns

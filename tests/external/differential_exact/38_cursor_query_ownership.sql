@@ -158,6 +158,8 @@ FETCH ALL FROM remaining_input;
 RELEASE SAVEPOINT outer_reads;
 SELECT seq_scan,seq_tup_read FROM pg_stat_xact_user_tables WHERE relname='cursor_savepoint_input';
 ROLLBACK;
+-- PostgreSQL may keep backend-local read counts until its next statistics flush.
+SELECT pg_stat_force_next_flush();
 BEGIN;
 SELECT seq_scan,seq_tup_read FROM pg_stat_xact_user_tables WHERE relname='cursor_savepoint_input';
 SAVEPOINT old_table;
@@ -173,6 +175,73 @@ SELECT seq_scan,seq_tup_read,n_tup_ins FROM pg_stat_xact_user_tables WHERE relna
 COMMIT;
 DROP TABLE cursor_reused_input;
 DROP TABLE cursor_savepoint_input;
+
+-- Per-row expressions and filters advance with FETCH. Constant/type errors
+-- remain analysis/plan errors, even if the input table is empty.
+CREATE TABLE cursor_expression_input(id integer);
+INSERT INTO cursor_expression_input VALUES (1),(2),(0);
+BEGIN;
+DECLARE calculated NO SCROLL CURSOR FOR SELECT 100/id AS quotient FROM cursor_expression_input;
+FETCH NEXT FROM calculated;
+FETCH NEXT FROM calculated;
+SAVEPOINT expression_error;
+FETCH NEXT FROM calculated;
+ROLLBACK TO SAVEPOINT expression_error;
+SELECT seq_scan,seq_tup_read FROM pg_stat_xact_user_tables WHERE relname='cursor_expression_input';
+FETCH NEXT FROM calculated;
+ROLLBACK TO SAVEPOINT expression_error;
+CLOSE calculated;
+ROLLBACK;
+BEGIN;
+DECLARE filtered NO SCROLL CURSOR FOR
+SELECT id*10 AS scaled FROM cursor_expression_input WHERE id<>0 AND NOT (id IS NULL);
+FETCH NEXT FROM filtered;
+FETCH ALL FROM filtered;
+CLOSE filtered;
+COMMIT;
+BEGIN;
+DECLARE constant_error NO SCROLL CURSOR FOR SELECT 1/0 FROM cursor_expression_input;
+ROLLBACK;
+TRUNCATE cursor_expression_input;
+BEGIN;
+DECLARE typed_error NO SCROLL CURSOR FOR SELECT id FROM cursor_expression_input WHERE id;
+ROLLBACK;
+BEGIN;
+DECLARE literal_error NO SCROLL CURSOR FOR SELECT id FROM cursor_expression_input WHERE 'invalid';
+ROLLBACK;
+INSERT INTO cursor_expression_input VALUES (1);
+BEGIN;
+DECLARE literal_filter NO SCROLL CURSOR FOR SELECT id FROM cursor_expression_input WHERE 't';
+FETCH ALL FROM literal_filter;
+COMMIT;
+DROP TABLE cursor_expression_input;
+
+CREATE TABLE cursor_empty_input(id integer);
+INSERT INTO cursor_empty_input VALUES (1);
+BEGIN;
+DECLARE empty_filter NO SCROLL CURSOR FOR SELECT id FROM cursor_empty_input WHERE FALSE;
+FETCH ALL FROM empty_filter;
+SELECT seq_scan,seq_tup_read FROM pg_stat_xact_user_tables WHERE relname='cursor_empty_input';
+DROP TABLE cursor_empty_input;
+FETCH ALL FROM empty_filter;
+COMMIT;
+
+-- Name resolution at DECLARE survives a new operator on the same search path.
+CREATE SCHEMA cursor_ops;
+SET search_path=cursor_ops,pg_catalog;
+CREATE TABLE operator_input(id integer);
+INSERT INTO operator_input VALUES (1),(2);
+BEGIN;
+DECLARE bound_ops NO SCROLL CURSOR FOR SELECT id+10 AS result FROM operator_input;
+CREATE FUNCTION cursor_ops.custom_add(integer,integer) RETURNS integer LANGUAGE SQL RETURN $1-$2;
+CREATE OPERATOR cursor_ops.+ (FUNCTION=cursor_ops.custom_add,LEFTARG=integer,RIGHTARG=integer);
+FETCH NEXT FROM bound_ops;
+FETCH NEXT FROM bound_ops;
+SELECT id+10 AS result FROM operator_input;
+CLOSE bound_ops;
+COMMIT;
+RESET search_path;
+DROP SCHEMA cursor_ops CASCADE;
 
 -- A record wider than one byte must not lose fields or the following column.
 BEGIN;

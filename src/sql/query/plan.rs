@@ -271,7 +271,7 @@ pub(super) fn conjunct_passes<'a>(
     row: &impl ColumnLookup<'a>,
     hooks: &EvalHooks<'_, 'a>,
 ) -> Result<bool, SqlError> {
-    match eval_full(e, arena, params, row, hooks)? {
+    match crate::sql::eval::boolean_argument(eval_full(e, arena, params, row, hooks)?, "WHERE")? {
         Datum::Bool(true) => Ok(true),
         Datum::Bool(false) | Datum::Null => Ok(false),
         _ => Err(sql_err!(

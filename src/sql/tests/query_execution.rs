@@ -31,12 +31,24 @@ fn object_key<'a>(request: &'a str, prefix: &str) -> &'a str {
 
 #[test]
 fn cursor_retained_cold_fetch_resumes_after_delivered_rows() {
+    cold_cursor_fetch("SELECT id,code FROM cold_orders", 1);
+}
+
+#[test]
+fn cursor_retained_cold_filter_resumes_after_rejected_and_delivered_rows() {
+    cold_cursor_fetch(
+        "SELECT id*2/2,code FROM cold_orders WHERE id%2=0 AND code<>''",
+        2,
+    );
+}
+
+fn cold_cursor_fetch(select: &str, stride: i32) {
     use crate::sql::cursor::FetchMotion;
 
-    let mut config = test_config("cursor-retained-cold-fetch");
+    let mut config = test_config(&format!("cursor-retained-cold-fetch-{stride}"));
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_bucket = format!("retained-cursor-{}", std::process::id());
+    config.object_store_bucket = format!("retained-cursor-{stride}-{}", std::process::id());
     config.wal_upload = true;
     config.wal_upload_sync = true;
     config.object_store_get_slots = 4;
@@ -92,7 +104,12 @@ fn cursor_retained_cold_fetch_resumes_after_delivered_rows() {
     replace_uncached_blocks(&mut engine, &network);
     session.success(
         &mut engine,
-        "BEGIN; DECLARE cold NO SCROLL CURSOR FOR SELECT id,code FROM cold_orders",
+        &format!(
+            "BEGIN; \
+            DECLARE empty_cold NO SCROLL CURSOR FOR SELECT id FROM cold_orders WHERE FALSE; \
+            FETCH ALL FROM empty_cold; CLOSE empty_cold; \
+            DECLARE cold NO SCROLL CURSOR FOR {select}"
+        ),
         true,
     );
     assert!(
@@ -144,7 +161,7 @@ fn cursor_retained_cold_fetch_resumes_after_delivered_rows() {
                     assert_eq!(command_tags(session.send.readable()), ["FETCH 0"]);
                     break;
                 }
-                let rows = (320 - count).min(17);
+                let rows = (320 / stride - count).min(17);
                 assert_eq!(fetched.len(), rows as usize);
                 assert_eq!(
                     command_tags(session.send.readable()),
@@ -152,8 +169,9 @@ fn cursor_retained_cold_fetch_resumes_after_delivered_rows() {
                 );
                 for fetched in &fetched {
                     let (id, code) = fetched.split_once('|').unwrap();
-                    assert_eq!(id.parse::<i32>().unwrap(), count + 1);
-                    assert_eq!(checksum(code.as_bytes()), expected[count as usize]);
+                    let id = id.parse::<i32>().unwrap();
+                    assert_eq!(id, (count + 1) * stride);
+                    assert_eq!(checksum(code.as_bytes()), expected[(id - 1) as usize]);
                     count += 1;
                 }
                 assert_eq!(session.cursors.produced_rows(slot), count as usize);
@@ -199,7 +217,7 @@ fn cursor_retained_cold_fetch_resumes_after_delivered_rows() {
             }
         }
     }
-    assert_eq!(count, 320);
+    assert_eq!(count, 320 / stride);
     assert!(
         waited_inside_fetch,
         "a fetch must retain buffered rows while another connection runs"

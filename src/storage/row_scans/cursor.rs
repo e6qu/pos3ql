@@ -323,7 +323,7 @@ mod tests {
         let mut small_rows = FixedBuf::new(&mut read_budget, "small retained rows", 1).unwrap();
         crate::mem::guard::forbid_alloc(|| {
             query
-                .bind("SELECT n,payload FROM retained_plan", &[], &[])
+                .bind("SELECT n+0,payload FROM retained_plan WHERE n>0", &[], &[])
                 .unwrap();
             assert!(
                 query

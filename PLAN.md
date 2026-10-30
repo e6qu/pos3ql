@@ -55,9 +55,10 @@ A waiting schema edit must never attach itself to a new object that reused a nam
   cursor over `nextval('order_numbers')` must not issue numbers for rows that
   have not been fetched. Row locks follow fetched rows. Holding a cursor across
   commit saves the required result before releasing its transaction.
-  Simple `NO SCROLL` cursors selecting columns or captured parameters from one
-  physical table now retain their reader and use bounded memory per fetch.
-  Extend this to expressions, filters, joins, ordering, row locks and holdable
+  Simple `NO SCROLL` cursors over one physical table retain their reader,
+  built-in arithmetic/comparisons, boolean filters and captured parameters.
+  They use bounded memory per fetch and keep operator choices from declaration.
+  Extend this to function calls and effects, joins, ordering, row locks and holdable
   cursors, then reuse the positions for ordinary results after their first flush.
   Keep read counts through savepoint rollback and release; never transfer a
   retired table’s pending counters to a replacement that reuses its slot.

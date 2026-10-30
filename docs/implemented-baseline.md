@@ -178,8 +178,17 @@ saves two rows; `FETCH 0` before the first row reads none. Closing it releases
 the unread source. Fetching another batch reuses the result buffer: a long
 cursor can use repeated small fetches without retaining earlier batches.
 `MOVE` advances without saving output; a forward jump saves its target row.
-This path currently accepts columns, wildcards, constants
-and captured parameters, without filters, ordering or row-level security.
+This path accepts columns, wildcards, constants, captured parameters, built-in
+binary operators, negation, boolean logic, null tests and filters composed from
+those expressions. For example, `SELECT 100/id FROM orders WHERE id<>0` tests
+each input as fetching advances; it does not divide by an unread row's `id`.
+Built-in operator choices stay fixed after declaration. A later operator or
+search-path change does not change the open cursor. Type errors and constant
+errors such as `1/0` are checked during declaration, including for empty input.
+Filters discard rejected rows and release their temporary memory before
+reading the next input. Scan counters include rejected and erroring input rows.
+Function calls, casts, user-defined operators, ordering and row-level security
+still use the eager path.
 Resident rows keep their immutable byte owner instead of copying a wide row
 into cursor memory just to return a small column. For example, selecting `id`
 does not copy an unselected 128 KiB text field into `cursor_query_bytes`.

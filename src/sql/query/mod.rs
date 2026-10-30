@@ -22,8 +22,8 @@ use super::ast::{
     WindowFrame,
 };
 use super::eval::{
-    ColumnLookup, EvalHooks, PrivilegeRelation, SequenceAccess, SqlError, SubqueryValues,
-    eval_full, resolved_expression_collation, sqlstate,
+    CatalogAccess, ColumnLookup, EvalHooks, PrivilegeRelation, SequenceAccess, SqlError,
+    SubqueryValues, eval_full, resolved_expression_collation, sqlstate,
 };
 use super::exec::{MAX_PROJ, describe_items};
 use super::types::{ColDesc, ColType, Datum};
@@ -6180,6 +6180,75 @@ fn rewrite_grouped_expr<'a>(
     }
 }
 
+/// Check SELECT types before folding constants or requesting any input rows.
+fn check_select_types<'a>(
+    statement: &'a Select<'a>,
+    scope: &QueryScope<'a>,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<(), SqlError> {
+    let columns = CatalogScopeCols {
+        scope,
+        outer_scope: None,
+        storage,
+        txid,
+        arena,
+    };
+    let check = |e: &Expr| -> Result<(), SqlError> {
+        if user_type_expression_description(e, "", storage, txid).is_some() {
+            Ok(())
+        } else {
+            super::exec::infer_type_res(e, &columns).map(|_| ())
+        }
+    };
+    // SELECT-list items first: PostgreSQL analyzes types before it folds
+    // constants, so an invalid aggregate/operator (e.g. `min(boolean)`)
+    // errors ahead of a constant division elsewhere in the query.
+    for item in statement.items {
+        if let SelectItem::Expr { expression, .. } = item {
+            check(expression)?;
+        }
+    }
+    if let Some(w) = statement.where_clause {
+        check(w)?;
+        let (oid, _) = super::exec::infer_type_res(w, &columns)?;
+        let catalog = storage_catalog(storage, arena, txid);
+        let boolean = oid == super::types::oid::BOOL
+            || oid == super::types::oid::UNKNOWN
+            || catalog.domain_base_type(oid) == Some(ColType::Bool);
+        if !boolean {
+            let type_name = match ColType::from_oid(oid) {
+                Some(ctype) => ctype.name(),
+                None => catalog.type_name(oid, arena)?.unwrap_or("unknown"),
+            };
+            return Err(sql_err!(
+                sqlstate::DATATYPE_MISMATCH,
+                "argument of WHERE must be type boolean, not type {}",
+                type_name
+            ));
+        }
+        if let Expr::Str(text) = w {
+            super::eval::parse_bool(text)?;
+        }
+    }
+    for g in statement.group_by {
+        check(g)?;
+    }
+    if let Some(h) = statement.having {
+        check(h)?;
+    }
+    for ob in statement.order_by {
+        check(resolve_order_target(
+            ob.expression,
+            statement.items,
+            scope,
+            arena,
+        )?)?;
+    }
+    Ok(())
+}
+
 /// Surfaces plan-time constant errors (e.g. `1/0`) across every expression
 /// of a SELECT, matching PostgreSQL's constant folding.
 pub fn check_select_constants<'a>(
@@ -6548,56 +6617,8 @@ pub(crate) fn select_query_resumable<'a, 'statement>(
         merge_action: None,
     };
 
-    // Plan-time type analysis: validate operator/aggregate types across every
-    // clause so incompatible types error before scanning (matching
-    // PostgreSQL), not only when a row reaches them. SELECT items are also
-    // type-checked by describe below.
-    {
-        let columns = CatalogScopeCols {
-            scope: &scope,
-            outer_scope: None,
-            storage,
-            txid,
-            arena,
-        };
-        let check = |e: &Expr| -> Result<(), SqlError> {
-            if user_type_expression_description(e, "", storage, txid).is_some() {
-                Ok(())
-            } else {
-                super::exec::infer_type_res(e, &columns).map(|_| ())
-            }
-        };
-        let analyze = || -> Result<(), SqlError> {
-            // SELECT-list items first: PostgreSQL analyzes types before it folds
-            // constants, so an invalid aggregate/operator (e.g. `min(boolean)`)
-            // errors ahead of a constant division elsewhere in the query.
-            for item in statement.items {
-                if let SelectItem::Expr { expression, .. } = item {
-                    check(expression)?;
-                }
-            }
-            if let Some(w) = statement.where_clause {
-                check(w)?;
-            }
-            for g in statement.group_by {
-                check(g)?;
-            }
-            if let Some(h) = statement.having {
-                check(h)?;
-            }
-            for ob in statement.order_by {
-                check(resolve_order_target(
-                    ob.expression,
-                    statement.items,
-                    &scope,
-                    arena,
-                )?)?;
-            }
-            Ok(())
-        };
-        if let Err(e) = analyze() {
-            return sql_fail(e);
-        }
+    if let Err(error) = check_select_types(statement, &scope, storage, txid, arena) {
+        return sql_fail(error);
     }
 
     // Constant folding runs after type analysis, matching PostgreSQL's

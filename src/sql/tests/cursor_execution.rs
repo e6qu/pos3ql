@@ -339,6 +339,148 @@ fn cursor_retained_reuses_fetch_memory_and_discards_move_and_skipped_rows() {
 }
 
 #[test]
+fn cursor_retained_filters_advance_input_without_saving_rejected_rows() {
+    use crate::config::TransactionMode;
+    use crate::sql::cursor::FetchMotion;
+    for mode in [TransactionMode::Mvcc, TransactionMode::Locking] {
+        let mut config = test_config("cursor-retained-filter");
+        config.transaction_mode = mode;
+        config.cursor_bytes = 32;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        session.success(
+            &mut engine,
+            "CREATE TABLE filtered_input(id integer); \
+             INSERT INTO filtered_input SELECT g FROM generate_series(1,128) AS g; BEGIN; \
+             DECLARE filtered NO SCROLL CURSOR FOR \
+             SELECT id*2 FROM filtered_input WHERE id%3=0 AND NOT (id IS NULL)",
+            true,
+        );
+        let (slot, _) = session
+            .cursors
+            .read_request("filtered", FetchMotion::Count(1), false)
+            .unwrap()
+            .expect("retained filter plan");
+        assert_eq!(session.cursors.produced_rows(slot), 0);
+        for n in 1..=42 {
+            let output = session.success(&mut engine, "FETCH NEXT FROM filtered", true);
+            assert_eq!(data_rows(&output), [(n * 6).to_string()]);
+            assert_eq!(session.cursors.buffered_rows(slot), 1);
+            let statistics = session.success(&mut engine,
+                "SELECT seq_scan,seq_tup_read FROM pg_stat_xact_user_tables WHERE relname='filtered_input'", true);
+            assert_eq!(data_rows(&statistics), [format!("1|{}", n * 3)]);
+        }
+        assert_eq!(
+            command_tags(&session.success(&mut engine, "FETCH NEXT FROM filtered", true)),
+            ["FETCH 0"]
+        );
+        let statistics = session.success(&mut engine,
+            "SELECT seq_scan,seq_tup_read FROM pg_stat_xact_user_tables WHERE relname='filtered_input'", true);
+        assert_eq!(data_rows(&statistics), ["1|128"]);
+        session.success(&mut engine, "CLOSE filtered; COMMIT", true);
+    }
+}
+
+#[test]
+fn cursor_retained_builtin_operators_keep_their_declared_identity() {
+    use crate::sql::cursor::FetchMotion;
+    let config = test_config("cursor-retained-operator-binding");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE SCHEMA cursor_ops; SET search_path=cursor_ops,pg_catalog; \
+         CREATE TABLE operator_input(id integer); INSERT INTO operator_input VALUES (1),(2); \
+         BEGIN; DECLARE bound_ops NO SCROLL CURSOR FOR SELECT id+10 FROM operator_input",
+        true,
+    );
+    assert!(
+        session
+            .cursors
+            .read_request("bound_ops", FetchMotion::Count(1), false)
+            .unwrap()
+            .is_some()
+    );
+    session.success(&mut engine,
+        "CREATE FUNCTION cursor_ops.custom_add(integer,integer) RETURNS integer LANGUAGE SQL RETURN $1-$2; \
+         CREATE OPERATOR cursor_ops.+ (FUNCTION=cursor_ops.custom_add,LEFTARG=integer,RIGHTARG=integer)", true);
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "FETCH NEXT FROM bound_ops", true)),
+        ["11"]
+    );
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "FETCH NEXT FROM bound_ops", true)),
+        ["12"]
+    );
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "SELECT id+10 FROM operator_input", true)),
+        ["-9", "-8"]
+    );
+    session.success(
+        &mut engine,
+        "CLOSE bound_ops; ROLLBACK; RESET search_path",
+        true,
+    );
+}
+
+#[test]
+fn cursor_retained_errors_occur_when_the_requested_row_is_evaluated() {
+    let config = test_config("cursor-retained-expression-errors");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(&mut engine,
+        "CREATE TABLE expression_input(id integer); INSERT INTO expression_input VALUES (1),(2),(0); \
+         BEGIN; DECLARE calculated NO SCROLL CURSOR FOR SELECT 100/id FROM expression_input", true);
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "FETCH NEXT FROM calculated", true)),
+        ["100"]
+    );
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "FETCH NEXT FROM calculated", true)),
+        ["50"]
+    );
+    session.success(&mut engine, "SAVEPOINT before_error", true);
+    assert_eq!(
+        error_sqlstates(&session.execute(&mut engine, "FETCH NEXT FROM calculated", true)),
+        ["22012"]
+    );
+    session.success(&mut engine, "ROLLBACK TO SAVEPOINT before_error", true);
+    assert_eq!(data_rows(&session.success(&mut engine,
+        "SELECT seq_scan,seq_tup_read FROM pg_stat_xact_user_tables WHERE relname='expression_input'", true)), ["1|3"]);
+    assert_eq!(
+        error_sqlstates(&session.execute(&mut engine, "FETCH NEXT FROM calculated", true)),
+        ["55000"]
+    );
+    session.success(
+        &mut engine,
+        "ROLLBACK TO SAVEPOINT before_error; CLOSE calculated; ROLLBACK",
+        true,
+    );
+    for (select, state) in [
+        ("SELECT 1/0 FROM expression_input", "22012"),
+        ("SELECT id FROM expression_input WHERE id", "42804"),
+    ] {
+        session.success(&mut engine, "BEGIN", true);
+        assert_eq!(
+            error_sqlstates(&session.execute(
+                &mut engine,
+                &format!("DECLARE invalid NO SCROLL CURSOR FOR {select}"),
+                true
+            )),
+            [state]
+        );
+        assert!(!session.cursors.exists("invalid"));
+        session.success(&mut engine, "ROLLBACK", true);
+    }
+    session.success(&mut engine,
+        "BEGIN; DECLARE empty_filter NO SCROLL CURSOR FOR SELECT id FROM expression_input WHERE FALSE; \
+         DROP TABLE expression_input; FETCH ALL FROM empty_filter; COMMIT", true);
+}
+
+#[test]
 fn cursor_dynamic_open_rejects_multiple_commands_before_issuing_sequence_values() {
     let config = test_config("cursor-open-command-count");
     let mut budget = test_engine_budget(&config, 1 << 29);

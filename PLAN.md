@@ -59,8 +59,10 @@ A waiting schema edit must never attach itself to a new object that reused a nam
   built-in arithmetic/comparisons, `CASE WHEN` expressions, array construction,
   element access and slices, boolean filters, integer row limits/offsets and
   captured parameters. Preserve their declared common types through subqueries,
-  null values and result inspection without issuing skipped effects. Carry
-  sequence effects through subqueries and row bounds without losing their
+  null values and result inspection without issuing skipped effects. Preserve
+  enclosing column types in nested table-function inputs, including empty
+  and null arrays; describing a result must not require a sample row.
+  Carry sequence effects through subqueries and row bounds without losing their
   connection state or repeating completed calls.
   Forward-only cursors reuse memory per fetch; scrolling cursors retain visited
   results. Omitted scroll options follow the bound plan’s backward-read support.

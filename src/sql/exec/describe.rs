@@ -1538,14 +1538,31 @@ pub fn derived_name<'a>(expression: &Expr<'a>) -> &'a str {
         Expr::Exists(_) => "exists",
         Expr::ArraySubquery(_) | Expr::Array(_) => "array",
         // A scalar subquery is named by its single output column.
-        Expr::Subquery(s) => match s.items.first() {
-            Some(SelectItem::Expr { alias: Some(a), .. }) => a,
-            Some(SelectItem::Expr {
-                expression,
-                alias: None,
-            }) => derived_name(expression),
-            _ => "?column?",
-        },
+        Expr::Subquery(select) => {
+            let mut select = *select;
+            while let Some(tree) = select.set_body {
+                let mut left = tree;
+                loop {
+                    match left {
+                        crate::sql::ast::SetTree::Select(leaf) => {
+                            select = leaf;
+                            break;
+                        }
+                        crate::sql::ast::SetTree::Op { left: branch, .. } => left = branch,
+                    }
+                }
+            }
+            match select.items.first() {
+                Some(SelectItem::Expr {
+                    alias: Some(alias), ..
+                }) => alias,
+                Some(SelectItem::Expr {
+                    expression,
+                    alias: None,
+                }) => derived_name(expression),
+                _ => "?column?",
+            }
+        }
         _ => "?column?",
     }
 }
@@ -4481,7 +4498,19 @@ pub fn infer_type_res(
             "family" | "masklen" => of(ColType::Int4),
             "host" | "abbrev" | "text" | "inet_out" | "cidr_out" | "macaddr_out"
             | "macaddr8_out" => of(ColType::Text),
-            "broadcast" | "netmask" | "hostmask" | "set_masklen" | "inet_in" | "network_larger"
+            "set_masklen" => {
+                if let Some(argument) = args.first()
+                    && {
+                        let oid = infer_type_res(argument, columns)?.0;
+                        columns.domain_base_type(oid).map_or(oid, ColType::oid) == oid::CIDR
+                    }
+                {
+                    of(ColType::Cidr)
+                } else {
+                    of(ColType::Inet)
+                }
+            }
+            "broadcast" | "netmask" | "hostmask" | "inet_in" | "network_larger"
             | "network_smaller" | "inetnot" | "inetand" | "inetor" | "inetpl" | "int8pl_inet"
             | "inetmi_int8" => of(ColType::Inet),
             "inet_send" | "cidr_send" | "macaddr_send" | "macaddr8_send" => of(ColType::Bytea),
@@ -4939,17 +4968,19 @@ pub fn infer_type_res(
                     .first()
                     .map(|a| infer_type_res(a, columns))
                     .transpose()?
-                    .map(|t| t.0);
+                    .map(|t| columns.domain_base_type(t.0).map_or(t.0, ColType::oid));
                 let b = args
                     .get(1)
                     .map(|a| infer_type_res(a, columns))
                     .transpose()?
-                    .map(|t| t.0);
+                    .map(|t| columns.domain_base_type(t.0).map_or(t.0, ColType::oid));
                 // `mod` keeps a numeric operand's type; gcd/lcm are integer-only.
                 if *name == "mod" && (a == Some(oid::NUMERIC) || b == Some(oid::NUMERIC)) {
                     of(ColType::Numeric)
                 } else if a == Some(oid::INT8) || b == Some(oid::INT8) {
                     of(ColType::Int8)
+                } else if *name == "mod" && a == Some(oid::INT2) && b == Some(oid::INT2) {
+                    of(ColType::Int2)
                 } else {
                     of(ColType::Int4)
                 }

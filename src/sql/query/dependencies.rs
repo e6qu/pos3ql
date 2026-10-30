@@ -1039,7 +1039,7 @@ fn dml_dependency_scope<'a>(
     let from = arena
         .alloc(FromClause { base, joins })
         .map_err(|_| super::arena_full())?;
-    super::QueryScope::resolve_schema(storage, from, txid, arena)
+    super::QueryScope::resolve_schema(storage, from, txid, arena, None)
 }
 
 fn collect_select<'a>(
@@ -1179,7 +1179,7 @@ fn collect_select<'a>(
         }
         if all_tables {
             let bound = context.bound_from(&from, storage, txid, visible_ctes, arena)?;
-            let scope = super::QueryScope::resolve_schema(storage, &bound, txid, arena)?;
+            let scope = super::QueryScope::resolve_schema(storage, &bound, txid, arena, None)?;
             for item in select.items {
                 match item {
                     SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
@@ -1529,7 +1529,7 @@ fn collect_routine_dependencies(
         let mark = arena.mark();
         let result = (|| {
             let bound = context.bound_from(from, storage, txid, ctes, arena)?;
-            let scope = super::QueryScope::resolve_schema(storage, &bound, txid, arena)?;
+            let scope = super::QueryScope::resolve_schema(storage, &bound, txid, arena, None)?;
             let resolver = DependencyTypes {
                 scope: Some(&scope),
                 excluded: None,

@@ -166,7 +166,7 @@ impl ParameterInference<'_> {
 
         let scope = match select.from.as_ref() {
             Some(from) => {
-                match query::QueryScope::resolve_schema(self.storage, from, txid, arena) {
+                match query::QueryScope::resolve_schema(self.storage, from, txid, arena, None) {
                     Ok(scope) => Some(scope),
                     Err(_) => return,
                 }

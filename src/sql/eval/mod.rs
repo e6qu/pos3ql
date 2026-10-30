@@ -5997,7 +5997,12 @@ fn static_type<'a>(e: &Expr<'a>, row: &impl ColumnLookup<'a>) -> Option<ColType>
             "int4" => Some(ColType::Int4),
             "int8" => Some(ColType::Int8),
             "float8" => Some(ColType::Float8),
-            "inet_in" | "broadcast" | "netmask" | "hostmask" | "set_masklen" | "network_larger"
+            "set_masklen" => match args.first().and_then(|argument| static_type(argument, row)) {
+                Some(ColType::Cidr) => Some(ColType::Cidr),
+                Some(_) => Some(ColType::Inet),
+                None => None,
+            },
+            "inet_in" | "broadcast" | "netmask" | "hostmask" | "network_larger"
             | "network_smaller" | "inetnot" | "inetand" | "inetor" | "inetpl" | "int8pl_inet"
             | "inetmi_int8" => Some(ColType::Inet),
             "cidr_in" | "cidr" | "network" | "inet_merge" => Some(ColType::Cidr),

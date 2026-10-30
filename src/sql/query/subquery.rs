@@ -379,7 +379,7 @@ fn external_list_subquery<'a>(
     let own_scope = select
         .from
         .as_ref()
-        .map(|from| QueryScope::resolve_schema(storage, from, txid, arena))
+        .map(|from| QueryScope::resolve_schema(storage, from, txid, arena, outer))
         .transpose()?;
     let mut witness = if let Some(witness) = row_witness {
         witness
@@ -523,7 +523,7 @@ fn streaming_scalar_subquery<'a>(
     let own_scope = select
         .from
         .as_ref()
-        .map(|from| QueryScope::resolve_schema(storage, from, txid, arena))
+        .map(|from| QueryScope::resolve_schema(storage, from, txid, arena, outer))
         .transpose()?;
     let witness = spooled_column_witness(
         select,
@@ -617,7 +617,7 @@ fn streaming_array_subquery<'a>(
     let own_scope = select
         .from
         .as_ref()
-        .map(|from| QueryScope::resolve_schema(storage, from, txid, arena))
+        .map(|from| QueryScope::resolve_schema(storage, from, txid, arena, outer))
         .transpose()?;
     let witness = spooled_column_witness(
         select,
@@ -1032,7 +1032,7 @@ fn subquery_collations<'a>(
     let scope = select
         .from
         .as_ref()
-        .map(|from| QueryScope::resolve_schema(storage, from, txid, arena))
+        .map(|from| QueryScope::resolve_schema(storage, from, txid, arena, outer))
         .transpose()?;
     if let [SelectItem::Expr { expression, .. }] = select.items
         && let Some((_, collations)) =
@@ -1142,7 +1142,7 @@ fn row_subquery_witness<'a>(
     let scope = select
         .from
         .as_ref()
-        .map(|from| QueryScope::resolve_schema(storage, from, txid, arena))
+        .map(|from| QueryScope::resolve_schema(storage, from, txid, arena, outer))
         .transpose()?;
     for (index, item) in select.items.iter().enumerate() {
         let SelectItem::Expr { expression, alias } = item else {
@@ -1639,7 +1639,7 @@ fn correlation_schema<'a>(
     if references_outer(&from.base) || from.joins.iter().any(|join| references_outer(&join.table)) {
         return Ok(None);
     }
-    QueryScope::resolve_schema(storage, from, txid, arena).map(Some)
+    QueryScope::resolve_schema(storage, from, txid, arena, None).map(Some)
 }
 
 /// Whether any column in this select (WHERE or projection) fails to resolve
@@ -2513,7 +2513,7 @@ pub(crate) fn subquery_expression_type(
     let scope = select
         .from
         .as_ref()
-        .map(|from| QueryScope::resolve_schema(storage, from, txid, arena))
+        .map(|from| QueryScope::resolve_schema(storage, from, txid, arena, Some(outer)))
         .transpose()?;
     let columns = SubqueryColumns {
         scope: scope.as_ref(),
@@ -2886,7 +2886,7 @@ fn run_subquery<'a>(
         let own_scope = select
             .from
             .as_ref()
-            .and_then(|f| QueryScope::resolve_schema(storage, f, txid, arena).ok());
+            .and_then(|f| QueryScope::resolve_schema(storage, f, txid, arena, outer).ok());
         let witness = spooled_column_witness(
             select,
             storage,
@@ -3201,6 +3201,10 @@ fn run_subquery<'a>(
 /// scalar / IN callers can consume them. Correlated columns are not visible to a
 /// set-operation body (each leaf is materialized independently); an unresolved
 /// reference surfaces loudly as a missing-column error from the leaf itself.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "explicit subquery execution context"
+)]
 fn run_set_subquery<'a>(
     tree: &'a SetTree<'a>,
     outer_select: &'a Select<'a>,

@@ -320,7 +320,7 @@ impl<'a> RetainedSelect<'a> {
         {
             return Ok(None);
         }
-        let scope = QueryScope::resolve_schema(storage, from, txid, arena)?;
+        let scope = QueryScope::resolve_schema(storage, from, txid, arena, None)?;
         if scope.n != 1 || scope.derived[0].is_some() || scope.slots[0] == usize::MAX {
             return Ok(None);
         }

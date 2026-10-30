@@ -387,6 +387,7 @@ fn collect_stored_query_composite_field_rename_select<'a>(
             from_clause,
             rename.txid,
             rename.arena,
+            None,
         )?),
         None => None,
     };
@@ -4907,7 +4908,7 @@ fn patch_subquery_column_types<'a>(
                                 }) = sub.items.first()
                                 && let Some(from) = sub.from
                                 && let Ok(inner_scope) =
-                                    QueryScope::resolve_schema(storage, &from, txid, arena)
+                                    QueryScope::resolve_schema(storage, &from, txid, arena, None)
                                 && let Ok(witness) = subquery_witness(
                                     storage,
                                     txid,
@@ -5698,7 +5699,7 @@ pub(crate) fn describe_select<'a>(
     }
     match &sel.from {
         Some(from) => {
-            let scope = QueryScope::resolve_schema(storage, from, txid, arena)?;
+            let scope = QueryScope::resolve_schema(storage, from, txid, arena, None)?;
             describe_select_items(sel.items, Some(&scope), storage, txid, arena, out)
         }
         None => describe_select_items(sel.items, None, storage, txid, arena, out),
@@ -8962,7 +8963,16 @@ fn array_subquery_field_type_inner<'q>(
     let mut element = [ColDesc::new("", 0, 0); 1];
     let count = match &select.from {
         Some(from) => {
-            let scope = QueryScope::resolve_schema(storage, from, txid, arena)?;
+            let scope = QueryScope::resolve_schema(
+                storage,
+                from,
+                txid,
+                arena,
+                outer_scope
+                    .map(ScopeSchema)
+                    .as_ref()
+                    .map(|schema| schema as &dyn ColumnLookup<'_>),
+            )?;
             describe_scope_items(
                 select.items,
                 &scope,
@@ -9053,7 +9063,16 @@ fn subquery_result_type_inner<'a>(
     } else {
         match &select.from {
             Some(from) => {
-                let scope = QueryScope::resolve_schema(storage, from, txid, arena)?;
+                let scope = QueryScope::resolve_schema(
+                    storage,
+                    from,
+                    txid,
+                    arena,
+                    outer_scope
+                        .map(ScopeSchema)
+                        .as_ref()
+                        .map(|schema| schema as &dyn ColumnLookup<'_>),
+                )?;
                 describe_scope_items(
                     select.items,
                     &scope,

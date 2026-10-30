@@ -997,7 +997,7 @@ fn leaf_col_unknown<'a>(
                     let scratch_mark = arena.mark();
                     let raw = match &s.from {
                         None => exec::infer_type_pub(expression, None).map(|t| t.0),
-                        Some(f) => QueryScope::resolve_schema(storage, f, txid, arena)
+                        Some(f) => QueryScope::resolve_schema(storage, f, txid, arena, None)
                             .and_then(|sc| infer_scope_type(expression, &sc).map(|t| t.0)),
                     };
                     // Inference retains only an owned OID/error, not its
@@ -1078,7 +1078,7 @@ fn describe_leaf_inner<'a>(
             Ok(count)
         }
         Some(from) => {
-            let scope = QueryScope::resolve_schema(storage, from, txid, arena)?;
+            let scope = QueryScope::resolve_schema(storage, from, txid, arena, None)?;
             let count = describe_scope_items(s.items, &scope, None, storage, txid, arena, columns)?;
             super::srf::preserve_projection_type_identities(
                 s.items,
@@ -1258,7 +1258,7 @@ fn register_record_shapes_inner(
     let scope = statement
         .from
         .as_ref()
-        .map(|from| QueryScope::resolve_schema(storage, from, txid, arena))
+        .map(|from| QueryScope::resolve_schema(storage, from, txid, arena, None))
         .transpose()?;
     let scope = scope.as_ref();
     let mut slot = 0usize;

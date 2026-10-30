@@ -30,10 +30,12 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --test sqlstate_gate --locked
-      - run: >-
+      - if: ${{ !cancelled() }}
+        run: >-
           cargo test --lib --locked -- cursor_ arena_retained_slices_ query_reads_held_ checkpoint_reads_held_
           cursor_read_statistics_ captured_resident_byte_scans_ retained_checkpoint_ table_sources_survive_ subquery_execution_ store::sst::tests:: pg::respond::tests:: procedural_static_utility_ sql::parser::tests:: exec::projected::tests:: sequence::tests::
           configured_user_type_capacities_ owned_enum_rewrite_sources_ type_reference_moves_ user_type_schema_identity_ user_defined_aggregate_resolves_
+          lateral_joins create_table_as_builds_and_populates moved_enum_identity_ postgresql_18_catalog_reference_family_ regcollation_values_
           --nocapture --test-threads=1
       - run: python3 tools/check-docs.py
       - run: bash tools/check-bugs.sh
@@ -160,10 +162,10 @@ jobs:
           server_pid=$!
           for attempt in $(seq 1 100); do
             kill -0 "$server_pid"
-            if rg -q 'accepting connections$' "$evidence/server.log"; then break; fi
+            if grep -q 'accepting connections$' "$evidence/server.log"; then break; fi
             sleep 0.1
           done
-          rg -q 'accepting connections$' "$evidence/server.log"
+          grep -q 'accepting connections$' "$evidence/server.log"
           source=tests/external/differential_exact/38_cursor_query_ownership.sql
           for port in 5432 15598; do
             if [[ "$port" == 5432 ]]; then

@@ -11560,6 +11560,7 @@ impl Engine {
                             from,
                             txn.txid,
                             arena,
+                            None,
                         ) {
                             Ok(scope) => query::describe_select_items(
                                 s.items,

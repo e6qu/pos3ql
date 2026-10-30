@@ -7,6 +7,8 @@ with its reproducer, observed behavior and exact external blocker or reason it
 cannot be repaired. Keep reproductions, regression checks and PostgreSQL
 comparisons in the fixing PR, including declared result types, input lifetimes,
 argument and sequence effects, and when errors occur.
+Include overload selection with typed nulls and the declared inputs of correlated
+table functions; a correct non-null value alone does not establish its SQL type.
 Preserve failed outputs and diagnostics before removing temporary fixtures.
 See [CONTRIBUTING.md](CONTRIBUTING.md).
 

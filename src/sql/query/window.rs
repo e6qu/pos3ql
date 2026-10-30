@@ -181,7 +181,7 @@ pub(crate) fn rewrite_grouped_windows<'a>(
     let scope = statement
         .from
         .as_ref()
-        .and_then(|f| QueryScope::resolve_schema(storage, f, txid, arena).ok());
+        .and_then(|f| QueryScope::resolve_schema(storage, f, txid, arena, None).ok());
     let context = GroupedRewrite {
         group_by: statement.group_by,
         group_names,

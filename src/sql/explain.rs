@@ -863,7 +863,9 @@ pub(super) fn plan_select<'a>(
 ) -> Result<Plan<'a>, SqlError> {
     let started = std::time::Instant::now();
     let scope = match &statement.from {
-        Some(from) => Some(QueryScope::resolve_schema(storage, from, txid, arena)?),
+        Some(from) => Some(QueryScope::resolve_schema(
+            storage, from, txid, arena, None,
+        )?),
         None => None,
     };
     let capacity = scope
@@ -1485,7 +1487,7 @@ pub(super) fn plan_modification<'a>(
     if let Some(from) = joined_from {
         let target_slot = relation_slot(storage, txid, target.schema, target.name)
             .expect("target existence checked above");
-        let scope = QueryScope::resolve_schema(storage, from, txid, arena)?;
+        let scope = QueryScope::resolve_schema(storage, from, txid, arena, None)?;
         let order = arena
             .alloc_slice_with(scope.n, |index| index)
             .map_err(|_| arena_full())?;

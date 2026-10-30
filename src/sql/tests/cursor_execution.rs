@@ -1,6 +1,58 @@
 use super::*;
 
 #[test]
+fn cursor_expression_metadata_preserves_overloads_and_correlated_function_inputs() {
+    let config = test_config("cursor-expression-overload-types");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(&mut engine, "CREATE DOMAIN cursor_short AS smallint; \
+        CREATE DOMAIN cursor_network AS cidr; CREATE DOMAIN cursor_day AS date; \
+        CREATE TABLE cursor_function_inputs(id integer, options text[], days cursor_day[]); \
+        INSERT INTO cursor_function_inputs VALUES(1,ARRAY['a','b'],ARRAY[DATE '2026-10-30',NULL]::cursor_day[]), \
+        (2,NULL,NULL),(3,ARRAY['c'],ARRAY[]::cursor_day[])", true);
+    assert_eq!(data_rows(&session.success(&mut engine,
+        "SELECT pg_typeof(mod(7::smallint,3::smallint)),pg_typeof(mod(NULL::smallint,3::smallint)), \
+        pg_typeof(mod(7::cursor_short,3::cursor_short)), \
+        pg_typeof(set_masklen('192.168.1.0/24'::cidr,16)), \
+        pg_typeof(set_masklen(NULL::cursor_network,16)), \
+        pg_typeof(set_masklen(NULL::inet,16))", true)),
+        ["smallint|smallint|smallint|cidr|cidr|inet"]);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT mod('-9223372036854775808'::bigint,-1::bigint), \
+        mod('-2147483648'::integer,-1),mod('-32768'::smallint,-1::smallint)",
+            true
+        )),
+        ["0|0|0"]
+    );
+    let named = session.success(
+        &mut engine,
+        "SELECT (SELECT 1 AS first_name UNION ALL SELECT 2 LIMIT 1), \
+        (SELECT lower('A') INTERSECT SELECT 'a')",
+        true,
+    );
+    assert_eq!(data_rows(&named), ["1|a"]);
+    assert_eq!(row_description_names(&named), ["first_name", "lower"]);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT id,ARRAY(SELECT 'x.'||option FROM unnest(t.options) option), \
+        pg_typeof(ARRAY(SELECT day_value FROM unnest(t.days) day_value)), \
+        ARRAY(SELECT day_value FROM unnest(t.days) day_value) \
+        FROM cursor_function_inputs t ORDER BY id",
+            true
+        )),
+        [
+            "1|{x.a,x.b}|cursor_day[]|{2026-10-30,NULL}",
+            "2|{}|cursor_day[]|{}",
+            "3|{x.c}|cursor_day[]|{}"
+        ]
+    );
+}
+
+#[test]
 fn cursor_named_array_casts_and_function_metadata_use_declared_conversions() {
     let config = test_config("cursor-named-array-conversions");
     let mut budget = test_engine_budget(&config, 1 << 29);

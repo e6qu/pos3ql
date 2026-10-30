@@ -57115,7 +57115,7 @@ pub fn describe_merge_returning<'a>(
             joins,
         })
         .map_err(|_| super::query::arena_full_pub())?;
-    let scope = super::query::QueryScope::resolve_schema(storage, from, txid, arena)?;
+    let scope = super::query::QueryScope::resolve_schema(storage, from, txid, arena, None)?;
     let output_alias = |item: &SelectItem<'a>| {
         let mut alias = None;
         let mut conflicting = false;
@@ -57227,7 +57227,7 @@ pub fn describe_merge_returning<'a>(
                 })
                 .map_err(|_| super::query::arena_full_pub())?;
             let output_scope =
-                super::query::QueryScope::resolve_schema(storage, output_from, txid, arena)?;
+                super::query::QueryScope::resolve_schema(storage, output_from, txid, arena, None)?;
             count += super::query::describe_scope_items(
                 core::slice::from_ref(item),
                 &output_scope,
@@ -61542,12 +61542,13 @@ fn emit_merge_returning<'a>(
             expression_count += 1;
         }
     }
-    let subqueries = match super::query::subquery_hooks(
+    let subqueries = match super::query::subquery_hooks_outer(
         &expressions[..expression_count],
         storage,
         txid,
         arena,
         params,
+        &lookup,
         Some(&crate::sql::sequence::SeqEval::new(
             storage,
             seq_session,

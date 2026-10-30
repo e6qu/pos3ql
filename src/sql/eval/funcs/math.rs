@@ -733,7 +733,8 @@ pub(crate) fn dispatch<'a>(
                 if y == 0 {
                     return Err(sql_err!(sqlstate::DIVISION_BY_ZERO, "division by zero"));
                 }
-                let r = x % y;
+                // The remainder is zero even when MIN / -1 would overflow.
+                let r = if y == -1 { 0 } else { x % y };
                 Ok(match wl.max(wr) {
                     2 => Datum::Int2(r as i16),
                     4 => Datum::Int4(r as i32),

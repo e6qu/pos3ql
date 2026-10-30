@@ -1944,6 +1944,10 @@ pub(crate) fn describe_derived_definition<'a>(
     arena: &'a Arena,
     outer: Option<&QueryScope<'a>>,
 ) -> Result<TableDef, SqlError> {
+    let outer_schema = outer.map(super::ScopeSchema);
+    let outer_columns = outer_schema
+        .as_ref()
+        .map(|schema| schema as &dyn ColumnLookup<'_>);
     let mut descriptors = [ColDesc::new("", 0, 0); MAX_PROJ];
     let mut type_oids = [0_i32; MAX_PROJ];
     let mut output_collations = [crate::sql::ast::Collation::None; MAX_PROJ];
@@ -1958,7 +1962,7 @@ pub(crate) fn describe_derived_definition<'a>(
         )?,
         None => match &sub.from {
             Some(f) => {
-                let ss = QueryScope::resolve_schema(storage, f, txid, arena)?;
+                let ss = QueryScope::resolve_schema(storage, f, txid, arena, outer_columns)?;
                 let n = describe_scope_items(
                     sub.items,
                     &ss,
@@ -2008,7 +2012,7 @@ pub(crate) fn describe_derived_definition<'a>(
                                 }) = inner_sub.items.first()
                             {
                                 let inner_scope = inner_sub.from.as_ref().and_then(|inf| {
-                                    QueryScope::resolve_schema(storage, inf, txid, arena).ok()
+                                    QueryScope::resolve_schema(storage, inf, txid, arena, None).ok()
                                 });
                                 let witness = subquery_witness(
                                     storage,

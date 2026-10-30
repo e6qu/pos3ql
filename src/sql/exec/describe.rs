@@ -5174,7 +5174,7 @@ pub fn infer_type_res(
             | "tsmultirange" | "tstzmultirange" => of(ColType::Multirange(
                 crate::sql::types::RangeKind::from_multirange_name(name).expect("multirange name"),
             )),
-            "similar_to"
+            crate::sql::parser::SIMILAR_TO
             | "isempty"
             | "lower_inc"
             | "upper_inc"

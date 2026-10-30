@@ -21348,6 +21348,19 @@ fn eval_trigger_expression<'a>(
     expression: &'a Expr<'a>,
     row: &impl ColumnLookup<'a>,
 ) -> Result<Datum<'a>, SqlError> {
+    let subqueries = expression
+        .contains_subquery()
+        .then(|| {
+            super::query::subquery_hooks_outer(
+                &[Some(expression)],
+                context.storage(),
+                context.txn.txid,
+                context.arena,
+                context.params,
+                row,
+            )
+        })
+        .transpose()?;
     let catalog = super::query::storage_catalog(context.storage(), context.arena, context.txn.txid);
     let sequence = crate::sql::sequence::SeqEval::new(
         context.storage(),
@@ -21357,6 +21370,7 @@ fn eval_trigger_expression<'a>(
     let hooks = EvalHooks {
         catalog: Some(&catalog),
         sequences: Some(&sequence),
+        subs: subqueries.as_ref(),
         ..NO_HOOKS
     };
     eval_full(expression, context.arena, context.params, row, &hooks)

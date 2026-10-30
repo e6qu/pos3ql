@@ -31,7 +31,7 @@ jobs:
       - run: cargo test --test sqlstate_gate --locked
       - run: >-
           cargo test --lib --locked -- cursor_ arena_retained_slices_ query_reads_held_ checkpoint_reads_held_
-          cursor_read_statistics_ captured_resident_byte_scans_ retained_checkpoint_ store::sst::tests:: pg::respond::tests:: procedural_static_utility_ sql::parser::tests:: exec::projected::tests:: sequence::tests::
+          cursor_read_statistics_ captured_resident_byte_scans_ retained_checkpoint_ table_sources_survive_ store::sst::tests:: pg::respond::tests:: procedural_static_utility_ sql::parser::tests:: exec::projected::tests:: sequence::tests::
           --nocapture --test-threads=1
       - run: cargo clippy --all-targets -- -D warnings
       - run: python3 tools/check-docs.py

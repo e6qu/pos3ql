@@ -203,7 +203,9 @@ input. Unlike forward-only cursors, their accumulated history must fit
 the cursor failed until closed. When the scroll option is omitted, a physical
 scan permits scrolling; a provably empty result is forward-only. The matching
 `pg_cursors.is_scrollable` value is chosen at declaration. Constant false or
-null filters avoid input reads, including string boolean literals such as `'f'`.
+null filters avoid input reads, including string boolean literals such as `'f'`
+and captured parameter values. A local variable changed after `OPEN` cannot
+change whether that cursor's filter matches.
 
 For these query shapes, `WITH HOLD` saves the unread result during commit
 and keeps the current position. It also works without `BEGIN`: the declaration's
@@ -333,6 +335,10 @@ SELECT has_table_privilege(identity, 'SELECT') IS NULL FROM saved_order_identity
 A trigger can return from a nested branch or raise an exception without a
 `RETURN` statement. Creation accepts both. If execution reaches the end without
 returning, the command fails with `2F005` and rolls back its changes.
+Native procedural expressions can read subqueries using their current variables
+and trigger rows. For example, `IF EXISTS (SELECT 1 FROM orders WHERE id=NEW.id)`
+tests the inserted row's identifier. A scalar subquery with no rows returns
+NULL; more than one row fails with `21000`.
 
 DDL success follows its end-of-command event triggers. A hook that raises an
 error rolls the command back and keeps its notices, without sending a success

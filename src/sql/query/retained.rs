@@ -78,6 +78,32 @@ fn retained_expression(
     }
 }
 
+fn row_independent(expression: &Expr<'_>, scope: &QueryScope<'_>) -> bool {
+    match expression {
+        Expr::Null
+        | Expr::Bool(_)
+        | Expr::Int(_)
+        | Expr::Float(_)
+        | Expr::NumericLit(_)
+        | Expr::Str(_)
+        | Expr::BitLit(_)
+        | Expr::Param(_) => true,
+        Expr::RoutineParam {
+            qualifier, name, ..
+        } => scope.find_column(*qualifier, name).is_err_and(|error| {
+            error.sqlstate == sqlstate::UNDEFINED_COLUMN
+                || error.sqlstate == sqlstate::UNDEFINED_TABLE
+        }),
+        Expr::Unary { operand, .. } | Expr::IsNull { operand, .. } => {
+            row_independent(operand, scope)
+        }
+        Expr::Binary { left, right, .. } => {
+            row_independent(left, scope) && row_independent(right, scope)
+        }
+        _ => false,
+    }
+}
+
 fn retained_bound(expression: &Expr<'_>, catalog: &dyn super::super::eval::CatalogAccess) -> bool {
     match expression {
         Expr::Int(_) | Expr::Null | Expr::Param(_) | Expr::RoutineParam { .. } => true,
@@ -191,6 +217,10 @@ impl<'a> RetainedSelect<'a> {
             || !statement.order_by.is_empty()
             || !statement.locking.is_empty()
             || statement.with_ties
+            || matches!(
+                storage.resolve_relation(from.base.schema, from.base.table, txid),
+                Some(crate::storage::ResolvedRelation::View(_))
+            )
         {
             return Ok(None);
         }
@@ -310,12 +340,17 @@ impl<'a> RetainedSelect<'a> {
             })
             .transpose()?;
         let (predicate, eliminated) = match predicate {
-            Some(predicate) if predicate.is_constant() => {
-                let value = super::super::eval::eval(
+            Some(predicate) if row_independent(predicate, &scope) => {
+                let hooks = EvalHooks {
+                    catalog: Some(&catalog),
+                    ..super::super::eval::NO_HOOKS
+                };
+                let value = eval_full(
                     predicate,
                     arena,
-                    &[],
+                    params,
                     &super::super::eval::NoColumns,
+                    &hooks,
                 )?;
                 let value = super::super::eval::boolean_argument(value, "WHERE")?;
                 (None, !matches!(value, Datum::Bool(true)))

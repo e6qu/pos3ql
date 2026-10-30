@@ -56,6 +56,34 @@ BEGIN
 END $$;
 SELECT cursor_retained_native();
 DROP FUNCTION cursor_retained_native();
+CREATE TABLE expression_input(id integer);
+INSERT INTO expression_input VALUES (1),(2);
+CREATE FUNCTION expression_value(wanted integer) RETURNS integer LANGUAGE plpgsql AS $$
+DECLARE saved integer := (SELECT id FROM expression_input WHERE id=wanted);
+BEGIN
+  IF EXISTS (SELECT id FROM expression_input WHERE id=saved) THEN
+    saved := (SELECT id+10 FROM expression_input WHERE id=saved);
+  END IF;
+  RETURN (SELECT saved);
+END $$;
+SELECT expression_value(1),expression_value(2),expression_value(3);
+CREATE FUNCTION expression_many() RETURNS integer LANGUAGE plpgsql AS $$
+BEGIN RETURN (SELECT id FROM expression_input); END $$;
+SELECT expression_many();
+CREATE TABLE expression_target(id integer);
+CREATE FUNCTION expression_transition() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  IF EXISTS (SELECT id FROM expression_input WHERE id=NEW.id) THEN NEW.id := NEW.id+10; END IF;
+  RETURN NEW;
+END $$;
+CREATE TRIGGER expression_transition BEFORE INSERT ON expression_target
+FOR EACH ROW EXECUTE FUNCTION expression_transition();
+INSERT INTO expression_target VALUES (1),(3) RETURNING id;
+DROP TABLE expression_target;
+DROP FUNCTION expression_transition();
+DROP FUNCTION expression_many();
+DROP FUNCTION expression_value(integer);
+DROP TABLE expression_input;
 CREATE INDEX cursor_retained_order_idx ON cursor_retained_orders(id);
 
 -- PostgreSQL CheckTableNotInUse keeps an open reader attached to its table.
@@ -411,6 +439,16 @@ DECLARE c refcursor := 'parameter_default'; BEGIN
 END $$;
 BEGIN;
 SELECT default_parameter_cursor(false);
+SELECT is_scrollable FROM pg_cursors WHERE name='parameter_default';
+FETCH ALL FROM parameter_default;
+COMMIT;
+BEGIN;
+SELECT default_parameter_cursor(true);
+SELECT is_scrollable FROM pg_cursors WHERE name='parameter_default';
+FETCH LAST FROM parameter_default;
+COMMIT;
+BEGIN;
+SELECT default_parameter_cursor(NULL);
 SELECT is_scrollable FROM pg_cursors WHERE name='parameter_default';
 FETCH ALL FROM parameter_default;
 COMMIT;

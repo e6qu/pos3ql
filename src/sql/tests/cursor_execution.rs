@@ -1,6 +1,45 @@
 use super::*;
 
 #[test]
+fn cursor_view_planning_preserves_sources_and_pattern_boolean_types() {
+    let config = test_config("cursor-view-pattern-types");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE TABLE pattern_input(label text); \
+        INSERT INTO pattern_input VALUES ('a_c'),('abc'); \
+        CREATE VIEW pattern_view AS TABLE pattern_input; BEGIN; \
+        DECLARE view_rows CURSOR FOR TABLE pattern_view",
+        true,
+    );
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "FETCH ALL FROM view_rows; COMMIT", true)),
+        ["a_c", "abc"]
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT label,pg_typeof(label SIMILAR TO 'a#_c' ESCAPE '#') FROM pattern_input \
+        WHERE label SIMILAR TO 'a#_c' ESCAPE '#' ORDER BY label",
+            true
+        )),
+        ["a_c|boolean"]
+    );
+    session.success(
+        &mut engine,
+        "BEGIN; DECLARE pattern_rows NO SCROLL CURSOR FOR \
+        SELECT label FROM pattern_view WHERE label SIMILAR TO 'a#_c' ESCAPE '#'",
+        true,
+    );
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "FETCH ALL FROM pattern_rows; COMMIT", true)),
+        ["a_c"]
+    );
+}
+
+#[test]
 fn cursor_retained_fetch_advances_only_requested_rows_and_keeps_opening_values() {
     use crate::config::TransactionMode;
     use crate::sql::cursor::FetchMotion;
@@ -443,6 +482,42 @@ fn cursor_retained_default_mode_defers_reads_and_matches_plan_scrollability() {
 }
 
 #[test]
+fn cursor_retained_default_filter_is_bound_to_captured_boolean_values() {
+    let config = test_config("cursor-retained-captured-filter");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(&mut engine, "CREATE TABLE captured_filter_input(id integer); INSERT INTO captured_filter_input VALUES (1),(2); \
+        CREATE FUNCTION captured_filter(keep boolean) RETURNS refcursor LANGUAGE plpgsql AS $$ \
+        DECLARE c refcursor := 'captured'; BEGIN OPEN c FOR SELECT id FROM captured_filter_input WHERE keep; \
+          keep := NOT keep; RETURN c; END $$", true);
+    for (value, scrollable, expected) in [
+        ("false", "f", vec![]),
+        ("true", "t", vec!["1", "2"]),
+        ("NULL", "f", vec![]),
+    ] {
+        session.success(
+            &mut engine,
+            &format!("BEGIN; SELECT captured_filter({value})"),
+            true,
+        );
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "SELECT is_scrollable FROM pg_cursors WHERE name='captured'",
+                true
+            )),
+            [scrollable]
+        );
+        assert_eq!(
+            data_rows(&session.success(&mut engine, "FETCH ALL FROM captured", true)),
+            expected
+        );
+        session.success(&mut engine, "COMMIT", true);
+    }
+}
+
+#[test]
 fn cursor_retained_declaration_and_empty_filter_do_not_mark_unread_tables_as_read() {
     let config = test_config("cursor-retained-unread-serializable");
     let mut budget = test_engine_budget(&config, 1 << 29);
@@ -513,13 +588,66 @@ fn cursor_retained_implicit_commit_triggers_can_inspect_the_connection_cursors()
         FOR EACH ROW EXECUTE FUNCTION inspect_commit_cursor()", true);
     let failed = session.execute(&mut engine,
         "DECLARE held CURSOR WITH HOLD FOR SELECT id FROM cursor_catalog_input; INSERT INTO cursor_catalog_gate VALUES (1)", true);
-    assert_eq!(error_sqlstates(&failed), ["P0001"]);
+    assert_eq!(
+        error_sqlstates(&failed),
+        ["P0001"],
+        "{}",
+        String::from_utf8_lossy(&failed)
+    );
     assert!(
         String::from_utf8_lossy(&failed).contains("cursor visible"),
         "{}",
         String::from_utf8_lossy(&failed)
     );
     assert!(!session.cursors.exists("held"));
+}
+
+#[test]
+fn cursor_trigger_expressions_resolve_subqueries_with_locals_and_transition_rows() {
+    let config = test_config("cursor-trigger-expression-subqueries");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE TABLE expression_input(id integer); INSERT INTO expression_input VALUES (1),(2); \
+        CREATE FUNCTION expression_value(wanted integer) RETURNS integer LANGUAGE plpgsql AS $$ \
+        DECLARE saved integer := (SELECT id FROM expression_input WHERE id=wanted); BEGIN \
+          IF EXISTS (SELECT id FROM expression_input WHERE id=saved) THEN \
+            saved := (SELECT id+10 FROM expression_input WHERE id=saved); END IF; \
+          RETURN (SELECT saved); END $$",
+        true,
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT expression_value(1),expression_value(2),expression_value(3)",
+            true
+        )),
+        ["11|12|"]
+    );
+    session.success(
+        &mut engine,
+        "CREATE FUNCTION expression_many() RETURNS integer LANGUAGE plpgsql AS $$ \
+        BEGIN RETURN (SELECT id FROM expression_input); END $$",
+        true,
+    );
+    assert_eq!(
+        error_sqlstates(&session.execute(&mut engine, "SELECT expression_many()", true)),
+        ["21000"]
+    );
+    session.success(&mut engine, "CREATE TABLE expression_target(id integer); \
+        CREATE FUNCTION expression_transition() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN \
+          IF EXISTS (SELECT id FROM expression_input WHERE id=NEW.id) THEN NEW.id := NEW.id+10; END IF; RETURN NEW; END $$; \
+        CREATE TRIGGER expression_transition BEFORE INSERT ON expression_target FOR EACH ROW EXECUTE FUNCTION expression_transition()", true);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "INSERT INTO expression_target VALUES (1),(3) RETURNING id",
+            true
+        )),
+        ["11", "3"]
+    );
 }
 
 #[test]

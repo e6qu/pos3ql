@@ -292,9 +292,7 @@ impl<'a> QueryDefinitions<'a> {
 /// The resolved FROM clause: per table, its exposed name (alias or table
 /// name), definition, and storage slot.
 pub struct QueryScope<'d> {
-    storage: &'d Storage,
     txid: u32,
-    arena: &'d Arena,
     type_sources: Option<crate::storage::StatementFileLease>,
     pub names: &'d mut [&'d str],
     returning_aliases: &'d [&'d str],
@@ -513,9 +511,7 @@ impl<'d> QueryScope<'d> {
             .alloc_slice_with(from.joins.len().max(1), |_| None)
             .map_err(|_| arena_full())?;
         Ok(QueryScope {
-            storage,
             txid,
-            arena,
             type_sources: None,
             names,
             returning_aliases: &[],
@@ -1610,9 +1606,11 @@ impl<'d> QueryScope<'d> {
     /// available, before a derived relation turns it into column metadata.
     pub(crate) fn expression_collation(
         &self,
+        storage: &Storage,
+        arena: &Arena,
         expression: &Expr<'d>,
     ) -> Result<crate::sql::ast::Collation, SqlError> {
-        let catalog = super::storage_catalog(self.storage, self.arena, self.txid);
+        let catalog = super::storage_catalog(storage, arena, self.txid);
         crate::sql::eval::resolved_expression_collation(
             expression,
             &ScopeTypes(self),
@@ -1622,6 +1620,8 @@ impl<'d> QueryScope<'d> {
 
     pub(crate) fn described_expression_collation(
         &self,
+        storage: &Storage,
+        arena: &Arena,
         expression: &Expr<'d>,
     ) -> Result<
         (
@@ -1630,7 +1630,7 @@ impl<'d> QueryScope<'d> {
         ),
         SqlError,
     > {
-        let catalog = super::storage_catalog(self.storage, self.arena, self.txid);
+        let catalog = super::storage_catalog(storage, arena, self.txid);
         crate::sql::eval::described_expression_collation(
             expression,
             &ScopeTypes(self),

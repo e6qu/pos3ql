@@ -4698,8 +4698,30 @@ pub(crate) fn emit_data_row(
             "cannot display a value of type pg_ddl_command"
         ));
     }
+    if let Some(rows) = responder.cursor_row_buffer() {
+        let len = match super::exec::projected_row_len(values) {
+            Ok(len) => len,
+            Err(error) => return sql_fail(error),
+        };
+        let Some(total) = len.checked_add(4) else {
+            return sql_fail(super::cursor_result_too_large());
+        };
+        let Ok(length) = u32::try_from(len) else {
+            return sql_fail(super::cursor_result_too_large());
+        };
+        let out = rows.writable();
+        if total > out.len() {
+            return sql_fail(super::cursor_result_too_large());
+        }
+        // Publish the row boundary only after every typed value is encoded.
+        if let Err(error) = super::exec::encode_projected_into(values, &mut out[4..total]) {
+            return sql_fail(error);
+        }
+        out[..4].copy_from_slice(&length.to_le_bytes());
+        rows.advance(total);
+        return sql_ok();
+    }
     let formats = responder.result_formats();
-    let alternate_formats = responder.alternate_result_formats();
     let catalog = storage_catalog(storage, arena, txid);
     let mut text_values = [Datum::Null; MAX_PROJ];
     for (index, output) in text_values.iter_mut().enumerate().take(values.len()) {
@@ -4710,18 +4732,13 @@ pub(crate) fn emit_data_row(
             };
     }
     let text_values = &text_values[..values.len()];
-    let any_binary = (0..values.len()).any(|index| {
-        formats.is_binary(index)
-            || alternate_formats.is_some_and(|alternate| alternate.is_binary(index))
-    });
+    let any_binary = (0..values.len()).any(|index| formats.is_binary(index));
     if !any_binary {
         return responder.data_row(text_values).map(|()| Ok(()));
     }
     let mut plans = [super::exec::BinaryFieldPlan::Direct; MAX_PROJ];
     for (index, plan) in plans.iter_mut().enumerate().take(values.len()) {
-        if formats.is_binary(index)
-            || alternate_formats.is_some_and(|alternate| alternate.is_binary(index))
-        {
+        if formats.is_binary(index) {
             if formats.is_binary(index)
                 && responder.result_type_oid(index).is_some_and(|oid| {
                     super::exec::binary_output_capability(storage, oid, txid)
@@ -4758,13 +4775,7 @@ pub(crate) fn emit_data_row(
         }
     };
     responder.data_row_prepared(values, &|message| emit(message, formats))?;
-    if let Some(alternate) = alternate_formats {
-        responder
-            .data_row_prepared_alternate(values, &|message| emit(message, alternate))
-            .map(|()| Ok(()))
-    } else {
-        Ok(Ok(()))
-    }
+    sql_ok()
 }
 
 /// The aggregate hook data for a select's items: the aggregate-call node
@@ -8675,7 +8686,7 @@ pub fn describe_scope_items<'q>(
                     && ctype.is_collatable()
                 {
                     (out[n].collation, out[n].collation_derivation) =
-                        scope.described_expression_collation(expression)?;
+                        scope.described_expression_collation(storage, arena, expression)?;
                     if out[n].collation_derivation == super::types::CollationDerivation::None {
                         out[n].collation = super::ast::Collation::Default;
                         out[n].collation_derivation = super::types::CollationDerivation::Implicit;

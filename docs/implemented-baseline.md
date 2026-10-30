@@ -160,6 +160,13 @@ and rollback release retained owners. Cleanup respects active readers and
 backup roots. Retaining both row heaps can temporarily prevent reclamation and
 return `54000`.
 
+SQL cursors save typed values and format each fetched row using the session's
+current settings. For example, a saved `DATE '2020-01-02'` displays as
+`02/01/2020` after `SET DateStyle = 'SQL, DMY'`, including for a cursor kept
+across commit. Procedural `FETCH INTO` assigns the typed value directly.
+Cursor queries still execute during declaration; deferring expressions and
+row locks until fetch remains part of the [plan](../PLAN.md).
+
 UPDATE, DELETE, MERGE, conflict handling and schema validation preserve the
 original selected row values in fixed statement memory. They recheck the table
 lifetime and definition before installing a write; a changed source returns

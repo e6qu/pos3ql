@@ -85,10 +85,8 @@ pub enum FlushSink<'b> {
 
 pub struct Responder<'b> {
     pub buffer: &'b mut FixedBuf,
-    /// SQL cursor materialization captures both representations during one
-    /// evaluation so FETCH can honor its own result-format codes.
-    alternate_buffer: Option<&'b mut FixedBuf>,
-    alternate_formats: ResultFmt,
+    /// SQL cursors retain typed rows; FETCH chooses formats and rendering.
+    cursor_rows: Option<&'b mut FixedBuf>,
     /// Extended-protocol Execute must not resend RowDescription (the
     /// client got it from Describe).
     suppress_row_description: bool,
@@ -120,6 +118,31 @@ pub struct Responder<'b> {
     discard_serialize: ExplainSerialize,
     serialized_bytes: u64,
     serialization_micros: u64,
+}
+
+pub(crate) struct ResultFormatScope<'scope, 'buffer> {
+    responder: &'scope mut Responder<'buffer>,
+    previous: ResultFmt,
+}
+
+impl<'buffer> core::ops::Deref for ResultFormatScope<'_, 'buffer> {
+    type Target = Responder<'buffer>;
+
+    fn deref(&self) -> &Self::Target {
+        self.responder
+    }
+}
+
+impl core::ops::DerefMut for ResultFormatScope<'_, '_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.responder
+    }
+}
+
+impl Drop for ResultFormatScope<'_, '_> {
+    fn drop(&mut self) {
+        self.responder.formats = self.previous;
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -168,6 +191,49 @@ fn write_wire_text(
             b'0' + (byte & 7),
         ]),
         Datum::Xml(text) => crate::sql::xml::write_output(text, |part| out(part.as_bytes())),
+        Datum::Bytea(bytes) => {
+            if render.bytea_escape {
+                for byte in *bytes {
+                    match byte {
+                        b'\\' => out(b"\\\\"),
+                        0x20..=0x7e => out(&[*byte]),
+                        _ => out(&[
+                            b'\\',
+                            b'0' + (byte >> 6),
+                            b'0' + ((byte >> 3) & 7),
+                            b'0' + (byte & 7),
+                        ]),
+                    }
+                }
+            } else {
+                out(b"\\x");
+                const HEX: &[u8; 16] = b"0123456789abcdef";
+                for byte in *bytes {
+                    out(&[HEX[(byte >> 4) as usize], HEX[(byte & 15) as usize]]);
+                }
+            }
+        }
+        Datum::Date(date) => out(
+            crate::sql::datetime::format_date_styled(*date, render.datestyle)
+                .as_str()
+                .as_bytes(),
+        ),
+        Datum::Timestamp(timestamp) | Datum::Timestamptz(timestamp) => {
+            out(crate::sql::datetime::format_timestamp_styled(
+                *timestamp,
+                matches!(value, Datum::Timestamptz(_)),
+                render.datestyle,
+                render.parsed_timezone,
+            )
+            .as_str()
+            .as_bytes())
+        }
+        Datum::Interval(interval) => out(crate::sql::datetime::format_interval_styled(
+            *interval,
+            render.intervalstyle,
+        )
+        .as_str()
+        .as_bytes()),
         Datum::Float4(value) => {
             use core::fmt::Write as _;
             let _ = write!(
@@ -495,8 +561,7 @@ impl<'b> Responder<'b> {
     pub fn new(buffer: &'b mut FixedBuf) -> Self {
         Self {
             buffer,
-            alternate_buffer: None,
-            alternate_formats: ResultFmt::ALL_TEXT,
+            cursor_rows: None,
             suppress_row_description: false,
             formats: ResultFmt::ALL_TEXT,
             result_type_oids: [0; MAX_RESULT_COLS],
@@ -517,8 +582,7 @@ impl<'b> Responder<'b> {
     pub fn for_execute(buffer: &'b mut FixedBuf, formats: ResultFmt) -> Self {
         Self {
             buffer,
-            alternate_buffer: None,
-            alternate_formats: ResultFmt::ALL_TEXT,
+            cursor_rows: None,
             suppress_row_description: true,
             formats,
             result_type_oids: [0; MAX_RESULT_COLS],
@@ -536,12 +600,11 @@ impl<'b> Responder<'b> {
         }
     }
 
-    /// Captures text and binary SQL-cursor rows from one execution.
-    pub fn for_cursor(text: &'b mut FixedBuf, binary: &'b mut FixedBuf) -> Self {
+    /// Captures the description and typed values without rendering them.
+    pub fn for_cursor(description: &'b mut FixedBuf, rows: &'b mut FixedBuf) -> Self {
         Self {
-            buffer: text,
-            alternate_buffer: Some(binary),
-            alternate_formats: ResultFmt::ALL_BINARY,
+            buffer: description,
+            cursor_rows: Some(rows),
             suppress_row_description: false,
             formats: ResultFmt::ALL_TEXT,
             result_type_oids: [0; MAX_RESULT_COLS],
@@ -549,7 +612,7 @@ impl<'b> Responder<'b> {
             flush: FlushSink::None,
             render: crate::sql::guc::RenderContext::default(),
             discard_query_output: false,
-            suppress_command_complete: false,
+            suppress_command_complete: true,
             last_command_completion: None,
             affected_rows: None,
             discarded_rows: 0,
@@ -564,8 +627,7 @@ impl<'b> Responder<'b> {
     pub fn for_describe(buffer: &'b mut FixedBuf, formats: ResultFmt) -> Self {
         Self {
             buffer,
-            alternate_buffer: None,
-            alternate_formats: ResultFmt::ALL_TEXT,
+            cursor_rows: None,
             suppress_row_description: false,
             formats,
             result_type_oids: [0; MAX_RESULT_COLS],
@@ -842,21 +904,6 @@ impl<'b> Responder<'b> {
             }
             m.finish()
         })?;
-        if let Some(buffer) = self.alternate_buffer.as_deref_mut() {
-            let formats = self.alternate_formats;
-            let mut m = MsgOut::begin(buffer, wire::MSG_ROW_DESCRIPTION);
-            m.i16(columns.len() as i16);
-            for (i, c) in columns.iter().enumerate() {
-                m.cstr(c.name);
-                m.i32(0);
-                m.i16(0);
-                m.i32(c.type_oid);
-                m.i16(c.typlen);
-                m.i32(c.type_mod);
-                m.i16(if formats.is_binary(i) { 1 } else { 0 });
-            }
-            m.finish()?;
-        }
         Ok(())
     }
 
@@ -1004,32 +1051,25 @@ impl<'b> Responder<'b> {
         })
     }
 
-    pub(crate) fn data_row_prepared_alternate(
-        &mut self,
-        values: &[Datum],
-        write: &dyn Fn(&mut MsgOut),
-    ) -> Result<(), WireFull> {
-        let Some(buffer) = self.alternate_buffer.as_deref_mut() else {
-            return Ok(());
-        };
-        let mut message = MsgOut::begin(buffer, wire::MSG_DATA_ROW);
-        message.i16(values.len() as i16);
-        write(&mut message);
-        message.finish()
+    pub(crate) fn cursor_row_buffer(&mut self) -> Option<&mut FixedBuf> {
+        self.cursor_rows.as_deref_mut()
     }
 
     pub(crate) fn result_formats(&self) -> ResultFmt {
         self.formats
     }
 
-    pub(crate) fn result_type_oid(&self, index: usize) -> Option<i32> {
-        (index < self.result_columns).then(|| self.result_type_oids[index])
+    /// A binary SQL cursor must not change the next statement's wire format.
+    pub(crate) fn result_format_scope(&mut self, formats: ResultFmt) -> ResultFormatScope<'_, 'b> {
+        let previous = core::mem::replace(&mut self.formats, formats);
+        ResultFormatScope {
+            responder: self,
+            previous,
+        }
     }
 
-    pub(crate) fn alternate_result_formats(&self) -> Option<ResultFmt> {
-        self.alternate_buffer
-            .as_ref()
-            .map(|_| self.alternate_formats)
+    pub(crate) fn result_type_oid(&self, index: usize) -> Option<i32> {
+        (index < self.result_columns).then(|| self.result_type_oids[index])
     }
 
     /// Rewrites a captured SQL-cursor RowDescription for this FETCH's result
@@ -1039,11 +1079,19 @@ impl<'b> Responder<'b> {
         captured: &[u8],
         formats: ResultFmt,
     ) -> Result<(), WireFull> {
+        let payload = &captured[5..];
+        let count = i16::from_be_bytes(payload[..2].try_into().unwrap()) as usize;
+        self.result_columns = count;
+        let mut at = 2usize;
+        for column in 0..count {
+            let name_end = payload[at..].iter().position(|byte| *byte == 0).unwrap() + at + 1;
+            self.result_type_oids[column] =
+                i32::from_be_bytes(payload[name_end + 6..name_end + 10].try_into().unwrap());
+            at = name_end + 18;
+        }
         if self.suppress_row_description || self.discard_query_output {
             return Ok(());
         }
-        let payload = &captured[5..];
-        let count = i16::from_be_bytes(payload[..2].try_into().unwrap()) as usize;
         self.with_retry(|buffer| {
             let mut message = MsgOut::begin(buffer, wire::MSG_ROW_DESCRIPTION);
             message.i16(count as i16);
@@ -1055,47 +1103,6 @@ impl<'b> Responder<'b> {
                 at = name_end + 18;
             }
             message.finish()
-        })
-    }
-
-    /// Builds one FETCH DataRow from the text and binary representations
-    /// captured during DECLARE, including mixed per-column formats.
-    pub(crate) fn cursor_data_row(
-        &mut self,
-        text: &[u8],
-        binary: &[u8],
-        formats: ResultFmt,
-    ) -> Result<(), WireFull> {
-        fn payload(message: &[u8]) -> (&[u8], usize) {
-            let payload = &message[5..];
-            let count = i16::from_be_bytes(payload[..2].try_into().unwrap()) as usize;
-            (payload, count)
-        }
-        let (text, count) = payload(text);
-        let (binary, binary_count) = payload(binary);
-        debug_assert_eq!(count, binary_count);
-        self.with_retry(|buffer| {
-            let mut output = MsgOut::begin(buffer, wire::MSG_DATA_ROW);
-            output.i16(count as i16);
-            let mut text_at = 2usize;
-            let mut binary_at = 2usize;
-            for column in 0..count {
-                let text_len = i32::from_be_bytes(text[text_at..text_at + 4].try_into().unwrap());
-                let binary_len =
-                    i32::from_be_bytes(binary[binary_at..binary_at + 4].try_into().unwrap());
-                let (source, at, len) = if formats.is_binary(column) {
-                    (binary, binary_at, binary_len)
-                } else {
-                    (text, text_at, text_len)
-                };
-                output.i32(len);
-                if len >= 0 {
-                    output.bytes(&source[at + 4..at + 4 + len as usize]);
-                }
-                text_at += 4 + text_len.max(0) as usize;
-                binary_at += 4 + binary_len.max(0) as usize;
-            }
-            output.finish()
         })
     }
 
@@ -1121,176 +1128,18 @@ impl<'b> Responder<'b> {
     }
 
     pub(crate) fn encode_value_text(
-        m: &mut MsgOut,
-        v: &Datum,
+        message: &mut MsgOut,
+        value: &Datum,
         render: crate::sql::guc::RenderContext,
     ) {
-        {
-            match v {
-                Datum::Null => {
-                    m.i32(-1);
-                }
-                Datum::Text(s)
-                | Datum::Bpchar(s)
-                | Datum::Regtype { name: s, .. }
-                | Datum::RegObject { name: s, .. } => {
-                    m.i32(s.len() as i32);
-                    m.bytes(s.as_bytes());
-                }
-                Datum::Char(byte) => {
-                    let length = match byte {
-                        0 => 0,
-                        0x20..=0x7e => 1,
-                        _ => 4,
-                    };
-                    m.i32(length);
-                    match byte {
-                        0 => {}
-                        0x20..=0x7e => {
-                            m.u8(*byte);
-                        }
-                        _ => {
-                            m.bytes(&[
-                                b'\\',
-                                b'0' + (byte >> 6),
-                                b'0' + ((byte >> 3) & 7),
-                                b'0' + (byte & 7),
-                            ]);
-                        }
-                    }
-                }
-                Datum::Xml(_) => {
-                    m.field(|m| {
-                        write_wire_text(v, render, &mut |bytes| {
-                            m.bytes(bytes);
-                        })
-                    });
-                }
-                Datum::Array { .. } | Datum::Record(_) | Datum::Composite { .. } => {
-                    m.field(|m| {
-                        write_wire_text(v, render, &mut |bytes| {
-                            m.bytes(bytes);
-                        })
-                    });
-                }
-                Datum::Bytea(b) => {
-                    if render.bytea_escape {
-                        // bytea_output = escape: printable ASCII verbatim,
-                        // backslash doubled, everything else \nnn octal.
-                        let escaped_len: usize = b
-                            .iter()
-                            .map(|&byte| match byte {
-                                b'\\' => 2,
-                                0x20..=0x7e => 1,
-                                _ => 4,
-                            })
-                            .sum();
-                        m.i32(escaped_len as i32);
-                        for &byte in *b {
-                            match byte {
-                                b'\\' => {
-                                    m.bytes(b"\\\\");
-                                }
-                                0x20..=0x7e => {
-                                    m.bytes(&[byte]);
-                                }
-                                _ => {
-                                    m.bytes(&[
-                                        b'\\',
-                                        b'0' + (byte >> 6),
-                                        b'0' + ((byte >> 3) & 7),
-                                        b'0' + (byte & 7),
-                                    ]);
-                                }
-                            }
-                        }
-                    } else {
-                        // \x hex, streamed straight into the send buffer.
-                        m.i32((2 + b.len() * 2) as i32);
-                        m.bytes(b"\\x");
-                        const HEX: &[u8; 16] = b"0123456789abcdef";
-                        for byte in *b {
-                            m.bytes(&[HEX[(byte >> 4) as usize], HEX[(byte & 0xf) as usize]]);
-                        }
-                    }
-                }
-                Datum::Numeric(nm) => {
-                    // Numeric text can be long (up to MAX_NDIGITS*4 digits);
-                    // render into a bounded stack buffer.
-                    let text = stack_format!(4200, "{}", nm);
-                    debug_assert!(!text.is_truncated());
-                    m.i32(text.as_str().len() as i32);
-                    m.bytes(text.as_str().as_bytes());
-                }
-                Datum::Float4(value) => {
-                    let text = stack_format!(
-                        32,
-                        "{}",
-                        crate::sql::types::PgFloat4Rendered(*value, render.extra_float_digits,)
-                    );
-                    m.i32(text.len() as i32);
-                    m.bytes(text.as_str().as_bytes());
-                }
-                Datum::Float8(value) => {
-                    let text = stack_format!(
-                        32,
-                        "{}",
-                        crate::sql::types::PgFloat8Rendered(*value, render.extra_float_digits,)
-                    );
-                    m.i32(text.len() as i32);
-                    m.bytes(text.as_str().as_bytes());
-                }
-                // Date/time output honors the session DateStyle and time zone.
-                Datum::Date(d) => {
-                    let text = crate::sql::datetime::format_date_styled(*d, render.datestyle);
-                    m.i32(text.as_str().len() as i32);
-                    m.bytes(text.as_str().as_bytes());
-                }
-                Datum::Timestamp(t) | Datum::Timestamptz(t) => {
-                    let with_timezone = matches!(v, Datum::Timestamptz(_));
-                    let text = crate::sql::datetime::format_timestamp_styled(
-                        *t,
-                        with_timezone,
-                        render.datestyle,
-                        render.parsed_timezone,
-                    );
-                    m.i32(text.as_str().len() as i32);
-                    m.bytes(text.as_str().as_bytes());
-                }
-                Datum::Interval(interval) => {
-                    let text = crate::sql::datetime::format_interval_styled(
-                        *interval,
-                        render.intervalstyle,
-                    );
-                    m.i32(text.as_str().len() as i32);
-                    m.bytes(text.as_str().as_bytes());
-                }
-                // Records, JSON, ranges, multiranges, bit strings — anything
-                // whose text can be arbitrarily wide: count the length, emit it,
-                // then stream Display straight to the send buffer (no fixed-size
-                // scratch that would silently truncate a long value).
-                other => {
-                    use core::fmt::Write as _;
-                    struct Counter(usize);
-                    impl core::fmt::Write for Counter {
-                        fn write_str(&mut self, s: &str) -> core::fmt::Result {
-                            self.0 += s.len();
-                            Ok(())
-                        }
-                    }
-                    struct MsgWriter<'w, 'b>(&'w mut MsgOut<'b>);
-                    impl core::fmt::Write for MsgWriter<'_, '_> {
-                        fn write_str(&mut self, s: &str) -> core::fmt::Result {
-                            self.0.bytes(s.as_bytes());
-                            Ok(())
-                        }
-                    }
-                    let mut counter = Counter(0);
-                    let _ = write!(counter, "{other}");
-                    m.i32(counter.0 as i32);
-                    let _ = write!(MsgWriter(m), "{other}");
-                }
-            }
+        if value.is_null() {
+            message.i32(-1);
+        } else {
+            message.field(|message| {
+                write_wire_text(value, render, &mut |bytes| {
+                    message.bytes(bytes);
+                })
+            });
         }
     }
 
@@ -1320,115 +1169,23 @@ impl<'b> Responder<'b> {
                     "cannot display a value of type pg_ddl_command"
                 ));
             }
-            Datum::Char(0) => &[],
-            Datum::Char(byte @ 0x20..=0x7e) => {
-                arena.alloc_slice_copy(&[*byte]).map_err(|_| full())?
-            }
-            Datum::Char(byte) => arena
-                .alloc_slice_copy(&[
-                    b'\\',
-                    b'0' + (byte >> 6),
-                    b'0' + ((byte >> 3) & 7),
-                    b'0' + (byte & 7),
-                ])
-                .map_err(|_| full())?,
-            Datum::Array { .. } | Datum::Record(_) | Datum::Composite { .. } => {
-                let len = wire_text_len(v, render);
-                let bytes = arena.alloc_slice_with(len, |_| 0u8).map_err(|_| full())?;
-                let mut at = 0;
-                write_wire_text(v, render, &mut |part| {
-                    bytes[at..at + part.len()].copy_from_slice(part);
-                    at += part.len();
-                });
-                &*bytes
-            }
-            Datum::Xml(_) => {
-                let len = wire_text_len(v, render);
-                let bytes = arena.alloc_slice_with(len, |_| 0u8).map_err(|_| full())?;
-                let mut at = 0;
-                write_wire_text(v, render, &mut |part| {
-                    bytes[at..at + part.len()].copy_from_slice(part);
-                    at += part.len();
-                });
-                &*bytes
-            }
-            Datum::Text(s) | Datum::Bpchar(s) => s.as_bytes(),
-            Datum::Bytea(b) if render.bytea_escape => {
-                let escaped_len: usize = b
-                    .iter()
-                    .map(|&byte| match byte {
-                        b'\\' => 2,
-                        0x20..=0x7e => 1,
-                        _ => 4,
-                    })
-                    .sum();
-                let out = arena
-                    .alloc_slice_with(escaped_len, |_| 0u8)
+            Datum::Text(text)
+            | Datum::Bpchar(text)
+            | Datum::Regtype { name: text, .. }
+            | Datum::RegObject { name: text, .. } => text.as_bytes(),
+            value => {
+                let length = wire_text_len(value, render);
+                let bytes = arena
+                    .alloc_slice_with(length, |_| 0u8)
                     .map_err(|_| full())?;
-                let mut at = 0;
-                for &byte in b.iter() {
-                    match byte {
-                        b'\\' => {
-                            out[at..at + 2].copy_from_slice(b"\\\\");
-                            at += 2;
-                        }
-                        0x20..=0x7e => {
-                            out[at] = byte;
-                            at += 1;
-                        }
-                        _ => {
-                            out[at] = b'\\';
-                            out[at + 1] = b'0' + (byte >> 6);
-                            out[at + 2] = b'0' + ((byte >> 3) & 7);
-                            out[at + 3] = b'0' + (byte & 7);
-                            at += 4;
-                        }
-                    }
-                }
-                &*out
+                let mut at = 0usize;
+                write_wire_text(value, render, &mut |part| {
+                    bytes[at..at + part.len()].copy_from_slice(part);
+                    at += part.len();
+                });
+                debug_assert_eq!(at, length);
+                &*bytes
             }
-            Datum::Date(d) => arena
-                .alloc_str(crate::sql::datetime::format_date_styled(*d, render.datestyle).as_str())
-                .map_err(|_| full())?
-                .as_bytes(),
-            Datum::Timestamp(t) | Datum::Timestamptz(t) => {
-                let with_timezone = matches!(v, Datum::Timestamptz(_));
-                let text = crate::sql::datetime::format_timestamp_styled(
-                    *t,
-                    with_timezone,
-                    render.datestyle,
-                    render.parsed_timezone,
-                );
-                arena
-                    .alloc_str(text.as_str())
-                    .map_err(|_| full())?
-                    .as_bytes()
-            }
-            Datum::Interval(interval) => arena
-                .alloc_str(
-                    crate::sql::datetime::format_interval_styled(*interval, render.intervalstyle)
-                        .as_str(),
-                )
-                .map_err(|_| full())?
-                .as_bytes(),
-            Datum::Float4(value) => arena
-                .alloc_str_display(crate::sql::types::PgFloat4Rendered(
-                    *value,
-                    render.extra_float_digits,
-                ))
-                .map_err(|_| full())?
-                .as_bytes(),
-            Datum::Float8(value) => arena
-                .alloc_str_display(crate::sql::types::PgFloat8Rendered(
-                    *value,
-                    render.extra_float_digits,
-                ))
-                .map_err(|_| full())?
-                .as_bytes(),
-            other => arena
-                .alloc_str_display(other)
-                .map_err(|_| full())?
-                .as_bytes(),
         }))
     }
 
@@ -1907,8 +1664,7 @@ impl<'b> Responder<'b> {
         }
     }
 
-    /// Forwards pre-encoded wire message bytes verbatim (cursor FETCH replays
-    /// captured RowDescription/DataRow messages).
+    /// Forwards complete pre-encoded wire messages.
     pub fn raw(&mut self, bytes: &[u8]) -> Result<(), WireFull> {
         if self.buffer.append(bytes) {
             Ok(())

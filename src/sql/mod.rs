@@ -2503,6 +2503,14 @@ fn cursor_result_too_large() -> SqlError {
     )
 }
 
+fn cursor_description_too_large() -> SqlError {
+    sql_err!(
+        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+        "cursor row description exceeds {} bytes; use fewer or shorter column names",
+        cursor::DESCRIPTION_BYTES
+    )
+}
+
 impl Engine {
     /// Selects one exclusively leased startup-reserved query workspace.
     pub(crate) fn select_query_workspace(&mut self, workspace: QueryWorkspaceId) {
@@ -19400,8 +19408,8 @@ impl Engine {
                     return Err(sql_err!(sqlstate::SYNTAX_ERROR, "OPEN requires a SELECT"));
                 }
             };
-            let (text, binary) = cursors.result_buffers(at);
-            let mut capture = Responder::for_cursor(text, binary);
+            let (description, rows) = cursors.result_buffers(at);
+            let mut capture = Responder::for_cursor(description, rows);
             capture.set_render(guc.render());
             let sequence_state = sequence::SequenceReplayState::new(arena);
             let sequence = sequence::ReplaySeqEval::new(
@@ -19474,10 +19482,7 @@ impl Engine {
             }
             Err(WireFull) => {
                 cursors.abandon(at);
-                return Err(sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "cursor result exceeds cursor_bytes; raise it or narrow the query"
-                ));
+                return Err(cursor_description_too_large());
             }
         }
         if let Err(error) = cursors.seal(at) {
@@ -19506,8 +19511,8 @@ impl Engine {
     ) -> Result<(), SqlError> {
         let at = cursors.open(name, sql, scroll, false, false)?;
         let result = (|| -> Result<(), SqlError> {
-            let (text, binary) = cursors.result_buffers(at);
-            let mut capture = Responder::for_cursor(text, binary);
+            let (description, rows) = cursors.result_buffers(at);
+            let mut capture = Responder::for_cursor(description, rows);
             capture.set_render(guc.render());
             let mut columns = [types::ColDesc::new("", 0, 0); exec::MAX_PROJ];
             let count = query::describe_cursor_select(
@@ -19520,7 +19525,7 @@ impl Engine {
             )?;
             capture
                 .row_description(&columns[..count])
-                .map_err(|_| cursor_result_too_large())?;
+                .map_err(|_| cursor_description_too_large())?;
             let sequence_state = sequence::SequenceReplayState::new(arena);
             let sequence = sequence::ReplaySeqEval::new(
                 sequence::SeqEval::new(&self.storage, guc.seq_session(), txn.txid),
@@ -19540,7 +19545,7 @@ impl Engine {
                     {
                         Ok(Ok(())) => {}
                         Ok(Err(error)) => return Err(error),
-                        Err(WireFull) => return Err(cursor_result_too_large()),
+                        Err(WireFull) => return Err(cursor_description_too_large()),
                     }
                     rows += 1;
                     Ok(())
@@ -19548,7 +19553,7 @@ impl Engine {
             )?;
             capture
                 .command_complete(stack_format!(32, "SELECT {}", rows).as_str())
-                .map_err(|_| cursor_result_too_large())?;
+                .map_err(|_| cursor_description_too_large())?;
             Ok(())
         })();
         if let Err(error) = result {
@@ -19609,68 +19614,60 @@ impl Engine {
                 };
                 if !*move_only {
                     let requested = responder.result_formats();
-                    let wire = cursors.wire_parts(name).expect("fetch found it");
-                    let formats = if requested.count() == 0 && wire.declared_binary {
-                        crate::pg::respond::ResultFmt::ALL_BINARY
-                    } else {
-                        requested
-                    };
+                    let (description, formats) = cursors
+                        .fetch_description(name, requested)
+                        .expect("fetch found it");
+                    let mut formatted = responder.result_format_scope(formats);
+                    let responder = &mut *formatted;
                     let mut type_oids = [0i32; crate::pg::respond::MAX_RESULT_COLS];
-                    let columns =
-                        match cursor::description_type_oids(wire.description, &mut type_oids) {
-                            Ok(columns) => columns,
-                            Err(error) => return Ok(Err(error)),
-                        };
-                    responder.cursor_row_description(wire.description, formats)?;
+                    let columns = match cursor::description_type_oids(description, &mut type_oids) {
+                        Ok(columns) => columns,
+                        Err(error) => return Ok(Err(error)),
+                    };
+                    responder.cursor_row_description(description, formats)?;
                     for (index, oid) in type_oids[..columns].iter().enumerate() {
                         if !formats.is_binary(index) {
                             continue;
                         }
-                        let unavailable =
-                            match exec::binary_output_capability(&self.storage, *oid, txn.txid) {
-                                exec::BinaryOutputCapability::Supported => false,
-                                exec::BinaryOutputCapability::MissingAclItemSend => true,
-                                exec::BinaryOutputCapability::MissingAclItemElementSend => {
-                                    let mut present = false;
-                                    for &row in cursors.emitted() {
-                                        let (offset, len) = wire.binary_spans[row as usize];
-                                        let bytes =
-                                            &wire.binary[offset as usize..(offset + len) as usize];
-                                        match cursor::binary_row_field_is_null(bytes, index) {
-                                            Ok(false) => {
-                                                present = true;
-                                                break;
-                                            }
-                                            Ok(true) => {}
-                                            Err(error) => return Ok(Err(error)),
-                                        }
-                                    }
-                                    present
-                                }
-                                exec::BinaryOutputCapability::Unsupported => {
-                                    return Ok(Err(sql_err!(
-                                        eval::sqlstate::FEATURE_NOT_SUPPORTED,
-                                        "binary output is not supported for type oid {}",
-                                        oid
-                                    )));
-                                }
-                            };
-                        if unavailable {
-                            return Ok(Err(sql_err!(
-                                eval::sqlstate::UNDEFINED_FUNCTION,
-                                "no binary output function available for type aclitem"
-                            )));
+                        match exec::binary_output_capability(&self.storage, *oid, txn.txid) {
+                            exec::BinaryOutputCapability::Supported
+                            | exec::BinaryOutputCapability::MissingAclItemElementSend => {}
+                            exec::BinaryOutputCapability::MissingAclItemSend => {
+                                return Ok(Err(sql_err!(
+                                    eval::sqlstate::UNDEFINED_FUNCTION,
+                                    "no binary output function available for type aclitem"
+                                )));
+                            }
+                            exec::BinaryOutputCapability::Unsupported => {
+                                return Ok(Err(sql_err!(
+                                    eval::sqlstate::FEATURE_NOT_SUPPORTED,
+                                    "binary output is not supported for type oid {}",
+                                    oid
+                                )));
+                            }
                         }
                     }
                     for &row in cursors.emitted() {
-                        let (text_offset, text_len) = wire.text_spans[row as usize];
-                        let (binary_offset, binary_len) = wire.binary_spans[row as usize];
-                        responder.cursor_data_row(
-                            &wire.text[text_offset as usize..(text_offset + text_len) as usize],
-                            &wire.binary
-                                [binary_offset as usize..(binary_offset + binary_len) as usize],
-                            formats,
-                        )?;
+                        let mark = arena.mark();
+                        let result = {
+                            let mut values = [Datum::Null; crate::pg::respond::MAX_RESULT_COLS];
+                            match cursors.copy_row(name, row, arena, &mut values) {
+                                Ok(width) => query::emit_data_row(
+                                    &self.storage,
+                                    txn.txid,
+                                    arena,
+                                    responder,
+                                    &values[..width],
+                                ),
+                                Err(error) => Ok(Err(error)),
+                            }
+                        };
+                        // Copied values and prepared output end before this rewind.
+                        unsafe { arena.rewind_to(mark) };
+                        match result? {
+                            Ok(()) => {}
+                            Err(error) => return Ok(Err(error)),
+                        }
                     }
                     responder.command_complete(stack_format!(32, "FETCH {}", count).as_str())?;
                 } else {

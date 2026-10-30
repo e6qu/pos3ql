@@ -7,7 +7,10 @@
 use super::*;
 use crate::mem::mutex::Mutex;
 
+mod cursor_execution;
 mod key_preparation;
+mod object_reads;
+mod query_execution;
 mod row_layout;
 mod table_publication;
 mod transaction_publication;
@@ -97375,90 +97378,11 @@ fn parallel_physical_merge_source_failures_retry_the_same_pair_without_losing_ro
 }
 
 fn held_maintenance_read(mode: crate::config::TransactionMode, phase: &str) {
-    use crate::store::{BlockStore, OwnedObjectStore, StackPlan};
-    use std::io::{Read, Write};
-    use std::net::{TcpListener, TcpStream};
+    use crate::store::BlockStore;
+    use std::net::TcpListener;
     use std::time::{Duration, Instant};
 
-    fn advance(engine: &mut Engine) {
-        // Simulated upload completions update fixture inventories outside the runtime guard.
-        engine
-            .advance_wal_publication(Instant::now(), CommitProgressMode::Inline)
-            .unwrap();
-        for slot in 0..engine.ckpt.as_ref().unwrap().block_read_slots() {
-            if engine.pending_block_read_fd(slot).is_some() {
-                crate::mem::guard::forbid_alloc(|| engine.advance_pending_block_read(slot))
-                    .unwrap();
-            }
-        }
-    }
-
-    fn accept(engine: &mut Engine, listener: &TcpListener) -> (TcpStream, String) {
-        let deadline = Instant::now() + Duration::from_secs(2);
-        let mut stream = loop {
-            advance(engine);
-            match listener.accept() {
-                Ok((stream, _)) => break stream,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    assert!(Instant::now() < deadline, "maintenance GET did not connect");
-                    std::thread::yield_now();
-                }
-                Err(error) => panic!("accept maintenance GET: {error}"),
-            }
-        };
-        let request = read_request(engine, &mut stream);
-        (stream, request)
-    }
-
-    fn read_request(engine: &mut Engine, stream: &mut TcpStream) -> String {
-        let deadline = Instant::now() + Duration::from_secs(2);
-        stream.set_nonblocking(true).unwrap();
-        let mut request = [0; 8192];
-        let mut used = 0;
-        loop {
-            advance(engine);
-            match stream.read(&mut request[used..]) {
-                Ok(0) => panic!("maintenance GET ended before its headers"),
-                Ok(count) => used += count,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(error) => panic!("read maintenance GET: {error}"),
-            }
-            if request[..used].windows(4).any(|bytes| bytes == b"\r\n\r\n") {
-                break;
-            }
-            assert!(
-                used < request.len() && Instant::now() < deadline,
-                "maintenance GET headers did not finish"
-            );
-            std::thread::yield_now();
-        }
-        stream.set_nonblocking(false).unwrap();
-        stream
-            .set_write_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
-        core::str::from_utf8(&request[..used]).unwrap().to_owned()
-    }
-
-    fn reply(stream: &mut TcpStream, request: &str, body: &[u8]) {
-        let range = request.lines().find_map(|line| {
-            let (name, value) = line.split_once(':')?;
-            name.eq_ignore_ascii_case("Range").then_some(value.trim())
-        });
-        if let Some(range) = range {
-            let (first, last) = range
-                .strip_prefix("bytes=")
-                .unwrap()
-                .split_once('-')
-                .unwrap();
-            let first: usize = first.parse().unwrap();
-            let last: usize = last.parse().unwrap();
-            write!(stream, "HTTP/1.1 206 Partial Content\r\nETag: \"fixture\"\r\nContent-Length: {}\r\nContent-Range: bytes {first}-{last}/{}\r\nConnection: close\r\n\r\n", last-first+1, body.len()).unwrap();
-            stream.write_all(&body[first..=last]).unwrap();
-        } else {
-            write!(stream, "HTTP/1.1 200 OK\r\nETag: \"fixture\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
-            stream.write_all(body).unwrap();
-        }
-    }
+    use object_reads::{accept, advance, read_request, replace_uncached_blocks, reply};
 
     let label = format!("maintenance-held-{mode:?}-{}", phase.replace('_', "-"));
     let mut config = test_config(&label);
@@ -97558,17 +97482,7 @@ fn held_maintenance_read(mode: crate::config::TransactionMode, phase: &str) {
     network.object_store_access_key = "test-access".to_owned();
     network.object_store_secret_key = "test-secret".to_owned();
     let blocks = engine.ckpt.as_ref().unwrap().block_stack();
-    let mut io_budget = Budget::new(OwnedObjectStore::budget_bytes(&network));
-    let store = OwnedObjectStore::new(&network, &mut io_budget, "blocks/").unwrap();
-    *blocks.lock().unwrap() = crate::store::build_tiers(
-        &mut io_budget,
-        store,
-        StackPlan::resolve(0, 0),
-        std::path::Path::new(&config.data_dir),
-    )
-    .unwrap();
-    assert_eq!(io_budget.remaining(), 0);
-    engine.enable_async_block_reads();
+    replace_uncached_blocks(&mut engine, &network);
     let prefix = format!("/{}/", config.object_store_bucket);
     let mut held = None;
     for _ in 0..32 {
@@ -97851,16 +97765,7 @@ fn held_maintenance_read(mode: crate::config::TransactionMode, phase: &str) {
     }
     assert!(!engine.ckpt.as_ref().unwrap().retained_output_pending());
     assert!(!engine.block_reads_pending());
-    let mut restore_budget = Budget::new(OwnedObjectStore::budget_bytes(&config));
-    let store = OwnedObjectStore::new(&config, &mut restore_budget, "blocks/").unwrap();
-    *blocks.lock().unwrap() = crate::store::build_tiers(
-        &mut restore_budget,
-        store,
-        StackPlan::resolve(0, 0),
-        std::path::Path::new(&config.data_dir),
-    )
-    .unwrap();
-    engine.enable_async_block_reads();
+    replace_uncached_blocks(&mut engine, &config);
     assert!(engine.checkpoint().unwrap());
     let query = "SELECT count(*),sum(qty) FROM merge_wait; SELECT qty FROM merge_wait WHERE id=7; SELECT id FROM cached_order ORDER BY id";
     // Ordered query runs update the simulator's object inventory.

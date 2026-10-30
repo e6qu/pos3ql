@@ -865,7 +865,7 @@ pub(super) fn grouped_rows<'a>(
         .alloc_slice_with(n_keys, |_| Collation::None)
         .map_err(|_| arena_full())?;
     for (index, expression) in statement.group_by.iter().enumerate() {
-        group_collations[index] = scope.expression_collation(expression)?;
+        group_collations[index] = scope.expression_collation(storage, arena, expression)?;
     }
 
     // Grouping sets: the explicit set list, or a single implicit set of all
@@ -970,8 +970,11 @@ pub(super) fn grouped_rows<'a>(
     if n_order > 0 {
         let mut order_collations = [Collation::None; MAX_PROJ];
         for (index, expression) in order_exprs.iter().enumerate().take(n_order) {
-            order_collations[index] =
-                scope.expression_collation(expression.expect("resolved").expression)?;
+            order_collations[index] = scope.expression_collation(
+                storage,
+                arena,
+                expression.expect("resolved").expression,
+            )?;
         }
         for row in out_rows.iter() {
             for (index, &collation) in order_collations.iter().enumerate().take(n_order) {
@@ -1058,7 +1061,7 @@ pub(super) fn grouped_select<'a>(
                     Ok(expression) => expression,
                     Err(error) => return sql_fail(error),
                 };
-            collations[index] = match scope.expression_collation(expression) {
+            collations[index] = match scope.expression_collation(storage, arena, expression) {
                 Ok(collation) => collation,
                 Err(error) => return sql_fail(error),
             };

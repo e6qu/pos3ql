@@ -243,7 +243,7 @@ pub struct Config {
     pub subscription_tls_ca_file: String,
     /// Open SQL cursors per connection (DECLARE ... CURSOR).
     pub max_cursors: usize,
-    /// Bytes of materialized rows one cursor may hold.
+    /// Typed row bytes per SQL cursor, including each row's six-byte header.
     pub cursor_bytes: usize,
     /// Per-table rowid-map capacity (rows resident in the memtable).
     pub table_rows: usize,

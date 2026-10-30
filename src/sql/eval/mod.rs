@@ -161,6 +161,7 @@ pub mod sqlstate {
     pub const RESERVED_NAME: &str = "42939";
     pub const INVALID_SCHEMA_DEFINITION: &str = "42P15";
     pub const DUPLICATE_CURSOR: &str = "42P03";
+    pub const INVALID_CURSOR_DEFINITION: &str = "42P11";
     pub const DUPLICATE_FUNCTION: &str = "42723";
     pub const UNDEFINED_CURSOR: &str = "34000";
     pub const OBJECT_NOT_IN_PREREQUISITE_STATE: &str = "55000";

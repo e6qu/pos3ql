@@ -803,19 +803,44 @@ impl<'a> Parser<'a> {
         let name = self.col_ident("cursor name")?;
         let mut binary = false;
         let mut scroll = crate::sql::cursor::CursorScroll::Default;
+        let mut insensitive = false;
+        let mut asensitive = false;
         loop {
             if self.eat_ident("binary")? {
                 binary = true;
-            } else if self.eat_ident("insensitive")? || self.eat_ident("asensitive")? {
-                // Materialization makes every cursor insensitive.
+            } else if self.eat_ident("insensitive")? {
+                insensitive = true;
+            } else if self.eat_ident("asensitive")? {
+                asensitive = true;
             } else if self.eat_ident("scroll")? {
+                if scroll == crate::sql::cursor::CursorScroll::NoScroll {
+                    return Err(ParseError {
+                        at: statement_start,
+                        message: StackStr::from_str("cannot specify both SCROLL and NO SCROLL"),
+                        sqlstate: sqlstate::INVALID_CURSOR_DEFINITION,
+                    });
+                }
                 scroll = crate::sql::cursor::CursorScroll::Scroll;
             } else if self.eat_ident("no")? {
                 self.expect_ident("scroll")?;
+                if scroll == crate::sql::cursor::CursorScroll::Scroll {
+                    return Err(ParseError {
+                        at: statement_start,
+                        message: StackStr::from_str("cannot specify both SCROLL and NO SCROLL"),
+                        sqlstate: sqlstate::INVALID_CURSOR_DEFINITION,
+                    });
+                }
                 scroll = crate::sql::cursor::CursorScroll::NoScroll;
             } else {
                 break;
             }
+        }
+        if insensitive && asensitive {
+            return Err(ParseError {
+                at: statement_start,
+                message: StackStr::from_str("cannot specify both ASENSITIVE and INSENSITIVE"),
+                sqlstate: sqlstate::INVALID_CURSOR_DEFINITION,
+            });
         }
         self.expect_ident("cursor")?;
         let hold = if self.eat_ident("with")? {
@@ -830,7 +855,48 @@ impl<'a> Parser<'a> {
         self.expect_ident("for")?;
         // Capture the raw SELECT text; validated by parsing it now.
         let start = self.peek_at;
-        let _ = self.query_select()?;
+        let query = self.query_select()?;
+        if query.with.iter().any(|cte| cte.dml.is_some()) {
+            return Err(ParseError {
+                at: statement_start,
+                message: StackStr::from_str(
+                    "DECLARE CURSOR must not contain data-modifying statements in WITH",
+                ),
+                sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+            });
+        }
+        if let Some(clause) = query.locking.first() {
+            let restriction = if hold {
+                Some((
+                    "DECLARE CURSOR WITH HOLD",
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "not supported",
+                ))
+            } else if scroll == crate::sql::cursor::CursorScroll::Scroll {
+                Some((
+                    "DECLARE SCROLL CURSOR",
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "not supported",
+                ))
+            } else if insensitive {
+                Some(("DECLARE INSENSITIVE CURSOR", "42P11", "not valid"))
+            } else {
+                None
+            };
+            if let Some((prefix, state, reason)) = restriction {
+                return Err(ParseError {
+                    at: statement_start,
+                    message: stack_format!(
+                        96,
+                        "{} ... {} is {}",
+                        prefix,
+                        clause.strength.keyword(),
+                        reason,
+                    ),
+                    sqlstate: state,
+                });
+            }
+        }
         let end = self.peek_at;
         let sql = self.text[start..end].trim();
         let statement = self.text[statement_start..end].trim();
@@ -848,13 +914,19 @@ impl<'a> Parser<'a> {
     fn fetch_cursor(&mut self, move_only: bool) -> Result<Stmt<'a>, ParseError> {
         use crate::sql::cursor::FetchMotion;
         self.advance()?; // fetch | move
-        let signed_count = |p: &mut Self| -> Result<i64, ParseError> {
+        let signed_count = |p: &mut Self| -> Result<i32, ParseError> {
             let negative = p.eat_op("-")?;
+            if !negative {
+                let _ = p.eat_op("+")?;
+            }
             match p.peeked {
                 Tok::Num(text) => {
-                    let v: i64 = text
-                        .parse()
-                        .map_err(|_| p.unexpected("expected a row count"))?;
+                    // PostgreSQL's SignedIconst requires an int32 magnitude.
+                    let v: i32 = text.parse().map_err(|_| ParseError {
+                        at: p.peek_at,
+                        message: stack_format!(96, "syntax error at or near \"{}\"", text),
+                        sqlstate: sqlstate::SYNTAX_ERROR,
+                    })?;
                     p.advance()?;
                     Ok(if negative { -v } else { v })
                 }
@@ -876,7 +948,7 @@ impl<'a> Parser<'a> {
         } else if self.eat_ident("forward")? {
             if self.eat_ident("all")? {
                 FetchMotion::All
-            } else if matches!(self.peeked, Tok::Num(_)) || self.peeked == Tok::Op("-") {
+            } else if matches!(self.peeked, Tok::Num(_) | Tok::Op("-" | "+")) {
                 FetchMotion::Count(signed_count(self)?)
             } else {
                 FetchMotion::Count(1)
@@ -884,14 +956,14 @@ impl<'a> Parser<'a> {
         } else if self.eat_ident("backward")? {
             if self.eat_ident("all")? {
                 FetchMotion::BackwardAll
-            } else if matches!(self.peeked, Tok::Num(_)) || self.peeked == Tok::Op("-") {
+            } else if matches!(self.peeked, Tok::Num(_) | Tok::Op("-" | "+")) {
                 FetchMotion::Count(-signed_count(self)?)
             } else {
                 FetchMotion::Count(-1)
             }
         } else if self.eat_ident("all")? {
             FetchMotion::All
-        } else if matches!(self.peeked, Tok::Num(_)) || self.peeked == Tok::Op("-") {
+        } else if matches!(self.peeked, Tok::Num(_) | Tok::Op("-" | "+")) {
             FetchMotion::Count(signed_count(self)?)
         } else {
             FetchMotion::Count(1)
@@ -1845,7 +1917,35 @@ impl<'a> Parser<'a> {
             let _ = self.eat_ident("all")?;
             false
         };
-        let items = self.select_items()?;
+        // PostgreSQL permits an empty SELECT list, including before FROM.
+        // DISTINCT requires a nonempty list; RETURNING uses select_items directly.
+        let empty_list = !distinct
+            && matches!(
+                self.peeked,
+                Tok::Eof
+                    | Tok::Op(";" | ")")
+                    | Tok::Ident(
+                        "into"
+                            | "from"
+                            | "where"
+                            | "group"
+                            | "having"
+                            | "window"
+                            | "union"
+                            | "intersect"
+                            | "except"
+                            | "order"
+                            | "limit"
+                            | "offset"
+                            | "fetch"
+                            | "for"
+                    )
+            );
+        let items = if empty_list {
+            &[][..]
+        } else {
+            self.select_items()?
+        };
 
         // `SELECT ... INTO [TABLE] name ...` — a CREATE TABLE AS spelled the
         // old way. Legal only at the top level; a subquery / CTE / set-op branch
@@ -11206,10 +11306,13 @@ mod tests {
 
     #[test]
     fn syntax_errors_carry_position() {
-        with_parser("SELECT FROM", |p| {
-            let err = p.next_stmt().unwrap_err();
-            assert_eq!(err.at, 7);
-        });
+        for (sql, position) in [("SELECT FROM", 11), ("SELECT , 1", 7)] {
+            with_parser(sql, |parser| {
+                let error = parser.next_stmt().unwrap_err();
+                assert_eq!(error.sqlstate, sqlstate::SYNTAX_ERROR);
+                assert_eq!(error.at, position, "{sql}");
+            });
+        }
     }
 
     #[test]

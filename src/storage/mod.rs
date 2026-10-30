@@ -155,6 +155,8 @@ use row_images::{RowByteSource, RowVersionIdentity, VisibleRowBytes};
 pub(crate) use row_map::{RowEntries, RowMap};
 pub(crate) use row_reads::{RowRead, RowSelfChange};
 use row_reads::{RowReadView, RowReadVisitor};
+#[cfg(test)]
+pub(crate) use row_scans::cursor::{RowCursor, RowCursorBuffers};
 pub(crate) use row_scans::{CapturedRowScan, ValidationRead};
 use row_versions::{
     RowVersionPools, clear_pending_versions, pending_last, pop_pending_version,
@@ -15105,6 +15107,38 @@ struct CheckpointRowIdentity {
     suppress_spill: bool,
 }
 
+struct SpillWalkProgress {
+    identity: u64,
+    initialized: usize,
+    pending_advance: Option<u64>,
+}
+
+impl SpillWalkProgress {
+    const START: Self = Self {
+        identity: 0,
+        initialized: 0,
+        pending_advance: None,
+    };
+
+    fn resume<'a>(
+        &'a mut self,
+        members: &'a mut [MemberCursor],
+        context: &'a Mutex<ScanContext>,
+        max_rows: usize,
+        max_object_gets: u64,
+    ) -> SpillWalkResume<'a> {
+        SpillWalkResume {
+            members,
+            identity: &mut self.identity,
+            initialized: &mut self.initialized,
+            pending_advance: &mut self.pending_advance,
+            context,
+            max_rows,
+            max_object_gets,
+        }
+    }
+}
+
 /// One retained checkpoint row source. Its private startup-reserved context
 /// keeps unfinished column and large-row bytes while foreground scans reuse
 /// their own buffers. Resident identities and immutable file roots stay fixed.
@@ -15113,15 +15147,11 @@ pub(crate) struct CheckpointRowCursor {
     resident_rowids: Vec<CheckpointRowIdentity>,
     resident_initialized: bool,
     members: Box<[MemberCursor]>,
+    spill_progress: SpillWalkProgress,
+    scan_context: Mutex<ScanContext>,
     generations: SpillGenerationSnapshot,
-    /// Stable identity for the retained walk across checkpoint turns.
-    spill_walk_id: u64,
-    /// Member heads opened so far; opening a long generation list is paced.
-    spill_initialized: usize,
     resident_done: bool,
     spill_done: bool,
-    pending_advance: Option<u64>,
-    scan_context: Mutex<ScanContext>,
 }
 
 impl CheckpointRowCursor {
@@ -15155,15 +15185,12 @@ impl CheckpointRowCursor {
             arena,
             true,
             SpillOverlayMode::CommittedCheckpoint(&self.resident_rowids),
-            Some(SpillWalkResume {
-                members: &mut self.members,
-                identity: &mut self.spill_walk_id,
-                initialized: &mut self.spill_initialized,
-                pending_advance: &mut self.pending_advance,
-                context: &self.scan_context,
+            Some(self.spill_progress.resume(
+                &mut self.members,
+                &self.scan_context,
                 max_rows,
                 max_object_gets,
-            }),
+            )),
             SpillWalkOutput::Metadata(&mut |rowid, version| {
                 let len = version.len.expect("metadata walk selects a live version");
                 each(
@@ -15180,9 +15207,9 @@ impl CheckpointRowCursor {
     }
 
     pub(crate) fn budget_bytes(max_spill_generations: usize, table_rows: usize) -> usize {
-        max_spill_generations * core::mem::size_of::<MemberCursor>()
+        max_spill_generations * size_of::<MemberCursor>()
             + ScanContext::budget_bytes(max_spill_generations)
-            + core::mem::size_of::<Option<u64>>()
+            + size_of::<Option<u64>>()
             + SpillGenerationSnapshot::budget_bytes(max_spill_generations)
             + table_rows * core::mem::size_of::<CheckpointRowIdentity>()
     }
@@ -15193,13 +15220,11 @@ impl CheckpointRowCursor {
             resident_rowids: Vec::with_capacity(table_rows),
             resident_initialized: false,
             members: vec![MemberCursor::EMPTY; max_spill_generations].into_boxed_slice(),
+            spill_progress: SpillWalkProgress::START,
+            scan_context: Mutex::new(ScanContext::new(max_spill_generations)),
             generations: SpillGenerationSnapshot::new(max_spill_generations),
-            spill_walk_id: 0,
-            spill_initialized: 0,
             resident_done: false,
             spill_done: false,
-            pending_advance: None,
-            scan_context: Mutex::new(ScanContext::new(max_spill_generations)),
         }
     }
 
@@ -15208,10 +15233,8 @@ impl CheckpointRowCursor {
         self.resident_rowids.clear();
         self.resident_initialized = false;
         self.members.fill(MemberCursor::EMPTY);
+        self.spill_progress = SpillWalkProgress::START;
         self.generations.clear();
-        self.spill_walk_id = 0;
-        self.spill_initialized = 0;
-        self.pending_advance = None;
         self.resident_done = false;
         self.spill_done = false;
     }
@@ -15254,15 +15277,12 @@ impl CheckpointRowCursor {
             arena,
             true,
             SpillOverlayMode::CommittedCheckpoint(&self.resident_rowids),
-            Some(SpillWalkResume {
-                members: &mut self.members,
-                identity: &mut self.spill_walk_id,
-                initialized: &mut self.spill_initialized,
-                pending_advance: &mut self.pending_advance,
-                context: &self.scan_context,
+            Some(self.spill_progress.resume(
+                &mut self.members,
+                &self.scan_context,
                 max_rows,
                 max_object_gets,
-            }),
+            )),
             SpillWalkOutput::Rows {
                 columns: decoded_columns,
                 coalesce_packed,

@@ -407,6 +407,8 @@ struct MaterializationPlan<'a> {
 }
 
 fn projected_collations<'a>(
+    storage: &Storage,
+    arena: &Arena,
     statement: &Select<'a>,
     scope: &QueryScope<'a>,
 ) -> Result<[Collation; MAX_PROJ], SqlError> {
@@ -427,7 +429,7 @@ fn projected_collations<'a>(
         }
         match item {
             SelectItem::Expr { expression, .. } => {
-                collations[width] = scope.expression_collation(expression)?;
+                collations[width] = scope.expression_collation(storage, arena, expression)?;
                 width += 1;
             }
             SelectItem::Wildcard => {
@@ -528,7 +530,7 @@ fn prepare_materialization<'a>(
             arena,
             &order_exprs[..key],
         )?;
-        key_collations[key] = scope.expression_collation(resolved.expression)?;
+        key_collations[key] = scope.expression_collation(storage, arena, resolved.expression)?;
         order_exprs[key] = Some(resolved);
     }
     for (index, on) in statement.distinct_on.iter().enumerate() {
@@ -548,7 +550,8 @@ fn prepare_materialization<'a>(
                 "SELECT DISTINCT ON expressions must match initial ORDER BY expressions"
             ));
         }
-        key_collations[n_order + index] = scope.expression_collation(resolved.expression)?;
+        key_collations[n_order + index] =
+            scope.expression_collation(storage, arena, resolved.expression)?;
         order_exprs[n_order + index] = Some(resolved);
     }
     let n_keys = n_order + n_on;
@@ -697,7 +700,7 @@ pub(crate) fn materialized_rows<'a>(
     rank_window: Option<usize>,
 ) -> Result<MaterializedSelect<'a>, SqlError> {
     let plan = prepare_materialization(storage, txid, statement, scope, correlated, arena)?;
-    let visible_collations = projected_collations(statement, scope)?;
+    let visible_collations = projected_collations(storage, arena, statement, scope)?;
     let pax_columns = materialization_pax_columns(statement, scope, from, &plan);
     let MaterializationPlan {
         n_order,
@@ -1823,7 +1826,7 @@ pub(crate) fn materialized_select<'a>(
             Ok(expression) => expression,
             Err(error) => return sql_fail(error),
         };
-        order_collations[index] = match scope.expression_collation(expression) {
+        order_collations[index] = match scope.expression_collation(storage, arena, expression) {
             Ok(collation) => collation,
             Err(error) => return sql_fail(error),
         };

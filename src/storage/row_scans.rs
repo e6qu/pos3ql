@@ -8,6 +8,9 @@ use crate::sql::eval::{SqlError, sqlstate};
 use crate::sql_err;
 use core::ops::ControlFlow;
 
+#[cfg(test)]
+pub(super) mod cursor;
+
 pub(crate) struct CapturedRowScan<'arena> {
     source: TableRowSnapshot<'arena>,
     rows: &'arena [CapturedRowRecord],
@@ -105,8 +108,39 @@ impl Storage {
         commit: u64,
         arena: &'arena Arena,
     ) -> Result<CapturedRowScan<'arena>, SqlError> {
+        let (source, records, generation) =
+            self.capture_byte_partition(table_slot, txid, command, commit, Some(arena), |count| {
+                arena
+                    .alloc_slice_with(count, |_| CapturedRowRecord::EMPTY)
+                    .map_err(|_| {
+                        sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "captured resident rows exceed the statement arena"
+                        )
+                    })
+            })?;
+        for record in records.iter_mut() {
+            crate::sql::query::check_timeout()?;
+            source.resolve_saved(record, commit)?;
+        }
+        Ok(CapturedRowScan {
+            source,
+            rows: records,
+            generation,
+        })
+    }
+
+    fn capture_byte_partition<'roots, Records: AsMut<[CapturedRowRecord]>>(
+        &self,
+        table_slot: usize,
+        txid: u32,
+        command: u32,
+        commit: u64,
+        roots_arena: Option<&'roots Arena>,
+        allocate: impl FnOnce(usize) -> Result<Records, SqlError>,
+    ) -> Result<(TableRowSnapshot<'roots>, Records, u64), SqlError> {
         crate::sql::query::check_timeout()?;
-        let (source, records, generation) = {
+        let (source, mut records, generation) = {
             let table = &self.tables[table_slot];
             // A contended table releases every earlier owner before waiting.
             // No byte lookup or visitor runs during acquisition.
@@ -135,19 +169,14 @@ impl Storage {
                     || !state.pending.is_none()
                     || !state.history.is_empty()
             });
-            let source = TableRowSnapshot::capture(self, image, &generations, heap, Some(arena))?;
+            let source = TableRowSnapshot::capture(self, image, &generations, heap, roots_arena)?;
             let count = rows
                 .iter()
                 .filter(|(_, state)| !Self::redundant_spilled_row_state(state))
                 .count();
-            let records = arena
-                .alloc_slice_with(count, |_| CapturedRowRecord::EMPTY)
-                .map_err(|_| {
-                    sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "captured resident rows exceed the statement arena"
-                    )
-                })?;
+            let mut records = allocate(count)?;
+            let output = records.as_mut();
+            debug_assert_eq!(output.len(), count);
             let mut at = 0;
             for (&rowid, &state) in rows.iter() {
                 crate::sql::query::check_timeout()?;
@@ -161,21 +190,13 @@ impl Storage {
                     publication.row_layout,
                 )
                 .visible_version_at(txid, command, commit);
-                records[at] = source.capture_selection(rowid, selected)?;
+                output[at] = source.capture_selection(rowid, selected)?;
                 at += 1;
             }
             (source, records, publication.generation)
         };
-        for record in records.iter_mut() {
-            crate::sql::query::check_timeout()?;
-            source.resolve_saved(record, commit)?;
-        }
-        records.sort_unstable_by_key(|record| record.rowid);
-        Ok(CapturedRowScan {
-            source,
-            rows: records,
-            generation,
-        })
+        records.as_mut().sort_unstable_by_key(|record| record.rowid);
+        Ok((source, records, generation))
     }
 }
 

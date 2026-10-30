@@ -199,7 +199,13 @@ fixed memory budgets without separate staging-count ceilings. Heap locations
 use 32-bit addresses; `memtable_bytes` must not exceed `u32::MAX`. Startup reserves
 two heap buffers of that size, including one for relocation while readers retain
 old bytes. Reclamation returns `54000` while both buffers are retained. Effective search paths use
-the accepted GUC byte representation; cursor indexes use `cursor_bytes`.
+the accepted GUC byte representation. Each cursor reserves `cursor_bytes`
+for typed rows, a 1,024-byte description and `floor(cursor_bytes / 6)` row
+positions; the connection reserves the same number of fetch-selection positions.
+Each saved row includes a four-byte length and a two-byte column count.
+Long column names can fill the description even when the rows fit. That error
+names the description limit: use fewer or shorter labels. Increasing
+`cursor_bytes` only changes the row capacity.
 JSON/path and XML/XPath limits are specified in [SQL/JSON](sql-json.md) and
 [SQL/XML](sql-xml.md). Inspect the memory plan for the chosen configuration;
 accepted width can still exhaust its named statement or startup budget.

@@ -1,0 +1,43 @@
+-- PostgreSQL 18 parser/analyze.c transformDeclareCursorStmt is the reference
+-- for option conflicts and read-only cursor requirements. No row may be locked
+-- or modified, and no sequence call may run, while rejecting a declaration.
+CREATE TABLE cursor_declaration_rows (id integer);
+INSERT INTO cursor_declaration_rows VALUES (1), (2);
+CREATE SEQUENCE cursor_declaration_sequence;
+BEGIN;
+DECLARE c SCROLL NO SCROLL CURSOR FOR SELECT id FROM cursor_declaration_rows;
+ROLLBACK;
+BEGIN;
+DECLARE c NO SCROLL SCROLL CURSOR FOR SELECT id FROM cursor_declaration_rows;
+ROLLBACK;
+BEGIN;
+DECLARE c INSENSITIVE ASENSITIVE CURSOR FOR SELECT id FROM cursor_declaration_rows;
+ROLLBACK;
+BEGIN;
+DECLARE c ASENSITIVE INSENSITIVE CURSOR FOR SELECT id FROM cursor_declaration_rows;
+ROLLBACK;
+BEGIN;
+DECLARE c CURSOR WITH HOLD FOR SELECT id FROM cursor_declaration_rows FOR UPDATE;
+ROLLBACK;
+BEGIN;
+DECLARE c SCROLL CURSOR FOR SELECT id FROM cursor_declaration_rows FOR NO KEY UPDATE;
+ROLLBACK;
+BEGIN;
+DECLARE c INSENSITIVE CURSOR FOR SELECT id FROM cursor_declaration_rows FOR SHARE;
+ROLLBACK;
+BEGIN;
+DECLARE c CURSOR WITH HOLD FOR SELECT id FROM cursor_declaration_rows FOR KEY SHARE;
+ROLLBACK;
+BEGIN;
+DECLARE c CURSOR FOR WITH changed AS (INSERT INTO cursor_declaration_rows VALUES (3) RETURNING id) SELECT id FROM changed;
+ROLLBACK;
+BEGIN;
+DECLARE c CURSOR FOR WITH changed AS (DELETE FROM cursor_declaration_rows RETURNING id) SELECT id FROM changed;
+ROLLBACK;
+BEGIN;
+DECLARE c CURSOR FOR WITH changed AS (UPDATE cursor_declaration_rows SET id = nextval('cursor_declaration_sequence') RETURNING id) SELECT id FROM changed;
+ROLLBACK;
+SELECT count(*), sum(id) FROM cursor_declaration_rows;
+SELECT last_value, is_called FROM cursor_declaration_sequence;
+DROP TABLE cursor_declaration_rows;
+DROP SEQUENCE cursor_declaration_sequence;

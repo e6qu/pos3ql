@@ -1,7 +1,5 @@
--- SQL cursors: DECLARE / FETCH / MOVE / CLOSE. Materialized at DECLARE
--- (PostgreSQL's insensitive-cursor snapshot), SCROLL for backward and
--- absolute positioning, WITH HOLD across commit, and the exact motion
--- semantics of every FETCH direction.
+-- SQL cursor movement, scrolling and transaction lifetime. Snapshot selection
+-- at DECLARE does not imply that the whole query executes at DECLARE.
 DROP TABLE IF EXISTS ct;
 CREATE TABLE ct(a int, b text);
 INSERT INTO ct SELECT g, 'row-' || g FROM generate_series(1, 10) g;

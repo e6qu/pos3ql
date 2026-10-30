@@ -3182,13 +3182,15 @@ impl Conn {
                         self.portals[i].statement
                     });
                 if protocol_portal.is_none() {
-                    // PostgreSQL exposes a named SQL cursor to Describe Portal;
-                    // DECLARE captured its exact text or binary description.
-                    if let Some(description) = self.cursors.description(name) {
-                        return if self.send.append(description) {
-                            Step::Continue
-                        } else {
-                            Step::Close
+                    // SQL cursors expose their declaration's text/binary format.
+                    if let Some((description, formats)) = self
+                        .cursors
+                        .fetch_description(name, crate::pg::respond::ResultFmt::ALL_TEXT)
+                    {
+                        let mut responder = Responder::new(&mut self.send);
+                        return match responder.cursor_row_description(description, formats) {
+                            Ok(()) => Step::Continue,
+                            Err(WireFull) => Step::Close,
                         };
                     }
                 }

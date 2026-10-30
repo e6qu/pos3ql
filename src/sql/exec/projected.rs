@@ -1122,28 +1122,60 @@ pub fn decode_projected_col_record<'a>(
         at += 1;
         let (value, size) = decode_projected_value(bytes, tag, at);
         if current == col {
-            if tag == 19 {
-                let text_len = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
-                return decode_record_tail(bytes, at + 4 + text_len, arena);
-            }
-            if tag == 202 {
-                let slot = crate::storage::TypeCreation::from_le_bytes(
-                    bytes[at..at + 4].try_into().unwrap(),
-                )
-                .expect("projected composite creation");
-                let text_len =
-                    u32::from_le_bytes(bytes[at + 4..at + 8].try_into().unwrap()) as usize;
-                let Datum::Record(fields) = decode_record_tail(bytes, at + 8 + text_len, arena)?
-                else {
-                    unreachable!()
-                };
-                return Ok(Datum::Composite { slot, fields });
-            }
-            return Ok(value);
+            return restore_projected_record(bytes, tag, at, value, arena);
         }
         at += size;
         current += 1;
     }
+}
+
+/// Decodes a whole typed row in one pass, including nested record values.
+pub(crate) fn decode_projected_row_into<'a>(
+    bytes: &'a [u8],
+    arena: &'a Arena,
+    output: &mut [Datum<'a>],
+) -> Result<usize, SqlError> {
+    let width = projected_row_width(bytes);
+    if width > output.len() {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "projected row has more than {} columns",
+            output.len()
+        ));
+    }
+    let mut at = 2usize;
+    for value in &mut output[..width] {
+        let tag = bytes[at];
+        at += 1;
+        let (decoded, size) = decode_projected_value(bytes, tag, at);
+        *value = restore_projected_record(bytes, tag, at, decoded, arena)?;
+        at += size;
+    }
+    Ok(width)
+}
+
+fn restore_projected_record<'a>(
+    bytes: &'a [u8],
+    tag: u8,
+    at: usize,
+    scalar: Datum<'a>,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    if tag == 19 {
+        let text_len = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+        return decode_record_tail(bytes, at + 4 + text_len, arena);
+    }
+    if tag == 202 {
+        let slot =
+            crate::storage::TypeCreation::from_le_bytes(bytes[at..at + 4].try_into().unwrap())
+                .expect("projected composite creation");
+        let text_len = u32::from_le_bytes(bytes[at + 4..at + 8].try_into().unwrap()) as usize;
+        let Datum::Record(fields) = decode_record_tail(bytes, at + 8 + text_len, arena)? else {
+            unreachable!()
+        };
+        return Ok(Datum::Composite { slot, fields });
+    }
+    Ok(scalar)
 }
 
 /// Rebuilds a `Datum::Record` from the structural tail at `at`.

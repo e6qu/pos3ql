@@ -719,8 +719,9 @@ pub(crate) use describe::{enter_bound_parameter_types, enter_routine_parameter_t
 
 mod projected;
 pub(crate) use projected::{
-    compare_projected_prefix, encode_projected_by_into, encode_projected_into,
-    encode_projected_persistent_pub, projected_row_len_by, projected_row_width,
+    compare_projected_prefix, decode_projected_row_into, encode_projected_by_into,
+    encode_projected_into, encode_projected_persistent_pub, projected_row_len,
+    projected_row_len_by, projected_row_width,
 };
 pub use projected::{
     decode_projected_col_record, decode_projected_pub, decode_projected_value,
@@ -18945,9 +18946,11 @@ fn parse_trigger_statement<'a>(
     {
         return Ok(TriggerStatement::Dml(parse_trigger_dml(segment, arena)?));
     }
-    if ["create", "alter", "drop", "comment", "grant", "revoke"]
-        .iter()
-        .any(|keyword| strip_trigger_keyword(segment, keyword).is_some())
+    if [
+        "create", "alter", "drop", "comment", "grant", "revoke", "set", "reset",
+    ]
+    .iter()
+    .any(|keyword| strip_trigger_keyword(segment, keyword).is_some())
     {
         use crate::sql::lexer::{Lexer, Tok};
         let mut lexer = Lexer::new(segment, arena);
@@ -24674,7 +24677,7 @@ fn execute_trigger_block<'a>(
                         let PlpgsqlExecHost::Routine { cursors, .. } = &context.host else {
                             unreachable!("cursor host cannot change during execution")
                         };
-                        let wire = cursors.wire_parts(name).ok_or_else(|| {
+                        let description = cursors.description(name).ok_or_else(|| {
                             sql_err!(
                                 sqlstate::UNDEFINED_CURSOR,
                                 "cursor \"{}\" does not exist",
@@ -24683,7 +24686,7 @@ fn execute_trigger_block<'a>(
                         })?;
                         let mut borrowed_names = [None; MAX_COLUMNS];
                         let count = super::cursor::description_columns(
-                            wire.description,
+                            description,
                             &mut borrowed_names,
                             &mut column_type_oids,
                         )?;
@@ -24709,13 +24712,13 @@ fn execute_trigger_block<'a>(
                         ));
                     }
                     let mut values = [Datum::Null; MAX_COLUMNS];
-                    let mut decoded = [None; MAX_COLUMNS];
+                    let mut decoded = [Datum::Null; MAX_COLUMNS];
                     if let Some(row) = rows.first().copied() {
                         let width = {
                             let PlpgsqlExecHost::Routine { cursors, .. } = &context.host else {
                                 unreachable!("cursor host cannot change during execution")
                             };
-                            cursors.emitted_text_row(name, row, &mut decoded)?
+                            cursors.copy_row(name, row, arena, &mut decoded)?
                         };
                         if width != column_count {
                             return Err(sql_err!(
@@ -24726,16 +24729,7 @@ fn execute_trigger_block<'a>(
                             ));
                         }
                         if !record_target {
-                            for (index, field) in decoded[..width].iter().enumerate() {
-                                values[index] = match field {
-                                    Some(text) => Datum::Text(
-                                        arena
-                                            .alloc_str(text)
-                                            .map_err(|_| super::query::arena_full_pub())?,
-                                    ),
-                                    None => Datum::Null,
-                                };
-                            }
+                            values[..width].copy_from_slice(&decoded[..width]);
                         }
                     }
                     if record_target {
@@ -24745,14 +24739,7 @@ fn execute_trigger_block<'a>(
                             value: Datum::Null,
                         }; MAX_COLUMNS];
                         for index in 0..column_count {
-                            let value = match decoded[index] {
-                                Some(text) => Datum::Text(
-                                    arena
-                                        .alloc_str(text)
-                                        .map_err(|_| super::query::arena_full_pub())?,
-                                ),
-                                None => Datum::Null,
-                            };
+                            let value = decoded[index];
                             let value = match catalog_column_type(
                                 context.storage(),
                                 context.txn.txid,
@@ -25172,24 +25159,13 @@ fn execute_trigger_block<'a>(
                                 .map_err(|_| super::query::arena_full_pub())?
                         };
                         for row in rows.iter().copied() {
-                            let mut fields = [None; MAX_COLUMNS];
+                            let mut values = [Datum::Null; MAX_COLUMNS];
                             let width = {
                                 let PlpgsqlExecHost::Routine { cursors, .. } = &context.host else {
                                     unreachable!("cursor host cannot change during execution")
                                 };
-                                cursors.emitted_text_row(name, row, &mut fields)?
+                                cursors.copy_row(name, row, arena, &mut values)?
                             };
-                            let mut values = [Datum::Null; MAX_COLUMNS];
-                            for (index, field) in fields[..width].iter().enumerate() {
-                                values[index] = match field {
-                                    Some(text) => Datum::Text(
-                                        arena
-                                            .alloc_str(text)
-                                            .map_err(|_| super::query::arena_full_pub())?,
-                                    ),
-                                    None => Datum::Null,
-                                };
-                            }
                             capture(&values[..width])?;
                         }
                     }
@@ -72701,7 +72677,7 @@ mod tests {
     use crate::mem::budget::Budget;
 
     #[test]
-    fn event_trigger_static_utility_parse_preserves_lexical_errors() {
+    fn procedural_static_utility_parse_preserves_lexical_errors_and_assignments() {
         for (sql, capacity, message) in [
             (
                 "CREATE TABLE orders(id integer)",
@@ -72726,17 +72702,20 @@ mod tests {
         }
         let mut budget = Budget::new(8192);
         let arena = Arena::new(&mut budget, "procedural assignment parsing", 4096).unwrap();
-        let statement = crate::mem::guard::forbid_alloc(|| {
-            parse_trigger_statement(
-                "alter := 1",
-                &arena,
-                &[],
-                false,
-                PlpgsqlProgramKind::Anonymous,
-            )
-            .unwrap()
-        });
-        assert!(matches!(statement, TriggerStatement::LocalAssign(_)));
+        for sql in ["alter := 1", "set := 1", "reset := 1"] {
+            let statement = crate::mem::guard::forbid_alloc(|| {
+                parse_trigger_statement(sql, &arena, &[], false, PlpgsqlProgramKind::Anonymous)
+                    .unwrap()
+            });
+            assert!(matches!(statement, TriggerStatement::LocalAssign(_)));
+        }
+        for sql in ["SET DateStyle = 'SQL, DMY'", "RESET DateStyle", "RESET ALL"] {
+            let statement = crate::mem::guard::forbid_alloc(|| {
+                parse_trigger_statement(sql, &arena, &[], false, PlpgsqlProgramKind::Anonymous)
+                    .unwrap()
+            });
+            assert!(matches!(statement, TriggerStatement::Utility { .. }));
+        }
     }
 
     #[test]

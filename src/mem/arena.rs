@@ -13,6 +13,11 @@ use std::alloc::Layout;
 
 use super::budget::{Budget, BudgetError};
 
+#[cfg(test)]
+mod retained_slice;
+#[cfg(test)]
+pub(crate) use retained_slice::{ArenaSliceError, ArenaSliceHandle};
+
 pub struct Arena {
     what: &'static str,
     base: *mut u8,
@@ -318,10 +323,16 @@ impl Arena {
     /// Rewinds the arena. Requires `&mut self`, so the borrow checker
     /// guarantees no allocation handed out earlier is still alive.
     pub fn reset(&mut self) {
-        self.interned.set(None);
-        self.offset.set(0);
+        self.recycle_front();
         self.tail_offset.set(self.capacity);
         self.retention_identity = retention_identity();
+    }
+
+    /// Reclaims temporary parsing and row values while retained scan handles
+    /// keep their identity and bytes. Live references prevent this mutable borrow.
+    pub(crate) fn recycle_front(&mut self) {
+        self.interned.set(None);
+        self.offset.set(0);
     }
 
     pub(crate) fn retain<T: Copy>(&self, value: T) -> Result<ArenaHandle<T>, ArenaFull> {

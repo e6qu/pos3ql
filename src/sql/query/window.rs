@@ -349,7 +349,7 @@ fn frame_range<'a>(
                         (false, false) => compare_datums_collated(
                             storage,
                             txid,
-                            scope.expression_collation(o.expression)?,
+                            scope.expression_collation(storage, arena, o.expression)?,
                             &va,
                             &vb,
                         )?
@@ -434,7 +434,7 @@ fn frame_range<'a>(
             let c = compare_datums_collated(
                 storage,
                 txid,
-                scope.expression_collation(o.expression)?,
+                scope.expression_collation(storage, arena, o.expression)?,
                 &k,
                 &edge,
             )?;
@@ -454,7 +454,7 @@ fn frame_range<'a>(
                 let c = compare_datums_collated(
                     storage,
                     txid,
-                    scope.expression_collation(o.expression)?,
+                    scope.expression_collation(storage, arena, o.expression)?,
                     &k,
                     &edge,
                 )?;
@@ -481,7 +481,7 @@ fn frame_range<'a>(
                 let c = compare_datums_collated(
                     storage,
                     txid,
-                    scope.expression_collation(o.expression)?,
+                    scope.expression_collation(storage, arena, o.expression)?,
                     &k,
                     &edge,
                 )?;
@@ -676,7 +676,7 @@ fn window_keys_equal<'a>(
                 || !compare_datums_collated(
                     storage,
                     txid,
-                    scope.expression_collation(expression)?,
+                    scope.expression_collation(storage, arena, expression)?,
                     &left_value,
                     &right_value,
                 )?
@@ -722,7 +722,7 @@ fn peer_bounds<'a>(
                         (false, false) => compare_datums_collated(
                             storage,
                             txid,
-                            scope.expression_collation(o.expression)?,
+                            scope.expression_collation(storage, arena, o.expression)?,
                             &va,
                             &vb,
                         )?
@@ -897,7 +897,7 @@ fn compute_window<'a>(
                                 (false, false) => compare_datums_collated(
                                     storage,
                                     txid,
-                                    scope.expression_collation(o.expression)?,
+                                    scope.expression_collation(storage, arena, o.expression)?,
                                     &va,
                                     &vb,
                                 )?
@@ -1063,7 +1063,7 @@ fn compute_window<'a>(
                                     (false, false) => compare_datums_collated(
                                         storage,
                                         txid,
-                                        scope.expression_collation(o.expression)?,
+                                        scope.expression_collation(storage, arena, o.expression)?,
                                         &va,
                                         &vb,
                                     )?
@@ -1328,7 +1328,11 @@ fn compute_window<'a>(
                                         (false, false) => compare_datums_collated(
                                             storage,
                                             txid,
-                                            scope.expression_collation(o.expression)?,
+                                            scope.expression_collation(
+                                                storage,
+                                                arena,
+                                                o.expression,
+                                            )?,
                                             &va,
                                             &vb,
                                         )?
@@ -1421,7 +1425,7 @@ fn cmp_order<'a>(
         let c = order_by_key(
             storage,
             txid,
-            scope.expression_collation(o.expression)?,
+            scope.expression_collation(storage, arena, o.expression)?,
             &va,
             &vb,
             o,
@@ -1840,10 +1844,11 @@ pub(crate) fn external_window_into<'a>(
             .alloc_slice_with(spec.order_by.len(), |_| Collation::None)
             .map_err(|_| arena_full())?;
         for (index, expression) in spec.partition_by.iter().enumerate() {
-            partition_collations[index] = scope.expression_collation(expression)?;
+            partition_collations[index] = scope.expression_collation(storage, arena, expression)?;
         }
         for (index, order) in spec.order_by.iter().enumerate() {
-            order_collations[index] = scope.expression_collation(order.expression)?;
+            order_collations[index] =
+                scope.expression_collation(storage, arena, order.expression)?;
         }
         // Sort the source rows by (PARTITION BY keys, ORDER BY keys) so every
         // partition streams back as one contiguous run segment.
@@ -2088,7 +2093,7 @@ pub(crate) fn external_window_into<'a>(
         .map_err(|_| arena_full())?;
     for (index, key) in order_exprs.iter().enumerate() {
         statement_order_collations[index] =
-            scope.expression_collation(key.expect("set").expression)?;
+            scope.expression_collation(storage, arena, key.expect("set").expression)?;
     }
     let mut out_sorter = storage.external_sorter()?;
     out_sorter.reset();

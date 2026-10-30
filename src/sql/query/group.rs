@@ -1349,9 +1349,6 @@ fn ungrouped_column<'e, 'a>(
                     .find_map(|e| ungrouped_column(e, group_by, scope, storage, txid))
             })
         }
-        Expr::Between {
-            operand, low, high, ..
-        } => first(&[operand, low, high]),
         Expr::Like {
             operand, pattern, ..
         }

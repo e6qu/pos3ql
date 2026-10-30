@@ -2690,13 +2690,6 @@ fn dml_index_operand_is_invariant(expression: &Expr<'_>) -> bool {
         Expr::Binary { left, right, .. } => {
             dml_index_operand_is_invariant(left) && dml_index_operand_is_invariant(right)
         }
-        Expr::Between {
-            operand, low, high, ..
-        } => {
-            dml_index_operand_is_invariant(operand)
-                && dml_index_operand_is_invariant(low)
-                && dml_index_operand_is_invariant(high)
-        }
         Expr::Like {
             operand, pattern, ..
         }

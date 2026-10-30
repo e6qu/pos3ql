@@ -1,3 +1,71 @@
+-- BETWEEN expands to ordinary comparisons, including repeated operands.
+-- https://github.com/postgres/postgres/blob/REL_18_6/src/backend/parser/parse_expr.c#L1252
+SELECT 1 BETWEEN 2 AND NULL,1 NOT BETWEEN 2 AND NULL,
+       1 BETWEEN NULL AND 0,1 NOT BETWEEN NULL AND 0,
+       1 BETWEEN NULL AND 2,1 NOT BETWEEN NULL AND 2;
+SELECT 1 BETWEEN SYMMETRIC 2 AND 0,1 NOT BETWEEN SYMMETRIC 2 AND 0,
+       1 BETWEEN SYMMETRIC NULL AND 0,1 NOT BETWEEN SYMMETRIC NULL AND NULL;
+CREATE SEQUENCE between_calls START 10;
+SELECT nextval('between_calls') BETWEEN 10 AND 11;
+SELECT last_value FROM between_calls;
+ALTER SEQUENCE between_calls RESTART WITH 10;
+SELECT nextval('between_calls') NOT BETWEEN 100 AND nextval('between_calls');
+SELECT last_value FROM between_calls;
+ALTER SEQUENCE between_calls RESTART WITH 10;
+SELECT (SELECT nextval('between_calls')) BETWEEN 10 AND 11;
+SELECT last_value FROM between_calls;
+ALTER SEQUENCE between_calls RESTART WITH 10;
+SELECT (1+(SELECT nextval('between_calls'))) BETWEEN 11 AND 12;
+SELECT last_value FROM between_calls;
+ALTER SEQUENCE between_calls RESTART WITH 10;
+SELECT (SELECT (SELECT nextval('between_calls'))) BETWEEN 10 AND 11;
+SELECT last_value FROM between_calls;
+ALTER SEQUENCE between_calls RESTART WITH 10;
+SELECT nextval('between_calls') BETWEEN SYMMETRIC 1 AND 2;
+SELECT last_value FROM between_calls;
+ALTER SEQUENCE between_calls RESTART WITH 10;
+SELECT nextval('between_calls') NOT BETWEEN SYMMETRIC 100 AND 0;
+SELECT last_value FROM between_calls;
+DROP SEQUENCE between_calls;
+
+CREATE TABLE between_rows(id integer,lo integer,hi integer);
+INSERT INTO between_rows VALUES(1,0,2),(3,0,4),(9,5,6);
+BEGIN;
+DECLARE between_later NO SCROLL CURSOR FOR
+SELECT id,id BETWEEN lo AND 100/(id-9) FROM between_rows;
+FETCH 2 FROM between_later;
+SAVEPOINT before_between_error;
+FETCH NEXT FROM between_later;
+ROLLBACK TO SAVEPOINT before_between_error;
+FETCH NEXT FROM between_later;
+ROLLBACK;
+BEGIN;
+DECLARE between_filtered NO SCROLL CURSOR FOR
+SELECT id FROM between_rows WHERE id BETWEEN 100 AND 1/(id-9);
+FETCH ALL FROM between_filtered;
+COMMIT;
+CREATE SCHEMA between_scope;
+SET search_path=between_scope,pg_catalog;
+BEGIN;
+DECLARE between_bound NO SCROLL CURSOR FOR
+SELECT id,id BETWEEN 0 AND 4 FROM public.between_rows;
+CREATE FUNCTION between_scope.ge(integer,integer) RETURNS boolean
+LANGUAGE sql IMMUTABLE AS 'SELECT false';
+CREATE OPERATOR between_scope.>=
+(FUNCTION=between_scope.ge,LEFTARG=integer,RIGHTARG=integer);
+SELECT 1>=0;
+FETCH ALL FROM between_bound;
+COMMIT;
+SET search_path=public;
+DROP OPERATOR between_scope.>=(integer,integer);
+DROP FUNCTION between_scope.ge(integer,integer);
+DROP SCHEMA between_scope;
+CREATE VIEW between_view AS SELECT id BETWEEN lo AND hi AS inside FROM between_rows;
+ALTER TABLE between_rows RENAME COLUMN id TO renamed;
+SELECT inside FROM between_view;
+DROP VIEW between_view;
+DROP TABLE between_rows;
+
 -- PostgreSQL 18: SPI_cursor_open_internal rejects zero or multiple commands.
 -- https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/executor/spi.c
 CREATE SEQUENCE cursor_query_calls;

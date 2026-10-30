@@ -642,15 +642,6 @@ fn predicate_selectivity<'a>(
             let fraction = f64::from(column_statistics.null_fraction_ppm) / 1_000_000.0;
             if *negated { 1.0 - fraction } else { fraction }
         }
-        Expr::Between { operand, .. } => {
-            let Expr::Column { qualifier, name } = **operand else {
-                return 1.0;
-            };
-            match scope.find_column(qualifier, name) {
-                Ok(query::ResolvedColumn::Table(owner, _)) if owner == table => 0.005,
-                _ => 1.0,
-            }
-        }
         Expr::InList {
             operand,
             list,

@@ -11,6 +11,8 @@ Include overload selection with typed nulls and the declared inputs of correlate
 table functions; a correct non-null value alone does not establish its SQL type.
 Compare resident and forced-spill paths with the same SQL, including nested
 outer references and single-column table-function aliases.
+For range predicates, compare null truth tables, repeated sequence/subquery
+calls, operator binding and errors reached only by later fetches.
 Preserve failed outputs and diagnostics before removing temporary fixtures.
 Check native Linux amd64, Linux arm64 and macOS arm64 builds when changing C
 interfaces; a passing build on one target does not establish another's ABI.

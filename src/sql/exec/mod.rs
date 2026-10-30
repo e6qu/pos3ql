@@ -52840,13 +52840,6 @@ fn validate_copy_predicate(expression: &Expr, def: &TableDef) -> Result<(), SqlE
             }
             Ok(())
         }
-        Expr::Between {
-            operand, low, high, ..
-        } => {
-            validate_copy_predicate(operand, def)?;
-            validate_copy_predicate(low, def)?;
-            validate_copy_predicate(high, def)
-        }
         Expr::Slice { base, lower, upper } => {
             validate_copy_predicate(base, def)?;
             if let Some(lower) = lower {

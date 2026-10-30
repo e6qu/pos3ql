@@ -2044,14 +2044,6 @@ fn fold_check<'a>(
             }
             Ok(None)
         }
-        Expr::Between {
-            operand, low, high, ..
-        } => {
-            fold_check(operand, arena, catalog)?;
-            fold_check(low, arena, catalog)?;
-            fold_check(high, arena, catalog)?;
-            Ok(None)
-        }
         Expr::Like {
             operand, pattern, ..
         }
@@ -3026,35 +3018,6 @@ fn eval_full_inner<'a>(
             } else {
                 Datum::Bool(negated)
             })
-        }
-        Expr::Between {
-            operand,
-            low,
-            high,
-            negated,
-        } => {
-            let v = eval_full(operand, arena, params, row, hooks)?;
-            let lo = eval_full(low, arena, params, row, hooks)?;
-            let hi = eval_full(high, arena, params, row, hooks)?;
-            if v.is_null() || lo.is_null() || hi.is_null() {
-                return Ok(Datum::Null);
-            }
-            let a = coerce_unknown(v, &lo)?;
-            let lo = coerce_unknown(lo, &a)?;
-            let hi = coerce_unknown(hi, &a)?;
-            let collation = resolve_comparison_collation(operand, low, row, hooks.catalog)?;
-            let high_collation = resolve_comparison_collation(operand, high, row, hooks.catalog)?;
-            if collation != high_collation {
-                return Err(sql_err!(
-                    sqlstate::COLLATION_MISMATCH,
-                    "collation mismatch between \"{}\" and \"{}\"",
-                    collation.name(),
-                    high_collation.name()
-                ));
-            }
-            let inside = compare_datums_with_catalog(collation, hooks.catalog, &a, &lo)?.is_ge()
-                && compare_datums_with_catalog(collation, hooks.catalog, &a, &hi)?.is_le();
-            Ok(Datum::Bool(inside != negated))
         }
         Expr::Like {
             operand,
@@ -5918,7 +5881,6 @@ fn static_type<'a>(e: &Expr<'a>, row: &impl ColumnLookup<'a>) -> Option<ColType>
         }
         | Expr::IsNull { .. }
         | Expr::InList { .. }
-        | Expr::Between { .. }
         | Expr::Like { .. }
         | Expr::Match { .. } => Some(ColType::Bool),
         Expr::Binary {

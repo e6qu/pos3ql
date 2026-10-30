@@ -46,11 +46,6 @@ pub(super) fn expr_tables(expression: &Expr, scope: &QueryScope) -> Option<u64> 
         | Cast { operand, .. }
         | Collate { operand, .. } => expr_tables(operand, scope),
         Binary { left, right, .. } => Some(expr_tables(left, scope)? | expr_tables(right, scope)?),
-        Between {
-            operand, low, high, ..
-        } => Some(
-            expr_tables(operand, scope)? | expr_tables(low, scope)? | expr_tables(high, scope)?,
-        ),
         Like {
             operand, pattern, ..
         }
@@ -252,7 +247,6 @@ fn predicate_strength(expression: &Expr) -> u32 {
             ..
         } if list.iter().all(|item| item.is_constant()) => EXACT / (list.len() as u32).max(1),
         Expr::IsNull { .. } => EXACT / 4,
-        Expr::Between { .. } => EXACT / 8,
         Expr::Binary {
             operator: BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq,
             ..
@@ -343,9 +337,6 @@ pub(super) fn is_error_safe(e: &Expr) -> bool {
         Expr::InList { operand, list, .. } => {
             is_error_safe(operand) && list.iter().all(|e| is_error_safe(e))
         }
-        Expr::Between {
-            operand, low, high, ..
-        } => is_error_safe(operand) && is_error_safe(low) && is_error_safe(high),
         Expr::Like {
             operand, pattern, ..
         }
@@ -510,47 +501,6 @@ pub(super) fn reorder_qual<'a>(
     if !flatten_and(pred, &mut conjunct, &mut n) || n == 0 {
         return Ok(pred);
     }
-    // PostgreSQL rewrites `x BETWEEN a AND b` at parse time into `x >= a AND
-    // x <= b` — two *independent* top-level conjuncts that order separately
-    // (each is one comparison, cheaper than a compound clause).
-    let mut expanded: [&Expr; MAX_CONJUNCTS] = [pred; MAX_CONJUNCTS];
-    let mut m = 0usize;
-    for &c in &conjunct[..n] {
-        if let Expr::Between {
-            operand,
-            low,
-            high,
-            negated: false,
-        } = c
-        {
-            if m + 2 > MAX_CONJUNCTS {
-                return Ok(pred);
-            }
-            expanded[m] = arena
-                .alloc(Expr::Binary {
-                    operator: crate::sql::ast::BinaryOp::GtEq,
-                    left: operand,
-                    right: low,
-                })
-                .map_err(|_| arena_full())?;
-            expanded[m + 1] = arena
-                .alloc(Expr::Binary {
-                    operator: crate::sql::ast::BinaryOp::LtEq,
-                    left: operand,
-                    right: high,
-                })
-                .map_err(|_| arena_full())?;
-            m += 2;
-        } else {
-            if m + 1 > MAX_CONJUNCTS {
-                return Ok(pred);
-            }
-            expanded[m] = c;
-            m += 1;
-        }
-    }
-    let conjunct = expanded;
-    let n = m;
     if n <= 1 {
         return Ok(conjunct[0]);
     }
@@ -1050,16 +1000,6 @@ pub(super) fn postpone_cost(e: &Expr, scope: &QueryScope, arena: &Arena) -> u32 
                 + postpone_cost(right, scope, arena)
                 + 2
                 + coercion(left, right)
-        }
-        Between {
-            operand, low, high, ..
-        } => {
-            postpone_cost(operand, scope, arena)
-                + postpone_cost(low, scope, arena)
-                + postpone_cost(high, scope, arena)
-                + 4
-                + coercion(operand, low)
-                + coercion(operand, high)
         }
         InList { operand, list, .. } => {
             // PostgreSQL rewrites a one-element IN to plain `=` (one operator);

@@ -837,13 +837,6 @@ pub(crate) fn walk_children<'a>(
             }
             Ok(())
         }
-        Expr::Between {
-            operand, low, high, ..
-        } => {
-            f(operand)?;
-            f(low)?;
-            f(high)
-        }
         Expr::Like {
             operand,
             pattern,

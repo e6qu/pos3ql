@@ -2571,13 +2571,6 @@ fn collect_expression<'a>(
             }
             Ok(())
         }
-        Expr::Between {
-            operand, low, high, ..
-        } => {
-            child(operand)?;
-            child(low)?;
-            child(high)
-        }
         Expr::Like {
             operand,
             pattern,

@@ -181,6 +181,10 @@ cursor can use repeated small fetches without retaining earlier batches.
 This path accepts columns, wildcards, constants, captured parameters, built-in
 binary operators, negation, boolean logic, null tests, `CASE WHEN` expressions,
 array construction, element access, slices and filters composed from them.
+`BETWEEN` and `NOT BETWEEN`, including `SYMMETRIC`, use the same comparisons
+and boolean evaluation. For example, `1 BETWEEN 2 AND NULL` is false because
+the lower comparison is false. PostgreSQL can evaluate the tested expression
+more than once; a sequence call inside `BETWEEN` can issue multiple values.
 For example, `SELECT 100/id FROM orders WHERE id<>0` tests
 each input as fetching advances; it does not divide by an unread row's `id`.
 `CASE WHEN id<>0 THEN 100/id ELSE NULL END` evaluates only the selected branch

@@ -306,16 +306,6 @@ impl ParameterInference<'_> {
                     assign(right, type_oid, oids);
                 }
             }
-            Expr::Between {
-                operand, low, high, ..
-            } => {
-                if let Some(type_oid) = infer(operand) {
-                    assign(low, type_oid, oids);
-                    assign(high, type_oid, oids);
-                } else if let Some(type_oid) = infer(low).or_else(|| infer(high)) {
-                    assign(operand, type_oid, oids);
-                }
-            }
             Expr::InList { operand, list, .. } => {
                 if let Some(type_oid) = infer(operand) {
                     for item in *list {

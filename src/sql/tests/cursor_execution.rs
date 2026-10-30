@@ -1,6 +1,155 @@
 use super::*;
 
 #[test]
+fn cursor_between_comparisons_preserve_nulls_and_repeated_effects() {
+    let config = test_config("cursor-between-comparisons");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT 1 BETWEEN 2 AND NULL,1 NOT BETWEEN 2 AND NULL, \
+        1 BETWEEN NULL AND 0,1 NOT BETWEEN NULL AND 0, \
+        1 BETWEEN NULL AND 2,1 NOT BETWEEN NULL AND 2",
+            true
+        )),
+        ["f|t|f|t||"]
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT 1 BETWEEN SYMMETRIC 2 AND 0,1 NOT BETWEEN SYMMETRIC 2 AND 0, \
+        1 BETWEEN SYMMETRIC NULL AND 0,1 NOT BETWEEN SYMMETRIC NULL AND NULL",
+            true
+        )),
+        ["t|f||"]
+    );
+    session.success(&mut engine, "CREATE SEQUENCE between_calls START 10", true);
+    for (expression, result, last) in [
+        ("nextval('between_calls') BETWEEN 10 AND 11", "t", "11"),
+        (
+            "nextval('between_calls') NOT BETWEEN 100 AND nextval('between_calls')",
+            "t",
+            "10",
+        ),
+        (
+            "(SELECT nextval('between_calls')) BETWEEN 10 AND 11",
+            "t",
+            "11",
+        ),
+        (
+            "(1+(SELECT nextval('between_calls'))) BETWEEN 11 AND 12",
+            "t",
+            "11",
+        ),
+        (
+            "(SELECT (SELECT nextval('between_calls'))) BETWEEN 10 AND 11",
+            "t",
+            "11",
+        ),
+        (
+            "nextval('between_calls') BETWEEN SYMMETRIC 1 AND 2",
+            "f",
+            "13",
+        ),
+        (
+            "nextval('between_calls') NOT BETWEEN SYMMETRIC 100 AND 0",
+            "f",
+            "12",
+        ),
+    ] {
+        session.success(
+            &mut engine,
+            "ALTER SEQUENCE between_calls RESTART WITH 10",
+            true,
+        );
+        let sql = format!("SELECT {expression}; SELECT last_value FROM between_calls");
+        assert_eq!(
+            data_rows(&session.success(&mut engine, &sql, true)),
+            [result, last],
+            "{expression}"
+        );
+    }
+    for sql in [
+        "SELECT 1 BETWEEN ASYMMETRIC SYMMETRIC 0 AND 2",
+        "SELECT 1 BETWEEN SYMMETRIC ASYMMETRIC 0 AND 2",
+    ] {
+        assert_eq!(
+            error_sqlstates(&session.execute(&mut engine, sql, true)),
+            ["42601"]
+        );
+    }
+}
+
+#[test]
+fn cursor_between_retains_input_operators_and_deferred_errors() {
+    let config = test_config("cursor-between-retained-input");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE TABLE between_rows(id integer,lo integer,hi integer); \
+        INSERT INTO between_rows VALUES(1,0,2),(3,0,4),(9,5,6); \
+        BEGIN; DECLARE between_later NO SCROLL CURSOR FOR \
+        SELECT id,id BETWEEN lo AND 100/(id-9) FROM between_rows",
+        true,
+    );
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "FETCH 2 FROM between_later", true)),
+        ["1|f", "3|f"]
+    );
+    session.success(&mut engine, "SAVEPOINT before_between_error", true);
+    assert_eq!(
+        error_sqlstates(&session.execute(&mut engine, "FETCH NEXT FROM between_later", true)),
+        ["22012"]
+    );
+    session.success(
+        &mut engine,
+        "ROLLBACK TO SAVEPOINT before_between_error",
+        true,
+    );
+    assert_eq!(
+        error_sqlstates(&session.execute(&mut engine, "FETCH NEXT FROM between_later", true)),
+        ["55000"]
+    );
+    session.success(&mut engine, "ROLLBACK", true);
+    assert!(
+        data_rows(&session.success(
+            &mut engine,
+            "BEGIN; DECLARE between_filtered NO SCROLL CURSOR FOR \
+        SELECT id FROM between_rows WHERE id BETWEEN 100 AND 1/(id-9); \
+        FETCH ALL FROM between_filtered; COMMIT",
+            true
+        ))
+        .is_empty()
+    );
+    session.success(&mut engine, "CREATE SCHEMA between_scope; SET search_path=between_scope,pg_catalog; \
+        BEGIN; DECLARE between_bound NO SCROLL CURSOR FOR SELECT id,id BETWEEN 0 AND 4 FROM public.between_rows; \
+        CREATE FUNCTION between_scope.ge(integer,integer) RETURNS boolean LANGUAGE sql IMMUTABLE AS 'SELECT false'; \
+        CREATE OPERATOR between_scope.>= (FUNCTION=between_scope.ge,LEFTARG=integer,RIGHTARG=integer)", true);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT 1>=0; FETCH ALL FROM between_bound; COMMIT",
+            true
+        )),
+        ["f", "1|t", "3|t", "9|f"]
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SET search_path=public; \
+        CREATE VIEW between_view AS SELECT id BETWEEN lo AND hi AS inside FROM between_rows; \
+        ALTER TABLE between_rows RENAME COLUMN id TO renamed; SELECT inside FROM between_view",
+            true
+        )),
+        ["t", "t", "f"]
+    );
+}
+
+#[test]
 fn cursor_expression_metadata_preserves_overloads_and_correlated_function_inputs() {
     let config = test_config("cursor-expression-overload-types");
     let mut budget = test_engine_budget(&config, 1 << 29);

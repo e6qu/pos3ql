@@ -6026,12 +6026,6 @@ fn rewrite_grouped_expr<'a>(
                 negated: *negated,
             })
         }
-        Expr::Between { operand, low, high, negated } => alloc(Expr::Between {
-            operand: rewrite(operand)?,
-            low: rewrite(low)?,
-            high: rewrite(high)?,
-            negated: *negated,
-        }),
         Expr::Like { operand, pattern, negated, case_insensitive, escape } => alloc(Expr::Like {
             operand: rewrite(operand)?,
             pattern: rewrite(pattern)?,

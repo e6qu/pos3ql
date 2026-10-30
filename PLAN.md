@@ -69,6 +69,9 @@ A waiting schema edit must never attach itself to a new object that reused a nam
   Forward-only cursors reuse memory per fetch; scrolling cursors retain visited
   results. Omitted scroll options follow the bound plan’s backward-read support.
   Operator choices and row-independent filters stay fixed after declaration.
+  Normalize range predicates through the same comparisons and boolean rules:
+  null bounds, repeated operands, custom operators and fetched-row errors must
+  match PostgreSQL, including `BETWEEN SYMMETRIC`.
   Holdable versions save unread results during commit and release their input
   owners across simple queries, extended-protocol Sync, COPY and large-object calls.
   Extend retained execution to function calls and effects, joins, ordering and

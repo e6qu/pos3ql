@@ -642,13 +642,6 @@ fn validate_check_refs(
                 validate_check_refs(a, def, cols)?;
             }
         }
-        Expr::Between {
-            operand, low, high, ..
-        } => {
-            validate_check_refs(operand, def, cols)?;
-            validate_check_refs(low, def, cols)?;
-            validate_check_refs(high, def, cols)?;
-        }
         Expr::Like {
             operand, pattern, ..
         }

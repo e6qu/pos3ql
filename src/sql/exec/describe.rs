@@ -4078,28 +4078,6 @@ pub fn infer_type_res(
             }
             of(ColType::Bool)
         }
-        Expr::Between {
-            operand, low, high, ..
-        } => {
-            let value = coltype_of_oid(infer_type_res(operand, columns)?.0);
-            for bound in [*low, *high] {
-                validate_declared_enum_comparison(
-                    crate::sql::ast::BinaryOp::GtEq,
-                    infer_routine_argument_oid(operand, columns)?,
-                    infer_routine_argument_oid(bound, columns)?,
-                    columns,
-                )?;
-                let bound = coltype_of_oid(infer_type_res(bound, columns)?.0);
-                if let (Some(value), Some(bound)) = (value, bound)
-                    && (!comparable(value, bound)
-                        || !value.has_builtin_ordering()
-                        || !bound.has_builtin_ordering())
-                {
-                    return Err(operator_undefined(value, ">=", bound));
-                }
-            }
-            of(ColType::Bool)
-        }
         Expr::Like { .. } | Expr::Match { .. } => of(ColType::Bool),
         Expr::Case {
             operand,

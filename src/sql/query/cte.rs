@@ -2240,13 +2240,6 @@ fn expr_references(e: &Expr, name: &str) -> usize {
             expr_references(operand, name)
                 + list.iter().map(|x| expr_references(x, name)).sum::<usize>()
         }
-        Expr::Between {
-            operand, low, high, ..
-        } => {
-            expr_references(operand, name)
-                + expr_references(low, name)
-                + expr_references(high, name)
-        }
         Expr::Like {
             operand,
             pattern,
@@ -2382,9 +2375,6 @@ fn expr_mentions_column(expression: &Expr<'_>, qualifier: &str, name: &str) -> b
         Expr::InList { operand, list, .. } => {
             child(operand) || list.iter().any(|expression| child(expression))
         }
-        Expr::Between {
-            operand, low, high, ..
-        } => child(operand) || child(low) || child(high),
         Expr::Like {
             operand,
             pattern,
@@ -4967,9 +4957,6 @@ fn expr_has_subquery(e: &Expr) -> bool {
         Expr::InList { operand, list, .. } => {
             expr_has_subquery(operand) || list.iter().any(|a| expr_has_subquery(a))
         }
-        Expr::Between {
-            operand, low, high, ..
-        } => expr_has_subquery(operand) || expr_has_subquery(low) || expr_has_subquery(high),
         Expr::Like {
             operand,
             pattern,
@@ -5601,17 +5588,6 @@ fn subst_expr<'a>(
         } => Expr::InList {
             operand: subst_expr(operand, context, arena)?,
             list: subst_expr_slice(list, context, arena)?,
-            negated: *negated,
-        },
-        Expr::Between {
-            operand,
-            low,
-            high,
-            negated,
-        } => Expr::Between {
-            operand: subst_expr(operand, context, arena)?,
-            low: subst_expr(low, context, arena)?,
-            high: subst_expr(high, context, arena)?,
             negated: *negated,
         },
         Expr::Like {

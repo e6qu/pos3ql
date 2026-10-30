@@ -41,6 +41,10 @@ fn projection_only(items: &[SelectItem<'_>]) -> bool {
 }
 
 impl<'a> RetainedSelect<'a> {
+    pub(crate) fn uses_table(&self, table: usize) -> bool {
+        self.scope.slots[..self.scope.n].contains(&table)
+    }
+
     pub(crate) fn open(
         storage: &'a Storage,
         txid: u32,
@@ -143,7 +147,10 @@ impl<'a> RetainedSelect<'a> {
         }))
     }
 
-    #[expect(clippy::too_many_arguments, reason = "retained query pipeline plumbing")]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "retained query pipeline plumbing"
+    )]
     pub(crate) fn advance<'work>(
         &mut self,
         storage: &'work Storage,

@@ -5772,6 +5772,9 @@ fn drop_table_kind(
                 ) {
                     return sql_fail(error);
                 }
+                if let Err(error) = super::cursor::require_table_idle(index, name.name, tag) {
+                    return sql_fail(error);
+                }
                 if let Some(other) = storage.table(index).ddl_locked_by_other(txn.txid) {
                     if let Err(error) = storage.wait_for_transaction(txn.txid, other) {
                         return sql_fail(error);
@@ -63526,6 +63529,13 @@ pub(crate) fn truncate(
         ) {
             return sql_fail(error);
         }
+        if let Err(error) = super::cursor::require_table_idle(
+            table_index,
+            storage.table_def(table_index, txn.txid).name.as_str(),
+            "TRUNCATE",
+        ) {
+            return sql_fail(error);
+        }
     }
     let definitions = storage.table_definition_images();
     for &table_index in &list[..n] {
@@ -66431,6 +66441,17 @@ fn alter_table_relation(
         crate::sql::ast::TableLockMode::AccessExclusive
     };
     if let Err(error) = storage.lock_table(txn.txid, table_index, lock_mode, false) {
+        return sql_fail(error);
+    }
+    if !matches!(
+        statement.actions,
+        [AlterAction::RenameTable(_)
+            | AlterAction::RenameColumn { .. }
+            | AlterAction::RenameConstraint { .. }
+            | AlterAction::SetSchema(_)]
+    ) && let Err(error) =
+        super::cursor::require_table_idle(table_index, statement.table.name, tag)
+    {
         return sql_fail(error);
     }
     let definitions = storage.table_definition_images();

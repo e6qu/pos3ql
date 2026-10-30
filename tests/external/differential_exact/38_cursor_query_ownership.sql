@@ -56,7 +56,27 @@ BEGIN
 END $$;
 SELECT cursor_retained_native();
 DROP FUNCTION cursor_retained_native();
+
+-- PostgreSQL CheckTableNotInUse keeps an open reader attached to its table.
+-- https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/commands/tablecmds.c
+BEGIN;
+DECLARE busy_orders NO SCROLL CURSOR FOR SELECT id FROM cursor_retained_orders;
+SAVEPOINT busy_ddl;
 DROP TABLE cursor_retained_orders;
+ROLLBACK TO SAVEPOINT busy_ddl;
+TRUNCATE cursor_retained_orders;
+ROLLBACK TO SAVEPOINT busy_ddl;
+ALTER TABLE cursor_retained_orders ADD COLUMN extra integer;
+ROLLBACK TO SAVEPOINT busy_ddl;
+ALTER TABLE cursor_retained_orders RENAME TO cursor_renamed_orders;
+FETCH ALL FROM busy_orders;
+SAVEPOINT after_fetch;
+DROP TABLE cursor_renamed_orders;
+ROLLBACK TO SAVEPOINT after_fetch;
+CLOSE busy_orders;
+ALTER TABLE cursor_renamed_orders ADD COLUMN extra integer;
+DROP TABLE cursor_renamed_orders;
+COMMIT;
 
 -- A record wider than one byte must not lose fields or the following column.
 BEGIN;

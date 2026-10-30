@@ -59,6 +59,8 @@ A waiting schema edit must never attach itself to a new object that reused a nam
   physical table now retain their reader and fetch only requested rows. Extend
   this to expressions, filters, joins, ordering, row locks and holdable cursors,
   then reuse the positions for ordinary results after their first flush.
+  Keep the relation in use until the cursor closes, and test resumed fetches
+  through the same SQL command path used by network connections.
   Preserve the existing [cursor input, type and capacity rules](docs/postgresql-18-compatibility.md#capacity-boundaries)
   while adding execution positions. Later variable assignments must not change
   captured inputs. Keep issued sequence values in the owned execution state so

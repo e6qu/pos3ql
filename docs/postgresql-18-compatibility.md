@@ -226,6 +226,10 @@ eager executor. The retained reader's selected row identities, saved-file
 positions and pending row share `cursor_query_bytes`; exhaustion returns
 `54000`. Each query workspace also reserves fixed row and saved-file read
 buffers at startup, accounted separately from `work_arena_bytes`.
+The cursor keeps its relation in use through end of input until `CLOSE`.
+Destructive table changes in the same session raise `55006`; a table rename
+does not change its saved definition or input. This follows PostgreSQL's
+[active-relation check](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/commands/tablecmds.c).
 JSON/path and XML/XPath limits are specified in [SQL/JSON](sql-json.md) and
 [SQL/XML](sql-xml.md). Inspect the memory plan for the chosen configuration;
 accepted width can still exhaust its named statement or startup budget.

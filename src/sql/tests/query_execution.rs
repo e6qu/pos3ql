@@ -109,44 +109,59 @@ fn cursor_retained_cold_fetch_resumes_after_delivered_rows() {
     let mut count = 0;
     let mut waited_after_prefix = false;
     let mut deadline = Instant::now() + Duration::from_secs(2);
+    session.send.clear();
+    session.arena.reset();
     loop {
         advance(&mut engine);
         let previous = engine.replace_read_owner(Some(owner));
         let result = crate::mem::guard::forbid_alloc(|| {
-            engine.fetch_cursor(
-                "cold",
-                FetchMotion::Count(1),
-                session.transaction.txid,
+            engine.execute_simple_from(
+                "FETCH NEXT FROM cold",
+                0,
+                &session.arena,
+                &mut session.transaction,
+                &mut session.pool,
                 &mut session.cursors,
+                &mut session.guc,
+                &mut Responder::new(&mut session.send),
+                session.connection_id,
+                false,
             )
-        });
+        })
+        .unwrap();
         let _ = engine.replace_read_owner(previous);
         match result {
-            Ok(0) => break,
-            Ok(1) => {
-                session.arena.reset();
-                let mut values = [Datum::Null; 2];
-                crate::mem::guard::forbid_alloc(|| {
-                    session.cursors.copy_row(
-                        "cold",
-                        session.cursors.emitted()[0],
-                        &session.arena,
-                        &mut values,
-                    )
-                })
-                .unwrap();
-                assert_eq!(values[0], Datum::Int4(count + 1));
-                let Datum::Text(code) = values[1] else {
-                    panic!("text column")
-                };
+            ExecutionStatus::Complete => {
+                assert!(
+                    error_sqlstates(session.send.readable()).is_empty(),
+                    "{}",
+                    String::from_utf8_lossy(session.send.readable())
+                );
+                let fetched = data_rows(session.send.readable());
+                if fetched.is_empty() {
+                    assert_eq!(command_tags(session.send.readable()), ["FETCH 0"]);
+                    break;
+                }
+                assert_eq!(fetched.len(), 1);
+                assert_eq!(command_tags(session.send.readable()), ["FETCH 1"]);
+                let (id, code) = fetched[0].split_once('|').unwrap();
+                assert_eq!(id.parse::<i32>().unwrap(), count + 1);
                 assert_eq!(checksum(code.as_bytes()), expected[count as usize]);
                 count += 1;
                 assert_eq!(session.cursors.cached_rows(slot), count as usize);
+                session.send.clear();
+                session.arena.reset();
                 deadline = Instant::now() + Duration::from_secs(2);
             }
-            Ok(other) => panic!("FETCH NEXT returned {other} rows"),
-            Err(error) => {
-                assert_eq!(error.sqlstate, sqlstate::INTERNAL_IO_WAIT);
+            ExecutionStatus::Blocked {
+                output_mark, wait, ..
+            } => {
+                assert_eq!(wait, StatementWait::ObjectIo);
+                session.send.truncate_to(output_mark);
+                assert!(
+                    session.send.readable().is_empty(),
+                    "a suspended FETCH must not emit a partial response"
+                );
                 waited_after_prefix |= count != 0;
                 match listener.accept() {
                     Ok((mut stream, _)) => {

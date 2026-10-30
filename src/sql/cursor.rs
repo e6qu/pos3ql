@@ -79,6 +79,30 @@ pub(crate) fn with_active<R>(f: impl FnOnce(Option<&CursorPool>) -> R) -> R {
     })
 }
 
+pub(crate) fn require_table_idle(table: usize, name: &str, command: &str) -> Result<(), SqlError> {
+    let busy = with_active(|pool| {
+        pool.is_some_and(|pool| {
+            pool.slots.iter().any(|slot| {
+                slot.active
+                    && slot
+                        .query
+                        .retained
+                        .as_ref()
+                        .is_some_and(|query| query.uses_table(table))
+            })
+        })
+    });
+    if busy {
+        return Err(sql_err!(
+            sqlstate::OBJECT_IN_USE,
+            "cannot {} \"{}\" because it is being used by active queries in this session",
+            command,
+            name
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct CursorInfo<'a> {
     pub name: &'a str,

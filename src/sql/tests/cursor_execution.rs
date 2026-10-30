@@ -86,6 +86,54 @@ fn cursor_retained_native_open_captures_inputs_and_fetch_into_uses_the_reader() 
 }
 
 #[test]
+fn cursor_retained_table_cannot_be_dropped_or_rewritten_until_close() {
+    let config = test_config("cursor-retained-table-use");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE TABLE busy_orders(id integer); \
+        INSERT INTO busy_orders VALUES(1),(2); BEGIN; \
+        DECLARE busy NO SCROLL CURSOR FOR SELECT id FROM busy_orders; SAVEPOINT ddl",
+        true,
+    );
+    for sql in [
+        "DROP TABLE busy_orders",
+        "TRUNCATE busy_orders",
+        "ALTER TABLE busy_orders ADD COLUMN extra integer",
+    ] {
+        let output = session.execute(&mut engine, sql, true);
+        assert_eq!(error_sqlstates(&output), ["55006"], "{sql}");
+        assert!(
+            String::from_utf8_lossy(&output)
+                .contains("being used by active queries in this session")
+        );
+        session.success(&mut engine, "ROLLBACK TO SAVEPOINT ddl", true);
+    }
+    session.success(
+        &mut engine,
+        "ALTER TABLE busy_orders RENAME TO renamed_orders",
+        true,
+    );
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "FETCH ALL FROM busy", true)),
+        ["1", "2"]
+    );
+    session.success(&mut engine, "SAVEPOINT finished", true);
+    assert_eq!(
+        error_sqlstates(&session.execute(&mut engine, "DROP TABLE renamed_orders", true)),
+        ["55006"]
+    );
+    session.success(
+        &mut engine,
+        "ROLLBACK TO SAVEPOINT finished; CLOSE busy; \
+        ALTER TABLE renamed_orders ADD COLUMN extra integer; DROP TABLE renamed_orders; COMMIT",
+        true,
+    );
+}
+
+#[test]
 fn cursor_dynamic_open_rejects_multiple_commands_before_issuing_sequence_values() {
     let config = test_config("cursor-open-command-count");
     let mut budget = test_engine_budget(&config, 1 << 29);

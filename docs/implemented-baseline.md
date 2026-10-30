@@ -177,6 +177,9 @@ CURSOR FOR SELECT id, label FROM orders` followed by `FETCH 2 FROM c` reads and
 saves two rows; `FETCH 0` before the first row reads none. Closing it releases
 the unread source. This path currently accepts columns, wildcards, constants
 and captured parameters, without filters, ordering or row-level security.
+An open retained cursor prevents `DROP TABLE`, `TRUNCATE` and structural
+`ALTER TABLE` in the same session until `CLOSE`; renaming its table keeps the
+saved input valid.
 Other cursor queries still execute during declaration; deferring their
 expressions and row locks remains part of the [plan](../PLAN.md).
 

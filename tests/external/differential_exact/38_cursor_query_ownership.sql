@@ -235,6 +235,7 @@ DROP SEQUENCE effect_calls,bound_calls;
 CREATE DOMAIN cursor_short AS smallint;
 CREATE DOMAIN cursor_network AS cidr;
 CREATE DOMAIN cursor_day AS date;
+CREATE DOMAIN cursor_vector AS integer[];
 CREATE TABLE cursor_function_inputs(id integer, options text[], days cursor_day[]);
 INSERT INTO cursor_function_inputs VALUES
 (1,ARRAY['a','b'],ARRAY[DATE '2026-10-30',NULL]::cursor_day[]),
@@ -248,12 +249,17 @@ SELECT mod('-9223372036854775808'::bigint,-1::bigint),
        mod('-2147483648'::integer,-1),mod('-32768'::smallint,-1::smallint);
 SELECT (SELECT 1 AS first_name UNION ALL SELECT 2 LIMIT 1),
        (SELECT lower('A') INTERSECT SELECT 'a');
+SELECT pg_typeof(ARRAY(SELECT 1::smallint)),pg_typeof(ARRAY(SELECT NULL::numeric)),
+       ARRAY(SELECT 1::smallint);
+SELECT pg_typeof(ARRAY(SELECT ARRAY[1,2]::cursor_vector)),
+       array_ndims(ARRAY(SELECT ARRAY[1,2]::cursor_vector)),
+       cardinality(ARRAY(SELECT ARRAY[1,2]::cursor_vector));
 SELECT id,ARRAY(SELECT 'x.'||option FROM unnest(t.options) option),
        pg_typeof(ARRAY(SELECT day_value FROM unnest(t.days) day_value)),
        ARRAY(SELECT day_value FROM unnest(t.days) day_value)
 FROM cursor_function_inputs t ORDER BY id;
 DROP TABLE cursor_function_inputs;
-DROP DOMAIN cursor_short,cursor_network,cursor_day;
+DROP DOMAIN cursor_short,cursor_network,cursor_day,cursor_vector;
 
 
 BEGIN;
@@ -354,14 +360,16 @@ COMMIT;
 
 CREATE TABLE cursor_wide_input(id integer, payload text);
 INSERT INTO cursor_wide_input VALUES(7,repeat('x',131072));
--- Keep the old wide row in saved storage while its replacement fits the small spill fixture.
+-- The cursor owns the old 128 KiB row. Keep its replacement small enough for
+-- both versions and their headers to fit the 256 KiB forced-spill reservation.
 CHECKPOINT;
 BEGIN;
 DECLARE narrow_input NO SCROLL CURSOR FOR SELECT id FROM cursor_wide_input;
-UPDATE cursor_wide_input SET id=9;
+UPDATE cursor_wide_input SET id=9,payload='replacement';
 FETCH ALL FROM narrow_input;
 CLOSE narrow_input;
 COMMIT;
+SELECT id,length(payload) FROM cursor_wide_input;
 DROP TABLE cursor_wide_input;
 
 CREATE TABLE cursor_forward_input(id integer);

@@ -7778,7 +7778,7 @@ fn select_into_rows_mode<'a>(
                 arena,
                 params,
                 SUBQUERY_DEPTH,
-                None,
+                outer,
                 seq,
             )?;
             let hooks = EvalHooks {
@@ -7970,7 +7970,7 @@ fn select_into_rows_mode<'a>(
             arena,
             params,
             SUBQUERY_DEPTH,
-            None,
+            outer,
             seq,
         )?;
         let hooks = EvalHooks {

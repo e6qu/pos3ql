@@ -292,7 +292,10 @@ SELECT nextval('order_numbers'); -- 11
 Deferred checks run before implicit and explicit commits, including COPY and
 extended-protocol Sync. A failed deferred check rolls back the command rather
 than confirming a partial import. Volatile casts execute at runtime; skipped
-branches do not consume sequence values. Truly immutable constant expressions
+scalar and native procedural branches do not consume sequence values. Ordinary
+SQL still prepares some uncorrelated subqueries before choosing a branch;
+removing that eager preparation remains part of the retained execution work.
+Truly immutable constant expressions
 can raise planning errors even when a false filter removes every output row,
 following PostgreSQL's [volatility rules](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/include/catalog/pg_proc.dat).
 

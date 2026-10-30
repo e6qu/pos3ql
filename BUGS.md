@@ -9,6 +9,8 @@ comparisons in the fixing PR, including declared result types, input lifetimes,
 argument and sequence effects, and when errors occur.
 Include overload selection with typed nulls and the declared inputs of correlated
 table functions; a correct non-null value alone does not establish its SQL type.
+Compare resident and forced-spill paths with the same SQL, including nested
+outer references and single-column table-function aliases.
 Preserve failed outputs and diagnostics before removing temporary fixtures.
 See [CONTRIBUTING.md](CONTRIBUTING.md).
 

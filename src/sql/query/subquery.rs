@@ -309,6 +309,9 @@ fn scope_record_witness<'a>(
         _ => None,
     };
     if let Some(table_name) = table_name {
+        if scope.func_scalar_column(table_name).is_some() {
+            return Ok(None);
+        }
         let table = scope.table_index(table_name)?;
         let definition = scope
             .defs
@@ -610,24 +613,7 @@ fn streaming_array_subquery<'a>(
             "subqueries nested too deeply"
         ));
     }
-    let item = match select.items.first() {
-        Some(SelectItem::Expr { expression, .. }) => *expression,
-        _ => &Expr::Null,
-    };
-    let own_scope = select
-        .from
-        .as_ref()
-        .map(|from| QueryScope::resolve_schema(storage, from, txid, arena, outer))
-        .transpose()?;
-    let witness = spooled_column_witness(
-        select,
-        storage,
-        txid,
-        own_scope.as_ref(),
-        arena,
-        item,
-        outer,
-    )?;
+    let plan = array_subquery_plan(select, storage, txid, arena, outer)?;
     let mut sorter = storage.external_sorter()?;
     sorter.reset();
     let mut compare = |_left: &[u8], _right: &[u8]| Ok(core::cmp::Ordering::Equal);
@@ -682,7 +668,7 @@ fn streaming_array_subquery<'a>(
         }
         None => &[],
     };
-    let v = build_array_scalar(values, &witness, storage, txid, arena)?;
+    let v = build_array_scalar(values, plan, storage, txid, arena)?;
     Ok((v, v))
 }
 
@@ -1344,10 +1330,11 @@ fn eval_subquery_nodes<'a>(
                     n_scalars += 1;
                     continue;
                 }
-                let (values, _, witness) = run_subquery(
+                let plan = array_subquery_plan(select, storage, txid, arena, outer)?;
+                let (values, _, _) = run_subquery(
                     select, storage, txid, arena, params, depth, outer, 1, sequences,
                 )?;
-                let v = build_array_scalar(values, &witness, storage, txid, arena)?;
+                let v = build_array_scalar(values, plan, storage, txid, arena)?;
                 scalars[n_scalars] = (*node as *const _, v, v);
                 n_scalars += 1;
             }
@@ -2034,7 +2021,8 @@ pub(super) fn merge_correlated<'a, 'b>(
                     ns += 1;
                     continue;
                 }
-                let (values, _, witness) = run_subquery(
+                let plan = array_subquery_plan(select, storage, txid, arena, Some(outer))?;
+                let (values, _, _) = run_subquery(
                     select,
                     storage,
                     txid,
@@ -2045,7 +2033,7 @@ pub(super) fn merge_correlated<'a, 'b>(
                     1,
                     sequences,
                 )?;
-                let v = build_array_scalar(values, &witness, storage, txid, arena)?;
+                let v = build_array_scalar(values, plan, storage, txid, arena)?;
                 scalars[ns] = (*node as *const _, v, v);
                 ns += 1;
             }
@@ -2566,6 +2554,25 @@ pub(crate) fn subquery_expression_type(
     if !array {
         return Ok(Some(type_oid));
     }
+    Ok(Some(
+        array_element_plan(type_oid, storage, txid)?
+            .element
+            .array_oid(),
+    ))
+}
+
+fn array_element_plan(
+    type_oid: i32,
+    storage: &Storage,
+    txid: u32,
+) -> Result<crate::sql::eval::ArrayConstructorType, SqlError> {
+    let domain = matches!(
+        crate::storage::NamedTypeKind::from_oid(type_oid),
+        Some((crate::storage::NamedTypeKind::Domain, _, false))
+    );
+    let physical = crate::sql::eval::constructor_type_from_oid(type_oid, &|oid| {
+        storage.domain_base_type_for_oid(oid, txid)
+    });
     let element = if let Some((crate::storage::NamedTypeKind::Domain, creation, false)) =
         crate::storage::NamedTypeKind::from_oid(type_oid)
     {
@@ -2573,10 +2580,7 @@ pub(crate) fn subquery_expression_type(
             .domain_base_type_for_oid(type_oid, txid)
             .and_then(|base| crate::sql::types::ArrElem::domain(creation, base))
     } else {
-        crate::sql::eval::constructor_type_from_oid(type_oid, &|oid| {
-            storage.domain_base_type_for_oid(oid, txid)
-        })
-        .and_then(|ctype| match ctype {
+        physical.and_then(|ctype| match ctype {
             ColType::Array(element) => Some(element),
             scalar => crate::sql::types::ArrElem::from_coltype(scalar),
         })
@@ -2587,7 +2591,34 @@ pub(crate) fn subquery_expression_type(
             "ARRAY subquery result type is not supported"
         )
     })?;
-    Ok(Some(element.array_oid()))
+    Ok(crate::sql::eval::ArrayConstructorType {
+        element,
+        multidimensional: !domain && matches!(physical, Some(ColType::Array(_))),
+    })
+}
+
+fn array_subquery_plan(
+    select: &Select<'_>,
+    storage: &Storage,
+    txid: u32,
+    arena: &Arena,
+    outer: Option<&dyn ColumnLookup<'_>>,
+) -> Result<crate::sql::eval::ArrayConstructorType, SqlError> {
+    let empty = crate::sql::eval::NoColumns;
+    let type_oid = subquery_expression_type(
+        &Expr::Subquery(select),
+        storage,
+        txid,
+        arena,
+        outer.unwrap_or(&empty),
+    )?
+    .ok_or_else(|| {
+        sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "array subquery has no declared column type"
+        )
+    })?;
+    array_element_plan(type_oid, storage, txid)
 }
 
 fn catalog_type_witness(
@@ -3336,67 +3367,54 @@ fn set_window<'a>(
     Ok((start, ((total - start) as u64).min(limit) as usize))
 }
 
-/// Builds the `Datum::Array` for an `ARRAY(subquery)` constructor from the
-/// subquery's single-column `values`. The element type comes from the column's
-/// type `witness` (so an empty subquery still yields a correctly-typed empty
-/// array); each value is coerced to it before encoding.
+/// Serialize the already-typed value without rechecking domain constraints.
 fn normalize_array_subquery_element<'a>(
     value: Datum<'a>,
-    witness: &Datum<'a>,
+    element: crate::sql::types::ArrElem,
     storage: &Storage,
     txid: u32,
     arena: &'a Arena,
 ) -> Result<Datum<'a>, SqlError> {
-    let Some(element) = crate::sql::types::ArrElem::from_datum(witness) else {
-        return Ok(value);
-    };
     if value.is_null() {
         return Ok(value);
     }
-    match element {
-        crate::sql::types::ArrElem::Composite(_) => {
-            crate::sql::exec::coerce_user_type_array_element(value, element, storage, txid, arena)
-        }
+    match element.to_coltype() {
+        ColType::Composite(identity) => crate::sql::exec::coerce_user_type_array_element(
+            value,
+            crate::sql::types::ArrElem::Composite(identity),
+            storage,
+            txid,
+            arena,
+        ),
         _ => crate::sql::eval::cast_to(value, element.to_coltype(), arena),
     }
 }
 
+/// Declarations fix the element type and whether arrays add a dimension, even
+/// when the subquery produces no rows or only null values.
 fn build_array_scalar<'a>(
     values: &[Datum<'a>],
-    witness: &Datum<'a>,
+    plan: crate::sql::eval::ArrayConstructorType,
     storage: &Storage,
     txid: u32,
     arena: &'a Arena,
 ) -> Result<Datum<'a>, SqlError> {
-    if matches!(witness, Datum::Array { .. })
-        || values
-            .iter()
-            .any(|value| matches!(value, Datum::Array { .. }))
-    {
+    if plan.multidimensional {
         if values.is_empty() {
-            let Datum::Array { element, .. } = *witness else {
-                unreachable!("an empty array subquery carries its array witness");
-            };
             return Ok(Datum::Array {
-                element,
+                element: plan.element,
                 raw: crate::sql::array::EMPTY,
             });
         }
         return crate::sql::array::stack(values, arena);
     }
-    let element = crate::sql::types::ArrElem::from_datum(witness)
-        .or_else(|| {
-            values
-                .iter()
-                .find_map(crate::sql::types::ArrElem::from_datum)
-        })
-        .unwrap_or(crate::sql::types::ArrElem::Text);
+    let element = plan.element;
     let buffer = arena
         .alloc_slice_with(values.len(), |i| values[i])
         .map_err(|_| arena_full())?;
     for v in buffer.iter_mut() {
         if !v.is_null() {
-            *v = normalize_array_subquery_element(*v, witness, storage, txid, arena)?;
+            *v = normalize_array_subquery_element(*v, element, storage, txid, arena)?;
         }
     }
     Ok(Datum::Array {

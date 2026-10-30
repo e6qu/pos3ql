@@ -1855,12 +1855,17 @@ impl<'d> QueryScope<'d> {
     /// storage- or subquery-derived table returns None (its whole-row reference
     /// is a record).
     pub fn func_scalar_type(&self, name: &str) -> Option<ColType> {
+        self.func_scalar_column(name)
+            .map(|column| self.output_type(column))
+    }
+
+    pub(super) fn func_scalar_column(&self, name: &str) -> Option<ResolvedColumn> {
         let t = self.table_index(name).ok()?;
         if !self.func_scalar[t] {
             return None;
         }
         let def = self.defs.get(t)?;
-        (def.n_columns == 1).then(|| def.columns()[0].ctype)
+        (def.n_columns == 1).then_some(ResolvedColumn::Table(t, 0))
     }
 
     pub fn find_column(
@@ -1913,13 +1918,15 @@ impl<'d> QueryScope<'d> {
                             found = Some(self.output[k]);
                         }
                     }
-                    return found.ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::UNDEFINED_COLUMN,
-                            "column \"{}\" does not exist",
-                            name
-                        )
-                    });
+                    return found
+                        .or_else(|| self.func_scalar_column(name))
+                        .ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::UNDEFINED_COLUMN,
+                                "column \"{}\" does not exist",
+                                name
+                            )
+                        });
                 }
                 let mut found = None;
                 for t in 0..self.n {
@@ -1934,13 +1941,15 @@ impl<'d> QueryScope<'d> {
                         found = Some(ResolvedColumn::Table(t, c));
                     }
                 }
-                found.ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::UNDEFINED_COLUMN,
-                        "column \"{}\" does not exist",
-                        name
-                    )
-                })
+                found
+                    .or_else(|| self.func_scalar_column(name))
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::UNDEFINED_COLUMN,
+                            "column \"{}\" does not exist",
+                            name
+                        )
+                    })
             }
         }
     }

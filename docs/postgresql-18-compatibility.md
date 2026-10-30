@@ -40,6 +40,10 @@ needs an explicit type, such as `ARRAY[]::integer[]`. Type inspection still
 evaluates its argument: `pg_typeof(nextval('order_numbers'))` issues one number.
 Reached subqueries share the caller's sequence session. Row bounds evaluate
 `OFFSET` before `LIMIT`; both can call supported functions or scalar subqueries.
+Correlated table functions use enclosing column declarations even for empty or
+null inputs. For example, `ARRAY(SELECT d FROM unnest(orders.days) d)` keeps
+the declared element type of `orders.days`; a single-column function alias
+denotes its scalar value. Result descriptions do not require a sample row.
 
 Arrays of domains over built-in arrays are supported. For example, a domain
 `integer_vector` over `integer[]` can be used as `integer_vector[]`.

@@ -8,6 +8,7 @@ fn cursor_expression_metadata_preserves_overloads_and_correlated_function_inputs
     let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
     session.success(&mut engine, "CREATE DOMAIN cursor_short AS smallint; \
         CREATE DOMAIN cursor_network AS cidr; CREATE DOMAIN cursor_day AS date; \
+        CREATE DOMAIN cursor_vector AS integer[]; \
         CREATE TABLE cursor_function_inputs(id integer, options text[], days cursor_day[]); \
         INSERT INTO cursor_function_inputs VALUES(1,ARRAY['a','b'],ARRAY[DATE '2026-10-30',NULL]::cursor_day[]), \
         (2,NULL,NULL),(3,ARRAY['c'],ARRAY[]::cursor_day[])", true);
@@ -35,6 +36,24 @@ fn cursor_expression_metadata_preserves_overloads_and_correlated_function_inputs
     );
     assert_eq!(data_rows(&named), ["1|a"]);
     assert_eq!(row_description_names(&named), ["first_name", "lower"]);
+    let arrays = session.success(
+        &mut engine,
+        "SELECT pg_typeof(ARRAY(SELECT 1::smallint)),pg_typeof(ARRAY(SELECT NULL::numeric)), \
+        ARRAY(SELECT 1::smallint)",
+        true,
+    );
+    assert_eq!(data_rows(&arrays), ["smallint[]|numeric[]|{1}"]);
+    assert_eq!(row_description_type_oids(&arrays), [2206, 2206, 1005]);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT pg_typeof(ARRAY(SELECT ARRAY[1,2]::cursor_vector)), \
+        array_ndims(ARRAY(SELECT ARRAY[1,2]::cursor_vector)), \
+        cardinality(ARRAY(SELECT ARRAY[1,2]::cursor_vector))",
+            true
+        )),
+        ["cursor_vector[]|1|1"]
+    );
     assert_eq!(
         data_rows(&session.success(
             &mut engine,
@@ -201,6 +220,14 @@ fn cursor_subquery_array_types_resolve_without_running_skipped_effects() {
     );
     assert_eq!(data_rows(&session.success(&mut engine, "SELECT id,pg_typeof(ARRAY[(SELECT d)]),ARRAY[(SELECT d)] FROM subquery_arrays ORDER BY id", true)),
         ["1|subquery_day[]|{NULL}", "2|subquery_day[]|{2026-10-30}"]);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT id,pg_typeof(ARRAY[(SELECT (SELECT d))]) FROM subquery_arrays ORDER BY id",
+            true
+        )),
+        ["1|subquery_day[]", "2|subquery_day[]"]
+    );
     session.success(&mut engine, "CREATE SEQUENCE subquery_array_calls; \
         CREATE FUNCTION native_array_choice(choose boolean) RETURNS text LANGUAGE plpgsql AS $$ BEGIN \
           RETURN pg_typeof(CASE WHEN choose THEN ARRAY[7] ELSE ARRAY[(SELECT nextval('subquery_array_calls'))] END)::text; END $$; \

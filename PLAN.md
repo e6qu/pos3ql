@@ -64,6 +64,8 @@ A waiting schema edit must never attach itself to a new object that reused a nam
   and null arrays; describing a result must not require a sample row.
   Carry sequence effects through subqueries and row bounds without losing their
   connection state or repeating completed calls.
+  Bind array-subquery elements from their declared types, including domains over
+  arrays; selecting a domain value must not turn it into an extra array dimension.
   Forward-only cursors reuse memory per fetch; scrolling cursors retain visited
   results. Omitted scroll options follow the bound plan’s backward-read support.
   Operator choices and row-independent filters stay fixed after declaration.

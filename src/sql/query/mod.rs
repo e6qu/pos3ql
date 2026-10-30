@@ -8600,6 +8600,9 @@ pub fn describe_scope_items<'q>(
                     txid,
                     arena,
                 };
+                if let Expr::Cast { operand, .. } = expression {
+                    super::exec::infer_type_res(operand, &resolver)?;
+                }
                 let user_type = user_type_expression_description(expression, name, storage, txid);
                 let (mut oid, mut typlen) = match user_type {
                     Some(description) => (description.type_oid, description.typlen),
@@ -8651,10 +8654,12 @@ pub fn describe_scope_items<'q>(
                 } else if let Some(meta) = field_meta {
                     out[n].collation = meta.collation;
                 }
-                out[n] = super::exec::wire_column_description(out[n], storage, txid)?;
                 n += 1;
             }
         }
+    }
+    for column in &mut out[..n] {
+        *column = super::exec::wire_column_description(*column, storage, txid)?;
     }
     Ok(n)
 }
@@ -8690,6 +8695,16 @@ pub fn describe_catalog_items_as<'q>(
     let mut count = 0;
     let mut item_width = [0usize; MAX_PROJ];
     for (item_index, item) in items.iter().enumerate() {
+        if let SelectItem::Expr { expression: Expr::Cast { operand, .. }, .. } = item {
+            super::exec::infer_type_res(operand, &super::exec::CatalogCols {
+                definition,
+                alias,
+                output_aliases: &[],
+                storage,
+                txid,
+                arena,
+            })?;
+        }
         if let SelectItem::Expr { expression, alias } = item
             && let Some(description) = user_type_expression_description(
                 expression,

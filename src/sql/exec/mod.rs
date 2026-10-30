@@ -21433,7 +21433,11 @@ fn resolve_plpgsql_dynamic_prepared<'a>(
     };
     fn reject_parameters(expression: &Expr<'_>) -> Result<(), SqlError> {
         if let Expr::Param(index) | Expr::RoutineParam { index, .. } = expression {
-            return Err(sql_err!(sqlstate::UNDEFINED_PARAMETER, "there is no parameter ${}", index));
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_PARAMETER,
+                "there is no parameter ${}",
+                index
+            ));
         }
         super::query::walk_children(expression, &mut reject_parameters)
     }

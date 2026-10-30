@@ -535,15 +535,29 @@ mod tests {
                 unreachable!()
             }
 
-            fn index_def<'a>(&self, _: i32, _: i32, _: bool, _: &'a Arena) -> Result<Option<&'a str>, SqlError> {
+            fn index_def<'a>(
+                &self,
+                _: i32,
+                _: i32,
+                _: bool,
+                _: &'a Arena,
+            ) -> Result<Option<&'a str>, SqlError> {
                 unreachable!()
             }
 
-            fn constraint_def<'a>(&self, _: i32, _: &'a Arena) -> Result<Option<&'a str>, SqlError> {
+            fn constraint_def<'a>(
+                &self,
+                _: i32,
+                _: &'a Arena,
+            ) -> Result<Option<&'a str>, SqlError> {
                 unreachable!()
             }
 
-            fn partition_key_def<'a>(&self, _: i32, _: &'a Arena) -> Result<Option<&'a str>, SqlError> {
+            fn partition_key_def<'a>(
+                &self,
+                _: i32,
+                _: &'a Arena,
+            ) -> Result<Option<&'a str>, SqlError> {
                 unreachable!()
             }
 
@@ -555,10 +569,14 @@ mod tests {
                 unreachable!()
             }
 
-            fn comment<'a>(&self, _: crate::sql::eval::DescriptionTarget<'_>, _: u32, _: &'a Arena) -> Result<Option<&'a str>, SqlError> {
+            fn comment<'a>(
+                &self,
+                _: crate::sql::eval::DescriptionTarget<'_>,
+                _: u32,
+                _: &'a Arena,
+            ) -> Result<Option<&'a str>, SqlError> {
                 unreachable!()
             }
-
 
             fn declared_user_type_oid(
                 &self,
@@ -620,22 +638,43 @@ mod tests {
             let sql = format!("SELECT ROW((ROW({values})).*, 1)");
             crate::mem::guard::forbid_alloc(|| {
                 query.bind(&sql, &[], &[]).unwrap();
-                query.with_query(|statement, _, _| {
-                    let CursorStatement::Select(select) = statement else { panic!("SELECT") };
-                    let crate::sql::ast::SelectItem::Expr { expression, .. } = select.items[0] else { panic!("expression") };
-                    let mut visited = 0;
-                    let result = crate::sql::exec::record_shape_metadata(expression, &crate::sql::exec::NoCols, |_, _| { visited += 1; });
-                    assert_eq!(visited, crate::sql::MAX_PROJ);
-                    if fields == crate::sql::MAX_PROJ {
-                        let error = result.unwrap_err();
+                query
+                    .with_query(|statement, _, _| {
+                        let CursorStatement::Select(select) = statement else {
+                            panic!("SELECT")
+                        };
+                        let crate::sql::ast::SelectItem::Expr { expression, .. } = select.items[0]
+                        else {
+                            panic!("expression")
+                        };
+                        let mut visited = 0;
+                        let result = crate::sql::exec::record_shape_metadata(
+                            expression,
+                            &crate::sql::exec::NoCols,
+                            |_, _| {
+                                visited += 1;
+                            },
+                        );
+                        assert_eq!(visited, crate::sql::MAX_PROJ);
+                        if fields == crate::sql::MAX_PROJ {
+                            let error = result.unwrap_err();
+                            assert_eq!(error.sqlstate, sqlstate::TOO_MANY_COLUMNS);
+                        let error = crate::sql::exec::infer_type_res(
+                            expression,
+                            &crate::sql::exec::NoCols,
+                        )
+                        .unwrap_err();
                         assert_eq!(error.sqlstate, sqlstate::TOO_MANY_COLUMNS);
-                        assert_eq!(error.message.as_str(), "ROW expressions can have at most 1664 entries");
-                    } else {
-                        assert_eq!(result.unwrap(), Some(crate::sql::MAX_PROJ));
-                    }
-                }).unwrap();
+                            assert_eq!(
+                                error.message.as_str(),
+                                "ROW expressions can have at most 1664 entries"
+                            );
+                        } else {
+                            assert_eq!(result.unwrap(), Some(crate::sql::MAX_PROJ));
+                        }
+                    })
+                    .unwrap();
             });
         }
     }
-
 }

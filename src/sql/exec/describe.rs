@@ -220,7 +220,10 @@ fn describe_items_with_output_aliases<'q>(
                     "target lists can have at most 1664 entries"
                 ));
             }
-            out[n] = desc;
+            out[n] = match storage {
+                Some(storage) => wire_column_description(desc, storage, txid)?,
+                None => desc,
+            };
             n += 1;
             Ok(())
         };
@@ -336,10 +339,7 @@ fn describe_items_with_output_aliases<'q>(
                     description.collation = crate::sql::ast::Collation::Default;
                     description.collation_derivation = CollationDerivation::Implicit;
                 }
-                push(match storage {
-                    Some(storage) => wire_column_description(description, storage, txid)?,
-                    None => description,
-                })?;
+                push(description)?;
             }
         }
     }
@@ -2218,7 +2218,7 @@ fn expression_static_metadata(
             operand, type_mod, ..
         } => {
             let (type_oid, _) = infer_type_res(expression, columns).ok()?;
-            let ctype = coltype_of_oid(type_oid)?;
+            let ctype = coltype_of_oid(type_oid).or_else(|| columns.domain_base_type(type_oid))?;
             let collation = if ctype.is_collatable() {
                 expression_static_metadata(operand, columns)
                     .map(|meta| meta.collation)
@@ -2244,7 +2244,7 @@ fn expression_static_metadata(
             let ctype = if type_oid == oid::UNKNOWN {
                 ColType::Text
             } else {
-                coltype_of_oid(type_oid)?
+                coltype_of_oid(type_oid).or_else(|| columns.domain_base_type(type_oid))?
             };
             Some(StaticTypeMeta {
                 ctype,
@@ -2575,11 +2575,17 @@ fn record_shape_metadata_dyn(
                         return Ok(None);
                     }
                     if overflow {
-                        return Err(sql_err!(sqlstate::TOO_MANY_COLUMNS, "ROW expressions can have at most 1664 entries"));
+                        return Err(sql_err!(
+                            sqlstate::TOO_MANY_COLUMNS,
+                            "ROW expressions can have at most 1664 entries"
+                        ));
                     }
                 } else {
                     if count == RECORD_FIELD_NAMES.len() {
-                        return Err(sql_err!(sqlstate::TOO_MANY_COLUMNS, "ROW expressions can have at most 1664 entries"));
+                        return Err(sql_err!(
+                            sqlstate::TOO_MANY_COLUMNS,
+                            "ROW expressions can have at most 1664 entries"
+                        ));
                     }
                     let Some(metadata) = expression_static_metadata(arg, columns) else {
                         return Ok(None);
@@ -4573,7 +4579,10 @@ pub fn infer_type_res(
                 of(ColType::Json)
             }
             "to_jsonb" | "jsonb_build_object" | "jsonb_build_array" => of(ColType::Jsonb),
-            "row" => (oid::RECORD, -1),
+            "row" => {
+                record_shape_metadata(expression, columns, |_, _| {})?;
+                (oid::RECORD, -1)
+            }
             "sum" | "avg" => {
                 let a = args
                     .first()

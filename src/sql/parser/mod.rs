@@ -292,6 +292,14 @@ pub struct Parser<'a> {
     /// column merely because the caller used the named spelling.
     routine_parameters: [Option<&'a str>; crate::storage::MAX_ROUTINE_ARGUMENTS],
     routine_name: Option<&'a str>,
+    named_parameters: &'a [NamedParameter<'a>],
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct NamedParameter<'a> {
+    pub qualifier: Option<&'a str>,
+    pub name: &'a str,
+    pub index: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -524,8 +532,10 @@ pub(crate) fn parse_query_with_string_parameters<'a>(
 pub(crate) fn parse_cursor_command<'a>(
     sql: &'a str,
     arena: &'a Arena,
+    parameters: &'a [NamedParameter<'a>],
 ) -> Result<&'a Stmt<'a>, super::eval::SqlError> {
     let mut parser = Parser::new(sql, arena).map_err(|error| super::parse_error_to_sql(&error))?;
+    parser.named_parameters = parameters;
     let mut statement = None;
     let mut multiple = false;
     while let Some(parsed) = parser
@@ -700,6 +710,7 @@ impl<'a> Parser<'a> {
             stop_default_at_not_null: false,
             routine_parameters: [None; crate::storage::MAX_ROUTINE_ARGUMENTS],
             routine_name: None,
+            named_parameters: &[],
         })
     }
 
@@ -738,14 +749,18 @@ impl<'a> Parser<'a> {
         Ok(self)
     }
 
-    pub(super) fn routine_parameter(&self, name: &str) -> Option<u32> {
+    pub(super) fn routine_parameter(&self, name: &str) -> Option<(u32, crate::sql::ast::ParameterSource)> {
         self.routine_parameters
             .iter()
             .position(|parameter| parameter.is_some_and(|parameter| parameter == name))
-            .map(|index| index as u32 + 1)
+            .map(|index| (index as u32 + 1, crate::sql::ast::ParameterSource::SqlRoutine))
+            .or_else(|| self.named_parameters.iter().find(|parameter| parameter.qualifier.is_none() && parameter.name == name).map(|parameter| (parameter.index, crate::sql::ast::ParameterSource::PlpgsqlCursor)))
     }
 
-    pub(super) fn qualified_routine_parameter(&self, qualifier: &str, name: &str) -> Option<u32> {
+    pub(super) fn qualified_routine_parameter(&self, qualifier: &str, name: &str) -> Option<(u32, crate::sql::ast::ParameterSource)> {
+        if let Some(parameter) = self.named_parameters.iter().find(|parameter| parameter.qualifier == Some(qualifier) && parameter.name == name) {
+            return Some((parameter.index, crate::sql::ast::ParameterSource::PlpgsqlCursor));
+        }
         self.routine_name
             .is_some_and(|routine| routine == qualifier)
             .then(|| self.routine_parameter(name))

@@ -5698,50 +5698,6 @@ pub(crate) fn describe_select<'a>(
     }
 }
 
-/// Describes a PL/pgSQL cursor query whose FROM-less expressions may name the
-/// routine's typed locals. Table-backed projections retain the ordinary query
-/// scope; their predicates can still reach the same outer local scope during
-/// execution.
-pub(crate) fn describe_cursor_select<'a>(
-    select: &'a Select<'a>,
-    storage: &'a Storage,
-    txid: u32,
-    outer: &dyn ColumnLookup<'a>,
-    arena: &'a Arena,
-    out: &mut [ColDesc<'a>],
-) -> Result<usize, SqlError> {
-    if select.set_body.is_some() || select.from.is_some() {
-        return describe_select(select, storage, txid, arena, out);
-    }
-    let catalog = storage_catalog(storage, arena, txid);
-    let mut count = 0usize;
-    for item in select.items {
-        let SelectItem::Expr { expression, alias } = item else {
-            return Err(sql_err!(
-                sqlstate::UNDEFINED_TABLE,
-                "SELECT * with no tables specified is not valid"
-            ));
-        };
-        if count == out.len() {
-            return Err(sql_err!(
-                sqlstate::TOO_MANY_COLUMNS,
-                "target lists can have at most 1664 entries"
-            ));
-        }
-        let name = alias.unwrap_or(super::exec::derived_name(expression));
-        let ctype = super::exec::typeof_static_coltype(expression, outer, Some(&catalog))
-            .ok_or_else(|| {
-                sql_err!(
-                    sqlstate::UNDEFINED_COLUMN,
-                    "could not resolve PL/pgSQL cursor result type"
-                )
-            })?;
-        out[count] = ColDesc::of_type(name, ctype);
-        count += 1;
-    }
-    Ok(count)
-}
-
 fn describe_set_tree<'a>(
     tree: &'a crate::sql::ast::SetTree<'a>,
     storage: &'a Storage,

@@ -19385,12 +19385,13 @@ impl Engine {
         hold: bool,
         binary: bool,
         params: &[Datum],
+        locals: &[cursor::CursorLocal],
         txn: &TxnState,
         cursors: &mut cursor::CursorPool,
         guc: &GucState,
     ) -> Result<(), SqlError> {
         let at = cursors.open(name, statement, scroll, hold, binary)?;
-        if let Err(error) = cursors.bind_query(at, sql, params, &[]) {
+        if let Err(error) = cursors.bind_query(at, sql, params, locals) {
             cursors.abandon(at);
             return Err(error);
         }
@@ -19398,7 +19399,7 @@ impl Engine {
             let (query, description, rows) = cursors.execution_parts(at);
             let mut capture = Responder::for_cursor(description, rows);
             capture.set_render(guc.render());
-            query.with_query(|parsed, params, _, arena| {
+            query.with_query(|parsed, params, arena| {
                 let sequence_state = sequence::SequenceReplayState::new(arena);
                 let sequence = sequence::ReplaySeqEval::new(
                     sequence::SeqEval::new(&self.storage, guc.seq_session(), txn.txid),
@@ -19475,96 +19476,6 @@ impl Engine {
         Ok(())
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "cursor materialization carries the active routine and session contexts"
-    )]
-    pub(crate) fn materialize_plpgsql_cursor(
-        &mut self,
-        name: &str,
-        sql: &str,
-        scroll: cursor::CursorScroll,
-        locals: &[cursor::CursorLocal],
-        params: &[Datum],
-        txn: &TxnState,
-        cursors: &mut cursor::CursorPool,
-        guc: &GucState,
-    ) -> Result<(), SqlError> {
-        let at = cursors.open(name, sql, scroll, false, false)?;
-        if let Err(error) = cursors.bind_query(at, sql, params, locals) {
-            cursors.abandon(at);
-            return Err(error);
-        }
-        let result = {
-            let (query, description, rows) = cursors.execution_parts(at);
-            query.with_query(|parsed, params, outer, arena| {
-                let cursor::CursorStatement::Select(select) = parsed else {
-                    return Err(sql_err!(
-                        sqlstate::INTERNAL_ERROR,
-                        "cursor query changed kind after binding"
-                    ));
-                };
-                let mut capture = Responder::for_cursor(description, rows);
-                capture.set_render(guc.render());
-                let mut columns = [types::ColDesc::new("", 0, 0); exec::MAX_PROJ];
-                let count = query::describe_cursor_select(
-                    select,
-                    &self.storage,
-                    txn.txid,
-                    outer,
-                    arena,
-                    &mut columns,
-                )?;
-                capture
-                    .row_description(&columns[..count])
-                    .map_err(|_| cursor_description_too_large())?;
-                let sequence_state = sequence::SequenceReplayState::new(arena);
-                let sequence = sequence::ReplaySeqEval::new(
-                    sequence::SeqEval::new(&self.storage, guc.seq_session(), txn.txid),
-                    &sequence_state,
-                );
-                let mut rows = 0u64;
-                query::select_into_rows(
-                    &self.storage,
-                    txn.txid,
-                    select,
-                    arena,
-                    params,
-                    Some(outer),
-                    Some(&sequence),
-                    &mut |values| {
-                        match query::emit_data_row(
-                            &self.storage,
-                            txn.txid,
-                            arena,
-                            &mut capture,
-                            values,
-                        ) {
-                            Ok(Ok(())) => {}
-                            Ok(Err(error)) => return Err(error),
-                            Err(WireFull) => return Err(cursor_description_too_large()),
-                        }
-                        rows += 1;
-                        Ok(())
-                    },
-                )?;
-                capture
-                    .command_complete(stack_format!(32, "SELECT {}", rows).as_str())
-                    .map_err(|_| cursor_description_too_large())?;
-                Ok(())
-            })?
-        };
-        if let Err(error) = result {
-            cursors.abandon(at);
-            return Err(error);
-        }
-        if let Err(error) = cursors.seal(at) {
-            cursors.abandon(at);
-            return Err(error);
-        }
-        Ok(())
-    }
-
     pub(crate) fn execute_cursor_statement(
         &mut self,
         statement: &Stmt,
@@ -19594,7 +19505,7 @@ impl Engine {
                     )));
                 }
                 if let Err(error) = self.materialize_cursor(
-                    name, statement, sql, *scroll, *hold, *binary, params, txn, cursors, guc,
+                    name, statement, sql, *scroll, *hold, *binary, params, &[], txn, cursors, guc,
                 ) {
                     return Ok(Err(error));
                 }

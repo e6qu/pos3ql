@@ -288,7 +288,7 @@ fn resolve_set_order(
             Expr::Column {
                 name,
                 qualifier: None,
-            } => columns
+            } | Expr::RoutineParam { name, qualifier: None, .. } => columns
                 .iter()
                 .position(|column| column.name == *name)
                 .ok_or_else(|| {
@@ -1740,7 +1740,7 @@ pub(crate) fn set_rows_tie(
             Expr::Column {
                 name,
                 qualifier: None,
-            } => match columns.iter().position(|c| c.name == *name) {
+            } | Expr::RoutineParam { name, qualifier: None, .. } => match columns.iter().position(|c| c.name == *name) {
                 Some(i) => i,
                 None => return Ok(false),
             },
@@ -1782,7 +1782,7 @@ pub(crate) fn sort_set_rows(
             Expr::Column {
                 name,
                 qualifier: None,
-            } => match columns.iter().position(|c| c.name == *name) {
+            } | Expr::RoutineParam { name, qualifier: None, .. } => match columns.iter().position(|c| c.name == *name) {
                 Some(i) => i,
                 None => {
                     return Err(sql_err!(

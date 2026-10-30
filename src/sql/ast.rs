@@ -5527,6 +5527,12 @@ pub enum AlterStatisticsAction<'a> {
     SetTarget(StatisticsTarget),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParameterSource {
+    SqlRoutine,
+    PlpgsqlCursor,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Expr<'a> {
     Null,
@@ -5552,6 +5558,7 @@ pub enum Expr<'a> {
         qualifier: Option<&'a str>,
         name: &'a str,
         index: u32,
+        source: ParameterSource,
     },
     Param(u32),
     Unary {

@@ -3238,6 +3238,9 @@ pub(crate) fn infer_routine_argument_oid(
     expression: &Expr,
     columns: &dyn ColTypeResolver,
 ) -> Result<i32, SqlError> {
+    if matches!(expression, Expr::RoutineParam { source: crate::sql::ast::ParameterSource::PlpgsqlCursor, .. }) {
+        return infer_type_res(expression, columns).map(|result| result.0);
+    }
     match expression {
         Expr::Collate { operand, .. } => infer_routine_argument_oid(operand, columns),
         Expr::Column { qualifier, name }
@@ -3367,19 +3370,15 @@ pub fn infer_type_res(
             .map(|oid| (oid, coltype_of_oid(oid).map_or(-1, ColType::typlen)))
             .or_else(|| routine_parameter_type(*index).map(of))
             .unwrap_or((oid::UNKNOWN, -2)),
-        Expr::RoutineParam {
-            qualifier,
-            name,
-            index,
-        } => match columns.resolve(*qualifier, name) {
+        Expr::RoutineParam { qualifier, name, index, source } => match columns.resolve(*qualifier, name) {
+            Ok(_) if *source == crate::sql::ast::ParameterSource::PlpgsqlCursor => return Err(sql_err!(sqlstate::AMBIGUOUS_COLUMN,
+                "column reference \"{}{}{}\" is ambiguous", qualifier.unwrap_or(""), if qualifier.is_some() { "." } else { "" }, name)),
             Ok(column) => of(column),
-            Err(error)
-                if error.sqlstate == sqlstate::UNDEFINED_COLUMN
-                    || error.sqlstate == sqlstate::UNDEFINED_TABLE =>
-            {
-                routine_parameter_type(*index)
-                    .map(of)
-                    .unwrap_or((oid::UNKNOWN, -2))
+            Err(error) if error.sqlstate == sqlstate::UNDEFINED_COLUMN || error.sqlstate == sqlstate::UNDEFINED_TABLE => {
+                match source {
+                    crate::sql::ast::ParameterSource::SqlRoutine => routine_parameter_type(*index).map(of),
+                    crate::sql::ast::ParameterSource::PlpgsqlCursor => bound_parameter_type_oid(*index).map(|oid| (oid, coltype_of_oid(oid).map_or(-1, ColType::typlen))),
+                }.unwrap_or((oid::UNKNOWN, -2))
             }
             Err(error) => return Err(error),
         },

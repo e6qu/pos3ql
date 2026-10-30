@@ -2404,7 +2404,10 @@ fn eval_full_inner<'a>(
             qualifier,
             name,
             index,
+            source,
         } => match row.lookup(qualifier, name) {
+            Ok(_) if source == crate::sql::ast::ParameterSource::PlpgsqlCursor => Err(sql_err!(sqlstate::AMBIGUOUS_COLUMN,
+                "column reference \"{}{}{}\" is ambiguous", qualifier.unwrap_or(""), if qualifier.is_some() { "." } else { "" }, name)),
             Ok(value) => materialize_named_composite(value, hooks, arena),
             Err(error)
                 if error.sqlstate == sqlstate::UNDEFINED_COLUMN

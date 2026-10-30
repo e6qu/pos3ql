@@ -60,6 +60,8 @@ A waiting schema edit must never attach itself to a new object that reused a nam
   startup reservation; closing or rolling back must release that state.
   Static procedural cursors also capture local values and their declared types
   at `OPEN`; changing a variable afterward must not change the cursor's input.
+  Use the shared executor for table projections, set queries and captured
+  record fields; SQL routine arguments keep their own declared type scope.
   Wide and nested record values must retain every field through capture and
   saved results, including records with more than 255 fields.
   Keep saved results as typed values: `SET DateStyle = 'SQL, DMY'` before

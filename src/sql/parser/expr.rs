@@ -1064,12 +1064,13 @@ impl<'a> Parser<'a> {
                             name: column,
                         });
                     }
-                    if let Some(index) = self.qualified_routine_parameter(name, column) {
+                    if let Some((index, source)) = self.qualified_routine_parameter(name, column) {
                         self.max_param = self.max_param.max(index);
                         return self.arena_expr(Expr::RoutineParam {
                             qualifier: Some(name),
                             name: column,
                             index,
+                            source,
                         });
                     }
                     return self.arena_expr(Expr::Column {
@@ -1117,12 +1118,13 @@ impl<'a> Parser<'a> {
                         filter: None,
                     });
                 }
-                if let Some(parameter) = self.routine_parameter(name) {
+                if let Some((parameter, source)) = self.routine_parameter(name) {
                     self.max_param = self.max_param.max(parameter);
                     return self.arena_expr(Expr::RoutineParam {
                         qualifier: None,
                         name,
                         index: parameter,
+                        source,
                     });
                 }
                 // Only now, every construct this arm knows having had its
@@ -1173,12 +1175,13 @@ impl<'a> Parser<'a> {
                             name: third,
                         });
                     }
-                    if let Some(index) = self.qualified_routine_parameter(name, column) {
+                    if let Some((index, source)) = self.qualified_routine_parameter(name, column) {
                         self.max_param = self.max_param.max(index);
                         return self.arena_expr(Expr::RoutineParam {
                             qualifier: Some(name),
                             name: column,
                             index,
+                            source,
                         });
                     }
                     return self.arena_expr(Expr::Column {
@@ -1186,12 +1189,13 @@ impl<'a> Parser<'a> {
                         name: column,
                     });
                 }
-                if let Some(parameter) = self.routine_parameter(name) {
+                if let Some((parameter, source)) = self.routine_parameter(name) {
                     self.max_param = self.max_param.max(parameter);
                     return self.arena_expr(Expr::RoutineParam {
                         qualifier: None,
                         name,
                         index: parameter,
+                        source,
                     });
                 }
                 self.arena_expr(Expr::Column {

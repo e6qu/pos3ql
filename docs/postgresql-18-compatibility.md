@@ -230,6 +230,11 @@ The cursor keeps its relation in use through end of input until `CLOSE`.
 Destructive table changes in the same session raise `55006`; a table rename
 does not change its saved definition or input. This follows PostgreSQL's
 [active-relation check](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/commands/tablecmds.c).
+With `NO SCROLL`, `MOVE 0` reports whether there is a current row without
+reading it. `FETCH 0` before the first row returns no row; on a current row it
+raises `55000` because rereading would require a backward step. A fetch that
+fails remains failed after rolling back to a savepoint: further fetches raise
+`55000` with `portal "name" cannot be run`. Close and reopen the cursor.
 JSON/path and XML/XPath limits are specified in [SQL/JSON](sql-json.md) and
 [SQL/XML](sql-xml.md). Inspect the memory plan for the chosen configuration;
 accepted width can still exhaust its named statement or startup budget.

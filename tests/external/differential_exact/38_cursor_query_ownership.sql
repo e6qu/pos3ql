@@ -39,7 +39,7 @@ FETCH NEXT FROM retained_orders;
 UPDATE cursor_retained_orders SET label='changed' WHERE id=2;
 INSERT INTO cursor_retained_orders VALUES (4,'later');
 FETCH NEXT FROM retained_orders;
-FETCH 0 FROM retained_orders;
+MOVE 0 FROM retained_orders;
 FETCH ALL FROM retained_orders;
 FETCH NEXT FROM retained_orders;
 CLOSE retained_orders;
@@ -76,6 +76,24 @@ ROLLBACK TO SAVEPOINT after_fetch;
 CLOSE busy_orders;
 ALTER TABLE cursor_renamed_orders ADD COLUMN extra integer;
 DROP TABLE cursor_renamed_orders;
+COMMIT;
+
+-- PostgreSQL PortalRunFetch marks a cursor failed after an execution error.
+-- https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/tcop/pquery.c
+CREATE TABLE cursor_fetch_failure(id integer);
+INSERT INTO cursor_fetch_failure VALUES(1),(2);
+BEGIN;
+DECLARE fetch_failure NO SCROLL CURSOR FOR SELECT id FROM cursor_fetch_failure;
+FETCH NEXT FROM fetch_failure;
+MOVE 0 FROM fetch_failure;
+MOVE RELATIVE 0 FROM fetch_failure;
+SAVEPOINT before_fetch_error;
+FETCH 0 FROM fetch_failure;
+ROLLBACK TO SAVEPOINT before_fetch_error;
+FETCH NEXT FROM fetch_failure;
+ROLLBACK TO SAVEPOINT before_fetch_error;
+CLOSE fetch_failure;
+DROP TABLE cursor_fetch_failure;
 COMMIT;
 
 -- A record wider than one byte must not lose fields or the following column.

@@ -124,6 +124,7 @@ struct CursorSlot {
     /// Created in the still-open transaction: a rollback closes it even WITH
     /// HOLD (holdability begins at commit, as PostgreSQL has it).
     tentative: bool,
+    failed: bool,
     query: CursorQuery,
     description: FixedBuf,
     rows: FixedBuf,
@@ -131,6 +132,32 @@ struct CursorSlot {
     /// PostgreSQL's cursor position: 0 before the first row, `1..=n` on a
     /// row, `n + 1` after the last.
     position: i64,
+}
+
+impl CursorSlot {
+    fn validate_motion(&self, motion: FetchMotion, move_only: bool) -> Result<(), SqlError> {
+        if self.failed {
+            return Err(sql_err!(
+                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                "portal \"{}\" cannot be run",
+                self.name.as_str()
+            ));
+        }
+        let on_row = self.position >= 1 && self.position <= self.spans.len() as i64;
+        let backward = matches!(motion, FetchMotion::Count(k) | FetchMotion::Relative(k) if k < 0)
+            || matches!(motion, FetchMotion::BackwardAll)
+            || matches!(motion, FetchMotion::Absolute(k) if k < 0 || (i64::from(k) <= self.position && self.position != 0))
+            || (!move_only
+                && on_row
+                && matches!(motion, FetchMotion::Count(0) | FetchMotion::Relative(0)));
+        if self.scroll == CursorScroll::NoScroll && backward {
+            return Err(sql_err!(
+                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                "cursor can only scan forward"
+            ));
+        }
+        Ok(())
+    }
 }
 
 // Each saved row has a four-byte length and a two-byte column count.
@@ -308,6 +335,7 @@ impl CursorPool {
                 hold: false,
                 binary: false,
                 tentative: false,
+                failed: false,
                 query: CursorQuery::new(budget, config.cursor_query_bytes)?,
                 description: FixedBuf::new(budget, "cursor_description", DESCRIPTION_BYTES)?,
                 rows: FixedBuf::new(budget, "cursor_typed_rows", config.cursor_bytes)?,
@@ -379,6 +407,7 @@ impl CursorPool {
         slot.hold = hold;
         slot.binary = binary;
         slot.tentative = true;
+        slot.failed = false;
         slot.query.clear();
         slot.description.clear();
         slot.rows.clear();
@@ -424,22 +453,15 @@ impl CursorPool {
         &self,
         name: &str,
         motion: FetchMotion,
+        move_only: bool,
     ) -> Result<Option<(usize, usize)>, SqlError> {
         let Some(at) = self.find(name) else {
             return Ok(None);
         };
         let slot = &self.slots[at];
+        slot.validate_motion(motion, move_only)?;
         if slot.query.retained.is_none() {
             return Ok(None);
-        }
-        let backward = matches!(motion, FetchMotion::Count(k) | FetchMotion::Relative(k) if k < 0)
-            || matches!(motion, FetchMotion::BackwardAll)
-            || matches!(motion, FetchMotion::Absolute(k) if i64::from(k) < slot.position || k < 0);
-        if backward {
-            return Err(sql_err!(
-                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
-                "cursor can only scan forward"
-            ));
         }
         let needed = match motion {
             FetchMotion::All => usize::MAX,
@@ -461,6 +483,17 @@ impl CursorPool {
         let mut types = [0; crate::pg::respond::MAX_RESULT_COLS];
         let columns = description_type_oids(slot.description.readable(), &mut types)?;
         seal_rows(&slot.rows, columns, &mut slot.spans)
+    }
+
+    pub(crate) fn fail(&mut self, name: &str) {
+        if let Some(at) = self.find(name) {
+            let slot = &mut self.slots[at];
+            if slot.failed {
+                return;
+            }
+            slot.failed = true;
+            slot.query.clear();
+        }
     }
 
     /// Drops a half-built slot after a failed DECLARE.
@@ -542,7 +575,12 @@ impl CursorPool {
     /// (in emission order) plus the description bytes, updating the cursor's
     /// position. Backward motion on a non-SCROLL cursor is PostgreSQL's
     /// 55000.
-    pub fn fetch(&mut self, name: &str, motion: FetchMotion) -> Result<usize, SqlError> {
+    pub fn fetch(
+        &mut self,
+        name: &str,
+        motion: FetchMotion,
+        move_only: bool,
+    ) -> Result<usize, SqlError> {
         let Some(at) = self.find(name) else {
             return Err(sql_err!(
                 sqlstate::UNDEFINED_CURSOR,
@@ -551,6 +589,7 @@ impl CursorPool {
             ));
         };
         let slot = &mut self.slots[at];
+        slot.validate_motion(motion, move_only)?;
         let n = slot.spans.len() as i64;
         let target = match motion {
             FetchMotion::Absolute(k) if k >= 0 => i64::from(k).clamp(0, n + 1),
@@ -558,16 +597,6 @@ impl CursorPool {
             FetchMotion::Relative(k) => (slot.position + i64::from(k)).clamp(0, n + 1),
             _ => slot.position,
         };
-        let backward = matches!(motion, FetchMotion::Count(k) if k < 0)
-            || matches!(motion, FetchMotion::BackwardAll)
-            || matches!(motion, FetchMotion::Absolute(k) if k < 0 || target < slot.position)
-            || matches!(motion, FetchMotion::Relative(k) if k < 0);
-        if slot.scroll == CursorScroll::NoScroll && backward {
-            return Err(sql_err!(
-                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
-                "cursor can only scan forward"
-            ));
-        }
         self.emit.clear();
         let out_rows = &mut self.emit;
         let push_row = |row: i64, out: &mut Vec<u32>| {

@@ -61,6 +61,8 @@ A waiting schema edit must never attach itself to a new object that reused a nam
   then reuse the positions for ordinary results after their first flush.
   Keep the relation in use until the cursor closes, and test resumed fetches
   through the same SQL command path used by network connections.
+  A failed fetch releases its reader and stays failed after savepoint rollback;
+  distinguish `MOVE 0` from rereading a row with `FETCH 0` on `NO SCROLL`.
   Preserve the existing [cursor input, type and capacity rules](docs/postgresql-18-compatibility.md#capacity-boundaries)
   while adding execution positions. Later variable assignments must not change
   captured inputs. Keep issued sequence values in the owned execution state so

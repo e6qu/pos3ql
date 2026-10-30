@@ -19534,29 +19534,39 @@ impl Engine {
         &mut self,
         name: &str,
         motion: cursor::FetchMotion,
+        move_only: bool,
         txid: u32,
         cursors: &mut cursor::CursorPool,
     ) -> Result<usize, SqlError> {
-        if let Some((at, needed)) = cursors.read_request(name, motion)? {
-            let storage = &self.storage;
-            let (work, buffers) = self.work.cursor_parts();
-            while cursors.cached_rows(at) < needed {
-                let mark = work.mark();
-                let advanced = {
-                    let (query, description, rows) = cursors.execution_parts(at);
-                    let mut capture = Responder::for_cursor(description, rows);
-                    query.advance_source(storage, txid, work, buffers, &mut capture)
-                };
-                // Projection values have either been copied into typed rows or
-                // discarded; pending input belongs to the cursor's own arena.
-                unsafe { work.rewind_to(mark) };
-                if !advanced? {
-                    break;
+        let result = (|| {
+            if let Some((at, needed)) = cursors.read_request(name, motion, move_only)? {
+                let storage = &self.storage;
+                let (work, buffers) = self.work.cursor_parts();
+                while cursors.cached_rows(at) < needed {
+                    let mark = work.mark();
+                    let advanced = {
+                        let (query, description, rows) = cursors.execution_parts(at);
+                        let mut capture = Responder::for_cursor(description, rows);
+                        query.advance_source(storage, txid, work, buffers, &mut capture)
+                    };
+                    // Projection values have either been copied into typed rows or
+                    // discarded; pending input belongs to the cursor's own arena.
+                    unsafe { work.rewind_to(mark) };
+                    if !advanced? {
+                        break;
+                    }
+                    cursors.index_new_rows(at)?;
                 }
-                cursors.index_new_rows(at)?;
             }
+            cursors.fetch(name, motion, move_only)
+        })();
+        if result.as_ref().is_err_and(|error| {
+            error.sqlstate != sqlstate::INTERNAL_IO_WAIT
+                && error.sqlstate != sqlstate::INTERNAL_LOCK_WAIT
+        }) {
+            cursors.fail(name);
         }
-        cursors.fetch(name, motion)
+        result
     }
 
     pub(crate) fn execute_cursor_statement(
@@ -19610,72 +19620,84 @@ impl Engine {
                 motion,
                 move_only,
             } => {
-                let count = match self.fetch_cursor(name, *motion, txn.txid, cursors) {
-                    Ok(count) => count,
-                    Err(error) => return Ok(Err(error)),
-                };
-                if !*move_only {
-                    let requested = responder.result_formats();
-                    let (description, formats) = cursors
-                        .fetch_description(name, requested)
-                        .expect("fetch found it");
-                    let mut formatted = responder.result_format_scope(formats);
-                    let responder = &mut *formatted;
-                    let mut type_oids = [0i32; crate::pg::respond::MAX_RESULT_COLS];
-                    let columns = match cursor::description_type_oids(description, &mut type_oids) {
-                        Ok(columns) => columns,
-                        Err(error) => return Ok(Err(error)),
-                    };
-                    responder.cursor_row_description(description, formats)?;
-                    for (index, oid) in type_oids[..columns].iter().enumerate() {
-                        if !formats.is_binary(index) {
-                            continue;
-                        }
-                        match exec::binary_output_capability(&self.storage, *oid, txn.txid) {
-                            exec::BinaryOutputCapability::Supported
-                            | exec::BinaryOutputCapability::MissingAclItemElementSend => {}
-                            exec::BinaryOutputCapability::MissingAclItemSend => {
-                                return Ok(Err(sql_err!(
-                                    eval::sqlstate::UNDEFINED_FUNCTION,
-                                    "no binary output function available for type aclitem"
-                                )));
-                            }
-                            exec::BinaryOutputCapability::Unsupported => {
-                                return Ok(Err(sql_err!(
-                                    eval::sqlstate::FEATURE_NOT_SUPPORTED,
-                                    "binary output is not supported for type oid {}",
-                                    oid
-                                )));
-                            }
-                        }
-                    }
-                    for &row in cursors.emitted() {
-                        let mark = arena.mark();
-                        let result = {
-                            let mut values = [Datum::Null; crate::pg::respond::MAX_RESULT_COLS];
-                            match cursors.copy_row(name, row, arena, &mut values) {
-                                Ok(width) => query::emit_data_row(
-                                    &self.storage,
-                                    txn.txid,
-                                    arena,
-                                    responder,
-                                    &values[..width],
-                                ),
-                                Err(error) => Ok(Err(error)),
-                            }
-                        };
-                        // Copied values and prepared output end before this rewind.
-                        unsafe { arena.rewind_to(mark) };
-                        match result? {
-                            Ok(()) => {}
+                let outcome = (|| {
+                    let count =
+                        match self.fetch_cursor(name, *motion, *move_only, txn.txid, cursors) {
+                            Ok(count) => count,
                             Err(error) => return Ok(Err(error)),
+                        };
+                    if !*move_only {
+                        let requested = responder.result_formats();
+                        let (description, formats) = cursors
+                            .fetch_description(name, requested)
+                            .expect("fetch found it");
+                        let mut formatted = responder.result_format_scope(formats);
+                        let responder = &mut *formatted;
+                        let mut type_oids = [0i32; crate::pg::respond::MAX_RESULT_COLS];
+                        let columns =
+                            match cursor::description_type_oids(description, &mut type_oids) {
+                                Ok(columns) => columns,
+                                Err(error) => return Ok(Err(error)),
+                            };
+                        responder.cursor_row_description(description, formats)?;
+                        for (index, oid) in type_oids[..columns].iter().enumerate() {
+                            if !formats.is_binary(index) {
+                                continue;
+                            }
+                            match exec::binary_output_capability(&self.storage, *oid, txn.txid) {
+                                exec::BinaryOutputCapability::Supported
+                                | exec::BinaryOutputCapability::MissingAclItemElementSend => {}
+                                exec::BinaryOutputCapability::MissingAclItemSend => {
+                                    return Ok(Err(sql_err!(
+                                        eval::sqlstate::UNDEFINED_FUNCTION,
+                                        "no binary output function available for type aclitem"
+                                    )));
+                                }
+                                exec::BinaryOutputCapability::Unsupported => {
+                                    return Ok(Err(sql_err!(
+                                        eval::sqlstate::FEATURE_NOT_SUPPORTED,
+                                        "binary output is not supported for type oid {}",
+                                        oid
+                                    )));
+                                }
+                            }
                         }
+                        for &row in cursors.emitted() {
+                            let mark = arena.mark();
+                            let result = {
+                                let mut values = [Datum::Null; crate::pg::respond::MAX_RESULT_COLS];
+                                match cursors.copy_row(name, row, arena, &mut values) {
+                                    Ok(width) => query::emit_data_row(
+                                        &self.storage,
+                                        txn.txid,
+                                        arena,
+                                        responder,
+                                        &values[..width],
+                                    ),
+                                    Err(error) => Ok(Err(error)),
+                                }
+                            };
+                            // Copied values and prepared output end before this rewind.
+                            unsafe { arena.rewind_to(mark) };
+                            match result? {
+                                Ok(()) => {}
+                                Err(error) => return Ok(Err(error)),
+                            }
+                        }
+                        responder
+                            .command_complete(stack_format!(32, "FETCH {}", count).as_str())?;
+                    } else {
+                        responder.command_complete(stack_format!(32, "MOVE {}", count).as_str())?;
                     }
-                    responder.command_complete(stack_format!(32, "FETCH {}", count).as_str())?;
-                } else {
-                    responder.command_complete(stack_format!(32, "MOVE {}", count).as_str())?;
+                    Ok(Ok(()))
+                })();
+                if matches!(&outcome, Err(_))
+                    || matches!(&outcome, Ok(Err(error))
+                    if error.sqlstate != sqlstate::INTERNAL_IO_WAIT && error.sqlstate != sqlstate::INTERNAL_LOCK_WAIT)
+                {
+                    cursors.fail(name);
                 }
-                Ok(Ok(()))
+                outcome
             }
             Stmt::CloseCursor(name) => {
                 match name {

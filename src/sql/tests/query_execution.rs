@@ -100,7 +100,7 @@ fn cursor_retained_cold_fetch_resumes_after_delivered_rows() {
     );
     let (slot, _) = session
         .cursors
-        .read_request("cold", FetchMotion::Count(1))
+        .read_request("cold", FetchMotion::Count(1), false)
         .unwrap()
         .expect("retained physical plan");
     assert_eq!(session.cursors.cached_rows(slot), 0);

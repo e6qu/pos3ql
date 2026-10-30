@@ -20,14 +20,14 @@ fn cursor_retained_fetch_advances_only_requested_rows_and_keeps_opening_values()
         );
         let (slot, _) = session
             .cursors
-            .read_request("orders", FetchMotion::Count(1))
+            .read_request("orders", FetchMotion::Count(1), false)
             .unwrap()
             .expect("retained physical plan");
         assert_eq!(session.cursors.cached_rows(slot), 0);
         assert_eq!(
             session
                 .cursors
-                .read_request("orders", FetchMotion::BackwardAll)
+                .read_request("orders", FetchMotion::BackwardAll, false)
                 .unwrap_err()
                 .sqlstate,
             "55000"
@@ -55,10 +55,10 @@ fn cursor_retained_fetch_advances_only_requested_rows_and_keeps_opening_values()
         assert_eq!(session.cursors.cached_rows(slot), 2);
         let output = session.success(
             &mut engine,
-            "FETCH 0 FROM orders; FETCH ALL FROM orders; FETCH NEXT FROM orders",
+            "MOVE 0 FROM orders; FETCH ALL FROM orders; FETCH NEXT FROM orders",
             true,
         );
-        assert_eq!(data_rows(&output), ["2|second", "3|third"]);
+        assert_eq!(data_rows(&output), ["3|third"]);
         assert_eq!(session.cursors.cached_rows(slot), 3);
         session.success(&mut engine, "CLOSE orders; COMMIT", true);
         assert!(!session.cursors.exists("orders"));
@@ -129,6 +129,64 @@ fn cursor_retained_table_cannot_be_dropped_or_rewritten_until_close() {
         &mut engine,
         "ROLLBACK TO SAVEPOINT finished; CLOSE busy; \
         ALTER TABLE renamed_orders ADD COLUMN extra integer; DROP TABLE renamed_orders; COMMIT",
+        true,
+    );
+}
+
+#[test]
+fn cursor_failed_fetch_stays_failed_after_savepoint_rollback() {
+    let config = test_config("cursor-failed-fetch");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    for projection in ["id FROM fetch_failure", "1 FROM generate_series(1,2)"] {
+        session.success(&mut engine, "CREATE TABLE fetch_failure(id integer); INSERT INTO fetch_failure VALUES(1),(2); BEGIN", true);
+        session.success(
+            &mut engine,
+            &format!("DECLARE failed NO SCROLL CURSOR FOR SELECT {projection}"),
+            true,
+        );
+        session.success(&mut engine, "FETCH NEXT FROM failed; MOVE 0 FROM failed; MOVE RELATIVE 0 FROM failed; SAVEPOINT before_error", true);
+        assert_eq!(
+            error_sqlstates(&session.execute(&mut engine, "FETCH 0 FROM failed", true)),
+            ["55000"]
+        );
+        session.success(&mut engine, "ROLLBACK TO SAVEPOINT before_error", true);
+        let output = session.execute(&mut engine, "FETCH NEXT FROM failed", true);
+        assert_eq!(error_sqlstates(&output), ["55000"]);
+        assert!(String::from_utf8_lossy(&output).contains("portal \"failed\" cannot be run"));
+        session.success(
+            &mut engine,
+            "ROLLBACK TO SAVEPOINT before_error; CLOSE failed; DROP TABLE fetch_failure; COMMIT",
+            true,
+        );
+    }
+}
+
+#[test]
+fn cursor_retained_capacity_error_releases_its_reader_and_stays_failed() {
+    let mut config = test_config("cursor-retained-fetch-capacity");
+    config.cursor_bytes = 6;
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(&mut engine, "CREATE TABLE small_result(id integer); INSERT INTO small_result VALUES(1); \
+        BEGIN; DECLARE small NO SCROLL CURSOR FOR SELECT id FROM small_result; SAVEPOINT before_fetch", true);
+    let output = session.execute(&mut engine, "FETCH NEXT FROM small", true);
+    assert_eq!(error_sqlstates(&output), ["54000"]);
+    assert!(String::from_utf8_lossy(&output).contains("cursor result exceeds cursor_bytes"));
+    session.success(
+        &mut engine,
+        "ROLLBACK TO SAVEPOINT before_fetch; DROP TABLE small_result",
+        true,
+    );
+    assert_eq!(
+        error_sqlstates(&session.execute(&mut engine, "FETCH NEXT FROM small", true)),
+        ["55000"]
+    );
+    session.success(
+        &mut engine,
+        "ROLLBACK TO SAVEPOINT before_fetch; CLOSE small; ROLLBACK",
         true,
     );
 }

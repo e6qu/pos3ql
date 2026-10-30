@@ -24754,8 +24754,13 @@ fn execute_trigger_block<'a>(
                             "SQL cursors are not available in trigger execution"
                         ));
                     };
-                    let count =
-                        engine.fetch_cursor(name, statement.motion, context.txn.txid, cursors)?;
+                    let count = engine.fetch_cursor(
+                        name,
+                        statement.motion,
+                        statement.move_only,
+                        context.txn.txid,
+                        cursors,
+                    )?;
                     let rows = arena
                         .alloc_slice_copy(cursors.emitted())
                         .map_err(|_| super::query::arena_full_pub())?;
@@ -25271,7 +25276,13 @@ fn execute_trigger_block<'a>(
                                         "SQL cursors are not available in trigger execution"
                                     ));
                                 };
-                                engine.fetch_cursor(name, *motion, context.txn.txid, cursors)?;
+                                engine.fetch_cursor(
+                                    name,
+                                    *motion,
+                                    false,
+                                    context.txn.txid,
+                                    cursors,
+                                )?;
                                 arena
                                     .alloc_slice_copy(cursors.emitted())
                                     .map_err(|_| super::query::arena_full_pub())?

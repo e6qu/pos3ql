@@ -2,11 +2,12 @@
 
 use super::*;
 use crate::mem::arena::ArenaMark;
-use crate::storage::{MAX_COLUMNS, RowCursor, RowCursorBuffers, SpilledRowRepresentation, rowenc};
+use crate::storage::{
+    CursorRow, MAX_COLUMNS, RowCursor, RowCursorBuffers, SpilledRowRepresentation, rowenc,
+};
 
 struct PendingRow<'a> {
-    rowid: u64,
-    representation: SpilledRowRepresentation<'a>,
+    row: CursorRow<'a>,
     mark: ArenaMark,
 }
 
@@ -186,16 +187,12 @@ impl<'a> RetainedSelect<'a> {
                 self.source.close();
                 return Ok(false);
             };
-            self.pending = Some(PendingRow {
-                rowid: row.rowid,
-                representation: row.representation,
-                mark,
-            });
+            self.pending = Some(PendingRow { row, mark });
         }
         let pending = self.pending.as_ref().expect("captured input row");
         let definition = self.scope.defs.get(0).expect("retained source definition");
         let mut values = [Datum::Null; MAX_COLUMNS];
-        match pending.representation {
+        match pending.row.representation() {
             SpilledRowRepresentation::Encoded(bytes) => {
                 let mut schema = [ColType::Bool; MAX_COLUMNS];
                 definition.schema(&mut schema);
@@ -211,7 +208,7 @@ impl<'a> RetainedSelect<'a> {
                 values[..decoded.len()].copy_from_slice(decoded);
             }
         }
-        let rowids = [Some(pending.rowid)];
+        let rowids = [Some(pending.row.rowid)];
         let row = scan::JoinRow {
             scope: &self.scope,
             values: scan::JoinRowValues::Flat {

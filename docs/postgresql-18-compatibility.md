@@ -223,9 +223,12 @@ one local physical table defer row reads and pure projections to `FETCH`.
 Filters, joins, expressions with operations or calls, ordering, grouping,
 row-level security, inheritance expansion and other cursor modes still use the
 eager executor. The retained reader's selected row identities, saved-file
-positions and pending row share `cursor_query_bytes`; exhaustion returns
+positions and copied saved-row input share `cursor_query_bytes`; exhaustion returns
 `54000`. Each query workspace also reserves fixed row and saved-file read
 buffers at startup, accounted separately from `work_arena_bytes`.
+Resident input retains immutable heap bytes through an owned reader rather
+than copying the whole row into that arena. Selected output still must fit
+`cursor_bytes`.
 The cursor keeps its relation in use through end of input until `CLOSE`.
 Destructive table changes in the same session raise `55006`; a table rename
 does not change its saved definition or input. This follows PostgreSQL's

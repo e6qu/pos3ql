@@ -319,7 +319,7 @@ fn held_query_read(mode: crate::config::TransactionMode, saved: SavedRows, cance
         match result {
             Ok(Some(row)) => {
                 let mut decoded = [Datum::Null; 2];
-                let values = match row.representation {
+                let values = match row.representation() {
                     SpilledRowRepresentation::Encoded(bytes) => {
                         crate::mem::guard::forbid_alloc(|| {
                             crate::storage::rowenc::decode(

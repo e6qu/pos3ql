@@ -7,7 +7,7 @@ with its reproducer, observed behavior and exact external blocker or reason it
 cannot be repaired. Keep repaired-defect evidence, ownership checks and PostgreSQL comparisons in
 the fixing PR, including exhausted-memory behavior before irreversible effects
 and retained readers surviving command-arena resets and owner moves. Keep
-active-relation checks, failed-fetch cleanup and storage-wait retries in the same
+active-relation checks, failed-fetch cleanup, wide-row projections and storage-wait retries in the same
 regression coverage.
 Failed PostgreSQL comparisons preserve their outputs and diagnostics before
 temporary files are removed.

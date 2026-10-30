@@ -5,8 +5,27 @@ use crate::config::Config;
 use crate::mem::arena::{ArenaSliceError, ArenaSliceHandle};
 use crate::mem::budget::{Budget, BudgetError};
 use crate::storage::{
-    MemberCursor, RowReadBuffers, SpillWalkProgress, SpilledRow, SpilledRowRepresentation,
+    HeapRowRead, MemberCursor, RowReadBuffers, SpillWalkProgress, SpilledRowRepresentation,
 };
+
+pub(crate) struct CursorRow<'a> {
+    pub(crate) rowid: u64,
+    bytes: CursorRowBytes<'a>,
+}
+
+enum CursorRowBytes<'a> {
+    Heap(HeapRowRead),
+    Spilled(SpilledRowRepresentation<'a>),
+}
+
+impl CursorRow<'_> {
+    pub(crate) fn representation(&self) -> SpilledRowRepresentation<'_> {
+        match &self.bytes {
+            CursorRowBytes::Heap(bytes) => SpilledRowRepresentation::Encoded(bytes),
+            CursorRowBytes::Spilled(representation) => *representation,
+        }
+    }
+}
 
 pub(crate) struct RowCursor {
     source: Option<RowScanSource>,
@@ -151,7 +170,7 @@ impl RowCursor {
         state_arena: &Arena,
         arena: &'arena Arena,
         decoded_columns: Option<&[bool; crate::storage::MAX_COLUMNS]>,
-    ) -> Result<Option<SpilledRow<'arena>>, SqlError> {
+    ) -> Result<Option<CursorRow<'arena>>, SqlError> {
         crate::sql::query::check_timeout()?;
         let source = self.source.as_mut().ok_or_else(|| {
             sql_err!(
@@ -179,17 +198,18 @@ impl RowCursor {
                     .map_err(cursor_capacity)
             };
             let bytes = match home.bytes {
-                crate::storage::row_images::VisibleRowBytes::Heap(bytes) => copy(&bytes)?,
+                crate::storage::row_images::VisibleRowBytes::Heap(bytes) => {
+                    CursorRowBytes::Heap(bytes)
+                }
                 crate::storage::row_images::VisibleRowBytes::Spilled(row) => {
-                    row.with_bytes_in(&mut buffers.row, copy)?
+                    CursorRowBytes::Spilled(SpilledRowRepresentation::Encoded(
+                        row.with_bytes_in(&mut buffers.row, copy)?,
+                    ))
                 }
             };
             let rowid = record.rowid;
             source.resident += 1;
-            return Ok(Some(SpilledRow {
-                rowid,
-                representation: SpilledRowRepresentation::Encoded(bytes),
-            }));
+            return Ok(Some(CursorRow { rowid, bytes }));
         }
         let mut members = state_arena
             .retained_slice_mut(source.members)
@@ -212,9 +232,9 @@ impl RowCursor {
                         .resume(&mut members, &buffers.scan, 1, u64::MAX),
                 ),
                 &mut |rowid, _, representation| {
-                    row = Some(SpilledRow {
+                    row = Some(CursorRow {
                         rowid,
-                        representation,
+                        bytes: CursorRowBytes::Spilled(representation),
                     });
                     Ok(ControlFlow::Break(()))
                 },
@@ -240,8 +260,8 @@ mod tests {
         use crate::pg::respond::Responder;
         use crate::sql::cursor::CursorQuery;
 
-        // Exercise real catalog and row owners without constructing unused
-        // database features under Miri's interpreter.
+        // Exercise real owners with minimal unused catalog capacity under
+        // Miri's interpreter, including the required built-in text objects.
         let mut config = test_config();
         config.memtable_bytes = 256;
         config.max_tables = 2;
@@ -250,27 +270,27 @@ mod tests {
         config.max_catalog_versions_per_object = 1;
         config.catalog_history_bytes = 4096;
         config.max_spill_generations_per_table = 1;
-        config.max_views = 0;
-        config.max_materialized_views = 0;
-        config.max_routines = 0;
-        config.max_casts = 0;
-        config.max_operators = 0;
-        config.max_operator_families = 0;
-        config.max_operator_classes = 0;
-        config.max_composites = 0;
-        config.max_domains = 0;
-        config.max_enums = 0;
-        config.max_triggers = 0;
-        config.max_policies = 0;
-        config.max_publications = 0;
-        config.max_text_search_objects = 0;
-        config.max_large_objects = 0;
-        config.large_object_pages = 0;
-        config.max_extended_statistics = 0;
-        config.max_subscriptions = 0;
-        config.max_foreign_data_wrappers = 0;
-        config.max_foreign_servers = 0;
-        config.max_user_mappings = 0;
+        config.max_views = 1;
+        config.max_materialized_views = 1;
+        config.max_routines = 1;
+        config.max_casts = 1;
+        config.max_operators = 1;
+        config.max_operator_families = 1;
+        config.max_operator_classes = 1;
+        config.max_composites = 1;
+        config.max_domains = 1;
+        config.max_enums = 1;
+        config.max_triggers = 1;
+        config.max_policies = 1;
+        config.max_publications = 1;
+        config.max_text_search_objects = 21;
+        config.max_large_objects = 1;
+        config.large_object_pages = 1;
+        config.max_extended_statistics = 1;
+        config.max_subscriptions = 1;
+        config.max_foreign_data_wrappers = 1;
+        config.max_foreign_servers = 1;
+        config.max_user_mappings = 1;
         let mut budget = test_budget(&config);
         let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let visibility = storage.nested_statement_snapshot(7);
@@ -294,6 +314,7 @@ mod tests {
         let mut description =
             FixedBuf::new(&mut read_budget, "retained description", 1024).unwrap();
         let mut rows = FixedBuf::new(&mut read_budget, "retained rows", 1024).unwrap();
+        let mut small_rows = FixedBuf::new(&mut read_budget, "small retained rows", 1).unwrap();
         crate::mem::guard::forbid_alloc(|| {
             query.bind("SELECT n FROM retained_plan", &[], &[]).unwrap();
             assert!(
@@ -308,6 +329,18 @@ mod tests {
             );
         });
         assert!(rows.readable().is_empty());
+        let error = crate::mem::guard::forbid_alloc(|| {
+            query.advance_source(
+                &storage,
+                0,
+                &work,
+                &mut buffers,
+                &mut Responder::for_cursor(&mut description, &mut small_rows),
+            )
+        })
+        .unwrap_err();
+        assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+        // The pending row must own its bytes across movement and another edit.
         let mut query = Box::new(query);
         let mut storage = Box::new(storage);
         // A retained plan must not borrow the Storage object or its movable heap.
@@ -389,18 +422,19 @@ mod tests {
         );
         assert!(storage.heap.test_exclusive_write().is_ok());
         crate::mem::guard::forbid_alloc(|| cursor.open(&storage, table, 0, &metadata)).unwrap();
+        let row = crate::mem::guard::forbid_alloc(|| {
+            cursor.next(&mut buffers, &metadata, &tiny_output, None)
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(row.rowid, 1);
         assert_eq!(
-            crate::mem::guard::forbid_alloc(|| cursor.next(
-                &mut buffers,
-                &metadata,
-                &tiny_output,
-                None
-            ))
-            .err()
-            .unwrap()
-            .sqlstate,
-            sqlstate::PROGRAM_LIMIT_EXCEEDED
+            tiny_output.used(),
+            0,
+            "resident bytes already have an immutable owner"
         );
+        drop(row);
+        cursor.rewind(&metadata).unwrap();
         storage.commit_drop(table);
         let replacement = storage
             .create_table(make_def("replacement", &[("n", ColType::Int4, true)]))
@@ -414,7 +448,7 @@ mod tests {
             .unwrap()
             .unwrap();
             assert_eq!(row.rowid, expected);
-            let SpilledRowRepresentation::Encoded(bytes) = row.representation else {
+            let SpilledRowRepresentation::Encoded(bytes) = row.representation() else {
                 panic!("heap row")
             };
             let mut values = [Datum::Null];

@@ -177,6 +177,9 @@ CURSOR FOR SELECT id, label FROM orders` followed by `FETCH 2 FROM c` reads and
 saves two rows; `FETCH 0` before the first row reads none. Closing it releases
 the unread source. This path currently accepts columns, wildcards, constants
 and captured parameters, without filters, ordering or row-level security.
+Resident rows keep their immutable byte owner instead of copying a wide row
+into cursor memory just to return a small column. For example, selecting `id`
+does not copy an unselected 128 KiB text field into `cursor_query_bytes`.
 An open retained cursor prevents `DROP TABLE`, `TRUNCATE` and structural
 `ALTER TABLE` in the same session until `CLOSE`; renaming its table keeps the
 saved input valid.

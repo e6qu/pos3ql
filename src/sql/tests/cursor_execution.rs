@@ -223,6 +223,37 @@ fn cursor_retained_input_capacity_names_its_budget_and_releases_failed_open() {
 }
 
 #[test]
+fn cursor_retained_narrow_projection_borrows_wide_resident_rows() {
+    let mut config = test_config("cursor-retained-wide-resident");
+    config.cursor_query_bytes = 8192;
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE TABLE wide_input(id integer, payload text)",
+        true,
+    );
+    session.success(
+        &mut engine,
+        &format!(
+            "INSERT INTO wide_input VALUES(7,'{}')",
+            "x".repeat(128 << 10)
+        ),
+        true,
+    );
+    session.success(
+        &mut engine,
+        "BEGIN; DECLARE narrow NO SCROLL CURSOR FOR SELECT id FROM wide_input; \
+        UPDATE wide_input SET id=9",
+        true,
+    );
+    let output = session.success(&mut engine, "FETCH ALL FROM narrow", true);
+    assert_eq!(data_rows(&output), ["7"]);
+    session.success(&mut engine, "CLOSE narrow; COMMIT", true);
+}
+
+#[test]
 fn cursor_dynamic_open_rejects_multiple_commands_before_issuing_sequence_values() {
     let config = test_config("cursor-open-command-count");
     let mut budget = test_engine_budget(&config, 1 << 29);

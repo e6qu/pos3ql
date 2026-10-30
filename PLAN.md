@@ -58,7 +58,8 @@ A waiting schema edit must never attach itself to a new object that reused a nam
   Simple cursors over one physical table retain their reader,
   built-in arithmetic/comparisons, `CASE WHEN` expressions, array construction,
   element access and slices, boolean filters, integer row limits/offsets and
-  captured parameters.
+  captured parameters. Preserve their declared common types through subqueries,
+  null values and result inspection without issuing skipped effects.
   Forward-only cursors reuse memory per fetch; scrolling cursors retain visited
   results. Omitted scroll options follow the bound plan’s backward-read support.
   Operator choices and row-independent filters stay fixed after declaration.

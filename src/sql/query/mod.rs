@@ -37,9 +37,9 @@ pub use setops::set_query;
 pub(crate) use setops::set_query_into_rows;
 
 mod materialize;
+pub(crate) use materialize::ScopeSchema;
 use materialize::{
-    ScopeSchema, external_materialized_into, finalize_projected_row, materialized_rows,
-    materialized_select,
+    external_materialized_into, finalize_projected_row, materialized_rows, materialized_select,
 };
 
 mod scan;
@@ -628,7 +628,7 @@ pub(crate) use plan::join_order;
 use plan::{postpone_cost, reorder_qual, simplify_qual, where_passes};
 
 mod subquery;
-pub(crate) use subquery::ProceduralSubqueries;
+pub(crate) use subquery::{ProceduralSubqueries, subquery_expression_type};
 use subquery::{
     correlated_in_expression, correlated_scan_conjuncts, correlated_where_passes, merge_correlated,
     prepare_outer_subqueries, subquery_witness,
@@ -3075,6 +3075,26 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         self.execute_catalog_operator(None, name, &[left, right], &[left_oid, right_oid], arena)
     }
 
+    fn subquery_type(
+        &self,
+        expression: &Expr<'_>,
+        outer: &dyn ColumnLookup<'_>,
+    ) -> Result<Option<i32>, SqlError> {
+        let mark = self.routine_workspace.mark();
+        let result = subquery::subquery_expression_type(
+            expression,
+            self.storage,
+            self.txid,
+            self.routine_workspace,
+            outer,
+        );
+        // Describing a result never exposes this workspace's temporary bytes.
+        unsafe {
+            self.routine_workspace.rewind_to(mark);
+        }
+        result
+    }
+
     fn routine_result_oid(
         &self,
         name: &str,
@@ -4889,8 +4909,13 @@ fn patch_subquery_column_types<'a>(
                                 && let Some(from) = sub.from
                                 && let Ok(inner_scope) =
                                     QueryScope::resolve_schema(storage, &from, txid, arena)
-                                && let Ok(witness) =
-                                    subquery_witness(storage, txid, inner, Some(&inner_scope))
+                                && let Ok(witness) = subquery_witness(
+                                    storage,
+                                    txid,
+                                    inner,
+                                    Some(&inner_scope),
+                                    arena,
+                                )
                             {
                                 let ct = if matches!(**expression, Expr::ArraySubquery(_)) {
                                     array_subquery_column_type(witness)
@@ -9764,6 +9789,19 @@ pub(crate) struct CatalogScopeCols<'scope, 'definition, 'storage> {
 }
 
 impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_> {
+    fn subquery_type(&self, expression: &Expr<'_>) -> Result<Option<(i32, i16)>, SqlError> {
+        let schema = ScopeSchema(self.scope);
+        let outer_schema = self.outer_scope.map(ScopeSchema);
+        let outer = Chained {
+            inner: &schema,
+            outer: outer_schema
+                .as_ref()
+                .map(|schema| schema as &dyn ColumnLookup<'_>),
+        };
+        subquery_expression_type(expression, self.storage, self.txid, self.arena, &outer)
+            .map(|oid| oid.map(|oid| (oid, ColType::from_oid(oid).map_or(-1, ColType::typlen))))
+    }
+
     fn validate_explicit_cast(&self, source_oid: i32, target: ColType) -> Result<(), SqlError> {
         if self
             .storage

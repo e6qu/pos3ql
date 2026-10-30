@@ -500,6 +500,12 @@ pub(crate) fn expression_type_identity<'a>(
         )?;
         return Ok(ExpressionTypeIdentity::Known(plan.element.array_oid()));
     }
+    if matches!(expression, Expr::Subquery(_) | Expr::ArraySubquery(_))
+        && let Some(catalog) = hooks.catalog
+        && let Some(type_oid) = catalog.subquery_type(expression, row)?
+    {
+        return Ok(ExpressionTypeIdentity::Known(type_oid));
+    }
     if let Expr::Subquery(_) = expression
         && let Some(values) = hooks.subs
         && let Some((_, _, witness)) = values
@@ -508,6 +514,35 @@ pub(crate) fn expression_type_identity<'a>(
             .find(|(node, _, _)| core::ptr::eq(*node, expression as *const _))
     {
         return Ok(ExpressionTypeIdentity::Known(witness.type_oid()));
+    }
+    if let Expr::ArraySubquery(_) = expression
+        && let Some(values) = hooks.subs
+        && let Some(list) = values
+            .lists
+            .iter()
+            .find(|list| core::ptr::eq(list.node, expression as *const _ as *const ()))
+    {
+        let ctype = constructor_type_from_oid(list.witness.type_oid(), &|oid| {
+            hooks
+                .catalog
+                .and_then(|catalog| catalog.domain_base_type(oid))
+        })
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "array subquery element type is not supported"
+            )
+        })?;
+        let element = match ctype {
+            ColType::Array(element) => element,
+            scalar => ArrElem::from_coltype(scalar).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "array subquery element type is not supported"
+                )
+            })?,
+        };
+        return Ok(ExpressionTypeIdentity::Known(element.array_oid()));
     }
     // ROW() determines the anonymous record identity from its constructor,
     // including `record.*` arguments whose individual expressions are not
@@ -587,6 +622,24 @@ struct RuntimeColumnTypes<'row, 'datum> {
 }
 
 impl crate::sql::exec::ColTypeResolver for RuntimeColumnTypes<'_, '_> {
+    fn column_meta(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Option<crate::sql::exec::StaticTypeMeta> {
+        let ctype = self.row.col_type(qualifier, name)?;
+        let type_oid = match self.row.column_user_type(qualifier, name) {
+            Some(identity) => self.catalog?.declared_user_type_oid(ctype, identity)?,
+            None => ctype.oid(),
+        };
+        Some(crate::sql::exec::StaticTypeMeta {
+            type_oid,
+            ctype,
+            type_mod: -1,
+            collation: self.row.collation(qualifier, name),
+        })
+    }
+
     fn resolve(
         &self,
         qualifier: Option<&str>,
@@ -612,6 +665,15 @@ impl crate::sql::exec::ColTypeResolver for RuntimeColumnTypes<'_, '_> {
             .or_else(|| super::types::ColType::from_sql_name(type_name).map(|ctype| ctype.oid()))
     }
 
+    fn subquery_type(&self, expression: &Expr<'_>) -> Result<Option<(i32, i16)>, SqlError> {
+        match self.catalog {
+            Some(catalog) => catalog.subquery_type(expression, self.row).map(|oid| {
+                oid.map(|oid| (oid, ColType::from_oid(oid).map_or(-1, ColType::typlen)))
+            }),
+            None => Ok(None),
+        }
+    }
+
     fn routine_result(
         &self,
         name: &str,
@@ -622,13 +684,28 @@ impl crate::sql::exec::ColTypeResolver for RuntimeColumnTypes<'_, '_> {
         let type_oid =
             self.catalog?
                 .routine_result_oid(name, argument_names, variadic, arguments)?;
-        let ctype = ColType::from_oid(type_oid).or_else(|| self.domain_base_type(type_oid))?;
+        let ctype = constructor_type_from_oid(type_oid, &|oid| self.domain_base_type(oid))?;
         Some(crate::sql::exec::StaticTypeMeta {
             type_oid,
             ctype,
             type_mod: -1,
             collation: crate::sql::ast::Collation::Default,
         })
+    }
+
+    fn operator_result(
+        &self,
+        name: &str,
+        left: i32,
+        right: i32,
+    ) -> Option<crate::sql::exec::StaticTypeMeta> {
+        let encoded = stack_format!(
+            260,
+            "{}\u{1f}{}",
+            super::ast::CATALOG_OPERATOR_CALL_PREFIX,
+            name
+        );
+        self.routine_result(encoded.as_str(), &[], false, &[left, right])
     }
 }
 
@@ -1173,6 +1250,14 @@ pub trait CatalogAccess {
     }
     /// The declared result identity of a catalog routine. This is separate
     /// from execution because a domain result shares its base datum layout.
+    fn subquery_type(
+        &self,
+        _expression: &Expr<'_>,
+        _outer: &dyn ColumnLookup<'_>,
+    ) -> Result<Option<i32>, SqlError> {
+        Ok(None)
+    }
+
     fn routine_result_oid(
         &self,
         _name: &str,
@@ -3071,14 +3156,21 @@ fn eval_full_inner<'a>(
             otherwise,
             ..
         } => {
+            // Resolve all branch declarations without running skipped effects.
+            let unified = if hooks.catalog.is_some() {
+                let type_oid = expression_type_identity(expression, row, hooks)?.record_field_oid();
+                constructor_type_from_oid(type_oid, &|oid| {
+                    hooks
+                        .catalog
+                        .and_then(|catalog| catalog.domain_base_type(oid))
+                })
+            } else {
+                case_result_type(whens, &otherwise, row)
+            };
             let scrutinee = match operand {
                 Some(operator) => Some(eval_full(operator, arena, params, row, hooks)?),
                 None => None,
             };
-            // PostgreSQL unifies all branch result types to one common type;
-            // compute it so every row's value has the same type as the
-            // column PostgreSQL would report.
-            let unified = case_result_type(whens, &otherwise, row);
             let chosen = 'chosen: {
                 for (cond, result) in whens {
                     let hit = match &scrutinee {
@@ -4512,7 +4604,7 @@ pub(crate) fn array_constructor_type<'a>(
         if expected.is_none() {
             candidate = Some(match candidate {
                 None => physical,
-                Some(prior) => super::types::common_builtin_type(prior, physical)
+                Some(prior) => super::types::common_builtin_candidate(prior, physical)
                     .map_err(|error| common_type_error(error, "ARRAY"))?,
             });
         }
@@ -4541,6 +4633,28 @@ pub(crate) fn array_constructor_type<'a>(
         });
     }
     let candidate = candidate.unwrap_or(ColType::Text);
+    for item in items {
+        let type_oid = match item {
+            Expr::Array(children) => ColType::Array(
+                array_constructor_type(children, expected, resolve, domain_base)?.element,
+            )
+            .oid(),
+            other => resolve(other)?,
+        };
+        if type_oid != super::types::oid::UNKNOWN {
+            let from = constructor_type_from_oid(type_oid, domain_base)
+                .expect("validated constructor declaration");
+            if !super::types::builtin_implicit_cast(from, candidate) {
+                return Err(common_type_error(
+                    super::types::CommonTypeError::Conversion {
+                        from,
+                        to: candidate,
+                    },
+                    "ARRAY",
+                ));
+            }
+        }
+    }
     let element = match candidate {
         ColType::Array(element) => {
             multidimensional = true;

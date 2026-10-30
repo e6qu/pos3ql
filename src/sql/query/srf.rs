@@ -2015,6 +2015,7 @@ pub(crate) fn describe_derived_definition<'a>(
                                     txid,
                                     inner,
                                     inner_scope.as_ref().or(Some(&ss)),
+                                    arena,
                                 )?;
                                 if !witness.is_null() {
                                     descriptors[slot] = ColDesc::new(

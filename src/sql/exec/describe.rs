@@ -645,6 +645,36 @@ pub(crate) fn visit_catalog_rowtype_fields(
 }
 
 impl ColTypeResolver for CatalogCols<'_> {
+    fn subquery_type(&self, expression: &Expr<'_>) -> Result<Option<(i32, i16)>, SqlError> {
+        let scope = self
+            .definition
+            .map(|definition| {
+                super::super::query::QueryScope::for_returning(
+                    self.storage,
+                    definition,
+                    self.alias,
+                    self.output_aliases,
+                    self.txid,
+                    self.arena,
+                )
+            })
+            .transpose()?;
+        let schema = scope.as_ref().map(super::super::query::ScopeSchema);
+        let empty = super::super::eval::NoColumns;
+        let outer: &dyn super::super::eval::ColumnLookup<'_> = match &schema {
+            Some(schema) => schema,
+            None => &empty,
+        };
+        super::super::query::subquery_expression_type(
+            expression,
+            self.storage,
+            self.txid,
+            self.arena,
+            outer,
+        )
+        .map(|oid| oid.map(|oid| (oid, ColType::from_oid(oid).map_or(-1, ColType::typlen))))
+    }
+
     fn resolve(&self, qualifier: Option<&str>, name: &str) -> Result<ColType, SqlError> {
         match self.definition {
             Some(definition) => AliasedDefCols {
@@ -1576,6 +1606,10 @@ pub trait ColTypeResolver {
 
     fn domain_base_type(&self, _type_oid: i32) -> Option<ColType> {
         None
+    }
+
+    fn subquery_type(&self, _expression: &Expr<'_>) -> Result<Option<(i32, i16)>, SqlError> {
+        Ok(None)
     }
 
     fn named_type_oid(&self, type_name: &str) -> Option<i32> {
@@ -3173,70 +3207,6 @@ impl<'a> ColumnLookup<'a> for AliasedDefCols<'_, '_> {
     }
 }
 
-/// Adapts a runtime row (`ColumnLookup`) to the static `ColTypeResolver` that
-/// `infer_type_res` needs, so an expression's declared type can be recovered
-/// during evaluation even when its value is NULL.
-struct RowCols<'r, 'a> {
-    row: &'r dyn crate::sql::eval::ColumnLookup<'a>,
-    catalog: Option<&'r dyn crate::sql::eval::CatalogAccess>,
-}
-impl<'a> ColTypeResolver for RowCols<'_, 'a> {
-    fn resolve(&self, qualifier: Option<&str>, name: &str) -> Result<ColType, SqlError> {
-        self.row.col_type(qualifier, name).ok_or_else(|| {
-            sql_err!(
-                sqlstate::UNDEFINED_COLUMN,
-                "column \"{}\" does not exist",
-                name
-            )
-        })
-    }
-
-    fn named_type_oid(&self, type_name: &str) -> Option<i32> {
-        self.catalog
-            .and_then(|catalog| catalog.user_type_oid(type_name))
-            .or_else(|| ColType::from_sql_name(type_name).map(ColType::oid))
-    }
-}
-
-/// The PostgreSQL type name `pg_typeof` reports for `expression` evaluated
-/// against `row`, resolved statically (so a NULL value still names its declared
-/// type, matching PostgreSQL). `None` when the static type can't be pinned down
-/// (the caller then falls back to the runtime datum's type).
-/// The static [`ColType`] behind [`typeof_static`], for callers that must
-/// check the resolution against a runtime value before trusting it.
-pub fn typeof_static_coltype<'a>(
-    expression: &Expr,
-    row: &dyn crate::sql::eval::ColumnLookup<'a>,
-    catalog: Option<&dyn crate::sql::eval::CatalogAccess>,
-) -> Option<ColType> {
-    let (type_oid, _) = infer_type_res(expression, &RowCols { row, catalog }).ok()?;
-    coltype_of_oid(type_oid)
-}
-
-pub fn typeof_static<'a>(
-    expression: &Expr,
-    row: &dyn crate::sql::eval::ColumnLookup<'a>,
-    catalog: Option<&dyn crate::sql::eval::CatalogAccess>,
-) -> Option<&'static str> {
-    let (type_oid, _) = infer_type_res(expression, &RowCols { row, catalog }).ok()?;
-    Some(match coltype_of_oid(type_oid)? {
-        ColType::Array(elem) => elem.typeof_name(),
-        other => other.name(),
-    })
-}
-
-/// The exact static OID reported by `pg_typeof`, including pseudo and catalog
-/// types which do not have a standalone [`ColType`] representation.
-pub fn typeof_static_oid<'a>(
-    expression: &Expr,
-    row: &dyn crate::sql::eval::ColumnLookup<'a>,
-    catalog: Option<&dyn crate::sql::eval::CatalogAccess>,
-) -> Option<i32> {
-    infer_type_res(expression, &RowCols { row, catalog })
-        .ok()
-        .map(|(type_oid, _)| type_oid)
-}
-
 /// Whether two concrete types have a comparison operator, per PostgreSQL:
 /// same type, both numeric-tower, or both in the date/time family.
 /// Whether an OID names a range type (so range operators apply).
@@ -4151,13 +4121,13 @@ pub fn infer_type_res(
                             type_oid
                         )
                     })?;
-                    acc =
-                        Some(match acc {
-                            None => t,
-                            Some(prev) => crate::sql::types::common_builtin_type(prev, t).map_err(
-                                |error| super::super::eval::common_type_error(error, "CASE"),
-                            )?,
-                        });
+                    acc = Some(match acc {
+                        None => t,
+                        Some(prev) => crate::sql::types::common_builtin_candidate(prev, t)
+                            .map_err(|error| {
+                                super::super::eval::common_type_error(error, "CASE")
+                            })?,
+                    });
                 }
                 Ok(())
             };
@@ -4170,6 +4140,25 @@ pub fn infer_type_res(
                 consider(result)?;
             }
             let ctype = acc.unwrap_or(ColType::Text);
+            for result in otherwise
+                .iter()
+                .copied()
+                .chain(whens.iter().map(|(_, result)| *result))
+            {
+                let type_oid = infer_routine_argument_oid(result, columns)?;
+                if type_oid != oid::UNKNOWN {
+                    let from = super::super::eval::constructor_type_from_oid(type_oid, &|oid| {
+                        columns.domain_base_type(oid)
+                    })
+                    .expect("validated CASE declaration");
+                    if !crate::sql::types::builtin_implicit_cast(from, ctype) {
+                        return Err(super::super::eval::common_type_error(
+                            crate::sql::types::CommonTypeError::Conversion { from, to: ctype },
+                            "CASE",
+                        ));
+                    }
+                }
+            }
             if identical && let Some(type_oid) = first_oid.filter(|oid| *oid != oid::UNKNOWN) {
                 (type_oid, ctype.typlen())
             } else {
@@ -4177,11 +4166,10 @@ pub fn infer_type_res(
             }
         }
         Expr::DefaultMarker => (oid::UNKNOWN, -2),
-        // A scalar subquery's type is not known at static-inference time (its
-        // body is resolved against storage only at execution); an array-from-
-        // subquery is likewise unknown here. Both carry their real type in the
-        // pre-evaluated datum.
-        Expr::Subquery(_) | Expr::RowSubquery { .. } | Expr::ArraySubquery(_) => (oid::UNKNOWN, -2),
+        Expr::Subquery(_) | Expr::ArraySubquery(_) => columns
+            .subquery_type(expression)?
+            .unwrap_or((oid::UNKNOWN, -2)),
+        Expr::RowSubquery { .. } => (oid::UNKNOWN, -2),
         Expr::RecordFieldIndex { .. } => (oid::UNKNOWN, -2),
         // `x IN (subquery)` and EXISTS are predicates: their result is boolean.
         Expr::InSubquery { .. } | Expr::QuantifiedSubquery { .. } | Expr::Exists(_) => {

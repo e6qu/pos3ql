@@ -93,23 +93,34 @@ pub(crate) fn common_builtin_type(
     left: ColType,
     right: ColType,
 ) -> Result<ColType, CommonTypeError> {
-    if left == right {
-        return Ok(left);
-    }
-    if type_category(left) != type_category(right) {
-        return Err(CommonTypeError::Category { left, right });
-    }
-    let target = if builtin_implicit_cast(left, right) && !builtin_implicit_cast(right, left) {
-        right
-    } else {
-        left
-    };
+    let target = common_builtin_candidate(left, right)?;
     for from in [left, right] {
         if !builtin_implicit_cast(from, target) {
             return Err(CommonTypeError::Conversion { from, to: target });
         }
     }
     Ok(target)
+}
+
+/// Candidate selection precedes conversion validation for all members of an
+/// ARRAY or CASE, so later declarations still determine analysis errors.
+pub(crate) fn common_builtin_candidate(
+    left: ColType,
+    right: ColType,
+) -> Result<ColType, CommonTypeError> {
+    if left == right {
+        return Ok(left);
+    }
+    if type_category(left) != type_category(right) {
+        return Err(CommonTypeError::Category { left, right });
+    }
+    Ok(
+        if builtin_implicit_cast(left, right) && !builtin_implicit_cast(right, left) {
+            right
+        } else {
+            left
+        },
+    )
 }
 
 pub(crate) fn common_array_element(

@@ -705,8 +705,7 @@ pub use describe::{
     could_not_identify, derived_name, describe_items, expr_record_handle as expr_record_handle_pub,
     infer_type_pub, infer_type_res, init_record_shapes, not_composite, record_field_metadata,
     record_field_type, record_shape, register_named_composite_shape, register_shape_for,
-    reset_record_shapes, typeof_static, typeof_static_coltype, typeof_static_oid,
-    visit_record_shape as visit_record_shape_pub,
+    reset_record_shapes, visit_record_shape as visit_record_shape_pub,
     visit_record_shape_metadata as visit_record_shape_metadata_pub,
 };
 pub(crate) use describe::{

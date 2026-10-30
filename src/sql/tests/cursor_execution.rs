@@ -1,6 +1,58 @@
 use super::*;
 
 #[test]
+fn cursor_subquery_array_types_resolve_without_running_skipped_effects() {
+    let config = test_config("cursor-subquery-array-types");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT pg_typeof(ARRAY[(SELECT 1)]), \
+        pg_typeof(ARRAY[(SELECT NULL::date)]),pg_typeof(ARRAY[(SELECT ARRAY[1,2])]), \
+        ARRAY[(SELECT 1),(SELECT 2147483648)]",
+            true
+        )),
+        ["integer[]|date[]|integer[]|{1,2147483648}"]
+    );
+    session.success(
+        &mut engine,
+        "CREATE DOMAIN subquery_day AS date; \
+        CREATE TABLE subquery_arrays(id integer,d subquery_day); \
+        INSERT INTO subquery_arrays VALUES(1,NULL),(2,DATE '2026-10-30')",
+        true,
+    );
+    assert_eq!(data_rows(&session.success(&mut engine, "SELECT id,pg_typeof(ARRAY[(SELECT d)]),ARRAY[(SELECT d)] FROM subquery_arrays ORDER BY id", true)),
+        ["1|subquery_day[]|{NULL}", "2|subquery_day[]|{2026-10-30}"]);
+    session.success(&mut engine, "CREATE SEQUENCE subquery_array_calls; \
+        CREATE FUNCTION native_array_choice(choose boolean) RETURNS text LANGUAGE plpgsql AS $$ BEGIN \
+          RETURN pg_typeof(CASE WHEN choose THEN ARRAY[7] ELSE ARRAY[(SELECT nextval('subquery_array_calls'))] END)::text; END $$; \
+        CREATE FUNCTION native_domain_array(d subquery_day) RETURNS text LANGUAGE plpgsql AS $$ BEGIN \
+          RETURN pg_typeof(ARRAY[(SELECT d)])::text; END $$", true);
+    assert_eq!(data_rows(&session.success(&mut engine, "SELECT native_array_choice(true),native_domain_array(NULL); SELECT last_value,is_called FROM subquery_array_calls", true)),
+        ["bigint[]|subquery_day[]", "1|f"]);
+    assert_eq!(data_rows(&session.success(&mut engine, "SELECT native_array_choice(false); SELECT last_value,is_called FROM subquery_array_calls", true)), ["bigint[]", "1|t"]);
+    session.success(&mut engine, "CREATE FUNCTION next_array_call() RETURNS bigint LANGUAGE sql VOLATILE AS $$ SELECT nextval('subquery_array_calls') $$", true);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT pg_typeof(next_array_call()); SELECT last_value FROM subquery_array_calls",
+            true
+        )),
+        ["bigint", "2"]
+    );
+    assert_eq!(
+        error_sqlstates(&session.execute(
+            &mut engine,
+            "SELECT pg_typeof(ARRAY[(SELECT id FROM subquery_arrays)])",
+            true
+        )),
+        ["21000"]
+    );
+}
+
+#[test]
 fn cursor_array_domain_defaults_encode_their_composite_base() {
     let config = test_config("cursor-array-composite-domain-default");
     let mut budget = test_engine_budget(&config, 1 << 29);
@@ -175,7 +227,7 @@ fn cursor_retained_arrays_keep_captured_inputs_and_defer_index_errors() {
             [expected]
         );
     }
-    session.success(&mut engine, "CLOSE arrays; DECLARE index_failure NO SCROLL CURSOR FOR SELECT vals[1/(id-2)] FROM array_input", true);
+    session.success(&mut engine, "CLOSE arrays; DECLARE index_failure NO SCROLL CURSOR FOR SELECT vals[1/(id-2)] FROM array_input WHERE id<=2", true);
     assert_eq!(
         data_rows(&session.success(&mut engine, "FETCH NEXT FROM index_failure", true)),
         ["NULL"]

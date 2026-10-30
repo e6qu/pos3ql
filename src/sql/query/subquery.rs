@@ -20,12 +20,12 @@ use crate::storage::Storage;
 
 use super::setops::materialize_set_body;
 use super::{
-    Chained, QueryScope, SUBQUERY_DEPTH, ScopeCols, ScopeSchema, arena_full, cmp_key_rows,
-    collect_aggs, collect_table_sample_expressions, collect_windows, fold_aggregates,
+    CatalogScopeCols, Chained, QueryScope, SUBQUERY_DEPTH, ScopeCols, ScopeSchema, arena_full,
+    cmp_key_rows, collect_aggs, collect_table_sample_expressions, collect_windows, fold_aggregates,
     fromless_aggregate_hooks, pax_column_demand, scan_source_with_pax_columns, select_into_rows,
     select_into_rows_recycling, where_passes,
 };
-use crate::sql::exec::MAX_PROJ;
+use crate::sql::exec::{ColTypeResolver, MAX_PROJ};
 
 pub(super) const fn empty_subquery_list<'a>() -> SubqueryList<'a> {
     SubqueryList {
@@ -210,7 +210,7 @@ fn spooled_column_witness<'a>(
             if let Some((witness, _)) = scope_record_witness(item, scope, storage, txid, arena)? {
                 Ok(witness)
             } else {
-                subquery_witness_with_outer(storage, txid, item, scope, outer)
+                subquery_witness_with_outer(storage, txid, item, scope, outer, arena)
             }
         }
     }
@@ -1145,7 +1145,8 @@ fn row_subquery_witness<'a>(
         let SelectItem::Expr { expression, alias } = item else {
             unreachable!("non-expression projections were described above")
         };
-        let value = subquery_witness_with_outer(storage, txid, expression, scope.as_ref(), outer)?;
+        let value =
+            subquery_witness_with_outer(storage, txid, expression, scope.as_ref(), outer, arena)?;
         let generated = stack_format!(12, "f{}", index + 1);
         fields[index] = RecordField {
             name: match alias {
@@ -2252,61 +2253,79 @@ pub(crate) fn subquery_witness(
     txid: u32,
     item: &Expr,
     scope: Option<&QueryScope>,
+    arena: &Arena,
 ) -> Result<Datum<'static>, SqlError> {
-    subquery_witness_with_outer(storage, txid, item, scope, None)
+    subquery_witness_with_outer(storage, txid, item, scope, None, arena)
 }
 
-/// Static type lookup for a subquery projection. A correlated projection is
-/// resolved through both its own source and the enclosing row, just like its
-/// runtime evaluation; otherwise an empty result could turn a valid outer
-/// reference into a missing-local-table error.
-fn subquery_witness_with_outer<'scope, 'definition, 'outer, 'row>(
+fn subquery_witness_with_outer(
     storage: &Storage,
     txid: u32,
     item: &Expr,
-    scope: Option<&'scope QueryScope<'definition>>,
-    outer: Option<&'outer dyn ColumnLookup<'row>>,
+    scope: Option<&QueryScope>,
+    outer: Option<&dyn ColumnLookup<'_>>,
+    arena: &Arena,
 ) -> Result<Datum<'static>, SqlError> {
-    let inferred = match scope {
-        Some(scope) => match outer {
-            Some(outer) => {
-                crate::sql::exec::infer_type_res(item, &ScopeAndOuterCols { scope, outer })
-            }
-            None => crate::sql::exec::infer_type_res(item, &ScopeCols(scope)),
+    let inferred = crate::sql::exec::infer_type_res(
+        item,
+        &SubqueryColumns {
+            scope,
+            outer,
+            catalog: crate::sql::exec::CatalogCols {
+                definition: None,
+                alias: None,
+                output_aliases: &[],
+                storage,
+                txid,
+                arena,
+            },
         },
-        None => match outer {
-            Some(outer) => crate::sql::exec::infer_type_res(item, &OuterCols(outer)),
-            None => crate::sql::exec::infer_type_res(item, &crate::sql::exec::NoCols),
-        },
-    }?;
+    )?;
     if inferred.0 == crate::sql::types::oid::UNKNOWN {
         return type_witness(ColType::Text);
     }
     catalog_type_witness(storage, txid, inferred.0)
 }
 
-struct OuterCols<'reference, 'row>(&'reference dyn ColumnLookup<'row>);
+/// Query and procedural subqueries resolve inner columns before outer values,
+/// while retaining catalog identities for domains, routines and nested queries.
+struct SubqueryColumns<'scope, 'definition, 'outer, 'row, 'catalog> {
+    scope: Option<&'scope QueryScope<'definition>>,
+    outer: Option<&'outer dyn ColumnLookup<'row>>,
+    catalog: crate::sql::exec::CatalogCols<'catalog>,
+}
 
-impl crate::sql::exec::ColTypeResolver for OuterCols<'_, '_> {
-    fn resolve(&self, qualifier: Option<&str>, name: &str) -> Result<ColType, SqlError> {
-        self.0.col_type(qualifier, name).ok_or_else(|| {
-            sql_err!(
-                sqlstate::UNDEFINED_COLUMN,
-                "column \"{}\" does not exist",
-                name
-            )
-        })
+impl crate::sql::exec::ColTypeResolver for SubqueryColumns<'_, '_, '_, '_, '_> {
+    fn validate_explicit_cast(&self, source_oid: i32, target: ColType) -> Result<(), SqlError> {
+        self.catalog.validate_explicit_cast(source_oid, target)
     }
-}
 
-struct ScopeAndOuterCols<'scope, 'definition, 'outer, 'row> {
-    scope: &'scope QueryScope<'definition>,
-    outer: &'outer dyn ColumnLookup<'row>,
-}
+    fn visit_named_composite_fields(
+        &self,
+        name: &str,
+        visit: &mut dyn FnMut(&str, crate::sql::exec::StaticTypeMeta),
+    ) -> Result<Option<usize>, SqlError> {
+        self.catalog.visit_named_composite_fields(name, visit)
+    }
 
-impl crate::sql::exec::ColTypeResolver for ScopeAndOuterCols<'_, '_, '_, '_> {
+    fn routine_record_field(
+        &self,
+        name: &str,
+        argument_names: &[Option<&str>],
+        variadic: bool,
+        arguments: &[i32],
+        index: usize,
+    ) -> Option<(crate::util::StackStr<64>, crate::sql::exec::StaticTypeMeta)> {
+        self.catalog
+            .routine_record_field(name, argument_names, variadic, arguments, index)
+    }
+
     fn resolve(&self, qualifier: Option<&str>, name: &str) -> Result<ColType, SqlError> {
-        match ScopeCols(self.scope).resolve(qualifier, name) {
+        let inner = match self.scope {
+            Some(scope) => ScopeCols(scope).resolve(qualifier, name),
+            None => self.catalog.resolve(qualifier, name),
+        };
+        match inner {
             Ok(ctype) => Ok(ctype),
             Err(error)
                 if matches!(
@@ -2314,37 +2333,219 @@ impl crate::sql::exec::ColTypeResolver for ScopeAndOuterCols<'_, '_, '_, '_> {
                     sqlstate::UNDEFINED_COLUMN | sqlstate::UNDEFINED_TABLE
                 ) =>
             {
-                self.outer.col_type(qualifier, name).ok_or(error)
+                self.outer
+                    .and_then(|outer| outer.col_type(qualifier, name))
+                    .ok_or(error)
             }
             Err(error) => Err(error),
         }
     }
 
+    fn column_meta(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Option<crate::sql::exec::StaticTypeMeta> {
+        if let Some(scope) = self.scope
+            && scope.find_column(qualifier, name).is_ok()
+        {
+            return CatalogScopeCols {
+                scope,
+                outer_scope: None,
+                storage: self.catalog.storage,
+                txid: self.catalog.txid,
+                arena: self.catalog.arena,
+            }
+            .column_meta(qualifier, name);
+        }
+        let outer = self.outer?;
+        let ctype = outer.col_type(qualifier, name)?;
+        let type_oid = self.catalog.storage.routine_type_oid(
+            ctype,
+            outer.column_user_type(qualifier, name),
+            self.catalog.txid,
+        )?;
+        Some(crate::sql::exec::StaticTypeMeta {
+            ctype,
+            type_oid,
+            type_mod: -1,
+            collation: outer.collation(qualifier, name),
+        })
+    }
+
+    fn domain_base_type(&self, type_oid: i32) -> Option<ColType> {
+        self.catalog.domain_base_type(type_oid)
+    }
+
+    fn named_type_oid(&self, type_name: &str) -> Option<i32> {
+        self.catalog.named_type_oid(type_name)
+    }
+
+    fn routine_result(
+        &self,
+        name: &str,
+        argument_names: &[Option<&str>],
+        variadic: bool,
+        arguments: &[i32],
+    ) -> Option<crate::sql::exec::StaticTypeMeta> {
+        self.catalog
+            .routine_result(name, argument_names, variadic, arguments)
+    }
+
+    fn operator_result(
+        &self,
+        name: &str,
+        left: i32,
+        right: i32,
+    ) -> Option<crate::sql::exec::StaticTypeMeta> {
+        self.catalog.operator_result(name, left, right)
+    }
+
+    fn subquery_type(&self, expression: &Expr<'_>) -> Result<Option<(i32, i16)>, SqlError> {
+        let schema = self.scope.map(ScopeSchema);
+        let empty = crate::sql::eval::NoColumns;
+        let inner: &dyn ColumnLookup<'_> = match &schema {
+            Some(schema) => schema,
+            None => &empty,
+        };
+        let outer = Chained {
+            inner,
+            outer: self.outer,
+        };
+        subquery_expression_type(
+            expression,
+            self.catalog.storage,
+            self.catalog.txid,
+            self.catalog.arena,
+            &outer,
+        )
+        .map(|oid| oid.map(|oid| (oid, ColType::from_oid(oid).map_or(-1, ColType::typlen))))
+    }
+
     fn is_whole_row(&self, name: &str) -> bool {
-        self.scope.table_index(name).is_ok()
+        self.scope
+            .is_some_and(|scope| scope.table_index(name).is_ok())
     }
 
     fn whole_row_scalar_type(&self, name: &str) -> Option<ColType> {
-        self.scope.func_scalar_type(name)
+        self.scope?.func_scalar_type(name)
     }
 
     fn table_columns(&self, name: &str) -> Option<&[crate::storage::ColumnMeta]> {
-        let table = self.scope.table_index(name).ok()?;
-        Some(self.scope.defs.get(table)?.columns())
+        let scope = self.scope?;
+        let table = scope.table_index(name).ok()?;
+        Some(scope.defs.get(table)?.columns())
     }
 
     fn record_column_handle(&self, qualifier: Option<&str>, name: &str) -> Option<i32> {
-        let entry = self.scope.find_column(qualifier, name).ok()?;
-        if self.scope.output_type(entry) != ColType::Record {
+        let scope = self.scope?;
+        let entry = scope.find_column(qualifier, name).ok()?;
+        if scope.output_type(entry) != ColType::Record {
             return None;
         }
         match entry {
             crate::sql::query::scope::ResolvedColumn::Table(table, column) => {
-                Some(self.scope.defs.get(table)?.columns[column].type_mod)
+                Some(scope.defs.get(table)?.columns[column].type_mod)
             }
             crate::sql::query::scope::ResolvedColumn::Merged(_) => None,
         }
     }
+}
+
+pub(crate) fn subquery_expression_type(
+    expression: &Expr<'_>,
+    storage: &Storage,
+    txid: u32,
+    arena: &Arena,
+    outer: &dyn ColumnLookup<'_>,
+) -> Result<Option<i32>, SqlError> {
+    let (select, array) = match expression {
+        Expr::Subquery(select) => (select, false),
+        Expr::ArraySubquery(select) => (select, true),
+        _ => return Ok(None),
+    };
+    if select.set_body.is_some() {
+        return super::subquery_result_type(expression, None, storage, txid, arena)
+            .map(|result| result.map(|result| result.type_oid));
+    }
+    let scope = select
+        .from
+        .as_ref()
+        .map(|from| QueryScope::resolve_schema(storage, from, txid, arena))
+        .transpose()?;
+    let columns = SubqueryColumns {
+        scope: scope.as_ref(),
+        outer: Some(outer),
+        catalog: crate::sql::exec::CatalogCols {
+            definition: None,
+            alias: None,
+            output_aliases: &[],
+            storage,
+            txid,
+            arena,
+        },
+    };
+    let type_oid = match select.items {
+        [SelectItem::Expr { expression, .. }] => {
+            crate::sql::exec::infer_routine_argument_oid(expression, &columns)?
+        }
+        [SelectItem::Wildcard]
+            if scope
+                .as_ref()
+                .is_some_and(|scope| scope.star_columns() == 1) =>
+        {
+            let scope = scope.as_ref().unwrap();
+            let entry = scope.star_entry(0);
+            let user_type = match entry {
+                crate::sql::query::scope::ResolvedColumn::Table(table, column) => {
+                    scope.defs.get(table).expect("resolved source").columns[column].user_type
+                }
+                crate::sql::query::scope::ResolvedColumn::Merged(_) => None,
+            };
+            storage
+                .routine_type_oid(scope.output_type(entry), user_type, txid)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "subquery column has no declared type"
+                    )
+                })?
+        }
+        _ => {
+            return super::subquery_result_type(expression, None, storage, txid, arena)
+                .map(|result| result.map(|result| result.type_oid));
+        }
+    };
+    let type_oid = if type_oid == crate::sql::types::oid::UNKNOWN {
+        ColType::Text.oid()
+    } else {
+        type_oid
+    };
+    if !array {
+        return Ok(Some(type_oid));
+    }
+    let element = if let Some((crate::storage::NamedTypeKind::Domain, creation, false)) =
+        crate::storage::NamedTypeKind::from_oid(type_oid)
+    {
+        storage
+            .domain_base_type_for_oid(type_oid, txid)
+            .and_then(|base| crate::sql::types::ArrElem::domain(creation, base))
+    } else {
+        crate::sql::eval::constructor_type_from_oid(type_oid, &|oid| {
+            storage.domain_base_type_for_oid(oid, txid)
+        })
+        .and_then(|ctype| match ctype {
+            ColType::Array(element) => Some(element),
+            scalar => crate::sql::types::ArrElem::from_coltype(scalar),
+        })
+    }
+    .ok_or_else(|| {
+        sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "ARRAY subquery result type is not supported"
+        )
+    })?;
+    Ok(Some(element.array_oid()))
 }
 
 fn catalog_type_witness(
@@ -2711,7 +2912,7 @@ fn run_subquery<'a>(
                 return Ok((
                     &[],
                     false,
-                    subquery_witness_with_outer(storage, txid, item, None, outer)?,
+                    subquery_witness_with_outer(storage, txid, item, None, outer, arena)?,
                 ));
             };
             let agg_hooks = EvalHooks {
@@ -2727,7 +2928,7 @@ fn run_subquery<'a>(
             return Ok((
                 &*out,
                 v.is_null(),
-                subquery_witness_with_outer(storage, txid, item, None, outer)?,
+                subquery_witness_with_outer(storage, txid, item, None, outer, arena)?,
             ));
         }
         let base = Chained {
@@ -2740,7 +2941,7 @@ fn run_subquery<'a>(
             return Ok((
                 &[],
                 false,
-                subquery_witness_with_outer(storage, txid, item, None, outer)?,
+                subquery_witness_with_outer(storage, txid, item, None, outer, arena)?,
             ));
         }
         let v = eval_full(item, arena, params, &base, &hooks)?;
@@ -2748,7 +2949,7 @@ fn run_subquery<'a>(
         return Ok((
             &*out,
             v.is_null(),
-            subquery_witness_with_outer(storage, txid, item, None, outer)?,
+            subquery_witness_with_outer(storage, txid, item, None, outer, arena)?,
         ));
     };
     let scope = QueryScope::resolve_exec_outer(

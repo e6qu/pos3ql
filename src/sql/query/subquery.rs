@@ -988,7 +988,8 @@ fn subquery_collations<'a>(
     let mut output = [Collation::None; MAX_PROJ];
     if let Some(tree) = select.set_body {
         let mut columns = [crate::sql::types::ColDesc::new("", 0, 0); MAX_PROJ];
-        let count = super::setops::describe_set_body(storage, tree, txid, &mut columns, arena, None)?;
+        let count =
+            super::setops::describe_set_body(storage, tree, txid, &mut columns, arena, None)?;
         if count == 1
             && let Some((ColType::Composite(slot), _)) =
                 crate::sql::exec::catalog_column_type(storage, txid, columns[0].type_oid)
@@ -1100,7 +1101,8 @@ fn row_subquery_witness<'a>(
     }; MAX_PROJ];
     if let Some(tree) = select.set_body {
         let mut columns = [crate::sql::types::ColDesc::new("", 0, 0); MAX_PROJ];
-        let count = super::setops::describe_set_body(storage, tree, txid, &mut columns, arena, None)?;
+        let count =
+            super::setops::describe_set_body(storage, tree, txid, &mut columns, arena, None)?;
         for (index, column) in columns[..count].iter().enumerate() {
             let value = catalog_type_witness(storage, txid, column.type_oid)?;
             fields[index] = RecordField {

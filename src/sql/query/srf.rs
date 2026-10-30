@@ -1907,9 +1907,14 @@ pub(crate) fn describe_derived_definition<'a>(
     let mut type_oids = [0_i32; MAX_PROJ];
     let mut output_collations = [crate::sql::ast::Collation::None; MAX_PROJ];
     let n_cols = match sub.set_body {
-        Some(tree) => {
-            describe_set_body(storage, tree, txid, &mut descriptors, arena, Some(&mut type_oids))?
-        }
+        Some(tree) => describe_set_body(
+            storage,
+            tree,
+            txid,
+            &mut descriptors,
+            arena,
+            Some(&mut type_oids),
+        )?,
         None => match &sub.from {
             Some(f) => {
                 let ss = QueryScope::resolve_schema(storage, f, txid, arena)?;

@@ -1023,18 +1023,40 @@ fn describe_leaf_inner<'a>(
     }
     match &s.from {
         None => {
-            let count = super::describe_catalog_items(s.items, None, storage, txid, arena, columns)?;
-            super::srf::preserve_projection_type_identities(s.items, None, &exec::CatalogCols {
-                definition: None, alias: None, output_aliases: &[], storage, txid, arena,
-            }, &columns[..count], &mut type_oids[..count])?;
+            let count =
+                super::describe_catalog_items(s.items, None, storage, txid, arena, columns)?;
+            super::srf::preserve_projection_type_identities(
+                s.items,
+                None,
+                &exec::CatalogCols {
+                    definition: None,
+                    alias: None,
+                    output_aliases: &[],
+                    storage,
+                    txid,
+                    arena,
+                },
+                &columns[..count],
+                &mut type_oids[..count],
+            )?;
             Ok(count)
         }
         Some(from) => {
             let scope = QueryScope::resolve_schema(storage, from, txid, arena)?;
             let count = describe_scope_items(s.items, &scope, None, storage, txid, arena, columns)?;
-            super::srf::preserve_projection_type_identities(s.items, Some(&scope), &super::CatalogScopeCols {
-                scope: &scope, outer_scope: None, storage, txid, arena,
-            }, &columns[..count], &mut type_oids[..count])?;
+            super::srf::preserve_projection_type_identities(
+                s.items,
+                Some(&scope),
+                &super::CatalogScopeCols {
+                    scope: &scope,
+                    outer_scope: None,
+                    storage,
+                    txid,
+                    arena,
+                },
+                &columns[..count],
+                &mut type_oids[..count],
+            )?;
             Ok(count)
         }
     }
@@ -1473,7 +1495,10 @@ pub(crate) fn describe_set_body<'a>(
     // keep a domain only when every input has that exact declared type.
     if let Some(type_oids) = type_oids {
         if type_oids.len() < n_cols {
-            return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "set query type output is smaller than its column count"));
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "set query type output is smaller than its column count"
+            ));
         }
         for (index, type_oid) in type_oids[..n_cols].iter_mut().enumerate() {
             *type_oid = identical_types[index]

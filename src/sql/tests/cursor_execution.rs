@@ -481,6 +481,65 @@ fn cursor_retained_autocommit_hold_survives_later_rollback_and_failed_query_mess
 }
 
 #[test]
+fn cursor_retained_hold_finishes_with_a_legacy_large_object_transaction() {
+    let config = test_config("cursor-retained-legacy-commit");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE TABLE legacy_hold_input(id integer); INSERT INTO legacy_hold_input VALUES (1),(2)",
+        true,
+    );
+    session.send.clear();
+    session.arena.reset();
+    let result = crate::mem::guard::forbid_alloc(|| {
+        engine.execute_extended(
+            "DECLARE held NO SCROLL CURSOR WITH HOLD FOR SELECT id FROM legacy_hold_input",
+            &session.arena,
+            &[],
+            &[],
+            &mut session.transaction,
+            &mut session.pool,
+            &mut session.cursors,
+            &mut session.guc,
+            &mut Responder::new(&mut session.send),
+            session.connection_id,
+            false,
+        )
+    })
+    .unwrap();
+    assert_eq!(result, ExtendedExecutionStatus::Complete(true));
+    assert_eq!(session.transaction.mode, TxnMode::Implicit);
+    session.send.clear();
+    session.arena.reset();
+    let result = crate::mem::guard::forbid_alloc(|| {
+        engine.execute_large_object_fast_path(
+            3457,
+            &[Datum::Oid(4242), Datum::Bytea(b"held")],
+            true,
+            &session.arena,
+            &mut session.transaction,
+            &session.guc,
+            &mut session.cursors,
+            &mut Responder::new(&mut session.send),
+            session.connection_id,
+        )
+    })
+    .unwrap();
+    assert_eq!(result, ExtendedExecutionStatus::Complete(true));
+    assert!(!session.transaction.is_active());
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "BEGIN; FETCH NEXT FROM held; ROLLBACK", true)),
+        ["1"]
+    );
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "FETCH NEXT FROM held; CLOSE held", true)),
+        ["2"]
+    );
+}
+
+#[test]
 fn cursor_retained_hold_commit_errors_close_new_cursors_and_rollback() {
     let mut config = test_config("cursor-retained-hold-commit-error");
     config.cursor_bytes = 32;
@@ -538,6 +597,47 @@ fn cursor_retained_hold_runs_deferred_triggers_before_saving_unread_results() {
     assert_eq!(
         data_rows(&session.success(&mut engine, "SELECT count(*) FROM hold_trigger_gate", true)),
         ["0"]
+    );
+}
+
+#[test]
+fn cursor_trigger_functions_validate_return_when_the_execution_path_finishes() {
+    let config = test_config("cursor-trigger-return-paths");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(&mut engine, "CREATE TABLE trigger_return_input(id integer); \
+        CREATE FUNCTION trigger_conditional_return() RETURNS trigger LANGUAGE plpgsql AS $$ \
+        BEGIN IF NEW.id>0 THEN RETURN NEW; END IF; END $$; \
+        CREATE TRIGGER conditional_return BEFORE INSERT ON trigger_return_input \
+        FOR EACH ROW EXECUTE FUNCTION trigger_conditional_return(); INSERT INTO trigger_return_input VALUES (1)", true);
+    let row_error = session.execute(
+        &mut engine,
+        "INSERT INTO trigger_return_input VALUES (0)",
+        true,
+    );
+    assert_eq!(error_sqlstates(&row_error), ["2F005"]);
+    assert!(
+        String::from_utf8_lossy(&row_error)
+            .contains("control reached end of trigger procedure without RETURN")
+    );
+    session.success(&mut engine, "DROP TRIGGER conditional_return ON trigger_return_input; \
+        CREATE FUNCTION trigger_missing_statement_return() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN NULL; END $$; \
+        CREATE TRIGGER missing_statement_return AFTER INSERT ON trigger_return_input \
+        FOR EACH STATEMENT EXECUTE FUNCTION trigger_missing_statement_return()", true);
+    let statement_error = session.execute(
+        &mut engine,
+        "INSERT INTO trigger_return_input VALUES (2)",
+        true,
+    );
+    assert_eq!(error_sqlstates(&statement_error), ["2F005"]);
+    assert!(
+        String::from_utf8_lossy(&statement_error)
+            .contains("control reached end of trigger procedure without RETURN")
+    );
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "SELECT id FROM trigger_return_input", true)),
+        ["1"]
     );
 }
 

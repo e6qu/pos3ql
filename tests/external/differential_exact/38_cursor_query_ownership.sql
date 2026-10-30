@@ -348,6 +348,25 @@ SELECT count(*) FROM hold_trigger_gate;
 DROP TABLE hold_trigger_input,hold_trigger_gate;
 DROP FUNCTION hold_trigger_failure();
 
+-- RETURN can be nested or absent; reaching the end is checked during execution.
+-- https://github.com/postgres/postgres/blob/REL_18_6/src/pl/plpgsql/src/pl_exec.c#L1005-L1011
+CREATE TABLE trigger_return_input(id integer);
+CREATE FUNCTION trigger_conditional_return() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN IF NEW.id>0 THEN RETURN NEW; END IF; END $$;
+CREATE TRIGGER conditional_return BEFORE INSERT ON trigger_return_input
+FOR EACH ROW EXECUTE FUNCTION trigger_conditional_return();
+INSERT INTO trigger_return_input VALUES (1);
+INSERT INTO trigger_return_input VALUES (0);
+DROP TRIGGER conditional_return ON trigger_return_input;
+CREATE FUNCTION trigger_missing_statement_return() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN NULL; END $$;
+CREATE TRIGGER missing_statement_return AFTER INSERT ON trigger_return_input
+FOR EACH STATEMENT EXECUTE FUNCTION trigger_missing_statement_return();
+INSERT INTO trigger_return_input VALUES (2);
+SELECT id FROM trigger_return_input;
+DROP TABLE trigger_return_input;
+DROP FUNCTION trigger_conditional_return();
+DROP FUNCTION trigger_missing_statement_return();
+
 -- Name resolution at DECLARE survives a new operator on the same search path.
 CREATE SCHEMA cursor_ops;
 SET search_path=cursor_ops,pg_catalog;

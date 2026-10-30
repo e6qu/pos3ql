@@ -3586,9 +3586,11 @@ fn execute_row_trigger_body<'a>(
             TriggerReturnValue::New if before && new.is_none() => Ok(false),
             _ => Ok(true),
         },
-        Some(TriggerFlow::Exit(_) | TriggerFlow::Continue(_)) | None => {
-            Err(unsupported_trigger_body())
-        }
+        None => Err(sql_err!(
+            sqlstate::FUNCTION_EXECUTED_NO_RETURN_STATEMENT,
+            "control reached end of trigger procedure without RETURN"
+        )),
+        Some(TriggerFlow::Exit(_) | TriggerFlow::Continue(_)) => Err(unsupported_trigger_body()),
     }
 }
 
@@ -19401,13 +19403,6 @@ fn parse_plpgsql_program<'a>(
     if !matches!(ending, TriggerBlockEnd::End) || at != segments.len() {
         return Err(unsupported_trigger_body());
     }
-    let has_return = body
-        .statements
-        .iter()
-        .any(|statement| matches!(statement, TriggerStatement::Return(_)));
-    if program_kind == PlpgsqlProgramKind::Trigger && !has_return {
-        return Err(unsupported_trigger_body());
-    }
     Ok(ParsedTriggerProgram { locals, body })
 }
 
@@ -27596,7 +27591,13 @@ fn fire_statement_triggers_with_rows<'a>(
             None,
         )? {
             Some(TriggerFlow::Return(_)) => {}
-            Some(TriggerFlow::Exit(_) | TriggerFlow::Continue(_)) | None => {
+            None => {
+                return Err(sql_err!(
+                    sqlstate::FUNCTION_EXECUTED_NO_RETURN_STATEMENT,
+                    "control reached end of trigger procedure without RETURN"
+                ));
+            }
+            Some(TriggerFlow::Exit(_) | TriggerFlow::Continue(_)) => {
                 return Err(unsupported_trigger_body());
             }
         }

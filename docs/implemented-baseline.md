@@ -325,6 +325,10 @@ SELECT has_table_privilege(identity, 'SELECT') IS NULL FROM saved_order_identity
 -- true: the old identifier does not grant access to the replacement
 ```
 
+A trigger can return from a nested branch or raise an exception without a
+`RETURN` statement. Creation accepts both. If execution reaches the end without
+returning, the command fails with `2F005` and rolls back its changes.
+
 DDL success follows its end-of-command event triggers. A hook that raises an
 error rolls the command back and keeps its notices, without sending a success
 tag first. Supported static DDL in a `DO` block or routine uses the same

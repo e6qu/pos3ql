@@ -519,6 +519,42 @@ pub(crate) fn parse_query_with_string_parameters<'a>(
         })
 }
 
+/// Cursor plans contain exactly one command. Parse the complete input before
+/// checking that boundary, so a later syntax error retains its SQLSTATE.
+pub(crate) fn parse_cursor_command<'a>(
+    sql: &'a str,
+    arena: &'a Arena,
+) -> Result<&'a Stmt<'a>, super::eval::SqlError> {
+    let mut parser = Parser::new(sql, arena).map_err(|error| super::parse_error_to_sql(&error))?;
+    let mut statement = None;
+    let mut multiple = false;
+    while let Some(parsed) = parser
+        .next_stmt()
+        .map_err(|error| super::parse_error_to_sql(&error))?
+    {
+        if statement.is_none() {
+            statement = Some(parsed);
+        } else {
+            multiple = true;
+        }
+    }
+    if multiple || statement.is_none() {
+        return Err(crate::sql_err!(
+            sqlstate::INVALID_CURSOR_DEFINITION,
+            "cannot open multi-query plan as cursor"
+        ));
+    }
+    arena
+        .alloc(statement.unwrap())
+        .map(|statement| &*statement)
+        .map_err(|_| {
+            crate::sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "cursor query exceeds its SQL arena"
+            )
+        })
+}
+
 /// Parses exactly one stored statement. Rewrite rules retain action text in
 /// the durable catalog and cross this boundary again only after recovery has
 /// validated the text and its captured dependencies.

@@ -21332,10 +21332,17 @@ fn eval_trigger_expression<'a>(
     eval_full(expression, context.arena, context.params, row, &hooks)
 }
 
+#[derive(Clone, Copy)]
+enum DynamicCommandKind {
+    Statement,
+    Cursor,
+}
+
 fn bind_plpgsql_dynamic_query<'a>(
     context: &TriggerExecContext<'_, 'a, '_>,
     query: PlpgsqlDynamicQuery<'a>,
     scope: &TriggerLocalScope<'_, 'a>,
+    kind: DynamicCommandKind,
 ) -> Result<BoundPlpgsqlCommand<'a>, SqlError> {
     let command = eval_trigger_expression(context, query.command, scope)?;
     if command.is_null() {
@@ -21357,7 +21364,14 @@ fn bind_plpgsql_dynamic_query<'a>(
     }
     Ok(BoundPlpgsqlCommand {
         source: command,
-        statement: super::parser::parse_stored_statement(command, context.arena)?,
+        statement: match kind {
+            DynamicCommandKind::Statement => {
+                super::parser::parse_stored_statement(command, context.arena)?
+            }
+            DynamicCommandKind::Cursor => {
+                super::parser::parse_cursor_command(command, context.arena)?
+            }
+        },
         arguments: &*arguments,
     })
 }
@@ -21466,7 +21480,7 @@ fn execute_plpgsql_dynamic_query<'a>(
     sequence: &dyn crate::sql::eval::SequenceAccess,
     emit: &mut dyn for<'row> FnMut(&[Datum<'row>]) -> Result<(), SqlError>,
 ) -> Result<(), SqlError> {
-    let query = bind_plpgsql_dynamic_query(context, query, scope)?;
+    let query = bind_plpgsql_dynamic_query(context, query, scope, DynamicCommandKind::Statement)?;
     execute_bound_plpgsql_dynamic_query(context, query, scope, sequence, emit)
 }
 
@@ -24061,7 +24075,7 @@ fn materialize_plpgsql_dynamic_for_query<'a>(
     scope: &TriggerLocalScope<'_, 'a>,
     record_target: bool,
 ) -> Result<&'a [Datum<'a>], SqlError> {
-    let query = bind_plpgsql_dynamic_query(context, query, scope)?;
+    let query = bind_plpgsql_dynamic_query(context, query, scope, DynamicCommandKind::Statement)?;
     let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
     let width = match query.statement {
         Stmt::Select(select) => super::query::describe_select(
@@ -24561,7 +24575,12 @@ fn execute_trigger_block<'a>(
                     PlpgsqlCursorQuery::Dynamic(query) => {
                         let bound = resolve_plpgsql_dynamic_prepared(
                             context,
-                            bind_plpgsql_dynamic_query(context, query, &scope)?,
+                            bind_plpgsql_dynamic_query(
+                                context,
+                                query,
+                                &scope,
+                                DynamicCommandKind::Cursor,
+                            )?,
                             &scope,
                         )?;
                         if !matches!(bound.statement, Stmt::Select(_) | Stmt::SetQuery(_)) {
@@ -25003,7 +25022,12 @@ fn execute_trigger_block<'a>(
                 let mut row_count = 0usize;
                 let query = resolve_plpgsql_dynamic_prepared(
                     context,
-                    bind_plpgsql_dynamic_query(context, statement.query, &scope)?,
+                    bind_plpgsql_dynamic_query(
+                        context,
+                        statement.query,
+                        &scope,
+                        DynamicCommandKind::Statement,
+                    )?,
                     &scope,
                 )?;
                 let record_target = statement.targets.len() == 1
@@ -25244,7 +25268,12 @@ fn execute_trigger_block<'a>(
                 };
                 let query = resolve_plpgsql_dynamic_prepared(
                     context,
-                    bind_plpgsql_dynamic_query(context, query, &scope)?,
+                    bind_plpgsql_dynamic_query(
+                        context,
+                        query,
+                        &scope,
+                        DynamicCommandKind::Statement,
+                    )?,
                     &scope,
                 )?;
                 let row_count = match query.statement {

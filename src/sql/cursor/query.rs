@@ -43,29 +43,7 @@ impl CursorQuery {
             )
         };
         let source = self.arena.alloc_str(sql).map_err(|_| full())?;
-        let mut parser = crate::sql::parser::Parser::new(source, &self.arena)
-            .map_err(|error| crate::sql::parse_error_to_sql(&error))?;
-        let mut statement = None;
-        let mut multiple = false;
-        while let Some(parsed) = parser
-            .next_stmt()
-            .map_err(|error| crate::sql::parse_error_to_sql(&error))?
-        {
-            if statement.is_none() {
-                statement = Some(parsed);
-            } else {
-                multiple = true;
-            }
-        }
-        // SPI_cursor_open_internal in PostgreSQL 18 rejects plans that do not
-        // contain exactly one command before opening the portal.
-        if multiple || statement.is_none() {
-            return Err(sql_err!(
-                sqlstate::INVALID_CURSOR_DEFINITION,
-                "cannot open multi-query plan as cursor"
-            ));
-        }
-        let statement = self.arena.alloc(statement.unwrap()).map_err(|_| full())?;
+        let statement = crate::sql::parser::parse_cursor_command(source, &self.arena)?;
         let statement = match statement {
             Stmt::Select(select) => CursorStatement::Select(select),
             Stmt::SetQuery(query) => CursorStatement::SetQuery(query),

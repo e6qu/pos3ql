@@ -155,7 +155,6 @@ use row_images::{RowByteSource, RowVersionIdentity, VisibleRowBytes};
 pub(crate) use row_map::{RowEntries, RowMap};
 pub(crate) use row_reads::{RowRead, RowSelfChange};
 use row_reads::{RowReadView, RowReadVisitor};
-#[cfg(test)]
 pub(crate) use row_scans::cursor::{RowCursor, RowCursorBuffers};
 pub(crate) use row_scans::{CapturedRowScan, ValidationRead};
 use row_versions::{

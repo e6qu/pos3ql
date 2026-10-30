@@ -1,6 +1,91 @@
 use super::*;
 
 #[test]
+fn cursor_retained_fetch_advances_only_requested_rows_and_keeps_opening_values() {
+    use crate::config::TransactionMode;
+    use crate::sql::cursor::FetchMotion;
+
+    for mode in [TransactionMode::Mvcc, TransactionMode::Locking] {
+        let mut config = test_config("cursor-retained-fetch");
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        session.success(
+            &mut engine,
+            "CREATE TABLE retained_orders(id integer, label text); \
+             INSERT INTO retained_orders VALUES (1,'first'),(2,'second'),(3,'third'); \
+             BEGIN; DECLARE orders NO SCROLL CURSOR FOR SELECT id,label FROM retained_orders",
+            true,
+        );
+        let (slot, _) = session
+            .cursors
+            .read_request("orders", FetchMotion::Count(1))
+            .unwrap()
+            .expect("retained physical plan");
+        assert_eq!(session.cursors.cached_rows(slot), 0);
+        assert_eq!(
+            session
+                .cursors
+                .read_request("orders", FetchMotion::BackwardAll)
+                .unwrap_err()
+                .sqlstate,
+            "55000"
+        );
+        assert!(
+            data_rows(&session.success(
+                &mut engine,
+                "FETCH 0 FROM orders; MOVE 0 FROM orders",
+                true
+            ))
+            .is_empty()
+        );
+        assert_eq!(session.cursors.cached_rows(slot), 0);
+        let output = session.success(&mut engine, "FETCH NEXT FROM orders", true);
+        assert_eq!(data_rows(&output), ["1|first"]);
+        assert_eq!(session.cursors.cached_rows(slot), 1);
+        session.success(
+            &mut engine,
+            "UPDATE retained_orders SET label='changed' WHERE id=2; \
+            INSERT INTO retained_orders VALUES (4,'later')",
+            true,
+        );
+        let output = session.success(&mut engine, "FETCH FORWARD 1 FROM orders", true);
+        assert_eq!(data_rows(&output), ["2|second"]);
+        assert_eq!(session.cursors.cached_rows(slot), 2);
+        let output = session.success(
+            &mut engine,
+            "FETCH 0 FROM orders; FETCH ALL FROM orders; FETCH NEXT FROM orders",
+            true,
+        );
+        assert_eq!(data_rows(&output), ["2|second", "3|third"]);
+        assert_eq!(session.cursors.cached_rows(slot), 3);
+        session.success(&mut engine, "CLOSE orders; COMMIT", true);
+        assert!(!session.cursors.exists("orders"));
+    }
+}
+
+#[test]
+fn cursor_retained_native_open_captures_inputs_and_fetch_into_uses_the_reader() {
+    let config = test_config("cursor-retained-native");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE TABLE retained_native(id integer); \
+        INSERT INTO retained_native VALUES (1),(2); \
+        CREATE FUNCTION retained_native_fetch() RETURNS text LANGUAGE plpgsql AS $$ \
+        DECLARE c refcursor; label text := 'opening'; n integer; saved text; BEGIN \
+          OPEN c NO SCROLL FOR SELECT id,label FROM retained_native; label := 'changed'; \
+          FETCH NEXT FROM c INTO n,saved; CLOSE c; RETURN saved; END $$",
+        true,
+    );
+    let output = session.success(&mut engine, "SELECT retained_native_fetch()", true);
+    assert_eq!(data_rows(&output), ["opening"]);
+}
+
+#[test]
 fn cursor_dynamic_open_rejects_multiple_commands_before_issuing_sequence_values() {
     let config = test_config("cursor-open-command-count");
     let mut budget = test_engine_budget(&config, 1 << 29);

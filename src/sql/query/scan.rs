@@ -5119,24 +5119,12 @@ pub(super) fn validate_materialized_view_reads(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn scan_source_mode<'a>(
-    storage: &'a Storage,
-    scope: &QueryScope<'a>,
-    from: &'a FromClause<'a>,
+pub(super) fn admit_sources(
+    storage: &Storage,
+    scope: &QueryScope<'_>,
     txid: u32,
-    where_clause: Option<&'a Expr<'a>>,
-    arena: &'a Arena,
-    params: &[Datum<'a>],
-    hooks: &EvalHooks<'_, 'a>,
-    outer: Option<&dyn ColumnLookup<'a>>,
-    recycle_rows: bool,
-    retain_match: Option<&core::cell::Cell<bool>>,
     pax_demand: PaxReadDemand,
-    indexed_override: Option<&IndexedCandidates<'a>>,
-    automatic_index: bool,
-    f: &mut dyn FnMut(&JoinRow<'_, 'a, '_>) -> Result<bool, SqlError>,
-) -> Result<(), SqlError> {
+) -> Result<usize, SqlError> {
     let current_role = storage.current_role_slot(txid).ok_or_else(|| {
         sql_err!(
             sqlstate::INSUFFICIENT_PRIVILEGE,
@@ -5264,6 +5252,28 @@ fn scan_source_mode<'a>(
             storage.record_serializable_read(txid, scope.slots[table]);
         }
     }
+    Ok(current_role)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_source_mode<'a>(
+    storage: &'a Storage,
+    scope: &QueryScope<'a>,
+    from: &'a FromClause<'a>,
+    txid: u32,
+    where_clause: Option<&'a Expr<'a>>,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    hooks: &EvalHooks<'_, 'a>,
+    outer: Option<&dyn ColumnLookup<'a>>,
+    recycle_rows: bool,
+    retain_match: Option<&core::cell::Cell<bool>>,
+    pax_demand: PaxReadDemand,
+    indexed_override: Option<&IndexedCandidates<'a>>,
+    automatic_index: bool,
+    f: &mut dyn FnMut(&JoinRow<'_, 'a, '_>) -> Result<bool, SqlError>,
+) -> Result<(), SqlError> {
+    let current_role = admit_sources(storage, scope, txid, pax_demand)?;
     validate_materialized_view_reads(storage, scope, where_clause, arena, txid)?;
     let sample_plans = arena
         .alloc_slice_with(scope.n, |_| None::<TableSamplePlan>)

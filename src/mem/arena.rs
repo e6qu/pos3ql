@@ -13,9 +13,7 @@ use std::alloc::Layout;
 
 use super::budget::{Budget, BudgetError};
 
-#[cfg(test)]
 mod retained_slice;
-#[cfg(test)]
 pub(crate) use retained_slice::{ArenaSliceError, ArenaSliceHandle};
 
 pub struct Arena {

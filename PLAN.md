@@ -55,6 +55,10 @@ A waiting schema edit must never attach itself to a new object that reused a nam
   cursor over `nextval('order_numbers')` must not issue numbers for rows that
   have not been fetched. Row locks follow fetched rows. Holding a cursor across
   commit saves the required result before releasing its transaction.
+  Simple `NO SCROLL` cursors selecting columns or captured parameters from one
+  physical table now retain their reader and fetch only requested rows. Extend
+  this to expressions, filters, joins, ordering, row locks and holdable cursors,
+  then reuse the positions for ordinary results after their first flush.
   Preserve the existing [cursor input, type and capacity rules](docs/postgresql-18-compatibility.md#capacity-boundaries)
   while adding execution positions. Later variable assignments must not change
   captured inputs. Keep issued sequence values in the owned execution state so

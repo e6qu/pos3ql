@@ -218,8 +218,14 @@ parameter declarations, including a domain's own identity rather than its base
 representation. Dynamic SQL takes parameters only from `USING`: for example,
 `OPEN c FOR EXECUTE 'SELECT $1' USING d` captures a null date as a date, even
 inside a function whose first argument is an integer. Local names do not become
-columns inside the command string. These bindings do not yet defer cursor
-execution to FETCH.
+columns inside the command string. Simple non-holdable `NO SCROLL` cursors over
+one local physical table defer row reads and pure projections to `FETCH`.
+Filters, joins, expressions with operations or calls, ordering, grouping,
+row-level security, inheritance expansion and other cursor modes still use the
+eager executor. The retained reader's selected row identities, saved-file
+positions and pending row share `cursor_query_bytes`; exhaustion returns
+`54000`. Each query workspace also reserves fixed row and saved-file read
+buffers at startup, accounted separately from `work_arena_bytes`.
 JSON/path and XML/XPath limits are specified in [SQL/JSON](sql-json.md) and
 [SQL/XML](sql-xml.md). Inspect the memory plan for the chosen configuration;
 accepted width can still exhaust its named statement or startup budget.

@@ -24742,13 +24742,17 @@ fn execute_trigger_block<'a>(
                 };
                 let arena = context.arena;
                 let (count, rows) = {
-                    let PlpgsqlExecHost::Routine { cursors, .. } = &mut context.host else {
+                    let PlpgsqlExecHost::Routine {
+                        engine, cursors, ..
+                    } = &mut context.host
+                    else {
                         return Err(sql_err!(
                             sqlstate::FEATURE_NOT_SUPPORTED,
                             "SQL cursors are not available in trigger execution"
                         ));
                     };
-                    let count = cursors.fetch(name, statement.motion)?;
+                    let count =
+                        engine.fetch_cursor(name, statement.motion, context.txn.txid, cursors)?;
                     let rows = arena
                         .alloc_slice_copy(cursors.emitted())
                         .map_err(|_| super::query::arena_full_pub())?;
@@ -25255,14 +25259,16 @@ fn execute_trigger_block<'a>(
                         } => {
                             let arena = context.arena;
                             let rows = {
-                                let PlpgsqlExecHost::Routine { cursors, .. } = &mut context.host
+                                let PlpgsqlExecHost::Routine {
+                                    engine, cursors, ..
+                                } = &mut context.host
                                 else {
                                     return Err(sql_err!(
                                         sqlstate::FEATURE_NOT_SUPPORTED,
                                         "SQL cursors are not available in trigger execution"
                                     ));
                                 };
-                                cursors.fetch(name, *motion)?;
+                                engine.fetch_cursor(name, *motion, context.txn.txid, cursors)?;
                                 arena
                                     .alloc_slice_copy(cursors.emitted())
                                     .map_err(|_| super::query::arena_full_pub())?

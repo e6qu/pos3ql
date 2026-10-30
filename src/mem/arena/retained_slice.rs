@@ -72,6 +72,7 @@ impl<T> AsMut<[T]> for ArenaSliceMut<'_, T> {
 
 impl Arena {
     /// Upper bound including alignment when the preceding tail is unaligned.
+    #[cfg(test)]
     pub(crate) fn retained_slice_capacity<T>(len: usize) -> Option<usize> {
         let (layout, _) = slice_layout::<T>(len).ok()?;
         layout.size().checked_add(layout.align() - 1)

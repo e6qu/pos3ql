@@ -171,8 +171,14 @@ Dynamic command strings use only the explicit `USING` arguments; a local variabl
 name does not become a SQL column inside the string. Exact rules and reservations
 are in [compatibility](postgresql-18-compatibility.md#capacity-boundaries).
 
-Cursor queries still execute during declaration; deferring expressions and
-row locks until fetch remains part of the [plan](../PLAN.md).
+A simple `NO SCROLL` cursor over one physical table retains its selected rows
+without reading their contents at declaration. For example, `DECLARE c NO SCROLL
+CURSOR FOR SELECT id, label FROM orders` followed by `FETCH 2 FROM c` reads and
+saves two rows; `FETCH 0` before the first row reads none. Closing it releases
+the unread source. This path currently accepts columns, wildcards, constants
+and captured parameters, without filters, ordering or row-level security.
+Other cursor queries still execute during declaration; deferring their
+expressions and row locks remains part of the [plan](../PLAN.md).
 
 UPDATE, DELETE, MERGE, conflict handling and schema validation preserve the
 original selected row values in fixed statement memory. They recheck the table

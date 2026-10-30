@@ -67,6 +67,7 @@ fn cursor_capacity() -> SqlError {
 }
 
 impl RowCursor {
+    #[cfg(test)]
     pub(crate) fn position_bytes(rows: usize, members: usize) -> Option<usize> {
         Arena::retained_slice_capacity::<CapturedRowRecord>(rows)?
             .checked_add(Arena::retained_slice_capacity::<MemberCursor>(members)?)
@@ -125,6 +126,7 @@ impl RowCursor {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn rewind(&mut self, arena: &Arena) -> Result<(), SqlError> {
         let source = self.source.as_mut().ok_or_else(|| {
             sql_err!(
@@ -235,6 +237,93 @@ mod tests {
     use crate::sql::types::{ColType, Datum};
     use crate::storage::RowState;
     use crate::storage::tests::{make_def, test_budget, test_config};
+
+    #[test]
+    fn cursor_owned_query_retains_a_physical_plan_after_owner_and_storage_moves() {
+        use crate::mem::FixedBuf;
+        use crate::pg::respond::Responder;
+        use crate::sql::cursor::CursorQuery;
+
+        let config = test_config();
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
+        let visibility = storage.nested_statement_snapshot(7);
+        let table = storage
+            .create_table(make_def("retained_plan", &[("n", ColType::Int4, true)]))
+            .unwrap();
+        for rowid in 1..=2 {
+            let location = storage
+                .heap
+                .append_row(&[Datum::Int4(rowid as i32)])
+                .unwrap();
+            storage.tables[table]
+                .rows
+                .insert(rowid, RowState::committed_only_at(location, 7))
+                .unwrap();
+        }
+        let mut read_budget = Budget::new(RowCursorBuffers::allocation_bytes(&config) + (1 << 18));
+        let mut query = CursorQuery::new(&mut read_budget, 1 << 16).unwrap();
+        let work = Arena::new(&mut read_budget, "retained projection work", 1 << 16).unwrap();
+        let mut buffers = RowCursorBuffers::new(&config, &mut read_budget).unwrap();
+        let mut description =
+            FixedBuf::new(&mut read_budget, "retained description", 1024).unwrap();
+        let mut rows = FixedBuf::new(&mut read_budget, "retained rows", 1024).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            query.bind("SELECT n FROM retained_plan", &[], &[]).unwrap();
+            assert!(
+                query
+                    .prepare_source(
+                        &storage,
+                        0,
+                        &mut Responder::for_cursor(&mut description, &mut rows)
+                    )
+                    .unwrap()
+            );
+        });
+        assert!(rows.readable().is_empty());
+        let mut query = Box::new(query);
+        let mut storage = Box::new(storage);
+        // A retained plan must not borrow the Storage object or its movable heap.
+        storage
+            .create_table(make_def("another_relation", &[("n", ColType::Int4, true)]))
+            .unwrap();
+        for expected in 1..=2 {
+            rows.clear();
+            crate::mem::guard::forbid_alloc(|| {
+                assert!(
+                    query
+                        .advance_source(
+                            &storage,
+                            0,
+                            &work,
+                            &mut buffers,
+                            &mut Responder::for_cursor(&mut description, &mut rows)
+                        )
+                        .unwrap()
+                )
+            });
+            let bytes = rows.readable();
+            let length = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
+            assert_eq!(bytes.len(), length + 4);
+            let mut decoded = [Datum::Null];
+            crate::sql::exec::decode_projected_row_into(&bytes[4..], &work, &mut decoded).unwrap();
+            assert_eq!(decoded, [Datum::Int4(expected)]);
+        }
+        assert!(
+            !query
+                .advance_source(
+                    &storage,
+                    0,
+                    &work,
+                    &mut buffers,
+                    &mut Responder::for_cursor(&mut description, &mut rows)
+                )
+                .unwrap()
+        );
+        crate::mem::guard::forbid_alloc(|| query.clear());
+        assert!(storage.heap.test_exclusive_write().is_ok());
+        drop(visibility);
+    }
 
     #[test]
     fn query_row_cursor_retains_unread_heap_rows_without_borrowing_storage() {

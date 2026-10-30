@@ -166,7 +166,9 @@ fn seal_description(description: &mut FixedBuf) -> Result<usize, SqlError> {
 fn seal_rows(rows: &FixedBuf, columns: usize, spans: &mut Vec<(u32, u32)>) -> Result<(), SqlError> {
     let malformed = || sql_err!(sqlstate::INTERNAL_ERROR, "cursor captured a torn typed row");
     let bytes = rows.readable();
-    let mut at = 0usize;
+    let mut at = spans
+        .last()
+        .map_or(0, |&(offset, length)| offset as usize + length as usize);
     while at < bytes.len() {
         let header = bytes.get(at..at.saturating_add(4)).ok_or_else(malformed)?;
         let length = u32::from_le_bytes(header.try_into().unwrap()) as usize;
@@ -380,9 +382,9 @@ impl CursorPool {
     pub(crate) fn execution_parts(
         &mut self,
         at: usize,
-    ) -> (&CursorQuery, &mut FixedBuf, &mut FixedBuf) {
+    ) -> (&mut CursorQuery, &mut FixedBuf, &mut FixedBuf) {
         let slot = &mut self.slots[at];
-        (&slot.query, &mut slot.description, &mut slot.rows)
+        (&mut slot.query, &mut slot.description, &mut slot.rows)
     }
 
     /// Validates the description and indexes complete typed rows.
@@ -392,6 +394,49 @@ impl CursorPool {
         seal_rows(&slot.rows, columns, &mut slot.spans)?;
         slot.active = true;
         Ok(())
+    }
+
+    pub(crate) fn read_request(
+        &self,
+        name: &str,
+        motion: FetchMotion,
+    ) -> Result<Option<(usize, usize)>, SqlError> {
+        let Some(at) = self.find(name) else {
+            return Ok(None);
+        };
+        let slot = &self.slots[at];
+        if slot.query.retained.is_none() {
+            return Ok(None);
+        }
+        let backward = matches!(motion, FetchMotion::Count(k) | FetchMotion::Relative(k) if k < 0)
+            || matches!(motion, FetchMotion::BackwardAll)
+            || matches!(motion, FetchMotion::Absolute(k) if i64::from(k) < slot.position || k < 0);
+        if backward {
+            return Err(sql_err!(
+                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                "cursor can only scan forward"
+            ));
+        }
+        let needed = match motion {
+            FetchMotion::All => usize::MAX,
+            FetchMotion::Count(k) | FetchMotion::Relative(k) => {
+                slot.position.saturating_add(i64::from(k)) as usize
+            }
+            FetchMotion::Absolute(k) => k as usize,
+            FetchMotion::BackwardAll => unreachable!("backward motion was rejected"),
+        };
+        Ok(Some((at, needed)))
+    }
+
+    pub(crate) fn cached_rows(&self, at: usize) -> usize {
+        self.slots[at].spans.len()
+    }
+
+    pub(crate) fn index_new_rows(&mut self, at: usize) -> Result<(), SqlError> {
+        let slot = &mut self.slots[at];
+        let mut types = [0; crate::pg::respond::MAX_RESULT_COLS];
+        let columns = description_type_oids(slot.description.readable(), &mut types)?;
+        seal_rows(&slot.rows, columns, &mut slot.spans)
     }
 
     /// Drops a half-built slot after a failed DECLARE.

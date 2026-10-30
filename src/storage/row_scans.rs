@@ -8,7 +8,6 @@ use crate::sql::eval::{SqlError, sqlstate};
 use crate::sql_err;
 use core::ops::ControlFlow;
 
-#[cfg(test)]
 pub(super) mod cursor;
 
 pub(crate) struct CapturedRowScan<'arena> {

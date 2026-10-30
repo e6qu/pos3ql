@@ -20,6 +20,7 @@ pub(crate) struct CursorQuery {
     // Every reference in BoundQuery points into arena's allocation. Drop the
     // bound value before resetting or freeing that allocation.
     bound: Option<BoundQuery<'static>>,
+    pub(crate) retained: Option<crate::sql::query::RetainedSelect<'static>>,
     pub(crate) sequence_replay: crate::sql::sequence::SequenceReplayState,
     arena: Arena,
 }
@@ -57,12 +58,14 @@ impl CursorQuery {
     pub(crate) fn new(budget: &mut Budget, bytes: usize) -> Result<Self, BudgetError> {
         Ok(Self {
             bound: None,
+            retained: None,
             sequence_replay: crate::sql::sequence::SequenceReplayState::empty(),
             arena: Arena::new(budget, "cursor_query_bytes", bytes)?,
         })
     }
 
     pub(crate) fn clear(&mut self) {
+        self.retained = None;
         self.bound = None;
         self.sequence_replay = crate::sql::sequence::SequenceReplayState::empty();
         self.arena.reset();
@@ -170,6 +173,66 @@ impl CursorQuery {
         self.bound =
             Some(unsafe { core::mem::transmute::<BoundQuery<'_>, BoundQuery<'static>>(bound) });
         Ok(())
+    }
+
+    pub(crate) fn prepare_source(
+        &mut self,
+        storage: &crate::storage::Storage,
+        txid: u32,
+        responder: &mut crate::pg::respond::Responder<'_>,
+    ) -> Result<bool, SqlError> {
+        let bound = self.bound.as_ref().expect("bound cursor query");
+        let CursorStatement::Select(statement) = bound.statement else {
+            return Ok(false);
+        };
+        let mark = self.arena.mark();
+        let source = crate::sql::exec::with_bound_parameter_types(bound.parameter_types, || {
+            crate::sql::query::RetainedSelect::open(
+                storage,
+                txid,
+                statement,
+                bound.params,
+                &self.arena,
+                responder,
+            )
+        })?;
+        match source {
+            Some(source) => {
+                // Scope names and arrays borrow this allocation; definitions,
+                // heap bytes and saved files have owned readers. No Storage or
+                // Arena object reference remains in the retained source.
+                self.retained = Some(unsafe {
+                    core::mem::transmute::<
+                        crate::sql::query::RetainedSelect<'_>,
+                        crate::sql::query::RetainedSelect<'static>,
+                    >(source)
+                });
+                Ok(true)
+            }
+            None => {
+                // No source or borrowed description escaped the rejected plan.
+                unsafe { self.arena.rewind_to(mark) };
+                Ok(false)
+            }
+        }
+    }
+
+    pub(crate) fn advance_source(
+        &mut self,
+        storage: &crate::storage::Storage,
+        txid: u32,
+        work: &Arena,
+        buffers: &mut crate::storage::RowCursorBuffers,
+        responder: &mut crate::pg::respond::Responder<'_>,
+    ) -> Result<bool, SqlError> {
+        let bound = self.bound.as_ref().expect("bound cursor query");
+        let source = self.retained.as_mut().expect("retained cursor input");
+        // advance retains only bytes in this arena's allocation. It never
+        // stores this temporary reference to the movable Arena object itself.
+        let arena: &'static Arena = unsafe { &*(&self.arena as *const Arena) };
+        crate::sql::exec::with_bound_parameter_types(bound.parameter_types, || {
+            source.advance(storage, txid, bound.params, arena, work, buffers, responder)
+        })
     }
 
     pub(crate) fn with_query<R>(

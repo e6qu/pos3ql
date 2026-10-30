@@ -28,6 +28,9 @@ use super::eval::{
 use super::exec::{MAX_PROJ, describe_items};
 use super::types::{ColDesc, ColType, Datum};
 
+mod retained;
+pub(crate) use retained::RetainedSelect;
+
 mod setops;
 use setops::materialize_set_body;
 pub use setops::set_query;

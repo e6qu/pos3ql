@@ -292,6 +292,7 @@ struct QueryWorkspaces {
 
 struct QueryWorkspace {
     arena: Arena,
+    row_cursor_buffers: crate::storage::RowCursorBuffers,
     connection_id: i32,
     database_oid: crate::storage::DatabaseOid,
 }
@@ -367,6 +368,7 @@ impl QueryWorkspaces {
             slots
                 .push(QueryWorkspace {
                     arena: Arena::new(budget, "query_workspace_arena", config.work_arena_bytes)?,
+                    row_cursor_buffers: crate::storage::RowCursorBuffers::new(config, budget)?,
                     connection_id: 0,
                     database_oid: crate::storage::DatabaseOid::POSTGRES,
                 })
@@ -403,6 +405,10 @@ impl QueryWorkspaces {
 
     fn database_oid(&self) -> crate::storage::DatabaseOid {
         self.slots[execution_query_workspace().index()].database_oid
+    }
+    fn cursor_parts(&mut self) -> (&Arena, &mut crate::storage::RowCursorBuffers) {
+        let workspace = &mut self.slots[execution_query_workspace().index()];
+        (&workspace.arena, &mut workspace.row_cursor_buffers)
     }
 }
 
@@ -3596,6 +3602,7 @@ impl Engine {
             + config.query_workspace_slots.saturating_mul(
                 config
                     .work_arena_bytes
+                    .saturating_add(crate::storage::RowCursorBuffers::allocation_bytes(config))
                     .saturating_add(size_of::<QueryWorkspace>()),
             )
             + config.wal_buffer_bytes
@@ -19421,6 +19428,27 @@ impl Engine {
             cursors.abandon(at);
             return Err(error);
         }
+        if scroll == cursor::CursorScroll::NoScroll && !hold {
+            let prepared = {
+                let (query, description, rows) = cursors.execution_parts(at);
+                let mut capture = Responder::for_cursor(description, rows);
+                query.prepare_source(&self.storage, txn.txid, &mut capture)
+            };
+            match prepared {
+                Ok(true) => {
+                    if let Err(error) = cursors.seal(at) {
+                        cursors.abandon(at);
+                        return Err(error);
+                    }
+                    return Ok(());
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    cursors.abandon(at);
+                    return Err(error);
+                }
+            }
+        }
         let out = {
             let (query, description, rows) = cursors.execution_parts(at);
             let mut capture = Responder::for_cursor(description, rows);
@@ -19502,6 +19530,35 @@ impl Engine {
         Ok(())
     }
 
+    pub(crate) fn fetch_cursor(
+        &mut self,
+        name: &str,
+        motion: cursor::FetchMotion,
+        txid: u32,
+        cursors: &mut cursor::CursorPool,
+    ) -> Result<usize, SqlError> {
+        if let Some((at, needed)) = cursors.read_request(name, motion)? {
+            let storage = &self.storage;
+            let (work, buffers) = self.work.cursor_parts();
+            while cursors.cached_rows(at) < needed {
+                let mark = work.mark();
+                let advanced = {
+                    let (query, description, rows) = cursors.execution_parts(at);
+                    let mut capture = Responder::for_cursor(description, rows);
+                    query.advance_source(storage, txid, work, buffers, &mut capture)
+                };
+                // Projection values have either been copied into typed rows or
+                // discarded; pending input belongs to the cursor's own arena.
+                unsafe { work.rewind_to(mark) };
+                if !advanced? {
+                    break;
+                }
+                cursors.index_new_rows(at)?;
+            }
+        }
+        cursors.fetch(name, motion)
+    }
+
     pub(crate) fn execute_cursor_statement(
         &mut self,
         statement: &Stmt,
@@ -19553,7 +19610,7 @@ impl Engine {
                 motion,
                 move_only,
             } => {
-                let count = match cursors.fetch(name, *motion) {
+                let count = match self.fetch_cursor(name, *motion, txn.txid, cursors) {
                     Ok(count) => count,
                     Err(error) => return Ok(Err(error)),
                 };

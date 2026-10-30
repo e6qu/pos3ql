@@ -75,7 +75,7 @@ jobs:
       - name: Check declared null parameters over PostgreSQL wire protocol
         env:
           POS3QL_PORT: "5432"
-          POS3QL_WIRE_PROBE: test_cursor_preserves_declared_null_parameter_after_first_hundred
+          POS3QL_WIRE_PROBE: test_cursor_preserves_declared_null_parameter_after_first_hundred,test_nested_function_parameters_keep_their_declaration_over_wire_types
         run: python3 tests/external/wire_probe.py
       - uses: actions/upload-artifact@v5
         if: always()

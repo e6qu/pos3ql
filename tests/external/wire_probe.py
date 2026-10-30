@@ -1263,6 +1263,49 @@ def test_cursor_preserves_declared_null_parameter_after_first_hundred():
     s.close()
 
 
+def test_nested_function_parameters_keep_their_declaration_over_wire_types():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    setup = simple_query(
+        s,
+        "CREATE FUNCTION wire_parameter_scope(integer) RETURNS text LANGUAGE SQL "
+        "AS 'SELECT pg_typeof($1)::text'; "
+        "CREATE FUNCTION wire_positional_cursor(date) RETURNS refcursor LANGUAGE plpgsql AS $$ "
+        "DECLARE c refcursor := 'wire_positional'; BEGIN "
+        "OPEN c FOR SELECT pg_typeof($1)::text AS kind, $1 AS value; RETURN c; END $$",
+    )
+    check("nested parameter type fixture succeeds", not any(kind == b"E" for kind, _ in setup), setup)
+    for query, input_oid, expected in [
+        ("SELECT wire_parameter_scope($1::integer)", 20, "integer"),
+        ("SELECT wire_positional_cursor($1::date)", 25, "wire_positional"),
+    ]:
+        simple_query(s, "BEGIN")
+        parse = frontend_message(b"P", b"\x00" + query.encode() + b"\x00" + struct.pack("!hi", 1, input_oid))
+        bind = frontend_message(b"B", b"\x00\x00" + struct.pack("!hhih", 0, 1, -1, 0))
+        s.sendall(parse + bind + frontend_message(b"E", b"\x00" + struct.pack("!i", 0)) + frontend_message(b"S"))
+        output = []
+        while True:
+            item = read_message(s)
+            output.append(item)
+            if item[0] == b"Z":
+                break
+        check("callee parameter declaration overrides caller Bind type", first_text_row(output) == expected, output)
+        if expected == "wire_positional":
+            output = simple_query(s, "FETCH NEXT FROM wire_positional")
+            description = next((payload for kind, payload in output if kind == b"T"), None)
+            row = next((payload for kind, payload in output if kind == b"D"), None)
+            check(
+                "cursor captures the function's positional null date",
+                description is not None and row_description_type_oids(description) == [25, 1082]
+                and row == struct.pack("!hi", 2, 4) + b"date" + struct.pack("!i", -1),
+                output,
+            )
+        simple_query(s, "ROLLBACK")
+    simple_query(s, "DROP FUNCTION wire_parameter_scope(integer); DROP FUNCTION wire_positional_cursor(date)")
+    s.close()
+
+
 def test_routine_contract_infers_untyped_parse_parameter():
     s = connect()
     s.sendall(startup_payload(0))

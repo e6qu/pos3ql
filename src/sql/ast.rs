@@ -5552,8 +5552,9 @@ pub enum Expr<'a> {
         qualifier: Option<&'a str>,
         name: &'a str,
     },
-    /// A named SQL-routine argument. Column lookup has precedence; `index`
-    /// supplies the positional value only when this spelling binds no column.
+    /// A bound routine name. SQL routine arguments yield to table columns;
+    /// procedural cursor locals reject a column-name collision. `source`
+    /// also selects the declaration that supplies the parameter's type.
     RoutineParam {
         qualifier: Option<&'a str>,
         name: &'a str,

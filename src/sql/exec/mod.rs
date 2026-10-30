@@ -19896,6 +19896,7 @@ pub(crate) fn execute_plpgsql_procedure<'a>(
     responder: &mut Responder<'_>,
     outputs: &mut [Datum<'a>; crate::storage::MAX_ROUTINE_ARGUMENTS],
 ) -> Result<usize, SqlError> {
+    let _formal_scope = enter_routine_parameter_types(routine.arguments());
     let source = arena
         .alloc_str(routine.body.as_str())
         .map_err(|_| super::query::arena_full_pub())?;
@@ -20705,14 +20706,24 @@ impl<'a> TriggerLocalScope<'_, 'a> {
                         .expect("counted context name");
                     super::cursor::CursorLocal {
                         name: SqlName::parse(name).expect("static context name"),
-                        type_oid: self.col_type(None, name).expect("declared context type").oid(),
+                        type_oid: self
+                            .col_type(None, name)
+                            .expect("declared context type")
+                            .oid(),
                         value: Datum::Null,
                     }
                 }
             })
             .map_err(|_| super::query::arena_full_pub())?;
         for (local, declaration) in captured.iter_mut().zip(self.locals) {
-            local.type_oid = storage.routine_type_oid(declaration.ctype, declaration.user_type, txid).ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "captured local type no longer exists"))?;
+            local.type_oid = storage
+                .routine_type_oid(declaration.ctype, declaration.user_type, txid)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "captured local type no longer exists"
+                    )
+                })?;
         }
         for local in &mut captured[self.locals.len()..] {
             local.value = self.lookup(None, local.name.as_str())?;

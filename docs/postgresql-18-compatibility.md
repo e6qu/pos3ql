@@ -209,6 +209,12 @@ Each saved row includes a four-byte length and a two-byte column count.
 Long column names can fill the description even when the rows fit. That error
 names the description limit: use fewer or shorter labels. Increasing
 `cursor_bytes` only changes the row capacity.
+Static procedural cursor variables use the shared SELECT and set-query executor.
+For example, `OPEN c FOR SELECT label UNION ALL SELECT label` captures `label`
+when opened, including its type when the value is null. A variable name that
+also names a source column raises `42702`; qualify the table column or rename
+the variable. A caller's wire parameter types do not replace a function's own
+parameter declarations. These bindings do not yet defer cursor execution to FETCH.
 JSON/path and XML/XPath limits are specified in [SQL/JSON](sql-json.md) and
 [SQL/XML](sql-xml.md). Inspect the memory plan for the chosen configuration;
 accepted width can still exhaust its named statement or startup budget.

@@ -80,29 +80,66 @@ impl CursorQuery {
             _ => 0,
         };
         let count = locals.iter().try_fold(params.len(), |count, local| {
-            count.checked_add(1 + field_count(local.value)).ok_or_else(full)
+            count
+                .checked_add(1 + field_count(local.value))
+                .ok_or_else(full)
         })?;
         if count > u16::MAX as usize {
-            return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "cursor captured parameters exceed 65535 values"));
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "cursor captured parameters exceed 65535 values"
+            ));
         }
-        let parameters = self.arena.alloc_slice_with(count, |index| values.get(index).copied().unwrap_or(Datum::Null)).map_err(|_| full())?;
-        let parameter_types = self.arena.alloc_slice_with(count, |index| {
-            if index < params.len() { crate::sql::exec::bound_parameter_type_oid((index + 1) as u32).unwrap_or(0) } else { 0 }
-        }).map_err(|_| full())?;
-        let bindings = self.arena.alloc_slice_with(count - params.len(), |_| crate::sql::parser::NamedParameter { qualifier: None, name: "", index: 0 }).map_err(|_| full())?;
+        let parameters = self
+            .arena
+            .alloc_slice_with(count, |index| {
+                values.get(index).copied().unwrap_or(Datum::Null)
+            })
+            .map_err(|_| full())?;
+        let parameter_types = self
+            .arena
+            .alloc_slice_with(count, |index| {
+                if index < params.len() {
+                    crate::sql::exec::bound_parameter_type_oid((index + 1) as u32).unwrap_or(0)
+                } else {
+                    0
+                }
+            })
+            .map_err(|_| full())?;
+        let bindings = self
+            .arena
+            .alloc_slice_with(count - params.len(), |_| {
+                crate::sql::parser::NamedParameter {
+                    qualifier: None,
+                    name: "",
+                    index: 0,
+                }
+            })
+            .map_err(|_| full())?;
         let mut at = params.len();
         for local in locals {
-            let name = self.arena.alloc_str(local.name.as_str()).map_err(|_| full())?;
+            let name = self
+                .arena
+                .alloc_str(local.name.as_str())
+                .map_err(|_| full())?;
             let copied = copy_values(&self.arena, &[local.value])?[0];
             parameters[at] = copied;
             parameter_types[at] = local.type_oid;
-            bindings[at - params.len()] = crate::sql::parser::NamedParameter { qualifier: None, name, index: at as u32 + 1 };
+            bindings[at - params.len()] = crate::sql::parser::NamedParameter {
+                qualifier: None,
+                name,
+                index: at as u32 + 1,
+            };
             at += 1;
             if let Datum::Record(fields) | Datum::Composite { fields, .. } = copied {
                 for field in fields {
                     parameters[at] = field.value;
                     parameter_types[at] = field.type_oid;
-                    bindings[at - params.len()] = crate::sql::parser::NamedParameter { qualifier: Some(name), name: field.name, index: at as u32 + 1 };
+                    bindings[at - params.len()] = crate::sql::parser::NamedParameter {
+                        qualifier: Some(name),
+                        name: field.name,
+                        index: at as u32 + 1,
+                    };
                     at += 1;
                 }
             }
@@ -134,11 +171,7 @@ impl CursorQuery {
 
     pub(crate) fn with_query<R>(
         &self,
-        use_query: impl for<'a> FnOnce(
-            CursorStatement<'a>,
-            &'a [Datum<'a>],
-            &'a Arena,
-        ) -> R,
+        use_query: impl for<'a> FnOnce(CursorStatement<'a>, &'a [Datum<'a>], &'a Arena) -> R,
     ) -> Result<R, SqlError> {
         let bound = self.bound.as_ref().ok_or_else(|| {
             sql_err!(
@@ -284,12 +317,26 @@ mod tests {
         text.clear();
         crate::mem::guard::forbid_alloc(|| {
             query.with_query(|statement, params, arena| {
-                let CursorStatement::Select(select) = statement else { panic!("SELECT") };
-                let crate::sql::ast::SelectItem::Expr { expression, .. } = select.items[0] else { panic!("expression") };
-                let value = crate::sql::eval::eval_full(expression, arena, params, &crate::sql::eval::NoColumns, &crate::sql::eval::NO_HOOKS).unwrap();
+                let CursorStatement::Select(select) = statement else {
+                    panic!("SELECT")
+                };
+                let crate::sql::ast::SelectItem::Expr { expression, .. } = select.items[0] else {
+                    panic!("expression")
+                };
+                let value = crate::sql::eval::eval_full(
+                    expression,
+                    arena,
+                    params,
+                    &crate::sql::eval::NoColumns,
+                    &crate::sql::eval::NO_HOOKS,
+                )
+                .unwrap();
                 assert_eq!(value, Datum::Text("opening value"));
                 assert_eq!(params[2], Datum::Null);
-                assert_eq!(crate::sql::exec::bound_parameter_type_oid(3), Some(oid::DATE));
+                assert_eq!(
+                    crate::sql::exec::bound_parameter_type_oid(3),
+                    Some(oid::DATE)
+                );
                 assert_eq!(params[3], Datum::Bool(true));
             })
         })
@@ -332,13 +379,63 @@ mod tests {
                 assert_eq!(fields.len(), 256);
                 assert_eq!(fields[255].name, "field255");
                 assert_eq!(fields[255].value, Datum::Text("opening value"));
-                assert_eq!(
-                    params[257],
-                    Datum::Text("opening value")
-                );
+                assert_eq!(params[257], Datum::Text("opening value"));
             })
         })
         .unwrap();
+    }
+
+    #[test]
+    fn cursor_owned_query_keeps_captured_types_separate_from_sql_routine_formals() {
+        use crate::sql::ast::SelectItem;
+        use crate::sql::types::{ColType, oid};
+
+        let mut budget = Budget::new(32 << 10);
+        let mut query = CursorQuery::new(&mut budget, 16 << 10).unwrap();
+        let arena = Arena::new(&mut budget, "routine parameter parsing", 4096).unwrap();
+        let formal = [crate::storage::RoutineArgumentDef {
+            name: SqlName::parse("p").unwrap(), ctype: ColType::Int4, user_type: None,
+        }];
+        crate::mem::guard::forbid_alloc(|| {
+            let _formal_scope = crate::sql::exec::enter_routine_parameter_types(&formal);
+            assert_eq!(crate::sql::exec::bound_parameter_type_oid(1), Some(oid::INT4));
+            crate::sql::exec::with_bound_parameter_types(&[oid::DATE], || {
+                let mut parser = crate::sql::parser::Parser::new("SELECT p", &arena).unwrap()
+                    .with_routine_parameters("f", &formal).unwrap();
+                let Stmt::Select(select) = parser.next_stmt().unwrap().unwrap() else { panic!("SELECT") };
+                let SelectItem::Expr { expression, .. } = select.items[0] else { panic!("expression") };
+                assert_eq!(crate::sql::exec::infer_type_pub(expression, None).unwrap().0, oid::INT4);
+            });
+            query.bind("SELECT p", &[], &[CursorLocal {
+                name: SqlName::parse("p").unwrap(), type_oid: oid::DATE, value: Datum::Null,
+            }]).unwrap();
+            query.with_query(|statement, _, _| {
+                let CursorStatement::Select(select) = statement else { panic!("SELECT") };
+                let SelectItem::Expr { expression, .. } = select.items[0] else { panic!("expression") };
+                assert_eq!(crate::sql::exec::infer_type_pub(expression, None).unwrap().0, oid::DATE);
+            }).unwrap();
+        });
+    }
+
+    #[test]
+    fn cursor_owned_query_nested_parameter_scopes_restore_the_innermost_declaration() {
+        use crate::sql::exec::{bound_parameter_type_oid, enter_routine_parameter_types, with_bound_parameter_types};
+        use crate::sql::types::{ColType, oid};
+        let formal = [crate::storage::RoutineArgumentDef { name: SqlName::parse("p").unwrap(), ctype: ColType::Int4, user_type: None }];
+        with_bound_parameter_types(&[oid::DATE], || {
+            {
+                let _formal_scope = enter_routine_parameter_types(&formal);
+                assert_eq!(bound_parameter_type_oid(1), Some(oid::INT4));
+                with_bound_parameter_types(&[oid::TEXT], || assert_eq!(bound_parameter_type_oid(1), Some(oid::TEXT)));
+                assert_eq!(bound_parameter_type_oid(1), Some(oid::INT4));
+            }
+            assert_eq!(bound_parameter_type_oid(1), Some(oid::DATE));
+        });
+        let source = vec![oid::DATE];
+        let escaped = with_bound_parameter_types(&source, || enter_routine_parameter_types(&formal));
+        drop(source);
+        drop(escaped);
+        assert_eq!(bound_parameter_type_oid(1), None);
     }
 
     #[test]

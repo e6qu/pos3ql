@@ -1307,7 +1307,7 @@ fn agg_undefined(name: &str, arg_oid: i32) -> SqlError {
 /// name), or a CASE whose ELSE yields a name. `None` for anything unnamed.
 fn name_of<'a>(expression: &Expr<'a>) -> Option<&'a str> {
     match expression {
-        Expr::Column { name, .. } | Expr::SchemaColumn { name, .. } => Some(name),
+        Expr::Column { name, .. } | Expr::RoutineParam { name, .. } | Expr::SchemaColumn { name, .. } => Some(name),
         // The desugarings of syntax-only constructs must not be labelled with
         // the internal name they carry: `SIMILAR TO` is an operator, so its
         // column is anonymous, while PostgreSQL does label OVERLAPS.
@@ -1376,6 +1376,7 @@ fn name_of<'a>(expression: &Expr<'a>) -> Option<&'a str> {
             operand, type_name, ..
         } => match operand {
             Expr::Column { .. }
+            | Expr::RoutineParam { .. }
             | Expr::SchemaColumn { .. }
             | Expr::Subscript { .. }
             | Expr::Slice { .. }
@@ -1414,6 +1415,7 @@ fn name_of<'a>(expression: &Expr<'a>) -> Option<&'a str> {
 fn cast_source_name<'a>(expression: &Expr<'a>) -> Option<&'a str> {
     match expression {
         Expr::Column { .. }
+        | Expr::RoutineParam { .. }
         | Expr::SchemaColumn { .. }
         | Expr::Subscript { .. }
         | Expr::Slice { .. }
@@ -1677,6 +1679,12 @@ struct RoutineParameterTypes {
     types: [Option<ColType>; MAX_ROUTINE_ARGUMENTS],
 }
 
+#[derive(Clone, Copy)]
+enum ParameterContext {
+    Bound,
+    Routine,
+}
+
 impl RoutineParameterTypes {
     const EMPTY: Self = Self {
         types: [None; MAX_ROUTINE_ARGUMENTS],
@@ -1688,6 +1696,7 @@ std::thread_local! {
         const { Cell::new(RoutineParameterTypes::EMPTY) };
     static BOUND_PARAMETER_TYPES: Cell<BoundParameterTypes> =
         const { Cell::new(BoundParameterTypes::EMPTY) };
+    static PARAMETER_CONTEXT: Cell<ParameterContext> = const { Cell::new(ParameterContext::Bound) };
 }
 
 #[derive(Clone, Copy)]
@@ -1703,11 +1712,12 @@ impl BoundParameterTypes {
     };
 }
 
-struct BoundParameterScope(BoundParameterTypes);
+struct BoundParameterScope(BoundParameterTypes, ParameterContext);
 
 impl Drop for BoundParameterScope {
     fn drop(&mut self) {
         BOUND_PARAMETER_TYPES.with(|slot| slot.set(self.0));
+        PARAMETER_CONTEXT.with(|slot| slot.set(self.1));
     }
 }
 
@@ -1718,11 +1728,17 @@ pub(crate) fn with_bound_parameter_types<R>(oids: &[i32], run: impl FnOnce() -> 
         oids: oids.as_ptr(),
         len: oids.len(),
     };
-    let _scope = BoundParameterScope(BOUND_PARAMETER_TYPES.with(|slot| slot.replace(current)));
+    let _scope = BoundParameterScope(
+        BOUND_PARAMETER_TYPES.with(|slot| slot.replace(current)),
+        PARAMETER_CONTEXT.with(|slot| slot.replace(ParameterContext::Bound)),
+    );
     run()
 }
 
 pub(crate) fn bound_parameter_type_oid(index: u32) -> Option<i32> {
+    if matches!(PARAMETER_CONTEXT.with(Cell::get), ParameterContext::Routine) {
+        return routine_parameter_type(index).map(ColType::oid);
+    }
     let index = index.checked_sub(1)? as usize;
     BOUND_PARAMETER_TYPES.with(|types| {
         let current = types.get();
@@ -1738,7 +1754,7 @@ pub(crate) fn bound_parameter_type_oid(index: u32) -> Option<i32> {
 
 /// Restores the enclosing routine's declaration when nested SQL routines
 /// return.  A parameter type is execution context, not a process-wide default.
-pub(crate) struct RoutineParameterScope(RoutineParameterTypes);
+pub(crate) struct RoutineParameterScope(RoutineParameterTypes, ParameterContext);
 
 pub(crate) fn enter_routine_parameter_types(
     arguments: &[RoutineArgumentDef],
@@ -1748,12 +1764,13 @@ pub(crate) fn enter_routine_parameter_types(
         current.types[slot] = Some(argument.ctype);
     }
     let prior = ROUTINE_PARAMETER_TYPES.with(|slot| slot.replace(current));
-    RoutineParameterScope(prior)
+    RoutineParameterScope(prior, PARAMETER_CONTEXT.with(|slot| slot.replace(ParameterContext::Routine)))
 }
 
 impl Drop for RoutineParameterScope {
     fn drop(&mut self) {
         ROUTINE_PARAMETER_TYPES.with(|slot| slot.set(self.0));
+        PARAMETER_CONTEXT.with(|slot| slot.set(self.1));
     }
 }
 
@@ -3238,7 +3255,13 @@ pub(crate) fn infer_routine_argument_oid(
     expression: &Expr,
     columns: &dyn ColTypeResolver,
 ) -> Result<i32, SqlError> {
-    if matches!(expression, Expr::RoutineParam { source: crate::sql::ast::ParameterSource::PlpgsqlCursor, .. }) {
+    if matches!(
+        expression,
+        Expr::RoutineParam {
+            source: crate::sql::ast::ParameterSource::PlpgsqlCursor,
+            ..
+        }
+    ) {
         return infer_type_res(expression, columns).map(|result| result.0);
     }
     match expression {
@@ -3370,15 +3393,36 @@ pub fn infer_type_res(
             .map(|oid| (oid, coltype_of_oid(oid).map_or(-1, ColType::typlen)))
             .or_else(|| routine_parameter_type(*index).map(of))
             .unwrap_or((oid::UNKNOWN, -2)),
-        Expr::RoutineParam { qualifier, name, index, source } => match columns.resolve(*qualifier, name) {
-            Ok(_) if *source == crate::sql::ast::ParameterSource::PlpgsqlCursor => return Err(sql_err!(sqlstate::AMBIGUOUS_COLUMN,
-                "column reference \"{}{}{}\" is ambiguous", qualifier.unwrap_or(""), if qualifier.is_some() { "." } else { "" }, name)),
+        Expr::RoutineParam {
+            qualifier,
+            name,
+            index,
+            source,
+        } => match columns.resolve(*qualifier, name) {
+            Ok(_) if *source == crate::sql::ast::ParameterSource::PlpgsqlCursor => {
+                return Err(sql_err!(
+                    sqlstate::AMBIGUOUS_COLUMN,
+                    "column reference \"{}{}{}\" is ambiguous",
+                    qualifier.unwrap_or(""),
+                    if qualifier.is_some() { "." } else { "" },
+                    name
+                ));
+            }
             Ok(column) => of(column),
-            Err(error) if error.sqlstate == sqlstate::UNDEFINED_COLUMN || error.sqlstate == sqlstate::UNDEFINED_TABLE => {
+            Err(error)
+                if error.sqlstate == sqlstate::UNDEFINED_COLUMN
+                    || error.sqlstate == sqlstate::UNDEFINED_TABLE =>
+            {
                 match source {
-                    crate::sql::ast::ParameterSource::SqlRoutine => routine_parameter_type(*index).map(of),
-                    crate::sql::ast::ParameterSource::PlpgsqlCursor => bound_parameter_type_oid(*index).map(|oid| (oid, coltype_of_oid(oid).map_or(-1, ColType::typlen))),
-                }.unwrap_or((oid::UNKNOWN, -2))
+                    crate::sql::ast::ParameterSource::SqlRoutine => {
+                        routine_parameter_type(*index).map(of)
+                    }
+                    crate::sql::ast::ParameterSource::PlpgsqlCursor => {
+                        bound_parameter_type_oid(*index)
+                            .map(|oid| (oid, coltype_of_oid(oid).map_or(-1, ColType::typlen)))
+                    }
+                }
+                .unwrap_or((oid::UNKNOWN, -2))
             }
             Err(error) => return Err(error),
         },

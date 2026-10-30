@@ -19505,7 +19505,17 @@ impl Engine {
                     )));
                 }
                 if let Err(error) = self.materialize_cursor(
-                    name, statement, sql, *scroll, *hold, *binary, params, &[], txn, cursors, guc,
+                    name,
+                    statement,
+                    sql,
+                    *scroll,
+                    *hold,
+                    *binary,
+                    params,
+                    &[],
+                    txn,
+                    cursors,
+                    guc,
                 ) {
                     return Ok(Err(error));
                 }

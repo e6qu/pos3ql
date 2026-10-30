@@ -35,7 +35,10 @@ DECLARE wide_record SCROLL CURSOR FOR SELECT ROW(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 
 FETCH NEXT FROM wide_record;
 COMMIT;
 
+-- https://www.postgresql.org/docs/18/typeconv-union-case.html
 CREATE DOMAIN cursor_day AS date;
+SELECT pg_typeof(day) FROM (SELECT NULL::cursor_day AS day UNION ALL SELECT NULL::cursor_day) AS same_domain LIMIT 1;
+SELECT pg_typeof(day) FROM (SELECT NULL::cursor_day AS day UNION ALL SELECT NULL) AS mixed_domain LIMIT 1;
 CREATE FUNCTION cursor_set_locals(p integer) RETURNS refcursor LANGUAGE plpgsql AS $$
 DECLARE c refcursor := 'set_locals'; label text := 'opening value'; d cursor_day;
 BEGIN
@@ -60,7 +63,7 @@ INSERT INTO cursor_local_source VALUES (1), (2), (3);
 CREATE FUNCTION cursor_table_local() RETURNS refcursor LANGUAGE plpgsql AS $$
 DECLARE c refcursor := 'table_local'; label text := 'opening value'; cutoff integer := 2;
 BEGIN
-  OPEN c FOR SELECT id, label FROM cursor_local_source WHERE id <= cutoff ORDER BY id;
+  OPEN c FOR SELECT id, label, label::text FROM cursor_local_source WHERE id <= cutoff ORDER BY id;
   label := 'changed';
   cutoff := 0;
   RETURN c;

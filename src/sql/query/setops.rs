@@ -288,7 +288,12 @@ fn resolve_set_order(
             Expr::Column {
                 name,
                 qualifier: None,
-            } | Expr::RoutineParam { name, qualifier: None, .. } => columns
+            }
+            | Expr::RoutineParam {
+                name,
+                qualifier: None,
+                ..
+            } => columns
                 .iter()
                 .position(|column| column.name == *name)
                 .ok_or_else(|| {
@@ -1346,8 +1351,10 @@ pub(crate) fn describe_set_body<'a>(
     // `None` = still undetermined (an untyped NULL / UNKNOWN column adopts the
     // type of the other branches, as PostgreSQL resolves an unknown literal).
     let mut target: [Option<ColType>; MAX_PROJ] = [None; MAX_PROJ];
+    let mut identical_types: [Option<i32>; MAX_PROJ] = [None; MAX_PROJ];
     for (c, col) in columns[..n_cols].iter().enumerate() {
         let unknown = leaf_col_unknown(storage, leaf0, c, txid, arena);
+        identical_types[c] = Some(if unknown { crate::sql::types::oid::UNKNOWN } else { col.type_oid });
         if !unknown {
             leaf_collations[c] = SetColumnCollation {
                 value: col.collation,
@@ -1382,7 +1389,12 @@ pub(crate) fn describe_set_body<'a>(
         }
         let leaf_ref = *leaf;
         for c in 0..n_cols {
-            if leaf_col_unknown(storage, leaf_ref, c, txid, arena) {
+            let unknown = leaf_col_unknown(storage, leaf_ref, c, txid, arena);
+            let input_oid = if unknown { crate::sql::types::oid::UNKNOWN } else { lc[c].type_oid };
+            if identical_types[c] != Some(input_oid) {
+                identical_types[c] = None;
+            }
+            if unknown {
                 continue; // an untyped NULL column adopts the running type
             }
             leaf_collations[(leaf_index + 1) * n_cols + c] = SetColumnCollation {
@@ -1429,7 +1441,11 @@ pub(crate) fn describe_set_body<'a>(
         }
     }
     for (c, col) in columns[..n_cols].iter_mut().enumerate() {
-        col.type_oid = target[c].oid();
+        // PostgreSQL preserves a domain only when every input has that exact
+        // type. UNKNOWN or a different type selects their common base type.
+        col.type_oid = identical_types[c]
+            .filter(|oid| *oid != crate::sql::types::oid::UNKNOWN)
+            .unwrap_or_else(|| target[c].oid());
         col.typlen = target[c].typlen();
     }
     let collation_workspace = arena
@@ -1740,7 +1756,12 @@ pub(crate) fn set_rows_tie(
             Expr::Column {
                 name,
                 qualifier: None,
-            } | Expr::RoutineParam { name, qualifier: None, .. } => match columns.iter().position(|c| c.name == *name) {
+            }
+            | Expr::RoutineParam {
+                name,
+                qualifier: None,
+                ..
+            } => match columns.iter().position(|c| c.name == *name) {
                 Some(i) => i,
                 None => return Ok(false),
             },
@@ -1782,7 +1803,12 @@ pub(crate) fn sort_set_rows(
             Expr::Column {
                 name,
                 qualifier: None,
-            } | Expr::RoutineParam { name, qualifier: None, .. } => match columns.iter().position(|c| c.name == *name) {
+            }
+            | Expr::RoutineParam {
+                name,
+                qualifier: None,
+                ..
+            } => match columns.iter().position(|c| c.name == *name) {
                 Some(i) => i,
                 None => {
                     return Err(sql_err!(

@@ -6,7 +6,7 @@ Fix every reproducible defect in the PR that finds it. Record an entry only
 with its reproducer, observed behavior and exact external blocker or reason it
 cannot be repaired. Keep repaired-defect evidence, ownership checks and
 PostgreSQL comparisons in the fixing PR. Cover deferred expression errors and row bounds, scroll-history exhaustion,
-holdable cursor cleanup at commit/implicit rollback, frozen operator choices, savepoint read
+holdable cursor cleanup at commit/implicit rollback and COPY completion, frozen operator choices, savepoint read
 accounting and table-slot reuse, as well as exhausted memory before
 irreversible effects, owner moves, rollback and suspended queries. Preserve
 failed-comparison outputs and diagnostics before removing temporary files.

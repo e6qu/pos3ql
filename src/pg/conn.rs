@@ -2045,6 +2045,7 @@ impl Conn {
                 &self.arena,
                 &mut self.txn,
                 &self.guc,
+                &mut self.cursors,
                 &mut responder,
                 self.id,
             )

@@ -1216,6 +1216,48 @@ def test_bind_rejects_mismatched_result_format_count():
     s.close()
 
 
+def test_cursor_hold_copy_boundary_preserves_snapshot_and_abort_cleanup():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    setup = simple_query(s, "CREATE TABLE wire_hold_copy(id integer); INSERT INTO wire_hold_copy VALUES (1),(2),(3); DECLARE survivor NO SCROLL CURSOR WITH HOLD FOR SELECT id FROM wire_hold_copy LIMIT 1")
+    check("hold COPY: setup succeeds", not any(kind == b"E" for kind, _ in setup), setup)
+    for name, data, state in [("copy_held", b"4\n", None), ("copy_discarded", b"invalid\n", b"22P02")]:
+        sql = f"DECLARE {name} NO SCROLL CURSOR WITH HOLD FOR SELECT id FROM wire_hold_copy; COPY wire_hold_copy FROM STDIN"
+        s.sendall(frontend_message(b"Q", sql.encode() + b"\x00"))
+        result = []
+        while True:
+            item = read_message(s)
+            result.append(item)
+            if item[0] in (b"G", b"Z"):
+                break
+        check("hold COPY: declaration reaches COPY input", result[-1][0] == b"G", result)
+        if result[-1][0] != b"G":
+            break
+        s.sendall(frontend_message(b"d", data) + frontend_message(b"c"))
+        while True:
+            item = read_message(s)
+            result.append(item)
+            if item[0] == b"Z":
+                break
+        errors = [payload for kind, payload in result if kind == b"E"]
+        check("hold COPY: transaction completes with the expected status",
+              result[-1] == (b"Z", b"I")
+              and (not errors if state is None else len(errors) == 1 and b"C" + state + b"\x00" in errors[0]), result)
+        if state is None:
+            fetched = simple_query(s, "FETCH ALL FROM copy_held; CLOSE copy_held")
+            check("hold COPY: the declaration excludes rows inserted by later COPY",
+                  not any(kind == b"E" for kind, _ in fetched)
+                  and [text_row_fields(payload)[0] for kind, payload in fetched if kind == b"D"] == ["1", "2", "3"], fetched)
+        else:
+            absent = simple_query(s, "SELECT count(*) FROM pg_cursors WHERE name='copy_discarded'")
+            check("hold COPY: abort closes the new cursor", first_text_row(absent) == "0", absent)
+    survivor = simple_query(s, "FETCH ALL FROM survivor; CLOSE survivor")
+    check("hold COPY: an earlier held cursor survives another transaction's abort", first_text_row(survivor) == "1", survivor)
+    simple_query(s, "DROP TABLE wire_hold_copy")
+    s.close()
+
+
 def test_cursor_hold_commits_at_message_and_sync_boundaries():
     s = connect()
     s.sendall(startup_payload(0))

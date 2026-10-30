@@ -11285,6 +11285,7 @@ impl Engine {
         arena: &Arena,
         txn: &mut TxnState,
         guc: &GucState,
+        cursors: &mut cursor::CursorPool,
         responder: &mut Responder,
         conn_id: i32,
     ) -> Result<ExtendedExecutionStatus, WireFull> {

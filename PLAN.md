@@ -61,7 +61,7 @@ A waiting schema edit must never attach itself to a new object that reused a nam
   Forward-only cursors reuse memory per fetch; scrolling cursors retain visited
   results. Both keep operator choices from declaration.
   Holdable versions save unread results during commit and release their input
-  owners. Extend retained execution to function calls and effects, joins,
+  owners across simple queries, extended-protocol Sync, COPY and large-object calls. Extend retained execution to function calls and effects, joins,
   ordering and row locks. Make commit-time result saving yield during storage
   waits, then reuse the positions for ordinary results after their first flush.
   Keep read counts through savepoint rollback and release; never transfer a

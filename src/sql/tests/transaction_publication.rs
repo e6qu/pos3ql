@@ -255,6 +255,7 @@ fn transaction_admission_fast_path_yields_before_effects_and_resumes_once() {
                 &reader.arena,
                 &mut reader.transaction,
                 &reader.guc,
+                &mut reader.cursors,
                 &mut responder,
                 reader.connection_id,
             )
@@ -333,6 +334,7 @@ fn transaction_admission_fast_path_expired_wait_has_no_effects_and_can_roll_back
                 &reader.arena,
                 &mut reader.transaction,
                 &reader.guc,
+                &mut reader.cursors,
                 &mut responder,
                 reader.connection_id,
             )
@@ -398,6 +400,7 @@ fn transaction_admission_fast_path_private_object_wait_resumes_once() {
                 &reader.arena,
                 &mut reader.transaction,
                 &reader.guc,
+                &mut reader.cursors,
                 &mut responder,
                 reader.connection_id,
             )

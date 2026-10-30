@@ -30313,7 +30313,21 @@ fn pg_type<'a>(
     let compatible = catalog_rows(arena, n)?;
     for (target, source) in compatible.iter_mut().zip(&out[..n]) {
         let functions = type_io::functions(source, &out[..n], fields)?;
-        let values = arena.alloc_slice_copy(source).map_err(|_| arena_full())?;
+        assert_eq!(
+            def.columns.len(),
+            source.len() + 1,
+            "pg_type delimiter extends each source row"
+        );
+        let values = arena
+            .alloc_slice_with(def.columns.len(), |index| {
+                if index < source.len() {
+                    source[index]
+                } else {
+                    Datum::Null
+                }
+            })
+            .map_err(|_| arena_full())?;
+        values[source.len()] = Datum::Char(type_io::delimiter(source, &out[..n], fields)?);
         for (position, function) in routines.into_iter().zip(functions) {
             values[position] = Datum::RegObject {
                 type_oid: crate::sql::types::oid::REGPROC,

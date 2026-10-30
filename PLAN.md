@@ -46,13 +46,17 @@ Run real SQLAlchemy, Alembic and psycopg2 workflows against both servers.
 Relation names converted through `regclass` must remain resolvable outside the
 search path, including quoted names and indexes. Catalog vectors must preserve
 their element types and zero-based bounds through array functions used by
-schema inspection. Quantified pattern matching must use pattern semantics.
+schema inspection. Type inspection includes the correct element delimiter for
+base types, arrays and domains. Quantified pattern matching uses pattern semantics.
 Measure startup reservations and actual resident memory for empty and populated
 embedded databases; report the per-table contribution separately. Remove
-avoidable per-table row/history reservations through shared startup-owned
+avoidable per-table metadata reservations through shared startup-owned
 capacity, preserving stable reader identities, rollback and named exhaustion.
 Reserve needed row history before the durable commit boundary; a smaller shared
 pool must never fail for capacity after the commit is already durable.
+The explicit shared `row_history_slots` pool owns capacity with each pending row
+chain. Verify competing transactions, later readers, savepoint undo, prepared
+commit/rollback and cold restoration before closing this memory gate.
 Reject per-row history exhaustion before writing the commit too; a multirow
 transaction must leave every row unchanged and keep the server usable on error.
 Include the current execution-stack requirement in embedded measurements and

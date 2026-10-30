@@ -1,6 +1,38 @@
 use super::*;
 
 #[test]
+fn client_catalog_type_delimiters_follow_base_array_and_domain_types() {
+    let config = test_config("client-catalog-delimiters");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE DOMAIN client_box AS box; CREATE DOMAIN client_box_copy AS client_box",
+        true,
+    );
+    let result = session.success(&mut engine,"SELECT typname,typdelim FROM pg_type \
+        WHERE oid IN ('box'::regtype,'box[]'::regtype,'integer'::regtype,'int2vector'::regtype, \
+        'client_box'::regtype,'client_box[]'::regtype,'client_box_copy'::regtype,'client_box_copy[]'::regtype) ORDER BY typname",true);
+    assert_eq!(row_description_type_oids(&result), [19, 18]);
+    assert_eq!(
+        data_rows(&result),
+        [
+            "_box|;",
+            "_client_box|;",
+            "_client_box_copy|;",
+            "box|;",
+            "client_box|;",
+            "client_box_copy|;",
+            "int2vector|,",
+            "int4|,"
+        ]
+    );
+    assert!(data_rows(&session.success(&mut engine,
+        "SELECT typname,oid,typarray,typdelim FROM pg_type WHERE oid=to_regtype('absent_client_extension')",true)).is_empty());
+}
+
+#[test]
 fn client_catalog_vectors_keep_elements_types_and_zero_based_subscripts() {
     let config = test_config("client-catalog-vectors");
     let mut budget = test_engine_budget(&config, 1 << 29);

@@ -157,10 +157,12 @@ pub(crate) use row_reads::{RowRead, RowSelfChange};
 use row_reads::{RowReadView, RowReadVisitor};
 pub(crate) use row_scans::cursor::{CursorRow, RowCursor, RowCursorBuffers};
 pub(crate) use row_scans::{CapturedRowScan, ValidationRead};
+#[cfg(test)]
+use row_versions::push_committed_version;
 use row_versions::{
     RowVersionPools, clear_pending_versions, pending_last, pop_pending_version,
-    prune_committed_history, push_committed_version, push_pending_version, release_committed_chain,
-    release_committed_history_through, release_pending_chain,
+    prune_committed_history, push_pending_version, release_committed_chain,
+    release_committed_history_through, release_pending_chain, reserve_history_slot,
 };
 use row_walks::{RowScanIds, RowWalkPool};
 use spill_generations::{
@@ -2703,11 +2705,17 @@ pub(crate) struct PendingChange {
 pub struct PendingVersions {
     tail: Option<usize>,
     len: usize,
+    /// Owned with the pending chain, before any commit can become durable.
+    history_reservation: row_versions::PendingHistory,
 }
 
 impl PendingVersions {
     pub const fn empty() -> Self {
-        Self { tail: None, len: 0 }
+        Self {
+            tail: None,
+            len: 0,
+            history_reservation: row_versions::PendingHistory::None,
+        }
     }
 
     pub fn is_none(&self) -> bool {
@@ -4129,11 +4137,7 @@ pub(crate) fn committed_row_version_capacity(config: &Config) -> usize {
     if config.transaction_mode == crate::config::TransactionMode::Locking {
         return 0;
     }
-    config
-        .max_tables
-        .saturating_mul(config.table_rows)
-        .saturating_add(config.large_object_pages)
-        .saturating_mul(config.max_row_versions_per_row)
+    config.row_history_slots
 }
 
 pub(crate) fn row_heap_image_capacity(config: &Config) -> usize {
@@ -16449,7 +16453,7 @@ impl Storage {
                 continue;
             };
             let state = rows.remove(&rowid).expect("selected row exists");
-            release_pending_chain(&mut versions.pending_row_versions, state.pending.tail);
+            release_pending_chain(&mut versions, state.pending);
             release_committed_chain(&mut versions.committed_row_versions, state.history.tail);
             // Lookup backshifts never move a different row's stable slot.
             *cursor += 1;
@@ -16460,7 +16464,7 @@ impl Storage {
     fn remove_row_state(&mut self, table: usize, rowid: u64) -> Option<RowState> {
         let state = self.tables[table].rows.remove(&rowid)?;
         let row_versions = self.row_versions.exclusive();
-        release_pending_chain(&mut row_versions.pending_row_versions, state.pending.tail);
+        release_pending_chain(row_versions, state.pending);
         release_committed_chain(&mut row_versions.committed_row_versions, state.history.tail);
         Some(state)
     }
@@ -34569,15 +34573,36 @@ impl Storage {
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
-    /// Removes a committed row outright (journal replay of a DELETE), retaining
-    /// the shadowing marker a later delta checkpoint emits as a tombstone.
-    pub fn remove_committed(
+    /// Journal replay can also finish a recovered prepared transaction while
+    /// live readers retain earlier values. Keep its already-owned history.
+    pub(crate) fn replay_committed_row(
         &mut self,
         table_index: usize,
         rowid: u64,
+        image: Option<RowLoc>,
         commit_lsn: u64,
     ) -> Result<(), SqlError> {
-        if self.tables[table_index].spill_generations().is_empty()
+        let generation = self.tables[table_index].generation();
+        let mut state = match self.tables[table_index].rows.get(&rowid) {
+            Some(state) => state,
+            None => RowState {
+                committed: None,
+                committed_lsn: 0,
+                committed_generation: None,
+                checkpoint_change_lsn: 0,
+                history: CommittedHistory::empty(),
+                pending: PendingVersions::empty(),
+            },
+        };
+        if state.pending.is_some() {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "journal replay reached an owned pending row"
+            ));
+        }
+        if image.is_none()
+            && state.history.is_empty()
+            && self.tables[table_index].spill_generations().is_empty()
             && std::sync::Arc::strong_count(&self.tables[table_index].checkpoint_deletions) == 1
         {
             if self.remove_row_state(table_index, rowid).is_some() {
@@ -34586,31 +34611,18 @@ impl Storage {
             }
             return Ok(());
         }
-        // The spill list may hold this row, so the delete must both
-        // tombstone (for the next flush) and leave a shadowing marker (for
-        // reads until then) — same discipline as a committed DELETE.
-        self.remove_row_state(table_index, rowid);
+        state.committed = image.map(RowHome::Heap);
+        state.committed_lsn = commit_lsn;
+        state.committed_generation = Some(generation);
+        state.checkpoint_change_lsn = commit_lsn;
         let table = &mut self.tables[table_index];
-        table
-            .rows
-            .insert(
-                rowid,
-                RowState {
-                    committed: None,
-                    committed_lsn: commit_lsn,
-                    committed_generation: Some(0),
-                    checkpoint_change_lsn: commit_lsn,
-                    history: CommittedHistory::empty(),
-                    pending: PendingVersions::empty(),
-                },
+        table.rows.insert(rowid, state).map_err(|error| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "journal replay overflows {}",
+                error.what
             )
-            .map_err(|error| {
-                sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "journal replay overflows {}",
-                    error.what
-                )
-            })?;
+        })?;
         self.mark_value_bindings_changed_at(table_index, commit_lsn);
         let table = &mut self.tables[table_index];
         table.mark_dirty();
@@ -34665,11 +34677,14 @@ impl Storage {
                     .history_pressure
                     .store(true, std::sync::atomic::Ordering::Release);
             }
-            if state.history.len() >= self.max_row_versions_per_row {
+            row_versions::validate_history_length(&state.history, self.max_row_versions_per_row)?;
+            if !matches!(
+                state.pending.history_reservation,
+                row_versions::PendingHistory::Reserved(_)
+            ) {
                 return Err(sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "one row exceeds max_row_versions_per_row ({}) committed snapshot versions",
-                    self.max_row_versions_per_row
+                    sqlstate::INTERNAL_ERROR,
+                    "pending row has no owned history reservation"
                 ));
             }
         }
@@ -34848,18 +34863,8 @@ impl Storage {
         // opening this table must not decode its prior rows with the new shape.
         // Already selected byte sources retain their original images.
         if !rewritten && snapshots.retains_for(txid) && state.has_committed_version() {
-            let old = CommittedVersion {
-                home: state.committed,
-                lsn: state.committed_lsn,
-            };
-            push_committed_version(
-                &mut versions.committed_row_versions,
-                &mut state.history,
-                self.max_row_versions_per_row,
-                old,
-            )?;
-            if state.history.len().saturating_add(2) >= self.max_row_versions_per_row {
-                versions.history_pressure_changed = true;
+            versions.retain_current_row(state, self.max_row_versions_per_row)?;
+            if versions.history_pressure_changed {
                 self.row_versions
                     .history_pressure
                     .store(true, std::sync::atomic::Ordering::Release);
@@ -34913,7 +34918,7 @@ impl Storage {
         state.committed_lsn = commit_lsn;
         state.committed_generation = Some(generation);
         state.checkpoint_change_lsn = commit_lsn;
-        clear_pending_versions(&mut versions.pending_row_versions, &mut state.pending);
+        clear_pending_versions(&mut versions, &mut state.pending);
         if state.committed.is_none()
             && generations.is_empty()
             && state.history.is_empty()

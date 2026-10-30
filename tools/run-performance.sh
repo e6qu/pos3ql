@@ -263,6 +263,7 @@ write_config() {
   cat >"$config" <<EOF
 transaction_mode = mvcc
 catalog_history_bytes = 16MiB
+row_history_slots = 65536
 log_format = text
 listen_addr = 127.0.0.1:$port
 data_dir = $data

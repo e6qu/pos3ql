@@ -21,6 +21,7 @@ Check catalog-character comparisons with text arrays and schema-qualified outer
 references, including their types, collations and alias errors.
 Keep catalog-vector array functions, relation-name round trips and quantified
 pattern matching in the reference comparisons used by actual applications.
+Preserve type delimiters through domains and arrays for psycopg type discovery.
 Memory comparisons must separate configured reservations, drawn startup budget
 and measured process memory; retain both transaction modes, raw named component
 charges, compiler identity and the revision. Keep evidence metadata separately
@@ -29,6 +30,10 @@ The live built-in inventory must reject wrong properties for registered routines
 missing catalog entries remain an explicit completion gap in PLAN.md.
 Reproduce history exhaustion with an older reader and a multirow write; assert
 that rejected commits do not advance durable state or partially change rows.
+History reservations must remain owned while competing updates, savepoint undo
+and prepared recovery run; unused reservations must become reusable on rollback.
+Recovered prepared replay must preserve row history for existing readers across
+both replacement and deletion, rather than overwrite their saved values.
 Preserve failed outputs and diagnostics before removing temporary fixtures.
 Check native Linux amd64, Linux arm64 and macOS arm64 builds when changing C
 interfaces; a passing build on one target does not establish another's ABI.

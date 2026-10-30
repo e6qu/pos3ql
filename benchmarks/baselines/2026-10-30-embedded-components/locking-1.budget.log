@@ -1,0 +1,598 @@
+budget-draw	4927904	record_shapes
+budget-draw	8	catalog reference origin
+budget-draw	16	catalog source controls
+budget-draw	8	table creation controls
+budget-draw	8	catalog sequence controls
+budget-draw	16	object ACL grant order and undo counters
+budget-draw	8	comment tuple identity counter
+budget-draw	8	routine catalog capacity
+budget-draw	264	row heap controls
+budget-draw	1048576	memtable
+budget-draw	1048576	row heap relocation buffer
+budget-draw	666496	foreign-data wrappers
+budget-draw	1366784	foreign servers
+budget-draw	2658304	foreign user mappings
+budget-draw	83528	foreign tables
+budget-draw	5584912	tables
+budget-draw	56	table definition image owner
+budget-draw	18	table definition image occupancy
+budget-draw	19654128	table definition images
+budget-draw	168	row-version pool controls
+budget-draw	56	row metadata pool owner
+budget-draw	14848	row metadata read slots
+budget-draw	2048	captured pending row versions
+budget-draw	256	captured committed row versions
+budget-draw	2048	captured pending row versions
+budget-draw	256	captured committed row versions
+budget-draw	2048	captured pending row versions
+budget-draw	256	captured committed row versions
+budget-draw	2048	captured pending row versions
+budget-draw	256	captured committed row versions
+budget-draw	2048	captured pending row versions
+budget-draw	256	captured committed row versions
+budget-draw	2048	captured pending row versions
+budget-draw	256	captured committed row versions
+budget-draw	2048	captured pending row versions
+budget-draw	256	captured committed row versions
+budget-draw	2048	captured pending row versions
+budget-draw	256	captured committed row versions
+budget-draw	2048	captured pending row versions
+budget-draw	256	captured committed row versions
+budget-draw	2048	captured pending row versions
+budget-draw	256	captured committed row versions
+budget-draw	2048	captured pending row versions
+budget-draw	256	captured committed row versions
+budget-draw	2048	captured pending row versions
+budget-draw	256	captured committed row versions
+budget-draw	2048	captured pending row versions
+budget-draw	256	captured committed row versions
+budget-draw	2048	captured pending row versions
+budget-draw	256	captured committed row versions
+budget-draw	2048	captured pending row versions
+budget-draw	256	captured committed row versions
+budget-draw	2048	captured pending row versions
+budget-draw	256	captured committed row versions
+budget-draw	2048	captured pending row versions
+budget-draw	256	captured committed row versions
+budget-draw	2048	captured pending row versions
+budget-draw	256	captured committed row versions
+budget-draw	2048	captured pending row versions
+budget-draw	256	captured committed row versions
+budget-draw	2048	captured pending row versions
+budget-draw	256	captured committed row versions
+budget-draw	2048	captured pending row versions
+budget-draw	256	captured committed row versions
+budget-draw	2048	captured pending row versions
+budget-draw	256	captured committed row versions
+budget-draw	2048	captured pending row versions
+budget-draw	256	captured committed row versions
+budget-draw	2048	captured pending row versions
+budget-draw	256	captured committed row versions
+budget-draw	2048	captured pending row versions
+budget-draw	256	captured committed row versions
+budget-draw	2048	captured pending row versions
+budget-draw	256	captured committed row versions
+budget-draw	2048	captured pending row versions
+budget-draw	256	captured committed row versions
+budget-draw	2048	captured pending row versions
+budget-draw	256	captured committed row versions
+budget-draw	2048	captured pending row versions
+budget-draw	256	captured committed row versions
+budget-draw	2048	captured pending row versions
+budget-draw	256	captured committed row versions
+budget-draw	2048	captured pending row versions
+budget-draw	256	captured committed row versions
+budget-draw	2048	captured pending row versions
+budget-draw	256	captured committed row versions
+budget-draw	2048	captured pending row versions
+budget-draw	256	captured committed row versions
+budget-draw	2048	captured pending row versions
+budget-draw	256	captured committed row versions
+budget-draw	2048	captured pending row versions
+budget-draw	256	captured committed row versions
+budget-draw	2048	captured pending row versions
+budget-draw	256	captured committed row versions
+budget-draw	2048	captured pending row versions
+budget-draw	256	captured committed row versions
+budget-draw	2048	captured pending row versions
+budget-draw	256	captured committed row versions
+budget-draw	2048	captured pending row versions
+budget-draw	256	captured committed row versions
+budget-draw	2048	captured pending row versions
+budget-draw	256	captured committed row versions
+budget-draw	2048	captured pending row versions
+budget-draw	256	captured committed row versions
+budget-draw	2048	captured pending row versions
+budget-draw	256	captured committed row versions
+budget-draw	2048	captured pending row versions
+budget-draw	256	captured committed row versions
+budget-draw	2048	captured pending row versions
+budget-draw	256	captured committed row versions
+budget-draw	2048	captured pending row versions
+budget-draw	256	captured committed row versions
+budget-draw	2048	captured pending row versions
+budget-draw	256	captured committed row versions
+budget-draw	2048	captured pending row versions
+budget-draw	256	captured committed row versions
+budget-draw	2048	captured pending row versions
+budget-draw	256	captured committed row versions
+budget-draw	2048	captured pending row versions
+budget-draw	256	captured committed row versions
+budget-draw	2048	captured pending row versions
+budget-draw	256	captured committed row versions
+budget-draw	2048	captured pending row versions
+budget-draw	256	captured committed row versions
+budget-draw	2048	captured pending row versions
+budget-draw	256	captured committed row versions
+budget-draw	2048	captured pending row versions
+budget-draw	256	captured committed row versions
+budget-draw	2048	captured pending row versions
+budget-draw	256	captured committed row versions
+budget-draw	2048	captured pending row versions
+budget-draw	256	captured committed row versions
+budget-draw	2048	captured pending row versions
+budget-draw	256	captured committed row versions
+budget-draw	2048	captured pending row versions
+budget-draw	256	captured committed row versions
+budget-draw	2048	captured pending row versions
+budget-draw	256	captured committed row versions
+budget-draw	2048	captured pending row versions
+budget-draw	256	captured committed row versions
+budget-draw	2048	captured pending row versions
+budget-draw	256	captured committed row versions
+budget-draw	2048	captured pending row versions
+budget-draw	256	captured committed row versions
+budget-draw	2048	captured pending row versions
+budget-draw	256	captured committed row versions
+budget-draw	2048	captured pending row versions
+budget-draw	256	captured committed row versions
+budget-draw	2048	captured pending row versions
+budget-draw	256	captured committed row versions
+budget-draw	38993920	pending_row_versions
+budget-draw	0	committed_row_versions
+budget-draw	56	row walk owner
+budget-draw	4096	row walk slots
+budget-draw	65536	retained row walk identities
+budget-draw	65536	retained row walk identities
+budget-draw	65536	retained row walk identities
+budget-draw	65536	retained row walk identities
+budget-draw	65536	retained row walk identities
+budget-draw	65536	retained row walk identities
+budget-draw	65536	retained row walk identities
+budget-draw	65536	retained row walk identities
+budget-draw	65536	retained row walk identities
+budget-draw	65536	retained row walk identities
+budget-draw	65536	retained row walk identities
+budget-draw	65536	retained row walk identities
+budget-draw	65536	retained row walk identities
+budget-draw	65536	retained row walk identities
+budget-draw	65536	retained row walk identities
+budget-draw	65536	retained row walk identities
+budget-draw	65536	retained row walk identities
+budget-draw	65536	retained row walk identities
+budget-draw	65536	retained row walk identities
+budget-draw	65536	retained row walk identities
+budget-draw	65536	retained row walk identities
+budget-draw	65536	retained row walk identities
+budget-draw	65536	retained row walk identities
+budget-draw	65536	retained row walk identities
+budget-draw	65536	retained row walk identities
+budget-draw	65536	retained row walk identities
+budget-draw	65536	retained row walk identities
+budget-draw	65536	retained row walk identities
+budget-draw	65536	retained row walk identities
+budget-draw	65536	retained row walk identities
+budget-draw	65536	retained row walk identities
+budget-draw	65536	retained row walk identities
+budget-draw	65536	retained row walk identities
+budget-draw	65536	retained row walk identities
+budget-draw	65536	retained row walk identities
+budget-draw	65536	retained row walk identities
+budget-draw	65536	retained row walk identities
+budget-draw	65536	retained row walk identities
+budget-draw	65536	retained row walk identities
+budget-draw	65536	retained row walk identities
+budget-draw	65536	retained row walk identities
+budget-draw	65536	retained row walk identities
+budget-draw	65536	retained row walk identities
+budget-draw	65536	retained row walk identities
+budget-draw	65536	retained row walk identities
+budget-draw	65536	retained row walk identities
+budget-draw	65536	retained row walk identities
+budget-draw	65536	retained row walk identities
+budget-draw	65536	retained row walk identities
+budget-draw	65536	retained row walk identities
+budget-draw	65536	retained row walk identities
+budget-draw	65536	retained row walk identities
+budget-draw	65536	retained row walk identities
+budget-draw	65536	retained row walk identities
+budget-draw	65536	retained row walk identities
+budget-draw	65536	retained row walk identities
+budget-draw	65536	retained row walk identities
+budget-draw	65536	retained row walk identities
+budget-draw	65536	retained row walk identities
+budget-draw	65536	retained row walk identities
+budget-draw	65536	retained row walk identities
+budget-draw	65536	retained row walk identities
+budget-draw	65536	retained row walk identities
+budget-draw	65536	retained row walk identities
+budget-draw	40	snapshot reclamation control
+budget-draw	80	heap row-map ownership controls
+budget-draw	39	heap row-map ownership
+budget-draw	80	definition publication controls
+budget-draw	119	definition publication
+budget-draw	128	type revision controls
+budget-draw	512	type revisions
+budget-draw	512	type revisions
+budget-draw	512	type revisions
+budget-draw	96	domain definition image pool
+budget-draw	288	domain definition image pool
+budget-draw	22074624	domain definition image pool
+budget-draw	256	domain definition image pool
+budget-draw	96	enum definition image pool
+budget-draw	288	enum definition image pool
+budget-draw	71424	enum definition image pool
+budget-draw	256	enum definition image pool
+budget-draw	96	composite definition image pool
+budget-draw	288	composite definition image pool
+budget-draw	213919488	composite definition image pool
+budget-draw	256	composite definition image pool
+budget-draw	304	retained file root owner
+budget-draw	786432	statement type definition selections
+budget-draw	3584	retained SST roots
+budget-draw	4096	statement file membership
+budget-draw	1536	retained index files
+budget-draw	4096	statement index file membership
+budget-draw	139264	statement file owners
+budget-draw	64	query SST root owner
+budget-draw	1723392	query SST root slots
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	840	query SST root members
+budget-draw	56	table definition version controls
+budget-draw	19252224	pending_table_defs
+budget-draw	56	table statistics version controls
+budget-draw	639360	pending_table_statistics
+budget-draw	32	checkpoint deletion guard owners
+budget-draw	393216	table_rows
+budget-draw	917504	table_rows
+budget-draw	40040	table statistics ownership
+budget-draw	1024	table SST generations
+budget-draw	1024	table SST generation staging
+budget-draw	393216	table_rows
+budget-draw	917504	table_rows
+budget-draw	40040	table statistics ownership
+budget-draw	1024	table SST generations
+budget-draw	1024	table SST generation staging
+budget-draw	49152	large_objects
+budget-draw	7908352	views
+budget-draw	653312	rules
+budget-draw	27891456	routines
+budget-draw	11008	casts
+budget-draw	2816	access_methods
+budget-draw	40448	operators
+budget-draw	2597888	operator_families
+budget-draw	2618112	operator_classes
+budget-draw	191488	collations
+budget-draw	38912	conversions
+budget-draw	688128	text_search_objects
+budget-draw	569856	event_triggers
+budget-draw	125927424	stored_query_dependencies
+budget-draw	448	stored_query_dependency_counts
+budget-draw	71680	pending_stored_query_dependencies
+budget-draw	1126400	triggers
+budget-draw	3072	partition_trigger_states
+budget-draw	559104	policies
+budget-draw	499330	policy_roles
+budget-draw	201152	extended_statistics
+budget-draw	1056256	pending_extended_statistics_data
+budget-draw	3533056	publications
+budget-draw	2176	replication_slots
+budget-draw	175616	subscriptions
+budget-draw	40960	subscription_relation_catalog
+budget-draw	143360	matviews
+budget-draw	78336	sequences
+budget-draw	5120	sequence_values
+budget-draw	6144	type_creation_index
+budget-draw	768	type_creation_slots
+budget-draw	2451200	domains
+budget-draw	11008	enums
+budget-draw	120	enum member-image controls
+budget-draw	10653696	enum_members
+budget-draw	4624	enum member-image slots
+budget-draw	5120	pending_enum_members
+budget-draw	23767296	composites
+budget-draw	32	domain_graph_scratch
+budget-draw	6400	schemas
+budget-draw	15360	extensions
+budget-draw	8192	extension_dependencies
+budget-draw	74736	extension_configs
+budget-draw	90880	extension_packages
+budget-draw	199680	extension_scripts
+budget-draw	4194304	extension_script_source
+budget-draw	48128	comments
+budget-draw	41984	roles
+budget-draw	10240	role_memberships
+budget-draw	77312	role_settings
+budget-draw	48	role_graph_workspaces
+budget-draw	64	role_graph_scratch
+budget-draw	56	foreign_statement_contexts
+budget-draw	1088	foreign_statement_savepoints
+budget-draw	19072	system_settings
+budget-draw	0	prepared_transaction_catalog
+budget-draw	0	prepared transaction catalog candidate
+budget-draw	28672	acl_entries
+budget-draw	26624	default_acl_entries
+budget-draw	32768	column_acl_entries
+budget-draw	16384	parameter_acl_entries
+budget-draw	1206016	indexes
+budget-draw	768	brin_maintenance
+budget-draw	16384	brin_unsummarized_ranges
+budget-draw	35584	databases
+budget-draw	33792	tablespaces
+budget-draw	24	value index allocation controls
+budget-draw	128	value_index_pool
+budget-draw	1664	value index owners
+budget-draw	393216	value_index
+budget-draw	393216	value_index
+budget-draw	393216	value_index
+budget-draw	393216	value_index
+budget-draw	393216	value_index
+budget-draw	393216	value_index
+budget-draw	393216	value_index
+budget-draw	393216	value_index
+budget-draw	393216	value_index
+budget-draw	393216	value_index
+budget-draw	393216	value_index
+budget-draw	393216	value_index
+budget-draw	393216	value_index
+budget-draw	393216	value_index
+budget-draw	393216	value_index
+budget-draw	393216	value_index
+budget-draw	524184	index expression evaluation
+budget-draw	544	snapshot and lock owners
+budget-draw	32768	statement snapshots
+budget-draw	16	exported_snapshots
+budget-draw	16	active_snapshots
+budget-draw	16	transaction_identities
+budget-draw	1024	recent_transaction_statuses
+budget-draw	4	temporary_transactions
+budget-draw	204	temporary_namespaces
+budget-draw	3520	backend_activity
+budget-draw	8	backend_signals
+budget-draw	368	relation_cumulative_statistics
+budget-draw	5168	relation_transaction_statistics
+budget-draw	16	cumulative_transaction_nesting
+budget-draw	201600	index_cumulative_statistics
+budget-draw	4608	database_cumulative_statistics
+budget-draw	1024	function_cumulative_statistics
+budget-draw	1024	function_transaction_statistics
+budget-draw	9408	object_locks
+budget-draw	458752	row_locks
+budget-draw	16	lock_waits
+budget-draw	3072	advisory_locks
+budget-draw	32	advisory_lock_waits
+budget-draw	1536	advisory_lock_replay_actions
+budget-draw	24	advisory_lock_replay_states
+budget-draw	48	serializable_snapshots
+budget-draw	35200	foreign_sessions
+budget-draw	168	parameter ACL row controls
+budget-draw	13312	parameter ACL rows
+budget-draw	3072	parameter ACL grant identities
+budget-draw	768	parameter ACL replay grants
+budget-draw	128	catalog history owner
+budget-draw	0	catalog history bytes
+budget-draw	136	catalog history transaction reservations
+budget-draw	8	storage log position controls
+budget-draw	262144	collation left scratch
+budget-draw	262144	collation right scratch
+budget-draw	196608	temporary spill slots
+budget-draw	262144	temporary spill scratch
+budget-draw	393216	temporary spill index
+budget-draw	1975216	temporary spill writer
+budget-draw	4850	temporary spill retained root roster
+budget-draw	16777216	temporary spill sst
+budget-draw	15528	shared spill reader owner
+budget-draw	11006796	spill reader
+budget-draw	10019198	row-state walk contexts
+budget-draw	1150976	row-state walk cursors
+budget-draw	1536	row-state walk cursor slots
+budget-draw	1048576	transaction_wal_stage
+budget-draw	1048576	wal_buffer
+budget-draw	0	prepared transaction slots
+budget-draw	7880	query_workspaces
+budget-draw	8388608	query_workspace_arena
+budget-draw	15522316	query cursor byte buffers
+budget-draw	64	subscription_publications
+budget-draw	262144	subscription_receive
+budget-draw	65536	subscription_send
+budget-draw	64	subscription_publications
+budget-draw	262144	subscription_receive
+budget-draw	65536	subscription_send
+budget-draw	64	subscription_publications
+budget-draw	262144	subscription_receive
+budget-draw	65536	subscription_send
+budget-draw	64	subscription_publications
+budget-draw	262144	subscription_receive
+budget-draw	65536	subscription_send
+budget-draw	64	subscription_publications
+budget-draw	262144	subscription_receive
+budget-draw	65536	subscription_send
+budget-draw	64	subscription_publications
+budget-draw	262144	subscription_receive
+budget-draw	65536	subscription_send
+budget-draw	64	subscription_publications
+budget-draw	262144	subscription_receive
+budget-draw	65536	subscription_send
+budget-draw	64	subscription_publications
+budget-draw	262144	subscription_receive
+budget-draw	65536	subscription_send
+budget-draw	64	subscription_publications
+budget-draw	262144	subscription_receive
+budget-draw	65536	subscription_send
+budget-draw	64	subscription_publications
+budget-draw	262144	subscription_receive
+budget-draw	65536	subscription_send
+budget-draw	64	subscription_publications
+budget-draw	262144	subscription_receive
+budget-draw	65536	subscription_send
+budget-draw	64	subscription_publications
+budget-draw	262144	subscription_receive
+budget-draw	65536	subscription_send
+budget-draw	64	subscription_publications
+budget-draw	262144	subscription_receive
+budget-draw	65536	subscription_send
+budget-draw	64	subscription_publications
+budget-draw	262144	subscription_receive
+budget-draw	65536	subscription_send
+budget-draw	64	subscription_publications
+budget-draw	262144	subscription_receive
+budget-draw	65536	subscription_send
+budget-draw	64	subscription_publications
+budget-draw	262144	subscription_receive
+budget-draw	65536	subscription_send
+budget-draw	8388608	wal_upload_buffer
+budget-draw	64	database_connections
+budget-draw	2048	role_connections
+budget-draw	6144	logical_decoding_truncates
+budget-draw	136	post-publication cleanup controls
+budget-draw	32	transaction publication owner
+budget-draw	262144	scan_scratch
+budget-draw	40	query_dml_workspaces
+budget-draw	458752	query_dml_scratch
+budget-draw	56	statistics receipt pool controls
+budget-draw	56	statistics receipt workspaces
+budget-draw	48	statistics journal receipts
+budget-draw	296	heap relocation workspace controls
+budget-draw	3735552	compact_scratch
+budget-draw	4096	commit_altered_tables
+budget-draw	2048	commit_index_tables
+budget-draw	1024	logical_decoding_truncate_tables
+budget-draw	8	logical_decoding_truncate_relations
+budget-draw	2304	notify_listeners
+budget-draw	1033728	notify_outbox

@@ -7895,6 +7895,16 @@ impl Engine {
                 "statement is waiting for prepared transaction publication"
             ));
         }
+        if commit {
+            let prepared = &self.prepared_transactions.slot(slot).transaction;
+            self.storage.validate_row_history_publication(
+                prepared.txid,
+                prepared
+                    .touched()
+                    .iter()
+                    .map(|&(table, rowid, _)| (table as usize, rowid)),
+            )?;
+        }
         let lsn = self.storage.bump_lsn();
         let operation = if commit {
             WalOp::CommitPrepared { gid: gid.as_str() }
@@ -7929,6 +7939,10 @@ impl Engine {
             &mut self.prepared_transactions.slot_mut(slot).transaction,
         );
         let result = if commit && recovered {
+            for &(table, rowid, _) in txn.touched() {
+                self.storage
+                    .retain_prepared_row_history(table as usize, rowid, txn.txid)?;
+            }
             self.rollback_transaction_state(txn, true);
             self.prepared_transactions
                 .slot(slot)
@@ -22616,20 +22630,7 @@ fn apply_wal_op(
             };
             let loc = storage.heap.append_bytes(row)?;
             storage.observe_rowid(rowid);
-            let generation = storage.table(index).generation();
-            storage
-                .table_mut(index)
-                .rows
-                .insert(
-                    rowid,
-                    crate::storage::RowState::committed_in_generation(loc, lsn, generation),
-                )
-                .map_err(|e| SqlError {
-                    sqlstate: SqlState::known(sqlstate::PROGRAM_LIMIT_EXCEEDED),
-                    message: stack_format!(192, "journal replay overflows {}", e.what),
-                })?;
-            storage.mark_value_bindings_changed_at(index, lsn);
-            storage.table_mut(index).mark_dirty();
+            storage.replay_committed_row(index, rowid, Some(loc), lsn)?;
         }
         WalOp::Delete {
             schema,
@@ -22643,7 +22644,7 @@ fn apply_wal_op(
                     message: stack_format!(192, "journal deletes from unknown table \"{}\"", table),
                 });
             };
-            storage.remove_committed(index, rowid, lsn)?;
+            storage.replay_committed_row(index, rowid, None, lsn)?;
         }
         WalOp::CreateView {
             identity,

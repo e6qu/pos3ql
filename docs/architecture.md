@@ -138,12 +138,15 @@ and [backup rules](backup-restore.md) before scheduling an offline backup comman
 ## Memory and physical size
 
 An empty engine still reserves metadata for configured table slots. Row lookup
-positions scale with `max_tables × table_rows`; the shared committed-row history
-currently reserves `(max_tables × table_rows + large_object_pages) ×
-max_row_versions_per_row` slots in MVCC mode. Locking mode reserves no committed
-row history. This can make many small embedded tables expensive even before
-inserting data. Reducing it requires reserving needed history before a commit
-becomes durable; changing the size alone would allow a capacity failure too late.
+positions scale with `max_tables × table_rows`; wide table definitions and other
+metadata also reserve capacity before tables are created. MVCC row history uses
+the explicit shared `row_history_slots` capacity across all tables and large
+objects; `max_row_versions_per_row` remains a separate per-row bound. Locking
+mode reserves no committed-row history. An update owns its prospective history
+slot with its pending row chain, before durability. Queued and prepared commits
+keep that ownership; commit links the reserved slot without allocating another,
+and rollback releases it. History exhaustion returns `54000` at the write boundary.
+Per-table metadata can still make many small embedded tables expensive.
 
 The [embedded memory measurement](../examples/embedded-memory.rs) starts one empty
 engine per process and reports the configured reservation, startup budget drawn,
@@ -160,6 +163,9 @@ current execution contract. Peak resident memory includes the pages actually
 touched. The debug-build helper records this stack size with each sample.
 It also records each successful named startup reservation, so a large fixed
 cost can be traced to its owning pool rather than inferred from total memory.
+The retained [component breakdown](../benchmarks/baselines/2026-10-30-embedded-components/README.md)
+shows substantial fixed and per-table definition reservations in that revision;
+reserved bytes alone do not establish which pages became resident.
 
 Capacity is the smallest applicable bound, not just the size of the bucket:
 

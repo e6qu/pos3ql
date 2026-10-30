@@ -112,6 +112,7 @@ jobs:
             shared_heap_relocation_heap_
             row_lock_owners_heap_
             stable_row_slots_
+            row_history_reservation_
             sliced_heap_cleanup_heap_
             statement_files_miri_
             index_file_owners_miri_

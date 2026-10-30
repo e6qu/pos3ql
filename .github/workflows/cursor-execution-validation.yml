@@ -35,7 +35,7 @@ jobs:
           cargo test --lib --locked -- cursor_ arena_retained_slices_ query_reads_held_ checkpoint_reads_held_
           cursor_read_statistics_ captured_resident_byte_scans_ retained_checkpoint_ table_sources_survive_ subquery_execution_ store::sst::tests:: pg::respond::tests:: procedural_static_utility_ sql::parser::tests:: exec::projected::tests:: sequence::tests::
           configured_user_type_capacities_ owned_enum_rewrite_sources_ type_reference_moves_ user_type_schema_identity_ user_defined_aggregate_resolves_
-          lateral_joins create_table_as_builds_and_populates moved_enum_identity_ postgresql_18_catalog_reference_family_ regcollation_values_ row_history_exhaustion_ client_catalog_ mem::budget::tests
+          lateral_joins create_table_as_builds_and_populates moved_enum_identity_ postgresql_18_catalog_reference_family_ regcollation_values_ row_history_exhaustion_ row_history_reservation_ client_catalog_ mem::budget::tests config::tests
           --nocapture --test-threads=1
       - run: python3 tools/check-docs.py
       - run: bash tools/check-bugs.sh
@@ -48,9 +48,11 @@ jobs:
           git rev-parse HEAD > "$RUNNER_TEMP/embedded-memory/revision.txt"
           rustc -vV > "$RUNNER_TEMP/embedded-memory/compiler.txt"
           for mode in mvcc locking; do
+            if [ "$mode" = mvcc ]; then history_slots=65536; else history_slots=0; fi
             for tables in 1 8 32; do
               target/debug/examples/embedded-memory --tables "$tables" --table-rows 8192 \
-                --mode "$mode" --data-dir "$RUNNER_TEMP/embedded-memory/$mode-$tables" \
+                --mode "$mode" --row-history-slots "$history_slots" \
+                --data-dir "$RUNNER_TEMP/embedded-memory/$mode-$tables" \
                 --budget-limit-bytes 2147483648 \
                 2> "$RUNNER_TEMP/embedded-memory/$mode-$tables.budget.log" \
                 | tee -a "$RUNNER_TEMP/embedded-memory/samples.jsonl"

@@ -505,6 +505,21 @@ impl Storage {
             self.max_row_versions_per_row,
             change,
         )?;
+        if self.transaction_mode == crate::config::TransactionMode::Mvcc
+            && state.pending.len() == 1
+            && state.has_committed_version()
+        {
+            match reserve_history_slot(&mut versions.committed_row_versions) {
+                Ok(reservation) => {
+                    state.pending.history_reservation =
+                        super::row_versions::PendingHistory::Reserved(reservation)
+                }
+                Err(error) => {
+                    pop_pending_version(&mut versions, &mut state.pending);
+                    return Err(error);
+                }
+            }
+        }
         let undo = PendingWriteUndo {
             source: RowTableSource::capture(self, table, definition.identity),
             identity,
@@ -556,7 +571,7 @@ impl Storage {
         if head.identity != undo.identity || head.change.txid != txid {
             return;
         }
-        pop_pending_version(&mut versions.pending_row_versions, &mut state.pending);
+        pop_pending_version(versions, &mut state.pending);
         // A committed deletion still shadows older immutable SST images.
         if (!state.has_committed_version() && state.history.is_empty() && state.pending.is_none())
             || Self::redundant_spilled_row_state(state)

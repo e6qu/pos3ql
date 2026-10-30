@@ -25,15 +25,18 @@ remain in the plan.
 ## Transactions and durable success
 
 Every configuration explicitly selects `transaction_mode` and
-`catalog_history_bytes` before startup:
+`catalog_history_bytes` and `row_history_slots` before startup:
 
 | Mode | Reader and writer behavior | Isolation |
 |---|---|---|
 | `mvcc` | Keeps earlier values while readers need them | Supported PostgreSQL snapshot/isolation behavior, subject to fixed history capacity |
 | `locking` | Keeps current committed values; conflicting relation operations wait | Read committed, including PostgreSQL's equivalent read uncommitted; repeatable read, serializable and exported snapshots return `0A000` |
 
-Use a positive catalog-history reservation in MVCC mode and zero in locking
-mode. Rollback, savepoints and private uncommitted changes work in both modes.
+Use positive history reservations in MVCC mode and zero for both in locking
+mode. Row-history slots are shared across tables and large objects. Updates
+reserve their needed slot before commit, even when a reader starts while the
+commit waits. Rollback releases unused slots. Rollback, savepoints and private
+uncommitted changes work in both modes.
 A long report can retain row and catalog history until their fixed pools fill;
 the server returns a named capacity error instead of growing memory.
 

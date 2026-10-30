@@ -15,14 +15,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn measure() -> Result<(), Box<dyn std::error::Error>> {
     let arguments: Vec<_> = std::env::args().skip(1).collect();
-    if arguments.len() != 10
+    if arguments.len() != 12
         || arguments[0] != "--tables"
         || arguments[2] != "--table-rows"
         || arguments[4] != "--mode"
-        || arguments[6] != "--data-dir"
-        || arguments[8] != "--budget-limit-bytes"
+        || arguments[6] != "--row-history-slots"
+        || arguments[8] != "--data-dir"
+        || arguments[10] != "--budget-limit-bytes"
     {
-        return Err("usage: embedded-memory --tables N --table-rows N --mode mvcc|locking --data-dir NEW_DIRECTORY --budget-limit-bytes N".into());
+        return Err("usage: embedded-memory --tables N --table-rows N --mode mvcc|locking --row-history-slots N --data-dir NEW_DIRECTORY --budget-limit-bytes N".into());
     }
     let mut config = Config::default_dev();
     config.max_tables = arguments[1].parse()?;
@@ -35,6 +36,12 @@ fn measure() -> Result<(), Box<dyn std::error::Error>> {
     if config.max_tables == 0 || config.table_rows == 0 {
         return Err("tables and table-rows must be positive".into());
     }
+    config.row_history_slots = arguments[7].parse()?;
+    if (config.transaction_mode == TransactionMode::Mvcc) != (config.row_history_slots > 0) {
+        return Err(
+            "row-history-slots must be positive in mvcc mode and zero in locking mode".into(),
+        );
+    }
     config.catalog_history_bytes = if config.transaction_mode == TransactionMode::Mvcc {
         1 << 20
     } else {
@@ -45,8 +52,8 @@ fn measure() -> Result<(), Box<dyn std::error::Error>> {
     config.memtable_bytes = 1 << 20;
     config.work_arena_bytes = 8 << 20;
     config.object_store_on = false;
-    config.data_dir = arguments[7].clone();
-    let limit: usize = arguments[9].parse()?;
+    config.data_dir = arguments[9].clone();
+    let limit: usize = arguments[11].parse()?;
     let plan = config.memory_plan(0, Engine::extra_budget_bytes(&config));
     let reserved = plan.memtable + plan.tables + plan.block_cache;
     if reserved > limit {
@@ -76,7 +83,7 @@ fn measure() -> Result<(), Box<dyn std::error::Error>> {
         peak as u64 * 1024
     };
     println!(
-        "{{\"os\":\"{}\",\"arch\":\"{}\",\"mode\":\"{}\",\"max_tables\":{},\"table_rows\":{},\"max_connections\":1,\"query_workspace_slots\":1,\"memtable_bytes\":{},\"work_arena_bytes\":{},\"catalog_history_bytes\":{},\"max_row_versions_per_row\":{},\"large_object_pages\":{},\"startup_stack_bytes\":{},\"planned_engine_bytes\":{},\"drawn_engine_bytes\":{},\"startup_peak_rss_bytes\":{},\"startup_microseconds\":{}}}",
+        "{{\"os\":\"{}\",\"arch\":\"{}\",\"mode\":\"{}\",\"max_tables\":{},\"table_rows\":{},\"max_connections\":1,\"query_workspace_slots\":1,\"memtable_bytes\":{},\"work_arena_bytes\":{},\"catalog_history_bytes\":{},\"row_history_slots\":{},\"max_row_versions_per_row\":{},\"large_object_pages\":{},\"startup_stack_bytes\":{},\"planned_engine_bytes\":{},\"drawn_engine_bytes\":{},\"startup_peak_rss_bytes\":{},\"startup_microseconds\":{}}}",
         std::env::consts::OS,
         std::env::consts::ARCH,
         arguments[5],
@@ -85,6 +92,7 @@ fn measure() -> Result<(), Box<dyn std::error::Error>> {
         config.memtable_bytes,
         config.work_arena_bytes,
         config.catalog_history_bytes,
+        config.row_history_slots,
         config.max_row_versions_per_row,
         config.large_object_pages,
         pos3ql::sql::exec::QUERY_STACK_BYTES,

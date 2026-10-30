@@ -40,6 +40,7 @@ cargo build --release -q || { echo "build failed"; exit 1; }
 cat > "$WORK/p3.conf" <<EOF
 transaction_mode = mvcc
 catalog_history_bytes = 16MiB
+row_history_slots = 65536
 listen_addr = 127.0.0.1:${P3_PORT}
 data_dir = ${WORK}/p3data
 object_store = off

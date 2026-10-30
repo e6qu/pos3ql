@@ -13,3 +13,18 @@ SELECT last_value, is_called FROM cursor_query_calls;
 SELECT cursor_query_count('');
 DROP FUNCTION cursor_query_count(text);
 DROP SEQUENCE cursor_query_calls;
+
+CREATE FUNCTION cursor_captured_locals() RETURNS refcursor LANGUAGE plpgsql AS $$
+DECLARE c refcursor := 'captured_locals'; label text := 'opening value'; d date;
+BEGIN
+  OPEN c FOR SELECT label AS label, d AS day, found AS was_found;
+  label := 'changed';
+  d := DATE '2026-10-30';
+  RETURN c;
+END $$;
+BEGIN;
+SELECT cursor_captured_locals();
+FETCH ALL FROM captured_locals;
+CLOSE captured_locals;
+COMMIT;
+DROP FUNCTION cursor_captured_locals();

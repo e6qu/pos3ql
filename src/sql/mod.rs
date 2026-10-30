@@ -19390,7 +19390,7 @@ impl Engine {
         guc: &GucState,
     ) -> Result<(), SqlError> {
         let at = cursors.open(name, statement, scroll, hold, binary)?;
-        if let Err(error) = cursors.bind_query(at, sql, params) {
+        if let Err(error) = cursors.bind_query(at, sql, params, &[]) {
             cursors.abandon(at);
             return Err(error);
         }
@@ -19398,7 +19398,7 @@ impl Engine {
             let (query, description, rows) = cursors.execution_parts(at);
             let mut capture = Responder::for_cursor(description, rows);
             capture.set_render(guc.render());
-            query.with_query(|parsed, params, arena| {
+            query.with_query(|parsed, params, _, arena| {
                 let sequence_state = sequence::SequenceReplayState::new(arena);
                 let sequence = sequence::ReplaySeqEval::new(
                     sequence::SeqEval::new(&self.storage, guc.seq_session(), txn.txid),
@@ -19479,22 +19479,28 @@ impl Engine {
         clippy::too_many_arguments,
         reason = "cursor materialization carries the active routine and session contexts"
     )]
-    pub(crate) fn materialize_plpgsql_cursor<'a>(
-        &'a mut self,
+    pub(crate) fn materialize_plpgsql_cursor(
+        &mut self,
         name: &str,
         sql: &str,
         scroll: cursor::CursorScroll,
-        select: &'a ast::Select<'a>,
-        outer: &dyn eval::ColumnLookup<'a>,
-        arena: &'a Arena,
-        params: &[Datum<'a>],
+        locals: &[cursor::CursorLocal],
+        params: &[Datum],
         txn: &TxnState,
         cursors: &mut cursor::CursorPool,
         guc: &GucState,
     ) -> Result<(), SqlError> {
         let at = cursors.open(name, sql, scroll, false, false)?;
-        let result = (|| -> Result<(), SqlError> {
-            let (description, rows) = cursors.result_buffers(at);
+        if let Err(error) = cursors.bind_query(at, sql, params, locals) {
+            cursors.abandon(at);
+            return Err(error);
+        }
+        let result = {
+            let (query, description, rows) = cursors.execution_parts(at);
+            query.with_query(|parsed, params, outer, arena| {
+            let cursor::CursorStatement::Select(select) = parsed else {
+                return Err(sql_err!(sqlstate::INTERNAL_ERROR, "cursor query changed kind after binding"));
+            };
             let mut capture = Responder::for_cursor(description, rows);
             capture.set_render(guc.render());
             let mut columns = [types::ColDesc::new("", 0, 0); exec::MAX_PROJ];
@@ -19538,7 +19544,8 @@ impl Engine {
                 .command_complete(stack_format!(32, "SELECT {}", rows).as_str())
                 .map_err(|_| cursor_description_too_large())?;
             Ok(())
-        })();
+            })?
+        };
         if let Err(error) = result {
             cursors.abandon(at);
             return Err(error);

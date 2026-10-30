@@ -17,7 +17,7 @@ use super::types::Datum;
 use crate::mem::arena::Arena;
 
 mod query;
-pub(crate) use query::{CursorQuery, CursorStatement};
+pub(crate) use query::{CursorLocal, CursorQuery, CursorStatement};
 
 /// One FETCH/MOVE motion, normalized by the parser: positive counts move
 /// forward, negative backward (`NEXT` is `Count(1)`, `PRIOR` is `Count(-1)`,
@@ -372,8 +372,9 @@ impl CursorPool {
         at: usize,
         sql: &str,
         params: &[Datum],
+        locals: &[CursorLocal],
     ) -> Result<(), SqlError> {
-        self.slots[at].query.bind(sql, params)
+        self.slots[at].query.bind(sql, params, locals)
     }
 
     pub(crate) fn execution_parts(

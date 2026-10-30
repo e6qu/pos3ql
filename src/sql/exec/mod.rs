@@ -20658,6 +20658,42 @@ impl<'a> TriggerLocalScope<'_, 'a> {
             .iter()
             .position(|local| local.name.as_str().eq_ignore_ascii_case(name))
     }
+
+    fn cursor_locals(&self, arena: &'a Arena) -> Result<&'a [super::cursor::CursorLocal<'a>], SqlError> {
+        let context_names = [
+            "found", "sqlstate", "sqlerrm", "tg_name", "tg_when", "tg_level",
+            "tg_op", "tg_relid", "tg_relname", "tg_table_name", "tg_table_schema",
+            "tg_tablespace", "tg_nargs", "tg_argv", "tg_event", "tg_tag",
+        ];
+        let context_names = || context_names.iter().copied().filter(|name| {
+            TriggerStatusVariable::parse(name).is_some()
+                || (TriggerExceptionVariable::parse(name).is_some() && self.invocation.exception.is_some())
+                || plpgsql_context_field(self.invocation.program_kind, name).is_some()
+        });
+        let captured = arena.alloc_slice_with(self.locals.len() + context_names().count(), |index| {
+            if let Some(local) = self.locals.get(index) {
+                super::cursor::CursorLocal {
+                    name: local.name,
+                    ctype: local.ctype,
+                    user_type: local.user_type,
+                    value: self.values[index],
+                }
+            } else {
+                let name = context_names().nth(index - self.locals.len()).expect("counted context name");
+                super::cursor::CursorLocal {
+                    name: SqlName::parse(name).expect("static context name"),
+                    ctype: self.col_type(None, name).expect("declared context type"),
+                    user_type: None,
+                    value: Datum::Null,
+                }
+            }
+        }).map_err(|_| super::query::arena_full_pub())?;
+        for local in &mut captured[self.locals.len()..] {
+            local.value = self.lookup(None, local.name.as_str())?;
+        }
+        Ok(captured)
+    }
+
 }
 
 impl<'t, 'stored, 'value> ColumnLookup<'value> for TriggerLocalScope<'t, 'stored>
@@ -24603,14 +24639,13 @@ fn execute_trigger_block<'a>(
                         "SQL cursors are not available in trigger execution"
                     ));
                 };
-                if let Some(select) = static_select {
+                if static_select.is_some() {
+                    let captured = scope.cursor_locals(context.arena)?;
                     engine.materialize_plpgsql_cursor(
                         name,
                         source,
                         statement.scroll,
-                        select,
-                        &scope,
-                        context.arena,
+                        captured,
                         arguments,
                         context.txn,
                         cursors,

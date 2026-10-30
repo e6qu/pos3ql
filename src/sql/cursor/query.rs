@@ -2,6 +2,83 @@
 
 use super::*;
 use crate::sql::ast::{Select, SetQuery, Stmt};
+use crate::sql::eval::ColumnLookup;
+use crate::sql::types::ColType;
+
+#[derive(Clone, Copy)]
+pub(crate) struct CursorLocal<'a> {
+    pub name: SqlName,
+    pub ctype: ColType,
+    pub user_type: Option<crate::storage::UserTypeName>,
+    pub value: Datum<'a>,
+}
+
+pub(crate) struct CursorLocals<'a>(&'a [CursorLocal<'a>]);
+
+impl<'a> CursorLocals<'a> {
+    fn local(&self, name: &str) -> Option<&CursorLocal<'a>> {
+        self.0.iter().find(|local| local.name.as_str().eq_ignore_ascii_case(name))
+    }
+
+    fn field(&self, qualifier: &str, name: &str) -> Option<crate::sql::types::RecordField<'a>> {
+        match self.local(qualifier)?.value {
+            Datum::Record(fields) | Datum::Composite { fields, .. } => fields
+                .iter()
+                .find(|field| field.name.eq_ignore_ascii_case(name))
+                .copied(),
+            _ => None,
+        }
+    }
+}
+
+impl<'a> ColumnLookup<'a> for CursorLocals<'a> {
+    fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
+        if let Some(qualifier) = qualifier {
+            if qualifier.eq_ignore_ascii_case("old") || qualifier.eq_ignore_ascii_case("new") {
+                return Err(sql_err!(sqlstate::UNDEFINED_COLUMN,
+                    "record \"{}\" is not assigned yet", if qualifier.eq_ignore_ascii_case("old") { "OLD" } else { "NEW" }));
+            }
+            if let Some(field) = self.field(qualifier, name) {
+                return Ok(field.value);
+            }
+            if matches!(self.local(qualifier).map(|local| local.value), Some(Datum::Record(_) | Datum::Composite { .. })) {
+                return Err(sql_err!(sqlstate::UNDEFINED_COLUMN,
+                    "record \"{}\" has no field \"{}\"", qualifier, name));
+            }
+            return Err(sql_err!(sqlstate::UNDEFINED_TABLE,
+                "missing FROM-clause entry for table \"{}\"", qualifier));
+        }
+        self.local(name).map(|local| local.value).ok_or_else(||
+            sql_err!(sqlstate::UNDEFINED_COLUMN, "column \"{}\" does not exist", name))
+    }
+
+    fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
+        match qualifier {
+            Some(qualifier) => self.field(qualifier, name).and_then(|field| ColType::from_oid(field.type_oid)),
+            None => self.local(name).map(|local| local.ctype),
+        }
+    }
+
+    fn collation(&self, qualifier: Option<&str>, name: &str) -> crate::sql::ast::Collation {
+        match qualifier {
+            None if self.local(name).is_some_and(|local| local.ctype.is_collatable()) => crate::sql::ast::Collation::Default,
+            _ => crate::sql::ast::Collation::None,
+        }
+    }
+
+    fn record_field_collation(&self, base: &crate::sql::ast::Expr<'a>, field: &str) -> crate::sql::ast::Collation {
+        if let crate::sql::ast::Expr::Column { qualifier: None, name } = base
+            && self.field(name, field).and_then(|field| ColType::from_oid(field.type_oid)).is_some_and(|ctype| ctype.is_collatable()) {
+            crate::sql::ast::Collation::Default
+        } else {
+            crate::sql::ast::Collation::None
+        }
+    }
+
+    fn column_user_type(&self, qualifier: Option<&str>, name: &str) -> Option<crate::storage::UserTypeName> {
+        qualifier.is_none().then(|| self.local(name).and_then(|local| local.user_type)).flatten()
+    }
+}
 
 #[derive(Clone, Copy)]
 pub(crate) enum CursorStatement<'a> {
@@ -20,6 +97,7 @@ struct BoundQuery<'a> {
     statement: CursorStatement<'a>,
     params: &'a [Datum<'a>],
     parameter_types: &'a [i32],
+    locals: CursorLocals<'a>,
 }
 
 impl CursorQuery {
@@ -35,7 +113,7 @@ impl CursorQuery {
         self.arena.reset();
     }
 
-    pub(crate) fn bind(&mut self, sql: &str, params: &[Datum]) -> Result<(), SqlError> {
+    pub(crate) fn bind(&mut self, sql: &str, params: &[Datum], locals: &[CursorLocal]) -> Result<(), SqlError> {
         self.clear();
         let full = || {
             sql_err!(
@@ -67,10 +145,23 @@ impl CursorQuery {
                 crate::sql::exec::bound_parameter_type_oid((index + 1) as u32).unwrap_or(0)
             })
             .map_err(|_| full())?;
+        let captured = self.arena.alloc_slice_with(locals.len(), |index| CursorLocal {
+            name: locals[index].name,
+            ctype: locals[index].ctype,
+            user_type: locals[index].user_type,
+            value: Datum::Null,
+        }).map_err(|_| full())?;
+        for (local, source) in captured.iter_mut().zip(locals) {
+            let encoded = crate::sql::exec::encode_projected_pub(&[source.value], &self.arena)?;
+            let mut value = [Datum::Null];
+            crate::sql::exec::decode_projected_row_into(encoded, &self.arena, &mut value)?;
+            local.value = value[0];
+        }
         let bound = BoundQuery {
             statement,
             params: values,
             parameter_types,
+            locals: CursorLocals(captured),
         };
         // The parser only borrows the copied source and this private arena.
         // Parameter encoding and structural decoding copy every borrowed
@@ -83,7 +174,7 @@ impl CursorQuery {
 
     pub(crate) fn with_query<R>(
         &self,
-        use_query: impl for<'a> FnOnce(CursorStatement<'a>, &'a [Datum<'a>], &'a Arena) -> R,
+        use_query: impl for<'a> FnOnce(CursorStatement<'a>, &'a [Datum<'a>], &CursorLocals<'a>, &'a Arena) -> R,
     ) -> Result<R, SqlError> {
         let bound = self.bound.as_ref().ok_or_else(|| {
             sql_err!(
@@ -93,7 +184,7 @@ impl CursorQuery {
         })?;
         Ok(crate::sql::exec::with_bound_parameter_types(
             bound.parameter_types,
-            || use_query(bound.statement, bound.params, &self.arena),
+            || use_query(bound.statement, bound.params, &bound.locals, &self.arena),
         ))
     }
 }
@@ -114,14 +205,14 @@ mod tests {
             value: Datum::Text(&text),
         }];
         crate::mem::guard::forbid_alloc(|| {
-            query.bind(&source, &[Datum::Text(&text), Datum::Record(&fields)])
+            query.bind(&source, &[Datum::Text(&text), Datum::Record(&fields)], &[])
         })
         .unwrap();
         source.clear();
         text.clear();
         let mut moved = query;
         crate::mem::guard::forbid_alloc(|| {
-            moved.with_query(|statement, params, _| {
+            moved.with_query(|statement, params, _, _| {
                 assert!(
                     matches!(statement, CursorStatement::Select(select) if select.items.len() == 2)
                 );
@@ -136,12 +227,12 @@ mod tests {
         .unwrap();
         moved.clear();
         assert_eq!(
-            moved.with_query(|_, _, _| ()).unwrap_err().sqlstate,
+            moved.with_query(|_, _, _, _| ()).unwrap_err().sqlstate,
             sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE
         );
-        crate::mem::guard::forbid_alloc(|| moved.bind("SELECT 42", &[])).unwrap();
+        crate::mem::guard::forbid_alloc(|| moved.bind("SELECT 42", &[], &[])).unwrap();
         moved
-            .with_query(|_, params, _| assert!(params.is_empty()))
+            .with_query(|_, params, _, _| assert!(params.is_empty()))
             .unwrap();
     }
 
@@ -155,7 +246,7 @@ mod tests {
         let types = [oid::DATE; 101];
         let params = [Datum::Null; 101];
         crate::mem::guard::forbid_alloc(|| {
-            with_bound_parameter_types(&types, || query.bind("SELECT $101", &params))
+            with_bound_parameter_types(&types, || query.bind("SELECT $101", &params, &[]))
         })
         .unwrap();
         assert_eq!(bound_parameter_type_oid(101), None);
@@ -163,7 +254,7 @@ mod tests {
         crate::mem::guard::forbid_alloc(|| {
             with_bound_parameter_types(&other_types, || {
                 query
-                    .with_query(|_, params, _| {
+                    .with_query(|_, params, _, _| {
                         assert_eq!(params[100], Datum::Null);
                         assert_eq!(bound_parameter_type_oid(101), Some(oid::DATE));
                         assert_eq!(bound_parameter_type_oid(0), None);
@@ -196,17 +287,45 @@ mod tests {
     }
 
     #[test]
+    fn cursor_owned_query_copies_routine_locals_and_record_type_metadata() {
+        use crate::sql::types::{RecordField, oid};
+        use crate::sql::ast::{Collation, Expr};
+
+        let mut budget = Budget::new(64 << 10);
+        let mut query = CursorQuery::new(&mut budget, 64 << 10).unwrap();
+        let mut text = String::from("opening value");
+        let fields = [RecordField { name: "label", type_oid: oid::TEXT, value: Datum::Text(&text) }];
+        let locals = [
+            CursorLocal { name: SqlName::parse("r").unwrap(), ctype: ColType::Record, user_type: None, value: Datum::Record(&fields) },
+            CursorLocal { name: SqlName::parse("d").unwrap(), ctype: ColType::Date, user_type: None, value: Datum::Null },
+            CursorLocal { name: SqlName::parse("found").unwrap(), ctype: ColType::Bool, user_type: None, value: Datum::Bool(true) },
+        ];
+        crate::mem::guard::forbid_alloc(|| query.bind("SELECT r.label, d, found", &[], &locals)).unwrap();
+        text.clear();
+        crate::mem::guard::forbid_alloc(|| query.with_query(|_, _, locals, _| {
+            assert_eq!(locals.lookup(Some("R"), "LABEL").unwrap(), Datum::Text("opening value"));
+            assert_eq!(locals.col_type(Some("r"), "label"), Some(ColType::Text));
+            assert_eq!(locals.lookup(None, "d").unwrap(), Datum::Null);
+            assert_eq!(locals.col_type(None, "d"), Some(ColType::Date));
+            assert_eq!(locals.lookup(None, "FOUND").unwrap(), Datum::Bool(true));
+            assert_eq!(locals.record_field_collation(&Expr::Column { qualifier: None, name: "r" }, "label"), Collation::Default);
+            assert_eq!(locals.lookup(Some("r"), "absent").unwrap_err().sqlstate, sqlstate::UNDEFINED_COLUMN);
+            assert_eq!(locals.lookup(Some("absent"), "label").unwrap_err().sqlstate, sqlstate::UNDEFINED_TABLE);
+        })).unwrap();
+    }
+
+    #[test]
     fn cursor_owned_query_rejects_extra_commands_and_recovers_after_capacity_errors() {
         let mut budget = Budget::new(4096);
         let mut query = CursorQuery::new(&mut budget, 4096).unwrap();
         assert_eq!(
-            query.bind("SELECT 1; SELECT 2", &[]).unwrap_err().sqlstate,
+            query.bind("SELECT 1; SELECT 2", &[], &[]).unwrap_err().sqlstate,
             sqlstate::INVALID_CURSOR_DEFINITION
         );
         let wide = "x".repeat(8192);
-        let error = crate::mem::guard::forbid_alloc(|| query.bind(&wide, &[])).unwrap_err();
+        let error = crate::mem::guard::forbid_alloc(|| query.bind(&wide, &[], &[])).unwrap_err();
         assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
         assert!(error.message.as_str().contains("cursor_query_bytes"));
-        crate::mem::guard::forbid_alloc(|| query.bind("SELECT 1", &[])).unwrap();
+        crate::mem::guard::forbid_alloc(|| query.bind("SELECT 1", &[], &[])).unwrap();
     }
 }

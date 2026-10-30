@@ -202,6 +202,7 @@ old bytes. Reclamation returns `54000` while both buffers are retained. Effectiv
 the accepted GUC byte representation. Each cursor reserves `cursor_bytes`
 for typed rows, `cursor_query_bytes` for its query, copied parameters and their
 declared types (a `NULL` date parameter still has the date type),
+including local values and types captured by a static procedural `OPEN`,
 a 1,024-byte description and `floor(cursor_bytes / 6)` row
 positions; the connection reserves the same number of fetch-selection positions.
 Each saved row includes a four-byte length and a two-byte column count.

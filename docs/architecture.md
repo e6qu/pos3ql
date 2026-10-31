@@ -62,6 +62,13 @@ consumes one import number. A constant null, including an inserted default or
 an explicitly null variadic array, can eliminate a strict call. A null array
 member does not make the array null. A null row value still allows the other
 reached arguments to run.
+Parameter defaults capture managed object references when the function or
+procedure is created. Calls use one copied dependency image to bind omitted
+inputs while preserving the caller's sequence state. For example, renaming the
+sequence selected by `DEFAULT nextval('order_numbers')` does not redirect the
+default to a replacement; `nextval('order_numbers'::text)` requests runtime lookup.
+Captured references share the existing fixed dependency capacity and durable
+records, including replacement rollback and empty-cache recovery.
 This call boundary supplies retained execution with an explicit target; it
 does not yet make every function body yield during a storage wait.
 Runtime overload checks copy input descriptors rather than whole definitions.

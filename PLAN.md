@@ -46,6 +46,8 @@ Retained calls must preserve their bound identities, completed inputs and
 defaults across waits, including PostgreSQL's strict null and error behavior.
 Reuse the shared call boundary, including its bound input conversions and
 strict-null handling, rather than replaying argument evaluation.
+Preserve defaults' captured object references through renames, schema moves,
+replacement, rollback and recovery; explicit text inputs keep runtime name lookup.
 Preserve registered built-in and operator volatility when deciding which inputs
 can run during planning; maintenance calls must run only when the query reaches them.
 Retain catalog-aware planning errors even when a scan returns no input rows.
@@ -170,6 +172,10 @@ versions are not compatibility targets.
 Keep native Linux amd64, Linux arm64 and macOS arm64 builds, lint and boundary
 regressions passing; use the platform's declared C types at libc boundaries.
 Run the shared formatting prerequisite before admitting build and test matrices.
+Keep native SQL fixtures in native gates and interpreter ownership cases beside
+their runtime modules, so interpreter startup does not scan irrelevant fixtures.
+Reclaim each polling snapshot's scratch space instead of relying on a favorable
+thread schedule to finish before the arena fills.
 Keep compiler and per-test progress visible through CI cancellation while
 diagnosing deadline overruns; preserve the existing job budgets.
 

@@ -4945,6 +4945,13 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
         let mapping = routine
             .call_input_mapping(tref.func_argument_names, args.len(), tref.func_variadic)
             .expect("resolved table routine call has a valid argument mapping");
+        let default_dependencies = if (0..routine.argument_count)
+            .any(|index| !mapping[..args.len()].contains(&(index as u8)))
+        {
+            Some(storage.snapshot_routine_dependencies_for(routine_slot, txid, arena)?)
+        } else {
+            None
+        };
         let mut provided = [false; crate::storage::MAX_ROUTINE_ARGUMENTS];
         let mut variadic_values = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
         let mut variadic_count = 0usize;
@@ -4999,10 +5006,16 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                     "resolved table routine is missing a required argument"
                 ));
             };
-            let source = arena
-                .alloc_str(default.as_str())
-                .map_err(|_| arena_full())?;
-            let expression = crate::sql::parser::parse_expression(source, arena)?;
+            let expression = super::bind_routine_parameter_default(
+                default.as_str(),
+                storage,
+                txid,
+                default_dependencies
+                    .as_ref()
+                    .expect("omitted inputs capture default dependencies")
+                    .view(),
+                arena,
+            )?;
             let value = crate::sql::eval::eval_full(expression, arena, params, columns, &hooks)?;
             routine_params[input_index] = crate::sql::eval::cast_to(value, parameter.ctype, arena)?;
         }

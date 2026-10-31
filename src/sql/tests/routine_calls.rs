@@ -293,3 +293,88 @@ fn routine_named_variadic_and_default_inputs_keep_the_callers_effect_context() {
         );
     }
 }
+
+#[test]
+fn routine_defaults_retain_creation_bindings_and_recover_without_a_cache() {
+    let mut config = test_config("routine-default-creation-bindings");
+    config.max_sequences = 6;
+    config.max_routines = 16;
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = false;
+    config.wal_upload_sync = false;
+    config.object_store_bucket = format!("routine-default-bindings-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let fixture =
+        include_str!("../../../tests/external/differential_exact/45_routine_default_bindings.sql");
+    let (exercise, remainder) = fixture.split_once("-- dependency errors").unwrap();
+    let (dependency_errors, cleanup) = remainder.split_once("-- cleanup").unwrap();
+    let mut budget = test_engine_budget(&config, 1 << 30);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    assert_eq!(
+        data_rows(&session.success(&mut engine, exercise, true)),
+        [
+            "41|f",
+            "41|42|7|901|301",
+            "43",
+            "44",
+            "45|46|7|701|302",
+            "47:702",
+            "703",
+            "48",
+            "801|f",
+            "901"
+        ]
+    );
+    for sql in dependency_errors
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+    {
+        assert_eq!(
+            error_sqlstates(&session.execute(&mut engine, sql, true)),
+            ["2BP01"],
+            "{sql}"
+        );
+    }
+    assert!(engine.checkpoint().unwrap());
+    drop(session);
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut cold_budget = test_engine_budget(&config, 1 << 30);
+    let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+    let mut cold_session = ConfiguredTransactionSession::new(&config, &mut cold_budget);
+    // The object-store simulator allocates fixture keys during empty-cache reads.
+    assert_eq!(
+        data_rows(&cold_session.success(
+            &mut cold,
+            "SELECT public.default_scalar(),public.default_helper(),public.default_quoted()",
+            false
+        )),
+        ["49|7|303"]
+    );
+    cold_session.success(&mut cold, cleanup, false);
+    drop(cold_session);
+    drop(cold);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn routine_default_dependency_exhaustion_precedes_creation_and_effects() {
+    let mut config = test_config("routine-default-dependency-capacity");
+    config.max_stored_query_dependencies_per_object = 1;
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE SEQUENCE default_limit_one; CREATE SEQUENCE default_limit_two",
+        true,
+    );
+    assert_eq!(error_sqlstates(&session.execute(&mut engine,
+        "CREATE FUNCTION default_limit(left_value bigint DEFAULT nextval('default_limit_one'),right_value bigint DEFAULT nextval('default_limit_two')) RETURNS bigint LANGUAGE sql AS 'SELECT $1+$2'", true)), ["54000"]);
+    assert_eq!(data_rows(&session.success(&mut engine,
+        "SELECT to_regprocedure('default_limit(bigint,bigint)') IS NULL; SELECT is_called FROM default_limit_one; SELECT is_called FROM default_limit_two", true)), ["t", "f", "f"]);
+}

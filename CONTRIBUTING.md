@@ -259,6 +259,11 @@ catalog and wire contracts; they do not select pos3ql's object block layout.
 
 CI also exercises shared heap publication and saved row and index file ownership with
 Miri, alongside allocation-forbidden concurrent regressions.
+`tools/test-miri-ownership.sh LOG` runs the shared ownership gate on a suitable
+runner. Its SQL fixture module stays in native tests; put interpreter ownership
+cases beside their runtime modules. Preserve every selected ownership case when
+reducing interpreter startup work. Polling tests release each snapshot before
+reusing its fixed scratch arena, even when writers are slow.
 Pass the selected ownership filters together to share one interpreter startup;
 [Rust's test harness accepts multiple filters](https://doc.rust-lang.org/src/test/cli.rs.html#161-163).
 Every configured filter must produce passing tests, with none failed or ignored.

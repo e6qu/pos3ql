@@ -91,6 +91,8 @@ pub(crate) fn stored_query_dependencies(
     dependencies::collect(sql, storage, txid, path, bindings, arena)
 }
 
+pub(crate) use dependencies::collect_routine_parameter_defaults;
+
 pub(crate) fn stored_routine_dependencies(
     program: &RoutineFunctionProgram<'_>,
     storage: &Storage,
@@ -1225,6 +1227,18 @@ pub(crate) fn execute_bound_routine_query<'a>(
         Some((path, dependencies.view())),
         emit,
     )
+}
+
+pub(crate) fn bind_routine_parameter_default<'a>(
+    source: &str,
+    storage: &Storage,
+    txid: u32,
+    dependencies: crate::storage::StoredQueryDependencyView<'_>,
+    arena: &'a Arena,
+) -> Result<&'a Expr<'a>, SqlError> {
+    let source = arena.alloc_str(source).map_err(|_| arena_full())?;
+    let expression = super::parser::parse_expression(source, arena)?;
+    cte::expand_stored_expression(expression, storage, txid, dependencies, arena)
 }
 
 pub(crate) fn bind_stored_routine_statement<'a>(
@@ -3010,6 +3024,16 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         let mut input_type_oids =
             [super::types::oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
         let mut default_expressions = [None; crate::storage::MAX_ROUTINE_ARGUMENTS];
+        let default_dependencies = if (0..declared.argument_count)
+            .any(|index| !mapping[..arguments.len()].contains(&(index as u8)))
+        {
+            Some(
+                self.storage
+                    .snapshot_routine_dependencies_for(slot, self.txid, arena)?,
+            )
+        } else {
+            None
+        };
         for input_index in 0..declared.argument_count {
             let parameter = declared
                 .parameter_for_input(input_index)
@@ -3041,11 +3065,16 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                         "resolved routine is missing a required argument"
                     )
                 })?;
-                let source = arena
-                    .alloc_str(default.as_str())
-                    .map_err(|_| arena_full())?;
-                default_expressions[input_index] =
-                    Some(super::parser::parse_expression(source, arena)?);
+                default_expressions[input_index] = Some(bind_routine_parameter_default(
+                    default.as_str(),
+                    self.storage,
+                    self.txid,
+                    default_dependencies
+                        .as_ref()
+                        .expect("omitted inputs capture default dependencies")
+                        .view(),
+                    arena,
+                )?);
             }
         }
         let input_count = declared.argument_count;

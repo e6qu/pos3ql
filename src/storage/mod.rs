@@ -56621,7 +56621,7 @@ mod tests {
         config.max_stored_query_dependencies_per_object = 1;
         let mut budget = test_budget(&config);
         let storage = Storage::new(&config, &mut budget, 0).unwrap();
-        let arena = Arena::new(&mut budget, "view snapshot test", 1 << 16).unwrap();
+        let mut arena = Arena::new(&mut budget, "view snapshot test", 1 << 16).unwrap();
         let barrier = std::sync::Barrier::new(WORKERS + 1);
         let finished = std::sync::atomic::AtomicUsize::new(0);
         let names = ["worker_a", "worker_b", "worker_c", "worker_d"];
@@ -56665,7 +56665,10 @@ mod tests {
             }
             barrier.wait();
             crate::mem::guard::forbid_alloc(|| {
-                while finished.load(std::sync::atomic::Ordering::Acquire) != WORKERS {
+                let mut polls = 0;
+                while finished.load(std::sync::atomic::Ordering::Acquire) != WORKERS || polls < 1024
+                {
+                    arena.reset();
                     let catalog = storage.view_rule_catalog();
                     for (slot, view) in catalog.views.iter().enumerate() {
                         if view.ddl_state == CatalogDdlState::Absent {
@@ -56694,11 +56697,13 @@ mod tests {
                             CatalogDdlState::Present
                         );
                     }
+                    polls += 1;
                     std::thread::yield_now();
                 }
             });
         });
 
+        arena.reset();
         crate::mem::guard::forbid_alloc(|| {
             assert_eq!(storage.view_count(), WORKERS);
             assert_eq!(storage.rule_count(), WORKERS);

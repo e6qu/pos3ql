@@ -206,6 +206,47 @@ pub(super) fn collect(
     Ok(dependencies)
 }
 
+pub(crate) fn collect_routine_parameter_defaults(
+    parameters: &[crate::storage::RoutineParameterDef],
+    storage: &Storage,
+    txid: u32,
+    path: PathContext,
+    dependencies: &mut StoredQueryDependencies,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    for parameter in parameters {
+        let Some(default) = parameter.mode.default() else {
+            continue;
+        };
+        let source = arena
+            .alloc_str(default.as_str())
+            .map_err(|_| arena_full())?;
+        let expression = crate::sql::parser::parse_expression(source, arena)?;
+        let items = arena
+            .alloc_slice_copy(&[SelectItem::Expr {
+                expression,
+                alias: None,
+            }])
+            .map_err(|_| arena_full())?;
+        let select = arena
+            .alloc(Select {
+                items,
+                ..*crate::sql::parser::parse_query("SELECT NULL", arena)?
+            })
+            .map_err(|_| arena_full())?;
+        collect_select(
+            select,
+            storage,
+            txid,
+            CteNames::EMPTY,
+            dependencies,
+            arena,
+            CollectionContext::ordinary(&path, None),
+        )?;
+    }
+    Ok(())
+}
+
 pub(super) fn collect_routine_program(
     program: &super::RoutineFunctionProgram<'_>,
     storage: &Storage,
@@ -2467,16 +2508,7 @@ fn collect_expression<'a>(
         })?;
     }
     if let Expr::Call { name, args, .. } = expression
-        && matches!(*name, "nextval" | "currval" | "setval")
-        && let Some(sequence_name) = args.first().and_then(|argument| match argument {
-            Expr::Str(value)
-            | Expr::Cast {
-                operand: Expr::Str(value),
-                type_name: "regclass",
-                ..
-            } => Some(*value),
-            _ => None,
-        })
+        && let Some(sequence_name) = bound_sequence_literal(name, args)
     {
         collect_sequence(sequence_name, storage, txid, path, dependencies)?;
     }
@@ -2837,6 +2869,26 @@ fn collect_text_search_configuration(
         referenced_schema: SqlName::parse(schema.unwrap_or(""))?,
         referenced_name: SqlName::parse(name)?,
     })
+}
+
+/// A text cast requests lookup at execution time, even if another input
+/// names the same sequence and has a captured dependency.
+pub(super) fn bound_sequence_literal<'a>(function: &str, args: &[&'a Expr<'a>]) -> Option<&'a str> {
+    if !matches!(
+        function.strip_prefix("pg_catalog.").unwrap_or(function),
+        "nextval" | "currval" | "setval"
+    ) {
+        return None;
+    }
+    match args.first().copied()? {
+        Expr::Str(value)
+        | Expr::Cast {
+            operand: Expr::Str(value),
+            type_name: "regclass",
+            ..
+        } => Some(value),
+        _ => None,
+    }
 }
 
 fn collect_sequence(

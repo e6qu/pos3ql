@@ -14578,6 +14578,19 @@ impl Engine {
                 .call_input_mapping(argument_names, arguments.len(), variadic)
                 .expect("resolved procedure call has a valid argument mapping")
         });
+        let default_dependencies = if (0..declared.argument_count)
+            .any(|index| !mapping[..arguments.len()].contains(&(index as u8)))
+        {
+            match self
+                .storage
+                .snapshot_routine_dependencies_for(slot, txn.txid, arena)
+            {
+                Ok(dependencies) => Some(dependencies),
+                Err(error) => return Ok(Err(error)),
+            }
+        } else {
+            None
+        };
         let mut completed = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
         let mut completed_type_oids = [types::oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
         let mut provided = [false; crate::storage::MAX_ROUTINE_ARGUMENTS];
@@ -14646,11 +14659,16 @@ impl Engine {
                 .parameter_for_input(input_index)
                 .expect("procedure input signature has a declared parameter");
             completed[input_index] = if let Some(default) = parameter.mode.default() {
-                let source = match arena.alloc_str(default.as_str()) {
-                    Ok(source) => source,
-                    Err(_) => return Ok(Err(eval::arena_full())),
-                };
-                let expression = match parser::parse_expression(source, arena) {
+                let expression = match query::bind_routine_parameter_default(
+                    default.as_str(),
+                    &self.storage,
+                    txn.txid,
+                    default_dependencies
+                        .as_ref()
+                        .expect("omitted inputs capture default dependencies")
+                        .view(),
+                    arena,
+                ) {
                     Ok(expression) => expression,
                     Err(error) => return Ok(Err(error)),
                 };
@@ -24639,5 +24657,6 @@ pub(crate) fn test_engine_budget(config: &Config, fixture_bytes: usize) -> Budge
     Budget::new(plan.memtable + plan.tables + plan.block_cache + fixture_bytes)
 }
 
-#[cfg(test)]
+// Native SQL fixtures are separate from the ownership tests beside runtime modules.
+#[cfg(all(test, not(miri)))]
 mod tests;

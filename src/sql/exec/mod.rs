@@ -33614,7 +33614,7 @@ pub fn create_routine(
         Err(error) => return sql_fail(error),
     };
     let mut creation_path = StackStr::<128>::new();
-    let _formal_scope = match enter_routine_parameter_types(
+    let formal_scope = match enter_routine_parameter_types(
         &arguments[..argument_count],
         Some(&super::query::storage_catalog(storage, arena, txn.txid)),
     ) {
@@ -33862,6 +33862,25 @@ pub fn create_routine(
         }
         crate::storage::RoutineKind::Aggregate(_) => {
             unreachable!("CREATE ROUTINE cannot construct an aggregate")
+        }
+    }
+    drop(formal_scope);
+    if parameters[..routine.arguments.len()]
+        .iter()
+        .any(|parameter| parameter.mode.has_default())
+    {
+        let raw_path = guc.search_path();
+        let user = super::eval::funcs::system::session_user_owned();
+        let path = storage.compute_path(raw_path.as_str(), user.as_str(), txn.txid);
+        if let Err(error) = super::query::collect_routine_parameter_defaults(
+            &parameters[..routine.arguments.len()],
+            storage,
+            txn.txid,
+            path,
+            &mut dependencies,
+            arena,
+        ) {
+            return sql_fail(error);
         }
     }
     if creation_path.is_truncated() {

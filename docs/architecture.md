@@ -81,6 +81,8 @@ division by zero can follow an earlier sequence increment. Lateral functions and
 subqueries inherit the caller's sequence state. Builtin set-returning calls bind
 input values and SQL types once before counting or emitting their rows; external
 row iteration keeps those inputs without materializing the whole result.
+Their execution registration declares accepted argument counts directly; missing
+public `pg_proc` entries cannot disable an implemented function.
 Table-function descriptions use declared input types and never sample an input
 value. Global aggregates use one source scan, avoiding a second execution of
 lateral inputs just to count the rows before aggregation.

@@ -22,39 +22,78 @@ use super::subquery::subquery_witness;
 
 use super::{QueryScope, arena_full, describe_scope_items, record_star_width};
 
+enum SrfArity {
+    Exact(usize),
+    Between(usize, usize),
+}
+
+impl SrfArity {
+    fn accepts(&self, count: usize) -> bool {
+        match *self {
+            Self::Exact(expected) => count == expected,
+            Self::Between(minimum, maximum) => (minimum..=maximum).contains(&count),
+        }
+    }
+}
+
+// Execution contracts cover every supported set function. The public pg_proc
+// inventory is a separate compatibility surface and is still incomplete.
+fn srf_arity(name: &str) -> Option<SrfArity> {
+    let named = |names: &[&str]| {
+        names
+            .iter()
+            .any(|candidate| name.eq_ignore_ascii_case(candidate))
+    };
+    if is_event_trigger_introspection(name) || named(&["pg_cursor", "pg_listening_channels"]) {
+        Some(SrfArity::Exact(0))
+    } else if is_json_each_name(name)
+        || named(&[
+            "_pg_expandarray",
+            "unnest",
+            "jsonb_object_keys",
+            "json_object_keys",
+            "jsonb_array_elements",
+            "json_array_elements",
+            "jsonb_array_elements_text",
+            "json_array_elements_text",
+            "pg_snapshot_xip",
+            "txid_snapshot_xip",
+            "pg_options_to_table",
+            "aclexplode",
+            "pg_get_sequence_data",
+            "ts_token_type",
+        ])
+    {
+        Some(SrfArity::Exact(1))
+    } else if named(&[
+        "jsonb_populate_recordset",
+        "pg_input_error_info",
+        "ts_parse",
+    ]) {
+        Some(SrfArity::Exact(2))
+    } else if regex_srf_name(name).is_some()
+        || named(&[
+            "generate_series",
+            "string_to_table",
+            "generate_subscripts",
+            "json_populate_recordset",
+        ])
+    {
+        Some(SrfArity::Between(2, 3))
+    } else if named(&["jsonb_path_query", "jsonb_path_query_tz"]) {
+        Some(SrfArity::Between(2, 4))
+    } else if named(&["ts_debug", "ts_stat"]) {
+        Some(SrfArity::Between(1, 2))
+    } else if named(&["pg_get_publication_tables"]) {
+        Some(SrfArity::Between(1, crate::storage::MAX_ROUTINE_ARGUMENTS))
+    } else {
+        None
+    }
+}
+
 /// Whether `name` is one of the supported set-returning functions.
 pub(crate) fn is_srf_name(name: &str) -> bool {
-    is_event_trigger_introspection(name)
-        || name.eq_ignore_ascii_case("pg_cursor")
-        || name.eq_ignore_ascii_case("pg_listening_channels")
-        || name.eq_ignore_ascii_case("_pg_expandarray")
-        || name.eq_ignore_ascii_case("unnest")
-        || name.eq_ignore_ascii_case("generate_series")
-        || regex_srf_name(name).is_some()
-        || name.eq_ignore_ascii_case("jsonb_object_keys")
-        || name.eq_ignore_ascii_case("json_object_keys")
-        || name.eq_ignore_ascii_case("jsonb_array_elements")
-        || name.eq_ignore_ascii_case("json_array_elements")
-        || name.eq_ignore_ascii_case("jsonb_array_elements_text")
-        || name.eq_ignore_ascii_case("json_array_elements_text")
-        || name.eq_ignore_ascii_case("jsonb_path_query")
-        || name.eq_ignore_ascii_case("jsonb_path_query_tz")
-        || name.eq_ignore_ascii_case("json_populate_recordset")
-        || name.eq_ignore_ascii_case("jsonb_populate_recordset")
-        || name.eq_ignore_ascii_case("string_to_table")
-        || name.eq_ignore_ascii_case("generate_subscripts")
-        || name.eq_ignore_ascii_case("pg_snapshot_xip")
-        || name.eq_ignore_ascii_case("txid_snapshot_xip")
-        || name.eq_ignore_ascii_case("pg_options_to_table")
-        || name.eq_ignore_ascii_case("aclexplode")
-        || name.eq_ignore_ascii_case("pg_get_sequence_data")
-        || name.eq_ignore_ascii_case("pg_get_publication_tables")
-        || name.eq_ignore_ascii_case("pg_input_error_info")
-        || name.eq_ignore_ascii_case("ts_parse")
-        || name.eq_ignore_ascii_case("ts_token_type")
-        || name.eq_ignore_ascii_case("ts_debug")
-        || name.eq_ignore_ascii_case("ts_stat")
-        || is_json_each_name(name)
+    srf_arity(name).is_some()
 }
 
 fn is_object_address_record_function(name: &str) -> bool {
@@ -1357,12 +1396,7 @@ pub(super) fn with_bound_srf_inputs<'a, R: ColumnLookup<'a>, T>(
             "set-returning call has too many arguments"
         ));
     }
-    let accepted = if name.eq_ignore_ascii_case("_pg_expandarray") {
-        args.len() == 1
-    } else {
-        crate::sql::catalog::intrinsic_routine_accepts_arity(name, args.len())
-    };
-    if !accepted {
+    if !srf_arity(name).is_some_and(|arity| arity.accepts(args.len())) {
         return crate::sql::eval::undefined_function(name, args, arena, row, hooks);
     }
     let mut reordered = [&Expr::Null; 3];

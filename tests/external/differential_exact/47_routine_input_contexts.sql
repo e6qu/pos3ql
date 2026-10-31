@@ -37,6 +37,7 @@ DEALLOCATE input_set;
 SELECT last_value FROM input_effects;
 SELECT pg_typeof(value) FROM generate_series(nextval('input_effects'),23) AS value;
 SELECT last_value FROM input_effects;
+SELECT (pg_options_to_table(ARRAY['fillfactor=80','flag'])).*;
 SELECT count(*) FROM input_audit;
 DROP TABLE input_nulls;
 DROP PROCEDURE input_conversion(bigint,bigint);

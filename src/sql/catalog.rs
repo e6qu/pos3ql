@@ -3752,6 +3752,7 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     intrinsic!(6416, "hashdateextended", 20, "1082 20", 2, "i"),
     intrinsic!(6425, "timestamptz_hash", 23, "1184", 1, "i"),
     intrinsic!(6426, "timestamptz_hash_extended", 20, "1184 20", 2, "i"),
+    intrinsic!(2289, "pg_options_to_table", 2249, "1009", 1, "s"),
     // PostgreSQL 18.6 pg_proc.dat, including every registered series overload.
     // https://github.com/postgres/postgres/blob/724edf9bde9d356724ad384a2e196edc3c9f80f7/src/include/catalog/pg_proc.dat
     intrinsic!(1191, "generate_subscripts", 23, "2277 23 16", 3, "i"),
@@ -3771,15 +3772,6 @@ pub(crate) fn intrinsic_routine_has_name(name: &str) -> bool {
     INTRINSIC_ROUTINES
         .iter()
         .any(|routine| routine_name_matches(name, "pg_catalog", routine.name))
-}
-
-pub(crate) fn intrinsic_routine_accepts_arity(name: &str, arity: usize) -> bool {
-    INTRINSIC_ROUTINES.iter().any(|routine| {
-        let declared = routine.argument_count as usize;
-        let omitted = intrinsic_routine_defaults(routine.oid).map_or(0, |(count, _)| count);
-        routine_name_matches(name, "pg_catalog", routine.name)
-            && (declared - omitted..=declared).contains(&arity)
-    })
 }
 
 /// Foldability follows the registered catalog contract. Exact inputs win over
@@ -3992,7 +3984,8 @@ fn intrinsic_routine_is_strict(routine: IntrinsicRoutine) -> bool {
 fn intrinsic_routine_is_set_returning(routine: IntrinsicRoutine) -> bool {
     matches!(
         routine.oid,
-        1191 | 1192
+        2289 | 1191
+            | 1192
             | 1066
             | 1067
             | 1068
@@ -4431,6 +4424,7 @@ const OBJECT_ADDRESS_OUTPUT_NAMES: &[&str] = &["classid", "objid", "objsubid"];
 
 fn intrinsic_routine_argument_names(oid: i32) -> Option<&'static [&'static str]> {
     match oid {
+        2289 => Some(&["options_array"]),
         2307 | 3775 => Some(&["target"]),
         2096 => Some(&["pid", "timeout"]),
         2171 => Some(&["pid"]),
@@ -4473,6 +4467,7 @@ fn intrinsic_record_outputs(
     routine: IntrinsicRoutine,
 ) -> Option<(&'static [i32], &'static [&'static str])> {
     match routine.oid {
+        2289 => Some((&[25, 25], &["option_name", "option_value"])),
         6119 => Some((
             PUBLICATION_TABLE_OUTPUT_OIDS,
             PUBLICATION_TABLE_OUTPUT_NAMES,
@@ -26796,6 +26791,7 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 Datum::Null,
                 Datum::Float8(if routine.oid == 6120 { 10.0 } else { 1.0 }),
                 Datum::Float8(match routine.oid {
+                    2289 => 3.0,
                     2763 => 1.0,
                     2764 => 10.0,
                     2765 | 2766 => 1000.0,

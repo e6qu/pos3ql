@@ -40,6 +40,13 @@ pos3ql. For example, an identity column in a non-default schema must still be
 discovered correctly when an inspector queries the catalogs. These fixtures
 cover the recorded workflows, not every application or library feature.
 
+Catalog column references retain their schema, including in nested queries.
+For example, this form works when an application spells out every name:
+
+```sql
+SELECT pg_catalog.pg_class.relname FROM pg_catalog.pg_class;
+```
+
 Array and `CASE` result types come from their declarations, including subqueries
 and null values. For example, `ARRAY[(SELECT NULL::date)]` is `date[]`, and
 mixing integer and bigint members produces `bigint[]`. An empty constructor

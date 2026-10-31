@@ -2,51 +2,20 @@
 
 No known defects are blocked by an external dependency or an intractable problem.
 
-Fix every reproducible defect in the PR that finds it. Record an entry only
-with its reproducer, observed behavior and exact external blocker or reason it
-cannot be repaired. Keep reproductions, regression checks and PostgreSQL
-comparisons in the fixing PR, including declared result types, input lifetimes,
-argument and sequence effects, and when errors occur.
-Include overload selection with typed nulls and the declared inputs of correlated
-table functions; a correct non-null value alone does not establish its SQL type.
-Compare resident and forced-spill paths with the same SQL, including nested
-outer references and single-column table-function aliases.
-For range predicates, compare null truth tables, repeated sequence/subquery
-calls, operator binding and errors reached only by later fetches.
-Compare three-part catalog column references during planning and execution,
-including prepared queries, nested queries, wrong schemas and aliases.
-Keep actual client-generated SQL and migration failures as regressions; preserve
-psycopg2, SQLAlchemy and Alembic transcripts against the PostgreSQL reference.
-Check catalog-character comparisons with text arrays and schema-qualified outer
-references, including their types, collations and alias errors.
-Keep catalog-vector array functions, relation-name round trips and quantified
-pattern matching in the reference comparisons used by actual applications.
-Preserve type delimiters through domains and arrays for psycopg type discovery.
-Memory comparisons must separate configured reservations, drawn startup budget
-and measured process memory; retain both transaction modes, raw named component
-charges, compiler identity and the revision. Keep evidence metadata separately
-from disposable empty database files.
-Wide definition slots must remain initialized and owned until their readers
-release them; startup must not initialize payload pages for every unused slot.
-The live built-in inventory must reject wrong properties for registered routines;
-missing catalog entries remain an explicit completion gap in PLAN.md.
-Reproduce history exhaustion with an older reader and a multirow write; assert
-that rejected commits do not advance durable state or partially change rows.
-History reservations must remain owned while competing updates, savepoint undo
-and prepared recovery run; unused reservations must become reusable on rollback.
-Readers that can see the current row must not retain older images or obsolete
-deletion markers. Check shared-slot reuse under those readers without draining
-all history synchronously or repeating an update's inputs and effects.
-Deletion markers still belong to unfinished checkpoint captures until those
-captures release them, even when no query needs an older row value.
-Recovered prepared replay must preserve row history for existing readers across
-both replacement and deletion, rather than overwrite their saved values.
-Preserve failed outputs and diagnostics before removing temporary fixtures.
-Check native Linux amd64, Linux arm64 and macOS arm64 builds when changing C
-interfaces; a passing build on one target does not establish another's ABI.
-See [CONTRIBUTING.md](CONTRIBUTING.md).
+Fix reproducible defects in the PR that finds them, including incidental defects.
+Record an entry here only with its reproducer, observed behavior and the exact
+external blocker or reason it cannot be repaired. Ordinary regression cases
+and resolved investigations belong in their fixing PR, tests and evidence.
 
-Unfinished features and their verification criteria belong in [PLAN.md](PLAN.md).
+Follow [CONTRIBUTING.md](CONTRIBUTING.md) for PostgreSQL comparisons, actual
+application workflows, allocation checks, failure diagnostics and native platform
+checks. Compare SQL values, declared types, errors and effects; preserve rollback,
+reader ownership, checkpoint retention and recovery when changing shared memory.
+Memory evidence distinguishes reservations from resident pages and records the
+revision, compiler, settings and named component charges. Release checks validate
+the documentation actually shipped in the archive.
+
+Unfinished features and their acceptance criteria belong in [PLAN.md](PLAN.md).
 Current guarantees belong in the [behavior guide](docs/implemented-baseline.md)
 and its [owning technical guides](docs/README.md).
 

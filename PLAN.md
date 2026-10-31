@@ -43,11 +43,9 @@ errors and argument effects with PostgreSQL, including seeded hashes.
 Registered routine identities, aggregate kinds and null-call properties must
 match the live reference catalog even while missing routines are being added.
 Run real SQLAlchemy, Alembic and psycopg2 workflows against both servers.
-Relation names converted through `regclass` must remain resolvable outside the
-search path, including quoted names and indexes. Catalog vectors must preserve
-their element types and zero-based bounds through array functions used by
-schema inspection. Type inspection includes the correct element delimiter for
-base types, arrays and domains. Quantified pattern matching uses pattern semantics.
+Keep their catalog inspection, declared types, streaming and migration checks
+passing as function binding and execution expand; see the
+[tested application boundary](docs/postgresql-18-compatibility.md#implemented-boundary).
 Measure startup reservations and actual resident memory for empty and populated
 embedded databases; report the per-table contribution separately. Verify that
 unused wide definition slots stay untouched while live readers prevent slot reuse.
@@ -65,9 +63,12 @@ Reject per-row history exhaustion before writing the commit too; a multirow
 transaction must leave every row unchanged and keep the server usable on error.
 Include the current execution-stack requirement in embedded measurements and
 reduce avoidable wide construction frames alongside table and history metadata.
-The retained [empty-engine measurements](benchmarks/baselines/2026-10-30-embedded-startup/README.md)
+The retained [empty-engine measurements](https://github.com/e6qu/pos3ql/blob/6ff1ac865a86a5318cb4934fbf01be0926667811/benchmarks/baselines/2026-10-30-embedded-startup/README.md)
 establish a debug-build starting point; repeat them after memory repairs and add
 populated-table and client-session workloads before claiming an embedded minimum.
+The [lazy definition comparison](https://github.com/e6qu/pos3ql/blob/4054a6d3c79e916728f8e84d84139eae6d86b501/benchmarks/baselines/2026-10-30-embedded-lazy-definitions/README.md)
+records reduced empty-engine resident memory; fixed reservations and per-table
+metadata still need reduction and populated-workload measurements.
 
 ### Finish transaction visibility and keep maintenance moving
 
@@ -78,10 +79,6 @@ A waiting schema edit must never attach itself to a new object that reused a nam
 - When a report lists an object's saved name, its later column, index, comment
   and dependency reads must still refer to that same object. Unfinished edits
   must stay private to their transaction. Preserve repeated dependency rows.
-  Catalog sources must retain their real schema in planning and execution;
-  `SELECT pg_catalog.pg_class.relname FROM pg_catalog.pg_class` must resolve.
-  Preserve schema-qualified outer references and PostgreSQL's internal-character
-  to text comparison used by application schema inspection.
 - Keep older rows, indexes and saved files until readers and backups finish.
   Remove obsolete versions in limited batches so other queries keep moving.
   Files written by an unfinished checkpoint remain owned until its publication

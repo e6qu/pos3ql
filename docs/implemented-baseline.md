@@ -24,7 +24,7 @@ remain in the plan.
 
 ## Transactions and durable success
 
-Every configuration explicitly selects `transaction_mode` and
+Every configuration explicitly selects `transaction_mode`,
 `catalog_history_bytes` and `row_history_slots` before startup:
 
 | Mode | Reader and writer behavior | Isolation |

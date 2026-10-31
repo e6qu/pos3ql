@@ -1,6 +1,39 @@
 use super::*;
 
 #[test]
+fn constant_catalog_identifier_errors_do_not_depend_on_input_rows() {
+    let config = test_config("routine-constant-identifiers");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(&mut engine, "CREATE TABLE dispatch_empty(id integer)", true);
+    for (sql, state) in [
+        (
+            "SELECT 'dispatch_missing_relation'::regclass FROM dispatch_empty",
+            "42P01",
+        ),
+        (
+            "SELECT 'dispatch_missing_type'::regtype FROM dispatch_empty",
+            "42704",
+        ),
+        (
+            "SELECT 'dispatch_missing_function'::regproc FROM dispatch_empty",
+            "42883",
+        ),
+        (
+            "SELECT 'dispatch_missing_function()'::regprocedure FROM dispatch_empty",
+            "42883",
+        ),
+    ] {
+        assert_eq!(
+            error_sqlstates(&session.execute(&mut engine, sql, true)),
+            [state],
+            "{sql}"
+        );
+    }
+}
+
+#[test]
 fn stored_strict_calls_skip_constant_nulls_without_skipping_reached_inputs() {
     let config = test_config("routine-strict-inputs");
     let mut budget = test_engine_budget(&config, 1 << 29);
@@ -189,9 +222,9 @@ fn routine_arguments_run_once_and_preserve_strict_null_effects() {
     );
     session.success(
         &mut engine,
-        "SELECT set_config('test.dispatch_calls','',false); \
+        "SELECT set_config('application_name','',false); \
         CREATE FUNCTION dispatch_comparison(regclass,integer) RETURNS boolean LANGUAGE sql VOLATILE \
-        AS 'SELECT set_config(''test.dispatch_calls'',current_setting(''test.dispatch_calls'')||''x'',false) IS NOT NULL'; \
+        AS 'SELECT set_config(''application_name'',current_setting(''application_name'')||''x'',false) IS NOT NULL'; \
         CREATE OPERATOR === (LEFTARG=regclass,RIGHTARG=integer,FUNCTION=dispatch_comparison); \
         CREATE OPERATOR + (LEFTARG=regclass,RIGHTARG=integer,FUNCTION=dispatch_comparison)",
         true,
@@ -199,8 +232,8 @@ fn routine_arguments_run_once_and_preserve_strict_null_effects() {
     assert_eq!(
         data_rows(&session.success(
             &mut engine,
-            "SELECT 'dispatch_target'::regclass === 1; SELECT current_setting('test.dispatch_calls'); \
-            SELECT 'dispatch_target'::regclass + 1; SELECT current_setting('test.dispatch_calls')",
+            "SELECT 'dispatch_target'::regclass === 1; SELECT current_setting('application_name'); \
+            SELECT 'dispatch_target'::regclass + 1; SELECT current_setting('application_name')",
             true
         )),
         ["t", "x", "t", "xx"]

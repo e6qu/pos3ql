@@ -2991,7 +2991,8 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             })?;
         self.storage.require_routine_execute(slot, self.txid)?;
         let declared = self.storage.routine_for(slot, self.txid);
-        let mut input_type_oids = [super::types::oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
+        let mut input_type_oids =
+            [super::types::oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
         let mut default_expressions = [None; crate::storage::MAX_ROUTINE_ARGUMENTS];
         for input_index in 0..declared.argument_count {
             let parameter = declared
@@ -3033,11 +3034,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         }
         let routine = self
             .storage
-            .routine_for_bound_call(
-                slot,
-                &input_type_oids[..declared.argument_count],
-                self.txid,
-            )
+            .routine_for_bound_call(slot, &input_type_oids[..declared.argument_count], self.txid)
             .expect("resolved routine call has a valid polymorphic binding");
         let input_contract = |input_index: usize, expanded: bool| {
             let mut argument = routine.arguments()[input_index];
@@ -3061,7 +3058,10 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                 })?;
             Ok((argument, expected))
         };
-        let coerce_input = |value, source, argument: crate::storage::RoutineArgumentDef, expected| {
+        let coerce_input = |value,
+                            source,
+                            argument: crate::storage::RoutineArgumentDef,
+                            expected| {
             if source != expected
                 && let Some(value) = self.execute_defined_cast(
                     source,

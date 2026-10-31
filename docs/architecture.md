@@ -53,11 +53,15 @@ of these paths can occupy that worker. [PLAN.md](../PLAN.md) tracks their
 conversion and the later CPU worker pool separately.
 
 Stored-function dispatch selects the catalog identity and named-input mapping
-before evaluating arguments. Arguments and defaults run in declaration order
-with the caller's evaluation context. Lookup does not run an argument as a
-probe. For example, `setval('order_numbers', nextval('import_numbers'))`
-consumes one import number. A literal null can eliminate a strict call during
-planning; a null row value still allows the other reached arguments to run.
+and binds input types before evaluating arguments. Constant inputs and their
+conversions are checked before runtime inputs. Reached runtime inputs and
+defaults run in declaration order with the caller's evaluation context.
+Lookup does not run an argument as a probe. For example,
+`setval('order_numbers', nextval('import_numbers'))`
+consumes one import number. A constant null, including an inserted default or
+an explicitly null variadic array, can eliminate a strict call. A null array
+member does not make the array null. A null row value still allows the other
+reached arguments to run.
 This call boundary supplies retained execution with an explicit target; it
 does not yet make every function body yield during a storage wait.
 

@@ -17,6 +17,10 @@ the registered volatility of built-ins, stored functions and user operators, so
 maintenance and other effects cannot run as constant-folding probes.
 Strict stored-function checks include inserted null defaults, null variadic
 arrays, non-null arrays containing null members, and input-conversion errors.
+Catalog-identifier casts must still reject a missing object when the scanned
+catalog is empty; deletion checks retain the object's OID before dropping it.
+Cover relation, type and function identifiers without discarding their errors
+as failed context-free probes.
 Memory evidence distinguishes reservations from resident pages and records the
 revision, compiler, settings and named component charges. Release checks validate
 the documentation actually shipped in the archive.

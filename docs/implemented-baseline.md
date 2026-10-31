@@ -314,6 +314,10 @@ its runtime inputs; errors in constant inputs still surface. This includes
 inserted defaults and explicitly null variadic arrays. A null member inside a
 non-null variadic array does not skip the call. Runtime nulls still evaluate
 the other reached inputs.
+Constant catalog-identifier casts still validate their names without input rows:
+selecting `'missing_table'::regclass` from an empty table raises `42P01`.
+Capture an object's OID before dropping it when checking that its catalog rows
+were removed.
 
 ## Schema changes and object identity
 

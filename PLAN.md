@@ -48,6 +48,7 @@ Reuse the shared call boundary, including its bound input conversions and
 strict-null handling, rather than replaying argument evaluation.
 Preserve registered built-in and operator volatility when deciding which inputs
 can run during planning; maintenance calls must run only when the query reaches them.
+Retain catalog-aware planning errors even when a scan returns no input rows.
 Run real SQLAlchemy, Alembic and psycopg2 workflows against both servers.
 Keep their catalog inspection, declared types, streaming and migration checks
 passing as function binding and execution expand; see the

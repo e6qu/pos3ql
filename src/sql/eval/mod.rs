@@ -2067,11 +2067,13 @@ fn fold_check<'a>(
         return Ok(match result {
             Ok(Datum::Bool(b)) => Some(b),
             Ok(_) => None,
-            // Unresolved catalog values stay for runtime validation. Registered
-            // immutable casts above already have their catalog context.
+            // A catalog-aware immutable expression has its lookup context:
+            // missing objects are real planning errors, even without input rows.
+            // Context-free probes and unsupported execution stay for runtime.
             Err(e)
-                if e.sqlstate == sqlstate::UNDEFINED_OBJECT
-                    || e.sqlstate == sqlstate::UNDEFINED_FUNCTION
+                if (evaluation != Some(ExpressionEvaluation::Immutable)
+                    && (e.sqlstate == sqlstate::UNDEFINED_OBJECT
+                        || e.sqlstate == sqlstate::UNDEFINED_FUNCTION))
                     || e.sqlstate == sqlstate::FEATURE_NOT_SUPPORTED =>
             {
                 None

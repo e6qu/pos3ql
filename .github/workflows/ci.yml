@@ -55,13 +55,13 @@ jobs:
         if: ${{ matrix.check == 'build and test' }}
         run: cargo build --all-targets --locked --target "$NATIVE_TARGET"
 
-      - name: Socket readiness and allocation-free catalog publication
+      - name: Native SQL, catalog and socket boundaries
         if: ${{ matrix.check == 'build and test' }}
         run: >-
           cargo test --lib --locked --target "$NATIVE_TARGET" -- io:: mem::mutex::tests type_ domain_ enum_ composite_ table_name catalog_creation_
           timezone_abbreviation_ fixed_default_abbreviations_ degree_special_and_random_math_
           maintenance_metadata_ cleanup_download_overlap_ object_store::http::tests::
-          reader_scratch_is_synchronized_and_startup_bounded database_default_collation_is_bounded_
+          reader_scratch_is_synchronized_and_startup_bounded database_default_collation_is_bounded_ routine_calls::
           --test-threads=1
 
       - name: Native allocation-free boundaries

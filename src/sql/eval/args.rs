@@ -95,7 +95,7 @@ pub(crate) fn strict_arguments<'a, const N: usize>(
     let mut constants = [false; N];
     for (index, argument) in args.iter().enumerate() {
         constants[index] = super::constant_evaluation(argument, hooks.catalog)?
-            != Some(super::CastEvaluation::Runtime);
+            != Some(super::ExpressionEvaluation::Runtime);
         if constants[index] {
             values[index] = eval_full(argument, arena, params, row, hooks)?;
         }

@@ -75,11 +75,19 @@ fn routine_arguments_run_once_and_preserve_strict_null_effects() {
     {
         let catalog = query::storage_catalog(&engine.storage, &engine.work, 0);
         let expression = parser::parse_expression("dispatch_step()", &engine.work).unwrap();
-        assert!(matches!(eval::constant_evaluation(expression,Some(&catalog)).unwrap(),
-            Some(eval::CastEvaluation::Runtime)));
+        assert!(matches!(
+            eval::constant_evaluation(expression, Some(&catalog)).unwrap(),
+            Some(eval::ExpressionEvaluation::Runtime)
+        ));
     }
-    assert_eq!(data_rows(&session.success(&mut engine,
-        "SELECT dispatch_step(); SELECT last_value FROM dispatch_effects",true)),["17","17"]);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT dispatch_step(); SELECT last_value FROM dispatch_effects",
+            true
+        )),
+        ["17", "17"]
+    );
     assert_eq!(
         data_rows(&session.success(
             &mut engine,
@@ -88,15 +96,42 @@ fn routine_arguments_run_once_and_preserve_strict_null_effects() {
         )),
         ["18|18"]
     );
-    assert_eq!(data_rows(&session.success(&mut engine,
-        "SELECT last_value FROM dispatch_effects",true)),["18"]);
-    for sql in ["SELECT hashtextextended(NULL::text,dispatch_step())", "SELECT setval(NULL::regclass,dispatch_step())",
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "SELECT last_value FROM dispatch_effects", true)),
+        ["18"]
+    );
+    for sql in [
+        "SELECT hashtextextended(NULL::text,dispatch_step())",
+        "SELECT setval(NULL::regclass,dispatch_step())",
         "SELECT setval(NULL::text::regclass,dispatch_step())",
-        "SELECT setval((CASE WHEN true THEN NULL::text ELSE 'dispatch_target' END)::regclass,dispatch_step())"] {
-        assert_eq!(data_rows(&session.success(&mut engine,sql,true)),["NULL"],"{sql}");
-        assert_eq!(data_rows(&session.success(&mut engine,
-            "SELECT last_value FROM dispatch_effects",true)),["18"],"{sql}");
+        "SELECT setval((CASE WHEN true THEN NULL::text ELSE 'dispatch_target' END)::regclass,dispatch_step())",
+    ] {
+        assert_eq!(
+            data_rows(&session.success(&mut engine, sql, true)),
+            ["NULL"],
+            "{sql}"
+        );
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "SELECT last_value FROM dispatch_effects",
+                true
+            )),
+            ["18"],
+            "{sql}"
+        );
     }
+    let oversized = format!(
+        "SELECT dispatch_missing({})",
+        vec!["nextval('dispatch_effects')"; 24].join(",")
+    );
+    let rejected = session.execute(&mut engine, &oversized, true);
+    assert_eq!(error_sqlstates(&rejected), ["54000"]);
+    assert!(String::from_utf8_lossy(&rejected).contains("192 bytes"));
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "SELECT last_value FROM dispatch_effects", true)),
+        ["18"]
+    );
 }
 
 #[test]

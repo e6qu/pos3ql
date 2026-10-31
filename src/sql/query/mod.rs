@@ -2802,7 +2802,8 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
     }
 
     fn has_routine_candidate(&self, name: &str, arity: usize) -> bool {
-        self.storage.has_function_routine_candidate(name, arity, self.txid)
+        self.storage
+            .has_function_routine_candidate(name, arity, self.txid)
     }
 
     fn resolve_routine_call<'name>(
@@ -2852,7 +2853,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         argument_names: &[Option<&str>],
         variadic: bool,
         argument_type_oids: &[i32],
-    ) -> Result<Option<super::eval::CastEvaluation>, SqlError> {
+    ) -> Result<Option<super::eval::ExpressionEvaluation>, SqlError> {
         let Some(super::eval::RoutineCallTarget::Stored { oid, .. }) =
             self.resolve_routine_call(name, argument_names, variadic, argument_type_oids)?
         else {
@@ -2867,9 +2868,9 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             if routine.attributes.volatility == crate::storage::RoutineVolatility::Immutable
                 && !routine.kind.is_set_returning()
             {
-                super::eval::CastEvaluation::Immutable
+                super::eval::ExpressionEvaluation::Immutable
             } else {
-                super::eval::CastEvaluation::Runtime
+                super::eval::ExpressionEvaluation::Runtime
             },
         ))
     }
@@ -2889,7 +2890,8 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                 variadic,
             } => (oid, argument_mapping, variadic),
             super::eval::RoutineCallTarget::Operator { schema, name } => {
-                let values = arena.alloc_slice_with(arguments.len(), |_| Datum::Null)
+                let values = arena
+                    .alloc_slice_with(arguments.len(), |_| Datum::Null)
                     .map_err(|_| arena_full())?;
                 for (value, expression) in values.iter_mut().zip(arguments) {
                     *value = evaluate(expression)?;
@@ -2929,9 +2931,11 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                 .expect("input signature has a declared parameter");
             let mut supplied = false;
             let mut variadic_count = 0usize;
-            let expanded_variadic = !variadic && matches!(
-                parameter.mode, crate::storage::RoutineParameterMode::Variadic { .. }
-            );
+            let expanded_variadic = !variadic
+                && matches!(
+                    parameter.mode,
+                    crate::storage::RoutineParameterMode::Variadic { .. }
+                );
             for (call_index, expression) in arguments.iter().enumerate() {
                 if usize::from(mapping[call_index]) != input_index {
                     continue;
@@ -2948,8 +2952,10 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             }
             if expanded_variadic && supplied {
                 let ColType::Array(element) = parameter.ctype else {
-                    return Err(sql_err!(sqlstate::INTERNAL_ERROR,
-                        "variadic parameter is not an array"));
+                    return Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "variadic parameter is not an array"
+                    ));
                 };
                 completed[input_index] = Datum::Array {
                     element,
@@ -2962,7 +2968,8 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                     .alloc_str(default.as_str())
                     .map_err(|_| arena_full())?;
                 let expression = super::parser::parse_expression(source, arena)?;
-                completed[input_index] = super::eval::cast_to(evaluate(expression)?, parameter.ctype, arena)?;
+                completed[input_index] =
+                    super::eval::cast_to(evaluate(expression)?, parameter.ctype, arena)?;
             } else {
                 return Err(sql_err!(
                     sqlstate::INTERNAL_ERROR,
@@ -3071,7 +3078,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         &self,
         source_oid: i32,
         target_oid: i32,
-    ) -> Result<Option<super::eval::CastEvaluation>, SqlError> {
+    ) -> Result<Option<super::eval::ExpressionEvaluation>, SqlError> {
         let Some((_, cast)) = self
             .storage
             .cast_for_oids(source_oid, target_oid, self.txid)
@@ -3096,9 +3103,9 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             }
         };
         Ok(Some(if immutable {
-            super::eval::CastEvaluation::Immutable
+            super::eval::ExpressionEvaluation::Immutable
         } else {
-            super::eval::CastEvaluation::Runtime
+            super::eval::ExpressionEvaluation::Runtime
         }))
     }
 

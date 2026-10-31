@@ -1220,7 +1220,7 @@ pub trait CatalogAccess {
         _argument_names: &[Option<&str>],
         _variadic: bool,
         _argument_type_oids: &[i32],
-    ) -> Result<Option<CastEvaluation>, SqlError> {
+    ) -> Result<Option<ExpressionEvaluation>, SqlError> {
         Ok(None)
     }
 
@@ -1254,7 +1254,7 @@ pub trait CatalogAccess {
         &self,
         _source_oid: i32,
         _target_oid: i32,
-    ) -> Result<Option<CastEvaluation>, SqlError> {
+    ) -> Result<Option<ExpressionEvaluation>, SqlError> {
         Ok(None)
     }
     /// Applies a catalog-defined cast in the context that selected it.
@@ -1760,7 +1760,7 @@ pub trait CatalogAccess {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub enum CastEvaluation {
+pub enum ExpressionEvaluation {
     Immutable,
     Runtime,
 }
@@ -1906,7 +1906,7 @@ pub fn check_constant_errors<'a>(
 fn catalog_evaluation(
     expression: &Expr<'_>,
     catalog: &dyn CatalogAccess,
-) -> Result<Option<CastEvaluation>, SqlError> {
+) -> Result<Option<ExpressionEvaluation>, SqlError> {
     let mut found = None;
     if let Expr::Call {
         name,
@@ -1967,14 +1967,14 @@ fn catalog_evaluation(
             {
                 // Name resolution needs this catalog even for a constant cast.
                 // Strict null folding includes CASE and nested builtin casts.
-                Some(CastEvaluation::Immutable)
+                Some(ExpressionEvaluation::Immutable)
             } else {
                 catalog.cast_evaluation(source, target)?
             };
         }
     }
     super::query::walk_children(expression, &mut |child| {
-        if found != Some(CastEvaluation::Runtime)
+        if found != Some(ExpressionEvaluation::Runtime)
             && let Some(evaluation) = catalog_evaluation(child, catalog)?
         {
             found = Some(evaluation);
@@ -1987,9 +1987,9 @@ fn catalog_evaluation(
 pub(super) fn constant_evaluation(
     expression: &Expr<'_>,
     catalog: Option<&dyn CatalogAccess>,
-) -> Result<Option<CastEvaluation>, SqlError> {
+) -> Result<Option<ExpressionEvaluation>, SqlError> {
     if !expression.is_constant() {
-        return Ok(Some(CastEvaluation::Runtime));
+        return Ok(Some(ExpressionEvaluation::Runtime));
     }
     match catalog {
         Some(catalog) => catalog_evaluation(expression, catalog),
@@ -2012,8 +2012,8 @@ fn fold_check<'a>(
 ) -> Result<Option<bool>, SqlError> {
     use super::ast::BinaryOp;
     let evaluation = constant_evaluation(expression, catalog)?;
-    if evaluation != Some(CastEvaluation::Runtime) {
-        let result = if evaluation == Some(CastEvaluation::Immutable) {
+    if evaluation != Some(ExpressionEvaluation::Runtime) {
+        let result = if evaluation == Some(ExpressionEvaluation::Immutable) {
             let hooks = EvalHooks {
                 catalog,
                 ..NO_HOOKS
@@ -4780,34 +4780,60 @@ fn undefined_function<'a>(
     hooks: &EvalHooks<'_, 'a>,
 ) -> Result<Datum<'a>, SqlError> {
     use core::fmt::Write as _;
-    let mut list = StackStr::<256>::new();
-    let columns = RuntimeColumnTypes { row, catalog: hooks.catalog };
+    let full = || {
+        sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "function diagnostic exceeds SQL error message capacity (192 bytes)"
+        )
+    };
+    let mut message = StackStr::<192>::new();
+    write!(message, "function {}(", name).map_err(|_| full())?;
+    let columns = RuntimeColumnTypes {
+        row,
+        catalog: hooks.catalog,
+    };
     for (i, argument) in args.iter().enumerate() {
         if i > 0 {
-            let _ = list.write_str(", ");
+            message.write_str(", ").map_err(|_| full())?;
         }
         let type_oid = super::exec::infer_routine_argument_oid(argument, &columns)?;
         let named = if type_oid == super::types::oid::UNKNOWN {
             "unknown"
         } else if crate::storage::NamedTypeKind::from_oid(type_oid).is_some() {
-            hooks.catalog.ok_or_else(|| {
-                sql_err!(sqlstate::INTERNAL_ERROR, "function argument type catalog is unavailable")
-            })?.type_name(type_oid, arena)?.ok_or_else(|| {
-                sql_err!(sqlstate::INTERNAL_ERROR, "function argument type with OID {} is unavailable", type_oid)
-            })?
+            hooks
+                .catalog
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "function argument type catalog is unavailable"
+                    )
+                })?
+                .type_name(type_oid, arena)?
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "function argument type with OID {} is unavailable",
+                        type_oid
+                    )
+                })?
         } else {
-            ColType::from_oid(type_oid).map(ColType::name).ok_or_else(|| {
-                sql_err!(sqlstate::INTERNAL_ERROR, "function argument type with OID {} is unavailable", type_oid)
-            })?
+            ColType::from_oid(type_oid)
+                .map(ColType::name)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "function argument type with OID {} is unavailable",
+                        type_oid
+                    )
+                })?
         };
-        let _ = list.write_str(named);
+        message.write_str(named).map_err(|_| full())?;
     }
-    Err(sql_err!(
-        sqlstate::UNDEFINED_FUNCTION,
-        "function {}({}) does not exist",
-        name,
-        list.as_str()
-    ))
+    message.write_str(") does not exist").map_err(|_| full())?;
+    Err(SqlError {
+        sqlstate: SqlState::known(sqlstate::UNDEFINED_FUNCTION),
+        message,
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -5051,7 +5077,8 @@ fn call<'a>(
             )
         });
     }
-    if !star && let Some(catalog) = hooks.catalog
+    if !star
+        && let Some(catalog) = hooks.catalog
         && (catalog.has_routine_candidate(name, args.len())
             || crate::sql::ast::catalog_operator_call(name).is_some())
     {

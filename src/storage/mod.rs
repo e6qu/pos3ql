@@ -8998,9 +8998,9 @@ impl RoutineDef {
             .filter(|parameter| parameter.mode.is_input())
             .take_while(|parameter| parameter.mode.default().is_none())
             .count();
-        let variadic = parameters.iter().any(|parameter| {
-            matches!(parameter.mode, RoutineParameterMode::Variadic { .. })
-        });
+        let variadic = parameters
+            .iter()
+            .any(|parameter| matches!(parameter.mode, RoutineParameterMode::Variadic { .. }));
         required <= arity && (arity <= argument_count || variadic)
     }
 

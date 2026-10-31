@@ -80,6 +80,37 @@ pub(crate) fn arity_err(name: &str, got: usize) -> SqlError {
     )
 }
 
+/// Constant nulls suppress strict calls at planning, after constant errors are
+/// checked. Runtime nulls suppress only the call: every reached input still
+/// evaluates once. Callers validate their signature before entering this step.
+pub(crate) fn strict_arguments<'a, const N: usize>(
+    args: &[&Expr<'a>],
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    row: &impl ColumnLookup<'a>,
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<Option<[Datum<'a>; N]>, SqlError> {
+    assert!(args.len() <= N, "validated function argument capacity");
+    let mut values = [Datum::Null; N];
+    let mut constants = [false; N];
+    for (index, argument) in args.iter().enumerate() {
+        constants[index] = super::constant_evaluation(argument, hooks.catalog)?
+            != Some(super::CastEvaluation::Runtime);
+        if constants[index] {
+            values[index] = eval_full(argument, arena, params, row, hooks)?;
+        }
+    }
+    if (0..args.len()).any(|index| constants[index] && values[index].is_null()) {
+        return Ok(None);
+    }
+    for (index, argument) in args.iter().enumerate() {
+        if !constants[index] {
+            values[index] = eval_full(argument, arena, params, row, hooks)?;
+        }
+    }
+    Ok((!values[..args.len()].iter().any(Datum::is_null)).then_some(values))
+}
+
 /// Evaluates `args[i]` and requires text (None = SQL NULL).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn text_arg<'a>(

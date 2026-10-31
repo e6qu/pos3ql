@@ -42,6 +42,10 @@ presence alone is not support. Compare values, declared result types, nulls,
 errors and argument effects with PostgreSQL, including seeded hashes.
 Registered routine identities, aggregate kinds and null-call properties must
 match the live reference catalog even while missing routines are being added.
+Bind a function's identity and input mapping before running argument effects.
+Built-in dispatch and missing-function checks must not evaluate inputs as a
+lookup probe. Retained calls must preserve their completed inputs and use the
+caller's sequence state for defaults, including strict null and error behavior.
 Run real SQLAlchemy, Alembic and psycopg2 workflows against both servers.
 Keep their catalog inspection, declared types, streaming and migration checks
 passing as function binding and execution expand; see the

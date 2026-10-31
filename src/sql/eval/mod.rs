@@ -426,7 +426,7 @@ impl ExpressionTypeIdentity {
         }
     }
 
-    pub(crate) const fn routine_argument_oid(self, _value: &Datum<'_>) -> i32 {
+    pub(crate) const fn routine_argument_oid(self) -> i32 {
         match self {
             Self::Known(oid) => oid,
             // Keep an unconstrained literal or parameter unknown until the
@@ -891,6 +891,21 @@ pub enum DescriptionTarget<'a> {
     },
 }
 
+/// A callee chosen before evaluating its inputs. Stored functions keep their
+/// catalog identity and named/variadic input mapping through argument effects.
+#[derive(Clone, Copy)]
+pub enum RoutineCallTarget<'name> {
+    Stored {
+        oid: i32,
+        argument_mapping: [u8; crate::storage::MAX_ROUTINE_ARGUMENTS],
+        variadic: bool,
+    },
+    Operator {
+        schema: Option<&'name str>,
+        name: &'name str,
+    },
+}
+
 pub trait CatalogAccess {
     fn current_backend_pid(&self) -> Result<i32, SqlError> {
         Err(sql_err!(
@@ -1183,19 +1198,40 @@ pub trait CatalogAccess {
             "encoding conversion catalog is unavailable"
         ))
     }
-    /// Executes a catalog-resolved scalar SQL routine. `None` means this
-    /// catalog has no matching overload, preserving the normal undefined-
-    /// function diagnostic at the shared call choke point.
-    fn call_routine<'a>(
+    /// Resolve without running arguments. A missing overload must not consume
+    /// input effects before another dispatch path or an undefined-function error.
+    fn resolve_routine_call<'name>(
         &self,
-        _name: &str,
-        _arguments: &[Datum<'a>],
+        _name: &'name str,
         _argument_names: &[Option<&str>],
         _variadic: bool,
         _argument_type_oids: &[i32],
-        _arena: &'a Arena,
-    ) -> Result<Option<Datum<'a>>, SqlError> {
+    ) -> Result<Option<RoutineCallTarget<'name>>, SqlError> {
         Ok(None)
+    }
+
+    fn routine_evaluation(
+        &self,
+        _name: &str,
+        _argument_names: &[Option<&str>],
+        _variadic: bool,
+        _argument_type_oids: &[i32],
+    ) -> Result<Option<CastEvaluation>, SqlError> {
+        Ok(None)
+    }
+
+    fn call_routine<'a>(
+        &self,
+        _target: RoutineCallTarget<'_>,
+        _arguments: &[Datum<'a>],
+        _argument_type_oids: &[i32],
+        _sequences: Option<&dyn SequenceAccess>,
+        _arena: &'a Arena,
+    ) -> Result<Datum<'a>, SqlError> {
+        Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "resolved routine execution is unavailable"
+        ))
     }
     /// Executes a support function already bound to a durable catalog object.
     /// Aggregate definitions use this boundary so a later rename cannot turn
@@ -1863,11 +1899,23 @@ pub fn check_constant_errors<'a>(
     fold_check(expression, arena, catalog).map(|_| ())
 }
 
-fn catalog_cast_evaluation(
+fn catalog_evaluation(
     expression: &Expr<'_>,
     catalog: &dyn CatalogAccess,
 ) -> Result<Option<CastEvaluation>, SqlError> {
     let mut found = None;
+    if let Expr::Call {
+        name, args, argument_names, variadic, ..
+    } = expression {
+        let hooks = EvalHooks { catalog: Some(catalog), ..NO_HOOKS };
+        let mut types = [super::types::oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
+        if args.len() <= types.len() {
+            for (target, argument) in types.iter_mut().zip(*args) {
+                *target = expression_type_identity(argument, &NoColumns, &hooks)?.routine_argument_oid();
+            }
+            found = catalog.routine_evaluation(name, argument_names, *variadic, &types[..args.len()])?;
+        }
+    }
     if let Expr::Cast {
         operand, type_name, ..
     } = expression
@@ -1893,7 +1941,7 @@ fn catalog_cast_evaluation(
             .array_oid()
         } else {
             expression_type_identity(operand, &NoColumns, &hooks)?
-                .routine_argument_oid(&Datum::Null)
+                .routine_argument_oid()
         };
         if let Some(target) = target
             && let Some(evaluation) = catalog.cast_evaluation(source, target)?
@@ -1903,13 +1951,26 @@ fn catalog_cast_evaluation(
     }
     super::query::walk_children(expression, &mut |child| {
         if found != Some(CastEvaluation::Runtime)
-            && let Some(evaluation) = catalog_cast_evaluation(child, catalog)?
+            && let Some(evaluation) = catalog_evaluation(child, catalog)?
         {
             found = Some(evaluation);
         }
         Ok(())
     })?;
     Ok(found)
+}
+
+pub(super) fn constant_evaluation(
+    expression: &Expr<'_>,
+    catalog: Option<&dyn CatalogAccess>,
+) -> Result<Option<CastEvaluation>, SqlError> {
+    if !expression.is_constant() {
+        return Ok(Some(CastEvaluation::Runtime));
+    }
+    match catalog {
+        Some(catalog) => catalog_evaluation(expression, catalog),
+        None => Ok(None),
+    }
 }
 
 /// The simplification-aware core of [`check_constant_errors`], mirroring
@@ -1926,14 +1987,7 @@ fn fold_check<'a>(
     catalog: Option<&dyn CatalogAccess>,
 ) -> Result<Option<bool>, SqlError> {
     use super::ast::BinaryOp;
-    let evaluation = if expression.is_constant() {
-        match catalog {
-            Some(catalog) => catalog_cast_evaluation(expression, catalog)?,
-            None => None,
-        }
-    } else {
-        Some(CastEvaluation::Runtime)
-    };
+    let evaluation = constant_evaluation(expression, catalog)?;
     if evaluation != Some(CastEvaluation::Runtime) {
         let result = if evaluation == Some(CastEvaluation::Immutable) {
             let hooks = EvalHooks {
@@ -2231,8 +2285,8 @@ fn eval_binary_expression<'a>(
         && let Some(name) = operator.operator_name()
         && catalog.has_operator_candidate(name)
     {
-        let left_oid = expression_type_identity(left, row, hooks)?.routine_argument_oid(&l);
-        let right_oid = expression_type_identity(right, row, hooks)?.routine_argument_oid(&r);
+        let left_oid = expression_type_identity(left, row, hooks)?.routine_argument_oid();
+        let right_oid = expression_type_identity(right, row, hooks)?.routine_argument_oid();
         if let Some(value) = catalog.call_operator(name, l, r, left_oid, right_oid, arena)? {
             return Ok(value);
         }
@@ -2248,8 +2302,8 @@ fn eval_binary_expression<'a>(
     if (l.is_null() || r.is_null())
         && let Some(name) = operator.operator_name()
     {
-        let left_oid = expression_type_identity(left, row, hooks)?.routine_argument_oid(&l);
-        let right_oid = expression_type_identity(right, row, hooks)?.routine_argument_oid(&r);
+        let left_oid = expression_type_identity(left, row, hooks)?.routine_argument_oid();
+        let right_oid = expression_type_identity(right, row, hooks)?.routine_argument_oid();
         // NULL datums erase their declared type. Resolve the geometric
         // overload before applying strictness, so typed text is not accepted
         // as geometry and valid nullable columns cannot dispatch as text.
@@ -2698,7 +2752,7 @@ fn eval_full_inner<'a>(
             };
             if ColType::from_sql_name(type_name) == Some(ColType::PgNodeTree)
                 && !v.is_null()
-                && source_identity()?.routine_argument_oid(&v) != super::types::oid::PG_NODE_TREE
+                && source_identity()?.routine_argument_oid() != super::types::oid::PG_NODE_TREE
             {
                 return Err(sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
@@ -2706,7 +2760,7 @@ fn eval_full_inner<'a>(
                 ));
             }
             if let Some(catalog) = hooks.catalog {
-                let source_oid = source_identity()?.routine_argument_oid(&v);
+                let source_oid = source_identity()?.routine_argument_oid();
                 let target_oid = ColType::from_sql_name(type_name)
                     .map(ColType::oid)
                     .or_else(|| catalog.user_type_oid(type_name));
@@ -2741,7 +2795,7 @@ fn eval_full_inner<'a>(
             if let Some(target @ (ColType::Int2 | ColType::Int2Vector | ColType::OidVector)) =
                 ColType::from_sql_name(type_name)
             {
-                let source_oid = source_identity()?.routine_argument_oid(&v);
+                let source_oid = source_identity()?.routine_argument_oid();
                 validate_catalog_reference_cast(source_oid, target)?;
             }
             let catalog_text = matches!(v, Datum::CompositeText { .. })
@@ -4966,23 +5020,19 @@ fn call<'a>(
         });
     }
     if !star && let Some(catalog) = hooks.catalog {
-        let arguments = arena
-            .alloc_slice_with(args.len(), |_| Datum::Null)
-            .map_err(|_| arena_full())?;
         let argument_type_oids = arena
             .alloc_slice_with(args.len(), |_| crate::sql::types::oid::UNKNOWN)
             .map_err(|_| arena_full())?;
         for (slot, argument) in args.iter().enumerate() {
-            arguments[slot] = eval_full(argument, arena, params, row, hooks)?;
             argument_type_oids[slot] = expression_type_identity(argument, row, hooks)?
-                .routine_argument_oid(&arguments[slot]);
+                .routine_argument_oid();
         }
         if args.len() == 1
             && let Some((schema, "!!")) = crate::sql::ast::catalog_operator_call(name)
             && schema.is_none_or(|schema| schema.eq_ignore_ascii_case("pg_catalog"))
             && argument_type_oids[0] == crate::sql::types::oid::TSQUERY
         {
-            return match arguments[0] {
+            return match eval_full(args[0], arena, params, row, hooks)? {
                 Datum::Null => Ok(Datum::Null),
                 Datum::TsQuery(query) => crate::sql::full_text::not_query(query.as_str(), arena)
                     .map(crate::sql::full_text::restore_query)
@@ -4990,15 +5040,21 @@ fn call<'a>(
                 _ => unreachable!("tsquery operator argument identity"),
             };
         }
-        if let Some(result) = catalog.call_routine(
+        if let Some(target) = catalog.resolve_routine_call(
             name,
-            arguments,
             argument_names,
             variadic,
             argument_type_oids,
-            arena,
         )? {
-            return Ok(result);
+            let arguments = arena
+                .alloc_slice_with(args.len(), |_| Datum::Null)
+                .map_err(|_| arena_full())?;
+            for (value, argument) in arguments.iter_mut().zip(args) {
+                *value = eval_full(argument, arena, params, row, hooks)?;
+            }
+            return catalog.call_routine(
+                target, arguments, argument_type_oids, hooks.sequences, arena,
+            );
         }
     }
     match name {
@@ -5037,8 +5093,10 @@ fn call<'a>(
                     name
                 )
             })?;
-            let seq_name = match eval_full(args[0], arena, params, row, hooks)? {
-                Datum::Null => return Ok(Datum::Null),
+            let Some(values) = args::strict_arguments::<3>(args, arena, params, row, hooks)? else {
+                return Ok(Datum::Null);
+            };
+            let seq_name = match values[0] {
                 Datum::Text(value) => SequenceReference::Name(value),
                 Datum::Oid(value) => SequenceReference::Oid(value),
                 Datum::Int2(value) => SequenceReference::Oid(i32::from(value) as u32),
@@ -5064,14 +5122,16 @@ fn call<'a>(
                 "nextval" => engine.nextval(seq_name)?,
                 "currval" => engine.currval(seq_name)?,
                 _ => {
-                    let value = match args::int_arg(name, args, 1, arena, params, row, hooks)? {
-                        Some(v) => v,
-                        None => return Ok(Datum::Null),
+                    let value = match values[1] {
+                        Datum::Int2(value) => i64::from(value),
+                        Datum::Int4(value) => i64::from(value),
+                        Datum::Int8(value) => value,
+                        other => return Err(type_mismatch(name, &other)),
                     };
                     let is_called = if args.len() == 3 {
-                        match args::bool_arg(name, args, 2, arena, params, row, hooks)? {
-                            Some(b) => b,
-                            None => return Ok(Datum::Null),
+                        match values[2] {
+                            Datum::Bool(value) => value,
+                            other => return Err(type_mismatch(name, &other)),
                         }
                     } else {
                         true

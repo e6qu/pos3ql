@@ -2801,27 +2801,18 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         super::eval::funcs::bytea::convert_encoding(source, destination, procedure, input, arena)
     }
 
-    fn call_routine<'a>(
+    fn resolve_routine_call<'name>(
         &self,
-        name: &str,
-        arguments: &[Datum<'a>],
+        name: &'name str,
         argument_names: &[Option<&str>],
         variadic: bool,
         argument_type_oids: &[i32],
-        arena: &'a Arena,
-    ) -> Result<Option<Datum<'a>>, SqlError> {
+    ) -> Result<Option<super::eval::RoutineCallTarget<'name>>, SqlError> {
         if let Some((schema, operator)) = super::ast::catalog_operator_call(name) {
-            return self
-                .execute_catalog_operator(schema, operator, arguments, argument_type_oids, arena)
-                .and_then(|value| {
-                    value.map(Some).ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::UNDEFINED_FUNCTION,
-                            "operator does not exist: {}",
-                            operator
-                        )
-                    })
-                });
+            return Ok(Some(super::eval::RoutineCallTarget::Operator {
+                schema,
+                name: operator,
+            }));
         }
         let Some(slot) = (if argument_names.is_empty() {
             self.storage.routine_slot_for_call_syntax_oids(
@@ -2842,12 +2833,77 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         };
         self.storage.require_routine_execute(slot, self.txid)?;
         let declared = self.storage.routine_for(slot, self.txid);
+        let argument_mapping = declared
+            .call_input_mapping(argument_names, argument_type_oids.len(), variadic)
+            .expect("resolved routine call has a valid argument mapping");
+        Ok(Some(super::eval::RoutineCallTarget::Stored {
+            oid: crate::storage::routine_oid(&declared),
+            argument_mapping,
+            variadic,
+        }))
+    }
+
+    fn routine_evaluation(
+        &self,
+        name: &str,
+        argument_names: &[Option<&str>],
+        variadic: bool,
+        argument_type_oids: &[i32],
+    ) -> Result<Option<super::eval::CastEvaluation>, SqlError> {
+        let Some(super::eval::RoutineCallTarget::Stored { oid, .. }) =
+            self.resolve_routine_call(name, argument_names, variadic, argument_type_oids)?
+        else {
+            return Ok(None);
+        };
+        let slot = self.storage.routine_slot_by_oid(oid, self.txid)
+            .expect("resolved routine identity exists");
+        let routine = self.storage.routine_for(slot, self.txid);
+        Ok(Some(if routine.attributes.volatility == crate::storage::RoutineVolatility::Immutable
+            && !routine.kind.is_set_returning()
+        {
+            super::eval::CastEvaluation::Immutable
+        } else {
+            super::eval::CastEvaluation::Runtime
+        }))
+    }
+
+    fn call_routine<'a>(
+        &self,
+        target: super::eval::RoutineCallTarget<'_>,
+        arguments: &[Datum<'a>],
+        argument_type_oids: &[i32],
+        sequences: Option<&dyn SequenceAccess>,
+        arena: &'a Arena,
+    ) -> Result<Datum<'a>, SqlError> {
+        let (oid, mapping, variadic) = match target {
+            super::eval::RoutineCallTarget::Stored {
+                oid,
+                argument_mapping,
+                variadic,
+            } => (oid, argument_mapping, variadic),
+            super::eval::RoutineCallTarget::Operator { schema, name } => {
+                return self
+                    .execute_catalog_operator(schema, name, arguments, argument_type_oids, arena)?
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::UNDEFINED_FUNCTION,
+                            "operator does not exist: {}",
+                            name
+                        )
+                    });
+            }
+        };
+        let slot = self.storage.routine_slot_by_oid(oid, self.txid).ok_or_else(|| {
+            sql_err!(
+                sqlstate::UNDEFINED_FUNCTION,
+                "function with OID {} does not exist",
+                oid
+            )
+        })?;
+        let declared = self.storage.routine_for(slot, self.txid);
         let mut completed = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
         let mut completed_type_oids =
             [super::types::oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
-        let mapping = declared
-            .call_input_mapping(argument_names, arguments.len(), variadic)
-            .expect("resolved routine call has a valid argument mapping");
         let mut provided = [false; crate::storage::MAX_ROUTINE_ARGUMENTS];
         let mut variadic_values = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
         let mut variadic_count = 0usize;
@@ -2910,6 +2966,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                 let expression = super::parser::parse_expression(source, arena)?;
                 let hooks = EvalHooks {
                     catalog: Some(self),
+                    sequences,
                     ..super::eval::NO_HOOKS
                 };
                 let value = super::eval::eval_full(
@@ -2981,7 +3038,10 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                 )?
             };
         }
-        self.execute_routine(slot, routine, &completed[..declared.argument_count], arena)
+        self.execute_routine(slot, routine, &completed[..declared.argument_count], arena)?
+            .ok_or_else(|| {
+                sql_err!(sqlstate::INTERNAL_ERROR, "resolved routine has no scalar result")
+            })
     }
 
     fn call_routine_oid<'a>(

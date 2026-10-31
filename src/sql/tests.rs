@@ -14,6 +14,7 @@ mod object_reads;
 mod query_execution;
 mod row_history;
 mod row_layout;
+mod routine_calls;
 mod table_publication;
 mod transaction_publication;
 

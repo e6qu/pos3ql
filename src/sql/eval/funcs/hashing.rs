@@ -9,7 +9,7 @@ use crate::sql_err;
 
 use super::super::{
     ColumnLookup, EvalHooks, RuntimeColumnTypes, SqlError, cast_to, constructor_type_from_oid,
-    eval_full, resolved_expression_collation, sqlstate,
+    resolved_expression_collation, sqlstate,
 };
 
 pub(crate) fn signature(name: &str) -> Option<(ColType, bool)> {
@@ -90,36 +90,16 @@ pub(crate) fn dispatch<'a>(
             },
         )
         .expect("recognized hash signature")?;
-        let mut values = [Datum::Null; 2];
-        let mut constants = [false; 2];
-        for (index, argument) in args.iter().enumerate() {
-            constants[index] = argument.is_constant();
-            if constants[index] {
-                values[index] = eval_full(argument, arena, params, row, hooks)?;
-            }
-        }
         // PostgreSQL folds strict calls with a constant null before running
         // volatile arguments, but still checks constant argument errors.
         // https://github.com/postgres/postgres/blob/REL_18_6/src/backend/optimizer/util/clauses.c#L4173
-        if args
-            .iter()
-            .enumerate()
-            .any(|(index, _)| constants[index] && values[index].is_null())
-        {
+        let Some(values) = super::super::args::strict_arguments::<2>(
+            args, arena, params, row, hooks,
+        )? else {
             return Ok(Datum::Null);
-        }
-        for (index, argument) in args.iter().enumerate() {
-            if !constants[index] {
-                values[index] = eval_full(argument, arena, params, row, hooks)?;
-            }
-        }
+        };
         let value = values[0];
         let seed = if extended { values[1] } else { Datum::Int8(0) };
-        // Strict functions still evaluate reached arguments before deciding
-        // that a null input suppresses the function call.
-        if value.is_null() || seed.is_null() {
-            return Ok(Datum::Null);
-        }
         let value = cast_to(value, input, arena)?;
         let Datum::Int8(seed) = cast_to(seed, ColType::Int8, arena)? else {
             unreachable!("validated seed conversion")

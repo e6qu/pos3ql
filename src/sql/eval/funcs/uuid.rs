@@ -206,7 +206,7 @@ fn expected_argument<'a>(
     hooks: &EvalHooks<'_, 'a>,
 ) -> Result<Datum<'a>, SqlError> {
     let value = eval_full(expression, arena, params, row, hooks)?;
-    let actual_oid = expression_type_identity(expression, row, hooks)?.routine_argument_oid(&value);
+    let actual_oid = expression_type_identity(expression, row, hooks)?.routine_argument_oid();
     if actual_oid == expected.oid()
         || matches!(
             (expected, value),

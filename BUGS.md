@@ -11,6 +11,8 @@ Follow [CONTRIBUTING.md](CONTRIBUTING.md) for PostgreSQL comparisons, actual
 application workflows, allocation checks, failure diagnostics and native platform
 checks. Compare SQL values, declared types, errors and effects; preserve rollback,
 reader ownership, checkpoint retention and recovery when changing shared memory.
+Function checks include nested sequence effects, typed nulls and default inputs;
+overload discovery must finish before running those inputs.
 Memory evidence distinguishes reservations from resident pages and records the
 revision, compiler, settings and named component charges. Release checks validate
 the documentation actually shipped in the archive.

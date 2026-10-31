@@ -43516,9 +43516,7 @@ impl Storage {
     ) -> Option<RoutineDef> {
         let slot = self.routine_slot_by_oid(oid, txid)?;
         let mut routine = self.routine_for(slot, txid);
-        if routine.kind.function_result().is_none() {
-            return None;
-        }
+        routine.kind.function_result()?;
         let mapping = routine.call_input_mapping(
             argument_names,
             argument_type_oids.len(),

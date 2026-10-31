@@ -1433,15 +1433,20 @@ impl ColTypeResolver for DependencyTypes<'_, '_, '_> {
     fn routine_record_field(
         &self,
         name: &str,
+        bound_oid: Option<i32>,
         argument_names: &[Option<&str>],
         variadic: bool,
         arguments: &[i32],
         index: usize,
     ) -> Option<(crate::util::StackStr<64>, StaticTypeMeta)> {
-        if let Some(field) = intrinsic_record_field_meta(name, arguments, index) {
+        if bound_oid.is_none()
+            && let Some(field) = intrinsic_record_field_meta(name, arguments, index)
+        {
             return Some(field);
         }
-        let slot = if argument_names.is_empty() {
+        let slot = if let Some(oid) = bound_oid {
+            self.storage.routine_slot_by_oid(oid, self.txid)?
+        } else if argument_names.is_empty() {
             if variadic {
                 self.storage
                     .routine_slot_for_function_call_syntax_oids(name, arguments, true, self.txid)?

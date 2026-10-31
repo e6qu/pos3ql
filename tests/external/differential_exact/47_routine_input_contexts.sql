@@ -1,0 +1,27 @@
+CREATE SEQUENCE input_effects START 10;
+CREATE TABLE input_audit(value bigint);
+CREATE FUNCTION input_rows(left_value bigint DEFAULT nextval('input_effects'),right_value bigint DEFAULT nextval('input_effects')) RETURNS SETOF bigint LANGUAGE sql VOLATILE AS 'SELECT $1*100+$2';
+CREATE FUNCTION input_strict(first_value bigint,second_value bigint DEFAULT NULL) RETURNS SETOF bigint LANGUAGE sql VOLATILE STRICT AS 'SELECT $1';
+CREATE PROCEDURE input_conversion(left_value bigint,right_value bigint) LANGUAGE sql AS 'INSERT INTO input_audit VALUES ($1+$2)';
+SELECT * FROM input_rows(right_value=>nextval('input_effects'));
+SELECT * FROM input_rows(right_value=>nextval('input_effects'),left_value=>nextval('input_effects'));
+SELECT * FROM input_strict(nextval('input_effects'));
+SELECT last_value FROM input_effects;
+-- conversion errors
+CALL input_conversion(nextval('input_effects'),'bad');
+CALL input_conversion(nextval('input_effects'),1/0);
+SELECT * FROM input_rows(nextval('input_effects'),'bad');
+SELECT * FROM input_strict(NULL::bigint,1/0);
+-- after errors
+SELECT last_value FROM input_effects;
+CREATE TABLE input_nulls(value bigint);
+INSERT INTO input_nulls VALUES (NULL);
+SELECT result FROM input_nulls CROSS JOIN LATERAL input_strict(value,nextval('input_effects')) AS result;
+SELECT last_value FROM input_effects;
+SELECT count(*) FROM input_audit;
+DROP TABLE input_nulls;
+DROP PROCEDURE input_conversion(bigint,bigint);
+DROP FUNCTION input_rows(bigint,bigint);
+DROP FUNCTION input_strict(bigint,bigint);
+DROP TABLE input_audit;
+DROP SEQUENCE input_effects;

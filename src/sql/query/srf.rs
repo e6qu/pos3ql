@@ -3517,7 +3517,7 @@ fn table_func_routine<'a, C: ColumnLookup<'a>>(
     _params: &[Datum<'a>],
     columns: &C,
     eval_hooks: Option<&EvalHooks<'_, 'a>>,
-) -> Result<Option<(usize, &'a RoutineDef)>, SqlError> {
+) -> Result<Option<(usize, &'a mut RoutineDef)>, SqlError> {
     use core::fmt::Write as _;
 
     let args = tref.func_args.expect("table function carries arguments");
@@ -4934,91 +4934,37 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                 tref.table
             ));
         };
-        let table_columns = routine.table_columns();
-        let scalar_result = routine.kind.function_result();
         let catalog = super::storage_catalog(storage, arena, txid);
         let hooks = crate::sql::eval::EvalHooks {
             catalog: Some(&catalog),
             ..eval_hooks.copied().unwrap_or(crate::sql::eval::NO_HOOKS)
         };
-        let mut routine_params = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
         let mapping = routine
             .call_input_mapping(tref.func_argument_names, args.len(), tref.func_variadic)
             .expect("resolved table routine call has a valid argument mapping");
-        let default_dependencies = if (0..routine.argument_count)
-            .any(|index| !mapping[..args.len()].contains(&(index as u8)))
-        {
-            Some(storage.snapshot_routine_dependencies_for(routine_slot, txid, arena)?)
-        } else {
-            None
+        let mut argument_type_oids =
+            [crate::sql::types::oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
+        for (output, argument) in argument_type_oids.iter_mut().zip(args) {
+            *output = crate::sql::eval::expression_type_identity(argument, columns, &hooks)?
+                .routine_argument_oid();
+        }
+        let Some(routine_params) = catalog.prepare_routine_inputs(
+            routine_slot,
+            routine,
+            super::RoutineCallInputs {
+                arguments: args,
+                argument_type_oids: &argument_type_oids[..args.len()],
+                mapping: &mapping,
+                variadic: tref.func_variadic,
+            },
+            &mut |argument| crate::sql::eval::eval_full(argument, arena, params, columns, &hooks),
+            arena,
+        )?
+        else {
+            return Ok(&[]);
         };
-        let mut provided = [false; crate::storage::MAX_ROUTINE_ARGUMENTS];
-        let mut variadic_values = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
-        let mut variadic_count = 0usize;
-        for (call_index, argument) in args.iter().enumerate() {
-            let value = crate::sql::eval::eval_full(argument, arena, params, columns, &hooks)?;
-            let encoded = crate::sql::exec::encode_projected_pub(&[value], arena)?;
-            let value = crate::sql::exec::decode_projected_col_record(encoded, 0, arena)?;
-            let input_index = usize::from(mapping[call_index]);
-            if !tref.func_variadic
-                && matches!(
-                    routine
-                        .parameter_for_input(input_index)
-                        .expect("mapped table routine input has a declared parameter")
-                        .mode,
-                    crate::storage::RoutineParameterMode::Variadic { .. }
-                )
-            {
-                variadic_values[variadic_count] = value;
-                variadic_count += 1;
-                provided[input_index] = true;
-            } else {
-                routine_params[input_index] = value;
-                provided[input_index] = true;
-            }
-        }
-        if variadic_count != 0 {
-            let input_index = routine.argument_count - 1;
-            let parameter = routine
-                .parameter_for_input(input_index)
-                .expect("variadic table routine input has a declared parameter");
-            let ColType::Array(element) = parameter.ctype else {
-                return Err(sql_err!(
-                    sqlstate::INTERNAL_ERROR,
-                    "variadic table routine parameter is not an array"
-                ));
-            };
-            routine_params[input_index] = Datum::Array {
-                element,
-                raw: crate::sql::array::build(&variadic_values[..variadic_count], arena)?,
-            };
-        }
-        for input_index in 0..routine.argument_count {
-            if provided[input_index] {
-                continue;
-            }
-            let parameter = routine
-                .parameter_for_input(input_index)
-                .expect("table routine input has a declared parameter");
-            let Some(default) = parameter.mode.default() else {
-                return Err(sql_err!(
-                    sqlstate::INTERNAL_ERROR,
-                    "resolved table routine is missing a required argument"
-                ));
-            };
-            let expression = super::bind_routine_parameter_default(
-                default.as_str(),
-                storage,
-                txid,
-                default_dependencies
-                    .as_ref()
-                    .expect("omitted inputs capture default dependencies")
-                    .view(),
-                arena,
-            )?;
-            let value = crate::sql::eval::eval_full(expression, arena, params, columns, &hooks)?;
-            routine_params[input_index] = crate::sql::eval::cast_to(value, parameter.ctype, arena)?;
-        }
+        let table_columns = routine.table_columns();
+        let scalar_result = routine.kind.function_result();
         let _formal_scope =
             crate::sql::exec::enter_routine_parameter_types(routine.arguments(), hooks.catalog)?;
         let owner = crate::storage::SessionIdentity::bound(

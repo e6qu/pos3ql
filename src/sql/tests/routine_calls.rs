@@ -417,7 +417,7 @@ fn procedure_inputs_bind_before_effects_and_run_in_declaration_order() {
 #[test]
 fn routine_default_calls_keep_their_captured_overload() {
     let mut config = test_config("routine-default-overloads");
-    config.max_routines = 8;
+    config.max_routines = 12;
     let mut budget = test_engine_budget(&config, 1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
@@ -429,6 +429,39 @@ fn routine_default_calls_keep_their_captured_overload() {
             ),
             true
         )),
-        ["11|1144", "22|11|1144", "11|1144"]
+        ["11|1144", "22|11|1144", "11|1144", "11", "11"]
+    );
+}
+
+#[test]
+fn routine_inputs_share_conversions_order_and_strictness_in_every_context() {
+    let mut config = test_config("routine-input-contexts");
+    config.max_routines = 8;
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    let fixture =
+        include_str!("../../../tests/external/differential_exact/47_routine_input_contexts.sql");
+    let (setup, rest) = fixture.split_once("-- conversion errors").unwrap();
+    let (errors, finish) = rest.split_once("-- after errors").unwrap();
+    assert_eq!(
+        data_rows(&session.success(&mut engine, setup, true)),
+        ["1011", "1213", "13"]
+    );
+    let errors: Vec<_> = errors
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    assert_eq!(errors.len(), 4);
+    for (sql, state) in errors.into_iter().zip(["22P02", "22012", "22P02", "22012"]) {
+        assert_eq!(
+            error_sqlstates(&session.execute(&mut engine, sql, true)),
+            [state],
+            "{sql}"
+        );
+    }
+    assert_eq!(
+        data_rows(&session.success(&mut engine, finish, true)),
+        ["13", "14", "0"]
     );
 }

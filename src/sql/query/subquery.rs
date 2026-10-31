@@ -2345,13 +2345,20 @@ impl crate::sql::exec::ColTypeResolver for SubqueryColumns<'_, '_, '_, '_, '_> {
     fn routine_record_field(
         &self,
         name: &str,
+        bound_oid: Option<i32>,
         argument_names: &[Option<&str>],
         variadic: bool,
         arguments: &[i32],
         index: usize,
     ) -> Option<(crate::util::StackStr<64>, crate::sql::exec::StaticTypeMeta)> {
-        self.catalog
-            .routine_record_field(name, argument_names, variadic, arguments, index)
+        self.catalog.routine_record_field(
+            name,
+            bound_oid,
+            argument_names,
+            variadic,
+            arguments,
+            index,
+        )
     }
 
     fn resolve(&self, qualifier: Option<&str>, name: &str) -> Result<ColType, SqlError> {

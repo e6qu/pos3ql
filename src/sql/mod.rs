@@ -14492,8 +14492,7 @@ impl Engine {
         transaction_context: exec::PlpgsqlTransactionContext,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
-        let mut values = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
-        if arguments.len() > values.len() {
+        if arguments.len() > crate::storage::MAX_ROUTINE_ARGUMENTS {
             return Ok(Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "too many procedure arguments"
@@ -14566,175 +14565,28 @@ impl Engine {
                 .call_input_mapping(argument_names, arguments.len(), variadic)
                 .expect("resolved procedure call has a valid argument mapping")
         });
-        let mut bound_type_oids = [types::oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
-        for (input_index, oid) in bound_type_oids
-            .iter_mut()
-            .enumerate()
-            .take(declared.argument_count)
-        {
-            let parameter = declared
-                .parameter_for_input(input_index)
-                .expect("procedure input has a declared parameter");
-            let expanded = !variadic
-                && matches!(
-                    parameter.mode,
-                    crate::storage::RoutineParameterMode::Variadic { .. }
-                );
-            let supplied = mapping[..arguments.len()]
-                .iter()
-                .position(|mapped| usize::from(*mapped) == input_index);
-            *oid = match supplied {
-                Some(call_index) if !expanded => type_oids[call_index],
-                _ => match self.storage.routine_type_oid(
-                    parameter.ctype,
-                    parameter.user_type,
-                    txn.txid,
-                ) {
-                    Some(oid) => oid,
-                    None => {
-                        return Ok(Err(sql_err!(
-                            sqlstate::INTERNAL_ERROR,
-                            "procedure input type identity is unavailable"
-                        )));
-                    }
-                },
-            };
-        }
-        let input_count = declared.argument_count;
-        if self
-            .storage
-            .bind_routine_call(&mut declared, &bound_type_oids[..input_count], txn.txid)
-            .is_none()
-        {
-            return Ok(Err(sql_err!(
-                sqlstate::UNDEFINED_FUNCTION,
-                "procedure \"{}\" does not exist",
-                qualified.as_str()
-            )));
-        }
-        if let Err(error) = self.storage.require_routine_execute(slot, txn.txid) {
-            return Ok(Err(error));
-        }
-        let default_dependencies = if (0..declared.argument_count)
-            .any(|index| !mapping[..arguments.len()].contains(&(index as u8)))
-        {
-            match self
-                .storage
-                .snapshot_routine_dependencies_for(slot, txn.txid, arena)
-            {
-                Ok(dependencies) => Some(dependencies),
-                Err(error) => return Ok(Err(error)),
+        let completed = match catalog.prepare_routine_inputs(
+            slot,
+            &mut declared,
+            query::RoutineCallInputs {
+                arguments,
+                argument_type_oids: &type_oids[..arguments.len()],
+                mapping: &mapping,
+                variadic,
+            },
+            &mut |argument| eval::eval_full(argument, arena, params, &NoColumns, &hooks),
+            arena,
+        ) {
+            Ok(Some(values)) => values,
+            Ok(None) => {
+                return Ok(Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "procedure has an invalid strict input contract"
+                )));
             }
-        } else {
-            None
+            Err(error) => return Ok(Err(error)),
         };
-        let mut completed = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
-        // Input binding and permissions are complete before any argument effect.
-        for (input_index, completed_input) in completed
-            .iter_mut()
-            .enumerate()
-            .take(declared.argument_count)
-        {
-            let mut supplied = false;
-            for (call_index, argument) in arguments.iter().enumerate() {
-                if usize::from(mapping[call_index]) != input_index {
-                    continue;
-                }
-                values[call_index] =
-                    match eval::eval_full(argument, arena, params, &NoColumns, &hooks) {
-                        Ok(value) => value,
-                        Err(error) => return Ok(Err(error)),
-                    };
-                supplied = true;
-            }
-            if supplied {
-                continue;
-            }
-            let parameter = declared
-                .parameter_for_input(input_index)
-                .expect("procedure input signature has a declared parameter");
-            *completed_input = if let Some(default) = parameter.mode.default() {
-                let expression = match query::bind_routine_parameter_default(
-                    default.as_str(),
-                    &self.storage,
-                    txn.txid,
-                    default_dependencies
-                        .as_ref()
-                        .expect("omitted inputs capture default dependencies")
-                        .view(),
-                    arena,
-                ) {
-                    Ok(expression) => expression,
-                    Err(error) => return Ok(Err(error)),
-                };
-                match eval::eval_full(expression, arena, params, &NoColumns, &hooks) {
-                    Ok(value) => match eval::cast_to(value, parameter.ctype, arena) {
-                        Ok(value) => value,
-                        Err(error) => return Ok(Err(error)),
-                    },
-                    Err(error) => return Ok(Err(error)),
-                }
-            } else {
-                return Ok(Err(sql_err!(
-                    sqlstate::INTERNAL_ERROR,
-                    "resolved procedure is missing a required argument"
-                )));
-            };
-        }
-        let mut variadic_values = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
-        let mut variadic_count = 0usize;
-        for call_index in 0..arguments.len() {
-            if mapping[call_index] == u8::MAX {
-                continue;
-            }
-            let input_index = usize::from(mapping[call_index]);
-            if !variadic
-                && matches!(
-                    declared
-                        .parameter_for_input(input_index)
-                        .expect("mapped procedure input has a declared parameter")
-                        .mode,
-                    crate::storage::RoutineParameterMode::Variadic { .. }
-                )
-            {
-                variadic_values[variadic_count] = values[call_index];
-                variadic_count += 1;
-                continue;
-            }
-            completed[input_index] = values[call_index];
-        }
-        if variadic_count != 0 {
-            let input_index = declared.argument_count - 1;
-            let parameter = declared
-                .parameter_for_input(input_index)
-                .expect("variadic procedure input has a declared parameter");
-            let types::ColType::Array(element) = parameter.ctype else {
-                return Ok(Err(sql_err!(
-                    sqlstate::INTERNAL_ERROR,
-                    "variadic procedure parameter is not an array"
-                )));
-            };
-            completed[input_index] = Datum::Array {
-                element,
-                raw: match array::build(&variadic_values[..variadic_count], arena) {
-                    Ok(raw) => raw,
-                    Err(error) => return Ok(Err(error)),
-                },
-            };
-        }
         let routine = &declared;
-        for (index, argument) in routine.arguments().iter().copied().enumerate() {
-            completed[index] = match exec::coerce_routine_argument(
-                completed[index],
-                argument,
-                &self.storage,
-                txn.txid,
-                arena,
-            ) {
-                Ok(value) => value,
-                Err(error) => return Ok(Err(error)),
-            };
-        }
         let owner = match self
             .storage
             .capture_role_slot(routine.ownership.owner_to(txn.txid).into(), txn.txid)

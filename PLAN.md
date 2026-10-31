@@ -44,8 +44,9 @@ Registered routine identities, aggregate kinds and null-call properties must
 match the live reference catalog even while missing routines are being added.
 Retained calls must preserve their bound identities, completed inputs and
 defaults across waits, including PostgreSQL's strict null and error behavior.
-Reuse the shared call boundary, including its bound input conversions and
-strict-null handling, rather than replaying argument evaluation.
+Reuse the input preparation shared by scalar functions, table functions and
+procedures, including bound conversions and strict-null handling, rather than
+replaying argument evaluation.
 Preserve defaults' captured object references through renames, schema moves,
 replacement, rollback and recovery; later overloads must not redirect captured
 helper calls. Explicit text inputs keep runtime name lookup.

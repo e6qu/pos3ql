@@ -810,6 +810,9 @@ impl ColTypeResolver for CatalogCols<'_> {
                 _ => None,
             })
             .or_else(|| {
+                if bound_oid.is_some() {
+                    return None;
+                }
                 self.storage
                     .aggregate_for_call_oids(name, arguments, self.txid)
                     .map(|(_, _, aggregate)| aggregate.result_type)
@@ -857,15 +860,20 @@ impl ColTypeResolver for CatalogCols<'_> {
     fn routine_record_field(
         &self,
         name: &str,
+        bound_oid: Option<i32>,
         argument_names: &[Option<&str>],
         variadic: bool,
         arguments: &[i32],
         index: usize,
     ) -> Option<(crate::util::StackStr<64>, StaticTypeMeta)> {
-        if let Some(field) = intrinsic_record_field_meta(name, arguments, index) {
+        if bound_oid.is_none()
+            && let Some(field) = intrinsic_record_field_meta(name, arguments, index)
+        {
             return Some(field);
         }
-        let slot = if argument_names.is_empty() {
+        let slot = if let Some(oid) = bound_oid {
+            self.storage.routine_slot_by_oid(oid, self.txid)?
+        } else if argument_names.is_empty() {
             if variadic {
                 self.storage
                     .routine_slot_for_function_call_syntax_oids(name, arguments, true, self.txid)?
@@ -1671,11 +1679,15 @@ pub trait ColTypeResolver {
     fn routine_record_field(
         &self,
         name: &str,
+        bound_oid: Option<i32>,
         _argument_names: &[Option<&str>],
         _variadic: bool,
         arguments: &[i32],
         index: usize,
     ) -> Option<(crate::util::StackStr<64>, StaticTypeMeta)> {
+        if bound_oid.is_some() {
+            return None;
+        }
         let (field, type_oid, ctype) =
             crate::sql::catalog::intrinsic_record_field(name, arguments, index)?;
         Some((
@@ -2720,6 +2732,7 @@ fn record_shape_metadata_dyn(
         }
         Expr::Call {
             name,
+            bound_oid,
             args,
             argument_names,
             variadic,
@@ -2735,6 +2748,7 @@ fn record_shape_metadata_dyn(
             let mut count = 0usize;
             while let Some((field_name, meta)) = columns.routine_record_field(
                 name,
+                *bound_oid,
                 argument_names,
                 *variadic,
                 &argument_oids[..args.len()],
@@ -2912,6 +2926,7 @@ pub fn record_field_metadata(
         }
         Expr::Call {
             name,
+            bound_oid,
             args,
             argument_names,
             variadic,
@@ -2928,6 +2943,7 @@ pub fn record_field_metadata(
                 let mut found = None;
                 while let Some((name, meta)) = columns.routine_record_field(
                     name,
+                    *bound_oid,
                     argument_names,
                     *variadic,
                     &argument_oids[..args.len()],

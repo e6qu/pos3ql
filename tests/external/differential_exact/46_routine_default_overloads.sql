@@ -8,6 +8,14 @@ SELECT public.captured_helper('value'),public.captured_default(),public.captured
 ALTER FUNCTION public.captured_helper(varchar) RENAME TO renamed_helper;
 CREATE FUNCTION public.renamed_helper(value text) RETURNS integer LANGUAGE sql RETURN 33;
 SELECT public.captured_default(),public.captured_pair();
+CREATE FUNCTION public.captured_record(value varchar,OUT result integer,OUT marker integer) LANGUAGE sql AS 'SELECT 11,12';
+CREATE FUNCTION public.captured_record_default(value integer DEFAULT (public.captured_record('value')).result) RETURNS integer LANGUAGE sql AS 'SELECT $1';
+SELECT public.captured_record_default();
+CREATE FUNCTION public.captured_record(value text,OUT result text,OUT marker integer) LANGUAGE sql AS 'SELECT ''changed'',22';
+SELECT public.captured_record_default();
+DROP FUNCTION public.captured_record_default(integer);
+DROP FUNCTION public.captured_record(varchar);
+DROP FUNCTION public.captured_record(text);
 DROP FUNCTION public.captured_pair(integer,integer);
 DROP FUNCTION public.captured_default(integer);
 DROP FUNCTION public.captured_helper(integer);

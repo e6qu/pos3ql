@@ -73,9 +73,12 @@ a stored default. Overloaded stored calls choose only among their captured
 functions, even after names change.
 Captured references share the existing fixed dependency capacity and durable
 records, including replacement rollback and empty-cache recovery.
-Procedure calls resolve input types and check execution permission before
-argument effects. Named inputs and inserted defaults run in declaration order
-with the caller's sequence context.
+Scalar functions, table functions and procedures share the input preparation
+boundary: resolve input types and execution permission before effects, check
+constant conversions, then evaluate reached inputs in declaration order.
+A strict table function with a constant null input returns no rows without
+consuming a sequence input; a null value read from a row still evaluates the
+other reached inputs before the body is skipped.
 This call boundary supplies retained execution with an explicit target; it
 does not yet make every function body yield during a storage wait.
 Runtime overload checks copy input descriptors rather than whole definitions.

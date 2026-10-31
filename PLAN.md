@@ -47,7 +47,8 @@ defaults across waits, including PostgreSQL's strict null and error behavior.
 Reuse the shared call boundary, including its bound input conversions and
 strict-null handling, rather than replaying argument evaluation.
 Preserve defaults' captured object references through renames, schema moves,
-replacement, rollback and recovery; explicit text inputs keep runtime name lookup.
+replacement, rollback and recovery; later overloads must not redirect captured
+helper calls. Explicit text inputs keep runtime name lookup.
 Preserve registered built-in and operator volatility when deciding which inputs
 can run during planning; maintenance calls must run only when the query reaches them.
 Retain catalog-aware planning errors even when a scan returns no input rows.

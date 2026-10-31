@@ -196,6 +196,7 @@ fn bind_expression<'a>(
                 let name = arena.alloc_str(encoded.as_str()).map_err(|_| full())?;
                 let args = arena.alloc_slice_copy(&[left, right]).map_err(|_| full())?;
                 Expr::Call {
+                    bound_oid: None,
                     name,
                     args,
                     argument_names: &[],

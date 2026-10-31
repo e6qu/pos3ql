@@ -325,9 +325,7 @@ fn routine_defaults_retain_creation_bindings_and_recover_without_a_cache() {
             "48",
             "801|f",
             "901",
-            "8000",
-            "9000",
-            "9000",
+            "1|2",
             "100|100"
         ]
     );
@@ -413,5 +411,24 @@ fn procedure_inputs_bind_before_effects_and_run_in_declaration_order() {
             true
         )),
         ["13"]
+    );
+}
+
+#[test]
+fn routine_default_calls_keep_their_captured_overload() {
+    let mut config = test_config("routine-default-overloads");
+    config.max_routines = 8;
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            include_str!(
+                "../../../tests/external/differential_exact/46_routine_default_overloads.sql"
+            ),
+            true
+        )),
+        ["11|1144", "22|11|1144", "11|1144"]
     );
 }

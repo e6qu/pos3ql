@@ -2418,12 +2418,13 @@ impl crate::sql::exec::ColTypeResolver for SubqueryColumns<'_, '_, '_, '_, '_> {
     fn routine_result(
         &self,
         name: &str,
+        bound_oid: Option<i32>,
         argument_names: &[Option<&str>],
         variadic: bool,
         arguments: &[i32],
     ) -> Option<crate::sql::exec::StaticTypeMeta> {
         self.catalog
-            .routine_result(name, argument_names, variadic, arguments)
+            .routine_result(name, bound_oid, argument_names, variadic, arguments)
     }
 
     fn operator_result(

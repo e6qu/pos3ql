@@ -7744,6 +7744,25 @@ struct RoutineInputSignature {
 }
 
 impl RoutineInputSignature {
+    fn from_definition(routine: &RoutineDef, txid: u32) -> Self {
+        let arguments = routine.arguments_for(txid);
+        let parameters = routine.parameters_for(txid);
+        let mut signature = Self {
+            arguments: [RoutineArgumentDef::EMPTY; MAX_ROUTINE_ARGUMENTS],
+            argument_count: arguments.len(),
+            parameters: [RoutineParameterDef::EMPTY; MAX_ROUTINE_ARGUMENTS],
+            parameter_count: parameters.len(),
+            required_argument_count: parameters
+                .iter()
+                .filter(|parameter| parameter.mode.is_input())
+                .take_while(|parameter| !parameter.mode.has_default())
+                .count(),
+        };
+        signature.arguments[..arguments.len()].copy_from_slice(arguments);
+        signature.parameters[..parameters.len()].copy_from_slice(parameters);
+        signature
+    }
+
     fn arguments(&self) -> &[RoutineArgumentDef] {
         &self.arguments[..self.argument_count]
     }
@@ -43052,21 +43071,7 @@ impl Storage {
                 if !lookup.matches(routine) {
                     continue;
                 }
-                let arguments = routine.arguments_for(transaction);
-                let parameters = routine.parameters_for(transaction);
-                let mut signature = RoutineInputSignature {
-                    arguments: [RoutineArgumentDef::EMPTY; MAX_ROUTINE_ARGUMENTS],
-                    argument_count: arguments.len(),
-                    parameters: [RoutineParameterDef::EMPTY; MAX_ROUTINE_ARGUMENTS],
-                    parameter_count: parameters.len(),
-                    required_argument_count: parameters
-                        .iter()
-                        .filter(|parameter| parameter.mode.is_input())
-                        .take_while(|parameter| !parameter.mode.has_default())
-                        .count(),
-                };
-                signature.arguments[..arguments.len()].copy_from_slice(arguments);
-                signature.parameters[..parameters.len()].copy_from_slice(parameters);
+                let signature = RoutineInputSignature::from_definition(routine, transaction);
                 return Some((slot, signature));
             }
             None
@@ -43459,6 +43464,83 @@ impl Storage {
             declared_oids[index] = self.routine_argument_oid(argument, txid)?;
         }
         self.routine_for_bound_call(slot, &declared_oids[..routine.argument_count], txid)
+    }
+
+    pub(crate) fn captured_routine_slot_for_call(
+        &self,
+        dependencies: StoredQueryDependencyView<'_>,
+        name: &str,
+        argument_names: &[Option<&str>],
+        argument_type_oids: &[i32],
+        explicit_variadic: bool,
+        txid: u32,
+    ) -> Option<usize> {
+        let (schema, name) = name.split_once('.').unwrap_or(("", name));
+        self.routine_slot_in_candidates(
+            argument_names,
+            argument_type_oids,
+            explicit_variadic,
+            txid,
+            || {
+                dependencies.entries().iter().filter_map(|dependency| {
+                    if dependency.class != DependencyClass::Routine
+                        || dependency.referenced_schema.as_str() != schema
+                        || dependency.referenced_name.as_str() != name
+                    {
+                        return None;
+                    }
+                    let catalog = self.routines.lock().expect("routine catalog lock poisoned");
+                    let slot = usize::from(dependency.slot);
+                    let routine = catalog.get(slot)?;
+                    if routine.database != current_database()
+                        || !routine.visible_to(txid)
+                        || dependency.identity
+                            != StoredDependencyIdentity::RoutineOid(routine_oid(routine))
+                    {
+                        return None;
+                    }
+                    Some((slot, RoutineInputSignature::from_definition(routine, txid)))
+                })
+            },
+        )
+    }
+
+    /// Describe a captured function without resolving its name or overload again.
+    pub(crate) fn function_for_captured_call(
+        &self,
+        oid: i32,
+        argument_names: &[Option<&str>],
+        argument_type_oids: &[i32],
+        explicit_variadic: bool,
+        txid: u32,
+    ) -> Option<RoutineDef> {
+        let slot = self.routine_slot_by_oid(oid, txid)?;
+        let mut routine = self.routine_for(slot, txid);
+        if routine.kind.function_result().is_none() {
+            return None;
+        }
+        let mapping = routine.call_input_mapping(
+            argument_names,
+            argument_type_oids.len(),
+            explicit_variadic,
+        )?;
+        let mut completed = [crate::sql::types::oid::UNKNOWN; MAX_ROUTINE_ARGUMENTS];
+        for (index, argument) in routine.arguments().iter().enumerate() {
+            completed[index] = self.routine_argument_oid(argument, txid)?;
+        }
+        for (index, oid) in argument_type_oids.iter().enumerate() {
+            let input = usize::from(mapping[index]);
+            let expanded = !explicit_variadic
+                && routine.parameter_for_input(input).is_some_and(|parameter| {
+                    matches!(parameter.mode, RoutineParameterMode::Variadic { .. })
+                });
+            if !expanded {
+                completed[input] = *oid;
+            }
+        }
+        let count = routine.argument_count;
+        self.bind_routine_call(&mut routine, &completed[..count], txid)?;
+        Some(routine)
     }
 
     pub(crate) fn function_for_named_call_oids(
@@ -44251,16 +44333,50 @@ impl Storage {
         txid: u32,
         call_kind: RoutineCallKind,
     ) -> Option<usize> {
+        self.routine_slot_in_candidates(argument_names, argument_type_oids, false, txid, || {
+            self.routine_candidates(schema, name, txid, call_kind)
+        })
+    }
+
+    fn routine_slot_in_candidates<F, I>(
+        &self,
+        argument_names: &[Option<&str>],
+        argument_type_oids: &[i32],
+        explicit_variadic: bool,
+        txid: u32,
+        candidates: F,
+    ) -> Option<usize>
+    where
+        F: Fn() -> I,
+        I: Iterator<Item = (usize, RoutineInputSignature)>,
+    {
         let matches = |definition: &RoutineInputSignature, implicit: bool, polymorphic: bool| {
-            let Some(mapping) =
-                definition.call_input_mapping(argument_names, argument_type_oids.len(), false)
-            else {
+            let Some(mapping) = definition.call_input_mapping(
+                argument_names,
+                argument_type_oids.len(),
+                explicit_variadic,
+            ) else {
                 return false;
             };
             let mut binding = PolymorphicBinding::EMPTY;
             let mut saw_polymorphic = false;
             for (call_index, actual_oid) in argument_type_oids.iter().enumerate() {
-                let argument = definition.arguments[usize::from(mapping[call_index])];
+                let input = usize::from(mapping[call_index]);
+                let mut argument = definition.arguments[input];
+                if !explicit_variadic
+                    && argument_names.is_empty()
+                    && definition
+                        .parameter_for_input(input)
+                        .is_some_and(|parameter| {
+                            matches!(parameter.mode, RoutineParameterMode::Variadic { .. })
+                        })
+                    && let ColType::Array(element) = argument.ctype
+                {
+                    let Some(ctype) = ColType::from_oid(element.element_oid()) else {
+                        return false;
+                    };
+                    argument.ctype = ctype;
+                }
                 if let Some(kind) = argument.polymorphic_type() {
                     if !polymorphic || binding.bind(kind, *actual_oid).is_none() {
                         return false;
@@ -44281,7 +44397,7 @@ impl Storage {
         };
         let score = |definition: &RoutineInputSignature| {
             let mapping = definition
-                .call_input_mapping(argument_names, argument_type_oids.len(), false)
+                .call_input_mapping(argument_names, argument_type_oids.len(), explicit_variadic)
                 .expect("matched routine has a valid input mapping");
             argument_type_oids
                 .iter()
@@ -44296,8 +44412,7 @@ impl Storage {
                 .count()
         };
         for (implicit, polymorphic) in [(false, false), (true, false), (true, true)] {
-            let best_score = self
-                .routine_candidates(schema, name, txid, call_kind)
+            let best_score = candidates()
                 .filter_map(|(_, definition)| {
                     matches(&definition, implicit, polymorphic).then(|| score(&definition))
                 })
@@ -44307,14 +44422,18 @@ impl Storage {
                 && !polymorphic
                 && argument_type_oids.contains(&crate::sql::types::oid::UNKNOWN)
             {
-                for (_, definition) in self.routine_candidates(schema, name, txid, call_kind) {
+                for (_, definition) in candidates() {
                     if !matches(&definition, implicit, polymorphic)
                         || Some(score(&definition)) != best_score
                     {
                         continue;
                     }
                     let mapping = definition
-                        .call_input_mapping(argument_names, argument_type_oids.len(), false)
+                        .call_input_mapping(
+                            argument_names,
+                            argument_type_oids.len(),
+                            explicit_variadic,
+                        )
                         .expect("matched routine has a valid input mapping");
                     for (index, oid) in argument_type_oids.iter().enumerate() {
                         if *oid == crate::sql::types::oid::UNKNOWN {
@@ -44324,26 +44443,22 @@ impl Storage {
                     }
                 }
             }
-            let mut candidates = self
-                .routine_candidates(schema, name, txid, call_kind)
-                .filter_map(|(slot, routine)| {
-                    if !matches(&routine, implicit, polymorphic)
-                        || Some(score(&routine)) != best_score
-                    {
-                        return None;
-                    }
-                    let mapping = routine
-                        .call_input_mapping(argument_names, argument_type_oids.len(), false)
-                        .expect("matched routine has a valid input mapping");
-                    argument_type_oids
-                        .iter()
-                        .enumerate()
-                        .all(|(index, _)| {
-                            preferences
-                                .accepts(index, &routine.arguments[usize::from(mapping[index])])
-                        })
-                        .then_some(slot)
-                });
+            let mut candidates = candidates().filter_map(|(slot, routine)| {
+                if !matches(&routine, implicit, polymorphic) || Some(score(&routine)) != best_score
+                {
+                    return None;
+                }
+                let mapping = routine
+                    .call_input_mapping(argument_names, argument_type_oids.len(), explicit_variadic)
+                    .expect("matched routine has a valid input mapping");
+                argument_type_oids
+                    .iter()
+                    .enumerate()
+                    .all(|(index, _)| {
+                        preferences.accepts(index, &routine.arguments[usize::from(mapping[index])])
+                    })
+                    .then_some(slot)
+            });
             let first = candidates.next();
             if first.is_some() && candidates.next().is_none() {
                 return first;

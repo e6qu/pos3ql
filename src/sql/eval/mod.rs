@@ -566,6 +566,7 @@ pub(crate) fn expression_type_identity<'a>(
     }
     if let Expr::Call {
         name,
+        bound_oid,
         args,
         argument_names,
         variadic,
@@ -585,6 +586,7 @@ pub(crate) fn expression_type_identity<'a>(
         if resolved
             && let Some(result_oid) = catalog.routine_result_oid(
                 name,
+                *bound_oid,
                 argument_names,
                 *variadic,
                 &argument_oids[..args.len()],
@@ -677,13 +679,18 @@ impl crate::sql::exec::ColTypeResolver for RuntimeColumnTypes<'_, '_> {
     fn routine_result(
         &self,
         name: &str,
+        bound_oid: Option<i32>,
         argument_names: &[Option<&str>],
         variadic: bool,
         arguments: &[i32],
     ) -> Option<crate::sql::exec::StaticTypeMeta> {
-        let type_oid =
-            self.catalog?
-                .routine_result_oid(name, argument_names, variadic, arguments)?;
+        let type_oid = self.catalog?.routine_result_oid(
+            name,
+            bound_oid,
+            argument_names,
+            variadic,
+            arguments,
+        )?;
         let ctype = constructor_type_from_oid(type_oid, &|oid| self.domain_base_type(oid))?;
         Some(crate::sql::exec::StaticTypeMeta {
             type_oid,
@@ -705,7 +712,7 @@ impl crate::sql::exec::ColTypeResolver for RuntimeColumnTypes<'_, '_> {
             super::ast::CATALOG_OPERATOR_CALL_PREFIX,
             name
         );
-        self.routine_result(encoded.as_str(), &[], false, &[left, right])
+        self.routine_result(encoded.as_str(), None, &[], false, &[left, right])
     }
 }
 
@@ -1207,6 +1214,7 @@ pub trait CatalogAccess {
     fn resolve_routine_call<'name>(
         &self,
         _name: &'name str,
+        _bound_oid: Option<i32>,
         _argument_names: &[Option<&str>],
         _variadic: bool,
         _argument_type_oids: &[i32],
@@ -1217,6 +1225,7 @@ pub trait CatalogAccess {
     fn routine_evaluation(
         &self,
         _name: &str,
+        _bound_oid: Option<i32>,
         _argument_names: &[Option<&str>],
         _variadic: bool,
         _argument_type_oids: &[i32],
@@ -1310,6 +1319,7 @@ pub trait CatalogAccess {
     fn routine_result_oid(
         &self,
         _name: &str,
+        _bound_oid: Option<i32>,
         _argument_names: &[Option<&str>],
         _variadic: bool,
         _argument_type_oids: &[i32],
@@ -1919,12 +1929,14 @@ fn catalog_evaluation(
     let mut found = None;
     if let Expr::Call {
         name,
+        bound_oid,
         args,
         argument_names,
         variadic,
         ..
     } = expression
-        && (catalog.has_routine_candidate(name, args.len())
+        && (bound_oid.is_some()
+            || catalog.has_routine_candidate(name, args.len())
             || super::catalog::intrinsic_routine_has_name(name)
             || super::ast::catalog_operator_call(name).is_some())
     {
@@ -1951,8 +1963,13 @@ fn catalog_evaluation(
                     }
                 });
                 if found != Some(ExpressionEvaluation::Runtime)
-                    && let Some(evaluation) =
-                        catalog.routine_evaluation(name, argument_names, *variadic, types)?
+                    && let Some(evaluation) = catalog.routine_evaluation(
+                        name,
+                        *bound_oid,
+                        argument_names,
+                        *variadic,
+                        types,
+                    )?
                 {
                     found = Some(evaluation);
                 }
@@ -3016,6 +3033,7 @@ fn eval_full_inner<'a>(
         }
         Expr::Call {
             name,
+            bound_oid,
             args,
             argument_names,
             variadic,
@@ -3024,6 +3042,43 @@ fn eval_full_inner<'a>(
             over,
             ..
         } => {
+            if let Some(oid) = bound_oid {
+                let catalog = hooks.catalog.ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "captured routine catalog is unavailable"
+                    )
+                })?;
+                if args.len() > crate::storage::MAX_ROUTINE_ARGUMENTS {
+                    return Err(sql_err!(
+                        sqlstate::TOO_MANY_ARGUMENTS,
+                        "routine call has too many arguments"
+                    ));
+                }
+                let mut types = [super::types::oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
+                for (output, argument) in types.iter_mut().zip(args) {
+                    *output =
+                        expression_type_identity(argument, row, hooks)?.routine_argument_oid();
+                }
+                let types = &types[..args.len()];
+                let target = catalog
+                    .resolve_routine_call(name, Some(oid), argument_names, variadic, types)?
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::UNDEFINED_FUNCTION,
+                            "captured function with OID {} does not exist",
+                            oid
+                        )
+                    })?;
+                return catalog.call_routine(
+                    target,
+                    args,
+                    types,
+                    &mut |argument| eval_full(argument, arena, params, row, hooks),
+                    arena,
+                );
+            }
+
             if let Some((Some(schema), symbol)) = crate::sql::ast::catalog_operator_call(name)
                 && schema.eq_ignore_ascii_case("pg_catalog")
             {
@@ -5147,9 +5202,13 @@ fn call<'a>(
                 _ => unreachable!("tsquery operator argument identity"),
             };
         }
-        if let Some(target) =
-            catalog.resolve_routine_call(name, argument_names, variadic, argument_type_oids)?
-        {
+        if let Some(target) = catalog.resolve_routine_call(
+            name,
+            None,
+            argument_names,
+            variadic,
+            argument_type_oids,
+        )? {
             return catalog.call_routine(
                 target,
                 args,

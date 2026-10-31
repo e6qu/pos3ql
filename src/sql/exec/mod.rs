@@ -17479,6 +17479,7 @@ fn parse_plpgsql_assignment_target<'a>(
     let args = arg_list.as_slice();
     let expression = arena
         .alloc(Expr::Call {
+            bound_oid: None,
             name: "__jsonb_subscript_set",
             args,
             argument_names: &[],
@@ -45000,11 +45001,19 @@ struct StoredQueryRoot {
 fn stored_dependency_drop_error(storage: &Storage, txid: u32, root: StoredQueryRoot) -> SqlError {
     use core::fmt::Write as _;
     let visible = match root.class {
-        crate::storage::DependencyClass::Sequence => super::catalog::relation_oid_is_visible(
-            storage,
-            txid,
-            super::catalog::sequence_oid(storage, root.slot),
-        ),
+        crate::storage::DependencyClass::Sequence => {
+            let Some(visible) = super::catalog::relation_oid_visibility(
+                storage,
+                txid,
+                super::catalog::sequence_oid(storage, root.slot),
+            ) else {
+                return sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "dependency sequence identity is unavailable"
+                );
+            };
+            visible
+        }
         crate::storage::DependencyClass::Routine => {
             let oid = crate::storage::routine_oid(&storage.routine_for(root.slot, txid));
             let Some(visible) = super::catalog::function_oid_visibility(storage, txid, oid) else {

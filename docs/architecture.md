@@ -67,6 +67,10 @@ procedure is created. Calls use one copied dependency image to bind omitted
 inputs while preserving the caller's sequence state. For example, renaming the
 sequence selected by `DEFAULT nextval('order_numbers')` does not redirect the
 default to a replacement; `nextval('order_numbers'::text)` requests runtime lookup.
+Helper calls carry their captured catalog identity through expression expansion,
+result type inference, planning and evaluation. Adding an overload cannot redirect
+a stored default. Overloaded stored calls choose only among their captured
+functions, even after names change.
 Captured references share the existing fixed dependency capacity and durable
 records, including replacement rollback and empty-cache recovery.
 Procedure calls resolve input types and check execution permission before

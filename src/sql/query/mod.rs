@@ -2828,6 +2828,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
     fn resolve_routine_call<'name>(
         &self,
         name: &'name str,
+        bound_oid: Option<i32>,
         argument_names: &[Option<&str>],
         variadic: bool,
         argument_type_oids: &[i32],
@@ -2838,7 +2839,9 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                 name: operator,
             }));
         }
-        let Some(slot) = (if argument_names.is_empty() {
+        let Some(slot) = (if let Some(oid) = bound_oid {
+            self.storage.routine_slot_by_oid(oid, self.txid)
+        } else if argument_names.is_empty() {
             self.storage.routine_slot_for_call_syntax_oids(
                 name,
                 argument_type_oids,
@@ -2880,12 +2883,18 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
     fn routine_evaluation(
         &self,
         name: &str,
+        bound_oid: Option<i32>,
         argument_names: &[Option<&str>],
         variadic: bool,
         argument_type_oids: &[i32],
     ) -> Result<Option<super::eval::ExpressionEvaluation>, SqlError> {
-        let Some(super::eval::RoutineCallTarget::Stored { oid, .. }) =
-            self.resolve_routine_call(name, argument_names, variadic, argument_type_oids)?
+        let Some(super::eval::RoutineCallTarget::Stored { oid, .. }) = self.resolve_routine_call(
+            name,
+            bound_oid,
+            argument_names,
+            variadic,
+            argument_type_oids,
+        )?
         else {
             return Ok(None);
         };
@@ -3368,6 +3377,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
     fn routine_result_oid(
         &self,
         name: &str,
+        bound_oid: Option<i32>,
         argument_names: &[Option<&str>],
         variadic: bool,
         argument_type_oids: &[i32],
@@ -3405,7 +3415,15 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                 .storage
                 .routine_type_oid(result.ctype, result.user_type, self.txid);
         }
-        let routine = if argument_names.is_empty() {
+        let routine = if let Some(oid) = bound_oid {
+            self.storage.function_for_captured_call(
+                oid,
+                argument_names,
+                argument_type_oids,
+                variadic,
+                self.txid,
+            )
+        } else if argument_names.is_empty() {
             self.storage.function_for_call_syntax_oids(
                 name,
                 argument_type_oids,
@@ -6331,6 +6349,7 @@ fn rewrite_grouped_expr<'a>(
         }
         Expr::Call {
             name,
+            bound_oid,
             args,
             argument_names,
             variadic,
@@ -6387,6 +6406,7 @@ fn rewrite_grouped_expr<'a>(
             };
             alloc(Expr::Call {
                 name,
+                bound_oid: *bound_oid,
                 args,
                 argument_names,
                 variadic: *variadic,
@@ -10222,6 +10242,7 @@ impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_> {
     fn routine_result(
         &self,
         name: &str,
+        bound_oid: Option<i32>,
         argument_names: &[Option<&str>],
         variadic: bool,
         arguments: &[i32],
@@ -10286,7 +10307,15 @@ impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_> {
                 },
             });
         }
-        let routine = if argument_names.is_empty() {
+        let routine = if let Some(oid) = bound_oid {
+            self.storage.function_for_captured_call(
+                oid,
+                argument_names,
+                arguments,
+                variadic,
+                self.txid,
+            )
+        } else if argument_names.is_empty() {
             self.storage
                 .function_for_call_syntax_oids(name, arguments, variadic, self.txid)
         } else {

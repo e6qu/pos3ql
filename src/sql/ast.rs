@@ -5595,6 +5595,8 @@ pub enum Expr<'a> {
     /// (e.g. `string_agg(x, ',' ORDER BY y)`), empty otherwise.
     Call {
         name: &'a str,
+        /// Captured catalog identity for a stored call; SQL text carries names only.
+        bound_oid: Option<i32>,
         args: &'a [&'a Expr<'a>],
         /// Empty for positional calls; otherwise parallel to `args` and
         /// populated only for named notation parsed after positional inputs.

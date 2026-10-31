@@ -1,0 +1,16 @@
+CREATE FUNCTION public.captured_helper(value varchar) RETURNS integer LANGUAGE sql RETURN 11;
+CREATE FUNCTION public.captured_helper(value integer) RETURNS integer LANGUAGE sql RETURN 44;
+CREATE FUNCTION public.captured_pair(left_value integer DEFAULT public.captured_helper('value'),right_value integer DEFAULT public.captured_helper(3)) RETURNS integer LANGUAGE sql AS 'SELECT $1*100+$2';
+CREATE FUNCTION public.captured_default(value integer DEFAULT public.captured_helper('value')) RETURNS integer LANGUAGE sql AS 'SELECT $1';
+SELECT public.captured_default(),public.captured_pair();
+CREATE FUNCTION public.captured_helper(value text) RETURNS integer LANGUAGE sql RETURN 22;
+SELECT public.captured_helper('value'),public.captured_default(),public.captured_pair();
+ALTER FUNCTION public.captured_helper(varchar) RENAME TO renamed_helper;
+CREATE FUNCTION public.renamed_helper(value text) RETURNS integer LANGUAGE sql RETURN 33;
+SELECT public.captured_default(),public.captured_pair();
+DROP FUNCTION public.captured_pair(integer,integer);
+DROP FUNCTION public.captured_default(integer);
+DROP FUNCTION public.captured_helper(integer);
+DROP FUNCTION public.captured_helper(text);
+DROP FUNCTION public.renamed_helper(text);
+DROP FUNCTION public.renamed_helper(varchar);

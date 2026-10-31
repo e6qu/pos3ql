@@ -722,6 +722,7 @@ impl ColTypeResolver for CatalogCols<'_> {
     fn routine_result(
         &self,
         name: &str,
+        bound_oid: Option<i32>,
         argument_names: &[Option<&str>],
         variadic: bool,
         arguments: &[i32],
@@ -784,7 +785,15 @@ impl ColTypeResolver for CatalogCols<'_> {
                 },
             });
         }
-        let routine = if argument_names.is_empty() {
+        let routine = if let Some(oid) = bound_oid {
+            self.storage.function_for_captured_call(
+                oid,
+                argument_names,
+                arguments,
+                variadic,
+                self.txid,
+            )
+        } else if argument_names.is_empty() {
             self.storage
                 .function_for_call_syntax_oids(name, arguments, variadic, self.txid)
         } else {
@@ -1640,6 +1649,7 @@ pub trait ColTypeResolver {
     fn routine_result(
         &self,
         _name: &str,
+        _bound_oid: Option<i32>,
         _argument_names: &[Option<&str>],
         _variadic: bool,
         _arguments: &[i32],
@@ -3392,6 +3402,7 @@ pub(crate) fn routine_result_metadata(
 ) -> Option<StaticTypeMeta> {
     let Expr::Call {
         name,
+        bound_oid,
         args,
         argument_names,
         variadic,
@@ -3410,6 +3421,7 @@ pub(crate) fn routine_result_metadata(
     }
     if let Some(result) = columns.routine_result(
         name,
+        *bound_oid,
         argument_names,
         *variadic,
         &argument_type_oids[..args.len()],
@@ -3425,6 +3437,7 @@ pub(crate) fn routine_result_metadata(
     }
     columns.routine_result(
         name,
+        *bound_oid,
         argument_names,
         *variadic,
         &argument_type_oids[..args.len() + order_by.len()],

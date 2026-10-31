@@ -5351,28 +5351,40 @@ fn rewrite_stored_sequence_arguments<'a>(
 }
 
 fn rewrite_stored_routine_name<'a>(
+    call: &'a Expr<'a>,
     name: &'a str,
-    args: &[&Expr<'a>],
-    argument_names: &[Option<&str>],
-    variadic: bool,
     context: Subst<'_, 'a, '_, '_>,
     arena: &'a Arena,
-) -> Result<&'a str, SqlError> {
+) -> Result<(&'a str, Option<i32>), SqlError> {
+    let Expr::Call {
+        bound_oid,
+        args,
+        argument_names,
+        variadic,
+        ..
+    } = call
+    else {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "stored routine binding requires a call"
+        ));
+    };
+    let bound_oid = *bound_oid;
     let Some(dependencies) = context.dependencies else {
-        return Ok(name);
+        return Ok((name, bound_oid));
     };
     let Some(dependency) = super::dependencies::stored_routine_dependency_for_call(
         name,
         args,
         argument_names,
-        variadic,
+        *variadic,
         context.storage,
         context.txid,
         dependencies,
         arena,
     )?
     else {
-        return Ok(name);
+        return Ok((name, bound_oid));
     };
     let routine = context
         .storage
@@ -5389,9 +5401,10 @@ fn rewrite_stored_routine_name<'a>(
             "routine identity is too long"
         ));
     }
-    arena
+    let name = arena
         .alloc_str(qualified.as_str())
-        .map_err(|_| arena_full())
+        .map_err(|_| arena_full())?;
+    Ok((name, Some(crate::storage::routine_oid(&routine))))
 }
 
 fn rewrite_stored_operator_name<'a>(
@@ -5513,10 +5526,10 @@ fn subst_expr<'a>(
             order_by,
             over,
             filter,
+            ..
         } => {
             let name = rewrite_stored_operator_name(name, args, context, arena)?;
-            let name =
-                rewrite_stored_routine_name(name, args, argument_names, *variadic, context, arena)?;
+            let (name, bound_oid) = rewrite_stored_routine_name(e, name, context, arena)?;
             let mut ob: ArenaList<'a, OrderBy<'a>> = ArenaList::new(arena);
             for o in order_by.iter() {
                 ob.push(OrderBy {
@@ -5562,6 +5575,7 @@ fn subst_expr<'a>(
             let args = rewrite_stored_sequence_arguments(name, args, context, arena)?;
             Expr::Call {
                 name,
+                bound_oid,
                 args,
                 argument_names,
                 variadic: *variadic,

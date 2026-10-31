@@ -42,7 +42,7 @@ CREATE PROCEDURE public.default_overload(value integer) LANGUAGE sql AS 'INSERT 
 CALL public.default_overload('not a number');
 CALL public.default_overload(value=>'also text');
 CALL public.default_overload(3);
-SELECT value FROM public.default_audit WHERE value>=8000 ORDER BY value;
+SELECT count(*) FILTER (WHERE value=8000),count(*) FILTER (WHERE value=9000) FROM public.default_audit;
 CREATE FUNCTION public.default_choice(left_value integer,right_value integer) RETURNS integer LANGUAGE sql RETURN 100;
 CREATE FUNCTION public.default_choice(left_value text,right_value bigint) RETURNS integer LANGUAGE sql RETURN 200;
 SELECT public.default_choice('2',3),public.default_choice(right_value=>3,left_value=>'2');

@@ -24381,13 +24381,14 @@ impl Storage {
             AccessClass::Domain => self.domain(slot).ownership,
             AccessClass::Enum => self.enum_for(slot, 0).ownership,
             AccessClass::Index => self.index(slot).ownership,
-            AccessClass::Routine => self
-                .routines
-                .lock()
-                .expect("routine catalog lock poisoned")
-                .get(slot)
-                .expect("routine slot is in range")
-                .ownership,
+            AccessClass::Routine => {
+                self.routines
+                    .lock()
+                    .expect("routine catalog lock poisoned")
+                    .get(slot)
+                    .expect("routine slot is in range")
+                    .ownership
+            }
             AccessClass::Composite => self.composite(slot).ownership,
             AccessClass::Tablespace => self.tablespace(slot).ownership,
             AccessClass::Statistics => self.extended_statistics(slot).ownership,
@@ -44101,15 +44102,17 @@ impl Storage {
         txid: u32,
         kind: RoutineCallKind,
     ) -> Option<usize> {
-        let exact = self
-            .routine_candidates(schema, name, txid, kind)
-            .find_map(|(slot, definition)| {
-                (definition.argument_count == argument_type_oids.len()
-                    && definition.arguments().iter().zip(argument_type_oids).all(
-                        |(argument, oid)| self.routine_argument_oid(argument, txid) == Some(*oid),
-                    ))
-                .then_some(slot)
-            });
+        let exact =
+            self.routine_candidates(schema, name, txid, kind)
+                .find_map(|(slot, definition)| {
+                    (definition.argument_count == argument_type_oids.len()
+                        && definition.arguments().iter().zip(argument_type_oids).all(
+                            |(argument, oid)| {
+                                self.routine_argument_oid(argument, txid) == Some(*oid)
+                            },
+                        ))
+                    .then_some(slot)
+                });
         if exact.is_some() {
             return exact;
         }
@@ -44494,7 +44497,8 @@ impl Storage {
         txid: u32,
         arena: &crate::mem::arena::Arena,
     ) -> Result<StoredQueryDependencies, SqlError> {
-        let image = if let Some(dependency_slot) = self.routine_pending_dependency_slot(slot, txid) {
+        let image = if let Some(dependency_slot) = self.routine_pending_dependency_slot(slot, txid)
+        {
             self.stored_query_dependency_pending_base + dependency_slot as usize
         } else {
             self.committed_dependency_image(StoredQueryDependencyOwner::Routine(slot as u16))

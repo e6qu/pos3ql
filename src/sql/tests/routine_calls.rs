@@ -90,7 +90,8 @@ fn routine_arguments_run_once_and_preserve_strict_null_effects() {
     );
     assert_eq!(data_rows(&session.success(&mut engine,
         "SELECT last_value FROM dispatch_effects",true)),["18"]);
-    for sql in ["SELECT hashtextextended(NULL::text,dispatch_step())", "SELECT setval(NULL::regclass,dispatch_step())"] {
+    for sql in ["SELECT hashtextextended(NULL::text,dispatch_step())", "SELECT setval(NULL::regclass,dispatch_step())",
+        "SELECT setval(NULL::text::regclass,dispatch_step())"] {
         assert_eq!(data_rows(&session.success(&mut engine,sql,true)),["NULL"],"{sql}");
         assert_eq!(data_rows(&session.success(&mut engine,
             "SELECT last_value FROM dispatch_effects",true)),["18"],"{sql}");

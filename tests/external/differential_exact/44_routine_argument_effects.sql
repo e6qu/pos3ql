@@ -22,6 +22,8 @@ SELECT hashtextextended(NULL::text,dispatch_step());
 SELECT last_value FROM dispatch_effects;
 SELECT setval(NULL::regclass,dispatch_step());
 SELECT last_value FROM dispatch_effects;
+SELECT setval(NULL::text::regclass,dispatch_step());
+SELECT last_value FROM dispatch_effects;
 CREATE FUNCTION dispatch_pair(left_value bigint,right_value bigint) RETURNS bigint LANGUAGE sql VOLATILE AS 'SELECT $1*100+$2';
 CREATE FUNCTION dispatch_default(value bigint DEFAULT nextval('dispatch_effects')) RETURNS bigint LANGUAGE sql VOLATILE AS 'SELECT $1';
 CREATE FUNCTION dispatch_variadic(VARIADIC values_ bigint[]) RETURNS bigint LANGUAGE sql VOLATILE AS 'SELECT $1[1]*100+$1[2]';

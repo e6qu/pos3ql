@@ -42,10 +42,9 @@ presence alone is not support. Compare values, declared result types, nulls,
 errors and argument effects with PostgreSQL, including seeded hashes.
 Registered routine identities, aggregate kinds and null-call properties must
 match the live reference catalog even while missing routines are being added.
-Bind a function's identity and input mapping before running argument effects.
-Built-in dispatch and missing-function checks must not evaluate inputs as a
-lookup probe. Retained calls must preserve their completed inputs and use the
-caller's sequence state for defaults, including strict null and error behavior.
+Retained calls must preserve their bound identities, completed inputs and
+defaults across waits, including PostgreSQL's strict null and error behavior.
+Reuse the shared call boundary rather than replaying argument evaluation.
 Run real SQLAlchemy, Alembic and psycopg2 workflows against both servers.
 Keep their catalog inspection, declared types, streaming and migration checks
 passing as function binding and execution expand; see the
@@ -55,16 +54,8 @@ embedded databases; report the per-table contribution separately. Verify that
 unused wide definition slots stay untouched while live readers prevent slot reuse.
 Remove avoidable per-table metadata reservations through shared startup-owned
 capacity, preserving stable reader identities, rollback and named exhaustion.
-Reserve needed row history before the durable commit boundary; a smaller shared
-pool must never fail for capacity after the commit is already durable.
-The explicit shared `row_history_slots` pool owns capacity with each pending row
-chain. Verify competing transactions, later readers, savepoint undo, prepared
-commit/rollback and cold restoration before closing this memory gate.
-Reclaim obsolete row images while newer readers remain active. A full pool may
-perform one bounded cleanup batch before rejecting an update; retry must keep
-the same owned values and must not issue SQL effects again.
-Reject per-row history exhaustion before writing the commit too; a multirow
-transaction must leave every row unchanged and keep the server usable on error.
+Preserve shared row-history admission before durability, bounded reclamation,
+rollback and prepared/cold recovery while reducing the remaining reservations.
 Include the current execution-stack requirement in embedded measurements and
 reduce avoidable wide construction frames alongside table and history metadata.
 The retained [empty-engine measurements](https://github.com/e6qu/pos3ql/blob/6ff1ac865a86a5318cb4934fbf01be0926667811/benchmarks/baselines/2026-10-30-embedded-startup/README.md)

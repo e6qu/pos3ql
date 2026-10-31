@@ -395,7 +395,7 @@ fn procedure_inputs_bind_before_effects_and_run_in_declaration_order() {
     assert_eq!(data_rows(&session.success(&mut engine,
         "CALL procedure_pair(right_value=>nextval('procedure_effects')); \
          CALL procedure_pair(right_value=>nextval('procedure_effects'),left_value=>nextval('procedure_effects')); \
-         SELECT value FROM procedure_audit ORDER BY value; SELECT last_value FROM procedure_effects", true)), ["1011", "1213", "13"]);
+         SELECT value FROM procedure_audit ORDER BY value; SELECT last_value FROM procedure_effects", true)), ["1011", "1213", "14"]);
     assert_eq!(
         error_sqlstates(&session.execute(
             &mut engine,
@@ -446,14 +446,16 @@ fn routine_inputs_share_conversions_order_and_strictness_in_every_context() {
     let (errors, finish) = rest.split_once("-- after errors").unwrap();
     assert_eq!(
         data_rows(&session.success(&mut engine, setup, true)),
-        ["1011", "1213", "13"]
+        ["1011", "1213", "14"]
     );
     let errors: Vec<_> = errors
         .lines()
         .filter(|line| !line.trim().is_empty())
         .collect();
-    assert_eq!(errors.len(), 4);
-    for (sql, state) in errors.into_iter().zip(["22P02", "22012", "22P02", "22012"]) {
+    assert_eq!(errors.len(), 7);
+    for (sql, state) in errors.into_iter().zip([
+        "22P02", "22012", "22P02", "22012", "22012", "22P02", "42883",
+    ]) {
         assert_eq!(
             error_sqlstates(&session.execute(&mut engine, sql, true)),
             [state],
@@ -462,6 +464,9 @@ fn routine_inputs_share_conversions_order_and_strictness_in_every_context() {
     }
     assert_eq!(
         data_rows(&session.success(&mut engine, finish, true)),
-        ["13", "14", "0"]
+        [
+            "15", "16", "1", "17", "2", "18", "19", "0", "19", "1025", "20", "0", "21", "7|22",
+            "7|7", "22", "0"
+        ]
     );
 }

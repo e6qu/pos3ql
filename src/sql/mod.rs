@@ -14573,6 +14573,7 @@ impl Engine {
                 argument_type_oids: &type_oids[..arguments.len()],
                 mapping: &mapping,
                 variadic,
+                context: query::RoutineInputContext::Procedure,
             },
             &mut |argument| eval::eval_full(argument, arena, params, &NoColumns, &hooks),
             arena,

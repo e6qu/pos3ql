@@ -1193,18 +1193,27 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
             return Ok(values);
         }
         if is_srf_name(name) {
-            let count = srf_count(expression, arena, params, row, hooks)?;
-            let values = arena
-                .alloc_slice_with(count, |_| Datum::Null)
-                .map_err(|_| arena_full())?;
-            for (offset, value) in values.iter_mut().enumerate() {
-                let indexed_hooks = EvalHooks {
-                    srf_index: Some(offset + 1),
-                    ..*hooks
-                };
-                *value = eval_full(expression, arena, params, row, &indexed_hooks)?;
-            }
-            return Ok(values);
+            return with_bound_srf_inputs(
+                expression,
+                arena,
+                params,
+                row,
+                hooks,
+                |bound, inputs| {
+                    let count = srf_count(bound, arena, inputs, row, hooks)?;
+                    let values = arena
+                        .alloc_slice_with(count, |_| Datum::Null)
+                        .map_err(|_| arena_full())?;
+                    for (offset, value) in values.iter_mut().enumerate() {
+                        let indexed_hooks = EvalHooks {
+                            srf_index: Some(offset + 1),
+                            ..*hooks
+                        };
+                        *value = eval_full(bound, arena, inputs, row, &indexed_hooks)?;
+                    }
+                    Ok(values)
+                },
+            );
         }
 
         let (schema, table) = name
@@ -1317,6 +1326,97 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
         values,
         any,
     })
+}
+
+/// Bind one builtin set-returning call's inputs before counting or emitting rows.
+/// Parameter values and their SQL types stay local to this call; row iteration
+/// never replays an argument effect and keeps bounded inputs for large results.
+pub(super) fn with_bound_srf_inputs<'a, R: ColumnLookup<'a>, T>(
+    expression: &'a Expr<'a>,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    row: &R,
+    hooks: &EvalHooks<'_, 'a>,
+    run: impl FnOnce(&'a Expr<'a>, &'a [Datum<'a>]) -> Result<T, SqlError>,
+) -> Result<T, SqlError> {
+    let Expr::Call {
+        name,
+        args,
+        argument_names,
+        ..
+    } = expression
+    else {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "set input binding requires a call"
+        ));
+    };
+    if args.len() > crate::storage::MAX_ROUTINE_ARGUMENTS {
+        return Err(sql_err!(
+            sqlstate::TOO_MANY_ARGUMENTS,
+            "set-returning call has too many arguments"
+        ));
+    }
+    let accepted = if name.eq_ignore_ascii_case("_pg_expandarray") {
+        args.len() == 1
+    } else {
+        crate::sql::catalog::intrinsic_routine_accepts_arity(name, args.len())
+    };
+    if !accepted {
+        return crate::sql::eval::undefined_function(name, args, arena, row, hooks);
+    }
+    let mut reordered = [&Expr::Null; 3];
+    let arguments = if argument_names.iter().any(Option::is_some) {
+        let Some(regex_name) = regex_srf_name(name) else {
+            return Err(srf_signature_error(name));
+        };
+        let parameters: &[&str] = match args.len() {
+            2 => &["string", "pattern"],
+            3 => &["string", "pattern", "flags"],
+            _ => return Err(srf_signature_error(regex_name)),
+        };
+        crate::sql::eval::reorder_required_arguments(
+            regex_name,
+            args,
+            argument_names,
+            parameters,
+            &mut reordered[..args.len()],
+        )?;
+        &reordered[..args.len()]
+    } else {
+        args
+    };
+    let mut types = [crate::sql::types::oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
+    for (output, argument) in types.iter_mut().zip(arguments) {
+        *output = crate::sql::eval::expression_type_identity(argument, row, hooks)?
+            .routine_argument_oid();
+    }
+    let values = arena
+        .alloc_slice_with(arguments.len(), |_| Datum::Null)
+        .map_err(|_| arena_full())?;
+    let mut bound_arguments = crate::mem::arena::ArenaList::new(arena);
+    for (index, argument) in arguments.iter().enumerate() {
+        let value = eval_full(argument, arena, params, row, hooks)?;
+        let encoded = crate::sql::exec::encode_projected_pub(&[value], arena)?;
+        values[index] = crate::sql::exec::decode_projected_col_record(encoded, 0, arena)?;
+        let parameter: &'a Expr<'a> = arena
+            .alloc(Expr::Param(index as u32 + 1))
+            .map_err(|_| arena_full())?;
+        bound_arguments.push(parameter).map_err(|_| arena_full())?;
+    }
+    let mut bound = *expression;
+    let Expr::Call {
+        args,
+        argument_names,
+        ..
+    } = &mut bound
+    else {
+        unreachable!()
+    };
+    *args = bound_arguments.as_slice();
+    *argument_names = &[];
+    let bound = arena.alloc(bound).map_err(|_| arena_full())?;
+    crate::sql::exec::with_bound_parameter_types(&types[..arguments.len()], || run(bound, values))
 }
 
 /// Number of output rows a set-returning call yields for the current source row.
@@ -4956,8 +5056,13 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                 argument_type_oids: &argument_type_oids[..args.len()],
                 mapping: &mapping,
                 variadic: tref.func_variadic,
+                context: super::RoutineInputContext::Table,
             },
-            &mut |argument| crate::sql::eval::eval_full(argument, arena, params, columns, &hooks),
+            &mut |argument| {
+                let value = crate::sql::eval::eval_full(argument, arena, params, columns, &hooks)?;
+                let encoded = crate::sql::exec::encode_projected_pub(&[value], arena)?;
+                crate::sql::exec::decode_projected_col_record(encoded, 0, arena)
+            },
             arena,
         )?
         else {

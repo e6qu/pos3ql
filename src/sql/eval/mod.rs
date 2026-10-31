@@ -4871,13 +4871,13 @@ pub(crate) fn array_constructor_type<'a>(
 /// `nosuchfunc(integer)`, not `nosuchfunc()`. The types are the static ones —
 /// an argument is never evaluated to build an error about a function that will
 /// not run — so an untyped literal is `unknown`, exactly as PostgreSQL has it.
-fn undefined_function<'a>(
+pub(crate) fn undefined_function<'a, T>(
     name: &str,
     args: &[&Expr<'a>],
     arena: &'a Arena,
     row: &impl ColumnLookup<'a>,
     hooks: &EvalHooks<'_, 'a>,
-) -> Result<Datum<'a>, SqlError> {
+) -> Result<T, SqlError> {
     use core::fmt::Write as _;
     let mut message = StackStr::<192>::new();
     let _ = write!(message, "function {}(", name);

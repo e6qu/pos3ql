@@ -3760,6 +3760,15 @@ pub(crate) fn intrinsic_routine_has_name(name: &str) -> bool {
         .any(|routine| routine_name_matches(name, "pg_catalog", routine.name))
 }
 
+pub(crate) fn intrinsic_routine_accepts_arity(name: &str, arity: usize) -> bool {
+    INTRINSIC_ROUTINES.iter().any(|routine| {
+        let declared = routine.argument_count as usize;
+        let omitted = intrinsic_routine_defaults(routine.oid).map_or(0, |(count, _)| count);
+        routine_name_matches(name, "pg_catalog", routine.name)
+            && (declared - omitted..=declared).contains(&arity)
+    })
+}
+
 /// Foldability follows the registered catalog contract. Exact inputs win over
 /// coercions when overloads differ; an unresolved mixed family stays at runtime.
 pub(crate) fn intrinsic_routine_evaluation(

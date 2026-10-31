@@ -59,7 +59,7 @@ defaults run in declaration order with the caller's evaluation context.
 Lookup does not run an argument as a probe. For example,
 `setval('order_numbers', nextval('import_numbers'))`
 consumes one import number. A constant null, including an inserted default or
-an explicitly null variadic array, can eliminate a strict call. A null array
+an explicitly null variadic array, can eliminate a strict scalar call. A null array
 member does not make the array null. A null row value still allows the other
 reached arguments to run.
 Parameter defaults capture managed object references when the function or
@@ -73,12 +73,14 @@ a stored default. Overloaded stored calls choose only among their captured
 functions, even after names change.
 Captured references share the existing fixed dependency capacity and durable
 records, including replacement rollback and empty-cache recovery.
-Scalar functions, table functions and procedures share the input preparation
-boundary: resolve input types and execution permission before effects, check
-constant conversions, then evaluate reached inputs in declaration order.
-A strict table function with a constant null input returns no rows without
-consuming a sequence input; a null value read from a row still evaluates the
-other reached inputs before the body is skipped.
+Scalar functions, table functions and procedures share input preparation with
+an explicit call context. A strict function in `FROM` evaluates its inputs before
+returning no rows for a null input. `CALL` converts unknown literals before
+execution but evaluates ordinary expressions in declaration order: a later
+division by zero can follow an earlier sequence increment. Lateral functions and
+subqueries inherit the caller's sequence state. Builtin set-returning calls bind
+input values and SQL types once before counting or emitting their rows; external
+row iteration keeps those inputs without materializing the whole result.
 This call boundary supplies retained execution with an explicit target; it
 does not yet make every function body yield during a storage wait.
 Runtime overload checks copy input descriptors rather than whole definitions.

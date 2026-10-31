@@ -309,11 +309,16 @@ Planning uses registered built-in, stored-function and user-operator volatility.
 For example, `SELECT brin_summarize_new_values('orders_brin')` performs its
 maintenance when the query reaches the call; checking the query for constant
 errors must not perform that maintenance first.
-For a function declared `STRICT`, a constant null argument skips the call and
+For a scalar function declared `STRICT`, a constant null argument skips the call and
 its runtime inputs; errors in constant inputs still surface. This includes
 inserted defaults and explicitly null variadic arrays. A null member inside a
 non-null variadic array does not skip the call. Runtime nulls still evaluate
-the other reached inputs.
+the other reached inputs. A strict function used in `FROM` evaluates its inputs
+before skipping its body for a null. If procedure `import_batch` accepts two bigint
+inputs, `CALL import_batch(nextval('order_numbers'), 'bad')` rejects the invalid
+integer before issuing an order number. `CALL import_batch(nextval('order_numbers'),
+1/0)` issues a number before its runtime arithmetic error. Functions that produce
+multiple rows evaluate their inputs once, rather than once per output row.
 Constant catalog-identifier casts still validate their names without input rows:
 selecting `'missing_table'::regclass` from an empty table raises `42P01`.
 Capture an object's OID before dropping it when checking that its catalog rows

@@ -4274,6 +4274,7 @@ fn materialize_lateral<'a, C: ColumnLookup<'a>>(
     arena: &'a Arena,
     params: &[Datum<'a>],
     outer: &C,
+    base_hooks: &EvalHooks<'_, 'a>,
 ) -> Result<&'a [&'a [u8]], SqlError> {
     if let Some(sub) = tref.subquery {
         const EMPTY: &[u8] = &[];
@@ -4287,7 +4288,7 @@ fn materialize_lateral<'a, C: ColumnLookup<'a>>(
             arena,
             params,
             Some(outer),
-            None,
+            base_hooks.sequences,
             &mut |vals| {
                 let enc = crate::sql::exec::encode_projected_pub(vals, arena)?;
                 if len == cap {
@@ -4317,7 +4318,15 @@ fn materialize_lateral<'a, C: ColumnLookup<'a>>(
         // A lateral SRF (`LATERAL generate_series(1, t.n)`) evaluates its
         // arguments against the outer row.
         return super::table_func_rows_outer(
-            tref, storage, txid, arena, params, outer, None, None, None,
+            tref,
+            storage,
+            txid,
+            arena,
+            params,
+            outer,
+            Some(base_hooks),
+            None,
+            None,
         );
     }
     Err(sql_err!(
@@ -4326,6 +4335,10 @@ fn materialize_lateral<'a, C: ColumnLookup<'a>>(
     ))
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "lateral input keeps its caller evaluation context"
+)]
 fn external_lateral_function_run<'a, C: ColumnLookup<'a>>(
     storage: &'a Storage,
     txid: u32,
@@ -4334,12 +4347,13 @@ fn external_lateral_function_run<'a, C: ColumnLookup<'a>>(
     arena: &'a Arena,
     params: &[Datum<'a>],
     outer: &C,
+    base_hooks: &EvalHooks<'_, 'a>,
 ) -> Result<Option<crate::sql::external::ExternalRun>, SqlError> {
     let arguments = tref.func_args.expect("table function");
     let catalog = super::storage_catalog(storage, arena, txid);
     let hooks = EvalHooks {
-        catalog: Some(&catalog),
-        ..crate::sql::eval::NO_HOOKS
+        catalog: base_hooks.catalog.or(Some(&catalog)),
+        ..*base_hooks
     };
     let base_width = width - usize::from(tref.with_ordinality);
     let mut sorter = storage.external_sorter()?;
@@ -4410,44 +4424,46 @@ fn external_lateral_function_run<'a, C: ColumnLookup<'a>>(
             filter: None,
         })
         .map_err(|_| arena_full())?;
-    let count = super::srf::srf_count(&*call, arena, params, outer, &hooks)?;
-    for index in 1..=count {
-        let mark = arena.mark();
-        let row_hooks = EvalHooks {
-            srf_index: Some(index),
-            ..hooks
-        };
-        let value = eval_full(&*call, arena, params, outer, &row_hooks)?;
-        let mut values = [Datum::Null; MAX_COLUMNS];
-        match (base_width, value) {
-            (1, value) => values[0] = value,
-            (_, Datum::Record(fields)) if fields.len() == base_width => {
-                for (column, field) in fields.iter().enumerate() {
-                    values[column] = field.value;
+    super::srf::with_bound_srf_inputs(call, arena, params, outer, &hooks, |bound, inputs| {
+        let count = super::srf::srf_count(bound, arena, inputs, outer, &hooks)?;
+        for index in 1..=count {
+            let mark = arena.mark();
+            let row_hooks = EvalHooks {
+                srf_index: Some(index),
+                ..hooks
+            };
+            let value = eval_full(bound, arena, inputs, outer, &row_hooks)?;
+            let mut values = [Datum::Null; MAX_COLUMNS];
+            match (base_width, value) {
+                (1, value) => values[0] = value,
+                (_, Datum::Record(fields)) if fields.len() == base_width => {
+                    for (column, field) in fields.iter().enumerate() {
+                        values[column] = field.value;
+                    }
+                }
+                _ => {
+                    return Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "set-returning function row width does not match its definition"
+                    ));
                 }
             }
-            _ => {
-                return Err(sql_err!(
-                    sqlstate::INTERNAL_ERROR,
-                    "set-returning function row width does not match its definition"
-                ));
+            if tref.with_ordinality {
+                values[base_width] = Datum::Int8(index as i64);
             }
-        }
-        if tref.with_ordinality {
-            values[base_width] = Datum::Int8(index as i64);
+            storage
+                .with_block_store(|blocks| {
+                    sorter.push_projected_by(blocks, width, |column| values[column], &mut compare)
+                })
+                .expect("lateral function run has a block store")?;
+            // SAFETY: the evaluated SRF row was encoded into the immutable run;
+            // no datum allocated after this mark is retained.
+            unsafe { arena.rewind_to(mark) };
         }
         storage
-            .with_block_store(|blocks| {
-                sorter.push_projected_by(blocks, width, |column| values[column], &mut compare)
-            })
-            .expect("lateral function run has a block store")?;
-        // SAFETY: the evaluated SRF row was encoded into the immutable run;
-        // no datum allocated after this mark is retained.
-        unsafe { arena.rewind_to(mark) };
-    }
-    storage
-        .with_block_store(|blocks| sorter.finish(blocks, &mut compare))
-        .expect("lateral function run has a block store")
+            .with_block_store(|blocks| sorter.finish(blocks, &mut compare))
+            .expect("lateral function run has a block store")
+    })
 }
 
 enum LateralRows<'a> {
@@ -4465,6 +4481,7 @@ fn materialize_lateral_source<'a, C: ColumnLookup<'a>>(
     arena: &'a Arena,
     params: &[Datum<'a>],
     outer: &C,
+    base_hooks: &EvalHooks<'_, 'a>,
 ) -> Result<LateralRows<'a>, SqlError> {
     let external_function = tref.func_args.is_some()
         && super::srf::is_srf_name(tref.table)
@@ -4473,12 +4490,12 @@ fn materialize_lateral_source<'a, C: ColumnLookup<'a>>(
         && !tref.table.eq_ignore_ascii_case("pg_get_publication_tables");
     if !storage.spill_attached() || (tref.subquery.is_none() && !external_function) {
         return Ok(LateralRows::Local(materialize_lateral(
-            storage, txid, tref, arena, params, outer,
+            storage, txid, tref, arena, params, outer, base_hooks,
         )?));
     }
     if tref.subquery.is_none() {
         return Ok(LateralRows::External(external_lateral_function_run(
-            storage, txid, tref, width, arena, params, outer,
+            storage, txid, tref, width, arena, params, outer, base_hooks,
         )?));
     }
     let mut sorter = storage.external_sorter()?;
@@ -4491,7 +4508,7 @@ fn materialize_lateral_source<'a, C: ColumnLookup<'a>>(
         arena,
         params,
         Some(outer),
-        None,
+        base_hooks.sequences,
         &mut |values| {
             storage
                 .with_block_store(|blocks| {
@@ -6558,6 +6575,7 @@ fn scan_source_mode<'a>(
                 arena,
                 params,
                 &chained,
+                hooks,
             )? {
                 LateralRows::External(run) => {
                     if let Some(run) = run

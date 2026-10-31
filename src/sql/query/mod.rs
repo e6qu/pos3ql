@@ -1464,17 +1464,26 @@ pub(crate) fn builtin_operator_result(name: &str, arguments: &[i32]) -> Option<C
         .and_then(|(oid, _)| ColType::from_oid(oid))
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum RoutineInputContext {
+    Scalar,
+    Table,
+    Procedure,
+}
+
 pub(super) struct RoutineCallInputs<'call, 'expression> {
     pub arguments: &'call [&'expression Expr<'expression>],
     pub argument_type_oids: &'call [i32],
     pub mapping: &'call [u8; crate::storage::MAX_ROUTINE_ARGUMENTS],
     pub variadic: bool,
+    pub context: RoutineInputContext,
 }
 
 impl StorageCatalog<'_, '_, '_, '_> {
-    /// Bind and convert inputs before effects, then evaluate each reached input once.
-    /// None means a strict call was suppressed by a null input. Constant nulls
-    /// suppress runtime effects; row values are checked after all reached inputs.
+    /// Bind inputs before effects and evaluate them once under their SQL context.
+    /// None means a strict call was suppressed by a null input. Only scalar
+    /// calls suppress runtime effects for constant nulls; table calls first
+    /// evaluate every reached input.
     pub(super) fn prepare_routine_inputs<'a>(
         &self,
         slot: usize,
@@ -1489,6 +1498,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
             argument_type_oids,
             mapping,
             variadic,
+            context,
         } = inputs;
         if arguments.len() != argument_type_oids.len() || arguments.len() > mapping.len() {
             return Err(sql_err!(
@@ -1603,6 +1613,22 @@ impl StorageCatalog<'_, '_, '_, '_> {
             super::exec::coerce_routine_argument(value, argument, self.storage, self.txid, arena)
         };
         let constant_input = |expression: &Expr<'_>, source, expected| -> Result<bool, SqlError> {
+            // CALL evaluates ordinary expressions at execution time. Unknown
+            // literals are converted during PostgreSQL parse analysis, including
+            // a direct explicit cast from an unknown literal.
+            if context == RoutineInputContext::Procedure
+                && !matches!(
+                    expression,
+                    Expr::Str(_)
+                        | Expr::Null
+                        | Expr::Cast {
+                            operand: Expr::Str(_),
+                            ..
+                        }
+                )
+            {
+                return Ok(false);
+            }
             if super::eval::constant_evaluation(expression, Some(self))?
                 == Some(super::eval::ExpressionEvaluation::Runtime)
                 || matches!(
@@ -1654,7 +1680,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
         }
         // Check every constant input for errors before suppressing runtime
         // effects, including defaults inserted into the declared signature.
-        if declared.attributes.strict && constant_null {
+        if context == RoutineInputContext::Scalar && declared.attributes.strict && constant_null {
             return Ok(None);
         }
         let completed = arena
@@ -3305,6 +3331,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                 argument_type_oids,
                 mapping: &mapping,
                 variadic,
+                context: RoutineInputContext::Scalar,
             },
             evaluate,
             arena,

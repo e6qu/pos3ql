@@ -1961,10 +1961,16 @@ fn catalog_evaluation(
         } else {
             expression_type_identity(operand, &NoColumns, &hooks)?.routine_argument_oid()
         };
-        if let Some(target) = target
-            && let Some(evaluation) = catalog.cast_evaluation(source, target)?
-        {
-            found = Some(evaluation);
+        if let Some(target) = target {
+            found = if ColType::from_oid(target)
+                .is_some_and(|ctype| ctype.is_reg_object() || ctype == ColType::Regtype)
+            {
+                // Name resolution needs this catalog even for a constant cast.
+                // Strict null folding includes CASE and nested builtin casts.
+                Some(CastEvaluation::Immutable)
+            } else {
+                catalog.cast_evaluation(source, target)?
+            };
         }
     }
     super::query::walk_children(expression, &mut |child| {

@@ -5864,18 +5864,6 @@ impl Expr<'_> {
         self.is_aggregate() && matches!(self, Expr::Call { over: None, .. })
     }
 
-    // Builtin casts propagate a literal null without looking up an object.
-    // Named domains keep their runtime validation and are not stripped here.
-    fn is_literal_null(&self) -> bool {
-        match self {
-            Self::Null => true,
-            Self::Cast { operand, type_name, .. }
-                if ColType::from_sql_name(type_name).is_some() => operand.is_literal_null(),
-            Self::Collate { operand, .. } => operand.is_literal_null(),
-            _ => false,
-        }
-    }
-
     /// True when the expression is a compile-time constant: only literals
     /// and pure operations over them, with no column/parameter/subquery/
     /// aggregate reference. PostgreSQL evaluates these at plan time, so
@@ -5906,13 +5894,10 @@ impl Expr<'_> {
             | Expr::Exists(_)
             | Expr::ArraySubquery(_)
             | Expr::DefaultMarker => false,
-            // Catalog-defined casts need the query catalog for both their
-            // validation and their runtime representation. They are not
-            // foldable through the catalog-free evaluator.
-            Expr::Cast { operand, type_name, .. }
-                if ((type_name.eq_ignore_ascii_case("regclass")
-                    || type_name.eq_ignore_ascii_case("regtype")) && !operand.is_literal_null())
-                    || crate::sql::types::ColType::from_sql_name(type_name).is_none() =>
+            // User-defined casts retain runtime type/domain validation. Builtin
+            // catalog identifiers use the catalog-aware constant evaluator.
+            Expr::Cast { type_name, .. }
+                if crate::sql::types::ColType::from_sql_name(type_name).is_none() =>
             {
                 false
             }

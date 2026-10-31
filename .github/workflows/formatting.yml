@@ -1,0 +1,30 @@
+name: Rust formatting
+
+on:
+  workflow_call:
+
+jobs:
+  check:
+    name: Rust formatting
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check Rust formatting
+        run: |
+          if ! cargo fmt --check; then
+            cargo fmt
+            git diff --binary > "$RUNNER_TEMP/formatting.patch"
+            exit 1
+          fi
+
+      - name: Retain formatting correction
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: formatting-${{ github.sha }}
+          path: ${{ runner.temp }}/formatting.patch
+          if-no-files-found: ignore

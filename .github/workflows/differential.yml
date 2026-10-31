@@ -23,7 +23,12 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  formatting:
+    name: Format Differential
+    uses: ./.github/workflows/formatting.yml
+
   build:
+    needs: formatting
     name: differential release binary
     runs-on: ubuntu-latest
     timeout-minutes: 15

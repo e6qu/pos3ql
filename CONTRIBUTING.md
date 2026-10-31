@@ -75,6 +75,11 @@ the workflow that owns the check. Native build, lint and boundary checks cover
 Linux amd64, Linux arm64 and macOS arm64. See `Cargo.toml`, `examples/dev.conf`, and
 `.github/workflows/` for the actual build and environment definitions.
 
+Each build or test workflow first calls the shared Rust formatting check.
+A formatting failure keeps its test matrix from starting and retains a
+`formatting-<revision>` artifact containing the correction. Apply that patch
+before pushing again. Build and test jobs start only after formatting passes.
+
 SQL test harnesses prepare their Python clients with
 `tests/external/python_env.py VENV`. Dependencies and wheel hashes are pinned in
 `tests/external/requirements.lock`, with links to their PyPI release metadata.

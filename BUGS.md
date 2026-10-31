@@ -21,6 +21,8 @@ Catalog-identifier casts must still reject a missing object when the scanned
 catalog is empty; deletion checks retain the object's OID before dropping it.
 Cover relation, type and function identifiers without discarding their errors
 as failed context-free probes.
+Formatting checks precede build and test matrices; a rejected format must retain
+its correction without starting those workloads.
 Memory evidence distinguishes reservations from resident pages and records the
 revision, compiler, settings and named component charges. Release checks validate
 the documentation actually shipped in the archive.

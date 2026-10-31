@@ -8,7 +8,12 @@ permissions:
   contents: write
 
 jobs:
+  formatting:
+    name: Format Release
+    uses: ./.github/workflows/formatting.yml
+
   linux-x86_64:
+    needs: formatting
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:

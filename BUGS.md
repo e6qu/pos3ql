@@ -23,6 +23,8 @@ Cover relation, type and function identifiers without discarding their errors
 as failed context-free probes.
 Formatting checks precede build and test matrices; a rejected format must retain
 its correction without starting those workloads.
+Coverage library partitions stream compiler and per-test progress, so a job
+deadline cannot erase the last reached test or allocation-guard diagnostics.
 Memory evidence distinguishes reservations from resident pages and records the
 revision, compiler, settings and named component charges. Release checks validate
 the documentation actually shipped in the archive.

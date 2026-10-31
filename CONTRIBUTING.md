@@ -139,6 +139,9 @@ cached SQL remains runnable, and verify retention before deleting any file.
 Verify the invariant or external contract, not a test that merely restates the
 implementation. Boundary changes generally need accepted/rejected capacity,
 rollback, failure cleanup, WAL/checkpoint, and empty-cache recovery coverage.
+Coverage library partitions stream compiler output and each test's progress
+through the native allocation-error reporter. Use those timestamps to locate
+deadline overruns; buffered output must not hide the last running test.
 SQL and wire behavior needs comparison with actual PostgreSQL, including
 SQLSTATEs, types, result shape, and values. SQLSTATE-only and exact-message
 corpora share the same reference connection settings, including UTC and the

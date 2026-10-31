@@ -165,6 +165,8 @@ versions are not compatibility targets.
 Keep native Linux amd64, Linux arm64 and macOS arm64 builds, lint and boundary
 regressions passing; use the platform's declared C types at libc boundaries.
 Run the shared formatting prerequisite before admitting build and test matrices.
+Keep compiler and per-test progress visible through CI cancellation while
+diagnosing deadline overruns; preserve the existing job budgets.
 
 No runtime heap growth, growing pools or allocating sorts. Keep consequential
 settings explicit and avoid needless wrappers and fallbacks. Capacity increases

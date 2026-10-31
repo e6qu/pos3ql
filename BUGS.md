@@ -7,30 +7,9 @@ Record an entry here only with its reproducer, observed behavior and the exact
 external blocker or reason it cannot be repaired. Ordinary regression cases
 and resolved investigations belong in their fixing PR, tests and evidence.
 
-Follow [CONTRIBUTING.md](CONTRIBUTING.md) for PostgreSQL comparisons, actual
-application workflows, allocation checks, failure diagnostics and native platform
-checks. Compare SQL values, declared types, errors and effects; preserve rollback,
-reader ownership, checkpoint retention and recovery when changing shared memory.
-Function checks include nested sequence effects, typed nulls and default inputs;
-overload discovery must finish before running those inputs. Planning must respect
-the registered volatility of built-ins, stored functions and user operators, so
-maintenance and other effects cannot run as constant-folding probes.
-Strict stored-function checks include inserted null defaults, null variadic
-arrays, non-null arrays containing null members, and input-conversion errors.
-Catalog-identifier casts must still reject a missing object when the scanned
-catalog is empty; deletion checks retain the object's OID before dropping it.
-Cover relation, type and function identifiers without discarding their errors
-as failed context-free probes.
-Formatting checks precede build and test matrices; a rejected format must retain
-its correction without starting those workloads.
-Coverage library partitions stream compiler and per-test progress, so a job
-deadline cannot erase the last reached test or allocation-guard diagnostics.
-Overload and argument-mapping probes use input descriptors without copying
-routine bodies, result buffers or pending replacements. Snapshot one selected
-definition and bind it in place; preserve transactional replacement visibility.
-Memory evidence distinguishes reservations from resident pages and records the
-revision, compiler, settings and named component charges. Release checks validate
-the documentation actually shipped in the archive.
+Follow [CONTRIBUTING.md](CONTRIBUTING.md) for the required comparisons,
+allocation checks and failure diagnostics. Regression details belong in their
+owning tests and technical guides, rather than a second checklist here.
 
 Unfinished features and their acceptance criteria belong in [PLAN.md](PLAN.md).
 Current guarantees belong in the [behavior guide](docs/implemented-baseline.md)

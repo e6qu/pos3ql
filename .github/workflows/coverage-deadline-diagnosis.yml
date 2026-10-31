@@ -5,7 +5,7 @@ on:
     branches: [bound-routine-execution]
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.sha }}
   cancel-in-progress: true
 
 jobs:
@@ -22,8 +22,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - variant: before
-            revision: fa702ae87a0dfbbb8e0514103b2318b62581e465
           - variant: after
             revision: ${{ github.sha }}
     steps:

@@ -1943,9 +1943,8 @@ fn catalog_evaluation(
                 found = catalog.operator_evaluation(schema, operator, types)?;
             } else {
                 found = super::catalog::intrinsic_routine_evaluation(name, types, |from, to| {
-                    let physical = |oid| {
-                        constructor_type_from_oid(oid, &|oid| catalog.domain_base_type(oid))
-                    };
+                    let physical =
+                        |oid| constructor_type_from_oid(oid, &|oid| catalog.domain_base_type(oid));
                     match (physical(from), physical(to)) {
                         (Some(from), Some(to)) => super::types::builtin_implicit_cast(from, to),
                         _ => false,

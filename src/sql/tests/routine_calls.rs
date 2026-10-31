@@ -1,6 +1,61 @@
 use super::*;
 
 #[test]
+fn stored_strict_calls_skip_constant_nulls_without_skipping_reached_inputs() {
+    let config = test_config("routine-strict-inputs");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE SEQUENCE dispatch_strict_effects START 10; \
+        CREATE FUNCTION dispatch_strict(first_arg bigint,second_arg bigint) RETURNS bigint \
+        LANGUAGE sql VOLATILE STRICT AS 'SELECT $2'; \
+        CREATE FUNCTION dispatch_strict_default(first_arg bigint,second_arg bigint DEFAULT NULL) \
+        RETURNS bigint LANGUAGE sql VOLATILE STRICT AS 'SELECT $1'; \
+        CREATE FUNCTION dispatch_strict_variadic(marker bigint,VARIADIC values_ bigint[]) \
+        RETURNS bigint LANGUAGE sql VOLATILE STRICT AS 'SELECT $2[2]'; \
+        CREATE FUNCTION dispatch_strict_variadic_default(marker bigint,VARIADIC values_ bigint[] DEFAULT NULL) \
+        RETURNS bigint LANGUAGE sql VOLATILE STRICT AS 'SELECT $2[2]'",
+        true,
+    );
+    for sql in [
+        "SELECT dispatch_strict(NULL::bigint,nextval('dispatch_strict_effects'))",
+        "SELECT dispatch_strict(second_arg=>nextval('dispatch_strict_effects'),first_arg=>NULL::bigint)",
+        "SELECT dispatch_strict_default(nextval('dispatch_strict_effects'))",
+        "SELECT dispatch_strict_variadic_default(nextval('dispatch_strict_effects'))",
+        "SELECT dispatch_strict_variadic(nextval('dispatch_strict_effects'),VARIADIC NULL::bigint[])",
+    ] {
+        assert_eq!(
+            data_rows(&session.success(&mut engine, sql, true)),
+            ["NULL"],
+            "{sql}"
+        );
+    }
+    for (sql, state) in [
+        ("SELECT dispatch_strict(NULL::bigint,1/0)", "22012"),
+        ("SELECT dispatch_strict(NULL::bigint,'bad')", "22P02"),
+    ] {
+        assert_eq!(
+            error_sqlstates(&session.execute(&mut engine, sql, true)),
+            [state],
+            "{sql}"
+        );
+    }
+    assert_eq!(
+        data_rows(&session.success(&mut engine,
+            "SELECT last_value,is_called FROM dispatch_strict_effects; \
+            SELECT dispatch_strict_variadic(0,NULL::bigint,nextval('dispatch_strict_effects')); \
+            SELECT dispatch_strict_variadic(0,VARIADIC ARRAY[NULL::bigint,nextval('dispatch_strict_effects')]); \
+            CREATE TABLE dispatch_strict_inputs(id integer,value bigint); \
+            INSERT INTO dispatch_strict_inputs VALUES (1,NULL),(2,1); \
+            SELECT dispatch_strict(value,nextval('dispatch_strict_effects')) FROM dispatch_strict_inputs ORDER BY id; \
+            SELECT last_value,is_called FROM dispatch_strict_effects",true)),
+        ["10|f", "10", "11", "NULL", "13", "13|t"]
+    );
+}
+
+#[test]
 fn routine_arguments_run_once_and_preserve_strict_null_effects() {
     let mut config = test_config("routine-argument-effects");
     config.max_sequences = 2;

@@ -44,7 +44,8 @@ Registered routine identities, aggregate kinds and null-call properties must
 match the live reference catalog even while missing routines are being added.
 Retained calls must preserve their bound identities, completed inputs and
 defaults across waits, including PostgreSQL's strict null and error behavior.
-Reuse the shared call boundary rather than replaying argument evaluation.
+Reuse the shared call boundary, including its bound input conversions and
+strict-null handling, rather than replaying argument evaluation.
 Preserve registered built-in and operator volatility when deciding which inputs
 can run during planning; maintenance calls must run only when the query reaches them.
 Run real SQLAlchemy, Alembic and psycopg2 workflows against both servers.
@@ -92,38 +93,18 @@ A waiting schema edit must never attach itself to a new object that reused a nam
   cursor over `nextval('order_numbers')` must not issue numbers for rows that
   have not been fetched. Row locks follow fetched rows. Holding a cursor across
   commit saves the required result before releasing its transaction.
-  Simple cursors over one physical table retain their reader,
-  built-in arithmetic/comparisons, `CASE WHEN` expressions, array construction,
-  element access and slices, boolean filters, integer row limits/offsets and
-  captured parameters. Preserve their declared common types through subqueries,
-  null values and result inspection without issuing skipped effects. Preserve
-  enclosing column types in nested table-function inputs, including empty
-  and null arrays; describing a result must not require a sample row.
-  Carry sequence effects through subqueries and row bounds without losing their
-  connection state or repeating completed calls.
-  Bind array-subquery elements from their declared types, including domains over
-  arrays; selecting a domain value must not turn it into an extra array dimension.
-  Forward-only cursors reuse memory per fetch; scrolling cursors retain visited
-  results. Omitted scroll options follow the bound plan’s backward-read support.
-  Operator choices and row-independent filters stay fixed after declaration.
-  Normalize range predicates through the same comparisons and boolean rules:
-  null bounds, repeated operands, custom operators and fetched-row errors must
-  match PostgreSQL, including `BETWEEN SYMMETRIC`.
-  Holdable versions save unread results during commit and release their input
-  owners across simple queries, extended-protocol Sync, COPY and large-object calls.
   Extend retained execution to function calls and effects, joins, ordering and
   row locks. Make commit-time result saving yield during storage
   waits, then reuse the positions for ordinary results after their first flush.
   Keep read counts through savepoint rollback and release; never transfer a
   retired table’s pending counters to a replacement that reuses its slot.
-  Preserve relation ownership, failed-fetch cleanup, scan statistics and
-  PostgreSQL's distinction between fetching, skipping and moving rows.
-  Preserve the existing [cursor input, type and capacity rules](docs/postgresql-18-compatibility.md#capacity-boundaries)
-  while adding execution positions. Later variable assignments must not change
-  captured inputs. Keep issued sequence values in the owned execution state so
-  retries cannot issue them again. Preserve rollback, cleanup and PostgreSQL's errors for
-  invalid fields and utility parameters. Saved dates must still use the
-  settings chosen before `FETCH`, including after commit.
+  Preserve the existing [cursor input, type and capacity rules](docs/postgresql-18-compatibility.md#capacity-boundaries),
+  declared result types, captured inputs and settings, bound operators, reader
+  ownership, failed-fetch cleanup and scan statistics. Fetching, skipping and
+  moving rows must keep their distinct PostgreSQL effects. Sequence values
+  already issued remain owned by the command across retries and rollback.
+  Finishing or saving a result must release its input owners across all wire
+  command paths, including COPY and extended-protocol Sync.
 
 Follow PostgreSQL's distinction between listing an old catalog row and resolving
 an object for current use. After `orders` becomes `sales`, an older report can

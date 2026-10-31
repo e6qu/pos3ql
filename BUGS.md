@@ -15,6 +15,8 @@ Function checks include nested sequence effects, typed nulls and default inputs;
 overload discovery must finish before running those inputs. Planning must respect
 the registered volatility of built-ins, stored functions and user operators, so
 maintenance and other effects cannot run as constant-folding probes.
+Strict stored-function checks include inserted null defaults, null variadic
+arrays, non-null arrays containing null members, and input-conversion errors.
 Memory evidence distinguishes reservations from resident pages and records the
 revision, compiler, settings and named component charges. Release checks validate
 the documentation actually shipped in the archive.

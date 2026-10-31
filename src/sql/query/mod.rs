@@ -2991,9 +2991,146 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             })?;
         self.storage.require_routine_execute(slot, self.txid)?;
         let declared = self.storage.routine_for(slot, self.txid);
+        let mut input_type_oids = [super::types::oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
+        let mut default_expressions = [None; crate::storage::MAX_ROUTINE_ARGUMENTS];
+        for input_index in 0..declared.argument_count {
+            let parameter = declared
+                .parameter_for_input(input_index)
+                .expect("input signature has a declared parameter");
+            let expanded_variadic = !variadic
+                && matches!(
+                    parameter.mode,
+                    crate::storage::RoutineParameterMode::Variadic { .. }
+                );
+            let supplied = mapping[..arguments.len()]
+                .iter()
+                .position(|mapped| usize::from(*mapped) == input_index);
+            input_type_oids[input_index] = match supplied {
+                Some(call_index) if !expanded_variadic => argument_type_oids[call_index],
+                _ => self
+                    .storage
+                    .routine_type_oid(parameter.ctype, parameter.user_type, self.txid)
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "routine parameter type identity is unavailable"
+                        )
+                    })?,
+            };
+            if supplied.is_none() {
+                let default = parameter.mode.default().ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "resolved routine is missing a required argument"
+                    )
+                })?;
+                let source = arena
+                    .alloc_str(default.as_str())
+                    .map_err(|_| arena_full())?;
+                default_expressions[input_index] =
+                    Some(super::parser::parse_expression(source, arena)?);
+            }
+        }
+        let routine = self
+            .storage
+            .routine_for_bound_call(
+                slot,
+                &input_type_oids[..declared.argument_count],
+                self.txid,
+            )
+            .expect("resolved routine call has a valid polymorphic binding");
+        let input_contract = |input_index: usize, expanded: bool| {
+            let mut argument = routine.arguments()[input_index];
+            if expanded {
+                let ColType::Array(element) = argument.ctype else {
+                    return Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "variadic parameter is not an array"
+                    ));
+                };
+                argument.ctype = element.to_coltype();
+            }
+            let expected = self
+                .storage
+                .routine_type_oid(argument.ctype, argument.user_type, self.txid)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "routine argument type identity is unavailable"
+                    )
+                })?;
+            Ok((argument, expected))
+        };
+        let coerce_input = |value, source, argument: crate::storage::RoutineArgumentDef, expected| {
+            if source != expected
+                && let Some(value) = self.execute_defined_cast(
+                    source,
+                    expected,
+                    value,
+                    super::eval::DefinedCastContext::Implicit,
+                    arena,
+                )?
+            {
+                return Ok(value);
+            }
+            super::exec::coerce_routine_argument(value, argument, self.storage, self.txid, arena)
+        };
+        let constant_input = |expression: &Expr<'_>, source, expected| -> Result<bool, SqlError> {
+            if super::eval::constant_evaluation(expression, Some(self))?
+                == Some(super::eval::ExpressionEvaluation::Runtime)
+                || matches!(
+                    crate::storage::NamedTypeKind::from_oid(expected),
+                    Some((crate::storage::NamedTypeKind::Domain, _, _))
+                )
+                || (source != expected
+                    && self.cast_evaluation(source, expected)?
+                        == Some(super::eval::ExpressionEvaluation::Runtime))
+            {
+                return Ok(false);
+            }
+            Ok(true)
+        };
+        let mut constant_values = [None; crate::storage::MAX_ROUTINE_ARGUMENTS];
+        let mut constant_defaults = [None; crate::storage::MAX_ROUTINE_ARGUMENTS];
+        let mut constant_null = false;
+        for input_index in 0..declared.argument_count {
+            let parameter = declared
+                .parameter_for_input(input_index)
+                .expect("input signature has a declared parameter");
+            let expanded_variadic = !variadic
+                && matches!(
+                    parameter.mode,
+                    crate::storage::RoutineParameterMode::Variadic { .. }
+                );
+            let (argument, expected) = input_contract(input_index, expanded_variadic)?;
+            for (call_index, expression) in arguments.iter().enumerate() {
+                if usize::from(mapping[call_index]) != input_index {
+                    continue;
+                }
+                let source = argument_type_oids[call_index];
+                if constant_input(expression, source, expected)? {
+                    let value = coerce_input(evaluate(expression)?, source, argument, expected)?;
+                    constant_values[call_index] = Some(value);
+                    // A null array member does not make the array null.
+                    constant_null |= !expanded_variadic && value.is_null();
+                }
+            }
+            if let Some(expression) = default_expressions[input_index] {
+                let (argument, expected) = input_contract(input_index, false)?;
+                let source = input_type_oids[input_index];
+                if constant_input(expression, source, expected)? {
+                    let value = coerce_input(evaluate(expression)?, source, argument, expected)?;
+                    constant_defaults[input_index] = Some(value);
+                    constant_null |= value.is_null();
+                }
+            }
+        }
+        // Check every constant input for errors before suppressing runtime
+        // effects, including defaults inserted into the declared signature.
+        if declared.attributes.strict && constant_null {
+            return Ok(Datum::Null);
+        }
         let mut completed = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
-        let mut completed_type_oids =
-            [super::types::oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
         let mut variadic_values = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
         // PostgreSQL orders named inputs and inserted defaults by the declared
         // signature before execution; spelling order cannot reorder effects.
@@ -3004,26 +3141,35 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             let mut supplied = false;
             let mut variadic_count = 0usize;
             let expanded_variadic = !variadic
+                && default_expressions[input_index].is_none()
                 && matches!(
                     parameter.mode,
                     crate::storage::RoutineParameterMode::Variadic { .. }
                 );
+            let (argument, expected) = input_contract(input_index, expanded_variadic)?;
             for (call_index, expression) in arguments.iter().enumerate() {
                 if usize::from(mapping[call_index]) != input_index {
                     continue;
                 }
-                let value = evaluate(expression)?;
+                let value = match constant_values[call_index] {
+                    Some(value) => value,
+                    None => coerce_input(
+                        evaluate(expression)?,
+                        argument_type_oids[call_index],
+                        argument,
+                        expected,
+                    )?,
+                };
                 supplied = true;
                 if expanded_variadic {
                     variadic_values[variadic_count] = value;
                     variadic_count += 1;
                 } else {
                     completed[input_index] = value;
-                    completed_type_oids[input_index] = argument_type_oids[call_index];
                 }
             }
             if expanded_variadic && supplied {
-                let ColType::Array(element) = parameter.ctype else {
+                let ColType::Array(element) = routine.arguments()[input_index].ctype else {
                     return Err(sql_err!(
                         sqlstate::INTERNAL_ERROR,
                         "variadic parameter is not an array"
@@ -3035,73 +3181,22 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                 };
             } else if supplied {
                 continue;
-            } else if let Some(default) = parameter.mode.default() {
-                let source = arena
-                    .alloc_str(default.as_str())
-                    .map_err(|_| arena_full())?;
-                let expression = super::parser::parse_expression(source, arena)?;
-                completed[input_index] =
-                    super::eval::cast_to(evaluate(expression)?, parameter.ctype, arena)?;
+            } else if let Some(expression) = default_expressions[input_index] {
+                completed[input_index] = match constant_defaults[input_index] {
+                    Some(value) => value,
+                    None => coerce_input(
+                        evaluate(expression)?,
+                        input_type_oids[input_index],
+                        argument,
+                        expected,
+                    )?,
+                };
             } else {
                 return Err(sql_err!(
                     sqlstate::INTERNAL_ERROR,
                     "resolved routine is missing a required argument"
                 ));
             }
-            completed_type_oids[input_index] = self
-                .storage
-                .routine_type_oid(parameter.ctype, parameter.user_type, self.txid)
-                .ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::INTERNAL_ERROR,
-                        "routine parameter type identity is unavailable"
-                    )
-                })?;
-        }
-        let routine = self
-            .storage
-            .routine_for_bound_call(
-                slot,
-                &completed_type_oids[..declared.argument_count],
-                self.txid,
-            )
-            .expect("resolved routine call has a valid polymorphic binding");
-        for (index, argument) in routine.arguments().iter().copied().enumerate() {
-            let expected_oid = self
-                .storage
-                .routine_type_oid(argument.ctype, argument.user_type, self.txid)
-                .ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::INTERNAL_ERROR,
-                        "routine argument type identity is unavailable"
-                    )
-                })?;
-            completed[index] = if completed_type_oids[index] != expected_oid {
-                match self.execute_defined_cast(
-                    completed_type_oids[index],
-                    expected_oid,
-                    completed[index],
-                    super::eval::DefinedCastContext::Implicit,
-                    arena,
-                )? {
-                    Some(value) => value,
-                    None => super::exec::coerce_routine_argument(
-                        completed[index],
-                        argument,
-                        self.storage,
-                        self.txid,
-                        arena,
-                    )?,
-                }
-            } else {
-                super::exec::coerce_routine_argument(
-                    completed[index],
-                    argument,
-                    self.storage,
-                    self.txid,
-                    arena,
-                )?
-            };
         }
         self.execute_routine(slot, routine, &completed[..declared.argument_count], arena)?
             .ok_or_else(|| {

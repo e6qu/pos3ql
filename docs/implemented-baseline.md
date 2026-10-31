@@ -309,6 +309,11 @@ Planning uses registered built-in, stored-function and user-operator volatility.
 For example, `SELECT brin_summarize_new_values('orders_brin')` performs its
 maintenance when the query reaches the call; checking the query for constant
 errors must not perform that maintenance first.
+For a function declared `STRICT`, a constant null argument skips the call and
+its runtime inputs; errors in constant inputs still surface. This includes
+inserted defaults and explicitly null variadic arrays. A null member inside a
+non-null variadic array does not skip the call. Runtime nulls still evaluate
+the other reached inputs.
 
 ## Schema changes and object identity
 

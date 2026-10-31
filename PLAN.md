@@ -40,20 +40,11 @@ maximum row history independently for every possible table.
 Audit PostgreSQL 18 built-ins by signature and executable behavior. Catalog
 presence alone is not support. Compare values, declared result types, nulls,
 errors and argument effects with PostgreSQL, including seeded hashes.
-Registered routine identities, aggregate kinds and null-call properties must
-match the live reference catalog even while missing routines are being added.
-Retained calls must preserve their bound identities, completed inputs and
-defaults across waits, including PostgreSQL's strict null and error behavior.
-Reuse the input preparation shared by scalar functions, table functions and
-procedures, preserving each context's conversion and strict-null rules rather
-than replaying argument evaluation. Keep builtin set-returning inputs bound once
-through row counting and emission, including lateral joins and large results.
-Preserve defaults' captured object references through renames, schema moves,
-replacement, rollback and recovery; later overloads must not redirect captured
-helper calls. Explicit text inputs keep runtime name lookup.
-Preserve registered built-in and operator volatility when deciding which inputs
-can run during planning; maintenance calls must run only when the query reaches them.
-Retain catalog-aware planning errors even when a scan returns no input rows.
+Retained calls must preserve the selected function, converted inputs, omitted
+defaults and the next input position across storage waits. Reuse the shared
+input preparation for scalar functions, table functions and procedures, preserving
+each context's conversion and strict-null rules. The [architecture](docs/architecture.md)
+describes the implemented binding and one-time set-input behavior.
 Run real SQLAlchemy, Alembic and psycopg2 workflows against both servers.
 Keep their catalog inspection, declared types, streaming and migration checks
 passing as function binding and execution expand; see the
@@ -67,11 +58,8 @@ Preserve shared row-history admission before durability, bounded reclamation,
 rollback and prepared/cold recovery while reducing the remaining reservations.
 Include the current execution-stack requirement in embedded measurements and
 reduce avoidable wide construction frames alongside table and history metadata.
-Keep function lookup descriptors separate from reserved definition bodies and
-reuse owned definitions while binding and executing their arguments. The
-[instrumented lookup comparison](https://github.com/e6qu/pos3ql/blob/cfd803e74af661d4afc9d9e366b9293d08add65c/benchmarks/baselines/2026-10-31-routine-lookup/README.md)
-records that repair; it does not establish general query throughput or remove
-prefix replay of mutating calls.
+Retained execution must also remove the remaining query-prefix replay; faster
+catalog lookup alone does not preserve a function's execution position.
 The retained [empty-engine measurements](https://github.com/e6qu/pos3ql/blob/6ff1ac865a86a5318cb4934fbf01be0926667811/benchmarks/baselines/2026-10-30-embedded-startup/README.md)
 establish a debug-build starting point; repeat them after memory repairs and add
 populated-table and client-session workloads before claiming an embedded minimum.

@@ -2562,7 +2562,6 @@ fn populate_record_append_columns<'a, C: ColumnLookup<'a>>(
     storage: &Storage,
     txid: u32,
     arena: &'a Arena,
-    params: &[Datum<'a>],
     columns: &C,
     output: &mut [ColumnMeta; MAX_COLUMNS],
 ) -> Result<usize, SqlError> {
@@ -2577,7 +2576,10 @@ fn populate_record_append_columns<'a, C: ColumnLookup<'a>>(
     let type_oid = match crate::sql::eval::expression_type_identity(args[0], columns, &hooks)? {
         crate::sql::eval::ExpressionTypeIdentity::Known(oid) => oid,
         crate::sql::eval::ExpressionTypeIdentity::Unresolved => {
-            crate::sql::eval::eval_full(args[0], arena, params, columns, &hooks)?.type_oid()
+            return Err(sql_err!(
+                sqlstate::DATATYPE_MISMATCH,
+                "first argument of populate_record requires a declared row type"
+            ));
         }
     };
     let Some(composite_oid) =
@@ -3004,15 +3006,7 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
         if let Some(document) = args.get(1) {
             crate::sql::eval::funcs::json::check_json_family_static(tref.table, document)?;
         }
-        populate_record_append_columns(
-            args,
-            storage,
-            txid,
-            arena,
-            params,
-            columns,
-            &mut default_cols,
-        )?
+        populate_record_append_columns(args, storage, txid, arena, columns, &mut default_cols)?
     } else if is_json_table {
         let args = tref.func_args.unwrap_or(&[]);
         if args.len() != 6 {

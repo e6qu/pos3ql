@@ -173,7 +173,7 @@ Keep native Linux amd64, Linux arm64 and macOS arm64 builds, lint and boundary
 regressions passing; use the platform's declared C types at libc boundaries.
 Run the shared formatting prerequisite before admitting build and test matrices.
 Keep native SQL fixtures in native gates and interpreter ownership cases beside
-their runtime modules, so interpreter startup does not scan irrelevant fixtures.
+their runtime modules, so interpreter startup does not compile irrelevant fixtures.
 Reclaim each polling snapshot's scratch space instead of relying on a favorable
 thread schedule to finish before the arena fills.
 Keep compiler and per-test progress visible through CI cancellation while

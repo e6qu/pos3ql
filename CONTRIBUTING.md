@@ -261,7 +261,8 @@ CI also exercises shared heap publication and saved row and index file ownership
 Miri, alongside allocation-forbidden concurrent regressions.
 `tools/test-miri-ownership.sh LOG` runs the shared ownership gate on a suitable
 runner. Its SQL fixture module stays in native tests; put interpreter ownership
-cases beside their runtime modules. Preserve every selected ownership case when
+cases beside their runtime modules and shared test helpers outside fixture modules.
+Preserve every selected ownership case when
 reducing interpreter startup work. Polling tests release each snapshot before
 reusing its fixed scratch arena, even when writers are slow.
 Pass the selected ownership filters together to share one interpreter startup;

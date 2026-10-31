@@ -324,7 +324,11 @@ fn routine_defaults_retain_creation_bindings_and_recover_without_a_cache() {
             "703",
             "48",
             "801|f",
-            "901"
+            "901",
+            "8000",
+            "9000",
+            "9000",
+            "100|100"
         ]
     );
     for sql in dependency_errors
@@ -377,4 +381,37 @@ fn routine_default_dependency_exhaustion_precedes_creation_and_effects() {
         "CREATE FUNCTION default_limit(left_value bigint DEFAULT nextval('default_limit_one'),right_value bigint DEFAULT nextval('default_limit_two')) RETURNS bigint LANGUAGE sql AS 'SELECT $1+$2'", true)), ["54000"]);
     assert_eq!(data_rows(&session.success(&mut engine,
         "SELECT to_regprocedure('default_limit(bigint,bigint)') IS NULL; SELECT is_called FROM default_limit_one; SELECT is_called FROM default_limit_two", true)), ["t", "f", "f"]);
+}
+
+#[test]
+fn procedure_inputs_bind_before_effects_and_run_in_declaration_order() {
+    let config = test_config("procedure-input-effects");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(&mut engine,
+        "CREATE SEQUENCE procedure_effects START 10; \
+         CREATE TABLE procedure_audit(value bigint); \
+         CREATE PROCEDURE procedure_pair(left_value bigint DEFAULT nextval('procedure_effects'),right_value bigint DEFAULT nextval('procedure_effects')) \
+         LANGUAGE sql AS 'INSERT INTO procedure_audit VALUES ($1*100+$2)'", true);
+    assert_eq!(data_rows(&session.success(&mut engine,
+        "CALL procedure_pair(right_value=>nextval('procedure_effects')); \
+         CALL procedure_pair(right_value=>nextval('procedure_effects'),left_value=>nextval('procedure_effects')); \
+         SELECT value FROM procedure_audit ORDER BY value; SELECT last_value FROM procedure_effects", true)), ["1011", "1213", "13"]);
+    assert_eq!(
+        error_sqlstates(&session.execute(
+            &mut engine,
+            "CALL procedure_missing(nextval('procedure_effects'))",
+            true
+        )),
+        ["42883"]
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT last_value FROM procedure_effects",
+            true
+        )),
+        ["13"]
+    );
 }

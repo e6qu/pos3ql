@@ -69,6 +69,9 @@ sequence selected by `DEFAULT nextval('order_numbers')` does not redirect the
 default to a replacement; `nextval('order_numbers'::text)` requests runtime lookup.
 Captured references share the existing fixed dependency capacity and durable
 records, including replacement rollback and empty-cache recovery.
+Procedure calls resolve input types and check execution permission before
+argument effects. Named inputs and inserted defaults run in declaration order
+with the caller's sequence context.
 This call boundary supplies retained execution with an explicit target; it
 does not yet make every function body yield during a storage wait.
 Runtime overload checks copy input descriptors rather than whole definitions.

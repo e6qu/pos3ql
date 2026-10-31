@@ -31,18 +31,10 @@ jobs:
           view_rule_catalog_is_synchronized_and_startup_bounded --test-threads=1
 
   behavior:
-    name: Default PostgreSQL comparison (${{ matrix.variant }})
+    name: Default PostgreSQL comparison
     needs: formatting
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - variant: before
-            revision: ed7804d66f11c7fd4e09a696ae4407fc5858cb82
-          - variant: after
-            revision: ${{ github.sha }}
     services:
       postgres:
         image: mirror.gcr.io/library/postgres:18@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336
@@ -59,14 +51,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          ref: ${{ matrix.revision }}
-      - name: Add the same new regression to the original revision
-        if: matrix.variant == 'before'
-        env:
-          CANDIDATE_REVISION: ${{ github.sha }}
-        run: |
-          git fetch --depth=1 origin "$CANDIDATE_REVISION"
-          git show FETCH_HEAD:tests/external/differential_exact/45_routine_default_bindings.sql > tests/external/differential_exact/45_routine_default_bindings.sql
+          ref: ${{ github.sha }}
       - name: Configure PostgreSQL reference
         run: |
           postgres_container=$(docker ps --filter ancestor=mirror.gcr.io/library/postgres:18@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336 --format '{{.ID}}' | head -n 1)
@@ -82,7 +67,7 @@ jobs:
           exit 1
       - uses: ./.github/actions/python-test-environment
       - run: cargo build --release --locked
-      - name: Compare all exact fixtures and assert the original defect
+      - name: Compare every exact PostgreSQL fixture
         env:
           POS3QL_BIN: ${{ github.workspace }}/target/release/pos3ql
           POS3QL_VENV: ${{ github.workspace }}/venv
@@ -94,13 +79,12 @@ jobs:
           POS3QL_REFERENCE_EXTENSION_CONTROL_PATH: /tmp/pos3ql-extensions
           POS3QL_DIFF_CORPUS_SHARD: none
           POS3QL_DIFF_AUXILIARY: exact
-          VARIANT: ${{ matrix.variant }}
         run: |
           set +e
           bash tests/external/differential.sh 2>&1 | tee "$RUNNER_TEMP/default-bindings.log"
           comparison_status=${PIPESTATUS[0]}
           set -e
-          python3 - "$RUNNER_TEMP/default-bindings.log" "$comparison_status" "$VARIANT" <<'PY'
+          python3 - "$RUNNER_TEMP/default-bindings.log" "$comparison_status" <<'PY'
           import pathlib
           import re
           import sys
@@ -109,19 +93,15 @@ jobs:
           status = int(sys.argv[2])
           passed = re.findall(r"^PASS: exact errors: (\S+)$", log, re.MULTILINE)
           failed = re.findall(r"^FAIL: exact errors: (\S+)$", log, re.MULTILINE)
-          if sys.argv[3] == "before":
-              if status != 1 or len(passed) != 44 or failed != ["45_routine_default_bindings"]:
-                  raise SystemExit(f"Unexpected original result: status={status}, passed={len(passed)}, failed={failed}")
-              print("Confirmed original default-reference defect; all 44 earlier exact fixtures passed")
-          elif status != 0 or len(passed) != 45 or failed:
-              raise SystemExit(f"Candidate comparison failed: status={status}, passed={len(passed)}, failed={failed}")
-          else:
-              print("All 45 exact PostgreSQL fixtures passed")
+          expected = {path.stem for path in pathlib.Path("tests/external/differential_exact").glob("*.sql")}
+          if not expected or status != 0 or set(passed) != expected or len(passed) != len(expected) or failed:
+              raise SystemExit(f"Candidate comparison failed: status={status}, passed={len(passed)}, expected={len(expected)}, failed={failed}")
+          print(f"All {len(expected)} exact PostgreSQL fixtures passed")
           PY
       - uses: actions/upload-artifact@v6
         if: always()
         with:
-          name: routine-default-${{ matrix.variant }}
+          name: routine-default-after
           path: ${{ runner.temp }}/default-bindings.log
           if-no-files-found: ignore
 

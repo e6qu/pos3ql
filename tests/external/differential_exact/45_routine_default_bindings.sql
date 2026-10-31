@@ -37,10 +37,23 @@ ROLLBACK;
 SELECT public.default_scalar();
 SELECT last_value,is_called FROM default_first."Number.List";
 SELECT last_value FROM default_second.source;
+CREATE PROCEDURE public.default_overload(value text) LANGUAGE sql AS 'INSERT INTO public.default_audit VALUES (9000)';
+CREATE PROCEDURE public.default_overload(value integer) LANGUAGE sql AS 'INSERT INTO public.default_audit VALUES (8000)';
+CALL public.default_overload('not a number');
+CALL public.default_overload(value=>'also text');
+CALL public.default_overload(3);
+SELECT value FROM public.default_audit WHERE value>=8000 ORDER BY value;
+CREATE FUNCTION public.default_choice(left_value integer,right_value integer) RETURNS integer LANGUAGE sql RETURN 100;
+CREATE FUNCTION public.default_choice(left_value text,right_value bigint) RETURNS integer LANGUAGE sql RETURN 200;
+SELECT public.default_choice('2',3),public.default_choice(right_value=>3,left_value=>'2');
 -- dependency errors
 DROP SEQUENCE default_second.kept_source;
 DROP FUNCTION default_first.kept_helper();
 -- cleanup
+DROP PROCEDURE public.default_overload(text);
+DROP PROCEDURE public.default_overload(integer);
+DROP FUNCTION public.default_choice(integer,integer);
+DROP FUNCTION public.default_choice(text,bigint);
 DROP FUNCTION public.default_scalar(bigint);
 DROP FUNCTION public.default_qualified(bigint);
 DROP FUNCTION public.default_helper(integer);

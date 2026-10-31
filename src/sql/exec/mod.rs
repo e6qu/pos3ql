@@ -36478,10 +36478,17 @@ pub fn drop_routine(
             ) {
                 return sql_fail(error);
             }
-            return sql_fail(sql_err!(
-                sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
-                "cannot drop function {} because other objects depend on it",
-                routine.name_for(txn.txid).as_str()
+            return sql_fail(stored_dependency_drop_error(
+                storage,
+                txn.txid,
+                StoredQueryRoot {
+                    class: crate::storage::DependencyClass::Routine,
+                    slot,
+                    kind: "function",
+                    schema: routine.schema_for(txn.txid),
+                    name: routine.name_for(txn.txid),
+                    suffix: dependency_suffix,
+                },
             ));
         }
         if has_stored_dependents
@@ -41407,10 +41414,17 @@ pub fn drop_sequence(
             ) {
                 return sql_fail(error);
             }
-            return sql_fail(sql_err!(
-                sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
-                "cannot drop sequence {} because other objects depend on it",
-                sname.as_str()
+            return sql_fail(stored_dependency_drop_error(
+                storage,
+                txn.txid,
+                StoredQueryRoot {
+                    class: crate::storage::DependencyClass::Sequence,
+                    slot,
+                    kind: "sequence",
+                    schema,
+                    name: sname,
+                    suffix: crate::util::StackStr::new(),
+                },
             ));
         }
         if cascade {
@@ -44981,6 +44995,55 @@ struct StoredQueryRoot {
     schema: SqlName,
     name: SqlName,
     suffix: crate::util::StackStr<192>,
+}
+
+fn stored_dependency_drop_error(storage: &Storage, txid: u32, root: StoredQueryRoot) -> SqlError {
+    use core::fmt::Write as _;
+    let visible = match root.class {
+        crate::storage::DependencyClass::Sequence => super::catalog::relation_oid_is_visible(
+            storage,
+            txid,
+            super::catalog::sequence_oid(storage, root.slot),
+        ),
+        crate::storage::DependencyClass::Routine => {
+            let oid = crate::storage::routine_oid(&storage.routine_for(root.slot, txid));
+            let Some(visible) = super::catalog::function_oid_visibility(storage, txid, oid) else {
+                return sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "dependency routine identity is unavailable"
+                );
+            };
+            visible
+        }
+        _ => {
+            return sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "unsupported dependency diagnostic class"
+            );
+        }
+    };
+    let mut message = crate::util::StackStr::<192>::new();
+    let _ = write!(message, "cannot drop {} ", root.kind);
+    if !visible {
+        write_identifier(&mut message, root.schema.as_str());
+        let _ = message.write_char('.');
+    }
+    write_identifier(&mut message, root.name.as_str());
+    let _ = write!(
+        message,
+        "{} because other objects depend on it",
+        root.suffix.as_str()
+    );
+    if message.is_truncated() {
+        return sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "dependency diagnostic exceeds 192 bytes"
+        );
+    }
+    SqlError {
+        sqlstate: super::eval::SqlState::known(sqlstate::DEPENDENT_OBJECTS_STILL_EXIST),
+        message,
+    }
 }
 
 fn routine_dependency_suffix(

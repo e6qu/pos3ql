@@ -14519,31 +14519,22 @@ impl Engine {
                 .flatten()
         });
         let catalog = query::storage_catalog(&self.storage, &self.work, txn.txid);
+        let sequences = sequence::SeqEval::new(&self.storage, guc.seq_session(), txn.txid);
         let hooks = EvalHooks {
             catalog: Some(&catalog),
+            sequences: Some(&sequences),
             ..NO_HOOKS
         };
-        for (slot, argument) in arguments.iter().enumerate() {
-            if shape_mapping.is_some_and(|mapping| mapping[slot] == u8::MAX) {
-                continue;
-            }
-            values[slot] = match eval::eval_full(argument, arena, params, &NoColumns, &hooks) {
-                Ok(value) => value,
-                Err(error) => return Ok(Err(error)),
-            };
-        }
         let mut type_oids = [types::oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
         for (slot, argument) in arguments.iter().enumerate() {
             if shape_mapping.is_some_and(|mapping| mapping[slot] == u8::MAX) {
                 continue;
             }
-            type_oids[slot] = match argument {
-                ast::Expr::Cast { type_name, .. } => {
-                    crate::sql::catalog::user_type_oid(&self.storage, txn.txid, type_name)
-                        .unwrap_or_else(|| values[slot].type_oid())
-                }
-                _ => values[slot].type_oid(),
-            };
+            type_oids[slot] =
+                match exec::infer_type_catalog(argument, None, &self.storage, txn.txid, arena) {
+                    Ok((oid, _)) => oid,
+                    Err(error) => return Ok(Err(error)),
+                };
         }
         let slot = if shape_mapping.is_some() {
             shape_slot
@@ -14569,15 +14560,61 @@ impl Engine {
                 qualified.as_str()
             )));
         };
-        if let Err(error) = self.storage.require_routine_execute(slot, txn.txid) {
-            return Ok(Err(error));
-        }
-        let declared = self.storage.routine_for(slot, txn.txid);
+        let mut declared = self.storage.routine_for(slot, txn.txid);
         let mapping = shape_mapping.unwrap_or_else(|| {
             declared
                 .call_input_mapping(argument_names, arguments.len(), variadic)
                 .expect("resolved procedure call has a valid argument mapping")
         });
+        let mut bound_type_oids = [types::oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
+        for (input_index, oid) in bound_type_oids
+            .iter_mut()
+            .enumerate()
+            .take(declared.argument_count)
+        {
+            let parameter = declared
+                .parameter_for_input(input_index)
+                .expect("procedure input has a declared parameter");
+            let expanded = !variadic
+                && matches!(
+                    parameter.mode,
+                    crate::storage::RoutineParameterMode::Variadic { .. }
+                );
+            let supplied = mapping[..arguments.len()]
+                .iter()
+                .position(|mapped| usize::from(*mapped) == input_index);
+            *oid = match supplied {
+                Some(call_index) if !expanded => type_oids[call_index],
+                _ => match self.storage.routine_type_oid(
+                    parameter.ctype,
+                    parameter.user_type,
+                    txn.txid,
+                ) {
+                    Some(oid) => oid,
+                    None => {
+                        return Ok(Err(sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "procedure input type identity is unavailable"
+                        )));
+                    }
+                },
+            };
+        }
+        let input_count = declared.argument_count;
+        if self
+            .storage
+            .bind_routine_call(&mut declared, &bound_type_oids[..input_count], txn.txid)
+            .is_none()
+        {
+            return Ok(Err(sql_err!(
+                sqlstate::UNDEFINED_FUNCTION,
+                "procedure \"{}\" does not exist",
+                qualified.as_str()
+            )));
+        }
+        if let Err(error) = self.storage.require_routine_execute(slot, txn.txid) {
+            return Ok(Err(error));
+        }
         let default_dependencies = if (0..declared.argument_count)
             .any(|index| !mapping[..arguments.len()].contains(&(index as u8)))
         {
@@ -14592,73 +14629,31 @@ impl Engine {
             None
         };
         let mut completed = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
-        let mut completed_type_oids = [types::oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
-        let mut provided = [false; crate::storage::MAX_ROUTINE_ARGUMENTS];
-        let mut variadic_values = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
-        let mut variadic_count = 0usize;
-        for call_index in 0..arguments.len() {
-            if mapping[call_index] == u8::MAX {
-                continue;
+        // Input binding and permissions are complete before any argument effect.
+        for (input_index, completed_input) in completed
+            .iter_mut()
+            .enumerate()
+            .take(declared.argument_count)
+        {
+            let mut supplied = false;
+            for (call_index, argument) in arguments.iter().enumerate() {
+                if usize::from(mapping[call_index]) != input_index {
+                    continue;
+                }
+                values[call_index] =
+                    match eval::eval_full(argument, arena, params, &NoColumns, &hooks) {
+                        Ok(value) => value,
+                        Err(error) => return Ok(Err(error)),
+                    };
+                supplied = true;
             }
-            let input_index = usize::from(mapping[call_index]);
-            if !variadic
-                && matches!(
-                    declared
-                        .parameter_for_input(input_index)
-                        .expect("mapped procedure input has a declared parameter")
-                        .mode,
-                    crate::storage::RoutineParameterMode::Variadic { .. }
-                )
-            {
-                variadic_values[variadic_count] = values[call_index];
-                variadic_count += 1;
-                provided[input_index] = true;
-                continue;
-            }
-            completed[input_index] = values[call_index];
-            completed_type_oids[input_index] = type_oids[call_index];
-            provided[input_index] = true;
-        }
-        if variadic_count != 0 {
-            let input_index = declared.argument_count - 1;
-            let parameter = declared
-                .parameter_for_input(input_index)
-                .expect("variadic procedure input has a declared parameter");
-            let types::ColType::Array(element) = parameter.ctype else {
-                return Ok(Err(sql_err!(
-                    sqlstate::INTERNAL_ERROR,
-                    "variadic procedure parameter is not an array"
-                )));
-            };
-            completed[input_index] = Datum::Array {
-                element,
-                raw: match array::build(&variadic_values[..variadic_count], arena) {
-                    Ok(raw) => raw,
-                    Err(error) => return Ok(Err(error)),
-                },
-            };
-            completed_type_oids[input_index] =
-                match self
-                    .storage
-                    .routine_type_oid(parameter.ctype, parameter.user_type, txn.txid)
-                {
-                    Some(oid) => oid,
-                    None => {
-                        return Ok(Err(sql_err!(
-                            sqlstate::INTERNAL_ERROR,
-                            "variadic procedure parameter type identity is unavailable"
-                        )));
-                    }
-                };
-        }
-        for input_index in 0..declared.argument_count {
-            if provided[input_index] {
+            if supplied {
                 continue;
             }
             let parameter = declared
                 .parameter_for_input(input_index)
                 .expect("procedure input signature has a declared parameter");
-            completed[input_index] = if let Some(default) = parameter.mode.default() {
+            *completed_input = if let Some(default) = parameter.mode.default() {
                 let expression = match query::bind_routine_parameter_default(
                     default.as_str(),
                     &self.storage,
@@ -14685,28 +14680,49 @@ impl Engine {
                     "resolved procedure is missing a required argument"
                 )));
             };
-            completed_type_oids[input_index] =
-                match self
-                    .storage
-                    .routine_type_oid(parameter.ctype, parameter.user_type, txn.txid)
-                {
-                    Some(oid) => oid,
-                    None => {
-                        return Ok(Err(sql_err!(
-                            sqlstate::INTERNAL_ERROR,
-                            "procedure parameter type identity is unavailable"
-                        )));
-                    }
-                };
         }
-        let routine = self
-            .storage
-            .routine_for_bound_call(
-                slot,
-                &completed_type_oids[..declared.argument_count],
-                txn.txid,
-            )
-            .expect("resolved procedure call has a valid polymorphic binding");
+        let mut variadic_values = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
+        let mut variadic_count = 0usize;
+        for call_index in 0..arguments.len() {
+            if mapping[call_index] == u8::MAX {
+                continue;
+            }
+            let input_index = usize::from(mapping[call_index]);
+            if !variadic
+                && matches!(
+                    declared
+                        .parameter_for_input(input_index)
+                        .expect("mapped procedure input has a declared parameter")
+                        .mode,
+                    crate::storage::RoutineParameterMode::Variadic { .. }
+                )
+            {
+                variadic_values[variadic_count] = values[call_index];
+                variadic_count += 1;
+                continue;
+            }
+            completed[input_index] = values[call_index];
+        }
+        if variadic_count != 0 {
+            let input_index = declared.argument_count - 1;
+            let parameter = declared
+                .parameter_for_input(input_index)
+                .expect("variadic procedure input has a declared parameter");
+            let types::ColType::Array(element) = parameter.ctype else {
+                return Ok(Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "variadic procedure parameter is not an array"
+                )));
+            };
+            completed[input_index] = Datum::Array {
+                element,
+                raw: match array::build(&variadic_values[..variadic_count], arena) {
+                    Ok(raw) => raw,
+                    Err(error) => return Ok(Err(error)),
+                },
+            };
+        }
+        let routine = &declared;
         for (index, argument) in routine.arguments().iter().copied().enumerate() {
             completed[index] = match exec::coerce_routine_argument(
                 completed[index],
@@ -14750,7 +14766,7 @@ impl Engine {
                 } else {
                     exec::PlpgsqlTransactionContext::Atomic
                 },
-                &routine,
+                routine,
                 &completed[..declared.argument_count],
                 arena,
                 responder,
@@ -14866,7 +14882,7 @@ impl Engine {
                 statement,
                 &self.storage,
                 slot,
-                &routine,
+                routine,
                 txn.txid,
                 arena,
                 &completed[..declared.argument_count],
@@ -14908,7 +14924,7 @@ impl Engine {
                     &output_query,
                     &self.storage,
                     slot,
-                    &routine,
+                    routine,
                     txn.txid,
                     arena,
                     &completed[..declared.argument_count],
@@ -24655,6 +24671,13 @@ fn validate_recovered_enabled_subscription(
 pub(crate) fn test_engine_budget(config: &Config, fixture_bytes: usize) -> Budget {
     let plan = config.memory_plan(0, Engine::extra_budget_bytes(config));
     Budget::new(plan.memtable + plan.tables + plan.block_cache + fixture_bytes)
+}
+
+#[cfg(test)]
+impl Engine {
+    pub(crate) fn publication_storage_for_tests(&self) -> &Storage {
+        &self.storage
+    }
 }
 
 // Native SQL fixtures are separate from the ownership tests beside runtime modules.

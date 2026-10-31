@@ -7775,6 +7775,33 @@ impl RoutineInputSignature {
     }
 }
 
+// Unknown SQL inputs prefer the string category and its preferred type, text.
+// https://www.postgresql.org/docs/18/typeconv-func.html
+struct RoutineStringPreferences {
+    string: [bool; MAX_ROUTINE_ARGUMENTS],
+    text: [bool; MAX_ROUTINE_ARGUMENTS],
+}
+
+impl RoutineStringPreferences {
+    const EMPTY: Self = Self {
+        string: [false; MAX_ROUTINE_ARGUMENTS],
+        text: [false; MAX_ROUTINE_ARGUMENTS],
+    };
+
+    fn observe(&mut self, index: usize, argument: &RoutineArgumentDef) {
+        self.string[index] |= crate::sql::types::type_category(argument.ctype) == "S";
+        self.text[index] |= argument.ctype == ColType::Text && argument.user_type.is_none();
+    }
+
+    fn accepts(&self, index: usize, argument: &RoutineArgumentDef) -> bool {
+        if self.text[index] {
+            argument.ctype == ColType::Text && argument.user_type.is_none()
+        } else {
+            !self.string[index] || crate::sql::types::type_category(argument.ctype) == "S"
+        }
+    }
+}
+
 impl RoutineLookup<'_> {
     fn matches(&self, routine: &RoutineDef) -> bool {
         routine.database == self.database
@@ -44091,6 +44118,26 @@ impl Storage {
             })
     }
 
+    // Exact signature dispatch happens first. Ambiguous calls compare domain
+    // inputs with their base type, rather than favoring a domain parameter.
+    fn routine_best_match_input(
+        &self,
+        actual: i32,
+        expected: &RoutineArgumentDef,
+        txid: u32,
+    ) -> bool {
+        if actual == crate::sql::types::oid::UNKNOWN {
+            return false;
+        }
+        let actual = match NamedTypeKind::from_oid(actual) {
+            Some((NamedTypeKind::Domain, _, false)) => self
+                .domain_base_type_for_oid(actual, txid)
+                .and_then(ColType::try_oid),
+            _ => Some(actual),
+        };
+        actual.is_some_and(|actual| self.routine_argument_oid(expected, txid) == Some(actual))
+    }
+
     fn routine_slot_in_oids(
         &self,
         schema: &str,
@@ -44113,19 +44160,59 @@ impl Storage {
         if exact.is_some() {
             return exact;
         }
+        let accepts = |definition: &RoutineInputSignature| {
+            definition.accepts_input_arity(argument_type_oids.len())
+                && definition.arguments()[..argument_type_oids.len()]
+                    .iter()
+                    .zip(argument_type_oids)
+                    .all(|(argument, oid)| {
+                        self.routine_argument_oid(argument, txid)
+                            .is_some_and(|expected| {
+                                self.routine_implicit_cast(*oid, expected, txid)
+                            })
+                    })
+        };
+        let score = |definition: &RoutineInputSignature| {
+            definition
+                .arguments()
+                .iter()
+                .zip(argument_type_oids)
+                .filter(|(argument, oid)| self.routine_best_match_input(**oid, argument, txid))
+                .count()
+        };
+        let best_score = self
+            .routine_candidates(schema, name, txid, kind)
+            .filter_map(|(_, definition)| accepts(&definition).then(|| score(&definition)))
+            .max();
+        let mut preferences = RoutineStringPreferences::EMPTY;
+        if argument_type_oids.contains(&crate::sql::types::oid::UNKNOWN) {
+            for (_, definition) in self.routine_candidates(schema, name, txid, kind) {
+                if !accepts(&definition) || Some(score(&definition)) != best_score {
+                    continue;
+                }
+                for (index, (argument, oid)) in definition
+                    .arguments()
+                    .iter()
+                    .zip(argument_type_oids)
+                    .enumerate()
+                {
+                    if *oid == crate::sql::types::oid::UNKNOWN {
+                        preferences.observe(index, argument);
+                    }
+                }
+            }
+        }
         let concrete = self
             .routine_candidates(schema, name, txid, kind)
             .filter_map(|(slot, definition)| {
-                (definition.accepts_input_arity(argument_type_oids.len())
-                    && definition.arguments()[..argument_type_oids.len()]
+                (accepts(&definition)
+                    && Some(score(&definition)) == best_score
+                    && definition
+                        .arguments()
                         .iter()
-                        .zip(argument_type_oids)
-                        .all(|(argument, oid)| {
-                            self.routine_argument_oid(argument, txid)
-                                .is_some_and(|expected| {
-                                    self.routine_implicit_cast(*oid, expected, txid)
-                                })
-                        }))
+                        .take(argument_type_oids.len())
+                        .enumerate()
+                        .all(|(index, argument)| preferences.accepts(index, argument)))
                 .then_some(slot)
             });
         let mut concrete = concrete;
@@ -44192,11 +44279,70 @@ impl Storage {
             }
             polymorphic == saw_polymorphic
         };
+        let score = |definition: &RoutineInputSignature| {
+            let mapping = definition
+                .call_input_mapping(argument_names, argument_type_oids.len(), false)
+                .expect("matched routine has a valid input mapping");
+            argument_type_oids
+                .iter()
+                .enumerate()
+                .filter(|(index, oid)| {
+                    self.routine_best_match_input(
+                        **oid,
+                        &definition.arguments[usize::from(mapping[*index])],
+                        txid,
+                    )
+                })
+                .count()
+        };
         for (implicit, polymorphic) in [(false, false), (true, false), (true, true)] {
+            let best_score = self
+                .routine_candidates(schema, name, txid, call_kind)
+                .filter_map(|(_, definition)| {
+                    matches(&definition, implicit, polymorphic).then(|| score(&definition))
+                })
+                .max();
+            let mut preferences = RoutineStringPreferences::EMPTY;
+            if implicit
+                && !polymorphic
+                && argument_type_oids.contains(&crate::sql::types::oid::UNKNOWN)
+            {
+                for (_, definition) in self.routine_candidates(schema, name, txid, call_kind) {
+                    if !matches(&definition, implicit, polymorphic)
+                        || Some(score(&definition)) != best_score
+                    {
+                        continue;
+                    }
+                    let mapping = definition
+                        .call_input_mapping(argument_names, argument_type_oids.len(), false)
+                        .expect("matched routine has a valid input mapping");
+                    for (index, oid) in argument_type_oids.iter().enumerate() {
+                        if *oid == crate::sql::types::oid::UNKNOWN {
+                            preferences
+                                .observe(index, &definition.arguments[usize::from(mapping[index])]);
+                        }
+                    }
+                }
+            }
             let mut candidates = self
                 .routine_candidates(schema, name, txid, call_kind)
                 .filter_map(|(slot, routine)| {
-                    matches(&routine, implicit, polymorphic).then_some(slot)
+                    if !matches(&routine, implicit, polymorphic)
+                        || Some(score(&routine)) != best_score
+                    {
+                        return None;
+                    }
+                    let mapping = routine
+                        .call_input_mapping(argument_names, argument_type_oids.len(), false)
+                        .expect("matched routine has a valid input mapping");
+                    argument_type_oids
+                        .iter()
+                        .enumerate()
+                        .all(|(index, _)| {
+                            preferences
+                                .accepts(index, &routine.arguments[usize::from(mapping[index])])
+                        })
+                        .then_some(slot)
                 });
             let first = candidates.next();
             if first.is_some() && candidates.next().is_none() {

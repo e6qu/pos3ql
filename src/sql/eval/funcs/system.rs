@@ -2510,217 +2510,52 @@ pub(crate) fn dispatch<'a>(
             }
             "pg_typeof" => {
                 arity(1)?;
-                let regtype = |referenced_oid, name| Datum::Regtype {
+                // PostgreSQL evaluates the argument even when its declaration
+                // already determines the returned type. Effects occur once.
+                let value = eval_full(args[0], arena, params, row, hooks)?;
+                let referenced_oid =
+                    match super::super::expression_type_identity(args[0], row, hooks)? {
+                        super::super::ExpressionTypeIdentity::Known(oid) => oid,
+                        super::super::ExpressionTypeIdentity::Unresolved => {
+                            if matches!(
+                                args[0],
+                                crate::sql::ast::Expr::Str(_)
+                                    | crate::sql::ast::Expr::Null
+                                    | crate::sql::ast::Expr::Param(_)
+                            ) || value.is_null()
+                            {
+                                crate::sql::types::oid::UNKNOWN
+                            } else {
+                                value.type_oid()
+                            }
+                        }
+                    };
+                let name = if referenced_oid == crate::sql::types::oid::UNKNOWN {
+                    "unknown"
+                } else if let Some(name) = hooks
+                    .catalog
+                    .map(|catalog| catalog.type_name(referenced_oid, arena))
+                    .transpose()?
+                    .flatten()
+                {
+                    name
+                } else {
+                    match ColType::from_oid(referenced_oid) {
+                        Some(ColType::Array(element)) => element.typeof_name(),
+                        Some(ctype) => ctype.name(),
+                        None => {
+                            return Err(sql_err!(
+                                sqlstate::FEATURE_NOT_SUPPORTED,
+                                "type with OID {} has no output name",
+                                referenced_oid
+                            ));
+                        }
+                    }
+                };
+                Ok(Datum::Regtype {
                     referenced_oid,
                     name,
-                };
-                if let crate::sql::ast::Expr::Call { name, .. } = args[0]
-                    && matches!(
-                        *name,
-                        "json_populate_record"
-                            | "jsonb_populate_record"
-                            | "json_populate_recordset"
-                            | "jsonb_populate_recordset"
-                    )
-                    && let Some(cat) = hooks.catalog
-                    && let super::super::ExpressionTypeIdentity::Known(referenced_oid) =
-                        super::super::expression_type_identity(args[0], row, hooks)?
-                    && let Some(type_name) = cat.type_name(referenced_oid, arena)?
-                {
-                    return Ok(regtype(referenced_oid, type_name));
-                }
-                if let crate::sql::ast::Expr::Call {
-                    name,
-                    args,
-                    argument_names,
-                    star: false,
-                    ..
-                } = args[0]
-                    && let Some(cat) = hooks.catalog
-                {
-                    let argument_oids = arena
-                        .alloc_slice_with(args.len(), |_| crate::sql::types::oid::UNKNOWN)
-                        .map_err(|_| arena_full())?;
-                    for (index, argument) in args.iter().enumerate() {
-                        argument_oids[index] = match argument {
-                            crate::sql::ast::Expr::Cast { type_name, .. } => cat
-                                .user_type_oid(type_name)
-                                .unwrap_or(crate::sql::types::oid::UNKNOWN),
-                            _ => crate::sql::exec::infer_type_res(
-                                argument,
-                                &crate::sql::exec::NoCols,
-                            )
-                            .map(|(oid, _)| oid)
-                            .unwrap_or(crate::sql::types::oid::UNKNOWN),
-                        };
-                    }
-                    if let Some(referenced_oid) =
-                        cat.routine_result_oid(name, argument_names, false, argument_oids)
-                        && let Some(type_name) = cat.type_name(referenced_oid, arena)?
-                    {
-                        return Ok(regtype(referenced_oid, type_name));
-                    }
-                }
-                // A domain declaration can contain an array without being
-                // an array of the declared domain.
-                if let crate::sql::ast::Expr::Column { qualifier, name } = args[0]
-                    && let Some(identity) = row.column_user_type(*qualifier, name)
-                    && let Some(ctype) = row.col_type(*qualifier, name)
-                    && let Some(cat) = hooks.catalog
-                    && let Some(referenced_oid) = cat.declared_user_type_oid(ctype, identity)
-                    && let Some(type_name) = cat.type_name(referenced_oid, arena)?
-                {
-                    return Ok(regtype(referenced_oid, type_name));
-                }
-                if let crate::sql::ast::Expr::Subscript { base, .. } = args[0]
-                    && let crate::sql::ast::Expr::Column { qualifier, name } = &**base
-                    && let Some(ColType::Array(element)) = row.col_type(*qualifier, name)
-                    && let Some(cat) = hooks.catalog
-                    && let Some(name) = cat.type_name(element.element_oid(), arena)?
-                {
-                    return Ok(regtype(element.element_oid(), name));
-                }
-                let v = eval_full(args[0], arena, params, row, hooks)?;
-                if let crate::sql::ast::Expr::Cast { type_name, .. } = args[0]
-                    && let Some(cat) = hooks.catalog
-                    && let Some(name) = cat.user_type_name(type_name, arena)?
-                    && let Some(referenced_oid) = cat.user_type_oid(type_name)
-                {
-                    return Ok(regtype(referenced_oid, name));
-                }
-                // A named composite is represented structurally at execution
-                // time, while its PostgreSQL identity belongs to the catalog.
-                // Resolve that identity before the generic static-type path,
-                // whose structural representation is `record`.
-                if matches!(v, Datum::Composite { .. } | Datum::CompositeText { .. })
-                    && let Some(cat) = hooks.catalog
-                    && let Some(name) = cat.type_name(v.type_oid(), arena)?
-                {
-                    return Ok(regtype(v.type_oid(), name));
-                }
-                if matches!(args[0], crate::sql::ast::Expr::Field { .. })
-                    && let Ok(super::super::ExpressionTypeIdentity::Known(referenced_oid)) =
-                        super::super::expression_type_identity(args[0], row, hooks)
-                    && let Some(cat) = hooks.catalog
-                    && let Some(name) = cat.type_name(referenced_oid, arena)?
-                {
-                    return Ok(regtype(referenced_oid, name));
-                }
-                // Array subscripting yields a structural record value, but
-                // inference still retains the declared named-composite OID.
-                // Prefer that catalog identity to the structural runtime tag.
-                if let Some(referenced_oid) = exec::typeof_static_oid(args[0], row, hooks.catalog)
-                    && let Some(cat) = hooks.catalog
-                    && let Some(name) = cat.type_name(referenced_oid, arena)?
-                {
-                    return Ok(regtype(referenced_oid, name));
-                }
-                // PostgreSQL's pg_typeof reports the argument's *static* type —
-                // `current_user` is `name` though the value is plain text. The
-                // static answer is used whenever it is consistent with the
-                // runtime value (same storage type, or NULL); an inconsistent
-                // one — a mis-inferred set-returning function, say — falls
-                // back to the type the value itself carries.
-                if let Some(name) = exec::typeof_static(args[0], row, hooks.catalog)
-                    && let Some(referenced_oid) =
-                        exec::typeof_static_oid(args[0], row, hooks.catalog)
-                {
-                    let consistent = v.is_null()
-                        || exec::typeof_static_coltype(args[0], row, hooks.catalog).is_some_and(
-                            |ct| {
-                                ct.storage().oid() == v.type_oid()
-                                    || matches!((ct, v), (ColType::Xid, Datum::Oid(_)))
-                                    || matches!((ct, v), (ColType::Void, Datum::Text("")))
-                            },
-                        );
-                    if consistent {
-                        return Ok(regtype(referenced_oid, name));
-                    }
-                }
-                // An enum value reports its type name, resolved from the slot.
-                if let Datum::Enum { slot, .. } = v
-                    && let Some(cat) = hooks.catalog
-                    && let Some(name) = cat.enum_name(slot, arena)?
-                {
-                    return Ok(regtype(crate::sql::types::oid::enum_oid(slot), name));
-                }
-                if let Datum::Array { element, .. } = v
-                    && element.is_named()
-                    && let Some(cat) = hooks.catalog
-                    && let Some(name) = cat.user_array_name(element, arena)?
-                {
-                    return Ok(regtype(element.array_oid(), name));
-                }
-                let referenced_oid = if v.is_null() {
-                    crate::sql::types::oid::UNKNOWN
-                } else {
-                    v.type_oid()
-                };
-                let name = match v {
-                    Datum::Null => "unknown",
-                    Datum::Bool(_) => "boolean",
-                    Datum::Int2(_) => "smallint",
-                    Datum::Int4(_) => "integer",
-                    Datum::Oid(_) => "oid",
-                    Datum::Xid8(_) => "xid8",
-                    Datum::Snapshot { legacy: false, .. } => "pg_snapshot",
-                    Datum::Snapshot { legacy: true, .. } => "txid_snapshot",
-                    Datum::PgLsn(_) => "pg_lsn",
-                    Datum::Money(_) => "money",
-                    Datum::Tid(_) => "tid",
-                    Datum::Cid(_) => "cid",
-                    Datum::Int8(_) => "bigint",
-                    Datum::Float4(_) => "real",
-                    Datum::Float8(_) => "double precision",
-                    Datum::Char(_) => "\"char\"",
-                    Datum::Text(_) => "text",
-                    Datum::AclItem(_) => "aclitem",
-                    Datum::Bpchar(_) => "character",
-                    Datum::Regtype { .. } => "regtype",
-                    Datum::RegObject { type_oid, .. } => match type_oid {
-                        crate::sql::types::oid::REGPROC => "regproc",
-                        crate::sql::types::oid::REGPROCEDURE => "regprocedure",
-                        crate::sql::types::oid::REGOPER => "regoper",
-                        crate::sql::types::oid::REGOPERATOR => "regoperator",
-                        crate::sql::types::oid::REGCLASS => "regclass",
-                        crate::sql::types::oid::REGNAMESPACE => "regnamespace",
-                        crate::sql::types::oid::REGROLE => "regrole",
-                        _ => "regobject",
-                    },
-                    Datum::Date(_) => "date",
-                    Datum::Timestamp(_) => "timestamp without time zone",
-                    Datum::Timestamptz(_) => "timestamp with time zone",
-                    Datum::Time(_) => "time without time zone",
-                    Datum::Timetz(..) => "time with time zone",
-                    Datum::Interval(_) => "interval",
-                    Datum::Json { jsonb: false, .. } => "json",
-                    Datum::Json { jsonb: true, .. } => "jsonb",
-                    Datum::Xml(_) => "xml",
-                    Datum::JsonPath(_) => "jsonpath",
-                    Datum::TsVector(_) => "tsvector",
-                    Datum::TsQuery(_) => "tsquery",
-                    Datum::Array { element, .. } => element.typeof_name(),
-                    Datum::Int2Vector { .. } => "int2vector",
-                    Datum::OidVector { .. } => "oidvector",
-                    Datum::Uuid(_) => "uuid",
-                    Datum::Bytea(_) => "bytea",
-                    Datum::Numeric(_) => "numeric",
-                    Datum::Range { kind, .. } => kind.name(),
-                    Datum::Bit { varying: false, .. } => "bit",
-                    Datum::Bit { varying: true, .. } => "bit varying",
-                    Datum::Multirange { kind, .. } => kind.multirange_name(),
-                    Datum::Inet(_) => "inet",
-                    Datum::Cidr(_) => "cidr",
-                    Datum::Macaddr(_) => "macaddr",
-                    Datum::Macaddr8(_) => "macaddr8",
-                    Datum::Geometry { kind, .. } => kind.name(),
-                    Datum::Record(_) => "record",
-                    Datum::Enum { .. } => "enum",
-                    Datum::Composite { .. } | Datum::CompositeText { .. } => "record",
-                    Datum::PgDdlCommand => "pg_ddl_command",
-                    Datum::PgNodeTree(_) => "pg_node_tree",
-                };
-                Ok(regtype(referenced_oid, name))
+                })
             }
             _ => unreachable!("dispatch guard admitted an unhandled name"),
         }

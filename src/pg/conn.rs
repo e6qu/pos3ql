@@ -1842,6 +1842,7 @@ impl Conn {
                     && let Err(error) = engine.commit_txn_with_triggers(
                         &mut self.txn,
                         &self.guc,
+                        Some(&mut self.cursors),
                         &self.arena,
                         &mut responder,
                     )
@@ -2044,6 +2045,7 @@ impl Conn {
                 &self.arena,
                 &mut self.txn,
                 &self.guc,
+                &mut self.cursors,
                 &mut responder,
                 self.id,
             )
@@ -2654,6 +2656,7 @@ impl Conn {
                         &copy.setup,
                         &mut self.txn,
                         &self.guc,
+                        Some(&mut self.cursors),
                         &mut responder,
                         &self.copy_transition_scratch,
                         if extended {
@@ -2679,6 +2682,9 @@ impl Conn {
         self.copy_transition_scratch.clear();
         self.finish_lock_wait();
         let failed = outcome.is_err();
+        if failed && !self.txn.is_active() {
+            self.cursors.on_rollback();
+        }
         engine.finish_backend_statement(&self.txn, self.id);
         let mut responder = Responder::new(&mut self.send);
         let sent = match outcome {
@@ -3238,21 +3244,22 @@ impl Conn {
         if kind == b'S' && responder.parameter_description(param_oids).is_err() {
             return Step::Close;
         }
-        let _parameter_types = crate::sql::exec::enter_bound_parameter_types(param_oids);
-        match engine.describe(
-            text,
-            &self.arena,
-            &self.txn,
-            Some(&self.cursors),
-            &mut responder,
-        ) {
-            Ok(true) => Step::Continue,
-            Ok(false) => {
-                self.phase = Phase::SkipToSync;
-                Step::Continue
+        crate::sql::exec::with_bound_parameter_types(param_oids, || {
+            match engine.describe(
+                text,
+                &self.arena,
+                &self.txn,
+                Some(&self.cursors),
+                &mut responder,
+            ) {
+                Ok(true) => Step::Continue,
+                Ok(false) => {
+                    self.phase = Phase::SkipToSync;
+                    Step::Continue
+                }
+                Err(WireFull) => Step::Close,
             }
-            Err(WireFull) => Step::Close,
-        }
+        })
     }
 
     fn handle_execute(&mut self, engine: &mut Engine, total: usize) -> Step {

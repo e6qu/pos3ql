@@ -44,6 +44,15 @@ pub fn set_query<'a>(
     sequences: Option<&dyn SequenceAccess>,
     responder: &mut Responder,
 ) -> Outcome {
+    let bound_catalog = super::storage_catalog(storage, arena, txid);
+    let bound_queries = super::ProceduralSubqueries { storage, txid };
+    let bound_hooks = crate::sql::eval::EvalHooks {
+        catalog: Some(&bound_catalog),
+        subquery_executor: Some(&bound_queries),
+        sequences,
+        ..crate::sql::eval::NO_HOOKS
+    };
+
     // A row-locking clause can never apply to a set operation, matching
     // PostgreSQL's 0A000.
     if let Some(clause) = q.locking.first() {
@@ -60,7 +69,7 @@ pub fn set_query<'a>(
     };
     // Column names + types from the first leaf, unified across every leaf.
     let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
-    let n_cols = match describe_set_body(storage, body, txid, &mut columns, arena) {
+    let n_cols = match describe_set_body(storage, body, txid, &mut columns, arena, None) {
         Ok(n) => n,
         Err(e) => return sql_fail(e),
     };
@@ -112,12 +121,12 @@ pub fn set_query<'a>(
     if let Err(e) = sort_set_rows(storage, txid, arena, rows, q.order_by, &columns[..n_cols]) {
         return sql_fail(e);
     }
-    let limit = match exec::eval_limit_pub(q.limit, arena, params) {
-        Ok(l) => l,
+    let offset = match exec::eval_offset_pub(q.offset, arena, params, &bound_hooks) {
+        Ok(o) => o,
         Err(e) => return sql_fail(e),
     };
-    let offset = match exec::eval_offset_pub(q.offset, arena, params) {
-        Ok(o) => o,
+    let limit = match exec::eval_limit_pub(q.limit, arena, params, &bound_hooks) {
+        Ok(l) => l,
         Err(e) => return sql_fail(e),
     };
 
@@ -178,6 +187,15 @@ pub(crate) fn set_query_into_rows<'a>(
     sequences: Option<&dyn SequenceAccess>,
     emit: &mut dyn for<'row> FnMut(&[Datum<'row>]) -> Result<(), SqlError>,
 ) -> Result<(), SqlError> {
+    let bound_catalog = super::storage_catalog(storage, arena, txid);
+    let bound_queries = super::ProceduralSubqueries { storage, txid };
+    let bound_hooks = crate::sql::eval::EvalHooks {
+        catalog: Some(&bound_catalog),
+        subquery_executor: Some(&bound_queries),
+        sequences,
+        ..crate::sql::eval::NO_HOOKS
+    };
+
     if let Some(clause) = query.locking.first() {
         return Err(sql_err!(
             crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
@@ -204,7 +222,7 @@ pub(crate) fn set_query_into_rows<'a>(
         );
     }
     let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
-    let column_count = describe_set_body(storage, body, txid, &mut columns, arena)?;
+    let column_count = describe_set_body(storage, body, txid, &mut columns, arena, None)?;
     let mut target = [ColType::Bool; MAX_PROJ];
     for (column, desc) in columns[..column_count].iter().enumerate() {
         target[column] = exec::catalog_column_type(storage, txid, desc.type_oid)
@@ -237,8 +255,8 @@ pub(crate) fn set_query_into_rows<'a>(
         query.order_by,
         &columns[..column_count],
     )?;
-    let limit = exec::eval_limit_pub(query.limit, arena, params)?;
-    let offset = exec::eval_offset_pub(query.offset, arena, params)?;
+    let offset = exec::eval_offset_pub(query.offset, arena, params, &bound_hooks)?;
+    let limit = exec::eval_limit_pub(query.limit, arena, params, &bound_hooks)?;
     let start = (offset as usize).min(rows.len());
     let mut end = offset.saturating_add(limit).min(rows.len() as u64) as usize;
     if query.with_ties && limit > 0 && end < rows.len() && end > start {
@@ -288,6 +306,11 @@ fn resolve_set_order(
             Expr::Column {
                 name,
                 qualifier: None,
+            }
+            | Expr::RoutineParam {
+                name,
+                qualifier: None,
+                ..
             } => columns
                 .iter()
                 .position(|column| column.name == *name)
@@ -657,8 +680,17 @@ pub(crate) fn external_set_body_into<'a>(
     sequences: Option<&dyn SequenceAccess>,
     emit: &mut dyn for<'row> FnMut(&[Datum<'row>]) -> Result<(), SqlError>,
 ) -> Result<(), SqlError> {
+    let bound_catalog = super::storage_catalog(storage, arena, txid);
+    let bound_queries = super::ProceduralSubqueries { storage, txid };
+    let bound_hooks = crate::sql::eval::EvalHooks {
+        catalog: Some(&bound_catalog),
+        subquery_executor: Some(&bound_queries),
+        sequences,
+        ..crate::sql::eval::NO_HOOKS
+    };
+
     let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
-    let column_count = describe_set_body(storage, tree, txid, &mut columns, arena)?;
+    let column_count = describe_set_body(storage, tree, txid, &mut columns, arena, None)?;
     let mut target = [ColType::Bool; MAX_PROJ];
     for column in 0..column_count {
         target[column] = exec::catalog_column_type(storage, txid, columns[column].type_oid)
@@ -687,8 +719,8 @@ pub(crate) fn external_set_body_into<'a>(
     else {
         return Ok(());
     };
-    let limit = exec::eval_limit_pub(limit, arena, params)?;
-    let offset = exec::eval_offset_pub(offset, arena, params)?;
+    let offset = exec::eval_offset_pub(offset, arena, params, &bound_hooks)?;
+    let limit = exec::eval_limit_pub(limit, arena, params, &bound_hooks)?;
     // A trailing ORDER BY needs one final provider-neutral sort. Set-operation
     // output without ORDER BY retains the multiset merge order.
     let run = if order_by.is_empty() {
@@ -770,6 +802,15 @@ fn external_set_query<'a>(
     columns: &[ColDesc<'a>],
     responder: &mut Responder,
 ) -> Outcome {
+    let bound_catalog = super::storage_catalog(storage, arena, txid);
+    let bound_queries = super::ProceduralSubqueries { storage, txid };
+    let bound_hooks = crate::sql::eval::EvalHooks {
+        catalog: Some(&bound_catalog),
+        subquery_executor: Some(&bound_queries),
+        sequences,
+        ..crate::sql::eval::NO_HOOKS
+    };
+
     let run = match external_set_tree(
         tree,
         ExternalSetContext {
@@ -785,12 +826,12 @@ fn external_set_query<'a>(
         Ok(run) => run,
         Err(error) => return sql_fail(error),
     };
-    let limit = match exec::eval_limit_pub(query.limit, arena, params) {
-        Ok(limit) => limit,
+    let offset = match exec::eval_offset_pub(query.offset, arena, params, &bound_hooks) {
+        Ok(offset) => offset,
         Err(error) => return sql_fail(error),
     };
-    let offset = match exec::eval_offset_pub(query.offset, arena, params) {
-        Ok(offset) => offset,
+    let limit = match exec::eval_limit_pub(query.limit, arena, params, &bound_hooks) {
+        Ok(limit) => limit,
         Err(error) => return sql_fail(error),
     };
     responder.row_description(columns)?;
@@ -956,7 +997,7 @@ fn leaf_col_unknown<'a>(
                     let scratch_mark = arena.mark();
                     let raw = match &s.from {
                         None => exec::infer_type_pub(expression, None).map(|t| t.0),
-                        Some(f) => QueryScope::resolve_schema(storage, f, txid, arena)
+                        Some(f) => QueryScope::resolve_schema(storage, f, txid, arena, None)
                             .and_then(|sc| infer_scope_type(expression, &sc).map(|t| t.0)),
                     };
                     // Inference retains only an owned OID/error, not its
@@ -983,10 +1024,11 @@ fn describe_leaf<'a>(
     txid: u32,
     columns: &mut [ColDesc<'a>],
     arena: &'a Arena,
+    type_oids: &mut [i32],
 ) -> Result<usize, SqlError> {
     let mark = arena.mark();
     let result = (|| {
-        let count = describe_leaf_inner(storage, s, txid, columns, arena)?;
+        let count = describe_leaf_inner(storage, s, txid, columns, arena, type_oids)?;
         let mut names = [crate::storage::SqlName::EMPTY; MAX_PROJ];
         for (name, column) in names.iter_mut().zip(&columns[..count]) {
             *name = crate::storage::SqlName::parse(column.name)?;
@@ -1010,12 +1052,48 @@ fn describe_leaf_inner<'a>(
     txid: u32,
     columns: &mut [ColDesc<'a>],
     arena: &'a Arena,
+    type_oids: &mut [i32],
 ) -> Result<usize, SqlError> {
+    if let Some(tree) = s.set_body {
+        return describe_set_body(storage, tree, txid, columns, arena, Some(type_oids));
+    }
     match &s.from {
-        None => super::describe_catalog_items(s.items, None, storage, txid, arena, columns),
+        None => {
+            let count =
+                super::describe_catalog_items(s.items, None, storage, txid, arena, columns)?;
+            super::srf::preserve_projection_type_identities(
+                s.items,
+                None,
+                &exec::CatalogCols {
+                    definition: None,
+                    alias: None,
+                    output_aliases: &[],
+                    storage,
+                    txid,
+                    arena,
+                },
+                &columns[..count],
+                &mut type_oids[..count],
+            )?;
+            Ok(count)
+        }
         Some(from) => {
-            let scope = QueryScope::resolve_schema(storage, from, txid, arena)?;
-            describe_scope_items(s.items, &scope, None, storage, txid, arena, columns)
+            let scope = QueryScope::resolve_schema(storage, from, txid, arena, None)?;
+            let count = describe_scope_items(s.items, &scope, None, storage, txid, arena, columns)?;
+            super::srf::preserve_projection_type_identities(
+                s.items,
+                Some(&scope),
+                &super::CatalogScopeCols {
+                    scope: &scope,
+                    outer_scope: None,
+                    storage,
+                    txid,
+                    arena,
+                },
+                &columns[..count],
+                &mut type_oids[..count],
+            )?;
+            Ok(count)
         }
     }
 }
@@ -1180,7 +1258,7 @@ fn register_record_shapes_inner(
     let scope = statement
         .from
         .as_ref()
-        .map(|from| QueryScope::resolve_schema(storage, from, txid, arena))
+        .map(|from| QueryScope::resolve_schema(storage, from, txid, arena, None))
         .transpose()?;
     let scope = scope.as_ref();
     let mut slot = 0usize;
@@ -1333,12 +1411,14 @@ pub(crate) fn describe_set_body<'a>(
     txid: u32,
     columns: &mut [ColDesc<'a>],
     arena: &'a Arena,
+    type_oids: Option<&mut [i32]>,
 ) -> Result<usize, SqlError> {
     let mut leaves = ArenaList::new(arena);
     collect_set_leaves(tree, &mut leaves)?;
     let leaves = leaves.as_slice();
     let leaf0 = leaves.first().copied().expect(">=1 leaf");
-    let n_cols = describe_leaf(storage, leaf0, txid, columns, arena)?;
+    let mut leaf_types = [0; MAX_PROJ];
+    let n_cols = describe_leaf(storage, leaf0, txid, columns, arena, &mut leaf_types)?;
     register_first_leaf_record_shapes(storage, leaf0, txid, arena, columns, n_cols)?;
     let leaf_collations = arena
         .alloc_slice_with(leaves.len() * n_cols, |_| SetColumnCollation::NONE)
@@ -1346,8 +1426,14 @@ pub(crate) fn describe_set_body<'a>(
     // `None` = still undetermined (an untyped NULL / UNKNOWN column adopts the
     // type of the other branches, as PostgreSQL resolves an unknown literal).
     let mut target: [Option<ColType>; MAX_PROJ] = [None; MAX_PROJ];
+    let mut identical_types: [Option<i32>; MAX_PROJ] = [None; MAX_PROJ];
     for (c, col) in columns[..n_cols].iter().enumerate() {
         let unknown = leaf_col_unknown(storage, leaf0, c, txid, arena);
+        identical_types[c] = Some(if unknown {
+            crate::sql::types::oid::UNKNOWN
+        } else {
+            leaf_types[c]
+        });
         if !unknown {
             leaf_collations[c] = SetColumnCollation {
                 value: col.collation,
@@ -1373,7 +1459,7 @@ pub(crate) fn describe_set_body<'a>(
     }
     for (leaf_index, leaf) in leaves[1..].iter().enumerate() {
         let mut lc = [ColDesc::new("", 0, 0); MAX_PROJ];
-        let ln = describe_leaf(storage, leaf, txid, &mut lc, arena)?;
+        let ln = describe_leaf(storage, leaf, txid, &mut lc, arena, &mut leaf_types)?;
         if ln != n_cols {
             return Err(sql_err!(
                 sqlstate::SYNTAX_ERROR,
@@ -1382,7 +1468,16 @@ pub(crate) fn describe_set_body<'a>(
         }
         let leaf_ref = *leaf;
         for c in 0..n_cols {
-            if leaf_col_unknown(storage, leaf_ref, c, txid, arena) {
+            let unknown = leaf_col_unknown(storage, leaf_ref, c, txid, arena);
+            let input_oid = if unknown {
+                crate::sql::types::oid::UNKNOWN
+            } else {
+                leaf_types[c]
+            };
+            if identical_types[c] != Some(input_oid) {
+                identical_types[c] = None;
+            }
+            if unknown {
                 continue; // an untyped NULL column adopts the running type
             }
             leaf_collations[(leaf_index + 1) * n_cols + c] = SetColumnCollation {
@@ -1431,6 +1526,21 @@ pub(crate) fn describe_set_body<'a>(
     for (c, col) in columns[..n_cols].iter_mut().enumerate() {
         col.type_oid = target[c].oid();
         col.typlen = target[c].typlen();
+    }
+    // Wire descriptors expose domain base types. Derived sources separately
+    // keep a domain only when every input has that exact declared type.
+    if let Some(type_oids) = type_oids {
+        if type_oids.len() < n_cols {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "set query type output is smaller than its column count"
+            ));
+        }
+        for (index, type_oid) in type_oids[..n_cols].iter_mut().enumerate() {
+            *type_oid = identical_types[index]
+                .filter(|oid| *oid != crate::sql::types::oid::UNKNOWN)
+                .unwrap_or_else(|| target[index].oid());
+        }
     }
     let collation_workspace = arena
         .alloc_slice_with((2 * leaves.len() - 1) * n_cols, |_| {
@@ -1496,7 +1606,7 @@ fn materialize_set_body_tied<'a>(
     sequences: Option<&dyn SequenceAccess>,
 ) -> Result<MaterializedSet<'a>, SqlError> {
     let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
-    let n = describe_set_body(storage, tree, txid, &mut columns, arena)?;
+    let n = describe_set_body(storage, tree, txid, &mut columns, arena, None)?;
     let mut tgt = [ColType::Bool; MAX_PROJ];
     for c in 0..n {
         tgt[c] = exec::catalog_column_type(storage, txid, columns[c].type_oid)
@@ -1740,6 +1850,11 @@ pub(crate) fn set_rows_tie(
             Expr::Column {
                 name,
                 qualifier: None,
+            }
+            | Expr::RoutineParam {
+                name,
+                qualifier: None,
+                ..
             } => match columns.iter().position(|c| c.name == *name) {
                 Some(i) => i,
                 None => return Ok(false),
@@ -1782,6 +1897,11 @@ pub(crate) fn sort_set_rows(
             Expr::Column {
                 name,
                 qualifier: None,
+            }
+            | Expr::RoutineParam {
+                name,
+                qualifier: None,
+                ..
             } => match columns.iter().position(|c| c.name == *name) {
                 Some(i) => i,
                 None => {

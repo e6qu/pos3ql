@@ -967,6 +967,7 @@ pub(super) fn definition(name: &str, information_schema: bool) -> Option<SynthDe
             ("typisdefined", ColType::Bool),
             ("typstorage", ColType::Char),
             ("typdefaultbin", ColType::PgNodeTree),
+            ("typdelim", ColType::Char),
         ],
         (false, "pg_namespace") => &[
             ("tableoid", ColType::Oid),
@@ -1651,6 +1652,11 @@ pub(super) fn definition(name: &str, information_schema: bool) -> Option<SynthDe
         })
         .flatten();
     Some(SynthDef {
+        schema: if information_schema {
+            "information_schema"
+        } else {
+            "pg_catalog"
+        },
         name,
         columns,
         relation,

@@ -13,11 +13,35 @@ concurrency:
 
 jobs:
   reactor-ownership:
-    name: macOS readiness ownership
-    runs-on: macos-latest
+    name: native ${{ matrix.check }} (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [Linux arm64, macOS arm64]
+        check: [build and test, lint]
+        include:
+          - platform: Linux arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - platform: macOS arm64
+            runner: macos-15
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 15
+    env:
+      NATIVE_TARGET: ${{ matrix.target }}
     steps:
       - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Verify native compiler target
+        env:
+          EXPECTED_TARGET: ${{ env.NATIVE_TARGET }}
+        run: |
+          test "$(rustc -vV | sed -n 's/^host: //p')" = "$EXPECTED_TARGET"
 
       - name: Cache Rust dependencies
         uses: actions/cache@v5
@@ -25,17 +49,24 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: macOS-reactor-dependencies-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-native-dependencies-${{ hashFiles('Cargo.lock') }}
+
+      - name: Build all native targets
+        if: ${{ matrix.check == 'build and test' }}
+        run: cargo build --all-targets --locked --target "$NATIVE_TARGET"
 
       - name: Socket readiness and allocation-free catalog publication
+        if: ${{ matrix.check == 'build and test' }}
         run: >-
-          cargo test --lib --locked -- io:: mem::mutex::tests type_ domain_ enum_ composite_ table_name catalog_creation_
+          cargo test --lib --locked --target "$NATIVE_TARGET" -- io:: mem::mutex::tests type_ domain_ enum_ composite_ table_name catalog_creation_
           timezone_abbreviation_ fixed_default_abbreviations_ degree_special_and_random_math_
           maintenance_metadata_ cleanup_download_overlap_ object_store::http::tests::
+          reader_scratch_is_synchronized_and_startup_bounded database_default_collation_is_bounded_
           --test-threads=1
 
-      - name: macOS allocation-free mutex boundary
-        run: cargo clippy --all-targets -- -D warnings
+      - name: Native allocation-free boundaries
+        if: ${{ matrix.check == 'lint' }}
+        run: cargo clippy --all-targets --locked --target "$NATIVE_TARGET" -- -D warnings
 
   macos-lock-ownership:
     name: macOS mutex ownership
@@ -76,10 +107,13 @@ jobs:
             arena_owned_list_
             arena_retained_handles_
             arena_retained_slices_
+            cursor_owned_query_
             sequence::tests::statement_replay_
             shared_heap_relocation_heap_
             row_lock_owners_heap_
             stable_row_slots_
+            storage::row_versions::tests::row_history_reservation_
+            table_definition_cells_
             sliced_heap_cleanup_heap_
             statement_files_miri_
             index_file_owners_miri_
@@ -156,10 +190,14 @@ jobs:
           path: ${{ runner.temp }}/dist/
 
   build-and-check:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
+
+      - name: Verify Linux amd64 compiler target
+        run: |
+          test "$(rustc -vV | sed -n 's/^host: //p')" = x86_64-unknown-linux-gnu
 
       - name: Cache Rust build
         uses: actions/cache@v5

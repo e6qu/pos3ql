@@ -21,11 +21,18 @@ PGPORT=${PGPORT:-5432}
 PGUSER=${PGUSER:-postgres}
 export PGHOST PGPORT PGUSER
 P3_PORT=${P3_PORT:-15599}
+: "${POS3QL_VENV:?set the pinned Python test environment}"
+: "${POS3QL_DRIVER_EVIDENCE:?set the client evidence directory}"
 
 PASS=0 FAIL=0
 ok()  { PASS=$((PASS+1)); echo "PASS: $1"; }
 bad() { FAIL=$((FAIL+1)); echo "FAIL: $1"; }
-cleanup() { [[ -n "${P3_PID:-}" ]] && kill "$P3_PID" 2>/dev/null; rm -rf "$WORK"; }
+cleanup() {
+  [[ -n "${P3_PID:-}" ]] && kill "$P3_PID" 2>/dev/null
+  mkdir -p "$POS3QL_DRIVER_EVIDENCE"
+  find "$WORK" -maxdepth 1 -type f -exec cp {} "$POS3QL_DRIVER_EVIDENCE/" \;
+  rm -rf "$WORK"
+}
 trap cleanup EXIT
 
 # --- start pos3ql (pure SQL/protocol; object storage off) ------------------
@@ -33,6 +40,7 @@ cargo build --release -q || { echo "build failed"; exit 1; }
 cat > "$WORK/p3.conf" <<EOF
 transaction_mode = mvcc
 catalog_history_bytes = 16MiB
+row_history_slots = 65536
 listen_addr = 127.0.0.1:${P3_PORT}
 data_dir = ${WORK}/p3data
 object_store = off
@@ -50,6 +58,8 @@ for _ in $(seq 1 100); do
   sleep 0.1
 done
 echo "reference: $(psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -tAc 'SHOW server_version')"
+"$POS3QL_VENV/bin/python" -m pip freeze > "$WORK/python-packages.txt" || exit 1
+git rev-parse HEAD > "$WORK/revision.txt" || exit 1
 
 # Run a driver transcript against a host:port, writing to $1.
 # $2… is the command to run (it receives host port appended).
@@ -89,6 +99,26 @@ partition_move_probe() {
     python3 tests/external/wire_probe.py > "$1" 2>&1
 }
 diff_driver partition-move partition_move_probe
+
+# Exercise real Python clients and migration tools; do not substitute raw SQL
+# for their generated queries or normalize failed application operations.
+for suite in psycopg2 sqlalchemy alembic; do
+  python_client() {
+    "$POS3QL_VENV/bin/python" "$DRV/python_clients.py" --suite "$suite" \
+      --host "$2" --port "$3" --user "$PGUSER" --database postgres > "$1" 2>&1
+  }
+  diff_driver "$suite" python_client
+done
+
+# Retain the complete live catalog comparison separately from executable
+# client tests. Missing entries remain visible; this is not a support claim.
+if ! "$POS3QL_VENV/bin/python" tests/external/builtin_inventory.py \
+    --reference-host "$PGHOST" --reference-port "$PGPORT" \
+    --candidate-host 127.0.0.1 --candidate-port "$P3_PORT" \
+    --user "$PGUSER" --database postgres --revision "$(git rev-parse HEAD)" \
+    --output "$WORK/builtin-inventory.json"; then
+  bad "built-in catalog inventory capture"
+fi
 
 # --- pgJDBC (Java) ---------------------------------------------------------
 JDBC_VER=42.7.4

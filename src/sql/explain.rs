@@ -642,15 +642,6 @@ fn predicate_selectivity<'a>(
             let fraction = f64::from(column_statistics.null_fraction_ppm) / 1_000_000.0;
             if *negated { 1.0 - fraction } else { fraction }
         }
-        Expr::Between { operand, .. } => {
-            let Expr::Column { qualifier, name } = **operand else {
-                return 1.0;
-            };
-            match scope.find_column(qualifier, name) {
-                Ok(query::ResolvedColumn::Table(owner, _)) if owner == table => 0.005,
-                _ => 1.0,
-            }
-        }
         Expr::InList {
             operand,
             list,
@@ -863,7 +854,9 @@ pub(super) fn plan_select<'a>(
 ) -> Result<Plan<'a>, SqlError> {
     let started = std::time::Instant::now();
     let scope = match &statement.from {
-        Some(from) => Some(QueryScope::resolve_schema(storage, from, txid, arena)?),
+        Some(from) => Some(QueryScope::resolve_schema(
+            storage, from, txid, arena, None,
+        )?),
         None => None,
     };
     let capacity = scope
@@ -1485,7 +1478,7 @@ pub(super) fn plan_modification<'a>(
     if let Some(from) = joined_from {
         let target_slot = relation_slot(storage, txid, target.schema, target.name)
             .expect("target existence checked above");
-        let scope = QueryScope::resolve_schema(storage, from, txid, arena)?;
+        let scope = QueryScope::resolve_schema(storage, from, txid, arena, None)?;
         let order = arena
             .alloc_slice_with(scope.n, |index| index)
             .map_err(|_| arena_full())?;

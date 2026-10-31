@@ -1,5 +1,6 @@
 use super::object_reads::{accept, advance, read_request, replace_uncached_blocks, reply};
 use super::*;
+use crate::sql::cursor::CursorScroll;
 use crate::storage::{RowCursor, RowCursorBuffers, SpilledRowRepresentation};
 use crate::store::{BlockStore, StoreError};
 use std::net::TcpListener;
@@ -27,6 +28,328 @@ fn object_key<'a>(request: &'a str, prefix: &str) -> &'a str {
         .unwrap()
         .strip_prefix(prefix)
         .unwrap()
+}
+
+#[test]
+fn cursor_retained_cold_fetch_resumes_after_delivered_rows() {
+    cold_cursor_fetch(
+        "SELECT id,code FROM cold_orders",
+        1,
+        0,
+        320,
+        CursorScroll::NoScroll,
+        17,
+    );
+}
+
+#[test]
+fn cursor_retained_cold_filter_resumes_after_rejected_and_delivered_rows() {
+    cold_cursor_fetch(
+        "SELECT id*2/2,code FROM cold_orders WHERE id%2=0 AND code<>''",
+        2,
+        0,
+        160,
+        CursorScroll::NoScroll,
+        17,
+    );
+}
+
+#[test]
+fn cursor_retained_cold_row_bounds_resume_skips_and_stop_early() {
+    cold_cursor_fetch(
+        "SELECT id,code FROM cold_orders WHERE id%2=0 LIMIT 71 OFFSET 9",
+        2,
+        9,
+        71,
+        CursorScroll::NoScroll,
+        17,
+    );
+}
+
+#[test]
+fn cursor_retained_cold_scroll_reuses_history_after_storage_waits() {
+    cold_cursor_fetch(
+        "SELECT id,code FROM cold_orders WHERE id%2=0 LIMIT 71 OFFSET 9",
+        2,
+        9,
+        71,
+        CursorScroll::Scroll,
+        17,
+    );
+}
+
+#[test]
+fn cursor_retained_cold_default_mode_resumes_and_scrolls() {
+    cold_cursor_fetch(
+        "SELECT id,code FROM cold_orders WHERE id%2=0 LIMIT 71 OFFSET 9",
+        2,
+        9,
+        71,
+        CursorScroll::Default,
+        17,
+    );
+}
+
+#[test]
+fn cursor_retained_cold_case_resumes_conditions_and_selected_values() {
+    cold_cursor_fetch(
+        "SELECT CASE WHEN id>0 THEN id ELSE 0 END, \
+         CASE WHEN id%2=0 THEN code ELSE 'unused' END FROM cold_orders \
+         WHERE CASE WHEN id%2=0 THEN id>0 ELSE FALSE END LIMIT 70 OFFSET 10",
+        2,
+        10,
+        70,
+        CursorScroll::NoScroll,
+        17,
+    );
+}
+
+#[test]
+fn cursor_retained_cold_arrays_resume_values_and_filters() {
+    cold_cursor_fetch(
+        "SELECT (ARRAY[id,0])[1],code FROM cold_orders \
+         WHERE (ARRAY[id%2,1])[1]=0 LIMIT 69 OFFSET 11",
+        2,
+        11,
+        69,
+        CursorScroll::NoScroll,
+        23,
+    );
+}
+
+fn cold_cursor_fetch(
+    select: &str,
+    stride: i32,
+    skip: i32,
+    take: i32,
+    mode: CursorScroll,
+    batch: i32,
+) {
+    use crate::sql::cursor::FetchMotion;
+
+    let (scroll, scrollable, mode_name) = match mode {
+        CursorScroll::NoScroll => ("NO SCROLL", false, "no-scroll"),
+        CursorScroll::Scroll => ("SCROLL", true, "scroll"),
+        CursorScroll::Default => ("", true, "default"),
+    };
+    let mut config = test_config(&format!(
+        "cursor-retained-cold-fetch-{stride}-{skip}-{take}-{mode_name}"
+    ));
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_bucket = format!(
+        "retained-cursor-{stride}-{skip}-{take}-{mode_name}-{}",
+        std::process::id()
+    );
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_get_slots = 4;
+    config.object_store_hedge_after_ms = 0;
+    config.block_cache_bytes = 0;
+    config.disk_cache_bytes = 0;
+    config.max_spill_generations_per_table = 2;
+    config.memtable_bytes = 8 << 20;
+    config.cursor_bytes = if scrollable { 512 << 10 } else { 32 << 10 };
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let namespace = crate::object_store::sim::open_namespace(&config.object_store_bucket, 227);
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE TABLE cold_orders(id integer, code text)",
+        false,
+    );
+    let mut insert = String::from("INSERT INTO cold_orders VALUES ");
+    let mut expected = Vec::new();
+    for id in 1..=320 {
+        if id != 1 {
+            insert.push(',');
+        }
+        insert.push_str(&format!("({id},'"));
+        let start = insert.len();
+        let mut random = id as u64;
+        for _ in 0..1024 {
+            random = random
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            insert.push(char::from(b'a' + ((random >> 32) % 26) as u8));
+        }
+        expected.push(checksum(&insert.as_bytes()[start..]));
+        insert.push_str("')");
+    }
+    session.success(&mut engine, &insert, false);
+    assert!(engine.checkpoint().unwrap());
+    drop((session, engine));
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut other = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+    listener.set_nonblocking(true).unwrap();
+    let mut network = config.clone();
+    network.object_store_sim = false;
+    network.object_store_endpoint = listener.local_addr().unwrap().to_string();
+    network.object_store_access_key = "test-access".to_owned();
+    network.object_store_secret_key = "test-secret".to_owned();
+    replace_uncached_blocks(&mut engine, &network);
+    session.success(
+        &mut engine,
+        &format!(
+            "BEGIN; \
+            DECLARE empty_cold NO SCROLL CURSOR FOR SELECT id FROM cold_orders WHERE FALSE; \
+            FETCH ALL FROM empty_cold; CLOSE empty_cold; \
+            DECLARE cold {scroll} CURSOR FOR {select}"
+        ),
+        true,
+    );
+    assert!(
+        !engine.block_reads_pending(),
+        "DECLARE must not read saved row contents"
+    );
+    let (slot, _) = session
+        .cursors
+        .read_request("cold", FetchMotion::Count(1), false)
+        .unwrap()
+        .expect("retained physical plan");
+    assert_eq!(session.cursors.produced_rows(slot), 0);
+    let prefix = format!("/{}/", config.object_store_bucket);
+    let owner = ExecutionIdentity::new(1, engine.execution_identity().database_oid).read_owner();
+    let mut count = 0;
+    let mut waited_after_prefix = false;
+    let mut waited_inside_fetch = false;
+    let mut wait_positions = Vec::new();
+    let fetch = format!("FETCH FORWARD {batch} FROM cold");
+    let mut deadline = Instant::now() + Duration::from_secs(2);
+    session.send.clear();
+    session.arena.reset();
+    loop {
+        advance(&mut engine);
+        let previous = engine.replace_read_owner(Some(owner));
+        let result = crate::mem::guard::forbid_alloc(|| {
+            engine.execute_simple_from(
+                &fetch,
+                0,
+                &session.arena,
+                &mut session.transaction,
+                &mut session.pool,
+                &mut session.cursors,
+                &mut session.guc,
+                &mut Responder::new(&mut session.send),
+                session.connection_id,
+                false,
+            )
+        })
+        .unwrap();
+        let _ = engine.replace_read_owner(previous);
+        match result {
+            ExecutionStatus::Complete => {
+                assert!(
+                    error_sqlstates(session.send.readable()).is_empty(),
+                    "{}",
+                    String::from_utf8_lossy(session.send.readable())
+                );
+                let fetched = data_rows(session.send.readable());
+                if fetched.is_empty() {
+                    assert_eq!(command_tags(session.send.readable()), ["FETCH 0"]);
+                    break;
+                }
+                let rows = (take - count).min(batch);
+                assert_eq!(fetched.len(), rows as usize);
+                assert_eq!(
+                    command_tags(session.send.readable()),
+                    [format!("FETCH {rows}")]
+                );
+                for fetched in &fetched {
+                    let (id, code) = fetched.split_once('|').unwrap();
+                    let id = id.parse::<i32>().unwrap();
+                    assert_eq!(id, (skip + count + 1) * stride);
+                    assert_eq!(checksum(code.as_bytes()), expected[(id - 1) as usize]);
+                    count += 1;
+                }
+                assert_eq!(session.cursors.produced_rows(slot), count as usize);
+                assert_eq!(
+                    session.cursors.buffered_rows(slot),
+                    if scrollable { count } else { rows } as usize
+                );
+                session.send.clear();
+                session.arena.reset();
+                deadline = Instant::now() + Duration::from_secs(2);
+            }
+            ExecutionStatus::Blocked {
+                output_mark, wait, ..
+            } => {
+                assert_eq!(wait, StatementWait::ObjectIo);
+                session.send.truncate_to(output_mark);
+                assert!(
+                    session.send.readable().is_empty(),
+                    "a suspended FETCH must not emit a partial response"
+                );
+                waited_after_prefix |= count != 0;
+                let position = (count, session.cursors.produced_rows(slot));
+                if wait_positions.last() != Some(&position) {
+                    wait_positions.push(position);
+                }
+                if session.cursors.produced_rows(slot) > count as usize && !waited_inside_fetch {
+                    waited_inside_fetch = true;
+                    assert_eq!(
+                        data_rows(&other.success(&mut engine, "SELECT 42", true)),
+                        ["42"]
+                    );
+                }
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let request = read_request(&mut engine, &mut stream);
+                        let body = namespace
+                            .borrow()
+                            .object_bytes(object_key(&request, &prefix))
+                            .unwrap()
+                            .to_vec();
+                        reply(&mut stream, &request, &body);
+                        deadline = Instant::now() + Duration::from_secs(2);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "retained FETCH did not advance");
+                        std::thread::yield_now();
+                    }
+                    Err(error) => panic!("retained FETCH accept: {error}"),
+                }
+            }
+        }
+    }
+    assert_eq!(count, take);
+    assert!(
+        waited_inside_fetch,
+        "a fetch must retain buffered rows while another connection runs: {wait_positions:?}"
+    );
+    assert!(
+        waited_after_prefix,
+        "saved rows must wait after delivering a prefix"
+    );
+    if scrollable {
+        for (motion, id) in [
+            ("LAST", (skip + take) * stride),
+            ("PRIOR", (skip + take - 1) * stride),
+        ] {
+            let fetched = session.success(&mut engine, &format!("FETCH {motion} FROM cold"), true);
+            let rows = data_rows(&fetched);
+            assert_eq!(rows.len(), 1);
+            let (number, code) = rows[0].split_once('|').unwrap();
+            assert_eq!(number, id.to_string());
+            assert_eq!(checksum(code.as_bytes()), expected[(id - 1) as usize]);
+        }
+    }
+    let statistics = session.success(
+        &mut engine,
+        "SELECT seq_scan,seq_tup_read FROM pg_stat_xact_user_tables WHERE relname='cold_orders'",
+        true,
+    );
+    assert_eq!(
+        data_rows(&statistics),
+        [format!("1|{}", (skip + take) * stride)]
+    );
+    session.success(&mut engine, "CLOSE cold; ROLLBACK", true);
 }
 
 fn held_query_read(mode: crate::config::TransactionMode, saved: SavedRows, cancel: bool) {
@@ -157,7 +480,7 @@ fn held_query_read(mode: crate::config::TransactionMode, saved: SavedRows, cance
         match result {
             Ok(Some(row)) => {
                 let mut decoded = [Datum::Null; 2];
-                let values = match row.representation {
+                let values = match row.representation() {
                     SpilledRowRepresentation::Encoded(bytes) => {
                         crate::mem::guard::forbid_alloc(|| {
                             crate::storage::rowenc::decode(

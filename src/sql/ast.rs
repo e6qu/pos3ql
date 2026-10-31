@@ -5,6 +5,9 @@
 use crate::sql::types::ColType;
 use crate::util::StackStr;
 
+mod expression_copy;
+pub(crate) use expression_copy::duplicate_expression;
+
 /// A normalized PostgreSQL configuration parameter identity.  Configuration
 /// parameters are not SQL objects: they may be dotted and their spelling is
 /// case-insensitive, so keeping them separate prevents object ACL code from
@@ -5527,6 +5530,12 @@ pub enum AlterStatisticsAction<'a> {
     SetTarget(StatisticsTarget),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParameterSource {
+    SqlRoutine,
+    PlpgsqlCursor,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Expr<'a> {
     Null,
@@ -5546,12 +5555,14 @@ pub enum Expr<'a> {
         qualifier: Option<&'a str>,
         name: &'a str,
     },
-    /// A named SQL-routine argument. Column lookup has precedence; `index`
-    /// supplies the positional value only when this spelling binds no column.
+    /// A bound routine name. SQL routine arguments yield to table columns;
+    /// procedural cursor locals reject a column-name collision. `source`
+    /// also selects the declaration that supplies the parameter's type.
     RoutineParam {
         qualifier: Option<&'a str>,
         name: &'a str,
         index: u32,
+        source: ParameterSource,
     },
     Param(u32),
     Unary {
@@ -5604,13 +5615,6 @@ pub enum Expr<'a> {
     InList {
         operand: &'a Expr<'a>,
         list: &'a [&'a Expr<'a>],
-        negated: bool,
-    },
-    /// `expression [NOT] BETWEEN low AND high`.
-    Between {
-        operand: &'a Expr<'a>,
-        low: &'a Expr<'a>,
-        high: &'a Expr<'a>,
         negated: bool,
     },
     /// `expression [NOT] LIKE/ILIKE pattern`.
@@ -5908,9 +5912,6 @@ impl Expr<'_> {
             Expr::InList { operand, list, .. } => {
                 operand.is_constant() && list.iter().all(|e| e.is_constant())
             }
-            Expr::Between {
-                operand, low, high, ..
-            } => operand.is_constant() && low.is_constant() && high.is_constant(),
             Expr::Like {
                 operand, pattern, ..
             }
@@ -5997,9 +5998,6 @@ impl Expr<'_> {
             Expr::InList { operand, list, .. } => {
                 operand.contains_call() || list.iter().any(|e| e.contains_call())
             }
-            Expr::Between {
-                operand, low, high, ..
-            } => operand.contains_call() || low.contains_call() || high.contains_call(),
             Expr::Like {
                 operand, pattern, ..
             }
@@ -6079,9 +6077,6 @@ impl Expr<'_> {
             Expr::InList { operand, list, .. } => {
                 operand.contains_subquery() || list.iter().any(|e| e.contains_subquery())
             }
-            Expr::Between {
-                operand, low, high, ..
-            } => operand.contains_subquery() || low.contains_subquery() || high.contains_subquery(),
             Expr::Like {
                 operand, pattern, ..
             }
@@ -6171,12 +6166,6 @@ impl Expr<'_> {
             Expr::InList { operand, list, .. } => operand
                 .find_function(matches)
                 .or_else(|| list.iter().find_map(|e| e.find_function(matches))),
-            Expr::Between {
-                operand, low, high, ..
-            } => operand
-                .find_function(matches)
-                .or_else(|| low.find_function(matches))
-                .or_else(|| high.find_function(matches)),
             Expr::Like {
                 operand, pattern, ..
             }
@@ -6258,13 +6247,6 @@ impl Expr<'_> {
             Expr::InList { operand, list, .. } => {
                 operand.for_each_column(f);
                 list.iter().for_each(|e| e.for_each_column(f));
-            }
-            Expr::Between {
-                operand, low, high, ..
-            } => {
-                operand.for_each_column(f);
-                low.for_each_column(f);
-                high.for_each_column(f);
             }
             Expr::Like {
                 operand, pattern, ..
@@ -6355,13 +6337,6 @@ impl Expr<'_> {
                 operand.for_each_column_reference(f);
                 list.iter()
                     .for_each(|expression| expression.for_each_column_reference(f));
-            }
-            Expr::Between {
-                operand, low, high, ..
-            } => {
-                operand.for_each_column_reference(f);
-                low.for_each_column_reference(f);
-                high.for_each_column_reference(f);
             }
             Expr::Like {
                 operand, pattern, ..

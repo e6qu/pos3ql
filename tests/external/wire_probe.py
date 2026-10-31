@@ -1216,6 +1216,200 @@ def test_bind_rejects_mismatched_result_format_count():
     s.close()
 
 
+def test_cursor_hold_copy_boundary_preserves_snapshot_and_abort_cleanup():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    setup = simple_query(s, "CREATE TABLE wire_hold_copy(id integer); INSERT INTO wire_hold_copy VALUES (1),(2),(3); DECLARE survivor NO SCROLL CURSOR WITH HOLD FOR SELECT id FROM wire_hold_copy LIMIT 1")
+    check("hold COPY: setup succeeds", not any(kind == b"E" for kind, _ in setup), setup)
+    for name, data, state in [("copy_held", b"4\n", None), ("copy_discarded", b"invalid\n", b"22P02")]:
+        sql = f"DECLARE {name} NO SCROLL CURSOR WITH HOLD FOR SELECT id FROM wire_hold_copy; COPY wire_hold_copy FROM STDIN"
+        s.sendall(frontend_message(b"Q", sql.encode() + b"\x00"))
+        result = []
+        while True:
+            item = read_message(s)
+            result.append(item)
+            if item[0] in (b"G", b"Z"):
+                break
+        check("hold COPY: declaration reaches COPY input", result[-1][0] == b"G", result)
+        if result[-1][0] != b"G":
+            break
+        s.sendall(frontend_message(b"d", data) + frontend_message(b"c"))
+        while True:
+            item = read_message(s)
+            result.append(item)
+            if item[0] == b"Z":
+                break
+        errors = [payload for kind, payload in result if kind == b"E"]
+        check("hold COPY: transaction completes with the expected status",
+              result[-1] == (b"Z", b"I")
+              and (not errors if state is None else len(errors) == 1 and b"C" + state + b"\x00" in errors[0]), result)
+        if state is None:
+            fetched = simple_query(s, "FETCH ALL FROM copy_held; CLOSE copy_held")
+            check("hold COPY: the declaration excludes rows inserted by later COPY",
+                  not any(kind == b"E" for kind, _ in fetched)
+                  and [text_row_fields(payload)[0] for kind, payload in fetched if kind == b"D"] == ["1", "2", "3"], fetched)
+        else:
+            absent = simple_query(s, "SELECT count(*) FROM pg_cursors WHERE name='copy_discarded'")
+            check("hold COPY: abort closes the new cursor", first_text_row(absent) == "0", absent)
+    survivor = simple_query(s, "FETCH ALL FROM survivor; CLOSE survivor")
+    check("hold COPY: an earlier held cursor survives another transaction's abort", first_text_row(survivor) == "1", survivor)
+    simple_query(s, "DROP TABLE wire_hold_copy")
+    s.close()
+
+
+def test_cursor_hold_commits_at_message_and_sync_boundaries():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    setup = simple_query(s, "CREATE TABLE wire_hold_input(id integer); INSERT INTO wire_hold_input VALUES (1),(2),(3)")
+    failed = simple_query(s, "DECLARE discarded NO SCROLL CURSOR WITH HOLD FOR SELECT id FROM wire_hold_input; SELECT 1/0")
+    removed = simple_query(s, "SELECT count(*) FROM pg_cursors WHERE name='discarded'")
+    check("hold cursor: failed implicit query closes its new cursor",
+          not any(kind == b"E" for kind, _ in setup)
+          and any(kind == b"E" and b"C22012\x00" in payload for kind, payload in failed)
+          and failed[-1] == (b"Z", b"I") and first_text_row(removed) == "0", failed + removed)
+    declared = simple_query(s, "DECLARE held NO SCROLL CURSOR WITH HOLD FOR SELECT id FROM wire_hold_input LIMIT 2")
+    first = simple_query(s, "BEGIN; FETCH NEXT FROM held; ROLLBACK")
+    second = simple_query(s, "FETCH NEXT FROM held")
+    simple_query(s, "CLOSE held")
+    check("hold cursor: autocommit saves rows and a later rollback keeps position",
+          not any(kind == b"E" for messages in (declared, first, second) for kind, _ in messages)
+          and declared[-1] == (b"Z", b"I")
+          and first_text_row(first) == "1" and first_text_row(second) == "2", declared + first + second)
+    setup = simple_query(s,
+        "CREATE TABLE wire_hold_gate(id integer); "
+        "CREATE FUNCTION wire_hold_check() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN "
+        "IF (SELECT count(*) FROM pg_cursors WHERE name='inspected') <> 1 THEN RAISE EXCEPTION 'cursor missing'; END IF; "
+        "RAISE EXCEPTION 'cursor visible'; END $$; "
+        "CREATE CONSTRAINT TRIGGER wire_hold_check AFTER INSERT ON wire_hold_gate DEFERRABLE INITIALLY DEFERRED "
+        "FOR EACH ROW EXECUTE FUNCTION wire_hold_check()")
+    inspected = simple_query(s, "DECLARE inspected CURSOR WITH HOLD FOR SELECT id FROM wire_hold_input; INSERT INTO wire_hold_gate VALUES (1)")
+    check("hold cursor: implicit commit triggers see the connection's cursor catalog",
+          not any(kind == b"E" for kind, _ in setup)
+          and any(kind == b"E" and b"CP0001\x00" in payload and b"Mcursor visible\x00" in payload for kind, payload in inspected)
+          and inspected[-1] == (b"Z", b"I"), setup + inspected)
+    simple_query(s, "DROP TABLE wire_hold_gate; DROP FUNCTION wire_hold_check()")
+    parse = frontend_message(b"P", b"hold_statement\x00DECLARE held SCROLL CURSOR WITH HOLD FOR SELECT id FROM wire_hold_input\x00\x00\x00")
+    bind = frontend_message(b"B", b"\x00hold_statement\x00" + struct.pack("!hhh", 0, 0, 0))
+    s.sendall(parse + bind + frontend_message(b"E", b"\x00" + struct.pack("!i", 0)) + frontend_message(b"S"))
+    declared = []
+    while True:
+        item = read_message(s)
+        declared.append(item)
+        if item[0] == b"Z":
+            break
+    first = simple_query(s, "BEGIN; FETCH NEXT FROM held; ROLLBACK")
+    last = simple_query(s, "FETCH LAST FROM held")
+    cleanup = simple_query(s, "CLOSE held; DROP TABLE wire_hold_input")
+    check("hold cursor: Sync commits the extended-protocol declaration",
+          not any(kind == b"E" for messages in (declared, first, last, cleanup) for kind, _ in messages)
+          and declared[-1] == (b"Z", b"I")
+          and first_text_row(first) == "1" and first_text_row(last) == "3", declared + first + last + cleanup)
+    s.close()
+
+
+def test_cursor_preserves_declared_null_parameter_after_first_hundred():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    simple_query(s, "BEGIN")
+    query = (
+        "DECLARE wire_typed_cursor NO SCROLL CURSOR FOR "
+        "SELECT pg_typeof($101)::text AS kind, $101 AS value"
+    )
+    parameter_count = 101
+    parse = frontend_message(
+        b"P", b"wire_typed_statement\x00" + query.encode() + b"\x00"
+        + struct.pack("!h", parameter_count) + struct.pack("!i", 1082) * parameter_count,
+    )
+    bind = frontend_message(
+        b"B", b"\x00wire_typed_statement\x00" + struct.pack("!hh", 0, parameter_count)
+        + struct.pack("!i", -1) * parameter_count + struct.pack("!h", 0),
+    )
+    s.sendall(
+        parse + bind + frontend_message(b"E", b"\x00" + struct.pack("!i", 0))
+        + frontend_message(b"S")
+    )
+    opened = []
+    while True:
+        item = read_message(s)
+        opened.append(item)
+        if item[0] == b"Z":
+            break
+    check(
+        "cursor captures all declared null parameter types",
+        not any(kind == b"E" for kind, _ in opened)
+        and (b"C", b"DECLARE CURSOR\x00") in opened,
+        opened,
+    )
+    fetched = simple_query(s, "FETCH NEXT FROM wire_typed_cursor")
+    description = next((payload for kind, payload in fetched if kind == b"T"), None)
+    row = next((payload for kind, payload in fetched if kind == b"D"), None)
+    check(
+        "cursor retains date type for null $101 after opening command ends",
+        description is not None and row_description_type_oids(description) == [25, 1082]
+        and row == struct.pack("!hi", 2, 4) + b"date" + struct.pack("!i", -1),
+        fetched,
+    )
+    simple_query(s, "ROLLBACK")
+    s.close()
+
+
+def test_nested_function_parameters_keep_their_declaration_over_wire_types():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    setup = simple_query(
+        s,
+        "CREATE FUNCTION wire_parameter_scope(integer) RETURNS text LANGUAGE SQL "
+        "AS 'SELECT pg_typeof($1)::text'; "
+        "CREATE FUNCTION wire_positional_cursor(date) RETURNS refcursor LANGUAGE plpgsql AS $$ "
+        "DECLARE c refcursor := 'wire_positional'; BEGIN "
+        "OPEN c FOR SELECT pg_typeof($1)::text AS kind, $1 AS value; RETURN c; END $$; "
+        "CREATE DOMAIN wire_argument_day AS date; "
+        "CREATE FUNCTION wire_positional_domain(wire_argument_day) RETURNS refcursor LANGUAGE plpgsql AS $$ "
+        "DECLARE c refcursor := 'wire_domain'; BEGIN "
+        "OPEN c FOR SELECT pg_typeof($1)::text AS kind, $1 AS value; RETURN c; END $$; "
+        "CREATE FUNCTION wire_dynamic_cursor(integer) RETURNS refcursor LANGUAGE plpgsql AS $$ "
+        "DECLARE c refcursor := 'wire_dynamic'; d date; BEGIN "
+        "OPEN c FOR EXECUTE 'SELECT pg_typeof($1)::text AS kind, $1 AS value' USING d; RETURN c; END $$",
+    )
+    check("nested parameter type fixture succeeds", not any(kind == b"E" for kind, _ in setup), setup)
+    for query, input_oid, expected, cursor_kind in [
+        ("SELECT wire_parameter_scope($1::integer)", 20, "integer", None),
+        ("SELECT wire_positional_cursor($1::date)", 25, "wire_positional", "date"),
+        ("SELECT wire_positional_domain($1::wire_argument_day)", 25, "wire_domain", "wire_argument_day"),
+        ("SELECT wire_dynamic_cursor($1::integer)", 20, "wire_dynamic", "date"),
+    ]:
+        simple_query(s, "BEGIN")
+        parse = frontend_message(b"P", b"\x00" + query.encode() + b"\x00" + struct.pack("!hi", 1, input_oid))
+        bind = frontend_message(b"B", b"\x00\x00" + struct.pack("!hhih", 0, 1, -1, 0))
+        s.sendall(parse + bind + frontend_message(b"E", b"\x00" + struct.pack("!i", 0)) + frontend_message(b"S"))
+        output = []
+        while True:
+            item = read_message(s)
+            output.append(item)
+            if item[0] == b"Z":
+                break
+        check("callee parameter declaration overrides caller Bind type", first_text_row(output) == expected, output)
+        if cursor_kind is not None:
+            output = simple_query(s, "FETCH NEXT FROM " + expected)
+            description = next((payload for kind, payload in output if kind == b"T"), None)
+            row = next((payload for kind, payload in output if kind == b"D"), None)
+            check(
+                "cursor preserves the declared null type and exposes its wire representation",
+                description is not None and row_description_type_oids(description) == [25, 1082]
+                and row == struct.pack("!hi", 2, len(cursor_kind)) + cursor_kind.encode() + struct.pack("!i", -1),
+                output,
+            )
+        simple_query(s, "ROLLBACK")
+    simple_query(s, "DROP FUNCTION wire_parameter_scope(integer); DROP FUNCTION wire_positional_cursor(date); "
+                 "DROP FUNCTION wire_positional_domain(wire_argument_day); DROP FUNCTION wire_dynamic_cursor(integer); "
+                 "DROP DOMAIN wire_argument_day")
+    s.close()
+
+
 def test_routine_contract_infers_untyped_parse_parameter():
     s = connect()
     s.sendall(startup_payload(0))

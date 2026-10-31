@@ -108,6 +108,15 @@ bad() { FAIL=$((FAIL+1)); echo "FAIL: $1"; }
 
 cleanup() {
   local status=$?
+  if (( status != 0 )); then
+    mkdir -p "$EVIDENCE/diagnostics" || status=1
+    local diagnostic
+    for diagnostic in "$WORK"/*.pg "$WORK"/*.p3 "$WORK"/*.diff \
+        "$WORK"/*.stderr "$WORK"/*.out "$WORK"/*.log; do
+      [[ -f "$diagnostic" ]] || continue
+      cp "$diagnostic" "$EVIDENCE/diagnostics/" || status=1
+    done
+  fi
   if (( status != 0 )) && [[ -f "$WORK/p3.log" ]]; then
     printf '%s\n' 'pos3ql log after differential failure:' >&2
     tail -80 "$WORK/p3.log" >&2

@@ -95,6 +95,7 @@ pub(crate) enum RowWriteStatistics {
 enum PendingPublication {
     Written(PendingWriteUndo),
     Retry,
+    HistoryFull(SqlError),
     DefinitionBusy,
     Wait(u32, &'static str),
 }
@@ -180,6 +181,7 @@ impl Storage {
             ));
         }
         let txid = target.transaction();
+        let mut reclaimed_history = false;
         loop {
             {
                 let definition = self.tables[table_index].definition.read();
@@ -198,6 +200,19 @@ impl Storage {
             match self.publish_pending_write(prepared)? {
                 PendingPublication::Written(undo) => return Ok(undo),
                 PendingPublication::Retry => continue,
+                PendingPublication::HistoryFull(error) => {
+                    if reclaimed_history {
+                        return Err(error);
+                    }
+                    reclaimed_history = true;
+                    // Bound foreground cleanup and retain its shared cursor.
+                    // Retrying consumes the same owned input, not SQL effects.
+                    if self.advance_history_cleanup(super::snapshot_reclamation::SLOTS_PER_BATCH)
+                        != HistoryReclamation::Advanced
+                    {
+                        return Err(error);
+                    }
+                }
                 PendingPublication::DefinitionBusy => {
                     // Wait outside the snapshot registry and retain the original
                     // request identity when byte preparation needs another turn.
@@ -467,21 +482,10 @@ impl Storage {
             pending: PendingVersions::empty(),
         });
         if publication.row_layout.obsolete(&state) {
-            prune_committed_history(
-                &mut versions.committed_row_versions,
-                &mut state.history,
-                None,
-            );
+            prune_committed_history(&mut versions.committed_row_versions, &mut state, None);
             state.committed = None;
         }
-        // Readers at or after the current image need no earlier boundary.
-        let retained = oldest
-            .filter(|snapshot| !state.has_committed_version() || *snapshot < state.committed_lsn);
-        prune_committed_history(
-            &mut versions.committed_row_versions,
-            &mut state.history,
-            retained,
-        );
+        prune_committed_history(&mut versions.committed_row_versions, &mut state, oldest);
         // Pruning releases slots, so publish its chain handles even if a later
         // capacity check fails. Readers can never traverse a released chain.
         if current.is_some() {
@@ -505,6 +509,21 @@ impl Storage {
             self.max_row_versions_per_row,
             change,
         )?;
+        if self.transaction_mode == crate::config::TransactionMode::Mvcc
+            && state.pending.len() == 1
+            && state.has_committed_version()
+        {
+            match reserve_history_slot(&mut versions.committed_row_versions) {
+                Ok(reservation) => {
+                    state.pending.history_reservation =
+                        super::row_versions::PendingHistory::Reserved(reservation)
+                }
+                Err(error) => {
+                    pop_pending_version(&mut versions, &mut state.pending);
+                    return Ok(PendingPublication::HistoryFull(error));
+                }
+            }
+        }
         let undo = PendingWriteUndo {
             source: RowTableSource::capture(self, table, definition.identity),
             identity,
@@ -556,7 +575,7 @@ impl Storage {
         if head.identity != undo.identity || head.change.txid != txid {
             return;
         }
-        pop_pending_version(&mut versions.pending_row_versions, &mut state.pending);
+        pop_pending_version(versions, &mut state.pending);
         // A committed deletion still shadows older immutable SST images.
         if (!state.has_committed_version() && state.history.is_empty() && state.pending.is_none())
             || Self::redundant_spilled_row_state(state)
@@ -2020,7 +2039,13 @@ mod tests {
         while statistics.relation_transactions.len() < statistics.relation_transactions.capacity() {
             statistics
                 .relation_transactions
-                .push(RelationTransactionStatistics::new(8, table, 1))
+                .push(RelationTransactionStatistics::new(
+                    8,
+                    table,
+                    1,
+                    storage.tables[table].database(),
+                    storage.tables[table].identity().created_at,
+                ))
                 .unwrap();
         }
         std::thread::scope(|scope| {

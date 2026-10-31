@@ -458,6 +458,7 @@ pub(super) fn resolve_default(
             group: None,
             aggs: None,
             subs: None,
+            subquery_executor: None,
             windows: None,
             catalog: Some(&catalog),
             srf_index: None,
@@ -640,13 +641,6 @@ fn validate_check_refs(
             for a in *list {
                 validate_check_refs(a, def, cols)?;
             }
-        }
-        Expr::Between {
-            operand, low, high, ..
-        } => {
-            validate_check_refs(operand, def, cols)?;
-            validate_check_refs(low, def, cols)?;
-            validate_check_refs(high, def, cols)?;
         }
         Expr::Like {
             operand, pattern, ..

@@ -5,8 +5,27 @@ use crate::config::Config;
 use crate::mem::arena::{ArenaSliceError, ArenaSliceHandle};
 use crate::mem::budget::{Budget, BudgetError};
 use crate::storage::{
-    MemberCursor, RowReadBuffers, SpillWalkProgress, SpilledRow, SpilledRowRepresentation,
+    HeapRowRead, MemberCursor, RowReadBuffers, SpillWalkProgress, SpilledRowRepresentation,
 };
+
+pub(crate) struct CursorRow<'a> {
+    pub(crate) rowid: u64,
+    bytes: CursorRowBytes<'a>,
+}
+
+enum CursorRowBytes<'a> {
+    Heap(HeapRowRead),
+    Spilled(SpilledRowRepresentation<'a>),
+}
+
+impl CursorRow<'_> {
+    pub(crate) fn representation(&self) -> SpilledRowRepresentation<'_> {
+        match &self.bytes {
+            CursorRowBytes::Heap(bytes) => SpilledRowRepresentation::Encoded(bytes),
+            CursorRowBytes::Spilled(representation) => *representation,
+        }
+    }
+}
 
 pub(crate) struct RowCursor {
     source: Option<RowScanSource>,
@@ -59,14 +78,16 @@ fn state_error(error: ArenaSliceError) -> SqlError {
     }
 }
 
-fn cursor_capacity() -> SqlError {
+fn cursor_capacity(error: crate::mem::arena::ArenaFull) -> SqlError {
     sql_err!(
         sqlstate::PROGRAM_LIMIT_EXCEEDED,
-        "query cursor positions exceed the execution arena"
+        "query cursor memory exhausted: {}",
+        error
     )
 }
 
 impl RowCursor {
+    #[cfg(test)]
     pub(crate) fn position_bytes(rows: usize, members: usize) -> Option<usize> {
         Arena::retained_slice_capacity::<CapturedRowRecord>(rows)?
             .checked_add(Arena::retained_slice_capacity::<MemberCursor>(members)?)
@@ -100,7 +121,7 @@ impl RowCursor {
             |count| {
                 let handle = arena
                     .retain_slice_with(count, |_| CapturedRowRecord::EMPTY)
-                    .map_err(|_| cursor_capacity())?;
+                    .map_err(cursor_capacity)?;
                 rows_handle = Some(handle);
                 arena.retained_slice_mut(handle).map_err(state_error)
             },
@@ -112,7 +133,7 @@ impl RowCursor {
             .unwrap_or(0);
         let members = arena
             .retain_slice_with(member_count, |_| MemberCursor::EMPTY)
-            .map_err(|_| cursor_capacity())?;
+            .map_err(cursor_capacity)?;
         self.source = Some(RowScanSource {
             snapshot,
             rows: rows_handle.expect("successful capture allocated its resident selections"),
@@ -125,6 +146,7 @@ impl RowCursor {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn rewind(&mut self, arena: &Arena) -> Result<(), SqlError> {
         let source = self.source.as_mut().ok_or_else(|| {
             sql_err!(
@@ -148,7 +170,7 @@ impl RowCursor {
         state_arena: &Arena,
         arena: &'arena Arena,
         decoded_columns: Option<&[bool; crate::storage::MAX_COLUMNS]>,
-    ) -> Result<Option<SpilledRow<'arena>>, SqlError> {
+    ) -> Result<Option<CursorRow<'arena>>, SqlError> {
         crate::sql::query::check_timeout()?;
         let source = self.source.as_mut().ok_or_else(|| {
             sql_err!(
@@ -173,25 +195,21 @@ impl RowCursor {
                 arena
                     .alloc_slice_copy(bytes)
                     .map(|bytes| &*bytes)
-                    .map_err(|_| {
-                        sql_err!(
-                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                            "query cursor row exceeds the statement arena"
-                        )
-                    })
+                    .map_err(cursor_capacity)
             };
             let bytes = match home.bytes {
-                crate::storage::row_images::VisibleRowBytes::Heap(bytes) => copy(&bytes)?,
+                crate::storage::row_images::VisibleRowBytes::Heap(bytes) => {
+                    CursorRowBytes::Heap(bytes)
+                }
                 crate::storage::row_images::VisibleRowBytes::Spilled(row) => {
-                    row.with_bytes_in(&mut buffers.row, copy)?
+                    CursorRowBytes::Spilled(SpilledRowRepresentation::Encoded(
+                        row.with_bytes_in(&mut buffers.row, copy)?,
+                    ))
                 }
             };
             let rowid = record.rowid;
             source.resident += 1;
-            return Ok(Some(SpilledRow {
-                rowid,
-                representation: SpilledRowRepresentation::Encoded(bytes),
-            }));
+            return Ok(Some(CursorRow { rowid, bytes }));
         }
         let mut members = state_arena
             .retained_slice_mut(source.members)
@@ -214,9 +232,9 @@ impl RowCursor {
                         .resume(&mut members, &buffers.scan, 1, u64::MAX),
                 ),
                 &mut |rowid, _, representation| {
-                    row = Some(SpilledRow {
+                    row = Some(CursorRow {
                         rowid,
-                        representation,
+                        bytes: CursorRowBytes::Spilled(representation),
                     });
                     Ok(ControlFlow::Break(()))
                 },
@@ -235,6 +253,159 @@ mod tests {
     use crate::sql::types::{ColType, Datum};
     use crate::storage::RowState;
     use crate::storage::tests::{make_def, test_budget, test_config};
+
+    #[test]
+    fn cursor_owned_query_retains_a_physical_plan_after_owner_and_storage_moves() {
+        use crate::mem::FixedBuf;
+        use crate::pg::respond::Responder;
+        use crate::sql::cursor::CursorQuery;
+
+        // Exercise real owners with minimal unused catalog capacity under
+        // Miri's interpreter, including the required built-in text objects.
+        let mut config = test_config();
+        config.memtable_bytes = 256;
+        config.max_tables = 2;
+        config.table_rows = 2;
+        config.txn_rows = 2;
+        config.max_catalog_versions_per_object = 1;
+        config.catalog_history_bytes = 4096;
+        config.max_spill_generations_per_table = 1;
+        config.max_views = 1;
+        config.max_materialized_views = 1;
+        config.max_routines = 1;
+        config.max_casts = 1;
+        config.max_operators = 1;
+        config.max_operator_families = 1;
+        config.max_operator_classes = 1;
+        config.max_composites = 1;
+        config.max_domains = 1;
+        config.max_enums = 1;
+        config.max_triggers = 1;
+        config.max_policies = 1;
+        config.max_publications = 1;
+        config.max_text_search_objects = 21;
+        config.max_large_objects = 1;
+        config.large_object_pages = 1;
+        config.max_extended_statistics = 1;
+        config.max_subscriptions = 1;
+        config.max_foreign_data_wrappers = 1;
+        config.max_foreign_servers = 1;
+        config.max_user_mappings = 1;
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
+        let visibility = storage.nested_statement_snapshot(7);
+        let table = storage
+            .create_table(make_def(
+                "retained_plan",
+                &[
+                    ("n", ColType::Int4, true),
+                    ("payload", ColType::Text, false),
+                ],
+            ))
+            .unwrap();
+        for rowid in 1..=2 {
+            let location = storage
+                .heap
+                .append_row(&[Datum::Int4(rowid as i32), Datum::Text("value")])
+                .unwrap();
+            storage.tables[table]
+                .rows
+                .insert(rowid, RowState::committed_only_at(location, 7))
+                .unwrap();
+        }
+        let mut read_budget = Budget::new(RowCursorBuffers::allocation_bytes(&config) + (1 << 18));
+        let mut query = CursorQuery::new(&mut read_budget, 1 << 16).unwrap();
+        let work = Arena::new(&mut read_budget, "retained projection work", 1 << 16).unwrap();
+        let mut buffers = RowCursorBuffers::new(&config, &mut read_budget).unwrap();
+        let mut description =
+            FixedBuf::new(&mut read_budget, "retained description", 1024).unwrap();
+        let mut rows = FixedBuf::new(&mut read_budget, "retained rows", 1024).unwrap();
+        let mut small_rows = FixedBuf::new(&mut read_budget, "small retained rows", 1).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            query
+                .bind("SELECT n+0,payload FROM retained_plan WHERE n>0", &[], &[])
+                .unwrap();
+            assert!(
+                query
+                    .prepare_source(
+                        &storage,
+                        0,
+                        &mut Responder::for_cursor(
+                            &mut description,
+                            crate::pg::respond::CursorRowOutput::Save(&mut rows)
+                        )
+                    )
+                    .unwrap()
+            );
+        });
+        assert!(rows.readable().is_empty());
+        let error = crate::mem::guard::forbid_alloc(|| {
+            query.advance_source(
+                &storage,
+                0,
+                0,
+                &work,
+                &mut buffers,
+                &mut Responder::for_cursor(
+                    &mut description,
+                    crate::pg::respond::CursorRowOutput::Save(&mut small_rows),
+                ),
+            )
+        })
+        .unwrap_err();
+        assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+        // The pending row must own its bytes across movement and another edit.
+        let mut query = Box::new(query);
+        let mut storage = Box::new(storage);
+        // A retained plan must not borrow the Storage object or its movable heap.
+        storage
+            .create_table(make_def("another_relation", &[("n", ColType::Int4, true)]))
+            .unwrap();
+        for expected in 1..=2 {
+            rows.clear();
+            crate::mem::guard::forbid_alloc(|| {
+                assert!(
+                    query
+                        .advance_source(
+                            &storage,
+                            0,
+                            0,
+                            &work,
+                            &mut buffers,
+                            &mut Responder::for_cursor(
+                                &mut description,
+                                crate::pg::respond::CursorRowOutput::Save(&mut rows)
+                            )
+                        )
+                        .unwrap()
+                )
+            });
+            let bytes = rows.readable();
+            let length = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
+            assert_eq!(bytes.len(), length + 4);
+            let mut decoded = [Datum::Null; 2];
+            crate::sql::exec::decode_projected_row_into(&bytes[4..], &work, &mut decoded).unwrap();
+            assert_eq!(decoded, [Datum::Int4(expected), Datum::Text("value")]);
+        }
+        assert!(
+            !query
+                .advance_source(
+                    &storage,
+                    0,
+                    0,
+                    &work,
+                    &mut buffers,
+                    &mut Responder::for_cursor(
+                        &mut description,
+                        crate::pg::respond::CursorRowOutput::Save(&mut rows)
+                    )
+                )
+                .unwrap()
+        );
+        crate::mem::guard::forbid_alloc(|| query.clear());
+        assert!(storage.heap.test_exclusive_write().is_ok());
+        drop(visibility);
+    }
 
     #[test]
     fn query_row_cursor_retains_unread_heap_rows_without_borrowing_storage() {
@@ -273,18 +444,19 @@ mod tests {
         );
         assert!(storage.heap.test_exclusive_write().is_ok());
         crate::mem::guard::forbid_alloc(|| cursor.open(&storage, table, 0, &metadata)).unwrap();
+        let row = crate::mem::guard::forbid_alloc(|| {
+            cursor.next(&mut buffers, &metadata, &tiny_output, None)
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(row.rowid, 1);
         assert_eq!(
-            crate::mem::guard::forbid_alloc(|| cursor.next(
-                &mut buffers,
-                &metadata,
-                &tiny_output,
-                None
-            ))
-            .err()
-            .unwrap()
-            .sqlstate,
-            sqlstate::PROGRAM_LIMIT_EXCEEDED
+            tiny_output.used(),
+            0,
+            "resident bytes already have an immutable owner"
         );
+        drop(row);
+        cursor.rewind(&metadata).unwrap();
         storage.commit_drop(table);
         let replacement = storage
             .create_table(make_def("replacement", &[("n", ColType::Int4, true)]))
@@ -298,7 +470,7 @@ mod tests {
             .unwrap()
             .unwrap();
             assert_eq!(row.rowid, expected);
-            let SpilledRowRepresentation::Encoded(bytes) = row.representation else {
+            let SpilledRowRepresentation::Encoded(bytes) = row.representation() else {
                 panic!("heap row")
             };
             let mut values = [Datum::Null];

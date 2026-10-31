@@ -155,13 +155,14 @@ use row_images::{RowByteSource, RowVersionIdentity, VisibleRowBytes};
 pub(crate) use row_map::{RowEntries, RowMap};
 pub(crate) use row_reads::{RowRead, RowSelfChange};
 use row_reads::{RowReadView, RowReadVisitor};
-#[cfg(test)]
-pub(crate) use row_scans::cursor::{RowCursor, RowCursorBuffers};
+pub(crate) use row_scans::cursor::{CursorRow, RowCursor, RowCursorBuffers};
 pub(crate) use row_scans::{CapturedRowScan, ValidationRead};
+#[cfg(test)]
+use row_versions::push_committed_version;
 use row_versions::{
     RowVersionPools, clear_pending_versions, pending_last, pop_pending_version,
-    prune_committed_history, push_committed_version, push_pending_version, release_committed_chain,
-    release_committed_history_through, release_pending_chain,
+    prune_committed_history, push_pending_version, release_committed_chain,
+    release_committed_history_through, release_pending_chain, reserve_history_slot,
 };
 use row_walks::{RowScanIds, RowWalkPool};
 use spill_generations::{
@@ -2704,11 +2705,17 @@ pub(crate) struct PendingChange {
 pub struct PendingVersions {
     tail: Option<usize>,
     len: usize,
+    /// Owned with the pending chain, before any commit can become durable.
+    history_reservation: row_versions::PendingHistory,
 }
 
 impl PendingVersions {
     pub const fn empty() -> Self {
-        Self { tail: None, len: 0 }
+        Self {
+            tail: None,
+            len: 0,
+            history_reservation: row_versions::PendingHistory::None,
+        }
     }
 
     pub fn is_none(&self) -> bool {
@@ -2753,6 +2760,7 @@ impl RowState {
         Self::committed_in_generation(loc, commit_lsn, 0)
     }
 
+    #[cfg(test)]
     pub(crate) fn committed_in_generation(loc: RowLoc, commit_lsn: u64, generation: u64) -> Self {
         Self {
             committed: Some(RowHome::Heap(loc)),
@@ -4130,11 +4138,7 @@ pub(crate) fn committed_row_version_capacity(config: &Config) -> usize {
     if config.transaction_mode == crate::config::TransactionMode::Locking {
         return 0;
     }
-    config
-        .max_tables
-        .saturating_mul(config.table_rows)
-        .saturating_add(config.large_object_pages)
-        .saturating_mul(config.max_row_versions_per_row)
+    config.row_history_slots
 }
 
 pub(crate) fn row_heap_image_capacity(config: &Config) -> usize {
@@ -14235,6 +14239,8 @@ impl RelationCumulativeStatistics {
 pub(crate) struct RelationTransactionStatistics {
     txid: u32,
     table: u32,
+    database: DatabaseOid,
+    created_at: u64,
     nest_level: usize,
     pub(crate) seq_scan: u64,
     last_seq_scan: Option<i64>,
@@ -14253,10 +14259,18 @@ pub(crate) struct RelationTransactionStatistics {
 }
 
 impl RelationTransactionStatistics {
-    const fn new(txid: u32, table: usize, nest_level: usize) -> Self {
+    const fn new(
+        txid: u32,
+        table: usize,
+        nest_level: usize,
+        database: DatabaseOid,
+        created_at: u64,
+    ) -> Self {
         Self {
             txid,
             table: table as u32,
+            database,
+            created_at,
             nest_level,
             seq_scan: 0,
             last_seq_scan: None,
@@ -14742,9 +14756,9 @@ impl CollationRuntime {
                 "database_collation_locale is not a valid locale name"
             ));
         }
-        let mut name = [0i8; LOCALE_NAME_LIMIT];
+        let mut name = [0 as libc::c_char; LOCALE_NAME_LIMIT];
         for (index, byte) in bytes.iter().enumerate() {
-            name[index] = *byte as i8;
+            name[index] = *byte as libc::c_char;
         }
         // SAFETY: `name` is NUL-terminated and the returned locale is owned
         // by this runtime until Drop. No process-global locale is changed.
@@ -16440,7 +16454,7 @@ impl Storage {
                 continue;
             };
             let state = rows.remove(&rowid).expect("selected row exists");
-            release_pending_chain(&mut versions.pending_row_versions, state.pending.tail);
+            release_pending_chain(&mut versions, state.pending);
             release_committed_chain(&mut versions.committed_row_versions, state.history.tail);
             // Lookup backshifts never move a different row's stable slot.
             *cursor += 1;
@@ -16451,7 +16465,7 @@ impl Storage {
     fn remove_row_state(&mut self, table: usize, rowid: u64) -> Option<RowState> {
         let state = self.tables[table].rows.remove(&rowid)?;
         let row_versions = self.row_versions.exclusive();
-        release_pending_chain(&mut row_versions.pending_row_versions, state.pending.tail);
+        release_pending_chain(row_versions, state.pending);
         release_committed_chain(&mut row_versions.committed_row_versions, state.history.tail);
         Some(state)
     }
@@ -16486,6 +16500,7 @@ impl Storage {
         if txid == 0 || table == self.large_object_page_table as usize {
             return Ok(());
         }
+        let identity = self.tables[table].identity();
         let mut cumulative = self.cumulative_statistics();
         let nest_level = cumulative
             .transaction_nesting
@@ -16494,12 +16509,22 @@ impl Storage {
             .map_or(1, |(_, nest_level)| *nest_level);
         let statistics = &mut cumulative.relation_transactions;
         let position = if let Some(position) = statistics.iter().position(|entry| {
-            entry.txid == txid && entry.table as usize == table && entry.nest_level == nest_level
+            entry.txid == txid
+                && entry.table as usize == table
+                && entry.database == identity.database
+                && entry.created_at == identity.created_at
+                && entry.nest_level == nest_level
         }) {
             position
         } else {
             statistics
-                .push(RelationTransactionStatistics::new(txid, table, nest_level))
+                .push(RelationTransactionStatistics::new(
+                    txid,
+                    table,
+                    nest_level,
+                    identity.database,
+                    identity.created_at,
+                ))
                 .map_err(|_| {
                     sql_err!(
                         sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -16518,17 +16543,18 @@ impl Storage {
         table: usize,
         index_oid: Option<i32>,
         index_entries: usize,
+        observed_at: i64,
     ) -> Result<(), SqlError> {
-        let now = crate::sql::datetime::now_micros();
+        self.record_serializable_read(txid, table);
         self.with_relation_transaction_statistics(txid, table, |statistics| {
             if index_oid.is_some() {
                 statistics.idx_scan = statistics.idx_scan.saturating_add(1);
-                statistics.last_idx_scan = Some(now);
+                statistics.last_idx_scan = Some(observed_at);
                 statistics.idx_tup_read =
                     statistics.idx_tup_read.saturating_add(index_entries as u64);
             } else {
                 statistics.seq_scan = statistics.seq_scan.saturating_add(1);
-                statistics.last_seq_scan = Some(now);
+                statistics.last_seq_scan = Some(observed_at);
             }
         })?;
         if let Some(oid) = index_oid {
@@ -16579,7 +16605,7 @@ impl Storage {
                 };
                 let statistics = &mut indexes[position];
                 statistics.idx_scan = statistics.idx_scan.saturating_add(1);
-                statistics.last_idx_scan = Some(now);
+                statistics.last_idx_scan = Some(observed_at);
                 statistics.idx_tup_read =
                     statistics.idx_tup_read.saturating_add(index_entries as u64);
                 break;
@@ -16695,72 +16721,54 @@ impl Storage {
             while let Some(position) = transactions.iter().position(|statistics| {
                 statistics.txid == txid && statistics.nest_level == nest_level
             }) {
-                let mut transaction = transactions.swap_remove(position);
+                let transaction = transactions.swap_remove(position);
                 let table = transaction.table as usize;
                 if table >= relations.len() || table >= self.tables.len() {
                     continue;
                 }
-                let relation = &mut relations[table];
-                relation.seq_scan = relation.seq_scan.saturating_add(transaction.seq_scan);
-                relation.last_seq_scan = match (relation.last_seq_scan, transaction.last_seq_scan) {
+                let parent_nest_level = nest_level - 1;
+                let parent_position = if let Some(position) =
+                    transactions.iter().position(|parent| {
+                        parent.txid == txid
+                            && parent.table == transaction.table
+                            && parent.database == transaction.database
+                            && parent.created_at == transaction.created_at
+                            && parent.nest_level == parent_nest_level
+                    }) {
+                    position
+                } else {
+                    transactions
+                        .push(RelationTransactionStatistics::new(
+                            txid,
+                            table,
+                            parent_nest_level,
+                            transaction.database,
+                            transaction.created_at,
+                        ))
+                        .expect("removing a subtransaction leaves room for its parent");
+                    transactions.len() - 1
+                };
+                // Reading is observable work even when a savepoint is rolled back.
+                // Keep it in this transaction until its top-level completion.
+                let parent = &mut transactions[parent_position];
+                parent.seq_scan = parent.seq_scan.saturating_add(transaction.seq_scan);
+                parent.last_seq_scan = match (parent.last_seq_scan, transaction.last_seq_scan) {
                     (Some(left), Some(right)) => Some(left.max(right)),
                     (None, right) => right,
                     (left, None) => left,
                 };
-                relation.seq_tup_read = relation
-                    .seq_tup_read
-                    .saturating_add(transaction.seq_tup_read);
-                relation.idx_scan = relation.idx_scan.saturating_add(transaction.idx_scan);
-                relation.last_idx_scan = match (relation.last_idx_scan, transaction.last_idx_scan) {
+                parent.seq_tup_read = parent.seq_tup_read.saturating_add(transaction.seq_tup_read);
+                parent.idx_scan = parent.idx_scan.saturating_add(transaction.idx_scan);
+                parent.last_idx_scan = match (parent.last_idx_scan, transaction.last_idx_scan) {
                     (Some(left), Some(right)) => Some(left.max(right)),
                     (None, right) => right,
                     (left, None) => left,
                 };
-                relation.idx_tup_fetch = relation
+                parent.idx_tup_read = parent.idx_tup_read.saturating_add(transaction.idx_tup_read);
+                parent.idx_tup_fetch = parent
                     .idx_tup_fetch
                     .saturating_add(transaction.idx_tup_fetch);
-                if let Some(database_slot) = self
-                    .database_catalog()
-                    .definitions
-                    .iter()
-                    .position(|database| database.oid == self.tables[table].database())
-                {
-                    let database = &mut databases[database_slot];
-                    database.tup_returned = database
-                        .tup_returned
-                        .saturating_add(transaction.seq_tup_read)
-                        .saturating_add(transaction.idx_tup_read);
-                    database.tup_fetched = database
-                        .tup_fetched
-                        .saturating_add(transaction.idx_tup_fetch);
-                }
-                transaction.seq_scan = 0;
-                transaction.last_seq_scan = None;
-                transaction.seq_tup_read = 0;
-                transaction.idx_scan = 0;
-                transaction.last_idx_scan = None;
-                transaction.idx_tup_read = 0;
-                transaction.idx_tup_fetch = 0;
                 if committed {
-                    let parent_nest_level = nest_level - 1;
-                    let parent_position = if let Some(position) =
-                        transactions.iter().position(|parent| {
-                            parent.txid == txid
-                                && parent.table == transaction.table
-                                && parent.nest_level == parent_nest_level
-                        }) {
-                        position
-                    } else {
-                        transactions
-                            .push(RelationTransactionStatistics::new(
-                                txid,
-                                table,
-                                parent_nest_level,
-                            ))
-                            .expect("removing a subtransaction leaves room for its parent");
-                        transactions.len() - 1
-                    };
-                    let parent = &mut transactions[parent_position];
                     if transaction.truncated {
                         if !parent.truncated {
                             parent.pre_truncate_n_tup_ins = parent.n_tup_ins;
@@ -16790,6 +16798,25 @@ impl Storage {
                             transaction.n_tup_del,
                         )
                     };
+                    if let Some(database_slot) = self
+                        .database_catalog()
+                        .definitions
+                        .iter()
+                        .position(|database| database.oid == transaction.database)
+                    {
+                        let database = &mut databases[database_slot];
+                        database.tup_inserted = database.tup_inserted.saturating_add(n_tup_ins);
+                        database.tup_updated = database.tup_updated.saturating_add(n_tup_upd);
+                        database.tup_deleted = database.tup_deleted.saturating_add(n_tup_del);
+                    }
+                    let identity = self.tables[table].identity();
+                    if identity.database != transaction.database
+                        || identity.created_at != transaction.created_at
+                        || identity.existence == CatalogDdlState::Absent
+                    {
+                        continue;
+                    }
+                    let relation = &mut relations[table];
                     relation.n_tup_ins = relation.n_tup_ins.saturating_add(n_tup_ins);
                     relation.n_tup_upd = relation.n_tup_upd.saturating_add(n_tup_upd);
                     relation.n_tup_del = relation.n_tup_del.saturating_add(n_tup_del);
@@ -16799,17 +16826,6 @@ impl Storage {
                         .saturating_add(n_tup_upd);
                     relation.n_ins_since_vacuum =
                         relation.n_ins_since_vacuum.saturating_add(n_tup_ins);
-                    if let Some(database_slot) = self
-                        .database_catalog()
-                        .definitions
-                        .iter()
-                        .position(|database| database.oid == self.tables[table].database())
-                    {
-                        let database = &mut databases[database_slot];
-                        database.tup_inserted = database.tup_inserted.saturating_add(n_tup_ins);
-                        database.tup_updated = database.tup_updated.saturating_add(n_tup_upd);
-                        database.tup_deleted = database.tup_deleted.saturating_add(n_tup_del);
-                    }
                 }
             }
         }
@@ -16853,6 +16869,31 @@ impl Storage {
                     transaction.n_tup_del,
                 )
             };
+            if let Some(database_slot) = self
+                .database_catalog()
+                .definitions
+                .iter()
+                .position(|database| database.oid == transaction.database)
+            {
+                let database = &mut databases[database_slot];
+                database.tup_returned = database
+                    .tup_returned
+                    .saturating_add(transaction.seq_tup_read)
+                    .saturating_add(transaction.idx_tup_read);
+                database.tup_fetched = database
+                    .tup_fetched
+                    .saturating_add(transaction.idx_tup_fetch);
+                database.tup_inserted = database.tup_inserted.saturating_add(n_tup_ins);
+                database.tup_updated = database.tup_updated.saturating_add(n_tup_upd);
+                database.tup_deleted = database.tup_deleted.saturating_add(n_tup_del);
+            }
+            let identity = self.tables[table].identity();
+            if identity.database != transaction.database
+                || identity.created_at != transaction.created_at
+                || identity.existence == CatalogDdlState::Absent
+            {
+                continue;
+            }
             let relation = &mut relations[table];
             relation.seq_scan = relation.seq_scan.saturating_add(transaction.seq_scan);
             relation.last_seq_scan = match (relation.last_seq_scan, transaction.last_seq_scan) {
@@ -16896,24 +16937,6 @@ impl Storage {
                     .saturating_add(n_tup_ins)
                     .saturating_add(n_tup_upd)
                     .saturating_add(n_tup_del);
-            }
-            if let Some(database_slot) = self
-                .database_catalog()
-                .definitions
-                .iter()
-                .position(|database| database.oid == self.tables[table].database())
-            {
-                let database = &mut databases[database_slot];
-                database.tup_returned = database
-                    .tup_returned
-                    .saturating_add(transaction.seq_tup_read)
-                    .saturating_add(transaction.idx_tup_read);
-                database.tup_fetched = database
-                    .tup_fetched
-                    .saturating_add(transaction.idx_tup_fetch);
-                database.tup_inserted = database.tup_inserted.saturating_add(n_tup_ins);
-                database.tup_updated = database.tup_updated.saturating_add(n_tup_upd);
-                database.tup_deleted = database.tup_deleted.saturating_add(n_tup_del);
             }
         }
         if let Some(database_slot) = self.database_slot_by_oid(current_database(), 0) {
@@ -17130,12 +17153,24 @@ impl Storage {
         txid: u32,
         table: usize,
     ) -> RelationTransactionStatistics {
-        let mut total = RelationTransactionStatistics::new(txid, table, 1);
+        let identity = self.tables[table].identity();
+        let mut total = RelationTransactionStatistics::new(
+            txid,
+            table,
+            1,
+            identity.database,
+            identity.created_at,
+        );
         for statistics in self
             .cumulative_statistics()
             .relation_transactions
             .iter()
-            .filter(|entry| entry.txid == txid && entry.table as usize == table)
+            .filter(|entry| {
+                entry.txid == txid
+                    && entry.table as usize == table
+                    && entry.database == identity.database
+                    && entry.created_at == identity.created_at
+            })
         {
             total.seq_scan = total.seq_scan.saturating_add(statistics.seq_scan);
             total.last_seq_scan = match (total.last_seq_scan, statistics.last_seq_scan) {
@@ -34539,15 +34574,36 @@ impl Storage {
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
-    /// Removes a committed row outright (journal replay of a DELETE), retaining
-    /// the shadowing marker a later delta checkpoint emits as a tombstone.
-    pub fn remove_committed(
+    /// Journal replay can also finish a recovered prepared transaction while
+    /// live readers retain earlier values. Keep its already-owned history.
+    pub(crate) fn replay_committed_row(
         &mut self,
         table_index: usize,
         rowid: u64,
+        image: Option<RowLoc>,
         commit_lsn: u64,
     ) -> Result<(), SqlError> {
-        if self.tables[table_index].spill_generations().is_empty()
+        let generation = self.tables[table_index].generation();
+        let mut state = match self.tables[table_index].rows.get(&rowid) {
+            Some(state) => state,
+            None => RowState {
+                committed: None,
+                committed_lsn: 0,
+                committed_generation: None,
+                checkpoint_change_lsn: 0,
+                history: CommittedHistory::empty(),
+                pending: PendingVersions::empty(),
+            },
+        };
+        if state.pending.is_some() {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "journal replay reached an owned pending row"
+            ));
+        }
+        if image.is_none()
+            && state.history.is_empty()
+            && self.tables[table_index].spill_generations().is_empty()
             && std::sync::Arc::strong_count(&self.tables[table_index].checkpoint_deletions) == 1
         {
             if self.remove_row_state(table_index, rowid).is_some() {
@@ -34556,34 +34612,78 @@ impl Storage {
             }
             return Ok(());
         }
-        // The spill list may hold this row, so the delete must both
-        // tombstone (for the next flush) and leave a shadowing marker (for
-        // reads until then) — same discipline as a committed DELETE.
-        self.remove_row_state(table_index, rowid);
+        state.committed = image.map(RowHome::Heap);
+        state.committed_lsn = commit_lsn;
+        state.committed_generation = Some(generation);
+        state.checkpoint_change_lsn = commit_lsn;
         let table = &mut self.tables[table_index];
-        table
-            .rows
-            .insert(
-                rowid,
-                RowState {
-                    committed: None,
-                    committed_lsn: commit_lsn,
-                    committed_generation: Some(0),
-                    checkpoint_change_lsn: commit_lsn,
-                    history: CommittedHistory::empty(),
-                    pending: PendingVersions::empty(),
-                },
+        table.rows.insert(rowid, state).map_err(|error| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "journal replay overflows {}",
+                error.what
             )
-            .map_err(|error| {
-                sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "journal replay overflows {}",
-                    error.what
-                )
-            })?;
+        })?;
         self.mark_value_bindings_changed_at(table_index, commit_lsn);
         let table = &mut self.tables[table_index];
         table.mark_dirty();
+        Ok(())
+    }
+
+    /// Check every touched row before durability. The transaction owns its
+    /// pending row heads, so another writer cannot increase these histories
+    /// while a staged commit waits. Later readers can require one old image;
+    /// they cannot require more than the slot checked here.
+    pub(crate) fn validate_row_history_publication(
+        &self,
+        txid: u32,
+        touched: impl Iterator<Item = (usize, u64)>,
+    ) -> Result<(), SqlError> {
+        if self.transaction_mode == crate::config::TransactionMode::Locking {
+            return Ok(());
+        }
+        for (table_index, rowid) in touched {
+            if self.pending_table_rows_rewritten(table_index, txid) {
+                continue;
+            }
+            let table = &self.tables[table_index];
+            let (snapshots, mut versions, mut rows) = row_ownership::acquire(|| {
+                Ok((
+                    row_ownership::try_mutex(&self.snapshots, "snapshot state lock poisoned")?,
+                    self.row_versions.try_write_for_batch()?,
+                    table.rows.try_write_for_batch()?,
+                ))
+            });
+            let Some(state) = rows.get_mut(&rowid) else {
+                continue;
+            };
+            if !state.has_committed_version()
+                || pending_last(&versions.pending_row_versions, state.pending)
+                    .is_none_or(|pending| pending.txid != txid)
+            {
+                continue;
+            }
+            let oldest = snapshots
+                .retains_for(txid)
+                .then(|| snapshots.oldest())
+                .flatten();
+            if prune_committed_history(&mut versions.committed_row_versions, state, oldest) {
+                versions.history_pressure_changed = true;
+                self.row_versions
+                    .history_pressure
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+            row_versions::validate_history_length(&state.history, self.max_row_versions_per_row)?;
+            if !matches!(
+                state.pending.history_reservation,
+                row_versions::PendingHistory::Reserved(_)
+            ) {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "pending row has no owned history reservation"
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -34759,28 +34859,14 @@ impl Storage {
         // opening this table must not decode its prior rows with the new shape.
         // Already selected byte sources retain their original images.
         if !rewritten && snapshots.retains_for(txid) && state.has_committed_version() {
-            let old = CommittedVersion {
-                home: state.committed,
-                lsn: state.committed_lsn,
-            };
-            push_committed_version(
-                &mut versions.committed_row_versions,
-                &mut state.history,
-                self.max_row_versions_per_row,
-                old,
-            )?;
-            if state.history.len().saturating_add(2) >= self.max_row_versions_per_row {
-                versions.history_pressure_changed = true;
+            versions.retain_current_row(state, self.max_row_versions_per_row)?;
+            if versions.history_pressure_changed {
                 self.row_versions
                     .history_pressure
                     .store(true, std::sync::atomic::Ordering::Release);
             }
         } else {
-            prune_committed_history(
-                &mut versions.committed_row_versions,
-                &mut state.history,
-                None,
-            );
+            prune_committed_history(&mut versions.committed_row_versions, state, None);
         }
         if rewritten {
             for enforcer in publication.enforcers[..n_enforcers].iter_mut().flatten() {
@@ -34824,7 +34910,7 @@ impl Storage {
         state.committed_lsn = commit_lsn;
         state.committed_generation = Some(generation);
         state.checkpoint_change_lsn = commit_lsn;
-        clear_pending_versions(&mut versions.pending_row_versions, &mut state.pending);
+        clear_pending_versions(&mut versions, &mut state.pending);
         if state.committed.is_none()
             && generations.is_empty()
             && state.history.is_empty()
@@ -44155,46 +44241,7 @@ impl Storage {
             return true;
         }
 
-        matches!(
-            (actual_oid, expected_oid),
-            // Numeric widening casts from pg_cast.castcontext = 'i'.
-            (oid::INT2, oid::INT4 | oid::INT8 | oid::NUMERIC | oid::FLOAT4 | oid::FLOAT8)
-                | (oid::INT4, oid::INT8 | oid::NUMERIC | oid::FLOAT4 | oid::FLOAT8)
-                | (oid::INT8, oid::NUMERIC | oid::FLOAT4 | oid::FLOAT8)
-                | (oid::NUMERIC, oid::FLOAT4 | oid::FLOAT8)
-                | (oid::FLOAT4, oid::FLOAT8)
-                // PostgreSQL string-category binary and function casts.
-                | (oid::BPCHAR, oid::VARCHAR | oid::NAME | oid::TEXT)
-                | (oid::VARCHAR, oid::BPCHAR | oid::NAME | oid::TEXT | oid::REGCLASS)
-                | (oid::TEXT, oid::BPCHAR | oid::VARCHAR | oid::NAME | oid::REGCLASS)
-                | (oid::NAME, oid::TEXT)
-                | (oid::BIT, oid::VARBIT)
-                | (oid::VARBIT, oid::BIT)
-                // Date/time and network casts accepted implicitly by PG18.
-                | (oid::DATE, oid::TIMESTAMP | oid::TIMESTAMPTZ)
-                | (oid::TIMESTAMP, oid::TIMESTAMPTZ)
-                | (oid::TIME, oid::TIMETZ | oid::INTERVAL)
-                | (oid::CIDR, oid::INET)
-                | (oid::MACADDR, oid::MACADDR8)
-                | (oid::MACADDR8, oid::MACADDR)
-                // OID alias types are binary-coercible in both directions;
-                // integer casts to OID aliases follow PostgreSQL's pg_cast.
-                | (oid::INT2 | oid::INT4 | oid::INT8, oid::OID)
-                | (oid::INT2 | oid::INT4 | oid::INT8, oid::REGPROC)
-                | (oid::INT2 | oid::INT4 | oid::INT8, oid::REGPROCEDURE)
-                | (oid::INT2 | oid::INT4 | oid::INT8, oid::REGOPER)
-                | (oid::INT2 | oid::INT4 | oid::INT8, oid::REGOPERATOR)
-                | (oid::INT2 | oid::INT4 | oid::INT8, oid::REGCLASS)
-                | (oid::INT2 | oid::INT4 | oid::INT8, oid::REGTYPE)
-                | (oid::INT2 | oid::INT4 | oid::INT8, oid::REGNAMESPACE)
-                | (oid::INT2 | oid::INT4 | oid::INT8, oid::REGROLE)
-                | (oid::OID, oid::REGPROC | oid::REGPROCEDURE | oid::REGOPER | oid::REGOPERATOR | oid::REGCLASS | oid::REGTYPE | oid::REGNAMESPACE | oid::REGROLE)
-                | (oid::REGPROC | oid::REGPROCEDURE | oid::REGOPER | oid::REGOPERATOR | oid::REGCLASS | oid::REGTYPE | oid::REGNAMESPACE | oid::REGROLE, oid::OID)
-                | (oid::REGPROC, oid::REGPROCEDURE)
-                | (oid::REGPROCEDURE, oid::REGPROC)
-                | (oid::REGOPER, oid::REGOPERATOR)
-                | (oid::REGOPERATOR, oid::REGOPER)
-        )
+        crate::sql::types::builtin_implicit_cast(actual.ctype, expected.ctype)
     }
 
     pub(crate) fn domain_base_type_for_oid(&self, type_oid: i32, txid: u32) -> Option<ColType> {
@@ -53757,7 +53804,13 @@ mod tests {
             {
                 statistics
                     .relation_transactions
-                    .push(RelationTransactionStatistics::new(8, table, 1))
+                    .push(RelationTransactionStatistics::new(
+                        8,
+                        table,
+                        1,
+                        storage.tables[table].database(),
+                        storage.tables[table].identity().created_at,
+                    ))
                     .unwrap();
             }
         }
@@ -53911,11 +53964,7 @@ mod tests {
             assert_eq!(storage.row_bytes(table, 1, image, &arena).unwrap(), b"new!");
             let versions = storage.row_versions.exclusive();
             let state = storage.tables[table].rows.get_mut(&1).unwrap();
-            prune_committed_history(
-                &mut versions.committed_row_versions,
-                &mut state.history,
-                None,
-            );
+            prune_committed_history(&mut versions.committed_row_versions, state, None);
             assert_eq!(
                 storage
                     .row_bytes(table, 1, retained, &arena)
@@ -58601,6 +58650,109 @@ mod tests {
     }
 
     #[test]
+    fn cursor_read_statistics_survive_nested_savepoints_without_double_counting() {
+        for release_inner in [false, true] {
+            for release_outer in [false, true] {
+                for commit in [false, true] {
+                    let config = test_config();
+                    let mut budget = test_budget(&config);
+                    let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
+                    let mut definition =
+                        make_def("cursor_statistics", &[("id", ColType::Int4, true)]);
+                    definition.columns[0].primary = true;
+                    let table = storage.create_table(definition).unwrap();
+                    let index = storage
+                        .table_def(table, 0)
+                        .column_index_identity(0)
+                        .unwrap()
+                        .oid();
+                    let database = storage.database_slot_by_oid(current_database(), 0).unwrap();
+                    crate::mem::guard::forbid_alloc(|| {
+                        for level in [2, 3] {
+                            storage.set_cumulative_transaction_nest_level(7, level);
+                            storage
+                                .record_relation_scan(7, table, None, 0, level as i64)
+                                .unwrap();
+                            storage.record_relation_tuple_read(7, table, None).unwrap();
+                            storage
+                                .record_relation_scan(7, table, Some(index), 3, level as i64)
+                                .unwrap();
+                            storage
+                                .record_relation_tuple_read(7, table, Some(index))
+                                .unwrap();
+                        }
+                        storage.finish_cumulative_subtransactions(7, 3, release_inner);
+                        storage.finish_cumulative_subtransactions(7, 2, release_outer);
+                        // Finishing an already-finished savepoint must not add its reads again.
+                        storage.finish_cumulative_subtransactions(7, 2, release_outer);
+                        let transaction = storage.relation_transaction_statistics(7, table);
+                        assert_eq!(transaction.seq_scan, 2);
+                        assert_eq!(transaction.seq_tup_read, 2);
+                        assert_eq!(transaction.idx_scan, 2);
+                        assert_eq!(transaction.idx_tup_read, 6);
+                        assert_eq!(transaction.idx_tup_fetch, 2);
+                        assert_eq!(transaction.last_seq_scan, Some(3));
+                        assert_eq!(transaction.last_idx_scan, Some(3));
+                        assert_eq!(storage.relation_cumulative_statistics(table).seq_scan, 0);
+                        storage.finish_cumulative_transaction(7, commit);
+                        assert_eq!(
+                            storage.relation_transaction_statistics(7, table).seq_scan,
+                            0
+                        );
+                        let total = storage.relation_cumulative_statistics(table);
+                        assert_eq!(total.seq_scan, 2);
+                        assert_eq!(total.seq_tup_read, 2);
+                        assert_eq!(total.idx_scan, 2);
+                        assert_eq!(total.idx_tup_fetch, 2);
+                        assert_eq!(total.last_seq_scan, Some(3));
+                        assert_eq!(total.last_idx_scan, Some(3));
+                        let cumulative = storage.cumulative_statistics();
+                        assert_eq!(cumulative.databases[database].tup_returned, 8);
+                        assert_eq!(cumulative.databases[database].tup_fetched, 2);
+                    });
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cursor_read_statistics_never_follow_a_reused_table_slot() {
+        let config = test_config();
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
+        let old = storage
+            .create_table(make_def("old_statistics", &[("id", ColType::Int4, true)]))
+            .unwrap();
+        storage.set_cumulative_transaction_nest_level(7, 3);
+        storage.record_relation_scan(7, old, None, 0, 1).unwrap();
+        storage.record_relation_tuple_read(7, old, None).unwrap();
+        storage.record_relation_write(7, old, false, true).unwrap();
+        storage.rollback_create(old);
+        let new = storage
+            .create_table(make_def("new_statistics", &[("id", ColType::Int4, true)]))
+            .unwrap();
+        assert_eq!(old, new, "the regression must exercise slot reuse");
+        assert_eq!(storage.relation_transaction_statistics(7, new).seq_scan, 0);
+        storage.record_relation_scan(7, new, None, 0, 2).unwrap();
+        storage.record_relation_tuple_read(7, new, None).unwrap();
+        storage.finish_cumulative_subtransactions(7, 3, false);
+        storage.finish_cumulative_subtransactions(7, 2, true);
+        let transaction = storage.relation_transaction_statistics(7, new);
+        assert_eq!(transaction.seq_scan, 1);
+        assert_eq!(transaction.seq_tup_read, 1);
+        storage.finish_cumulative_transaction(7, true);
+        let total = storage.relation_cumulative_statistics(new);
+        assert_eq!(total.seq_scan, 1);
+        assert_eq!(total.seq_tup_read, 1);
+        assert_eq!(total.n_tup_ins, 0);
+        assert_eq!(total.n_dead_tup, 0);
+        let database = storage.database_slot_by_oid(current_database(), 0).unwrap();
+        let cumulative = storage.cumulative_statistics();
+        assert_eq!(cumulative.databases[database].tup_returned, 2);
+        assert_eq!(cumulative.databases[database].tup_inserted, 1);
+    }
+
+    #[test]
     fn relation_identity_statistics_retire_without_growth_or_cross_database_reset() {
         let config = test_config();
         let mut budget = test_budget(&config);
@@ -58616,7 +58768,13 @@ mod tests {
             .unwrap()
             .oid();
         storage
-            .record_relation_scan(1, table, Some(original), 1)
+            .record_relation_scan(
+                1,
+                table,
+                Some(original),
+                1,
+                crate::sql::datetime::now_micros(),
+            )
             .unwrap();
         storage
             .record_relation_tuple_read(1, table, Some(original))
@@ -58639,7 +58797,13 @@ mod tests {
             11
         );
         storage
-            .record_relation_scan(1, table, Some(original), 1)
+            .record_relation_scan(
+                1,
+                table,
+                Some(original),
+                1,
+                crate::sql::datetime::now_micros(),
+            )
             .unwrap();
         storage
             .record_relation_tuple_read(1, table, Some(original))
@@ -58662,7 +58826,13 @@ mod tests {
         };
         crate::mem::guard::forbid_alloc(|| {
             storage
-                .record_relation_scan(1, table, Some(original), 1)
+                .record_relation_scan(
+                    1,
+                    table,
+                    Some(original),
+                    1,
+                    crate::sql::datetime::now_micros(),
+                )
                 .unwrap();
             assert_eq!(
                 storage
@@ -58740,7 +58910,13 @@ mod tests {
                 .oid();
             assert_ne!(replacement, original);
             storage
-                .record_relation_scan(3, table, Some(replacement), 1)
+                .record_relation_scan(
+                    3,
+                    table,
+                    Some(replacement),
+                    1,
+                    crate::sql::datetime::now_micros(),
+                )
                 .unwrap();
             assert_eq!(storage.cumulative_statistics().indexes.len(), capacity);
             assert_eq!(
@@ -58770,7 +58946,13 @@ mod tests {
                 .unwrap()
                 .oid();
             storage
-                .record_relation_scan(4, table, Some(transient), 1)
+                .record_relation_scan(
+                    4,
+                    table,
+                    Some(transient),
+                    1,
+                    crate::sql::datetime::now_micros(),
+                )
                 .unwrap();
             let (target, mut next) = storage.select_table_definition(table, 4);
             next.columns[0].unique = false;
@@ -58797,7 +58979,7 @@ mod tests {
                 .unwrap()
                 .oid();
             storage
-                .record_relation_scan(5, table, Some(saved), 1)
+                .record_relation_scan(5, table, Some(saved), 1, crate::sql::datetime::now_micros())
                 .unwrap();
             {
                 let mut cumulative = storage.cumulative_statistics();
@@ -58824,7 +59006,13 @@ mod tests {
                 .unwrap()
                 .oid();
             storage
-                .record_relation_scan(5, table, Some(discarded), 1)
+                .record_relation_scan(
+                    5,
+                    table,
+                    Some(discarded),
+                    1,
+                    crate::sql::datetime::now_micros(),
+                )
                 .unwrap();
             assert_eq!(storage.cumulative_statistics().indexes.len(), capacity);
             storage.rollback_table_def(third);
@@ -58860,7 +59048,7 @@ mod tests {
             let slot = storage.create_index(explicit, 6).unwrap();
             let oid = crate::sql::catalog::explicit_index_oid(&storage.index(slot));
             storage
-                .record_relation_scan(6, table, Some(oid), 1)
+                .record_relation_scan(6, table, Some(oid), 1, crate::sql::datetime::now_micros())
                 .unwrap();
             assert_eq!(
                 storage.index_cumulative_statistics(database, oid).idx_scan,

@@ -85,7 +85,7 @@ def download(pip, directory, packages):
 
 def environment_ready(python, packages):
     expected = {name: version for name, (version, _) in packages.items()}
-    probe = ("import importlib.metadata as m, json; import psycopg, psycopg2; "
+    probe = ("import importlib.metadata as m, json; import psycopg, psycopg2, sqlalchemy, alembic; "
              "import sys, sysconfig; "
              "assert sys.implementation.cache_tag == " + repr(sys.implementation.cache_tag) + "; "
              "assert sysconfig.get_platform() == " + repr(sysconfig.get_platform()) + "; "

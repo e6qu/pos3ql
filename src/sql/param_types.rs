@@ -166,7 +166,7 @@ impl ParameterInference<'_> {
 
         let scope = match select.from.as_ref() {
             Some(from) => {
-                match query::QueryScope::resolve_schema(self.storage, from, txid, arena) {
+                match query::QueryScope::resolve_schema(self.storage, from, txid, arena, None) {
                     Ok(scope) => Some(scope),
                     Err(_) => return,
                 }
@@ -304,16 +304,6 @@ impl ParameterInference<'_> {
                 }
                 if let Some(type_oid) = infer(left) {
                     assign(right, type_oid, oids);
-                }
-            }
-            Expr::Between {
-                operand, low, high, ..
-            } => {
-                if let Some(type_oid) = infer(operand) {
-                    assign(low, type_oid, oids);
-                    assign(high, type_oid, oids);
-                } else if let Some(type_oid) = infer(low).or_else(|| infer(high)) {
-                    assign(operand, type_oid, oids);
                 }
             }
             Expr::InList { operand, list, .. } => {

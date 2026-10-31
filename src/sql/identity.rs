@@ -141,12 +141,13 @@ fn hash_bytes(mut bytes: &[u8], seed: u64) -> (u32, u32) {
     }
     for (index, byte) in bytes.iter().copied().enumerate() {
         #[cfg(target_endian = "little")]
-        let shift = (index % 4) * 8;
+        let shift = (index % 4 + usize::from(index >= 8)) * 8;
         #[cfg(target_endian = "big")]
         let shift = (3 - index % 4) * 8;
         match index / 4 {
             0 => a = a.wrapping_add(u32::from(byte) << shift),
             1 => b = b.wrapping_add(u32::from(byte) << shift),
+            2 => c = c.wrapping_add(u32::from(byte) << shift),
             _ => unreachable!(),
         }
     }

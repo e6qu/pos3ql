@@ -13,9 +13,7 @@ use std::alloc::Layout;
 
 use super::budget::{Budget, BudgetError};
 
-#[cfg(test)]
 mod retained_slice;
-#[cfg(test)]
 pub(crate) use retained_slice::{ArenaSliceError, ArenaSliceHandle};
 
 pub struct Arena {
@@ -83,10 +81,10 @@ impl<T> Clone for ArenaHandle<T> {
 }
 
 /// An allocation frontier retained while short-lived work above it is
-/// recycled. The marker is arena-specific and intentionally opaque.
+/// recycled. Moves preserve the allocation identity; reset invalidates it.
 #[derive(Clone, Copy)]
 pub(crate) struct ArenaMark {
-    arena: *const Arena,
+    identity: u64,
     offset: usize,
 }
 
@@ -375,7 +373,7 @@ impl Arena {
     /// Marks the current frontier for allocation-free per-row scratch reuse.
     pub(crate) fn mark(&self) -> ArenaMark {
         ArenaMark {
-            arena: self,
+            identity: self.retention_identity,
             offset: self.offset.get(),
         }
     }
@@ -391,8 +389,8 @@ impl Arena {
     /// below the mark.
     pub(crate) unsafe fn rewind_to(&self, mark: ArenaMark) {
         assert!(
-            core::ptr::eq(mark.arena, self),
-            "arena mark belongs to another arena"
+            mark.identity != 0 && mark.identity == self.retention_identity,
+            "arena mark was reset or replaced"
         );
         assert!(
             mark.offset <= self.offset.get(),
@@ -745,6 +743,34 @@ pub fn stable_sort_via<T>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cursor_owned_query_scratch_marks_follow_allocations_across_moves() {
+        let mut budget = Budget::new(8192);
+        let original = Arena::new(&mut budget, "movable query scratch", 4096).unwrap();
+        let other = Arena::new(&mut budget, "other query scratch", 4096).unwrap();
+        let value = original.retain(7u64).unwrap();
+        let stable_used = original.used();
+        let mark = original.mark();
+        original.alloc_slice_with(128, |_| 3u8).unwrap();
+        let mut moved = original;
+        crate::mem::guard::forbid_alloc(|| {
+            unsafe { moved.rewind_to(mark) };
+            assert_eq!(moved.used(), stable_used);
+            assert_eq!(moved.retained(value), Some(7));
+        });
+        let wrong = other.mark();
+        let error = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            moved.rewind_to(wrong);
+        }));
+        assert!(error.is_err());
+        let stale = moved.mark();
+        moved.reset();
+        let error = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            moved.rewind_to(stale);
+        }));
+        assert!(error.is_err());
+    }
+
     #[test]
     fn arena_retained_handles_survive_moves_and_rewinds_but_reject_reset_and_replacement() {
         let mut budget = Budget::new(4096);

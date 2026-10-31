@@ -16,6 +16,43 @@ use crate::sql::ast::{BinaryOp, Expr, UnaryOp};
 use crate::sql::types::ColType;
 
 impl<'a> Parser<'a> {
+    fn between_comparisons(
+        &self,
+        operand: &'a Expr<'a>,
+        low: &'a Expr<'a>,
+        high: &'a Expr<'a>,
+        negated: bool,
+    ) -> Result<&'a Expr<'a>, ParseError> {
+        // PostgreSQL expands BETWEEN before operator/type analysis. Separate
+        // expression identities preserve repeated volatile and subquery calls.
+        // https://github.com/postgres/postgres/blob/REL_18_6/src/backend/parser/parse_expr.c#L1252
+        let repeated = crate::sql::ast::duplicate_expression(operand, self.arena)
+            .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
+        let lower = self.arena_expr(Expr::Binary {
+            operator: if negated {
+                BinaryOp::Lt
+            } else {
+                BinaryOp::GtEq
+            },
+            left: operand,
+            right: low,
+        })?;
+        let upper = self.arena_expr(Expr::Binary {
+            operator: if negated {
+                BinaryOp::Gt
+            } else {
+                BinaryOp::LtEq
+            },
+            left: repeated,
+            right: high,
+        })?;
+        self.arena_expr(Expr::Binary {
+            operator: if negated { BinaryOp::Or } else { BinaryOp::And },
+            left: lower,
+            right: upper,
+        })
+    }
+
     /// The optional `ESCAPE c` trailing a LIKE or SIMILAR TO pattern.
     fn escape_clause(&mut self) -> Result<Option<&'a Expr<'a>>, ParseError> {
         if self.eat_ident("escape")? {
@@ -322,29 +359,31 @@ impl<'a> Parser<'a> {
                 if self.eat_ident("between")? {
                     let left_operand = left;
                     // ASYMMETRIC is the default and says so explicitly.
-                    self.eat_ident("asymmetric")?;
-                    let symmetric = self.eat_ident("symmetric")?;
+                    let symmetric = if self.eat_ident("asymmetric")? {
+                        false
+                    } else {
+                        self.eat_ident("symmetric")?
+                    };
                     // Operands bind tighter than AND here.
                     let low = self.expression(5)?;
                     self.expect_ident("and")?;
                     let high = self.expression(5)?;
-                    left = self.arena_expr(Expr::Between {
-                        operand: left,
-                        low,
-                        high,
-                        negated,
-                    })?;
+                    left = self.between_comparisons(left_operand, low, high, negated)?;
                     if symmetric {
                         // `x BETWEEN SYMMETRIC a AND b` holds when x lies between
                         // the two bounds in either order, which is the pair of
                         // asymmetric tests — AND-ed for NOT BETWEEN, as negating
                         // the disjunction requires.
-                        let swapped = self.arena_expr(Expr::Between {
-                            operand: left_operand,
-                            low: high,
-                            high: low,
+                        let duplicate = |expression| {
+                            crate::sql::ast::duplicate_expression(expression, self.arena)
+                                .map_err(|_| self.arena_full("statement too large for SQL arena"))
+                        };
+                        let swapped = self.between_comparisons(
+                            duplicate(left_operand)?,
+                            duplicate(high)?,
+                            duplicate(low)?,
                             negated,
-                        })?;
+                        )?;
                         left = self.arena_expr(Expr::Binary {
                             operator: if negated { BinaryOp::And } else { BinaryOp::Or },
                             left,
@@ -1064,12 +1103,13 @@ impl<'a> Parser<'a> {
                             name: column,
                         });
                     }
-                    if let Some(index) = self.qualified_routine_parameter(name, column) {
+                    if let Some((index, source)) = self.qualified_routine_parameter(name, column) {
                         self.max_param = self.max_param.max(index);
                         return self.arena_expr(Expr::RoutineParam {
                             qualifier: Some(name),
                             name: column,
                             index,
+                            source,
                         });
                     }
                     return self.arena_expr(Expr::Column {
@@ -1117,12 +1157,13 @@ impl<'a> Parser<'a> {
                         filter: None,
                     });
                 }
-                if let Some(parameter) = self.routine_parameter(name) {
+                if let Some((parameter, source)) = self.routine_parameter(name) {
                     self.max_param = self.max_param.max(parameter);
                     return self.arena_expr(Expr::RoutineParam {
                         qualifier: None,
                         name,
                         index: parameter,
+                        source,
                     });
                 }
                 // Only now, every construct this arm knows having had its
@@ -1173,12 +1214,13 @@ impl<'a> Parser<'a> {
                             name: third,
                         });
                     }
-                    if let Some(index) = self.qualified_routine_parameter(name, column) {
+                    if let Some((index, source)) = self.qualified_routine_parameter(name, column) {
                         self.max_param = self.max_param.max(index);
                         return self.arena_expr(Expr::RoutineParam {
                             qualifier: Some(name),
                             name: column,
                             index,
+                            source,
                         });
                     }
                     return self.arena_expr(Expr::Column {
@@ -1186,12 +1228,13 @@ impl<'a> Parser<'a> {
                         name: column,
                     });
                 }
-                if let Some(parameter) = self.routine_parameter(name) {
+                if let Some((parameter, source)) = self.routine_parameter(name) {
                     self.max_param = self.max_param.max(parameter);
                     return self.arena_expr(Expr::RoutineParam {
                         qualifier: None,
                         name,
                         index: parameter,
+                        source,
                     });
                 }
                 self.arena_expr(Expr::Column {

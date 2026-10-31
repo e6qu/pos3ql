@@ -1,8 +1,6 @@
-# Line coverage over both test layers. The in-process tests alone report 59%
-# and put the wire protocol at 6%, which measures what is instrumented rather
-# than what is tested: the corpora, the sqllogictest blocks and the psql golden
-# suite all drive the server binary as a subprocess. tools/coverage.sh
-# instruments that binary too, which is what takes the figure to ~80%.
+# Instrument both library tests and the server subprocesses used by the SQL,
+# client-protocol, and object-store suites. Library-only coverage omits code
+# exercised through those external clients. tools/coverage.sh merges both layers.
 #
 # Coverage-producing runs retain separate lcov files for the merge gate.
 # Instrumented unit tests are partitioned after one build per worker so test

@@ -83,10 +83,16 @@ pub enum FlushSink<'b> {
     },
 }
 
+pub(crate) enum CursorRowOutput<'b> {
+    Wire,
+    Save(&'b mut FixedBuf),
+    Discard,
+}
+
 pub struct Responder<'b> {
     pub buffer: &'b mut FixedBuf,
     /// SQL cursors retain typed rows; FETCH chooses formats and rendering.
-    cursor_rows: Option<&'b mut FixedBuf>,
+    cursor_rows: CursorRowOutput<'b>,
     /// Extended-protocol Execute must not resend RowDescription (the
     /// client got it from Describe).
     suppress_row_description: bool,
@@ -561,7 +567,7 @@ impl<'b> Responder<'b> {
     pub fn new(buffer: &'b mut FixedBuf) -> Self {
         Self {
             buffer,
-            cursor_rows: None,
+            cursor_rows: CursorRowOutput::Wire,
             suppress_row_description: false,
             formats: ResultFmt::ALL_TEXT,
             result_type_oids: [0; MAX_RESULT_COLS],
@@ -582,7 +588,7 @@ impl<'b> Responder<'b> {
     pub fn for_execute(buffer: &'b mut FixedBuf, formats: ResultFmt) -> Self {
         Self {
             buffer,
-            cursor_rows: None,
+            cursor_rows: CursorRowOutput::Wire,
             suppress_row_description: true,
             formats,
             result_type_oids: [0; MAX_RESULT_COLS],
@@ -600,11 +606,11 @@ impl<'b> Responder<'b> {
         }
     }
 
-    /// Captures the description and typed values without rendering them.
-    pub fn for_cursor(description: &'b mut FixedBuf, rows: &'b mut FixedBuf) -> Self {
+    /// Saves cursor values or discards them without rendering.
+    pub(crate) fn for_cursor(description: &'b mut FixedBuf, rows: CursorRowOutput<'b>) -> Self {
         Self {
             buffer: description,
-            cursor_rows: Some(rows),
+            cursor_rows: rows,
             suppress_row_description: false,
             formats: ResultFmt::ALL_TEXT,
             result_type_oids: [0; MAX_RESULT_COLS],
@@ -627,7 +633,7 @@ impl<'b> Responder<'b> {
     pub fn for_describe(buffer: &'b mut FixedBuf, formats: ResultFmt) -> Self {
         Self {
             buffer,
-            cursor_rows: None,
+            cursor_rows: CursorRowOutput::Wire,
             suppress_row_description: false,
             formats,
             result_type_oids: [0; MAX_RESULT_COLS],
@@ -1051,8 +1057,12 @@ impl<'b> Responder<'b> {
         })
     }
 
-    pub(crate) fn cursor_row_buffer(&mut self) -> Option<&mut FixedBuf> {
-        self.cursor_rows.as_deref_mut()
+    pub(crate) fn cursor_row_output(&mut self) -> CursorRowOutput<'_> {
+        match &mut self.cursor_rows {
+            CursorRowOutput::Wire => CursorRowOutput::Wire,
+            CursorRowOutput::Save(rows) => CursorRowOutput::Save(rows),
+            CursorRowOutput::Discard => CursorRowOutput::Discard,
+        }
     }
 
     pub(crate) fn result_formats(&self) -> ResultFmt {

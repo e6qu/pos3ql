@@ -6,6 +6,138 @@ use core::fmt::Write as _;
 use super::net::NetAddr;
 use super::numeric::Numeric;
 
+/// Builtin implicit conversions shared by overload and common-type resolution.
+pub(crate) fn builtin_implicit_cast(actual: ColType, expected: ColType) -> bool {
+    if actual == expected {
+        return true;
+    }
+    if let (ColType::Array(actual), ColType::Array(expected)) = (actual, expected) {
+        return builtin_implicit_cast(actual.to_coltype(), expected.to_coltype());
+    }
+    let actual_oid = actual.oid();
+    let expected_oid = expected.oid();
+    matches!(
+        (actual_oid, expected_oid),
+        // Numeric widening casts from pg_cast.castcontext = 'i'.
+        (oid::INT2, oid::INT4 | oid::INT8 | oid::NUMERIC | oid::FLOAT4 | oid::FLOAT8)
+        | (oid::INT4, oid::INT8 | oid::NUMERIC | oid::FLOAT4 | oid::FLOAT8)
+        | (oid::INT8, oid::NUMERIC | oid::FLOAT4 | oid::FLOAT8)
+        | (oid::NUMERIC, oid::FLOAT4 | oid::FLOAT8)
+        | (oid::FLOAT4, oid::FLOAT8)
+        // PostgreSQL string-category binary and function casts.
+        | (oid::CHAR, oid::TEXT)
+        | (oid::BPCHAR, oid::VARCHAR | oid::NAME | oid::TEXT)
+        | (oid::VARCHAR, oid::BPCHAR | oid::NAME | oid::TEXT | oid::REGCLASS)
+        | (oid::TEXT, oid::BPCHAR | oid::VARCHAR | oid::NAME | oid::REGCLASS)
+        | (oid::NAME, oid::TEXT)
+        | (oid::BIT, oid::VARBIT)
+        | (oid::VARBIT, oid::BIT)
+        // Date/time and network casts accepted implicitly by PG18.
+        | (oid::DATE, oid::TIMESTAMP | oid::TIMESTAMPTZ)
+        | (oid::TIMESTAMP, oid::TIMESTAMPTZ)
+        | (oid::TIME, oid::TIMETZ | oid::INTERVAL)
+        | (oid::CIDR, oid::INET)
+        | (oid::MACADDR, oid::MACADDR8)
+        | (oid::MACADDR8, oid::MACADDR)
+        // OID alias types are binary-coercible in both directions;
+        // integer casts to OID aliases follow PostgreSQL's pg_cast.
+        | (oid::INT2 | oid::INT4 | oid::INT8, oid::OID)
+        | (oid::INT2 | oid::INT4 | oid::INT8, oid::REGPROC)
+        | (oid::INT2 | oid::INT4 | oid::INT8, oid::REGPROCEDURE)
+        | (oid::INT2 | oid::INT4 | oid::INT8, oid::REGOPER)
+        | (oid::INT2 | oid::INT4 | oid::INT8, oid::REGOPERATOR)
+        | (oid::INT2 | oid::INT4 | oid::INT8, oid::REGCLASS)
+        | (oid::INT2 | oid::INT4 | oid::INT8, oid::REGTYPE)
+        | (oid::INT2 | oid::INT4 | oid::INT8, oid::REGNAMESPACE)
+        | (oid::INT2 | oid::INT4 | oid::INT8, oid::REGROLE)
+        | (oid::OID, oid::REGPROC | oid::REGPROCEDURE | oid::REGOPER | oid::REGOPERATOR | oid::REGCLASS | oid::REGTYPE | oid::REGNAMESPACE | oid::REGROLE)
+        | (oid::REGPROC | oid::REGPROCEDURE | oid::REGOPER | oid::REGOPERATOR | oid::REGCLASS | oid::REGTYPE | oid::REGNAMESPACE | oid::REGROLE, oid::OID)
+        | (oid::REGPROC, oid::REGPROCEDURE)
+        | (oid::REGPROCEDURE, oid::REGPROC)
+        | (oid::REGOPER, oid::REGOPERATOR)
+        | (oid::REGOPERATOR, oid::REGOPER)
+    )
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum CommonTypeError {
+    Category { left: ColType, right: ColType },
+    Conversion { from: ColType, to: ColType },
+}
+
+pub(crate) fn type_category(ctype: ColType) -> &'static str {
+    use ColType::*;
+    match ctype {
+        Void | Internal | PgDdlCommand | Record | AnyArray => "P",
+        Bool => "B",
+        Int2 | Int4 | Int8 | Numeric | Float4 | Float8 | Money | Oid | Regtype | Regproc
+        | Regprocedure | Regoper | Regoperator | Regclass | Regnamespace | Regrole | Regconfig
+        | Regdictionary | Regcollation => "N",
+        Date | Time | Timetz | Timestamp | Timestamptz => "D",
+        Interval => "T",
+        Text | Varchar | Bpchar | Name => "S",
+        Bit { .. } => "V",
+        Inet | Cidr | Macaddr | Macaddr8 => "I",
+        Geometry(_) => "G",
+        Array(_) | Int2Vector | OidVector | PgStatisticArray => "A",
+        Range(_) | Multirange(_) => "R",
+        Enum(_) => "E",
+        Composite(_) => "C",
+        Char | PgNodeTree | PgNdistinct | PgDependencies | PgMcvList => "Z",
+        _ => "U",
+    }
+}
+
+/// The common builtin type follows implicit conversion direction, not the
+/// runtime value or a numeric/string fallback.
+pub(crate) fn common_builtin_type(
+    left: ColType,
+    right: ColType,
+) -> Result<ColType, CommonTypeError> {
+    let target = common_builtin_candidate(left, right)?;
+    for from in [left, right] {
+        if !builtin_implicit_cast(from, target) {
+            return Err(CommonTypeError::Conversion { from, to: target });
+        }
+    }
+    Ok(target)
+}
+
+/// Candidate selection precedes conversion validation for all members of an
+/// ARRAY or CASE, so later declarations still determine analysis errors.
+pub(crate) fn common_builtin_candidate(
+    left: ColType,
+    right: ColType,
+) -> Result<ColType, CommonTypeError> {
+    if left == right {
+        return Ok(left);
+    }
+    if type_category(left) != type_category(right) {
+        return Err(CommonTypeError::Category { left, right });
+    }
+    Ok(
+        if builtin_implicit_cast(left, right) && !builtin_implicit_cast(right, left) {
+            right
+        } else {
+            left
+        },
+    )
+}
+
+pub(crate) fn common_array_element(
+    left: ArrElem,
+    right: ArrElem,
+) -> Result<ArrElem, CommonTypeError> {
+    if left == right {
+        return Ok(left);
+    }
+    let target = common_builtin_type(left.to_coltype(), right.to_coltype())?;
+    ArrElem::from_coltype(target).ok_or(CommonTypeError::Conversion {
+        from: left.to_coltype(),
+        to: target,
+    })
+}
+
 /// OIDs from PostgreSQL's `pg_type` (stable, documented catalog values).
 pub mod oid {
     pub const POINT: i32 = 600;
@@ -5003,7 +5135,7 @@ impl fmt::Display for Datum<'_> {
             Datum::Float4(v) => write_pg_float4(f, *v),
             Datum::Float8(v) => write_pg_float8(f, *v),
             Datum::Char(0) => Ok(()),
-            Datum::Char(value @ 0x20..=0x7e) => f.write_char(char::from(*value)),
+            Datum::Char(value @ 0x01..=0x7f) => f.write_char(char::from(*value)),
             Datum::Char(value) => write!(f, "\\{value:03o}"),
             // The output function emits the padding — psql shows `hi   `.
             Datum::Text(s)
@@ -5296,6 +5428,24 @@ impl<'a> ColDesc<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cursor_common_type_widening_preserves_prior_builtin_conversions() {
+        for prior in ArrElem::BUILTIN.map(ArrElem::to_coltype) {
+            for next in ArrElem::BUILTIN.map(ArrElem::to_coltype) {
+                if prior == next || common_builtin_candidate(prior, next).ok() != Some(next) {
+                    continue;
+                }
+                for earlier in ArrElem::BUILTIN.map(ArrElem::to_coltype) {
+                    assert!(
+                        !builtin_implicit_cast(earlier, prior)
+                            || builtin_implicit_cast(earlier, next),
+                        "candidate widening lost conversion from {earlier:?} through {prior:?} to {next:?}"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn typemod_encodes_postgres_exact_values() {

@@ -618,6 +618,15 @@ pub(crate) fn dispatch<'a>(
                     return Err(arity_err(name, args.len()));
                 }
                 if two_arg {
+                    let base_oid = |argument| -> Result<i32, SqlError> {
+                        let oid = super::super::expression_type_identity(argument, row, hooks)?
+                            .record_field_oid();
+                        Ok(hooks
+                            .catalog
+                            .and_then(|catalog| catalog.domain_base_type(oid))
+                            .map_or(oid, crate::sql::types::ColType::oid))
+                    };
+                    crate::sql::exec::numeric_log_type(base_oid(args[0])?, base_oid(args[1])?)?;
                     let db = eval_full(args[0], arena, params, row, hooks)?;
                     let dv = eval_full(args[1], arena, params, row, hooks)?;
                     if db.is_null() || dv.is_null() {
@@ -724,7 +733,8 @@ pub(crate) fn dispatch<'a>(
                 if y == 0 {
                     return Err(sql_err!(sqlstate::DIVISION_BY_ZERO, "division by zero"));
                 }
-                let r = x % y;
+                // The remainder is zero even when MIN / -1 would overflow.
+                let r = if y == -1 { 0 } else { x % y };
                 Ok(match wl.max(wr) {
                     2 => Datum::Int2(r as i16),
                     4 => Datum::Int4(r as i32),

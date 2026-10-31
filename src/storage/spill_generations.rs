@@ -3718,7 +3718,7 @@ mod tests {
             .unwrap();
             assert_eq!(row.rowid, expected_row);
             let mut values = [Datum::Null];
-            match row.representation {
+            match row.representation() {
                 SpilledRowRepresentation::Encoded(bytes) => {
                     crate::storage::rowenc::decode(bytes, &[ColType::Int4], &mut values).unwrap()
                 }

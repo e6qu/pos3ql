@@ -6,7 +6,7 @@ use {crate::mem::mutex::Mutex, std::sync::TryLockError};
 use super::{Storage, prune_committed_history};
 use crate::mem::budget::{Budget, BudgetError};
 
-const SLOTS_PER_BATCH: NonZeroUsize = NonZeroUsize::new(64).unwrap();
+pub(super) const SLOTS_PER_BATCH: NonZeroUsize = NonZeroUsize::new(64).unwrap();
 
 pub(super) struct SnapshotReclamation {
     workspace: Mutex<ReclamationWorkspace>,
@@ -299,13 +299,14 @@ impl Storage {
                 let obsolete = publication.row_layout.obsolete(state);
                 prune_committed_history(
                     &mut versions.committed_row_versions,
-                    &mut state.history,
+                    state,
                     if obsolete { None } else { oldest },
                 );
                 pressure |= !state.history.is_empty()
                     && state.history.len().saturating_add(2) >= self.max_row_versions_per_row;
-                ((oldest.is_none() || obsolete)
+                ((oldest.is_none_or(|snapshot| state.committed_lsn <= snapshot) || obsolete)
                     && generations.is_empty()
+                    && std::sync::Arc::strong_count(&self.tables[table].checkpoint_deletions) == 1
                     && state.committed.is_none()
                     && state.history.is_empty()
                     && state.pending.is_none())
@@ -353,6 +354,25 @@ mod tests {
         storage.set_lsn(7);
         storage.restore_visible_lsn(7);
         (storage, first, second)
+    }
+
+    #[test]
+    fn snapshot_reclamation_keeps_checkpoint_deletion_markers_until_capture_releases() {
+        let (mut storage, table, _) = fixture();
+        let mut deleted = storage.tables[table].rows.get(&1).unwrap();
+        deleted.committed = None;
+        storage.tables[table].rows.insert(1, deleted).unwrap();
+        let capture = storage.retain_checkpoint_deletions(table);
+        crate::mem::guard::forbid_alloc(|| {
+            storage.prune_snapshot_versions();
+            assert!(
+                storage.tables[table].rows.get(&1).is_some(),
+                "an unpublished checkpoint still needs the deletion marker"
+            );
+            drop(capture);
+            storage.prune_snapshot_versions();
+            assert!(storage.tables[table].rows.get(&1).is_none());
+        });
     }
 
     fn finish_history_work(storage: &Storage) {

@@ -24,7 +24,7 @@ planner transformation, function, or PostgreSQL subsystem.
 | Relational SQL | Tested DDL/DML, MERGE, MVCC transactions, savepoints/two-phase transactions, locks, CTEs, joins, grouping, windows, set operations, views/materialized views, inheritance/partitioning, triggers/rules, cursors, and maintenance |
 | Types | Modeled native scalar/array, range/multirange, enum/domain/composite, JSON/JSONB/jsonpath, XML, temporal, network/geometric, full-text, catalog-reference, ACL, transaction, bit/binary string, and UUID families |
 | Programming | SQL and PL/pgSQL functions/procedures/triggers, anonymous blocks, set-returning/table functions, dynamic SQL, transition/event triggers, privileges, security-definer state, and configuration scopes |
-| Catalogs/tools | Typed PostgreSQL-shaped catalogs and monitoring for tested psql, pg_dump/pg_restore, psycopg, pgJDBC, Npgsql, node-postgres, and pgx paths |
+| Catalogs/tools | Typed PostgreSQL-shaped catalogs and monitoring for tested psql, pg_dump/pg_restore, psycopg2, psycopg 3, SQLAlchemy, Alembic, pgJDBC, Npgsql, node-postgres, and pgx paths |
 | Replication | PostgreSQL publication/subscription and pgoutput interoperability within the [logical replication boundary](logical-replication.md) |
 | Persistence | Immutable object-native commits/checkpoints, recovery, backups, and [versioned durable formats](durable-format.md) |
 
@@ -32,6 +32,32 @@ The source repository's `tests/postgresql18_commands.tsv` records executable
 commands and explicit architecture rejections. Curated differential queries,
 raw-wire/driver probes, and the vendored regression schedule are continuing
 ratchets. Unsupported clauses and type combinations must reject explicitly.
+
+Actual application fixtures create and update SQLAlchemy models, inspect their
+columns and constraints, stream results, and upgrade and reverse Alembic schema
+changes. Both psycopg2 and psycopg 3 run those workflows against PostgreSQL and
+pos3ql. For example, an identity column in a non-default schema must still be
+discovered correctly when an inspector queries the catalogs. These fixtures
+cover the recorded workflows, not every application or library feature.
+
+Catalog column references retain their schema, including in nested queries.
+For example, this form works when an application spells out every name:
+
+```sql
+SELECT pg_catalog.pg_class.relname FROM pg_catalog.pg_class;
+```
+
+Array and `CASE` result types come from their declarations, including subqueries
+and null values. For example, `ARRAY[(SELECT NULL::date)]` is `date[]`, and
+mixing integer and bigint members produces `bigint[]`. An empty constructor
+needs an explicit type, such as `ARRAY[]::integer[]`. Type inspection still
+evaluates its argument: `pg_typeof(nextval('order_numbers'))` issues one number.
+Reached subqueries share the caller's sequence session. Row bounds evaluate
+`OFFSET` before `LIMIT`; both can call supported functions or scalar subqueries.
+Correlated table functions use enclosing column declarations even for empty or
+null inputs. For example, `ARRAY(SELECT d FROM unnest(orders.days) d)` keeps
+the declared element type of `orders.days`; a single-column function alias
+denotes its scalar value. Result descriptions do not require a sample row.
 
 Arrays of domains over built-in arrays are supported. For example, a domain
 `integer_vector` over `integer[]` can be used as `integer_vector[]`.
@@ -135,6 +161,7 @@ boundaries apply through catalogs, wire, WAL, checkpoints, and recovery:
 | Other definition breadth | Documented 64-item constructs, including LIST bounds, inheritance parents, trigger arguments, and routine configuration entries | Shared parse/storage boundary; widening requires review of representation and identity |
 | Stored default expressions | 120 bytes, including enum member bindings and saved catalog display text | Existing startup reservation; SQLSTATE 54000 names an overfull default or bound enum expression before installation |
 | Startup capacities | Independent catalog, connection, transaction/savepoint, row-version, lock, replication, cache, and checkpoint pools | Configuration and exact startup memory plan; named errors before partial publication |
+| MVCC row history | Explicit shared `row_history_slots` across tables/large objects, plus `max_row_versions_per_row` per row | Updates reserve before durability, including queued/prepared commits; exhaustion is `54000`; locking mode requires zero history slots |
 | Durable object requests | `object_store_get_slots` read clients, `object_store_put_slots` journal upload clients, `object_store_block_put_slots` physical upload clients, one separate atomic block client, administrative and independent journal/file cleanup clients, manifest publication clients, and configured credential/ownership clients | Each reserves header and response capacity; journal upload slots also reserve `wal_upload_buffer_bytes` immutable body bytes; physical slots reserve 256 KiB each and share a fixed writer-emission buffer. Read controls, upload outcomes and a 256 KiB block scratch buffer are charged separately from caches; atomic operations may wait synchronously |
 | Durable commit completion | `commit_queue_slots` complete transaction and session-context buffers | SQLSTATE 54000 names queue exhaustion before irreversible log staging; locks and outcomes survive storage waits and client disconnects |
 | Executing snapshot retention | 1,024 owned statement snapshot and selected row/index file owner slots per query workspace; separate transaction snapshots; checked 64-bit identities; independent `2 * max_value_indexes` retained index graphs | File ownership survives scan/arena release and statement waits; startup membership bits deduplicate aliases without using point-source slots; SQLSTATE 54000 before partial registration, file capture or identity reuse |
@@ -200,12 +227,74 @@ use 32-bit addresses; `memtable_bytes` must not exceed `u32::MAX`. Startup reser
 two heap buffers of that size, including one for relocation while readers retain
 old bytes. Reclamation returns `54000` while both buffers are retained. Effective search paths use
 the accepted GUC byte representation. Each cursor reserves `cursor_bytes`
-for typed rows, a 1,024-byte description and `floor(cursor_bytes / 6)` row
+for typed rows, `cursor_query_bytes` for its query, copied parameters and their
+declared types (a `NULL` date parameter still has the date type),
+including local values and types captured by a static procedural `OPEN`,
+a 1,024-byte description and `floor(cursor_bytes / 6)` row
 positions; the connection reserves the same number of fetch-selection positions.
 Each saved row includes a four-byte length and a two-byte column count.
+For retained `NO SCROLL` cursors, `cursor_bytes` bounds one fetched batch;
+the next fetch reuses it. `MOVE` and rows skipped by forward `ABSOLUTE` or
+`RELATIVE` motions do not consume saved-row capacity. A suspended fetch keeps
+its already saved rows until it completes. Other cursor paths still save the
+whole result during opening.
 Long column names can fill the description even when the rows fit. That error
 names the description limit: use fewer or shorter labels. Increasing
 `cursor_bytes` only changes the row capacity.
+Static procedural cursor variables use the shared SELECT and set-query executor.
+For example, `OPEN c FOR SELECT label UNION ALL SELECT label` captures `label`
+when opened, including its type when the value is null. A variable name that
+also names a source column raises `42702`; qualify the table column or rename
+the variable. A caller's wire parameter types do not replace a function's own
+parameter declarations, including a domain's own identity rather than its base
+representation. Dynamic SQL takes parameters only from `USING`: for example,
+`OPEN c FOR EXECUTE 'SELECT $1' USING d` captures a null date as a date, even
+inside a function whose first argument is an integer. Local names do not become
+columns inside the command string. The
+[behavior guide](implemented-baseline.md#reads-keep-their-selected-data)
+defines which query shapes retain input and execution positions, and when
+fetching evaluates expressions or reports their errors.
+The retained reader's selected row identities, saved-file
+positions and copied saved-row input share `cursor_query_bytes`; exhaustion returns
+`54000`. Each query workspace also reserves fixed row and saved-file read
+buffers at startup, accounted separately from `work_arena_bytes`.
+Resident input retains immutable heap bytes through an owned reader rather
+than copying the whole row into that arena. Selected output still must fit
+`cursor_bytes`.
+The cursor keeps its relation in use through end of input until `CLOSE`.
+Destructive table changes in the same session raise `55006`; a table rename
+does not change its saved definition or input. This follows PostgreSQL's
+[active-relation check](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/commands/tablecmds.c).
+Without a scroll option, a retained physical scan is scrollable; a plan with
+no input scan is forward-only. `pg_cursors.is_scrollable` reflects that choice.
+Constant false or null filters request no rows, including a string literal
+coerced to boolean. Type and constant errors precede execution permission checks.
+Holdable versions save unread results during commit, preserving the current
+position and releasing query/input owners before temporary-table commit actions.
+A forward-only held result must fit `cursor_bytes` for its unread suffix;
+a scrolling held result must fit its accumulated history and unread suffix.
+Deferred constraint triggers execute first. Saving currently runs under the
+synchronous commit read scope. `DECLARE ... WITH HOLD` is also accepted without
+an explicit transaction, including at extended-protocol `Sync`. Failed commit
+or implicit-query rollback closes newly created cursors; cursors held by an
+earlier commit survive.
+With explicit `SCROLL`, visited results stay in `cursor_bytes` for backward
+fetches. A forward jump or `MOVE` also saves newly visited rows; `FETCH LAST`
+reads through end of input. This history accumulates across fetches and can
+exhaust its named capacity. Forward-only cursors instead reuse their buffer
+per fetch. Both modes close their reader on a failed fetch.
+With `NO SCROLL`, `MOVE 0` reports whether there is a current row without
+reading it. `FETCH 0` before the first row returns no row; on a current row it
+raises `55000` because rereading would require a backward step. A fetch that
+fails remains failed after rolling back to a savepoint: further fetches raise
+`55000` with `portal "name" cannot be run`. Close and reopen the cursor.
+`MOVE BACKWARD ALL` before the first row returns zero. A negative absolute
+position first consumes the remaining forward input and then fails on its
+backward step. Scan statistics begin with the first requested input, including
+input consumed by `MOVE` or a forward jump. Read counters in
+`pg_stat_xact_user_tables` survive savepoint rollback and release: reading two
+rows and rolling back the savepoint still reports two rows read. A replacement
+table starts with its own counters, even if it reuses internal storage slots.
 JSON/path and XML/XPath limits are specified in [SQL/JSON](sql-json.md) and
 [SQL/XML](sql-xml.md). Inspect the memory plan for the chosen configuration;
 accepted width can still exhaust its named statement or startup budget.

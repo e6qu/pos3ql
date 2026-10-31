@@ -25,15 +25,18 @@ remain in the plan.
 ## Transactions and durable success
 
 Every configuration explicitly selects `transaction_mode` and
-`catalog_history_bytes` before startup:
+`catalog_history_bytes` and `row_history_slots` before startup:
 
 | Mode | Reader and writer behavior | Isolation |
 |---|---|---|
 | `mvcc` | Keeps earlier values while readers need them | Supported PostgreSQL snapshot/isolation behavior, subject to fixed history capacity |
 | `locking` | Keeps current committed values; conflicting relation operations wait | Read committed, including PostgreSQL's equivalent read uncommitted; repeatable read, serializable and exported snapshots return `0A000` |
 
-Use a positive catalog-history reservation in MVCC mode and zero in locking
-mode. Rollback, savepoints and private uncommitted changes work in both modes.
+Use positive history reservations in MVCC mode and zero for both in locking
+mode. Row-history slots are shared across tables and large objects. Updates
+reserve their needed slot before commit, even when a reader starts while the
+commit waits. Rollback releases unused slots. Rollback, savepoints and private
+uncommitted changes work in both modes.
 A long report can retain row and catalog history until their fixed pools fill;
 the server returns a named capacity error instead of growing memory.
 
@@ -164,8 +167,79 @@ SQL cursors save typed values and format each fetched row using the session's
 current settings. For example, a saved `DATE '2020-01-02'` displays as
 `02/01/2020` after `SET DateStyle = 'SQL, DMY'`, including for a cursor kept
 across commit. Procedural `FETCH INTO` assigns the typed value directly.
-Cursor queries still execute during declaration; deferring expressions and
-row locks until fetch remains part of the [plan](../PLAN.md).
+Opening a procedural cursor captures its input values and types. For example,
+changing `label` after `OPEN c FOR SELECT label` does not change the saved input.
+A null date remains a date even when the caller's first parameter is an integer.
+Dynamic command strings use only the explicit `USING` arguments; a local variable
+name does not become a SQL column inside the string. Exact rules and reservations
+are in [compatibility](postgresql-18-compatibility.md#capacity-boundaries).
+
+A simple `NO SCROLL` cursor over one physical table retains its selected rows
+without reading their contents at declaration. For example, `DECLARE c NO SCROLL
+CURSOR FOR SELECT id, label FROM orders` followed by `FETCH 2 FROM c` reads and
+saves two rows; `FETCH 0` before the first row reads none. Closing it releases
+the unread source. Fetching another batch reuses the result buffer: a long
+cursor can use repeated small fetches without retaining earlier batches.
+`MOVE` advances without saving output; a forward jump saves its target row.
+This path accepts columns, wildcards, constants, captured parameters, built-in
+binary operators, negation, boolean logic, null tests, `CASE WHEN` expressions,
+array construction, element access, slices and filters composed from them.
+`BETWEEN` and `NOT BETWEEN`, including `SYMMETRIC`, use the same comparisons
+and boolean evaluation. For example, `1 BETWEEN 2 AND NULL` is false because
+the lower comparison is false. PostgreSQL can evaluate the tested expression
+more than once; a sequence call inside `BETWEEN` can issue multiple values.
+For example, `SELECT 100/id FROM orders WHERE id<>0` tests
+each input as fetching advances; it does not divide by an unread row's `id`.
+`CASE WHEN id<>0 THEN 100/id ELSE NULL END` evaluates only the selected branch
+for each fetched row. Its result type stays the same across fetches.
+`ARRAY[id,id+1]`, `amounts[id]` and `amounts[2:3]` also evaluate as fetching
+advances. An array captured from a procedure keeps its opening values even if
+the procedure later changes its variable.
+Built-in operator choices stay fixed after declaration. A later operator or
+search-path change does not change the open cursor. Type errors and constant
+errors such as `1/0` are checked during declaration, including for empty input.
+Integer `LIMIT` and `OFFSET` expressions keep their counts through storage
+waits. `LIMIT 2 OFFSET 3` skips three qualifying rows and returns at most two;
+`LIMIT 0` reads no rows. Negative bounds fail when fetching starts. Offset rows
+still evaluate the child projection, so a skipped division by zero can fail.
+Filters discard rejected rows and release their temporary memory before
+reading the next input. Scan counters include rejected and erroring input rows. Serializable read
+tracking starts with the scan too: declaration or a provably empty result does
+not mark an unread table as read.
+Function calls, casts, user-defined operators, ordering and row-level security
+still use the eager path.
+With explicit `SCROLL`, the same query shapes also start without reading rows.
+They save visited results so `FETCH PRIOR`, `FETCH 0` and forward jumps within
+that history need no new input reads. `FETCH LAST` first consumes the remaining
+input. Unlike forward-only cursors, their accumulated history must fit
+`cursor_bytes`; exhaustion returns `54000`, releases input owners and leaves
+the cursor failed until closed. When the scroll option is omitted, a physical
+scan permits scrolling; a provably empty result is forward-only. The matching
+`pg_cursors.is_scrollable` value is chosen at declaration. Constant false or
+null filters avoid input reads, including string boolean literals such as `'f'`
+and captured parameter values. A local variable changed after `OPEN` cannot
+change whether that cursor's filter matches.
+
+For these query shapes, `WITH HOLD` saves the unread result during commit
+and keeps the current position. It also works without `BEGIN`: the declaration's
+implicit transaction saves the result before completing. Fetching from a held
+cursor inside a later transaction and rolling that transaction back does not
+rewind or close it. A commit-time result error rolls back and closes new cursors;
+already-held cursors survive. For example, an unread row with `id=0` makes
+`SELECT 100/id` fail during `COMMIT` if the cursor has `WITH HOLD`.
+Unread results must fit `cursor_bytes`; scrolling also retains its prior history.
+Deferred constraint triggers run before saving results, and input owners are
+released before temporary tables' commit actions. Commit-time saving currently
+uses the synchronous commit path; yielding during these storage reads remains
+part of the plan.
+Resident rows keep their immutable byte owner instead of copying a wide row
+into cursor memory just to return a small column. For example, selecting `id`
+does not copy an unselected 128 KiB text field into `cursor_query_bytes`.
+An open retained cursor prevents `DROP TABLE`, `TRUNCATE` and structural
+`ALTER TABLE` in the same session until `CLOSE`; renaming its table keeps the
+saved input valid.
+Other cursor queries still execute during declaration; deferring their
+expressions and row locks remains part of the [plan](../PLAN.md).
 
 UPDATE, DELETE, MERGE, conflict handling and schema validation preserve the
 original selected row values in fixed statement memory. They recheck the table
@@ -225,7 +299,10 @@ SELECT nextval('order_numbers'); -- 11
 Deferred checks run before implicit and explicit commits, including COPY and
 extended-protocol Sync. A failed deferred check rolls back the command rather
 than confirming a partial import. Volatile casts execute at runtime; skipped
-branches do not consume sequence values. Truly immutable constant expressions
+scalar and native procedural branches do not consume sequence values. Ordinary
+SQL still prepares some uncorrelated subqueries before choosing a branch;
+removing that eager preparation remains part of the retained execution work.
+Truly immutable constant expressions
 can raise planning errors even when a false filter removes every output row,
 following PostgreSQL's [volatility rules](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/include/catalog/pg_proc.dat).
 
@@ -270,6 +347,15 @@ CREATE TABLE orders(id integer);
 SELECT has_table_privilege(identity, 'SELECT') IS NULL FROM saved_order_identity;
 -- true: the old identifier does not grant access to the replacement
 ```
+
+A trigger can return from a nested branch or raise an exception without a
+`RETURN` statement. Creation accepts both. If execution reaches the end without
+returning, the command fails with `2F005` and rolls back its changes.
+Native procedural expressions can read subqueries using their current variables
+and trigger rows. For example, `IF EXISTS (SELECT 1 FROM orders WHERE id=NEW.id)`
+tests the inserted row's identifier. A scalar subquery with no rows returns
+NULL; more than one row fails with `21000`. A subquery in a skipped `CASE` or
+boolean branch does not run.
 
 DDL success follows its end-of-command event triggers. A hook that raises an
 error rolls the command back and keeps its notices, without sending a success

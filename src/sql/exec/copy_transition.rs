@@ -91,7 +91,7 @@ mod tests {
     #[test]
     fn copy_transition_values_reserve_the_exact_startup_budget() {
         let config = Config::parse(
-            "txn_rows = 3\ncopy_transition_bytes = 73\ntransaction_mode = mvcc\ncatalog_history_bytes = 16777216\n",
+            "txn_rows = 3\ncopy_transition_bytes = 73\ntransaction_mode = mvcc\ncatalog_history_bytes = 16777216\nrow_history_slots = 65536\n",
         ).unwrap();
         assert_eq!(config.copy_transition_bytes, 73);
         let required = CopyTransitionRows::budget_bytes(&config);

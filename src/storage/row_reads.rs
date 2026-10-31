@@ -781,6 +781,7 @@ mod tests {
         config.table_rows = 1;
         config.large_object_pages = 1;
         config.max_row_versions_per_row = 2;
+        config.row_history_slots = 4;
         let mut budget = Budget::new(1 << 20);
         (
             RowVersionPools::new(&config, &mut budget).unwrap(),
@@ -791,7 +792,7 @@ mod tests {
     fn install(versions: &mut RowVersionState, rows: &mut RowEntries, epoch: u32) {
         for (_, state) in rows.iter() {
             let mut pending = state.pending;
-            clear_pending_versions(&mut versions.pending_row_versions, &mut pending);
+            clear_pending_versions(versions, &mut pending);
             release_committed_chain(&mut versions.committed_row_versions, state.history.tail);
         }
         rows.clear();

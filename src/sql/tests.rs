@@ -7,10 +7,12 @@
 use super::*;
 use crate::mem::mutex::Mutex;
 
+mod client_catalog;
 mod cursor_execution;
 mod key_preparation;
 mod object_reads;
 mod query_execution;
+mod row_history;
 mod row_layout;
 mod table_publication;
 mod transaction_publication;
@@ -488,6 +490,7 @@ fn catalog_publication_schema_cascade_waits_for_affected_readers_only() {
                 engine.commit_txn_with_triggers(
                     &mut editor.transaction,
                     &editor.guc,
+                    Some(&mut editor.cursors),
                     &editor.arena,
                     &mut Responder::new(&mut editor.send),
                 )
@@ -6273,6 +6276,7 @@ fn query_workspaces_are_startup_bounded_and_isolated() {
     assert_eq!(
         Engine::extra_budget_bytes(&config) - Engine::extra_budget_bytes(&one),
         2 * (config.work_arena_bytes
+            + crate::storage::RowCursorBuffers::allocation_bytes(&config)
             + core::mem::size_of::<QueryWorkspace>()
             + dml_workspace_bytes)
             + Storage::extra_budget_bytes(&config)
@@ -6281,7 +6285,9 @@ fn query_workspaces_are_startup_bounded_and_isolated() {
             - crate::storage::StatisticsReceiptPool::budget_bytes(&one)
     );
     let bytes = config.query_workspace_slots
-        * (config.work_arena_bytes + core::mem::size_of::<QueryWorkspace>());
+        * (config.work_arena_bytes
+            + crate::storage::RowCursorBuffers::allocation_bytes(&config)
+            + core::mem::size_of::<QueryWorkspace>());
     let mut budget = Budget::new(bytes);
     let mut workspaces = QueryWorkspaces::new(&config, &mut budget).unwrap();
     assert_eq!(budget.remaining(), 0);
@@ -17953,6 +17959,7 @@ fn finish_copy(
         setup,
         txn,
         guc,
+        None,
         &mut Responder::new(&mut send),
         inserted,
         CopyFinishMode::ImplicitTransaction,
@@ -95326,6 +95333,7 @@ fn statement_files_streamed_copy_keeps_trigger_sources_between_data_messages() {
                         &setup,
                         &mut reader.transaction,
                         &reader.guc,
+                        Some(&mut reader.cursors),
                         &mut Responder::new(&mut send),
                         &transition,
                         CopyFinishMode::ImplicitTransaction,

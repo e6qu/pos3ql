@@ -194,6 +194,30 @@ macro_rules! intrinsic {
 }
 
 const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
+    // PostgreSQL 18.6 scalar hash identities and signatures.
+    // https://github.com/postgres/postgres/blob/REL_18_6/src/include/catalog/pg_proc.dat
+    intrinsic!(449, "hashint2", 23, "21", 1, "i"),
+    intrinsic!(441, "hashint2extended", 20, "21 20", 2, "i"),
+    intrinsic!(450, "hashint4", 23, "23", 1, "i"),
+    intrinsic!(425, "hashint4extended", 20, "23 20", 2, "i"),
+    intrinsic!(949, "hashint8", 23, "20", 1, "i"),
+    intrinsic!(442, "hashint8extended", 20, "20 20", 2, "i"),
+    intrinsic!(451, "hashfloat4", 23, "700", 1, "i"),
+    intrinsic!(443, "hashfloat4extended", 20, "700 20", 2, "i"),
+    intrinsic!(452, "hashfloat8", 23, "701", 1, "i"),
+    intrinsic!(444, "hashfloat8extended", 20, "701 20", 2, "i"),
+    intrinsic!(453, "hashoid", 23, "26", 1, "i"),
+    intrinsic!(445, "hashoidextended", 20, "26 20", 2, "i"),
+    intrinsic!(454, "hashchar", 23, "18", 1, "i"),
+    intrinsic!(446, "hashcharextended", 20, "18 20", 2, "i"),
+    intrinsic!(455, "hashname", 23, "19", 1, "i"),
+    intrinsic!(447, "hashnameextended", 20, "19 20", 2, "i"),
+    intrinsic!(400, "hashtext", 23, "25", 1, "i"),
+    intrinsic!(448, "hashtextextended", 20, "25 20", 2, "i"),
+    intrinsic!(6417, "hashbool", 23, "16", 1, "i"),
+    intrinsic!(6418, "hashboolextended", 20, "16 20", 2, "i"),
+    intrinsic!(1080, "hashbpchar", 23, "1042", 1, "i"),
+    intrinsic!(972, "hashbpcharextended", 20, "1042 20", 2, "i"),
     // PostgreSQL 18.6 GiST support routines, exposed so pg_amproc joins to
     // pg_proc with the same built-in identities as a vanilla server.
     intrinsic!(1030, "gist_point_compress", 2281, "2281", 1, "i"),
@@ -1467,7 +1491,7 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
         volatility: "s",
     },
     IntrinsicRoutine {
-        oid: 3075,
+        oid: 2621,
         name: "pg_reload_conf",
         result_oid: 16,
         argument_types: "",
@@ -3730,36 +3754,44 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     intrinsic!(6426, "timestamptz_hash_extended", 20, "1184 20", 2, "i"),
 ];
 
+// PostgreSQL 18.6 pg_proc.dat; checked against the live built-in inventory.
+// https://github.com/postgres/postgres/blob/REL_18_6/src/include/catalog/pg_proc.dat
 fn intrinsic_routine_kind(routine: IntrinsicRoutine) -> &'static str {
     if matches!(
         routine.oid,
-        2901 | 2112
-            | 2125
-            | 2141
-            | 2106
+        2106 | 2112
             | 2113
             | 2122
             | 2123
             | 2124
+            | 2125
             | 2126
             | 2127
             | 2128
             | 2138
             | 2139
             | 2140
+            | 2141
             | 2142
             | 2143
             | 2144
+            | 2242
+            | 2243
             | 2797
             | 2798
+            | 2901
+            | 3545
             | 3564
             | 3565
+            | 4189
+            | 4190
             | 4301
             | 4389
             | 4450
+            | 6167
             | 6227
-            | 4189
-            | 4190
+            | 6395
+            | 6396
     ) {
         "a"
     } else {
@@ -3770,79 +3802,11 @@ fn intrinsic_routine_kind(routine: IntrinsicRoutine) -> &'static str {
 fn intrinsic_routine_is_strict(routine: IntrinsicRoutine) -> bool {
     !matches!(
         routine.oid,
-        1081 | 2078
-            | 2137
-            | 2230
-            | 2274
-            | 2307
-            | 3775
-            | 2900
-            | 2901
-            | 3205
-            | 3209
-            | 3475
-            | 3491
-            | 3960
-            | 3961
-            | 6338
-            | 3566
-            | 4568
-            | 6170
-            | 6232
-            | 2943
-            | 3348
-            | 3434
-            | 2944
-            | 2945
-            | 2946
-            | 2947
-            | 2948
-            | 3360
-            | 5059
-            | 5060
-            | 5061
-            | 5062
-            | 5063
-            | 5064
-            | 5065
-            | 5066
-            | 2112
-            | 2125
-            | 2141
-            | 2797
-            | 2798
-            | 2242
-            | 2243
-            | 3543
-            | 3544
-            | 3545
-            | 6299
-            | 6395
-            | 6396
-            | 6167
-            | 3564
-            | 3565
-            | 4301
-            | 4389
-            | 4450
-            | 6227
-            | 4189
-            | 4190
-            | 4299
-            | 4300
-            | 6225
-            | 6226
-            | 376
-            | 394
+        376 | 394
+            | 1081
+            | 1271
             | 1289
             | 1290
-            | 3058
-            | 3059
-            | 3539
-            | 3540
-            | 6160
-            | 6161
-            | 1271
             | 1304
             | 1305
             | 1306
@@ -3857,23 +3821,85 @@ fn intrinsic_routine_is_strict(routine: IntrinsicRoutine) -> bool {
             | 2042
             | 2043
             | 2044
+            | 2078
             | 2106
+            | 2112
             | 2113
             | 2122
             | 2123
             | 2124
+            | 2125
             | 2126
             | 2127
             | 2128
+            | 2137
             | 2138
             | 2139
             | 2140
+            | 2141
             | 2142
             | 2143
             | 2144
+            | 2230
+            | 2242
+            | 2243
+            | 2274
+            | 2307
+            | 2797
+            | 2798
+            | 2900
+            | 2901
+            | 3058
+            | 3059
+            | 3205
+            | 3209
             | 3325
+            | 3434
+            | 3475
+            | 3491
+            | 3539
+            | 3540
+            | 3543
+            | 3544
+            | 3545
             | 3549
+            | 3564
+            | 3565
+            | 3775
+            | 3840
+            | 3841
+            | 3844
+            | 3845
+            | 3933
+            | 3934
+            | 3937
+            | 3938
+            | 3941
+            | 3942
+            | 3945
+            | 3946
+            | 3960
+            | 3961
+            | 4189
+            | 4190
+            | 4299
+            | 4300
+            | 4301
+            | 4389
+            | 4450
+            | 6160
+            | 6161
+            | 6167
+            | 6170
+            | 6225
+            | 6226
+            | 6227
+            | 6232
+            | 6299
             | 6326
+            | 6338
+            | 6395
+            | 6396
     )
 }
 
@@ -11709,44 +11735,44 @@ pub fn relname_text<'a>(
     oid: i32,
     arena: &'a Arena,
 ) -> Result<Option<&'a str>, SqlError> {
+    let reference = |schema: &str, name: &str| {
+        let mut output = StackStr::<260>::new();
+        if relation_oid_for_name(storage, txid, None, name) != Some(oid) {
+            write_identifier(&mut output, schema);
+            let _ = output.write_char('.');
+        }
+        write_identifier(&mut output, name);
+        arena
+            .alloc_str(output.as_str())
+            .map(Some)
+            .map_err(|_| arena_full())
+    };
     if let Some(name) = catalog_relation_name(oid) {
-        return arena.alloc_str(name).map(Some).map_err(|_| arena_full());
+        return reference("pg_catalog", name);
     }
     if let Some(slot) = table_slot_by_oid(storage, txid, oid) {
-        return arena
-            .alloc_str(storage.table_def(slot, txid).name.as_str())
-            .map(Some)
-            .map_err(|_| arena_full());
+        let table = storage.table_def(slot, txid);
+        return reference(table.schema.as_str(), table.name.as_str());
     }
     if let Some(slot) = sequence_slot_by_oid(storage, txid, oid) {
-        return arena
-            .alloc_str(storage.sequence_for(slot, txid).name.as_str())
-            .map(Some)
-            .map_err(|_| arena_full());
+        let sequence = storage.sequence_for(slot, txid);
+        return reference(sequence.schema.as_str(), sequence.name.as_str());
     }
     if let Some(slot) = view_slot_by_oid(storage, txid, oid) {
-        return arena
-            .alloc_str(storage.view(slot).name_for(txid).as_str())
-            .map(Some)
-            .map_err(|_| arena_full());
+        let view = storage.view(slot);
+        return reference(view.schema_for(txid).as_str(), view.name_for(txid).as_str());
     }
     for (slot, composite) in storage.composites_with_slots_visible_to(txid) {
         if named_composite_relation_oid(storage, slot) == oid {
-            return arena
-                .alloc_str(composite.name.as_str())
-                .map(Some)
-                .map_err(|_| arena_full());
+            return reference(composite.schema.as_str(), composite.name.as_str());
         }
     }
     // Other relation families were resolved above. Index names are copied
     // directly, without constructing catalog rows.
     if oid >= crate::storage::FIRST_IMPLICIT_INDEX_OID
-        && let Some((_, name)) = index_identity_by_oid(storage, txid, oid)
+        && let Some((schema, name)) = index_identity_by_oid(storage, txid, oid)
     {
-        return arena
-            .alloc_str(name.as_str())
-            .map(Some)
-            .map_err(|_| arena_full());
+        return reference(schema.as_str(), name.as_str());
     }
     Ok(None)
 }
@@ -16385,6 +16411,7 @@ fn index_expression_display<'a>(
 
 #[derive(Clone, Copy)]
 struct SynthDef<'a> {
+    schema: &'static str,
     name: &'a str,
     columns: &'a [(&'a str, ColType)],
     relation: Option<core::num::NonZeroU32>,
@@ -16392,6 +16419,7 @@ struct SynthDef<'a> {
 
 fn materialize_def(specification: SynthDef<'_>) -> TableDef {
     let mut definition = TableDef {
+        schema: SqlName::parse(specification.schema).expect("catalog schema fits"),
         name: SqlName::parse(specification.name).expect("catalog name fits"),
         columns: [ColumnMeta::EMPTY; MAX_COLUMNS],
         n_columns: specification
@@ -29512,54 +29540,7 @@ fn pg_type<'a>(
         ColType::Geometry(super::types::GeometryKind::Circle),
         ColType::Record,
     ];
-    let category = |t: &ColType| match t {
-        ColType::Void | ColType::Internal | ColType::PgDdlCommand | ColType::Record => "P",
-        ColType::Bool => "B",
-        ColType::Int2
-        | ColType::Int4
-        | ColType::Oid
-        | ColType::Int8
-        | ColType::Float4
-        | ColType::Float8
-        | ColType::Numeric
-        | ColType::Money
-        | ColType::Regtype
-        | ColType::Regproc
-        | ColType::Regprocedure
-        | ColType::Regoper
-        | ColType::Regoperator
-        | ColType::Regclass
-        | ColType::Regnamespace
-        | ColType::Regrole
-        | ColType::Regconfig
-        | ColType::Regdictionary
-        | ColType::Regcollation => "N",
-        ColType::Date | ColType::Time | ColType::Timestamp | ColType::Timestamptz => "D",
-        ColType::Interval => "T",
-        ColType::Xid
-        | ColType::Xid8
-        | ColType::Tid
-        | ColType::Cid
-        | ColType::PgSnapshot
-        | ColType::TxidSnapshot
-        | ColType::PgLsn
-        | ColType::AclItem
-        | ColType::Refcursor
-        | ColType::Uuid
-        | ColType::Bytea
-        | ColType::TsVector
-        | ColType::TsQuery
-        | ColType::Xml
-        | ColType::Jsonpath => "U",
-        ColType::PgNodeTree
-        | ColType::PgNdistinct
-        | ColType::PgDependencies
-        | ColType::PgMcvList => "Z",
-        // Network address types are PostgreSQL typcategory 'I'.
-        ColType::Inet | ColType::Cidr | ColType::Macaddr | ColType::Macaddr8 => "I",
-        ColType::Geometry(_) => "G",
-        _ => "S",
-    };
+    let category = |t: &ColType| super::types::type_category(*t);
     let visible_domains = (0..storage.domain_count())
         .filter(|&slot| storage.domain_slot_visible_to(slot, txid))
         .count();
@@ -30332,7 +30313,21 @@ fn pg_type<'a>(
     let compatible = catalog_rows(arena, n)?;
     for (target, source) in compatible.iter_mut().zip(&out[..n]) {
         let functions = type_io::functions(source, &out[..n], fields)?;
-        let values = arena.alloc_slice_copy(source).map_err(|_| arena_full())?;
+        assert_eq!(
+            def.columns.len(),
+            source.len() + 1,
+            "pg_type delimiter extends each source row"
+        );
+        let values = arena
+            .alloc_slice_with(def.columns.len(), |index| {
+                if index < source.len() {
+                    source[index]
+                } else {
+                    Datum::Null
+                }
+            })
+            .map_err(|_| arena_full())?;
+        values[source.len()] = Datum::Char(type_io::delimiter(source, &out[..n], fields)?);
         for (position, function) in routines.into_iter().zip(functions) {
             values[position] = Datum::RegObject {
                 type_oid: crate::sql::types::oid::REGPROC,

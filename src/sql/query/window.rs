@@ -181,7 +181,7 @@ pub(crate) fn rewrite_grouped_windows<'a>(
     let scope = statement
         .from
         .as_ref()
-        .and_then(|f| QueryScope::resolve_schema(storage, f, txid, arena).ok());
+        .and_then(|f| QueryScope::resolve_schema(storage, f, txid, arena, None).ok());
     let context = GroupedRewrite {
         group_by: statement.group_by,
         group_names,
@@ -1622,6 +1622,7 @@ pub(crate) fn project_window_rows<'a>(
                 params,
                 &mut *where_scalars,
                 &mut *where_lists,
+                hooks.sequences,
             )?;
             Some(&row_subs)
         };
@@ -1629,6 +1630,7 @@ pub(crate) fn project_window_rows<'a>(
             group: None,
             aggs: None,
             subs,
+            subquery_executor: hooks.subquery_executor,
             windows: Some((win_ptrs, &wv[..win_nodes.len()])),
             catalog: hooks.catalog,
             srf_index: hooks.srf_index,
@@ -2203,6 +2205,7 @@ pub(crate) fn external_window_into<'a>(
                     params,
                     &mut *where_scalars,
                     &mut *where_lists,
+                    hooks.sequences,
                 )?;
                 Some(&row_subs)
             };
@@ -2210,6 +2213,7 @@ pub(crate) fn external_window_into<'a>(
                 group: None,
                 aggs: None,
                 subs,
+                subquery_executor: hooks.subquery_executor,
                 windows: Some((win_ptrs, &wv[..win_count])),
                 catalog: hooks.catalog,
                 srf_index: hooks.srf_index,

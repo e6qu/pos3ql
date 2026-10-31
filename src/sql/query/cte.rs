@@ -1734,7 +1734,7 @@ fn materialize_query_cte<'a>(
         .alloc(SetTree::Select(query))
         .map_err(|_| arena_full())?;
     let mut described = [ColDesc::new("", 0, 0); MAX_PROJ];
-    let ncols = describe_set_body(storage, tree, txid, &mut described, arena)?;
+    let ncols = describe_set_body(storage, tree, txid, &mut described, arena, None)?;
     if aliases.len() > ncols {
         return Err(sql_err!(
             sqlstate::INVALID_COLUMN_REFERENCE,
@@ -1792,7 +1792,7 @@ pub fn describe_set_query<'a>(
     arena: &'a Arena,
 ) -> Result<usize, SqlError> {
     let body = expand_set_tree(q.with, q.body, storage, txid, arena)?;
-    describe_set_body(storage, body, txid, columns, arena)
+    describe_set_body(storage, body, txid, columns, arena, None)
 }
 
 /// Expands WITH CTEs and view references across a whole set-operation tree
@@ -2240,13 +2240,6 @@ fn expr_references(e: &Expr, name: &str) -> usize {
             expr_references(operand, name)
                 + list.iter().map(|x| expr_references(x, name)).sum::<usize>()
         }
-        Expr::Between {
-            operand, low, high, ..
-        } => {
-            expr_references(operand, name)
-                + expr_references(low, name)
-                + expr_references(high, name)
-        }
         Expr::Like {
             operand,
             pattern,
@@ -2382,9 +2375,6 @@ fn expr_mentions_column(expression: &Expr<'_>, qualifier: &str, name: &str) -> b
         Expr::InList { operand, list, .. } => {
             child(operand) || list.iter().any(|expression| child(expression))
         }
-        Expr::Between {
-            operand, low, high, ..
-        } => child(operand) || child(low) || child(high),
         Expr::Like {
             operand,
             pattern,
@@ -2907,7 +2897,7 @@ fn reject_recursive_name_collision<'a>(
         arena,
     )?;
     let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
-    describe_set_body(storage, rewritten, txid, &mut columns, arena)?;
+    describe_set_body(storage, rewritten, txid, &mut columns, arena, None)?;
     Err(sql_err!(
         sqlstate::SYNTAX_ERROR,
         "{} column name \"{}\" already used in WITH query column list",
@@ -3282,7 +3272,7 @@ fn describe_recursive_materialized<'a>(
     let (base_tree, recursive_tree, _) = recursive_parts(cte.query, cte.name)?;
     let base_tree = subst_set_tree(base_tree, outer, arena)?;
     let mut described = [ColDesc::new("", 0, 0); MAX_PROJ];
-    let ncols = describe_set_body(storage, base_tree, txid, &mut described, arena)?;
+    let ncols = describe_set_body(storage, base_tree, txid, &mut described, arena, None)?;
     if cte.columns.len() > ncols {
         return Err(sql_err!(
             sqlstate::INVALID_COLUMN_REFERENCE,
@@ -3657,7 +3647,7 @@ fn materialize_recursive<'a>(
     // Column names and types come from the non-recursive term, with the CTE's
     // rename list applied.
     let mut described = [ColDesc::new("", 0, 0); MAX_PROJ];
-    let ncols = describe_set_body(storage, base_tree, txid, &mut described, arena)?;
+    let ncols = describe_set_body(storage, base_tree, txid, &mut described, arena, None)?;
     if cte.columns.len() > ncols {
         return Err(sql_err!(
             sqlstate::INVALID_COLUMN_REFERENCE,
@@ -3797,7 +3787,7 @@ fn materialize_recursive<'a>(
         };
         let step_tree = subst_set_tree(recursive_tree, context, arena)?;
         let mut step_desc = [ColDesc::new("", 0, 0); MAX_PROJ];
-        let stepn = describe_set_body(storage, step_tree, txid, &mut step_desc, arena)?;
+        let stepn = describe_set_body(storage, step_tree, txid, &mut step_desc, arena, None)?;
         let expected_step_columns = ncols + decoration.state_types.len();
         if stepn != expected_step_columns {
             return Err(sql_err!(
@@ -3937,7 +3927,7 @@ fn materialize_recursive<'a>(
     };
     let step_tree = subst_set_tree(recursive_tree, context, arena)?;
     let mut step_desc = [ColDesc::new("", 0, 0); MAX_PROJ];
-    let stepn = describe_set_body(storage, step_tree, txid, &mut step_desc, arena)?;
+    let stepn = describe_set_body(storage, step_tree, txid, &mut step_desc, arena, None)?;
     let expected_step_columns = ncols + decoration.state_types.len();
     if stepn != expected_step_columns {
         return Err(sql_err!(
@@ -4967,9 +4957,6 @@ fn expr_has_subquery(e: &Expr) -> bool {
         Expr::InList { operand, list, .. } => {
             expr_has_subquery(operand) || list.iter().any(|a| expr_has_subquery(a))
         }
-        Expr::Between {
-            operand, low, high, ..
-        } => expr_has_subquery(operand) || expr_has_subquery(low) || expr_has_subquery(high),
         Expr::Like {
             operand,
             pattern,
@@ -5601,17 +5588,6 @@ fn subst_expr<'a>(
         } => Expr::InList {
             operand: subst_expr(operand, context, arena)?,
             list: subst_expr_slice(list, context, arena)?,
-            negated: *negated,
-        },
-        Expr::Between {
-            operand,
-            low,
-            high,
-            negated,
-        } => Expr::Between {
-            operand: subst_expr(operand, context, arena)?,
-            low: subst_expr(low, context, arena)?,
-            high: subst_expr(high, context, arena)?,
             negated: *negated,
         },
         Expr::Like {

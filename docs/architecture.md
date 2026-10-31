@@ -137,6 +137,50 @@ and [backup rules](backup-restore.md) before scheduling an offline backup comman
 
 ## Memory and physical size
 
+An empty engine still reserves metadata for configured table slots. Row lookup
+positions scale with `max_tables × table_rows`; wide table definitions and other
+metadata also reserve capacity before tables are created. MVCC row history uses
+the explicit shared `row_history_slots` capacity across all tables and large
+objects; `max_row_versions_per_row` remains a separate per-row bound. Locking
+mode reserves no committed-row history. An update owns its prospective history
+slot with its pending row chain, before durability. Queued and prepared commits
+keep that ownership; commit links the reserved slot without allocating another,
+and rollback releases it. History exhaustion returns `54000` at the write boundary.
+Obsolete versions can be reclaimed while newer readers are active. On slot
+pressure, write admission examines at most 64 row metadata positions and retries
+with its owned input. Each history chain has the separate per-row version bound.
+It never repeats SQL expressions or drains the whole
+database synchronously; remaining pressure returns the named capacity error.
+Per-table metadata can still make many small embedded tables expensive.
+Pending table definitions reserve their complete payload capacity at startup,
+but initialize only dense occupancy locks. Wide payload pages are touched when
+a definition is staged; its matching read/write guard protects initialization,
+retirement and reuse. Reserving unused slots does not initialize every payload.
+
+The [embedded memory measurement](https://github.com/e6qu/pos3ql/blob/6ff1ac865a86a5318cb4934fbf01be0926667811/examples/embedded-memory.rs) starts one empty
+engine per process and reports the configured reservation, startup budget drawn,
+peak resident memory and startup time. CI records 1, 8 and 32 configured tables
+with both transaction modes and the same explicit memory settings. These are
+empty-engine measurements, separate from a server's connection buffers, query
+workloads and production throughput.
+The retained [empty-engine baseline](https://github.com/e6qu/pos3ql/blob/6ff1ac865a86a5318cb4934fbf01be0926667811/benchmarks/baselines/2026-10-30-embedded-startup/README.md)
+includes raw measurements and their revision; its resident costs must not be
+mistaken for configured byte reservations or a production minimum.
+The helper uses the same explicit 128 MiB virtual stack reservation as the
+server and native tests; ordinary operating-system thread defaults are not the
+current execution contract. Peak resident memory includes the pages actually
+touched. The debug-build helper records this stack size with each sample.
+It also records each successful named startup reservation, so a large fixed
+cost can be traced to its owning pool rather than inferred from total memory.
+The retained [component breakdown](https://github.com/e6qu/pos3ql/blob/6ff1ac865a86a5318cb4934fbf01be0926667811/benchmarks/baselines/2026-10-30-embedded-components/README.md)
+shows substantial fixed and per-table definition reservations in that revision;
+reserved bytes alone do not establish which pages became resident.
+The [before/after measurements](https://github.com/e6qu/pos3ql/blob/4054a6d3c79e916728f8e84d84139eae6d86b501/benchmarks/baselines/2026-10-30-embedded-lazy-definitions/README.md)
+show empty-engine peak memory falling from about 735 MiB to 431 MiB with 32
+configured table slots after unused pending definition payloads were left
+uninitialized. Those debug-build samples establish neither populated-table
+costs nor a production memory minimum.
+
 Capacity is the smallest applicable bound, not just the size of the bucket:
 
 | Boundary | Current bound and practical meaning |

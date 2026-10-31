@@ -289,12 +289,20 @@ pub(crate) fn row_security_passes<'a>(
         {
             *output = Some(predicate.expression);
         }
-        let subqueries =
-            super::subquery::subquery_hooks_outer(expressions, storage, txid, arena, params, row)?;
+        let subqueries = super::subquery::subquery_hooks_outer(
+            expressions,
+            storage,
+            txid,
+            arena,
+            params,
+            row,
+            base_hooks.sequences,
+        )?;
         let hooks = EvalHooks {
             group: None,
             aggs: None,
             subs: Some(&subqueries),
+            subquery_executor: base_hooks.subquery_executor,
             windows: None,
             catalog: base_hooks.catalog,
             srf_index: None,
@@ -2682,13 +2690,6 @@ fn dml_index_operand_is_invariant(expression: &Expr<'_>) -> bool {
         Expr::Binary { left, right, .. } => {
             dml_index_operand_is_invariant(left) && dml_index_operand_is_invariant(right)
         }
-        Expr::Between {
-            operand, low, high, ..
-        } => {
-            dml_index_operand_is_invariant(operand)
-                && dml_index_operand_is_invariant(low)
-                && dml_index_operand_is_invariant(high)
-        }
         Expr::Like {
             operand, pattern, ..
         }
@@ -4952,6 +4953,9 @@ fn hash_join_keys<'a>(
         };
         let pt = scope.defs.get(probe_t).expect("resolved").columns[probe_col].ctype;
         let bt = scope.defs.get(build_t).expect("resolved").columns[build_col].ctype;
+        if !join_key_types_compatible(pt, bt) {
+            continue;
+        }
         let probe_collation =
             scope.defs.get(probe_t).expect("resolved").columns[probe_col].collation;
         let build_collation =
@@ -4964,7 +4968,7 @@ fn hash_join_keys<'a>(
                 build_collation.name()
             ));
         }
-        if join_key_types_compatible(pt, bt) && npairs < pairs.len() {
+        if npairs < pairs.len() {
             pairs[npairs] = (probe_col, build_col);
             npairs += 1;
         }
@@ -5119,24 +5123,12 @@ pub(super) fn validate_materialized_view_reads(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn scan_source_mode<'a>(
-    storage: &'a Storage,
-    scope: &QueryScope<'a>,
-    from: &'a FromClause<'a>,
+pub(super) fn admit_sources(
+    storage: &Storage,
+    scope: &QueryScope<'_>,
     txid: u32,
-    where_clause: Option<&'a Expr<'a>>,
-    arena: &'a Arena,
-    params: &[Datum<'a>],
-    hooks: &EvalHooks<'_, 'a>,
-    outer: Option<&dyn ColumnLookup<'a>>,
-    recycle_rows: bool,
-    retain_match: Option<&core::cell::Cell<bool>>,
     pax_demand: PaxReadDemand,
-    indexed_override: Option<&IndexedCandidates<'a>>,
-    automatic_index: bool,
-    f: &mut dyn FnMut(&JoinRow<'_, 'a, '_>) -> Result<bool, SqlError>,
-) -> Result<(), SqlError> {
+) -> Result<usize, SqlError> {
     let current_role = storage.current_role_slot(txid).ok_or_else(|| {
         sql_err!(
             sqlstate::INSUFFICIENT_PRIVILEGE,
@@ -5261,9 +5253,30 @@ fn scan_source_mode<'a>(
                 crate::sql::ast::TableLockMode::AccessShare,
                 false,
             )?;
-            storage.record_serializable_read(txid, scope.slots[table]);
         }
     }
+    Ok(current_role)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_source_mode<'a>(
+    storage: &'a Storage,
+    scope: &QueryScope<'a>,
+    from: &'a FromClause<'a>,
+    txid: u32,
+    where_clause: Option<&'a Expr<'a>>,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    hooks: &EvalHooks<'_, 'a>,
+    outer: Option<&dyn ColumnLookup<'a>>,
+    recycle_rows: bool,
+    retain_match: Option<&core::cell::Cell<bool>>,
+    pax_demand: PaxReadDemand,
+    indexed_override: Option<&IndexedCandidates<'a>>,
+    automatic_index: bool,
+    f: &mut dyn FnMut(&JoinRow<'_, 'a, '_>) -> Result<bool, SqlError>,
+) -> Result<(), SqlError> {
+    let current_role = admit_sources(storage, scope, txid, pax_demand)?;
     validate_materialized_view_reads(storage, scope, where_clause, arena, txid)?;
     let sample_plans = arena
         .alloc_slice_with(scope.n, |_| None::<TableSamplePlan>)
@@ -5708,7 +5721,13 @@ fn scan_source_mode<'a>(
             } else if let Some(demand) = pax_demand.selected_mask(build_t)
                 && let Some(scan) = storage.immutable_row_scan_in(build_slot, arena)?
             {
-                storage.record_relation_scan(txid, build_slot, None, 0)?;
+                storage.record_relation_scan(
+                    txid,
+                    build_slot,
+                    None,
+                    0,
+                    crate::sql::datetime::now_micros(),
+                )?;
                 scan.for_each_spilled_row_batch(arena, false, Some(demand), &mut |rows| {
                     for spilled in rows {
                         storage.record_relation_tuple_read(txid, build_slot, None)?;
@@ -5725,7 +5744,13 @@ fn scan_source_mode<'a>(
                     Ok(ControlFlow::Continue(()))
                 })?;
             } else {
-                storage.record_relation_scan(txid, build_slot, None, 0)?;
+                storage.record_relation_scan(
+                    txid,
+                    build_slot,
+                    None,
+                    0,
+                    crate::sql::datetime::now_micros(),
+                )?;
                 storage.for_each_row_state(build_slot, &mut |rowid, state| {
                     let Some(home) = storage.visible_row_home(build_slot, rowid, state, txid)?
                     else {
@@ -5788,7 +5813,13 @@ fn scan_source_mode<'a>(
                 && let Some(demand) = pax_demand.selected_mask(probe_t)
                 && let Some(scan) = storage.immutable_row_scan_in(probe_slot, arena)?
             {
-                storage.record_relation_scan(txid, probe_slot, None, 0)?;
+                storage.record_relation_scan(
+                    txid,
+                    probe_slot,
+                    None,
+                    0,
+                    crate::sql::datetime::now_micros(),
+                )?;
                 let mut stopped = false;
                 scan.for_each_spilled_row_batch(arena, recycle_rows, Some(demand), &mut |rows| {
                     for spilled in rows {
@@ -6092,7 +6123,13 @@ fn scan_source_mode<'a>(
             } else {
                 // Collect and sort the probe table's visible rows to match the
                 // nested loop's output order.
-                storage.record_relation_scan(txid, probe_slot, None, 0)?;
+                storage.record_relation_scan(
+                    txid,
+                    probe_slot,
+                    None,
+                    0,
+                    crate::sql::datetime::now_micros(),
+                )?;
                 let probe_count = storage.visible_row_count(probe_slot, txid)?;
                 let probe_snapshot = storage.table_row_snapshot(probe_slot, Some(arena))?;
                 let probe_ordered = arena
@@ -6448,7 +6485,13 @@ fn scan_source_mode<'a>(
         }
         macro_rules! visit_sequential_physical_rows {
             ($slot:expr) => {{
-                storage.record_relation_scan(txid, $slot, None, 0)?;
+                storage.record_relation_scan(
+                    txid,
+                    $slot,
+                    None,
+                    0,
+                    crate::sql::datetime::now_micros(),
+                )?;
                 let scan = storage.captured_row_scan_in($slot, txid, arena)?;
                 let mut index = 0usize;
                 let mut aborted = false;
@@ -6617,6 +6660,7 @@ fn scan_source_mode<'a>(
                         slot,
                         Some(access.index_oid),
                         access.index_entries,
+                        crate::sql::datetime::now_micros(),
                     )?;
                 }
                 for (index, &rowid) in access.rowids.iter().enumerate() {
@@ -6682,7 +6726,13 @@ fn scan_source_mode<'a>(
                     .get(order[depth])
                     .expect("resolved logical relation");
                 for &leaf in &leaves[..n_leaves] {
-                    storage.record_relation_scan(txid, leaf, None, 0)?;
+                    storage.record_relation_scan(
+                        txid,
+                        leaf,
+                        None,
+                        0,
+                        crate::sql::datetime::now_micros(),
+                    )?;
                     let physical = definitions.definition(storage, leaf, txid)?;
                     let mapping = crate::storage::RelationColumnMap::new(logical, physical, arena)?;
                     let mut schema = [ColType::Bool; MAX_COLUMNS];
@@ -6751,6 +6801,7 @@ fn scan_source_mode<'a>(
                     slot,
                     access.map(|access| access.index_oid),
                     access.map_or(0, |access| access.index_entries),
+                    crate::sql::datetime::now_micros(),
                 )?;
             }
             // A key-carrying ordered candidate set can satisfy the scan

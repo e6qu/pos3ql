@@ -58,7 +58,7 @@ pub(crate) fn projected_row_len_by<'a>(
     let mut len = size_of_val(&count_u16);
     for index in 0..count {
         len = len
-            .checked_add(projected_value_len(&value_at(index)))
+            .checked_add(projected_value_len(&value_at(index))?)
             .ok_or_else(|| {
                 sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -104,7 +104,7 @@ pub(crate) fn projected_row_len(values: &[Datum]) -> Result<usize, SqlError> {
     })?;
     let mut len = size_of_val(&count);
     for v in values {
-        len = len.checked_add(projected_value_len(v)).ok_or_else(|| {
+        len = len.checked_add(projected_value_len(v)?).ok_or_else(|| {
             sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "projected row is too large"
@@ -145,8 +145,8 @@ pub(crate) fn projected_row_width(bytes: &[u8]) -> usize {
 }
 
 /// The projected-encoding byte length of one value (tag + payload).
-pub fn projected_value_len(v: &Datum) -> usize {
-    1 + match v {
+pub fn projected_value_len(v: &Datum) -> Result<usize, SqlError> {
+    Ok(1 + match v {
         Datum::Null | Datum::PgDdlCommand => 0,
         Datum::PgNodeTree(node) => 4 + node.as_str().len(),
         Datum::Bool(_) => 1,
@@ -194,17 +194,14 @@ pub fn projected_value_len(v: &Datum) -> usize {
         // structural tail — field names, OIDs, nested tagged values — that
         // [`decode_projected_col_record`] rebuilds into a `Datum::Record`
         // when a consumer needs field access.
-        Datum::Record(fields) => {
-            let mut n = 4 + record_text_len(v) + 1;
-            for f in *fields {
-                n += 1 + f.name.len() + 4 + projected_value_len(&f.value);
+        Datum::Record(fields) | Datum::Composite { fields, .. } => {
+            let length_bytes = RecordLengths::for_fields(fields)?.bytes();
+            let mut n = 4 + record_text_len(v) + length_bytes;
+            if matches!(v, Datum::Composite { .. }) {
+                n += 4;
             }
-            n
-        }
-        Datum::Composite { fields, .. } => {
-            let mut n = 4 + 4 + record_text_len(v) + 1;
             for f in *fields {
-                n += 1 + f.name.len() + 4 + projected_value_len(&f.value);
+                n += length_bytes + f.name.len() + 4 + projected_value_len(&f.value)?;
             }
             n
         }
@@ -213,6 +210,66 @@ pub fn projected_value_len(v: &Datum) -> usize {
             text,
             ..
         } => 4 + physical_field_count_len(*physical_fields) + 4 + text.len(),
+    })
+}
+
+#[derive(Clone, Copy)]
+enum RecordLengths {
+    Byte,
+    TwoBytes,
+}
+
+impl RecordLengths {
+    fn for_fields(fields: &[crate::sql::types::RecordField<'_>]) -> Result<Self, SqlError> {
+        if fields.len() > u16::MAX as usize
+            || fields
+                .iter()
+                .any(|field| field.name.len() > u16::MAX as usize)
+        {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "record field count or name exceeds projected encoding capacity"
+            ));
+        }
+        Ok(
+            if fields.len() > u8::MAX as usize
+                || fields
+                    .iter()
+                    .any(|field| field.name.len() > u8::MAX as usize)
+            {
+                Self::TwoBytes
+            } else {
+                Self::Byte
+            },
+        )
+    }
+
+    const fn bytes(self) -> usize {
+        match self {
+            Self::Byte => 1,
+            Self::TwoBytes => 2,
+        }
+    }
+
+    fn write(self, value: usize, out: &mut [u8]) {
+        match self {
+            Self::Byte => {
+                out[0] =
+                    u8::try_from(value).expect("projected_value_len checked narrow record lengths")
+            }
+            Self::TwoBytes => out[..2].copy_from_slice(
+                &u16::try_from(value)
+                    .expect("projected_value_len checked wide record lengths")
+                    .to_le_bytes(),
+            ),
+        }
+    }
+
+    fn read(self, bytes: &[u8], at: usize) -> usize {
+        match self {
+            Self::Byte => bytes[at] as usize,
+            Self::TwoBytes => u16::from_le_bytes(bytes[at..at + 2].try_into().unwrap()) as usize,
+        }
     }
 }
 
@@ -555,7 +612,10 @@ fn write_projected_value(v: &Datum, out: &mut [u8]) -> usize {
                     Ok(())
                 }
             }
-            out[0] = 19;
+            let lengths = RecordLengths::for_fields(fields)
+                .expect("projected_value_len checked record lengths");
+            let length_bytes = lengths.bytes();
+            out[0] = if length_bytes == 1 { 19 } else { 51 };
             let mut w = SliceWriter { buf: out, at: 5 };
             let _ = write!(w, "{v}");
             let text_len = w.at - 5;
@@ -563,11 +623,11 @@ fn write_projected_value(v: &Datum, out: &mut [u8]) -> usize {
             // Structural tail: field count, then per field its name, type
             // OID, and nested tagged value.
             let mut at = 5 + text_len;
-            out[at] = fields.len() as u8;
-            at += 1;
+            lengths.write(fields.len(), &mut out[at..]);
+            at += length_bytes;
             for f in *fields {
-                out[at] = f.name.len() as u8;
-                at += 1;
+                lengths.write(f.name.len(), &mut out[at..]);
+                at += length_bytes;
                 out[at..at + f.name.len()].copy_from_slice(f.name.as_bytes());
                 at += f.name.len();
                 out[at..at + 4].copy_from_slice(&f.type_oid.to_le_bytes());
@@ -589,18 +649,21 @@ fn write_projected_value(v: &Datum, out: &mut [u8]) -> usize {
                     Ok(())
                 }
             }
-            out[0] = 202;
+            let lengths = RecordLengths::for_fields(fields)
+                .expect("projected_value_len checked record lengths");
+            let length_bytes = lengths.bytes();
+            out[0] = if length_bytes == 1 { 202 } else { 204 };
             out[1..5].copy_from_slice(&slot.to_le_bytes());
             let mut w = SliceWriter { buf: out, at: 9 };
             let _ = write!(w, "{v}");
             let text_len = w.at - 9;
             out[5..9].copy_from_slice(&(text_len as u32).to_le_bytes());
             let mut at = 9 + text_len;
-            out[at] = fields.len() as u8;
-            at += 1;
+            lengths.write(fields.len(), &mut out[at..]);
+            at += length_bytes;
             for f in *fields {
-                out[at] = f.name.len() as u8;
-                at += 1;
+                lengths.write(f.name.len(), &mut out[at..]);
+                at += length_bytes;
                 out[at..at + f.name.len()].copy_from_slice(f.name.as_bytes());
                 at += f.name.len();
                 out[at..at + 4].copy_from_slice(&f.type_oid.to_le_bytes());
@@ -852,7 +915,7 @@ pub fn decode_projected_value(bytes: &[u8], tag: u8, at: usize) -> (Datum<'_>, u
                 .expect("projected geometry was encoded from valid UTF-8");
             (Datum::Geometry { kind, text }, 5 + len)
         }
-        19 => {
+        19 | 51 => {
             // The arena-free decode returns a record's rendered text — right
             // for comparators and output. Field access goes through
             // [`decode_projected_col_record`], which rebuilds the structure
@@ -862,7 +925,16 @@ pub fn decode_projected_value(bytes: &[u8], tag: u8, at: usize) -> (Datum<'_>, u
                 .expect("projected record text was encoded from valid UTF-8");
             (
                 Datum::Text(s),
-                4 + len + record_tail_len(bytes, at + 4 + len),
+                4 + len
+                    + record_tail_len(
+                        bytes,
+                        at + 4 + len,
+                        if tag == 19 {
+                            RecordLengths::Byte
+                        } else {
+                            RecordLengths::TwoBytes
+                        },
+                    ),
             )
         }
         9 => (Datum::Uuid(bytes[at..at + 16].try_into().unwrap()), 16),
@@ -981,13 +1053,22 @@ pub fn decode_projected_value(bytes: &[u8], tag: u8, at: usize) -> (Datum<'_>, u
                 8 + len,
             )
         }
-        202 => {
+        202 | 204 => {
             let len = u32::from_le_bytes(bytes[at + 4..at + 8].try_into().unwrap()) as usize;
             let s = core::str::from_utf8(&bytes[at + 8..at + 8 + len])
                 .expect("projected composite text was encoded from valid UTF-8");
             (
                 Datum::Text(s),
-                8 + len + record_tail_len(bytes, at + 8 + len),
+                8 + len
+                    + record_tail_len(
+                        bytes,
+                        at + 8 + len,
+                        if tag == 202 {
+                            RecordLengths::Byte
+                        } else {
+                            RecordLengths::TwoBytes
+                        },
+                    ),
             )
         }
         203 => {
@@ -1092,14 +1173,15 @@ pub(crate) fn compare_projected_prefix(a: &[u8], b: &[u8], width: usize) -> core
 }
 
 /// The byte length of a record's structural tail starting at `at` (the field
-/// count byte), nested records included.
-fn record_tail_len(bytes: &[u8], at: usize) -> usize {
+/// count prefix), nested records included.
+fn record_tail_len(bytes: &[u8], at: usize, lengths: RecordLengths) -> usize {
     let mut cursor = at;
-    let n_fields = bytes[cursor] as usize;
-    cursor += 1;
+    let length_bytes = lengths.bytes();
+    let n_fields = lengths.read(bytes, cursor);
+    cursor += length_bytes;
     for _ in 0..n_fields {
-        let name_len = bytes[cursor] as usize;
-        cursor += 1 + name_len + 4;
+        let name_len = lengths.read(bytes, cursor);
+        cursor += length_bytes + name_len + 4;
         let tag = bytes[cursor];
         cursor += 1;
         cursor += decode_projected_value(bytes, tag, cursor).1;
@@ -1161,16 +1243,35 @@ fn restore_projected_record<'a>(
     scalar: Datum<'a>,
     arena: &'a Arena,
 ) -> Result<Datum<'a>, SqlError> {
-    if tag == 19 {
+    if matches!(tag, 19 | 51) {
         let text_len = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
-        return decode_record_tail(bytes, at + 4 + text_len, arena);
+        return decode_record_tail(
+            bytes,
+            at + 4 + text_len,
+            if tag == 19 {
+                RecordLengths::Byte
+            } else {
+                RecordLengths::TwoBytes
+            },
+            arena,
+        );
     }
-    if tag == 202 {
+    if matches!(tag, 202 | 204) {
         let slot =
             crate::storage::TypeCreation::from_le_bytes(bytes[at..at + 4].try_into().unwrap())
                 .expect("projected composite creation");
         let text_len = u32::from_le_bytes(bytes[at + 4..at + 8].try_into().unwrap()) as usize;
-        let Datum::Record(fields) = decode_record_tail(bytes, at + 8 + text_len, arena)? else {
+        let Datum::Record(fields) = decode_record_tail(
+            bytes,
+            at + 8 + text_len,
+            if tag == 202 {
+                RecordLengths::Byte
+            } else {
+                RecordLengths::TwoBytes
+            },
+            arena,
+        )?
+        else {
             unreachable!()
         };
         return Ok(Datum::Composite { slot, fields });
@@ -1182,12 +1283,14 @@ fn restore_projected_record<'a>(
 fn decode_record_tail<'a>(
     bytes: &'a [u8],
     at: usize,
+    lengths: RecordLengths,
     arena: &'a Arena,
 ) -> Result<Datum<'a>, SqlError> {
     use crate::sql::types::RecordField;
+    let length_bytes = lengths.bytes();
     let mut cursor = at;
-    let n_fields = bytes[cursor] as usize;
-    cursor += 1;
+    let n_fields = lengths.read(bytes, cursor);
+    cursor += length_bytes;
     let fields = arena
         .alloc_slice_with(n_fields, |_| RecordField {
             name: "",
@@ -1201,8 +1304,8 @@ fn decode_record_tail<'a>(
             )
         })?;
     for f in fields.iter_mut() {
-        let name_len = bytes[cursor] as usize;
-        cursor += 1;
+        let name_len = lengths.read(bytes, cursor);
+        cursor += length_bytes;
         f.name = core::str::from_utf8(&bytes[cursor..cursor + name_len])
             .expect("projected record name was encoded from valid UTF-8");
         cursor += name_len;
@@ -1210,29 +1313,9 @@ fn decode_record_tail<'a>(
         cursor += 4;
         let tag = bytes[cursor];
         cursor += 1;
-        if tag == 19 {
-            let text_len =
-                u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
-            f.value = decode_record_tail(bytes, cursor + 4 + text_len, arena)?;
-            cursor += decode_projected_value(bytes, tag, cursor).1;
-        } else if tag == 202 {
-            let slot = crate::storage::TypeCreation::from_le_bytes(
-                bytes[cursor..cursor + 4].try_into().unwrap(),
-            )
-            .expect("projected composite creation");
-            let text_len =
-                u32::from_le_bytes(bytes[cursor + 4..cursor + 8].try_into().unwrap()) as usize;
-            let Datum::Record(fields) = decode_record_tail(bytes, cursor + 8 + text_len, arena)?
-            else {
-                unreachable!()
-            };
-            f.value = Datum::Composite { slot, fields };
-            cursor += decode_projected_value(bytes, tag, cursor).1;
-        } else {
-            let (value, size) = decode_projected_value(bytes, tag, cursor);
-            f.value = value;
-            cursor += size;
-        }
+        let (value, size) = decode_projected_value(bytes, tag, cursor);
+        f.value = restore_projected_record(bytes, tag, cursor, value, arena)?;
+        cursor += size;
     }
     Ok(Datum::Record(fields))
 }
@@ -1257,6 +1340,113 @@ pub fn sort_dedup_projected(rows: &mut [&[u8]], width: usize) -> usize {
 mod tests {
     use super::*;
     use crate::mem::budget::Budget;
+
+    #[test]
+    fn projected_records_preserve_wide_nested_fields_and_following_columns() {
+        use crate::sql::types::{RecordField, oid};
+
+        let mut budget = Budget::new(2 << 20);
+        let mut arena = Arena::new(&mut budget, "wide projected records", 2 << 20).unwrap();
+        for count in [255, 256, crate::sql::exec::MAX_PROJ] {
+            let fields = vec![
+                RecordField {
+                    name: "field",
+                    type_oid: oid::INT4,
+                    value: Datum::Int4(42)
+                };
+                count
+            ];
+            let composite = Datum::Composite {
+                slot: crate::storage::TypeCreation::parse(17).unwrap(),
+                fields: &fields,
+            };
+            let nested = [RecordField {
+                name: "nested",
+                type_oid: oid::RECORD,
+                value: composite,
+            }];
+            let values = [
+                Datum::Record(&fields),
+                composite,
+                Datum::Record(&nested),
+                Datum::Int4(99),
+            ];
+            crate::mem::guard::forbid_alloc(|| {
+                let encoded = encode_projected_pub(&values, &arena).unwrap();
+                assert_eq!(projected_prefix_len(encoded, values.len()), encoded.len());
+                assert_eq!(decode_projected_pub(encoded, 3), Datum::Int4(99));
+                let mut restored = [Datum::Null; 4];
+                assert_eq!(
+                    decode_projected_row_into(encoded, &arena, &mut restored).unwrap(),
+                    values.len()
+                );
+                assert_eq!(restored, values);
+                for (index, value) in values.iter().enumerate() {
+                    assert_eq!(
+                        decode_projected_col_record(encoded, index, &arena).unwrap(),
+                        *value
+                    );
+                }
+                let raw = crate::sql::array::build(&[Datum::Record(&fields)], &arena).unwrap();
+                let payload = crate::sql::array::element_payloads(raw).next().unwrap();
+                assert_eq!(
+                    decode_projected_col_record(payload, 0, &arena).unwrap(),
+                    values[0]
+                );
+            });
+            arena.reset();
+        }
+    }
+
+    #[test]
+    fn projected_records_preserve_long_field_names_and_reject_unencodable_shapes() {
+        use crate::sql::types::{RecordField, oid};
+
+        let mut budget = Budget::new(64 << 10);
+        let arena = Arena::new(&mut budget, "projected record names", 64 << 10).unwrap();
+        let name = "x".repeat(256);
+        let fields = [RecordField {
+            name: &name,
+            type_oid: oid::TEXT,
+            value: Datum::Text("value"),
+        }];
+        crate::mem::guard::forbid_alloc(|| {
+            let encoded = encode_projected_pub(&[Datum::Record(&fields)], &arena).unwrap();
+            assert_eq!(
+                decode_projected_col_record(encoded, 0, &arena).unwrap(),
+                Datum::Record(&fields)
+            );
+        });
+        let too_long = "x".repeat(u16::MAX as usize + 1);
+        let fields = [RecordField {
+            name: &too_long,
+            ..fields[0]
+        }];
+        let error = crate::mem::guard::forbid_alloc(|| {
+            encode_projected_pub(&[Datum::Record(&fields)], &arena)
+        })
+        .unwrap_err();
+        assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+        assert!(
+            error
+                .message
+                .as_str()
+                .contains("record field count or name")
+        );
+        let fields = vec![
+            RecordField {
+                name: "x",
+                type_oid: oid::INT4,
+                value: Datum::Int4(1)
+            };
+            u16::MAX as usize + 1
+        ];
+        let error = crate::mem::guard::forbid_alloc(|| {
+            encode_projected_pub(&[Datum::Record(&fields)], &arena)
+        })
+        .unwrap_err();
+        assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+    }
 
     #[test]
     fn projected_width_is_not_truncated_to_one_byte() {

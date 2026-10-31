@@ -350,6 +350,32 @@ pub struct QueryScope<'d> {
 /// may depend on a preceding column before a concrete row has been bound.
 struct ScopeTypes<'s, 'd>(&'s QueryScope<'d>);
 
+/// Schema construction can inspect a caller's columns without retaining values
+/// whose lifetime belongs to that caller's row scratch.
+struct OuterColumnTypes<'s, 'row>(&'s dyn ColumnLookup<'row>);
+
+impl<'a> ColumnLookup<'a> for OuterColumnTypes<'_, '_> {
+    fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
+        self.0.lookup(qualifier, name).map(|_| Datum::Null)
+    }
+
+    fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
+        self.0.col_type(qualifier, name)
+    }
+
+    fn collation(&self, qualifier: Option<&str>, name: &str) -> crate::sql::ast::Collation {
+        self.0.collation(qualifier, name)
+    }
+
+    fn column_user_type(&self, qualifier: Option<&str>, name: &str) -> Option<UserTypeName> {
+        self.0.column_user_type(qualifier, name)
+    }
+
+    fn whole_row_is_scalar(&self, table: &str) -> bool {
+        self.0.whole_row_is_scalar(table)
+    }
+}
+
 impl<'a> ColumnLookup<'a> for ScopeTypes<'_, '_> {
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
         self.0.find_column(qualifier, name)?;
@@ -431,7 +457,7 @@ impl<'d> QueryScope<'d> {
                 joins: &[],
             })
             .map_err(|_| arena_full())?;
-        let mut scope = Self::resolve_schema(storage, from, txid, arena)?;
+        let mut scope = Self::resolve_schema(storage, from, txid, arena, None)?;
         scope.returning_aliases = arena
             .alloc_slice_copy(output_aliases)
             .map_err(|_| arena_full())?;
@@ -862,18 +888,19 @@ impl<'d> QueryScope<'d> {
 
     /// Like `resolve`, but synthesizes a `TableDef` for each derived table
     /// (`FROM (SELECT ...)`) without materializing its rows. Used where only
-    /// the output schema is needed (extended-protocol Describe), which has no
-    /// txid or bound parameters.
+    /// the output schema is needed. An enclosing row supplies declared types
+    /// for correlated table-function arguments without executing the functions.
     pub fn resolve_schema<'a>(
         storage: &'a Storage,
         from: &'a FromClause<'a>,
         txid: u32,
         arena: &'a Arena,
+        outer: Option<&dyn ColumnLookup<'_>>,
     ) -> Result<QueryScope<'a>, SqlError> {
         let mut scope = QueryScope::empty(storage, txid, arena, from)?;
-        scope.add_schema(storage, &from.base, txid, arena)?;
+        scope.add_schema(storage, &from.base, txid, arena, outer)?;
         for j in from.joins {
-            scope.add_schema(storage, &j.table, txid, arena)?;
+            scope.add_schema(storage, &j.table, txid, arena, outer)?;
         }
         scope.build_merges(from, arena, None)?;
         Ok(scope)
@@ -885,6 +912,7 @@ impl<'d> QueryScope<'d> {
         tref: &'a TableRef<'a>,
         txid: u32,
         arena: &'a Arena,
+        outer: Option<&dyn ColumnLookup<'_>>,
     ) -> Result<(), SqlError>
     where
         'a: 'd,
@@ -911,7 +939,19 @@ impl<'d> QueryScope<'d> {
             return self.add_materialized(storage, tref, m, txid, arena, false);
         }
         if tref.is_function_source() {
-            return self.add_table_func(storage, tref, txid, arena, &[], None, false, None);
+            let outer_types = outer.map(OuterColumnTypes);
+            return self.add_table_func(
+                storage,
+                tref,
+                txid,
+                arena,
+                &[],
+                None,
+                false,
+                outer_types
+                    .as_ref()
+                    .map(|columns| columns as &dyn ColumnLookup<'a>),
+            );
         }
         let Some(sub) = tref.subquery else {
             if matches!(
@@ -1757,11 +1797,21 @@ impl<'d> QueryScope<'d> {
             // A composed qualifier whose table name matches some entry is an
             // *invalid* reference (wrong schema or an alias); one matching
             // nothing is *missing* — PostgreSQL's two wordings.
-            Some((_, table)) if self.names[..self.n].contains(&table) => sql_err!(
-                sqlstate::UNDEFINED_TABLE,
-                "invalid reference to FROM-clause entry for table \"{}\"",
-                table
-            ),
+            Some((schema, table))
+                if self.names[..self.n].contains(&table)
+                    || (0..self.n).any(|index| {
+                        self.defs.get(index).is_some_and(|definition| {
+                            definition.schema.as_str() == schema
+                                && definition.name.as_str() == table
+                        })
+                    }) =>
+            {
+                sql_err!(
+                    sqlstate::UNDEFINED_TABLE,
+                    "invalid reference to FROM-clause entry for table \"{}\"",
+                    table
+                )
+            }
             Some((_, table)) => sql_err!(
                 sqlstate::UNDEFINED_TABLE,
                 "missing FROM-clause entry for table \"{}\"",
@@ -1815,12 +1865,17 @@ impl<'d> QueryScope<'d> {
     /// storage- or subquery-derived table returns None (its whole-row reference
     /// is a record).
     pub fn func_scalar_type(&self, name: &str) -> Option<ColType> {
+        self.func_scalar_column(name)
+            .map(|column| self.output_type(column))
+    }
+
+    pub(super) fn func_scalar_column(&self, name: &str) -> Option<ResolvedColumn> {
         let t = self.table_index(name).ok()?;
         if !self.func_scalar[t] {
             return None;
         }
         let def = self.defs.get(t)?;
-        (def.n_columns == 1).then(|| def.columns()[0].ctype)
+        (def.n_columns == 1).then_some(ResolvedColumn::Table(t, 0))
     }
 
     pub fn find_column(
@@ -1873,13 +1928,15 @@ impl<'d> QueryScope<'d> {
                             found = Some(self.output[k]);
                         }
                     }
-                    return found.ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::UNDEFINED_COLUMN,
-                            "column \"{}\" does not exist",
-                            name
-                        )
-                    });
+                    return found
+                        .or_else(|| self.func_scalar_column(name))
+                        .ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::UNDEFINED_COLUMN,
+                                "column \"{}\" does not exist",
+                                name
+                            )
+                        });
                 }
                 let mut found = None;
                 for t in 0..self.n {
@@ -1894,13 +1951,15 @@ impl<'d> QueryScope<'d> {
                         found = Some(ResolvedColumn::Table(t, c));
                     }
                 }
-                found.ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::UNDEFINED_COLUMN,
-                        "column \"{}\" does not exist",
-                        name
-                    )
-                })
+                found
+                    .or_else(|| self.func_scalar_column(name))
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::UNDEFINED_COLUMN,
+                            "column \"{}\" does not exist",
+                            name
+                        )
+                    })
             }
         }
     }
@@ -2049,7 +2108,7 @@ mod tests {
                 owners.push(owner);
             }
             let scope =
-                QueryScope::resolve_schema(&storage, query.from.as_ref().unwrap(), 0, &arena)
+                QueryScope::resolve_schema(&storage, query.from.as_ref().unwrap(), 0, &arena, None)
                     .unwrap();
             assert!(core::ptr::eq(
                 scope.defs.get(0).unwrap(),
@@ -2094,10 +2153,10 @@ mod tests {
         let query = crate::sql::parser::parse_query("SELECT * FROM source", &arena).unwrap();
         crate::mem::guard::forbid_alloc(|| {
             let pending =
-                QueryScope::resolve_schema(&storage, query.from.as_ref().unwrap(), 7, &arena)
+                QueryScope::resolve_schema(&storage, query.from.as_ref().unwrap(), 7, &arena, None)
                     .unwrap();
             let committed =
-                QueryScope::resolve_schema(&storage, query.from.as_ref().unwrap(), 8, &arena)
+                QueryScope::resolve_schema(&storage, query.from.as_ref().unwrap(), 8, &arena, None)
                     .unwrap();
             assert_eq!(pending.star_columns(), 2);
             assert_eq!(committed.star_columns(), 1);
@@ -2137,6 +2196,7 @@ mod tests {
                     query.from.as_ref().unwrap(),
                     0,
                     &arena,
+                    None,
                 ) {
                     Ok(_) => panic!("two images exceed the one free cell"),
                     Err(error) => error,
@@ -2148,14 +2208,19 @@ mod tests {
                         .as_str()
                         .contains("table definition image pool")
                 );
-                let scope =
-                    QueryScope::resolve_schema(&storage, single.from.as_ref().unwrap(), 0, &arena)
-                        .unwrap();
+                let scope = QueryScope::resolve_schema(
+                    &storage,
+                    single.from.as_ref().unwrap(),
+                    0,
+                    &arena,
+                    None,
+                )
+                .unwrap();
                 assert_eq!(scope.defs.get(0).unwrap().name.as_str(), "first");
             }
             drop(owners.pop().unwrap());
             let scope =
-                QueryScope::resolve_schema(&storage, query.from.as_ref().unwrap(), 0, &arena)
+                QueryScope::resolve_schema(&storage, query.from.as_ref().unwrap(), 0, &arena, None)
                     .unwrap();
             assert_eq!(scope.defs.get(1).unwrap().name.as_str(), "second");
         });
@@ -2191,6 +2256,7 @@ mod tests {
                         query.from.as_ref().unwrap(),
                         0,
                         &arena,
+                        None,
                     ) {
                         Ok(_) => panic!("invalid scope must fail"),
                         Err(error) => error,

@@ -1224,6 +1224,15 @@ pub trait CatalogAccess {
         Ok(None)
     }
 
+    fn operator_evaluation(
+        &self,
+        _schema: Option<&str>,
+        _name: &str,
+        _argument_type_oids: &[i32],
+    ) -> Result<Option<ExpressionEvaluation>, SqlError> {
+        Ok(None)
+    }
+
     fn call_routine<'a>(
         &self,
         _target: RoutineCallTarget<'_>,
@@ -1915,7 +1924,9 @@ fn catalog_evaluation(
         variadic,
         ..
     } = expression
-        && catalog.has_routine_candidate(name, args.len())
+        && (catalog.has_routine_candidate(name, args.len())
+            || super::catalog::intrinsic_routine_has_name(name)
+            || super::ast::catalog_operator_call(name).is_some())
     {
         let hooks = EvalHooks {
             catalog: Some(catalog),
@@ -1927,13 +1938,45 @@ fn catalog_evaluation(
                 *target =
                     expression_type_identity(argument, &NoColumns, &hooks)?.routine_argument_oid();
             }
-            found = catalog.routine_evaluation(
-                name,
-                argument_names,
-                *variadic,
-                &types[..args.len()],
-            )?;
+            let types = &types[..args.len()];
+            if let Some((schema, operator)) = super::ast::catalog_operator_call(name) {
+                found = catalog.operator_evaluation(schema, operator, types)?;
+            } else {
+                found = super::catalog::intrinsic_routine_evaluation(name, types, |from, to| {
+                    let physical = |oid| {
+                        constructor_type_from_oid(oid, &|oid| catalog.domain_base_type(oid))
+                    };
+                    match (physical(from), physical(to)) {
+                        (Some(from), Some(to)) => super::types::builtin_implicit_cast(from, to),
+                        _ => false,
+                    }
+                });
+                if found != Some(ExpressionEvaluation::Runtime)
+                    && let Some(evaluation) =
+                        catalog.routine_evaluation(name, argument_names, *variadic, types)?
+                {
+                    found = Some(evaluation);
+                }
+            }
         }
+    }
+    if let Expr::Binary {
+        operator,
+        left,
+        right,
+    } = expression
+        && let Some(name) = operator.operator_name()
+        && catalog.has_operator_candidate(name)
+    {
+        let hooks = EvalHooks {
+            catalog: Some(catalog),
+            ..NO_HOOKS
+        };
+        let types = [
+            expression_type_identity(left, &NoColumns, &hooks)?.routine_argument_oid(),
+            expression_type_identity(right, &NoColumns, &hooks)?.routine_argument_oid(),
+        ];
+        found = catalog.operator_evaluation(None, name, &types)?;
     }
     if let Expr::Cast {
         operand, type_name, ..
@@ -4780,21 +4823,15 @@ fn undefined_function<'a>(
     hooks: &EvalHooks<'_, 'a>,
 ) -> Result<Datum<'a>, SqlError> {
     use core::fmt::Write as _;
-    let full = || {
-        sql_err!(
-            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "function diagnostic exceeds SQL error message capacity (192 bytes)"
-        )
-    };
     let mut message = StackStr::<192>::new();
-    write!(message, "function {}(", name).map_err(|_| full())?;
+    let _ = write!(message, "function {}(", name);
     let columns = RuntimeColumnTypes {
         row,
         catalog: hooks.catalog,
     };
     for (i, argument) in args.iter().enumerate() {
         if i > 0 {
-            message.write_str(", ").map_err(|_| full())?;
+            let _ = message.write_str(", ");
         }
         let type_oid = super::exec::infer_routine_argument_oid(argument, &columns)?;
         let named = if type_oid == super::types::oid::UNKNOWN {
@@ -4827,9 +4864,16 @@ fn undefined_function<'a>(
                     )
                 })?
         };
-        message.write_str(named).map_err(|_| full())?;
+        let _ = message.write_str(named);
     }
-    message.write_str(") does not exist").map_err(|_| full())?;
+    let _ = message.write_str(") does not exist");
+    // Fixed strings record truncation instead of returning a formatting error.
+    if message.is_truncated() {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "function diagnostic exceeds SQL error message capacity (192 bytes)"
+        ));
+    }
     Err(SqlError {
         sqlstate: SqlState::known(sqlstate::UNDEFINED_FUNCTION),
         message,

@@ -305,6 +305,10 @@ removing that eager preparation remains part of the retained execution work.
 Truly immutable constant expressions
 can raise planning errors even when a false filter removes every output row,
 following PostgreSQL's [volatility rules](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/include/catalog/pg_proc.dat).
+Planning uses registered built-in, stored-function and user-operator volatility.
+For example, `SELECT brin_summarize_new_values('orders_brin')` performs its
+maintenance when the query reaches the call; checking the query for constant
+errors must not perform that maintenance first.
 
 ## Schema changes and object identity
 

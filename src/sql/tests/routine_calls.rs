@@ -132,6 +132,24 @@ fn routine_arguments_run_once_and_preserve_strict_null_effects() {
         data_rows(&session.success(&mut engine, "SELECT last_value FROM dispatch_effects", true)),
         ["18"]
     );
+    session.success(
+        &mut engine,
+        "SELECT set_config('test.dispatch_calls','',false); \
+        CREATE FUNCTION dispatch_comparison(regclass,integer) RETURNS boolean LANGUAGE sql VOLATILE \
+        AS 'SELECT set_config(''test.dispatch_calls'',current_setting(''test.dispatch_calls'')||''x'',false) IS NOT NULL'; \
+        CREATE OPERATOR === (LEFTARG=regclass,RIGHTARG=integer,FUNCTION=dispatch_comparison); \
+        CREATE OPERATOR + (LEFTARG=regclass,RIGHTARG=integer,FUNCTION=dispatch_comparison)",
+        true,
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT 'dispatch_target'::regclass === 1; SELECT current_setting('test.dispatch_calls'); \
+            SELECT 'dispatch_target'::regclass + 1; SELECT current_setting('test.dispatch_calls')",
+            true
+        )),
+        ["t", "x", "t", "xx"]
+    );
 }
 
 #[test]

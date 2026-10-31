@@ -3754,6 +3754,70 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     intrinsic!(6426, "timestamptz_hash_extended", 20, "1184 20", 2, "i"),
 ];
 
+pub(crate) fn intrinsic_routine_has_name(name: &str) -> bool {
+    INTRINSIC_ROUTINES
+        .iter()
+        .any(|routine| routine_name_matches(name, "pg_catalog", routine.name))
+}
+
+/// Foldability follows the registered catalog contract. Exact inputs win over
+/// coercions when overloads differ; an unresolved mixed family stays at runtime.
+pub(crate) fn intrinsic_routine_evaluation(
+    name: &str,
+    arguments: &[i32],
+    can_coerce: impl Fn(i32, i32) -> bool,
+) -> Option<super::eval::ExpressionEvaluation> {
+    use super::eval::ExpressionEvaluation::{Immutable, Runtime};
+    let mut family = None;
+    let mut mixed = false;
+    let mut best = None;
+    let mut best_exact = 0;
+    for routine in INTRINSIC_ROUTINES {
+        if !routine_name_matches(name, "pg_catalog", routine.name) {
+            continue;
+        }
+        let evaluation = if routine.volatility == "i"
+            && intrinsic_routine_kind(*routine) == "f"
+            && !intrinsic_routine_is_set_returning(*routine)
+        {
+            Immutable
+        } else {
+            Runtime
+        };
+        mixed |= family.is_some_and(|prior| prior != evaluation);
+        family = Some(evaluation);
+        if routine.argument_count as usize != arguments.len() {
+            continue;
+        }
+        let mut exact = 0;
+        let compatible = routine
+            .argument_types
+            .split_ascii_whitespace()
+            .zip(arguments)
+            .all(|(expected, actual)| {
+                let expected: i32 = expected.parse().expect("registered argument OID");
+                exact += usize::from(*actual == expected);
+                *actual == super::types::oid::UNKNOWN
+                    || *actual == expected
+                    || can_coerce(*actual, expected)
+            });
+        if !compatible {
+            continue;
+        }
+        if best.is_none() || exact > best_exact {
+            best = Some(evaluation);
+            best_exact = exact;
+        } else if exact == best_exact && evaluation == Runtime {
+            best = Some(Runtime);
+        }
+    }
+    if mixed {
+        Some(best.unwrap_or(Runtime))
+    } else {
+        family
+    }
+}
+
 // PostgreSQL 18.6 pg_proc.dat; checked against the live built-in inventory.
 // https://github.com/postgres/postgres/blob/REL_18_6/src/include/catalog/pg_proc.dat
 fn intrinsic_routine_kind(routine: IntrinsicRoutine) -> &'static str {

@@ -45,6 +45,8 @@ match the live reference catalog even while missing routines are being added.
 Retained calls must preserve their bound identities, completed inputs and
 defaults across waits, including PostgreSQL's strict null and error behavior.
 Reuse the shared call boundary rather than replaying argument evaluation.
+Preserve registered built-in and operator volatility when deciding which inputs
+can run during planning; maintenance calls must run only when the query reaches them.
 Run real SQLAlchemy, Alembic and psycopg2 workflows against both servers.
 Keep their catalog inspection, declared types, streaming and migration checks
 passing as function binding and execution expand; see the

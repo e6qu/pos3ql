@@ -2875,6 +2875,78 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         ))
     }
 
+    fn operator_evaluation(
+        &self,
+        schema: Option<&str>,
+        name: &str,
+        arguments: &[i32],
+    ) -> Result<Option<super::eval::ExpressionEvaluation>, SqlError> {
+        if !(1..=2).contains(&arguments.len()) {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "invalid operator input contract"
+            ));
+        }
+        let (left, right) = if arguments.len() == 1 {
+            (None, Some(arguments[0]))
+        } else {
+            (Some(arguments[0]), Some(arguments[1]))
+        };
+        let Some(slot) = self
+            .storage
+            .operator_slot_for_oids(schema, name, left, right, self.txid)?
+        else {
+            return Ok(None);
+        };
+        let operator = self.storage.operator_for(slot, self.txid);
+        for (actual, expected) in [
+            (left, operator.signature.left),
+            (right, operator.signature.right),
+        ] {
+            let (Some(actual), Some(expected)) = (actual, expected) else {
+                continue;
+            };
+            let expected = self
+                .storage
+                .routine_type_oid(expected.ctype, expected.user_type, self.txid)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "operator input type identity is unavailable"
+                    )
+                })?;
+            if actual != expected
+                && (matches!(
+                    crate::storage::NamedTypeKind::from_oid(expected),
+                    Some((crate::storage::NamedTypeKind::Domain, _, _))
+                ) || self.cast_evaluation(actual, expected)?
+                    == Some(super::eval::ExpressionEvaluation::Runtime))
+            {
+                return Ok(Some(super::eval::ExpressionEvaluation::Runtime));
+            }
+        }
+        let Some(oid) = operator.implementation.routine() else {
+            return Ok(Some(super::eval::ExpressionEvaluation::Runtime));
+        };
+        let slot = self
+            .storage
+            .routine_slot_by_oid(oid, self.txid)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_FUNCTION,
+                    "operator function does not exist"
+                )
+            })?;
+        let routine = self.storage.routine_for(slot, self.txid);
+        Ok(Some(
+            if routine.attributes.volatility == crate::storage::RoutineVolatility::Immutable {
+                super::eval::ExpressionEvaluation::Immutable
+            } else {
+                super::eval::ExpressionEvaluation::Runtime
+            },
+        ))
+    }
+
     fn call_routine<'a>(
         &self,
         target: super::eval::RoutineCallTarget<'_>,

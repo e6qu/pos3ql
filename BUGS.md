@@ -12,7 +12,9 @@ application workflows, allocation checks, failure diagnostics and native platfor
 checks. Compare SQL values, declared types, errors and effects; preserve rollback,
 reader ownership, checkpoint retention and recovery when changing shared memory.
 Function checks include nested sequence effects, typed nulls and default inputs;
-overload discovery must finish before running those inputs.
+overload discovery must finish before running those inputs. Planning must respect
+the registered volatility of built-ins, stored functions and user operators, so
+maintenance and other effects cannot run as constant-folding probes.
 Memory evidence distinguishes reservations from resident pages and records the
 revision, compiler, settings and named component charges. Release checks validate
 the documentation actually shipped in the archive.

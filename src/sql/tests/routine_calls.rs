@@ -395,7 +395,7 @@ fn procedure_inputs_bind_before_effects_and_run_in_declaration_order() {
     assert_eq!(data_rows(&session.success(&mut engine,
         "CALL procedure_pair(right_value=>nextval('procedure_effects')); \
          CALL procedure_pair(right_value=>nextval('procedure_effects'),left_value=>nextval('procedure_effects')); \
-         SELECT value FROM procedure_audit ORDER BY value; SELECT last_value FROM procedure_effects", true)), ["1011", "1213", "14"]);
+         SELECT value FROM procedure_audit ORDER BY value; SELECT last_value FROM procedure_effects", true)), ["1011", "1213", "13"]);
     assert_eq!(
         error_sqlstates(&session.execute(
             &mut engine,
@@ -466,7 +466,7 @@ fn routine_inputs_share_conversions_order_and_strictness_in_every_context() {
         data_rows(&session.success(&mut engine, finish, true)),
         [
             "15", "16", "1", "17", "2", "18", "19", "0", "19", "1025", "20", "0", "21", "7|22",
-            "7|7", "22", "0"
+            "7|7", "22", "bigint", "23", "0"
         ]
     );
 }

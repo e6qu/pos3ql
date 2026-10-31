@@ -3752,6 +3752,19 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     intrinsic!(6416, "hashdateextended", 20, "1082 20", 2, "i"),
     intrinsic!(6425, "timestamptz_hash", 23, "1184", 1, "i"),
     intrinsic!(6426, "timestamptz_hash_extended", 20, "1184 20", 2, "i"),
+    // PostgreSQL 18.6 pg_proc.dat, including every registered series overload.
+    // https://github.com/postgres/postgres/blob/724edf9bde9d356724ad384a2e196edc3c9f80f7/src/include/catalog/pg_proc.dat
+    intrinsic!(1191, "generate_subscripts", 23, "2277 23 16", 3, "i"),
+    intrinsic!(1192, "generate_subscripts", 23, "2277 23", 2, "i"),
+    intrinsic!(1066, "generate_series", 23, "23 23 23", 3, "i"),
+    intrinsic!(1067, "generate_series", 23, "23 23", 2, "i"),
+    intrinsic!(1068, "generate_series", 20, "20 20 20", 3, "i"),
+    intrinsic!(1069, "generate_series", 20, "20 20", 2, "i"),
+    intrinsic!(3259, "generate_series", 1700, "1700 1700 1700", 3, "i"),
+    intrinsic!(3260, "generate_series", 1700, "1700 1700", 2, "i"),
+    intrinsic!(938, "generate_series", 1114, "1114 1114 1186", 3, "i"),
+    intrinsic!(939, "generate_series", 1184, "1184 1184 1186", 3, "s"),
+    intrinsic!(6274, "generate_series", 1184, "1184 1184 1186 25", 4, "i"),
 ];
 
 pub(crate) fn intrinsic_routine_has_name(name: &str) -> bool {
@@ -3979,7 +3992,18 @@ fn intrinsic_routine_is_strict(routine: IntrinsicRoutine) -> bool {
 fn intrinsic_routine_is_set_returning(routine: IntrinsicRoutine) -> bool {
     matches!(
         routine.oid,
-        1293 | 1179
+        1191 | 1192
+            | 1066
+            | 1067
+            | 1068
+            | 1069
+            | 3259
+            | 3260
+            | 938
+            | 939
+            | 6274
+            | 1293
+            | 1179
             | 2947
             | 3205
             | 3475
@@ -4034,6 +4058,17 @@ fn intrinsic_routine_parallel(routine: IntrinsicRoutine) -> &'static str {
 
 fn intrinsic_routine_source(routine: IntrinsicRoutine) -> &'static str {
     match routine.oid {
+        1191 => "generate_subscripts",
+        1192 => "generate_subscripts_nodir",
+        1066 => "generate_series_step_int4",
+        1067 => "generate_series_int4",
+        1068 => "generate_series_step_int8",
+        1069 => "generate_series_int8",
+        3259 => "generate_series_step_numeric",
+        3260 => "generate_series_numeric",
+        938 => "generate_series_timestamp",
+        939 => "generate_series_timestamptz",
+        6274 => "generate_series_timestamptz_at_zone",
         2026 => "pg_backend_pid",
         2561 => "pg_blocking_pids",
         2171 => "pg_cancel_backend",

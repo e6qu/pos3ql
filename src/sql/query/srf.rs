@@ -2755,6 +2755,38 @@ fn json_to_record_append_columns(
     Ok(definitions.len())
 }
 
+fn table_function_input_type<'a>(
+    expression: &'a Expr<'a>,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+    columns: &impl ColumnLookup<'a>,
+) -> Result<Option<ColType>, SqlError> {
+    let catalog = super::storage_catalog(storage, arena, txid);
+    let hooks = EvalHooks {
+        catalog: Some(&catalog),
+        ..crate::sql::eval::NO_HOOKS
+    };
+    let crate::sql::eval::ExpressionTypeIdentity::Known(oid) =
+        crate::sql::eval::expression_type_identity(expression, columns, &hooks)?
+    else {
+        return Ok(None);
+    };
+    if oid == crate::sql::types::oid::UNKNOWN {
+        return Ok(None);
+    }
+    storage
+        .routine_result_for_oid(oid, txid)
+        .map(|result| Some(result.ctype))
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::DATATYPE_MISMATCH,
+                "table function input type with OID {} is unavailable",
+                oid
+            )
+        })
+}
+
 fn table_function_array_element_type(
     storage: &Storage,
     txid: u32,
@@ -3341,11 +3373,8 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
             ));
         }
         let vector_unnest = args.len() == 1
-            && (crate::sql::eval::static_type_pub(args[0], columns) == Some(ColType::TsVector)
-                || matches!(
-                    crate::sql::eval::eval(args[0], arena, params, columns),
-                    Ok(Datum::TsVector(_))
-                ));
+            && table_function_input_type(args[0], storage, txid, arena, columns)?
+                == Some(ColType::TsVector);
         if vector_unnest {
             for (index, (name, ctype)) in [
                 ("lexeme", ColType::Text),
@@ -3375,24 +3404,21 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
                 ));
             }
             for (index, argument) in args.iter().enumerate() {
-                let (ctype, user_type) = match crate::sql::eval::static_type_pub(argument, columns)
-                {
-                    Some(ColType::Array(element)) => {
-                        table_function_array_element_type(storage, txid, element)?
-                    }
-                    Some(ColType::Int2Vector) => (ColType::Int2, None),
-                    Some(ColType::OidVector) => (ColType::Oid, None),
-                    Some(ColType::Multirange(kind)) => (ColType::Range(kind), None),
-                    _ => match crate::sql::eval::eval(argument, arena, params, columns)? {
-                        Datum::Array { element, .. } => {
+                let (ctype, user_type) =
+                    match table_function_input_type(argument, storage, txid, arena, columns)? {
+                        Some(ColType::Array(element)) => {
                             table_function_array_element_type(storage, txid, element)?
                         }
-                        Datum::Int2Vector { .. } => (ColType::Int2, None),
-                        Datum::OidVector { .. } => (ColType::Oid, None),
-                        Datum::Multirange { kind, .. } => (ColType::Range(kind), None),
-                        _ => (ColType::Text, None),
-                    },
-                };
+                        Some(ColType::Int2Vector) => (ColType::Int2, None),
+                        Some(ColType::OidVector) => (ColType::Oid, None),
+                        Some(ColType::Multirange(kind)) => (ColType::Range(kind), None),
+                        _ => {
+                            return Err(sql_err!(
+                                sqlstate::DATATYPE_MISMATCH,
+                                "UNNEST requires an array, vector or multirange input"
+                            ));
+                        }
+                    };
                 let type_mod = match argument {
                     Expr::Cast { type_mod, .. } => *type_mod,
                     _ => -1,
@@ -3420,15 +3446,17 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
     } else {
         let single_type = if is_gs {
             let arguments = tref.func_args.unwrap_or(&[]);
-            let start = arguments
-                .first()
-                .and_then(|argument| crate::sql::eval::static_type_pub(argument, columns));
-            let has_numeric = arguments.iter().any(|argument| {
-                crate::sql::eval::static_type_pub(argument, columns) == Some(ColType::Numeric)
-            });
-            let has_int8 = arguments.iter().any(|argument| {
-                crate::sql::eval::static_type_pub(argument, columns) == Some(ColType::Int8)
-            });
+            let mut start = None;
+            let mut has_numeric = false;
+            let mut has_int8 = false;
+            for (index, argument) in arguments.iter().enumerate() {
+                let ctype = table_function_input_type(argument, storage, txid, arena, columns)?;
+                if index == 0 {
+                    start = ctype;
+                }
+                has_numeric |= ctype == Some(ColType::Numeric);
+                has_int8 |= ctype == Some(ColType::Int8);
+            }
             crate::sql::eval::generate_series_result_type(start, has_numeric, has_int8)
         } else if is_gsub {
             ColType::Int4
@@ -3456,18 +3484,11 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
             }
             ColType::Jsonb
         } else {
-            let args = tref.func_args.unwrap_or(&[]);
-            match args.first() {
-                Some(e) => match crate::sql::eval::static_type_pub(e, columns) {
-                    Some(ColType::Array(element)) => element.to_coltype(),
-                    Some(_) => ColType::Text,
-                    None => match crate::sql::eval::eval(e, arena, params, columns)? {
-                        Datum::Array { element, .. } => element.to_coltype(),
-                        _ => ColType::Text,
-                    },
-                },
-                None => ColType::Text,
-            }
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "table function {} has no supported declared output type",
+                tref.table
+            ));
         };
         // A single-column function's default column name is `value` for
         // array_elements, else the (aliased) function name.

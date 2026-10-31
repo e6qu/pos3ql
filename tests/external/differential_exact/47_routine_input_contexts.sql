@@ -27,13 +27,15 @@ SELECT count(*) FROM input_nulls CROSS JOIN LATERAL unnest(ARRAY[nextval('input_
 SELECT last_value FROM input_effects;
 SELECT unnest(ARRAY[nextval('input_effects'),0::bigint]);
 SELECT last_value FROM input_effects;
-SELECT count(*) FROM input_nulls CROSS JOIN LATERAL generate_series(nextval('input_effects'),1044::bigint) AS numbers;
+SELECT count(*) FROM input_nulls CROSS JOIN LATERAL generate_series(nextval('input_effects'),1044) AS numbers;
 SELECT last_value FROM input_effects;
 SELECT count(*) FROM input_nulls CROSS JOIN LATERAL generate_series(nextval('input_effects'),0::bigint) AS numbers;
 SELECT last_value FROM input_effects;
 PREPARE input_set(bigint) AS SELECT $1,unnest(ARRAY[nextval('input_effects'),$1]);
 EXECUTE input_set(7);
 DEALLOCATE input_set;
+SELECT last_value FROM input_effects;
+SELECT pg_typeof(value) FROM generate_series(nextval('input_effects'),23) AS value;
 SELECT last_value FROM input_effects;
 SELECT count(*) FROM input_audit;
 DROP TABLE input_nulls;

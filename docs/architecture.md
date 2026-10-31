@@ -81,6 +81,9 @@ division by zero can follow an earlier sequence increment. Lateral functions and
 subqueries inherit the caller's sequence state. Builtin set-returning calls bind
 input values and SQL types once before counting or emitting their rows; external
 row iteration keeps those inputs without materializing the whole result.
+Table-function descriptions use declared input types and never sample an input
+value. Global aggregates use one source scan, avoiding a second execution of
+lateral inputs just to count the rows before aggregation.
 This call boundary supplies retained execution with an explicit target; it
 does not yet make every function body yield during a storage wait.
 Runtime overload checks copy input descriptors rather than whole definitions.

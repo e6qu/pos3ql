@@ -34,6 +34,9 @@ numbers, error codes, and source provenance in the appropriate technical guide.
 Use the documentation index to avoid repeating the same contract across files.
 Preserve dated measurements and upstream licenses; simplify current guidance
 without rewriting historical evidence.
+Link historical benchmark evidence with immutable GitHub URLs. Release archives
+ship the benchmark index; their links must not depend on baseline files being
+installed locally.
 
 Architecture claims must identify current code paths and remaining gaps. Distinguish
 hard encodings, startup reservations, configured examples, calculated ceilings and

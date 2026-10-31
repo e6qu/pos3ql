@@ -1198,7 +1198,7 @@ pub(crate) fn execute_bound_routine_query<'a>(
     query: &RoutineQuery<'a>,
     storage: &'a Storage,
     routine_slot: usize,
-    routine: crate::storage::RoutineDef,
+    routine: &crate::storage::RoutineDef,
     txid: u32,
     arena: &'a Arena,
     params: &[Datum<'a>],
@@ -1231,7 +1231,7 @@ pub(crate) fn bind_stored_routine_statement<'a>(
     statement: &'a Stmt<'a>,
     storage: &Storage,
     routine_slot: usize,
-    routine: crate::storage::RoutineDef,
+    routine: &crate::storage::RoutineDef,
     txid: u32,
     arena: &'a Arena,
     params: &[Datum<'a>],
@@ -1401,7 +1401,12 @@ pub(crate) fn execute_index_comparison<'a>(
         })?;
     let catalog = storage_catalog(storage, arena, txid);
     let result = catalog
-        .execute_routine(slot, storage.routine_for(slot, txid), &[left, right], arena)?
+        .execute_routine(
+            slot,
+            &storage.routine_for(slot, txid),
+            &[left, right],
+            arena,
+        )?
         .ok_or_else(|| {
             sql_err!(
                 sqlstate::INVALID_FUNCTION_DEFINITION,
@@ -1600,7 +1605,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
                     arguments[2] =
                         Datum::Bool(matches!(context, super::eval::DefinedCastContext::Explicit));
                 }
-                self.execute_routine(slot, routine, &arguments[..routine.argument_count], arena)?
+                self.execute_routine(slot, &routine, &arguments[..routine.argument_count], arena)?
                     .unwrap_or(Datum::Null)
             }
         };
@@ -1738,7 +1743,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
         self.storage.require_routine_execute(function, self.txid)?;
         self.execute_routine(
             function,
-            self.storage.routine_for(function, self.txid),
+            &self.storage.routine_for(function, self.txid),
             &coerced[..expected_count],
             arena,
         )?
@@ -1754,7 +1759,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
     fn execute_routine<'a>(
         &self,
         slot: usize,
-        routine: crate::storage::RoutineDef,
+        routine: &crate::storage::RoutineDef,
         arguments: &[Datum<'a>],
         arena: &'a Arena,
     ) -> Result<Option<Datum<'a>>, SqlError> {
@@ -1852,7 +1857,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
         if track
             && let Err(error) = self
                 .storage
-                .ensure_function_statistics(crate::storage::routine_oid(&routine))
+                .ensure_function_statistics(crate::storage::routine_oid(routine))
         {
             let _ = super::statistics::finish_function_timing(timed);
             return Err(error);
@@ -2002,7 +2007,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
         {
             self.storage.record_function_call(
                 self.txid,
-                crate::storage::routine_oid(&routine),
+                crate::storage::routine_oid(routine),
                 total,
                 own,
             )?;
@@ -2836,12 +2841,23 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         }) else {
             return Ok(None);
         };
-        let declared = self.storage.routine_for(slot, self.txid);
-        let argument_mapping = declared
-            .call_input_mapping(argument_names, argument_type_oids.len(), variadic)
-            .expect("resolved routine call has a valid argument mapping");
+        let (oid, argument_mapping) = self
+            .storage
+            .routine_call_mapping(
+                slot,
+                argument_names,
+                argument_type_oids.len(),
+                variadic,
+                self.txid,
+            )
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "resolved routine input mapping is unavailable"
+                )
+            })?;
         Ok(Some(super::eval::RoutineCallTarget::Stored {
-            oid: crate::storage::routine_oid(&declared),
+            oid,
             argument_mapping,
             variadic,
         }))
@@ -2990,7 +3006,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                 )
             })?;
         self.storage.require_routine_execute(slot, self.txid)?;
-        let declared = self.storage.routine_for(slot, self.txid);
+        let mut declared = self.storage.routine_for(slot, self.txid);
         let mut input_type_oids =
             [super::types::oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
         let mut default_expressions = [None; crate::storage::MAX_ROUTINE_ARGUMENTS];
@@ -3032,10 +3048,11 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                     Some(super::parser::parse_expression(source, arena)?);
             }
         }
-        let routine = self
-            .storage
-            .routine_for_bound_call(slot, &input_type_oids[..declared.argument_count], self.txid)
+        let input_count = declared.argument_count;
+        self.storage
+            .bind_routine_call(&mut declared, &input_type_oids[..input_count], self.txid)
             .expect("resolved routine call has a valid polymorphic binding");
+        let routine = &declared;
         let input_contract = |input_index: usize, expanded: bool| {
             let mut argument = routine.arguments()[input_index];
             if expanded {
@@ -3238,7 +3255,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                     "aggregate support function polymorphic contract does not match its arguments"
                 )
             })?;
-        self.execute_routine(slot, routine, arguments, arena)
+        self.execute_routine(slot, &routine, arguments, arena)
     }
 
     fn cast_evaluation(

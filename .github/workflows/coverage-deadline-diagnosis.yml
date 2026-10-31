@@ -13,65 +13,67 @@ jobs:
     name: Format diagnosis
     uses: ./.github/workflows/formatting.yml
 
-  library-b:
-    name: Original library coverage partition
+  comparison:
+    name: Routine boundary workload (${{ matrix.variant }})
     needs: formatting
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    env:
-      CARGO_PROFILE_RELEASE_DEBUG: "1"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: before
+            revision: fa702ae87a0dfbbb8e0514103b2318b62581e465
+          - variant: after
+            revision: ${{ github.sha }}
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
         with:
+          ref: ${{ matrix.revision }}
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.99.1"
           components: llvm-tools-preview
-      - uses: taiki-e/install-action@cargo-llvm-cov
-      - name: Install the native stack sampler
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov@0.9.1
+          checksum: true
+          fallback: none
+      - name: Record compiler, revision and runner resources
         run: |
-          sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends gdb
-      - name: Record compiler and runner resources
-        run: |
+          git rev-parse HEAD
           rustc -vV
           cargo -V
           nproc
           free -m
           df -h "$GITHUB_WORKSPACE"
-      - name: Reproduce the original coverage workload with live progress
-        shell: bash
-        env:
-          COVERAGE_SHARD: lib:1-of-4
-          COVERAGE_LCOV: ${{ github.workspace }}/coverage-lib-1-of-4.lcov
-          POS3QL_PGBIN: /usr/lib/postgresql/18/bin
-          POS3QL_VENV: ${{ github.workspace }}/venv
+      - name: Build the original instrumented test executable
         run: |
-          set -euo pipefail
-          progress="$RUNNER_TEMP/coverage-progress.log"
-          sh tools/coverage.sh > >(tee "$progress") 2>&1 &
-          coverage_pid=$!
-          while kill -0 "$coverage_pid" 2>/dev/null; do
-            if grep -Fq 'remaining_execution_widths_are_allocation_free_and_survive_cold_recovery has been running' "$progress"; then
-              for sample in $(seq 1 5); do
-                test_pid=$(pgrep -f "^$GITHUB_WORKSPACE/target/release/deps/pos3ql-[0-9a-f]+" | head -n 1 || true)
-                if [ -z "$test_pid" ]; then
-                  echo "Coverage test process finished before stack sample $sample"
-                  break
-                fi
-                echo "=== active coverage stack sample $sample ==="
-                sudo gdb --batch --quiet \
-                  -ex 'set pagination off' \
-                  -ex 'set print frame-arguments none' \
-                  -ex 'thread apply all bt 16' \
-                  -ex detach -p "$test_pid"
-                sleep 10
-              done
-              break
-            fi
-            sleep 1
-          done
-          wait "$coverage_pid"
-      - uses: actions/upload-artifact@v6
+          coverage_environment=$(cargo llvm-cov show-env --sh)
+          eval "$coverage_environment"
+          cargo test --lib --release --locked --no-run
+      - name: Time the unchanged boundary and recovery fixture
+        run: |
+          coverage_environment=$(cargo llvm-cov show-env --sh)
+          eval "$coverage_environment"
+          /usr/bin/time -v python3 tools/test_command.py \
+            cargo test --lib --release --locked -- \
+            --exact sql::tests::remaining_execution_widths_are_allocation_free_and_survive_cold_recovery \
+            --test-threads=1
+
+  lint:
+    name: Call binding build, lint and correctness
+    needs: formatting
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
         with:
-          name: coverage-deadline-library-b
-          path: coverage-lib-1-of-4.lcov
-          if-no-files-found: error
+          toolchain: "1.99.1"
+          components: clippy
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Function, polymorphic, domain and call-boundary regressions
+        run: >-
+          python3 tools/test_command.py cargo test --lib --locked --
+          routine_ function_ polymorphic_ domain_ routine_calls:: --test-threads=1

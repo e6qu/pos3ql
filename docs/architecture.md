@@ -64,6 +64,10 @@ member does not make the array null. A null row value still allows the other
 reached arguments to run.
 This call boundary supplies retained execution with an explicit target; it
 does not yet make every function body yield during a storage wait.
+Runtime overload checks copy input descriptors rather than whole definitions.
+The selected definition is captured once, bound in place and borrowed by its
+execution helpers. Candidate catalog locks are released before type coercion,
+argument effects or SQL execution.
 
 ## Reads and storage layout
 

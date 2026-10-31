@@ -62,6 +62,8 @@ Preserve shared row-history admission before durability, bounded reclamation,
 rollback and prepared/cold recovery while reducing the remaining reservations.
 Include the current execution-stack requirement in embedded measurements and
 reduce avoidable wide construction frames alongside table and history metadata.
+Keep function lookup descriptors separate from reserved definition bodies and
+reuse owned definitions while binding and executing their arguments.
 The retained [empty-engine measurements](https://github.com/e6qu/pos3ql/blob/6ff1ac865a86a5318cb4934fbf01be0926667811/benchmarks/baselines/2026-10-30-embedded-startup/README.md)
 establish a debug-build starting point; repeat them after memory repairs and add
 populated-table and client-session workloads before claiming an embedded minimum.

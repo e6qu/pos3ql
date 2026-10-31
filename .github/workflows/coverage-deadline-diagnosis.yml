@@ -1,0 +1,45 @@
+name: Coverage deadline diagnosis
+
+on:
+  push:
+    branches: [bound-routine-execution]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  formatting:
+    name: Format diagnosis
+    uses: ./.github/workflows/formatting.yml
+
+  library-b:
+    name: Original library coverage partition
+    needs: formatting
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Record compiler and runner resources
+        run: |
+          rustc -vV
+          cargo -V
+          nproc
+          free -m
+          df -h "$GITHUB_WORKSPACE"
+      - name: Reproduce the original coverage workload with live progress
+        env:
+          COVERAGE_SHARD: lib:1-of-4
+          COVERAGE_LCOV: ${{ github.workspace }}/coverage-lib-1-of-4.lcov
+          POS3QL_PGBIN: /usr/lib/postgresql/18/bin
+          POS3QL_VENV: ${{ github.workspace }}/venv
+        run: sh tools/coverage.sh
+      - uses: actions/upload-artifact@v6
+        with:
+          name: coverage-deadline-library-b
+          path: coverage-lib-1-of-4.lcov
+          if-no-files-found: error

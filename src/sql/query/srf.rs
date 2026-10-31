@@ -1211,7 +1211,7 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
                         };
                         *value = eval_full(bound, arena, inputs, row, &indexed_hooks)?;
                     }
-                    Ok(values)
+                    Ok(&*values)
                 },
             );
         }

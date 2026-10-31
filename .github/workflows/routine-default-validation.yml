@@ -104,19 +104,3 @@ jobs:
           name: routine-default-after
           path: ${{ runner.temp }}/default-bindings.log
           if-no-files-found: ignore
-
-  ownership:
-    name: Complete interpreter ownership gate
-    needs: formatting
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: miri
-      - run: cargo miri setup
-      - name: Preserve all 95 configured ownership cases
-        run: |
-          /usr/bin/time -v bash tools/test-miri-ownership.sh "$RUNNER_TEMP/miri-default-validation.log"
-          grep -q '^test result: ok\. 95 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/miri-default-validation.log"

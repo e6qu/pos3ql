@@ -34,6 +34,9 @@ numbers, error codes, and source provenance in the appropriate technical guide.
 Use the documentation index to avoid repeating the same contract across files.
 Preserve dated measurements and upstream licenses; simplify current guidance
 without rewriting historical evidence.
+Link historical benchmark evidence with immutable GitHub URLs. Release archives
+ship the benchmark index; their links must not depend on baseline files being
+installed locally.
 
 Architecture claims must identify current code paths and remaining gaps. Distinguish
 hard encodings, startup reservations, configured examples, calculated ceilings and
@@ -74,6 +77,11 @@ external suites also use Python 3, Docker, and the client tools installed by
 the workflow that owns the check. Native build, lint and boundary checks cover
 Linux amd64, Linux arm64 and macOS arm64. See `Cargo.toml`, `examples/dev.conf`, and
 `.github/workflows/` for the actual build and environment definitions.
+
+Each build or test workflow first calls the shared Rust formatting check.
+A formatting failure keeps its test matrix from starting and retains a
+`formatting-<revision>` artifact containing the correction. Apply that patch
+before pushing again. Build and test jobs start only after formatting passes.
 
 SQL test harnesses prepare their Python clients with
 `tests/external/python_env.py VENV`. Dependencies and wheel hashes are pinned in
@@ -134,6 +142,9 @@ cached SQL remains runnable, and verify retention before deleting any file.
 Verify the invariant or external contract, not a test that merely restates the
 implementation. Boundary changes generally need accepted/rejected capacity,
 rollback, failure cleanup, WAL/checkpoint, and empty-cache recovery coverage.
+Coverage library partitions stream compiler output and each test's progress
+through the native allocation-error reporter. Use those timestamps to locate
+deadline overruns; buffered output must not hide the last running test.
 SQL and wire behavior needs comparison with actual PostgreSQL, including
 SQLSTATEs, types, result shape, and values. SQLSTATE-only and exact-message
 corpora share the same reference connection settings, including UTC and the

@@ -15,7 +15,12 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  formatting:
+    name: Format Drivers
+    uses: ./.github/workflows/formatting.yml
+
   drivers:
+    needs: formatting
     runs-on: ubuntu-latest
     timeout-minutes: 15
 

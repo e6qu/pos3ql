@@ -12,7 +12,12 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  formatting:
+    name: Format CI
+    uses: ./.github/workflows/formatting.yml
+
   reactor-ownership:
+    needs: formatting
     name: native ${{ matrix.check }} (${{ matrix.platform }})
     strategy:
       fail-fast: false
@@ -55,13 +60,13 @@ jobs:
         if: ${{ matrix.check == 'build and test' }}
         run: cargo build --all-targets --locked --target "$NATIVE_TARGET"
 
-      - name: Socket readiness and allocation-free catalog publication
+      - name: Native SQL, catalog and socket boundaries
         if: ${{ matrix.check == 'build and test' }}
         run: >-
           cargo test --lib --locked --target "$NATIVE_TARGET" -- io:: mem::mutex::tests type_ domain_ enum_ composite_ table_name catalog_creation_
           timezone_abbreviation_ fixed_default_abbreviations_ degree_special_and_random_math_
           maintenance_metadata_ cleanup_download_overlap_ object_store::http::tests::
-          reader_scratch_is_synchronized_and_startup_bounded database_default_collation_is_bounded_
+          reader_scratch_is_synchronized_and_startup_bounded database_default_collation_is_bounded_ routine_calls::
           --test-threads=1
 
       - name: Native allocation-free boundaries
@@ -69,6 +74,7 @@ jobs:
         run: cargo clippy --all-targets --locked --target "$NATIVE_TARGET" -- -D warnings
 
   macos-lock-ownership:
+    needs: formatting
     name: macOS mutex ownership
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -90,6 +96,7 @@ jobs:
             "$RUNNER_TEMP/macos-mutex.log"
 
   heap-aliasing:
+    needs: formatting
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -154,26 +161,11 @@ jobs:
           PY
 
   release-package:
+    needs: formatting
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
-
-      - name: Formatting
-        run: |
-          if ! cargo fmt --check; then
-            cargo fmt
-            git diff --binary > "$RUNNER_TEMP/formatting.patch"
-            exit 1
-          fi
-
-      - name: Retain formatting correction
-        if: failure()
-        uses: actions/upload-artifact@v6
-        with:
-          name: formatting-${{ github.sha }}
-          path: ${{ runner.temp }}/formatting.patch
-          if-no-files-found: ignore
 
       - name: Build release executable
         run: cargo build --release --locked
@@ -190,6 +182,7 @@ jobs:
           path: ${{ runner.temp }}/dist/
 
   build-and-check:
+    needs: formatting
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -303,6 +296,7 @@ jobs:
           cargo test --locked --test object_store_it -- --test-threads=1
 
   library-tests:
+    needs: formatting
     name: library tests (${{ matrix.partition }})
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -330,6 +324,7 @@ jobs:
         run: sh tools/test-lib-shard.sh '${{ matrix.partition }}'
 
   wide-execution:
+    needs: formatting
     name: wide execution and cold recovery
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -358,6 +353,7 @@ jobs:
           -- --exact --test-threads=1
 
   object-store-compatibility:
+    needs: formatting
     name: object-store (${{ matrix.implementation }})
     strategy:
       fail-fast: false
@@ -463,6 +459,7 @@ jobs:
         run: docker logs object-store
 
   performance-smoke:
+    needs: formatting
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -497,6 +494,7 @@ jobs:
   # One fixed range per worker preserves the complete 16-seed sweep within
   # the five-minute job contract, including a cold rebuild.
   storage-vopr:
+    needs: formatting
     name: storage-vopr (${{ matrix.first }}-${{ matrix.last }})
     strategy:
       fail-fast: false
@@ -535,6 +533,7 @@ jobs:
   # them preserves every assertion while halving queue pressure on the small
   # runner pool.
   external-runs:
+    needs: formatting
     name: external-runs (${{ matrix.phase }})
     strategy:
       fail-fast: false

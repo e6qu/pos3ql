@@ -17,7 +17,12 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  formatting:
+    name: Format coverage
+    uses: ./.github/workflows/formatting.yml
+
   shard:
+    needs: formatting
     name: shard ${{ matrix.name }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -93,6 +98,7 @@ jobs:
           if-no-files-found: ignore
 
   torture:
+    needs: formatting
     name: shard torture-${{ matrix.name }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -147,6 +153,7 @@ jobs:
           retention-days: 7
 
   subscription:
+    needs: formatting
     name: shard subscription
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -197,6 +204,7 @@ jobs:
         run: sh tools/coverage.sh
 
   spill-differential:
+    needs: formatting
     name: shard spilldiff-${{ matrix.name }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -281,6 +289,7 @@ jobs:
   # bounded; differential.sh enters this mode only when all reference settings
   # are explicitly supplied.
   reference-diff:
+    needs: formatting
     name: shard diff-${{ matrix.name }}
     runs-on: ubuntu-latest
     timeout-minutes: 15

@@ -52,6 +52,23 @@ reads. A cold read on one
 of these paths can occupy that worker. [PLAN.md](../PLAN.md) tracks their
 conversion and the later CPU worker pool separately.
 
+Stored-function dispatch selects the catalog identity and named-input mapping
+and binds input types before evaluating arguments. Constant inputs and their
+conversions are checked before runtime inputs. Reached runtime inputs and
+defaults run in declaration order with the caller's evaluation context.
+Lookup does not run an argument as a probe. For example,
+`setval('order_numbers', nextval('import_numbers'))`
+consumes one import number. A constant null, including an inserted default or
+an explicitly null variadic array, can eliminate a strict call. A null array
+member does not make the array null. A null row value still allows the other
+reached arguments to run.
+This call boundary supplies retained execution with an explicit target; it
+does not yet make every function body yield during a storage wait.
+Runtime overload checks copy input descriptors rather than whole definitions.
+The selected definition is captured once, bound in place and borrowed by its
+execution helpers. Candidate catalog locks are released before type coercion,
+argument effects or SQL execution.
+
 ## Reads and storage layout
 
 The durable layout is log structured: new transactions and saved generations

@@ -1,0 +1,37 @@
+{
+  "test": "sql::tests::remaining_execution_widths_are_allocation_free_and_survive_cold_recovery",
+  "rustc": "1.99.1 (58cf8f9c3 2026-10-13)",
+  "cargo": "1.99.1 (5f94df478 2026-08-27)",
+  "cargo_llvm_cov": "0.9.1",
+  "runner": "ubuntu-latest, x86_64-unknown-linux-gnu",
+  "logical_cpus": 4,
+  "memory_mib": 15982,
+  "profile": "release, cargo llvm-cov show-env instrumentation",
+  "test_threads": 1,
+  "fixture": "tests/external/differential/179_remaining_execution_widths.sql",
+  "fixture_sha256": "d384f881ed92b5815c516e29772fa2428a1aa7dff5d72669cf2e88b3001796e5",
+  "samples": [
+    {
+      "variant": "before",
+      "revision": "fa702ae87a0dfbbb8e0514103b2318b62581e465",
+      "job_url": "https://github.com/e6qu/pos3ql/actions/runs/41238034847/job/124646199622",
+      "download_sha256": "f9aa2014efb764c843bd119af641be25a8b3ef5fb9cf88785afc7004fddee032",
+      "excerpt_file": "before.log",
+      "test_seconds": 486.2,
+      "user_seconds": 485.93,
+      "system_seconds": 0.22,
+      "peak_rss_kib": 265956
+    },
+    {
+      "variant": "after",
+      "revision": "b0981ab8da792d7629b630af61264d107679d8d0",
+      "job_url": "https://github.com/e6qu/pos3ql/actions/runs/41239162352/job/124650216057",
+      "download_sha256": "b09a70d6f698398ed05193c98a05f52ef61a9063fadf0e08901899c51f7d9052",
+      "excerpt_file": "after.log",
+      "test_seconds": 19.82,
+      "user_seconds": 19.5,
+      "system_seconds": 0.18,
+      "peak_rss_kib": 266344
+    }
+  ]
+}

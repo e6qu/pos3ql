@@ -7,13 +7,9 @@ Record an entry here only with its reproducer, observed behavior and the exact
 external blocker or reason it cannot be repaired. Ordinary regression cases
 and resolved investigations belong in their fixing PR, tests and evidence.
 
-Follow [CONTRIBUTING.md](CONTRIBUTING.md) for PostgreSQL comparisons, actual
-application workflows, allocation checks, failure diagnostics and native platform
-checks. Compare SQL values, declared types, errors and effects; preserve rollback,
-reader ownership, checkpoint retention and recovery when changing shared memory.
-Memory evidence distinguishes reservations from resident pages and records the
-revision, compiler, settings and named component charges. Release checks validate
-the documentation actually shipped in the archive.
+Follow [CONTRIBUTING.md](CONTRIBUTING.md) for the required comparisons,
+allocation checks and failure diagnostics. Regression details belong in their
+owning tests and technical guides, rather than a second checklist here.
 
 Unfinished features and their acceptance criteria belong in [PLAN.md](PLAN.md).
 Current guarantees belong in the [behavior guide](docs/implemented-baseline.md)

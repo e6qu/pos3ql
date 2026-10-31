@@ -34,6 +34,7 @@ and bandwidth calculations do not update these historical reports.
 | 2026-10-30 | [Empty embedded engine startup budget and resident memory](https://github.com/e6qu/pos3ql/blob/6ff1ac865a86a5318cb4934fbf01be0926667811/benchmarks/baselines/2026-10-30-embedded-startup/README.md) |
 | 2026-10-30 | [Named empty-engine startup reservations](https://github.com/e6qu/pos3ql/blob/6ff1ac865a86a5318cb4934fbf01be0926667811/benchmarks/baselines/2026-10-30-embedded-components/README.md) |
 | 2026-10-30 | [Empty-engine memory before and after lazy definition initialization](https://github.com/e6qu/pos3ql/blob/4054a6d3c79e916728f8e84d84139eae6d86b501/benchmarks/baselines/2026-10-30-embedded-lazy-definitions/README.md) |
+| 2026-10-31 | [Instrumented function lookup repair comparison](https://github.com/e6qu/pos3ql/blob/cfd803e74af661d4afc9d9e366b9293d08add65c/benchmarks/baselines/2026-10-31-routine-lookup/README.md) |
 
 Follow each run's README for qualifications and raw artifact locations. Preserve
 these files during documentation cleanup; do not regenerate a report against

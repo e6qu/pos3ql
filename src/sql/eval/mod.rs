@@ -1200,6 +1200,10 @@ pub trait CatalogAccess {
     }
     /// Resolve without running arguments. A missing overload must not consume
     /// input effects before another dispatch path or an undefined-function error.
+    fn has_routine_candidate(&self, _name: &str, _arity: usize) -> bool {
+        false
+    }
+
     fn resolve_routine_call<'name>(
         &self,
         _name: &'name str,
@@ -1223,9 +1227,9 @@ pub trait CatalogAccess {
     fn call_routine<'a>(
         &self,
         _target: RoutineCallTarget<'_>,
-        _arguments: &[Datum<'a>],
+        _arguments: &[&'a Expr<'a>],
         _argument_type_oids: &[i32],
-        _sequences: Option<&dyn SequenceAccess>,
+        _evaluate: &mut dyn FnMut(&'a Expr<'a>) -> Result<Datum<'a>, SqlError>,
         _arena: &'a Arena,
     ) -> Result<Datum<'a>, SqlError> {
         Err(sql_err!(
@@ -1905,15 +1909,30 @@ fn catalog_evaluation(
 ) -> Result<Option<CastEvaluation>, SqlError> {
     let mut found = None;
     if let Expr::Call {
-        name, args, argument_names, variadic, ..
-    } = expression {
-        let hooks = EvalHooks { catalog: Some(catalog), ..NO_HOOKS };
+        name,
+        args,
+        argument_names,
+        variadic,
+        ..
+    } = expression
+        && catalog.has_routine_candidate(name, args.len())
+    {
+        let hooks = EvalHooks {
+            catalog: Some(catalog),
+            ..NO_HOOKS
+        };
         let mut types = [super::types::oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
         if args.len() <= types.len() {
             for (target, argument) in types.iter_mut().zip(*args) {
-                *target = expression_type_identity(argument, &NoColumns, &hooks)?.routine_argument_oid();
+                *target =
+                    expression_type_identity(argument, &NoColumns, &hooks)?.routine_argument_oid();
             }
-            found = catalog.routine_evaluation(name, argument_names, *variadic, &types[..args.len()])?;
+            found = catalog.routine_evaluation(
+                name,
+                argument_names,
+                *variadic,
+                &types[..args.len()],
+            )?;
         }
     }
     if let Expr::Cast {
@@ -1940,8 +1959,7 @@ fn catalog_evaluation(
             .element
             .array_oid()
         } else {
-            expression_type_identity(operand, &NoColumns, &hooks)?
-                .routine_argument_oid()
+            expression_type_identity(operand, &NoColumns, &hooks)?.routine_argument_oid()
         };
         if let Some(target) = target
             && let Some(evaluation) = catalog.cast_evaluation(source, target)?
@@ -4748,34 +4766,42 @@ pub(crate) fn array_constructor_type<'a>(
 /// `nosuchfunc(integer)`, not `nosuchfunc()`. The types are the static ones —
 /// an argument is never evaluated to build an error about a function that will
 /// not run — so an untyped literal is `unknown`, exactly as PostgreSQL has it.
-fn undefined_function<'a>(name: &str, args: &[&Expr<'a>], row: &impl ColumnLookup<'a>) -> SqlError {
+fn undefined_function<'a>(
+    name: &str,
+    args: &[&Expr<'a>],
+    arena: &'a Arena,
+    row: &impl ColumnLookup<'a>,
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<Datum<'a>, SqlError> {
     use core::fmt::Write as _;
     let mut list = StackStr::<256>::new();
+    let columns = RuntimeColumnTypes { row, catalog: hooks.catalog };
     for (i, argument) in args.iter().enumerate() {
         if i > 0 {
             let _ = list.write_str(", ");
         }
-        // An untyped literal is `unknown` to PostgreSQL however it would later
-        // coerce, and an array constructor names its element type.
-        let named = if is_unknown_literal(argument) {
-            None
-        } else if let Expr::Array(items) = argument {
-            items
-                .first()
-                .and_then(|first| static_type(first, row))
-                .and_then(crate::sql::types::ArrElem::from_coltype)
-                .map(|element| element.array_name())
+        let type_oid = super::exec::infer_routine_argument_oid(argument, &columns)?;
+        let named = if type_oid == super::types::oid::UNKNOWN {
+            "unknown"
+        } else if crate::storage::NamedTypeKind::from_oid(type_oid).is_some() {
+            hooks.catalog.ok_or_else(|| {
+                sql_err!(sqlstate::INTERNAL_ERROR, "function argument type catalog is unavailable")
+            })?.type_name(type_oid, arena)?.ok_or_else(|| {
+                sql_err!(sqlstate::INTERNAL_ERROR, "function argument type with OID {} is unavailable", type_oid)
+            })?
         } else {
-            static_type(argument, row).map(ColType::name)
+            ColType::from_oid(type_oid).map(ColType::name).ok_or_else(|| {
+                sql_err!(sqlstate::INTERNAL_ERROR, "function argument type with OID {} is unavailable", type_oid)
+            })?
         };
-        let _ = list.write_str(named.unwrap_or("unknown"));
+        let _ = list.write_str(named);
     }
-    sql_err!(
+    Err(sql_err!(
         sqlstate::UNDEFINED_FUNCTION,
         "function {}({}) does not exist",
         name,
         list.as_str()
-    )
+    ))
 }
 
 #[derive(Clone, Copy)]
@@ -4847,7 +4873,7 @@ fn call<'a>(
     }
     if name.eq_ignore_ascii_case("parse_ident") && argument_names.iter().any(Option::is_some) {
         if args.len() != 2 || star || variadic {
-            return Err(undefined_function(name, args, row));
+            return undefined_function(name, args, arena, row, hooks);
         }
         let mut parse_ident_args = [&Expr::Null; 2];
         reorder_required_arguments(
@@ -5019,13 +5045,16 @@ fn call<'a>(
             )
         });
     }
-    if !star && let Some(catalog) = hooks.catalog {
+    if !star && let Some(catalog) = hooks.catalog
+        && (catalog.has_routine_candidate(name, args.len())
+            || crate::sql::ast::catalog_operator_call(name).is_some())
+    {
         let argument_type_oids = arena
             .alloc_slice_with(args.len(), |_| crate::sql::types::oid::UNKNOWN)
             .map_err(|_| arena_full())?;
         for (slot, argument) in args.iter().enumerate() {
-            argument_type_oids[slot] = expression_type_identity(argument, row, hooks)?
-                .routine_argument_oid();
+            argument_type_oids[slot] =
+                expression_type_identity(argument, row, hooks)?.routine_argument_oid();
         }
         if args.len() == 1
             && let Some((schema, "!!")) = crate::sql::ast::catalog_operator_call(name)
@@ -5040,20 +5069,15 @@ fn call<'a>(
                 _ => unreachable!("tsquery operator argument identity"),
             };
         }
-        if let Some(target) = catalog.resolve_routine_call(
-            name,
-            argument_names,
-            variadic,
-            argument_type_oids,
-        )? {
-            let arguments = arena
-                .alloc_slice_with(args.len(), |_| Datum::Null)
-                .map_err(|_| arena_full())?;
-            for (value, argument) in arguments.iter_mut().zip(args) {
-                *value = eval_full(argument, arena, params, row, hooks)?;
-            }
+        if let Some(target) =
+            catalog.resolve_routine_call(name, argument_names, variadic, argument_type_oids)?
+        {
             return catalog.call_routine(
-                target, arguments, argument_type_oids, hooks.sequences, arena,
+                target,
+                args,
+                argument_type_oids,
+                &mut |argument| eval_full(argument, arena, params, row, hooks),
+                arena,
             );
         }
     }
@@ -5815,7 +5839,7 @@ fn call<'a>(
                 .map_err(|_| arena_full())?;
             Ok(Datum::Record(fields))
         }
-        _ => Err(undefined_function(name, args, row)),
+        _ => undefined_function(name, args, arena, row, hooks),
     }
 }
 

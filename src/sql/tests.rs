@@ -12,9 +12,9 @@ mod cursor_execution;
 mod key_preparation;
 mod object_reads;
 mod query_execution;
+mod routine_calls;
 mod row_history;
 mod row_layout;
-mod routine_calls;
 mod table_publication;
 mod transaction_publication;
 

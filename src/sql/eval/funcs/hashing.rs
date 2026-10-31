@@ -93,9 +93,9 @@ pub(crate) fn dispatch<'a>(
         // PostgreSQL folds strict calls with a constant null before running
         // volatile arguments, but still checks constant argument errors.
         // https://github.com/postgres/postgres/blob/REL_18_6/src/backend/optimizer/util/clauses.c#L4173
-        let Some(values) = super::super::args::strict_arguments::<2>(
-            args, arena, params, row, hooks,
-        )? else {
+        let Some(values) =
+            super::super::args::strict_arguments::<2>(args, arena, params, row, hooks)?
+        else {
             return Ok(Datum::Null);
         };
         let value = values[0];

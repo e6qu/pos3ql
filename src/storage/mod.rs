@@ -8998,7 +8998,10 @@ impl RoutineDef {
             .filter(|parameter| parameter.mode.is_input())
             .take_while(|parameter| parameter.mode.default().is_none())
             .count();
-        required <= arity && arity <= argument_count
+        let variadic = parameters.iter().any(|parameter| {
+            matches!(parameter.mode, RoutineParameterMode::Variadic { .. })
+        });
+        required <= arity && (arity <= argument_count || variadic)
     }
 
     pub(crate) fn parameter_for_input(&self, input_index: usize) -> Option<RoutineParameterDef> {

@@ -24,7 +24,7 @@ planner transformation, function, or PostgreSQL subsystem.
 | Relational SQL | Tested DDL/DML, MERGE, MVCC transactions, savepoints/two-phase transactions, locks, CTEs, joins, grouping, windows, set operations, views/materialized views, inheritance/partitioning, triggers/rules, cursors, and maintenance |
 | Types | Modeled native scalar/array, range/multirange, enum/domain/composite, JSON/JSONB/jsonpath, XML, temporal, network/geometric, full-text, catalog-reference, ACL, transaction, bit/binary string, and UUID families |
 | Programming | SQL and PL/pgSQL functions/procedures/triggers, anonymous blocks, set-returning/table functions, dynamic SQL, transition/event triggers, privileges, security-definer state, and configuration scopes |
-| Catalogs/tools | Typed PostgreSQL-shaped catalogs and monitoring for tested psql, pg_dump/pg_restore, psycopg, pgJDBC, Npgsql, node-postgres, and pgx paths |
+| Catalogs/tools | Typed PostgreSQL-shaped catalogs and monitoring for tested psql, pg_dump/pg_restore, psycopg2, psycopg 3, SQLAlchemy, Alembic, pgJDBC, Npgsql, node-postgres, and pgx paths |
 | Replication | PostgreSQL publication/subscription and pgoutput interoperability within the [logical replication boundary](logical-replication.md) |
 | Persistence | Immutable object-native commits/checkpoints, recovery, backups, and [versioned durable formats](durable-format.md) |
 
@@ -32,6 +32,13 @@ The source repository's `tests/postgresql18_commands.tsv` records executable
 commands and explicit architecture rejections. Curated differential queries,
 raw-wire/driver probes, and the vendored regression schedule are continuing
 ratchets. Unsupported clauses and type combinations must reject explicitly.
+
+Actual application fixtures create and update SQLAlchemy models, inspect their
+columns and constraints, stream results, and upgrade and reverse Alembic schema
+changes. Both psycopg2 and psycopg 3 run those workflows against PostgreSQL and
+pos3ql. For example, an identity column in a non-default schema must still be
+discovered correctly when an inspector queries the catalogs. These fixtures
+cover the recorded workflows, not every application or library feature.
 
 Array and `CASE` result types come from their declarations, including subqueries
 and null values. For example, `ARRAY[(SELECT NULL::date)]` is `date[]`, and

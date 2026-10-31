@@ -1,8 +1,13 @@
 //! Guards retain committed definitions and the pending slots that issued a view.
 
+use core::cell::UnsafeCell;
+use core::mem::MaybeUninit;
 use core::mem::size_of;
 use core::ops::{Deref, DerefMut};
-use {crate::mem::mutex::Mutex, std::sync::RwLock, std::sync::RwLockReadGuard};
+use {
+    crate::mem::mutex::Mutex,
+    std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard},
+};
 
 use super::table_names::{
     DefinitionWrite, IdentityWrite, NameIdentity, TableNameScope, TableNames,
@@ -230,10 +235,18 @@ impl TableDefinition {
     }
 }
 
-/// Every slot is initialized at startup. Readers retain one slot, while the
-/// allocation cursor is held only while publishing or retiring bounded links.
+struct DefinitionVersionCell(UnsafeCell<MaybeUninit<PendingTableDefSlot>>);
+
+// SAFETY: each payload is accessed only with its matching occupancy read/write
+// guard, or exclusive pool ownership. The payload is initialized before the
+// occupied bit is published; read guards prevent retirement and reuse.
+unsafe impl Sync for DefinitionVersionCell {}
+
+/// Dense locks initialize at startup; wide payload pages are touched only by
+/// staged definitions. The complete payload capacity is still startup-charged.
 pub(super) struct DefinitionVersions {
-    slots: FixedVec<RwLock<Option<PendingTableDefSlot>>>,
+    slots: FixedVec<RwLock<bool>>,
+    images: Box<[DefinitionVersionCell]>,
     allocation: Mutex<usize>,
 }
 
@@ -243,19 +256,31 @@ impl DefinitionVersions {
     }
 
     pub(super) const fn budget_bytes(capacity: usize) -> usize {
-        Self::control_bytes() + capacity * size_of::<RwLock<Option<PendingTableDefSlot>>>()
+        Self::control_bytes()
+            + capacity * (size_of::<RwLock<bool>>() + size_of::<DefinitionVersionCell>())
     }
 
     pub(super) fn new(budget: &mut Budget, capacity: usize) -> Result<Self, BudgetError> {
         budget.draw(Self::control_bytes(), "table definition version controls")?;
-        let mut slots = FixedVec::new(budget, "pending_table_defs", capacity)?;
+        let mut slots = FixedVec::new(budget, "table definition slot locks", capacity)?;
         for _ in 0..capacity {
             slots
-                .push(RwLock::new(None))
+                .push(RwLock::new(false))
                 .expect("startup slot capacity reserved");
         }
+        budget.draw_array(
+            capacity,
+            size_of::<DefinitionVersionCell>(),
+            "pending_table_defs",
+        )?;
+        let images = Box::<[DefinitionVersionCell]>::new_uninit_slice(capacity);
+        // SAFETY: every cell contains only MaybeUninit behind UnsafeCell. An
+        // unoccupied slot is never read, and all payload initialization occurs
+        // under its dense write lock before publishing occupancy.
+        let images = unsafe { images.assume_init() };
         Ok(Self {
             slots,
+            images,
             allocation: Mutex::new(0),
         })
     }
@@ -265,7 +290,29 @@ impl DefinitionVersions {
             state: self.slots[slot]
                 .read()
                 .expect("definition slot lock poisoned"),
+            image: &self.images[slot],
         }
+    }
+
+    fn write(&self, slot: usize) -> DefinitionSlotWrite<'_> {
+        DefinitionSlotWrite {
+            state: self.slots[slot]
+                .write()
+                .expect("definition slot lock poisoned"),
+            image: &self.images[slot],
+        }
+    }
+
+    fn exclusive_slot(&mut self, slot: usize) -> &mut PendingTableDefSlot {
+        assert!(
+            *self.slots[slot]
+                .get_mut()
+                .expect("definition slot lock poisoned"),
+            "published definition slot exists"
+        );
+        // SAFETY: exclusive pool ownership excludes all slot guards; occupancy
+        // proves this payload was initialized before its link was published.
+        unsafe { self.images[slot].0.get_mut().assume_init_mut() }
     }
 
     pub(super) fn validate_schema_rename(
@@ -333,9 +380,7 @@ impl DefinitionVersions {
         let mut changed = movement.rewrite(state.edit_committed(revision));
         let mut tail = state.pending.map(|head| head.tail);
         while let Some(slot) = tail {
-            let mut owner = self.slots[slot as usize]
-                .write()
-                .expect("definition slot lock poisoned");
+            let mut owner = self.write(slot as usize);
             let entry = owner.as_mut().expect("published definition slot exists");
             changed |= movement.rewrite(&mut entry.version.def);
             tail = entry.previous;
@@ -352,9 +397,7 @@ impl DefinitionVersions {
         let mut changed = movement.rewrite_definition(state.edit_committed(revision));
         let mut tail = state.pending.map(|head| head.tail);
         while let Some(slot) = tail {
-            let mut owner = self.slots[slot as usize]
-                .write()
-                .expect("definition slot lock poisoned");
+            let mut owner = self.write(slot as usize);
             let entry = owner.as_mut().expect("published definition slot exists");
             changed |= movement.rewrite_definition(&mut entry.version.def);
             tail = entry.previous;
@@ -374,11 +417,7 @@ impl DefinitionVersions {
         let result: Result<(), SqlError> = (|| {
             let mut tail = state.pending.map(|head| head.tail);
             while let Some(slot) = tail {
-                let entry = self.slots[slot as usize]
-                    .get_mut()
-                    .expect("definition slot lock poisoned")
-                    .as_mut()
-                    .expect("published definition slot exists");
+                let entry = self.exclusive_slot(slot as usize);
                 let pending = &mut entry.version;
                 super::rename_schema_name(&mut pending.def.schema, prior, name);
                 for column in pending.def.columns.iter_mut().take(pending.def.n_columns) {
@@ -442,10 +481,9 @@ impl DefinitionVersions {
             .expect("definition allocation lock poisoned");
         for distance in 0..self.slots.len() {
             let slot = (*cursor + distance) % self.slots.len();
-            if self.slots[slot]
+            if *self.slots[slot]
                 .read()
                 .expect("definition slot lock poisoned")
-                .is_some()
             {
                 continue;
             }
@@ -456,9 +494,7 @@ impl DefinitionVersions {
                 )
             })?;
             let transaction = version.txid;
-            *self.slots[slot]
-                .write()
-                .expect("definition slot lock poisoned") = Some(PendingTableDefSlot {
+            self.write(slot).install(PendingTableDefSlot {
                 previous,
                 depth,
                 version,
@@ -630,9 +666,8 @@ impl DefinitionVersions {
             .allocation
             .lock()
             .expect("definition allocation lock poisoned");
-        let previous = self.slots[head.tail as usize]
-            .write()
-            .expect("definition slot lock poisoned")
+        let previous = self
+            .write(head.tail as usize)
             .take()
             .expect("published definition slot exists")
             .previous;
@@ -659,9 +694,8 @@ impl DefinitionVersions {
             .expect("definition allocation lock poisoned");
         let mut tail = state.pending.take().map(|head| head.tail);
         while let Some(slot) = tail {
-            tail = self.slots[slot as usize]
-                .write()
-                .expect("definition slot lock poisoned")
+            tail = self
+                .write(slot as usize)
                 .take()
                 .expect("published definition slot exists")
                 .previous;
@@ -684,15 +718,53 @@ impl DefinitionVersions {
 }
 
 struct DefinitionSlotRead<'a> {
-    state: RwLockReadGuard<'a, Option<PendingTableDefSlot>>,
+    state: RwLockReadGuard<'a, bool>,
+    image: &'a DefinitionVersionCell,
 }
 
 impl Deref for DefinitionSlotRead<'_> {
     type Target = PendingTableDefSlot;
     fn deref(&self) -> &Self::Target {
-        self.state
-            .as_ref()
-            .expect("published definition slot exists")
+        assert!(*self.state, "published definition slot exists");
+        // SAFETY: the matching read guard proves occupancy and prevents a
+        // writer from changing or retiring this initialized payload.
+        unsafe { (&*self.image.0.get()).assume_init_ref() }
+    }
+}
+
+struct DefinitionSlotWrite<'a> {
+    state: RwLockWriteGuard<'a, bool>,
+    image: &'a DefinitionVersionCell,
+}
+
+impl DefinitionSlotWrite<'_> {
+    fn as_mut(&mut self) -> Option<&mut PendingTableDefSlot> {
+        if !*self.state {
+            return None;
+        }
+        // SAFETY: occupancy proves initialization; the exclusive guard and
+        // this mutable borrow exclude every other access to the payload.
+        Some(unsafe { (&mut *self.image.0.get()).assume_init_mut() })
+    }
+
+    fn install(&mut self, value: PendingTableDefSlot) {
+        assert!(!*self.state, "definition allocation owns an empty slot");
+        // SAFETY: the write guard excludes readers and competing writers.
+        // Publishing occupancy only after the write makes reads initialized.
+        unsafe {
+            (*self.image.0.get()).write(value);
+        }
+        *self.state = true;
+    }
+
+    fn take(&mut self) -> Option<PendingTableDefSlot> {
+        if !*self.state {
+            return None;
+        }
+        *self.state = false;
+        // SAFETY: the occupied slot was initialized and is held exclusively.
+        // Clearing occupancy transfers its value without touching empty pages.
+        Some(unsafe { (&*self.image.0.get()).assume_init_read() })
     }
 }
 
@@ -966,6 +1038,41 @@ mod tests {
                     )
                     .is_some()
             );
+        });
+    }
+
+    #[test]
+    fn table_definition_cells_keep_readers_initialized_through_retirement_and_reuse() {
+        let versions = versions(1);
+        let first = TableDefinition::new(definition(1));
+        let other = TableDefinition::new(definition(1));
+        crate::mem::guard::forbid_alloc(|| {
+            versions.stage(&first, pending(2, 7), 8).unwrap();
+            let retained = PendingDefinitionRead::current(&first, &versions).unwrap();
+            assert_eq!(retained.def.n_columns, 2);
+            assert_eq!(
+                versions
+                    .stage(&other, pending(3, 9), 8)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::PROGRAM_LIMIT_EXCEEDED
+            );
+            assert_eq!(retained.def.n_columns, 2);
+            let slot = first.read().pending.unwrap().tail as usize;
+            assert!(versions.slots[slot].try_write().is_err());
+            drop(retained);
+            assert!(versions.rollback(&first, 7));
+            assert!(!*versions.slots[slot].read().unwrap());
+            versions.stage(&other, pending(3, 9), 8).unwrap();
+            assert_eq!(
+                PendingDefinitionRead::current(&other, &versions)
+                    .unwrap()
+                    .def
+                    .n_columns,
+                3
+            );
+            versions.clear(&other);
+            assert!(!*versions.slots[slot].read().unwrap());
         });
     }
 

@@ -2760,6 +2760,7 @@ impl RowState {
         Self::committed_in_generation(loc, commit_lsn, 0)
     }
 
+    #[cfg(test)]
     pub(crate) fn committed_in_generation(loc: RowLoc, commit_lsn: u64, generation: u64) -> Self {
         Self {
             committed: Some(RowHome::Heap(loc)),
@@ -34665,13 +34666,8 @@ impl Storage {
             let oldest = snapshots
                 .retains_for(txid)
                 .then(|| snapshots.oldest())
-                .flatten()
-                .filter(|snapshot| *snapshot < state.committed_lsn);
-            if prune_committed_history(
-                &mut versions.committed_row_versions,
-                &mut state.history,
-                oldest,
-            ) {
+                .flatten();
+            if prune_committed_history(&mut versions.committed_row_versions, state, oldest) {
                 versions.history_pressure_changed = true;
                 self.row_versions
                     .history_pressure
@@ -34870,11 +34866,7 @@ impl Storage {
                     .store(true, std::sync::atomic::Ordering::Release);
             }
         } else {
-            prune_committed_history(
-                &mut versions.committed_row_versions,
-                &mut state.history,
-                None,
-            );
+            prune_committed_history(&mut versions.committed_row_versions, state, None);
         }
         if rewritten {
             for enforcer in publication.enforcers[..n_enforcers].iter_mut().flatten() {
@@ -53972,11 +53964,7 @@ mod tests {
             assert_eq!(storage.row_bytes(table, 1, image, &arena).unwrap(), b"new!");
             let versions = storage.row_versions.exclusive();
             let state = storage.tables[table].rows.get_mut(&1).unwrap();
-            prune_committed_history(
-                &mut versions.committed_row_versions,
-                &mut state.history,
-                None,
-            );
+            prune_committed_history(&mut versions.committed_row_versions, state, None);
             assert_eq!(
                 storage
                     .row_bytes(table, 1, retained, &arena)

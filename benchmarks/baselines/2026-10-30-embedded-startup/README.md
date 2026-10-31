@@ -39,8 +39,8 @@ This points to other startup structures as substantial costs; it does not
 identify a single allocation as their cause. Later measurements must retain
 named component reservations and use a new revision and evidence directory.
 
-Reproduce the sample matrix on a dedicated runner, with a new directory for
-each invocation:
+Reproduce the sample matrix using the recorded revision's helper on a dedicated
+runner, with a new directory for each invocation:
 
 ```sh
 cargo build --example embedded-memory --locked

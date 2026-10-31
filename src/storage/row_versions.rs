@@ -534,10 +534,20 @@ pub(super) fn release_committed_chain(
     heap_changed
 }
 
-/// Keeps every version newer than the oldest snapshot and the first version
-/// at or before it. That is the minimal chain that can answer every active
-/// snapshot. Reports whether any heap reference was released.
+/// Keep the oldest reader's boundary and every newer image. If the current
+/// value or deletion covers all readers, no history remains necessary.
+/// Reports whether any heap reference was released.
 pub(super) fn prune_committed_history(
+    pool: &mut RowVersionPool<CommittedVersionSlot>,
+    row: &mut RowState,
+    oldest_snapshot: Option<u64>,
+) -> bool {
+    let oldest = oldest_snapshot
+        .filter(|snapshot| !row.has_committed_version() || *snapshot < row.committed_lsn);
+    prune_committed_chain(pool, &mut row.history, oldest)
+}
+
+pub(super) fn prune_committed_chain(
     pool: &mut RowVersionPool<CommittedVersionSlot>,
     history: &mut CommittedHistory,
     oldest_snapshot: Option<u64>,
@@ -674,6 +684,61 @@ mod tests {
             let second = reserve_history_slot(&mut state.committed_row_versions).unwrap();
             release_reserved_history(&mut state.committed_row_versions, first);
             release_reserved_history(&mut state.committed_row_versions, second);
+        });
+    }
+
+    #[test]
+    fn row_history_reservation_reclaims_images_when_the_current_row_covers_readers() {
+        let mut pools = pools(2);
+        let state = pools.exclusive();
+        let mut row = RowState::committed_only_at(RowLoc::test(3, 4), 3);
+        crate::mem::guard::forbid_alloc(|| {
+            for lsn in [1, 2] {
+                push_committed_version(
+                    &mut state.committed_row_versions,
+                    &mut row.history,
+                    2,
+                    committed(lsn),
+                )
+                .unwrap();
+            }
+            assert!(prune_committed_history(
+                &mut state.committed_row_versions,
+                &mut row,
+                Some(2)
+            ));
+            assert_eq!(row.history.len(), 1);
+            assert_eq!(
+                committed_version_at(&state.committed_row_versions, row.history, 2),
+                Some(committed(2))
+            );
+            assert!(prune_committed_history(
+                &mut state.committed_row_versions,
+                &mut row,
+                Some(3)
+            ));
+            assert!(row.history.is_empty());
+            let first = reserve_history_slot(&mut state.committed_row_versions).unwrap();
+            let second = reserve_history_slot(&mut state.committed_row_versions).unwrap();
+            release_reserved_history(&mut state.committed_row_versions, first);
+            release_reserved_history(&mut state.committed_row_versions, second);
+            row.committed = None;
+            push_committed_version(
+                &mut state.committed_row_versions,
+                &mut row.history,
+                2,
+                committed(2),
+            )
+            .unwrap();
+            assert!(prune_committed_history(
+                &mut state.committed_row_versions,
+                &mut row,
+                Some(3)
+            ));
+            assert!(
+                row.history.is_empty(),
+                "a visible deletion also covers newer readers"
+            );
         });
     }
 
@@ -839,7 +904,7 @@ mod tests {
             )
             .unwrap();
             assert_eq!(state.pending_row_versions.len(), 2);
-            assert!(prune_committed_history(
+            assert!(prune_committed_chain(
                 &mut state.committed_row_versions,
                 &mut history,
                 Some(2)
@@ -860,14 +925,14 @@ mod tests {
             .unwrap();
             assert_eq!(state.committed_row_versions.len(), 2);
             clear_pending_versions(state, &mut commands);
-            assert!(prune_committed_history(
+            assert!(prune_committed_chain(
                 &mut state.committed_row_versions,
                 &mut history,
                 None
             ));
             assert!(commands.is_none());
             assert!(history.is_empty());
-            assert!(!prune_committed_history(
+            assert!(!prune_committed_chain(
                 &mut state.committed_row_versions,
                 &mut history,
                 None
@@ -915,7 +980,7 @@ mod tests {
                 )
                 .unwrap();
                 clear_pending_versions(state, &mut commands);
-                prune_committed_history(&mut state.committed_row_versions, &mut history, None);
+                prune_committed_chain(&mut state.committed_row_versions, &mut history, None);
             }
             assert_eq!(state.pending_row_versions.len(), 2);
             assert_eq!(state.committed_row_versions.len(), 2);

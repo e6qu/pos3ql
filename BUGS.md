@@ -26,12 +26,19 @@ Memory comparisons must separate configured reservations, drawn startup budget
 and measured process memory; retain both transaction modes, raw named component
 charges, compiler identity and the revision. Keep evidence metadata separately
 from disposable empty database files.
+Wide definition slots must remain initialized and owned until their readers
+release them; startup must not initialize payload pages for every unused slot.
 The live built-in inventory must reject wrong properties for registered routines;
 missing catalog entries remain an explicit completion gap in PLAN.md.
 Reproduce history exhaustion with an older reader and a multirow write; assert
 that rejected commits do not advance durable state or partially change rows.
 History reservations must remain owned while competing updates, savepoint undo
 and prepared recovery run; unused reservations must become reusable on rollback.
+Readers that can see the current row must not retain older images or obsolete
+deletion markers. Check shared-slot reuse under those readers without draining
+all history synchronously or repeating an update's inputs and effects.
+Deletion markers still belong to unfinished checkpoint captures until those
+captures release them, even when no query needs an older row value.
 Recovered prepared replay must preserve row history for existing readers across
 both replacement and deletion, rather than overwrite their saved values.
 Preserve failed outputs and diagnostics before removing temporary fixtures.

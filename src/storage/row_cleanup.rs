@@ -277,7 +277,7 @@ impl Storage {
                     };
                     changed |= prune_committed_history(
                         &mut versions.as_mut().unwrap().committed_row_versions,
-                        &mut state.history,
+                        state,
                         oldest,
                     );
                 }

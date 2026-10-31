@@ -146,7 +146,15 @@ mode reserves no committed-row history. An update owns its prospective history
 slot with its pending row chain, before durability. Queued and prepared commits
 keep that ownership; commit links the reserved slot without allocating another,
 and rollback releases it. History exhaustion returns `54000` at the write boundary.
+Obsolete versions can be reclaimed while newer readers are active. On slot
+pressure, write admission runs at most one 64-slot cleanup batch and retries
+with its owned input. It never repeats SQL expressions or drains the whole
+database synchronously; remaining pressure returns the named capacity error.
 Per-table metadata can still make many small embedded tables expensive.
+Pending table definitions reserve their complete payload capacity at startup,
+but initialize only dense occupancy locks. Wide payload pages are touched when
+a definition is staged; its matching read/write guard protects initialization,
+retirement and reuse. Reserving unused slots does not initialize every payload.
 
 The [embedded memory measurement](../examples/embedded-memory.rs) starts one empty
 engine per process and reports the configured reservation, startup budget drawn,

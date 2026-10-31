@@ -69,7 +69,8 @@ fn row_history_reservation_survives_prepared_recovery_and_releases_on_resolution
                 ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(11);
             writer.success(
                 &mut engine,
-                "CREATE TABLE prepared_history(id integer PRIMARY KEY,value integer); \
+                "CREATE SEQUENCE history_reclaim_calls START 2; \
+                CREATE TABLE prepared_history(id integer PRIMARY KEY,value integer); \
                 INSERT INTO prepared_history VALUES(1,0),(2,0),(3,0); \
                 BEGIN; UPDATE prepared_history SET value=1 WHERE id=1; \
                 DELETE FROM prepared_history WHERE id=2; PREPARE TRANSACTION 'history-slot'",
@@ -114,7 +115,7 @@ fn row_history_reservation_survives_prepared_recovery_and_releases_on_resolution
             resolver.success(
                 &mut engine,
                 "UPDATE prepared_history SET value=value WHERE id=1; \
-                UPDATE prepared_history SET value=2 WHERE id=3",
+                UPDATE prepared_history SET value=nextval('history_reclaim_calls') WHERE id=3",
                 true,
             );
             let rows = data_rows(&resolver.success(
@@ -129,6 +130,14 @@ fn row_history_reservation_survives_prepared_recovery_and_releases_on_resolution
                 } else {
                     vec!["0", "0", "2"]
                 }
+            );
+            assert_eq!(
+                data_rows(&resolver.success(
+                    &mut engine,
+                    "SELECT last_value,is_called FROM history_reclaim_calls",
+                    true
+                )),
+                ["2|t"]
             );
         }
     }

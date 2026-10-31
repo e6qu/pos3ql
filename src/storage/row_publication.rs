@@ -95,6 +95,7 @@ pub(crate) enum RowWriteStatistics {
 enum PendingPublication {
     Written(PendingWriteUndo),
     Retry,
+    HistoryFull(SqlError),
     DefinitionBusy,
     Wait(u32, &'static str),
 }
@@ -180,6 +181,7 @@ impl Storage {
             ));
         }
         let txid = target.transaction();
+        let mut reclaimed_history = false;
         loop {
             {
                 let definition = self.tables[table_index].definition.read();
@@ -198,6 +200,19 @@ impl Storage {
             match self.publish_pending_write(prepared)? {
                 PendingPublication::Written(undo) => return Ok(undo),
                 PendingPublication::Retry => continue,
+                PendingPublication::HistoryFull(error) => {
+                    if reclaimed_history {
+                        return Err(error);
+                    }
+                    reclaimed_history = true;
+                    // Bound foreground cleanup and retain its shared cursor.
+                    // Retrying consumes the same owned input, not SQL effects.
+                    if self.advance_history_cleanup(super::snapshot_reclamation::SLOTS_PER_BATCH)
+                        != HistoryReclamation::Advanced
+                    {
+                        return Err(error);
+                    }
+                }
                 PendingPublication::DefinitionBusy => {
                     // Wait outside the snapshot registry and retain the original
                     // request identity when byte preparation needs another turn.
@@ -467,21 +482,10 @@ impl Storage {
             pending: PendingVersions::empty(),
         });
         if publication.row_layout.obsolete(&state) {
-            prune_committed_history(
-                &mut versions.committed_row_versions,
-                &mut state.history,
-                None,
-            );
+            prune_committed_history(&mut versions.committed_row_versions, &mut state, None);
             state.committed = None;
         }
-        // Readers at or after the current image need no earlier boundary.
-        let retained = oldest
-            .filter(|snapshot| !state.has_committed_version() || *snapshot < state.committed_lsn);
-        prune_committed_history(
-            &mut versions.committed_row_versions,
-            &mut state.history,
-            retained,
-        );
+        prune_committed_history(&mut versions.committed_row_versions, &mut state, oldest);
         // Pruning releases slots, so publish its chain handles even if a later
         // capacity check fails. Readers can never traverse a released chain.
         if current.is_some() {
@@ -516,7 +520,7 @@ impl Storage {
                 }
                 Err(error) => {
                     pop_pending_version(&mut versions, &mut state.pending);
-                    return Err(error);
+                    return Ok(PendingPublication::HistoryFull(error));
                 }
             }
         }

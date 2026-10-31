@@ -49,14 +49,18 @@ their element types and zero-based bounds through array functions used by
 schema inspection. Type inspection includes the correct element delimiter for
 base types, arrays and domains. Quantified pattern matching uses pattern semantics.
 Measure startup reservations and actual resident memory for empty and populated
-embedded databases; report the per-table contribution separately. Remove
-avoidable per-table metadata reservations through shared startup-owned
+embedded databases; report the per-table contribution separately. Verify that
+unused wide definition slots stay untouched while live readers prevent slot reuse.
+Remove avoidable per-table metadata reservations through shared startup-owned
 capacity, preserving stable reader identities, rollback and named exhaustion.
 Reserve needed row history before the durable commit boundary; a smaller shared
 pool must never fail for capacity after the commit is already durable.
 The explicit shared `row_history_slots` pool owns capacity with each pending row
 chain. Verify competing transactions, later readers, savepoint undo, prepared
 commit/rollback and cold restoration before closing this memory gate.
+Reclaim obsolete row images while newer readers remain active. A full pool may
+perform one bounded cleanup batch before rejecting an update; retry must keep
+the same owned values and must not issue SQL effects again.
 Reject per-row history exhaustion before writing the commit too; a multirow
 transaction must leave every row unchanged and keep the server usable on error.
 Include the current execution-stack requirement in embedded measurements and

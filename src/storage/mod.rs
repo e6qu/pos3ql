@@ -24813,7 +24813,6 @@ impl Storage {
             AccessClass::Routine => RoutineIter {
                 catalog: &self.routines,
                 next_slot: 0,
-                lookup: None,
             }
             .find_map(|(slot, routine)| {
                 (routine.database == current_database()
@@ -25157,7 +25156,6 @@ impl Storage {
                 RoutineIter {
                     catalog: &self.routines,
                     next_slot: 0,
-                    lookup: None,
                 }
                 .find_map(|(slot, candidate)| {
                     (candidate.database == target_database && candidate.created_at == created_at)
@@ -29991,7 +29989,6 @@ impl Storage {
         for (_, definition) in (RoutineIter {
             catalog: &self.routines,
             next_slot: 0,
-            lookup: None,
         })
         .filter(|(_, definition)| {
             definition.database == current_database()

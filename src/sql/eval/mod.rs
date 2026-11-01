@@ -2602,12 +2602,19 @@ pub fn eval_full<'a>(
     row: &impl ColumnLookup<'a>,
     hooks: &EvalHooks<'_, 'a>,
 ) -> Result<Datum<'a>, SqlError> {
-    let value = materialize_acl_value(
-        eval_full_inner(expression, arena, params, row, hooks)?,
-        hooks,
-        arena,
-    )?;
-    materialize_enum_values(value, hooks.catalog, arena)
+    let evaluate = || {
+        let value = materialize_acl_value(
+            eval_full_inner(expression, arena, params, row, hooks)?,
+            hooks,
+            arena,
+        )?;
+        materialize_enum_values(value, hooks.catalog, arena)
+    };
+    if let Some(site) = super::query::input_progress::expression_site(expression) {
+        super::query::input_progress::value(site, arena, evaluate)
+    } else {
+        evaluate()
+    }
 }
 
 fn eval_full_inner<'a>(

@@ -5100,168 +5100,190 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
         return Ok(&*rows);
     }
     if !tref.table.eq_ignore_ascii_case("generate_series") {
-        let Some((routine_slot, routine)) =
-            table_func_routine(tref, storage, txid, arena, params, columns, eval_hooks)?
-        else {
-            return Err(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "table function \"{}\" is not supported",
-                tref.table
-            ));
-        };
-        let catalog = super::storage_catalog(storage, arena, txid);
-        let hooks = crate::sql::eval::EvalHooks {
-            catalog: Some(&catalog),
-            ..eval_hooks.copied().unwrap_or(crate::sql::eval::NO_HOOKS)
-        };
-        let mapping = routine
-            .call_input_mapping(tref.func_argument_names, args.len(), tref.func_variadic)
-            .expect("resolved table routine call has a valid argument mapping");
-        let mut argument_type_oids =
-            [crate::sql::types::oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
-        for (output, argument) in argument_type_oids.iter_mut().zip(args) {
-            *output = crate::sql::eval::expression_type_identity(argument, columns, &hooks)?
-                .routine_argument_oid();
-        }
-        let Some(routine_params) = catalog.prepare_routine_inputs(
-            routine_slot,
-            routine,
-            super::RoutineCallInputs {
-                arguments: args,
-                argument_type_oids: &argument_type_oids[..args.len()],
-                mapping: &mapping,
-                variadic: tref.func_variadic,
-                context: super::RoutineInputContext::Table,
-            },
-            &mut |argument| {
-                let value = crate::sql::eval::eval_full(argument, arena, params, columns, &hooks)?;
-                let encoded = crate::sql::exec::encode_projected_pub(&[value], arena)?;
-                crate::sql::exec::decode_projected_col_record(encoded, 0, arena)
-            },
-            arena,
-        )?
-        else {
-            return Ok(&[]);
-        };
-        let table_columns = routine.table_columns();
-        let scalar_result = routine.kind.function_result();
-        let _formal_scope =
-            crate::sql::exec::enter_routine_parameter_types(routine.arguments(), hooks.catalog)?;
-        let owner = crate::storage::SessionIdentity::bound(
-            storage.capture_role_slot(routine.ownership.owner_to(txid).into(), txid)?,
-        );
-        let _security = routine
-            .attributes
-            .security_definer
-            .then(|| crate::sql::eval::funcs::system::enter_current_user(owner));
-        let _config = (!routine.configs().is_empty())
-            .then(|| crate::sql::guc::enter_active_routine_configs(routine.configs()))
-            .transpose()?;
-        if routine.language == crate::storage::RoutineLanguage::PlPgSql {
-            let (invocations, statement_arena) = match (invocations, statement_arena) {
-                (Some(invocations), Some(statement_arena)) => (invocations, statement_arena),
-                (None, None) => super::active_routine_invocations().ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::FEATURE_NOT_SUPPORTED,
-                        "PL/pgSQL table functions require a resumable query executor"
-                    )
-                })?,
-                _ => {
-                    return Err(sql_err!(
-                        sqlstate::INTERNAL_ERROR,
-                        "routine invocation state is missing its statement arena"
-                    ));
-                }
+        return super::input_progress::call(arena, || {
+            let Some((routine_slot, routine)) =
+                table_func_routine(tref, storage, txid, arena, params, columns, eval_hooks)?
+            else {
+                return Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "table function \"{}\" is not supported",
+                    tref.table
+                ));
             };
-            return invocations
-                .resolve_rows(
-                    routine,
-                    &routine_params[..routine.argument_count],
-                    statement_arena,
-                )?
-                .ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::INTERNAL_ERROR,
-                        "pending PL/pgSQL table routine did not suspend query execution"
-                    )
-                });
-        }
-        let program = super::parse_stored_routine_function_program(
-            routine.body_kind,
-            routine.body.as_str(),
-            arena,
-            scalar_result == Some(ColType::Void),
-            routine.name.as_str(),
-            routine.arguments(),
-        )?;
-        if super::routine_program_requires_mutable_execution(&program) {
-            let (invocations, statement_arena) = match (invocations, statement_arena) {
-                (Some(invocations), Some(statement_arena)) => (invocations, statement_arena),
-                (None, None) => super::active_routine_invocations().ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::FEATURE_NOT_SUPPORTED,
-                        "data-modifying SQL table functions require a resumable query executor"
-                    )
-                })?,
-                _ => {
-                    return Err(sql_err!(
-                        sqlstate::INTERNAL_ERROR,
-                        "routine invocation state is missing its statement arena"
-                    ));
-                }
+            let catalog = super::storage_catalog(storage, arena, txid);
+            let hooks = crate::sql::eval::EvalHooks {
+                catalog: Some(&catalog),
+                ..eval_hooks.copied().unwrap_or(crate::sql::eval::NO_HOOKS)
             };
-            return invocations
-                .resolve_rows(
-                    routine,
-                    &routine_params[..routine.argument_count],
-                    statement_arena,
-                )?
-                .ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::INTERNAL_ERROR,
-                        "pending SQL table routine did not suspend query execution"
-                    )
-                });
-        }
-        for query in program.preceding {
-            let super::RoutinePrelude::Statement(statement) = query else {
-                let super::RoutinePrelude::Forbidden(statement) = query else {
-                    unreachable!("routine prelude has two variants");
-                };
-                return Err(super::routine_forbidden_statement_error(statement));
-            };
-            let query = match statement {
-                crate::sql::ast::Stmt::Select(query) => super::RoutineQuery::Select(query),
-                crate::sql::ast::Stmt::SetQuery(query) => super::RoutineQuery::Set(query),
-                _ => unreachable!("mutable table routine was classified before execution"),
-            };
-            super::execute_bound_routine_query(
-                &query,
-                storage,
+            let mapping = routine
+                .call_input_mapping(tref.func_argument_names, args.len(), tref.func_variadic)
+                .expect("resolved table routine call has a valid argument mapping");
+            let mut argument_type_oids =
+                [crate::sql::types::oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
+            for (output, argument) in argument_type_oids.iter_mut().zip(args) {
+                *output = crate::sql::eval::expression_type_identity(argument, columns, &hooks)?
+                    .routine_argument_oid();
+            }
+            let Some(routine_params) = catalog.prepare_routine_inputs(
                 routine_slot,
                 routine,
-                txid,
+                super::RoutineCallInputs {
+                    arguments: args,
+                    argument_type_oids: &argument_type_oids[..args.len()],
+                    mapping: &mapping,
+                    variadic: tref.func_variadic,
+                    context: super::RoutineInputContext::Table,
+                },
+                &mut |argument| {
+                    let value =
+                        crate::sql::eval::eval_full(argument, arena, params, columns, &hooks)?;
+                    let encoded = crate::sql::exec::encode_projected_pub(&[value], arena)?;
+                    crate::sql::exec::decode_projected_col_record(encoded, 0, arena)
+                },
                 arena,
-                &routine_params[..routine.argument_count],
-                false,
-                None,
-                &mut |_| Ok(()),
+            )?
+            else {
+                return Ok(&[]);
+            };
+            let table_columns = routine.table_columns();
+            let scalar_result = routine.kind.function_result();
+            let _formal_scope = crate::sql::exec::enter_routine_parameter_types(
+                routine.arguments(),
+                hooks.catalog,
             )?;
-        }
-        let result_query = match program.result {
-            super::RoutineFunctionResult::Query(query) => query,
-            super::RoutineFunctionResult::Void(statement) => match statement {
-                crate::sql::ast::Stmt::Select(query) => arena
-                    .alloc(super::RoutineQuery::Select(query))
-                    .map_err(|_| arena_full())?,
-                crate::sql::ast::Stmt::SetQuery(query) => arena
-                    .alloc(super::RoutineQuery::Set(query))
-                    .map_err(|_| arena_full())?,
+            let owner = crate::storage::SessionIdentity::bound(
+                storage.capture_role_slot(routine.ownership.owner_to(txid).into(), txid)?,
+            );
+            let _security = routine
+                .attributes
+                .security_definer
+                .then(|| crate::sql::eval::funcs::system::enter_current_user(owner));
+            let _config = (!routine.configs().is_empty())
+                .then(|| crate::sql::guc::enter_active_routine_configs(routine.configs()))
+                .transpose()?;
+            if routine.language == crate::storage::RoutineLanguage::PlPgSql {
+                let (invocations, statement_arena) = match (invocations, statement_arena) {
+                    (Some(invocations), Some(statement_arena)) => (invocations, statement_arena),
+                    (None, None) => super::active_routine_invocations().ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::FEATURE_NOT_SUPPORTED,
+                            "PL/pgSQL table functions require a resumable query executor"
+                        )
+                    })?,
+                    _ => {
+                        return Err(sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "routine invocation state is missing its statement arena"
+                        ));
+                    }
+                };
+                return invocations
+                    .resolve_rows(
+                        routine,
+                        &routine_params[..routine.argument_count],
+                        statement_arena,
+                    )?
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "pending PL/pgSQL table routine did not suspend query execution"
+                        )
+                    });
+            }
+            let program = super::parse_stored_routine_function_program(
+                routine.body_kind,
+                routine.body.as_str(),
+                arena,
+                scalar_result == Some(ColType::Void),
+                routine.name.as_str(),
+                routine.arguments(),
+            )?;
+            if super::routine_program_requires_mutable_execution(&program) {
+                let (invocations, statement_arena) = match (invocations, statement_arena) {
+                    (Some(invocations), Some(statement_arena)) => (invocations, statement_arena),
+                    (None, None) => super::active_routine_invocations().ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::FEATURE_NOT_SUPPORTED,
+                            "data-modifying SQL table functions require a resumable query executor"
+                        )
+                    })?,
+                    _ => {
+                        return Err(sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "routine invocation state is missing its statement arena"
+                        ));
+                    }
+                };
+                return invocations
+                    .resolve_rows(
+                        routine,
+                        &routine_params[..routine.argument_count],
+                        statement_arena,
+                    )?
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "pending SQL table routine did not suspend query execution"
+                        )
+                    });
+            }
+            for query in program.preceding {
+                let super::RoutinePrelude::Statement(statement) = query else {
+                    let super::RoutinePrelude::Forbidden(statement) = query else {
+                        unreachable!("routine prelude has two variants");
+                    };
+                    return Err(super::routine_forbidden_statement_error(statement));
+                };
+                let query = match statement {
+                    crate::sql::ast::Stmt::Select(query) => super::RoutineQuery::Select(query),
+                    crate::sql::ast::Stmt::SetQuery(query) => super::RoutineQuery::Set(query),
+                    _ => unreachable!("mutable table routine was classified before execution"),
+                };
+                super::execute_bound_routine_query(
+                    &query,
+                    storage,
+                    routine_slot,
+                    routine,
+                    txid,
+                    arena,
+                    &routine_params[..routine.argument_count],
+                    false,
+                    None,
+                    &mut |_| Ok(()),
+                )?;
+            }
+            let result_query = match program.result {
+                super::RoutineFunctionResult::Query(query) => query,
+                super::RoutineFunctionResult::Void(statement) => match statement {
+                    crate::sql::ast::Stmt::Select(query) => arena
+                        .alloc(super::RoutineQuery::Select(query))
+                        .map_err(|_| arena_full())?,
+                    crate::sql::ast::Stmt::SetQuery(query) => arena
+                        .alloc(super::RoutineQuery::Set(query))
+                        .map_err(|_| arena_full())?,
+                    _ => unreachable!("mutable table routine was classified before execution"),
+                },
                 _ => unreachable!("mutable table routine was classified before execution"),
-            },
-            _ => unreachable!("mutable table routine was classified before execution"),
-        };
-        if scalar_result == Some(ColType::Void) {
+            };
+            if scalar_result == Some(ColType::Void) {
+                super::execute_bound_routine_query(
+                    result_query,
+                    storage,
+                    routine_slot,
+                    routine,
+                    txid,
+                    arena,
+                    &routine_params[..routine.argument_count],
+                    false,
+                    None,
+                    &mut |_| Ok(()),
+                )?;
+                return Ok(&[]);
+            }
+            const EMPTY: &[u8] = &[];
+            let mut rows: *mut &[u8] = core::ptr::null_mut();
+            let mut len = 0usize;
+            let mut cap = 0usize;
             super::execute_bound_routine_query(
                 result_query,
                 storage,
@@ -5272,77 +5294,60 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                 &routine_params[..routine.argument_count],
                 false,
                 None,
-                &mut |_| Ok(()),
-            )?;
-            return Ok(&[]);
-        }
-        const EMPTY: &[u8] = &[];
-        let mut rows: *mut &[u8] = core::ptr::null_mut();
-        let mut len = 0usize;
-        let mut cap = 0usize;
-        super::execute_bound_routine_query(
-            result_query,
-            storage,
-            routine_slot,
-            routine,
-            txid,
-            arena,
-            &routine_params[..routine.argument_count],
-            false,
-            None,
-            &mut |values| {
-                let expected_columns = table_columns.map_or(1, <[_]>::len);
-                if values.len() != expected_columns {
-                    return Err(sql_err!(
-                        sqlstate::SYNTAX_ERROR,
-                        "SQL function query must return {} column{}",
-                        expected_columns,
-                        if expected_columns == 1 { "" } else { "s" }
-                    ));
-                }
-                let encoded = if let Some(output) = table_columns {
-                    let mut cast = [Datum::Null; MAX_COLUMNS];
-                    for (slot, column) in output.iter().enumerate() {
-                        let projected =
-                            crate::sql::exec::encode_projected_pub(&[values[slot]], arena)?;
-                        cast[slot] = crate::sql::eval::cast_to(
-                            crate::sql::exec::decode_projected_pub(projected, 0),
-                            column.ctype,
+                &mut |values| {
+                    let expected_columns = table_columns.map_or(1, <[_]>::len);
+                    if values.len() != expected_columns {
+                        return Err(sql_err!(
+                            sqlstate::SYNTAX_ERROR,
+                            "SQL function query must return {} column{}",
+                            expected_columns,
+                            if expected_columns == 1 { "" } else { "s" }
+                        ));
+                    }
+                    let encoded = if let Some(output) = table_columns {
+                        let mut cast = [Datum::Null; MAX_COLUMNS];
+                        for (slot, column) in output.iter().enumerate() {
+                            let projected =
+                                crate::sql::exec::encode_projected_pub(&[values[slot]], arena)?;
+                            cast[slot] = crate::sql::eval::cast_to(
+                                crate::sql::exec::decode_projected_pub(projected, 0),
+                                column.ctype,
+                                arena,
+                            )?;
+                        }
+                        crate::sql::exec::encode_projected_pub(&cast[..output.len()], arena)?
+                    } else {
+                        let projected = crate::sql::exec::encode_projected_pub(values, arena)?;
+                        let value = crate::sql::exec::decode_projected_pub(projected, 0);
+                        let value = crate::sql::eval::cast_to(
+                            value,
+                            scalar_result.expect("set routine result"),
                             arena,
                         )?;
+                        crate::sql::exec::encode_projected_pub(&[value], arena)?
+                    };
+                    if len == cap {
+                        let new_cap = if cap == 0 { 8 } else { cap * 2 };
+                        let fresh = arena
+                            .alloc_slice_with(new_cap, |_| EMPTY)
+                            .map_err(|_| arena_full())?;
+                        if len > 0 {
+                            let prior = unsafe { core::slice::from_raw_parts(rows, len) };
+                            fresh[..len].copy_from_slice(prior);
+                        }
+                        rows = fresh.as_mut_ptr();
+                        cap = new_cap;
                     }
-                    crate::sql::exec::encode_projected_pub(&cast[..output.len()], arena)?
-                } else {
-                    let projected = crate::sql::exec::encode_projected_pub(values, arena)?;
-                    let value = crate::sql::exec::decode_projected_pub(projected, 0);
-                    let value = crate::sql::eval::cast_to(
-                        value,
-                        scalar_result.expect("set routine result"),
-                        arena,
-                    )?;
-                    crate::sql::exec::encode_projected_pub(&[value], arena)?
-                };
-                if len == cap {
-                    let new_cap = if cap == 0 { 8 } else { cap * 2 };
-                    let fresh = arena
-                        .alloc_slice_with(new_cap, |_| EMPTY)
-                        .map_err(|_| arena_full())?;
-                    if len > 0 {
-                        let prior = unsafe { core::slice::from_raw_parts(rows, len) };
-                        fresh[..len].copy_from_slice(prior);
-                    }
-                    rows = fresh.as_mut_ptr();
-                    cap = new_cap;
-                }
-                unsafe { rows.add(len).write(encoded) };
-                len += 1;
-                Ok(())
-            },
-        )?;
-        return Ok(if len == 0 {
-            &[]
-        } else {
-            unsafe { core::slice::from_raw_parts(rows, len) }
+                    unsafe { rows.add(len).write(encoded) };
+                    len += 1;
+                    Ok(())
+                },
+            )?;
+            Ok(if len == 0 {
+                &[]
+            } else {
+                unsafe { core::slice::from_raw_parts(rows, len) }
+            })
         });
     }
     if args.len() != 2 && args.len() != 3 {

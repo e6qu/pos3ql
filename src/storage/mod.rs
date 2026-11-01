@@ -9130,19 +9130,28 @@ impl RoutineDef {
         argument_count: usize,
         explicit_variadic: bool,
     ) -> Option<[u8; MAX_ROUTINE_ARGUMENTS]> {
-        let parameter_for_input = |index| {
-            parameters
-                .iter()
-                .filter(|parameter| parameter.mode.is_input())
-                .nth(index)
-        };
-        let variadic_index = parameters
+        let inputs = parameters
             .iter()
-            .filter(|parameter| parameter.mode.is_input())
+            .filter(|parameter| parameter.mode.is_input());
+        if inputs.clone().count() != input_count {
+            return None;
+        }
+        Self::map_parameter_positions(inputs, argument_names, argument_count, explicit_variadic)
+    }
+
+    fn map_parameter_positions<'parameter>(
+        parameters: impl Iterator<Item = &'parameter RoutineParameterDef> + Clone,
+        argument_names: &[Option<&str>],
+        argument_count: usize,
+        explicit_variadic: bool,
+    ) -> Option<[u8; MAX_ROUTINE_ARGUMENTS]> {
+        let input_count = parameters.clone().count();
+        let parameter_for_input = |index| parameters.clone().nth(index);
+        let variadic_index = parameters
+            .clone()
             .enumerate()
-            .find_map(|(input_index, parameter)| {
-                matches!(parameter.mode, RoutineParameterMode::Variadic { .. })
-                    .then_some(input_index)
+            .find_map(|(index, parameter)| {
+                matches!(parameter.mode, RoutineParameterMode::Variadic { .. }).then_some(index)
             });
         if argument_count > MAX_ROUTINE_ARGUMENTS
             || (argument_count > input_count && variadic_index.is_none())
@@ -9200,15 +9209,17 @@ impl RoutineDef {
         &self,
         argument_names: &[Option<&str>],
         argument_count: usize,
+        explicit_variadic: bool,
     ) -> Option<[u8; MAX_ROUTINE_ARGUMENTS]> {
-        if !matches!(self.kind, RoutineKind::Procedure)
-            || argument_count > self.parameter_count
-            || (!argument_names.is_empty() && argument_names.len() != argument_count)
-        {
+        if !matches!(self.kind, RoutineKind::Procedure) {
             return None;
         }
-        let mut mapping = [u8::MAX; MAX_ROUTINE_ARGUMENTS];
-        let mut occupied = [false; MAX_ROUTINE_ARGUMENTS];
+        let mut mapping = Self::map_parameter_positions(
+            self.parameters().iter(),
+            argument_names,
+            argument_count,
+            explicit_variadic,
+        )?;
         let mut input_of_parameter = [u8::MAX; MAX_ROUTINE_ARGUMENTS];
         let mut input_index = 0usize;
         for (parameter_index, parameter) in self.parameters().iter().enumerate() {
@@ -9217,27 +9228,8 @@ impl RoutineDef {
                 input_index += 1;
             }
         }
-        for (call_index, mapped_input) in mapping.iter_mut().enumerate().take(argument_count) {
-            let parameter_index = match argument_names.get(call_index).copied().flatten() {
-                None => call_index,
-                Some(name) => self
-                    .parameters()
-                    .iter()
-                    .position(|parameter| parameter.name.as_str().eq_ignore_ascii_case(name))?,
-            };
-            if occupied[parameter_index] {
-                return None;
-            }
-            occupied[parameter_index] = true;
-            *mapped_input = input_of_parameter[parameter_index];
-        }
-        for (parameter_index, occupied) in occupied.iter().enumerate().take(self.parameter_count) {
-            if !occupied {
-                let parameter = self.parameters[parameter_index];
-                if !parameter.mode.is_input() || !parameter.mode.has_default() {
-                    return None;
-                }
-            }
+        for position in mapping.iter_mut().take(argument_count) {
+            *position = input_of_parameter[usize::from(*position)];
         }
         Some(mapping)
     }
@@ -43959,6 +43951,7 @@ impl Storage {
         name: &str,
         argument_names: &[Option<&str>],
         argument_count: usize,
+        explicit_variadic: bool,
         txid: u32,
     ) -> Option<usize> {
         let resolve = |schema: &str, routine_name: &str| {
@@ -43969,7 +43962,7 @@ impl Storage {
                     && definition.schema_for(txid).as_str() == schema
                     && definition.name_for(txid).as_str() == routine_name
                     && definition
-                        .procedure_call_mapping(argument_names, argument_count)
+                        .procedure_call_mapping(argument_names, argument_count, explicit_variadic)
                         .is_some())
                 .then_some(slot)
             });
@@ -44027,9 +44020,11 @@ impl Storage {
                     .iter()
                     .any(|parameter| parameter.mode.is_output());
                 let input_mapping = if output_call {
-                    let Some(mapping) =
-                        routine.procedure_call_mapping(argument_names, actual_oids.len())
-                    else {
+                    let Some(mapping) = routine.procedure_call_mapping(
+                        argument_names,
+                        actual_oids.len(),
+                        explicit_variadic,
+                    ) else {
                         continue;
                     };
                     mapping

@@ -11644,7 +11644,7 @@ impl Engine {
                 name,
                 arguments,
                 argument_names,
-                variadic: _,
+                variadic,
             } => {
                 let qualified = match name.schema {
                     Some(schema) => stack_format!(260, "{}.{}", schema, name.name),
@@ -11654,6 +11654,7 @@ impl Engine {
                     qualified.as_str(),
                     argument_names,
                     arguments.len(),
+                    *variadic,
                     txn.txid,
                 ) else {
                     responder.error(
@@ -14780,6 +14781,7 @@ impl Engine {
             qualified.as_str(),
             argument_names,
             arguments.len(),
+            variadic,
             txn.txid,
         );
         let shape_mapping = shape_slot.and_then(|slot| {
@@ -14788,7 +14790,7 @@ impl Engine {
                 .parameters()
                 .iter()
                 .any(|parameter| parameter.mode.is_output())
-                .then(|| routine.procedure_call_mapping(argument_names, arguments.len()))
+                .then(|| routine.procedure_call_mapping(argument_names, arguments.len(), variadic))
                 .flatten()
         });
         let catalog = query::storage_catalog(&self.storage, &self.work, txn.txid);

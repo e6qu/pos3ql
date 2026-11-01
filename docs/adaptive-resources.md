@@ -17,6 +17,16 @@ reserved memory must remain unchanged.
   `max_tables * RowMap::budget_bytes(table_rows)`. Table construction creates
   those maps before serving requests. Removing this multiplication requires
   shared ownership and admission, not merely changing a configuration label.
+- [Row bytes](../src/storage/row_heap.rs) already share two `memtable_bytes`
+  buffers for active data and relocation. Committed MVCC history uses the
+  instance-wide `row_history_slots`; locking mode reserves no committed history.
+- [Definition images](../src/storage/definition_images.rs) are already leased
+  globally, but reserve `(max_tables + 1) *
+  (max_catalog_versions_per_object + 1) * query_workspace_slots` wide slots.
+  [Retained row walks](../src/storage/row_walks.rs) reserve
+  `query_workspace_slots * 64` identities, each with
+  `max(table_rows, large_object_pages, value_index_rows)` row-ID positions.
+  Reducing per-table maps alone would leave these multipliers in place.
 - The [RAM block cache](../src/store/cache.rs) and
   [disk block cache](../src/store/disk.rs) already share fixed slots across
   objects. CLOCK eviction gives recently used blocks another chance to remain.

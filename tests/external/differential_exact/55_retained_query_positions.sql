@@ -117,6 +117,13 @@ TRUNCATE query_position_audit;
 DROP FUNCTION query_position_install_strict();
 DROP FUNCTION query_position_install_nonstrict();
 DROP TABLE query_position_null_source;
+
+CREATE PROCEDURE query_position_variadic_procedure(OUT result integer,marker integer DEFAULT 7,VARIADIC members integer[] DEFAULT ARRAY[]::integer[]) LANGUAGE sql AS $$SELECT $1+cardinality($2)$$;
+CALL query_position_variadic_procedure(result=>NULL,marker=>9,VARIADIC members=>ARRAY[]::integer[]);
+CALL query_position_variadic_procedure(NULL);
+CALL query_position_variadic_procedure(NULL,9,VARIADIC ARRAY[]::integer[]);
+CALL query_position_variadic_procedure(NULL,9,4,5);
+DROP PROCEDURE query_position_variadic_procedure(integer,integer[]);
 DROP FUNCTION query_position_write(integer);
 DROP TABLE query_position_audit;
 DROP TABLE query_position_source;

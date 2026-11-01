@@ -25,6 +25,7 @@ fn query_positions_do_not_repeat_completed_projection_effects() {
             ],
             &["0|7", "NULL", "7", "0|NULL", "7", "7"],
             &["0|7", "NULL", "7", "0|NULL", "7", "7"],
+            &["9", "7", "9", "11"],
         ]
         .concat()
     );
@@ -37,8 +38,8 @@ fn query_positions_do_not_repeat_completed_projection_effects() {
         completions += usize::from(remaining[0] == b'C');
         remaining = &remaining[length + 1..];
     }
-    assert_eq!(descriptions, 47);
-    assert_eq!(completions, 111);
+    assert_eq!(descriptions, 51);
+    assert_eq!(completions, 117);
 }
 
 #[test]
@@ -92,6 +93,56 @@ fn retained_variadic_calls_require_explicit_empty_arrays_or_declared_defaults() 
             true,
         )),
         ["0"]
+    );
+}
+
+#[test]
+fn variadic_procedures_preserve_output_positions_and_named_array_syntax() {
+    let config = test_config("variadic-procedure-mapping");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE PROCEDURE variadic_output(OUT result integer,marker integer DEFAULT 7, \
+         VARIADIC members integer[] DEFAULT ARRAY[]::integer[]) LANGUAGE sql \
+         AS $$SELECT $1+cardinality($2)$$",
+        true,
+    );
+    for sql in [
+        "CALL variadic_output(result=>NULL)",
+        "CALL variadic_output(result=>NULL,marker=>9)",
+        "CALL variadic_output(result=>NULL,marker=>9,members=>ARRAY[]::integer[])",
+    ] {
+        assert_eq!(
+            error_sqlstates(&session.execute(&mut engine, sql, true)),
+            ["42883"],
+            "{sql}"
+        );
+    }
+    for sql in [
+        "CREATE PROCEDURE invalid_variadic_output(VARIADIC members integer[], \
+         OUT result integer) LANGUAGE sql AS $$SELECT cardinality($1)$$",
+        "CREATE PROCEDURE invalid_variadic_default_output(marker integer DEFAULT 7, \
+         VARIADIC members integer[] DEFAULT ARRAY[]::integer[],OUT result integer) \
+         LANGUAGE sql AS $$SELECT $1+cardinality($2)$$",
+    ] {
+        assert_eq!(
+            error_sqlstates(&session.execute(&mut engine, sql, true)),
+            ["42P13"],
+            "{sql}"
+        );
+    }
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "CALL variadic_output(result=>NULL,marker=>9,VARIADIC members=>ARRAY[]::integer[]); \
+             CALL variadic_output(NULL); \
+             CALL variadic_output(NULL,9,VARIADIC ARRAY[]::integer[]); \
+             CALL variadic_output(NULL,9,4,5)",
+            true,
+        )),
+        ["9", "7", "9", "11"]
     );
 }
 

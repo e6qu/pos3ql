@@ -3564,7 +3564,8 @@ impl<'a> Parser<'a> {
                     return Err(self.limit("function arguments", arguments.len()));
                 }
                 let argument = self.routine_argument()?;
-                if saw_variadic && !matches!(argument.mode, RoutineArgumentMode::Out) {
+                if saw_variadic && (!function || !matches!(argument.mode, RoutineArgumentMode::Out))
+                {
                     return Err(ParseError {
                         at: self.peek_at,
                         message: stack_format!(

@@ -26,6 +26,8 @@ expressions must not accumulate routine input records. Compare anonymous-record
 casts with PostgreSQL before using a named type to persist function results.
 Named row function regressions cover SELECT values and FROM columns, including
 null rows, combined producers, lateral inputs and empty-cache recovery.
+Input-retention cases include engine-owned statistics, logical replication and
+large-object builtins; their arguments must not repeat around an engine handoff.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

@@ -68,6 +68,13 @@ pub(crate) mod unicode;
 mod unicode_data;
 pub mod xml;
 
+/// Builtins handed to the mutable engine share one description and input boundary.
+pub(crate) fn engine_intrinsic_result_type(name: &str, arity: usize) -> Option<(i32, i16)> {
+    statistics::result_type(name, arity)
+        .or_else(|| logical_replication::result_type(name, arity))
+        .or_else(|| large_object::result_type(name, arity))
+}
+
 use crate::checkpoint::{CheckpointSetupError, CheckpointStep, Checkpointer, TemporarySpiller};
 use crate::config::Config;
 use crate::mem::arena::{Arena, ArenaList};

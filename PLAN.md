@@ -45,7 +45,8 @@ object-store waits, function bodies and ordinary query positions. Preserve
 once-only argument effects, converted values, selected defaults and bound types
 while removing query-prefix replay. Avoid charging simple builtin index
 expressions for resumable state. Keep the shared input preparation for scalar
-functions, table functions and procedures, including their distinct conversion
+functions, table functions, procedures and engine-owned builtins, including
+statistics and large objects, while preserving their distinct conversion
 and strict-null rules. The [architecture](docs/architecture.md) describes the
 implemented input progress, type contracts, record expansion and set inputs.
 Preserve the distinct SELECT-value and FROM-column layouts of named row results

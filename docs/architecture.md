@@ -111,6 +111,9 @@ The new body is still selected when execution begins.
 Scalar builtins with inputs that can suspend and stored functions use the same
 input root. Builtin trees proved unable to suspend do not allocate input records;
 repeated index checks such as `lower(label)` keep their existing scratch budget.
+Statistics, logical replication and large-object builtins share an explicit
+engine-handoff classification with their result descriptions, so this shortcut
+cannot treat those calls as ordinary builtin evaluation.
 Builtin set
 inputs, including `generate_series(start, stop)`, also keep completed arguments
 when a later input pauses. Input records borrow temporary row values while a

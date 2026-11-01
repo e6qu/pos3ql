@@ -2608,7 +2608,7 @@ fn routine_input_handoff(expression: &Expr<'_>, catalog: Option<&dyn CatalogAcce
             if bound_oid.is_some()
                 || catalog.is_some_and(|catalog| catalog.has_routine_candidate(name, args.len()))
                 || !super::catalog::intrinsic_routine_has_name(name)
-                || super::logical_replication::result_type(
+                || super::engine_intrinsic_result_type(
                     name.strip_prefix("pg_catalog.").unwrap_or(name),
                     args.len(),
                 )

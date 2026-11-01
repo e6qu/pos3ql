@@ -2770,12 +2770,11 @@ fn is_utc(v: &str) -> bool {
 fn time_zone_numeric_offset(value: &str) -> Result<Option<i32>, SqlError> {
     let text = value.trim();
     if let Some((east, west)) = text.strip_prefix('<').and_then(|text| text.split_once('>')) {
-        if let Some(seconds) = parse_hms(east) {
-            if super::datetime::iso_offset_string(seconds).as_str() == east
-                && super::datetime::iso_offset_string(-seconds).as_str() == west
-            {
-                return Ok(Some(seconds));
-            }
+        if let Some(seconds) = parse_hms(east)
+            && super::datetime::iso_offset_string(seconds).as_str() == east
+            && super::datetime::iso_offset_string(-seconds).as_str() == west
+        {
+            return Ok(Some(seconds));
         }
         return Ok(None);
     }

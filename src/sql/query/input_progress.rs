@@ -21,6 +21,7 @@ pub(crate) enum InputSite<'a> {
         variadic: bool,
     },
     Query(InputQuery),
+    Expression(InputNode),
     Classification {
         routine: i32,
         parameter: usize,
@@ -28,6 +29,9 @@ pub(crate) enum InputSite<'a> {
     },
     Definition(i32),
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InputNode { Value, Reference, Unary, Binary, Cast, Composite }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InputQuery {
@@ -39,7 +43,7 @@ pub(crate) enum InputQuery {
     Quantified,
 }
 
-pub(crate) fn expression_site<'a>(expression: &Expr<'a>) -> Option<InputSite<'a>> {
+pub(crate) fn expression_site<'a>(expression: &Expr<'a>) -> InputSite<'a> {
     match expression {
         Expr::Call {
             name,
@@ -47,19 +51,26 @@ pub(crate) fn expression_site<'a>(expression: &Expr<'a>) -> Option<InputSite<'a>
             args,
             variadic,
             ..
-        } => Some(InputSite::Call {
+        } => InputSite::Call {
             name,
             bound_oid: *bound_oid,
             arity: args.len(),
             variadic: *variadic,
-        }),
-        Expr::Subquery(_) => Some(InputSite::Query(InputQuery::Scalar)),
-        Expr::RowSubquery { .. } => Some(InputSite::Query(InputQuery::Row)),
-        Expr::ArraySubquery(_) => Some(InputSite::Query(InputQuery::Array)),
-        Expr::Exists(_) => Some(InputSite::Query(InputQuery::Exists)),
-        Expr::InSubquery { .. } => Some(InputSite::Query(InputQuery::In)),
-        Expr::QuantifiedSubquery { .. } => Some(InputSite::Query(InputQuery::Quantified)),
-        _ => None,
+        },
+        Expr::Subquery(_) => InputSite::Query(InputQuery::Scalar),
+        Expr::RowSubquery { .. } => InputSite::Query(InputQuery::Row),
+        Expr::ArraySubquery(_) => InputSite::Query(InputQuery::Array),
+        Expr::Exists(_) => InputSite::Query(InputQuery::Exists),
+        Expr::InSubquery { .. } => InputSite::Query(InputQuery::In),
+        Expr::QuantifiedSubquery { .. } => InputSite::Query(InputQuery::Quantified),
+        Expr::Null | Expr::Bool(_) | Expr::Int(_) | Expr::Float(_) | Expr::NumericLit(_)
+        | Expr::Str(_) | Expr::BitLit(_) => InputSite::Expression(InputNode::Value),
+        Expr::Column { .. } | Expr::RoutineParam { .. } | Expr::Param(_)
+        | Expr::WholeRow(_) | Expr::SchemaColumn { .. } => InputSite::Expression(InputNode::Reference),
+        Expr::Unary { .. } => InputSite::Expression(InputNode::Unary),
+        Expr::Binary { .. } => InputSite::Expression(InputNode::Binary),
+        Expr::Cast { .. } => InputSite::Expression(InputNode::Cast),
+        _ => InputSite::Expression(InputNode::Composite),
     }
 }
 
@@ -99,6 +110,7 @@ impl InputSite<'_> {
                 variadic,
             },
             Self::Query(kind) => InputSite::Query(kind),
+            Self::Expression(kind) => InputSite::Expression(kind),
             Self::Definition(oid) => InputSite::Definition(oid),
             Self::Classification {
                 routine,
@@ -267,10 +279,16 @@ impl<'a> InputDefinition<'a> {
 }
 
 #[derive(Clone, Copy)]
+enum InputValue<'a> {
+    Evaluated(&'a Datum<'a>),
+    Encoded(&'a [u8]),
+}
+
+#[derive(Clone, Copy)]
 enum InputState<'a> {
     Pending,
     Value {
-        encoded: &'a [u8],
+        value: InputValue<'a>,
         next_input: usize,
         next_invocation: usize,
         next_call: usize,
@@ -286,6 +304,7 @@ struct InputFrame<'a> {
 
 #[derive(Clone, Copy)]
 enum AttemptFrame<'statement, 'query> {
+    // retain is the only constructor: saved values are encoded statement bytes.
     Saved(&'statement InputFrame<'statement>),
     Temporary(InputFrame<'query>),
 }
@@ -366,6 +385,7 @@ impl<'statement: 'query, 'query> InputAttempt<'statement, 'query> {
                     variadic,
                 },
                 InputSite::Query(kind) => InputSite::Query(kind),
+                InputSite::Expression(kind) => InputSite::Expression(kind),
                 InputSite::Definition(oid) => InputSite::Definition(oid),
                 InputSite::Classification {
                     routine,
@@ -402,7 +422,7 @@ impl<'statement: 'query, 'query> InputAttempt<'statement, 'query> {
         Ok((ordinal, frame))
     }
 
-    fn value<'value>(
+    fn value<'value: 'query>(
         &self,
         site: InputSite<'_>,
         output: &'value Arena,
@@ -411,7 +431,7 @@ impl<'statement: 'query, 'query> InputAttempt<'statement, 'query> {
         let (ordinal, mut frame) = self.frame(site)?;
         match frame.state {
             InputState::Value {
-                encoded,
+                value,
                 next_input,
                 next_invocation,
                 next_call,
@@ -419,8 +439,13 @@ impl<'statement: 'query, 'query> InputAttempt<'statement, 'query> {
                 self.next.set(next_input);
                 self.invocation.set(next_invocation);
                 self.registry.next.set(next_call);
-                let encoded = output.alloc_slice_copy(encoded).map_err(|_| full())?;
-                return super::super::exec::decode_projected_col_record(encoded, 0, output);
+                return match value {
+                    InputValue::Encoded(encoded) => {
+                        let encoded = output.alloc_slice_copy(encoded).map_err(|_| full())?;
+                        super::super::exec::decode_projected_col_record(encoded, 0, output)
+                    }
+                    InputValue::Evaluated(value) => super::super::exec::detach_routine_datum(*value, output),
+                };
             }
             InputState::Pending => {}
             InputState::Definition(_) => return Err(changed()),
@@ -428,7 +453,7 @@ impl<'statement: 'query, 'query> InputAttempt<'statement, 'query> {
         // A nested expression may append frames; never hold a borrow across it.
         let result = evaluate()?;
         frame.state = InputState::Value {
-            encoded: super::super::exec::encode_projected_pub(&[result], self.arena)?,
+            value: InputValue::Evaluated(self.arena.alloc(result).map_err(|_| full())?),
             next_input: self.next.get(),
             next_invocation: self.invocation.get(),
             next_call: self.registry.next.get(),
@@ -481,12 +506,15 @@ impl<'statement: 'query, 'query> InputAttempt<'statement, 'query> {
                     let state = match frame.state {
                         InputState::Pending => InputState::Pending,
                         InputState::Value {
-                            encoded,
+                            value,
                             next_input,
                             next_invocation,
                             next_call,
                         } => InputState::Value {
-                            encoded: copy_bytes(encoded, arena)?,
+                            value: InputValue::Encoded(match value {
+                                InputValue::Evaluated(value) => super::super::exec::encode_projected_persistent_pub(&[*value], arena)?,
+                                InputValue::Encoded(encoded) => copy_bytes(encoded, arena)?,
+                            }),
                             next_input,
                             next_invocation,
                             next_call,
@@ -564,6 +592,7 @@ pub(super) fn evaluation(
 pub(crate) struct ExpressionPosition {
     previous: Option<usize>,
     pub(crate) target: Option<i32>,
+    _thread: core::marker::PhantomData<*const ()>,
 }
 impl Drop for ExpressionPosition {
     fn drop(&mut self) {
@@ -596,12 +625,14 @@ pub(crate) fn enter_expression(expression: &Expr<'_>) -> Result<ExpressionPositi
         return Ok(ExpressionPosition {
             previous,
             target: None,
+            _thread: core::marker::PhantomData,
         });
     }
     let Some((invocations, _)) = active_routine_invocations() else {
         return Ok(ExpressionPosition {
             previous,
             target: None,
+            _thread: core::marker::PhantomData,
         });
     };
     let registry = &invocations.inputs;
@@ -619,10 +650,10 @@ pub(crate) fn enter_expression(expression: &Expr<'_>) -> Result<ExpressionPositi
             .and_then(|index| saved.as_slice()[index].frames.first())
             .and_then(|frame| definition_oid(**frame))
     };
-    Ok(ExpressionPosition { previous, target })
+    Ok(ExpressionPosition { previous, target, _thread: core::marker::PhantomData })
 }
 
-pub(super) struct InputScope {
+pub(crate) struct InputScope {
     previous: Option<ActiveInput>,
 }
 impl Drop for InputScope {
@@ -631,7 +662,7 @@ impl Drop for InputScope {
     }
 }
 
-pub(super) fn enter() -> InputScope {
+pub(crate) fn enter() -> InputScope {
     let current = AVAILABLE_INPUT.with(Cell::get);
     InputScope {
         previous: ACTIVE_INPUT.with(|active| active.replace(current)),
@@ -670,7 +701,7 @@ pub(crate) fn enter_body() -> BodyScope {
     }
 }
 
-pub(super) fn call<T>(
+pub(crate) fn call<T>(
     arena: &Arena,
     execute: impl FnOnce() -> Result<T, SqlError>,
 ) -> Result<T, SqlError> {
@@ -863,6 +894,27 @@ mod tests {
                 assert_eq!(invocations.inputs.saved.borrow().len(), 0);
             });
         }
+    }
+
+    #[test]
+    fn retained_input_ownership_borrows_wide_values_until_suspension() {
+        let mut budget = Budget::new(4096);
+        let statement = Arena::new(&mut budget, "input statement", 1024).unwrap();
+        let work = Arena::new(&mut budget, "input work", 2048).unwrap();
+        let invocations = RoutineInvocationState::new(&statement);
+        let _scope = enter_routine_invocation_scope(Some(RoutineInvocationContext::new(
+            &invocations, &statement,
+        )));
+        crate::mem::guard::forbid_alloc(|| {
+            let raw = work.alloc_slice_copy(&[b'x'; 1024]).unwrap();
+            let text = core::str::from_utf8(raw).unwrap();
+            let result = call(&work, || {
+                let _scope = enter();
+                value(InputSite::Query(InputQuery::Scalar), &work, || Ok(Datum::Text(text)))
+            }).unwrap();
+            assert!(matches!(result, Datum::Text(value) if core::ptr::eq(value.as_ptr(), text.as_ptr())));
+            assert_eq!(statement.used(), 0);
+        });
     }
 
     #[test]

@@ -108,8 +108,12 @@ also stay fixed. Outer-query planning keeps one volatility decision per function
 identity; a replacement body has its own planning scope. A reached call keeps its selected function when an argument
 changes `search_path`; another same-named function cannot take over on resumption.
 The new body is still selected when execution begins.
-Input records remain temporary row scratch for calls that finish immediately.
-Only a suspended call copies its live records into statement memory. Function
+Scalar builtins and stored functions use the same input root. Builtin set
+inputs, including `generate_series(start, stop)`, also keep completed arguments
+when a later input pauses. Input records borrow temporary row values while a
+call runs; only a suspended call encodes its live values into statement memory.
+Bound set inputs are reused while rows are emitted, without saving another
+input record for each output row. Function
 bodies and subqueries own separate input scopes so their row-scratch recycling
 cannot invalidate the caller's saved inputs. Exhaustion reports
 `retained routine inputs exceed statement memory` (SQLSTATE `54000`). These

@@ -1387,6 +1387,7 @@ pub(super) fn with_bound_srf_inputs<'a, R: ColumnLookup<'a>, T>(
     hooks: &EvalHooks<'_, 'a>,
     run: impl FnOnce(&'a Expr<'a>, &'a [Datum<'a>]) -> Result<T, SqlError>,
 ) -> Result<T, SqlError> {
+    super::input_progress::call(arena, || {
     let Expr::Call {
         name,
         args,
@@ -1439,7 +1440,10 @@ pub(super) fn with_bound_srf_inputs<'a, R: ColumnLookup<'a>, T>(
         .map_err(|_| arena_full())?;
     let mut bound_arguments = crate::mem::arena::ArenaList::new(arena);
     for (index, argument) in arguments.iter().enumerate() {
-        let value = eval_full(argument, arena, params, row, hooks)?;
+        let value = {
+            let _inputs = super::input_progress::enter();
+            eval_full(argument, arena, params, row, hooks)?
+        };
         let encoded = crate::sql::exec::encode_projected_pub(&[value], arena)?;
         values[index] = crate::sql::exec::decode_projected_col_record(encoded, 0, arena)?;
         let parameter: &'a Expr<'a> = arena
@@ -1460,6 +1464,7 @@ pub(super) fn with_bound_srf_inputs<'a, R: ColumnLookup<'a>, T>(
     *argument_names = &[];
     let bound = arena.alloc(bound).map_err(|_| arena_full())?;
     crate::sql::exec::with_bound_parameter_types(&types[..arguments.len()], || run(bound, values))
+    })
 }
 
 /// Number of output rows a set-returning call yields for the current source row.
@@ -3832,6 +3837,7 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
             statement_arena,
         );
     }
+    super::input_progress::call(arena, || -> Result<&'a [&'a [u8]], SqlError> {
     let written_args = tref.func_args.expect("table function carries arguments");
     let regex_name = tref
         .schema
@@ -3923,8 +3929,10 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
             Ok(&*rows)
         });
     }
-    let eval_argument =
-        |argument| crate::sql::eval::eval_full(argument, arena, params, columns, &argument_hooks);
+    let eval_argument = |argument| {
+        let _inputs = super::input_progress::enter();
+        crate::sql::eval::eval_full(argument, arena, params, columns, &argument_hooks)
+    };
     if tref.table.eq_ignore_ascii_case("parse_ident") {
         if !(1..=2).contains(&args.len()) || tref.func_variadic {
             return Err(srf_signature_error(tref.table));
@@ -5102,7 +5110,6 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
         return Ok(&*rows);
     }
     if !tref.table.eq_ignore_ascii_case("generate_series") {
-        return super::input_progress::call(arena, || -> Result<&'a [&'a [u8]], SqlError> {
             let Some((routine_slot, routine)) =
                 table_func_routine(tref, storage, txid, arena, params, columns, eval_hooks)?
             else {
@@ -5346,12 +5353,11 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                     Ok(())
                 },
             )?;
-            Ok(if len == 0 {
+            return Ok(if len == 0 {
                 &[]
             } else {
                 unsafe { core::slice::from_raw_parts(rows, len) }
-            })
-        });
+            });
     }
     if args.len() != 2 && args.len() != 3 {
         return Err(sql_err!(
@@ -5490,6 +5496,7 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
         v += step;
     }
     Ok(&*rows)
+    })
 }
 
 #[allow(clippy::too_many_arguments)]

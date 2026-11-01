@@ -12,14 +12,33 @@ fn retained_routine_inputs_preserve_argument_effects_across_pending_calls() {
     assert_eq!(
         data_rows(&output),
         [
-            "0", "1", "1", "1", "0", "8", "1", "7", "8", "0", "8", "1", "7", "8", "0", "8", "1",
-            "7", "8", "0", "8", "1", "7", "8", "0", "17", "1", "7", "9", "17", "0", "8", "1", "7",
-            "8", "0", "1", "2", "1", "1", "0", "1", "2", "1", "1", "0", "1", "1", "1", "0", "108",
-            "0", "7", "108", "11", "7", "11", "5", "6", "integer", "integer",
-        ]
+            &["0", "1", "1", "1"][..],
+            &["0", "8", "1", "7", "8"],
+            &["0", "8", "1", "7", "8"],
+            &["0", "8", "1", "7", "8"],
+            &["0", "8", "1", "7", "8"],
+            &["0", "17", "1", "7", "9", "17"],
+            &["0", "8", "1", "7", "8"],
+            &["0", "1", "2", "1", "1"],
+            &["0", "1", "2", "1", "1"],
+            &["0", "1", "1", "1"],
+            &["0", "1/7", "1", "7"],
+            &["0", "8/value", "1", "7"],
+            &["0", "1", "2", "3", "1", "3"],
+            &["0", "1", "2", "3", "1", "3"],
+            &["0", "108", "0", "7", "108"],
+            &["11", "7", "11"],
+            &["5", "6", "integer", "integer"],
+        ].concat()
     );
-    let descriptions = row_description_type_oids(&output);
-    assert_eq!(&descriptions[descriptions.len() - 2..], &[23, 2206]);
+    let mut descriptions = Vec::new();
+    let mut remaining = output.as_slice();
+    while !remaining.is_empty() {
+        let length = i32::from_be_bytes(remaining[1..5].try_into().unwrap()) as usize;
+        if remaining[0] == b'T' { descriptions.extend(row_description_type_oids(remaining)); }
+        remaining = &remaining[1+length..];
+    }
+    assert_eq!(&descriptions[descriptions.len()-2..], &[23, 2206]);
 }
 
 #[test]

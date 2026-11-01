@@ -40,16 +40,13 @@ maximum row history independently for every possible table.
 Audit PostgreSQL 18 built-ins by signature and executable behavior. Catalog
 presence alone is not support. Compare values, declared result types, nulls,
 errors and argument effects with PostgreSQL, including seeded hashes.
-When a mutable function pauses its enclosing query, completed argument effects,
-conversions and nested calls must remain done. Preserve the selected defaults
-and input classification even when an earlier argument replaces a definition.
-Extend these retained input positions to object-store waits and function bodies;
-the internal function handoff alone does not remove query-prefix replay. Reuse the shared
-input preparation for scalar functions, table functions and procedures, preserving
-each context's conversion and strict-null rules. The [architecture](docs/architecture.md)
-describes the implemented binding, retained result types, record expansion and
-one-time set-input behavior. These contracts must remain intact as execution
-positions replace query-prefix replay.
+Extend the retained input positions from internal function handoffs to
+object-store waits, function bodies and ordinary query positions. Preserve
+once-only argument effects, converted values, selected defaults and bound types
+while removing query-prefix replay. Keep the shared input preparation for scalar
+functions, table functions and procedures, including their distinct conversion
+and strict-null rules. The [architecture](docs/architecture.md) describes the
+implemented input progress, type contracts, record expansion and set inputs.
 Run real SQLAlchemy, Alembic and psycopg2 workflows against both servers.
 Keep their catalog inspection, declared types, streaming and migration checks
 passing as function binding and execution expand; see the

@@ -2637,6 +2637,7 @@ pub fn eval_full<'a>(
         } else {
             expression
         };
+        let run = || {
         let _query_inputs = matches!(
             expression,
             Expr::Subquery(_)
@@ -2653,12 +2654,17 @@ pub fn eval_full<'a>(
             arena,
         )?;
         materialize_enum_values(value, hooks.catalog, arena)
+        };
+        if matches!(expression, Expr::Call { .. }) && hooks.srf_index.is_none() {
+            super::query::input_progress::call(arena, || {
+                let _inputs = super::query::input_progress::enter();
+                run()
+            })
+        } else { run() }
     };
-    if let Some(site) = super::query::input_progress::expression_site(expression) {
-        super::query::input_progress::value(site, arena, evaluate)
-    } else {
-        evaluate()
-    }
+    super::query::input_progress::value(
+        super::query::input_progress::expression_site(expression), arena, evaluate,
+    )
 }
 
 fn eval_full_inner<'a>(

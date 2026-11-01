@@ -3606,7 +3606,6 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                     });
             }
         };
-        input_progress::call(arena, || {
             let slot = self
                 .storage
                 .routine_slot_by_oid(oid, self.txid)
@@ -3642,7 +3641,6 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                         "resolved routine has no scalar result"
                     )
                 })
-        })
     }
 
     fn call_routine_oid<'a>(

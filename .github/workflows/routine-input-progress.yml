@@ -21,6 +21,10 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+      - name: Format checkout and retain correction
+        run: |
+          cargo fmt --all
+          git diff --binary > "$RUNNER_TEMP/input-formatting.patch"
       - name: Rebuild this checkout's crate
         run: cargo clean -p pos3ql
       - name: Function argument effects and resumption
@@ -28,3 +32,12 @@ jobs:
           cargo test --lib --locked -- routine_calls:: retained_input_ownership_ --test-threads=1 --nocapture
       - name: Lint complete implementation
         run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Retain formatting correction
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: input-formatting-${{ github.sha }}
+          path: ${{ runner.temp }}/input-formatting.patch
+          if-no-files-found: ignore
+      - name: Require committed formatting
+        run: test ! -s "$RUNNER_TEMP/input-formatting.patch"

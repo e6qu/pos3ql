@@ -16051,32 +16051,6 @@ fn rename_routine_parameters_schema(
     }
 }
 
-fn schema_path_components(remaining: &str) -> impl Iterator<Item = &str> {
-    let mut remaining = Some(remaining);
-    core::iter::from_fn(move || {
-        let current = remaining.take()?;
-        let mut quoted = false;
-        let mut end = current.len();
-        for (at, character) in current.char_indices() {
-            match character {
-                '"' => quoted = !quoted,
-                ',' if !quoted => {
-                    end = at;
-                    break;
-                }
-                _ => {}
-            }
-        }
-        let component = &current[..end];
-        remaining = if end == current.len() {
-            None
-        } else {
-            Some(&current[end + 1..])
-        };
-        Some(component)
-    })
-}
-
 fn quoted_identifier_matches(source: &str, name: &str) -> bool {
     let mut source = source.chars().peekable();
     let mut name = name.chars();
@@ -16117,11 +16091,19 @@ pub(crate) fn rename_schema_path(
 
     let original = *path;
     let mut rewritten = StackStr::<128>::new();
-    for (index, component) in schema_path_components(original.as_str()).enumerate() {
+    for (index, component) in crate::sql::guc::search_path_components(original.as_str()).enumerate()
+    {
+        let component = component.map_err(|_| {
+            sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "stored search path has invalid list syntax"
+            )
+        })?;
         if index != 0 {
             let _ = rewritten.write_char(',');
         }
-        let name = component.trim();
+        let name = component
+            .trim_matches(|character| matches!(character, ' ' | '\t' | '\n' | '\r' | '\x0c'));
         let matches = if let Some(inner) = name.strip_prefix('"') {
             let inner = inner.strip_suffix('"').ok_or_else(|| {
                 sql_err!(
@@ -16131,11 +16113,22 @@ pub(crate) fn rename_schema_path(
             })?;
             quoted_identifier_matches(inner, old.as_str())
         } else {
-            name == old.as_str()
+            name.bytes()
+                .map(|byte| byte.to_ascii_lowercase())
+                .eq(old.as_str().bytes())
         };
         if matches {
-            let start = component.len() - component.trim_start().len();
-            let end = component.trim_end().len();
+            let start = component.len()
+                - component
+                    .trim_start_matches(|character| {
+                        matches!(character, ' ' | '\t' | '\n' | '\r' | '\x0c')
+                    })
+                    .len();
+            let end = component
+                .trim_end_matches(|character| {
+                    matches!(character, ' ' | '\t' | '\n' | '\r' | '\x0c')
+                })
+                .len();
             let _ = rewritten.write_str(&component[..start]);
             write_schema_identifier(&mut rewritten, new);
             let _ = rewritten.write_str(&component[end..]);
@@ -31370,36 +31363,40 @@ impl Storage {
         let mut entries = [PathEntry::Catalog; MAX_PATH_ENTRIES];
         let mut n = 0;
         let mut explicit_catalog = false;
-        let mut name_buf = [0u8; 63];
-        // Elements split on commas outside double quotes (the stored form is
-        // canonical: only double-quoted elements may embed commas).
-        for element in schema_path_components(raw).map(str::trim) {
+        for element in crate::sql::guc::search_path_components(raw) {
+            let element = element
+                .expect("search path crossed its validated GUC boundary")
+                .trim_matches(|character| matches!(character, ' ' | '\t' | '\n' | '\r' | '\x0c'));
             if element.is_empty() {
                 continue;
             }
             // Unquote a `"quoted name"` element ("" is an embedded quote).
-            let name: &str = if element.starts_with('"') {
+            let mut decoded = StackStr::<63>::new();
+            if element.starts_with('"') {
                 let inner = element
                     .strip_prefix('"')
                     .and_then(|inner| inner.strip_suffix('"'))
                     .expect("validated search-path identifier has paired quotes");
-                let mut len = 0;
-                let mut bytes = inner.bytes().peekable();
-                while let Some(b) = bytes.next() {
-                    if len == name_buf.len() {
+                let mut characters = inner.chars().peekable();
+                while let Some(character) = characters.next() {
+                    let _ = core::fmt::Write::write_char(&mut decoded, character);
+                    if decoded.is_truncated() {
                         break;
                     }
-                    name_buf[len] = b;
-                    len += 1;
-                    if b == b'"' {
-                        // "" collapses to one quote.
-                        bytes.next();
+                    if character == '"' {
+                        characters.next();
                     }
                 }
-                core::str::from_utf8(&name_buf[..len]).unwrap_or(inner)
             } else {
-                element
-            };
+                for character in element.chars() {
+                    let _ =
+                        core::fmt::Write::write_char(&mut decoded, character.to_ascii_lowercase());
+                    if decoded.is_truncated() {
+                        break;
+                    }
+                }
+            }
+            let name = decoded.as_str();
             let name = if name == "$user" { user } else { name };
             if name == "pg_catalog" {
                 if !explicit_catalog {

@@ -15,10 +15,29 @@ use super::ast::{TransactionCharacteristics, TransactionIsolation};
 use super::datetime::{DateFormat, DateStyle, FieldOrder, IntervalStyle};
 use super::eval::SqlError;
 
-/// Maximum canonical byte length of a session search path. The resolver's
+/// Maximum stored byte length of a session search path. The resolver's
 /// entry bound is derived from this value, so a byte-valid path cannot overrun
 /// a narrower effective-path array.
 pub const SEARCH_PATH_BYTES: usize = 128;
+
+#[derive(Clone, Copy)]
+enum SettingInput<'a> {
+    Sql(&'a str),
+    Value(&'a str),
+}
+
+impl<'a> SettingInput<'a> {
+    fn value(self) -> &'a str {
+        match self {
+            Self::Sql(raw) => unquote(raw),
+            Self::Value(value) => value,
+        }
+    }
+
+    fn resets(self) -> bool {
+        matches!(self, Self::Sql(raw) if raw.trim().eq_ignore_ascii_case("default"))
+    }
+}
 
 #[derive(Clone, Copy)]
 struct PrngState {
@@ -269,9 +288,10 @@ pub fn set_active_config(
         // for exactly the dynamic extent of execute_stmt and its Drop guard
         // clears it on every exit. GucState mutation is behind RefCell.
         let guc = unsafe { &*pointer };
-        if let Some(characteristics) =
-            guc.current_transaction_setting(name, value.unwrap_or("DEFAULT"))
-        {
+        if let Some(characteristics) = guc.current_transaction_setting_input(
+            name,
+            value.map_or(SettingInput::Sql("DEFAULT"), SettingInput::Value),
+        ) {
             let characteristics = characteristics?;
             let txn_pointer = ACTIVE_TXN.with(Cell::get);
             if txn_pointer.is_null() {
@@ -1536,7 +1556,15 @@ impl GucState {
         name: &str,
         raw: &str,
     ) -> Option<Result<TransactionCharacteristics, SqlError>> {
-        let value = unquote(raw);
+        self.current_transaction_setting_input(name, SettingInput::Sql(raw))
+    }
+
+    fn current_transaction_setting_input(
+        &self,
+        name: &str,
+        input: SettingInput<'_>,
+    ) -> Option<Result<TransactionCharacteristics, SqlError>> {
+        let value = input.value();
         let mut characteristics = TransactionCharacteristics::EMPTY;
         let cannot_reset = || {
             sql_err!(
@@ -1546,7 +1574,7 @@ impl GucState {
             )
         };
         if name.eq_ignore_ascii_case("transaction_isolation") {
-            if value.eq_ignore_ascii_case("default") {
+            if input.resets() {
                 return Some(Err(cannot_reset()));
             }
             let isolation = match parse_transaction_isolation(value) {
@@ -1561,7 +1589,7 @@ impl GucState {
             };
             characteristics.isolation = Some(isolation);
         } else if name.eq_ignore_ascii_case("transaction_read_only") {
-            if value.eq_ignore_ascii_case("default") {
+            if input.resets() {
                 return Some(Err(cannot_reset()));
             }
             let read_only = match parse_on_off(value) {
@@ -1570,7 +1598,7 @@ impl GucState {
             };
             characteristics.read_only = Some(read_only);
         } else if name.eq_ignore_ascii_case("transaction_deferrable") {
-            if value.eq_ignore_ascii_case("default") {
+            if input.resets() {
                 return Some(Err(cannot_reset()));
             }
             let deferrable = match parse_on_off(value) {
@@ -1637,9 +1665,13 @@ impl GucState {
     /// error for an unknown parameter, a read-only parameter, or a value the
     /// engine cannot honor.
     pub fn set(&self, name: &str, raw: &str, local: bool) -> Result<(), SqlError> {
+        self.assign(name, SettingInput::Sql(raw), local)
+    }
+
+    fn assign(&self, name: &str, input: SettingInput<'_>, local: bool) -> Result<(), SqlError> {
         if name.eq_ignore_ascii_case("seed") {
-            let value = unquote(raw);
-            if value.eq_ignore_ascii_case("default") {
+            let value = input.value();
+            if input.resets() {
                 return Err(sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
                     "parameter \"seed\" cannot be reset"
@@ -1656,13 +1688,13 @@ impl GucState {
         }
         let mut state = self.store.borrow_mut();
         let mut values = state.current;
-        change_setting(&mut values, &state.defaults, name, raw)?;
+        change_setting(&mut values, &state.defaults, name, input)?;
         super::txn::validate_isolation_mode(
             self.transaction_mode,
             values.default_transaction_isolation,
         )?;
         let bit = guc_bit(name);
-        let resetting = unquote(raw).eq_ignore_ascii_case("default");
+        let resetting = input.resets();
         finish_setting_change(&mut state, values, bit, local, resetting);
         Ok(())
     }
@@ -1730,7 +1762,12 @@ impl GucState {
     pub(crate) fn set_cluster_default(&self, name: &str, raw: &str) -> Result<(), SqlError> {
         let mut state = self.store.borrow_mut();
         let mut cluster = state.cluster_defaults;
-        change_setting(&mut cluster, &GucValues::new(), name, raw)?;
+        change_setting(
+            &mut cluster,
+            &GucValues::new(),
+            name,
+            SettingInput::Value(raw),
+        )?;
         state.cluster_defaults = cluster;
         state.cluster_overrides |= guc_bit(name);
         Self::recompute_cluster_defaults(&mut state);
@@ -1751,7 +1788,7 @@ impl GucState {
     ) -> Result<(), SqlError> {
         let mut state = self.store.borrow_mut();
         let mut values = state.defaults;
-        change_setting(&mut values, &state.defaults, name, raw)?;
+        change_setting(&mut values, &state.defaults, name, SettingInput::Value(raw))?;
         let bit = guc_bit(name);
         state.connection_overrides |= bit;
         state.database_overrides &= !bit;
@@ -1942,7 +1979,11 @@ impl GucState {
         value: Option<&str>,
         local: bool,
     ) -> Result<StackStr<256>, SqlError> {
-        self.set(name, value.unwrap_or("DEFAULT"), local)?;
+        self.assign(
+            name,
+            value.map_or(SettingInput::Sql("DEFAULT"), SettingInput::Value),
+            local,
+        )?;
         self.get_owned(name).ok_or_else(|| {
             sql_err!(
                 sqlstate::UNDEFINED_OBJECT,
@@ -1961,7 +2002,7 @@ impl GucState {
             let mut state = self.store.borrow_mut();
             let prior = state.current;
             let mut values = state.current;
-            change_setting(&mut values, &state.defaults, name, raw)?;
+            change_setting(&mut values, &state.defaults, name, SettingInput::Sql(raw))?;
             state.current = values;
             prior
         };
@@ -1989,7 +2030,7 @@ impl GucState {
                 &mut current,
                 &state.defaults,
                 config.name.as_str(),
-                config.value.as_str(),
+                SettingInput::Value(config.value.as_str()),
             )?;
         }
         state.current = current;
@@ -2045,12 +2086,12 @@ fn change_setting(
     values: &mut GucValues,
     defaults: &GucValues,
     name: &str,
-    raw: &str,
+    input: SettingInput<'_>,
 ) -> Result<(), SqlError> {
-    if unquote(raw).eq_ignore_ascii_case("default") {
+    if input.resets() {
         reset_setting(values, defaults, name)
     } else {
-        apply_setting(values, name, raw)
+        apply_setting(values, name, input)
     }
 }
 
@@ -2125,9 +2166,13 @@ fn reset_setting(values: &mut GucValues, defaults: &GucValues, name: &str) -> Re
     Ok(())
 }
 
-fn apply_setting(values: &mut GucValues, name: &str, raw: &str) -> Result<(), SqlError> {
-    let v = unquote(raw);
-    let is_default = v.eq_ignore_ascii_case("default");
+fn apply_setting(
+    values: &mut GucValues,
+    name: &str,
+    input: SettingInput<'_>,
+) -> Result<(), SqlError> {
+    let v = input.value();
+    let is_default = input.resets();
 
     if name.eq_ignore_ascii_case("datestyle") {
         // DateStyle is cumulative: each SET updates only the components it
@@ -2297,12 +2342,18 @@ fn apply_setting(values: &mut GucValues, name: &str, raw: &str) -> Result<(), Sq
         if is_default {
             return store(&mut values.search_path, "\"$user\", public");
         }
-        let mut canonical = StackStr::<128>::new();
-        // The raw text, not the pre-unquoted value: quoting decides how
-        // elements split, and a single-quoted string is one element
-        // however many commas it holds.
-        canonicalize_search_path(raw, &mut canonical)?;
-        return store(&mut values.search_path, canonical.as_str());
+        match input {
+            SettingInput::Sql(raw) => {
+                let mut canonical = StackStr::<SEARCH_PATH_BYTES>::new();
+                canonicalize_search_path(raw, &mut canonical)?;
+                validate_search_path(canonical.as_str())?;
+                return store(&mut values.search_path, canonical.as_str());
+            }
+            SettingInput::Value(value) => {
+                validate_search_path(value)?;
+                return store(&mut values.search_path, value);
+            }
+        }
     }
     if name.eq_ignore_ascii_case("extra_float_digits") {
         // Floats already render at their shortest exact round-trip form —
@@ -2952,6 +3003,86 @@ fn canonicalize_search_path(
                 SEARCH_PATH_BYTES
             ));
         }
+    }
+    Ok(())
+}
+
+fn path_space(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | b'\x0c')
+}
+
+/// Splits the decoded GUC value, preserving its spelling for SHOW and saved
+/// settings. Quoting and separators follow PostgreSQL SplitIdentifierString.
+pub(crate) fn search_path_components(value: &str) -> impl Iterator<Item = Result<&str, SqlError>> {
+    let mut remaining = Some(value);
+    let mut after_comma = false;
+    core::iter::from_fn(move || {
+        let raw = remaining.take()?;
+        let bytes = raw.as_bytes();
+        let mut at = 0;
+        while at < bytes.len() && path_space(bytes[at]) {
+            at += 1;
+        }
+        let invalid = || {
+            sql_err!(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "invalid value for parameter \"search_path\": \"{}\"; list syntax is invalid",
+                value
+            )
+        };
+        if at == bytes.len() {
+            return after_comma.then(|| Err(invalid()));
+        }
+        if bytes[at] == b'"' {
+            at += 1;
+            loop {
+                if at == bytes.len() || bytes[at] == 0 {
+                    return Some(Err(invalid()));
+                }
+                if bytes[at] == b'"' {
+                    at += 1;
+                    if bytes.get(at) != Some(&b'"') {
+                        break;
+                    }
+                }
+                at += 1;
+            }
+        } else {
+            let start = at;
+            while at < bytes.len() && bytes[at] != b',' && !path_space(bytes[at]) {
+                if bytes[at] == 0 {
+                    return Some(Err(invalid()));
+                }
+                at += 1;
+            }
+            if at == start {
+                return Some(Err(invalid()));
+            }
+        }
+        while at < bytes.len() && path_space(bytes[at]) {
+            at += 1;
+        }
+        if at < bytes.len() {
+            if bytes[at] != b',' {
+                return Some(Err(invalid()));
+            }
+            remaining = Some(&raw[at + 1..]);
+            after_comma = true;
+        }
+        Some(Ok(&raw[..at]))
+    })
+}
+
+fn validate_search_path(value: &str) -> Result<(), SqlError> {
+    if value.len() > SEARCH_PATH_BYTES {
+        return Err(sql_err!(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "search_path is too long (limit {} bytes)",
+            SEARCH_PATH_BYTES
+        ));
+    }
+    for component in search_path_components(value) {
+        component?;
     }
     Ok(())
 }

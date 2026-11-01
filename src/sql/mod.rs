@@ -18606,13 +18606,13 @@ impl Engine {
             )));
         }
         let old_path = guc.search_path();
-        if let Err(error) = guc.set("search_path", path.as_str(), true) {
+        if let Err(error) = guc.set_config("search_path", Some(path.as_str()), true) {
             return Ok(Err(error));
         }
         let mut parser = match Parser::new(rendered, arena) {
             Ok(parser) => parser,
             Err(error) => {
-                let _ = guc.set("search_path", old_path.as_str(), true);
+                let _ = guc.set_config("search_path", Some(old_path.as_str()), true);
                 return Ok(Err(parse_error_to_sql(&error)));
             }
         };
@@ -18622,7 +18622,7 @@ impl Engine {
                 Ok(Some(statement)) => statement,
                 Ok(None) => break,
                 Err(error) => {
-                    let _ = guc.set("search_path", old_path.as_str(), true);
+                    let _ = guc.set_config("search_path", Some(old_path.as_str()), true);
                     return Ok(Err(parse_error_to_sql(&error)));
                 }
             };
@@ -18638,7 +18638,7 @@ impl Engine {
                     | Stmt::AlterExtension { .. }
                     | Stmt::DropExtension { .. }
             ) {
-                let _ = guc.set("search_path", old_path.as_str(), true);
+                let _ = guc.set_config("search_path", Some(old_path.as_str()), true);
                 return Ok(Err(sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
                     "extension scripts cannot control transactions or extension lifecycle"
@@ -18648,7 +18648,7 @@ impl Engine {
                 if let Err(error) =
                     self.execute_extension_config_dump(extension, arguments, arena, params, txn)
                 {
-                    let _ = guc.set("search_path", old_path.as_str(), true);
+                    let _ = guc.set_config("search_path", Some(old_path.as_str()), true);
                     return Ok(Err(error));
                 }
                 continue;
@@ -18670,12 +18670,12 @@ impl Engine {
             let result = match result {
                 Ok(result) => result,
                 Err(full) => {
-                    let _ = guc.set("search_path", old_path.as_str(), true);
+                    let _ = guc.set_config("search_path", Some(old_path.as_str()), true);
                     return Err(full);
                 }
             };
             if let Err(error) = result {
-                let _ = guc.set("search_path", old_path.as_str(), true);
+                let _ = guc.set_config("search_path", Some(old_path.as_str()), true);
                 return Ok(Err(error));
             }
             let ddl_end = txn.ddl().len();
@@ -18684,7 +18684,7 @@ impl Engine {
                     && let Err(error) =
                         exec::record_extension_member(&mut self.storage, txn, extension, object)
                 {
-                    let _ = guc.set("search_path", old_path.as_str(), true);
+                    let _ = guc.set_config("search_path", Some(old_path.as_str()), true);
                     return Ok(Err(error));
                 }
             }
@@ -18692,7 +18692,7 @@ impl Engine {
             // completed statement has published every durable effect.
             unsafe { arena.rewind_to(statement_mark) };
         }
-        let _ = guc.set("search_path", old_path.as_str(), true);
+        let _ = guc.set_config("search_path", Some(old_path.as_str()), true);
         Ok(Ok(()))
     }
 

@@ -1136,6 +1136,110 @@ fn qualified_builtin_types_survive_mutable_function_handoffs() {
 }
 
 #[test]
+fn decoded_guc_values_keep_their_spelling_and_resolve_search_path_names() {
+    let config = test_config("decoded-guc-values");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    let sql = include_str!(
+        "../../../tests/external/differential_exact/56_search_path_value_assignment.sql"
+    );
+    assert_eq!(
+        data_rows(&session.success(&mut engine, sql, true)),
+        [
+            "GUC_RAW,public",
+            "GUC_RAW,public|7",
+            "  \"Guc Space\" , public  ",
+            "8",
+            "guc_raw, public",
+            "\"guc_raw,public\"",
+            "'public'",
+            "  abc  ",
+            "'abc'",
+            "DEFAULT",
+            "DEFAULT",
+            "DEFAULT",
+            "\"$user\", public",
+            "GUC_RAW,public",
+            "public",
+            "GUC_RAW,public|public",
+            "GUC_RAW,public",
+            "  \"Guc Space\" , public  ",
+            "GUC_RAW,public",
+            "public",
+        ]
+    );
+    session.success(
+        &mut engine,
+        "SELECT set_config('search_path','GUC_RAW,public',false)",
+        true,
+    );
+    for value in [
+        "foo bar",
+        "public,,pg_catalog",
+        "public,",
+        "\"unclosed",
+        "\"public\"tail",
+    ] {
+        assert_eq!(
+            error_sqlstates(&session.execute(
+                &mut engine,
+                &format!("SELECT set_config('search_path','{value}',false)"),
+                true
+            )),
+            ["22023"]
+        );
+        assert_eq!(
+            data_rows(&session.success(&mut engine, "SELECT current_setting('search_path')", true)),
+            ["GUC_RAW,public"]
+        );
+    }
+}
+
+#[test]
+fn saved_guc_values_preserve_raw_spelling_without_runtime_allocations() {
+    let guc = GucState::new();
+    let raw = "  \"Mixed Case\" , public  ";
+    let configs = [crate::storage::RoutineConfig {
+        name: crate::storage::SqlName::parse("search_path").unwrap(),
+        value: crate::util::StackStr::from_str(raw),
+    }];
+    crate::mem::guard::forbid_alloc(|| {
+        guc.set_connection_default(
+            "search_path",
+            "GUC_RAW,public",
+            guc::ConnectionDefaultSource::Role,
+        )
+        .unwrap();
+        assert_eq!(
+            guc.get_owned("search_path").unwrap().as_str(),
+            "GUC_RAW,public"
+        );
+        guc.set("search_path", "public", false).unwrap();
+        guc.set("search_path", "DEFAULT", false).unwrap();
+        assert_eq!(
+            guc.get_owned("search_path").unwrap().as_str(),
+            "GUC_RAW,public"
+        );
+        {
+            let _scope = guc.enter_routine_configs(&configs).unwrap();
+            assert_eq!(guc.get_owned("search_path").unwrap().as_str(), raw);
+        }
+        assert_eq!(
+            guc.get_owned("search_path").unwrap().as_str(),
+            "GUC_RAW,public"
+        );
+        guc.begin_transaction();
+        guc.set_config("search_path", Some(raw), true).unwrap();
+        guc.commit_transaction();
+        assert_eq!(
+            guc.get_owned("search_path").unwrap().as_str(),
+            "GUC_RAW,public"
+        );
+    });
+}
+
+#[test]
 fn bound_builtin_casts_keep_indexed_point_reads() {
     let config = test_config("retained-query-indexed-casts");
     let mut budget = test_engine_budget(&config, 1 << 29);

@@ -420,7 +420,7 @@ impl<'statement: 'query, 'query> InputAttempt<'statement, 'query> {
                 .map_err(|_| full())?;
         }
         let frame = frames
-            .as_slice()
+            .borrowed_slice()
             .get(ordinal)
             .copied()
             .ok_or_else(changed)?
@@ -516,7 +516,7 @@ impl<'statement: 'query, 'query> InputAttempt<'statement, 'query> {
     fn retain(&self, ordinal: usize) -> Result<(), SqlError> {
         let arena = self.registry.arena;
         let mut copied = ArenaList::new(arena);
-        for frame in self.frames.borrow().as_slice() {
+        for frame in self.frames.borrow().borrowed_slice() {
             let saved = match *frame {
                 AttemptFrame::Saved(frame) => frame,
                 AttemptFrame::Temporary(frame) => {
@@ -559,12 +559,12 @@ impl<'statement: 'query, 'query> InputAttempt<'statement, 'query> {
             copied.push(saved).map_err(|_| full())?;
         }
         let frames = arena
-            .alloc_persistent_slice_with(copied.len(), |index| copied.as_slice()[index])
+            .alloc_persistent_slice_with(copied.len(), |index| copied.borrowed_slice()[index])
             .map_err(|_| full())?;
         let saved = SavedInputs { ordinal, frames };
         let mut entries = self.registry.saved.borrow_mut();
         match entries
-            .as_slice()
+            .borrowed_slice()
             .binary_search_by_key(&ordinal, |entry| entry.ordinal)
         {
             Ok(index) => entries.as_mut_slice().map_err(|_| full())?[index] = saved,
@@ -599,10 +599,10 @@ pub(super) fn evaluation(
     };
     let mut entries = invocations.inputs.evaluations.borrow_mut();
     match entries
-        .as_slice()
+        .borrowed_slice()
         .binary_search_by_key(&oid, |entry| entry.0)
     {
-        Ok(index) => Ok(entries.as_slice()[index].1),
+        Ok(index) => Ok(entries.borrowed_slice()[index].1),
         Err(index) => {
             entries.push((oid, current)).map_err(|_| full())?;
             entries.as_mut_slice().map_err(|_| full())?[index..].rotate_right(1);
@@ -636,7 +636,7 @@ pub(super) fn selected_target() -> Option<i32> {
     attempt
         .frames
         .borrow()
-        .as_slice()
+        .borrowed_slice()
         .get(attempt.next.get())
         .and_then(|frame| definition_oid(frame.frame()))
 }
@@ -666,10 +666,10 @@ pub(crate) fn enter_expression(expression: &Expr<'_>) -> Result<ExpressionPositi
     } else {
         let saved = registry.saved.borrow();
         saved
-            .as_slice()
+            .borrowed_slice()
             .binary_search_by_key(&ordinal, |entry| entry.ordinal)
             .ok()
-            .and_then(|index| saved.as_slice()[index].frames.first())
+            .and_then(|index| saved.borrowed_slice()[index].frames.first())
             .and_then(|frame| definition_oid(**frame))
     };
     Ok(ExpressionPosition {
@@ -750,10 +750,10 @@ pub(crate) fn call<T>(
     {
         let saved = registry.saved.borrow();
         if let Ok(index) = saved
-            .as_slice()
+            .borrowed_slice()
             .binary_search_by_key(&ordinal, |entry| entry.ordinal)
         {
-            for frame in saved.as_slice()[index].frames {
+            for frame in saved.borrowed_slice()[index].frames {
                 frames
                     .push(AttemptFrame::Saved(frame))
                     .map_err(|_| full())?;
@@ -920,6 +920,40 @@ mod tests {
                 assert_eq!(invocations.inputs.saved.borrow().len(), 0);
             });
         }
+    }
+
+    #[test]
+    fn retained_input_ownership_tracks_all_arguments_in_bounded_scratch() {
+        let mut budget = Budget::new(40960);
+        let statement = Arena::new(&mut budget, "input statement", 1024).unwrap();
+        let work = Arena::new(&mut budget, "input work", 32768).unwrap();
+        let invocations = RoutineInvocationState::new(&statement);
+        let _scope = enter_routine_invocation_scope(Some(RoutineInvocationContext::new(
+            &invocations,
+            &statement,
+        )));
+        crate::mem::guard::forbid_alloc(|| {
+            call(&work, || {
+                let _scope = enter();
+                for parameter in 0..crate::storage::MAX_ROUTINE_ARGUMENTS {
+                    let result = value(
+                        InputSite::Argument {
+                            routine: 42,
+                            parameter,
+                            written: Some(parameter),
+                            source: 23,
+                            target: 23,
+                        },
+                        &work,
+                        || Ok(Datum::Int4(parameter as i32)),
+                    )?;
+                    assert!(matches!(result, Datum::Int4(value) if value == parameter as i32));
+                }
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(statement.used(), 0);
+        });
     }
 
     #[test]

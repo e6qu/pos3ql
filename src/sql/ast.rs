@@ -5699,12 +5699,11 @@ pub enum Expr<'a> {
         base: &'a Expr<'a>,
         field: &'a str,
     },
-    /// An ordinal field of the record yielded by a multi-column DML subquery.
-    /// Keeping the ordinal avoids exposing select-list labels as assignment
-    /// semantics.
+    /// An ordinal field of a bound record projection or DML subquery.
+    /// Labels cannot change which physical field an expression selects.
     RecordFieldIndex {
         base: &'a Expr<'a>,
-        index: u8,
+        index: u16,
     },
     /// `t.*` in an expression position: the table's typed composite row.
     WholeRow(&'a str),

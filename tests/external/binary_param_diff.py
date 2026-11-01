@@ -105,6 +105,10 @@ RESULT_CASES = [
     "SELECT (binary_pending_record(ARRAY[1,NULL,3])).*",
     "SELECT * FROM binary_pending_table(42::int4)",
     "SELECT * FROM binary_pending_table(ARRAY[1,NULL,3])",
+    "SELECT (information_schema._pg_expandarray(ARRAY['a',NULL,'c'])).*",
+    "SELECT (result.keys).x,(result.keys).n FROM "
+    "(SELECT information_schema._pg_expandarray(ARRAY['x',NULL,'z']) AS keys) AS result "
+    "ORDER BY (result.keys).n",
 ]
 
 

@@ -45,7 +45,9 @@ input position across storage waits. Extend the captured function identity and
 bound type contract into those input and body positions. Reuse the shared
 input preparation for scalar functions, table functions and procedures, preserving
 each context's conversion and strict-null rules. The [architecture](docs/architecture.md)
-describes the implemented binding and one-time set-input behavior.
+describes the implemented binding, retained result types, record expansion and
+one-time set-input behavior. These contracts must remain intact as execution
+positions replace query-prefix replay.
 Run real SQLAlchemy, Alembic and psycopg2 workflows against both servers.
 Keep their catalog inspection, declared types, streaming and migration checks
 passing as function binding and execution expand; see the
@@ -166,6 +168,9 @@ regressions passing; use the platform's declared C types at libc boundaries.
 Run the shared formatting prerequisite before admitting build and test matrices.
 Keep native SQL fixtures in native gates and interpreter ownership cases beside
 their runtime modules, so interpreter startup does not compile irrelevant fixtures.
+Shared fixture helpers remain available to ownership cases; native storage tests
+do not enter interpreter startup. Keep time-only timezone expectations independent
+of the day or season on which CI runs.
 Reclaim each polling snapshot's scratch space instead of relying on a favorable
 thread schedule to finish before the arena fills.
 Keep compiler and per-test progress visible through CI cancellation while

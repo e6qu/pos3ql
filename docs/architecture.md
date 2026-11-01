@@ -98,6 +98,15 @@ parameter/default buffers are not retained per invocation. Exhaustion reports
 The function body is looked up when execution starts: PostgreSQL uses a replacement
 body if evaluating an argument replaced it. Read-only and mutable SQL functions
 share the same scalar and record result construction.
+Record field descriptions bind the call's input types, named arguments and
+defaults without running them. The same bound types describe table-function
+columns, so an array returned through `anyelement` has the correct binary format.
+For `SELECT (pair(nextval('numbers'))).*`, PostgreSQL expands a scalar call
+into one call per output field. A set-returning call instead shares its producer
+across those fields; two explicitly written calls remain independent. Expansion
+happens before argument queries and set producers are planned, including in
+`RETURNING`. Array expansion keeps each element's type separately from its integer
+position; ordinary arrays cannot be accessed as records with `.x` or `.f1`.
 Runtime overload checks copy input descriptors rather than whole definitions.
 The selected definition is captured once, bound in place and borrowed by its
 execution helpers. Candidate catalog locks are released before type coercion,

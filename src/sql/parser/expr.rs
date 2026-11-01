@@ -26,7 +26,7 @@ impl<'a> Parser<'a> {
         // PostgreSQL expands BETWEEN before operator/type analysis. Separate
         // expression identities preserve repeated volatile and subquery calls.
         // https://github.com/postgres/postgres/blob/REL_18_6/src/backend/parser/parse_expr.c#L1252
-        let repeated = crate::sql::ast::duplicate_expression(operand, self.arena)
+        let repeated = crate::sql::ast::duplicate_expression(operand, self.arena, &[])
             .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
         let lower = self.arena_expr(Expr::Binary {
             operator: if negated {
@@ -378,7 +378,7 @@ impl<'a> Parser<'a> {
                         // asymmetric tests — AND-ed for NOT BETWEEN, as negating
                         // the disjunction requires.
                         let duplicate = |expression| {
-                            crate::sql::ast::duplicate_expression(expression, self.arena)
+                            crate::sql::ast::duplicate_expression(expression, self.arena, &[])
                                 .map_err(|_| self.arena_full("statement too large for SQL arena"))
                         };
                         let swapped = self.between_comparisons(

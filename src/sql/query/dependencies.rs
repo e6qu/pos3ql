@@ -1462,25 +1462,15 @@ impl ColTypeResolver for DependencyTypes<'_, '_, '_> {
                 self.txid,
             )?
         };
-        let routine = self.storage.routine_for(slot, self.txid);
-        let column = routine.record_result_columns()?.get(index)?;
-        Some((
-            crate::util::StackStr::from_str(column.name.as_str()),
-            StaticTypeMeta {
-                ctype: column.ctype,
-                type_oid: self.storage.routine_type_oid(
-                    column.ctype,
-                    column.user_type,
-                    self.txid,
-                )?,
-                type_mod: -1,
-                collation: if column.ctype.is_collatable() {
-                    crate::sql::ast::Collation::Default
-                } else {
-                    crate::sql::ast::Collation::None
-                },
-            },
-        ))
+        crate::sql::exec::catalog_routine_record_field(
+            self.storage,
+            self.txid,
+            slot,
+            argument_names,
+            variadic,
+            arguments,
+            index,
+        )
     }
 
     fn visit_named_composite_fields(

@@ -735,7 +735,10 @@ pub(crate) struct RoutineCallContract<'a> {
 }
 
 impl<'a> RoutineCallContract<'a> {
-    fn capture(routine: &crate::storage::RoutineDef, arena: &'a Arena) -> Result<&'a Self, SqlError> {
+    fn capture(
+        routine: &crate::storage::RoutineDef,
+        arena: &'a Arena,
+    ) -> Result<&'a Self, SqlError> {
         let full = || {
             sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -3108,6 +3111,56 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             };
         }
         Ok(Some(fields))
+    }
+
+    fn visit_composite_fields(
+        &self,
+        creation: Option<crate::storage::TypeCreation>,
+        visit: &mut dyn FnMut(&str, super::exec::StaticTypeMeta),
+    ) -> Option<usize> {
+        super::exec::visit_catalog_composite_fields(self.storage, self.txid, creation, visit)
+    }
+
+    fn visit_named_composite_fields(
+        &self,
+        name: &str,
+        visit: &mut dyn FnMut(&str, super::exec::StaticTypeMeta),
+    ) -> Result<Option<usize>, SqlError> {
+        super::exec::visit_catalog_rowtype_fields(
+            self.storage,
+            self.txid,
+            name,
+            self.routine_workspace,
+            visit,
+        )
+    }
+
+    fn routine_record_field(
+        &self,
+        name: &str,
+        bound_oid: Option<i32>,
+        argument_names: &[Option<&str>],
+        variadic: bool,
+        arguments: &[i32],
+        index: usize,
+    ) -> Option<(crate::util::StackStr<64>, super::exec::StaticTypeMeta)> {
+        let columns = super::exec::CatalogCols {
+            definition: None,
+            alias: None,
+            output_aliases: &[],
+            storage: self.storage,
+            txid: self.txid,
+            arena: self.routine_workspace,
+        };
+        super::exec::ColTypeResolver::routine_record_field(
+            &columns,
+            name,
+            bound_oid,
+            argument_names,
+            variadic,
+            arguments,
+            index,
+        )
     }
 
     fn composite_base_type_oid(&self, type_oid: i32) -> Option<i32> {
@@ -6971,6 +7024,46 @@ pub(crate) fn lock_result_row(
     Ok(true)
 }
 
+fn expand_select_record_calls<'a>(
+    statement: &'a Select<'a>,
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+    outer: Option<&dyn ColumnLookup<'a>>,
+) -> Result<&'a Select<'a>, SqlError> {
+    if !statement.items.iter().any(|item| {
+        matches!(item, SelectItem::RecordStar(Expr::Call { name, .. })
+            if !name.eq_ignore_ascii_case("row"))
+    }) {
+        return Ok(statement);
+    }
+    let scope = statement
+        .from
+        .as_ref()
+        .map(|from| QueryScope::resolve_schema(storage, from, txid, arena, outer))
+        .transpose()?;
+    let schema = scope.as_ref().map(ScopeSchema);
+    let empty = super::eval::NoColumns;
+    let inner: &dyn ColumnLookup<'a> = match schema.as_ref() {
+        Some(schema) => schema,
+        None => &empty,
+    };
+    let row = Chained { inner, outer };
+    let catalog = storage_catalog(storage, arena, txid);
+    let columns = super::eval::RuntimeColumnTypes {
+        row: &row,
+        catalog: Some(&catalog),
+    };
+    let items =
+        super::exec::expand_record_call_items(statement.items, &columns, storage, txid, arena)?;
+    let mut expanded = *statement;
+    expanded.items = items;
+    arena
+        .alloc(expanded)
+        .map(|value| &*value)
+        .map_err(|_| arena_full())
+}
+
 pub fn select_query<'a>(
     storage: &'a Storage,
     txid: u32,
@@ -6997,6 +7090,10 @@ pub(crate) fn select_query_resumable<'a, 'statement>(
     statement_arena: Option<&'statement Arena>,
     responder: &mut Responder,
 ) -> Outcome {
+    let statement = match expand_select_record_calls(statement, storage, txid, arena, None) {
+        Ok(statement) => statement,
+        Err(error) => return sql_fail(error),
+    };
     let bound_catalog = storage_catalog(storage, arena, txid);
     let bound_queries = ProceduralSubqueries { storage, txid };
     let bound_hooks = crate::sql::eval::EvalHooks {
@@ -7597,6 +7694,10 @@ pub(crate) fn constant_select_resumable<'a, 'statement>(
     statement_arena: Option<&'statement Arena>,
     responder: &mut Responder,
 ) -> Outcome {
+    let statement = match expand_select_record_calls(statement, storage, txid, arena, None) {
+        Ok(statement) => statement,
+        Err(error) => return sql_fail(error),
+    };
     let bound_catalog = storage_catalog(storage, arena, txid);
     let bound_queries = ProceduralSubqueries { storage, txid };
     let bound_hooks = crate::sql::eval::EvalHooks {
@@ -8157,6 +8258,7 @@ fn select_into_rows_mode<'a>(
     recycle_rows: bool,
     emit: &mut dyn for<'row> FnMut(&[Datum<'row>]) -> Result<(), SqlError>,
 ) -> Result<(), SqlError> {
+    let statement = expand_select_record_calls(statement, storage, txid, arena, outer)?;
     let bound_catalog = storage_catalog(storage, arena, txid);
     let bound_queries = ProceduralSubqueries { storage, txid };
     let bound_hooks = crate::sql::eval::EvalHooks {
@@ -10635,25 +10737,15 @@ impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_> {
                 self.txid,
             )?
         };
-        let routine = self.storage.routine_for(slot, self.txid);
-        let column = routine.record_result_columns()?.get(index)?;
-        Some((
-            crate::util::StackStr::from_str(column.name.as_str()),
-            super::exec::StaticTypeMeta {
-                ctype: column.ctype,
-                type_oid: self.storage.routine_type_oid(
-                    column.ctype,
-                    column.user_type,
-                    self.txid,
-                )?,
-                type_mod: -1,
-                collation: if column.ctype.is_collatable() {
-                    super::ast::Collation::Default
-                } else {
-                    super::ast::Collation::None
-                },
-            },
-        ))
+        super::exec::catalog_routine_record_field(
+            self.storage,
+            self.txid,
+            slot,
+            argument_names,
+            variadic,
+            arguments,
+            index,
+        )
     }
 
     fn composite_field(

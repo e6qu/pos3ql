@@ -13937,11 +13937,11 @@ impl Engine {
                 .enumerate()
                 .take(pending.argument_count)
             {
-                *argument =
-                    match exec::decode_projected_col_record(pending.arguments, index, arena) {
-                        Ok(value) => value,
-                        Err(error) => return Ok(Err(error)),
-                    };
+                *argument = match exec::decode_projected_col_record(pending.arguments, index, arena)
+                {
+                    Ok(value) => value,
+                    Err(error) => return Ok(Err(error)),
+                };
             }
             let inputs = match arena.alloc_slice_copy(&arguments[..pending.argument_count]) {
                 Ok(inputs) => inputs,

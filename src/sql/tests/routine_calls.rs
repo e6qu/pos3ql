@@ -496,7 +496,8 @@ fn pending_routine_calls_keep_bound_types_and_structural_values() {
     let mut budget = test_engine_budget(&config, 1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
-    let sql = include_str!("../../../tests/external/differential_exact/48_pending_routine_types.sql");
+    let sql =
+        include_str!("../../../tests/external/differential_exact/48_pending_routine_types.sql");
     assert_eq!(
         data_rows(&session.success(&mut engine, sql, true)),
         [

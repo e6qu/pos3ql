@@ -36,7 +36,14 @@ cleanup() {
 trap cleanup EXIT
 
 # --- start pos3ql (pure SQL/protocol; object storage off) ------------------
-cargo build --release -q || { echo "build failed"; exit 1; }
+git rev-parse HEAD > "$WORK/revision.txt" || exit 1
+if ! (
+  set -o pipefail
+  cargo build --release --locked 2>&1 | tee "$WORK/build.log"
+); then
+  echo "build failed"
+  exit 1
+fi
 cat > "$WORK/p3.conf" <<EOF
 transaction_mode = mvcc
 catalog_history_bytes = 16MiB
@@ -70,7 +77,6 @@ for _ in $(seq 1 100); do
 done
 echo "reference: $(psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -tAc 'SHOW server_version')"
 "$POS3QL_VENV/bin/python" -m pip freeze > "$WORK/python-packages.txt" || exit 1
-git rev-parse HEAD > "$WORK/revision.txt" || exit 1
 
 # Run a driver transcript against a host:port, writing to $1.
 # $2… is the command to run (it receives host port appended).

@@ -1716,6 +1716,7 @@ impl<'d> QueryScope<'d> {
                 Ok(&*arena
                     .alloc(Expr::Call {
                         bound_oid: None,
+                        bound_strict: None,
                         name: "coalesce",
                         args,
                         argument_names: &[],

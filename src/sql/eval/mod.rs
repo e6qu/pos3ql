@@ -947,6 +947,8 @@ pub enum RoutineCallTarget<'name> {
         oid: i32,
         argument_mapping: [u8; crate::storage::MAX_ROUTINE_ARGUMENTS],
         variadic: bool,
+        /// Null-input behavior selected when the enclosing query was bound.
+        bound_strict: Option<bool>,
     },
     Operator {
         schema: Option<&'name str>,
@@ -2685,6 +2687,7 @@ pub fn eval_full<'a>(
                 order_by,
                 over,
                 filter,
+                bound_strict,
                 ..
             },
         ) = (position.target, *expression)
@@ -2692,6 +2695,7 @@ pub fn eval_full<'a>(
             bound = Expr::Call {
                 name,
                 bound_oid: Some(oid),
+                bound_strict,
                 args,
                 argument_names,
                 variadic,
@@ -3240,6 +3244,7 @@ fn eval_full_inner<'a>(
         Expr::Call {
             name,
             bound_oid,
+            bound_strict,
             args,
             argument_names,
             variadic,
@@ -3272,13 +3277,20 @@ fn eval_full_inner<'a>(
                         expression_type_identity(argument, row, hooks)?.routine_argument_oid();
                 }
                 let types = &types[..args.len()];
-                if let Some(target) = catalog.resolve_routine_call(
+                if let Some(mut target) = catalog.resolve_routine_call(
                     name,
                     bound_oid,
                     argument_names,
                     variadic,
                     types,
                 )? {
+                    if let RoutineCallTarget::Stored {
+                        bound_strict: selected,
+                        ..
+                    } = &mut target
+                    {
+                        *selected = bound_strict;
+                    }
                     return catalog.call_routine(
                         target,
                         args,

@@ -62,6 +62,61 @@ SELECT query_position_default() FROM query_position_source WHERE value=2;
 SELECT value FROM query_position_audit ORDER BY value;
 DROP FUNCTION query_position_replace_default();
 DROP FUNCTION query_position_default(integer);
+
+TRUNCATE query_position_audit;
+CREATE FUNCTION query_position_variadic(VARIADIC members integer[]) RETURNS integer LANGUAGE sql VOLATILE AS $$INSERT INTO public.query_position_audit VALUES(cardinality($1)); SELECT cardinality($1)$$;
+CREATE FUNCTION query_position_variadic_default(marker integer DEFAULT 7,VARIADIC members integer[] DEFAULT ARRAY[]::integer[]) RETURNS integer LANGUAGE sql VOLATILE AS $$INSERT INTO public.query_position_audit VALUES($1+cardinality($2)); SELECT $1+cardinality($2)$$;
+SELECT query_position_variadic(VARIADIC ARRAY[]::integer[]) FROM query_position_source WHERE value=2;
+SELECT query_position_variadic(7,8) FROM query_position_source WHERE value=2;
+SELECT query_position_variadic(VARIADIC members=>ARRAY[]::integer[]) FROM query_position_source WHERE value=2;
+SELECT query_position_variadic_default() FROM query_position_source WHERE value=2;
+SELECT query_position_variadic_default(marker=>9,VARIADIC members=>ARRAY[]::integer[]) FROM query_position_source WHERE value=2;
+SELECT query_position_variadic_default(marker=>11,VARIADIC members=>ARRAY[]::integer[]) FROM query_position_source WHERE value=2;
+SELECT query_position_variadic_default(13,4,5) FROM query_position_source WHERE value=2;
+SELECT value FROM query_position_audit ORDER BY value;
+DROP FUNCTION query_position_variadic(integer[]);
+DROP FUNCTION query_position_variadic_default(integer,integer[]);
+
+TRUNCATE query_position_audit;
+CREATE TABLE query_position_null_source(value integer);
+INSERT INTO query_position_null_source VALUES(NULL);
+CREATE FUNCTION query_position_install_strict() RETURNS integer LANGUAGE sql VOLATILE AS $outer$CREATE OR REPLACE FUNCTION public.query_position_strict_target(value integer) RETURNS integer LANGUAGE sql VOLATILE STRICT AS $inner$INSERT INTO public.query_position_audit VALUES(7); SELECT 7$inner$; SELECT 0$outer$;
+CREATE FUNCTION query_position_install_nonstrict() RETURNS integer LANGUAGE sql VOLATILE AS $outer$CREATE OR REPLACE FUNCTION public.query_position_strict_target(value integer) RETURNS integer LANGUAGE sql VOLATILE CALLED ON NULL INPUT AS $inner$INSERT INTO public.query_position_audit VALUES(7); SELECT 7$inner$; SELECT 0$outer$;
+
+CREATE FUNCTION query_position_strict_target(value integer) RETURNS integer LANGUAGE sql VOLATILE CALLED ON NULL INPUT AS $$INSERT INTO public.query_position_audit VALUES(5); SELECT 5$$;
+SELECT query_position_install_strict(),query_position_strict_target(NULL) FROM query_position_null_source;
+SELECT query_position_strict_target(NULL) FROM query_position_null_source;
+SELECT value FROM query_position_audit ORDER BY value;
+DROP FUNCTION query_position_strict_target(integer);
+TRUNCATE query_position_audit;
+
+CREATE FUNCTION query_position_strict_target(value integer) RETURNS integer LANGUAGE sql VOLATILE STRICT AS $$INSERT INTO public.query_position_audit VALUES(5); SELECT 5$$;
+SELECT query_position_install_nonstrict(),query_position_strict_target(NULL) FROM query_position_null_source;
+SELECT query_position_strict_target(NULL) FROM query_position_null_source;
+SELECT value FROM query_position_audit ORDER BY value;
+DROP FUNCTION query_position_strict_target(integer);
+TRUNCATE query_position_audit;
+
+CREATE FUNCTION query_position_strict_target(value integer) RETURNS integer LANGUAGE sql VOLATILE CALLED ON NULL INPUT AS $$INSERT INTO public.query_position_audit VALUES(5); SELECT 5$$;
+PREPARE query_position_strict_prepared AS SELECT query_position_install_strict(),query_position_strict_target(value) FROM query_position_null_source;
+EXECUTE query_position_strict_prepared;
+DEALLOCATE query_position_strict_prepared;
+SELECT query_position_strict_target(value) FROM query_position_null_source;
+SELECT value FROM query_position_audit ORDER BY value;
+DROP FUNCTION query_position_strict_target(integer);
+TRUNCATE query_position_audit;
+
+CREATE FUNCTION query_position_strict_target(value integer) RETURNS integer LANGUAGE sql VOLATILE STRICT AS $$INSERT INTO public.query_position_audit VALUES(5); SELECT 5$$;
+PREPARE query_position_strict_prepared AS SELECT query_position_install_nonstrict(),query_position_strict_target(value) FROM query_position_null_source;
+EXECUTE query_position_strict_prepared;
+DEALLOCATE query_position_strict_prepared;
+SELECT query_position_strict_target(value) FROM query_position_null_source;
+SELECT value FROM query_position_audit ORDER BY value;
+DROP FUNCTION query_position_strict_target(integer);
+TRUNCATE query_position_audit;
+DROP FUNCTION query_position_install_strict();
+DROP FUNCTION query_position_install_nonstrict();
+DROP TABLE query_position_null_source;
 DROP FUNCTION query_position_write(integer);
 DROP TABLE query_position_audit;
 DROP TABLE query_position_source;

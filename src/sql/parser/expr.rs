@@ -143,6 +143,7 @@ impl<'a> Parser<'a> {
                     };
                     left = self.arena_expr(Expr::Call {
                         bound_oid: None,
+                        bound_strict: None,
                         name,
                         args: self.arena_slice(&[left])?,
                         argument_names: &[],
@@ -248,6 +249,7 @@ impl<'a> Parser<'a> {
                     self.advance()?;
                     left = self.arena_expr(Expr::Call {
                         bound_oid: None,
+                        bound_strict: None,
                         name: "timezone",
                         args: self.arena_slice(&[left])?,
                         argument_names: &[],
@@ -265,6 +267,7 @@ impl<'a> Parser<'a> {
                 let zone = self.expression(8)?;
                 left = self.arena_expr(Expr::Call {
                     bound_oid: None,
+                    bound_strict: None,
                     name: "timezone",
                     args: self.arena_slice(&[zone, left])?,
                     argument_names: &[],
@@ -455,6 +458,7 @@ impl<'a> Parser<'a> {
                     };
                     let call = self.arena_expr(Expr::Call {
                         bound_oid: None,
+                        bound_strict: None,
                         name: crate::sql::parser::SIMILAR_TO,
                         args,
                         argument_names: &[],
@@ -815,6 +819,7 @@ impl<'a> Parser<'a> {
                 let field_lit = self.arena_expr(Expr::Str(field))?;
                 self.arena_expr(Expr::Call {
                     bound_oid: None,
+                    bound_strict: None,
                     name: "extract",
                     args: self.arena_slice(&[field_lit, source])?,
                     argument_names: &[],
@@ -1156,6 +1161,7 @@ impl<'a> Parser<'a> {
                     }
                     return self.arena_expr(Expr::Call {
                         bound_oid: None,
+                        bound_strict: None,
                         name,
                         args,
                         argument_names: &[],
@@ -1269,6 +1275,7 @@ impl<'a> Parser<'a> {
         let args = self.arena_slice(args)?;
         self.arena_expr(Expr::Call {
             bound_oid: None,
+            bound_strict: None,
             name,
             args,
             argument_names: &[],
@@ -1490,6 +1497,7 @@ impl<'a> Parser<'a> {
         self.expect_op(")")?;
         self.arena_expr(Expr::Call {
             bound_oid: None,
+            bound_strict: None,
             name: if unique { "__json_unique" } else { "__json" },
             args: self.arena_slice(&[input])?,
             argument_names: &[],
@@ -1966,6 +1974,7 @@ impl<'a> Parser<'a> {
         let args = self.arena_slice(args)?;
         self.arena_expr(Expr::Call {
             bound_oid: None,
+            bound_strict: None,
             name,
             args,
             argument_names: &[],
@@ -2179,6 +2188,7 @@ impl<'a> Parser<'a> {
             let over = self.parse_over()?;
             return self.arena_expr(Expr::Call {
                 bound_oid: None,
+                bound_strict: None,
                 name,
                 args: &[],
                 argument_names: &[],
@@ -2277,6 +2287,7 @@ impl<'a> Parser<'a> {
         };
         self.arena_expr(Expr::Call {
             bound_oid: None,
+            bound_strict: None,
             name,
             args,
             argument_names,
@@ -2315,6 +2326,7 @@ impl<'a> Parser<'a> {
         let over = self.parse_over()?;
         let aggregate = self.arena_expr(Expr::Call {
             bound_oid: None,
+            bound_strict: None,
             name: match (absent, result == "jsonb") {
                 (true, false) => "__json_arrayagg_absent_json",
                 (false, false) => "__json_arrayagg_null_json",
@@ -2368,6 +2380,7 @@ impl<'a> Parser<'a> {
         let over = self.parse_over()?;
         let aggregate = self.arena_expr(Expr::Call {
             bound_oid: None,
+            bound_strict: None,
             name: match (absent, unique, result == "jsonb") {
                 (false, false, false) => "__json_objectagg_null_json",
                 (true, false, false) => "__json_objectagg_absent_json",
@@ -2497,6 +2510,7 @@ impl<'a> Parser<'a> {
         let args = self.arena_slice(&[left, right])?;
         self.arena_expr(Expr::Call {
             bound_oid: None,
+            bound_strict: None,
             name,
             args,
             argument_names: &[],
@@ -2531,6 +2545,7 @@ impl<'a> Parser<'a> {
             .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
         self.arena_expr(Expr::Call {
             bound_oid: None,
+            bound_strict: None,
             name,
             args: self.arena_slice(&[operand])?,
             argument_names: &[],

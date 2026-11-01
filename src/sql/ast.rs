@@ -5612,6 +5612,8 @@ pub enum Expr<'a> {
         name: &'a str,
         /// Captured catalog identity for a stored call; SQL text carries names only.
         bound_oid: Option<i32>,
+        /// Null-input behavior selected while preparing this query.
+        bound_strict: Option<bool>,
         args: &'a [&'a Expr<'a>],
         /// Empty for positional calls; otherwise parallel to `args` and
         /// populated only for named notation parsed after positional inputs.

@@ -80,8 +80,10 @@ capacity limits and the regression suites for individual cases.
 Single-table statements with supported scalar expressions reuse the owned
 physical reader across mutable function handoffs. Execution keeps the current
 row, finishes its predicate once and retains each completed projection item
-before advancing to the next. Function targets and builtin cast choices bind
-before row effects. A session-setting change in an earlier column cannot redirect
+before advancing to the next. Function targets, original defaults, builtin cast choices and whether null
+inputs skip a call bind before row effects. Replacing a function can change
+its body when it starts, while the current query keeps that null-handling
+decision. A session-setting change in an earlier column cannot redirect
 a later bound call. Each active row borrows the unused region of its existing
 statement arena; completed output is copied before that region is released.
 Nested function execution can borrow a further region without growing memory.

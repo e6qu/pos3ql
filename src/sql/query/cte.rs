@@ -5555,6 +5555,7 @@ fn subst_expr<'a>(
             order_by,
             over,
             filter,
+            bound_strict,
             ..
         } => {
             let name = rewrite_stored_operator_name(name, args, context, arena)?;
@@ -5605,6 +5606,7 @@ fn subst_expr<'a>(
             Expr::Call {
                 name,
                 bound_oid,
+                bound_strict: *bound_strict,
                 args,
                 argument_names,
                 variadic: *variadic,

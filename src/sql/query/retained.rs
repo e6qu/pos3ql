@@ -299,6 +299,7 @@ fn bind_expression<'a>(
                 let args = arena.alloc_slice_copy(&[left, right]).map_err(full)?;
                 Expr::Call {
                     bound_oid: None,
+                    bound_strict: None,
                     name,
                     args,
                     argument_names: &[],
@@ -394,6 +395,7 @@ fn bind_expression<'a>(
         Expr::Call {
             name,
             bound_oid,
+            bound_strict,
             args,
             argument_names,
             variadic,
@@ -422,12 +424,32 @@ fn bind_expression<'a>(
                 *variadic,
                 argument_oids,
             )?;
-            let (bound_oid, args, argument_names, variadic) = match target {
+            let (bound_oid, bound_strict, args, argument_names, variadic) = match target {
                 Some(super::super::eval::RoutineCallTarget::Stored {
                     oid,
                     argument_mapping,
                     ..
                 }) => {
+                    let selected_strict = match *bound_strict {
+                        Some(strict) => strict,
+                        None => {
+                            let slot = columns
+                                .storage
+                                .routine_slot_by_oid(oid, columns.txid)
+                                .ok_or_else(|| {
+                                    sql_err!(
+                                        sqlstate::UNDEFINED_FUNCTION,
+                                        "captured function with OID {} does not exist",
+                                        oid
+                                    )
+                                })?;
+                            columns
+                                .storage
+                                .routine_for(slot, columns.txid)
+                                .attributes
+                                .strict
+                        }
+                    };
                     let (args, expanded_variadic, expanded) = bind_defaults(
                         oid,
                         args,
@@ -439,12 +461,19 @@ fn bind_expression<'a>(
                     )?;
                     (
                         Some(oid),
+                        Some(selected_strict),
                         args,
                         if expanded { &[][..] } else { *argument_names },
                         expanded_variadic,
                     )
                 }
-                _ => (*bound_oid, &*args, *argument_names, *variadic),
+                _ => (
+                    *bound_oid,
+                    *bound_strict,
+                    &*args,
+                    *argument_names,
+                    *variadic,
+                ),
             };
             let name = if bound_oid.is_none()
                 && !name.contains('.')
@@ -459,6 +488,7 @@ fn bind_expression<'a>(
             Expr::Call {
                 name,
                 bound_oid,
+                bound_strict,
                 args,
                 argument_names,
                 variadic,

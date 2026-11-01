@@ -1581,6 +1581,7 @@ where
             Expr::Call {
                 name: left_name,
                 bound_oid: left_bound_oid,
+                bound_strict: left_bound_strict,
                 args: left_args,
                 argument_names: left_argument_names,
                 variadic: left_variadic,
@@ -1593,6 +1594,7 @@ where
             Expr::Call {
                 name: right_name,
                 bound_oid: right_bound_oid,
+                bound_strict: right_bound_strict,
                 args: right_args,
                 argument_names: right_argument_names,
                 variadic: right_variadic,
@@ -1605,6 +1607,7 @@ where
         ) => {
             left_name.eq_ignore_ascii_case(right_name)
                 && left_bound_oid == right_bound_oid
+                && left_bound_strict == right_bound_strict
                 && left_argument_names == right_argument_names
                 && left_variadic == right_variadic
                 && left_star == right_star
@@ -4419,6 +4422,7 @@ fn external_lateral_function_run<'a, C: ColumnLookup<'a>>(
     let call = arena
         .alloc(Expr::Call {
             bound_oid: None,
+            bound_strict: None,
             name: tref.table,
             args: arguments,
             argument_names: tref.func_argument_names,

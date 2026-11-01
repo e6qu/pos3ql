@@ -797,8 +797,13 @@ impl ColTypeResolver for CatalogCols<'_> {
             self.storage
                 .function_for_call_syntax_oids(name, arguments, variadic, self.txid)
         } else {
-            self.storage
-                .function_for_named_call_oids(name, argument_names, arguments, self.txid)
+            self.storage.function_for_named_call_oids(
+                name,
+                argument_names,
+                arguments,
+                variadic,
+                self.txid,
+            )
         };
         let result = routine
             .and_then(|routine| routine.function_result_contract())
@@ -879,6 +884,7 @@ impl ColTypeResolver for CatalogCols<'_> {
                 name,
                 argument_names,
                 arguments,
+                variadic,
                 self.txid,
             )?
         };
@@ -2731,7 +2737,7 @@ pub(crate) fn resolved_set_call(
     } else if argument_names.is_empty() {
         storage.function_for_call_syntax_oids(name, arguments, *variadic, txid)
     } else {
-        storage.function_for_named_call_oids(name, argument_names, arguments, txid)
+        storage.function_for_named_call_oids(name, argument_names, arguments, *variadic, txid)
     };
     Ok(routine.is_some_and(|routine| routine.kind.is_set_returning()))
 }

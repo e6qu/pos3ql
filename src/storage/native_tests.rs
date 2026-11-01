@@ -5735,6 +5735,7 @@ fn routine_candidate_lookup_preserves_visibility_identity_and_guard_release() {
                 "renamed",
                 &[],
                 &[],
+                false,
                 7,
                 RoutineCallKind::Scalar
             ),

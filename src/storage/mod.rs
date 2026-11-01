@@ -9147,7 +9147,10 @@ impl RoutineDef {
         if argument_count > MAX_ROUTINE_ARGUMENTS
             || (argument_count > input_count && variadic_index.is_none())
             || (!argument_names.is_empty() && argument_names.len() != argument_count)
-            || explicit_variadic && !argument_names.is_empty()
+            || explicit_variadic && variadic_index.is_none()
+            || (!explicit_variadic
+                && variadic_index.is_some()
+                && argument_names.iter().any(Option::is_some))
         {
             return None;
         }
@@ -9173,6 +9176,14 @@ impl RoutineDef {
             }
             occupied[input_index] = true;
             *mapped_input = u8::try_from(input_index).ok()?;
+        }
+        if explicit_variadic
+            && variadic_index
+                != argument_count
+                    .checked_sub(1)
+                    .map(|index| usize::from(mapping[index]))
+        {
+            return None;
         }
         for (input_index, occupied) in occupied.iter().enumerate().take(input_count) {
             if !occupied && !parameter_for_input(input_index)?.mode.has_default() {
@@ -43329,6 +43340,7 @@ impl Storage {
         name: &str,
         argument_names: &[Option<&str>],
         argument_type_oids: &[i32],
+        explicit_variadic: bool,
         txid: u32,
     ) -> Option<usize> {
         if argument_type_oids.len() > MAX_ROUTINE_ARGUMENTS
@@ -43342,6 +43354,7 @@ impl Storage {
                 routine_name,
                 argument_names,
                 argument_type_oids,
+                explicit_variadic,
                 txid,
                 RoutineCallKind::Scalar,
             )
@@ -43365,6 +43378,7 @@ impl Storage {
         name: &str,
         argument_names: &[Option<&str>],
         argument_type_oids: &[i32],
+        explicit_variadic: bool,
         txid: u32,
     ) -> Option<usize> {
         if argument_type_oids.len() > MAX_ROUTINE_ARGUMENTS
@@ -43378,6 +43392,7 @@ impl Storage {
                 routine_name,
                 argument_names,
                 argument_type_oids,
+                explicit_variadic,
                 txid,
                 RoutineCallKind::Function,
             )
@@ -43548,17 +43563,22 @@ impl Storage {
         name: &str,
         argument_names: &[Option<&str>],
         argument_type_oids: &[i32],
+        explicit_variadic: bool,
         txid: u32,
     ) -> Option<RoutineDef> {
         let slot = self.routine_slot_for_named_function_call_oids(
             name,
             argument_names,
             argument_type_oids,
+            explicit_variadic,
             txid,
         )?;
         let routine = self.routine_for(slot, txid);
-        let mapping =
-            routine.call_input_mapping(argument_names, argument_type_oids.len(), false)?;
+        let mapping = routine.call_input_mapping(
+            argument_names,
+            argument_type_oids.len(),
+            explicit_variadic,
+        )?;
         let mut completed = [crate::sql::types::oid::UNKNOWN; MAX_ROUTINE_ARGUMENTS];
         for (input_index, argument) in routine.arguments().iter().enumerate() {
             completed[input_index] = self.routine_argument_oid(argument, txid)?;
@@ -43906,6 +43926,7 @@ impl Storage {
         name: &str,
         argument_names: &[Option<&str>],
         argument_type_oids: &[i32],
+        explicit_variadic: bool,
         txid: u32,
     ) -> Option<usize> {
         let resolve = |schema: &str, routine_name: &str| {
@@ -43914,6 +43935,7 @@ impl Storage {
                 routine_name,
                 argument_names,
                 argument_type_oids,
+                explicit_variadic,
                 txid,
                 RoutineCallKind::Procedure,
             )
@@ -44310,12 +44332,17 @@ impl Storage {
         name: &str,
         argument_names: &[Option<&str>],
         argument_type_oids: &[i32],
+        explicit_variadic: bool,
         txid: u32,
         call_kind: RoutineCallKind,
     ) -> Option<usize> {
-        self.routine_slot_in_candidates(argument_names, argument_type_oids, false, txid, || {
-            self.routine_candidates(schema, name, txid, call_kind)
-        })
+        self.routine_slot_in_candidates(
+            argument_names,
+            argument_type_oids,
+            explicit_variadic,
+            txid,
+            || self.routine_candidates(schema, name, txid, call_kind),
+        )
     }
 
     fn routine_slot_in_candidates<F, I>(

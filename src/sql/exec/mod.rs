@@ -17483,6 +17483,7 @@ fn parse_plpgsql_assignment_target<'a>(
     let expression = arena
         .alloc(Expr::Call {
             bound_oid: None,
+            bound_strict: None,
             name: "__jsonb_subscript_set",
             args,
             argument_names: &[],

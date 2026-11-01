@@ -20,6 +20,11 @@ fn query_positions_do_not_repeat_completed_projection_effects() {
             &["query_second,pg_catalog,public|2|2", "shadow"],
             &["2|2", "777"],
             &["0|101", "109", "101", "109"],
+            &[
+                "0", "2", "0", "7", "9", "11", "15", "0", "0", "2", "7", "9", "11", "15"
+            ],
+            &["0|7", "NULL", "7", "0|NULL", "7", "7"],
+            &["0|7", "NULL", "7", "0|NULL", "7", "7"],
         ]
         .concat()
     );
@@ -32,8 +37,62 @@ fn query_positions_do_not_repeat_completed_projection_effects() {
         completions += usize::from(remaining[0] == b'C');
         remaining = &remaining[length + 1..];
     }
-    assert_eq!(descriptions, 27);
-    assert_eq!(completions, 62);
+    assert_eq!(descriptions, 47);
+    assert_eq!(completions, 111);
+}
+
+#[test]
+fn retained_variadic_calls_require_explicit_empty_arrays_or_declared_defaults() {
+    let config = test_config("retained-variadic-arity");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE TABLE retained_variadic_source(value integer); \
+         INSERT INTO retained_variadic_source VALUES(1); \
+         CREATE FUNCTION retained_variadic_required(VARIADIC members integer[]) \
+         RETURNS integer LANGUAGE sql VOLATILE AS $$SELECT cardinality($1)$$; \
+         CREATE FUNCTION retained_variadic_named_default(marker integer DEFAULT 7, \
+         VARIADIC members integer[] DEFAULT ARRAY[]::integer[]) RETURNS integer \
+         LANGUAGE sql VOLATILE AS $$SELECT $1+cardinality($2)$$",
+        true,
+    );
+    assert_eq!(
+        error_sqlstates(&session.execute(
+            &mut engine,
+            "SELECT retained_variadic_required() FROM retained_variadic_source",
+            true,
+        )),
+        ["42883"]
+    );
+    assert_eq!(
+        error_sqlstates(&session.execute(
+            &mut engine,
+            "SELECT retained_variadic_named_default(marker=>9) FROM retained_variadic_source",
+            true,
+        )),
+        ["42883"]
+    );
+    assert_eq!(
+        error_sqlstates(&session.execute(
+            &mut engine,
+            "CREATE FUNCTION retained_variadic_invalid(marker integer DEFAULT 7, \
+             VARIADIC members integer[]) RETURNS integer LANGUAGE sql \
+             AS $$SELECT $1+cardinality($2)$$",
+            true,
+        )),
+        ["42P13"]
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT retained_variadic_required(VARIADIC ARRAY[]::integer[]) \
+             FROM retained_variadic_source",
+            true,
+        )),
+        ["0"]
+    );
 }
 
 #[test]
@@ -844,4 +903,38 @@ fn record_call_expansion_preserves_scalar_effects_and_shared_set_producers() {
             ),
         }
     }
+}
+
+#[test]
+fn retained_query_handoffs_count_one_scan_and_each_source_row_once() {
+    let config = test_config("retained-query-scan-counts");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE TABLE query_scan_source(value integer); \
+         INSERT INTO query_scan_source VALUES(1),(2),(3); \
+         CREATE TABLE query_scan_audit(value integer); \
+         CREATE FUNCTION query_scan_write(value integer) RETURNS integer \
+         LANGUAGE sql VOLATILE AS \
+         $$INSERT INTO query_scan_audit VALUES($1); SELECT $1$$",
+        true,
+    );
+    session.success(&mut engine, "BEGIN", true);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT query_scan_write(value) FROM query_scan_source; \
+             SELECT seq_scan,seq_tup_read FROM pg_stat_xact_user_tables \
+             WHERE relid='query_scan_source'::regclass",
+            true,
+        )),
+        ["1", "2", "3", "1|3"]
+    );
+    session.success(&mut engine, "ROLLBACK", true);
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "SELECT count(*) FROM query_scan_audit", true,)),
+        ["0"]
+    );
 }

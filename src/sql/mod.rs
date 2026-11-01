@@ -14823,6 +14823,7 @@ impl Engine {
                 qualified.as_str(),
                 argument_names,
                 &type_oids[..arguments.len()],
+                variadic,
                 txn.txid,
             )
         };

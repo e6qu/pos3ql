@@ -43,6 +43,9 @@ keep temporary call state bounded to active rows rather than all earlier rows.
 Preserve selected definitions, types, one result header, scan counts,
 cancellation, rollback and named capacity errors. Compare effects and values
 with PostgreSQL, including empty-cache reads, nested calls and replaced objects.
+Keep original defaults and null handling while using the body selected at
+execution. Preserve explicit versus expanded variadic arguments through lookup,
+input mapping, descriptions and recovered declarations.
 Then extend those positions through function bodies and object-store waits,
 complex plans, SQL cursors and results already sent to the client.
 The [architecture](docs/architecture.md) describes implemented function-input

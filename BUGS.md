@@ -32,6 +32,8 @@ Routine result conversions must use structural decoding for named and anonymous
 records, including mutable table functions and restored declarations.
 Use the shared structural value copy for SQL and PL/pgSQL results and detached
 trigger rows; test named fields in conflict-update triggers as well as functions.
+Query-position regressions compare effects in separate projection columns, not
+only inside function arguments, and verify both result rows and audit writes.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

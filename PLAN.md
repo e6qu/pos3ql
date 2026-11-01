@@ -52,6 +52,15 @@ implemented input progress, type contracts, record expansion and set inputs.
 Preserve the distinct SELECT-value and FROM-column layouts of named row results
 and bind their stored type identities before conversion as execution positions expand.
 Keep the same structural copy boundary for procedural results and trigger rows.
+The next execution change must preserve the source row, predicate and completed
+projection columns across a mutable function handoff. For example, selecting
+a counter increment before a function that writes an audit row must increment
+once per source row, with one audit row and one result per row. Reuse the
+existing retained physical reader and startup-reserved byte buffers. Keep
+transient function state bounded to active execution positions rather than
+retaining a replay log for every earlier row. Cover successful values, scan
+counts, capacity errors, cancellation, rollback and empty-cache reads before
+extending the same positions to cursors and externally waiting statements.
 Run real SQLAlchemy, Alembic and psycopg2 workflows against both servers.
 Keep their catalog inspection, declared types, streaming and migration checks
 passing as function binding and execution expand; see the

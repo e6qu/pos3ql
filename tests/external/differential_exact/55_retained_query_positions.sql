@@ -1,0 +1,12 @@
+CREATE TABLE query_position_source(value integer PRIMARY KEY);
+INSERT INTO query_position_source VALUES(1),(2),(3);
+CREATE TABLE query_position_audit(value integer);
+CREATE FUNCTION query_position_write(value integer) RETURNS integer LANGUAGE sql VOLATILE AS $$INSERT INTO query_position_audit VALUES($1); SELECT $1$$;
+SELECT set_config('application_name','0',false);
+SELECT set_config('application_name',(current_setting('application_name')::integer+1)::text,false),query_position_write(value) FROM query_position_source;
+SELECT current_setting('application_name');
+SELECT value FROM query_position_audit ORDER BY value;
+DROP FUNCTION query_position_write(integer);
+DROP TABLE query_position_audit;
+DROP TABLE query_position_source;
+RESET application_name;

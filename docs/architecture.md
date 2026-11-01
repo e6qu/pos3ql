@@ -125,6 +125,12 @@ cannot invalidate the caller's saved inputs. Exhaustion reports
 `retained routine inputs exceed statement memory` (SQLSTATE `54000`). These
 positions cover internal function handoffs; whole-query, body and post-flush
 positions still need retained execution before all storage waits can yield.
+The cursor reader already retains physical input positions for simple scans.
+It currently excludes function calls and casts. Ordinary SELECT execution still
+restarts its surrounding query after an internal mutable-function handoff;
+input retention alone does not preserve earlier projection columns. The next
+execution work reuses that reader to retain the current row and projection
+position, with bounded temporary call state and one output header.
 Record field descriptions bind the call's input types, named arguments and
 defaults without running them. The same bound types describe table-function
 columns, so an array returned through `anyelement` has the correct binary format.

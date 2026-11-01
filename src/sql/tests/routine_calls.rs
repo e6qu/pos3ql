@@ -1,6 +1,21 @@
 use super::*;
 
 #[test]
+fn query_positions_do_not_repeat_completed_projection_effects() {
+    let config = test_config("retained-query-positions");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    let sql = include_str!(
+        "../../../tests/external/differential_exact/55_retained_query_positions.sql"
+    );
+    assert_eq!(
+        data_rows(&session.success(&mut engine, sql, true)),
+        ["0", "1|1", "2|2", "3|3", "3", "1", "2", "3"]
+    );
+}
+
+#[test]
 fn intrinsic_handoffs_retain_completed_builtin_inputs() {
     let config = test_config("retained-intrinsic-inputs");
     let mut budget = test_engine_budget(&config, 1 << 29);

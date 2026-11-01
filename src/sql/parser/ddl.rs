@@ -3648,7 +3648,7 @@ impl<'a> Parser<'a> {
                         });
                     }
                     columns[column_count] = RoutineResultColumn {
-                        name: self.any_ident("function result column")?,
+                        name: self.type_function_ident("function result column")?,
                         type_name: self.type_name()?,
                     };
                     column_count += 1;

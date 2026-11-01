@@ -48233,7 +48233,7 @@ fn routine_acl_checkpoint_recovery_uses_overload_safe_identity() {
              GRANT EXECUTE ON FUNCTION checkpoint_overload() TO checkpoint_reader;
              CREATE TABLE checkpoint_procedure_log (value integer);
              INSERT INTO checkpoint_procedure_log VALUES (4), (5);
-             CREATE FUNCTION checkpoint_pairs() RETURNS TABLE (position integer, value integer) LANGUAGE SQL
+             CREATE FUNCTION checkpoint_pairs() RETURNS TABLE (\"position\" integer, value integer) LANGUAGE SQL
                AS 'SELECT value - 3, value FROM checkpoint_procedure_log ORDER BY value';
              CREATE PROCEDURE checkpoint_log(value integer) LANGUAGE SQL AS 'INSERT INTO checkpoint_procedure_log VALUES ($1)';",
         );
@@ -48268,7 +48268,7 @@ fn routine_acl_checkpoint_recovery_uses_overload_safe_identity() {
             "1|4",
             "2|5",
             "6|9",
-            "CREATE OR REPLACE FUNCTION public.checkpoint_pairs() RETURNS TABLE (position integer, value integer) LANGUAGE sql AS 'SELECT value - 3, value FROM checkpoint_procedure_log ORDER BY value'",
+            "CREATE OR REPLACE FUNCTION public.checkpoint_pairs() RETURNS TABLE (\"position\" integer, value integer) LANGUAGE sql AS 'SELECT value - 3, value FROM checkpoint_procedure_log ORDER BY value'",
         ]
     );
 }

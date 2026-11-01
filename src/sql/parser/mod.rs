@@ -11291,12 +11291,15 @@ mod tests {
     }
 
     #[test]
-    fn routine_parameter_names_obey_postgresql_column_identifier_grammar() {
+    fn routine_parameter_names_obey_postgresql_type_function_identifier_grammar() {
         for sql in [
             "CREATE FUNCTION f(values integer) RETURNS integer LANGUAGE SQL AS 'SELECT 1'",
             "CREATE PROCEDURE p(VARIADIC values integer[]) LANGUAGE SQL AS 'SELECT 1'",
             "ALTER FUNCTION f(values integer) RENAME TO g",
             "DROP PROCEDURE p(values integer)",
+            "CREATE FUNCTION f() RETURNS TABLE (position integer) LANGUAGE SQL AS 'SELECT 1'",
+            "CREATE FUNCTION f() RETURNS TABLE (values integer) LANGUAGE SQL AS 'SELECT 1'",
+            "CREATE FUNCTION f() RETURNS TABLE (select integer) LANGUAGE SQL AS 'SELECT 1'",
         ] {
             with_parser(sql, |parser| {
                 assert!(parser.next_stmt().is_err(), "accepted {sql}")
@@ -11306,6 +11309,9 @@ mod tests {
             "CREATE FUNCTION f(\"values\" integer) RETURNS integer LANGUAGE SQL AS 'SELECT 1'",
             "CREATE FUNCTION f(begin integer, set text) RETURNS integer LANGUAGE SQL AS 'SELECT 1'",
             "CREATE FUNCTION f(left integer) RETURNS integer LANGUAGE SQL AS 'SELECT 1'",
+            "CREATE FUNCTION f() RETURNS TABLE (\"position\" integer) LANGUAGE SQL AS 'SELECT 1'",
+            "CREATE FUNCTION f() RETURNS TABLE (left integer) LANGUAGE SQL AS 'SELECT 1'",
+            "CREATE FUNCTION f() RETURNS TABLE (begin integer, set text) LANGUAGE SQL AS 'SELECT 1, NULL'",
         ] {
             with_parser(sql, |parser| {
                 assert!(parser.next_stmt().unwrap().is_some(), "rejected {sql}")

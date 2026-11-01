@@ -24,7 +24,7 @@ pub use epoll as reactor;
 
 pub(crate) mod tcp;
 
-#[cfg(test)]
+#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 mod tests {
     use super::Reactor;
     use crate::mem::budget::Budget;

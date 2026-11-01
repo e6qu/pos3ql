@@ -3084,7 +3084,7 @@ pub(crate) fn referenced_key_changed(
     Ok(false)
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 mod tests {
     use super::*;
 

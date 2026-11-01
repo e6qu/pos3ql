@@ -1903,7 +1903,7 @@ fn in_range(lo: char, hi: char, ch: char, options: RegexOptions) -> bool {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 mod tests {
     use super::regex_search;
 

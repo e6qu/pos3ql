@@ -1415,7 +1415,7 @@ impl ColTypeResolver for DependencyTypes<'_, '_, '_> {
             self.storage
                 .function_for_named_call_oids(name, argument_names, arguments, self.txid)?
         };
-        let ctype = routine.kind.function_result()?;
+        let ctype = routine.function_result_contract()?.ctype;
         Some(StaticTypeMeta {
             type_oid: self
                 .storage

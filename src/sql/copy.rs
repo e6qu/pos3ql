@@ -542,7 +542,7 @@ fn copy_row_too_large() -> SqlError {
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 mod tests {
     use super::*;
     use crate::mem::budget::Budget;

@@ -40,14 +40,18 @@ maximum row history independently for every possible table.
 Audit PostgreSQL 18 built-ins by signature and executable behavior. Catalog
 presence alone is not support. Compare values, declared result types, nulls,
 errors and argument effects with PostgreSQL, including seeded hashes.
-Retained calls must preserve converted inputs, omitted defaults and the next
-input position across storage waits. Extend the captured function identity and
-bound type contract into those input and body positions. Reuse the shared
-input preparation for scalar functions, table functions and procedures, preserving
-each context's conversion and strict-null rules. The [architecture](docs/architecture.md)
-describes the implemented binding, retained result types, record expansion and
-one-time set-input behavior. These contracts must remain intact as execution
-positions replace query-prefix replay.
+Extend the retained input positions from internal function handoffs to
+object-store waits, function bodies and ordinary query positions. Preserve
+once-only argument effects, converted values, selected defaults and bound types
+while removing query-prefix replay. Avoid charging simple builtin index
+expressions for resumable state. Keep the shared input preparation for scalar
+functions, table functions, procedures and engine-owned builtins, including
+statistics and large objects, while preserving their distinct conversion
+and strict-null rules. The [architecture](docs/architecture.md) describes the
+implemented input progress, type contracts, record expansion and set inputs.
+Preserve the distinct SELECT-value and FROM-column layouts of named row results
+and bind their stored type identities before conversion as execution positions expand.
+Keep the same structural copy boundary for procedural results and trigger rows.
 Run real SQLAlchemy, Alembic and psycopg2 workflows against both servers.
 Keep their catalog inspection, declared types, streaming and migration checks
 passing as function binding and execution expand; see the

@@ -1,6 +1,112 @@
 use super::*;
 
 #[test]
+fn intrinsic_handoffs_retain_completed_builtin_inputs() {
+    let config = test_config("retained-intrinsic-inputs");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    let sql =
+        include_str!("../../../tests/external/differential_exact/54_retained_intrinsic_inputs.sql");
+    assert_eq!(
+        data_rows(&session.success(&mut engine, sql, true)),
+        ["0", "0.", "0.", "0", "1", "0."]
+    );
+}
+
+#[test]
+fn named_routine_rows_expose_fields_in_table_sources() {
+    let config = test_config("named-routine-table-rows");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    let sql =
+        include_str!("../../../tests/external/differential_exact/53_named_routine_table_rows.sql");
+    assert_eq!(
+        data_rows(&session.success(&mut engine, sql, true)),
+        [
+            "7|one|1",
+            "NULL|NULL|2",
+            "8|two|1",
+            "NULL|NULL|2",
+            "9|sql",
+            "10|pl|1",
+            "NULL|NULL|2",
+            "11|out",
+            "1",
+            "7|one|20|1",
+            "NULL|NULL|21|2",
+            "NULL|NULL|22|3",
+            "1|7|one",
+            "1|NULL|NULL",
+            "2|7|one",
+            "2|NULL|NULL",
+            "(7,one)",
+            "NULL",
+            "4|new",
+        ]
+    );
+}
+
+#[test]
+fn retained_routine_inputs_preserve_argument_effects_across_pending_calls() {
+    let config = test_config("retained-routine-inputs");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    let sql =
+        include_str!("../../../tests/external/differential_exact/50_retained_routine_inputs.sql");
+    let output = session.success(&mut engine, sql, true);
+    assert_eq!(
+        data_rows(&output),
+        [
+            &["0", "1", "1", "1"][..],
+            &["0", "8", "1", "7", "8"],
+            &["0", "8", "1", "7", "8"],
+            &["0", "8", "1", "7", "8"],
+            &["0", "8", "1", "7", "8"],
+            &["0", "17", "1", "7", "9", "17"],
+            &["0", "8", "1", "7", "8"],
+            &["0", "1", "2", "1", "1"],
+            &["0", "1", "2", "1", "1"],
+            &["0", "1", "1", "1"],
+            &["0", "1/7", "1", "7"],
+            &["0", "8/value", "1", "7"],
+            &["0", "1", "2", "3", "1", "3"],
+            &["0", "1", "2", "3", "1", "3"],
+            &["0", "108", "0", "7", "108"],
+            &["11", "7", "11"],
+            &["5", "6", "integer", "integer"],
+        ]
+        .concat()
+    );
+    let mut descriptions = Vec::new();
+    let mut remaining = output.as_slice();
+    while !remaining.is_empty() {
+        let length = i32::from_be_bytes(remaining[1..5].try_into().unwrap()) as usize;
+        if remaining[0] == b'T' {
+            descriptions.extend(row_description_type_oids(remaining));
+        }
+        remaining = &remaining[1 + length..];
+    }
+    assert_eq!(&descriptions[descriptions.len() - 2..], &[23, 2206]);
+}
+
+#[test]
+fn retained_routine_targets_survive_argument_search_path_changes() {
+    let config = test_config("retained-routine-targets");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    let sql =
+        include_str!("../../../tests/external/differential_exact/51_retained_routine_targets.sql");
+    assert_eq!(
+        data_rows(&session.success(&mut engine, sql, true)),
+        ["11", "11", "22", "11", "22", "11", "11"]
+    );
+}
+
+#[test]
 fn constant_catalog_identifier_errors_do_not_depend_on_input_rows() {
     let config = test_config("routine-constant-identifiers");
     let mut budget = test_engine_budget(&config, 1 << 29);

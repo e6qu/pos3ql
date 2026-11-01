@@ -781,7 +781,7 @@ pub(super) fn correlated_scan_conjuncts<'a>(
 }
 
 pub(crate) fn walk_children<'a>(
-    expression: &'a Expr<'a>,
+    expression: &Expr<'a>,
     f: &mut dyn FnMut(&'a Expr<'a>) -> Result<(), SqlError>,
 ) -> Result<(), SqlError> {
     match expression {

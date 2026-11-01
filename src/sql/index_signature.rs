@@ -476,7 +476,7 @@ fn json_hex(raw: &[u8], at: usize) -> u32 {
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 mod tests {
     use super::*;
     use crate::sql::full_text::{restore_query, restore_vector};

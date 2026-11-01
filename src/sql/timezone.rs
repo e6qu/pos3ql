@@ -440,7 +440,7 @@ pub fn parse_posix_tz(s: &str) -> Option<PosixZone> {
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 mod tests {
     use super::*;
     use crate::sql::datetime::days_from_civil;

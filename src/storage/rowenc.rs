@@ -1050,7 +1050,7 @@ fn decode_physical_field_count(input: &[u8]) -> Option<(u16, usize)> {
     Some((fields, prefix))
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 mod tests {
     use super::*;
 

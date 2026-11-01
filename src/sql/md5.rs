@@ -111,7 +111,7 @@ pub fn hex(d: &[u8; 16], out: &mut [u8; 32]) {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 mod tests {
     use super::*;
 

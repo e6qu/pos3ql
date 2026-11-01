@@ -279,7 +279,7 @@ impl std::fmt::Display for ReactorSetupError {
 
 impl std::error::Error for ReactorSetupError {}
 
-#[cfg(test)]
+#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 mod tests {
     use super::*;
     use std::io::Write;

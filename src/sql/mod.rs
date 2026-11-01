@@ -68,6 +68,13 @@ pub(crate) mod unicode;
 mod unicode_data;
 pub mod xml;
 
+/// Builtins handed to the mutable engine share one description and input boundary.
+pub(crate) fn engine_intrinsic_result_type(name: &str, arity: usize) -> Option<(i32, i16)> {
+    statistics::result_type(name, arity)
+        .or_else(|| logical_replication::result_type(name, arity))
+        .or_else(|| large_object::result_type(name, arity))
+}
+
 use crate::checkpoint::{CheckpointSetupError, CheckpointStep, Checkpointer, TemporarySpiller};
 use crate::config::Config;
 use crate::mem::arena::{Arena, ArenaList};
@@ -14084,18 +14091,19 @@ impl Engine {
             let encoded = if let Some(output) = table_columns {
                 let mut cast = [Datum::Null; crate::storage::MAX_COLUMNS];
                 for (slot, column) in output.iter().enumerate() {
-                    let projected = exec::encode_projected_pub(&[values[slot]], arena)?;
                     cast[slot] = eval::cast_to(
-                        exec::decode_projected_pub(projected, 0),
+                        exec::detach_routine_datum(values[slot], arena)?,
                         column.ctype,
                         arena,
                     )?;
                 }
                 exec::encode_projected_pub(&cast[..output.len()], arena)?
             } else {
-                let projected = exec::encode_projected_pub(values, arena)?;
-                let value =
-                    eval::cast_to(exec::decode_projected_pub(projected, 0), result_type, arena)?;
+                let value = eval::cast_to(
+                    exec::detach_routine_datum(values[0], arena)?,
+                    result_type,
+                    arena,
+                )?;
                 exec::encode_projected_pub(&[value], arena)?
             };
             if len.get() == cap.get() {

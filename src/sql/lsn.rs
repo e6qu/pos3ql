@@ -79,7 +79,7 @@ pub fn hash_extended(value: u64, seed: i64) -> i64 {
     ) as i64
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 mod tests {
     use super::*;
 

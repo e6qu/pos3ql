@@ -98,9 +98,54 @@ parameter/default buffers are not retained per invocation. Exhaustion reports
 The function body is looked up when execution starts: PostgreSQL uses a replacement
 body if evaluating an argument replaced it. Read-only and mutable SQL functions
 share the same scalar and record result construction.
+Before this handoff, input preparation retains its own progress. For example,
+`save_order(set_config('application_name', current_setting('application_name') || '.', false))`
+must append one dot even when `save_order` pauses. Completed argument expressions and
+conversions reuse their values; a partially evaluated expression reuses completed
+nested calls. Omitted defaults keep their original declaration and dependency
+image even if another argument replaces the function. Constant-input decisions
+also stay fixed. Outer-query planning keeps one volatility decision per function
+identity; a replacement body has its own planning scope. A reached call keeps its selected function when an argument
+changes `search_path`; another same-named function cannot take over on resumption.
+The new body is still selected when execution begins.
+Scalar builtins with inputs that can suspend and stored functions use the same
+input root. Builtin trees proved unable to suspend do not allocate input records;
+repeated index checks such as `lower(label)` keep their existing scratch budget.
+Statistics, logical replication and large-object builtins share an explicit
+engine-handoff classification with their result descriptions, so this shortcut
+cannot treat those calls as ordinary builtin evaluation.
+Builtin set
+inputs, including `generate_series(start, stop)`, also keep completed arguments
+when a later input pauses. Input records borrow temporary row values while a
+call runs; only a suspended call encodes its live values into statement memory.
+Bound set inputs are reused while rows are emitted, without saving another
+input record for each output row. Function
+bodies and subqueries own separate input scopes so their row-scratch recycling
+cannot invalidate the caller's saved inputs. Exhaustion reports
+`retained routine inputs exceed statement memory` (SQLSTATE `54000`). These
+positions cover internal function handoffs; whole-query, body and post-flush
+positions still need retained execution before all storage waits can yield.
 Record field descriptions bind the call's input types, named arguments and
 defaults without running them. The same bound types describe table-function
 columns, so an array returned through `anyelement` has the correct binary format.
+A single-column `RETURNS TABLE` function yields its column value in a SELECT
+list, while multiple columns yield a record; the binary result type follows the
+same distinction.
+Named row results keep their type and fields as SELECT values; in FROM, their
+declared fields become separate columns. Null rows, ROWS FROM, lateral inputs
+and WITH ORDINALITY use that same column layout.
+Routine binding resolves named input and result representations before accepting
+an exact signature match. Table-function result conversion decodes structured
+fields rather than interpreting their rendered text as the original value.
+SQL and PL/pgSQL result conversion use the same structural value copy as pending
+calls. Detached trigger rows use that codec too, preserving named fields in
+conflict updates.
+A saved view or table column needs a concrete type: expand `(pair(1)).*` into
+separate columns or declare the function's result as a named composite type.
+Casting an anonymous function result directly to a named composite fails with
+`42846`; an explicit `ROW(...)` constructor can supply its fields. An anonymous
+`record` column fails with `42P16`, as required by
+[PostgreSQL's pseudo-type rules](https://www.postgresql.org/docs/18/datatype-pseudo.html).
 For `SELECT (pair(nextval('numbers'))).*`, PostgreSQL expands a scalar call
 into one call per output field. A set-returning call instead shares its producer
 across those fields; two explicitly written calls remain independent. Expansion

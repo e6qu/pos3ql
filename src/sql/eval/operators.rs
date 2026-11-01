@@ -3039,7 +3039,7 @@ pub(crate) fn logic<'a>(
     Ok(out.map_or(Datum::Null, Datum::Bool))
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 mod hash_tests {
     use super::*;
     use crate::sql::types::Datum;

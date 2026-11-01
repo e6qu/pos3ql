@@ -30,6 +30,8 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 webpki-roots = "0.26"
 
 [features]
+# Limit Miri test discovery to ownership modules; native tests stay complete.
+miri-ownership = []
 checkpoint-profile = []
 
 [profile.release]

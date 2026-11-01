@@ -16683,8 +16683,7 @@ impl<'a> PlpgsqlSetResult<'a> {
                         "RETURN NEXT must provide one column"
                     ));
                 }
-                let projected = encode_projected_pub(values, arena)?;
-                let value = cast_to(decode_projected_pub(projected, 0), result.ctype, arena)?;
+                let value = cast_to(detach_routine_datum(values[0], arena)?, result.ctype, arena)?;
                 encode_projected_pub(&[value], arena)?
             }
             None => {
@@ -16700,8 +16699,11 @@ impl<'a> PlpgsqlSetResult<'a> {
                 }
                 let mut cast = [Datum::Null; MAX_ROUTINE_OUTPUT_COLUMNS];
                 for (index, column) in columns[..count].iter().enumerate() {
-                    let projected = encode_projected_pub(&[values[index]], arena)?;
-                    cast[index] = cast_to(decode_projected_pub(projected, 0), column.ctype, arena)?;
+                    cast[index] = cast_to(
+                        detach_routine_datum(values[index], arena)?,
+                        column.ctype,
+                        arena,
+                    )?;
                 }
                 encode_projected_pub(&cast[..count], arena)?
             }
@@ -20390,7 +20392,7 @@ pub(crate) fn execute_plpgsql_table_function<'a>(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 mod trigger_program_tests {
     use super::*;
     use crate::mem::budget::Budget;
@@ -20659,9 +20661,7 @@ fn detached_trigger_row<'a>(
                 "trigger row exceeds the statement arena"
             )
         })?;
-    for (index, value) in row.iter_mut().enumerate() {
-        *value = decode_projected_pub(encoded, index);
-    }
+    projected::decode_projected_row_into(encoded, arena, row)?;
     Ok(row)
 }
 
@@ -73047,7 +73047,7 @@ pub fn coltype_of_oid_pub(o: i32) -> Option<crate::sql::types::ColType> {
     describe::coltype_of_oid(o)
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 mod tests {
     use super::*;
     use crate::mem::budget::Budget;

@@ -215,7 +215,7 @@ pub(crate) fn for_each_qualified_identifier(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 mod tests {
     use super::*;
 

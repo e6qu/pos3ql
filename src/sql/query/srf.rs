@@ -1297,7 +1297,7 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
                 name
             ));
         };
-        let rows = table_func_rows_outer(
+        let rows = table_func_base_rows_outer(
             source,
             storage,
             txid,
@@ -1307,11 +1307,12 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
             Some(hooks),
             None,
             None,
-        )?;
+        )?
+        .encoded;
         let values = arena
             .alloc_slice_with(rows.len(), |_| Datum::Null)
             .map_err(|_| arena_full())?;
-        if let Some(columns) = routine.table_columns() {
+        if let Some(columns) = routine.record_result_columns() {
             for (value, encoded) in values.iter_mut().zip(rows) {
                 let mut decoded = [crate::sql::types::RecordField {
                     name: "",
@@ -1387,79 +1388,86 @@ pub(super) fn with_bound_srf_inputs<'a, R: ColumnLookup<'a>, T>(
     hooks: &EvalHooks<'_, 'a>,
     run: impl FnOnce(&'a Expr<'a>, &'a [Datum<'a>]) -> Result<T, SqlError>,
 ) -> Result<T, SqlError> {
-    let Expr::Call {
-        name,
-        args,
-        argument_names,
-        ..
-    } = expression
-    else {
-        return Err(sql_err!(
-            sqlstate::INTERNAL_ERROR,
-            "set input binding requires a call"
-        ));
-    };
-    if args.len() > crate::storage::MAX_ROUTINE_ARGUMENTS {
-        return Err(sql_err!(
-            sqlstate::TOO_MANY_ARGUMENTS,
-            "set-returning call has too many arguments"
-        ));
-    }
-    if !srf_arity(name).is_some_and(|arity| arity.accepts(args.len())) {
-        return crate::sql::eval::undefined_function(name, args, arena, row, hooks);
-    }
-    let mut reordered = [&Expr::Null; 3];
-    let arguments = if argument_names.iter().any(Option::is_some) {
-        let Some(regex_name) = regex_srf_name(name) else {
-            return Err(srf_signature_error(name));
-        };
-        let parameters: &[&str] = match args.len() {
-            2 => &["string", "pattern"],
-            3 => &["string", "pattern", "flags"],
-            _ => return Err(srf_signature_error(regex_name)),
-        };
-        crate::sql::eval::reorder_required_arguments(
-            regex_name,
+    super::input_progress::call(arena, || {
+        let Expr::Call {
+            name,
             args,
             argument_names,
-            parameters,
-            &mut reordered[..args.len()],
-        )?;
-        &reordered[..args.len()]
-    } else {
-        args
-    };
-    let mut types = [crate::sql::types::oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
-    for (output, argument) in types.iter_mut().zip(arguments) {
-        *output = crate::sql::eval::expression_type_identity(argument, row, hooks)?
-            .routine_argument_oid();
-    }
-    let values = arena
-        .alloc_slice_with(arguments.len(), |_| Datum::Null)
-        .map_err(|_| arena_full())?;
-    let mut bound_arguments = crate::mem::arena::ArenaList::new(arena);
-    for (index, argument) in arguments.iter().enumerate() {
-        let value = eval_full(argument, arena, params, row, hooks)?;
-        let encoded = crate::sql::exec::encode_projected_pub(&[value], arena)?;
-        values[index] = crate::sql::exec::decode_projected_col_record(encoded, 0, arena)?;
-        let parameter: &'a Expr<'a> = arena
-            .alloc(Expr::Param(index as u32 + 1))
+            ..
+        } = expression
+        else {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "set input binding requires a call"
+            ));
+        };
+        if args.len() > crate::storage::MAX_ROUTINE_ARGUMENTS {
+            return Err(sql_err!(
+                sqlstate::TOO_MANY_ARGUMENTS,
+                "set-returning call has too many arguments"
+            ));
+        }
+        if !srf_arity(name).is_some_and(|arity| arity.accepts(args.len())) {
+            return crate::sql::eval::undefined_function(name, args, arena, row, hooks);
+        }
+        let mut reordered = [&Expr::Null; 3];
+        let arguments = if argument_names.iter().any(Option::is_some) {
+            let Some(regex_name) = regex_srf_name(name) else {
+                return Err(srf_signature_error(name));
+            };
+            let parameters: &[&str] = match args.len() {
+                2 => &["string", "pattern"],
+                3 => &["string", "pattern", "flags"],
+                _ => return Err(srf_signature_error(regex_name)),
+            };
+            crate::sql::eval::reorder_required_arguments(
+                regex_name,
+                args,
+                argument_names,
+                parameters,
+                &mut reordered[..args.len()],
+            )?;
+            &reordered[..args.len()]
+        } else {
+            args
+        };
+        let mut types = [crate::sql::types::oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
+        for (output, argument) in types.iter_mut().zip(arguments) {
+            *output = crate::sql::eval::expression_type_identity(argument, row, hooks)?
+                .routine_argument_oid();
+        }
+        let values = arena
+            .alloc_slice_with(arguments.len(), |_| Datum::Null)
             .map_err(|_| arena_full())?;
-        bound_arguments.push(parameter).map_err(|_| arena_full())?;
-    }
-    let mut bound = *expression;
-    let Expr::Call {
-        args,
-        argument_names,
-        ..
-    } = &mut bound
-    else {
-        unreachable!()
-    };
-    *args = bound_arguments.as_slice();
-    *argument_names = &[];
-    let bound = arena.alloc(bound).map_err(|_| arena_full())?;
-    crate::sql::exec::with_bound_parameter_types(&types[..arguments.len()], || run(bound, values))
+        let mut bound_arguments = crate::mem::arena::ArenaList::new(arena);
+        for (index, argument) in arguments.iter().enumerate() {
+            let value = {
+                let _inputs = super::input_progress::enter();
+                eval_full(argument, arena, params, row, hooks)?
+            };
+            let encoded = crate::sql::exec::encode_projected_pub(&[value], arena)?;
+            values[index] = crate::sql::exec::decode_projected_col_record(encoded, 0, arena)?;
+            let parameter: &'a Expr<'a> = arena
+                .alloc(Expr::Param(index as u32 + 1))
+                .map_err(|_| arena_full())?;
+            bound_arguments.push(parameter).map_err(|_| arena_full())?;
+        }
+        let mut bound = *expression;
+        let Expr::Call {
+            args,
+            argument_names,
+            ..
+        } = &mut bound
+        else {
+            unreachable!()
+        };
+        *args = bound_arguments.as_slice();
+        *argument_names = &[];
+        let bound = arena.alloc(bound).map_err(|_| arena_full())?;
+        crate::sql::exec::with_bound_parameter_types(&types[..arguments.len()], || {
+            run(bound, values)
+        })
+    })
 }
 
 /// Number of output rows a set-returning call yields for the current source row.
@@ -3299,7 +3307,37 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
         }
         names.len()
     } else if let Some((_, routine)) = routine {
-        if let Some(output) = routine.table_columns() {
+        if let Some(creation) = routine_composite_result(routine, storage, txid)? {
+            let target = crate::storage::TypeDefinitionTarget::by_creation(
+                storage,
+                crate::storage::NamedTypeKind::Composite,
+                creation,
+            )?;
+            let definition = storage
+                .read_composite_definition(target, txid)?
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "composite result type does not exist"
+                    )
+                })?;
+            if definition.active_field_count() > default_cols.len() {
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "table function output exceeds configured column capacity"
+                ));
+            }
+            for (out, field) in default_cols.iter_mut().zip(definition.active_fields()) {
+                *out = table_function_column(
+                    field.name,
+                    field.ctype,
+                    field.user_type,
+                    field.type_mod,
+                    field.collation,
+                );
+            }
+            definition.active_field_count()
+        } else if let Some(output) = routine.table_columns() {
             for (slot, column) in output.iter().enumerate() {
                 default_cols[slot] = table_function_column(
                     column.name,
@@ -3707,7 +3745,9 @@ fn table_func_routine<'a, C: ColumnLookup<'a>>(
     } else {
         tref.table
     };
-    let slot = if tref.func_argument_names.is_empty() {
+    let slot = if let Some(oid) = super::input_progress::selected_target() {
+        storage.routine_slot_by_oid(oid, txid)
+    } else if tref.func_argument_names.is_empty() {
         storage.routine_slot_for_function_call_syntax_oids(
             name,
             &argument_type_oids[..args.len()],
@@ -3750,6 +3790,31 @@ fn table_func_routine<'a, C: ColumnLookup<'a>>(
     )))
 }
 
+fn routine_composite_result(
+    routine: &RoutineDef,
+    storage: &Storage,
+    txid: u32,
+) -> Result<Option<crate::storage::TypeCreation>, SqlError> {
+    let oid = storage
+        .routine_function_result_oid(routine, txid)
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "routine result type does not exist"
+            )
+        })?;
+    Ok(match crate::storage::NamedTypeKind::from_oid(oid) {
+        Some((crate::storage::NamedTypeKind::Composite, creation, false)) => Some(creation),
+        _ => None,
+    })
+}
+
+struct TableFunctionRows<'a> {
+    // SELECT keeps each named row as a value; FROM exposes its fields.
+    encoded: &'a [&'a [u8]],
+    composite: Option<crate::storage::TypeCreation>,
+}
+
 /// Evaluates a table function's arguments against `columns` — an
 /// outer row, for a `LATERAL func(outer.col)`.
 #[allow(clippy::too_many_arguments)]
@@ -3764,7 +3829,7 @@ pub(crate) fn table_func_rows_outer<'a, C: ColumnLookup<'a>>(
     invocations: Option<&super::RoutineInvocationState<'a>>,
     statement_arena: Option<&'a Arena>,
 ) -> Result<&'a [&'a [u8]], SqlError> {
-    let rows = table_func_base_rows_outer(
+    let produced = table_func_base_rows_outer(
         tref,
         storage,
         txid,
@@ -3775,6 +3840,74 @@ pub(crate) fn table_func_rows_outer<'a, C: ColumnLookup<'a>>(
         invocations,
         statement_arena,
     )?;
+    let rows = if let Some(creation) = produced.composite {
+        let target = crate::storage::TypeDefinitionTarget::by_creation(
+            storage,
+            crate::storage::NamedTypeKind::Composite,
+            creation,
+        )?;
+        // Release this declaration reader before materializing individual values.
+        let width = {
+            let definition = storage
+                .read_composite_definition(target, txid)?
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "composite result type does not exist"
+                    )
+                })?;
+            definition.active_field_count()
+        };
+        if width > MAX_COLUMNS {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "table function output exceeds configured column capacity"
+            ));
+        }
+        let catalog = super::storage_catalog(storage, arena, txid);
+        let rows = arena
+            .alloc_slice_with(produced.encoded.len(), |_| &[] as &[u8])
+            .map_err(|_| arena_full())?;
+        let values = arena
+            .alloc_slice_with(width, |_| Datum::Null)
+            .map_err(|_| arena_full())?;
+        for (out, encoded) in rows.iter_mut().zip(produced.encoded) {
+            let mut value = crate::sql::exec::decode_projected_col_record(encoded, 0, arena)?;
+            if let Datum::CompositeText {
+                slot,
+                physical_fields,
+                text,
+            } = value
+            {
+                value = crate::sql::eval::CatalogAccess::materialize_composite(
+                    &catalog,
+                    slot,
+                    physical_fields,
+                    text,
+                    arena,
+                )?;
+            }
+            values.fill(Datum::Null);
+            match value {
+                Datum::Composite { slot, fields } if slot == creation && fields.len() == width => {
+                    for (out, field) in values.iter_mut().zip(fields) {
+                        *out = field.value;
+                    }
+                }
+                Datum::Null => {}
+                _ => {
+                    return Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "table function composite result changed its declared shape"
+                    ));
+                }
+            }
+            *out = crate::sql::exec::encode_projected_pub(values, arena)?;
+        }
+        &*rows
+    } else {
+        produced.encoded
+    };
     if !tref.with_ordinality {
         return Ok(rows);
     }
@@ -3784,14 +3917,15 @@ pub(crate) fn table_func_rows_outer<'a, C: ColumnLookup<'a>>(
     let wrapped = arena
         .alloc_slice_with(rows.len(), |_| EMPTY)
         .map_err(|_| arena_full())?;
+    let values = arena
+        .alloc_slice_with(base_columns + 1, |_| Datum::Null)
+        .map_err(|_| arena_full())?;
     for (index, row) in rows.iter().enumerate() {
-        let mut values = [Datum::Null; MAX_COLUMNS];
         for (column, slot) in values[..base_columns].iter_mut().enumerate() {
             *slot = crate::sql::exec::decode_projected_col_record(row, column, arena)?;
         }
         values[base_columns] = Datum::Int8((index + 1) as i64);
-        wrapped[index] =
-            crate::sql::exec::encode_projected_pub(&values[..base_columns + 1], arena)?;
+        wrapped[index] = crate::sql::exec::encode_projected_pub(values, arena)?;
     }
     Ok(&*wrapped)
 }
@@ -3807,7 +3941,7 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
     eval_hooks: Option<&EvalHooks<'_, 'a>>,
     invocations: Option<&super::RoutineInvocationState<'a>>,
     statement_arena: Option<&'a Arena>,
-) -> Result<&'a [&'a [u8]], SqlError> {
+) -> Result<TableFunctionRows<'a>, SqlError> {
     let argument_catalog = super::storage_catalog(storage, arena, txid);
     let argument_hooks = EvalHooks {
         catalog: eval_hooks
@@ -3828,1034 +3962,1056 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
             eval_hooks,
             invocations,
             statement_arena,
-        );
+        )
+        .map(|encoded| TableFunctionRows {
+            encoded,
+            composite: None,
+        });
     }
-    let written_args = tref.func_args.expect("table function carries arguments");
-    let regex_name = tref
-        .schema
-        .is_none_or(|schema| schema == "pg_catalog")
-        .then_some(tref.table)
-        .filter(|name| matches!(*name, "regexp_matches" | "regexp_split_to_table"));
-    let mut reordered = [&Expr::Null; 3];
-    let args = if let Some(name) = regex_name
-        && tref.func_argument_names.iter().any(Option::is_some)
-    {
-        let parameters: &[&str] = match written_args.len() {
-            2 => &["string", "pattern"],
-            3 => &["string", "pattern", "flags"],
-            _ => return Err(srf_signature_error(name)),
+    let mut composite = None;
+    let encoded = super::input_progress::call(arena, || -> Result<&'a [&'a [u8]], SqlError> {
+        let written_args = tref.func_args.expect("table function carries arguments");
+        let regex_name = tref
+            .schema
+            .is_none_or(|schema| schema == "pg_catalog")
+            .then_some(tref.table)
+            .filter(|name| matches!(*name, "regexp_matches" | "regexp_split_to_table"));
+        let mut reordered = [&Expr::Null; 3];
+        let args = if let Some(name) = regex_name
+            && tref.func_argument_names.iter().any(Option::is_some)
+        {
+            let parameters: &[&str] = match written_args.len() {
+                2 => &["string", "pattern"],
+                3 => &["string", "pattern", "flags"],
+                _ => return Err(srf_signature_error(name)),
+            };
+            crate::sql::eval::reorder_required_arguments(
+                name,
+                written_args,
+                tref.func_argument_names,
+                parameters,
+                &mut reordered[..written_args.len()],
+            )?;
+            &*arena
+                .alloc_slice_copy(&reordered[..written_args.len()])
+                .map_err(|_| arena_full())?
+        } else {
+            written_args
         };
-        crate::sql::eval::reorder_required_arguments(
-            name,
-            written_args,
-            tref.func_argument_names,
-            parameters,
-            &mut reordered[..written_args.len()],
-        )?;
-        &*arena
-            .alloc_slice_copy(&reordered[..written_args.len()])
-            .map_err(|_| arena_full())?
-    } else {
-        written_args
-    };
-    if is_event_trigger_introspection(tref.table) {
-        return event_trigger_rows(tref.table, args, storage, txid, arena);
-    }
-    if tref.table.eq_ignore_ascii_case("pg_listening_channels") {
-        require_no_arguments(tref.table, args)?;
-        let pid = storage.current_connection_id();
-        let count = storage.listening_channel_count(pid);
-        const EMPTY: &[u8] = &[];
-        let rows = arena
-            .alloc_slice_with(count, |_| EMPTY)
-            .map_err(|_| arena_full())?;
-        for (index, output) in rows.iter_mut().enumerate() {
-            let channel = storage.listening_channel_at(pid, index).ok_or_else(|| {
-                sql_err!(
-                    sqlstate::INTERNAL_ERROR,
-                    "listening-channel registry changed during scan"
-                )
-            })?;
-            let channel = arena
-                .alloc_str(channel.as_str())
-                .map_err(|_| arena_full())?;
-            *output = crate::sql::exec::encode_projected_pub(&[Datum::Text(channel)], arena)?;
+        if is_event_trigger_introspection(tref.table) {
+            return event_trigger_rows(tref.table, args, storage, txid, arena);
         }
-        return Ok(rows);
-    }
-    if tref.table.eq_ignore_ascii_case("pg_cursor") {
-        require_no_arguments(tref.table, args)?;
-        return crate::sql::cursor::with_active(|pool| {
-            let count = pool.map_or(0, crate::sql::cursor::CursorPool::len);
+        if tref.table.eq_ignore_ascii_case("pg_listening_channels") {
+            require_no_arguments(tref.table, args)?;
+            let pid = storage.current_connection_id();
+            let count = storage.listening_channel_count(pid);
             const EMPTY: &[u8] = &[];
             let rows = arena
                 .alloc_slice_with(count, |_| EMPTY)
                 .map_err(|_| arena_full())?;
-            if let Some(pool) = pool {
-                let mut index = 0usize;
-                let mut error = None;
-                pool.visit(|cursor| {
-                    if error.is_some() {
-                        return;
-                    }
-                    let values = [
-                        Datum::Text(cursor.name),
-                        Datum::Text(cursor.statement),
-                        Datum::Bool(cursor.holdable),
-                        Datum::Bool(cursor.binary),
-                        Datum::Bool(cursor.scrollable),
-                        Datum::Timestamptz(cursor.created_at),
-                    ];
-                    match crate::sql::exec::encode_projected_pub(&values, arena) {
-                        Ok(encoded) => {
-                            rows[index] = encoded;
-                            index += 1;
-                        }
-                        Err(found) => error = Some(found),
-                    }
-                });
-                if let Some(error) = error {
-                    return Err(error);
-                }
+            for (index, output) in rows.iter_mut().enumerate() {
+                let channel = storage.listening_channel_at(pid, index).ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "listening-channel registry changed during scan"
+                    )
+                })?;
+                let channel = arena
+                    .alloc_str(channel.as_str())
+                    .map_err(|_| arena_full())?;
+                *output = crate::sql::exec::encode_projected_pub(&[Datum::Text(channel)], arena)?;
             }
-            Ok(&*rows)
-        });
-    }
-    let eval_argument =
-        |argument| crate::sql::eval::eval_full(argument, arena, params, columns, &argument_hooks);
-    if tref.table.eq_ignore_ascii_case("parse_ident") {
-        if !(1..=2).contains(&args.len()) || tref.func_variadic {
-            return Err(srf_signature_error(tref.table));
+            return Ok(rows);
         }
-        let hooks = eval_hooks.copied().unwrap_or(crate::sql::eval::NO_HOOKS);
-        let value = crate::sql::eval::funcs::string::dispatch(
-            tref.table, args, false, false, arena, params, columns, &hooks,
-        )
-        .ok_or_else(|| srf_signature_error(tref.table))??;
-        let encoded = crate::sql::exec::encode_projected_pub(&[value], arena)?;
-        return arena
-            .alloc_slice_with(1, |_| encoded)
-            .map(|rows| &*rows)
-            .map_err(|_| arena_full());
-    }
-    if tref.table.eq_ignore_ascii_case("pg_input_error_info") {
-        if args.len() != 2 || tref.func_variadic {
-            return Err(srf_signature_error(tref.table));
+        if tref.table.eq_ignore_ascii_case("pg_cursor") {
+            require_no_arguments(tref.table, args)?;
+            return crate::sql::cursor::with_active(|pool| {
+                let count = pool.map_or(0, crate::sql::cursor::CursorPool::len);
+                const EMPTY: &[u8] = &[];
+                let rows = arena
+                    .alloc_slice_with(count, |_| EMPTY)
+                    .map_err(|_| arena_full())?;
+                if let Some(pool) = pool {
+                    let mut index = 0usize;
+                    let mut error = None;
+                    pool.visit(|cursor| {
+                        if error.is_some() {
+                            return;
+                        }
+                        let values = [
+                            Datum::Text(cursor.name),
+                            Datum::Text(cursor.statement),
+                            Datum::Bool(cursor.holdable),
+                            Datum::Bool(cursor.binary),
+                            Datum::Bool(cursor.scrollable),
+                            Datum::Timestamptz(cursor.created_at),
+                        ];
+                        match crate::sql::exec::encode_projected_pub(&values, arena) {
+                            Ok(encoded) => {
+                                rows[index] = encoded;
+                                index += 1;
+                            }
+                            Err(found) => error = Some(found),
+                        }
+                    });
+                    if let Some(error) = error {
+                        return Err(error);
+                    }
+                }
+                Ok(&*rows)
+            });
         }
-        let input = match eval_argument(args[0])? {
-            Datum::Text(value) | Datum::Bpchar(value) => value,
-            Datum::Null => return Ok(&[]),
-            _ => return Err(srf_signature_error(tref.table)),
+        let eval_argument = |argument| {
+            let _inputs = super::input_progress::enter();
+            crate::sql::eval::eval_full(argument, arena, params, columns, &argument_hooks)
         };
-        let type_name = match eval_argument(args[1])? {
-            Datum::Text(value) | Datum::Bpchar(value) => value,
-            Datum::Null => return Ok(&[]),
-            _ => return Err(srf_signature_error(tref.table)),
-        };
-        let catalog = super::storage_catalog(storage, arena, txid);
-        let hooks = EvalHooks {
-            catalog: Some(&catalog),
-            ..eval_hooks.copied().unwrap_or(crate::sql::eval::NO_HOOKS)
-        };
-        let error = crate::sql::eval::input_error(input, type_name, arena, &hooks)?;
-        let values = if let Some(error) = error {
-            [
-                Datum::Text(arena.alloc_str(error.message).map_err(|_| arena_full())?),
-                Datum::Null,
-                Datum::Null,
-                Datum::Text(
-                    arena
-                        .alloc_str(error.sqlstate.as_str())
-                        .map_err(|_| arena_full())?,
-                ),
-            ]
-        } else {
-            [Datum::Null; 4]
-        };
-        let encoded = crate::sql::exec::encode_projected_pub(&values, arena)?;
-        return arena
-            .alloc_slice_with(1, |_| encoded)
-            .map(|rows| &*rows)
-            .map_err(|_| arena_full());
-    }
-    if is_object_address_record_function(tref.table) {
-        let catalog = super::storage_catalog(storage, arena, txid);
-        let hooks = EvalHooks {
-            catalog: Some(&catalog),
-            ..eval_hooks.copied().unwrap_or(crate::sql::eval::NO_HOOKS)
-        };
-        let value = crate::sql::eval::funcs::system::dispatch(
-            tref.table, args, false, arena, params, columns, &hooks,
-        )
-        .ok_or_else(|| srf_signature_error(tref.table))??;
-        let field_count = if tref.table.eq_ignore_ascii_case("pg_identify_object") {
-            4
-        } else {
-            3
-        };
-        let mut values = [Datum::Null; 4];
-        match value {
-            Datum::Record(fields) => {
-                if fields.len() != field_count {
+        if tref.table.eq_ignore_ascii_case("parse_ident") {
+            if !(1..=2).contains(&args.len()) || tref.func_variadic {
+                return Err(srf_signature_error(tref.table));
+            }
+            let hooks = eval_hooks.copied().unwrap_or(crate::sql::eval::NO_HOOKS);
+            let value = crate::sql::eval::funcs::string::dispatch(
+                tref.table, args, false, false, arena, params, columns, &hooks,
+            )
+            .ok_or_else(|| srf_signature_error(tref.table))??;
+            let encoded = crate::sql::exec::encode_projected_pub(&[value], arena)?;
+            return arena
+                .alloc_slice_with(1, |_| encoded)
+                .map(|rows| &*rows)
+                .map_err(|_| arena_full());
+        }
+        if tref.table.eq_ignore_ascii_case("pg_input_error_info") {
+            if args.len() != 2 || tref.func_variadic {
+                return Err(srf_signature_error(tref.table));
+            }
+            let input = match eval_argument(args[0])? {
+                Datum::Text(value) | Datum::Bpchar(value) => value,
+                Datum::Null => return Ok(&[]),
+                _ => return Err(srf_signature_error(tref.table)),
+            };
+            let type_name = match eval_argument(args[1])? {
+                Datum::Text(value) | Datum::Bpchar(value) => value,
+                Datum::Null => return Ok(&[]),
+                _ => return Err(srf_signature_error(tref.table)),
+            };
+            let catalog = super::storage_catalog(storage, arena, txid);
+            let hooks = EvalHooks {
+                catalog: Some(&catalog),
+                ..eval_hooks.copied().unwrap_or(crate::sql::eval::NO_HOOKS)
+            };
+            let error = crate::sql::eval::input_error(input, type_name, arena, &hooks)?;
+            let values = if let Some(error) = error {
+                [
+                    Datum::Text(arena.alloc_str(error.message).map_err(|_| arena_full())?),
+                    Datum::Null,
+                    Datum::Null,
+                    Datum::Text(
+                        arena
+                            .alloc_str(error.sqlstate.as_str())
+                            .map_err(|_| arena_full())?,
+                    ),
+                ]
+            } else {
+                [Datum::Null; 4]
+            };
+            let encoded = crate::sql::exec::encode_projected_pub(&values, arena)?;
+            return arena
+                .alloc_slice_with(1, |_| encoded)
+                .map(|rows| &*rows)
+                .map_err(|_| arena_full());
+        }
+        if is_object_address_record_function(tref.table) {
+            let catalog = super::storage_catalog(storage, arena, txid);
+            let hooks = EvalHooks {
+                catalog: Some(&catalog),
+                ..eval_hooks.copied().unwrap_or(crate::sql::eval::NO_HOOKS)
+            };
+            let value = crate::sql::eval::funcs::system::dispatch(
+                tref.table, args, false, arena, params, columns, &hooks,
+            )
+            .ok_or_else(|| srf_signature_error(tref.table))??;
+            let field_count = if tref.table.eq_ignore_ascii_case("pg_identify_object") {
+                4
+            } else {
+                3
+            };
+            let mut values = [Datum::Null; 4];
+            match value {
+                Datum::Record(fields) => {
+                    if fields.len() != field_count {
+                        return Err(sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "catalog object function returned an invalid record"
+                        ));
+                    }
+                    for (output, field) in values.iter_mut().zip(fields) {
+                        *output = field.value;
+                    }
+                }
+                Datum::Null => {}
+                _ => {
                     return Err(sql_err!(
                         sqlstate::INTERNAL_ERROR,
-                        "catalog object function returned an invalid record"
+                        "catalog object function returned a non-record value"
                     ));
                 }
-                for (output, field) in values.iter_mut().zip(fields) {
-                    *output = field.value;
-                }
             }
-            Datum::Null => {}
-            _ => {
-                return Err(sql_err!(
-                    sqlstate::INTERNAL_ERROR,
-                    "catalog object function returned a non-record value"
-                ));
+            let encoded = crate::sql::exec::encode_projected_pub(&values[..field_count], arena)?;
+            return arena
+                .alloc_slice_with(1, |_| encoded)
+                .map(|rows| &*rows)
+                .map_err(|_| arena_full());
+        }
+        if tref.table.eq_ignore_ascii_case("pg_snapshot_xip")
+            || tref.table.eq_ignore_ascii_case("txid_snapshot_xip")
+        {
+            if args.len() != 1 {
+                return Err(srf_signature_error(tref.table));
             }
-        }
-        let encoded = crate::sql::exec::encode_projected_pub(&values[..field_count], arena)?;
-        return arena
-            .alloc_slice_with(1, |_| encoded)
-            .map(|rows| &*rows)
-            .map_err(|_| arena_full());
-    }
-    if tref.table.eq_ignore_ascii_case("pg_snapshot_xip")
-        || tref.table.eq_ignore_ascii_case("txid_snapshot_xip")
-    {
-        if args.len() != 1 {
-            return Err(srf_signature_error(tref.table));
-        }
-        let legacy = tref.table.eq_ignore_ascii_case("txid_snapshot_xip");
-        let snapshot = match eval_argument(args[0])? {
-            Datum::Snapshot {
-                value,
-                legacy: actual,
-            } if actual == legacy => value,
-            Datum::Null => return Ok(&[]),
-            _ => return Err(srf_signature_error(tref.table)),
-        };
-        const EMPTY: &[u8] = &[];
-        let rows = arena
-            .alloc_slice_with(snapshot.xip().len(), |_| EMPTY)
-            .map_err(|_| arena_full())?;
-        for (row, transaction_id) in rows.iter_mut().zip(snapshot.xip()) {
-            let value =
-                if legacy {
+            let legacy = tref.table.eq_ignore_ascii_case("txid_snapshot_xip");
+            let snapshot = match eval_argument(args[0])? {
+                Datum::Snapshot {
+                    value,
+                    legacy: actual,
+                } if actual == legacy => value,
+                Datum::Null => return Ok(&[]),
+                _ => return Err(srf_signature_error(tref.table)),
+            };
+            const EMPTY: &[u8] = &[];
+            let rows = arena
+                .alloc_slice_with(snapshot.xip().len(), |_| EMPTY)
+                .map_err(|_| arena_full())?;
+            for (row, transaction_id) in rows.iter_mut().zip(snapshot.xip()) {
+                let value = if legacy {
                     Datum::Int8(i64::try_from(transaction_id).map_err(|_| {
                         sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "bigint out of range")
                     })?)
                 } else {
                     Datum::Xid8(transaction_id)
                 };
-            *row = crate::sql::exec::encode_projected_pub(&[value], arena)?;
-        }
-        return Ok(&*rows);
-    }
-    if tref.table.eq_ignore_ascii_case("json_table") {
-        let catalog = super::storage_catalog(storage, arena, txid);
-        let hooks = EvalHooks {
-            catalog: Some(&catalog),
-            ..eval_hooks.copied().unwrap_or(crate::sql::eval::NO_HOOKS)
-        };
-        return json_table_rows(args, arena, params, columns, &hooks);
-    }
-    if tref.table.eq_ignore_ascii_case("xmltable") {
-        let catalog = super::storage_catalog(storage, arena, txid);
-        let hooks = EvalHooks {
-            catalog: Some(&catalog),
-            ..eval_hooks.copied().unwrap_or(crate::sql::eval::NO_HOOKS)
-        };
-        return xml_table_rows(args, arena, params, columns, &hooks);
-    }
-    if matches!(
-        tref.table,
-        "json_populate_record"
-            | "jsonb_populate_record"
-            | "json_populate_recordset"
-            | "jsonb_populate_recordset"
-    ) {
-        let catalog = super::storage_catalog(storage, arena, txid);
-        let hooks = EvalHooks {
-            catalog: Some(&catalog),
-            ..eval_hooks.copied().unwrap_or(crate::sql::eval::NO_HOOKS)
-        };
-        return populate_record_rows(tref.table, args, arena, params, columns, &hooks);
-    }
-    if matches!(
-        tref.table,
-        "json_to_record" | "jsonb_to_record" | "json_to_recordset" | "jsonb_to_recordset"
-    ) {
-        let catalog = super::storage_catalog(storage, arena, txid);
-        let hooks = EvalHooks {
-            catalog: Some(&catalog),
-            ..eval_hooks.copied().unwrap_or(crate::sql::eval::NO_HOOKS)
-        };
-        return json_to_record_rows(
-            tref.table, args, storage, txid, arena, params, columns, &hooks,
-        );
-    }
-    if is_logical_slot_record_function(tref.table) {
-        let hooks = eval_hooks.copied().unwrap_or(crate::sql::eval::NO_HOOKS);
-        let value = crate::sql::logical_replication::dispatch(
-            tref.table, args, false, arena, params, columns, &hooks,
-        )
-        .ok_or_else(|| srf_signature_error(tref.table))??;
-        let values = match value {
-            Datum::Record(fields) if fields.len() == 2 => [fields[0].value, fields[1].value],
-            Datum::Null => [Datum::Null, Datum::Null],
-            _ => {
-                return Err(sql_err!(
-                    sqlstate::INTERNAL_ERROR,
-                    "logical slot function returned an invalid record"
-                ));
+                *row = crate::sql::exec::encode_projected_pub(&[value], arena)?;
             }
-        };
-        let encoded = crate::sql::exec::encode_projected_pub(&values, arena)?;
-        let rows = arena
-            .alloc_slice_with(1, |_| encoded)
-            .map_err(|_| arena_full())?;
-        return Ok(&*rows);
-    }
-    if tref.table.eq_ignore_ascii_case("pg_get_publication_tables") {
-        let evaluated =
-            evaluate_publication_arguments_with(args, tref.func_variadic, arena, eval_argument)?;
-        return publication_table_rows(storage, txid, arena, evaluated);
-    }
-    if tref.table.eq_ignore_ascii_case("ts_stat") {
-        if !(1..=2).contains(&args.len()) {
-            return Err(sql_err!(
-                sqlstate::UNDEFINED_FUNCTION,
-                "function ts_stat(...) does not exist"
-            ));
+            return Ok(&*rows);
         }
-        let source = match eval_argument(args[0])? {
-            Datum::Null => return Ok(&[]),
-            Datum::Text(source) | Datum::Bpchar(source) => source,
-            _ => return Err(srf_signature_error(tref.table)),
-        };
-        let mut selected_weights = 0b1111u8;
-        if args.len() == 2 {
-            let weights = match eval_argument(args[1])? {
-                Datum::Null => return Ok(&[]),
-                Datum::Text(weights) | Datum::Bpchar(weights) => weights,
-                _ => return Err(srf_signature_error(tref.table)),
+        if tref.table.eq_ignore_ascii_case("json_table") {
+            let catalog = super::storage_catalog(storage, arena, txid);
+            let hooks = EvalHooks {
+                catalog: Some(&catalog),
+                ..eval_hooks.copied().unwrap_or(crate::sql::eval::NO_HOOKS)
             };
-            selected_weights = 0;
-            for weight in weights.bytes() {
-                selected_weights |= match weight {
-                    b'A' => 1 << 3,
-                    b'B' => 1 << 2,
-                    b'C' => 1 << 1,
-                    b'D' => 1,
-                    _ => {
-                        return Err(sql_err!(
-                            sqlstate::INVALID_PARAMETER_VALUE,
-                            "unrecognized weight: \"{}\"",
-                            weight as char
-                        ));
-                    }
-                };
-            }
+            return json_table_rows(args, arena, params, columns, &hooks);
         }
-        let query = crate::sql::parser::parse_query(source, arena)?;
-        let routine_query = super::RoutineQuery::Select(query);
-        #[derive(Clone, Copy)]
-        struct Statistic<'a> {
-            word: &'a str,
-            documents: i32,
-            entries: i32,
+        if tref.table.eq_ignore_ascii_case("xmltable") {
+            let catalog = super::storage_catalog(storage, arena, txid);
+            let hooks = EvalHooks {
+                catalog: Some(&catalog),
+                ..eval_hooks.copied().unwrap_or(crate::sql::eval::NO_HOOKS)
+            };
+            return xml_table_rows(args, arena, params, columns, &hooks);
         }
-        let mut statistics: crate::mem::arena::ArenaList<'_, Statistic<'_>> =
-            crate::mem::arena::ArenaList::new(arena);
-        super::execute_routine_query(
-            &routine_query,
-            storage,
-            txid,
-            arena,
-            &[],
-            false,
-            &mut |row| {
-                if row.len() != 1 {
+        if matches!(
+            tref.table,
+            "json_populate_record"
+                | "jsonb_populate_record"
+                | "json_populate_recordset"
+                | "jsonb_populate_recordset"
+        ) {
+            let catalog = super::storage_catalog(storage, arena, txid);
+            let hooks = EvalHooks {
+                catalog: Some(&catalog),
+                ..eval_hooks.copied().unwrap_or(crate::sql::eval::NO_HOOKS)
+            };
+            return populate_record_rows(tref.table, args, arena, params, columns, &hooks);
+        }
+        if matches!(
+            tref.table,
+            "json_to_record" | "jsonb_to_record" | "json_to_recordset" | "jsonb_to_recordset"
+        ) {
+            let catalog = super::storage_catalog(storage, arena, txid);
+            let hooks = EvalHooks {
+                catalog: Some(&catalog),
+                ..eval_hooks.copied().unwrap_or(crate::sql::eval::NO_HOOKS)
+            };
+            return json_to_record_rows(
+                tref.table, args, storage, txid, arena, params, columns, &hooks,
+            );
+        }
+        if is_logical_slot_record_function(tref.table) {
+            let hooks = eval_hooks.copied().unwrap_or(crate::sql::eval::NO_HOOKS);
+            let value = crate::sql::logical_replication::dispatch(
+                tref.table, args, false, arena, params, columns, &hooks,
+            )
+            .ok_or_else(|| srf_signature_error(tref.table))??;
+            let values = match value {
+                Datum::Record(fields) if fields.len() == 2 => [fields[0].value, fields[1].value],
+                Datum::Null => [Datum::Null, Datum::Null],
+                _ => {
                     return Err(sql_err!(
-                        sqlstate::DATATYPE_MISMATCH,
-                        "ts_stat query must return one tsvector column"
+                        sqlstate::INTERNAL_ERROR,
+                        "logical slot function returned an invalid record"
                     ));
                 }
-                let vector = match row[0] {
-                    Datum::Null => return Ok(()),
-                    Datum::TsVector(vector) => vector,
-                    _ => {
+            };
+            let encoded = crate::sql::exec::encode_projected_pub(&values, arena)?;
+            let rows = arena
+                .alloc_slice_with(1, |_| encoded)
+                .map_err(|_| arena_full())?;
+            return Ok(&*rows);
+        }
+        if tref.table.eq_ignore_ascii_case("pg_get_publication_tables") {
+            let evaluated = evaluate_publication_arguments_with(
+                args,
+                tref.func_variadic,
+                arena,
+                eval_argument,
+            )?;
+            return publication_table_rows(storage, txid, arena, evaluated);
+        }
+        if tref.table.eq_ignore_ascii_case("ts_stat") {
+            if !(1..=2).contains(&args.len()) {
+                return Err(sql_err!(
+                    sqlstate::UNDEFINED_FUNCTION,
+                    "function ts_stat(...) does not exist"
+                ));
+            }
+            let source = match eval_argument(args[0])? {
+                Datum::Null => return Ok(&[]),
+                Datum::Text(source) | Datum::Bpchar(source) => source,
+                _ => return Err(srf_signature_error(tref.table)),
+            };
+            let mut selected_weights = 0b1111u8;
+            if args.len() == 2 {
+                let weights = match eval_argument(args[1])? {
+                    Datum::Null => return Ok(&[]),
+                    Datum::Text(weights) | Datum::Bpchar(weights) => weights,
+                    _ => return Err(srf_signature_error(tref.table)),
+                };
+                selected_weights = 0;
+                for weight in weights.bytes() {
+                    selected_weights |= match weight {
+                        b'A' => 1 << 3,
+                        b'B' => 1 << 2,
+                        b'C' => 1 << 1,
+                        b'D' => 1,
+                        _ => {
+                            return Err(sql_err!(
+                                sqlstate::INVALID_PARAMETER_VALUE,
+                                "unrecognized weight: \"{}\"",
+                                weight as char
+                            ));
+                        }
+                    };
+                }
+            }
+            let query = crate::sql::parser::parse_query(source, arena)?;
+            let routine_query = super::RoutineQuery::Select(query);
+            #[derive(Clone, Copy)]
+            struct Statistic<'a> {
+                word: &'a str,
+                documents: i32,
+                entries: i32,
+            }
+            let mut statistics: crate::mem::arena::ArenaList<'_, Statistic<'_>> =
+                crate::mem::arena::ArenaList::new(arena);
+            super::execute_routine_query(
+                &routine_query,
+                storage,
+                txid,
+                arena,
+                &[],
+                false,
+                &mut |row| {
+                    if row.len() != 1 {
                         return Err(sql_err!(
                             sqlstate::DATATYPE_MISMATCH,
                             "ts_stat query must return one tsvector column"
                         ));
                     }
-                };
-                let parsed = crate::sql::full_text::parse_vector(vector.as_str(), arena)?;
-                for lexeme_index in 0..parsed.lexeme_count() {
-                    let (word, positions) = parsed.lexeme(lexeme_index).expect("vector index");
-                    let occurrences = if positions.is_empty() {
-                        i32::from(selected_weights & 1 != 0)
-                    } else {
-                        positions
-                            .iter()
-                            .filter(|position| selected_weights & (1 << position.weight) != 0)
-                            .count() as i32
-                    };
-                    if occurrences == 0 {
-                        continue;
-                    }
-                    let slot = match statistics
-                        .borrowed_slice()
-                        .iter()
-                        .position(|candidate| candidate.word == word)
-                    {
-                        Some(slot) => slot,
-                        None => {
-                            statistics
-                                .push(Statistic {
-                                    word: arena.alloc_str(word).map_err(|_| arena_full())?,
-                                    documents: 0,
-                                    entries: 0,
-                                })
-                                .map_err(|_| arena_full())?;
-                            statistics.len() - 1
+                    let vector = match row[0] {
+                        Datum::Null => return Ok(()),
+                        Datum::TsVector(vector) => vector,
+                        _ => {
+                            return Err(sql_err!(
+                                sqlstate::DATATYPE_MISMATCH,
+                                "ts_stat query must return one tsvector column"
+                            ));
                         }
                     };
-                    let statistic = &mut statistics.as_mut_slice().map_err(|_| arena_full())?[slot];
-                    statistic.documents = statistic.documents.saturating_add(1);
-                    statistic.entries = statistic.entries.saturating_add(occurrences);
-                }
-                Ok(())
-            },
-        )?;
-        statistics
-            .as_mut_slice()
-            .map_err(|_| arena_full())?
-            .sort_unstable_by(|left, right| right.word.cmp(left.word));
-        const EMPTY: &[u8] = &[];
-        let rows = arena
-            .alloc_slice_with(statistics.len(), |_| EMPTY)
-            .map_err(|_| arena_full())?;
-        for (statistic, row) in statistics.as_slice().iter().zip(rows.iter_mut()) {
-            *row = crate::sql::exec::encode_projected_pub(
-                &[
-                    Datum::Text(statistic.word),
-                    Datum::Int4(statistic.documents),
-                    Datum::Int4(statistic.entries),
-                ],
-                arena,
-            )?;
-        }
-        return Ok(&*rows);
-    }
-    if tref.table.eq_ignore_ascii_case("ts_debug") {
-        if !(1..=2).contains(&args.len()) {
-            return Err(sql_err!(
-                sqlstate::UNDEFINED_FUNCTION,
-                "function ts_debug(...) does not exist"
-            ));
-        }
-        let catalog = super::storage_catalog(storage, arena, txid);
-        let (configuration, document_index) = if args.len() == 2 {
-            (eval_argument(args[0])?, 1)
-        } else {
-            let setting =
-                crate::sql::eval::funcs::system::session_setting("default_text_search_config")
-                    .unwrap_or_else(|| StackStr::from_str("pg_catalog.english"));
-            (
-                Datum::Text(
-                    arena
-                        .alloc_str(setting.as_str())
-                        .map_err(|_| arena_full())?,
-                ),
-                0,
-            )
-        };
-        let configuration_oid = match configuration {
-            Datum::Null => return Ok(&[]),
-            Datum::RegObject {
-                type_oid,
-                referenced_oid,
-                ..
-            } if type_oid == crate::sql::types::oid::REGCONFIG => referenced_oid,
-            Datum::Text(name) | Datum::Bpchar(name) => {
-                let (schema, name) = name
-                    .rsplit_once('.')
-                    .map_or((None, name), |(schema, name)| {
-                        (Some(schema.trim_matches('"')), name.trim_matches('"'))
-                    });
-                crate::sql::eval::CatalogAccess::resolve_text_search_configuration(
-                    &catalog, schema, name,
-                )
-                .ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::UNDEFINED_OBJECT,
-                        "text search configuration does not exist"
-                    )
-                })?
-            }
-            _ => return Err(srf_signature_error(tref.table)),
-        };
-        let configuration_slot = storage
-            .text_search_slot_by_oid(
-                crate::sql::ast::TextSearchObjectKind::Configuration,
-                configuration_oid,
-                txid,
-            )
-            .ok_or_else(|| {
-                sql_err!(
-                    sqlstate::UNDEFINED_OBJECT,
-                    "text search configuration does not exist"
-                )
-            })?;
-        let crate::storage::TextSearchDefinition::Configuration { mappings, .. } = storage
-            .text_search_object(configuration_slot)
-            .definition_for(txid)
-        else {
-            return Err(sql_err!(
-                sqlstate::INTERNAL_ERROR,
-                "invalid text-search configuration catalog entry"
-            ));
-        };
-        let document = match eval_argument(args[document_index])? {
-            Datum::Null => return Ok(&[]),
-            Datum::Text(document) | Datum::Bpchar(document) => document,
-            _ => return Err(srf_signature_error(tref.table)),
-        };
-        let tokens = crate::sql::full_text::parse_document(document, arena)?;
-        const EMPTY: &[u8] = &[];
-        let rows = arena
-            .alloc_slice_with(tokens.len(), |_| EMPTY)
-            .map_err(|_| arena_full())?;
-        for (token, row) in tokens.iter().zip(rows.iter_mut()) {
-            let token_index = usize::from(token.kind.saturating_sub(1));
-            let mapping_count = usize::from(mappings.counts[token_index]);
-            let mut dictionaries =
-                [Datum::Null; crate::storage::TEXT_SEARCH_DICTIONARIES_PER_TOKEN];
-            let mut selected = Datum::Null;
-            let mut lexemes = Datum::Null;
-            for (index, dictionary_oid) in mappings.dictionaries[token_index][..mapping_count]
-                .iter()
-                .enumerate()
-            {
-                let dictionary_name = crate::sql::eval::CatalogAccess::text_search_dictionary_name(
-                    &catalog,
-                    *dictionary_oid,
-                )
-                .ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::INTERNAL_ERROR,
-                        "text-search mapping dictionary is missing"
-                    )
-                })?;
-                let dictionary_name = arena
-                    .alloc_str(dictionary_name.as_str())
-                    .map_err(|_| arena_full())?;
-                let dictionary = Datum::RegObject {
-                    type_oid: crate::sql::types::oid::REGDICTIONARY,
-                    referenced_oid: *dictionary_oid,
-                    name: dictionary_name,
-                };
-                dictionaries[index] = dictionary;
-                match crate::sql::eval::CatalogAccess::lexize_text_search_dictionary(
-                    &catalog,
-                    *dictionary_oid,
-                    token.text,
-                    arena,
-                )? {
-                    crate::sql::full_text::TextSearchLexeme::Unmapped => {}
-                    crate::sql::full_text::TextSearchLexeme::StopWord => {
-                        selected = dictionary;
-                        lexemes = Datum::Array {
-                            element: crate::sql::types::ArrElem::Text,
-                            raw: crate::sql::array::build(&[], arena)?,
+                    let parsed = crate::sql::full_text::parse_vector(vector.as_str(), arena)?;
+                    for lexeme_index in 0..parsed.lexeme_count() {
+                        let (word, positions) = parsed.lexeme(lexeme_index).expect("vector index");
+                        let occurrences = if positions.is_empty() {
+                            i32::from(selected_weights & 1 != 0)
+                        } else {
+                            positions
+                                .iter()
+                                .filter(|position| selected_weights & (1 << position.weight) != 0)
+                                .count() as i32
                         };
-                        break;
-                    }
-                    crate::sql::full_text::TextSearchLexeme::Lexeme(value) => {
-                        selected = dictionary;
-                        lexemes = Datum::Array {
-                            element: crate::sql::types::ArrElem::Text,
-                            raw: crate::sql::array::build(&[Datum::Text(value)], arena)?,
+                        if occurrences == 0 {
+                            continue;
+                        }
+                        let slot = match statistics
+                            .borrowed_slice()
+                            .iter()
+                            .position(|candidate| candidate.word == word)
+                        {
+                            Some(slot) => slot,
+                            None => {
+                                statistics
+                                    .push(Statistic {
+                                        word: arena.alloc_str(word).map_err(|_| arena_full())?,
+                                        documents: 0,
+                                        entries: 0,
+                                    })
+                                    .map_err(|_| arena_full())?;
+                                statistics.len() - 1
+                            }
                         };
-                        break;
+                        let statistic =
+                            &mut statistics.as_mut_slice().map_err(|_| arena_full())?[slot];
+                        statistic.documents = statistic.documents.saturating_add(1);
+                        statistic.entries = statistic.entries.saturating_add(occurrences);
                     }
-                }
-            }
-            let (alias, description) = crate::sql::full_text::TOKEN_TYPES[token_index];
-            let values = [
-                Datum::Text(alias),
-                Datum::Text(description),
-                Datum::Text(token.text),
-                Datum::Array {
-                    element: crate::sql::types::ArrElem::Regdictionary,
-                    raw: crate::sql::array::build(&dictionaries[..mapping_count], arena)?,
+                    Ok(())
                 },
-                selected,
-                lexemes,
-            ];
-            *row = crate::sql::exec::encode_projected_pub(&values, arena)?;
-        }
-        return Ok(&*rows);
-    }
-    if tref.table.eq_ignore_ascii_case("ts_parse")
-        || tref.table.eq_ignore_ascii_case("ts_token_type")
-    {
-        let expected = if tref.table.eq_ignore_ascii_case("ts_parse") {
-            2
-        } else {
-            1
-        };
-        if args.len() != expected {
-            return Err(sql_err!(
-                sqlstate::UNDEFINED_FUNCTION,
-                "function {}(...) does not exist",
-                tref.table
-            ));
-        }
-        let parser = eval_argument(args[0])?;
-        let parser_slot = match parser {
-            Datum::Null => return Ok(&[]),
-            Datum::Oid(oid) => storage.text_search_slot_by_oid(
-                crate::sql::ast::TextSearchObjectKind::Parser,
-                i32::try_from(oid).map_err(|_| srf_signature_error(tref.table))?,
-                txid,
-            ),
-            Datum::Int4(oid) => storage.text_search_slot_by_oid(
-                crate::sql::ast::TextSearchObjectKind::Parser,
-                oid,
-                txid,
-            ),
-            Datum::Text(name) | Datum::Bpchar(name) => {
-                let (schema, name) = name
-                    .rsplit_once('.')
-                    .map_or((None, name), |(schema, name)| {
-                        (Some(schema.trim_matches('"')), name.trim_matches('"'))
-                    });
-                storage.text_search_slot_on_path(
-                    crate::sql::ast::TextSearchObjectKind::Parser,
-                    schema,
-                    name,
-                    txid,
-                )
-            }
-            _ => return Err(srf_signature_error(tref.table)),
-        }
-        .ok_or_else(|| {
-            sql_err!(
-                sqlstate::UNDEFINED_OBJECT,
-                "text search parser does not exist"
-            )
-        })?;
-        let _definition = storage.text_search_object(parser_slot).definition_for(txid);
-        const EMPTY: &[u8] = &[];
-        if tref.table.eq_ignore_ascii_case("ts_token_type") {
+            )?;
+            statistics
+                .as_mut_slice()
+                .map_err(|_| arena_full())?
+                .sort_unstable_by(|left, right| right.word.cmp(left.word));
+            const EMPTY: &[u8] = &[];
             let rows = arena
-                .alloc_slice_with(crate::sql::full_text::TOKEN_TYPES.len(), |_| EMPTY)
+                .alloc_slice_with(statistics.len(), |_| EMPTY)
                 .map_err(|_| arena_full())?;
-            for (index, row) in rows.iter_mut().enumerate() {
-                let (alias, description) = crate::sql::full_text::TOKEN_TYPES[index];
+            for (statistic, row) in statistics.as_slice().iter().zip(rows.iter_mut()) {
                 *row = crate::sql::exec::encode_projected_pub(
                     &[
-                        Datum::Int4((index + 1) as i32),
-                        Datum::Text(alias),
-                        Datum::Text(description),
+                        Datum::Text(statistic.word),
+                        Datum::Int4(statistic.documents),
+                        Datum::Int4(statistic.entries),
                     ],
                     arena,
                 )?;
             }
             return Ok(&*rows);
         }
-        let document = match eval_argument(args[1])? {
-            Datum::Null => return Ok(&[]),
-            Datum::Text(document) | Datum::Bpchar(document) => document,
-            _ => return Err(srf_signature_error(tref.table)),
-        };
-        let tokens = crate::sql::full_text::parse_document(document, arena)?;
-        let rows = arena
-            .alloc_slice_with(tokens.len(), |_| EMPTY)
-            .map_err(|_| arena_full())?;
-        for (token, row) in tokens.iter().zip(rows.iter_mut()) {
-            *row = crate::sql::exec::encode_projected_pub(
-                &[Datum::Int4(i32::from(token.kind)), Datum::Text(token.text)],
+        if tref.table.eq_ignore_ascii_case("ts_debug") {
+            if !(1..=2).contains(&args.len()) {
+                return Err(sql_err!(
+                    sqlstate::UNDEFINED_FUNCTION,
+                    "function ts_debug(...) does not exist"
+                ));
+            }
+            let catalog = super::storage_catalog(storage, arena, txid);
+            let (configuration, document_index) = if args.len() == 2 {
+                (eval_argument(args[0])?, 1)
+            } else {
+                let setting =
+                    crate::sql::eval::funcs::system::session_setting("default_text_search_config")
+                        .unwrap_or_else(|| StackStr::from_str("pg_catalog.english"));
+                (
+                    Datum::Text(
+                        arena
+                            .alloc_str(setting.as_str())
+                            .map_err(|_| arena_full())?,
+                    ),
+                    0,
+                )
+            };
+            let configuration_oid = match configuration {
+                Datum::Null => return Ok(&[]),
+                Datum::RegObject {
+                    type_oid,
+                    referenced_oid,
+                    ..
+                } if type_oid == crate::sql::types::oid::REGCONFIG => referenced_oid,
+                Datum::Text(name) | Datum::Bpchar(name) => {
+                    let (schema, name) = name
+                        .rsplit_once('.')
+                        .map_or((None, name), |(schema, name)| {
+                            (Some(schema.trim_matches('"')), name.trim_matches('"'))
+                        });
+                    crate::sql::eval::CatalogAccess::resolve_text_search_configuration(
+                        &catalog, schema, name,
+                    )
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::UNDEFINED_OBJECT,
+                            "text search configuration does not exist"
+                        )
+                    })?
+                }
+                _ => return Err(srf_signature_error(tref.table)),
+            };
+            let configuration_slot = storage
+                .text_search_slot_by_oid(
+                    crate::sql::ast::TextSearchObjectKind::Configuration,
+                    configuration_oid,
+                    txid,
+                )
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "text search configuration does not exist"
+                    )
+                })?;
+            let crate::storage::TextSearchDefinition::Configuration { mappings, .. } = storage
+                .text_search_object(configuration_slot)
+                .definition_for(txid)
+            else {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "invalid text-search configuration catalog entry"
+                ));
+            };
+            let document = match eval_argument(args[document_index])? {
+                Datum::Null => return Ok(&[]),
+                Datum::Text(document) | Datum::Bpchar(document) => document,
+                _ => return Err(srf_signature_error(tref.table)),
+            };
+            let tokens = crate::sql::full_text::parse_document(document, arena)?;
+            const EMPTY: &[u8] = &[];
+            let rows = arena
+                .alloc_slice_with(tokens.len(), |_| EMPTY)
+                .map_err(|_| arena_full())?;
+            for (token, row) in tokens.iter().zip(rows.iter_mut()) {
+                let token_index = usize::from(token.kind.saturating_sub(1));
+                let mapping_count = usize::from(mappings.counts[token_index]);
+                let mut dictionaries =
+                    [Datum::Null; crate::storage::TEXT_SEARCH_DICTIONARIES_PER_TOKEN];
+                let mut selected = Datum::Null;
+                let mut lexemes = Datum::Null;
+                for (index, dictionary_oid) in mappings.dictionaries[token_index][..mapping_count]
+                    .iter()
+                    .enumerate()
+                {
+                    let dictionary_name =
+                        crate::sql::eval::CatalogAccess::text_search_dictionary_name(
+                            &catalog,
+                            *dictionary_oid,
+                        )
+                        .ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::INTERNAL_ERROR,
+                                "text-search mapping dictionary is missing"
+                            )
+                        })?;
+                    let dictionary_name = arena
+                        .alloc_str(dictionary_name.as_str())
+                        .map_err(|_| arena_full())?;
+                    let dictionary = Datum::RegObject {
+                        type_oid: crate::sql::types::oid::REGDICTIONARY,
+                        referenced_oid: *dictionary_oid,
+                        name: dictionary_name,
+                    };
+                    dictionaries[index] = dictionary;
+                    match crate::sql::eval::CatalogAccess::lexize_text_search_dictionary(
+                        &catalog,
+                        *dictionary_oid,
+                        token.text,
+                        arena,
+                    )? {
+                        crate::sql::full_text::TextSearchLexeme::Unmapped => {}
+                        crate::sql::full_text::TextSearchLexeme::StopWord => {
+                            selected = dictionary;
+                            lexemes = Datum::Array {
+                                element: crate::sql::types::ArrElem::Text,
+                                raw: crate::sql::array::build(&[], arena)?,
+                            };
+                            break;
+                        }
+                        crate::sql::full_text::TextSearchLexeme::Lexeme(value) => {
+                            selected = dictionary;
+                            lexemes = Datum::Array {
+                                element: crate::sql::types::ArrElem::Text,
+                                raw: crate::sql::array::build(&[Datum::Text(value)], arena)?,
+                            };
+                            break;
+                        }
+                    }
+                }
+                let (alias, description) = crate::sql::full_text::TOKEN_TYPES[token_index];
+                let values = [
+                    Datum::Text(alias),
+                    Datum::Text(description),
+                    Datum::Text(token.text),
+                    Datum::Array {
+                        element: crate::sql::types::ArrElem::Regdictionary,
+                        raw: crate::sql::array::build(&dictionaries[..mapping_count], arena)?,
+                    },
+                    selected,
+                    lexemes,
+                ];
+                *row = crate::sql::exec::encode_projected_pub(&values, arena)?;
+            }
+            return Ok(&*rows);
+        }
+        if tref.table.eq_ignore_ascii_case("ts_parse")
+            || tref.table.eq_ignore_ascii_case("ts_token_type")
+        {
+            let expected = if tref.table.eq_ignore_ascii_case("ts_parse") {
+                2
+            } else {
+                1
+            };
+            if args.len() != expected {
+                return Err(sql_err!(
+                    sqlstate::UNDEFINED_FUNCTION,
+                    "function {}(...) does not exist",
+                    tref.table
+                ));
+            }
+            let parser = eval_argument(args[0])?;
+            let parser_slot = match parser {
+                Datum::Null => return Ok(&[]),
+                Datum::Oid(oid) => storage.text_search_slot_by_oid(
+                    crate::sql::ast::TextSearchObjectKind::Parser,
+                    i32::try_from(oid).map_err(|_| srf_signature_error(tref.table))?,
+                    txid,
+                ),
+                Datum::Int4(oid) => storage.text_search_slot_by_oid(
+                    crate::sql::ast::TextSearchObjectKind::Parser,
+                    oid,
+                    txid,
+                ),
+                Datum::Text(name) | Datum::Bpchar(name) => {
+                    let (schema, name) = name
+                        .rsplit_once('.')
+                        .map_or((None, name), |(schema, name)| {
+                            (Some(schema.trim_matches('"')), name.trim_matches('"'))
+                        });
+                    storage.text_search_slot_on_path(
+                        crate::sql::ast::TextSearchObjectKind::Parser,
+                        schema,
+                        name,
+                        txid,
+                    )
+                }
+                _ => return Err(srf_signature_error(tref.table)),
+            }
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "text search parser does not exist"
+                )
+            })?;
+            let _definition = storage.text_search_object(parser_slot).definition_for(txid);
+            const EMPTY: &[u8] = &[];
+            if tref.table.eq_ignore_ascii_case("ts_token_type") {
+                let rows = arena
+                    .alloc_slice_with(crate::sql::full_text::TOKEN_TYPES.len(), |_| EMPTY)
+                    .map_err(|_| arena_full())?;
+                for (index, row) in rows.iter_mut().enumerate() {
+                    let (alias, description) = crate::sql::full_text::TOKEN_TYPES[index];
+                    *row = crate::sql::exec::encode_projected_pub(
+                        &[
+                            Datum::Int4((index + 1) as i32),
+                            Datum::Text(alias),
+                            Datum::Text(description),
+                        ],
+                        arena,
+                    )?;
+                }
+                return Ok(&*rows);
+            }
+            let document = match eval_argument(args[1])? {
+                Datum::Null => return Ok(&[]),
+                Datum::Text(document) | Datum::Bpchar(document) => document,
+                _ => return Err(srf_signature_error(tref.table)),
+            };
+            let tokens = crate::sql::full_text::parse_document(document, arena)?;
+            let rows = arena
+                .alloc_slice_with(tokens.len(), |_| EMPTY)
+                .map_err(|_| arena_full())?;
+            for (token, row) in tokens.iter().zip(rows.iter_mut()) {
+                *row = crate::sql::exec::encode_projected_pub(
+                    &[Datum::Int4(i32::from(token.kind)), Datum::Text(token.text)],
+                    arena,
+                )?;
+            }
+            return Ok(&*rows);
+        }
+        if tref.table.eq_ignore_ascii_case("pg_get_sequence_data") {
+            if args.len() != 1 {
+                return Err(sql_err!(
+                    sqlstate::UNDEFINED_FUNCTION,
+                    "pg_get_sequence_data(...) argument count"
+                ));
+            }
+            let Some(oid) = crate::sql::eval::sequence_data_oid(eval_argument(args[0])?)? else {
+                return Ok(&[]);
+            };
+            let Some((last_value, is_called)) =
+                crate::sql::catalog::sequence_state_by_oid(storage, oid, txid)
+            else {
+                return Ok(&[]);
+            };
+            let encoded = crate::sql::exec::encode_projected_pub(
+                &[Datum::Int8(last_value), Datum::Bool(is_called)],
                 arena,
             )?;
+            return arena
+                .alloc_slice_copy(&[encoded])
+                .map(|rows| &*rows)
+                .map_err(|_| arena_full());
         }
-        return Ok(&*rows);
-    }
-    if tref.table.eq_ignore_ascii_case("pg_get_sequence_data") {
-        if args.len() != 1 {
-            return Err(sql_err!(
-                sqlstate::UNDEFINED_FUNCTION,
-                "pg_get_sequence_data(...) argument count"
-            ));
+        if tref.table.eq_ignore_ascii_case("aclexplode") {
+            if args.len() != 1 {
+                return Err(srf_signature_error(tref.table));
+            }
+            let catalog = super::storage_catalog(storage, arena, txid);
+            let hooks = EvalHooks {
+                catalog: Some(&catalog),
+                ..eval_hooks.copied().unwrap_or(crate::sql::eval::NO_HOOKS)
+            };
+            let raw = match eval_full(args[0], arena, params, columns, &hooks)? {
+                Datum::Array {
+                    element: crate::sql::types::ArrElem::AclItem,
+                    raw,
+                } => raw,
+                Datum::Null => return Ok(&[]),
+                _ => return Err(srf_signature_error(tref.table)),
+            };
+            let count = crate::sql::acl::explode_count(raw)?;
+            const EMPTY: &[u8] = &[];
+            let rows = arena
+                .alloc_slice_with(count, |_| EMPTY)
+                .map_err(|_| arena_full())?;
+            for (index, slot) in rows.iter_mut().enumerate() {
+                let value = crate::sql::acl::explode_at(raw, index, &catalog, arena)?
+                    .expect("ACL count fixes every expansion index");
+                *slot = crate::sql::exec::encode_projected_pub(
+                    &[
+                        Datum::Oid(value.grantor),
+                        Datum::Oid(value.grantee),
+                        Datum::Text(value.privilege),
+                        Datum::Bool(value.grantable),
+                    ],
+                    arena,
+                )?;
+            }
+            return Ok(&*rows);
         }
-        let Some(oid) = crate::sql::eval::sequence_data_oid(eval_argument(args[0])?)? else {
-            return Ok(&[]);
-        };
-        let Some((last_value, is_called)) =
-            crate::sql::catalog::sequence_state_by_oid(storage, oid, txid)
-        else {
-            return Ok(&[]);
-        };
-        let encoded = crate::sql::exec::encode_projected_pub(
-            &[Datum::Int8(last_value), Datum::Bool(is_called)],
-            arena,
-        )?;
-        return arena
-            .alloc_slice_copy(&[encoded])
-            .map(|rows| &*rows)
-            .map_err(|_| arena_full());
-    }
-    if tref.table.eq_ignore_ascii_case("aclexplode") {
-        if args.len() != 1 {
-            return Err(srf_signature_error(tref.table));
-        }
-        let catalog = super::storage_catalog(storage, arena, txid);
-        let hooks = EvalHooks {
-            catalog: Some(&catalog),
-            ..eval_hooks.copied().unwrap_or(crate::sql::eval::NO_HOOKS)
-        };
-        let raw = match eval_full(args[0], arena, params, columns, &hooks)? {
-            Datum::Array {
-                element: crate::sql::types::ArrElem::AclItem,
+        // pg_options_to_table(text[]): split each `name=value` option into the
+        // two catalog columns used by pg_dump for FDW and per-column options.
+        if tref.table.eq_ignore_ascii_case("pg_options_to_table") {
+            if args.len() != 1 {
+                return Err(sql_err!(
+                    sqlstate::UNDEFINED_FUNCTION,
+                    "pg_options_to_table(...) argument count"
+                ));
+            }
+            let raw = match eval_argument(args[0])? {
+                Datum::Array {
+                    element: crate::sql::types::ArrElem::Text,
+                    raw,
+                } => raw,
+                Datum::Null => return Ok(&[]),
+                _ => return Err(srf_signature_error(tref.table)),
+            };
+            let count = crate::sql::array::len(raw);
+            const EMPTY: &[u8] = &[];
+            let rows = arena
+                .alloc_slice_with(count, |_| EMPTY)
+                .map_err(|_| arena_full())?;
+            for (slot, source) in rows.iter_mut().zip(crate::sql::array::elements(
                 raw,
-            } => raw,
-            Datum::Null => return Ok(&[]),
-            _ => return Err(srf_signature_error(tref.table)),
-        };
-        let count = crate::sql::acl::explode_count(raw)?;
-        const EMPTY: &[u8] = &[];
-        let rows = arena
-            .alloc_slice_with(count, |_| EMPTY)
-            .map_err(|_| arena_full())?;
-        for (index, slot) in rows.iter_mut().enumerate() {
-            let value = crate::sql::acl::explode_at(raw, index, &catalog, arena)?
-                .expect("ACL count fixes every expansion index");
-            *slot = crate::sql::exec::encode_projected_pub(
-                &[
-                    Datum::Oid(value.grantor),
-                    Datum::Oid(value.grantee),
-                    Datum::Text(value.privilege),
-                    Datum::Bool(value.grantable),
-                ],
-                arena,
-            )?;
+                crate::sql::types::ArrElem::Text,
+            )) {
+                let option = match source {
+                    Datum::Text(option) => option,
+                    Datum::Null => {
+                        return Err(sql_err!(
+                            sqlstate::NULL_VALUE_NOT_ALLOWED,
+                            "null value not allowed"
+                        ));
+                    }
+                    _ => return Err(srf_signature_error(tref.table)),
+                };
+                let (name, value) = match option.split_once('=') {
+                    Some((name, value)) => (Datum::Text(name), Datum::Text(value)),
+                    None => (Datum::Text(option), Datum::Null),
+                };
+                *slot = crate::sql::exec::encode_projected_pub(&[name, value], arena)?;
+            }
+            return Ok(&*rows);
         }
-        return Ok(&*rows);
-    }
-    // pg_options_to_table(text[]): split each `name=value` option into the
-    // two catalog columns used by pg_dump for FDW and per-column options.
-    if tref.table.eq_ignore_ascii_case("pg_options_to_table") {
-        if args.len() != 1 {
-            return Err(sql_err!(
-                sqlstate::UNDEFINED_FUNCTION,
-                "pg_options_to_table(...) argument count"
-            ));
-        }
-        let raw = match eval_argument(args[0])? {
-            Datum::Array {
-                element: crate::sql::types::ArrElem::Text,
-                raw,
-            } => raw,
-            Datum::Null => return Ok(&[]),
-            _ => return Err(srf_signature_error(tref.table)),
-        };
-        let count = crate::sql::array::len(raw);
-        const EMPTY: &[u8] = &[];
-        let rows = arena
-            .alloc_slice_with(count, |_| EMPTY)
-            .map_err(|_| arena_full())?;
-        for (slot, source) in rows.iter_mut().zip(crate::sql::array::elements(
-            raw,
-            crate::sql::types::ArrElem::Text,
-        )) {
-            let option = match source {
-                Datum::Text(option) => option,
-                Datum::Null => {
+        // json_each / jsonb_each[_text]: one (key, value) row per object member.
+        if is_json_each_name(tref.table) {
+            let jsonb = tref.table.eq_ignore_ascii_case("jsonb_each")
+                || tref.table.eq_ignore_ascii_case("jsonb_each_text");
+            let as_text = tref.table.eq_ignore_ascii_case("json_each_text")
+                || tref.table.eq_ignore_ascii_case("jsonb_each_text");
+            let document = eval_argument(args[0])?;
+            crate::sql::eval::funcs::json::check_json_family(tref.table, &document)?;
+            let text = match crate::sql::eval::text_view(document) {
+                Datum::Json { text, .. } => text,
+                Datum::Text(s) => s,
+                Datum::Null => return Ok(&[]),
+                _ => {
                     return Err(sql_err!(
-                        sqlstate::NULL_VALUE_NOT_ALLOWED,
-                        "null value not allowed"
+                        sqlstate::INVALID_PARAMETER_VALUE,
+                        "cannot deconstruct a scalar"
                     ));
                 }
-                _ => return Err(srf_signature_error(tref.table)),
             };
-            let (name, value) = match option.split_once('=') {
-                Some((name, value)) => (Datum::Text(name), Datum::Text(value)),
-                None => (Datum::Text(option), Datum::Null),
-            };
-            *slot = crate::sql::exec::encode_projected_pub(&[name, value], arena)?;
+            let pairs = crate::sql::eval::json_each_pairs(text, jsonb, as_text, arena)?;
+            const EMPTY: &[u8] = &[];
+            let rows = arena
+                .alloc_slice_with(pairs.len(), |_| EMPTY)
+                .map_err(|_| arena_full())?;
+            for (slot, (key, value)) in rows.iter_mut().zip(pairs.iter()) {
+                *slot = crate::sql::exec::encode_projected_pub(&[Datum::Text(key), *value], arena)?;
+            }
+            return Ok(&*rows);
         }
-        return Ok(&*rows);
-    }
-    // json_each / jsonb_each[_text]: one (key, value) row per object member.
-    if is_json_each_name(tref.table) {
-        let jsonb = tref.table.eq_ignore_ascii_case("jsonb_each")
-            || tref.table.eq_ignore_ascii_case("jsonb_each_text");
-        let as_text = tref.table.eq_ignore_ascii_case("json_each_text")
-            || tref.table.eq_ignore_ascii_case("jsonb_each_text");
-        let document = eval_argument(args[0])?;
-        crate::sql::eval::funcs::json::check_json_family(tref.table, &document)?;
-        let text = match crate::sql::eval::text_view(document) {
-            Datum::Json { text, .. } => text,
-            Datum::Text(s) => s,
-            Datum::Null => return Ok(&[]),
-            _ => {
+        // string_to_table(string, delimiter [, null_string]): one text row per
+        // piece. A NULL delimiter splits into characters and a piece equal to
+        // null_string is NULL, both as `string_to_array` has it — the split rule
+        // itself is shared, so the two cannot drift apart.
+        if tref.table.eq_ignore_ascii_case("string_to_table") {
+            if !(2..=3).contains(&args.len()) {
                 return Err(sql_err!(
-                    sqlstate::INVALID_PARAMETER_VALUE,
-                    "cannot deconstruct a scalar"
+                    sqlstate::UNDEFINED_FUNCTION,
+                    "function string_to_table(...) with {} arguments does not exist",
+                    args.len()
                 ));
             }
-        };
-        let pairs = crate::sql::eval::json_each_pairs(text, jsonb, as_text, arena)?;
-        const EMPTY: &[u8] = &[];
-        let rows = arena
-            .alloc_slice_with(pairs.len(), |_| EMPTY)
-            .map_err(|_| arena_full())?;
-        for (slot, (key, value)) in rows.iter_mut().zip(pairs.iter()) {
-            *slot = crate::sql::exec::encode_projected_pub(&[Datum::Text(key), *value], arena)?;
-        }
-        return Ok(&*rows);
-    }
-    // string_to_table(string, delimiter [, null_string]): one text row per
-    // piece. A NULL delimiter splits into characters and a piece equal to
-    // null_string is NULL, both as `string_to_array` has it — the split rule
-    // itself is shared, so the two cannot drift apart.
-    if tref.table.eq_ignore_ascii_case("string_to_table") {
-        if !(2..=3).contains(&args.len()) {
-            return Err(sql_err!(
-                sqlstate::UNDEFINED_FUNCTION,
-                "function string_to_table(...) with {} arguments does not exist",
-                args.len()
-            ));
-        }
-        let evaluate = |i: usize| eval_argument(args[i]).map(crate::sql::eval::text_view);
-        let source = match evaluate(0)? {
-            Datum::Text(s) => s,
-            Datum::Null => return Ok(&[]),
-            _ => return Err(srf_signature_error(tref.table)),
-        };
-        let delimiter = match evaluate(1)? {
-            Datum::Text(d) => Some(d),
-            Datum::Null => None,
-            _ => return Err(srf_signature_error(tref.table)),
-        };
-        let null_string = if args.len() == 3 {
-            match evaluate(2)? {
-                Datum::Text(t) => Some(t),
+            let evaluate = |i: usize| eval_argument(args[i]).map(crate::sql::eval::text_view);
+            let source = match evaluate(0)? {
+                Datum::Text(s) => s,
+                Datum::Null => return Ok(&[]),
+                _ => return Err(srf_signature_error(tref.table)),
+            };
+            let delimiter = match evaluate(1)? {
+                Datum::Text(d) => Some(d),
                 Datum::Null => None,
                 _ => return Err(srf_signature_error(tref.table)),
-            }
-        } else {
-            None
-        };
-        let n = crate::sql::eval::count_split_pieces(source, delimiter)?;
-        const EMPTY: &[u8] = &[];
-        let rows = arena
-            .alloc_slice_with(n, |_| EMPTY)
-            .map_err(|_| arena_full())?;
-        crate::sql::eval::for_each_split_piece(source, delimiter, |piece, index| {
-            let value = if null_string == Some(piece) {
-                Datum::Null
-            } else {
-                Datum::Text(piece)
             };
-            rows[index] = crate::sql::exec::encode_projected_pub(&[value], arena)?;
-            Ok(())
-        })?;
-        return Ok(&*rows);
-    }
-    // regexp_split_to_table(string, pattern [, flags]): one text row per piece.
-    if regex_name == Some("regexp_split_to_table") {
-        if !(2..=3).contains(&args.len()) {
-            return Err(sql_err!(
-                sqlstate::UNDEFINED_FUNCTION,
-                "regexp_split_to_table(...) argument count"
-            ));
-        }
-        let (src, pat) = match (
-            crate::sql::eval::text_view(eval_argument(args[0])?),
-            crate::sql::eval::text_view(eval_argument(args[1])?),
-        ) {
-            (Datum::Text(s), Datum::Text(p)) => (s, p),
-            (Datum::Null, _) | (_, Datum::Null) => return Ok(&[]),
-            _ => return Err(srf_signature_error(tref.table)),
-        };
-        let parsed = if args.len() == 3 {
-            match crate::sql::eval::text_view(eval_argument(args[2])?) {
-                Datum::Text(f) => crate::sql::eval::regexp_options(f)?,
-                Datum::Null => return Ok(&[]),
-                _ => return Err(srf_signature_error(tref.table)),
-            }
-        } else {
-            crate::sql::eval::regexp_options("")?
-        };
-        if parsed.global {
-            return Err(sql_err!(
-                sqlstate::INVALID_PARAMETER_VALUE,
-                "regexp_split_to_table() does not support the \"global\" option"
-            ));
-        }
-        let n = crate::sql::eval::regex_split_count_pub(src, pat, parsed.options)?;
-        const EMPTY: &[u8] = &[];
-        let rows = arena
-            .alloc_slice_with(n, |_| EMPTY)
-            .map_err(|_| arena_full())?;
-        crate::sql::eval::for_each_regex_split(src, pat, parsed.options, |piece, index| {
-            rows[index] = crate::sql::exec::encode_projected_pub(&[Datum::Text(piece)], arena)?;
-            Ok(())
-        })?;
-        return Ok(&*rows);
-    }
-    // generate_subscripts(array, dim [, reverse]): declared indices along one
-    // dimension, including non-default lower bounds.
-    if tref.table.eq_ignore_ascii_case("generate_subscripts") {
-        if !(2..=3).contains(&args.len()) {
-            return Err(sql_err!(
-                sqlstate::UNDEFINED_FUNCTION,
-                "generate_subscripts(...) argument count"
-            ));
-        }
-        let input = match crate::sql::eval::text_view(eval_argument(args[0])?) {
-            Datum::Null => return Ok(&[]),
-            value => crate::sql::array::Input::from_datum(value)
-                .ok_or_else(|| srf_signature_error(tref.table))?,
-        };
-        let dim = match crate::sql::eval::text_view(eval_argument(args[1])?) {
-            Datum::Int4(v) => v as i64,
-            Datum::Int8(v) => v,
-            Datum::Null => return Ok(&[]),
-            _ => return Err(srf_signature_error(tref.table)),
-        };
-        let reverse = if args.len() == 3 {
-            match eval_argument(args[2])? {
-                Datum::Bool(reverse) => reverse,
-                Datum::Null => return Ok(&[]),
-                _ => return Err(srf_signature_error(tref.table)),
-            }
-        } else {
-            false
-        };
-        let dimension = usize::try_from(dim).ok().and_then(|dim| dim.checked_sub(1));
-        let Some((count, lower, upper)) = (match dimension {
-            Some(dimension) => input.bounds(dimension)?,
-            None => None,
-        }) else {
-            return Ok(&[]);
-        };
-        const EMPTY: &[u8] = &[];
-        let rows = arena
-            .alloc_slice_with(count, |_| EMPTY)
-            .map_err(|_| arena_full())?;
-        for (i, slot) in rows.iter_mut().enumerate() {
-            let offset = i32::try_from(i).expect("array dimension fits i32");
-            let subscript = if reverse {
-                upper - offset
-            } else {
-                lower + offset
-            };
-            *slot = crate::sql::exec::encode_projected_pub(&[Datum::Int4(subscript)], arena)?;
-        }
-        return Ok(&*rows);
-    }
-    // regexp_matches(string, pattern [, flags]): one row per match, each a
-    // text[] of the capture groups (or the whole match when there are no groups).
-    if regex_name == Some("regexp_matches") {
-        if !(2..=3).contains(&args.len()) {
-            return Err(sql_err!(
-                sqlstate::UNDEFINED_FUNCTION,
-                "regexp_matches(...) argument count"
-            ));
-        }
-        let string = crate::sql::eval::text_view(eval_argument(args[0])?);
-        let pattern = crate::sql::eval::text_view(eval_argument(args[1])?);
-        let (string, pattern) = match (string, pattern) {
-            (Datum::Text(string), Datum::Text(pattern)) => (string, pattern),
-            (Datum::Null, _) | (_, Datum::Null) => return Ok(&[]),
-            _ => return Err(srf_signature_error(tref.table)),
-        };
-        let flags = if args.len() == 3 {
-            match crate::sql::eval::text_view(eval_argument(args[2])?) {
-                Datum::Text(f) => f,
-                Datum::Null => return Ok(&[]),
-                _ => return Err(srf_signature_error(tref.table)),
-            }
-        } else {
-            ""
-        };
-        let parsed = crate::sql::eval::regexp_options(flags)?;
-        // Collect each match's encoded text[] row.
-        let mut rows: ArenaList<'a, &'a [u8]> = ArenaList::new(arena);
-        let mut spans = [(-1i64, -1i64); crate::sql::regex::MAX_GROUPS];
-        let mut from = 0usize;
-        while let Some(((mstart, mend), ng)) = crate::sql::regex::find_captures_with_options(
-            pattern,
-            string,
-            from,
-            parsed.options,
-            &mut spans,
-        )? {
-            let mut elems = [Datum::Null; crate::sql::regex::MAX_GROUPS];
-            let count = if ng == 0 {
-                elems[0] = Datum::Text(&string[mstart..mend]);
-                1
-            } else {
-                for (i, span) in spans[..ng].iter().enumerate() {
-                    elems[i] = if span.0 < 0 {
-                        Datum::Null
-                    } else {
-                        Datum::Text(&string[span.0 as usize..span.1 as usize])
-                    };
+            let null_string = if args.len() == 3 {
+                match evaluate(2)? {
+                    Datum::Text(t) => Some(t),
+                    Datum::Null => None,
+                    _ => return Err(srf_signature_error(tref.table)),
                 }
-                ng
+            } else {
+                None
             };
-            let arr = Datum::Array {
-                element: crate::sql::types::ArrElem::Text,
-                raw: crate::sql::array::build(&elems[..count], arena)?,
-            };
-            rows.push(crate::sql::exec::encode_projected_pub(&[arr], arena)?)
+            let n = crate::sql::eval::count_split_pieces(source, delimiter)?;
+            const EMPTY: &[u8] = &[];
+            let rows = arena
+                .alloc_slice_with(n, |_| EMPTY)
                 .map_err(|_| arena_full())?;
-            if !parsed.global {
-                break;
-            }
-            let Some(next) = crate::sql::regex::next_match_from(string, mstart, mend) else {
-                break;
-            };
-            from = next;
+            crate::sql::eval::for_each_split_piece(source, delimiter, |piece, index| {
+                let value = if null_string == Some(piece) {
+                    Datum::Null
+                } else {
+                    Datum::Text(piece)
+                };
+                rows[index] = crate::sql::exec::encode_projected_pub(&[value], arena)?;
+                Ok(())
+            })?;
+            return Ok(&*rows);
         }
-        return Ok(rows.as_slice());
-    }
-    // jsonb_object_keys(obj) / json_object_keys(obj): one text row per key.
-    if tref.table.eq_ignore_ascii_case("jsonb_object_keys")
-        || tref.table.eq_ignore_ascii_case("json_object_keys")
-    {
-        let jsonb = tref.table.eq_ignore_ascii_case("jsonb_object_keys");
-        let document = eval_argument(args[0])?;
-        crate::sql::eval::funcs::json::check_json_family(tref.table, &document)?;
-        let text = match crate::sql::eval::text_view(document) {
-            Datum::Json { text, .. } => text,
-            Datum::Text(s) => s,
-            Datum::Null => return Ok(&[]),
-            _ => {
-                return Err(crate::sql::json::object_keys_error(
-                    tref.table,
-                    crate::sql::json::Kind::Scalar,
+        // regexp_split_to_table(string, pattern [, flags]): one text row per piece.
+        if regex_name == Some("regexp_split_to_table") {
+            if !(2..=3).contains(&args.len()) {
+                return Err(sql_err!(
+                    sqlstate::UNDEFINED_FUNCTION,
+                    "regexp_split_to_table(...) argument count"
                 ));
             }
-        };
-        let kind = crate::sql::json::kind_of(text);
-        if kind != crate::sql::json::Kind::Object {
-            return Err(crate::sql::json::object_keys_error(tref.table, kind));
-        }
-        const EMPTY: &[u8] = &[];
-        // jsonb: normalized/sorted keys; json: source order with duplicates.
-        if jsonb {
-            let crate::sql::json::Json::Object(members) = crate::sql::json::parse(text, arena)?
-            else {
-                return Err(crate::sql::json::object_keys_error(tref.table, kind));
+            let (src, pat) = match (
+                crate::sql::eval::text_view(eval_argument(args[0])?),
+                crate::sql::eval::text_view(eval_argument(args[1])?),
+            ) {
+                (Datum::Text(s), Datum::Text(p)) => (s, p),
+                (Datum::Null, _) | (_, Datum::Null) => return Ok(&[]),
+                _ => return Err(srf_signature_error(tref.table)),
             };
+            let parsed = if args.len() == 3 {
+                match crate::sql::eval::text_view(eval_argument(args[2])?) {
+                    Datum::Text(f) => crate::sql::eval::regexp_options(f)?,
+                    Datum::Null => return Ok(&[]),
+                    _ => return Err(srf_signature_error(tref.table)),
+                }
+            } else {
+                crate::sql::eval::regexp_options("")?
+            };
+            if parsed.global {
+                return Err(sql_err!(
+                    sqlstate::INVALID_PARAMETER_VALUE,
+                    "regexp_split_to_table() does not support the \"global\" option"
+                ));
+            }
+            let n = crate::sql::eval::regex_split_count_pub(src, pat, parsed.options)?;
+            const EMPTY: &[u8] = &[];
+            let rows = arena
+                .alloc_slice_with(n, |_| EMPTY)
+                .map_err(|_| arena_full())?;
+            crate::sql::eval::for_each_regex_split(src, pat, parsed.options, |piece, index| {
+                rows[index] = crate::sql::exec::encode_projected_pub(&[Datum::Text(piece)], arena)?;
+                Ok(())
+            })?;
+            return Ok(&*rows);
+        }
+        // generate_subscripts(array, dim [, reverse]): declared indices along one
+        // dimension, including non-default lower bounds.
+        if tref.table.eq_ignore_ascii_case("generate_subscripts") {
+            if !(2..=3).contains(&args.len()) {
+                return Err(sql_err!(
+                    sqlstate::UNDEFINED_FUNCTION,
+                    "generate_subscripts(...) argument count"
+                ));
+            }
+            let input = match crate::sql::eval::text_view(eval_argument(args[0])?) {
+                Datum::Null => return Ok(&[]),
+                value => crate::sql::array::Input::from_datum(value)
+                    .ok_or_else(|| srf_signature_error(tref.table))?,
+            };
+            let dim = match crate::sql::eval::text_view(eval_argument(args[1])?) {
+                Datum::Int4(v) => v as i64,
+                Datum::Int8(v) => v,
+                Datum::Null => return Ok(&[]),
+                _ => return Err(srf_signature_error(tref.table)),
+            };
+            let reverse = if args.len() == 3 {
+                match eval_argument(args[2])? {
+                    Datum::Bool(reverse) => reverse,
+                    Datum::Null => return Ok(&[]),
+                    _ => return Err(srf_signature_error(tref.table)),
+                }
+            } else {
+                false
+            };
+            let dimension = usize::try_from(dim).ok().and_then(|dim| dim.checked_sub(1));
+            let Some((count, lower, upper)) = (match dimension {
+                Some(dimension) => input.bounds(dimension)?,
+                None => None,
+            }) else {
+                return Ok(&[]);
+            };
+            const EMPTY: &[u8] = &[];
+            let rows = arena
+                .alloc_slice_with(count, |_| EMPTY)
+                .map_err(|_| arena_full())?;
+            for (i, slot) in rows.iter_mut().enumerate() {
+                let offset = i32::try_from(i).expect("array dimension fits i32");
+                let subscript = if reverse {
+                    upper - offset
+                } else {
+                    lower + offset
+                };
+                *slot = crate::sql::exec::encode_projected_pub(&[Datum::Int4(subscript)], arena)?;
+            }
+            return Ok(&*rows);
+        }
+        // regexp_matches(string, pattern [, flags]): one row per match, each a
+        // text[] of the capture groups (or the whole match when there are no groups).
+        if regex_name == Some("regexp_matches") {
+            if !(2..=3).contains(&args.len()) {
+                return Err(sql_err!(
+                    sqlstate::UNDEFINED_FUNCTION,
+                    "regexp_matches(...) argument count"
+                ));
+            }
+            let string = crate::sql::eval::text_view(eval_argument(args[0])?);
+            let pattern = crate::sql::eval::text_view(eval_argument(args[1])?);
+            let (string, pattern) = match (string, pattern) {
+                (Datum::Text(string), Datum::Text(pattern)) => (string, pattern),
+                (Datum::Null, _) | (_, Datum::Null) => return Ok(&[]),
+                _ => return Err(srf_signature_error(tref.table)),
+            };
+            let flags = if args.len() == 3 {
+                match crate::sql::eval::text_view(eval_argument(args[2])?) {
+                    Datum::Text(f) => f,
+                    Datum::Null => return Ok(&[]),
+                    _ => return Err(srf_signature_error(tref.table)),
+                }
+            } else {
+                ""
+            };
+            let parsed = crate::sql::eval::regexp_options(flags)?;
+            // Collect each match's encoded text[] row.
+            let mut rows: ArenaList<'a, &'a [u8]> = ArenaList::new(arena);
+            let mut spans = [(-1i64, -1i64); crate::sql::regex::MAX_GROUPS];
+            let mut from = 0usize;
+            while let Some(((mstart, mend), ng)) = crate::sql::regex::find_captures_with_options(
+                pattern,
+                string,
+                from,
+                parsed.options,
+                &mut spans,
+            )? {
+                let mut elems = [Datum::Null; crate::sql::regex::MAX_GROUPS];
+                let count = if ng == 0 {
+                    elems[0] = Datum::Text(&string[mstart..mend]);
+                    1
+                } else {
+                    for (i, span) in spans[..ng].iter().enumerate() {
+                        elems[i] = if span.0 < 0 {
+                            Datum::Null
+                        } else {
+                            Datum::Text(&string[span.0 as usize..span.1 as usize])
+                        };
+                    }
+                    ng
+                };
+                let arr = Datum::Array {
+                    element: crate::sql::types::ArrElem::Text,
+                    raw: crate::sql::array::build(&elems[..count], arena)?,
+                };
+                rows.push(crate::sql::exec::encode_projected_pub(&[arr], arena)?)
+                    .map_err(|_| arena_full())?;
+                if !parsed.global {
+                    break;
+                }
+                let Some(next) = crate::sql::regex::next_match_from(string, mstart, mend) else {
+                    break;
+                };
+                from = next;
+            }
+            return Ok(rows.as_slice());
+        }
+        // jsonb_object_keys(obj) / json_object_keys(obj): one text row per key.
+        if tref.table.eq_ignore_ascii_case("jsonb_object_keys")
+            || tref.table.eq_ignore_ascii_case("json_object_keys")
+        {
+            let jsonb = tref.table.eq_ignore_ascii_case("jsonb_object_keys");
+            let document = eval_argument(args[0])?;
+            crate::sql::eval::funcs::json::check_json_family(tref.table, &document)?;
+            let text = match crate::sql::eval::text_view(document) {
+                Datum::Json { text, .. } => text,
+                Datum::Text(s) => s,
+                Datum::Null => return Ok(&[]),
+                _ => {
+                    return Err(crate::sql::json::object_keys_error(
+                        tref.table,
+                        crate::sql::json::Kind::Scalar,
+                    ));
+                }
+            };
+            let kind = crate::sql::json::kind_of(text);
+            if kind != crate::sql::json::Kind::Object {
+                return Err(crate::sql::json::object_keys_error(tref.table, kind));
+            }
+            const EMPTY: &[u8] = &[];
+            // jsonb: normalized/sorted keys; json: source order with duplicates.
+            if jsonb {
+                let crate::sql::json::Json::Object(members) = crate::sql::json::parse(text, arena)?
+                else {
+                    return Err(crate::sql::json::object_keys_error(tref.table, kind));
+                };
+                let rows = arena
+                    .alloc_slice_with(members.len(), |_| EMPTY)
+                    .map_err(|_| arena_full())?;
+                for (slot, (key, _)) in rows.iter_mut().zip(members.iter()) {
+                    *slot = crate::sql::exec::encode_projected_pub(&[Datum::Text(key)], arena)?;
+                }
+                return Ok(&*rows);
+            }
+            let members = crate::sql::json::object_members_source(text, arena)?;
             let rows = arena
                 .alloc_slice_with(members.len(), |_| EMPTY)
                 .map_err(|_| arena_full())?;
@@ -4864,107 +5020,121 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
             }
             return Ok(&*rows);
         }
-        let members = crate::sql::json::object_members_source(text, arena)?;
-        let rows = arena
-            .alloc_slice_with(members.len(), |_| EMPTY)
-            .map_err(|_| arena_full())?;
-        for (slot, (key, _)) in rows.iter_mut().zip(members.iter()) {
-            *slot = crate::sql::exec::encode_projected_pub(&[Datum::Text(key)], arena)?;
-        }
-        return Ok(&*rows);
-    }
-    if tref.table.eq_ignore_ascii_case("jsonb_path_query")
-        || tref.table.eq_ignore_ascii_case("jsonb_path_query_tz")
-    {
-        if !(2..=4).contains(&args.len()) {
-            return Err(srf_signature_error(tref.table));
-        }
-        let target = eval_argument(args[0])?;
-        let path = eval_argument(args[1])?;
-        let variables = if args.len() >= 3 {
-            Some(eval_argument(args[2])?)
-        } else {
-            None
-        };
-        let silent = if args.len() == 4 {
-            Some(eval_argument(args[3])?)
-        } else {
-            None
-        };
-        let Some(values) = crate::sql::eval::funcs::json::path_query_values(
-            target,
-            path,
-            variables,
-            silent,
-            tref.table.ends_with("_tz"),
-            arena,
-        )?
-        else {
-            return Ok(&[]);
-        };
-        const EMPTY: &[u8] = &[];
-        let rows = arena
-            .alloc_slice_with(values.len(), |_| EMPTY)
-            .map_err(|_| arena_full())?;
-        for (slot, value) in rows.iter_mut().zip(values) {
-            let datum = Datum::Json {
-                text: crate::sql::eval::json_to_text_pub(value, arena)?,
-                jsonb: true,
-            };
-            *slot = crate::sql::exec::encode_projected_pub(&[datum], arena)?;
-        }
-        return Ok(&*rows);
-    }
-    // jsonb_array_elements / json_array_elements[_text]: one row per element.
-    if tref.table.eq_ignore_ascii_case("jsonb_array_elements")
-        || tref.table.eq_ignore_ascii_case("json_array_elements")
-        || tref.table.eq_ignore_ascii_case("jsonb_array_elements_text")
-        || tref.table.eq_ignore_ascii_case("json_array_elements_text")
-    {
-        let jsonb = tref.table.eq_ignore_ascii_case("jsonb_array_elements")
-            || tref.table.eq_ignore_ascii_case("jsonb_array_elements_text");
-        let as_text = tref.table.eq_ignore_ascii_case("jsonb_array_elements_text")
-            || tref.table.eq_ignore_ascii_case("json_array_elements_text");
-        let document = eval_argument(args[0])?;
-        crate::sql::eval::funcs::json::check_json_family(tref.table, &document)?;
-        let text = match crate::sql::eval::text_view(document) {
-            Datum::Json { text, .. } => text,
-            Datum::Text(s) => s,
-            Datum::Null => return Ok(&[]),
-            _ => {
-                return Err(crate::sql::json::array_elements_error(
-                    tref.table,
-                    jsonb,
-                    crate::sql::json::Kind::Scalar,
-                ));
+        if tref.table.eq_ignore_ascii_case("jsonb_path_query")
+            || tref.table.eq_ignore_ascii_case("jsonb_path_query_tz")
+        {
+            if !(2..=4).contains(&args.len()) {
+                return Err(srf_signature_error(tref.table));
             }
-        };
-        let kind = crate::sql::json::kind_of(text);
-        if kind != crate::sql::json::Kind::Array {
-            return Err(crate::sql::json::array_elements_error(
-                tref.table, jsonb, kind,
-            ));
+            let target = eval_argument(args[0])?;
+            let path = eval_argument(args[1])?;
+            let variables = if args.len() >= 3 {
+                Some(eval_argument(args[2])?)
+            } else {
+                None
+            };
+            let silent = if args.len() == 4 {
+                Some(eval_argument(args[3])?)
+            } else {
+                None
+            };
+            let Some(values) = crate::sql::eval::funcs::json::path_query_values(
+                target,
+                path,
+                variables,
+                silent,
+                tref.table.ends_with("_tz"),
+                arena,
+            )?
+            else {
+                return Ok(&[]);
+            };
+            const EMPTY: &[u8] = &[];
+            let rows = arena
+                .alloc_slice_with(values.len(), |_| EMPTY)
+                .map_err(|_| arena_full())?;
+            for (slot, value) in rows.iter_mut().zip(values) {
+                let datum = Datum::Json {
+                    text: crate::sql::eval::json_to_text_pub(value, arena)?,
+                    jsonb: true,
+                };
+                *slot = crate::sql::exec::encode_projected_pub(&[datum], arena)?;
+            }
+            return Ok(&*rows);
         }
-        const EMPTY: &[u8] = &[];
-        if jsonb {
-            let crate::sql::json::Json::Array(items) = crate::sql::json::parse(text, arena)? else {
+        // jsonb_array_elements / json_array_elements[_text]: one row per element.
+        if tref.table.eq_ignore_ascii_case("jsonb_array_elements")
+            || tref.table.eq_ignore_ascii_case("json_array_elements")
+            || tref.table.eq_ignore_ascii_case("jsonb_array_elements_text")
+            || tref.table.eq_ignore_ascii_case("json_array_elements_text")
+        {
+            let jsonb = tref.table.eq_ignore_ascii_case("jsonb_array_elements")
+                || tref.table.eq_ignore_ascii_case("jsonb_array_elements_text");
+            let as_text = tref.table.eq_ignore_ascii_case("jsonb_array_elements_text")
+                || tref.table.eq_ignore_ascii_case("json_array_elements_text");
+            let document = eval_argument(args[0])?;
+            crate::sql::eval::funcs::json::check_json_family(tref.table, &document)?;
+            let text = match crate::sql::eval::text_view(document) {
+                Datum::Json { text, .. } => text,
+                Datum::Text(s) => s,
+                Datum::Null => return Ok(&[]),
+                _ => {
+                    return Err(crate::sql::json::array_elements_error(
+                        tref.table,
+                        jsonb,
+                        crate::sql::json::Kind::Scalar,
+                    ));
+                }
+            };
+            let kind = crate::sql::json::kind_of(text);
+            if kind != crate::sql::json::Kind::Array {
                 return Err(crate::sql::json::array_elements_error(
                     tref.table, jsonb, kind,
                 ));
-            };
+            }
+            const EMPTY: &[u8] = &[];
+            if jsonb {
+                let crate::sql::json::Json::Array(items) = crate::sql::json::parse(text, arena)?
+                else {
+                    return Err(crate::sql::json::array_elements_error(
+                        tref.table, jsonb, kind,
+                    ));
+                };
+                let rows = arena
+                    .alloc_slice_with(items.len(), |_| EMPTY)
+                    .map_err(|_| arena_full())?;
+                for (slot, element) in rows.iter_mut().zip(items.iter()) {
+                    let datum = if as_text {
+                        match *element {
+                            crate::sql::json::Json::Str(s) => Datum::Text(s),
+                            crate::sql::json::Json::Null => Datum::Null,
+                            _ => Datum::Text(crate::sql::eval::json_to_text_pub(element, arena)?),
+                        }
+                    } else {
+                        Datum::Json {
+                            text: crate::sql::eval::json_to_text_pub(element, arena)?,
+                            jsonb,
+                        }
+                    };
+                    *slot = crate::sql::exec::encode_projected_pub(&[datum], arena)?;
+                }
+                return Ok(&*rows);
+            }
+            // json: each element's verbatim source text.
+            let items = crate::sql::json::array_elements_source(text, arena)?;
             let rows = arena
                 .alloc_slice_with(items.len(), |_| EMPTY)
                 .map_err(|_| arena_full())?;
             for (slot, element) in rows.iter_mut().zip(items.iter()) {
                 let datum = if as_text {
-                    match *element {
+                    match crate::sql::json::parse(element, arena)? {
                         crate::sql::json::Json::Str(s) => Datum::Text(s),
                         crate::sql::json::Json::Null => Datum::Null,
-                        _ => Datum::Text(crate::sql::eval::json_to_text_pub(element, arena)?),
+                        _ => Datum::Text(element),
                     }
                 } else {
                     Datum::Json {
-                        text: crate::sql::eval::json_to_text_pub(element, arena)?,
+                        text: element,
                         jsonb,
                     }
                 };
@@ -4972,296 +5142,299 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
             }
             return Ok(&*rows);
         }
-        // json: each element's verbatim source text.
-        let items = crate::sql::json::array_elements_source(text, arena)?;
-        let rows = arena
-            .alloc_slice_with(items.len(), |_| EMPTY)
-            .map_err(|_| arena_full())?;
-        for (slot, element) in rows.iter_mut().zip(items.iter()) {
-            let datum = if as_text {
-                match crate::sql::json::parse(element, arena)? {
-                    crate::sql::json::Json::Str(s) => Datum::Text(s),
-                    crate::sql::json::Json::Null => Datum::Null,
-                    _ => Datum::Text(element),
+        // PostgreSQL's FROM-only multi-argument UNNEST advances all arrays in
+        // lockstep and NULL-pads the shorter inputs. A NULL array is empty; it
+        // does not suppress rows produced by another argument.
+        if tref.table.eq_ignore_ascii_case("unnest") {
+            if args.is_empty() {
+                return Err(sql_err!(
+                    sqlstate::UNDEFINED_FUNCTION,
+                    "function unnest() does not exist"
+                ));
+            }
+            if args.len() > MAX_COLUMNS {
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "UNNEST output exceeds configured column capacity"
+                ));
+            }
+            let mut arrays = [Datum::Null; MAX_COLUMNS];
+            for (slot, argument) in arrays.iter_mut().zip(args) {
+                *slot = crate::sql::eval::text_view(eval_argument(argument)?);
+            }
+            if args.len() == 1
+                && let Datum::TsVector(vector) = arrays[0]
+            {
+                let parsed = crate::sql::full_text::parse_vector(vector.as_str(), arena)?;
+                const EMPTY: &[u8] = &[];
+                let rows = arena
+                    .alloc_slice_with(parsed.lexeme_count(), |_| EMPTY)
+                    .map_err(|_| arena_full())?;
+                for (index, row) in rows.iter_mut().enumerate() {
+                    let values = tsvector_unnest_values(&parsed, index, arena)?;
+                    *row = crate::sql::exec::encode_projected_pub(&values, arena)?;
                 }
-            } else {
-                Datum::Json {
-                    text: element,
-                    jsonb,
+                return Ok(&*rows);
+            }
+            let mut count = 0usize;
+            for value in &arrays[..args.len()] {
+                match *value {
+                    Datum::Array { raw, .. } => count = count.max(crate::sql::array::len(raw)),
+                    value @ (Datum::Int2Vector { .. } | Datum::OidVector { .. }) => {
+                        count = count.max(
+                            crate::sql::array::Input::from_datum(value)
+                                .expect("catalog vector")
+                                .element_count(),
+                        );
+                    }
+                    Datum::Multirange { text, .. } => {
+                        count = count.max(crate::sql::range::component_count(text)?);
+                    }
+                    Datum::Null => {}
+                    _ => {
+                        return Err(sql_err!(
+                            sqlstate::UNDEFINED_FUNCTION,
+                            "unnest requires an array or multirange argument"
+                        ));
+                    }
                 }
-            };
-            *slot = crate::sql::exec::encode_projected_pub(&[datum], arena)?;
-        }
-        return Ok(&*rows);
-    }
-    // PostgreSQL's FROM-only multi-argument UNNEST advances all arrays in
-    // lockstep and NULL-pads the shorter inputs. A NULL array is empty; it
-    // does not suppress rows produced by another argument.
-    if tref.table.eq_ignore_ascii_case("unnest") {
-        if args.is_empty() {
-            return Err(sql_err!(
-                sqlstate::UNDEFINED_FUNCTION,
-                "function unnest() does not exist"
-            ));
-        }
-        if args.len() > MAX_COLUMNS {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "UNNEST output exceeds configured column capacity"
-            ));
-        }
-        let mut arrays = [Datum::Null; MAX_COLUMNS];
-        for (slot, argument) in arrays.iter_mut().zip(args) {
-            *slot = crate::sql::eval::text_view(eval_argument(argument)?);
-        }
-        if args.len() == 1
-            && let Datum::TsVector(vector) = arrays[0]
-        {
-            let parsed = crate::sql::full_text::parse_vector(vector.as_str(), arena)?;
+            }
             const EMPTY: &[u8] = &[];
             let rows = arena
-                .alloc_slice_with(parsed.lexeme_count(), |_| EMPTY)
+                .alloc_slice_with(count, |_| EMPTY)
                 .map_err(|_| arena_full())?;
-            for (index, row) in rows.iter_mut().enumerate() {
-                let values = tsvector_unnest_values(&parsed, index, arena)?;
-                *row = crate::sql::exec::encode_projected_pub(&values, arena)?;
+            let mut element_iters: [Option<crate::sql::array::Elements<'_>>; MAX_COLUMNS] =
+                std::array::from_fn(|_| None);
+            for (column, value) in arrays[..args.len()].iter().enumerate() {
+                if let Datum::Array { element, raw } = *value {
+                    element_iters[column] = Some(crate::sql::array::elements(raw, element));
+                }
+            }
+            for (row_index, row) in rows.iter_mut().enumerate() {
+                let mut values = [Datum::Null; MAX_COLUMNS];
+                for (column, array) in arrays[..args.len()].iter().enumerate() {
+                    values[column] = match *array {
+                        Datum::Array { .. } => element_iters[column]
+                            .as_mut()
+                            .and_then(Iterator::next)
+                            .unwrap_or(Datum::Null),
+                        value @ (Datum::Int2Vector { .. } | Datum::OidVector { .. }) => {
+                            crate::sql::array::Input::from_datum(value)
+                                .expect("catalog vector")
+                                .get(row_index)
+                                .unwrap_or(Datum::Null)
+                        }
+                        Datum::Multirange { text, kind } => {
+                            if let Some(component) =
+                                crate::sql::range::component_at(text, row_index)?
+                            {
+                                Datum::Range {
+                                    text: component,
+                                    kind,
+                                }
+                            } else {
+                                Datum::Null
+                            }
+                        }
+                        Datum::Null => Datum::Null,
+                        _ => {
+                            return Err(sql_err!(
+                                sqlstate::INTERNAL_ERROR,
+                                "validated UNNEST input changed type"
+                            ));
+                        }
+                    };
+                }
+                *row = crate::sql::exec::encode_projected_pub(&values[..args.len()], arena)?;
             }
             return Ok(&*rows);
         }
-        let mut count = 0usize;
-        for value in &arrays[..args.len()] {
-            match *value {
-                Datum::Array { raw, .. } => count = count.max(crate::sql::array::len(raw)),
-                value @ (Datum::Int2Vector { .. } | Datum::OidVector { .. }) => {
-                    count = count.max(
-                        crate::sql::array::Input::from_datum(value)
-                            .expect("catalog vector")
-                            .element_count(),
-                    );
-                }
-                Datum::Multirange { text, .. } => {
-                    count = count.max(crate::sql::range::component_count(text)?);
-                }
-                Datum::Null => {}
-                _ => {
-                    return Err(sql_err!(
-                        sqlstate::UNDEFINED_FUNCTION,
-                        "unnest requires an array or multirange argument"
-                    ));
-                }
+        if !tref.table.eq_ignore_ascii_case("generate_series") {
+            let Some((routine_slot, routine)) =
+                table_func_routine(tref, storage, txid, arena, params, columns, eval_hooks)?
+            else {
+                return Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "table function \"{}\" is not supported",
+                    tref.table
+                ));
+            };
+            let catalog = super::storage_catalog(storage, arena, txid);
+            let hooks = crate::sql::eval::EvalHooks {
+                catalog: Some(&catalog),
+                ..eval_hooks.copied().unwrap_or(crate::sql::eval::NO_HOOKS)
+            };
+            let mapping = routine
+                .call_input_mapping(tref.func_argument_names, args.len(), tref.func_variadic)
+                .expect("resolved table routine call has a valid argument mapping");
+            let mut argument_type_oids =
+                [crate::sql::types::oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
+            for (output, argument) in argument_type_oids.iter_mut().zip(args) {
+                *output = crate::sql::eval::expression_type_identity(argument, columns, &hooks)?
+                    .routine_argument_oid();
             }
-        }
-        const EMPTY: &[u8] = &[];
-        let rows = arena
-            .alloc_slice_with(count, |_| EMPTY)
-            .map_err(|_| arena_full())?;
-        let mut element_iters: [Option<crate::sql::array::Elements<'_>>; MAX_COLUMNS] =
-            std::array::from_fn(|_| None);
-        for (column, value) in arrays[..args.len()].iter().enumerate() {
-            if let Datum::Array { element, raw } = *value {
-                element_iters[column] = Some(crate::sql::array::elements(raw, element));
-            }
-        }
-        for (row_index, row) in rows.iter_mut().enumerate() {
-            let mut values = [Datum::Null; MAX_COLUMNS];
-            for (column, array) in arrays[..args.len()].iter().enumerate() {
-                values[column] = match *array {
-                    Datum::Array { .. } => element_iters[column]
-                        .as_mut()
-                        .and_then(Iterator::next)
-                        .unwrap_or(Datum::Null),
-                    value @ (Datum::Int2Vector { .. } | Datum::OidVector { .. }) => {
-                        crate::sql::array::Input::from_datum(value)
-                            .expect("catalog vector")
-                            .get(row_index)
-                            .unwrap_or(Datum::Null)
-                    }
-                    Datum::Multirange { text, kind } => {
-                        if let Some(component) = crate::sql::range::component_at(text, row_index)? {
-                            Datum::Range {
-                                text: component,
-                                kind,
-                            }
-                        } else {
-                            Datum::Null
-                        }
-                    }
-                    Datum::Null => Datum::Null,
+            let Some(routine_params) = catalog.prepare_routine_inputs(
+                routine_slot,
+                routine,
+                super::RoutineCallInputs {
+                    arguments: args,
+                    argument_type_oids: &argument_type_oids[..args.len()],
+                    mapping: &mapping,
+                    variadic: tref.func_variadic,
+                    context: super::RoutineInputContext::Table,
+                },
+                &mut |argument| {
+                    let value =
+                        crate::sql::eval::eval_full(argument, arena, params, columns, &hooks)?;
+                    let encoded = crate::sql::exec::encode_projected_pub(&[value], arena)?;
+                    crate::sql::exec::decode_projected_col_record(encoded, 0, arena)
+                },
+                arena,
+            )?
+            else {
+                return Ok(&[]);
+            };
+            let _input_body = super::input_progress::enter_body();
+            composite = routine_composite_result(routine, storage, txid)?;
+            let table_columns = routine.table_columns();
+            let scalar_result = routine.kind.function_result();
+            let _formal_scope = crate::sql::exec::enter_routine_parameter_types(
+                routine.arguments(),
+                hooks.catalog,
+            )?;
+            let owner = crate::storage::SessionIdentity::bound(
+                storage.capture_role_slot(routine.ownership.owner_to(txid).into(), txid)?,
+            );
+            let _security = routine
+                .attributes
+                .security_definer
+                .then(|| crate::sql::eval::funcs::system::enter_current_user(owner));
+            let _config = (!routine.configs().is_empty())
+                .then(|| crate::sql::guc::enter_active_routine_configs(routine.configs()))
+                .transpose()?;
+            if routine.language == crate::storage::RoutineLanguage::PlPgSql {
+                let (invocations, statement_arena) = match (invocations, statement_arena) {
+                    (Some(invocations), Some(statement_arena)) => (invocations, statement_arena),
+                    (None, None) => super::active_routine_invocations().ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::FEATURE_NOT_SUPPORTED,
+                            "PL/pgSQL table functions require a resumable query executor"
+                        )
+                    })?,
                     _ => {
                         return Err(sql_err!(
                             sqlstate::INTERNAL_ERROR,
-                            "validated UNNEST input changed type"
+                            "routine invocation state is missing its statement arena"
                         ));
                     }
                 };
+                return invocations
+                    .resolve_rows(
+                        routine,
+                        &routine_params[..routine.argument_count],
+                        statement_arena,
+                    )?
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "pending PL/pgSQL table routine did not suspend query execution"
+                        )
+                    });
             }
-            *row = crate::sql::exec::encode_projected_pub(&values[..args.len()], arena)?;
-        }
-        return Ok(&*rows);
-    }
-    if !tref.table.eq_ignore_ascii_case("generate_series") {
-        let Some((routine_slot, routine)) =
-            table_func_routine(tref, storage, txid, arena, params, columns, eval_hooks)?
-        else {
-            return Err(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "table function \"{}\" is not supported",
-                tref.table
-            ));
-        };
-        let catalog = super::storage_catalog(storage, arena, txid);
-        let hooks = crate::sql::eval::EvalHooks {
-            catalog: Some(&catalog),
-            ..eval_hooks.copied().unwrap_or(crate::sql::eval::NO_HOOKS)
-        };
-        let mapping = routine
-            .call_input_mapping(tref.func_argument_names, args.len(), tref.func_variadic)
-            .expect("resolved table routine call has a valid argument mapping");
-        let mut argument_type_oids =
-            [crate::sql::types::oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
-        for (output, argument) in argument_type_oids.iter_mut().zip(args) {
-            *output = crate::sql::eval::expression_type_identity(argument, columns, &hooks)?
-                .routine_argument_oid();
-        }
-        let Some(routine_params) = catalog.prepare_routine_inputs(
-            routine_slot,
-            routine,
-            super::RoutineCallInputs {
-                arguments: args,
-                argument_type_oids: &argument_type_oids[..args.len()],
-                mapping: &mapping,
-                variadic: tref.func_variadic,
-                context: super::RoutineInputContext::Table,
-            },
-            &mut |argument| {
-                let value = crate::sql::eval::eval_full(argument, arena, params, columns, &hooks)?;
-                let encoded = crate::sql::exec::encode_projected_pub(&[value], arena)?;
-                crate::sql::exec::decode_projected_col_record(encoded, 0, arena)
-            },
-            arena,
-        )?
-        else {
-            return Ok(&[]);
-        };
-        let table_columns = routine.table_columns();
-        let scalar_result = routine.kind.function_result();
-        let _formal_scope =
-            crate::sql::exec::enter_routine_parameter_types(routine.arguments(), hooks.catalog)?;
-        let owner = crate::storage::SessionIdentity::bound(
-            storage.capture_role_slot(routine.ownership.owner_to(txid).into(), txid)?,
-        );
-        let _security = routine
-            .attributes
-            .security_definer
-            .then(|| crate::sql::eval::funcs::system::enter_current_user(owner));
-        let _config = (!routine.configs().is_empty())
-            .then(|| crate::sql::guc::enter_active_routine_configs(routine.configs()))
-            .transpose()?;
-        if routine.language == crate::storage::RoutineLanguage::PlPgSql {
-            let (invocations, statement_arena) = match (invocations, statement_arena) {
-                (Some(invocations), Some(statement_arena)) => (invocations, statement_arena),
-                (None, None) => super::active_routine_invocations().ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::FEATURE_NOT_SUPPORTED,
-                        "PL/pgSQL table functions require a resumable query executor"
-                    )
-                })?,
-                _ => {
-                    return Err(sql_err!(
-                        sqlstate::INTERNAL_ERROR,
-                        "routine invocation state is missing its statement arena"
-                    ));
-                }
-            };
-            return invocations
-                .resolve_rows(
-                    routine,
-                    &routine_params[..routine.argument_count],
-                    statement_arena,
-                )?
-                .ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::INTERNAL_ERROR,
-                        "pending PL/pgSQL table routine did not suspend query execution"
-                    )
-                });
-        }
-        let program = super::parse_stored_routine_function_program(
-            routine.body_kind,
-            routine.body.as_str(),
-            arena,
-            scalar_result == Some(ColType::Void),
-            routine.name.as_str(),
-            routine.arguments(),
-        )?;
-        if super::routine_program_requires_mutable_execution(&program) {
-            let (invocations, statement_arena) = match (invocations, statement_arena) {
-                (Some(invocations), Some(statement_arena)) => (invocations, statement_arena),
-                (None, None) => super::active_routine_invocations().ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::FEATURE_NOT_SUPPORTED,
-                        "data-modifying SQL table functions require a resumable query executor"
-                    )
-                })?,
-                _ => {
-                    return Err(sql_err!(
-                        sqlstate::INTERNAL_ERROR,
-                        "routine invocation state is missing its statement arena"
-                    ));
-                }
-            };
-            return invocations
-                .resolve_rows(
-                    routine,
-                    &routine_params[..routine.argument_count],
-                    statement_arena,
-                )?
-                .ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::INTERNAL_ERROR,
-                        "pending SQL table routine did not suspend query execution"
-                    )
-                });
-        }
-        for query in program.preceding {
-            let super::RoutinePrelude::Statement(statement) = query else {
-                let super::RoutinePrelude::Forbidden(statement) = query else {
-                    unreachable!("routine prelude has two variants");
-                };
-                return Err(super::routine_forbidden_statement_error(statement));
-            };
-            let query = match statement {
-                crate::sql::ast::Stmt::Select(query) => super::RoutineQuery::Select(query),
-                crate::sql::ast::Stmt::SetQuery(query) => super::RoutineQuery::Set(query),
-                _ => unreachable!("mutable table routine was classified before execution"),
-            };
-            super::execute_bound_routine_query(
-                &query,
-                storage,
-                routine_slot,
-                routine,
-                txid,
+            let program = super::parse_stored_routine_function_program(
+                routine.body_kind,
+                routine.body.as_str(),
                 arena,
-                &routine_params[..routine.argument_count],
-                false,
-                None,
-                &mut |_| Ok(()),
+                scalar_result == Some(ColType::Void),
+                routine.name.as_str(),
+                routine.arguments(),
             )?;
-        }
-        let result_query = match program.result {
-            super::RoutineFunctionResult::Query(query) => query,
-            super::RoutineFunctionResult::Void(statement) => match statement {
-                crate::sql::ast::Stmt::Select(query) => arena
-                    .alloc(super::RoutineQuery::Select(query))
-                    .map_err(|_| arena_full())?,
-                crate::sql::ast::Stmt::SetQuery(query) => arena
-                    .alloc(super::RoutineQuery::Set(query))
-                    .map_err(|_| arena_full())?,
+            if super::routine_program_requires_mutable_execution(&program) {
+                let (invocations, statement_arena) = match (invocations, statement_arena) {
+                    (Some(invocations), Some(statement_arena)) => (invocations, statement_arena),
+                    (None, None) => super::active_routine_invocations().ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::FEATURE_NOT_SUPPORTED,
+                            "data-modifying SQL table functions require a resumable query executor"
+                        )
+                    })?,
+                    _ => {
+                        return Err(sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "routine invocation state is missing its statement arena"
+                        ));
+                    }
+                };
+                return invocations
+                    .resolve_rows(
+                        routine,
+                        &routine_params[..routine.argument_count],
+                        statement_arena,
+                    )?
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "pending SQL table routine did not suspend query execution"
+                        )
+                    });
+            }
+            for query in program.preceding {
+                let super::RoutinePrelude::Statement(statement) = query else {
+                    let super::RoutinePrelude::Forbidden(statement) = query else {
+                        unreachable!("routine prelude has two variants");
+                    };
+                    return Err(super::routine_forbidden_statement_error(statement));
+                };
+                let query = match statement {
+                    crate::sql::ast::Stmt::Select(query) => super::RoutineQuery::Select(query),
+                    crate::sql::ast::Stmt::SetQuery(query) => super::RoutineQuery::Set(query),
+                    _ => unreachable!("mutable table routine was classified before execution"),
+                };
+                super::execute_bound_routine_query(
+                    &query,
+                    storage,
+                    routine_slot,
+                    routine,
+                    txid,
+                    arena,
+                    &routine_params[..routine.argument_count],
+                    false,
+                    None,
+                    &mut |_| Ok(()),
+                )?;
+            }
+            let result_query = match program.result {
+                super::RoutineFunctionResult::Query(query) => query,
+                super::RoutineFunctionResult::Void(statement) => match statement {
+                    crate::sql::ast::Stmt::Select(query) => arena
+                        .alloc(super::RoutineQuery::Select(query))
+                        .map_err(|_| arena_full())?,
+                    crate::sql::ast::Stmt::SetQuery(query) => arena
+                        .alloc(super::RoutineQuery::Set(query))
+                        .map_err(|_| arena_full())?,
+                    _ => unreachable!("mutable table routine was classified before execution"),
+                },
                 _ => unreachable!("mutable table routine was classified before execution"),
-            },
-            _ => unreachable!("mutable table routine was classified before execution"),
-        };
-        if scalar_result == Some(ColType::Void) {
+            };
+            if scalar_result == Some(ColType::Void) {
+                super::execute_bound_routine_query(
+                    result_query,
+                    storage,
+                    routine_slot,
+                    routine,
+                    txid,
+                    arena,
+                    &routine_params[..routine.argument_count],
+                    false,
+                    None,
+                    &mut |_| Ok(()),
+                )?;
+                return Ok(&[]);
+            }
+            const EMPTY: &[u8] = &[];
+            let mut rows: *mut &[u8] = core::ptr::null_mut();
+            let mut len = 0usize;
+            let mut cap = 0usize;
             super::execute_bound_routine_query(
                 result_query,
                 storage,
@@ -5272,216 +5445,198 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                 &routine_params[..routine.argument_count],
                 false,
                 None,
-                &mut |_| Ok(()),
-            )?;
-            return Ok(&[]);
-        }
-        const EMPTY: &[u8] = &[];
-        let mut rows: *mut &[u8] = core::ptr::null_mut();
-        let mut len = 0usize;
-        let mut cap = 0usize;
-        super::execute_bound_routine_query(
-            result_query,
-            storage,
-            routine_slot,
-            routine,
-            txid,
-            arena,
-            &routine_params[..routine.argument_count],
-            false,
-            None,
-            &mut |values| {
-                let expected_columns = table_columns.map_or(1, <[_]>::len);
-                if values.len() != expected_columns {
-                    return Err(sql_err!(
-                        sqlstate::SYNTAX_ERROR,
-                        "SQL function query must return {} column{}",
-                        expected_columns,
-                        if expected_columns == 1 { "" } else { "s" }
-                    ));
-                }
-                let encoded = if let Some(output) = table_columns {
-                    let mut cast = [Datum::Null; MAX_COLUMNS];
-                    for (slot, column) in output.iter().enumerate() {
-                        let projected =
-                            crate::sql::exec::encode_projected_pub(&[values[slot]], arena)?;
-                        cast[slot] = crate::sql::eval::cast_to(
-                            crate::sql::exec::decode_projected_pub(projected, 0),
-                            column.ctype,
+                &mut |values| {
+                    let expected_columns = table_columns.map_or(1, <[_]>::len);
+                    if values.len() != expected_columns {
+                        return Err(sql_err!(
+                            sqlstate::SYNTAX_ERROR,
+                            "SQL function query must return {} column{}",
+                            expected_columns,
+                            if expected_columns == 1 { "" } else { "s" }
+                        ));
+                    }
+                    let encoded = if let Some(output) = table_columns {
+                        let mut cast = [Datum::Null; MAX_COLUMNS];
+                        for (slot, column) in output.iter().enumerate() {
+                            cast[slot] = crate::sql::eval::cast_to(
+                                crate::sql::exec::detach_routine_datum(values[slot], arena)?,
+                                column.ctype,
+                                arena,
+                            )?;
+                        }
+                        crate::sql::exec::encode_projected_pub(&cast[..output.len()], arena)?
+                    } else {
+                        let value = crate::sql::exec::detach_routine_datum(values[0], arena)?;
+                        let value = crate::sql::eval::cast_to(
+                            value,
+                            scalar_result.expect("set routine result"),
                             arena,
                         )?;
+                        crate::sql::exec::encode_projected_pub(&[value], arena)?
+                    };
+                    if len == cap {
+                        let new_cap = if cap == 0 { 8 } else { cap * 2 };
+                        let fresh = arena
+                            .alloc_slice_with(new_cap, |_| EMPTY)
+                            .map_err(|_| arena_full())?;
+                        if len > 0 {
+                            let prior = unsafe { core::slice::from_raw_parts(rows, len) };
+                            fresh[..len].copy_from_slice(prior);
+                        }
+                        rows = fresh.as_mut_ptr();
+                        cap = new_cap;
                     }
-                    crate::sql::exec::encode_projected_pub(&cast[..output.len()], arena)?
-                } else {
-                    let projected = crate::sql::exec::encode_projected_pub(values, arena)?;
-                    let value = crate::sql::exec::decode_projected_pub(projected, 0);
-                    let value = crate::sql::eval::cast_to(
-                        value,
-                        scalar_result.expect("set routine result"),
-                        arena,
-                    )?;
-                    crate::sql::exec::encode_projected_pub(&[value], arena)?
-                };
-                if len == cap {
-                    let new_cap = if cap == 0 { 8 } else { cap * 2 };
-                    let fresh = arena
-                        .alloc_slice_with(new_cap, |_| EMPTY)
-                        .map_err(|_| arena_full())?;
-                    if len > 0 {
-                        let prior = unsafe { core::slice::from_raw_parts(rows, len) };
-                        fresh[..len].copy_from_slice(prior);
-                    }
-                    rows = fresh.as_mut_ptr();
-                    cap = new_cap;
-                }
-                unsafe { rows.add(len).write(encoded) };
-                len += 1;
-                Ok(())
-            },
-        )?;
-        return Ok(if len == 0 {
-            &[]
-        } else {
-            unsafe { core::slice::from_raw_parts(rows, len) }
-        });
-    }
-    if args.len() != 2 && args.len() != 3 {
-        return Err(sql_err!(
-            sqlstate::UNDEFINED_FUNCTION,
-            "generate_series expects 2 or 3 arguments"
-        ));
-    }
-    // Temporal series: a date/timestamp start with an interval step.
-    let start_val = crate::sql::eval::text_view(eval_argument(args[0])?);
-    let stop_raw = eval_argument(args[1])?;
-    let step_raw = if args.len() == 3 {
-        eval_argument(args[2])?
-    } else {
-        Datum::Int4(1)
-    };
-    if let Some((base, kind)) = crate::sql::eval::timestamp_series_start(&start_val) {
-        if args.len() != 3 {
+                    unsafe { rows.add(len).write(encoded) };
+                    len += 1;
+                    Ok(())
+                },
+            )?;
+            return Ok(if len == 0 {
+                &[]
+            } else {
+                unsafe { core::slice::from_raw_parts(rows, len) }
+            });
+        }
+        if args.len() != 2 && args.len() != 3 {
             return Err(sql_err!(
                 sqlstate::UNDEFINED_FUNCTION,
-                "generate_series over timestamps requires a step"
+                "generate_series expects 2 or 3 arguments"
             ));
         }
-        // Coerce bare string literals for the stop and step (function resolution).
-        let stop_val = crate::sql::eval::cast_to(
-            crate::sql::eval::text_view(stop_raw),
-            kind.coltype(),
-            arena,
-        )?;
-        let step_val = crate::sql::eval::cast_to(
-            crate::sql::eval::text_view(step_raw),
-            ColType::Interval,
-            arena,
-        )?;
-        let (Some((stop_micros, _)), Datum::Interval(step_iv)) = (
-            crate::sql::eval::timestamp_series_start(&stop_val),
-            step_val,
-        ) else {
+        // Temporal series: a date/timestamp start with an interval step.
+        let start_val = crate::sql::eval::text_view(eval_argument(args[0])?);
+        let stop_raw = eval_argument(args[1])?;
+        let step_raw = if args.len() == 3 {
+            eval_argument(args[2])?
+        } else {
+            Datum::Int4(1)
+        };
+        if let Some((base, kind)) = crate::sql::eval::timestamp_series_start(&start_val) {
+            if args.len() != 3 {
+                return Err(sql_err!(
+                    sqlstate::UNDEFINED_FUNCTION,
+                    "generate_series over timestamps requires a step"
+                ));
+            }
+            // Coerce bare string literals for the stop and step (function resolution).
+            let stop_val = crate::sql::eval::cast_to(
+                crate::sql::eval::text_view(stop_raw),
+                kind.coltype(),
+                arena,
+            )?;
+            let step_val = crate::sql::eval::cast_to(
+                crate::sql::eval::text_view(step_raw),
+                ColType::Interval,
+                arena,
+            )?;
+            let (Some((stop_micros, _)), Datum::Interval(step_iv)) = (
+                crate::sql::eval::timestamp_series_start(&stop_val),
+                step_val,
+            ) else {
+                return Ok(&[]);
+            };
+            let count = crate::sql::eval::timestamp_series_count(base, stop_micros, step_iv)?;
+            const EMPTY: &[u8] = &[];
+            let rows = arena
+                .alloc_slice_with(count, |_| EMPTY)
+                .map_err(|_| arena_full())?;
+            let mut v = base;
+            for slot in rows.iter_mut() {
+                *slot = crate::sql::exec::encode_projected_pub(&[kind.datum(v)], arena)?;
+                v = crate::sql::datetime::add_interval(v, step_iv);
+            }
+            return Ok(&*rows);
+        }
+        if start_val.is_null() {
+            return Ok(&[]);
+        }
+        if matches!(start_val, Datum::Numeric(_))
+            || matches!(stop_raw, Datum::Numeric(_))
+            || matches!(step_raw, Datum::Numeric(_))
+        {
+            if stop_raw.is_null() || step_raw.is_null() {
+                return Ok(&[]);
+            }
+            let (Datum::Numeric(start), Datum::Numeric(stop), Datum::Numeric(step)) = (
+                crate::sql::eval::cast_to(start_val, ColType::Numeric, arena)?,
+                crate::sql::eval::cast_to(stop_raw, ColType::Numeric, arena)?,
+                crate::sql::eval::cast_to(step_raw, ColType::Numeric, arena)?,
+            ) else {
+                return Ok(&[]);
+            };
+            let count = crate::sql::eval::numeric_series_count(start, stop, step, arena)?;
+            const EMPTY: &[u8] = &[];
+            let rows = arena
+                .alloc_slice_with(count, |_| EMPTY)
+                .map_err(|_| arena_full())?;
+            for (index, slot) in rows.iter_mut().enumerate() {
+                let value =
+                    crate::sql::eval::numeric_series_at(start, stop, step, index + 1, arena)?
+                        .expect("numeric series count and value share one boundary");
+                *slot = crate::sql::exec::encode_projected_pub(&[Datum::Numeric(value)], arena)?;
+            }
+            return Ok(&*rows);
+        }
+        let as_i64 = |value: Datum<'a>| match value {
+            Datum::Int4(value) => Ok(Some(value as i64)),
+            Datum::Int8(value) => Ok(Some(value)),
+            Datum::Null => Ok(None),
+            _ => Err(sql_err!(
+                sqlstate::UNDEFINED_FUNCTION,
+                "generate_series requires integer arguments"
+            )),
+        };
+        let Some(start) = as_i64(start_val)? else {
             return Ok(&[]);
         };
-        let count = crate::sql::eval::timestamp_series_count(base, stop_micros, step_iv)?;
-        const EMPTY: &[u8] = &[];
-        let rows = arena
-            .alloc_slice_with(count, |_| EMPTY)
-            .map_err(|_| arena_full())?;
-        let mut v = base;
-        for slot in rows.iter_mut() {
-            *slot = crate::sql::exec::encode_projected_pub(&[kind.datum(v)], arena)?;
-            v = crate::sql::datetime::add_interval(v, step_iv);
-        }
-        return Ok(&*rows);
-    }
-    if start_val.is_null() {
-        return Ok(&[]);
-    }
-    if matches!(start_val, Datum::Numeric(_))
-        || matches!(stop_raw, Datum::Numeric(_))
-        || matches!(step_raw, Datum::Numeric(_))
-    {
-        if stop_raw.is_null() || step_raw.is_null() {
-            return Ok(&[]);
-        }
-        let (Datum::Numeric(start), Datum::Numeric(stop), Datum::Numeric(step)) = (
-            crate::sql::eval::cast_to(start_val, ColType::Numeric, arena)?,
-            crate::sql::eval::cast_to(stop_raw, ColType::Numeric, arena)?,
-            crate::sql::eval::cast_to(step_raw, ColType::Numeric, arena)?,
-        ) else {
+        let Some(stop) = as_i64(stop_raw)? else {
             return Ok(&[]);
         };
-        let count = crate::sql::eval::numeric_series_count(start, stop, step, arena)?;
-        const EMPTY: &[u8] = &[];
-        let rows = arena
-            .alloc_slice_with(count, |_| EMPTY)
-            .map_err(|_| arena_full())?;
-        for (index, slot) in rows.iter_mut().enumerate() {
-            let value = crate::sql::eval::numeric_series_at(start, stop, step, index + 1, arena)?
-                .expect("numeric series count and value share one boundary");
-            *slot = crate::sql::exec::encode_projected_pub(&[Datum::Numeric(value)], arena)?;
-        }
-        return Ok(&*rows);
-    }
-    let as_i64 = |value: Datum<'a>| match value {
-        Datum::Int4(value) => Ok(Some(value as i64)),
-        Datum::Int8(value) => Ok(Some(value)),
-        Datum::Null => Ok(None),
-        _ => Err(sql_err!(
-            sqlstate::UNDEFINED_FUNCTION,
-            "generate_series requires integer arguments"
-        )),
-    };
-    let Some(start) = as_i64(start_val)? else {
-        return Ok(&[]);
-    };
-    let Some(stop) = as_i64(stop_raw)? else {
-        return Ok(&[]);
-    };
-    let step = if args.len() == 3 {
-        let Some(step) = as_i64(step_raw)? else {
-            return Ok(&[]);
+        let step = if args.len() == 3 {
+            let Some(step) = as_i64(step_raw)? else {
+                return Ok(&[]);
+            };
+            step
+        } else {
+            1
         };
-        step
-    } else {
-        1
-    };
-    if step == 0 {
-        return Err(sql_err!(
-            sqlstate::INVALID_PARAMETER_VALUE,
-            "step size cannot equal zero"
-        ));
-    }
-    let count = if step > 0 {
-        if stop < start {
+        if step == 0 {
+            return Err(sql_err!(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "step size cannot equal zero"
+            ));
+        }
+        let count = if step > 0 {
+            if stop < start {
+                0
+            } else {
+                ((stop - start) / step) as usize + 1
+            }
+        } else if stop > start {
             0
         } else {
-            ((stop - start) / step) as usize + 1
-        }
-    } else if stop > start {
-        0
-    } else {
-        ((start - stop) / (-step)) as usize + 1
-    };
-    const EMPTY: &[u8] = &[];
-    let rows = arena
-        .alloc_slice_with(count, |_| EMPTY)
-        .map_err(|_| arena_full())?;
-    let wide = matches!(start_val, Datum::Int8(_))
-        || matches!(stop_raw, Datum::Int8(_))
-        || matches!(step_raw, Datum::Int8(_));
-    let mut v = start;
-    for slot in rows.iter_mut() {
-        let value = if wide {
-            Datum::Int8(v)
-        } else {
-            Datum::Int4(v as i32)
+            ((start - stop) / (-step)) as usize + 1
         };
-        *slot = crate::sql::exec::encode_projected_pub(&[value], arena)?;
-        v += step;
-    }
-    Ok(&*rows)
+        const EMPTY: &[u8] = &[];
+        let rows = arena
+            .alloc_slice_with(count, |_| EMPTY)
+            .map_err(|_| arena_full())?;
+        let wide = matches!(start_val, Datum::Int8(_))
+            || matches!(stop_raw, Datum::Int8(_))
+            || matches!(step_raw, Datum::Int8(_));
+        let mut v = start;
+        for slot in rows.iter_mut() {
+            let value = if wide {
+                Datum::Int8(v)
+            } else {
+                Datum::Int4(v as i32)
+            };
+            *slot = crate::sql::exec::encode_projected_pub(&[value], arena)?;
+            v += step;
+        }
+        Ok(&*rows)
+    })?;
+    Ok(TableFunctionRows { encoded, composite })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6387,7 +6542,7 @@ fn rows_from_base_rows_outer<'a, C: ColumnLookup<'a>>(
                 "ROWS FROM output exceeds configured column capacity"
             ));
         }
-        rows_by_function[index] = table_func_base_rows_outer(
+        rows_by_function[index] = table_func_rows_outer(
             function,
             storage,
             txid,

@@ -5425,7 +5425,7 @@ impl<'a> ColDesc<'a> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 mod tests {
     use super::*;
 
@@ -5904,7 +5904,7 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 mod code_roundtrip_tests {
     use super::*;
 
@@ -6066,7 +6066,7 @@ mod code_roundtrip_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 mod named_type_layout_tests {
     use super::*;
     use core::mem::{align_of, size_of};

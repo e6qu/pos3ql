@@ -28,7 +28,7 @@ pub(crate) fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
     outer.finish()
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 mod tests {
     use super::*;
     use crate::crypto::sha256::HexDigest;

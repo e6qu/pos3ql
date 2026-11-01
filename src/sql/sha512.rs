@@ -204,7 +204,7 @@ pub fn sha384(data: &[u8]) -> [u8; 48] {
     out
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 mod tests {
     use super::*;
 

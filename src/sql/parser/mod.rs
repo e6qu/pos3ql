@@ -8863,7 +8863,7 @@ impl<'a> Parser<'a> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 mod tests {
     use super::*;
     use crate::mem::Budget;

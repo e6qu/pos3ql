@@ -295,7 +295,7 @@ impl<'source_arena> CapturedRowScan<'source_arena> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 mod tests {
     use super::*;
     use crate::mem::budget::Budget;

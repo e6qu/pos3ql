@@ -182,7 +182,7 @@ pub(crate) const PROCEDURES: &[(i32, i32, i32, i32, i16, i32, &str)] = &[
     (10331, 5008, 604, 604, 6, 5011, "spg_poly_quad_compress"),
 ];
 
-#[cfg(test)]
+#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 mod tests {
     use super::{FAMILIES, OPERATORS, PROCEDURES};
 

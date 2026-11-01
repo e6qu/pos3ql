@@ -680,7 +680,7 @@ pub fn format_mac(bytes: &[u8], out: &mut impl fmt::Write) -> fmt::Result {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 mod tests {
     use super::*;
 

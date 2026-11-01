@@ -28,6 +28,7 @@ use super::eval::{
 use super::exec::{MAX_PROJ, describe_items};
 use super::types::{ColDesc, ColType, Datum};
 
+pub(super) mod input_progress;
 mod retained;
 pub(crate) use retained::RetainedSelect;
 
@@ -759,35 +760,53 @@ impl<'a> RoutineCallContract<'a> {
                 ));
             }
         };
-        let arguments = arena
-            .alloc_persistent_slice_with(routine.argument_count, |index| routine.arguments[index])
-            .map_err(|_| full())?;
-        let parameters = arena
-            .alloc_persistent_slice_with(routine.parameter_count, |index| {
-                let parameter = &routine.parameters[index];
-                crate::storage::RoutineArgumentDef {
-                    name: parameter.name,
-                    ctype: parameter.ctype,
-                    user_type: parameter.user_type,
-                }
-            })
-            .map_err(|_| full())?;
-        let result_columns = arena
-            .alloc_persistent_slice_with(routine.result_column_count, |index| {
-                routine.result_columns[index]
-            })
-            .map_err(|_| full())?;
-        let captured = Self {
-            oid: crate::storage::routine_oid(routine),
-            arguments,
-            parameters,
+        let captured = Self::copy_signature(
+            routine,
             result,
-            result_columns,
-        };
+            |values| {
+                arena
+                    .alloc_persistent_slice_with(values.len(), |index| values[index])
+                    .map(|values| &*values)
+                    .map_err(|_| full())
+            },
+            |parameters| {
+                arena
+                    .alloc_persistent_slice_with(parameters.len(), |index| {
+                        let parameter = &parameters[index];
+                        crate::storage::RoutineArgumentDef {
+                            name: parameter.name,
+                            ctype: parameter.ctype,
+                            user_type: parameter.user_type,
+                        }
+                    })
+                    .map(|values| &*values)
+                    .map_err(|_| full())
+            },
+        )?;
         let retained = arena
             .alloc_persistent_slice_with(1, |_| captured)
             .map_err(|_| full())?;
         Ok(&retained[0])
+    }
+
+    fn copy_signature(
+        routine: &crate::storage::RoutineDef,
+        result: RoutineCallResult,
+        mut copy: impl FnMut(
+            &[crate::storage::RoutineArgumentDef],
+        ) -> Result<&'a [crate::storage::RoutineArgumentDef], SqlError>,
+        copy_parameters: impl FnOnce(
+            &[crate::storage::RoutineParameterDef],
+        )
+            -> Result<&'a [crate::storage::RoutineArgumentDef], SqlError>,
+    ) -> Result<Self, SqlError> {
+        Ok(Self {
+            oid: crate::storage::routine_oid(routine),
+            arguments: copy(routine.arguments())?,
+            parameters: copy_parameters(routine.parameters())?,
+            result,
+            result_columns: copy(&routine.result_columns[..routine.result_column_count])?,
+        })
     }
 
     pub(crate) fn bind(&self, routine: &mut crate::storage::RoutineDef) -> Result<(), SqlError> {
@@ -908,6 +927,7 @@ pub(crate) struct RoutineInvocationState<'a> {
     completed: Cell<usize>,
     pending: Cell<Option<PendingRoutineInvocation<'a>>>,
     results: RefCell<ArenaList<'a, RoutineInvocationResult<'a>>>,
+    inputs: input_progress::RoutineInputs<'a>,
 }
 
 #[derive(Clone, Copy)]
@@ -1022,12 +1042,14 @@ impl<'a> RoutineInvocationState<'a> {
             completed: Cell::new(0),
             pending: Cell::new(None),
             results: RefCell::new(ArenaList::new_persistent(arena)),
+            inputs: input_progress::RoutineInputs::new(arena),
         }
     }
 
     pub(crate) fn begin_attempt(&self) {
         self.next.set(0);
         self.pending.set(None);
+        self.inputs.begin_attempt();
     }
 
     pub(crate) fn resolve<'query>(
@@ -1684,6 +1706,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
         arena: &'a Arena,
     ) -> Result<Option<&'a [Datum<'a>]>, SqlError> {
         use super::eval::CatalogAccess as _;
+        let _input_scope = input_progress::enter();
         let RoutineCallInputs {
             arguments,
             argument_type_oids,
@@ -1698,11 +1721,13 @@ impl StorageCatalog<'_, '_, '_, '_> {
             ));
         }
         self.storage.require_routine_execute(slot, self.txid)?;
+        let captured = input_progress::definition(declared, slot, self.storage, self.txid, arena)?;
         let mut input_type_oids =
             [super::types::oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
         let mut default_expressions = [None; crate::storage::MAX_ROUTINE_ARGUMENTS];
-        let default_dependencies = if (0..declared.argument_count)
-            .any(|index| !mapping[..arguments.len()].contains(&(index as u8)))
+        let default_dependencies = if captured.is_none()
+            && (0..declared.argument_count)
+                .any(|index| !mapping[..arguments.len()].contains(&(index as u8)))
         {
             Some(
                 self.storage
@@ -1746,10 +1771,14 @@ impl StorageCatalog<'_, '_, '_, '_> {
                     default.as_str(),
                     self.storage,
                     self.txid,
-                    default_dependencies
-                        .as_ref()
-                        .expect("omitted inputs capture default dependencies")
-                        .view(),
+                    captured
+                        .map(|definition| definition.dependencies())
+                        .unwrap_or_else(|| {
+                            default_dependencies
+                                .as_ref()
+                                .expect("omitted inputs capture default dependencies")
+                                .view()
+                        }),
                     arena,
                 )?);
             }
@@ -1803,7 +1832,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
             }
             super::exec::coerce_routine_argument(value, argument, self.storage, self.txid, arena)
         };
-        let constant_input = |expression: &Expr<'_>, source, expected| -> Result<bool, SqlError> {
+        let classify_input = |expression: &Expr<'_>, source, expected| -> Result<bool, SqlError> {
             // CALL evaluates ordinary expressions at execution time. Unknown
             // literals are converted during PostgreSQL parse analysis, including
             // a direct explicit cast from an unknown literal.
@@ -1834,6 +1863,24 @@ impl StorageCatalog<'_, '_, '_, '_> {
             }
             Ok(true)
         };
+        let constant_input = |expression: &Expr<'_>, source, expected, parameter, written| {
+            let value = input_progress::value(
+                input_progress::InputSite::Classification {
+                    routine: crate::storage::routine_oid(routine),
+                    parameter,
+                    written,
+                },
+                arena,
+                || classify_input(expression, source, expected).map(Datum::Bool),
+            )?;
+            match value {
+                Datum::Bool(constant) => Ok(constant),
+                _ => Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "retained input classification changed type"
+                )),
+            }
+        };
         let mut constant_values = [None; crate::storage::MAX_ROUTINE_ARGUMENTS];
         let mut constant_defaults = [None; crate::storage::MAX_ROUTINE_ARGUMENTS];
         let mut constant_null = false;
@@ -1852,8 +1899,18 @@ impl StorageCatalog<'_, '_, '_, '_> {
                     continue;
                 }
                 let source = argument_type_oids[call_index];
-                if constant_input(expression, source, expected)? {
-                    let value = coerce_input(evaluate(expression)?, source, argument, expected)?;
+                if constant_input(expression, source, expected, input_index, Some(call_index))? {
+                    let value = input_progress::value(
+                        input_progress::InputSite::Argument {
+                            routine: crate::storage::routine_oid(routine),
+                            parameter: input_index,
+                            written: Some(call_index),
+                            source,
+                            target: expected,
+                        },
+                        arena,
+                        || coerce_input(evaluate(expression)?, source, argument, expected),
+                    )?;
                     constant_values[call_index] = Some(value);
                     // A null array member does not make the array null.
                     constant_null |= !expanded_variadic && value.is_null();
@@ -1862,8 +1919,18 @@ impl StorageCatalog<'_, '_, '_, '_> {
             if let Some(expression) = default_expressions[input_index] {
                 let (argument, expected) = input_contract(input_index, false)?;
                 let source = input_type_oids[input_index];
-                if constant_input(expression, source, expected)? {
-                    let value = coerce_input(evaluate(expression)?, source, argument, expected)?;
+                if constant_input(expression, source, expected, input_index, None)? {
+                    let value = input_progress::value(
+                        input_progress::InputSite::Argument {
+                            routine: crate::storage::routine_oid(routine),
+                            parameter: input_index,
+                            written: None,
+                            source,
+                            target: expected,
+                        },
+                        arena,
+                        || coerce_input(evaluate(expression)?, source, argument, expected),
+                    )?;
                     constant_defaults[input_index] = Some(value);
                     constant_null |= value.is_null();
                 }
@@ -1899,11 +1966,23 @@ impl StorageCatalog<'_, '_, '_, '_> {
                 }
                 let value = match constant_values[call_index] {
                     Some(value) => value,
-                    None => coerce_input(
-                        evaluate(expression)?,
-                        argument_type_oids[call_index],
-                        argument,
-                        expected,
+                    None => input_progress::value(
+                        input_progress::InputSite::Argument {
+                            routine: crate::storage::routine_oid(routine),
+                            parameter: input_index,
+                            written: Some(call_index),
+                            source: argument_type_oids[call_index],
+                            target: expected,
+                        },
+                        arena,
+                        || {
+                            coerce_input(
+                                evaluate(expression)?,
+                                argument_type_oids[call_index],
+                                argument,
+                                expected,
+                            )
+                        },
                     )?,
                 };
                 supplied = true;
@@ -1930,11 +2009,23 @@ impl StorageCatalog<'_, '_, '_, '_> {
             } else if let Some(expression) = default_expressions[input_index] {
                 completed[input_index] = match constant_defaults[input_index] {
                     Some(value) => value,
-                    None => coerce_input(
-                        evaluate(expression)?,
-                        input_type_oids[input_index],
-                        argument,
-                        expected,
+                    None => input_progress::value(
+                        input_progress::InputSite::Argument {
+                            routine: crate::storage::routine_oid(routine),
+                            parameter: input_index,
+                            written: None,
+                            source: input_type_oids[input_index],
+                            target: expected,
+                        },
+                        arena,
+                        || {
+                            coerce_input(
+                                evaluate(expression)?,
+                                input_type_oids[input_index],
+                                argument,
+                                expected,
+                            )
+                        },
                     )?,
                 };
             } else {
@@ -2265,6 +2356,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
         if routine.attributes.strict && arguments.iter().any(Datum::is_null) {
             return Ok(Some(Datum::Null));
         }
+        let _input_body = input_progress::enter_body();
         let owner = crate::storage::SessionIdentity::bound(
             self.storage
                 .capture_role_slot(routine.ownership.owner_to(self.txid).into(), self.txid)?,
@@ -3397,7 +3489,8 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             .routine_slot_by_oid(oid, self.txid)
             .expect("resolved routine identity exists");
         let routine = self.storage.routine_for(slot, self.txid);
-        Ok(Some(
+        Ok(Some(input_progress::evaluation(
+            oid,
             if routine.attributes.volatility == crate::storage::RoutineVolatility::Immutable
                 && !routine.kind.is_set_returning()
             {
@@ -3405,7 +3498,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             } else {
                 super::eval::ExpressionEvaluation::Runtime
             },
-        ))
+        )?))
     }
 
     fn operator_evaluation(
@@ -3471,13 +3564,14 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                 )
             })?;
         let routine = self.storage.routine_for(slot, self.txid);
-        Ok(Some(
+        Ok(Some(input_progress::evaluation(
+            oid,
             if routine.attributes.volatility == crate::storage::RoutineVolatility::Immutable {
                 super::eval::ExpressionEvaluation::Immutable
             } else {
                 super::eval::ExpressionEvaluation::Runtime
             },
-        ))
+        )?))
     }
 
     fn call_routine<'a>(
@@ -3604,11 +3698,20 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                     .ok_or_else(|| {
                         sql_err!(sqlstate::UNDEFINED_FUNCTION, "cast function does not exist")
                     })?;
-                self.storage
+                let immutable = self
+                    .storage
                     .routine_for(slot, self.txid)
                     .attributes
                     .volatility
-                    == crate::storage::RoutineVolatility::Immutable
+                    == crate::storage::RoutineVolatility::Immutable;
+                input_progress::evaluation(
+                    oid,
+                    if immutable {
+                        super::eval::ExpressionEvaluation::Immutable
+                    } else {
+                        super::eval::ExpressionEvaluation::Runtime
+                    },
+                )? == super::eval::ExpressionEvaluation::Immutable
             }
         };
         Ok(Some(if immutable {
@@ -9867,7 +9970,7 @@ fn user_type_expression_description<'q>(
             if let Some(routine) =
                 storage.routine_for_call_oids(routine_name, &argument_type_oids[..args.len()], txid)
             {
-                let result = routine.kind.function_result()?;
+                let result = routine.function_result_contract()?.ctype;
                 return Some(ColDesc::new(name, result.oid(), result.typlen()));
             }
         }
@@ -10661,14 +10764,7 @@ impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_> {
                 .function_for_named_call_oids(name, argument_names, arguments, self.txid)
         };
         let result = routine
-            .and_then(|routine| match routine.kind {
-                crate::storage::RoutineKind::Function { result }
-                | crate::storage::RoutineKind::SetFunction { result } => Some(result),
-                crate::storage::RoutineKind::RecordFunction { .. } => {
-                    Some(crate::storage::RoutineResult::builtin(ColType::Record))
-                }
-                _ => None,
-            })
+            .and_then(|routine| routine.function_result_contract())
             .or_else(|| {
                 if bound_oid.is_some() {
                     return None;

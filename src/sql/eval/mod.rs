@@ -2595,6 +2595,56 @@ fn materialize_acl_value<'a>(
     }
 }
 
+/// Only trees proved unable to suspend may omit their own input journal.
+/// An enclosing stored call still records their values in its active journal.
+fn routine_input_handoff(expression: &Expr<'_>, catalog: Option<&dyn CatalogAccess>) -> bool {
+    match expression {
+        Expr::Call {
+            name,
+            bound_oid,
+            args,
+            ..
+        } => {
+            if bound_oid.is_some()
+                || catalog.is_some_and(|catalog| catalog.has_routine_candidate(name, args.len()))
+                || !super::catalog::intrinsic_routine_has_name(name)
+                || super::engine_intrinsic_result_type(
+                    name.strip_prefix("pg_catalog.").unwrap_or(name),
+                    args.len(),
+                )
+                .is_some()
+            {
+                return true;
+            }
+        }
+        // Casts, operators and subqueries can invoke stored code even without
+        // a Call node. Keep their journal until their executable target is bound.
+        Expr::Cast { .. }
+        | Expr::Unary { .. }
+        | Expr::Subquery(_)
+        | Expr::RowSubquery { .. }
+        | Expr::ArraySubquery(_)
+        | Expr::Exists(_)
+        | Expr::InSubquery { .. }
+        | Expr::QuantifiedSubquery { .. } => return true,
+        Expr::Binary { operator, .. }
+            if operator.operator_name().is_some_and(|name| {
+                catalog.is_some_and(|catalog| catalog.has_operator_candidate(name))
+            }) =>
+        {
+            return true;
+        }
+        _ => {}
+    }
+    let mut handoff = false;
+    super::query::walk_children(expression, &mut |child| {
+        handoff |= routine_input_handoff(child, catalog);
+        Ok(())
+    })
+    .expect("input handoff inspection does not evaluate expressions");
+    handoff
+}
+
 pub fn eval_full<'a>(
     expression: &Expr<'a>,
     arena: &'a Arena,
@@ -2602,12 +2652,80 @@ pub fn eval_full<'a>(
     row: &impl ColumnLookup<'a>,
     hooks: &EvalHooks<'_, 'a>,
 ) -> Result<Datum<'a>, SqlError> {
-    let value = materialize_acl_value(
-        eval_full_inner(expression, arena, params, row, hooks)?,
-        hooks,
+    let evaluate = || {
+        let position = super::query::input_progress::enter_expression(expression)?;
+        let bound;
+        let expression = if let (
+            Some(oid),
+            Expr::Call {
+                name,
+                args,
+                argument_names,
+                variadic,
+                star,
+                distinct,
+                order_by,
+                over,
+                filter,
+                ..
+            },
+        ) = (position.target, *expression)
+        {
+            bound = Expr::Call {
+                name,
+                bound_oid: Some(oid),
+                args,
+                argument_names,
+                variadic,
+                star,
+                distinct,
+                order_by,
+                over,
+                filter,
+            };
+            &bound
+        } else {
+            expression
+        };
+        let run = || {
+            let _query_inputs = matches!(
+                expression,
+                Expr::Subquery(_)
+                    | Expr::RowSubquery { .. }
+                    | Expr::ArraySubquery(_)
+                    | Expr::Exists(_)
+                    | Expr::InSubquery { .. }
+                    | Expr::QuantifiedSubquery { .. }
+            )
+            .then(super::query::input_progress::enter_body);
+            let value = materialize_acl_value(
+                eval_full_inner(expression, arena, params, row, hooks)?,
+                hooks,
+                arena,
+            )?;
+            materialize_enum_values(value, hooks.catalog, arena)
+        };
+        let bound_set_row = matches!(expression, Expr::Call { name, args, .. }
+            if hooks.srf_index.is_some()
+                && super::query::is_builtin_set_routine(name)
+                && args.iter().all(|argument| matches!(argument, Expr::Param(_))));
+        if matches!(expression, Expr::Call { .. })
+            && !bound_set_row
+            && routine_input_handoff(expression, hooks.catalog)
+        {
+            super::query::input_progress::call(arena, || {
+                let _inputs = super::query::input_progress::enter();
+                run()
+            })
+        } else {
+            run()
+        }
+    };
+    super::query::input_progress::value(
+        super::query::input_progress::expression_site(expression),
         arena,
-    )?;
-    materialize_enum_values(value, hooks.catalog, arena)
+        evaluate,
+    )
 }
 
 fn eval_full_inner<'a>(
@@ -8546,7 +8664,7 @@ pub(crate) fn arena_full() -> SqlError {
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 mod tests {
     use super::*;
     use crate::mem::Budget;

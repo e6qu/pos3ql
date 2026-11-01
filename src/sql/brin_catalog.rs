@@ -1342,7 +1342,7 @@ pub(crate) const PROCEDURES: [(i32, i32, i32, i32, i16, i32, &str); 382] = [
     (10713, 4104, 603, 603, 13, 187, "box_contain"),
 ];
 
-#[cfg(test)]
+#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 mod tests {
     use super::{OPERATORS, PROCEDURES};
 

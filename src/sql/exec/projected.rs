@@ -1336,7 +1336,7 @@ pub fn sort_dedup_projected(rows: &mut [&[u8]], width: usize) -> usize {
     unique
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 mod tests {
     use super::*;
     use crate::mem::budget::Budget;

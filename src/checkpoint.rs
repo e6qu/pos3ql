@@ -19670,7 +19670,7 @@ fn parse_partition_bound_manifest(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 mod stored_dependency_tests {
     #[test]
     fn manifest_hex_decode_rejects_non_ascii_without_panicking() {

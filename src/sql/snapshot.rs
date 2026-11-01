@@ -216,7 +216,7 @@ fn validate_binary(raw: &[u8]) -> Result<(), SqlError> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 mod tests {
     use super::*;
     use crate::mem::budget::Budget;

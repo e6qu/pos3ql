@@ -746,7 +746,7 @@ pub fn decode_binary<'a>(
     render(kind, values, closed.unwrap_or(false), arena)
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 mod tests {
     use super::*;
     use crate::sql::ast::BinaryOp;

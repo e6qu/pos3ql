@@ -801,14 +801,7 @@ impl ColTypeResolver for CatalogCols<'_> {
                 .function_for_named_call_oids(name, argument_names, arguments, self.txid)
         };
         let result = routine
-            .and_then(|routine| match routine.kind {
-                crate::storage::RoutineKind::Function { result }
-                | crate::storage::RoutineKind::SetFunction { result } => Some(result),
-                crate::storage::RoutineKind::RecordFunction { .. } => {
-                    Some(crate::storage::RoutineResult::builtin(ColType::Record))
-                }
-                _ => None,
-            })
+            .and_then(|routine| routine.function_result_contract())
             .or_else(|| {
                 if bound_oid.is_some() {
                     return None;
@@ -4101,17 +4094,7 @@ pub fn infer_type_res(
         return Ok((result.type_oid, result.ctype.typlen()));
     }
     if let Expr::Call { name, args, .. } = expression
-        && let Some(result) = crate::sql::statistics::result_type(name, args.len())
-    {
-        return Ok(result);
-    }
-    if let Expr::Call { name, args, .. } = expression
-        && let Some(result) = crate::sql::logical_replication::result_type(name, args.len())
-    {
-        return Ok(result);
-    }
-    if let Expr::Call { name, args, .. } = expression
-        && let Some(result) = crate::sql::large_object::result_type(name, args.len())
+        && let Some(result) = crate::sql::engine_intrinsic_result_type(name, args.len())
     {
         return Ok(result);
     }
@@ -4299,6 +4282,17 @@ pub fn infer_type_res(
                 columns.validate_explicit_cast(source_oid, target)?;
             }
             if let Some(type_oid) = columns.named_type_oid(type_name) {
+                if matches!(coltype_of_oid(type_oid), Some(ColType::Composite(_)))
+                    && infer_type_res(operand, columns)?.0 == oid::RECORD
+                    && !matches!(operand, Expr::WholeRow(_))
+                    && !matches!(operand, Expr::Call { name, .. } if name.eq_ignore_ascii_case("row"))
+                {
+                    return Err(sql_err!(
+                        sqlstate::CANNOT_COERCE,
+                        "cannot cast type record to {}",
+                        type_name
+                    ));
+                }
                 return Ok((
                     type_oid,
                     coltype_of_oid(type_oid).map_or(-1, ColType::typlen),

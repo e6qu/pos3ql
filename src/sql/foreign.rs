@@ -1700,7 +1700,7 @@ pub(crate) fn truncate_tables(
     execute_command(storage, txid, connection, timeout, query.as_str())
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 mod tests {
     use super::RemoteTupleId;
     use crate::util::StackStr;

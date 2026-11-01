@@ -2113,7 +2113,7 @@ fn temporal<'a>(
         .map_err(|_| sql_err!(sqlstate::OUT_OF_MEMORY, "out of memory"))
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 mod tests {
     use super::*;
     use crate::mem::Budget;

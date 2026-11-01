@@ -1105,7 +1105,7 @@ static DOUBLE_POW5_SPLIT: [[u64; 2]; 326] = [
     [2850236603241744433, 111253692925360069],
 ];
 
-#[cfg(test)]
+#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 mod tests {
     use super::*;
 

@@ -67494,13 +67494,13 @@ fn routine_setting_values_and_reset_values_share_one_bounded_definition() {
     ];
     crate::mem::guard::forbid_alloc(|| {
         assert_eq!(
-            guc.canonical_routine_setting("standard_conforming_strings", "on")
+            guc.validate_setting_value("standard_conforming_strings", Some("on"))
                 .unwrap()
                 .as_str(),
             "on"
         );
         assert_eq!(
-            guc.canonical_routine_setting("xmloption", "document")
+            guc.validate_setting_value("xmloption", Some("document"))
                 .unwrap()
                 .as_str(),
             "document"

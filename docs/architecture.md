@@ -11,6 +11,11 @@ Their tables use the same startup memory budget and object-store namespace.
 A backup or writer replacement concerns that namespace; creating a SQL database
 does not create an independently operated storage service.
 
+Startup may take exclusive recovery ownership before validating the remaining
+journal. This prevents the previous writer from publishing while recovery runs;
+a failed recovery can therefore leave that writer fenced out. The new process
+accepts SQL writes only after journal replay and restored definitions validate.
+
 ## The request path
 
 ```mermaid
@@ -65,6 +70,12 @@ current_setting('application_name') || '.', false))` appends one dot when the
 input finishes, even if `save_order` pauses. Simple builtin trees that cannot
 pause consume no retained input records. Engine-owned statistics, replication
 and large-object calls use the same explicit handoff classification.
+
+SQL `SET` parses SQL syntax; `set_config` and saved settings take decoded values.
+For example, `set_config('search_path', 'orders,public', false)` preserves that
+spelling, while `SET search_path TO orders, public` stores a formatted SQL list.
+Both validate the list before lookup. Routine scopes and transaction rollback
+restore the stored value without parsing it again as SQL.
 
 Scalar functions, table functions and procedures share input binding, while
 keeping PostgreSQL's distinct null and result rules. Typed structural copies

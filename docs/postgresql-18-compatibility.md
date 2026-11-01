@@ -172,6 +172,7 @@ boundaries apply through catalogs, wire, WAL, checkpoints, and recovery:
 | Other definition breadth | Documented 64-item constructs, including LIST bounds, inheritance parents, trigger arguments, and routine configuration entries | Shared parse/storage boundary; widening requires review of representation and identity |
 | Stored default expressions | 120 bytes, including enum member bindings and saved catalog display text | Existing startup reservation; SQLSTATE 54000 names an overfull default or bound enum expression before installation |
 | Startup capacities | Independent catalog, connection, transaction/savepoint, row-version, lock, replication, cache, and checkpoint pools | Configuration and exact startup memory plan; named errors before partial publication |
+| Connection startup options | 256 bytes per decoded option word; backslashes escape spaces and backslashes | SQLSTATE 54000 on word exhaustion; values are decoded without SQL quoting rules, and RESET restores the startup value |
 | MVCC row history | Explicit shared `row_history_slots` across tables/large objects, plus `max_row_versions_per_row` per row | Updates reserve before durability, including queued/prepared commits; exhaustion is `54000`; locking mode requires zero history slots |
 | Durable object requests | `object_store_get_slots` read clients, `object_store_put_slots` journal upload clients, `object_store_block_put_slots` physical upload clients, one separate atomic block client, administrative and independent journal/file cleanup clients, manifest publication clients, and configured credential/ownership clients | Each reserves header and response capacity; journal upload slots also reserve `wal_upload_buffer_bytes` immutable body bytes; physical slots reserve 256 KiB each and share a fixed writer-emission buffer. Read controls, upload outcomes and a 256 KiB block scratch buffer are charged separately from caches; atomic operations may wait synchronously |
 | Durable commit completion | `commit_queue_slots` complete transaction and session-context buffers | SQLSTATE 54000 names queue exhaustion before irreversible log staging; locks and outcomes survive storage waits and client disconnects |
@@ -236,9 +237,21 @@ programs, statement lists, multiranges, and mutable-routine results use their
 fixed memory budgets without separate staging-count ceilings. Heap locations
 use 32-bit addresses; `memtable_bytes` must not exceed `u32::MAX`. Startup reserves
 two heap buffers of that size, including one for relocation while readers retain
-old bytes. Reclamation returns `54000` while both buffers are retained. Effective search paths use
-the accepted GUC byte representation. Each cursor reserves `cursor_bytes`
-for typed rows, `cursor_query_bytes` for its query, copied parameters and their
+old bytes. Reclamation returns `54000` while both buffers are retained.
+Search paths accept at most 128 stored UTF-8 bytes; an oversized value or invalid
+list returns `22023`. Decoded values preserve their spaces and quoting; schema
+lookup folds unquoted names and decodes quoted names. Restored definitions must
+pass the same list validation before use. SQL identifiers longer than 63 bytes
+return `42622`; pos3ql rejects them instead of PostgreSQL's truncation and notice.
+SQL string values can use the full search-path byte budget. `application_name`
+accepts 64 stored bytes after PostgreSQL's
+[ASCII cleaning](https://github.com/postgres/postgres/blob/REL_18_6/src/common/string.c#L81): each non-printable or
+non-ASCII byte becomes literal `\xhh` using lowercase hexadecimal digits.
+Escaping beyond that capacity returns
+`22023` without changing the prior value.
+
+Each cursor reserves `cursor_bytes` for typed rows, `cursor_query_bytes` for its
+query, copied parameters and their
 declared types (a `NULL` date parameter still has the date type),
 including local values and types captured by a static procedural `OPEN`,
 a 1,024-byte description and `floor(cursor_bytes / 6)` row

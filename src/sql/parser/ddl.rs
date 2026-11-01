@@ -3015,11 +3015,7 @@ impl<'a> Parser<'a> {
                     if !self.eat_op("=")? {
                         self.expect_ident("to")?;
                     }
-                    let start = self.peek_at;
-                    while !matches!(self.peeked, Tok::Op(";") | Tok::Eof) {
-                        self.advance()?;
-                    }
-                    RoutineConfigValue::Value(self.text[start..self.peek_at].trim())
+                    self.configuration_value_list(name, true)?
                 };
                 AlterDatabaseAction::Set { name, value }
             }
@@ -3925,22 +3921,7 @@ impl<'a> Parser<'a> {
                     if !self.eat_op("=")? {
                         self.expect_ident("to")?;
                     }
-                    let value_start = self.peek_at;
-                    loop {
-                        if matches!(self.peeked, Tok::Op("+") | Tok::Op("-")) {
-                            self.advance()?;
-                        }
-                        if !matches!(self.peeked, Tok::Ident(_) | Tok::Num(_) | Tok::Str(_)) {
-                            return Err(self.unexpected("configuration value"));
-                        }
-                        self.advance()?;
-                        if !self.eat_op(",")? {
-                            break;
-                        }
-                    }
-                    crate::sql::ast::RoutineConfigValue::Value(
-                        self.text[value_start..self.peek_at].trim(),
-                    )
+                    self.configuration_value_list(config_name, true)?
                 };
                 if let Some(existing) = configs[..config_count]
                     .iter_mut()
@@ -4107,15 +4088,7 @@ impl<'a> Parser<'a> {
                 if !self.eat_op("=")? {
                     self.expect_ident("to")?;
                 }
-                let start = self.peek_at;
-                while !matches!(self.peeked, Tok::Op(";") | Tok::Eof) {
-                    self.advance()?;
-                }
-                let value = self.text[start..self.peek_at].trim();
-                if value.is_empty() {
-                    return Err(self.unexpected("configuration value"));
-                }
-                crate::sql::ast::RoutineConfigValue::Value(value)
+                self.configuration_value_list(name, true)?
             };
             return Ok(Stmt::AlterRoleSetting {
                 role,
@@ -7518,26 +7491,7 @@ impl<'a> Parser<'a> {
                         if !self.eat_op("=")? {
                             self.expect_ident("to")?;
                         }
-                        let start = self.peek_at;
-                        if matches!(self.peeked, Tok::Op("+") | Tok::Op("-")) {
-                            self.advance()?;
-                        }
-                        if !matches!(self.peeked, Tok::Ident(_) | Tok::Num(_) | Tok::Str(_)) {
-                            return Err(self.unexpected("configuration value"));
-                        }
-                        self.advance()?;
-                        while self.eat_op(",")? {
-                            if matches!(self.peeked, Tok::Op("+") | Tok::Op("-")) {
-                                self.advance()?;
-                            }
-                            if !matches!(self.peeked, Tok::Ident(_) | Tok::Num(_) | Tok::Str(_)) {
-                                return Err(self.unexpected("configuration value"));
-                            }
-                            self.advance()?;
-                        }
-                        crate::sql::ast::RoutineConfigValue::Value(
-                            self.text[start..self.peek_at].trim(),
-                        )
+                        self.configuration_value_list(name, true)?
                     };
                     AlterRoutineAction::SetConfig { name, value }
                 }

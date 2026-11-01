@@ -4954,6 +4954,25 @@ pub(crate) struct StoredQueryDefinition {
     pub dependencies: StoredQueryDependencies,
 }
 
+/// Stored SQL must cross the same path boundary as a session assignment before
+/// publication. In particular, a fixed string's truncated prefix is not a path.
+pub(crate) fn validate_stored_search_path(path: &StackStr<128>) -> Result<(), SqlError> {
+    if path.is_truncated() {
+        return Err(sql_err!(
+            sqlstate::DATA_EXCEPTION,
+            "stored creation search path exceeds {} bytes",
+            crate::sql::guc::SEARCH_PATH_BYTES
+        ));
+    }
+    crate::sql::guc::validate_search_path(path.as_str()).map_err(|error| {
+        sql_err!(
+            sqlstate::DATA_EXCEPTION,
+            "invalid stored creation search path: {}",
+            error.message
+        )
+    })
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RuleTarget {
     Table(u16),
@@ -16102,8 +16121,7 @@ pub(crate) fn rename_schema_path(
         if index != 0 {
             let _ = rewritten.write_char(',');
         }
-        let name = component
-            .trim_matches(|character| matches!(character, ' ' | '\t' | '\n' | '\r' | '\x0c'));
+        let name = component.trim_matches(crate::sql::guc::search_path_space);
         let matches = if let Some(inner) = name.strip_prefix('"') {
             let inner = inner.strip_suffix('"').ok_or_else(|| {
                 sql_err!(
@@ -16120,14 +16138,10 @@ pub(crate) fn rename_schema_path(
         if matches {
             let start = component.len()
                 - component
-                    .trim_start_matches(|character| {
-                        matches!(character, ' ' | '\t' | '\n' | '\r' | '\x0c')
-                    })
+                    .trim_start_matches(crate::sql::guc::search_path_space)
                     .len();
             let end = component
-                .trim_end_matches(|character| {
-                    matches!(character, ' ' | '\t' | '\n' | '\r' | '\x0c')
-                })
+                .trim_end_matches(crate::sql::guc::search_path_space)
                 .len();
             let _ = rewritten.write_str(&component[..start]);
             write_schema_identifier(&mut rewritten, new);
@@ -31366,7 +31380,7 @@ impl Storage {
         for element in crate::sql::guc::search_path_components(raw) {
             let element = element
                 .expect("search path crossed its validated GUC boundary")
-                .trim_matches(|character| matches!(character, ' ' | '\t' | '\n' | '\r' | '\x0c'));
+                .trim_matches(crate::sql::guc::search_path_space);
             if element.is_empty() {
                 continue;
             }
@@ -42865,6 +42879,7 @@ impl Storage {
         or_replace: bool,
         txid: u32,
     ) -> Result<ViewPublication, SqlError> {
+        validate_stored_search_path(&definition.query.creation_path)?;
         self.require_schema_create(schema.as_str(), txid)?;
         if self.find_table(schema.as_str(), name.as_str()).is_some() {
             return Err(sql_err!(
@@ -51835,6 +51850,7 @@ impl Storage {
         or_replace: bool,
         txid: u32,
     ) -> Result<RulePublication, SqlError> {
+        validate_stored_search_path(&definition.creation_path)?;
         let target = self.query_rule_target(definition.target, txid)?;
         let mut owners = self.catalog_dependency_owners(
             &self.view_rule_catalog,
@@ -52219,6 +52235,7 @@ impl Storage {
         definition: RuleDefinition,
         dependencies: StoredQueryDependencies,
     ) -> Result<(), SqlError> {
+        validate_stored_search_path(&definition.creation_path)?;
         CatalogIdentity::require(created_at)?;
         if slot >= self.rule_count() {
             return Err(sql_err!(

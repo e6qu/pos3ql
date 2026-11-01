@@ -8440,6 +8440,7 @@ fn decode_op_inner<'a>(
             let raw = payload.get(at..at + path_len)?;
             at += path_len;
             let path = core::str::from_utf8(raw).ok()?;
+            crate::sql::guc::validate_search_path(path).ok()?;
             let security_invoker = match *payload.get(at)? {
                 0 => false,
                 1 => true,
@@ -8624,6 +8625,7 @@ fn decode_op_inner<'a>(
             ));
             at += 2;
             let path = core::str::from_utf8(payload.get(at..at + path_len)?).ok()?;
+            crate::sql::guc::validate_search_path(path).ok()?;
             at += path_len;
             let encoded = payload.get(at..)?;
             if !validate_stored_query_dependencies(encoded) {
@@ -9384,6 +9386,7 @@ fn decode_op_inner<'a>(
                 u16::from_le_bytes(payload.get(at..at + 2)?.try_into().unwrap()) as usize;
             at += 2;
             let path = core::str::from_utf8(payload.get(at..at + path_len)?).ok()?;
+            crate::sql::guc::validate_search_path(path).ok()?;
             at += path_len;
             let populated = stored_boolean(*payload.get(at)?)?;
             at += 1;
@@ -10601,9 +10604,7 @@ fn decode_op_inner<'a>(
                 crate::storage::RoutineKind::from_wire_code(code, result)?
             };
             let creation_path = crate::util::StackStr::from_str(take_name(&mut at)?);
-            if creation_path.is_truncated() {
-                return None;
-            }
+            crate::storage::validate_stored_search_path(&creation_path).ok()?;
             let encoded_dependencies = payload.get(at..)?;
             if !validate_stored_query_dependencies(encoded_dependencies) {
                 return None;
@@ -16907,9 +16908,134 @@ mod tests {
         assert!(decode_op(KIND_CREATE_ROUTINE, payload.readable()).is_some());
         let (_, restored, _) = decode_routine_payload(payload.readable(), false).unwrap();
         assert_eq!(restored.ownership.owner, 42);
+        let dependencies_len = WalStoredQueryDependencies::Captured(
+            crate::storage::StoredQueryDependencies::EMPTY.view(),
+        )
+        .encoded_len();
+        let path_offset = payload.len() - dependencies_len - 1 - "public".len();
+        assert_eq!(payload.readable()[path_offset], "public".len() as u8);
+        assert_eq!(
+            &payload.readable()[path_offset + 1..path_offset + 7],
+            b"public"
+        );
+        let mut malformed = FixedBuf::new(&mut budget, "oversized routine path WAL", 2048).unwrap();
+        let oversized = ["a".repeat(129), "é".repeat(65)];
+        crate::mem::guard::forbid_alloc(|| {
+            for path in &oversized {
+                malformed.clear();
+                assert!(malformed.append(&payload.readable()[..path_offset]));
+                assert!(malformed.append(&[path.len() as u8]));
+                assert!(malformed.append(path.as_bytes()));
+                assert!(malformed.append(&payload.readable()[path_offset + 7..]));
+                // The complete encoded field exceeds the destination; it must
+                // be rejected rather than installed as a clipped valid prefix.
+                assert!(decode_op(KIND_CREATE_ROUTINE, malformed.readable()).is_none());
+            }
+        });
         let last = payload.len() - 1;
         payload.filled_mut()[last] = 0xff;
         assert!(decode_op(KIND_CREATE_ROUTINE, payload.readable()).is_none());
+    }
+
+    #[test]
+    fn stored_query_payloads_reject_invalid_and_oversized_creation_paths() {
+        let oversized = "a".repeat(crate::sql::guc::SEARCH_PATH_BYTES + 1);
+        let oversized_utf8 = "é".repeat(crate::sql::guc::SEARCH_PATH_BYTES / 2 + 1);
+        let columns = crate::storage::ViewColumns::from_names(&["value"]).unwrap();
+        let dependencies = crate::storage::StoredQueryDependencies::EMPTY;
+        let identity = crate::storage::CatalogPosition::new(0, 1).unwrap();
+        let mut budget = Budget::new(4096);
+        let mut payload = FixedBuf::new(&mut budget, "stored path validation", 4096).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            for (path, valid) in [
+                ("public", true),
+                ("", true),
+                ("\"quoted, path\",public", true),
+                ("\"é\",public", true),
+                ("public,", false),
+                ("\"unterminated", false),
+                ("public public", false),
+                ("public,,other", false),
+                (oversized.as_str(), false),
+                (oversized_utf8.as_str(), false),
+            ] {
+                let operations = [
+                    WalOp::CreateView {
+                        identity: crate::storage::ViewCatalogIdentity::new(0, 1, 0, 2).unwrap(),
+                        schema: "public",
+                        name: "saved_view",
+                        columns: WalViewColumns::Captured(&columns),
+                        sql: "SELECT 1 AS value",
+                        path,
+                        security_invoker: false,
+                        security_barrier: 0,
+                        check_option: 0,
+                        dependencies: WalStoredQueryDependencies::Captured(dependencies.view()),
+                    },
+                    WalOp::CreateMatview {
+                        identity,
+                        backing: crate::storage::CatalogPosition::new(0, 2).unwrap(),
+                        schema: "public",
+                        name: "saved_matview",
+                        sql: "SELECT 1 AS value",
+                        path,
+                        dependencies: WalStoredQueryDependencies::Captured(dependencies.view()),
+                        populated: false,
+                    },
+                    WalOp::SetRule {
+                        slot: 0,
+                        created_at: 1,
+                        target: TriggerTargetKind::Table,
+                        table_schema: "public",
+                        table: "source",
+                        name: "saved_rule",
+                        event: crate::storage::RewriteEvent::Insert,
+                        mode: crate::storage::RewriteMode::Also,
+                        enabled: crate::storage::RuleEnabled::Origin,
+                        source: "NOTHING",
+                        condition: None,
+                        actions: [crate::storage::RuleTextSpan::EMPTY;
+                            crate::storage::MAX_RULE_ACTIONS],
+                        action_count: 0,
+                        returning_action: None,
+                        path,
+                        dependencies: WalStoredQueryDependencies::Captured(dependencies.view()),
+                    },
+                ];
+                for operation in operations {
+                    payload.clear();
+                    assert!(append_payload(&mut payload, &operation));
+                    assert_eq!(
+                        decode_op(op_kind(&operation), payload.readable()).is_some(),
+                        valid,
+                        "{path:?}"
+                    );
+                }
+                if path.len() <= crate::sql::guc::SEARCH_PATH_BYTES {
+                    let definition = crate::storage::RoutineDef {
+                        created_at: 1,
+                        schema: crate::storage::SqlName::parse("public").unwrap(),
+                        name: crate::storage::SqlName::parse("saved_routine").unwrap(),
+                        body: crate::util::StackStr::from_str("SELECT 1"),
+                        creation_path: crate::util::StackStr::from_str(path),
+                        ddl_state: crate::storage::CatalogDdlState::Present,
+                        ..crate::storage::RoutineDef::EMPTY
+                    };
+                    let operation = WalOp::CreateRoutine {
+                        identity,
+                        definition: &definition,
+                        dependencies: WalStoredQueryDependencies::Captured(dependencies.view()),
+                    };
+                    payload.clear();
+                    assert!(append_payload(&mut payload, &operation));
+                    assert_eq!(
+                        decode_op(op_kind(&operation), payload.readable()).is_some(),
+                        valid,
+                        "{path:?}"
+                    );
+                }
+            }
+        });
     }
 
     #[test]

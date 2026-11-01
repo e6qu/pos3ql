@@ -573,6 +573,7 @@ impl Storage {
         populated: bool,
         txid: u32,
     ) -> Result<MatviewDdlUndo, SqlError> {
+        super::validate_stored_search_path(&query.creation_path)?;
         let target =
             self.query_table_target(backing_table, txid, type_contracts::QueryTargetUse::Read)?;
         let name = self.table_def(backing_table, txid).name;

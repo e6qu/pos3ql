@@ -1151,6 +1151,14 @@ fn decoded_guc_values_keep_their_spelling_and_resolve_search_path_names() {
             "GUC_RAW,public|7",
             "  \"Guc Space\" , public  ",
             "8",
+            "\x0bpublic\x0b",
+            "public",
+            "public\x0b,\x0bpg_catalog",
+            "public",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "\"ééééééééééééééééééééééééééééééééa\"",
+            "\"éééééééééééééééééééééééééééééééééééééééééééééééééé\"",
             "guc_raw, public",
             "\"guc_raw,public\"",
             "'public'",
@@ -1176,6 +1184,8 @@ fn decoded_guc_values_keep_their_spelling_and_resolve_search_path_names() {
     );
     for value in [
         "foo bar",
+        "public\x0bpg_catalog",
+        "public,\x0b",
         "public,,pg_catalog",
         "public,",
         "\"unclosed",
@@ -1191,6 +1201,124 @@ fn decoded_guc_values_keep_their_spelling_and_resolve_search_path_names() {
         );
         assert_eq!(
             data_rows(&session.success(&mut engine, "SELECT current_setting('search_path')", true)),
+            ["GUC_RAW,public"]
+        );
+    }
+}
+
+#[test]
+fn sql_setting_strings_are_decoded_once_before_guc_assignment() {
+    let config = test_config("decoded-sql-setting-values");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    let sql =
+        include_str!("../../../tests/external/differential_exact/57_decoded_sql_settings.sql");
+    assert_eq!(
+        data_rows(&session.success(&mut engine, sql, true)),
+        [
+            "a'b",
+            "dollar'quote",
+            "doubled'quote",
+            "a\\x09b",
+            "DEFAULT",
+            "1",
+            "\"Case\tName\", public",
+            "\"quote'name\", \"dollar,name\", \"Mixed Case\"",
+            "ISO, DMY",
+            "function'value|outside",
+            "changed'value|outside",
+            "outside|t",
+            "outside|t",
+            "DEFAULT",
+            "application_name=role'value",
+            "application_name=database'value",
+            "UTC",
+            "<+02>-02",
+            "<+02>-02",
+            "<+02>-02",
+            "<-02>+02",
+            "<+02:30>-02:30",
+            "9000",
+            "+02:00",
+            "-7200",
+            "<+02:30>-02:30",
+        ]
+    );
+    for sql in [
+        "SET application_name TO one,two",
+        "SET nonexistent_parameter TO one,two",
+        "SET server_version TO one,two",
+        "SET TIME ZONE 'DEFAULT'",
+        "SET TIME ZONE 'LOCAL'",
+        "SET TIME ZONE $$DEFAULT$$",
+    ] {
+        assert_eq!(
+            error_sqlstates(&session.execute(&mut engine, sql, true)),
+            ["22023"],
+            "{sql}"
+        );
+    }
+}
+
+#[test]
+fn search_path_sql_capacity_errors_preserve_the_selected_value() {
+    let config = test_config("search-path-sql-capacity");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    for (name, expected) in [
+        ("a".repeat(63), "a".repeat(63)),
+        (
+            format!("{}a", "é".repeat(31)),
+            format!("\"{}a\"", "é".repeat(31)),
+        ),
+    ] {
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                &format!("SET search_path TO {name}; SHOW search_path"),
+                true,
+            )),
+            [expected]
+        );
+    }
+    session.success(
+        &mut engine,
+        "SELECT set_config('search_path','GUC_RAW,public',false)",
+        true,
+    );
+    for name in [
+        "a".repeat(64),
+        "a".repeat(65),
+        "é".repeat(32),
+        format!("{}a", "é".repeat(32)),
+    ] {
+        for sql in [
+            format!("SET search_path TO {name}"),
+            format!("SET search_path TO \"{name}\""),
+        ] {
+            assert_eq!(
+                error_sqlstates(&session.execute(&mut engine, &sql, true)),
+                ["42622"]
+            );
+            assert_eq!(
+                data_rows(&session.success(&mut engine, "SHOW search_path", true)),
+                ["GUC_RAW,public"]
+            );
+        }
+    }
+    for value in ["a".repeat(129), "é".repeat(64), "é".repeat(65)] {
+        assert_eq!(
+            error_sqlstates(&session.execute(
+                &mut engine,
+                &format!("SET search_path TO '{value}'"),
+                true,
+            )),
+            ["22023"]
+        );
+        assert_eq!(
+            data_rows(&session.success(&mut engine, "SHOW search_path", true)),
             ["GUC_RAW,public"]
         );
     }
@@ -1215,8 +1343,13 @@ fn saved_guc_values_preserve_raw_spelling_without_runtime_allocations() {
             guc.get_owned("search_path").unwrap().as_str(),
             "GUC_RAW,public"
         );
-        guc.set("search_path", "public", false).unwrap();
-        guc.set("search_path", "DEFAULT", false).unwrap();
+        guc.begin_transaction();
+        guc.set_config("search_path", Some("public"), false)
+            .unwrap();
+        guc.commit_transaction();
+        guc.begin_transaction();
+        guc.set_config("search_path", None, false).unwrap();
+        guc.commit_transaction();
         assert_eq!(
             guc.get_owned("search_path").unwrap().as_str(),
             "GUC_RAW,public"
@@ -1236,6 +1369,24 @@ fn saved_guc_values_preserve_raw_spelling_without_runtime_allocations() {
             guc.get_owned("search_path").unwrap().as_str(),
             "GUC_RAW,public"
         );
+    });
+}
+
+#[test]
+fn reset_xmloption_restores_the_connection_default_without_allocating() {
+    let guc = GucState::new();
+    crate::mem::guard::forbid_alloc(|| {
+        guc.set_connection_default("xmloption", "document", guc::ConnectionDefaultSource::Role)
+            .unwrap();
+        guc.begin_transaction();
+        guc.set_config("xmloption", Some("content"), false).unwrap();
+        guc.commit_transaction();
+        assert_eq!(guc.get_owned("xmloption").unwrap().as_str(), "content");
+        guc.begin_transaction();
+        guc.reset("xmloption").unwrap();
+        guc.commit_transaction();
+        assert_eq!(guc.get_owned("xmloption").unwrap().as_str(), "document");
+        assert!(guc.render().xml_document);
     });
 }
 
@@ -1264,4 +1415,174 @@ fn bound_builtin_casts_keep_indexed_point_reads() {
         ["5110|-5110|5111", "0|0|1|1"]
     );
     session.success(&mut engine, "ROLLBACK", true);
+}
+#[test]
+fn application_names_escape_non_printable_bytes_without_allocating() {
+    let guc = GucState::new();
+    let exactly_full = "é".repeat(8);
+    let full_expected = "\\xc3\\xa9".repeat(8);
+    let overflowing = "é".repeat(9);
+    crate::mem::guard::forbid_alloc(|| {
+        for (value, expected) in [
+            (" plain !~\\ ", " plain !~\\ "),
+            ("a\tb", "a\\x09b"),
+            (
+                "\x01\t\n\x0b\x0c\r\x1b\x1f\x7f",
+                "\\x01\\x09\\x0a\\x0b\\x0c\\x0d\\x1b\\x1f\\x7f",
+            ),
+            ("é中🦀", "\\xc3\\xa9\\xe4\\xb8\\xad\\xf0\\x9f\\xa6\\x80"),
+            ("\\x09", "\\x09"),
+        ] {
+            assert_eq!(
+                guc.set_config("application_name", Some(value), false)
+                    .unwrap()
+                    .as_str(),
+                expected
+            );
+            assert_eq!(
+                guc.get_owned("application_name").unwrap().as_str(),
+                expected
+            );
+        }
+        assert_eq!(
+            guc.set_config("application_name", Some(&exactly_full), false)
+                .unwrap()
+                .as_str(),
+            full_expected
+        );
+        assert_eq!(
+            guc.set_config("application_name", Some(&overflowing), false)
+                .unwrap_err()
+                .sqlstate,
+            "22023"
+        );
+        assert_eq!(
+            guc.get_owned("application_name").unwrap().as_str(),
+            full_expected
+        );
+        assert_eq!(
+            guc.set_config("application_name", Some("zero\0byte"), false)
+                .unwrap_err()
+                .sqlstate,
+            "22021"
+        );
+        assert_eq!(
+            guc.get_owned("application_name").unwrap().as_str(),
+            full_expected
+        );
+    });
+}
+#[test]
+fn datestyle_assignments_preserve_reset_defaults_and_reject_conflicts_atomically() {
+    let guc = GucState::new();
+    guc.set_connection_default(
+        "DateStyle",
+        "SQL, YMD",
+        guc::ConnectionDefaultSource::Database,
+    )
+    .unwrap();
+    crate::mem::guard::forbid_alloc(|| {
+        for (value, expected) in [
+            ("", "German, DMY"),
+            (" \t\n\u{b}", "German, DMY"),
+            ("DEFAULT", "SQL, YMD"),
+            ("DEFAULT,ISO", "ISO, YMD"),
+            ("ISO,DEFAULT", "ISO, YMD"),
+            ("DEFAULT,German", "German, DMY"),
+            ("German,DEFAULT", "German, YMD"),
+            ("MDY,DEFAULT,German", "German, MDY"),
+            ("German,DEFAULT,MDY", "German, MDY"),
+            ("ISO,ISO", "ISO, DMY"),
+            ("\"ISO\", \"DMY\"", "ISO, DMY"),
+            ("PostgreSQL", "Postgres, DMY"),
+            ("European", "German, DMY"),
+            ("US", "German, MDY"),
+            ("NonEuro", "German, MDY"),
+            ("German,MDY,German", "German, MDY"),
+            ("DEFAULT,DEFAULT", "SQL, YMD"),
+        ] {
+            guc.set_config("DateStyle", Some("German,DMY"), false)
+                .unwrap();
+            assert_eq!(
+                guc.set_config("DateStyle", Some(value), false)
+                    .unwrap()
+                    .as_str(),
+                expected,
+                "{value:?}"
+            );
+        }
+        guc.set_config("DateStyle", Some("DEFAULT"), false).unwrap();
+        assert_eq!(guc.get_owned("DateStyle").unwrap().as_str(), "SQL, YMD");
+        guc.set_config("DateStyle", Some("German,MDY"), false)
+            .unwrap();
+        for value in [
+            "ISO,SQL",
+            "DMY,MDY",
+            "ISO SQL",
+            "ISO,",
+            "ISO,,MDY",
+            "\"ISO,DMY\"",
+            "\"ISO\"suffix",
+            "\"ISO",
+            "\"IS\"\"O\"",
+            "'DEFAULT'",
+            "German,Euro,US",
+            "ISO,SQL,DEFAULT",
+            "SQL,DEFAULT,ISO",
+        ] {
+            assert_eq!(
+                guc.set_config("DateStyle", Some(value), false)
+                    .unwrap_err()
+                    .sqlstate,
+                "22023",
+                "{value:?}"
+            );
+            assert_eq!(guc.get_owned("DateStyle").unwrap().as_str(), "German, MDY");
+        }
+        assert_eq!(
+            guc.set_config("DateStyle", None, false).unwrap().as_str(),
+            "SQL, YMD"
+        );
+    });
+}
+
+#[test]
+fn datestyle_sql_values_apply_cumulative_components_and_quoted_defaults() {
+    let config = test_config("decoded-datestyle-components");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SET DateStyle TO SQL,YMD; SELECT current_setting('DateStyle'); \
+         SET DateStyle TO German; SELECT current_setting('DateStyle'); \
+         SELECT set_config('DateStyle','German,DEFAULT',false); \
+         SET DateStyle TO 'DEFAULT'; SELECT current_setting('DateStyle'); \
+         SELECT set_config('DateStyle','\"SQL\",\"DMY\"',false); \
+         SELECT set_config('DateStyle','',false)",
+            true
+        )),
+        [
+            "SQL, YMD",
+            "German, DMY",
+            "German, MDY",
+            "ISO, MDY",
+            "SQL, DMY",
+            "SQL, DMY"
+        ]
+    );
+    for sql in [
+        "SET DateStyle TO ISO,SQL",
+        "SELECT set_config('DateStyle','DMY,MDY',false)",
+    ] {
+        assert_eq!(
+            error_sqlstates(&session.execute(&mut engine, sql, true)),
+            ["22023"]
+        );
+        assert_eq!(
+            data_rows(&session.success(&mut engine, "SELECT current_setting('DateStyle')", true)),
+            ["SQL, DMY"]
+        );
+    }
 }

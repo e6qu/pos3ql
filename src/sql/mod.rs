@@ -8932,7 +8932,12 @@ impl Engine {
             responder.command_complete("SET")?;
             return Ok(Ok(()));
         }
-        if let Some(characteristics) = guc.current_transaction_setting(name, value) {
+        let characteristics = match syntax {
+            ast::SettingSyntax::DecodedValue => guc.current_transaction_value(name, Some(value)),
+            ast::SettingSyntax::Default => guc.current_transaction_value(name, None),
+            _ => None,
+        };
+        if let Some(characteristics) = characteristics {
             let characteristics = match characteristics {
                 Ok(characteristics) => characteristics,
                 Err(error) => return Ok(Err(error)),
@@ -8946,7 +8951,10 @@ impl Engine {
             return Ok(Ok(()));
         }
         let changed = match syntax {
-            ast::SettingSyntax::Generic => guc.set(name, value, local),
+            ast::SettingSyntax::DecodedValue => {
+                guc.set_config(name, Some(value), local).map(|_| ())
+            }
+            ast::SettingSyntax::Default => guc.set_config(name, None, local).map(|_| ()),
             ast::SettingSyntax::FromCurrent => {
                 unreachable!("FROM CURRENT is handled before value application")
             }

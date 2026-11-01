@@ -71,25 +71,62 @@ fn fixed_eq(left: &[u8], right: &[u8]) -> bool {
             == 0
 }
 
+fn startup_option_word(
+    characters: &mut core::iter::Peekable<core::str::Chars<'_>>,
+) -> Result<Option<StackStr<256>>, SqlError> {
+    while characters
+        .peek()
+        .is_some_and(|character| crate::sql::guc::search_path_space(*character))
+    {
+        characters.next();
+    }
+    if characters.peek().is_none() {
+        return Ok(None);
+    }
+    let mut word = StackStr::<256>::new();
+    while let Some(character) = characters.next() {
+        let character = if character == '\\' {
+            let Some(escaped) = characters.next() else {
+                break;
+            };
+            escaped
+        } else if crate::sql::guc::search_path_space(character) {
+            break;
+        } else {
+            character
+        };
+        let _ = core::fmt::Write::write_char(&mut word, character);
+        if word.is_truncated() {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "startup option word exceeds 256 bytes"
+            ));
+        }
+    }
+    Ok(Some(word))
+}
+
 fn apply_startup_options(guc: &GucState, options: &str, superuser: bool) -> Result<(), SqlError> {
-    let mut words = options.split_ascii_whitespace();
-    while let Some(word) = words.next() {
-        let assignment = if word == "-c" {
-            words.next().ok_or_else(|| {
+    let mut words = options.chars().peekable();
+    while let Some(word) = startup_option_word(&mut words)? {
+        let separate;
+        let assignment = if word.as_str() == "-c" {
+            separate = startup_option_word(&mut words)?.ok_or_else(|| {
                 sql_err!(
                     sqlstate::INVALID_PARAMETER_VALUE,
                     "-c in startup options requires a parameter assignment"
                 )
-            })?
-        } else if let Some(assignment) = word.strip_prefix("-c") {
+            })?;
+            separate.as_str()
+        } else if let Some(assignment) = word.as_str().strip_prefix("-c") {
             assignment
-        } else if let Some(assignment) = word.strip_prefix("--") {
+        } else if let Some(assignment) = word.as_str().strip_prefix("--") {
             assignment
         } else {
             return Err(sql_err!(
-                sqlstate::INVALID_PARAMETER_VALUE,
+                sqlstate::SYNTAX_ERROR,
                 "unsupported startup option \"{}\"",
-                word
+                word.as_str()
             ));
         };
         let Some((name, value)) = assignment.split_once('=') else {
@@ -111,7 +148,7 @@ fn apply_startup_options(guc: &GucState, options: &str, superuser: bool) -> Resu
                 "permission denied to set parameter \"event_triggers\""
             ));
         }
-        guc.set(name, value, false)?;
+        guc.set_config(name, Some(value), false)?;
     }
     Ok(())
 }
@@ -1312,7 +1349,7 @@ impl Conn {
                         "permission denied to set parameter \"event_triggers\""
                     ))
                 }
-                _ => self.guc.set(key, value, false),
+                _ => self.guc.set_config(key, Some(value), false).map(|_| ()),
             };
             if let Err(error) = result {
                 let mut responder = Responder::new(&mut self.send);
@@ -7852,6 +7889,180 @@ mod tests {
         apply_startup_options(&guc, "-c event_triggers=off", true)
             .expect("a superuser may disable login event triggers");
         assert!(!guc.event_triggers());
+    }
+
+    #[test]
+    fn startup_packets_keep_decoded_setting_values_and_client_reset_values() {
+        let directory =
+            std::env::temp_dir().join(format!("pos3ql-raw-startup-{}", std::process::id()));
+        let mut config = Config::default_dev();
+        config.data_dir = directory.to_string_lossy().into_owned();
+        config.max_connections = 1;
+        config.max_tables = 2;
+        config.max_extended_statistics = 16;
+        config.table_rows = 16;
+        config.txn_rows = 16;
+        config.memtable_bytes = 1 << 20;
+        config.wal_bytes = 1 << 20;
+        config.wal_buffer_bytes = 1 << 16;
+        config.sql_arena_bytes = 128 << 10;
+        config.work_arena_bytes = 1 << 20;
+        config.max_prepared = 2;
+        config.max_portals = 2;
+        config.remove_test_data_dir_on_drop();
+        let mut budget = crate::sql::test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let auth = AuthContext {
+            mode: AuthMode::Trust,
+            password: String::new(),
+            scram: None,
+        };
+        type StartupCase = (
+            &'static [(&'static str, &'static str)],
+            &'static str,
+            &'static str,
+        );
+        let cases: &[StartupCase] = &[
+            (
+                &[
+                    ("application_name", "  startup  "),
+                    ("search_path", "  \"Mixed Case\" ,public  "),
+                ],
+                "  startup  ",
+                "  \"Mixed Case\" ,public  ",
+            ),
+            (
+                &[
+                    ("application_name", "'startup'"),
+                    ("search_path", "DEFAULT"),
+                ],
+                "'startup'",
+                "DEFAULT",
+            ),
+            (
+                &[
+                    ("application_name", "DEFAULT"),
+                    ("options", "-c search_path=GUC_RAW,public"),
+                ],
+                "DEFAULT",
+                "GUC_RAW,public",
+            ),
+            (
+                &[(
+                    "options",
+                    r"-c application_name=\ \ startup\ \  -c search_path=GUC_RAW,public",
+                )],
+                "  startup  ",
+                "GUC_RAW,public",
+            ),
+            (
+                &[(
+                    "options",
+                    "-capplication_name='startup' --search_path=GUC_RAW,public",
+                )],
+                "'startup'",
+                "GUC_RAW,public",
+            ),
+            (
+                &[("options", "--application_name=DEFAULT")],
+                "DEFAULT",
+                "\"$user\", public",
+            ),
+            (
+                &[("options", "-c\x0bapplication_name=VT")],
+                "VT",
+                "\"$user\", public",
+            ),
+            (
+                &[("options", r"-c application_name=a\\b")],
+                r"a\b",
+                "\"$user\", public",
+            ),
+            (
+                &[("options", "-c application_name=tail\\")],
+                "tail",
+                "\"$user\", public",
+            ),
+        ];
+        for (index, (parameters, application_name, search_path)) in cases.iter().enumerate() {
+            let mut connection = Conn::new(&config, &mut budget).unwrap();
+            connection.id = 80 + index as i32;
+            let mut payload = b"user\0postgres\0database\0postgres\0".to_vec();
+            for (name, value) in *parameters {
+                payload.extend_from_slice(name.as_bytes());
+                payload.push(0);
+                payload.extend_from_slice(value.as_bytes());
+                payload.push(0);
+            }
+            payload.push(0);
+            let mut startup = ((payload.len() + 8) as i32).to_be_bytes().to_vec();
+            startup.extend_from_slice(&wire::PROTOCOL_3_2.to_be_bytes());
+            startup.extend_from_slice(&payload);
+            assert!(connection.recv.append(&startup));
+            assert!(matches!(
+                crate::mem::guard::forbid_alloc(|| connection.process_startup(
+                    &mut engine,
+                    b"raw-startup-key!",
+                    &auth,
+                    None
+                )),
+                Step::Continue
+            ));
+            assert_eq!(connection.phase, Phase::Ready, "{parameters:?}");
+            assert!(!has_backend_message(
+                connection.send.readable(),
+                wire::MSG_ERROR_RESPONSE
+            ));
+            assert_eq!(
+                connection
+                    .guc
+                    .get_owned("application_name")
+                    .unwrap()
+                    .as_str(),
+                *application_name
+            );
+            assert_eq!(connection.guc.search_path().as_str(), *search_path);
+            assert_eq!(connection.guc.source("application_name"), "client");
+            connection.send.clear();
+            assert!(connection.recv.append(&frontend(wire::FMSG_QUERY,
+                b"RESET ALL; SELECT current_setting('application_name'),current_setting('search_path')\0")));
+            assert!(matches!(
+                crate::mem::guard::forbid_alloc(|| connection.process_message(&mut engine)),
+                Step::Continue
+            ));
+            let mut responses = connection.send.readable();
+            let mut row_seen = false;
+            while !responses.is_empty() {
+                let length = i32::from_be_bytes(responses[1..5].try_into().unwrap()) as usize;
+                if responses[0] == wire::MSG_DATA_ROW {
+                    let mut row = MsgIn::new(&responses[5..length + 1]);
+                    assert_eq!(row.i16().unwrap(), 2);
+                    for expected in [*application_name, *search_path] {
+                        let length = row.i32().unwrap() as usize;
+                        assert_eq!(row.take(length).unwrap(), expected.as_bytes());
+                    }
+                    row_seen = true;
+                }
+                responses = &responses[length + 1..];
+            }
+            assert!(row_seen);
+            engine.drop_connection(connection.id);
+            engine.release_role_connection(connection.authenticated_role.take().unwrap());
+            engine.release_database_connection(connection.authenticated_database.take().unwrap());
+        }
+    }
+
+    #[test]
+    fn startup_options_do_not_treat_quotes_as_shell_quoting_or_truncate_words() {
+        let guc = GucState::new();
+        let oversized = format!("-c application_name={}", "x".repeat(257));
+        crate::mem::guard::forbid_alloc(|| {
+            let error =
+                apply_startup_options(&guc, "-c application_name='one two'", true).unwrap_err();
+            assert_eq!(error.sqlstate, sqlstate::SYNTAX_ERROR);
+            let error = apply_startup_options(&guc, &oversized, true).unwrap_err();
+            assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+        });
     }
 
     #[test]

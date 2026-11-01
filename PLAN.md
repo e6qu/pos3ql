@@ -37,19 +37,18 @@ first result column and writes an audit row through a function in its second.
 It must produce three increments, three audit rows and three result rows,
 including when a function pauses. Completed columns must not run again.
 
-Keep source, predicate and projection positions through mutable function
-handoffs. Reuse the retained physical reader and existing startup arenas;
-keep temporary call state bounded to active rows rather than all earlier rows.
-Preserve selected definitions, types, one result header, scan counts,
-cancellation, rollback and named capacity errors. Compare effects and values
-with PostgreSQL, including empty-cache reads, nested calls and replaced objects.
-Keep original defaults and null handling while using the body selected at
-execution. Preserve explicit versus expanded variadic arguments through lookup,
-input mapping, descriptions and recovered declarations.
-Then extend those positions through function bodies and object-store waits,
-complex plans, SQL cursors and results already sent to the client.
-The [architecture](docs/architecture.md) describes implemented function-input
-retention and typed result handling; these alone do not complete query resumption.
+Supported single-table scalar statements retain their source, predicate and
+projection positions through mutable function handoffs, using the existing
+physical reader and startup arenas. Temporary call state belongs to active rows.
+Calls retain selected identities, original defaults and null handling; explicit
+variadic arrays remain distinct from expanded arguments.
+
+Extend those positions through function bodies and object-store waits, complex
+plans, named/custom casts, SQL cursors and results already sent to the client.
+Preserve types, one result header, scan counts, cancellation, rollback and named
+capacity errors. Compare effects and values with PostgreSQL, including empty-cache
+reads, nested calls and replaced objects. The
+[architecture](docs/architecture.md) describes the current boundaries.
 
 Audit PostgreSQL 18 built-ins by signature and executable behavior, including
 `hashtextextended('order-42', 0)`. Catalog presence alone is not support.
@@ -166,7 +165,7 @@ readers keep their selected objects and values, and new reads see whole commits.
 Reusing a name or slot never redirects a reader to replacement data. Cleanup
 respects readers and backups. Preserve the existing rollback, savepoint,
 prepared-transaction, capacity and empty-cache recovery checks throughout this
-conversion. Corrupt or stale restored state must fail before writer promotion.
+conversion. Reject corrupt or stale restored state before accepting SQL writes.
 Resumption preserves effects once, including triggers and issued sequence values;
 skipped expression branches must not run their queries or effects.
 Lost commit replies resolve to all changes or none.

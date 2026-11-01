@@ -7668,13 +7668,14 @@ pub fn alter_role_setting(
             };
             let value = match value {
                 crate::sql::ast::RoutineConfigValue::Current => guc.get_owned(name.as_str()),
-                crate::sql::ast::RoutineConfigValue::Value(value)
-                    if value.trim().eq_ignore_ascii_case("default") =>
-                {
+                crate::sql::ast::RoutineConfigValue::Default => {
+                    if let Err(error) = guc.validate_setting_value(name.as_str(), None) {
+                        return sql_fail(error);
+                    }
                     None
                 }
                 crate::sql::ast::RoutineConfigValue::Value(value) => {
-                    match guc.canonical_routine_setting(name.as_str(), value) {
+                    match guc.validate_setting_value(name.as_str(), Some(value)) {
                         Ok(value) => Some(value),
                         Err(error) => return sql_fail(error),
                     }
@@ -7844,7 +7845,7 @@ pub fn alter_system(
                 Ok(name) => name,
                 Err(error) => return sql_fail(error),
             };
-            let value = match guc.canonical_routine_setting(name.as_str(), raw) {
+            let value = match guc.validate_setting_value(name.as_str(), Some(raw)) {
                 Ok(value) => crate::util::StackStr::from_str(value.as_str()),
                 Err(error) => return sql_fail(error),
             };
@@ -33907,14 +33908,21 @@ pub fn create_routine(
         ));
     }
     let mut configs = [crate::storage::RoutineConfig::EMPTY; crate::storage::MAX_ROUTINE_CONFIGS];
-    for (index, config) in routine.configs.iter().enumerate() {
+    let mut config_count = 0;
+    for config in routine.configs.iter() {
         let name = match SqlName::parse(config.name) {
             Ok(name) => name,
             Err(error) => return sql_fail(error),
         };
         let value = match config.value {
+            super::ast::RoutineConfigValue::Default => {
+                if let Err(error) = guc.validate_setting_value(config.name, None) {
+                    return sql_fail(error);
+                }
+                continue;
+            }
             super::ast::RoutineConfigValue::Value(value) => {
-                match guc.canonical_routine_setting(config.name, value) {
+                match guc.validate_setting_value(config.name, Some(value)) {
                     Ok(value) => StackStr::from_str(value.as_str()),
                     Err(error) => return sql_fail(error),
                 }
@@ -33937,7 +33945,8 @@ pub fn create_routine(
                 crate::storage::ROUTINE_CONFIG_VALUE_MAX
             ));
         }
-        configs[index] = crate::storage::RoutineConfig { name, value };
+        configs[config_count] = crate::storage::RoutineConfig { name, value };
+        config_count += 1;
     }
     let attributes = crate::storage::RoutineAttributes {
         strict: routine.attributes.strict,
@@ -33983,7 +33992,7 @@ pub fn create_routine(
                 language,
                 attributes,
                 configs,
-                config_count: routine.configs.len(),
+                config_count,
                 body_kind,
                 body,
                 creation_path,
@@ -34041,7 +34050,7 @@ pub fn create_routine(
                 language,
                 attributes,
                 configs,
-                config_count: routine.configs.len(),
+                config_count,
                 body_kind,
                 body,
                 creation_path,
@@ -35920,9 +35929,26 @@ pub fn alter_routine(
                         Ok(name) => name,
                         Err(error) => return sql_fail(error),
                     };
+                    if value == super::ast::RoutineConfigValue::Default {
+                        if let Err(error) = guc.validate_setting_value(name, None) {
+                            return sql_fail(error);
+                        }
+                        if let Some(index) = configs[..config_count]
+                            .iter()
+                            .position(|config| config.name == stored_name)
+                        {
+                            configs.copy_within(index + 1..config_count, index);
+                            config_count -= 1;
+                            configs[config_count] = crate::storage::RoutineConfig::EMPTY;
+                        }
+                        continue;
+                    }
                     let stored_value = match value {
+                        super::ast::RoutineConfigValue::Default => {
+                            unreachable!("default removes the setting above")
+                        }
                         super::ast::RoutineConfigValue::Value(value) => {
-                            match guc.canonical_routine_setting(name, value) {
+                            match guc.validate_setting_value(name, Some(value)) {
                                 Ok(value) => StackStr::from_str(value.as_str()),
                                 Err(error) => return sql_fail(error),
                             }
@@ -51364,8 +51390,14 @@ pub fn alter_database(
             };
             let value = match value {
                 crate::sql::ast::RoutineConfigValue::Current => guc.get_owned(name.as_str()),
+                crate::sql::ast::RoutineConfigValue::Default => {
+                    if let Err(error) = guc.validate_setting_value(name.as_str(), None) {
+                        return sql_fail(error);
+                    }
+                    None
+                }
                 crate::sql::ast::RoutineConfigValue::Value(raw) => {
-                    match guc.canonical_routine_setting(name.as_str(), raw) {
+                    match guc.validate_setting_value(name.as_str(), Some(raw)) {
                         Ok(value) => Some(value),
                         Err(error) => return sql_fail(error),
                     }

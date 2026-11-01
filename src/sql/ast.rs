@@ -528,7 +528,8 @@ pub enum TransactionTarget {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingSyntax {
-    Generic,
+    DecodedValue,
+    Default,
     FromCurrent,
     TimeZone,
     TimeZoneInterval(i32),
@@ -1088,8 +1089,8 @@ pub enum Stmt<'a> {
         target: ClusterTarget<'a>,
         verbose: bool,
     },
-    /// SET [LOCAL] name {=|TO} value. `value` is the raw source text of the
-    /// value (quotes included); the session GUC store validates and applies it.
+    /// SET values retain decoded SQL strings separately from DEFAULT and the
+    /// numeric/interval TIME ZONE forms. The GUC store validates the value.
     Set {
         name: &'a str,
         value: &'a str,
@@ -4300,6 +4301,7 @@ pub struct RoutineConfigClause<'a> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RoutineConfigValue<'a> {
+    Default,
     Value(&'a str),
     Current,
 }

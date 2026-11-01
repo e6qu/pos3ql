@@ -1523,13 +1523,19 @@ impl<'a> Parser<'a> {
                     return Ok(Stmt::SetCatalog(self.str_literal("catalog name")?));
                 }
                 if self.eat_ident("schema")? {
-                    let start = self.peek_at;
-                    let _ = self.str_literal("schema name")?;
+                    if !matches!(self.peeked, Tok::Str(_)) {
+                        return Err(self.unexpected("schema name string"));
+                    }
+                    let RoutineConfigValue::Value(value) =
+                        self.configuration_value_list("search_path", false)?
+                    else {
+                        unreachable!("schema syntax requires a string")
+                    };
                     return Ok(Stmt::Set {
                         name: "search_path",
-                        value: self.text[start..self.peek_at].trim(),
+                        value,
                         local,
-                        syntax: SettingSyntax::Generic,
+                        syntax: SettingSyntax::DecodedValue,
                     });
                 }
                 if self.eat_ident("names")? {
@@ -1538,15 +1544,17 @@ impl<'a> Parser<'a> {
                     let value = if reset {
                         "DEFAULT"
                     } else {
-                        let start = self.peek_at;
-                        let _ = self.str_literal("encoding name")?;
-                        self.text[start..self.peek_at].trim()
+                        self.str_literal("encoding name")?
                     };
                     return Ok(Stmt::Set {
                         name: "client_encoding",
                         value,
                         local,
-                        syntax: SettingSyntax::Generic,
+                        syntax: if reset {
+                            SettingSyntax::Default
+                        } else {
+                            SettingSyntax::DecodedValue
+                        },
                     });
                 }
                 if self.eat_ident("xml")? {
@@ -1561,7 +1569,7 @@ impl<'a> Parser<'a> {
                         name: "xmloption",
                         value,
                         local,
-                        syntax: SettingSyntax::Generic,
+                        syntax: SettingSyntax::DecodedValue,
                     });
                 }
                 let (name, syntax) = if self.eat_ident("time")? {
@@ -1581,7 +1589,7 @@ impl<'a> Parser<'a> {
                     if !self.eat_op("=")? {
                         self.expect_ident("to")?;
                     }
-                    (n, SettingSyntax::Generic)
+                    (n, SettingSyntax::DecodedValue)
                 };
                 if syntax == SettingSyntax::TimeZone && self.eat_ident("interval")? {
                     let precision = if self.peeked == Tok::Op("(") {
@@ -1620,10 +1628,32 @@ impl<'a> Parser<'a> {
                         syntax: SettingSyntax::TimeZoneInterval(type_mod),
                     });
                 }
-                let value = if syntax == SettingSyntax::TimeZone {
-                    self.time_zone_setting_value()?
+                let (value, syntax) = if syntax == SettingSyntax::TimeZone {
+                    if self.eat_ident("default")? || self.eat_ident("local")? {
+                        ("DEFAULT", SettingSyntax::Default)
+                    } else if let Tok::Str(value) | Tok::QuotedIdent(value) = self.peeked {
+                        self.advance()?;
+                        (value, SettingSyntax::DecodedValue)
+                    } else {
+                        (self.time_zone_setting_value()?, syntax)
+                    }
                 } else {
-                    self.configuration_value_list()?
+                    let numeric_timezone = name.eq_ignore_ascii_case("timezone")
+                        && matches!(self.peeked, Tok::Num(_) | Tok::Op("+") | Tok::Op("-"));
+                    match self.configuration_value_list(name, true)? {
+                        RoutineConfigValue::Default => ("DEFAULT", SettingSyntax::Default),
+                        RoutineConfigValue::Value(value) => (
+                            value,
+                            if numeric_timezone {
+                                SettingSyntax::TimeZone
+                            } else {
+                                SettingSyntax::DecodedValue
+                            },
+                        ),
+                        RoutineConfigValue::Current => {
+                            unreachable!("FROM CURRENT is separate syntax")
+                        }
+                    }
                 };
                 Ok(Stmt::Set {
                     name,
@@ -5106,18 +5136,17 @@ impl<'a> Parser<'a> {
         if self.eat_ident("system")? {
             if self.eat_ident("set")? {
                 let name = self.any_ident("configuration parameter")?;
-                let _ = self.eat_op("=")?;
-                let start = self.peek_at;
-                while !matches!(self.peeked, Tok::Op(";") | Tok::Eof) {
-                    self.advance()?;
+                if !self.eat_op("=")? {
+                    self.expect_ident("to")?;
                 }
-                let value = self.text[start..self.peek_at].trim();
-                if value.is_empty() {
-                    return Err(self.err_here("configuration value is required"));
-                }
+                let value = match self.configuration_value_list(name, true)? {
+                    RoutineConfigValue::Value(value) => Some(value),
+                    RoutineConfigValue::Default => None,
+                    RoutineConfigValue::Current => unreachable!("ALTER SYSTEM has no FROM CURRENT"),
+                };
                 return Ok(Stmt::AlterSystem {
                     name: Some(name),
-                    value: Some(value),
+                    value,
                 });
             }
             self.expect_ident("reset")?;
@@ -8278,23 +8307,88 @@ impl<'a> Parser<'a> {
         Ok(parsed)
     }
 
-    fn configuration_value_list(&mut self) -> Result<&'a str, ParseError> {
-        let start = self.peek_at;
+    fn configuration_value_list(
+        &mut self,
+        name: &str,
+        allow_list: bool,
+    ) -> Result<RoutineConfigValue<'a>, ParseError> {
+        if self.eat_ident("default")? {
+            return Ok(RoutineConfigValue::Default);
+        }
+        let mut bytes = ArenaList::new(self.arena);
+        let mut count = 0;
         loop {
-            if (self.eat_op("+")? || self.eat_op("-")?) && !matches!(self.peeked, Tok::Num(_)) {
+            let negative = self.eat_op("-")?;
+            let positive = !negative && self.eat_op("+")?;
+            if (positive || negative) && !matches!(self.peeked, Tok::Num(_)) {
                 return Err(self.unexpected("expected a numeric configuration value"));
             }
-            match self.peeked {
-                Tok::Ident(_) | Tok::QuotedIdent(_) | Tok::Str(_) | Tok::Num(_) => {
-                    self.advance()?;
-                }
+            let (value, identifier) = match self.peeked {
+                Tok::Ident(value) | Tok::QuotedIdent(value) => (value, true),
+                Tok::Str(value) | Tok::Num(value) => (value, false),
                 _ => return Err(self.unexpected("expected a configuration value")),
+            };
+            let path = name.eq_ignore_ascii_case("search_path");
+            if path && identifier && value.len() > 63 {
+                return Err(ParseError {
+                    at: self.peek_at,
+                    message: stack_format!(96, "search_path identifier is longer than 63 bytes"),
+                    sqlstate: sqlstate::NAME_TOO_LONG,
+                });
             }
+            if count != 0 {
+                for byte in b", " {
+                    bytes
+                        .push(*byte)
+                        .map_err(|_| self.arena_full("configuration value exceeds SQL arena"))?;
+                }
+            }
+            let quoted = path && super::eval::ident_needs_quotes(value);
+            if quoted {
+                bytes
+                    .push(b'"')
+                    .map_err(|_| self.arena_full("configuration value exceeds SQL arena"))?;
+            }
+            if negative {
+                bytes
+                    .push(b'-')
+                    .map_err(|_| self.arena_full("configuration value exceeds SQL arena"))?;
+            }
+            for byte in value.as_bytes() {
+                bytes
+                    .push(*byte)
+                    .map_err(|_| self.arena_full("configuration value exceeds SQL arena"))?;
+                if quoted && *byte == b'"' {
+                    bytes
+                        .push(b'"')
+                        .map_err(|_| self.arena_full("configuration value exceeds SQL arena"))?;
+                }
+            }
+            if quoted {
+                bytes
+                    .push(b'"')
+                    .map_err(|_| self.arena_full("configuration value exceeds SQL arena"))?;
+            }
+            count += 1;
+            self.advance()?;
             if !self.eat_op(",")? {
                 break;
             }
+            if !allow_list {
+                return Err(self.unexpected("expected one configuration value"));
+            }
+            if !name.eq_ignore_ascii_case("search_path") && !name.eq_ignore_ascii_case("datestyle")
+            {
+                return Err(ParseError {
+                    at: self.peek_at,
+                    message: stack_format!(96, "parameter \"{}\" requires a single value", name),
+                    sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                });
+            }
         }
-        Ok(self.text[start..self.peek_at].trim())
+        Ok(RoutineConfigValue::Value(
+            core::str::from_utf8(bytes.as_slice()).expect("decoded configuration value is UTF-8"),
+        ))
     }
 
     fn time_zone_setting_value(&mut self) -> Result<&'a str, ParseError> {

@@ -6674,15 +6674,12 @@ impl Checkpointer {
                                 .ok_or(CheckpointSetupError::Corrupt("invalid routine kind"))?
                         }
                     };
-                    let creation_path =
-                        StackStr::<128>::from_str(&decode_hex_name(words.next().ok_or(
-                            CheckpointSetupError::Corrupt("routine creation path missing"),
-                        )?)?);
-                    if creation_path.is_truncated() {
-                        return Err(CheckpointSetupError::Corrupt(
-                            "routine creation path too long",
-                        ));
-                    }
+                    let creation_path = parse_creation_path(
+                        &decode_hex_name(words.next().ok_or(CheckpointSetupError::Corrupt(
+                            "routine creation path missing",
+                        ))?)?,
+                        "invalid routine creation search path",
+                    )?;
                     let dependencies = parse_stored_query_dependencies(&mut words)?;
                     if words.next().is_some() {
                         return Err(CheckpointSetupError::Corrupt("malformed routine record"));
@@ -6898,12 +6895,12 @@ impl Checkpointer {
                         }
                     };
                     let creation_path =
-                        StackStr::<128>::from_str(&decode_hex_name(words.next().ok_or(
-                            CheckpointSetupError::Corrupt("rule creation path missing"),
-                        )?)?);
-                    if creation_path.is_truncated() {
-                        return Err(CheckpointSetupError::Corrupt("rule creation path too long"));
-                    }
+                        parse_creation_path(
+                            &decode_hex_name(words.next().ok_or(
+                                CheckpointSetupError::Corrupt("rule creation path missing"),
+                            )?)?,
+                            "invalid rule creation search path",
+                        )?;
                     let dependencies = parse_stored_query_dependencies(&mut words)?;
                     if words.next().is_some() {
                         return Err(CheckpointSetupError::Corrupt("trailing rule fields"));
@@ -17525,6 +17522,15 @@ fn decode_hex_name(hex: &str) -> Result<String, CheckpointSetupError> {
         .map_err(|_| CheckpointSetupError::Corrupt("hex name not UTF-8"))
 }
 
+fn parse_creation_path(
+    value: &str,
+    invalid: &'static str,
+) -> Result<StackStr<{ crate::sql::guc::SEARCH_PATH_BYTES }>, CheckpointSetupError> {
+    crate::sql::guc::validate_search_path(value)
+        .map_err(|_| CheckpointSetupError::Corrupt(invalid))?;
+    Ok(StackStr::from_str(value))
+}
+
 fn decode_manifest_hex_bytes(hex: &str) -> Result<Vec<u8>, CheckpointSetupError> {
     if hex == "-" {
         return Ok(Vec::new());
@@ -18865,8 +18871,7 @@ fn load_view(
     use core::fmt::Write;
     let mut buffer = StackStr::<{ crate::storage::VIEW_SQL_MAX }>::new();
     let _ = write!(buffer, "{sql}");
-    let mut path_buffer = StackStr::<128>::new();
-    let _ = write!(path_buffer, "{path}");
+    let path_buffer = parse_creation_path(&path, "invalid view creation search path")?;
     let definition = crate::storage::ViewDefinition {
         persistence: crate::storage::RelationPersistence::Permanent,
         columns,
@@ -18936,8 +18941,7 @@ fn load_matview(
     use core::fmt::Write;
     let mut buffer = StackStr::<{ crate::storage::VIEW_SQL_MAX }>::new();
     let _ = write!(buffer, "{sql}");
-    let mut path_buffer = StackStr::<128>::new();
-    let _ = write!(path_buffer, "{path}");
+    let path_buffer = parse_creation_path(&path, "invalid materialized-view creation search path")?;
     let backing_table = backing.slot();
     if backing_table >= storage.table_count()
         || !storage.table_slot_visible_to(backing_table, 0)
@@ -19672,6 +19676,55 @@ fn parse_partition_bound_manifest(
 
 #[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 mod stored_dependency_tests {
+    #[test]
+    fn manifest_views_reject_invalid_and_oversized_paths_before_installing_metadata() {
+        let (_checkpoint, mut storage, _, _config) = index_gc_fixture("invalid-manifest-paths", 16);
+        let oversized = "a".repeat(crate::sql::guc::SEARCH_PATH_BYTES + 1);
+        let oversized_utf8 = "é".repeat(crate::sql::guc::SEARCH_PATH_BYTES / 2 + 1);
+        for path in [
+            "public,",
+            "\"unterminated",
+            "public public",
+            oversized.as_str(),
+            oversized_utf8.as_str(),
+        ] {
+            let view = format!(
+                "vw13 0 1 0 2 {} {} {} {} 0 0 0 0:0: 0",
+                ManifestName("SELECT 1"),
+                ManifestName("public"),
+                ManifestName(path),
+                ManifestName("rejected_view")
+            );
+            assert!(
+                matches!(
+                    load_view(&mut storage, &view, 2),
+                    Err(CheckpointSetupError::Corrupt(
+                        "invalid view creation search path"
+                    ))
+                ),
+                "{path:?}"
+            );
+            let matview = format!(
+                "mv6 0 1 0 2 {} {} {} {} 0 0",
+                ManifestName("SELECT 1"),
+                ManifestName("public"),
+                ManifestName(path),
+                ManifestName("rejected_matview")
+            );
+            assert!(
+                matches!(
+                    load_matview(&mut storage, &matview, 2),
+                    Err(CheckpointSetupError::Corrupt(
+                        "invalid materialized-view creation search path"
+                    ))
+                ),
+                "{path:?}"
+            );
+            assert_eq!(storage.live_views().count(), 0);
+            assert_eq!(storage.live_matviews().count(), 0);
+        }
+    }
+
     #[test]
     fn manifest_hex_decode_rejects_non_ascii_without_panicking() {
         for invalid in ["é", "🦀", "0é0", "0g", "abc"] {

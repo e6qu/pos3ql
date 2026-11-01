@@ -317,7 +317,7 @@ impl SubscriptionApply {
             config.max_savepoints_per_transaction,
             config.transaction_mode,
         )?;
-        guc.set("search_path", "", false)
+        guc.set_config("search_path", Some(""), false)
             .expect("empty worker search path is valid");
         Ok(Self {
             stream,

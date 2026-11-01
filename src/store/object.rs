@@ -964,7 +964,7 @@ impl BlockStore for OwnedObjectStore {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 mod tests {
     use std::io::Read;
     use std::io::Write;

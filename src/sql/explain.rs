@@ -2555,7 +2555,7 @@ pub(super) fn emit_plan(
     Ok(Ok(()))
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 mod tests {
     use super::{PlanNode, object_request_cost, structured_node_name};
     use crate::store::BlockIoStats;

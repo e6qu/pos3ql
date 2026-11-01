@@ -683,7 +683,7 @@ pub fn make<'a>(
         .map_err(|_| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "query arena exhausted"))
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 mod tests {
     use super::*;
 

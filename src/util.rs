@@ -121,7 +121,7 @@ macro_rules! stack_format {
     }};
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 mod tests {
     use super::*;
     use core::fmt::Write;

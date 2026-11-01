@@ -1,0 +1,13 @@
+CREATE TYPE record_view_pair AS (item integer,label varchar(4));
+CREATE FUNCTION record_view_rows(start_value integer) RETURNS TABLE(item integer,label varchar(4)) LANGUAGE sql AS $$SELECT start_value,'one'::varchar(4) UNION ALL SELECT start_value+1,'two'::varchar(4)$$;
+CREATE VIEW record_view_values AS SELECT record_view_rows(7)::record_view_pair AS value,generate_series(20,22) AS generated;
+SELECT value,generated FROM record_view_values ORDER BY generated;
+SELECT (value).item,(value).label FROM record_view_values ORDER BY generated;
+CREATE TABLE record_view_copy AS SELECT * FROM record_view_values;
+SELECT (value).item,(value).label,generated FROM record_view_copy ORDER BY generated;
+DROP TABLE record_view_copy;
+DROP VIEW record_view_values;
+CREATE VIEW record_view_anonymous AS SELECT record_view_rows(7) AS value;
+CREATE TABLE record_view_anonymous_rows AS SELECT record_view_rows(7) AS value;
+DROP FUNCTION record_view_rows(integer);
+DROP TYPE record_view_pair;

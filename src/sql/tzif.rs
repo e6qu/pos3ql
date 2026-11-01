@@ -579,7 +579,7 @@ fn parse_footer(d: &[u8]) -> Option<super::timezone::PosixZone> {
     super::timezone::parse_posix_tz(s)
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 mod tests {
     use super::*;
     use crate::sql::datetime::{PG_EPOCH_DAYS, days_from_civil};

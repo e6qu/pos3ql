@@ -589,7 +589,7 @@ impl Storage {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 mod tests {
     use super::super::tests::{make_def, test_budget, test_config};
     use super::*;

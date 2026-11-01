@@ -153,7 +153,7 @@ pub(crate) fn validate(
     (seen == count && reader.0.is_empty()).then_some(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 mod tests {
     use super::*;
 

@@ -1348,7 +1348,7 @@ fn classify_int_literal(s: &str) -> IntLiteral {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 mod tests {
     use super::*;
 

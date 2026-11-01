@@ -47710,7 +47710,8 @@ fn rows_from_view_and_named_routine_parameters_survive_object_cold_recovery() {
         let created = run_with(
             &mut engine,
             &mut budget,
-            "CREATE FUNCTION durable_rows(start_value integer) \
+            "CREATE TYPE durable_row_pair AS (item integer, label varchar(4)); \
+             CREATE FUNCTION durable_rows(start_value integer) \
                RETURNS TABLE(item integer, label varchar(4)) LANGUAGE SQL AS \
                $$ SELECT start_value, 'one'::varchar(4) UNION ALL \
                   SELECT start_value + 1, 'two'::varchar(4) $$",
@@ -47751,11 +47752,18 @@ fn rows_from_view_and_named_routine_parameters_survive_object_cold_recovery() {
              CREATE VIEW durable_row_quantified_view AS \
                SELECT ROW(1,2) <= ANY (SELECT item, item + 1 FROM durable_rows(1)) AS matches",
         );
+        for statement in [
+            "CREATE VIEW invalid_record_view AS SELECT durable_rows(9) AS value",
+            "CREATE TABLE invalid_record_table AS SELECT durable_rows(9) AS value",
+        ] {
+            let rejected = run_with(&mut engine, &mut budget, statement);
+            assert_eq!(error_sqlstates(&rejected), ["42P16"], "{statement}");
+        }
         let target_view = run_with(
             &mut engine,
             &mut budget,
             "CREATE VIEW durable_target_set_view AS \
-               SELECT durable_rows(9) AS value, generate_series(30,32) AS generated",
+               SELECT durable_rows(9)::durable_row_pair AS value, generate_series(30,32) AS generated",
         );
         assert!(
             String::from_utf8_lossy(&target_view).contains("CREATE VIEW"),
@@ -47828,6 +47836,12 @@ fn rows_from_view_and_named_routine_parameters_survive_object_cold_recovery() {
         "{}",
         String::from_utf8_lossy(&target_rows)
     );
+    let target_fields = run_with(
+        &mut recovered,
+        &mut budget,
+        "SELECT (value).item, (value).label FROM durable_target_set_view ORDER BY generated",
+    );
+    assert_eq!(data_rows(&target_fields), ["9|one", "10|two", "NULL|NULL"]);
     assert_eq!(
         data_rows(&run_with(
             &mut recovered,

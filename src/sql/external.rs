@@ -545,7 +545,7 @@ fn run_error(error: SstError) -> SqlError {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 mod tests {
     use super::*;
     use crate::mem::budget::Budget;

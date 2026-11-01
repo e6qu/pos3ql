@@ -125,6 +125,10 @@ columns, so an array returned through `anyelement` has the correct binary format
 A single-column `RETURNS TABLE` function yields its column value in a SELECT
 list, while multiple columns yield a record; the binary result type follows the
 same distinction.
+A saved view or table column needs a concrete type: expand `(pair(1)).*` into
+separate columns or cast the record to a named composite type. An anonymous
+`record` column fails with `42P16`, as required by
+[PostgreSQL's pseudo-type rules](https://www.postgresql.org/docs/18/datatype-pseudo.html).
 For `SELECT (pair(nextval('numbers'))).*`, PostgreSQL expands a scalar call
 into one call per output field. A set-returning call instead shares its producer
 across those fields; two explicitly written calls remain independent. Expansion

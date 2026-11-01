@@ -274,7 +274,7 @@ impl<S: BlockStore> BlockStore for BlockCache<S> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 mod tests {
     use super::super::memory::MemoryBlockStore;
     use super::*;

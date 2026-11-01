@@ -265,14 +265,17 @@ catalog and wire contracts; they do not select pos3ql's object block layout.
 CI also exercises shared heap publication and saved row and index file ownership with
 Miri, alongside allocation-forbidden concurrent regressions.
 `tools/test-miri-ownership.sh LOG` runs the shared ownership gate on a suitable
-runner. Its SQL fixture module stays in native tests; put interpreter ownership
-cases beside their runtime modules and shared test helpers outside fixture modules.
-Preserve every selected ownership case when
-reducing interpreter startup work. Polling tests release each snapshot before
-reusing its fixed scratch arena, even when writers are slow.
-Pass the selected ownership filters together to share one interpreter startup;
-[Rust's test harness accepts multiple filters](https://doc.rust-lang.org/src/test/cli.rs.html#161-163).
-Every configured filter must produce passing tests, with none failed or ignored.
+runner. The explicit `miri-ownership` Cargo feature omits unrelated test modules
+only under Miri; native builds retain their full test set. This avoids spending
+interpreter time constructing test descriptions that the ownership gate never
+runs. Miri without that feature keeps the broader test harness available.
+Keep ownership cases beside their runtime modules and shared helpers outside
+native fixture modules. List every selected case by its complete Rust name in
+`tools/miri-ownership-tests.txt`; its module must stay enabled in ownership mode.
+The script checks that every listed proof passes, with none missing, failed or
+ignored. Preserve the full proof set when reducing interpreter startup work.
+Polling tests release each snapshot before reusing its fixed scratch arena,
+even when writers are slow. All selected proofs share one interpreter startup.
 Coverage stops at a failed build or instrumentation setup and retains its
 diagnostics; it must never run a cached executable after that failure.
 Native test shards preserve failed exit codes and resolve allocation-abort

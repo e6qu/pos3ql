@@ -671,7 +671,7 @@ pub(crate) fn writer_id(config: &Config) -> u64 {
     (u64::from(high.finish()) << 32) | u64::from(low.finish())
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 mod tests {
     use super::*;
 

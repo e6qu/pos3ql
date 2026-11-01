@@ -1831,7 +1831,7 @@ impl Storage {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 mod tests {
     use super::*;
     use crate::storage::tests::{test_budget, test_config, test_view_definition};

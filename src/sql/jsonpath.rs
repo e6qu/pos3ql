@@ -2571,7 +2571,7 @@ fn runtime_error() -> SqlError {
     sql_err!(sqlstate::DATA_EXCEPTION, "JSON path evaluation failed")
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 mod tests {
     use super::*;
 

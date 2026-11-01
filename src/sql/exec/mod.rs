@@ -20390,7 +20390,7 @@ pub(crate) fn execute_plpgsql_table_function<'a>(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 mod trigger_program_tests {
     use super::*;
     use crate::mem::budget::Budget;
@@ -73047,7 +73047,7 @@ pub fn coltype_of_oid_pub(o: i32) -> Option<crate::sql::types::ColType> {
     describe::coltype_of_oid(o)
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 mod tests {
     use super::*;
     use crate::mem::budget::Budget;

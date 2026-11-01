@@ -12582,7 +12582,7 @@ fn routine_name_matches(written: &str, schema: &str, name: &str) -> bool {
             .is_none_or(|written_schema| identifier_spelling_matches(written_schema, schema))
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 mod routine_name_tests {
     use super::{
         ACCESS_METHODS, PROCEDURAL_LANGUAGES, access_method_name, access_method_oid,

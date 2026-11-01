@@ -54198,5 +54198,5 @@ mod tests {
     include!("native_tests.rs");
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 mod table_name_tests;

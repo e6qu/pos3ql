@@ -13060,7 +13060,7 @@ fn decode_bounded_default_bytes(
     Some(bytes)
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 mod tests {
     use super::*;
 

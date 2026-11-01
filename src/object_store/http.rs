@@ -1789,7 +1789,7 @@ fn parse_head(head: &[u8]) -> Result<ResponseHead, S3Error> {
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 mod tests {
     use super::*;
     use std::io::BufRead;

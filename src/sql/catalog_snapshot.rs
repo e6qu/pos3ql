@@ -529,7 +529,7 @@ pub(crate) fn capture_transaction(
     Ok(batch.has_rows().then_some(batch))
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 mod key_definitions {
     use super::*;
     use crate::mem::budget::Budget;

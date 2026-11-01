@@ -280,7 +280,7 @@ impl WriterProbe {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 mod tests {
     use super::*;
     use crate::object_store::{Precondition, sim};

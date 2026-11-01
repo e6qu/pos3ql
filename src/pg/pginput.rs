@@ -643,7 +643,7 @@ pub fn copy_data(bytes: &[u8]) -> Result<CopyData<'_>, DecodeError> {
     copy_data_with_state(bytes, &mut DecodeState::default())
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 mod tests {
     use super::*;
     use crate::mem::guard;

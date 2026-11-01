@@ -761,7 +761,7 @@ impl<'a> RowReadView<'a> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 mod tests {
     use super::super::row_versions::{
         clear_pending_versions, push_committed_version, push_pending_version,

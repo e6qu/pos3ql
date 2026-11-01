@@ -1982,7 +1982,7 @@ fn parse_count(value: &str) -> Result<u32, String> {
         .map_err(|_| format!("invalid count '{value}'"))
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 mod tests {
     use super::*;
 

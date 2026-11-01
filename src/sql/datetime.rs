@@ -2441,7 +2441,7 @@ pub fn now_micros() -> i64 {
     dur.as_micros() as i64 - PG_EPOCH_SECS * 1_000_000
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 mod tests {
     use super::*;
     use crate::sql::types::Interval;

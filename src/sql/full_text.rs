@@ -4470,7 +4470,7 @@ pub fn emit_query_hash(source: &str, mut emit: impl FnMut(&[u8])) {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 mod tests {
     use super::*;
     use crate::mem::Budget;

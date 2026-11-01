@@ -9,6 +9,9 @@ composite receive codec reached through the parameter path. The result cases
 request binary DataRows too, covering the send side for ranges, multiranges,
 and anonymous records.
 
+Every listed query is expected to succeed. Matching client errors are failures,
+including when both servers reject the same result shape.
+
   binary_param_diff.py --pg PORT --p3 PORT [--host HOST]
 """
 import argparse
@@ -86,6 +89,22 @@ RESULT_CASES = [
     "SELECT * FROM ROWS FROM (generate_series(1,2), unnest(ARRAY['x'::varchar(2)])) "
     "WITH ORDINALITY AS r(series,label,ordinality) ORDER BY ordinality",
     "SELECT binary_result_values(4), generate_series(10,12)",
+    "SELECT binary_pending_pl(42::int4), binary_pending_pl(9000000000::int8), "
+    "binary_pending_pl(ARRAY[1,NULL,3])",
+    "SELECT binary_pending_sql(42::int4), binary_pending_sql(9000000000::int8), "
+    "binary_pending_sql(ARRAY[1,NULL,3])",
+    "SELECT binary_pending_pl(state), binary_pending_pl(positive), binary_pending_pl(pair) "
+    "FROM binary_result_rows",
+    "SELECT binary_pending_sql(state), binary_pending_sql(positive), binary_pending_sql(pair) "
+    "FROM binary_result_rows",
+    "SELECT binary_pending_pl_rows(42::int4)",
+    "SELECT * FROM binary_pending_pl_rows(9000000000::int8)",
+    "SELECT binary_pending_sql_rows(ARRAY[1,NULL,3])",
+    "SELECT * FROM binary_pending_sql_rows(42::int4)",
+    "SELECT binary_pending_record(42::int4)",
+    "SELECT (binary_pending_record(ARRAY[1,NULL,3])).*",
+    "SELECT * FROM binary_pending_table(42::int4)",
+    "SELECT * FROM binary_pending_table(ARRAY[1,NULL,3])",
 ]
 
 
@@ -126,6 +145,22 @@ def main():
         "LANGUAGE SQL AS 'SELECT $1'; "
         "CREATE FUNCTION binary_result_values(integer) RETURNS SETOF integer "
         "LANGUAGE SQL AS 'SELECT $1 UNION ALL SELECT $1 + 1'; "
+        "CREATE TABLE binary_pending_audit(value integer); "
+        "CREATE FUNCTION binary_pending_pl(value anyelement) RETURNS anyelement "
+        "LANGUAGE plpgsql AS $$BEGIN RETURN value; END$$; "
+        "CREATE FUNCTION binary_pending_sql(value anyelement) RETURNS anyelement "
+        "LANGUAGE sql VOLATILE AS 'INSERT INTO binary_pending_audit VALUES (1); SELECT $1'; "
+        "CREATE FUNCTION binary_pending_pl_rows(value anyelement) RETURNS SETOF anyelement "
+        "LANGUAGE plpgsql AS $$BEGIN RETURN NEXT value; END$$; "
+        "CREATE FUNCTION binary_pending_sql_rows(value anyelement) RETURNS SETOF anyelement "
+        "LANGUAGE sql VOLATILE AS 'INSERT INTO binary_pending_audit VALUES (2); "
+        "SELECT $1 UNION ALL SELECT $1'; "
+        "CREATE FUNCTION binary_pending_record(input_value anyelement,OUT value anyelement, "
+        "OUT marker integer) LANGUAGE sql VOLATILE AS 'INSERT INTO binary_pending_audit "
+        "VALUES (3); SELECT $1,7'; "
+        "CREATE FUNCTION binary_pending_table(input_value anyelement) RETURNS TABLE "
+        "(value anyelement,marker integer) LANGUAGE sql VOLATILE AS 'INSERT INTO "
+        "binary_pending_audit VALUES (4); SELECT $1,8'; "
         "CREATE SEQUENCE binary_result_sequence START WITH 7"
     )
     pg.execute(setup)
@@ -133,19 +168,27 @@ def main():
 
     fails = 0
     for sql, param in CASES:
+        pg_error = None
         try:
             r_pg = run_case(pg, sql, param)
         except Exception as e:
             r_pg = f"ERROR:{type(e).__name__}"
+            pg_error = repr(e)
+        p3_error = None
         try:
             r_p3 = run_case(p3, sql, param)
         except Exception as e:
             r_p3 = f"ERROR:{type(e).__name__}"
-        if r_pg == r_p3:
+            p3_error = repr(e)
+        if pg_error is None and p3_error is None and r_pg == r_p3:
             print("ok:   %-34s -> %s" % (sql, r_pg))
         else:
             fails += 1
             print("DIFF: %-34s  pg=%r  p3=%r" % (sql, r_pg, r_p3))
+            if pg_error is not None:
+                print("      PostgreSQL error: %s" % pg_error)
+            if p3_error is not None:
+                print("      pos3ql error: %s" % p3_error)
 
     for sql in RESULT_CASES:
         pg_error = None
@@ -160,7 +203,7 @@ def main():
         except Exception as e:
             r_p3 = f"ERROR:{type(e).__name__}"
             p3_error = repr(e)
-        if r_pg == r_p3:
+        if pg_error is None and p3_error is None and r_pg == r_p3:
             print("ok:   %-34s -> %s" % (sql, r_pg))
         else:
             fails += 1

@@ -5149,7 +5149,7 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
             };
             return invocations
                 .resolve_rows(
-                    routine_slot,
+                    routine,
                     &routine_params[..routine.argument_count],
                     statement_arena,
                 )?
@@ -5186,7 +5186,7 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
             };
             return invocations
                 .resolve_rows(
-                    routine_slot,
+                    routine,
                     &routine_params[..routine.argument_count],
                     statement_arena,
                 )?

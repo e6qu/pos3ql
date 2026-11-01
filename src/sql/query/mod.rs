@@ -31,6 +31,9 @@ use super::types::{ColDesc, ColType, Datum};
 mod retained;
 pub(crate) use retained::RetainedSelect;
 
+#[cfg(test)]
+mod routine_contract_tests;
+
 mod setops;
 use setops::materialize_set_body;
 pub use setops::set_query;
@@ -700,10 +703,159 @@ pub fn check_timeout() -> Result<(), SqlError> {
 
 #[derive(Clone, Copy)]
 pub(crate) struct PendingRoutineInvocation<'a> {
-    pub slot: usize,
-    pub intrinsic_oid: Option<i32>,
+    pub target: PendingRoutineTarget<'a>,
     pub arguments: &'a [u8],
     pub argument_count: usize,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum PendingRoutineTarget<'a> {
+    Stored(RoutineCallContract<'a>),
+    Intrinsic(i32),
+}
+
+/// Keep the selected SQL types after values have erased domains and
+/// polymorphic bindings. The body is resolved when execution starts, matching
+/// PostgreSQL when evaluating an input replaces that body's definition.
+#[derive(Clone, Copy)]
+pub(crate) struct RoutineCallContract<'a> {
+    pub oid: i32,
+    arguments: &'a [crate::storage::RoutineArgumentDef],
+    parameters: &'a [crate::storage::RoutineArgumentDef],
+    kind: crate::storage::RoutineKind,
+    result_columns: &'a [crate::storage::RoutineArgumentDef],
+}
+
+impl<'a> RoutineCallContract<'a> {
+    fn capture(routine: &crate::storage::RoutineDef, arena: &'a Arena) -> Result<Self, SqlError> {
+        let full = || {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "pending routine type contract exceeds statement memory"
+            )
+        };
+        let arguments = arena
+            .alloc_persistent_slice_with(routine.argument_count, |index| routine.arguments[index])
+            .map_err(|_| full())?;
+        let parameters = arena
+            .alloc_persistent_slice_with(routine.parameter_count, |index| {
+                let parameter = &routine.parameters[index];
+                crate::storage::RoutineArgumentDef {
+                    name: parameter.name,
+                    ctype: parameter.ctype,
+                    user_type: parameter.user_type,
+                }
+            })
+            .map_err(|_| full())?;
+        let result_columns = arena
+            .alloc_persistent_slice_with(routine.result_column_count, |index| {
+                routine.result_columns[index]
+            })
+            .map_err(|_| full())?;
+        Ok(Self {
+            oid: crate::storage::routine_oid(routine),
+            arguments,
+            parameters,
+            kind: routine.kind,
+            result_columns,
+        })
+    }
+
+    pub(crate) fn bind(&self, routine: &mut crate::storage::RoutineDef) -> Result<(), SqlError> {
+        if crate::storage::routine_oid(routine) != self.oid
+            || routine.argument_count != self.arguments.len()
+            || routine.parameter_count != self.parameters.len()
+            || routine.result_column_count != self.result_columns.len()
+        {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "pending routine identity or result shape changed"
+            ));
+        }
+        routine.arguments[..self.arguments.len()].copy_from_slice(self.arguments);
+        for (parameter, captured) in routine.parameters.iter_mut().zip(self.parameters) {
+            parameter.ctype = captured.ctype;
+            parameter.user_type = captured.user_type;
+        }
+        routine.kind = self.kind;
+        routine.result_columns[..self.result_columns.len()].copy_from_slice(self.result_columns);
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum RoutineResultShape<'a> {
+    Scalar,
+    Record(&'a [super::types::RecordField<'a>]),
+}
+
+impl<'a> RoutineResultShape<'a> {
+    pub(crate) fn bind(
+        routine: &crate::storage::RoutineDef,
+        storage: &Storage,
+        txid: u32,
+        arena: &'a Arena,
+    ) -> Result<Self, SqlError> {
+        if !matches!(
+            routine.kind,
+            crate::storage::RoutineKind::RecordFunction { .. }
+                | crate::storage::RoutineKind::TableFunction
+        ) {
+            return Ok(Self::Scalar);
+        }
+        let columns = &routine.result_columns[..routine.result_column_count];
+        let fields = arena
+            .alloc_slice_with(columns.len(), |_| super::types::RecordField {
+                name: "",
+                type_oid: super::types::oid::UNKNOWN,
+                value: Datum::Null,
+            })
+            .map_err(|_| arena_full())?;
+        for (field, column) in fields.iter_mut().zip(columns) {
+            field.name = arena
+                .alloc_str(column.name.as_str())
+                .map_err(|_| arena_full())?;
+            field.type_oid = storage
+                .routine_type_oid(column.ctype, column.user_type, txid)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "routine result type identity is unavailable"
+                    )
+                })?;
+        }
+        Ok(Self::Record(fields))
+    }
+
+    pub(crate) fn capture(
+        &self,
+        values: &[Datum<'_>],
+        arena: &'a Arena,
+    ) -> Result<Datum<'a>, SqlError> {
+        let width = match self {
+            Self::Scalar => 1,
+            Self::Record(fields) => fields.len(),
+        };
+        if values.len() != width {
+            return Err(sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "SQL function query returns {} columns but {} were declared",
+                values.len(),
+                width
+            ));
+        }
+        let encoded = super::exec::encode_projected_pub(values, arena)?;
+        match self {
+            Self::Scalar => super::exec::decode_projected_col_record(encoded, 0, arena),
+            Self::Record(shape) => {
+                let fields = arena.alloc_slice_copy(shape).map_err(|_| arena_full())?;
+                for (index, field) in fields.iter_mut().enumerate() {
+                    field.value = super::exec::decode_projected_col_record(encoded, index, arena)?;
+                }
+                Ok(Datum::Record(fields))
+            }
+        }
+    }
 }
 
 /// A completed routine invocation is either a scalar expression value or the
@@ -844,7 +996,7 @@ impl<'a> RoutineInvocationState<'a> {
 
     pub(crate) fn resolve<'query>(
         &self,
-        slot: usize,
+        routine: &crate::storage::RoutineDef,
         arguments: &[Datum],
         statement_arena: &'a Arena,
         query_arena: &'query Arena,
@@ -862,8 +1014,10 @@ impl<'a> RoutineInvocationState<'a> {
             return Ok(Some(super::exec::detach_routine_datum(value, query_arena)?));
         }
         self.pending.set(Some(PendingRoutineInvocation {
-            slot,
-            intrinsic_oid: None,
+            target: PendingRoutineTarget::Stored(RoutineCallContract::capture(
+                routine,
+                statement_arena,
+            )?),
             arguments: super::exec::encode_projected_persistent_pub(arguments, statement_arena)?,
             argument_count: arguments.len(),
         }));
@@ -893,8 +1047,7 @@ impl<'a> RoutineInvocationState<'a> {
             return super::exec::detach_routine_datum(value, query_arena);
         }
         self.pending.set(Some(PendingRoutineInvocation {
-            slot: 0,
-            intrinsic_oid: Some(oid),
+            target: PendingRoutineTarget::Intrinsic(oid),
             arguments: super::exec::encode_projected_persistent_pub(arguments, statement_arena)?,
             argument_count: arguments.len(),
         }));
@@ -925,7 +1078,7 @@ impl<'a> RoutineInvocationState<'a> {
 
     pub(crate) fn resolve_rows(
         &self,
-        slot: usize,
+        routine: &crate::storage::RoutineDef,
         arguments: &[Datum],
         statement_arena: &'a Arena,
     ) -> Result<Option<&'a [&'a [u8]]>, SqlError> {
@@ -942,8 +1095,10 @@ impl<'a> RoutineInvocationState<'a> {
             return Ok(Some(rows));
         }
         self.pending.set(Some(PendingRoutineInvocation {
-            slot,
-            intrinsic_oid: None,
+            target: PendingRoutineTarget::Stored(RoutineCallContract::capture(
+                routine,
+                statement_arena,
+            )?),
             arguments: super::exec::encode_projected_persistent_pub(arguments, statement_arena)?,
             argument_count: arguments.len(),
         }));
@@ -2085,18 +2240,16 @@ impl StorageCatalog<'_, '_, '_, '_> {
         let _config = (!routine.configs().is_empty())
             .then(|| super::guc::enter_active_routine_configs(routine.configs()))
             .transpose()?;
-        let (result_contract, record_columns) = match routine.kind {
+        let result_contract = match routine.kind {
             crate::storage::RoutineKind::Function { result }
-            | crate::storage::RoutineKind::SetFunction { result } => (Some(result), None),
+            | crate::storage::RoutineKind::SetFunction { result } => Some(result),
             crate::storage::RoutineKind::RecordFunction {
                 set_returning: false,
-            } => (
-                None,
-                Some(&routine.result_columns[..routine.result_column_count]),
-            ),
+            } => None,
             _ => unreachable!("routine call resolution returns functions only"),
         };
         let result_type = result_contract.map_or(ColType::Record, |result| result.ctype);
+        let result_shape = RoutineResultShape::bind(routine, self.storage, self.txid, arena)?;
         let _type_sources = self.storage.select_type_definition_graph(
             routine
                 .arguments()
@@ -2114,7 +2267,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
         if routine.language == crate::storage::RoutineLanguage::PlPgSql {
             if let Some(invocations) = self.invocations {
                 return invocations.resolve(
-                    slot,
+                    routine,
                     arguments,
                     self.statement_arena
                         .expect("routine invocation state has statement arena"),
@@ -2122,7 +2275,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
                 );
             }
             if let Some((invocations, statement_arena)) = active_routine_invocations() {
-                return invocations.resolve(slot, arguments, statement_arena, arena);
+                return invocations.resolve(routine, arguments, statement_arena, arena);
             }
             return Err(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
@@ -2142,7 +2295,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
         if routine_program_requires_mutable_execution(&function_program) {
             if let Some(invocations) = self.invocations {
                 return invocations.resolve(
-                    slot,
+                    routine,
                     arguments,
                     self.statement_arena
                         .expect("routine invocation state has statement arena"),
@@ -2150,7 +2303,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
                 );
             }
             if let Some((invocations, statement_arena)) = active_routine_invocations() {
-                return invocations.resolve(slot, arguments, statement_arena, arena);
+                return invocations.resolve(routine, arguments, statement_arena, arena);
             }
             return Err(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
@@ -2255,48 +2408,9 @@ impl StorageCatalog<'_, '_, '_, '_> {
                 true,
                 None,
                 &mut |values| {
-                    let expected = record_columns.map_or(1, <[_]>::len);
-                    if values.len() != expected {
-                        return Err(sql_err!(
-                            sqlstate::SYNTAX_ERROR,
-                            "SQL function query returns {} columns but {} were declared",
-                            values.len(),
-                            expected
-                        ));
+                    if result.is_none() {
+                        result = Some(result_shape.capture(values, arena)?);
                     }
-                    if result.is_some() {
-                        return Ok(());
-                    }
-                    let encoded = crate::sql::exec::encode_projected_pub(values, arena)?;
-                    result = Some(if let Some(columns) = record_columns {
-                        let fields = arena
-                            .alloc_slice_with(columns.len(), |_| super::types::RecordField {
-                                name: "",
-                                type_oid: super::types::oid::UNKNOWN,
-                                value: Datum::Null,
-                            })
-                            .map_err(|_| arena_full())?;
-                        for (index, (field, column)) in fields.iter_mut().zip(columns).enumerate() {
-                            field.name = arena
-                                .alloc_str(column.name.as_str())
-                                .map_err(|_| arena_full())?;
-                            field.type_oid = self
-                                .storage
-                                .routine_type_oid(column.ctype, column.user_type, self.txid)
-                                .ok_or_else(|| {
-                                    sql_err!(
-                                        sqlstate::INTERNAL_ERROR,
-                                        "routine result type identity is unavailable"
-                                    )
-                                })?;
-                            field.value = crate::sql::exec::decode_projected_col_record(
-                                encoded, index, arena,
-                            )?;
-                        }
-                        Datum::Record(fields)
-                    } else {
-                        crate::sql::exec::decode_projected_col_record(encoded, 0, arena)?
-                    });
                     Ok(())
                 },
             )?;

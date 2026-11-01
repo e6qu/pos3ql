@@ -489,3 +489,34 @@ fn routine_inputs_share_conversions_order_and_strictness_in_every_context() {
         ]
     );
 }
+
+#[test]
+fn pending_routine_calls_keep_bound_types_and_structural_values() {
+    let config = test_config("pending-routine-types");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    let sql = include_str!("../../../tests/external/differential_exact/48_pending_routine_types.sql");
+    assert_eq!(
+        data_rows(&session.success(&mut engine, sql, true)),
+        [
+            "7|9|{1,NULL,3}",
+            "7|9|{1,NULL,3}",
+            "1|sql",
+            "2|pl",
+            "7|8",
+            "3",
+            "3",
+            "4",
+            "4",
+            "5",
+            "6",
+            "7|7",
+            "{1,NULL,3}|7",
+            "8|8",
+            "{2,NULL,4}|8",
+            "101",
+            "5|2|4|2|0|1"
+        ]
+    );
+}

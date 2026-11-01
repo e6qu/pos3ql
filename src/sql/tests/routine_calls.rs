@@ -10,7 +10,11 @@ fn retained_routine_inputs_preserve_argument_effects_across_pending_calls() {
         include_str!("../../../tests/external/differential_exact/50_retained_routine_inputs.sql");
     assert_eq!(
         data_rows(&session.success(&mut engine, sql, true)),
-        ["0", "1", "1", "1"]
+        [
+            "0", "1", "1", "1", "0", "8", "1", "7", "8", "0", "8", "1", "7", "8", "0", "8", "1",
+            "7", "8", "0", "8", "1", "7", "8", "0", "17", "1", "7", "9", "17", "0", "8", "1", "7",
+            "8", "0", "1", "2", "1", "1", "0", "1", "2", "1", "1", "0", "1", "1", "1",
+        ]
     );
 }
 

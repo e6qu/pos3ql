@@ -5100,7 +5100,7 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
         return Ok(&*rows);
     }
     if !tref.table.eq_ignore_ascii_case("generate_series") {
-        return super::input_progress::call(arena, || {
+        return super::input_progress::call(arena, || -> Result<&'a [&'a [u8]], SqlError> {
             let Some((routine_slot, routine)) =
                 table_func_routine(tref, storage, txid, arena, params, columns, eval_hooks)?
             else {

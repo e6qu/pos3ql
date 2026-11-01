@@ -2207,9 +2207,6 @@ impl<'a> Parser<'a> {
         if self.peeked != Tok::Op(")") {
             loop {
                 let this_variadic = self.eat_ident("variadic")?;
-                if this_variadic && (!args.is_empty() && saw_named) {
-                    return Err(self.err_here("VARIADIC argument cannot use named notation"));
-                }
                 let first = self.expression(0)?;
                 if self.eat_op("=>")? {
                     let argument_name = match first {

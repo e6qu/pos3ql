@@ -96,6 +96,7 @@ pub(super) fn enter_statement<'arena>(
     session: &SeqSession,
     resumed: bool,
 ) -> StatementSequenceScope<'arena> {
+    let arena = arena.retention_owner();
     let previous = STATEMENT_ARENA.with(|active| active.get());
     if !previous.is_null() {
         return StatementSequenceScope {
@@ -652,6 +653,79 @@ mod tests {
     use crate::mem::budget::Budget;
 
     #[test]
+    fn cursor_owned_query_statement_sequence_effects_survive_row_regions_and_command_retries() {
+        let mut budget = Budget::new(4096);
+        let arena =
+            Arena::new(&mut budget, "command sequence effects and row state", 4096).unwrap();
+        let guc = crate::sql::guc::GucState::new();
+        let session = guc.seq_session();
+        let call = SequenceCall {
+            operation: SequenceOperation::Last,
+            source: None,
+        };
+        let actions = Cell::new(0);
+        crate::mem::guard::forbid_alloc(|| {
+            arena
+                .with_remaining_region(|row| {
+                    // A command can itself start in an embedding caller's scoped
+                    // arena. Its retry journal must belong to the durable owner.
+                    let _statement = enter_statement(row, session, false);
+                    assert_eq!(
+                        statement_call(session, call, || {
+                            actions.set(actions.get() + 1);
+                            Ok(7)
+                        })
+                        .unwrap(),
+                        7
+                    );
+                    row.with_remaining_region(|nested| {
+                        let _nested_statement = enter_statement(nested, session, false);
+                        assert_eq!(
+                            statement_call(session, call, || {
+                                actions.set(actions.get() + 1);
+                                Ok(8)
+                            })
+                            .unwrap(),
+                            8
+                        );
+                    })
+                    .unwrap();
+                })
+                .unwrap();
+            for _ in 0..2 {
+                let _retry = enter_statement(&arena, session, true);
+                arena
+                    .with_remaining_region(|row| {
+                        row.alloc([0xa5u8; 256]).unwrap();
+                        for expected in [7, 8] {
+                            assert_eq!(
+                                statement_call(session, call, || panic!(
+                                    "issued sequence value must replay"
+                                ))
+                                .unwrap(),
+                                expected
+                            );
+                        }
+                    })
+                    .unwrap();
+            }
+            let complete = enter_statement(&arena, session, true);
+            for expected in [7, 8] {
+                assert_eq!(
+                    statement_call(session, call, || panic!(
+                        "issued sequence value must replay"
+                    ))
+                    .unwrap(),
+                    expected
+                );
+            }
+            complete.finish(session).unwrap();
+            assert_eq!(actions.get(), 2);
+            assert!(arena.high_water() <= arena.capacity());
+        });
+    }
+
+    #[test]
     fn statement_replay_preserves_calls_through_nested_scopes_and_front_rewinds() {
         let mut budget = Budget::new(1 << 16);
         let arena = Arena::new(&mut budget, "statement sequence effects", 1 << 16).unwrap();
@@ -724,20 +798,28 @@ mod tests {
         crate::mem::guard::forbid_alloc(|| {
             {
                 let _statement = enter_statement(&arena, session, false);
-                loop {
-                    let before = actions.get();
-                    match statement_call(session, call, || {
-                        actions.set(before + 1);
-                        Ok(before)
-                    }) {
-                        Ok(value) => assert_eq!(value, before),
-                        Err(error) => {
-                            assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
-                            assert_eq!(actions.get(), before);
-                            break;
+                arena
+                    .with_remaining_region(|row| {
+                        let live = row.alloc([0xa5u8; 128]).unwrap();
+                        loop {
+                            let before = actions.get();
+                            match statement_call(session, call, || {
+                                actions.set(before + 1);
+                                Ok(before)
+                            }) {
+                                Ok(value) => assert_eq!(value, before),
+                                Err(error) => {
+                                    assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+                                    assert_eq!(actions.get(), before);
+                                    break;
+                                }
+                            }
+                            assert_eq!(live, &[0xa5u8; 128]);
                         }
-                    }
-                }
+                        assert!(actions.get() > 0);
+                        assert_eq!(live, &[0xa5u8; 128]);
+                    })
+                    .unwrap();
             }
             {
                 let statement = enter_statement(&arena, session, true);

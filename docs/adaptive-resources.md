@@ -13,36 +13,36 @@ reserved memory must remain unchanged.
 
 ## What already exists
 
-- [Storage startup accounting](../src/storage/mod.rs#L19671) still charges
+- [Storage startup accounting](https://github.com/e6qu/pos3ql/blob/b36e100a1d48221d6a06a15ecb68981dc699d26f/src/storage/mod.rs) still charges
   `max_tables * RowMap::budget_bytes(table_rows)` for row lookup structures.
   Table construction creates
   those maps before serving requests. Removing this multiplication requires
   shared ownership and admission, not merely changing a configuration label.
-- [Row bytes](../src/storage/row_heap.rs) already share two `memtable_bytes`
+- [Row bytes](https://github.com/e6qu/pos3ql/blob/b36e100a1d48221d6a06a15ecb68981dc699d26f/src/storage/row_heap.rs) already share two `memtable_bytes`
   buffers for active data and relocation. Committed MVCC history uses the
   instance-wide `row_history_slots`; locking mode reserves no committed history.
-- [Copies of table definitions](../src/storage/definition_images.rs) are already
+- [Copies of table definitions](https://github.com/e6qu/pos3ql/blob/b36e100a1d48221d6a06a15ecb68981dc699d26f/src/storage/definition_images.rs) are already
   leased globally to readers, but reserve `(max_tables + 1) *
   (max_catalog_versions_per_object + 1) * query_workspace_slots` wide slots.
-  [Retained row walks](../src/storage/row_walks.rs) reserve
+  [Retained row walks](https://github.com/e6qu/pos3ql/blob/b36e100a1d48221d6a06a15ecb68981dc699d26f/src/storage/row_walks.rs) reserve
   `query_workspace_slots * 64` identities, each with
   `max(table_rows, large_object_pages, value_index_rows)` row-ID positions.
   Reducing per-table maps alone would leave these multipliers in place.
-- The [RAM block cache](../src/store/cache.rs) and
-  [disk block cache](../src/store/disk.rs) already share fixed slots across
+- The [RAM block cache](https://github.com/e6qu/pos3ql/blob/b36e100a1d48221d6a06a15ecb68981dc699d26f/src/store/cache.rs) and
+  [disk block cache](https://github.com/e6qu/pos3ql/blob/b36e100a1d48221d6a06a15ecb68981dc699d26f/src/store/disk.rs) already share fixed slots across
   objects. CLOCK eviction gives recently used blocks another chance to remain.
   The disk file has a fixed logical length; sizing it does not guarantee
   physical disk space has been reserved.
-- [SST writing](../src/store/sst.rs) uses compressed row groups for small deltas
+- [SST writing](https://github.com/e6qu/pos3ql/blob/b36e100a1d48221d6a06a15ecb68981dc699d26f/src/store/sst.rs) uses compressed row groups for small deltas
   and PAX, column-oriented row groups, for full slices. The
-  [checkpoint writer](../src/checkpoint.rs#L13786) selects these formats.
-  [Column reading](../src/storage/mod.rs#L32209) retains completed columns and
+  [checkpoint writer](https://github.com/e6qu/pos3ql/blob/b36e100a1d48221d6a06a15ecb68981dc699d26f/src/checkpoint.rs) selects these formats.
+  [Column reading](https://github.com/e6qu/pos3ql/blob/b36e100a1d48221d6a06a15ecb68981dc699d26f/src/storage/mod.rs) retains completed columns and
   starts missing selected columns before yielding. Some paths reuse a whole
   packed container instead of fetching its extents separately.
-- [Read-ahead](../src/store/sst.rs#L2525) uses the configured request slots and
+- [Read-ahead](https://github.com/e6qu/pos3ql/blob/b36e100a1d48221d6a06a15ecb68981dc699d26f/src/store/sst.rs) uses the configured request slots and
   leaves one for the current read. That window skips packed references.
-  [Physical output batches](../src/store/write_batch.rs) fill available upload
-  slots. [Group commit](../src/server.rs#L1758) shares publication work from one
+  [Physical output batches](https://github.com/e6qu/pos3ql/blob/b36e100a1d48221d6a06a15ecb68981dc699d26f/src/store/write_batch.rs) fill available upload
+  slots. [Group commit](https://github.com/e6qu/pos3ql/blob/b36e100a1d48221d6a06a15ecb68981dc699d26f/src/server.rs) shares publication work from one
   reactor turn without adding a timer to collect more arrivals.
 
 These mechanisms do not establish workload-driven resource allocation or
@@ -115,7 +115,7 @@ from falsely appearing to be successful low-latency samples.
 Measure queue time separately from object service time, useful and transferred
 bytes, active/waiting leases, pinned bytes, cache reuse/eviction, wasted
 read-ahead, batch fill, maintenance backlog and controller decisions. Existing
-[block counters](../src/store/mod.rs#L541) are a starting point; sampling buffers
+[block counters](https://github.com/e6qu/pos3ql/blob/b36e100a1d48221d6a06a15ecb68981dc699d26f/src/store/mod.rs) are a starting point; sampling buffers
 and latency distributions must also fit startup budgets.
 
 Test idle, burst, sustained and cooling traffic; switches between hot tables;

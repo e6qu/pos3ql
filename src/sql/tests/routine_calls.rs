@@ -1068,3 +1068,95 @@ fn retained_query_handoffs_count_one_scan_and_each_source_row_once() {
         ["0"]
     );
 }
+
+#[test]
+fn qualified_builtin_types_survive_mutable_function_handoffs() {
+    let config = test_config("qualified-builtin-handoff-types");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE TABLE qualified_builtin_source(value integer); \
+         INSERT INTO qualified_builtin_source VALUES(2); \
+         CREATE TABLE qualified_builtin_audit(value integer); \
+         CREATE FUNCTION qualified_builtin_write(value integer) RETURNS integer \
+         LANGUAGE sql VOLATILE AS \
+         $$INSERT INTO qualified_builtin_audit VALUES($1); SELECT $1$$",
+        true,
+    );
+    for prefix in ["", "pg_catalog."] {
+        let sql = format!(
+            "SELECT {prefix}abs(-7.5)+1.0, \
+             {prefix}ln({prefix}abs(-7.5)+1.0), \
+             {prefix}hashfloat8extended(0::float8,23)+1, \
+             {prefix}hashtext(NULL::text), \
+             {prefix}hashtextextended(NULL::text,0), \
+             qualified_builtin_write(value) FROM qualified_builtin_source"
+        );
+        let output = session.success(&mut engine, &sql, true);
+        assert_eq!(
+            row_description_type_oids(&output),
+            [1700, 1700, 20, 23, 20, 23]
+        );
+        let rows = data_rows(&output);
+        assert_eq!(rows.len(), 1);
+        let values = rows[0].split('|').collect::<Vec<_>>();
+        assert_eq!(values[0], "8.5");
+        assert!((values[1].parse::<f64>().unwrap() - 8.5f64.ln()).abs() < 1e-12);
+        assert_eq!(&values[2..], &["24", "NULL", "NULL", "2"]);
+    }
+    session.success(
+        &mut engine,
+        "CREATE SCHEMA qualified_builtin_user; \
+         CREATE FUNCTION qualified_builtin_user.abs(value numeric) RETURNS text \
+         LANGUAGE sql IMMUTABLE AS $$SELECT 'custom'::text$$; \
+         CREATE FUNCTION qualified_builtin_user.hashtextextended(value text,seed bigint) \
+         RETURNS numeric LANGUAGE sql IMMUTABLE AS $$SELECT 123.5$$",
+        true,
+    );
+    let output = session.success(
+        &mut engine,
+        "SELECT qualified_builtin_user.abs(-7.5), \
+         qualified_builtin_user.hashtextextended('label',0)+1.0, \
+         qualified_builtin_write(value) FROM qualified_builtin_source",
+        true,
+    );
+    assert_eq!(row_description_type_oids(&output), [25, 1700, 23]);
+    assert_eq!(data_rows(&output), ["custom|124.5|2"]);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT count(*) FROM qualified_builtin_audit",
+            true,
+        )),
+        ["3"]
+    );
+}
+
+#[test]
+fn bound_builtin_casts_keep_indexed_point_reads() {
+    let config = test_config("retained-query-indexed-casts");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE TABLE query_indexed_casts(id integer PRIMARY KEY,payload integer); \
+         INSERT INTO query_indexed_casts \
+         SELECT value,value*10 FROM generate_series(1,1024) AS source(value)",
+        true,
+    );
+    session.success(&mut engine, "BEGIN", true);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT payload::text,-payload,payload+1 FROM query_indexed_casts WHERE id=511; \
+             SELECT seq_scan,seq_tup_read,idx_scan,idx_tup_fetch \
+             FROM pg_stat_xact_user_tables WHERE relname='query_indexed_casts'",
+            true,
+        )),
+        ["5110|-5110|5111", "0|0|1|1"]
+    );
+    session.success(&mut engine, "ROLLBACK", true);
+}

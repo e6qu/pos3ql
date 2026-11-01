@@ -1792,9 +1792,6 @@ impl<'a> Parser<'a> {
         if !self.eat_op(")")? {
             loop {
                 let this_variadic = self.eat_ident("variadic")?;
-                if this_variadic && saw_named {
-                    return Err(self.err_here("VARIADIC argument cannot use named notation"));
-                }
                 let first = self.expression(0)?;
                 let (argument, argument_name) = if self.eat_op("=>")? {
                     let argument_name = match first {
@@ -3036,26 +3033,21 @@ impl<'a> Parser<'a> {
         // immediately after the (possibly schema-qualified) name.
         let mut func_argument_names: &'a [Option<&'a str>] = &[];
         let mut func_variadic = false;
-        let mut func_args = if table.eq_ignore_ascii_case("json_table")
-            && self.peeked == Tok::Op("(")
-        {
-            Some(self.json_table_arguments()?)
-        } else if table.eq_ignore_ascii_case("xmltable") && self.peeked == Tok::Op("(") {
-            Some(self.xml_table_arguments()?)
-        } else if self.peeked == Tok::Op("(") {
-            self.advance()?;
-            let mut args = ArenaList::new(self.arena);
-            let mut names = ArenaList::new(self.arena);
-            let mut saw_named = false;
-            if self.peeked != Tok::Op(")") {
-                loop {
-                    let this_variadic = self.eat_ident("variadic")?;
-                    if this_variadic && saw_named {
-                        return Err(self.err_here("VARIADIC argument cannot use named notation"));
-                    }
-                    let first = self.expression(0)?;
-                    let (argument, argument_name) =
-                        if self.eat_op("=>")? {
+        let mut func_args =
+            if table.eq_ignore_ascii_case("json_table") && self.peeked == Tok::Op("(") {
+                Some(self.json_table_arguments()?)
+            } else if table.eq_ignore_ascii_case("xmltable") && self.peeked == Tok::Op("(") {
+                Some(self.xml_table_arguments()?)
+            } else if self.peeked == Tok::Op("(") {
+                self.advance()?;
+                let mut args = ArenaList::new(self.arena);
+                let mut names = ArenaList::new(self.arena);
+                let mut saw_named = false;
+                if self.peeked != Tok::Op(")") {
+                    loop {
+                        let this_variadic = self.eat_ident("variadic")?;
+                        let first = self.expression(0)?;
+                        let (argument, argument_name) = if self.eat_op("=>")? {
                             let argument_name = match first {
                                 Expr::Column {
                                     qualifier: None,
@@ -3076,28 +3068,28 @@ impl<'a> Parser<'a> {
                             }
                             (first, None)
                         };
-                    self.push(&mut args, argument)?;
-                    self.push(&mut names, argument_name)?;
-                    if this_variadic {
-                        func_variadic = true;
-                        if self.peeked != Tok::Op(")") {
-                            return Err(self.err_here("VARIADIC argument must be last"));
+                        self.push(&mut args, argument)?;
+                        self.push(&mut names, argument_name)?;
+                        if this_variadic {
+                            func_variadic = true;
+                            if self.peeked != Tok::Op(")") {
+                                return Err(self.err_here("VARIADIC argument must be last"));
+                            }
+                            break;
                         }
-                        break;
-                    }
-                    if !self.eat_op(",")? {
-                        break;
+                        if !self.eat_op(",")? {
+                            break;
+                        }
                     }
                 }
-            }
-            self.expect_op(")")?;
-            if saw_named {
-                func_argument_names = names.as_slice();
-            }
-            Some(args.as_slice())
-        } else {
-            None
-        };
+                self.expect_op(")")?;
+                if saw_named {
+                    func_argument_names = names.as_slice();
+                }
+                Some(args.as_slice())
+            } else {
+                None
+            };
         if func_args.is_some() && inheritance == RelationInheritance::Only {
             return Err(self.err_here("ONLY requires a relation, not a function call"));
         }
@@ -11129,6 +11121,62 @@ mod tests {
                 ));
             },
         );
+    }
+
+    #[test]
+    fn named_variadic_arguments_keep_their_names_in_every_call_form() {
+        with_parser(
+            "SELECT f(marker=>7,VARIADIC \"Members\"=>ARRAY[]::integer[]); \
+             SELECT * FROM f(marker=>7,VARIADIC \"Members\"=>ARRAY[]::integer[]); \
+             CALL p(marker=>7,VARIADIC \"Members\"=>ARRAY[]::integer[])",
+            |parser| {
+                let Stmt::Select(select) = parser.next_stmt().unwrap().unwrap() else {
+                    panic!("scalar call")
+                };
+                let SelectItem::Expr {
+                    expression:
+                        Expr::Call {
+                            argument_names,
+                            variadic,
+                            ..
+                        },
+                    ..
+                } = select.items[0]
+                else {
+                    panic!("scalar function expression")
+                };
+                assert!(*variadic);
+                assert_eq!(*argument_names, [Some("marker"), Some("Members")]);
+                let Stmt::Select(select) = parser.next_stmt().unwrap().unwrap() else {
+                    panic!("table call")
+                };
+                let table = &select.from.unwrap().base;
+                assert!(table.func_variadic);
+                assert_eq!(table.func_argument_names, [Some("marker"), Some("Members")]);
+                let Stmt::Call {
+                    argument_names,
+                    variadic,
+                    ..
+                } = parser.next_stmt().unwrap().unwrap()
+                else {
+                    panic!("procedure call")
+                };
+                assert!(variadic);
+                assert_eq!(argument_names, [Some("marker"), Some("Members")]);
+            },
+        );
+        for sql in [
+            "SELECT f(marker=>7,VARIADIC ARRAY[]::integer[])",
+            "SELECT * FROM f(marker=>7,VARIADIC ARRAY[]::integer[])",
+            "CALL p(marker=>7,VARIADIC ARRAY[]::integer[])",
+            "SELECT f(VARIADIC members=>ARRAY[]::integer[],marker=>7)",
+            "SELECT * FROM f(VARIADIC members=>ARRAY[]::integer[],marker=>7)",
+            "CALL p(VARIADIC members=>ARRAY[]::integer[],marker=>7)",
+        ] {
+            with_parser(sql, |parser| {
+                assert!(parser.next_stmt().is_err(), "accepted {sql}");
+            });
+        }
     }
 
     #[test]

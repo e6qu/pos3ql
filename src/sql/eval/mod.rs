@@ -2622,14 +2622,21 @@ pub(crate) fn routine_input_handoff(
             args,
             ..
         } => {
-            if bound_oid.is_some()
-                || catalog.is_some_and(|catalog| catalog.has_routine_candidate(name, args.len()))
-                || !super::catalog::intrinsic_routine_has_name(name)
-                || super::engine_intrinsic_result_type(
-                    name.strip_prefix("pg_catalog.").unwrap_or(name),
-                    args.len(),
-                )
-                .is_some()
+            let builtin_operator = bound_oid.is_none()
+                && super::ast::catalog_operator_call(name).is_some_and(|(schema, symbol)| {
+                    schema == Some("pg_catalog")
+                        && catalog.is_none_or(|catalog| !catalog.has_operator_candidate(symbol))
+                });
+            if !builtin_operator
+                && (bound_oid.is_some()
+                    || catalog
+                        .is_some_and(|catalog| catalog.has_routine_candidate(name, args.len()))
+                    || !super::catalog::intrinsic_routine_has_name(name)
+                    || super::engine_intrinsic_result_type(
+                        name.strip_prefix("pg_catalog.").unwrap_or(name),
+                        args.len(),
+                    )
+                    .is_some())
             {
                 return true;
             }
@@ -2640,13 +2647,13 @@ pub(crate) fn routine_input_handoff(
             binding: CastBinding::Resolve,
             ..
         }
-        | Expr::Unary { .. }
         | Expr::Subquery(_)
         | Expr::RowSubquery { .. }
         | Expr::ArraySubquery(_)
         | Expr::Exists(_)
         | Expr::InSubquery { .. }
         | Expr::QuantifiedSubquery { .. } => return true,
+        Expr::Unary { operator, .. } if operator.arithmetic_function().is_some() => return true,
         Expr::Binary { operator, .. }
             if operator.operator_name().is_some_and(|name| {
                 catalog.is_some_and(|catalog| catalog.has_operator_candidate(name))

@@ -88,6 +88,11 @@ a later bound call. Each active row borrows the unused region of its existing
 statement arena; completed output is copied before that region is released.
 Nested function execution can borrow a further region without growing memory.
 Row ownership and scan positions survive outside those temporary regions.
+Issued sequence numbers keep command-lived records in the owning arena. For
+example, a number issued before a lock wait must not be issued again when that
+command retries. Temporary row regions and the command's retained records share
+a checked allocation frontier; recording an effect reserves space before it
+runs, and ending a row preserves those command records.
 
 This does not complete every query continuation. Complex plans, functions with
 subqueries or set expansion, named/custom casts and function bodies still have

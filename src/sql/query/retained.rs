@@ -229,8 +229,14 @@ fn validate_statement_casts(
         operand, type_name, ..
     } = expression
     {
-        let source = super::super::exec::infer_type_res(operand, columns)?.0;
         let target = ColType::from_sql_name(type_name).expect("admitted builtin cast");
+        // An explicit array cast supplies the constructor's element type,
+        // including ARRAY[], before whole-value cast lookup.
+        let source = if matches!(operand, Expr::Array(_)) && matches!(target, ColType::Array(_)) {
+            target.oid()
+        } else {
+            super::super::exec::infer_routine_argument_oid(operand, columns)?
+        };
         *safe &= columns
             .storage
             .cast_for_oids(source, target.oid(), columns.txid)
@@ -373,17 +379,26 @@ fn bind_expression<'a>(
         } if columns.is_some() => {
             let operand = bind_expression(operand, arena, columns, defaults)?;
             let columns = columns.expect("statement type resolver");
-            let source = super::super::exec::infer_routine_argument_oid(operand, columns)?;
             let binding = match ColType::from_sql_name(type_name) {
-                Some(target)
+                Some(target) => {
+                    let source = if matches!(operand, Expr::Array(_))
+                        && matches!(target, ColType::Array(_))
+                    {
+                        target.oid()
+                    } else {
+                        super::super::exec::infer_routine_argument_oid(operand, columns)?
+                    };
                     if columns
                         .storage
                         .cast_for_oids(source, target.oid(), columns.txid)
-                        .is_none() =>
-                {
-                    crate::sql::ast::CastBinding::Builtin
+                        .is_none()
+                    {
+                        crate::sql::ast::CastBinding::Builtin
+                    } else {
+                        *binding
+                    }
                 }
-                _ => *binding,
+                None => *binding,
             };
             Expr::Cast {
                 operand,
@@ -504,10 +519,6 @@ fn bind_expression<'a>(
     Ok(arena.alloc(bound).map_err(full)?)
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "bind omitted inputs to their selected declaration"
-)]
 fn bind_defaults<'a>(
     oid: i32,
     arguments: &'a [&'a Expr<'a>],
@@ -689,10 +700,6 @@ impl<'a> RetainedSelect<'a> {
         )
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "shared retained query preparation"
-    )]
     fn open_mode(
         storage: &'a Storage,
         txid: u32,
@@ -891,6 +898,21 @@ impl<'a> RetainedSelect<'a> {
         let predicate = predicate
             .map(|predicate| bind_expression(predicate, arena, binding_columns, None))
             .transpose()?;
+        if mode == RetainedMode::Statement
+            && !items.iter().any(|item| match item {
+                SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
+                    super::super::eval::routine_input_handoff(expression, Some(&catalog))
+                }
+                SelectItem::Wildcard | SelectItem::TableWildcard(_) => false,
+            })
+            && !predicate.is_some_and(|predicate| {
+                super::super::eval::routine_input_handoff(predicate, Some(&catalog))
+            })
+        {
+            // Binding can prove a cast/operator cannot suspend. Keep such
+            // queries on the general executor's existing index access paths.
+            return Ok(None);
+        }
         let bounds = RowBounds::Unstarted {
             limit: statement
                 .limit

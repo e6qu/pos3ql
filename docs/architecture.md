@@ -107,6 +107,8 @@ across those fields; two explicitly written calls remain independent. Expansion
 happens before argument queries and set producers are planned, including in
 `RETURNING`. Array expansion keeps each element's type separately from its integer
 position; ordinary arrays cannot be accessed as records with `.x` or `.f1`.
+Scalar and set-returning overloads compete together by argument types; returning
+one row cannot give a weaker type match priority over a set-returning function.
 Runtime overload checks copy input descriptors rather than whole definitions.
 The selected definition is captured once, bound in place and borrowed by its
 execution helpers. Candidate catalog locks are released before type coercion,

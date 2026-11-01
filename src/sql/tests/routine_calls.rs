@@ -498,8 +498,11 @@ fn pending_routine_calls_keep_bound_types_and_structural_values() {
     let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
     let sql =
         include_str!("../../../tests/external/differential_exact/48_pending_routine_types.sql");
+    let (calls, replacement) = sql.split_once("-- replacement timing").unwrap();
+    let mut rows = data_rows(&session.success(&mut engine, calls, true));
+    rows.extend(data_rows(&session.success(&mut engine, replacement, true)));
     assert_eq!(
-        data_rows(&session.success(&mut engine, sql, true)),
+        rows,
         [
             "7|9|{1,NULL,3}",
             "7|9|{1,NULL,3}",
@@ -545,6 +548,8 @@ fn record_call_expansion_preserves_scalar_effects_and_shared_set_producers() {
             "17",
             "18|19",
             "set|set",
+            "untyped|untyped",
+            "integer",
             "20|20",
             "21|21",
             "20",

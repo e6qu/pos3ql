@@ -8866,6 +8866,7 @@ impl RoutineKind {
 
 #[derive(Clone, Copy)]
 enum RoutineCallKind {
+    Function,
     Scalar,
     Set,
     Trigger,
@@ -8877,6 +8878,7 @@ enum RoutineCallKind {
 impl RoutineCallKind {
     const fn accepts(self, kind: RoutineKind) -> bool {
         match self {
+            Self::Function => kind.function_result().is_some(),
             Self::Scalar => kind.function_result().is_some() && !kind.is_set_returning(),
             Self::Set => kind.is_set_returning(),
             Self::Trigger => matches!(kind, RoutineKind::Trigger),
@@ -43234,16 +43236,13 @@ impl Storage {
         {
             return Some(slot);
         }
-        self.routine_slot_for_call_syntax_oids(name, argument_type_oids, explicit_variadic, txid)
-            .or_else(|| {
-                self.variadic_routine_slot_on_path_oids(
-                    name,
-                    argument_type_oids,
-                    explicit_variadic,
-                    txid,
-                    RoutineCallKind::Set,
-                )
-            })
+        self.variadic_routine_slot_on_path_oids(
+            name,
+            argument_type_oids,
+            explicit_variadic,
+            txid,
+            RoutineCallKind::Function,
+        )
     }
 
     fn variadic_routine_slot_on_path_oids(
@@ -43352,10 +43351,10 @@ impl Storage {
         argument_type_oids: &[i32],
         txid: u32,
     ) -> Option<usize> {
-        if let Some(slot) =
-            self.routine_slot_for_named_call_oids(name, argument_names, argument_type_oids, txid)
+        if argument_type_oids.len() > MAX_ROUTINE_ARGUMENTS
+            || argument_names.len() != argument_type_oids.len()
         {
-            return Some(slot);
+            return None;
         }
         let resolve = |schema: &str, routine_name: &str| {
             self.routine_slot_in_named_oids(
@@ -43364,7 +43363,7 @@ impl Storage {
                 argument_names,
                 argument_type_oids,
                 txid,
-                RoutineCallKind::Set,
+                RoutineCallKind::Function,
             )
         };
         if let Some((schema, routine_name)) = name.split_once('.') {
@@ -43422,10 +43421,7 @@ impl Storage {
         argument_type_oids: &[i32],
         txid: u32,
     ) -> Option<RoutineDef> {
-        self.routine_slot_on_path_oids(name, argument_type_oids, txid, RoutineCallKind::Scalar)
-            .or_else(|| {
-                self.routine_slot_on_path_oids(name, argument_type_oids, txid, RoutineCallKind::Set)
-            })
+        self.routine_slot_for_function_call_oids(name, argument_type_oids, txid)
             .and_then(|slot| self.routine_for_bound_call(slot, argument_type_oids, txid))
     }
 
@@ -43441,23 +43437,13 @@ impl Storage {
         {
             return Some(routine);
         }
-        let slot = self
-            .variadic_routine_slot_on_path_oids(
-                name,
-                argument_type_oids,
-                explicit_variadic,
-                txid,
-                RoutineCallKind::Scalar,
-            )
-            .or_else(|| {
-                self.variadic_routine_slot_on_path_oids(
-                    name,
-                    argument_type_oids,
-                    explicit_variadic,
-                    txid,
-                    RoutineCallKind::Set,
-                )
-            })?;
+        let slot = self.variadic_routine_slot_on_path_oids(
+            name,
+            argument_type_oids,
+            explicit_variadic,
+            txid,
+            RoutineCallKind::Function,
+        )?;
         let routine = self.routine_for(slot, txid);
         let mut declared_oids = [crate::sql::types::oid::UNKNOWN; MAX_ROUTINE_ARGUMENTS];
         for (index, argument) in routine.arguments().iter().enumerate() {
@@ -43774,10 +43760,7 @@ impl Storage {
         argument_type_oids: &[i32],
         txid: u32,
     ) -> Option<usize> {
-        self.routine_slot_on_path_oids(name, argument_type_oids, txid, RoutineCallKind::Scalar)
-            .or_else(|| {
-                self.routine_slot_on_path_oids(name, argument_type_oids, txid, RoutineCallKind::Set)
-            })
+        self.routine_slot_on_path_oids(name, argument_type_oids, txid, RoutineCallKind::Function)
     }
 
     pub(crate) fn has_set_routine_candidate(&self, name: &str, arity: usize, txid: u32) -> bool {

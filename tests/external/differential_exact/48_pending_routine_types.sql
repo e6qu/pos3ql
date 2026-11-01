@@ -24,6 +24,7 @@ SELECT * FROM pending_table(ARRAY[2,NULL,4]);
 SELECT (pending_named(right_value=>'named',left_value=>12)).*;
 SELECT (pending_named(left_value=>13)).*;
 DROP FUNCTION pending_named(integer,text);
+-- replacement timing
 CREATE FUNCTION pending_replace(value integer) RETURNS integer LANGUAGE sql VOLATILE AS 'INSERT INTO pending_type_audit VALUES (10); SELECT $1+10';
 CREATE FUNCTION pending_replace_argument() RETURNS integer LANGUAGE plpgsql AS $$BEGIN EXECUTE 'CREATE OR REPLACE FUNCTION pending_replace(value integer) RETURNS integer LANGUAGE sql VOLATILE AS ''INSERT INTO pending_type_audit VALUES (100); SELECT $1+100'''; RETURN 1; END$$;
 SELECT pending_replace(pending_replace_argument());

@@ -1452,7 +1452,7 @@ impl ColTypeResolver for DependencyTypes<'_, '_, '_> {
                     .routine_slot_for_function_call_syntax_oids(name, arguments, true, self.txid)?
             } else {
                 self.storage
-                    .routine_slot_for_table_call_oids(name, arguments, self.txid)?
+                    .routine_slot_for_function_call_oids(name, arguments, self.txid)?
             }
         } else {
             self.storage.routine_slot_for_named_function_call_oids(

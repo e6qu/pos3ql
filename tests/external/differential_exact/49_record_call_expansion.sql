@@ -1,6 +1,7 @@
 CREATE SEQUENCE record_effects START 10;
 CREATE FUNCTION record_pair(value bigint,OUT first_value bigint,OUT second_value bigint) LANGUAGE sql VOLATILE AS 'SELECT $1,$1';
 CREATE FUNCTION record_pair(value text,OUT first_value text,OUT second_value text) RETURNS SETOF record LANGUAGE sql VOLATILE AS 'SELECT $1,$1';
+CREATE FUNCTION record_pair(value integer,OUT first_value integer,OUT second_value integer) RETURNS SETOF record LANGUAGE sql VOLATILE AS 'SELECT $1,$1';
 CREATE FUNCTION record_set(value bigint,OUT first_value bigint,OUT second_value bigint) RETURNS SETOF record LANGUAGE sql VOLATILE AS 'SELECT $1,$1 UNION ALL SELECT $1+1,$1+1';
 CREATE TABLE record_inputs(id integer);
 INSERT INTO record_inputs VALUES (1),(2);
@@ -12,6 +13,8 @@ SELECT id,(record_pair(nextval('record_effects'))).* FROM record_inputs ORDER BY
 SELECT last_value FROM record_effects;
 SELECT * FROM (SELECT (record_pair(nextval('record_effects'))).*) AS nested;
 SELECT (record_pair('set'::text)).*;
+SELECT (record_pair('untyped')).*;
+SELECT pg_typeof((record_pair(9)).first_value);
 SELECT (record_set(nextval('record_effects'))).*;
 SELECT last_value FROM record_effects;
 SELECT record_set(nextval('record_effects')),record_set(nextval('record_effects'));
@@ -40,6 +43,7 @@ DROP TABLE record_merge_source;
 DROP TABLE record_inputs;
 DROP FUNCTION record_pair(bigint);
 DROP FUNCTION record_pair(text);
+DROP FUNCTION record_pair(integer);
 DROP FUNCTION record_set(bigint);
 DROP SEQUENCE record_effects;
 -- invalid field

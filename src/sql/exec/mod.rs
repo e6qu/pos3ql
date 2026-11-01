@@ -7678,10 +7678,9 @@ pub fn alter_role_setting(
                     if storage
                         .role_settings()
                         .any(|(_, setting)| setting.visible_to(txn.txid) && setting.scope == scope)
+                        && let Err(error) = guc.validate_setting_value(name.as_str(), None)
                     {
-                        if let Err(error) = guc.validate_setting_value(name.as_str(), None) {
-                            return sql_fail(error);
-                        }
+                        return sql_fail(error);
                     }
                     None
                 }
@@ -7705,15 +7704,13 @@ pub fn alter_role_setting(
             stage_role_setting(storage, wal, txn, scope, name, value)
         }
         crate::sql::ast::RoleSettingAction::Reset(name) => {
-            if let Some(name) = name {
-                if storage
+            if let Some(name) = name
+                && storage
                     .role_settings()
                     .any(|(_, setting)| setting.visible_to(txn.txid) && setting.scope == scope)
-                {
-                    if let Err(error) = guc.validate_setting_value(name, None) {
-                        return sql_fail(error);
-                    }
-                }
+                && let Err(error) = guc.validate_setting_value(name, None)
+            {
+                return sql_fail(error);
             }
             let mut result = Ok(());
             loop {
@@ -51420,10 +51417,9 @@ pub fn alter_database(
                     if storage
                         .role_settings()
                         .any(|(_, setting)| setting.visible_to(txn.txid) && setting.scope == scope)
+                        && let Err(error) = guc.validate_setting_value(name.as_str(), None)
                     {
-                        if let Err(error) = guc.validate_setting_value(name.as_str(), None) {
-                            return sql_fail(error);
-                        }
+                        return sql_fail(error);
                     }
                     None
                 }
@@ -51463,10 +51459,9 @@ pub fn alter_database(
                 if storage
                     .role_settings()
                     .any(|(_, setting)| setting.visible_to(txn.txid) && setting.scope == scope)
+                    && let Err(error) = guc.validate_setting_value(name, None)
                 {
-                    if let Err(error) = guc.validate_setting_value(name, None) {
-                        return sql_fail(error);
-                    }
+                    return sql_fail(error);
                 }
             }
             loop {

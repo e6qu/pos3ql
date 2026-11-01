@@ -292,6 +292,7 @@ pub(super) struct RoutineInputs<'a> {
     arena: &'a Arena,
     next: Cell<usize>,
     saved: RefCell<ArenaList<'a, SavedInputs<'a>>>,
+    evaluations: RefCell<ArenaList<'a, (i32, super::super::eval::ExpressionEvaluation)>>,
 }
 
 impl<'a> RoutineInputs<'a> {
@@ -300,6 +301,7 @@ impl<'a> RoutineInputs<'a> {
             arena,
             next: Cell::new(0),
             saved: RefCell::new(ArenaList::new_persistent(arena)),
+            evaluations: RefCell::new(ArenaList::new_persistent(arena)),
         }
     }
     pub(super) fn begin_attempt(&self) {
@@ -504,6 +506,33 @@ thread_local! {
     static AVAILABLE_INPUT: Cell<Option<ActiveInput>> = const { Cell::new(None) };
     static ACTIVE_INPUT: Cell<Option<ActiveInput>> = const { Cell::new(None) };
     static CURRENT_CALL: Cell<Option<usize>> = const { Cell::new(None) };
+    static IN_BODY: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Replanning a paused outer query cannot adopt a function's new volatility.
+/// Keep one decision per catalog identity, rather than one allocation per row.
+pub(super) fn evaluation(
+    oid: i32,
+    current: super::super::eval::ExpressionEvaluation,
+) -> Result<super::super::eval::ExpressionEvaluation, SqlError> {
+    if IN_BODY.with(Cell::get) {
+        return Ok(current);
+    }
+    let Some((invocations, _)) = active_routine_invocations() else {
+        return Ok(current);
+    };
+    let mut entries = invocations.inputs.evaluations.borrow_mut();
+    match entries
+        .as_slice()
+        .binary_search_by_key(&oid, |entry| entry.0)
+    {
+        Ok(index) => Ok(entries.as_slice()[index].1),
+        Err(index) => {
+            entries.push((oid, current)).map_err(|_| full())?;
+            entries.as_mut_slice().map_err(|_| full())?[index..].rotate_right(1);
+            Ok(current)
+        }
+    }
 }
 
 pub(crate) struct ExpressionPosition {
@@ -525,6 +554,7 @@ fn definition_oid(frame: InputFrame<'_>) -> Option<i32> {
 
 pub(super) fn selected_target() -> Option<i32> {
     let active = AVAILABLE_INPUT.with(Cell::get)?;
+    // AvailableScope keeps the stack-owned attempt live during this lookup.
     let attempt = unsafe { &*(active as *const InputAttempt<'_, '_>) };
     attempt
         .frames
@@ -595,12 +625,14 @@ pub(crate) struct BodyScope {
     active: Option<ActiveInput>,
     available: Option<ActiveInput>,
     expression: Option<usize>,
+    in_body: bool,
 }
 impl Drop for BodyScope {
     fn drop(&mut self) {
         ACTIVE_INPUT.with(|active| active.set(self.active));
         AVAILABLE_INPUT.with(|active| active.set(self.available));
         CURRENT_CALL.with(|current| current.set(self.expression));
+        IN_BODY.with(|current| current.set(self.in_body));
     }
 }
 pub(crate) fn enter_body() -> BodyScope {
@@ -608,6 +640,7 @@ pub(crate) fn enter_body() -> BodyScope {
         active: ACTIVE_INPUT.with(|active| active.replace(None)),
         available: AVAILABLE_INPUT.with(|active| active.replace(None)),
         expression: CURRENT_CALL.with(|current| current.replace(None)),
+        in_body: IN_BODY.with(|current| current.replace(true)),
     }
 }
 
@@ -778,7 +811,7 @@ mod tests {
     }
 
     #[test]
-    fn retained_input_ownership_successful_rows_do_not_consume_statement_memory() {
+    fn retained_input_ownership_successful_inputs_do_not_grow_statement_memory_per_row() {
         let mut budget = Budget::new(8192);
         let statement = Arena::new(&mut budget, "input statement", 1024).unwrap();
         let mut work = Arena::new(&mut budget, "input work", 4096).unwrap();
@@ -804,6 +837,30 @@ mod tests {
                 assert_eq!(invocations.inputs.saved.borrow().len(), 0);
             });
         }
+    }
+
+    #[test]
+    fn retained_input_ownership_keeps_outer_planning_separate_from_new_bodies() {
+        use super::super::super::eval::ExpressionEvaluation::{Immutable, Runtime};
+        let mut budget = Budget::new(4096);
+        let statement = Arena::new(&mut budget, "input planning", 4096).unwrap();
+        let invocations = RoutineInvocationState::new(&statement);
+        let _scope = enter_routine_invocation_scope(Some(RoutineInvocationContext::new(
+            &invocations,
+            &statement,
+        )));
+        crate::mem::guard::forbid_alloc(|| {
+            assert!(evaluation(42, Runtime).unwrap() == Runtime);
+            let before = statement.used();
+            invocations.begin_attempt();
+            assert!(evaluation(42, Immutable).unwrap() == Runtime);
+            {
+                let _body = enter_body();
+                assert!(evaluation(42, Immutable).unwrap() == Immutable);
+            }
+            assert!(evaluation(42, Immutable).unwrap() == Runtime);
+            assert_eq!(statement.used(), before);
+        });
     }
 
     #[test]

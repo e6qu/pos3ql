@@ -3477,7 +3477,8 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             .routine_slot_by_oid(oid, self.txid)
             .expect("resolved routine identity exists");
         let routine = self.storage.routine_for(slot, self.txid);
-        Ok(Some(
+        Ok(Some(input_progress::evaluation(
+            oid,
             if routine.attributes.volatility == crate::storage::RoutineVolatility::Immutable
                 && !routine.kind.is_set_returning()
             {
@@ -3485,7 +3486,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             } else {
                 super::eval::ExpressionEvaluation::Runtime
             },
-        ))
+        )?))
     }
 
     fn operator_evaluation(
@@ -3551,13 +3552,14 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                 )
             })?;
         let routine = self.storage.routine_for(slot, self.txid);
-        Ok(Some(
+        Ok(Some(input_progress::evaluation(
+            oid,
             if routine.attributes.volatility == crate::storage::RoutineVolatility::Immutable {
                 super::eval::ExpressionEvaluation::Immutable
             } else {
                 super::eval::ExpressionEvaluation::Runtime
             },
-        ))
+        )?))
     }
 
     fn call_routine<'a>(
@@ -3686,11 +3688,20 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                     .ok_or_else(|| {
                         sql_err!(sqlstate::UNDEFINED_FUNCTION, "cast function does not exist")
                     })?;
-                self.storage
+                let immutable = self
+                    .storage
                     .routine_for(slot, self.txid)
                     .attributes
                     .volatility
-                    == crate::storage::RoutineVolatility::Immutable
+                    == crate::storage::RoutineVolatility::Immutable;
+                input_progress::evaluation(
+                    oid,
+                    if immutable {
+                        super::eval::ExpressionEvaluation::Immutable
+                    } else {
+                        super::eval::ExpressionEvaluation::Runtime
+                    },
+                )? == super::eval::ExpressionEvaluation::Immutable
             }
         };
         Ok(Some(if immutable {

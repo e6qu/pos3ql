@@ -99,12 +99,13 @@ The function body is looked up when execution starts: PostgreSQL uses a replacem
 body if evaluating an argument replaced it. Read-only and mutable SQL functions
 share the same scalar and record result construction.
 Before this handoff, input preparation retains its own progress. For example,
-`save_order(set_config('application_name', 'import', false)::text)` must not run
-`set_config` again when `save_order` pauses. Completed argument expressions and
+`save_order(set_config('application_name', current_setting('application_name') || '.', false))`
+must append one dot even when `save_order` pauses. Completed argument expressions and
 conversions reuse their values; a partially evaluated expression reuses completed
 nested calls. Omitted defaults keep their original declaration and dependency
 image even if another argument replaces the function. Constant-input decisions
-also stay fixed. A reached call keeps its selected function when an argument
+also stay fixed. Outer-query planning keeps one volatility decision per function
+identity; a replacement body has its own planning scope. A reached call keeps its selected function when an argument
 changes `search_path`; another same-named function cannot take over on resumption.
 The new body is still selected when execution begins.
 Input records remain temporary row scratch for calls that finish immediately.

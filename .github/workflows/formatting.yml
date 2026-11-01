@@ -15,8 +15,9 @@ jobs:
 
       - name: Check Rust formatting
         run: |
-          if ! cargo fmt --check; then
+          if ! { cargo fmt --check && rustfmt --check --edition 2024 src/storage/native_tests.rs; }; then
             cargo fmt
+            rustfmt --edition 2024 src/storage/native_tests.rs
             git diff --binary > "$RUNNER_TEMP/formatting.patch"
             exit 1
           fi

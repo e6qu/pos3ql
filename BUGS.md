@@ -15,5 +15,10 @@ Unfinished features and their acceptance criteria belong in [PLAN.md](PLAN.md).
 Current guarantees belong in the [behavior guide](docs/implemented-baseline.md)
 and its [owning technical guides](docs/README.md).
 
+Successful-call regressions must compare successful values. Matching errors on
+both servers do not establish support; keep SQL and binary-client checks aligned.
+Record expansion checks must also compare argument effects and declared field
+types, including independent calls and shared set-returning producers.
+
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

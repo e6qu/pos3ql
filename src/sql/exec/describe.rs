@@ -889,25 +889,15 @@ impl ColTypeResolver for CatalogCols<'_> {
                 self.txid,
             )?
         };
-        let routine = self.storage.routine_for(slot, self.txid);
-        let column = routine.record_result_columns()?.get(index)?;
-        Some((
-            crate::util::StackStr::from_str(column.name.as_str()),
-            StaticTypeMeta {
-                ctype: column.ctype,
-                type_oid: self.storage.routine_type_oid(
-                    column.ctype,
-                    column.user_type,
-                    self.txid,
-                )?,
-                type_mod: -1,
-                collation: if column.ctype.is_collatable() {
-                    crate::sql::ast::Collation::Default
-                } else {
-                    crate::sql::ast::Collation::None
-                },
-            },
-        ))
+        catalog_routine_record_field(
+            self.storage,
+            self.txid,
+            slot,
+            argument_names,
+            variadic,
+            arguments,
+            index,
+        )
     }
 
     fn is_whole_row(&self, name: &str) -> bool {
@@ -1077,54 +1067,46 @@ fn describe_record_star<'q>(
                 push,
             )
         }
-        Expr::Call { name, args, .. } if storage.is_some() => {
-            let storage = storage.expect("matched");
+        Expr::Call { .. } if storage.is_some() => {
             let resolver = CatalogCols {
                 definition: def,
                 alias: table_alias,
                 output_aliases,
-                storage,
+                storage: storage.expect("matched"),
                 txid,
                 arena,
             };
-            let mut argument_oids = [oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
-            if args.len() > argument_oids.len() {
-                return Err(sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "too many function arguments"
-                ));
-            }
-            for (index, argument) in args.iter().enumerate() {
-                argument_oids[index] = infer_routine_argument_oid(argument, &resolver)?;
-            }
-            let Some(slot) =
-                storage.routine_slot_for_table_call_oids(name, &argument_oids[..args.len()], txid)
-            else {
-                return Err(sql_err!(
-                    sqlstate::WRONG_OBJECT_TYPE,
-                    "row expansion is not supported on this expression"
-                ));
-            };
-            let routine = storage.routine(slot);
-            let Some(columns) = routine.record_result_columns() else {
-                return Err(sql_err!(
-                    sqlstate::WRONG_OBJECT_TYPE,
-                    "row expansion is not supported on this expression"
-                ));
-            };
-            for column in columns {
-                let name = arena.alloc_str(column.name.as_str()).map_err(|_| {
-                    sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "record description exceeds the statement arena"
-                    )
-                })?;
-                let mut description = ColDesc::of_type(name, column.ctype);
-                if column.ctype.is_collatable() {
-                    description = description.with_collation(crate::sql::ast::Collation::Default);
+            let mut error = None;
+            let width = record_shape_metadata(base, &resolver, |field, meta| {
+                if error.is_some() {
+                    return;
                 }
-                push(description)?;
+                error = arena
+                    .alloc_str(field)
+                    .map_err(|_| {
+                        sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "record description exceeds the statement arena"
+                        )
+                    })
+                    .and_then(|field| {
+                        push(
+                            ColDesc::new(field, meta.type_oid, meta.ctype.typlen())
+                                .with_type_mod(meta.type_mod)
+                                .with_collation(meta.collation),
+                        )
+                    })
+                    .err();
+            })?;
+            if let Some(error) = error {
+                return Err(error);
             }
+            width.ok_or_else(|| {
+                sql_err!(
+                    sqlstate::WRONG_OBJECT_TYPE,
+                    "row expansion is not supported on this expression"
+                )
+            })?;
             Ok(())
         }
         Expr::WholeRow(table)
@@ -2150,6 +2132,49 @@ pub(crate) fn visit_catalog_composite_fields(
     Some(count)
 }
 
+pub(crate) fn catalog_routine_record_field(
+    storage: &crate::storage::Storage,
+    txid: u32,
+    slot: usize,
+    argument_names: &[Option<&str>],
+    variadic: bool,
+    arguments: &[i32],
+    index: usize,
+) -> Option<(crate::util::StackStr<64>, StaticTypeMeta)> {
+    let (oid, _) =
+        storage.routine_call_mapping(slot, argument_names, arguments.len(), variadic, txid)?;
+    let routine =
+        storage.function_for_captured_call(oid, argument_names, arguments, variadic, txid)?;
+    if let Some(columns) = routine.record_result_columns() {
+        let column = columns.get(index)?;
+        return Some((
+            crate::util::StackStr::from_str(column.name.as_str()),
+            StaticTypeMeta {
+                ctype: column.ctype,
+                type_oid: storage.routine_type_oid(column.ctype, column.user_type, txid)?,
+                type_mod: -1,
+                collation: if column.ctype.is_collatable() {
+                    crate::sql::ast::Collation::Default
+                } else {
+                    crate::sql::ast::Collation::None
+                },
+            },
+        ));
+    }
+    let ColType::Composite(creation) = routine.kind.function_result()? else {
+        return None;
+    };
+    let mut selected = None;
+    let mut at = 0usize;
+    visit_catalog_composite_fields(storage, txid, creation, &mut |name, meta| {
+        if at == index {
+            selected = Some((crate::util::StackStr::from_str(name), meta));
+        }
+        at += 1;
+    })?;
+    selected
+}
+
 fn visit_registered_composite_fields(
     slot: Option<crate::storage::TypeCreation>,
     visit: &mut dyn FnMut(&str, StaticTypeMeta),
@@ -2278,6 +2303,47 @@ pub fn expr_record_handle(base: &Expr, columns: &dyn ColTypeResolver) -> Option<
     }
 }
 
+fn record_field_index_metadata(
+    base: &Expr<'_>,
+    index: usize,
+    columns: &dyn ColTypeResolver,
+) -> Result<Option<StaticTypeMeta>, SqlError> {
+    if let Expr::Call {
+        name,
+        bound_oid,
+        args,
+        argument_names,
+        variadic,
+        ..
+    } = base
+        && args.len() <= MAX_ROUTINE_ARGUMENTS
+    {
+        let mut arguments = [oid::UNKNOWN; MAX_ROUTINE_ARGUMENTS];
+        for (output, argument) in arguments.iter_mut().zip(*args) {
+            *output = infer_routine_argument_oid(argument, columns)?;
+        }
+        if let Some((_, metadata)) = columns.routine_record_field(
+            name,
+            *bound_oid,
+            argument_names,
+            *variadic,
+            &arguments[..args.len()],
+            index,
+        ) {
+            return Ok(Some(metadata));
+        }
+    }
+    let mut selected = None;
+    let mut at = 0usize;
+    record_shape_metadata(base, columns, |_, metadata| {
+        if at == index {
+            selected = Some(metadata);
+        }
+        at += 1;
+    })?;
+    Ok(selected)
+}
+
 fn expression_static_metadata(
     expression: &Expr,
     columns: &dyn ColTypeResolver,
@@ -2287,6 +2353,11 @@ fn expression_static_metadata(
             columns.column_meta(*qualifier, name)
         }
         Expr::Field { base, field } => record_field_metadata(base, field, columns).ok(),
+        Expr::RecordFieldIndex { base, index } => {
+            record_field_index_metadata(base, usize::from(*index), columns)
+                .ok()
+                .flatten()
+        }
         Expr::Cast {
             operand, type_mod, ..
         } => {
@@ -2618,6 +2689,150 @@ pub(crate) fn record_shape_metadata(
     mut visit: impl FnMut(&str, StaticTypeMeta),
 ) -> Result<Option<usize>, SqlError> {
     record_shape_metadata_dyn(base, columns, &mut visit)
+}
+
+pub(crate) fn resolved_set_call(
+    expression: &Expr<'_>,
+    columns: &dyn ColTypeResolver,
+    storage: &crate::storage::Storage,
+    txid: u32,
+) -> Result<bool, SqlError> {
+    let Expr::Call {
+        name,
+        bound_oid,
+        args,
+        argument_names,
+        variadic,
+        ..
+    } = expression
+    else {
+        return Ok(false);
+    };
+    if bound_oid.is_none() {
+        if crate::sql::query::is_builtin_set_routine(name) {
+            return Ok(true);
+        }
+        if !storage.has_set_routine_candidate(name, args.len(), txid) {
+            return Ok(false);
+        }
+    }
+    let mut arguments = [oid::UNKNOWN; MAX_ROUTINE_ARGUMENTS];
+    if args.len() > arguments.len() {
+        return Ok(false);
+    }
+    for (output, argument) in arguments.iter_mut().zip(*args) {
+        *output = infer_routine_argument_oid(argument, columns)?;
+    }
+    let arguments = &arguments[..args.len()];
+    let routine = if let Some(oid) = bound_oid {
+        storage.function_for_captured_call(*oid, argument_names, arguments, *variadic, txid)
+    } else if argument_names.is_empty() {
+        storage.function_for_call_syntax_oids(name, arguments, *variadic, txid)
+    } else {
+        storage.function_for_named_call_oids(name, argument_names, arguments, txid)
+    };
+    Ok(routine.is_some_and(|routine| routine.kind.is_set_returning()))
+}
+
+/// PostgreSQL expands a record-valued call into independent field expressions
+/// before planning its arguments and set-returning producers.
+pub(crate) fn expand_record_call_items<'a>(
+    items: &'a [SelectItem<'a>],
+    columns: &dyn ColTypeResolver,
+    storage: &crate::storage::Storage,
+    txid: u32,
+    arena: &'a crate::mem::arena::Arena,
+) -> Result<&'a [SelectItem<'a>], SqlError> {
+    let expands = |item: &SelectItem<'_>| {
+        matches!(item, SelectItem::RecordStar(Expr::Call { name, .. })
+            if !name.eq_ignore_ascii_case("row"))
+    };
+    if !items.iter().any(expands) {
+        return Ok(items);
+    }
+    fn collect_shared<'a>(
+        expression: &'a Expr<'a>,
+        columns: &dyn ColTypeResolver,
+        storage: &crate::storage::Storage,
+        txid: u32,
+        shared: &mut crate::mem::arena::ArenaList<'a, &'a Expr<'a>>,
+    ) -> Result<(), SqlError> {
+        if resolved_set_call(expression, columns, storage, txid)? {
+            return shared
+                .push(expression)
+                .map_err(|_| crate::sql::eval::arena_full());
+        }
+        crate::sql::query::walk_children(expression, &mut |child| {
+            collect_shared(child, columns, storage, txid, shared)
+        })
+    }
+    let mut expanded = crate::mem::arena::ArenaList::new(arena);
+    for item in items {
+        if expanded.len() == MAX_PROJ {
+            return Err(sql_err!(
+                sqlstate::TOO_MANY_COLUMNS,
+                "target lists can have at most 1664 entries"
+            ));
+        }
+        if !expands(item) {
+            expanded
+                .push(*item)
+                .map_err(|_| crate::sql::eval::arena_full())?;
+            continue;
+        }
+        let SelectItem::RecordStar(base) = item else {
+            unreachable!()
+        };
+        let mut shared = crate::mem::arena::ArenaList::new(arena);
+        collect_shared(base, columns, storage, txid, &mut shared)?;
+        let mut failure = None;
+        let mut ordinal = 0u16;
+        let width = record_shape_metadata(base, columns, |field, _| {
+            if failure.is_some() {
+                return;
+            }
+            let append = (|| -> Result<(), SqlError> {
+                if expanded.len() == MAX_PROJ {
+                    return Err(sql_err!(
+                        sqlstate::TOO_MANY_COLUMNS,
+                        "target lists can have at most 1664 entries"
+                    ));
+                }
+                let field = arena
+                    .alloc_str(field)
+                    .map_err(|_| crate::sql::eval::arena_full())?;
+                let base = crate::sql::ast::duplicate_expression(base, arena, shared.as_slice())
+                    .map_err(|_| crate::sql::eval::arena_full())?;
+                let expression = arena
+                    .alloc(Expr::RecordFieldIndex {
+                        base,
+                        index: ordinal,
+                    })
+                    .map_err(|_| crate::sql::eval::arena_full())?;
+                expanded
+                    .push(SelectItem::Expr {
+                        expression,
+                        alias: Some(field),
+                    })
+                    .map_err(|_| crate::sql::eval::arena_full())?;
+                ordinal += 1;
+                Ok(())
+            })();
+            if let Err(error) = append {
+                failure = Some(error);
+            }
+        })?;
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        if width.is_none() {
+            return Err(sql_err!(
+                sqlstate::WRONG_OBJECT_TYPE,
+                "row expansion is not supported on this expression"
+            ));
+        }
+    }
+    Ok(expanded.as_slice())
 }
 
 fn record_shape_metadata_dyn(
@@ -4229,7 +4444,12 @@ pub fn infer_type_res(
             .subquery_type(expression)?
             .unwrap_or((oid::UNKNOWN, -2)),
         Expr::RowSubquery { .. } => (oid::UNKNOWN, -2),
-        Expr::RecordFieldIndex { .. } => (oid::UNKNOWN, -2),
+        Expr::RecordFieldIndex { base, index } => {
+            record_field_index_metadata(base, usize::from(*index), columns)?
+                .map_or((oid::UNKNOWN, -2), |metadata| {
+                    (metadata.type_oid, metadata.ctype.typlen())
+                })
+        }
         // `x IN (subquery)` and EXISTS are predicates: their result is boolean.
         Expr::InSubquery { .. } | Expr::QuantifiedSubquery { .. } | Expr::Exists(_) => {
             of(ColType::Bool)

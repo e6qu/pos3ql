@@ -819,7 +819,7 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
     hooks: &EvalHooks<'_, 'a>,
 ) -> Result<ProjectSet<'a>, SqlError> {
     let empty = ProjectSetValue {
-        node: core::ptr::null(),
+        node: None,
         values: &[],
         fixed_index: None,
     };
@@ -841,7 +841,7 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
         max: &mut usize,
         any: &mut bool,
     ) -> Result<(), SqlError> {
-        let Expr::Call { name, args, .. } = expression else {
+        let Expr::Call { .. } = expression else {
             return super::walk_children(expression, &mut |child| {
                 visit(
                     child,
@@ -858,9 +858,11 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
                 )
             });
         };
-        let built_in = is_srf_name(name);
-        let catalog = storage.has_set_routine_candidate(name, args.len(), txid);
-        if !built_in && !catalog {
+        let columns = crate::sql::eval::RuntimeColumnTypes {
+            row,
+            catalog: hooks.catalog,
+        };
+        if !crate::sql::exec::resolved_set_call(expression, &columns, storage, txid)? {
             return super::walk_children(expression, &mut |child| {
                 visit(
                     child,
@@ -877,6 +879,12 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
                 )
             });
         }
+        if materialized[..*materialized_count]
+            .iter()
+            .any(|set| set.node.is_some_and(|node| core::ptr::eq(node, expression)))
+        {
+            return Ok(());
+        }
         if *materialized_count == materialized.len() {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -885,7 +893,7 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
         }
         let values = materialize_call(expression, storage, txid, arena, params, row, hooks)?;
         materialized[*materialized_count] = ProjectSetValue {
-            node: expression as *const Expr<'a> as *const (),
+            node: Some(expression),
             values,
             fixed_index: None,
         };
@@ -909,7 +917,7 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
             unreachable!("project-set materialization requires a call")
         };
         let empty = ProjectSetValue {
-            node: core::ptr::null(),
+            node: None,
             values: &[],
             fixed_index: None,
         };
@@ -990,6 +998,7 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
         let Expr::Call {
             name,
             args,
+            argument_names,
             variadic,
             ..
         } = expression
@@ -1265,8 +1274,8 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
                 alias: None,
                 subquery: None,
                 func_args: Some(args),
-                func_argument_names: &[],
-                func_variadic: false,
+                func_argument_names: argument_names,
+                func_variadic: *variadic,
                 rows_from: None,
                 col_alias: None,
                 inheritance: crate::sql::ast::RelationInheritance::Descendants,
@@ -3717,7 +3726,24 @@ fn table_func_routine<'a, C: ColumnLookup<'a>>(
         return Ok(None);
     };
     storage.require_routine_execute(slot, txid)?;
-    let routine = storage.routine_for(slot, txid);
+    let (oid, _) = storage
+        .routine_call_mapping(
+            slot,
+            tref.func_argument_names,
+            args.len(),
+            tref.func_variadic,
+            txid,
+        )
+        .ok_or_else(|| srf_signature_error(name))?;
+    let routine = storage
+        .function_for_captured_call(
+            oid,
+            tref.func_argument_names,
+            &argument_type_oids[..args.len()],
+            tref.func_variadic,
+            txid,
+        )
+        .ok_or_else(|| srf_signature_error(name))?;
     Ok(Some((
         slot,
         arena.alloc(routine).map_err(|_| arena_full())?,
@@ -5149,7 +5175,7 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
             };
             return invocations
                 .resolve_rows(
-                    routine_slot,
+                    routine,
                     &routine_params[..routine.argument_count],
                     statement_arena,
                 )?
@@ -5186,7 +5212,7 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
             };
             return invocations
                 .resolve_rows(
-                    routine_slot,
+                    routine,
                     &routine_params[..routine.argument_count],
                     statement_arena,
                 )?

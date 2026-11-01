@@ -7079,7 +7079,7 @@ impl<'a> Parser<'a> {
                     for index in 0..name_count {
                         let field = self.arena_expr(Expr::RecordFieldIndex {
                             base: record,
-                            index: index as u8,
+                            index: index as u16,
                         })?;
                         self.push(&mut values, field)?;
                     }

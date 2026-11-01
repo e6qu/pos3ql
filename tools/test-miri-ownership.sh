@@ -12,6 +12,7 @@ filters=(
   arena_retained_slices_
   cursor_owned_query_
   sequence::tests::statement_replay_
+  pending_routine_contract_
   shared_heap_relocation_heap_
   row_lock_owners_heap_
   stable_row_slots_

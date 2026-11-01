@@ -618,9 +618,9 @@ pub(crate) fn expression_type_identity<'a>(
     }
 }
 
-struct RuntimeColumnTypes<'row, 'datum> {
-    row: &'row dyn ColumnLookup<'datum>,
-    catalog: Option<&'row dyn CatalogAccess>,
+pub(crate) struct RuntimeColumnTypes<'row, 'datum> {
+    pub(crate) row: &'row dyn ColumnLookup<'datum>,
+    pub(crate) catalog: Option<&'row dyn CatalogAccess>,
 }
 
 impl crate::sql::exec::ColTypeResolver for RuntimeColumnTypes<'_, '_> {
@@ -713,6 +713,44 @@ impl crate::sql::exec::ColTypeResolver for RuntimeColumnTypes<'_, '_> {
             name
         );
         self.routine_result(encoded.as_str(), None, &[], false, &[left, right])
+    }
+
+    fn routine_record_field(
+        &self,
+        name: &str,
+        bound_oid: Option<i32>,
+        argument_names: &[Option<&str>],
+        variadic: bool,
+        arguments: &[i32],
+        index: usize,
+    ) -> Option<(crate::util::StackStr<64>, crate::sql::exec::StaticTypeMeta)> {
+        self.catalog?.routine_record_field(
+            name,
+            bound_oid,
+            argument_names,
+            variadic,
+            arguments,
+            index,
+        )
+    }
+
+    fn visit_composite_fields(
+        &self,
+        creation: Option<crate::storage::TypeCreation>,
+        visit: &mut dyn FnMut(&str, crate::sql::exec::StaticTypeMeta),
+    ) -> Option<usize> {
+        self.catalog?.visit_composite_fields(creation, visit)
+    }
+
+    fn visit_named_composite_fields(
+        &self,
+        name: &str,
+        visit: &mut dyn FnMut(&str, crate::sql::exec::StaticTypeMeta),
+    ) -> Result<Option<usize>, SqlError> {
+        match self.catalog {
+            Some(catalog) => catalog.visit_named_composite_fields(name, visit),
+            None => Ok(None),
+        }
     }
 }
 
@@ -847,7 +885,7 @@ pub struct EvalHooks<'h, 'a> {
 
 #[derive(Clone, Copy)]
 pub struct ProjectSetValue<'a> {
-    pub node: *const (),
+    pub node: Option<&'a Expr<'a>>,
     pub values: &'a [Datum<'a>],
     /// Nested project-set levels select their input independently of the
     /// outer level currently being expanded.
@@ -1144,6 +1182,34 @@ pub trait CatalogAccess {
         _arena: &'a Arena,
     ) -> Result<Option<&'a [super::types::RecordField<'a>]>, SqlError> {
         Ok(None)
+    }
+
+    fn visit_composite_fields(
+        &self,
+        _creation: Option<crate::storage::TypeCreation>,
+        _visit: &mut dyn FnMut(&str, crate::sql::exec::StaticTypeMeta),
+    ) -> Option<usize> {
+        None
+    }
+
+    fn visit_named_composite_fields(
+        &self,
+        _name: &str,
+        _visit: &mut dyn FnMut(&str, crate::sql::exec::StaticTypeMeta),
+    ) -> Result<Option<usize>, SqlError> {
+        Ok(None)
+    }
+
+    fn routine_record_field(
+        &self,
+        _name: &str,
+        _bound_oid: Option<i32>,
+        _argument_names: &[Option<&str>],
+        _variadic: bool,
+        _arguments: &[i32],
+        _index: usize,
+    ) -> Option<(crate::util::StackStr<64>, crate::sql::exec::StaticTypeMeta)> {
+        None
     }
     /// Resolves a named composite or a domain over one to the composite OID
     /// that defines its physical fields.
@@ -2615,7 +2681,7 @@ fn eval_full_inner<'a>(
     }
     if let Some(set) = hooks.project_sets.and_then(|sets| {
         sets.iter()
-            .find(|set| set.node == expression as *const Expr<'a> as *const ())
+            .find(|set| set.node.is_some_and(|node| core::ptr::eq(node, expression)))
     }) && let Some(index) = set.fixed_index.or(hooks.srf_index)
     {
         return Ok(set.values.get(index - 1).copied().unwrap_or(Datum::Null));
@@ -3890,24 +3956,6 @@ fn eval_full_inner<'a>(
                         .find(|f| f.name.eq_ignore_ascii_case(field))
                         .map(|f| f.value)
                         .ok_or_else(|| crate::sql::exec::could_not_identify(field))
-                }
-                // The `_pg_expandarray` result is encoded as the 2-element array
-                // `[x, n]`; `.x`/`.f1` is the element and `.n`/`.f2` the ordinal.
-                Datum::Array { element, raw } => {
-                    let index = if field.eq_ignore_ascii_case("x")
-                        || field.eq_ignore_ascii_case("f1")
-                    {
-                        0
-                    } else if field.eq_ignore_ascii_case("n") || field.eq_ignore_ascii_case("f2") {
-                        1
-                    } else {
-                        return Err(sql_err!(
-                            sqlstate::UNDEFINED_COLUMN,
-                            "field \"{}\" not found",
-                            field
-                        ));
-                    };
-                    Ok(super::array::get(raw, element, index).unwrap_or(Datum::Null))
                 }
                 _ => Err(crate::sql::exec::not_composite(field, type_name_of(&b))),
             }
@@ -5490,36 +5538,62 @@ fn call<'a>(
                 from = next;
             }
         }
-        // Set-returning `_pg_expandarray(array)` yields, for the current expansion
-        // index k, the composite `(x, n)` = (array[k], k), encoded as `[x, n]`.
+        // `_pg_expandarray` keeps the element's SQL type separate from the
+        // integer ordinal, including text, domains and named array elements.
         "_pg_expandarray" => {
             arity(1)?;
-            let a = eval_full(args[0], arena, params, row, hooks)?;
-            let k = hooks.srf_index.unwrap_or(1);
-            let x = match a {
-                Datum::Array { element, raw } => {
-                    super::array::get(raw, element, k - 1).unwrap_or(Datum::Null)
-                }
-                Datum::Int2Vector { raw, .. } => raw
-                    .as_chunks::<2>()
-                    .0
-                    .get(k - 1)
-                    .map(|bytes| Datum::Int4(i16::from_le_bytes(*bytes) as i32))
-                    .unwrap_or(Datum::Null),
-                Datum::OidVector { raw, .. } => raw
-                    .as_chunks::<4>()
-                    .0
-                    .get(k - 1)
-                    .map(|bytes| Datum::Oid(u32::from_le_bytes(*bytes)))
-                    .unwrap_or(Datum::Null),
+            let array = eval_full(args[0], arena, params, row, hooks)?;
+            let k = hooks.srf_index.ok_or_else(|| {
+                sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "set-returning function called where not allowed"
+                )
+            })?;
+            let (value, type_oid) = match array {
+                Datum::Array { element, raw } => (
+                    super::array::get(raw, element, k - 1).unwrap_or(Datum::Null),
+                    element.element_oid(),
+                ),
+                Datum::Int2Vector { raw, .. } => (
+                    raw.as_chunks::<2>()
+                        .0
+                        .get(k - 1)
+                        .map(|bytes| Datum::Int2(i16::from_le_bytes(*bytes)))
+                        .unwrap_or(Datum::Null),
+                    super::types::oid::INT2,
+                ),
+                Datum::OidVector { raw, .. } => (
+                    raw.as_chunks::<4>()
+                        .0
+                        .get(k - 1)
+                        .map(|bytes| Datum::Oid(u32::from_le_bytes(*bytes)))
+                        .unwrap_or(Datum::Null),
+                    super::types::oid::OID,
+                ),
                 Datum::Null => return Ok(Datum::Null),
-                _ => return Err(type_mismatch("_pg_expandarray requires an array", &a)),
+                _ => return Err(type_mismatch("_pg_expandarray requires an array", &array)),
             };
-            let comp = [x, Datum::Int4(k as i32)];
-            Ok(Datum::Array {
-                element: super::types::ArrElem::Int4,
-                raw: super::array::build(&comp, arena)?,
-            })
+            let ordinal = i32::try_from(k).map_err(|_| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "array expansion ordinal exceeds integer range"
+                )
+            })?;
+            let fields = arena
+                .alloc_slice_copy(&[
+                    super::types::RecordField {
+                        name: "x",
+                        type_oid,
+                        value,
+                    },
+                    super::types::RecordField {
+                        name: "n",
+                        type_oid: super::types::oid::INT4,
+                        value: Datum::Int4(ordinal),
+                    },
+                ])
+                .map_err(|_| arena_full())?;
+            Ok(Datum::Record(fields))
         }
         // Set-returning `jsonb_object_keys(obj)` / `json_object_keys(obj)`
         // yield each key of the object as one text row.

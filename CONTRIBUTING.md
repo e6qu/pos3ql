@@ -208,6 +208,11 @@ CI builds all targets and runs Clippy natively on Linux amd64, Linux arm64 and
 macOS arm64. The jobs verify their compiler host before building; the arm64 jobs
 also exercise socket readiness, mutexes and libc collation. Use libc's platform
 types at C boundaries: `c_char` need not have the same signedness on every target.
+Function-call regressions run before the broader native boundary cases, so a
+broken call contract stops the job without waiting through unrelated tests.
+Native storage fixtures stay outside interpreter startup; their shared helpers
+remain available to the selected ownership tests. The formatting gate checks
+the included native fixture file explicitly because Cargo does not traverse it.
 
 Python client dependencies and their wheel hashes are pinned in
 `tests/external/requirements.lock`. SQLAlchemy and Alembic run with both psycopg2

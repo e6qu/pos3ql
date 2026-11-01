@@ -13306,51 +13306,65 @@ impl Engine {
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
         query::protect_statement_effects();
-        if let Some(oid) = pending.intrinsic_oid {
-            let arguments = match arena.alloc_slice_with(pending.argument_count, |_| Datum::Null) {
-                Ok(arguments) => arguments,
-                Err(_) => return Ok(Err(eval::arena_full())),
-            };
-            for (index, argument) in arguments.iter_mut().enumerate() {
-                *argument = match exec::decode_projected_col_record(pending.arguments, index, arena)
+        let contract = match pending.target {
+            query::PendingRoutineTarget::Stored(contract) => contract,
+            query::PendingRoutineTarget::Intrinsic(oid) => {
+                let arguments =
+                    match arena.alloc_slice_with(pending.argument_count, |_| Datum::Null) {
+                        Ok(arguments) => arguments,
+                        Err(_) => return Ok(Err(eval::arena_full())),
+                    };
+                for (index, argument) in arguments.iter_mut().enumerate() {
+                    *argument =
+                        match exec::decode_projected_col_record(pending.arguments, index, arena) {
+                            Ok(value) => value,
+                            Err(error) => return Ok(Err(error)),
+                        };
+                }
+                let logical_replication_intrinsic = logical_replication::is_intrinsic(oid);
+                let statistics_intrinsic = statistics::is_intrinsic(oid);
+                if !logical_replication_intrinsic
+                    && !statistics_intrinsic
+                    && large_object::is_mutating(oid)
                 {
+                    self.storage.assign_transaction_identity(txn.txid);
+                }
+                let value = match if statistics_intrinsic {
+                    statistics::execute(oid, &arguments[..pending.argument_count], self, txn)
+                } else if logical_replication_intrinsic {
+                    logical_replication::execute(
+                        oid,
+                        &arguments[..pending.argument_count],
+                        self,
+                        txn,
+                        arena,
+                    )
+                } else {
+                    large_object::execute(
+                        oid,
+                        &arguments[..pending.argument_count],
+                        &mut self.storage,
+                        txn,
+                        arena,
+                    )
+                } {
                     Ok(value) => value,
                     Err(error) => return Ok(Err(error)),
                 };
+                return Ok(invocations.complete(value));
             }
-            let logical_replication_intrinsic = logical_replication::is_intrinsic(oid);
-            let statistics_intrinsic = statistics::is_intrinsic(oid);
-            if !logical_replication_intrinsic
-                && !statistics_intrinsic
-                && large_object::is_mutating(oid)
-            {
-                self.storage.assign_transaction_identity(txn.txid);
-            }
-            let value = match if statistics_intrinsic {
-                statistics::execute(oid, &arguments[..pending.argument_count], self, txn)
-            } else if logical_replication_intrinsic {
-                logical_replication::execute(
-                    oid,
-                    &arguments[..pending.argument_count],
-                    self,
-                    txn,
-                    arena,
-                )
-            } else {
-                large_object::execute(
-                    oid,
-                    &arguments[..pending.argument_count],
-                    &mut self.storage,
-                    txn,
-                    arena,
-                )
-            } {
-                Ok(value) => value,
-                Err(error) => return Ok(Err(error)),
-            };
-            return Ok(invocations.complete(value));
+        };
+        let Some(slot) = self.storage.routine_slot_by_oid(contract.oid, txn.txid) else {
+            return Ok(Err(sql_err!(
+                sqlstate::UNDEFINED_FUNCTION,
+                "pending function with OID {} does not exist",
+                contract.oid
+            )));
+        };
+        let mut routine = self.storage.routine_for(slot, txn.txid);
+        if let Err(error) = contract.bind(&mut routine) {
+            return Ok(Err(error));
         }
-        let routine = self.storage.routine_for(pending.slot, txn.txid);
         let track = match guc.track_functions() {
             guc::TrackFunctions::None => false,
             guc::TrackFunctions::Pl => routine.language == crate::storage::RoutineLanguage::PlPgSql,
@@ -13367,7 +13381,7 @@ impl Engine {
         }
         if routine.kind.is_set_returning() {
             let executed = self.execute_pending_table_routine(
-                pending, arena, txn, sqlprep, cursors, guc, responder,
+                pending, slot, &routine, arena, txn, sqlprep, cursors, guc, responder,
             );
             let succeeded = matches!(&executed, Ok(Ok(_)));
             if let Some((total, own)) = statistics::finish_function_timing(timed)
@@ -13387,8 +13401,9 @@ impl Engine {
             };
             return Ok(invocations.complete_rows(rows));
         }
-        let executed = self
-            .execute_pending_scalar_routine(pending, arena, txn, sqlprep, cursors, guc, responder);
+        let executed = self.execute_pending_scalar_routine(
+            pending, slot, &routine, arena, txn, sqlprep, cursors, guc, responder,
+        );
         let succeeded = matches!(&executed, Ok(Ok(_)));
         if let Some((total, own)) = statistics::finish_function_timing(timed)
             && succeeded
@@ -13480,7 +13495,7 @@ impl Engine {
     fn execute_scalar_routine_program<'a>(
         &mut self,
         slot: usize,
-        routine: crate::storage::RoutineDef,
+        routine: &crate::storage::RoutineDef,
         result_type: ColType,
         program: query::RoutineFunctionProgram<'a>,
         arguments: &[Datum<'a>],
@@ -13534,7 +13549,7 @@ impl Engine {
                 statement,
                 &self.storage,
                 slot,
-                &routine,
+                routine,
                 txn.txid,
                 arena,
                 arguments,
@@ -13557,18 +13572,16 @@ impl Engine {
                 }
             }
         }
+        let result_shape =
+            match query::RoutineResultShape::bind(routine, &self.storage, txn.txid, arena) {
+                Ok(shape) => shape,
+                Err(error) => return Ok(Err(error)),
+            };
         let result = core::cell::Cell::new(Datum::Null);
         let has_result = core::cell::Cell::new(false);
         let mut capture_result = |row: &[Datum]| {
-            if row.len() != 1 {
-                return Err(sql_err!(
-                    sqlstate::SYNTAX_ERROR,
-                    "SQL function query must return one column"
-                ));
-            }
             if !has_result.get() {
-                let encoded = exec::encode_projected_pub(row, arena)?;
-                result.set(exec::decode_projected_pub(encoded, 0));
+                result.set(result_shape.capture(row, arena)?);
                 has_result.set(true);
             }
             Ok(())
@@ -13588,7 +13601,7 @@ impl Engine {
                     result_query,
                     &self.storage,
                     slot,
-                    &routine,
+                    routine,
                     txn.txid,
                     &self.work,
                     arguments,
@@ -13624,7 +13637,7 @@ impl Engine {
                     statement,
                     &self.storage,
                     slot,
-                    &routine,
+                    routine,
                     txn.txid,
                     arena,
                     arguments,
@@ -13684,7 +13697,7 @@ impl Engine {
                     statement,
                     &self.storage,
                     slot,
-                    &routine,
+                    routine,
                     txn.txid,
                     arena,
                     arguments,
@@ -13753,6 +13766,8 @@ impl Engine {
     fn execute_pending_scalar_routine<'a>(
         &mut self,
         pending: query::PendingRoutineInvocation<'a>,
+        slot: usize,
+        routine: &crate::storage::RoutineDef,
         arena: &'a Arena,
         txn: &mut TxnState,
         sqlprep: &mut SqlPreparedPool,
@@ -13760,7 +13775,6 @@ impl Engine {
         guc: &mut GucState,
         responder: &mut Responder,
     ) -> Result<Result<Datum<'a>, SqlError>, WireFull> {
-        let routine = self.storage.routine_for(pending.slot, txn.txid);
         let Some(result_type) = routine.kind.function_result() else {
             return Ok(Err(sql_err!(
                 sqlstate::INTERNAL_ERROR,
@@ -13785,10 +13799,13 @@ impl Engine {
             .enumerate()
             .take(pending.argument_count)
         {
-            *argument = exec::decode_projected_pub(pending.arguments, index);
+            *argument = match exec::decode_projected_col_record(pending.arguments, index, arena) {
+                Ok(value) => value,
+                Err(error) => return Ok(Err(error)),
+            };
         }
         if routine.language == crate::storage::RoutineLanguage::PlPgSql {
-            if let Err(error) = self.storage.require_routine_execute(pending.slot, txn.txid) {
+            if let Err(error) = self.storage.require_routine_execute(slot, txn.txid) {
                 return Ok(Err(error));
             }
             let owner = match self
@@ -13812,7 +13829,7 @@ impl Engine {
                 sqlprep,
                 cursors,
                 guc,
-                &routine,
+                routine,
                 &arguments[..pending.argument_count],
                 arena,
                 responder,
@@ -13856,7 +13873,7 @@ impl Engine {
             Err(error) => return Ok(Err(error)),
         };
         self.execute_scalar_routine_program(
-            pending.slot,
+            slot,
             routine,
             result_type,
             program,
@@ -13874,6 +13891,8 @@ impl Engine {
     fn execute_pending_table_routine<'a>(
         &mut self,
         pending: query::PendingRoutineInvocation<'a>,
+        slot: usize,
+        routine: &crate::storage::RoutineDef,
         arena: &'a Arena,
         txn: &mut TxnState,
         sqlprep: &mut SqlPreparedPool,
@@ -13881,14 +13900,13 @@ impl Engine {
         guc: &mut GucState,
         responder: &mut Responder,
     ) -> Result<Result<&'a [&'a [u8]], SqlError>, WireFull> {
-        let routine = self.storage.routine_for(pending.slot, txn.txid);
         if !routine.kind.is_set_returning() {
             return Ok(Err(sql_err!(
                 sqlstate::INTERNAL_ERROR,
                 "table routine invocation resolved to a scalar function"
             )));
         }
-        if let Err(error) = self.storage.require_routine_execute(pending.slot, txn.txid) {
+        if let Err(error) = self.storage.require_routine_execute(slot, txn.txid) {
             return Ok(Err(error));
         }
         let owner = match self
@@ -13919,7 +13937,11 @@ impl Engine {
                 .enumerate()
                 .take(pending.argument_count)
             {
-                *argument = exec::decode_projected_pub(pending.arguments, index);
+                *argument = match exec::decode_projected_col_record(pending.arguments, index, arena)
+                {
+                    Ok(value) => value,
+                    Err(error) => return Ok(Err(error)),
+                };
             }
             let inputs = match arena.alloc_slice_copy(&arguments[..pending.argument_count]) {
                 Ok(inputs) => inputs,
@@ -13938,7 +13960,7 @@ impl Engine {
                 Err(error) => return Ok(Err(error)),
             };
             return Ok(exec::execute_plpgsql_table_function(
-                self, txn, sqlprep, cursors, guc, &routine, &*inputs, arena, responder,
+                self, txn, sqlprep, cursors, guc, routine, &*inputs, arena, responder,
             ));
         }
         let body = match arena.alloc_str(routine.body.as_str()) {
@@ -13983,7 +14005,10 @@ impl Engine {
             .enumerate()
             .take(pending.argument_count)
         {
-            *argument = exec::decode_projected_pub(pending.arguments, index);
+            *argument = match exec::decode_projected_col_record(pending.arguments, index, arena) {
+                Ok(value) => value,
+                Err(error) => return Ok(Err(error)),
+            };
         }
         let _formal_scope = match exec::enter_routine_parameter_types(
             routine.arguments(),
@@ -14009,8 +14034,8 @@ impl Engine {
             let statement = match query::bind_stored_routine_statement(
                 statement,
                 &self.storage,
-                pending.slot,
-                &routine,
+                slot,
+                routine,
                 txn.txid,
                 arena,
                 &arguments[..pending.argument_count],
@@ -14107,8 +14132,8 @@ impl Engine {
                 let outcome = query::execute_bound_routine_query(
                     result,
                     &self.storage,
-                    pending.slot,
-                    &routine,
+                    slot,
+                    routine,
                     txn.txid,
                     &self.work,
                     &arguments[..pending.argument_count],
@@ -14143,8 +14168,8 @@ impl Engine {
                 let statement = match query::bind_stored_routine_statement(
                     statement,
                     &self.storage,
-                    pending.slot,
-                    &routine,
+                    slot,
+                    routine,
                     txn.txid,
                     arena,
                     &arguments[..pending.argument_count],
@@ -14198,8 +14223,8 @@ impl Engine {
                 let statement = match query::bind_stored_routine_statement(
                     statement,
                     &self.storage,
-                    pending.slot,
-                    &routine,
+                    slot,
+                    routine,
                     txn.txid,
                     arena,
                     &arguments[..pending.argument_count],

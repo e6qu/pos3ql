@@ -489,3 +489,122 @@ fn routine_inputs_share_conversions_order_and_strictness_in_every_context() {
         ]
     );
 }
+
+#[test]
+fn pending_routine_calls_keep_bound_types_and_structural_values() {
+    let config = test_config("pending-routine-types");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    let sql =
+        include_str!("../../../tests/external/differential_exact/48_pending_routine_types.sql");
+    let (calls, replacement) = sql.split_once("-- replacement timing").unwrap();
+    let mut rows = data_rows(&session.success(&mut engine, calls, true));
+    rows.extend(data_rows(&session.success(&mut engine, replacement, true)));
+    assert_eq!(
+        rows,
+        [
+            "7|9|{1,NULL,3}",
+            "7|9|{1,NULL,3}",
+            "1|sql",
+            "2|pl",
+            "7|8",
+            "3",
+            "3",
+            "4",
+            "4",
+            "5",
+            "6",
+            "7|7",
+            "{1,NULL,3}|7",
+            "8|8",
+            "{2,NULL,4}|8",
+            "12|named",
+            "13|fallback",
+            "101",
+            "6|2|4|2|0|1"
+        ]
+    );
+}
+
+#[test]
+fn record_call_expansion_preserves_scalar_effects_and_shared_set_producers() {
+    let config = test_config("record-call-expansion");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    let sql =
+        include_str!("../../../tests/external/differential_exact/49_record_call_expansion.sql");
+    let (valid, _) = sql.split_once("-- invalid field").unwrap();
+    assert_eq!(
+        data_rows(&session.success(&mut engine, valid, true)),
+        [
+            "10|11",
+            "11",
+            "12|13",
+            "13",
+            "1|14|15",
+            "2|16|17",
+            "17",
+            "18|19",
+            "set|set",
+            "untyped|untyped",
+            "integer",
+            "20|20",
+            "21|21",
+            "20",
+            "(21,21)|(22,22)",
+            "(22,22)|(23,23)",
+            "22",
+            "(23,23)|(24,24)",
+            "(24,24)|(25,25)",
+            "24",
+            "25|25",
+            "26|26",
+            "27|27",
+            "26",
+            "27|28",
+            "29|30",
+            "31|32",
+            "33|34",
+            "34",
+            "a|1",
+            "NULL|2",
+            "c|3",
+            "x|1",
+            "NULL|2",
+            "z|3",
+            "7|named",
+            "8|default",
+            "4|7",
+            "5|7"
+        ]
+    );
+    for sql in ["SELECT (ARRAY[1,2]).f1", "SELECT (ARRAY[1,2]).x"] {
+        assert_eq!(
+            error_sqlstates(&session.execute(&mut engine, sql, true)),
+            ["42809"]
+        );
+    }
+    session.success(
+        &mut engine,
+        "CREATE FUNCTION capacity_record(OUT x integer,OUT y integer) LANGUAGE sql AS 'SELECT 1,2'",
+        true,
+    );
+    for (additional, state) in [(MAX_PROJ - 2, None), (MAX_PROJ - 1, Some("54011"))] {
+        let mut sql = String::from("SELECT (capacity_record()).*");
+        for _ in 0..additional {
+            sql.push_str(",1");
+        }
+        match state {
+            None => {
+                let output = session.success(&mut engine, &sql, true);
+                assert_eq!(data_rows(&output)[0].split('|').count(), MAX_PROJ);
+            }
+            Some(state) => assert_eq!(
+                error_sqlstates(&session.execute(&mut engine, &sql, true)),
+                [state]
+            ),
+        }
+    }
+}

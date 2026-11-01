@@ -88,6 +88,27 @@ value. Global aggregates use one source scan, avoiding a second execution of
 lateral inputs just to count the rows before aggregation.
 This call boundary supplies retained execution with an explicit target; it
 does not yet make every function body yield during a storage wait.
+Calls handed to the mutable executor retain their function identity, converted
+values and bound input/output types in statement-owned memory. For example, a
+function declared with `anyelement` and called with `42::integer` still returns
+an integer to a binary client. Composite inputs retain their fields rather than
+becoming rendered text. Only live type descriptors are copied; unused reserved
+parameter/default buffers are not retained per invocation. Exhaustion reports
+`pending routine type contract exceeds statement memory`.
+The function body is looked up when execution starts: PostgreSQL uses a replacement
+body if evaluating an argument replaced it. Read-only and mutable SQL functions
+share the same scalar and record result construction.
+Record field descriptions bind the call's input types, named arguments and
+defaults without running them. The same bound types describe table-function
+columns, so an array returned through `anyelement` has the correct binary format.
+For `SELECT (pair(nextval('numbers'))).*`, PostgreSQL expands a scalar call
+into one call per output field. A set-returning call instead shares its producer
+across those fields; two explicitly written calls remain independent. Expansion
+happens before argument queries and set producers are planned, including in
+`RETURNING`. Array expansion keeps each element's type separately from its integer
+position; ordinary arrays cannot be accessed as records with `.x` or `.f1`.
+Scalar and set-returning overloads compete together by argument types; returning
+one row cannot give a weaker type match priority over a set-returning function.
 Runtime overload checks copy input descriptors rather than whole definitions.
 The selected definition is captured once, bound in place and borrowed by its
 execution helpers. Candidate catalog locks are released before type coercion,

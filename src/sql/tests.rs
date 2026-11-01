@@ -87381,8 +87381,10 @@ fn postgresql_18_temporal_boundaries() {
          SELECT timestamp '2024-07-15 12:00' = timestamptz '2024-07-15 16:00+00',
                 date '2024-07-15' = timestamptz '2024-07-15 04:00+00';
          SELECT timestamp '2024-07-15 12:00' AT LOCAL,
-                timestamptz '2024-07-15 16:00+00' AT LOCAL,
-                timetz '12:00+02' AT LOCAL;
+                timestamptz '2024-07-15 16:00+00' AT LOCAL;
+         SET TIME ZONE INTERVAL '-04:00';
+         SELECT timetz '12:00+02' AT LOCAL;
+         SET TIME ZONE 'America/New_York';
          SELECT make_timestamptz(2024,7,15,12,0,0,'Europe/Bucharest');
          SELECT date_add(timestamptz '2024-03-09 12:00-05', interval '1 day'),
                 date_add(timestamptz '2024-03-09 12:00-05', interval '1 day','UTC'),
@@ -87469,7 +87471,8 @@ fn postgresql_18_temporal_boundaries() {
         [
             "infinity|-infinity|f|f|2024-07-15 12:00:00-04|2024-07-15 12:00:00",
             "t|t",
-            "2024-07-15 12:00:00-04|2024-07-15 12:00:00|06:00:00-04",
+            "2024-07-15 12:00:00-04|2024-07-15 12:00:00",
+            "06:00:00-04",
             "2024-07-15 05:00:00-04",
             "2024-03-10 12:00:00-04|2024-03-10 13:00:00-04|2024-03-10 12:00:00-04|2024-03-10 12:00:00-04|2024-03-10 00:00:00-05|2024-03-10 12:00:00-04",
             "2024-07-15 12:00:00-04|2024-07-14 20:00:00-04|2024-07-14 20:00:00-04|2024-01-01 00:00:01.234|120 years",

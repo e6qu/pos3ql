@@ -697,8 +697,9 @@ pub(super) use schema::rename as stage_schema_rename;
 
 mod describe;
 pub(crate) use describe::{
-    CatalogCols, builtin_binary_type, catalog_composite_field, numeric_log_type,
-    visit_catalog_composite_fields, visit_catalog_rowtype_fields,
+    CatalogCols, builtin_binary_type, catalog_composite_field, catalog_routine_record_field,
+    expand_record_call_items, numeric_log_type, resolved_set_call, visit_catalog_composite_fields,
+    visit_catalog_rowtype_fields,
 };
 pub use describe::{
     ColTypeResolver, DefCols, NoCols, RECORD_FIELD_NAMES, check_row_field_types,
@@ -61460,9 +61461,18 @@ fn emit_projected(
         new_name: returning.new_name(),
         new,
     };
+    let catalog = super::query::storage_catalog(storage, arena, txid);
+    let columns = super::eval::RuntimeColumnTypes {
+        row: &context,
+        catalog: Some(&catalog),
+    };
+    let items = match expand_record_call_items(returning.items, &columns, storage, txid, arena) {
+        Ok(items) => items,
+        Err(error) => return Ok(Err(error)),
+    };
     let mut expressions: [Option<&Expr>; MAX_PROJ] = [None; MAX_PROJ];
     let mut expression_count = 0usize;
-    for item in returning.items {
+    for item in items {
         let expression = match item {
             SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
                 Some(*expression)
@@ -61490,7 +61500,6 @@ fn emit_projected(
         Ok(subqueries) => subqueries,
         Err(error) => return Ok(Err(error)),
     };
-    let catalog = super::query::storage_catalog(storage, arena, txid);
     let returning_sequences = crate::sql::sequence::SeqEval::new(storage, seq_session, txid);
     let hooks = EvalHooks {
         sequences: Some(&returning_sequences),
@@ -61500,7 +61509,7 @@ fn emit_projected(
     };
     let mut projected = [Datum::Null; MAX_PROJ];
     let mut n = 0;
-    for item in returning.items {
+    for item in items {
         match item {
             SelectItem::Wildcard => {
                 for v in current {
@@ -61618,9 +61627,18 @@ fn emit_merge_returning<'a>(
         new_name: Some(returning.new_name()),
         new,
     };
+    let catalog = super::query::storage_catalog(storage, arena, txid);
+    let columns = super::eval::RuntimeColumnTypes {
+        row: &lookup,
+        catalog: Some(&catalog),
+    };
+    let items = match expand_record_call_items(returning.items, &columns, storage, txid, arena) {
+        Ok(items) => items,
+        Err(error) => return Ok(Err(error)),
+    };
     let mut expressions: [Option<&Expr>; MAX_PROJ] = [None; MAX_PROJ];
     let mut expression_count = 0usize;
-    for item in returning.items {
+    for item in items {
         if let SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) = item {
             expressions[expression_count] = Some(*expression);
             expression_count += 1;
@@ -61642,7 +61660,6 @@ fn emit_merge_returning<'a>(
         Ok(subqueries) => subqueries,
         Err(error) => return Ok(Err(error)),
     };
-    let catalog = super::query::storage_catalog(storage, arena, txid);
     let effect_sequences = crate::sql::sequence::SeqEval::new(storage, seq_session, txid);
     let hooks = EvalHooks {
         subs: Some(&subqueries),
@@ -61653,7 +61670,7 @@ fn emit_merge_returning<'a>(
     };
     let mut projected = [Datum::Null; MAX_PROJ];
     let mut n = 0usize;
-    for item in returning.items {
+    for item in items {
         match item {
             SelectItem::Wildcard => {
                 for index in 0..source_def.n_columns {

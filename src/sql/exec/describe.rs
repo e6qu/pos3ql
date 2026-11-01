@@ -1452,7 +1452,11 @@ fn name_of<'a>(expression: &Expr<'a>) -> Option<&'a str> {
             }
             _ => cast_target_name(type_name),
         },
-        Expr::Collate { operand, .. } => name_of(operand),
+        Expr::BoundDefault {
+            expression: operand,
+            ..
+        }
+        | Expr::Collate { operand, .. } => name_of(operand),
         // A desugared CASE (`IS TRUE`, `IS DISTINCT FROM`) is anonymous, as
         // PostgreSQL labels those `?column?`; a real CASE forwards to its ELSE.
         Expr::Case {
@@ -1483,7 +1487,12 @@ fn cast_source_name<'a>(expression: &Expr<'a>) -> Option<&'a str> {
         | Expr::Call { .. }
         | Expr::Array(_)
         | Expr::ArraySubquery(_) => name_of(expression),
-        Expr::Cast { operand, .. } | Expr::Collate { operand, .. } => cast_source_name(operand),
+        Expr::Cast { operand, .. }
+        | Expr::BoundDefault {
+            expression: operand,
+            ..
+        }
+        | Expr::Collate { operand, .. } => cast_source_name(operand),
         _ => None,
     }
 }
@@ -4099,6 +4108,12 @@ pub fn infer_type_res(
         return Ok(result);
     }
     Ok(match expression {
+        Expr::BoundDefault { type_oid, .. } => (
+            *type_oid,
+            coltype_of_oid(*type_oid)
+                .or_else(|| columns.domain_base_type(*type_oid))
+                .map_or(-1, ColType::typlen),
+        ),
         Expr::RecursiveState { ctype, .. } => of(*ctype),
         Expr::Null | Expr::Str(_) => (oid::UNKNOWN, -2),
         Expr::Param(index) => bound_parameter_type_oid(*index)

@@ -1910,7 +1910,8 @@ fn append_record(buffer: &mut FixedBuf, lsn: u64, operation: &WalOp) -> Result<(
 }
 
 impl Wal {
-    /// Opens (creating and preallocating if needed) `<data_dir>/journal.wal`.
+    /// Opens `<data_dir>/journal.wal` and fixes its logical length. Filesystem
+    /// space is not guaranteed until writes succeed.
     pub fn open(config: &Config, budget: &mut Budget) -> Result<Self, WalSetupError> {
         crate::sql::set_execution_database_oid(crate::storage::DatabaseOid::POSTGRES);
         std::fs::create_dir_all(&config.data_dir)
@@ -1936,7 +1937,7 @@ impl Wal {
         }
         if len < capacity {
             file.set_len(capacity)
-                .map_err(|e| WalSetupError::Io("preallocate journal", e))?;
+                .map_err(|e| WalSetupError::Io("size journal", e))?;
         }
         let mut stages = Vec::with_capacity(config.max_connections as usize);
         for _ in 0..config.max_connections {

@@ -37,8 +37,10 @@ A database where you can:
 - Trust a successful commit even if the database machine loses its local disk.
 - Replace a failed server, recover from object storage, and route clients to
   the replacement with a tested procedure.
-- Choose a memory budget before startup and get an explicit capacity error
-  when it is exhausted.
+- Choose memory and disk limits before startup. Share the reserved capacity
+  according to traffic, so busy tables and requests can use space that cold
+  tables do not need; report an explicit error when required capacity is full.
+  This [adaptive allocation goal](docs/adaptive-resources.md) is unfinished.
 - Judge speed and cost from repeatable measurements against vanilla
   PostgreSQL, including a comparison with the same CPU and memory allowance.
 

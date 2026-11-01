@@ -1344,6 +1344,10 @@ fn ungrouped_column<'e, 'a>(
         | Expr::ArraySubquery(_) => None,
         Expr::Unary { operand, .. }
         | Expr::Cast { operand, .. }
+        | Expr::BoundDefault {
+            expression: operand,
+            ..
+        }
         | Expr::Collate { operand, .. }
         | Expr::IsNull { operand, .. }
         | Expr::InSubquery { operand, .. }

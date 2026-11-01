@@ -8,6 +8,7 @@
 use core::cell::Cell;
 use core::fmt;
 use core::marker::PhantomData;
+use core::mem::ManuallyDrop;
 use core::sync::atomic::{AtomicU64, Ordering};
 use std::alloc::Layout;
 
@@ -23,6 +24,7 @@ pub struct Arena {
     offset: Cell<usize>,
     tail_offset: Cell<usize>,
     high_water: Cell<usize>,
+    region_active: Cell<bool>,
     retention_identity: u64,
     interned: Cell<Option<core::ptr::NonNull<InternedAllocation>>>,
 }
@@ -134,9 +136,52 @@ impl Arena {
             offset: Cell::new(0),
             tail_offset: Cell::new(capacity),
             high_water: Cell::new(0),
+            region_active: Cell::new(false),
             retention_identity: retention_identity(),
             interned: Cell::new(None),
         })
+    }
+
+    /// Lends the remaining aligned storage to one scoped arena. The closure
+    /// cannot return references into that region; copied handles carry its
+    /// distinct identity. Existing parent allocations remain live, but parent
+    /// allocations fail until the region ends, including during unwinding.
+    pub(crate) fn with_remaining_region<R>(
+        &self,
+        each: impl for<'region> FnOnce(&'region Arena) -> R,
+    ) -> Result<R, ArenaFull> {
+        if self.region_active.get() {
+            return Err(self.full(1));
+        }
+        let offset = self.offset.get();
+        let start = offset.next_multiple_of(ARENA_ALIGN);
+        let tail = self.tail_offset.get();
+        if start >= tail {
+            return Err(self.full(1));
+        }
+        let region = ArenaRegion {
+            parent: self,
+            offset,
+            padding: start - offset,
+            previous_used: self.used(),
+            arena: ManuallyDrop::new(Arena {
+                what: self.what,
+                // SAFETY: this aligned, nonempty range lies between the
+                // parent's existing front and tail allocations. The guard
+                // excludes parent allocations until its child is retired.
+                base: unsafe { self.base.add(start) },
+                capacity: tail - start,
+                offset: Cell::new(0),
+                tail_offset: Cell::new(tail - start),
+                high_water: Cell::new(0),
+                region_active: Cell::new(false),
+                retention_identity: retention_identity(),
+                interned: Cell::new(None),
+            }),
+        };
+        self.region_active.set(true);
+        self.offset.set(tail);
+        Ok(each(&region.arena))
     }
 
     #[expect(
@@ -329,6 +374,7 @@ impl Arena {
     /// Reclaims temporary parsing and row values while retained scan handles
     /// keep their identity and bytes. Live references prevent this mutable borrow.
     pub(crate) fn recycle_front(&mut self) {
+        assert!(!self.region_active.get(), "arena region is still borrowed");
         self.interned.set(None);
         self.offset.set(0);
     }
@@ -388,6 +434,7 @@ impl Arena {
     /// per-row value before rewinding; long-lived AST/scope state is allocated
     /// below the mark.
     pub(crate) unsafe fn rewind_to(&self, mark: ArenaMark) {
+        assert!(!self.region_active.get(), "arena region is still borrowed");
         assert!(
             mark.identity != 0 && mark.identity == self.retention_identity,
             "arena mark was reset or replaced"
@@ -421,6 +468,9 @@ impl Arena {
     }
 
     fn alloc_raw(&self, layout: Layout) -> Result<*mut u8, ArenaFull> {
+        if self.region_active.get() {
+            return Err(self.full(layout.size()));
+        }
         assert!(
             layout.align() <= ARENA_ALIGN,
             "arena '{}': alignment {} exceeds arena alignment {}",
@@ -444,6 +494,9 @@ impl Arena {
     }
 
     fn alloc_raw_tail(&self, layout: Layout) -> Result<*mut u8, ArenaFull> {
+        if self.region_active.get() {
+            return Err(self.full(layout.size()));
+        }
         assert!(
             layout.align() <= ARENA_ALIGN,
             "arena '{}': alignment {} exceeds arena alignment {}",
@@ -475,6 +528,26 @@ impl Arena {
             remaining: self.tail_offset.get() - self.offset.get(),
             capacity: self.capacity,
         }
+    }
+}
+
+struct ArenaRegion<'parent> {
+    parent: &'parent Arena,
+    offset: usize,
+    padding: usize,
+    previous_used: usize,
+    // This arena borrows its allocation. Never run Arena::drop on it.
+    arena: ManuallyDrop<Arena>,
+}
+
+impl Drop for ArenaRegion<'_> {
+    fn drop(&mut self) {
+        let high_water = self.previous_used + self.padding + self.arena.high_water();
+        self.parent
+            .high_water
+            .set(self.parent.high_water.get().max(high_water));
+        self.parent.offset.set(self.offset);
+        self.parent.region_active.set(false);
     }
 }
 
@@ -743,6 +816,127 @@ pub fn stable_sort_via<T>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cursor_owned_query_regions_reuse_storage_without_aliasing_or_heap_allocation() {
+        let mut budget = Budget::new(256);
+        let arena = Arena::new(&mut budget, "query regions", 256).unwrap();
+        let original = arena.alloc(7u8).unwrap();
+        let saved = arena.retain(41u64).unwrap();
+        let previous_used = arena.used();
+        crate::mem::guard::forbid_alloc(|| {
+            let stale = arena
+                .with_remaining_region(|region| {
+                    assert_eq!(region.capacity(), 232);
+                    let aligned = region.alloc(42u128).unwrap();
+                    assert_eq!((aligned as *const u128 as usize) % ARENA_ALIGN, 0);
+                    let handle = region.retain(43u64).unwrap();
+                    assert_eq!(region.retained(handle), Some(43));
+                    assert_eq!(region.retained(saved), None);
+                    assert_eq!(*original, 7);
+                    assert_eq!(arena.retained(saved), Some(41));
+                    for error in [
+                        arena.alloc(9u8).unwrap_err(),
+                        arena.alloc(()).unwrap_err(),
+                        arena.alloc_persistent_slice_with(0, |_| 0u8).unwrap_err(),
+                        arena.with_remaining_region(|_| ()).unwrap_err(),
+                    ] {
+                        assert_eq!(error.what, "query regions");
+                        assert_eq!(error.remaining, 0);
+                    }
+                    assert_eq!(*aligned, 42);
+                    handle
+                })
+                .unwrap();
+            assert_eq!(arena.used(), previous_used);
+            assert_eq!(arena.high_water(), 48);
+            assert_eq!(arena.retained(stale), None);
+            assert!(!arena.replace_retained(stale, 0));
+            arena
+                .with_remaining_region(|region| {
+                    assert_eq!(region.retained(stale), None);
+                    assert!(!region.replace_retained(stale, 0));
+                    let mark = region.mark();
+                    region.alloc(11u64).unwrap();
+                    let front = region.used();
+                    region
+                        .with_remaining_region(|nested| {
+                            assert_eq!(*nested.alloc(99u128).unwrap(), 99);
+                        })
+                        .unwrap();
+                    assert_eq!(region.used(), front);
+                    // No reference into the discarded front allocation survives.
+                    unsafe { region.rewind_to(mark) };
+                    let bytes = region
+                        .alloc_slice_with(region.capacity(), |_| 0xa5u8)
+                        .unwrap();
+                    assert_eq!(bytes[bytes.len() - 1], 0xa5);
+                })
+                .unwrap();
+            assert_eq!(arena.used(), previous_used);
+            assert_eq!(arena.high_water(), arena.capacity());
+            assert_eq!(*original, 7);
+            assert_eq!(arena.retained(saved), Some(41));
+            assert_eq!(*arena.alloc(19u64).unwrap(), 19);
+        });
+    }
+
+    #[test]
+    fn cursor_owned_query_regions_restore_frontiers_and_drop_values_after_unwind() {
+        let mut budget = Budget::new(256);
+        let mut arena = Arena::new(&mut budget, "unwinding region", 256).unwrap();
+        arena.alloc(7u8).unwrap();
+        let saved = arena.retain(8u64).unwrap();
+        let previous_used = arena.used();
+        let dropped = Cell::new(0);
+        let stale = Cell::new(None);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _: Result<(), ArenaFull> = arena.with_remaining_region(|region| {
+                stale.set(Some(region.retain(9u64).unwrap()));
+                let _owned = region
+                    .alloc_owned_slice_with(2, |_| Counted(&dropped))
+                    .unwrap();
+                region.alloc(10u128).unwrap();
+                panic!("stop scoped query");
+            });
+        }));
+        assert!(result.is_err());
+        assert_eq!(dropped.get(), 2);
+        assert_eq!(arena.used(), previous_used);
+        assert!(arena.high_water() > previous_used);
+        assert_eq!(arena.retained(saved), Some(8));
+        assert_eq!(arena.retained(stale.get().unwrap()), None);
+        arena
+            .with_remaining_region(|region| {
+                assert_eq!(*region.alloc(11u128).unwrap(), 11);
+            })
+            .unwrap();
+        arena.reset();
+        assert_eq!(arena.used(), 0);
+        assert_eq!(*arena.alloc([0u8; 256]).unwrap(), [0u8; 256]);
+    }
+
+    #[test]
+    fn cursor_owned_query_regions_reject_empty_aligned_capacity_without_consuming_storage() {
+        let mut budget = Budget::new(64);
+        let arena = Arena::new(&mut budget, "small query region", 64).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            arena.alloc([0u8; 63]).unwrap();
+            let error = arena
+                .with_remaining_region(|_| panic!("no aligned storage"))
+                .unwrap_err();
+            assert_eq!(error.what, "small query region");
+            assert_eq!(error.remaining, 1);
+            assert_eq!(arena.used(), 63);
+            assert_eq!(arena.high_water(), 63);
+            arena.alloc(1u8).unwrap();
+            let error = arena
+                .with_remaining_region(|_| panic!("no storage"))
+                .unwrap_err();
+            assert_eq!(error.remaining, 0);
+            assert_eq!(arena.used(), 64);
+        });
+    }
+
     #[test]
     fn cursor_owned_query_scratch_marks_follow_allocations_across_moves() {
         let mut budget = Budget::new(8192);

@@ -7,7 +7,7 @@ use crate::mem::arena::Arena;
 use crate::stack_format;
 use crate::util::StackStr;
 
-use super::ast::{BinaryOp, Collation, Expr, GroupingSet, UnaryOp};
+use super::ast::{BinaryOp, CastBinding, Collation, Expr, GroupingSet, UnaryOp};
 use super::numeric::Numeric;
 use super::types::{ArrElem, ColType, Datum, RecordField};
 
@@ -443,6 +443,9 @@ pub(crate) fn expression_type_identity<'a>(
     row: &dyn ColumnLookup<'a>,
     hooks: &EvalHooks<'_, 'a>,
 ) -> Result<ExpressionTypeIdentity, SqlError> {
+    if let Expr::BoundDefault { type_oid, .. } = expression {
+        return Ok(ExpressionTypeIdentity::Known(*type_oid));
+    }
     if let Expr::Collate { operand, .. } = expression {
         return expression_type_identity(operand, row, hooks);
     }
@@ -2061,7 +2064,10 @@ fn catalog_evaluation(
         found = catalog.operator_evaluation(None, name, &types)?;
     }
     if let Expr::Cast {
-        operand, type_name, ..
+        operand,
+        type_name,
+        binding,
+        ..
     } = expression
     {
         let hooks = EvalHooks {
@@ -2093,8 +2099,10 @@ fn catalog_evaluation(
                 // Name resolution needs this catalog even for a constant cast.
                 // Strict null folding includes CASE and nested builtin casts.
                 Some(ExpressionEvaluation::Immutable)
-            } else {
+            } else if *binding == CastBinding::Resolve {
                 catalog.cast_evaluation(source, target)?
+            } else {
+                None
             };
         }
     }
@@ -2232,6 +2240,10 @@ fn fold_check<'a>(
         } => Ok(fold_check(operand, arena, catalog)?.map(|b| !b)),
         Expr::Unary { operand, .. }
         | Expr::Cast { operand, .. }
+        | Expr::BoundDefault {
+            expression: operand,
+            ..
+        }
         | Expr::Collate { operand, .. }
         | Expr::IsNull { operand, .. } => {
             fold_check(operand, arena, catalog)?;
@@ -2597,7 +2609,10 @@ fn materialize_acl_value<'a>(
 
 /// Only trees proved unable to suspend may omit their own input journal.
 /// An enclosing stored call still records their values in its active journal.
-fn routine_input_handoff(expression: &Expr<'_>, catalog: Option<&dyn CatalogAccess>) -> bool {
+pub(crate) fn routine_input_handoff(
+    expression: &Expr<'_>,
+    catalog: Option<&dyn CatalogAccess>,
+) -> bool {
     match expression {
         Expr::Call {
             name,
@@ -2619,7 +2634,10 @@ fn routine_input_handoff(expression: &Expr<'_>, catalog: Option<&dyn CatalogAcce
         }
         // Casts, operators and subqueries can invoke stored code even without
         // a Call node. Keep their journal until their executable target is bound.
-        Expr::Cast { .. }
+        Expr::Cast {
+            binding: CastBinding::Resolve,
+            ..
+        }
         | Expr::Unary { .. }
         | Expr::Subquery(_)
         | Expr::RowSubquery { .. }
@@ -2845,6 +2863,7 @@ fn eval_full_inner<'a>(
         }
     }
     match *expression {
+        Expr::BoundDefault { expression, .. } => eval_full(expression, arena, params, row, hooks),
         Expr::Null => Ok(Datum::Null),
         // A whole-row value: NULL for an outer-join null row, else a non-null
         // Preserve the table field layout for composite evaluation and output.
@@ -2998,6 +3017,7 @@ fn eval_full_inner<'a>(
             operand,
             type_name,
             type_mod,
+            binding,
         } => {
             let array_target = ColType::from_sql_name(type_name).or_else(|| {
                 let catalog = hooks.catalog?;
@@ -3028,7 +3048,9 @@ fn eval_full_inner<'a>(
                     "cannot accept a value of type pg_node_tree"
                 ));
             }
-            if let Some(catalog) = hooks.catalog {
+            if binding == CastBinding::Resolve
+                && let Some(catalog) = hooks.catalog
+            {
                 let source_oid = source_identity()?.routine_argument_oid();
                 let target_oid = ColType::from_sql_name(type_name)
                     .map(ColType::oid)
@@ -3226,7 +3248,12 @@ fn eval_full_inner<'a>(
             over,
             ..
         } => {
-            if let Some(oid) = bound_oid {
+            let qualified_candidate = !star
+                && name.starts_with("pg_catalog.")
+                && hooks
+                    .catalog
+                    .is_some_and(|catalog| catalog.has_routine_candidate(name, args.len()));
+            if bound_oid.is_some() || qualified_candidate {
                 let catalog = hooks.catalog.ok_or_else(|| {
                     sql_err!(
                         sqlstate::INTERNAL_ERROR,
@@ -3245,22 +3272,28 @@ fn eval_full_inner<'a>(
                         expression_type_identity(argument, row, hooks)?.routine_argument_oid();
                 }
                 let types = &types[..args.len()];
-                let target = catalog
-                    .resolve_routine_call(name, Some(oid), argument_names, variadic, types)?
-                    .ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::UNDEFINED_FUNCTION,
-                            "captured function with OID {} does not exist",
-                            oid
-                        )
-                    })?;
-                return catalog.call_routine(
-                    target,
-                    args,
+                if let Some(target) = catalog.resolve_routine_call(
+                    name,
+                    bound_oid,
+                    argument_names,
+                    variadic,
                     types,
-                    &mut |argument| eval_full(argument, arena, params, row, hooks),
-                    arena,
-                );
+                )? {
+                    return catalog.call_routine(
+                        target,
+                        args,
+                        types,
+                        &mut |argument| eval_full(argument, arena, params, row, hooks),
+                        arena,
+                    );
+                }
+                if let Some(oid) = bound_oid {
+                    return Err(sql_err!(
+                        sqlstate::UNDEFINED_FUNCTION,
+                        "captured function with OID {} does not exist",
+                        oid
+                    ));
+                }
             }
 
             if let Some((Some(schema), symbol)) = crate::sql::ast::catalog_operator_call(name)
@@ -4505,6 +4538,7 @@ fn expression_collation<'a>(
                 indeterminate: false,
             }))
         }
+        Expr::BoundDefault { expression, .. } => expression_collation(expression, row, catalog),
         Expr::Cast {
             operand, type_name, ..
         } => match ColType::from_sql_name(type_name) {
@@ -5164,14 +5198,15 @@ fn call<'a>(
     } else {
         args
     };
-    let name = regex_srf_name.unwrap_or(written_name);
-    let effect_name = name.strip_prefix("pg_catalog.").unwrap_or(name);
-    if super::ast::is_volatile_function(effect_name) {
+    let name = written_name
+        .strip_prefix("pg_catalog.")
+        .unwrap_or(written_name);
+    if super::ast::is_volatile_function(name) {
         super::query::protect_statement_effects();
     }
     if name.eq_ignore_ascii_case("parse_ident") && argument_names.iter().any(Option::is_some) {
         if args.len() != 2 || star || variadic {
-            return undefined_function(name, args, arena, row, hooks);
+            return undefined_function(written_name, args, arena, row, hooks);
         }
         let mut parse_ident_args = [&Expr::Null; 2];
         reorder_required_arguments(
@@ -5198,7 +5233,7 @@ fn call<'a>(
             Err(sql_err!(
                 sqlstate::UNDEFINED_FUNCTION,
                 "function {}(...) with {} arguments does not exist",
-                name,
+                written_name,
                 if star { 1 } else { args.len() }
             ))
         } else {
@@ -5345,8 +5380,8 @@ fn call<'a>(
     }
     if !star
         && let Some(catalog) = hooks.catalog
-        && (catalog.has_routine_candidate(name, args.len())
-            || crate::sql::ast::catalog_operator_call(name).is_some())
+        && (catalog.has_routine_candidate(written_name, args.len())
+            || crate::sql::ast::catalog_operator_call(written_name).is_some())
     {
         let argument_type_oids = arena
             .alloc_slice_with(args.len(), |_| crate::sql::types::oid::UNKNOWN)
@@ -5356,7 +5391,7 @@ fn call<'a>(
                 expression_type_identity(argument, row, hooks)?.routine_argument_oid();
         }
         if args.len() == 1
-            && let Some((schema, "!!")) = crate::sql::ast::catalog_operator_call(name)
+            && let Some((schema, "!!")) = crate::sql::ast::catalog_operator_call(written_name)
             && schema.is_none_or(|schema| schema.eq_ignore_ascii_case("pg_catalog"))
             && argument_type_oids[0] == crate::sql::types::oid::TSQUERY
         {
@@ -5369,7 +5404,7 @@ fn call<'a>(
             };
         }
         if let Some(target) = catalog.resolve_routine_call(
-            name,
+            written_name,
             None,
             argument_names,
             variadic,
@@ -6168,7 +6203,7 @@ fn call<'a>(
                 .map_err(|_| arena_full())?;
             Ok(Datum::Record(fields))
         }
-        _ => undefined_function(name, args, arena, row, hooks),
+        _ => undefined_function(written_name, args, arena, row, hooks),
     }
 }
 
@@ -6266,6 +6301,7 @@ fn static_type<'a>(e: &Expr<'a>, row: &impl ColumnLookup<'a>) -> Option<ColType>
             let qualifier = crate::stack_format!(130, "{}.{}", schema, table);
             row.col_type(Some(qualifier.as_str()), name)
         }
+        Expr::BoundDefault { type_oid, .. } => ColType::from_oid(*type_oid),
         Expr::Cast { type_name, .. } => ColType::from_sql_name(type_name),
         Expr::Collate { operand, .. } => static_type(operand, row),
         Expr::Array(items) => {
@@ -8686,6 +8722,59 @@ mod tests {
         let mut budget = Budget::new(1 << 20);
         let arena = Arena::new(&mut budget, "test", 1 << 18).unwrap();
         f(&arena);
+    }
+
+    #[test]
+    fn builtin_dispatch_accepts_only_catalog_qualification() {
+        with_arena(|arena| {
+            for (name, expected) in [("pg_catalog.lower", "hello"), ("pg_catalog.upper", "HELLO")] {
+                assert!(matches!(
+                    call(name, &[&Expr::Str("Hello")], CallSyntax::ordinary(), arena,
+                        NO_PARAMS, &NoColumns, &NO_HOOKS).unwrap(),
+                    Datum::Text(value) if value == expected
+                ));
+            }
+            assert!(matches!(
+                call(
+                    "pg_catalog.length",
+                    &[&Expr::Str("Hello")],
+                    CallSyntax::ordinary(),
+                    arena,
+                    NO_PARAMS,
+                    &NoColumns,
+                    &NO_HOOKS
+                )
+                .unwrap(),
+                Datum::Int4(5)
+            ));
+            assert!(matches!(
+                call(
+                    "pg_catalog.abs",
+                    &[&Expr::Int(-7)],
+                    CallSyntax::ordinary(),
+                    arena,
+                    NO_PARAMS,
+                    &NoColumns,
+                    &NO_HOOKS
+                )
+                .unwrap(),
+                Datum::Int4(7)
+            ));
+            for name in ["public.lower", "pg_catalog.missing_function"] {
+                let error = call(
+                    name,
+                    &[&Expr::Str("Hello")],
+                    CallSyntax::ordinary(),
+                    arena,
+                    NO_PARAMS,
+                    &NoColumns,
+                    &NO_HOOKS,
+                )
+                .unwrap_err();
+                assert_eq!(error.sqlstate.as_str(), sqlstate::UNDEFINED_FUNCTION);
+                assert!(error.message.as_str().contains(name));
+            }
+        });
     }
 
     #[test]

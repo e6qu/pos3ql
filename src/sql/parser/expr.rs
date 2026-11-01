@@ -12,7 +12,7 @@ use crate::sql::eval::sqlstate;
 use crate::sql::lexer::Tok;
 
 use super::{ParseError, Parser, is_base_prefixed, is_reserved_keyword};
-use crate::sql::ast::{BinaryOp, Expr, UnaryOp};
+use crate::sql::ast::{BinaryOp, CastBinding, Expr, UnaryOp};
 use crate::sql::types::ColType;
 
 impl<'a> Parser<'a> {
@@ -73,6 +73,7 @@ impl<'a> Parser<'a> {
                     self.record_catalog_literal(left, kind)?;
                 }
                 left = self.arena_expr(Expr::Cast {
+                    binding: CastBinding::Resolve,
                     operand: left,
                     type_name,
                     type_mod,
@@ -900,6 +901,7 @@ impl<'a> Parser<'a> {
                     self.record_catalog_literal(operand, kind)?;
                 }
                 self.arena_expr(Expr::Cast {
+                    binding: CastBinding::Resolve,
                     operand,
                     type_name,
                     type_mod,
@@ -1023,6 +1025,7 @@ impl<'a> Parser<'a> {
                     self.advance()?;
                     let operand = self.arena_expr(Expr::Str(lit))?;
                     return self.arena_expr(Expr::Cast {
+                        binding: CastBinding::Resolve,
                         operand,
                         type_name: if with_timezone {
                             if name.eq_ignore_ascii_case("timestamp") {
@@ -1062,6 +1065,7 @@ impl<'a> Parser<'a> {
                         self.record_catalog_literal(operand, kind)?;
                     }
                     return self.arena_expr(Expr::Cast {
+                        binding: CastBinding::Resolve,
                         operand,
                         type_name: name,
                         type_mod,
@@ -1570,6 +1574,7 @@ impl<'a> Parser<'a> {
             return Ok(call);
         }
         self.arena_expr(Expr::Cast {
+            binding: CastBinding::Resolve,
             operand: call,
             type_name,
             type_mod,
@@ -1700,6 +1705,7 @@ impl<'a> Parser<'a> {
         )?;
         if result == "text" && (!type_name.eq_ignore_ascii_case("text") || type_mod >= 0) {
             return self.arena_expr(Expr::Cast {
+                binding: CastBinding::Resolve,
                 operand: call,
                 type_name,
                 type_mod,
@@ -1820,6 +1826,7 @@ impl<'a> Parser<'a> {
         self.push(&mut args, type_mod_expr)?;
         let call = self.plain_call("__json_value", args.as_slice())?;
         self.arena_expr(Expr::Cast {
+            binding: CastBinding::Resolve,
             operand: call,
             type_name,
             type_mod,
@@ -1941,6 +1948,7 @@ impl<'a> Parser<'a> {
         )?;
         if result == "text" && (!type_name.eq_ignore_ascii_case("text") || type_mod >= 0) {
             return self.arena_expr(Expr::Cast {
+                binding: CastBinding::Resolve,
                 operand: call,
                 type_name,
                 type_mod,
@@ -2394,6 +2402,7 @@ impl<'a> Parser<'a> {
         }
         if result == "text" {
             return self.arena_expr(Expr::Cast {
+                binding: CastBinding::Resolve,
                 operand: aggregate,
                 type_name,
                 type_mod,
@@ -2728,6 +2737,7 @@ impl<'a> Parser<'a> {
         };
         let operand = self.arena_expr(Expr::Str(literal))?;
         self.arena_expr(Expr::Cast {
+            binding: CastBinding::Resolve,
             operand,
             type_name: name,
             type_mod,

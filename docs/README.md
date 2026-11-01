@@ -47,6 +47,11 @@ an example of a future goal is labeled as remaining work in the plan.
 - [SQL/JSON](sql-json.md)
 - [SQL/XML and XPath](sql-xml.md)
 
+## Designs still to implement
+
+- [Sharing fixed resources according to load](adaptive-resources.md): shared
+  table capacity, read/write demand, row/column layout and bounded batching.
+
 ## Evidence and provenance
 
 - [Retained benchmarks](../benchmarks/README.md): dated raw artifacts and reports.

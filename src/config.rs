@@ -156,7 +156,6 @@ pub struct Config {
     /// Cluster-wide extended-statistics catalog slots. A relation can consume
     /// any available slots; there is no separate per-relation ceiling.
     pub max_extended_statistics: usize,
-    max_extended_statistics_explicit: bool,
     /// Unsummarized logical ranges retained for each BRIN index. The backing
     /// storage is reserved for every index at startup.
     pub max_brin_unsummarized_ranges_per_index: usize,
@@ -436,7 +435,6 @@ impl Config {
             max_parameter_acl_entries: 128,
             max_indexes: 32,
             max_extended_statistics: 256,
-            max_extended_statistics_explicit: false,
             max_brin_unsummarized_ranges_per_index: 64,
             max_stored_query_dependencies_per_object: 64,
             max_views: 32,
@@ -559,20 +557,6 @@ impl Config {
             }
             value.clear();
         }
-    }
-
-    pub(crate) fn extended_statistics_capacity(&self) -> usize {
-        if self.max_extended_statistics_explicit {
-            self.max_extended_statistics
-        } else {
-            self.max_tables.saturating_mul(8).min(usize::from(u16::MAX))
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn set_extended_statistics_capacity(&mut self, capacity: usize) {
-        self.max_extended_statistics = capacity;
-        self.max_extended_statistics_explicit = true;
     }
 
     #[cfg(test)]
@@ -892,7 +876,6 @@ impl Config {
                 "max_extended_statistics" => {
                     config.max_extended_statistics =
                         parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize;
-                    config.max_extended_statistics_explicit = true;
                 }
                 "max_brin_unsummarized_ranges_per_index" => {
                     config.max_brin_unsummarized_ranges_per_index =
@@ -1206,37 +1189,6 @@ impl Config {
                 _ => return Err(ConfigError::at(line_no, format!("unknown key '{key}'"))),
             }
         }
-        // Preserve historical one-slot-per-table sizing for configurations
-        // that predate the independent catalog pools. Naming a capacity opts
-        // that object class into its own startup budget.
-        if seen.iter().any(|setting| setting == "max_tables") {
-            let inherited_capacity = config.max_tables;
-            for (name, capacity) in [
-                ("max_indexes", &mut config.max_indexes),
-                ("max_views", &mut config.max_views),
-                ("max_materialized_views", &mut config.max_materialized_views),
-                ("max_routines", &mut config.max_routines),
-                ("max_casts", &mut config.max_casts),
-                ("max_operators", &mut config.max_operators),
-                ("max_operator_families", &mut config.max_operator_families),
-                ("max_operator_classes", &mut config.max_operator_classes),
-                ("max_triggers", &mut config.max_triggers),
-                ("max_publications", &mut config.max_publications),
-            ] {
-                if !seen.iter().any(|setting| setting == name) {
-                    *capacity = inherited_capacity;
-                }
-            }
-            if !seen
-                .iter()
-                .any(|setting| setting == "max_extended_statistics")
-            {
-                config.max_extended_statistics = inherited_capacity
-                    .saturating_mul(8)
-                    .min(usize::from(u16::MAX));
-            }
-        }
-
         if !seen.iter().any(|name| name == "transaction_mode") {
             return Err(ConfigError::at(
                 0,
@@ -2879,27 +2831,42 @@ sql_arena_bytes = 4096
     }
 
     #[test]
-    fn table_derived_catalog_capacities_are_independent_with_compatible_defaulting() {
-        let inherited = Config::parse(
+    fn catalog_capacities_are_independent_of_table_capacity() {
+        let defaults = Config::default_dev();
+        let parsed = Config::parse(
             "max_tables = 7\n\ntransaction_mode = mvcc\ncatalog_history_bytes = 16MiB\nrow_history_slots = 65536\n",
         )
         .unwrap();
-        assert_eq!(inherited.max_tables, 7);
-        assert_eq!(inherited.max_extended_statistics, 56);
+        assert_eq!(parsed.max_tables, 7);
+        assert_eq!(
+            parsed.max_extended_statistics,
+            defaults.max_extended_statistics
+        );
         assert_eq!(
             [
-                inherited.max_indexes,
-                inherited.max_views,
-                inherited.max_materialized_views,
-                inherited.max_routines,
-                inherited.max_casts,
-                inherited.max_operators,
-                inherited.max_operator_families,
-                inherited.max_operator_classes,
-                inherited.max_triggers,
-                inherited.max_publications,
+                parsed.max_indexes,
+                parsed.max_views,
+                parsed.max_materialized_views,
+                parsed.max_routines,
+                parsed.max_casts,
+                parsed.max_operators,
+                parsed.max_operator_families,
+                parsed.max_operator_classes,
+                parsed.max_triggers,
+                parsed.max_publications,
             ],
-            [7; 10]
+            [
+                defaults.max_indexes,
+                defaults.max_views,
+                defaults.max_materialized_views,
+                defaults.max_routines,
+                defaults.max_casts,
+                defaults.max_operators,
+                defaults.max_operator_families,
+                defaults.max_operator_classes,
+                defaults.max_triggers,
+                defaults.max_publications,
+            ]
         );
 
         let independent = Config::parse(concat!(

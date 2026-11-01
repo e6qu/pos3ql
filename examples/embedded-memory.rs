@@ -27,6 +27,8 @@ fn measure() -> Result<(), Box<dyn std::error::Error>> {
     }
     let mut config = Config::default_dev();
     config.max_tables = arguments[1].parse()?;
+    // Keep the shared statistics pool constant while varying table capacity.
+    config.max_extended_statistics = 256;
     config.table_rows = arguments[3].parse()?;
     config.transaction_mode = match arguments[5].as_str() {
         "mvcc" => TransactionMode::Mvcc,

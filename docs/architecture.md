@@ -52,118 +52,49 @@ reads. A cold read on one
 of these paths can occupy that worker. [PLAN.md](../PLAN.md) tracks their
 conversion and the later CPU worker pool separately.
 
-Stored-function dispatch selects the catalog identity and named-input mapping
-and binds input types before evaluating arguments. Constant inputs and their
-conversions are checked before runtime inputs. Reached runtime inputs and
-defaults run in declaration order with the caller's evaluation context.
-Lookup does not run an argument as a probe. For example,
-`setval('order_numbers', nextval('import_numbers'))`
-consumes one import number. A constant null, including an inserted default or
-an explicitly null variadic array, can eliminate a strict scalar call. A null array
-member does not make the array null. A null row value still allows the other
-reached arguments to run.
-Parameter defaults capture managed object references when the function or
-procedure is created. Calls use one copied dependency image to bind omitted
-inputs while preserving the caller's sequence state. For example, renaming the
-sequence selected by `DEFAULT nextval('order_numbers')` does not redirect the
-default to a replacement; `nextval('order_numbers'::text)` requests runtime lookup.
-Helper calls carry their captured catalog identity through expression expansion,
-result type inference, planning and evaluation. Adding an overload cannot redirect
-a stored default. Overloaded stored calls choose only among their captured
-functions, even after names change.
-Captured references share the existing fixed dependency capacity and durable
-records, including replacement rollback and empty-cache recovery.
-Scalar functions, table functions and procedures share input preparation with
-an explicit call context. A strict function in `FROM` evaluates its inputs before
-returning no rows for a null input. `CALL` converts unknown literals before
-execution but evaluates ordinary expressions in declaration order: a later
-division by zero can follow an earlier sequence increment. Lateral functions and
-subqueries inherit the caller's sequence state. Builtin set-returning calls bind
-input values and SQL types once before counting or emitting their rows; external
-row iteration keeps those inputs without materializing the whole result.
-Their execution registration declares accepted argument counts directly; missing
-public `pg_proc` entries cannot disable an implemented function.
-Table-function descriptions use declared input types and never sample an input
-value. Global aggregates use one source scan, avoiding a second execution of
-lateral inputs just to count the rows before aggregation.
-This call boundary supplies retained execution with an explicit target; it
-does not yet make every function body yield during a storage wait.
-Calls handed to the mutable executor retain their function identity, converted
-values and bound input/output types in statement-owned memory. For example, a
-function declared with `anyelement` and called with `42::integer` still returns
-an integer to a binary client. Composite inputs retain their fields rather than
-becoming rendered text. Only live type descriptors are copied; unused reserved
-parameter/default buffers are not retained per invocation. Exhaustion reports
-`pending routine type contract exceeds statement memory`.
-The function body is looked up when execution starts: PostgreSQL uses a replacement
-body if evaluating an argument replaced it. Read-only and mutable SQL functions
-share the same scalar and record result construction.
-Before this handoff, input preparation retains its own progress. For example,
-`save_order(set_config('application_name', current_setting('application_name') || '.', false))`
-must append one dot even when `save_order` pauses. Completed argument expressions and
-conversions reuse their values; a partially evaluated expression reuses completed
-nested calls. Omitted defaults keep their original declaration and dependency
-image even if another argument replaces the function. Constant-input decisions
-also stay fixed. Outer-query planning keeps one volatility decision per function
-identity; a replacement body has its own planning scope. A reached call keeps its selected function when an argument
-changes `search_path`; another same-named function cannot take over on resumption.
-The new body is still selected when execution begins.
-Scalar builtins with inputs that can suspend and stored functions use the same
-input root. Builtin trees proved unable to suspend do not allocate input records;
-repeated index checks such as `lower(label)` keep their existing scratch budget.
-Statistics, logical replication and large-object builtins share an explicit
-engine-handoff classification with their result descriptions, so this shortcut
-cannot treat those calls as ordinary builtin evaluation.
-Builtin set
-inputs, including `generate_series(start, stop)`, also keep completed arguments
-when a later input pauses. Input records borrow temporary row values while a
-call runs; only a suspended call encodes its live values into statement memory.
-Bound set inputs are reused while rows are emitted, without saving another
-input record for each output row. Function
-bodies and subqueries own separate input scopes so their row-scratch recycling
-cannot invalidate the caller's saved inputs. Exhaustion reports
-`retained routine inputs exceed statement memory` (SQLSTATE `54000`). These
-positions cover internal function handoffs; whole-query, body and post-flush
-positions still need retained execution before all storage waits can yield.
-The cursor reader already retains physical input positions for simple scans.
-It currently excludes function calls and casts. Ordinary SELECT execution still
-restarts its surrounding query after an internal mutable-function handoff;
-input retention alone does not preserve earlier projection columns. The next
-execution work reuses that reader to retain the current row and projection
-position, with bounded temporary call state and one output header.
-Record field descriptions bind the call's input types, named arguments and
-defaults without running them. The same bound types describe table-function
-columns, so an array returned through `anyelement` has the correct binary format.
-A single-column `RETURNS TABLE` function yields its column value in a SELECT
-list, while multiple columns yield a record; the binary result type follows the
-same distinction.
-Named row results keep their type and fields as SELECT values; in FROM, their
-declared fields become separate columns. Null rows, ROWS FROM, lateral inputs
-and WITH ORDINALITY use that same column layout.
-Routine binding resolves named input and result representations before accepting
-an exact signature match. Table-function result conversion decodes structured
-fields rather than interpreting their rendered text as the original value.
-SQL and PL/pgSQL result conversion use the same structural value copy as pending
-calls. Detached trigger rows use that codec too, preserving named fields in
-conflict updates.
-A saved view or table column needs a concrete type: expand `(pair(1)).*` into
-separate columns or declare the function's result as a named composite type.
-Casting an anonymous function result directly to a named composite fails with
-`42846`; an explicit `ROW(...)` constructor can supply its fields. An anonymous
-`record` column fails with `42P16`, as required by
-[PostgreSQL's pseudo-type rules](https://www.postgresql.org/docs/18/datatype-pseudo.html).
-For `SELECT (pair(nextval('numbers'))).*`, PostgreSQL expands a scalar call
-into one call per output field. A set-returning call instead shares its producer
-across those fields; two explicitly written calls remain independent. Expansion
-happens before argument queries and set producers are planned, including in
-`RETURNING`. Array expansion keeps each element's type separately from its integer
-position; ordinary arrays cannot be accessed as records with `.x` or `.f1`.
-Scalar and set-returning overloads compete together by argument types; returning
-one row cannot give a weaker type match priority over a set-returning function.
-Runtime overload checks copy input descriptors rather than whole definitions.
-The selected definition is captured once, bound in place and borrowed by its
-execution helpers. Candidate catalog locks are released before type coercion,
-argument effects or SQL execution.
+Function calls bind their selected function, input mapping and declared types
+before running arguments. Reached inputs and defaults run in declaration order;
+lookup never evaluates an argument as a probe. Defaults keep the object identities
+captured when the routine was created. A renamed sequence therefore cannot be
+replaced accidentally by another sequence with its old name.
+
+When a mutable function needs the engine, input preparation preserves completed
+expressions, conversions, defaults and nested calls in the statement arena.
+For example, `save_order(set_config('application_name',
+current_setting('application_name') || '.', false))` appends one dot when the
+input finishes, even if `save_order` pauses. Simple builtin trees that cannot
+pause consume no retained input records. Engine-owned statistics, replication
+and large-object calls use the same explicit handoff classification.
+
+Scalar functions, table functions and procedures share input binding, while
+keeping PostgreSQL's distinct null and result rules. Typed structural copies
+preserve named and anonymous row fields through SQL and PL/pgSQL functions,
+triggers, pending calls and the binary protocol. A named row is one value in
+`SELECT make_order(1)`, but its declared fields become columns in
+`SELECT * FROM make_order(1)`. A single-column `RETURNS TABLE` produces its
+column value in the SELECT list; multiple columns produce a record. Result
+descriptions use declared types and never sample an argument's value.
+See [compatibility](postgresql-18-compatibility.md) for record, conversion and
+capacity limits and the regression suites for individual cases.
+
+Single-table statements with supported scalar expressions reuse the owned
+physical reader across mutable function handoffs. Execution keeps the current
+row, finishes its predicate once and retains each completed projection item
+before advancing to the next. Function targets and builtin cast choices bind
+before row effects. A session-setting change in an earlier column cannot redirect
+a later bound call. Each active row borrows the unused region of its existing
+statement arena; completed output is copied before that region is released.
+Nested function execution can borrow a further region without growing memory.
+Row ownership and scan positions survive outside those temporary regions.
+
+This does not complete every query continuation. Complex plans, functions with
+subqueries or set expansion, named/custom casts and function bodies still have
+restart paths. The cursor reader retains simple physical input positions but
+currently excludes calls and casts. Cursors and results already sent to the
+client need the same once-only execution positions before all storage waits can
+yield. Exhaustion remains a named error; no extra per-table or per-query backing
+allocation is introduced by the scoped row region. [PLAN.md](../PLAN.md) owns the
+remaining acceptance and deployment qualification.
 
 ## Reads and storage layout
 
@@ -265,6 +196,16 @@ with its owned input. Each history chain has the separate per-row version bound.
 It never repeats SQL expressions or drains the whole
 database synchronously; remaining pressure returns the named capacity error.
 Per-table metadata can still make many small embedded tables expensive.
+Row bytes, committed history and immutable block caches already use shared
+startup pools. The remaining row-map reservation includes a fixed slot array
+and hash index for each configured table. Retained row-ID arrays and definition
+images add their own table/row/worker multipliers. They need separate accounting;
+reducing one cache setting does not remove these metadata costs.
+The [adaptive resource design](adaptive-resources.md) proposes shared leases
+and workload-driven admission inside fixed memory and disk limits. It is
+unfinished; no controller currently reallocates these reservations by load.
+Catalog capacities are independent settings: changing `max_tables` does not
+silently resize indexes, routines, views or extended statistics.
 Pending table definitions reserve their complete payload capacity at startup,
 but initialize only dense occupancy locks. Wide payload pages are touched when
 a definition is staged; its matching read/write guard protects initialization,
@@ -273,7 +214,9 @@ retirement and reuse. Reserving unused slots does not initialize every payload.
 The [embedded memory measurement](https://github.com/e6qu/pos3ql/blob/6ff1ac865a86a5318cb4934fbf01be0926667811/examples/embedded-memory.rs) starts one empty
 engine per process and reports the configured reservation, startup budget drawn,
 peak resident memory and startup time. CI records 1, 8 and 32 configured tables
-with both transaction modes and the same explicit memory settings. These are
+with both transaction modes and the same explicit memory settings. The current
+helper also fixes extended-statistics capacity independently of table count;
+older samples used implicit table-dependent sizing and must retain that provenance. These are
 empty-engine measurements, separate from a server's connection buffers, query
 workloads and production throughput.
 The retained [empty-engine baseline](https://github.com/e6qu/pos3ql/blob/6ff1ac865a86a5318cb4934fbf01be0926667811/benchmarks/baselines/2026-10-30-embedded-startup/README.md)

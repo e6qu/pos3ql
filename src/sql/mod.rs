@@ -1618,6 +1618,7 @@ fn relabelled_column_type(
             operand,
             type_name,
             type_mod,
+            ..
         } => {
             let (from, from_type_mod) =
                 relabelled_column_type(operand, column, source, source_type_mod)?;
@@ -13161,9 +13162,48 @@ impl Engine {
         guc: &mut GucState,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
+        let source_snapshot = txn.command_id().saturating_add(1);
+        self.storage.set_read_snapshot(source_snapshot);
+        let catalog = query::storage_catalog(&self.storage, &self.work, txn.txid);
+        let can_handoff = statement.items.iter().any(|item| match item {
+            ast::SelectItem::Expr { expression, .. } | ast::SelectItem::RecordStar(expression) => {
+                eval::routine_input_handoff(expression, Some(&catalog))
+            }
+            _ => false,
+        }) || statement
+            .where_clause
+            .is_some_and(|predicate| eval::routine_input_handoff(predicate, Some(&catalog)));
+        if can_handoff {
+            let mark = arena.mark();
+            let retained = match query::RetainedSelect::open_statement(
+                &self.storage,
+                txn.txid,
+                statement,
+                params,
+                arena,
+                responder,
+            ) {
+                Ok(source) => source,
+                Err(error) => return Ok(Err(error)),
+            };
+            if let Some(mut source) = retained {
+                return self.execute_retained_select(
+                    &mut source,
+                    arena,
+                    params,
+                    source_snapshot,
+                    txn,
+                    sqlprep,
+                    cursors,
+                    guc,
+                    responder,
+                );
+            }
+            // A rejected shape owns no retained reader or arena description.
+            unsafe { arena.rewind_to(mark) };
+        }
         let invocations = query::RoutineInvocationState::new(arena);
         let sequence_state = sequence::SequenceReplayState::empty();
-        let source_snapshot = txn.command_id().saturating_add(1);
         loop {
             self.work.reset();
             self.storage.set_read_snapshot(source_snapshot);
@@ -13206,6 +13246,207 @@ impl Engine {
                 return Ok(Err(error));
             }
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_retained_expression<'frame, T>(
+        &mut self,
+        frame: &'frame Arena,
+        source_snapshot: u32,
+        txn: &mut TxnState,
+        sqlprep: &mut SqlPreparedPool,
+        cursors: &mut cursor::CursorPool,
+        guc: &mut GucState,
+        responder: &mut Responder,
+        mut evaluate: impl FnMut(
+            &Storage,
+            &Arena,
+            &dyn SequenceAccess,
+            &query::RoutineInvocationState<'frame>,
+        ) -> Result<T, SqlError>,
+    ) -> Result<Result<T, SqlError>, WireFull> {
+        let invocations = query::RoutineInvocationState::new(frame);
+        let sequence_state = sequence::SequenceReplayState::empty();
+        loop {
+            self.work.reset();
+            self.storage.set_read_snapshot(source_snapshot);
+            invocations.begin_attempt();
+            sequence_state.begin_attempt();
+            let output_mark = responder.buffer.mark();
+            let outcome = {
+                let sequence = sequence::ReplaySeqEval::new(
+                    sequence::SeqEval::new(&self.storage, guc.seq_session(), txn.txid),
+                    &sequence_state,
+                    frame,
+                );
+                let _scope = query::enter_routine_invocation_scope(Some(
+                    query::RoutineInvocationContext::new(&invocations, frame),
+                ));
+                evaluate(&self.storage, &self.work, &sequence, &invocations)
+            };
+            let Err(error) = outcome else {
+                return Ok(outcome);
+            };
+            if error.sqlstate != sqlstate::INTERNAL_ROUTINE_INVOCATION {
+                return Ok(Err(error));
+            }
+            responder.buffer.truncate_to(output_mark);
+            let Some(pending) = invocations.take_pending() else {
+                return Ok(Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "retained expression yielded without a pending call"
+                )));
+            };
+            if let Err(error) = self.complete_pending_routine(
+                pending,
+                &invocations,
+                frame,
+                txn,
+                sqlprep,
+                cursors,
+                guc,
+                responder,
+            )? {
+                return Ok(Err(error));
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_retained_select<'statement>(
+        &mut self,
+        source: &mut query::RetainedSelect<'statement>,
+        arena: &'statement Arena,
+        params: &[Datum],
+        source_snapshot: u32,
+        txn: &mut TxnState,
+        sqlprep: &mut SqlPreparedPool,
+        cursors: &mut cursor::CursorPool,
+        guc: &mut GucState,
+        responder: &mut Responder,
+    ) -> Result<Result<(), SqlError>, WireFull> {
+        let mut emitted = 0u64;
+        loop {
+            self.storage.set_read_snapshot(source_snapshot);
+            let next = {
+                let (_, buffers) = self.work.cursor_parts();
+                source.prepare_statement_row(
+                    &self.storage,
+                    txn.txid,
+                    datetime::now_micros(),
+                    arena,
+                    buffers,
+                )
+            };
+            match next {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(error) => return Ok(Err(error)),
+            }
+            let row = arena.with_remaining_region(|frame| {
+                let txid = txn.txid;
+                let passes = self.execute_retained_expression(
+                    frame,
+                    source_snapshot,
+                    txn,
+                    sqlprep,
+                    cursors,
+                    guc,
+                    responder,
+                    |storage, work, sequences, invocations| {
+                        source.evaluate_statement_predicate(
+                            storage,
+                            txid,
+                            work,
+                            params,
+                            Some(sequences),
+                            Some(invocations),
+                            frame,
+                        )
+                    },
+                )?;
+                let passes = match passes {
+                    Ok(passes) => passes,
+                    Err(error) => return Ok(Err(error)),
+                };
+                if !passes {
+                    return Ok(Ok(false));
+                }
+                let skipped = source.skip_statement_row();
+                let mut projected = crate::mem::arena::ArenaList::new(frame);
+                for index in 0..source.statement_items_len() {
+                    let values = self.execute_retained_expression(
+                        frame,
+                        source_snapshot,
+                        txn,
+                        sqlprep,
+                        cursors,
+                        guc,
+                        responder,
+                        |storage, work, sequences, invocations| {
+                            source.evaluate_statement_item(
+                                index,
+                                storage,
+                                txid,
+                                work,
+                                params,
+                                Some(sequences),
+                                Some(invocations),
+                                frame,
+                            )
+                        },
+                    )?;
+                    let values = match values {
+                        Ok(values) => values,
+                        Err(error) => return Ok(Err(error)),
+                    };
+                    for value in values {
+                        if projected.len() == MAX_PROJ {
+                            return Ok(Err(sql_err!(
+                                sqlstate::TOO_MANY_COLUMNS,
+                                "target lists can have at most 1664 entries"
+                            )));
+                        }
+                        if projected.push(*value).is_err() {
+                            return Ok(Err(eval::arena_full()));
+                        }
+                    }
+                }
+                if skipped {
+                    return Ok(Ok(false));
+                }
+                self.storage.set_read_snapshot(source_snapshot);
+                match query::emit_data_row(
+                    &self.storage,
+                    txid,
+                    frame,
+                    responder,
+                    projected.as_slice(),
+                )? {
+                    Ok(()) => Ok(Ok(true)),
+                    Err(error) => Ok(Err(error)),
+                }
+            });
+            let row = match row {
+                Ok(row) => row?,
+                Err(error) => {
+                    return Ok(Err(sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "retained query row exceeds statement memory: {}",
+                        error
+                    )));
+                }
+            };
+            let row_emitted = match row {
+                Ok(emitted) => emitted,
+                Err(error) => return Ok(Err(error)),
+            };
+            source.finish_statement_row(arena, row_emitted);
+            emitted += u64::from(row_emitted);
+        }
+        let tag = stack_format!(48, "SELECT {}", emitted);
+        responder.command_complete(tag.as_str())?;
+        Ok(Ok(()))
     }
 
     #[allow(clippy::too_many_arguments)]

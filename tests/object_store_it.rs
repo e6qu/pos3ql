@@ -97,6 +97,7 @@ fn engine_config(run: &str, data_dir: &str) -> Option<(Config, TestDirectory)> {
     config.max_connections = 1;
     config.memtable_bytes = 1 << 20;
     config.max_tables = 8;
+    config.max_extended_statistics = 64;
     config.max_views = 8;
     config.max_materialized_views = 8;
     config.max_routines = 8;

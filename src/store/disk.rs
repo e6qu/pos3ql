@@ -1,7 +1,7 @@
 //! A fixed disk cache between RAM frames and the durable block store.
 //!
-//! Startup reserves a file of equal-sized slots and an in-memory identity
-//! index. CLOCK eviction reuses slots without growing either reservation.
+//! Startup fixes the cache file's logical length and reserves its in-memory
+//! identity index. CLOCK eviction reuses slots without extending the file.
 //! Slots contain complete framed blocks; reads verify their checksum and
 //! identity, and writes must finish before a slot enters the index.
 //!
@@ -69,8 +69,9 @@ impl<S: BlockStore> DiskCache<S> {
     }
 
     /// Opens (creating if absent) a cache file of `slot_count` slots at `path`.
-    /// The file is preallocated to its full size, as the journal is, so a slot
-    /// write is only ever an overwrite and never extends the file.
+    /// Startup fixes the logical file length, so slot writes stay within it.
+    /// This does not reserve physical disk blocks; later writes can fail if
+    /// the filesystem runs out of space.
     pub(crate) fn open(
         budget: &mut Budget,
         what: &'static str,
@@ -99,7 +100,8 @@ impl<S: BlockStore> DiskCache<S> {
         // A previous run's file is discarded rather than trusted: its index is
         // gone with the process that built it, so its slots cannot be located,
         // and re-warming from the store is what a cache is for. Sizing to the
-        // full extent up front makes every later write an overwrite.
+        // logical length up front bounds later writes without reserving
+        // physical disk blocks.
         let capacity = (slot_count * SLOT_SIZE) as u64;
         file.set_len(capacity)
             .map_err(|e| DiskError::Io("size cache file", e))?;

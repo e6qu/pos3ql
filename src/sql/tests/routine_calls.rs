@@ -6,12 +6,128 @@ fn query_positions_do_not_repeat_completed_projection_effects() {
     let mut budget = test_engine_budget(&config, 1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
-    let sql = include_str!(
-        "../../../tests/external/differential_exact/55_retained_query_positions.sql"
-    );
+    let sql =
+        include_str!("../../../tests/external/differential_exact/55_retained_query_positions.sql");
+    let output = session.success(&mut engine, sql, true);
     assert_eq!(
-        data_rows(&session.success(&mut engine, sql, true)),
-        ["0", "1|1", "2|2", "3|3", "3", "1", "2", "3"]
+        data_rows(&output),
+        [
+            &["0", "1|1", "2|2", "3|3", "3", "1", "2", "3"][..],
+            &["0", "20", "20", "20", "3", "0|3", "20|3"],
+            &["0", "3|99", "3", "0|3", "99|3"],
+            &["0", "1|7|2|8|3", "3", "7|2", "8|1"],
+            &["query_second,public|12", "12", "22", "12", "22"],
+            &["query_second,pg_catalog,public|2|2", "shadow"],
+            &["2|2", "777"],
+            &["0|101", "109", "101", "109"],
+        ]
+        .concat()
+    );
+    let mut remaining = output.as_slice();
+    let mut descriptions = 0;
+    let mut completions = 0;
+    while !remaining.is_empty() {
+        let length = i32::from_be_bytes(remaining[1..5].try_into().unwrap()) as usize;
+        descriptions += usize::from(remaining[0] == b'T');
+        completions += usize::from(remaining[0] == b'C');
+        remaining = &remaining[length + 1..];
+    }
+    assert_eq!(descriptions, 27);
+    assert_eq!(completions, 62);
+}
+
+#[test]
+fn retained_query_errors_rollback_completed_writes_and_session_changes() {
+    let config = test_config("retained-query-rollback");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE TABLE query_rollback_source(value integer); \
+         INSERT INTO query_rollback_source VALUES(1); \
+         CREATE TABLE query_rollback_audit(value integer); \
+         CREATE SEQUENCE query_rollback_numbers; \
+         CREATE FUNCTION query_rollback_write(value integer) RETURNS integer \
+         LANGUAGE sql VOLATILE AS \
+         $$INSERT INTO query_rollback_audit VALUES($1); SELECT $1$$; \
+         SELECT set_config('application_name','0',false)",
+        true,
+    );
+    session.success(&mut engine, "BEGIN", true);
+    let output = session.execute(
+        &mut engine,
+        "SELECT nextval('query_rollback_numbers'), \
+         set_config('application_name','changed',false), \
+         query_rollback_write(value), 1/(value-1) FROM query_rollback_source",
+        true,
+    );
+    assert_eq!(error_sqlstates(&output), ["22012"]);
+    session.success(&mut engine, "ROLLBACK", true);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT current_setting('application_name'); \
+             SELECT count(*) FROM query_rollback_audit; \
+             SELECT last_value,is_called FROM query_rollback_numbers; \
+             SELECT query_rollback_write(value) FROM query_rollback_source; \
+             SELECT value FROM query_rollback_audit",
+            true,
+        )),
+        ["0", "0", "1|t", "1", "1"]
+    );
+}
+
+#[test]
+fn retained_query_call_state_is_reused_between_rows() {
+    const ROWS: usize = 1024;
+    let config = test_config("retained-query-bounded-rows");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let statement_bytes = crate::storage::RowCursor::position_bytes(ROWS, 0).unwrap() + (128 << 10);
+    let mut session =
+        ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, statement_bytes);
+    session.success(
+        &mut engine,
+        "CREATE TABLE query_bounded_source(value integer); \
+         CREATE TABLE query_bounded_audit(value integer); \
+         CREATE FUNCTION query_bounded_write(value integer) RETURNS integer \
+         LANGUAGE sql VOLATILE AS \
+         $$INSERT INTO query_bounded_audit VALUES($1); SELECT $1$$",
+        true,
+    );
+    for value in 1..=ROWS {
+        session.success(
+            &mut engine,
+            &format!("INSERT INTO query_bounded_source VALUES({value})"),
+            true,
+        );
+    }
+    session.success(
+        &mut engine,
+        "SELECT set_config('application_name','0',false)",
+        true,
+    );
+    let output = session.success(
+        &mut engine,
+        "SELECT set_config('application_name', \
+         (current_setting('application_name')::integer+1)::text,false), \
+         query_bounded_write(value) FROM query_bounded_source",
+        true,
+    );
+    let rows = data_rows(&output);
+    assert_eq!(rows.len(), ROWS);
+    for (index, row) in rows.iter().enumerate() {
+        assert_eq!(row.split('|').next().unwrap(), (index + 1).to_string());
+    }
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT current_setting('application_name'); \
+             SELECT count(*),count(DISTINCT value),sum(value) FROM query_bounded_audit",
+            true,
+        )),
+        ["1024", "1024|1024|524800"]
     );
 }
 

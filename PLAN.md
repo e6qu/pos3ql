@@ -30,58 +30,89 @@ and [what has actually been measured](docs/performance.md).
 
 ## Remaining work
 
-### Close application compatibility and embedded memory gaps
+### Retain query progress and finish application compatibility
 
-**Examples:** an application can call `hashtextextended('order-42', 0)`, use
-SQLAlchemy models and psycopg2 cursors, and upgrade or reverse its schema with
-Alembic. An embedded database with many small tables should not reserve the
-maximum row history independently for every possible table.
+**Example:** a query reads three orders, increments a session counter in its
+first result column and writes an audit row through a function in its second.
+It must produce three increments, three audit rows and three result rows,
+including when a function pauses. Completed columns must not run again.
 
-Audit PostgreSQL 18 built-ins by signature and executable behavior. Catalog
-presence alone is not support. Compare values, declared result types, nulls,
-errors and argument effects with PostgreSQL, including seeded hashes.
-Extend the retained input positions from internal function handoffs to
-object-store waits, function bodies and ordinary query positions. Preserve
-once-only argument effects, converted values, selected defaults and bound types
-while removing query-prefix replay. Avoid charging simple builtin index
-expressions for resumable state. Keep the shared input preparation for scalar
-functions, table functions, procedures and engine-owned builtins, including
-statistics and large objects, while preserving their distinct conversion
-and strict-null rules. The [architecture](docs/architecture.md) describes the
-implemented input progress, type contracts, record expansion and set inputs.
-Preserve the distinct SELECT-value and FROM-column layouts of named row results
-and bind their stored type identities before conversion as execution positions expand.
-Keep the same structural copy boundary for procedural results and trigger rows.
-The next execution change must preserve the source row, predicate and completed
-projection columns across a mutable function handoff. For example, selecting
-a counter increment before a function that writes an audit row must increment
-once per source row, with one audit row and one result per row. Reuse the
-existing retained physical reader and startup-reserved byte buffers. Keep
-transient function state bounded to active execution positions rather than
-retaining a replay log for every earlier row. Cover successful values, scan
-counts, capacity errors, cancellation, rollback and empty-cache reads before
-extending the same positions to cursors and externally waiting statements.
-Run real SQLAlchemy, Alembic and psycopg2 workflows against both servers.
-Keep their catalog inspection, declared types, streaming and migration checks
-passing as function binding and execution expand; see the
-[tested application boundary](docs/postgresql-18-compatibility.md#implemented-boundary).
-Measure startup reservations and actual resident memory for empty and populated
-embedded databases; report the per-table contribution separately. Verify that
-unused wide definition slots stay untouched while live readers prevent slot reuse.
-Remove avoidable per-table metadata reservations through shared startup-owned
-capacity, preserving stable reader identities, rollback and named exhaustion.
-Preserve shared row-history admission before durability, bounded reclamation,
-rollback and prepared/cold recovery while reducing the remaining reservations.
-Include the current execution-stack requirement in embedded measurements and
-reduce avoidable wide construction frames alongside table and history metadata.
-Retained execution must also remove the remaining query-prefix replay; faster
-catalog lookup alone does not preserve a function's execution position.
-The retained [empty-engine measurements](https://github.com/e6qu/pos3ql/blob/6ff1ac865a86a5318cb4934fbf01be0926667811/benchmarks/baselines/2026-10-30-embedded-startup/README.md)
-establish a debug-build starting point; repeat them after memory repairs and add
-populated-table and client-session workloads before claiming an embedded minimum.
-The [lazy definition comparison](https://github.com/e6qu/pos3ql/blob/4054a6d3c79e916728f8e84d84139eae6d86b501/benchmarks/baselines/2026-10-30-embedded-lazy-definitions/README.md)
-records reduced empty-engine resident memory; fixed reservations and per-table
-metadata still need reduction and populated-workload measurements.
+Keep source, predicate and projection positions through mutable function
+handoffs. Reuse the retained physical reader and existing startup arenas;
+keep temporary call state bounded to active rows rather than all earlier rows.
+Preserve selected definitions, types, one result header, scan counts,
+cancellation, rollback and named capacity errors. Compare effects and values
+with PostgreSQL, including empty-cache reads, nested calls and replaced objects.
+Then extend those positions through function bodies and object-store waits,
+complex plans, SQL cursors and results already sent to the client.
+The [architecture](docs/architecture.md) describes implemented function-input
+retention and typed result handling; these alone do not complete query resumption.
+
+Audit PostgreSQL 18 built-ins by signature and executable behavior, including
+`hashtextextended('order-42', 0)`. Catalog presence alone is not support.
+Keep values, declared types, nulls, errors and argument effects aligned with
+PostgreSQL. Run real SQLAlchemy, Alembic and psycopg2 inspection, migrations,
+streaming and binary-client workflows against both servers; preserve native
+Linux amd64, Linux arm64 and macOS arm64 coverage.
+
+### Share fixed memory and disk capacity according to demand
+
+**Example:** configuring many possible tables must not reserve a large private
+row map for each empty table. If most traffic touches `orders`, it should use
+available shared slots. A long report keeps its selected versions until it
+finishes; those slots cannot be reassigned simply because demand changes.
+
+Keep startup allocation and arenas. Separate hard instance capacity from active
+leases. Row bytes, committed history and object caches already share capacity;
+remove the remaining `max_tables * table_rows` row-map reservation, retained
+row-ID multipliers and avoidable wide definition-image reservations. Keep small
+stable table identities and generation-checked handles. Make independent limits
+explicit, including embedded configuration; never silently derive unrelated
+capacities from table count. Preserve prepared transactions, rollback, pending
+publication, snapshots and empty-cache recovery as ownership changes.
+
+Reserve forward progress for commit, rollback, required reads and maintenance.
+Use bounded reclamation and report pinned capacity and named exhaustion.
+Control applies to reusable capacity and admission, never SQL visibility or
+durability. Keep memory, cache-disk and temporary/journal limits distinct.
+The [resource design](docs/adaptive-resources.md) records candidate policies and
+code evidence; proposed controls are not current settings.
+
+Measure 1/8/32/128 configured tables at equal explicit global capacity: empty,
+one hot table, evenly hot tables, moving demand and populated sessions in both
+transaction modes. Report named startup reservations, resident pages, stack and
+TLS costs separately. Keep controller state within startup budgets and prove
+capacity conservation, no runtime heap growth and safe release after errors.
+Preserve the [historical embedded measurements](https://github.com/e6qu/pos3ql/blob/4054a6d3c79e916728f8e84d84139eae6d86b501/benchmarks/baselines/2026-10-30-embedded-lazy-definitions/README.md);
+repeat with independent statistics capacity and populated workloads before
+claiming a current embedded minimum.
+
+### Adapt batching, admission and future layout to the workload
+
+**Example:** an isolated lookup starts immediately. During sustained traffic,
+compatible queued reads and writes share bounded batches for throughput. A
+nightly column report must not evict every frequently reused lookup block.
+
+Retain fixed object-request slots, backing arenas and disk limits. Adjust active
+windows, lease ownership and compatible batch sizes inside them. Bound queue
+delay and bytes; protect demand reads, commit publication and required
+maintenance before speculative read-ahead or duplicate requests. Use measured
+column demand, reuse, update rate and rewrite cost when choosing future immutable
+row/column output and ranged versus whole-object reads. Avoid rapid layout
+rewrites after short bursts.
+
+Compare simple feedback with PI/PID control using explicit policy, ceilings,
+minimum progress, sample interval/count and maximum batch delay/bytes. Clamp
+changes, filter noisy samples, avoid repeated reversals, and prevent integral
+error accumulating when owned capacity cannot be reclaimed. Choose the policy
+from measurements rather than assuming a more elaborate controller is better.
+
+Compare fixed and adaptive policies at equal resources on MinIO and SeaweedFS,
+with both vanilla PostgreSQL controls. Test idle/burst/sustained/cooling traffic,
+point/scan mixtures, narrow columns, bulk writes, delay/failure, cancellation,
+long readers and maintenance pressure. Retain latency distributions, throughput,
+requests/bytes, useful prefetch, cache/pinned usage, fairness and controller
+settling. Correctness, durable ordering and startup limits must hold throughout.
 
 ### Finish transaction visibility and keep maintenance moving
 

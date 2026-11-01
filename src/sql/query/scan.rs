@@ -1538,11 +1538,13 @@ where
                 operand: left,
                 type_name: left_name,
                 type_mod: left_mod,
+                ..
             },
             Expr::Cast {
                 operand: right,
                 type_name: right_name,
                 type_mod: right_mod,
+                ..
             },
         ) => {
             left_mod == right_mod
@@ -2689,6 +2691,10 @@ fn dml_index_operand_is_invariant(expression: &Expr<'_>) -> bool {
         Expr::Unary { operand, .. }
         | Expr::IsNull { operand, .. }
         | Expr::Cast { operand, .. }
+        | Expr::BoundDefault {
+            expression: operand,
+            ..
+        }
         | Expr::Collate { operand, .. } => dml_index_operand_is_invariant(operand),
         Expr::Binary { left, right, .. } => {
             dml_index_operand_is_invariant(left) && dml_index_operand_is_invariant(right)

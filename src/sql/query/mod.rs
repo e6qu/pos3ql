@@ -931,15 +931,15 @@ pub(crate) struct RoutineInvocationState<'a> {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct RoutineInvocationContext<'a> {
-    invocations: &'a RoutineInvocationState<'a>,
-    statement_arena: &'a Arena,
+pub(crate) struct RoutineInvocationContext<'scope, 'arena> {
+    invocations: &'scope RoutineInvocationState<'arena>,
+    statement_arena: &'arena Arena,
 }
 
-impl<'a> RoutineInvocationContext<'a> {
+impl<'scope, 'arena> RoutineInvocationContext<'scope, 'arena> {
     pub(crate) const fn new(
-        invocations: &'a RoutineInvocationState<'a>,
-        statement_arena: &'a Arena,
+        invocations: &'scope RoutineInvocationState<'arena>,
+        statement_arena: &'arena Arena,
     ) -> Self {
         Self {
             invocations,
@@ -964,7 +964,7 @@ impl Drop for RoutineInvocationScope {
 }
 
 pub(crate) fn enter_routine_invocation_scope(
-    context: Option<RoutineInvocationContext<'_>>,
+    context: Option<RoutineInvocationContext<'_, '_>>,
 ) -> RoutineInvocationScope {
     let current = match context {
         Some(context) => Some((
@@ -6680,10 +6680,15 @@ fn rewrite_grouped_expr<'a>(
             left: rewrite(left)?,
             right: rewrite(right)?,
         }),
-        Expr::Cast { operand, type_name, type_mod } => alloc(Expr::Cast {
+        Expr::Cast { operand, type_name, type_mod, binding } => alloc(Expr::Cast {
             operand: rewrite(operand)?,
             type_name,
             type_mod: *type_mod,
+            binding: *binding,
+        }),
+        Expr::BoundDefault { expression, type_oid } => alloc(Expr::BoundDefault {
+            expression: rewrite(expression)?,
+            type_oid: *type_oid,
         }),
         Expr::Collate { operand, collation } => alloc(Expr::Collate {
             operand: rewrite(operand)?,

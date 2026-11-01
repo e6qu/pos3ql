@@ -1777,7 +1777,7 @@ fn catalog_lifetime_config(name: &str, mode: crate::config::TransactionMode) -> 
     config.max_user_mappings = 2;
     config.max_publications = 2;
     config.max_subscriptions = 2;
-    config.set_extended_statistics_capacity(2);
+    config.max_extended_statistics = 2;
     config.extension_control_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/external/extensions")
         .to_str()
@@ -3056,7 +3056,7 @@ fn catalog_lifetime_template_copies_preserve_local_identifiers_and_statistics() 
             config.max_foreign_servers = 4;
             config.max_user_mappings = 4;
             config.max_publications = 4;
-            config.set_extended_statistics_capacity(4);
+            config.max_extended_statistics = 4;
             config.object_store_on = true;
             config.object_store_sim = true;
             config.wal_upload = true;
@@ -17432,6 +17432,7 @@ fn test_config(name: &str) -> Config {
     config.temporary_spill_bytes = 0;
     config.max_connections = 8;
     config.max_tables = 8;
+    config.max_extended_statistics = 64;
     config.max_composites = 8;
     config.max_views = 8;
     config.max_materialized_views = 8;
@@ -64769,7 +64770,7 @@ fn configured_statistics_and_brin_ranges_cross_old_per_object_bounds() {
     config.max_indexes = 1;
     config.max_routines = 1;
     config.max_triggers = TRIGGERS;
-    config.set_extended_statistics_capacity(STATISTICS);
+    config.max_extended_statistics = STATISTICS;
     config.max_brin_unsummarized_ranges_per_index = RANGES;
     config.wal_buffer_bytes = 4 << 20;
     config.checkpoint_manifest_bytes = 4 << 20;

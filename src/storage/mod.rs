@@ -4071,7 +4071,7 @@ fn pending_table_statistics_capacity(config: &Config) -> usize {
 
 fn pending_extended_statistics_capacity(config: &Config) -> usize {
     config
-        .extended_statistics_capacity()
+        .max_extended_statistics
         .saturating_mul(config.max_catalog_versions_per_object)
         .min(
             catalog_transaction_capacity(config).saturating_mul(config.max_analyze_per_transaction),
@@ -19707,7 +19707,7 @@ impl Storage {
                 * (size_of::<TriggerDef>() + config.max_tables * size_of::<PartitionTriggerState>())
             + config.max_policies * size_of::<PolicyDef>()
             + policy_role_budget_bytes(config)
-            + config.extended_statistics_capacity() * size_of::<ExtendedStatisticsDef>()
+            + config.max_extended_statistics * size_of::<ExtendedStatisticsDef>()
             + config.max_publications * size_of::<PublicationDef>()
             + config.max_materialized_views * size_of::<MatviewDef>()
             + config.max_indexes * (size_of::<IndexDef>() + size_of::<BrinMaintenanceState>())
@@ -20165,7 +20165,7 @@ impl Storage {
                 .push(PUBLIC_ROLE)
                 .expect("sized to policy role images");
         }
-        let extended_statistics_capacity = config.extended_statistics_capacity();
+        let extended_statistics_capacity = config.max_extended_statistics;
         let mut extended_statistics =
             FixedVec::new(budget, "extended_statistics", extended_statistics_capacity)?;
         for _ in 0..extended_statistics_capacity {
@@ -54140,6 +54140,7 @@ mod tests {
         c.memtable_bytes = 1 << 16;
         c.max_connections = 2;
         c.max_tables = 4;
+        c.max_extended_statistics = 32;
         c.table_rows = 128;
         c.txn_rows = 128;
         c.value_index_rows = 512;

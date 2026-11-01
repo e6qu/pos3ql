@@ -2525,7 +2525,12 @@ fn collect_expression<'a>(
         )
     };
     match expression {
-        Expr::Cast { operand, .. } | Expr::Collate { operand, .. } => child(operand),
+        Expr::Cast { operand, .. }
+        | Expr::BoundDefault {
+            expression: operand,
+            ..
+        }
+        | Expr::Collate { operand, .. } => child(operand),
         Expr::Unary { operand, .. }
         | Expr::IsNull { operand, .. }
         | Expr::Field { base: operand, .. } => child(operand),
@@ -2758,7 +2763,12 @@ fn collect_type(
 fn regclass_literal<'a>(expression: &'a Expr<'a>) -> Option<&'a str> {
     match expression {
         Expr::Str(value) => Some(value),
-        Expr::Cast { operand, .. } | Expr::Collate { operand, .. } => regclass_literal(operand),
+        Expr::Cast { operand, .. }
+        | Expr::BoundDefault {
+            expression: operand,
+            ..
+        }
+        | Expr::Collate { operand, .. } => regclass_literal(operand),
         _ => None,
     }
 }

@@ -117,6 +117,7 @@ fn vopr_config(seed: u64) -> Config {
     config.block_cache_bytes = 512 * 1024;
     config.disk_cache_bytes = 1 << 20;
     config.max_tables = 4;
+    config.max_extended_statistics = 32;
     // Each VOPR world owns exactly one session. Keep fixed per-connection
     // metadata aligned with that modeled concurrency.
     config.max_connections = 1;

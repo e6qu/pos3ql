@@ -5536,6 +5536,14 @@ pub enum ParameterSource {
     PlpgsqlCursor,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CastBinding {
+    /// Resolve a user-defined cast before attempting the builtin conversion.
+    Resolve,
+    /// The query selected the builtin conversion; do not resolve it again.
+    Builtin,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Expr<'a> {
     Null,
@@ -5579,6 +5587,13 @@ pub enum Expr<'a> {
         type_name: &'a str,
         /// Encoded atttypmod for `::numeric(p,s)` / `::varchar(n)`, or -1.
         type_mod: i32,
+        binding: CastBinding,
+    },
+    /// A planned routine default keeps its declared input type without an
+    /// extra conversion. Routine input preparation performs its one coercion.
+    BoundDefault {
+        expression: &'a Expr<'a>,
+        type_oid: i32,
     },
     /// An explicit collation that remains part of expression identity until
     /// the comparison, ordering, or key path consumes it.
@@ -5904,6 +5919,10 @@ impl Expr<'_> {
             }
             Expr::Unary { operand, .. }
             | Expr::Cast { operand, .. }
+            | Expr::BoundDefault {
+                expression: operand,
+                ..
+            }
             | Expr::Collate { operand, .. }
             | Expr::IsNull { operand, .. } => operand.is_constant(),
             Expr::Binary { left, right, .. } => left.is_constant() && right.is_constant(),
@@ -5974,6 +5993,10 @@ impl Expr<'_> {
             | Expr::DefaultMarker => false,
             Expr::Unary { operand, .. }
             | Expr::Cast { operand, .. }
+            | Expr::BoundDefault {
+                expression: operand,
+                ..
+            }
             | Expr::Collate { operand, .. }
             | Expr::IsNull { operand, .. }
             | Expr::Field { base: operand, .. }
@@ -6052,6 +6075,10 @@ impl Expr<'_> {
             | Expr::DefaultMarker => false,
             Expr::Unary { operand, .. }
             | Expr::Cast { operand, .. }
+            | Expr::BoundDefault {
+                expression: operand,
+                ..
+            }
             | Expr::Collate { operand, .. }
             | Expr::IsNull { operand, .. }
             | Expr::Field { base: operand, .. }
@@ -6141,6 +6168,10 @@ impl Expr<'_> {
             | Expr::ArraySubquery(_) => None,
             Expr::Unary { operand, .. }
             | Expr::Cast { operand, .. }
+            | Expr::BoundDefault {
+                expression: operand,
+                ..
+            }
             | Expr::Collate { operand, .. }
             | Expr::IsNull { operand, .. }
             | Expr::Field { base: operand, .. }
@@ -6215,6 +6246,10 @@ impl Expr<'_> {
             | Expr::ArraySubquery(_) => {}
             Expr::Unary { operand, .. }
             | Expr::Cast { operand, .. }
+            | Expr::BoundDefault {
+                expression: operand,
+                ..
+            }
             | Expr::Collate { operand, .. }
             | Expr::IsNull { operand, .. }
             | Expr::Field { base: operand, .. }
@@ -6302,6 +6337,10 @@ impl Expr<'_> {
             | Expr::ArraySubquery(_) => {}
             Expr::Unary { operand, .. }
             | Expr::Cast { operand, .. }
+            | Expr::BoundDefault {
+                expression: operand,
+                ..
+            }
             | Expr::Collate { operand, .. }
             | Expr::IsNull { operand, .. }
             | Expr::Field { base: operand, .. }

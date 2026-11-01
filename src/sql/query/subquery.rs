@@ -787,6 +787,10 @@ pub(crate) fn walk_children<'a>(
     match expression {
         Expr::Unary { operand, .. }
         | Expr::Cast { operand, .. }
+        | Expr::BoundDefault {
+            expression: operand,
+            ..
+        }
         | Expr::Collate { operand, .. }
         | Expr::IsNull { operand, .. } => f(operand),
         Expr::Binary { left, right, .. } => {
@@ -1159,7 +1163,11 @@ fn row_projected<'a>(
             // PostgreSQL retains RowExpr arity through an explicit cast when
             // checking the sublink's projected column count. A scalar cast
             // from text to a composite remains one value.
-            Expr::Cast { operand, .. } => arity(operand),
+            Expr::Cast { operand, .. }
+            | Expr::BoundDefault {
+                expression: operand,
+                ..
+            } => arity(operand),
             _ => 1,
         }
     }

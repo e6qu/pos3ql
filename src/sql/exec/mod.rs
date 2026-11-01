@@ -52900,6 +52900,10 @@ fn validate_copy_predicate(expression: &Expr, def: &TableDef) -> Result<(), SqlE
         )),
         Expr::Unary { operand, .. }
         | Expr::Cast { operand, .. }
+        | Expr::BoundDefault {
+            expression: operand,
+            ..
+        }
         | Expr::Collate { operand, .. }
         | Expr::IsNull { operand, .. }
         | Expr::Field { base: operand, .. }

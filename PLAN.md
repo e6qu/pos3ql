@@ -40,9 +40,11 @@ maximum row history independently for every possible table.
 Audit PostgreSQL 18 built-ins by signature and executable behavior. Catalog
 presence alone is not support. Compare values, declared result types, nulls,
 errors and argument effects with PostgreSQL, including seeded hashes.
-Retained calls must preserve converted inputs, omitted defaults and the next
-input position across storage waits. Extend the captured function identity and
-bound type contract into those input and body positions. Reuse the shared
+When a mutable function pauses its enclosing query, completed argument effects,
+conversions and nested calls must remain done. Preserve the selected defaults
+and input classification even when an earlier argument replaces a definition.
+Extend these retained input positions to object-store waits and function bodies;
+the internal function handoff alone does not remove query-prefix replay. Reuse the shared
 input preparation for scalar functions, table functions and procedures, preserving
 each context's conversion and strict-null rules. The [architecture](docs/architecture.md)
 describes the implemented binding, retained result types, record expansion and

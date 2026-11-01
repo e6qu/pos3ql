@@ -98,9 +98,26 @@ parameter/default buffers are not retained per invocation. Exhaustion reports
 The function body is looked up when execution starts: PostgreSQL uses a replacement
 body if evaluating an argument replaced it. Read-only and mutable SQL functions
 share the same scalar and record result construction.
+Before this handoff, input preparation retains its own progress. For example,
+`save_order(set_config('application_name', 'import', false)::text)` must not run
+`set_config` again when `save_order` pauses. Completed argument expressions and
+conversions reuse their values; a partially evaluated expression reuses completed
+nested calls. Omitted defaults keep their original declaration and dependency
+image even if another argument replaces the function. Constant-input decisions
+also stay fixed. The new body is still selected when execution begins.
+Input records remain temporary row scratch for calls that finish immediately.
+Only a suspended call copies its live records into statement memory. Function
+bodies and subqueries own separate input scopes so their row-scratch recycling
+cannot invalidate the caller's saved inputs. Exhaustion reports
+`retained routine inputs exceed statement memory` (SQLSTATE `54000`). These
+positions cover internal function handoffs; whole-query, body and post-flush
+positions still need retained execution before all storage waits can yield.
 Record field descriptions bind the call's input types, named arguments and
 defaults without running them. The same bound types describe table-function
 columns, so an array returned through `anyelement` has the correct binary format.
+A single-column `RETURNS TABLE` function yields its column value in a SELECT
+list, while multiple columns yield a record; the binary result type follows the
+same distinction.
 For `SELECT (pair(nextval('numbers'))).*`, PostgreSQL expands a scalar call
 into one call per output field. A set-returning call instead shares its producer
 across those fields; two explicitly written calls remain independent. Expansion

@@ -1820,7 +1820,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
             }
             super::exec::coerce_routine_argument(value, argument, self.storage, self.txid, arena)
         };
-        let constant_input = |expression: &Expr<'_>, source, expected| -> Result<bool, SqlError> {
+        let classify_input = |expression: &Expr<'_>, source, expected| -> Result<bool, SqlError> {
             // CALL evaluates ordinary expressions at execution time. Unknown
             // literals are converted during PostgreSQL parse analysis, including
             // a direct explicit cast from an unknown literal.
@@ -1851,6 +1851,24 @@ impl StorageCatalog<'_, '_, '_, '_> {
             }
             Ok(true)
         };
+        let constant_input = |expression: &Expr<'_>, source, expected, parameter, written| {
+            let value = input_progress::value(
+                input_progress::InputSite::Classification {
+                    routine: crate::storage::routine_oid(routine),
+                    parameter,
+                    written,
+                },
+                arena,
+                || classify_input(expression, source, expected).map(Datum::Bool),
+            )?;
+            match value {
+                Datum::Bool(constant) => Ok(constant),
+                _ => Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "retained input classification changed type"
+                )),
+            }
+        };
         let mut constant_values = [None; crate::storage::MAX_ROUTINE_ARGUMENTS];
         let mut constant_defaults = [None; crate::storage::MAX_ROUTINE_ARGUMENTS];
         let mut constant_null = false;
@@ -1869,7 +1887,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
                     continue;
                 }
                 let source = argument_type_oids[call_index];
-                if constant_input(expression, source, expected)? {
+                if constant_input(expression, source, expected, input_index, Some(call_index))? {
                     let value = input_progress::value(
                         input_progress::InputSite::Argument {
                             routine: crate::storage::routine_oid(routine),
@@ -1889,7 +1907,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
             if let Some(expression) = default_expressions[input_index] {
                 let (argument, expected) = input_contract(input_index, false)?;
                 let source = input_type_oids[input_index];
-                if constant_input(expression, source, expected)? {
+                if constant_input(expression, source, expected, input_index, None)? {
                     let value = input_progress::value(
                         input_progress::InputSite::Argument {
                             routine: crate::storage::routine_oid(routine),

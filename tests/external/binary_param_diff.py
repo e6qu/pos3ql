@@ -89,6 +89,8 @@ RESULT_CASES = [
     "SELECT * FROM ROWS FROM (generate_series(1,2), unnest(ARRAY['x'::varchar(2)])) "
     "WITH ORDINALITY AS r(series,label,ordinality) ORDER BY ordinality",
     "SELECT binary_result_values(4), generate_series(10,12)",
+    "SELECT binary_single_column(4)",
+    "SELECT * FROM binary_single_column(4)",
     "SELECT binary_pending_pl(42::int4), binary_pending_pl(9000000000::int8), "
     "binary_pending_pl(ARRAY[1,NULL,3])",
     "SELECT binary_pending_sql(42::int4), binary_pending_sql(9000000000::int8), "
@@ -148,6 +150,8 @@ def main():
         "CREATE FUNCTION binary_result_pair_echo(binary_result_pair) RETURNS binary_result_pair "
         "LANGUAGE SQL AS 'SELECT $1'; "
         "CREATE FUNCTION binary_result_values(integer) RETURNS SETOF integer "
+        "LANGUAGE SQL AS 'SELECT $1 UNION ALL SELECT $1 + 1'; "
+        "CREATE FUNCTION binary_single_column(integer) RETURNS TABLE(value integer) "
         "LANGUAGE SQL AS 'SELECT $1 UNION ALL SELECT $1 + 1'; "
         "CREATE TABLE binary_pending_audit(value integer); "
         "CREATE FUNCTION binary_pending_pl(value anyelement) RETURNS anyelement "

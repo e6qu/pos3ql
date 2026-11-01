@@ -21,6 +21,11 @@ pub(crate) enum InputSite<'a> {
         variadic: bool,
     },
     Query(InputQuery),
+    Classification {
+        routine: i32,
+        parameter: usize,
+        written: Option<usize>,
+    },
     Definition(i32),
 }
 
@@ -95,6 +100,15 @@ impl InputSite<'_> {
             },
             Self::Query(kind) => InputSite::Query(kind),
             Self::Definition(oid) => InputSite::Definition(oid),
+            Self::Classification {
+                routine,
+                parameter,
+                written,
+            } => InputSite::Classification {
+                routine,
+                parameter,
+                written,
+            },
         })
     }
 }
@@ -334,6 +348,15 @@ impl<'statement: 'query, 'query> InputAttempt<'statement, 'query> {
                 },
                 InputSite::Query(kind) => InputSite::Query(kind),
                 InputSite::Definition(oid) => InputSite::Definition(oid),
+                InputSite::Classification {
+                    routine,
+                    parameter,
+                    written,
+                } => InputSite::Classification {
+                    routine,
+                    parameter,
+                    written,
+                },
             };
             frames
                 .push(AttemptFrame::Temporary(InputFrame {
@@ -371,6 +394,7 @@ impl<'statement: 'query, 'query> InputAttempt<'statement, 'query> {
                 self.next.set(next_input);
                 self.invocation.set(next_invocation);
                 self.registry.next.set(next_call);
+                let encoded = output.alloc_slice_copy(encoded).map_err(|_| full())?;
                 return super::super::exec::decode_projected_col_record(encoded, 0, output);
             }
             InputState::Pending => {}
@@ -455,14 +479,15 @@ impl<'statement: 'query, 'query> InputAttempt<'statement, 'query> {
             .map_err(|_| full())?;
         let saved = SavedInputs { ordinal, frames };
         let mut entries = self.registry.saved.borrow_mut();
-        if let Some(index) = entries
+        match entries
             .as_slice()
-            .iter()
-            .position(|entry| entry.ordinal == ordinal)
+            .binary_search_by_key(&ordinal, |entry| entry.ordinal)
         {
-            entries.as_mut_slice().map_err(|_| full())?[index] = saved;
-        } else {
-            entries.push(saved).map_err(|_| full())?;
+            Ok(index) => entries.as_mut_slice().map_err(|_| full())?[index] = saved,
+            Err(index) => {
+                entries.push(saved).map_err(|_| full())?;
+                entries.as_mut_slice().map_err(|_| full())?[index..].rotate_right(1);
+            }
         }
         Ok(())
     }
@@ -530,17 +555,17 @@ pub(super) fn call<T>(
     let ordinal = registry.next.get();
     registry.next.set(ordinal.checked_add(1).ok_or_else(full)?);
     let mut frames = ArenaList::new(arena);
-    if let Some(saved) = registry
-        .saved
-        .borrow()
-        .as_slice()
-        .iter()
-        .find(|entry| entry.ordinal == ordinal)
     {
-        for frame in saved.frames {
-            frames
-                .push(AttemptFrame::Saved(frame))
-                .map_err(|_| full())?;
+        let saved = registry.saved.borrow();
+        if let Ok(index) = saved
+            .as_slice()
+            .binary_search_by_key(&ordinal, |entry| entry.ordinal)
+        {
+            for frame in saved.as_slice()[index].frames {
+                frames
+                    .push(AttemptFrame::Saved(frame))
+                    .map_err(|_| full())?;
+            }
         }
     }
     let attempt = InputAttempt {

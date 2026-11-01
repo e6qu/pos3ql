@@ -278,8 +278,14 @@ Stack arguments are omitted; protocol coverage installs its debugger explicitly.
 
 PostgreSQL service and client containers use Docker's official image from
 [Google's Docker Hub cache](https://docs.cloud.google.com/artifact-registry/docs/pull-cached-dockerhub-images),
-pinned by manifest digest. Keep service images, container selectors, and client adapters on the
-same digest. Verify updated manifests against Docker Hub's official image and
+pinned to the Linux amd64 image manifest used by these jobs. The PostgreSQL 18.6
+manifest is `sha256:885953109528ad3dfc90362b1a6f50a78620b5315be19f187753d267e484dc5b`,
+selected from official image index
+`sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336`.
+Pin the platform manifest directly: pulling the whole index can fail on mirrored
+attestation descriptors that are unnecessary for running the server.
+Keep service images, container selectors, and client adapters on the same digest.
+Verify updated manifests against Docker Hub's official image and
 retain that comparison in the PR; do not switch registries silently on failure.
 SeaweedFS qualification uses the upstream GHCR release image at the same digest
 as its Docker Hub publication. Registry changes preserve image provenance.

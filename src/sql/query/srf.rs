@@ -3846,15 +3846,18 @@ pub(crate) fn table_func_rows_outer<'a, C: ColumnLookup<'a>>(
             crate::storage::NamedTypeKind::Composite,
             creation,
         )?;
-        let definition = storage
-            .read_composite_definition(target, txid)?
-            .ok_or_else(|| {
-                sql_err!(
-                    sqlstate::UNDEFINED_OBJECT,
-                    "composite result type does not exist"
-                )
-            })?;
-        let width = definition.active_field_count();
+        // Release this declaration reader before materializing individual values.
+        let width = {
+            let definition = storage
+                .read_composite_definition(target, txid)?
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "composite result type does not exist"
+                    )
+                })?;
+            definition.active_field_count()
+        };
         if width > MAX_COLUMNS {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -3864,6 +3867,9 @@ pub(crate) fn table_func_rows_outer<'a, C: ColumnLookup<'a>>(
         let catalog = super::storage_catalog(storage, arena, txid);
         let rows = arena
             .alloc_slice_with(produced.encoded.len(), |_| &[] as &[u8])
+            .map_err(|_| arena_full())?;
+        let values = arena
+            .alloc_slice_with(width, |_| Datum::Null)
             .map_err(|_| arena_full())?;
         for (out, encoded) in rows.iter_mut().zip(produced.encoded) {
             let mut value = crate::sql::exec::decode_projected_col_record(encoded, 0, arena)?;
@@ -3881,7 +3887,7 @@ pub(crate) fn table_func_rows_outer<'a, C: ColumnLookup<'a>>(
                     arena,
                 )?;
             }
-            let mut values = [Datum::Null; MAX_COLUMNS];
+            values.fill(Datum::Null);
             match value {
                 Datum::Composite { slot, fields } if slot == creation && fields.len() == width => {
                     for (out, field) in values.iter_mut().zip(fields) {
@@ -3896,7 +3902,7 @@ pub(crate) fn table_func_rows_outer<'a, C: ColumnLookup<'a>>(
                     ));
                 }
             }
-            *out = crate::sql::exec::encode_projected_pub(&values[..width], arena)?;
+            *out = crate::sql::exec::encode_projected_pub(values, arena)?;
         }
         &*rows
     } else {
@@ -3911,14 +3917,15 @@ pub(crate) fn table_func_rows_outer<'a, C: ColumnLookup<'a>>(
     let wrapped = arena
         .alloc_slice_with(rows.len(), |_| EMPTY)
         .map_err(|_| arena_full())?;
+    let values = arena
+        .alloc_slice_with(base_columns + 1, |_| Datum::Null)
+        .map_err(|_| arena_full())?;
     for (index, row) in rows.iter().enumerate() {
-        let mut values = [Datum::Null; MAX_COLUMNS];
         for (column, slot) in values[..base_columns].iter_mut().enumerate() {
             *slot = crate::sql::exec::decode_projected_col_record(row, column, arena)?;
         }
         values[base_columns] = Datum::Int8((index + 1) as i64);
-        wrapped[index] =
-            crate::sql::exec::encode_projected_pub(&values[..base_columns + 1], arena)?;
+        wrapped[index] = crate::sql::exec::encode_projected_pub(values, arena)?;
     }
     Ok(&*wrapped)
 }

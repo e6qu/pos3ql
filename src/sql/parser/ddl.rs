@@ -3007,7 +3007,7 @@ impl<'a> Parser<'a> {
             if self.eat_ident("tablespace")? {
                 AlterDatabaseAction::SetTablespace(self.any_ident("tablespace name")?)
             } else {
-                let name = self.any_ident("configuration parameter")?;
+                let name = self.configuration_parameter_name()?;
                 let value = if self.eat_ident("from")? {
                     self.expect_ident("current")?;
                     RoutineConfigValue::Current
@@ -3023,7 +3023,7 @@ impl<'a> Parser<'a> {
             AlterDatabaseAction::Reset(if self.eat_ident("all")? {
                 None
             } else {
-                Some(self.any_ident("configuration parameter")?)
+                Some(self.configuration_parameter_name()?)
             })
         } else if self.eat_ident("refresh")? {
             self.expect_ident("collation")?;
@@ -3908,12 +3908,7 @@ impl<'a> Parser<'a> {
                     sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
                 });
             } else if self.eat_ident("set")? {
-                let name_start = self.peek_at;
-                let _ = self.any_ident("configuration parameter")?;
-                while self.eat_op(".")? {
-                    let _ = self.any_ident("configuration parameter")?;
-                }
-                let config_name = self.text[name_start..self.peek_at].trim();
+                let config_name = self.configuration_parameter_name()?;
                 let value = if self.eat_ident("from")? {
                     self.expect_ident("current")?;
                     crate::sql::ast::RoutineConfigValue::Current
@@ -4080,7 +4075,7 @@ impl<'a> Parser<'a> {
             None
         };
         if self.eat_ident("set")? {
-            let name = self.any_ident("configuration parameter")?;
+            let name = self.configuration_parameter_name()?;
             let value = if self.eat_ident("from")? {
                 self.expect_ident("current")?;
                 crate::sql::ast::RoutineConfigValue::Current
@@ -4102,7 +4097,7 @@ impl<'a> Parser<'a> {
                 database,
                 action: crate::sql::ast::RoleSettingAction::Reset(
                     (!self.eat_ident("all")?)
-                        .then(|| self.any_ident("configuration parameter"))
+                        .then(|| self.configuration_parameter_name())
                         .transpose()?,
                 ),
             });
@@ -7478,12 +7473,7 @@ impl<'a> Parser<'a> {
                 if self.eat_ident("schema")? {
                     AlterRoutineAction::SetSchema(self.col_ident("schema name")?)
                 } else {
-                    let name_start = self.peek_at;
-                    let _ = self.any_ident("configuration parameter")?;
-                    while self.eat_op(".")? {
-                        let _ = self.any_ident("configuration parameter")?;
-                    }
-                    let name = self.text[name_start..self.peek_at].trim();
+                    let name = self.configuration_parameter_name()?;
                     let value = if self.eat_ident("from")? {
                         self.expect_ident("current")?;
                         crate::sql::ast::RoutineConfigValue::Current
@@ -7499,7 +7489,7 @@ impl<'a> Parser<'a> {
                 AlterRoutineAction::ResetConfig(if self.eat_ident("all")? {
                     None
                 } else {
-                    Some(self.any_ident("configuration parameter")?)
+                    Some(self.configuration_parameter_name()?)
                 })
             } else if self.eat_ident("strict")? {
                 AlterRoutineAction::SetStrict(true)

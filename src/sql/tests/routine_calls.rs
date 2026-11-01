@@ -1734,6 +1734,12 @@ fn invalid_setting_values_use_parameter_errors_without_changing_values() {
             ("xmloption", "not_a_value"),
             ("track_functions", "not_a_value"),
             ("default_text_search_config", ""),
+            ("standard_conforming_strings", "not_a_value"),
+            ("synchronize_seqscans", "not_a_value"),
+            ("idle_in_transaction_session_timeout", "not_a_value"),
+            ("transaction_timeout", "not_a_value"),
+            ("lock_timeout", "'0'"),
+            ("statement_timeout", "2147483648"),
         ] {
             let prior = guc.get_owned(name).unwrap();
             assert_eq!(
@@ -1803,6 +1809,59 @@ fn rendered_routine_definitions_preserve_quoted_names_and_saved_setting_input() 
         )),
         ["8"]
     );
+}
+
+#[test]
+fn fixed_settings_parse_values_before_checking_supported_behavior() {
+    let guc = GucState::new();
+    crate::mem::guard::forbid_alloc(|| {
+        for value in ["on", "t", "tr", "tru", "true", "y", "yes", "1"] {
+            assert_eq!(
+                guc.set_config("standard_conforming_strings", Some(value), false)
+                    .unwrap()
+                    .as_str(),
+                "on"
+            );
+        }
+        for value in ["off", "of", "f", "false", "n", "no", "0"] {
+            assert_eq!(
+                guc.set_config("synchronize_seqscans", Some(value), false)
+                    .unwrap()
+                    .as_str(),
+                "off"
+            );
+        }
+        for name in ["idle_in_transaction_session_timeout", "transaction_timeout"] {
+            assert_eq!(
+                guc.set_config(name, Some("0ms"), false).unwrap().as_str(),
+                "0"
+            );
+            assert_eq!(
+                guc.set_config(name, Some("1ms"), false)
+                    .unwrap_err()
+                    .sqlstate,
+                "0A000"
+            );
+        }
+        for name in ["standard_conforming_strings", "synchronize_seqscans"] {
+            assert_eq!(
+                guc.set_config(name, Some("o"), false).unwrap_err().sqlstate,
+                "22023"
+            );
+        }
+        for (name, value) in [
+            ("standard_conforming_strings", "off"),
+            ("synchronize_seqscans", "on"),
+            ("default_table_access_method", "HEAP"),
+        ] {
+            assert_eq!(
+                guc.set_config(name, Some(value), false)
+                    .unwrap_err()
+                    .sqlstate,
+                "0A000"
+            );
+        }
+    });
 }
 
 #[test]

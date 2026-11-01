@@ -1576,7 +1576,7 @@ impl<'a> Parser<'a> {
                     self.expect_ident("zone")?;
                     ("timezone", SettingSyntax::TimeZone)
                 } else {
-                    let n = self.any_ident("configuration parameter")?;
+                    let n = self.configuration_parameter_name()?;
                     if self.eat_ident("from")? {
                         self.expect_ident("current")?;
                         return Ok(Stmt::Set {
@@ -1687,9 +1687,7 @@ impl<'a> Parser<'a> {
                     self.expect_ident("level")?;
                     Ok(Stmt::Reset(Some("transaction_isolation")))
                 } else {
-                    Ok(Stmt::Reset(Some(
-                        self.any_ident("configuration parameter")?,
-                    )))
+                    Ok(Stmt::Reset(Some(self.configuration_parameter_name()?)))
                 }
             }
             Tok::Ident("show") => {
@@ -4700,12 +4698,31 @@ impl<'a> Parser<'a> {
     }
 
     fn configuration_parameter_name(&mut self) -> Result<&'a str, ParseError> {
-        let start = self.peek_at;
-        let _ = self.any_ident("configuration parameter")?;
-        while self.eat_op(".")? {
-            let _ = self.any_ident("configuration parameter component")?;
+        let first = self.col_ident("configuration parameter")?;
+        if !self.eat_op(".")? {
+            return Ok(first);
         }
-        Ok(self.text[start..self.peek_at].trim())
+        let mut bytes = ArenaList::new(self.arena);
+        for byte in first.as_bytes() {
+            bytes
+                .push(*byte)
+                .map_err(|_| self.arena_full("configuration name exceeds SQL arena"))?;
+        }
+        loop {
+            bytes
+                .push(b'.')
+                .map_err(|_| self.arena_full("configuration name exceeds SQL arena"))?;
+            let component = self.col_ident("configuration parameter component")?;
+            for byte in component.as_bytes() {
+                bytes
+                    .push(*byte)
+                    .map_err(|_| self.arena_full("configuration name exceeds SQL arena"))?;
+            }
+            if !self.eat_op(".")? {
+                break;
+            }
+        }
+        Ok(core::str::from_utf8(bytes.as_slice()).expect("decoded configuration name is UTF-8"))
     }
 
     fn routine_privilege_target(
@@ -5135,7 +5152,7 @@ impl<'a> Parser<'a> {
         }
         if self.eat_ident("system")? {
             if self.eat_ident("set")? {
-                let name = self.any_ident("configuration parameter")?;
+                let name = self.configuration_parameter_name()?;
                 if !self.eat_op("=")? {
                     self.expect_ident("to")?;
                 }

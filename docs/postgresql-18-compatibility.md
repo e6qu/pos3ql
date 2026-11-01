@@ -257,6 +257,9 @@ return `22023`, following
 [PostgreSQL's setting rules](https://github.com/postgres/postgres/blob/REL_18_6/src/backend/commands/variable.c#L251)
 and [fixed-offset bounds](https://github.com/postgres/postgres/blob/REL_18_6/src/timezone/localtime.c#L667).
 `NaN` timezone values are unsupported and return `0A000`.
+Timeouts accept at most 2,147,483,647 milliseconds; invalid text and larger values
+return `22023`. Disabled-only timeout settings accept equivalent zero values such
+as `0ms`; enabling them returns `0A000`.
 
 Each cursor reserves `cursor_bytes` for typed rows, `cursor_query_bytes` for its
 query, copied parameters and their

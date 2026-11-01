@@ -1482,11 +1482,13 @@ impl GucState {
     }
 
     pub fn statement_timeout_ms(&self) -> u64 {
-        parse_timeout_ms(self.store.borrow().current.statement_timeout.as_str()).unwrap_or(0)
+        parse_timeout_ms(self.store.borrow().current.statement_timeout.as_str())
+            .expect("stored statement_timeout is validated")
     }
 
     pub fn lock_timeout_ms(&self) -> u64 {
-        parse_timeout_ms(self.store.borrow().current.lock_timeout.as_str()).unwrap_or(0)
+        parse_timeout_ms(self.store.borrow().current.lock_timeout.as_str())
+            .expect("stored lock_timeout is validated")
     }
 
     pub(crate) fn event_triggers(&self) -> bool {
@@ -2149,7 +2151,7 @@ fn apply_setting(
         ));
     }
     if name.eq_ignore_ascii_case("standard_conforming_strings") {
-        if v.eq_ignore_ascii_case("on") {
+        if parse_on_off(v).ok_or_else(|| invalid_setting_value(name, v))? {
             return Ok(());
         }
         return Err(sql_err!(
@@ -2182,7 +2184,7 @@ fn apply_setting(
         return store(&mut values.default_text_search_config, v);
     }
     if name.eq_ignore_ascii_case("default_table_access_method") {
-        if v.eq_ignore_ascii_case("heap") {
+        if v == "heap" {
             return Ok(());
         }
         return Err(sql_err!(
@@ -2218,7 +2220,7 @@ fn apply_setting(
         return store(&mut values.lc_monetary, canonical);
     }
     if name.eq_ignore_ascii_case("synchronize_seqscans") {
-        if v.eq_ignore_ascii_case("off") {
+        if !parse_on_off(v).ok_or_else(|| invalid_setting_value(name, v))? {
             return Ok(());
         }
         return Err(sql_err!(
@@ -2295,7 +2297,7 @@ fn apply_setting(
     {
         // These timeout mechanisms do not run yet, so only the disabled value
         // is honored; a non-zero value would be a silent no-operator.
-        if v == "0" {
+        if parse_timeout_ms(v).ok_or_else(|| invalid_setting_value(name, v))? == 0 {
             return Ok(());
         }
         return Err(sql_err!(
@@ -2528,18 +2530,19 @@ fn owned_setting(values: &GucValues, name: &str) -> Option<StackStr<256>> {
 
 /// Parses a PostgreSQL boolean GUC value (on/off/true/false/1/0), allocation-free.
 fn parse_on_off(v: &str) -> Option<bool> {
-    if ["on", "true", "yes", "1"]
-        .iter()
-        .any(|s| v.eq_ignore_ascii_case(s))
-    {
-        Some(true)
-    } else if ["off", "false", "no", "0"]
-        .iter()
-        .any(|s| v.eq_ignore_ascii_case(s))
-    {
-        Some(false)
-    } else {
-        None
+    if v.is_empty() {
+        return None;
+    }
+    let matches = |word: &str| {
+        word.get(..v.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(v))
+    };
+    let on = ["on", "true", "yes", "1"].into_iter().any(matches);
+    let off = ["off", "false", "no", "0"].into_iter().any(matches);
+    match (on, off) {
+        (true, false) => Some(true),
+        (false, true) => Some(false),
+        _ => None,
     }
 }
 
@@ -2559,9 +2562,9 @@ pub(crate) fn parse_transaction_isolation(v: &str) -> Option<TransactionIsolatio
 
 /// Parses a `statement_timeout` value into milliseconds: a bare integer is
 /// milliseconds, or a `ms`/`s`/`min`/`h`/`d` unit suffix scales it (matching
-/// PostgreSQL). Returns None for a malformed value.
+/// PostgreSQL). Returns None for malformed values or values above i32::MAX.
 fn parse_timeout_ms(v: &str) -> Option<u64> {
-    let t = v.trim().trim_matches('\'').trim();
+    let t = v.trim();
     let (num_part, mult) = if let Some(n) = t.strip_suffix("ms") {
         (n, 1u64)
     } else if let Some(n) = t.strip_suffix("min") {
@@ -2580,6 +2583,7 @@ fn parse_timeout_ms(v: &str) -> Option<u64> {
         .parse::<u64>()
         .ok()
         .and_then(|n| n.checked_mul(mult))
+        .filter(|milliseconds| *milliseconds <= i32::MAX as u64)
 }
 
 // PostgreSQL escapes each non-printable UTF-8 byte, preserving ASCII backslashes.

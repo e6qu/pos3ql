@@ -4292,6 +4292,17 @@ pub fn infer_type_res(
                 columns.validate_explicit_cast(source_oid, target)?;
             }
             if let Some(type_oid) = columns.named_type_oid(type_name) {
+                if matches!(coltype_of_oid(type_oid), Some(ColType::Composite(_)))
+                    && infer_type_res(operand, columns)?.0 == oid::RECORD
+                    && !matches!(operand, Expr::WholeRow(_))
+                    && !matches!(operand, Expr::Call { name, .. } if name.eq_ignore_ascii_case("row"))
+                {
+                    return Err(sql_err!(
+                        sqlstate::CANNOT_COERCE,
+                        "cannot cast type record to {}",
+                        type_name
+                    ));
+                }
                 return Ok((
                     type_oid,
                     coltype_of_oid(type_oid).map_or(-1, ColType::typlen),

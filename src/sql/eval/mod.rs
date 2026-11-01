@@ -2595,6 +2595,56 @@ fn materialize_acl_value<'a>(
     }
 }
 
+/// Only trees proved unable to suspend may omit their own input journal.
+/// An enclosing stored call still records their values in its active journal.
+fn routine_input_handoff(expression: &Expr<'_>, catalog: Option<&dyn CatalogAccess>) -> bool {
+    match expression {
+        Expr::Call {
+            name,
+            bound_oid,
+            args,
+            ..
+        } => {
+            if bound_oid.is_some()
+                || catalog.is_some_and(|catalog| catalog.has_routine_candidate(name, args.len()))
+                || !super::catalog::intrinsic_routine_has_name(name)
+                || super::logical_replication::result_type(
+                    name.strip_prefix("pg_catalog.").unwrap_or(name),
+                    args.len(),
+                )
+                .is_some()
+            {
+                return true;
+            }
+        }
+        // Casts, operators and subqueries can invoke stored code even without
+        // a Call node. Keep their journal until their executable target is bound.
+        Expr::Cast { .. }
+        | Expr::Unary { .. }
+        | Expr::Subquery(_)
+        | Expr::RowSubquery { .. }
+        | Expr::ArraySubquery(_)
+        | Expr::Exists(_)
+        | Expr::InSubquery { .. }
+        | Expr::QuantifiedSubquery { .. } => return true,
+        Expr::Binary { operator, .. }
+            if operator.operator_name().is_some_and(|name| {
+                catalog.is_some_and(|catalog| catalog.has_operator_candidate(name))
+            }) =>
+        {
+            return true;
+        }
+        _ => {}
+    }
+    let mut handoff = false;
+    super::query::walk_children(expression, &mut |child| {
+        handoff |= routine_input_handoff(child, catalog);
+        Ok(())
+    })
+    .expect("input handoff inspection does not evaluate expressions");
+    handoff
+}
+
 pub fn eval_full<'a>(
     expression: &Expr<'a>,
     arena: &'a Arena,
@@ -2659,7 +2709,10 @@ pub fn eval_full<'a>(
             if hooks.srf_index.is_some()
                 && super::query::is_builtin_set_routine(name)
                 && args.iter().all(|argument| matches!(argument, Expr::Param(_))));
-        if matches!(expression, Expr::Call { .. }) && !bound_set_row {
+        if matches!(expression, Expr::Call { .. })
+            && !bound_set_row
+            && routine_input_handoff(expression, hooks.catalog)
+        {
             super::query::input_progress::call(arena, || {
                 let _inputs = super::query::input_progress::enter();
                 run()

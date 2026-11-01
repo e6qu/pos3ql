@@ -47714,7 +47714,11 @@ fn rows_from_view_and_named_routine_parameters_survive_object_cold_recovery() {
              CREATE FUNCTION durable_rows(start_value integer) \
                RETURNS TABLE(item integer, label varchar(4)) LANGUAGE SQL AS \
                $$ SELECT start_value, 'one'::varchar(4) UNION ALL \
-                  SELECT start_value + 1, 'two'::varchar(4) $$",
+                  SELECT start_value + 1, 'two'::varchar(4) $$; \
+             CREATE FUNCTION durable_named_rows(start_value integer) \
+               RETURNS SETOF durable_row_pair LANGUAGE SQL AS \
+               $$ SELECT ROW(start_value, 'one'::varchar(4))::durable_row_pair UNION ALL \
+                  SELECT ROW(start_value + 1, 'two'::varchar(4))::durable_row_pair $$",
         );
         let target_set = run_with(
             &mut engine,
@@ -47759,11 +47763,18 @@ fn rows_from_view_and_named_routine_parameters_survive_object_cold_recovery() {
             let rejected = run_with(&mut engine, &mut budget, statement);
             assert_eq!(error_sqlstates(&rejected), ["42P16"], "{statement}");
         }
+        for statement in [
+            "SELECT durable_rows(9)::durable_row_pair",
+            "CREATE VIEW invalid_record_cast AS SELECT durable_rows(9)::durable_row_pair AS value",
+        ] {
+            let rejected = run_with(&mut engine, &mut budget, statement);
+            assert_eq!(error_sqlstates(&rejected), ["42846"], "{statement}");
+        }
         let target_view = run_with(
             &mut engine,
             &mut budget,
             "CREATE VIEW durable_target_set_view AS \
-               SELECT durable_rows(9)::durable_row_pair AS value, generate_series(30,32) AS generated",
+               SELECT durable_named_rows(9) AS value, generate_series(30,32) AS generated",
         );
         assert!(
             String::from_utf8_lossy(&target_view).contains("CREATE VIEW"),

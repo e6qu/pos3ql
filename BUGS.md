@@ -21,6 +21,9 @@ Argument resumption checks must also compare non-sequence effects, changed
 session settings, selected defaults and replacement timing with PostgreSQL.
 Record expansion checks must also compare argument effects and declared field
 types, including independent calls and shared set-returning producers.
+Keep small-arena index checks in the full gate: repeated nonsuspending builtin
+expressions must not accumulate routine input records. Compare anonymous-record
+casts with PostgreSQL before using a named type to persist function results.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

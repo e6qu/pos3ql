@@ -108,7 +108,10 @@ also stay fixed. Outer-query planning keeps one volatility decision per function
 identity; a replacement body has its own planning scope. A reached call keeps its selected function when an argument
 changes `search_path`; another same-named function cannot take over on resumption.
 The new body is still selected when execution begins.
-Scalar builtins and stored functions use the same input root. Builtin set
+Scalar builtins with inputs that can suspend and stored functions use the same
+input root. Builtin trees proved unable to suspend do not allocate input records;
+repeated index checks such as `lower(label)` keep their existing scratch budget.
+Builtin set
 inputs, including `generate_series(start, stop)`, also keep completed arguments
 when a later input pauses. Input records borrow temporary row values while a
 call runs; only a suspended call encodes its live values into statement memory.
@@ -126,7 +129,9 @@ A single-column `RETURNS TABLE` function yields its column value in a SELECT
 list, while multiple columns yield a record; the binary result type follows the
 same distinction.
 A saved view or table column needs a concrete type: expand `(pair(1)).*` into
-separate columns or cast the record to a named composite type. An anonymous
+separate columns or declare the function's result as a named composite type.
+Casting an anonymous function result directly to a named composite fails with
+`42846`; an explicit `ROW(...)` constructor can supply its fields. An anonymous
 `record` column fails with `42P16`, as required by
 [PostgreSQL's pseudo-type rules](https://www.postgresql.org/docs/18/datatype-pseudo.html).
 For `SELECT (pair(nextval('numbers'))).*`, PostgreSQL expands a scalar call

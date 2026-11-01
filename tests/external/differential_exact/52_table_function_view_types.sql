@@ -1,6 +1,9 @@
 CREATE TYPE record_view_pair AS (item integer,label varchar(4));
 CREATE FUNCTION record_view_rows(start_value integer) RETURNS TABLE(item integer,label varchar(4)) LANGUAGE sql AS $$SELECT start_value,'one'::varchar(4) UNION ALL SELECT start_value+1,'two'::varchar(4)$$;
-CREATE VIEW record_view_values AS SELECT record_view_rows(7)::record_view_pair AS value,generate_series(20,22) AS generated;
+SELECT record_view_rows(7)::record_view_pair;
+CREATE VIEW record_view_invalid_cast AS SELECT record_view_rows(7)::record_view_pair AS value;
+CREATE FUNCTION record_view_named(start_value integer) RETURNS SETOF record_view_pair LANGUAGE sql AS $$SELECT ROW(start_value,'one'::varchar(4))::record_view_pair UNION ALL SELECT ROW(start_value+1,'two'::varchar(4))::record_view_pair$$;
+CREATE VIEW record_view_values AS SELECT record_view_named(7) AS value,generate_series(20,22) AS generated;
 SELECT value,generated FROM record_view_values ORDER BY generated;
 SELECT (value).item,(value).label FROM record_view_values ORDER BY generated;
 CREATE TABLE record_view_copy AS SELECT * FROM record_view_values;
@@ -10,4 +13,5 @@ DROP VIEW record_view_values;
 CREATE VIEW record_view_anonymous AS SELECT record_view_rows(7) AS value;
 CREATE TABLE record_view_anonymous_rows AS SELECT record_view_rows(7) AS value;
 DROP FUNCTION record_view_rows(integer);
+DROP FUNCTION record_view_named(integer);
 DROP TYPE record_view_pair;

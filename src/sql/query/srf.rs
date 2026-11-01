@@ -998,6 +998,7 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
         let Expr::Call {
             name,
             args,
+            argument_names,
             variadic,
             ..
         } = expression
@@ -1273,8 +1274,8 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
                 alias: None,
                 subquery: None,
                 func_args: Some(args),
-                func_argument_names: &[],
-                func_variadic: false,
+                func_argument_names: argument_names,
+                func_variadic: *variadic,
                 rows_from: None,
                 col_alias: None,
                 inheritance: crate::sql::ast::RelationInheritance::Descendants,

@@ -27,6 +27,13 @@ MERGE INTO record_inputs AS target USING (VALUES (4)) AS source(id) ON target.id
 SELECT last_value FROM record_effects;
 SELECT (information_schema._pg_expandarray(ARRAY['a',NULL,'c'])).*;
 SELECT (result.keys).x,(result.keys).n FROM (SELECT information_schema._pg_expandarray(ARRAY['x',NULL,'z']) AS keys) AS result ORDER BY (result.keys).n;
+CREATE FUNCTION record_named_set(value integer,marker text DEFAULT 'default',OUT first_value integer,OUT second_value text) RETURNS SETOF record LANGUAGE sql VOLATILE AS 'SELECT $1,$2';
+CREATE FUNCTION record_variadic_set(VARIADIC values_in integer[]) RETURNS TABLE(value integer,marker integer) LANGUAGE sql VOLATILE AS 'SELECT unnest($1),7';
+SELECT (record_named_set(marker=>'named',value=>7)).*;
+SELECT (record_named_set(value=>8)).*;
+SELECT (record_variadic_set(VARIADIC ARRAY[4,5])).*;
+DROP FUNCTION record_named_set(integer,text);
+DROP FUNCTION record_variadic_set(integer[]);
 DROP TABLE record_inputs;
 DROP FUNCTION record_pair(bigint);
 DROP FUNCTION record_pair(text);

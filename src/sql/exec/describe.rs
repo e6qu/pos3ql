@@ -1067,54 +1067,46 @@ fn describe_record_star<'q>(
                 push,
             )
         }
-        Expr::Call { name, args, .. } if storage.is_some() => {
-            let storage = storage.expect("matched");
+        Expr::Call { .. } if storage.is_some() => {
             let resolver = CatalogCols {
                 definition: def,
                 alias: table_alias,
                 output_aliases,
-                storage,
+                storage: storage.expect("matched"),
                 txid,
                 arena,
             };
-            let mut argument_oids = [oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
-            if args.len() > argument_oids.len() {
-                return Err(sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "too many function arguments"
-                ));
-            }
-            for (index, argument) in args.iter().enumerate() {
-                argument_oids[index] = infer_routine_argument_oid(argument, &resolver)?;
-            }
-            let Some(slot) =
-                storage.routine_slot_for_table_call_oids(name, &argument_oids[..args.len()], txid)
-            else {
-                return Err(sql_err!(
-                    sqlstate::WRONG_OBJECT_TYPE,
-                    "row expansion is not supported on this expression"
-                ));
-            };
-            let routine = storage.routine(slot);
-            let Some(columns) = routine.record_result_columns() else {
-                return Err(sql_err!(
-                    sqlstate::WRONG_OBJECT_TYPE,
-                    "row expansion is not supported on this expression"
-                ));
-            };
-            for column in columns {
-                let name = arena.alloc_str(column.name.as_str()).map_err(|_| {
-                    sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "record description exceeds the statement arena"
-                    )
-                })?;
-                let mut description = ColDesc::of_type(name, column.ctype);
-                if column.ctype.is_collatable() {
-                    description = description.with_collation(crate::sql::ast::Collation::Default);
+            let mut error = None;
+            let width = record_shape_metadata(base, &resolver, |field, meta| {
+                if error.is_some() {
+                    return;
                 }
-                push(description)?;
+                error = arena
+                    .alloc_str(field)
+                    .map_err(|_| {
+                        sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "record description exceeds the statement arena"
+                        )
+                    })
+                    .and_then(|field| {
+                        push(
+                            ColDesc::new(field, meta.type_oid, meta.ctype.typlen())
+                                .with_type_mod(meta.type_mod)
+                                .with_collation(meta.collation),
+                        )
+                    })
+                    .err();
+            })?;
+            if let Some(error) = error {
+                return Err(error);
             }
+            width.ok_or_else(|| {
+                sql_err!(
+                    sqlstate::WRONG_OBJECT_TYPE,
+                    "row expansion is not supported on this expression"
+                )
+            })?;
             Ok(())
         }
         Expr::WholeRow(table)
@@ -2776,6 +2768,12 @@ pub(crate) fn expand_record_call_items<'a>(
     }
     let mut expanded = crate::mem::arena::ArenaList::new(arena);
     for item in items {
+        if expanded.len() == MAX_PROJ {
+            return Err(sql_err!(
+                sqlstate::TOO_MANY_COLUMNS,
+                "target lists can have at most 1664 entries"
+            ));
+        }
         if !expands(item) {
             expanded
                 .push(*item)

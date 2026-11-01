@@ -568,7 +568,11 @@ fn record_call_expansion_preserves_scalar_effects_and_shared_set_producers() {
             "c|3",
             "x|1",
             "NULL|2",
-            "z|3"
+            "z|3",
+            "7|named",
+            "8|default",
+            "4|7",
+            "5|7"
         ]
     );
     for sql in ["SELECT (ARRAY[1,2]).f1", "SELECT (ARRAY[1,2]).x"] {
@@ -576,5 +580,26 @@ fn record_call_expansion_preserves_scalar_effects_and_shared_set_producers() {
             error_sqlstates(&session.execute(&mut engine, sql, true)),
             ["42809"]
         );
+    }
+    session.success(
+        &mut engine,
+        "CREATE FUNCTION capacity_record(OUT x integer,OUT y integer) LANGUAGE sql AS 'SELECT 1,2'",
+        true,
+    );
+    for (additional, state) in [(MAX_PROJ - 2, None), (MAX_PROJ - 1, Some("54011"))] {
+        let mut sql = String::from("SELECT (capacity_record()).*");
+        for _ in 0..additional {
+            sql.push_str(",1");
+        }
+        match state {
+            None => {
+                let output = session.success(&mut engine, &sql, true);
+                assert_eq!(data_rows(&output)[0].split('|').count(), MAX_PROJ);
+            }
+            Some(state) => assert_eq!(
+                error_sqlstates(&session.execute(&mut engine, &sql, true)),
+                [state]
+            ),
+        }
     }
 }

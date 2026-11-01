@@ -710,8 +710,16 @@ pub(crate) struct PendingRoutineInvocation<'a> {
 
 #[derive(Clone, Copy)]
 pub(crate) enum PendingRoutineTarget<'a> {
-    Stored(RoutineCallContract<'a>),
+    Stored(&'a RoutineCallContract<'a>),
     Intrinsic(i32),
+}
+
+#[derive(Clone, Copy)]
+enum RoutineCallResult {
+    Scalar(crate::storage::RoutineResult),
+    Set(crate::storage::RoutineResult),
+    Record { set_returning: bool },
+    Table,
 }
 
 /// Keep the selected SQL types after values have erased domains and
@@ -722,17 +730,31 @@ pub(crate) struct RoutineCallContract<'a> {
     pub oid: i32,
     arguments: &'a [crate::storage::RoutineArgumentDef],
     parameters: &'a [crate::storage::RoutineArgumentDef],
-    kind: crate::storage::RoutineKind,
+    result: RoutineCallResult,
     result_columns: &'a [crate::storage::RoutineArgumentDef],
 }
 
 impl<'a> RoutineCallContract<'a> {
-    fn capture(routine: &crate::storage::RoutineDef, arena: &'a Arena) -> Result<Self, SqlError> {
+    fn capture(routine: &crate::storage::RoutineDef, arena: &'a Arena) -> Result<&'a Self, SqlError> {
         let full = || {
             sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "pending routine type contract exceeds statement memory"
             )
+        };
+        let result = match routine.kind {
+            crate::storage::RoutineKind::Function { result } => RoutineCallResult::Scalar(result),
+            crate::storage::RoutineKind::SetFunction { result } => RoutineCallResult::Set(result),
+            crate::storage::RoutineKind::RecordFunction { set_returning } => {
+                RoutineCallResult::Record { set_returning }
+            }
+            crate::storage::RoutineKind::TableFunction => RoutineCallResult::Table,
+            _ => {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "pending invocation requires a function result contract"
+                ));
+            }
         };
         let arguments = arena
             .alloc_persistent_slice_with(routine.argument_count, |index| routine.arguments[index])
@@ -752,13 +774,17 @@ impl<'a> RoutineCallContract<'a> {
                 routine.result_columns[index]
             })
             .map_err(|_| full())?;
-        Ok(Self {
+        let captured = Self {
             oid: crate::storage::routine_oid(routine),
             arguments,
             parameters,
-            kind: routine.kind,
+            result,
             result_columns,
-        })
+        };
+        let retained = arena
+            .alloc_persistent_slice_with(1, |_| captured)
+            .map_err(|_| full())?;
+        Ok(&retained[0])
     }
 
     pub(crate) fn bind(&self, routine: &mut crate::storage::RoutineDef) -> Result<(), SqlError> {
@@ -777,7 +803,14 @@ impl<'a> RoutineCallContract<'a> {
             parameter.ctype = captured.ctype;
             parameter.user_type = captured.user_type;
         }
-        routine.kind = self.kind;
+        routine.kind = match self.result {
+            RoutineCallResult::Scalar(result) => crate::storage::RoutineKind::Function { result },
+            RoutineCallResult::Set(result) => crate::storage::RoutineKind::SetFunction { result },
+            RoutineCallResult::Record { set_returning } => {
+                crate::storage::RoutineKind::RecordFunction { set_returning }
+            }
+            RoutineCallResult::Table => crate::storage::RoutineKind::TableFunction,
+        };
         routine.result_columns[..self.result_columns.len()].copy_from_slice(self.result_columns);
         Ok(())
     }

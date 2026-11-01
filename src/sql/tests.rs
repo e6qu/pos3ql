@@ -12,6 +12,7 @@ mod cursor_execution;
 mod key_preparation;
 mod object_reads;
 mod query_execution;
+mod routine_calls;
 mod row_history;
 mod row_layout;
 mod table_publication;
@@ -16575,21 +16576,41 @@ fn extension_lifecycle_rejects_invalid_states_and_obeys_dependency_classes() {
             String::from_utf8_lossy(&rejected)
         );
     }
-    assert_eq!(
-        data_rows(&run_with(
-            &mut engine,
-            &mut budget,
+    let member_relation_oid = data_rows(&run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT 'extension_member_foreign'::regclass::oid",
+    ))[0]
+        .parse::<u32>()
+        .unwrap();
+    let dropped_members = run_with(
+        &mut engine,
+        &mut budget,
+        &format!(
             "DROP EXTENSION empty_ext; \
              SELECT count(*) FROM pg_foreign_data_wrapper \
                WHERE fdwname='extension_member_wrapper'; \
              SELECT count(*) FROM pg_foreign_server \
                WHERE srvname='extension_member_server'; \
              SELECT count(*) FROM pg_foreign_table \
-               WHERE ftrelid='extension_member_foreign'::regclass; \
+               WHERE ftrelid={member_relation_oid}::oid; \
              SELECT count(*) FROM pg_event_trigger \
-               WHERE evtname='extension_member_event'",
+               WHERE evtname='extension_member_event'"
+        ),
+    );
+    assert_eq!(
+        data_rows(&dropped_members),
+        ["0", "0", "0", "0"],
+        "{}",
+        String::from_utf8_lossy(&dropped_members)
+    );
+    assert_eq!(
+        error_sqlstates(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT 'extension_member_foreign'::regclass",
         )),
-        ["0", "0", "0", "0"]
+        ["42P01"]
     );
 
     let index_if_exists_dependency = run_with(

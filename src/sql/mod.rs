@@ -13534,7 +13534,7 @@ impl Engine {
                 statement,
                 &self.storage,
                 slot,
-                routine,
+                &routine,
                 txn.txid,
                 arena,
                 arguments,
@@ -13588,7 +13588,7 @@ impl Engine {
                     result_query,
                     &self.storage,
                     slot,
-                    routine,
+                    &routine,
                     txn.txid,
                     &self.work,
                     arguments,
@@ -13624,7 +13624,7 @@ impl Engine {
                     statement,
                     &self.storage,
                     slot,
-                    routine,
+                    &routine,
                     txn.txid,
                     arena,
                     arguments,
@@ -13684,7 +13684,7 @@ impl Engine {
                     statement,
                     &self.storage,
                     slot,
-                    routine,
+                    &routine,
                     txn.txid,
                     arena,
                     arguments,
@@ -14010,7 +14010,7 @@ impl Engine {
                 statement,
                 &self.storage,
                 pending.slot,
-                routine,
+                &routine,
                 txn.txid,
                 arena,
                 &arguments[..pending.argument_count],
@@ -14108,7 +14108,7 @@ impl Engine {
                     result,
                     &self.storage,
                     pending.slot,
-                    routine,
+                    &routine,
                     txn.txid,
                     &self.work,
                     &arguments[..pending.argument_count],
@@ -14144,7 +14144,7 @@ impl Engine {
                     statement,
                     &self.storage,
                     pending.slot,
-                    routine,
+                    &routine,
                     txn.txid,
                     arena,
                     &arguments[..pending.argument_count],
@@ -14199,7 +14199,7 @@ impl Engine {
                     statement,
                     &self.storage,
                     pending.slot,
-                    routine,
+                    &routine,
                     txn.txid,
                     arena,
                     &arguments[..pending.argument_count],
@@ -14492,8 +14492,7 @@ impl Engine {
         transaction_context: exec::PlpgsqlTransactionContext,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
-        let mut values = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
-        if arguments.len() > values.len() {
+        if arguments.len() > crate::storage::MAX_ROUTINE_ARGUMENTS {
             return Ok(Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "too many procedure arguments"
@@ -14519,31 +14518,22 @@ impl Engine {
                 .flatten()
         });
         let catalog = query::storage_catalog(&self.storage, &self.work, txn.txid);
+        let sequences = sequence::SeqEval::new(&self.storage, guc.seq_session(), txn.txid);
         let hooks = EvalHooks {
             catalog: Some(&catalog),
+            sequences: Some(&sequences),
             ..NO_HOOKS
         };
-        for (slot, argument) in arguments.iter().enumerate() {
-            if shape_mapping.is_some_and(|mapping| mapping[slot] == u8::MAX) {
-                continue;
-            }
-            values[slot] = match eval::eval_full(argument, arena, params, &NoColumns, &hooks) {
-                Ok(value) => value,
-                Err(error) => return Ok(Err(error)),
-            };
-        }
         let mut type_oids = [types::oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
         for (slot, argument) in arguments.iter().enumerate() {
             if shape_mapping.is_some_and(|mapping| mapping[slot] == u8::MAX) {
                 continue;
             }
-            type_oids[slot] = match argument {
-                ast::Expr::Cast { type_name, .. } => {
-                    crate::sql::catalog::user_type_oid(&self.storage, txn.txid, type_name)
-                        .unwrap_or_else(|| values[slot].type_oid())
-                }
-                _ => values[slot].type_oid(),
-            };
+            type_oids[slot] =
+                match exec::infer_type_catalog(argument, None, &self.storage, txn.txid, arena) {
+                    Ok((oid, _)) => oid,
+                    Err(error) => return Ok(Err(error)),
+                };
         }
         let slot = if shape_mapping.is_some() {
             shape_slot
@@ -14569,138 +14559,35 @@ impl Engine {
                 qualified.as_str()
             )));
         };
-        if let Err(error) = self.storage.require_routine_execute(slot, txn.txid) {
-            return Ok(Err(error));
-        }
-        let declared = self.storage.routine_for(slot, txn.txid);
+        let mut declared = self.storage.routine_for(slot, txn.txid);
         let mapping = shape_mapping.unwrap_or_else(|| {
             declared
                 .call_input_mapping(argument_names, arguments.len(), variadic)
                 .expect("resolved procedure call has a valid argument mapping")
         });
-        let mut completed = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
-        let mut completed_type_oids = [types::oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
-        let mut provided = [false; crate::storage::MAX_ROUTINE_ARGUMENTS];
-        let mut variadic_values = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
-        let mut variadic_count = 0usize;
-        for call_index in 0..arguments.len() {
-            if mapping[call_index] == u8::MAX {
-                continue;
-            }
-            let input_index = usize::from(mapping[call_index]);
-            if !variadic
-                && matches!(
-                    declared
-                        .parameter_for_input(input_index)
-                        .expect("mapped procedure input has a declared parameter")
-                        .mode,
-                    crate::storage::RoutineParameterMode::Variadic { .. }
-                )
-            {
-                variadic_values[variadic_count] = values[call_index];
-                variadic_count += 1;
-                provided[input_index] = true;
-                continue;
-            }
-            completed[input_index] = values[call_index];
-            completed_type_oids[input_index] = type_oids[call_index];
-            provided[input_index] = true;
-        }
-        if variadic_count != 0 {
-            let input_index = declared.argument_count - 1;
-            let parameter = declared
-                .parameter_for_input(input_index)
-                .expect("variadic procedure input has a declared parameter");
-            let types::ColType::Array(element) = parameter.ctype else {
+        let completed = match catalog.prepare_routine_inputs(
+            slot,
+            &mut declared,
+            query::RoutineCallInputs {
+                arguments,
+                argument_type_oids: &type_oids[..arguments.len()],
+                mapping: &mapping,
+                variadic,
+                context: query::RoutineInputContext::Procedure,
+            },
+            &mut |argument| eval::eval_full(argument, arena, params, &NoColumns, &hooks),
+            arena,
+        ) {
+            Ok(Some(values)) => values,
+            Ok(None) => {
                 return Ok(Err(sql_err!(
                     sqlstate::INTERNAL_ERROR,
-                    "variadic procedure parameter is not an array"
+                    "procedure has an invalid strict input contract"
                 )));
-            };
-            completed[input_index] = Datum::Array {
-                element,
-                raw: match array::build(&variadic_values[..variadic_count], arena) {
-                    Ok(raw) => raw,
-                    Err(error) => return Ok(Err(error)),
-                },
-            };
-            completed_type_oids[input_index] =
-                match self
-                    .storage
-                    .routine_type_oid(parameter.ctype, parameter.user_type, txn.txid)
-                {
-                    Some(oid) => oid,
-                    None => {
-                        return Ok(Err(sql_err!(
-                            sqlstate::INTERNAL_ERROR,
-                            "variadic procedure parameter type identity is unavailable"
-                        )));
-                    }
-                };
-        }
-        for input_index in 0..declared.argument_count {
-            if provided[input_index] {
-                continue;
             }
-            let parameter = declared
-                .parameter_for_input(input_index)
-                .expect("procedure input signature has a declared parameter");
-            completed[input_index] = if let Some(default) = parameter.mode.default() {
-                let source = match arena.alloc_str(default.as_str()) {
-                    Ok(source) => source,
-                    Err(_) => return Ok(Err(eval::arena_full())),
-                };
-                let expression = match parser::parse_expression(source, arena) {
-                    Ok(expression) => expression,
-                    Err(error) => return Ok(Err(error)),
-                };
-                match eval::eval_full(expression, arena, params, &NoColumns, &hooks) {
-                    Ok(value) => match eval::cast_to(value, parameter.ctype, arena) {
-                        Ok(value) => value,
-                        Err(error) => return Ok(Err(error)),
-                    },
-                    Err(error) => return Ok(Err(error)),
-                }
-            } else {
-                return Ok(Err(sql_err!(
-                    sqlstate::INTERNAL_ERROR,
-                    "resolved procedure is missing a required argument"
-                )));
-            };
-            completed_type_oids[input_index] =
-                match self
-                    .storage
-                    .routine_type_oid(parameter.ctype, parameter.user_type, txn.txid)
-                {
-                    Some(oid) => oid,
-                    None => {
-                        return Ok(Err(sql_err!(
-                            sqlstate::INTERNAL_ERROR,
-                            "procedure parameter type identity is unavailable"
-                        )));
-                    }
-                };
-        }
-        let routine = self
-            .storage
-            .routine_for_bound_call(
-                slot,
-                &completed_type_oids[..declared.argument_count],
-                txn.txid,
-            )
-            .expect("resolved procedure call has a valid polymorphic binding");
-        for (index, argument) in routine.arguments().iter().copied().enumerate() {
-            completed[index] = match exec::coerce_routine_argument(
-                completed[index],
-                argument,
-                &self.storage,
-                txn.txid,
-                arena,
-            ) {
-                Ok(value) => value,
-                Err(error) => return Ok(Err(error)),
-            };
-        }
+            Err(error) => return Ok(Err(error)),
+        };
+        let routine = &declared;
         let owner = match self
             .storage
             .capture_role_slot(routine.ownership.owner_to(txn.txid).into(), txn.txid)
@@ -14732,7 +14619,7 @@ impl Engine {
                 } else {
                     exec::PlpgsqlTransactionContext::Atomic
                 },
-                &routine,
+                routine,
                 &completed[..declared.argument_count],
                 arena,
                 responder,
@@ -24640,4 +24527,12 @@ pub(crate) fn test_engine_budget(config: &Config, fixture_bytes: usize) -> Budge
 }
 
 #[cfg(test)]
+impl Engine {
+    pub(crate) fn publication_storage_for_tests(&self) -> &Storage {
+        &self.storage
+    }
+}
+
+// Native SQL fixtures are separate from the ownership tests beside runtime modules.
+#[cfg(all(test, not(miri)))]
 mod tests;

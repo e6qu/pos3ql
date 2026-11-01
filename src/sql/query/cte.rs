@@ -5311,77 +5311,80 @@ fn rewrite_stored_sequence_arguments<'a>(
     context: Subst<'_, 'a, '_, '_>,
     arena: &'a Arena,
 ) -> Result<&'a [&'a Expr<'a>], SqlError> {
-    if !matches!(function, "nextval" | "currval" | "setval") {
-        return Ok(args);
-    }
-    let Some(written) = args.first().and_then(|argument| match argument {
-        Expr::Str(value) => Some(*value),
-        Expr::Cast { operand, .. } | Expr::Collate { operand, .. } => match **operand {
-            Expr::Str(value) => Some(value),
-            _ => None,
-        },
-        _ => None,
-    }) else {
+    let Some(written) = super::dependencies::bound_sequence_literal(function, args) else {
         return Ok(args);
     };
     let Some(dependencies) = context.dependencies else {
         return Ok(args);
     };
-    let (referenced_schema, referenced_name) = written.split_once('.').unwrap_or(("", written));
+    let (referenced_schema, referenced_name) =
+        match crate::sql::identifiers::ObjectReference::parse(written)? {
+            crate::sql::identifiers::ObjectReference::Oid(oid) => (
+                crate::storage::SqlName::EMPTY,
+                crate::storage::SqlName::parse(crate::stack_format!(16, "{}", oid).as_str())?,
+            ),
+            crate::sql::identifiers::ObjectReference::Name(parsed) => (
+                parsed.schema.unwrap_or(crate::storage::SqlName::EMPTY),
+                parsed.name,
+            ),
+        };
     let Some(dependency) = dependencies.entries().iter().find(|dependency| {
         dependency.class == crate::storage::DependencyClass::Sequence
-            && dependency.referenced_schema.as_str() == referenced_schema
-            && dependency.referenced_name.as_str() == referenced_name
+            && dependency.referenced_schema == referenced_schema
+            && dependency.referenced_name == referenced_name
     }) else {
         return Ok(args);
     };
-    let sequence = context
-        .storage
-        .sequence_for(dependency.slot as usize, context.txid);
-    let qualified = crate::stack_format!(
-        128,
-        "{}.{}",
-        sequence.schema.as_str(),
-        sequence.name.as_str()
-    );
-    if qualified.is_truncated() {
-        return Err(sql_err!(
-            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "sequence name is too long"
-        ));
-    }
-    let rendered = arena
-        .alloc_str(qualified.as_str())
+    let oid = crate::sql::catalog::sequence_oid(context.storage, dependency.slot as usize);
+    let rendered = arena.alloc_str_display(oid).map_err(|_| arena_full())?;
+    let operand = arena.alloc(Expr::Str(rendered)).map_err(|_| arena_full())?;
+    let first = arena
+        .alloc(Expr::Cast {
+            operand,
+            type_name: "regclass",
+            type_mod: -1,
+        })
         .map_err(|_| arena_full())?;
-    let first = arena.alloc(Expr::Str(rendered)).map_err(|_| arena_full())?;
     let rewritten = arena.alloc_slice_copy(args).map_err(|_| arena_full())?;
     rewritten[0] = first;
     Ok(rewritten)
 }
 
 fn rewrite_stored_routine_name<'a>(
+    call: &'a Expr<'a>,
     name: &'a str,
-    args: &[&Expr<'a>],
-    argument_names: &[Option<&str>],
-    variadic: bool,
     context: Subst<'_, 'a, '_, '_>,
     arena: &'a Arena,
-) -> Result<&'a str, SqlError> {
+) -> Result<(&'a str, Option<i32>), SqlError> {
+    let Expr::Call {
+        bound_oid,
+        args,
+        argument_names,
+        variadic,
+        ..
+    } = call
+    else {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "stored routine binding requires a call"
+        ));
+    };
+    let bound_oid = *bound_oid;
     let Some(dependencies) = context.dependencies else {
-        return Ok(name);
+        return Ok((name, bound_oid));
     };
     let Some(dependency) = super::dependencies::stored_routine_dependency_for_call(
         name,
         args,
         argument_names,
-        variadic,
+        *variadic,
         context.storage,
         context.txid,
         dependencies,
         arena,
     )?
     else {
-        return Ok(name);
+        return Ok((name, bound_oid));
     };
     let routine = context
         .storage
@@ -5398,9 +5401,10 @@ fn rewrite_stored_routine_name<'a>(
             "routine identity is too long"
         ));
     }
-    arena
+    let name = arena
         .alloc_str(qualified.as_str())
-        .map_err(|_| arena_full())
+        .map_err(|_| arena_full())?;
+    Ok((name, Some(crate::storage::routine_oid(&routine))))
 }
 
 fn rewrite_stored_operator_name<'a>(
@@ -5522,10 +5526,10 @@ fn subst_expr<'a>(
             order_by,
             over,
             filter,
+            ..
         } => {
             let name = rewrite_stored_operator_name(name, args, context, arena)?;
-            let name =
-                rewrite_stored_routine_name(name, args, argument_names, *variadic, context, arena)?;
+            let (name, bound_oid) = rewrite_stored_routine_name(e, name, context, arena)?;
             let mut ob: ArenaList<'a, OrderBy<'a>> = ArenaList::new(arena);
             for o in order_by.iter() {
                 ob.push(OrderBy {
@@ -5571,6 +5575,7 @@ fn subst_expr<'a>(
             let args = rewrite_stored_sequence_arguments(name, args, context, arena)?;
             Expr::Call {
                 name,
+                bound_oid,
                 args,
                 argument_names,
                 variadic: *variadic,

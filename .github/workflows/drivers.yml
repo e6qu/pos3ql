@@ -15,13 +15,18 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  formatting:
+    name: Format Drivers
+    uses: ./.github/workflows/formatting.yml
+
   drivers:
+    needs: formatting
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
     services:
       postgres:
-        image: mirror.gcr.io/library/postgres:18@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336
+        image: mirror.gcr.io/library/postgres:18@sha256:885953109528ad3dfc90362b1a6f50a78620b5315be19f187753d267e484dc5b
         env:
           POSTGRES_HOST_AUTH_METHOD: trust
           # Match pos3ql: C collation, UTF8 encoding.
@@ -43,7 +48,7 @@ jobs:
 
       - name: Enable PostgreSQL prepared transactions and logical replication
         run: |
-          postgres_container=$(docker ps --filter ancestor=mirror.gcr.io/library/postgres:18@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336 --format '{{.ID}}' | head -n 1)
+          postgres_container=$(docker ps --filter ancestor=mirror.gcr.io/library/postgres:18@sha256:885953109528ad3dfc90362b1a6f50a78620b5315be19f187753d267e484dc5b --format '{{.ID}}' | head -n 1)
           test -n "$postgres_container"
           docker exec "$postgres_container" psql -U postgres -X -v ON_ERROR_STOP=1 \
             -c "ALTER SYSTEM SET max_prepared_transactions = 8" \

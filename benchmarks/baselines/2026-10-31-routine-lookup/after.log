@@ -1,0 +1,369 @@
+2026-10-31T20:34:31.7018566Z b0981ab8da792d7629b630af61264d107679d8d0
+2026-10-31T20:34:31.7332266Z ##[group]Run dtolnay/rust-toolchain@master
+2026-10-31T20:34:31.7332468Z with:
+2026-10-31T20:34:31.7332611Z   toolchain: 1.99.1
+2026-10-31T20:34:31.7332776Z   components: llvm-tools-preview
+2026-10-31T20:34:31.7332956Z ##[endgroup]
+2026-10-31T20:34:31.7375589Z ##[start-action display=Parse toolchain version;id=__dtolnay_rust-toolchain.parse]
+2026-10-31T20:34:31.7412932Z ##[group]Run if [[ -z $toolchain ]]; then
+2026-10-31T20:34:31.7413249Z [36;1mif [[ -z $toolchain ]]; then[0m
+2026-10-31T20:34:31.7413587Z [36;1m  # GitHub does not enforce `required: true` inputs itself. https://github.com/actions/runner/issues/1070[0m
+2026-10-31T20:34:31.7413924Z [36;1m  echo "'toolchain' is a required input" >&2[0m
+2026-10-31T20:34:31.7414123Z [36;1m  exit 1[0m
+2026-10-31T20:34:31.7414344Z [36;1melif [[ $toolchain =~ ^stable' '[0-9]+' '(year|month|week|day)s?' 'ago$ ]]; then[0m
+2026-10-31T20:34:31.7414735Z [36;1m  if [[ Linux == macOS ]]; then[0m
+2026-10-31T20:34:31.7415100Z [36;1m    echo "toolchain=1.$((($(date -v-$(sed 's/stable \([0-9]*\) \(.\).*/\1\2/' <<< $toolchain) +%s)/60/60/24-16569)/7/6))" >> $GITHUB_OUTPUT[0m
+2026-10-31T20:34:31.7415411Z [36;1m  else[0m
+2026-10-31T20:34:31.7415669Z [36;1m    echo "toolchain=1.$((($(date --date "${toolchain#stable }" +%s)/60/60/24-16569)/7/6))" >> $GITHUB_OUTPUT[0m
+2026-10-31T20:34:31.7415947Z [36;1m  fi[0m
+2026-10-31T20:34:31.7416151Z [36;1melif [[ $toolchain =~ ^stable' 'minus' '[0-9]+' 'releases?$ ]]; then[0m
+2026-10-31T20:34:31.7416469Z [36;1m  echo "toolchain=1.$((($(date +%s)/60/60/24-16569)/7/6-${toolchain//[^0-9]/}))" >> $GITHUB_OUTPUT[0m
+2026-10-31T20:34:31.7416756Z [36;1melif [[ $toolchain =~ ^1\.[0-9]+$ ]]; then[0m
+2026-10-31T20:34:31.7417072Z [36;1m  echo "toolchain=1.$((i=${toolchain#1.}, c=($(date +%s)/60/60/24-16569)/7/6, i+9*i*(10*i<=c)+90*i*(100*i<=c)))" >> $GITHUB_OUTPUT[0m
+2026-10-31T20:34:31.7417366Z [36;1melse[0m
+2026-10-31T20:34:31.7417510Z [36;1m  delimiter=EOF[0m
+2026-10-31T20:34:31.7417716Z [36;1m  while [[ $toolchain == *$delimiter* ]]; do delimiter+=_; done[0m
+2026-10-31T20:34:31.7418024Z [36;1m  printf 'toolchain<<%s\n%s\n%s\n' "$delimiter" "$toolchain" "$delimiter" >> $GITHUB_OUTPUT[0m
+2026-10-31T20:34:31.7418282Z [36;1mfi[0m
+2026-10-31T20:34:31.7445829Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+2026-10-31T20:34:31.7446060Z env:
+2026-10-31T20:34:31.7446200Z   toolchain: 1.99.1
+2026-10-31T20:34:31.7446351Z ##[endgroup]
+2026-10-31T20:34:31.7523165Z ##[end-action id=__dtolnay_rust-toolchain.parse;outcome=success;conclusion=success;duration_ms=14]
+2026-10-31T20:34:31.7526002Z ##[start-action display=Set $CARGO_HOME;id=__dtolnay_rust-toolchain.__run]
+2026-10-31T20:34:31.7548674Z ##[group]Run echo CARGO_HOME=${CARGO_HOME:-"$HOME/.cargo"} >> $GITHUB_ENV
+2026-10-31T20:34:31.7548974Z [36;1mecho CARGO_HOME=${CARGO_HOME:-"$HOME/.cargo"} >> $GITHUB_ENV[0m
+2026-10-31T20:34:31.7570500Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+2026-10-31T20:34:31.7570711Z ##[endgroup]
+2026-10-31T20:34:31.7612723Z ##[end-action id=__dtolnay_rust-toolchain.__run;outcome=success;conclusion=success;duration_ms=8]
+2026-10-31T20:34:31.7614151Z ##[start-action display=Install rustup if needed;id=__dtolnay_rust-toolchain.__run_2]
+2026-10-31T20:34:31.7631771Z ##[group]Run if ! command -v rustup &>/dev/null; then
+2026-10-31T20:34:31.7632012Z [36;1mif ! command -v rustup &>/dev/null; then[0m
+2026-10-31T20:34:31.7632458Z [36;1m  curl --proto '=https' --tlsv1.2 --retry 10 --retry-connrefused --location --silent --show-error --fail https://sh.rustup.rs | sh -s -- --default-toolchain none -y[0m
+2026-10-31T20:34:31.7632877Z [36;1m  echo "$CARGO_HOME/bin" >> $GITHUB_PATH[0m
+2026-10-31T20:34:31.7633062Z [36;1mfi[0m
+2026-10-31T20:34:31.7653744Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+2026-10-31T20:34:31.7653977Z env:
+2026-10-31T20:34:31.7654124Z   CARGO_HOME: /home/runner/.cargo
+2026-10-31T20:34:31.7654297Z ##[endgroup]
+2026-10-31T20:34:31.7692941Z ##[end-action id=__dtolnay_rust-toolchain.__run_2;outcome=success;conclusion=success;duration_ms=7]
+2026-10-31T20:34:31.7694412Z ##[start-action display=Install rustup if needed on windows;id=__dtolnay_rust-toolchain.__run_3]
+2026-10-31T20:34:31.7698979Z ##[end-action id=__dtolnay_rust-toolchain.__run_3;outcome=skipped;conclusion=skipped;duration_ms=0]
+2026-10-31T20:34:31.7707313Z ##[start-action display=rustup toolchain install 1.99.1;id=__dtolnay_rust-toolchain.__run_4]
+2026-10-31T20:34:31.7720675Z ##[group]Run set -f  # split targets and components on commas and whitespace, without glob expansion
+2026-10-31T20:34:31.7721072Z [36;1mset -f  # split targets and components on commas and whitespace, without glob expansion[0m
+2026-10-31T20:34:31.7721336Z [36;1mflags=()[0m
+2026-10-31T20:34:31.7721519Z [36;1mfor t in ${targets//,/ }; do flags+=(--target "$t"); done[0m
+2026-10-31T20:34:31.7721775Z [36;1mfor c in ${components//,/ }; do flags+=(--component "$c"); done[0m
+2026-10-31T20:34:31.7722087Z [36;1mif [[ $toolchain == nightly && -n $components ]]; then flags+=(--allow-downgrade); fi[0m
+2026-10-31T20:34:31.7722349Z [36;1mlog=$(mktemp)[0m
+2026-10-31T20:34:31.7722514Z [36;1mtrap 'rm -f "$log"' EXIT[0m
+2026-10-31T20:34:31.7722690Z [36;1mfor attempt in 1 2 3 4 5; do[0m
+2026-10-31T20:34:31.7723031Z [36;1m  if rustup toolchain install "$toolchain" "${flags[@]}" --profile minimal --no-self-update --force-non-host 2>&1 | tee "$log"; then[0m
+2026-10-31T20:34:31.7723358Z [36;1m    break[0m
+2026-10-31T20:34:31.7723500Z [36;1m  else[0m
+2026-10-31T20:34:31.7723642Z [36;1m    status=$?[0m
+2026-10-31T20:34:31.7723791Z [36;1m  fi[0m
+2026-10-31T20:34:31.7724007Z [36;1m  if [[ $attempt == 5 ]] || ! grep -Fq 'checksum failed for ' "$log" \[0m
+2026-10-31T20:34:31.7724372Z [36;1m      || ! grep -Fq 'this is likely due to an ongoing update of the official release server' "$log"; then[0m
+2026-10-31T20:34:31.7724865Z [36;1m    exit "$status"[0m
+2026-10-31T20:34:31.7725022Z [36;1m  fi[0m
+2026-10-31T20:34:31.7725252Z [36;1m  echo "Retrying rustup toolchain install in 30 seconds (retry $attempt of 4)" >&2[0m
+2026-10-31T20:34:31.7725507Z [36;1m  sleep 30[0m
+2026-10-31T20:34:31.7725648Z [36;1mdone[0m
+2026-10-31T20:34:31.7747387Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+2026-10-31T20:34:31.7747598Z env:
+2026-10-31T20:34:31.7747740Z   CARGO_HOME: /home/runner/.cargo
+2026-10-31T20:34:31.7747914Z   toolchain: 1.99.1
+2026-10-31T20:34:31.7748058Z   targets: 
+2026-10-31T20:34:31.7748205Z   components: llvm-tools-preview
+2026-10-31T20:34:31.7748380Z   RUSTUP_PERMIT_COPY_RENAME: 1
+2026-10-31T20:34:31.7748541Z ##[endgroup]
+2026-10-31T20:34:31.8113614Z info: syncing channel updates for 1.99.1-x86_64-unknown-linux-gnu
+2026-10-31T20:34:31.9055097Z info: latest update on 2026-10-15 for version 1.99.1 (58cf8f9c3 2026-10-13)
+2026-10-31T20:34:31.9055855Z info: downloading 4 components
+2026-10-31T20:34:39.6647427Z 
+2026-10-31T20:34:39.6701439Z   1.99.1-x86_64-unknown-linux-gnu installed - rustc 1.99.1 (58cf8f9c3 2026-10-13)
+2026-10-31T20:34:39.6701707Z 
+2026-10-31T20:34:39.6927752Z ##[end-action id=__dtolnay_rust-toolchain.__run_4;outcome=success;conclusion=success;duration_ms=7921]
+2026-10-31T20:34:39.6932888Z ##[start-action display=rustup default 1.99.1;id=__dtolnay_rust-toolchain.__run_5]
+2026-10-31T20:34:39.6945638Z ##[group]Run rustup default "$toolchain" --force-non-host
+2026-10-31T20:34:39.6945892Z [36;1mrustup default "$toolchain" --force-non-host[0m
+2026-10-31T20:34:39.6969013Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+2026-10-31T20:34:39.6969190Z env:
+2026-10-31T20:34:39.6969306Z   CARGO_HOME: /home/runner/.cargo
+2026-10-31T20:34:39.6969448Z   toolchain: 1.99.1
+2026-10-31T20:34:39.6969564Z ##[endgroup]
+2026-10-31T20:34:39.7036582Z info: using existing install for 1.99.1-x86_64-unknown-linux-gnu
+2026-10-31T20:34:39.7044115Z info: default toolchain set to 1.99.1-x86_64-unknown-linux-gnu
+2026-10-31T20:34:39.7044280Z 
+2026-10-31T20:34:39.7093821Z   1.99.1-x86_64-unknown-linux-gnu unchanged - rustc 1.99.1 (58cf8f9c3 2026-10-13)
+2026-10-31T20:34:39.7094131Z 
+2026-10-31T20:34:39.7108446Z ##[end-action id=__dtolnay_rust-toolchain.__run_5;outcome=success;conclusion=success;duration_ms=17]
+2026-10-31T20:34:39.7110716Z ##[start-action display=Create cachekey;id=__dtolnay_rust-toolchain.rustc-version]
+2026-10-31T20:34:39.7121719Z ##[group]Run DATE=$(rustc +"$toolchain" --version --verbose | sed -ne 's/^commit-date: \(20[0-9][0-9]\)-\([01][0-9]\)-\([0-3][0-9]\)$/\1\2\3/p')
+2026-10-31T20:34:39.7122192Z [36;1mDATE=$(rustc +"$toolchain" --version --verbose | sed -ne 's/^commit-date: \(20[0-9][0-9]\)-\([01][0-9]\)-\([0-3][0-9]\)$/\1\2\3/p')[0m
+2026-10-31T20:34:39.7122544Z [36;1mHASH=$(rustc +"$toolchain" --version --verbose | sed -ne 's/^commit-hash: //p')[0m
+2026-10-31T20:34:39.7122814Z [36;1mecho "cachekey=$(echo $DATE$HASH | head -c12)" >> $GITHUB_OUTPUT[0m
+2026-10-31T20:34:39.7142780Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+2026-10-31T20:34:39.7142955Z env:
+2026-10-31T20:34:39.7143106Z   CARGO_HOME: /home/runner/.cargo
+2026-10-31T20:34:39.7143241Z   toolchain: 1.99.1
+2026-10-31T20:34:39.7143357Z ##[endgroup]
+2026-10-31T20:34:39.7377831Z ##[end-action id=__dtolnay_rust-toolchain.rustc-version;outcome=success;conclusion=success;duration_ms=26]
+2026-10-31T20:34:39.7379435Z ##[start-action display=Disable incremental compilation;id=__dtolnay_rust-toolchain.__run_6]
+2026-10-31T20:34:39.7391233Z ##[group]Run if [ -z "${CARGO_INCREMENTAL+set}" ]; then
+2026-10-31T20:34:39.7391441Z [36;1mif [ -z "${CARGO_INCREMENTAL+set}" ]; then[0m
+2026-10-31T20:34:39.7391617Z [36;1m  echo CARGO_INCREMENTAL=0 >> $GITHUB_ENV[0m
+2026-10-31T20:34:39.7391844Z [36;1mfi[0m
+2026-10-31T20:34:39.7412592Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+2026-10-31T20:34:39.7412772Z env:
+2026-10-31T20:34:39.7412884Z   CARGO_HOME: /home/runner/.cargo
+2026-10-31T20:34:39.7413023Z ##[endgroup]
+2026-10-31T20:34:39.7465786Z ##[end-action id=__dtolnay_rust-toolchain.__run_6;outcome=success;conclusion=success;duration_ms=8]
+2026-10-31T20:34:39.7467043Z ##[start-action display=Enable colors in Cargo output;id=__dtolnay_rust-toolchain.__run_7]
+2026-10-31T20:34:39.7477842Z ##[group]Run if [ -z "${CARGO_TERM_COLOR+set}" ]; then
+2026-10-31T20:34:39.7478055Z [36;1mif [ -z "${CARGO_TERM_COLOR+set}" ]; then[0m
+2026-10-31T20:34:39.7478239Z [36;1m  echo CARGO_TERM_COLOR=always >> $GITHUB_ENV[0m
+2026-10-31T20:34:39.7478397Z [36;1mfi[0m
+2026-10-31T20:34:39.7497348Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+2026-10-31T20:34:39.7497520Z env:
+2026-10-31T20:34:39.7497636Z   CARGO_HOME: /home/runner/.cargo
+2026-10-31T20:34:39.7497777Z   CARGO_INCREMENTAL: 0
+2026-10-31T20:34:39.7497897Z ##[endgroup]
+2026-10-31T20:34:39.7533165Z ##[end-action id=__dtolnay_rust-toolchain.__run_7;outcome=success;conclusion=success;duration_ms=6]
+2026-10-31T20:34:39.7535434Z ##[start-action display=Enable Cargo sparse registry;id=__dtolnay_rust-toolchain.__run_8]
+2026-10-31T20:34:39.7547069Z ##[group]Run # implemented in 1.66, stabilized in 1.68, made default in 1.70
+2026-10-31T20:34:39.7547342Z [36;1m# implemented in 1.66, stabilized in 1.68, made default in 1.70[0m
+2026-10-31T20:34:39.7547708Z [36;1mif [ -z "${CARGO_REGISTRIES_CRATES_IO_PROTOCOL+set}" -o -f "/home/runner/work/_temp"/.implicit_cargo_registries_crates_io_protocol ]; then[0m
+2026-10-31T20:34:39.7548186Z [36;1m  if rustc +"$toolchain" --version --verbose | grep -q '^release: 1\.6[89]\.'; then[0m
+2026-10-31T20:34:39.7548493Z [36;1m    touch "/home/runner/work/_temp"/.implicit_cargo_registries_crates_io_protocol || true[0m
+2026-10-31T20:34:39.7548782Z [36;1m    echo CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse >> $GITHUB_ENV[0m
+2026-10-31T20:34:39.7549056Z [36;1m  elif rustc +"$toolchain" --version --verbose | grep -q '^release: 1\.6[67]\.'; then[0m
+2026-10-31T20:34:39.7549363Z [36;1m    touch "/home/runner/work/_temp"/.implicit_cargo_registries_crates_io_protocol || true[0m
+2026-10-31T20:34:39.7549641Z [36;1m    echo CARGO_REGISTRIES_CRATES_IO_PROTOCOL=git >> $GITHUB_ENV[0m
+2026-10-31T20:34:39.7549914Z [36;1m  fi[0m
+2026-10-31T20:34:39.7550022Z [36;1mfi[0m
+2026-10-31T20:34:39.7569096Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+2026-10-31T20:34:39.7569270Z env:
+2026-10-31T20:34:39.7569392Z   CARGO_HOME: /home/runner/.cargo
+2026-10-31T20:34:39.7569530Z   CARGO_INCREMENTAL: 0
+2026-10-31T20:34:39.7569655Z   CARGO_TERM_COLOR: always
+2026-10-31T20:34:39.7569780Z   toolchain: 1.99.1
+2026-10-31T20:34:39.7569900Z ##[endgroup]
+2026-10-31T20:34:39.7768961Z ##[end-action id=__dtolnay_rust-toolchain.__run_8;outcome=success;conclusion=success;duration_ms=23]
+2026-10-31T20:34:39.7771200Z ##[start-action display=Work around spurious network errors in curl 8.0;id=__dtolnay_rust-toolchain.__run_9]
+2026-10-31T20:34:39.7782268Z ##[group]Run # https://rust-lang.zulipchat.com/#narrow/stream/246057-t-cargo/topic/timeout.20investigation
+2026-10-31T20:34:39.7782680Z [36;1m# https://rust-lang.zulipchat.com/#narrow/stream/246057-t-cargo/topic/timeout.20investigation[0m
+2026-10-31T20:34:39.7783016Z [36;1mif rustc +"$toolchain" --version --verbose | grep -q '^release: 1\.7[01]\.'; then[0m
+2026-10-31T20:34:39.7783267Z [36;1m  echo CARGO_HTTP_MULTIPLEXING=false >> $GITHUB_ENV[0m
+2026-10-31T20:34:39.7783443Z [36;1mfi[0m
+2026-10-31T20:34:39.7803497Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+2026-10-31T20:34:39.7803673Z env:
+2026-10-31T20:34:39.7803789Z   CARGO_HOME: /home/runner/.cargo
+2026-10-31T20:34:39.7803929Z   CARGO_INCREMENTAL: 0
+2026-10-31T20:34:39.7804054Z   CARGO_TERM_COLOR: always
+2026-10-31T20:34:39.7804178Z   toolchain: 1.99.1
+2026-10-31T20:34:39.7804295Z ##[endgroup]
+2026-10-31T20:34:39.7919174Z ##[end-action id=__dtolnay_rust-toolchain.__run_9;outcome=success;conclusion=success;duration_ms=14]
+2026-10-31T20:34:39.7921745Z ##[start-action display=rustc +1.99.1 --version --verbose;id=__dtolnay_rust-toolchain.__run_10]
+2026-10-31T20:34:39.7932339Z ##[group]Run rustc +"$toolchain" --version --verbose
+2026-10-31T20:34:39.7932551Z [36;1mrustc +"$toolchain" --version --verbose[0m
+2026-10-31T20:34:39.7952130Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+2026-10-31T20:34:39.7952302Z env:
+2026-10-31T20:34:39.7952416Z   CARGO_HOME: /home/runner/.cargo
+2026-10-31T20:34:39.7952567Z   CARGO_INCREMENTAL: 0
+2026-10-31T20:34:39.7952695Z   CARGO_TERM_COLOR: always
+2026-10-31T20:34:39.7952819Z   toolchain: 1.99.1
+2026-10-31T20:34:39.7952932Z ##[endgroup]
+2026-10-31T20:34:39.8055740Z rustc 1.99.1 (58cf8f9c3 2026-10-13)
+2026-10-31T20:34:39.8055979Z binary: rustc
+2026-10-31T20:34:39.8056193Z commit-hash: 58cf8f9c35b355199727627d07ae34a4e2846d67
+2026-10-31T20:34:39.8056468Z commit-date: 2026-10-13
+2026-10-31T20:34:39.8056666Z host: x86_64-unknown-linux-gnu
+2026-10-31T20:34:39.8056864Z release: 1.99.1
+2026-10-31T20:34:39.8057153Z LLVM version: 23.1.1
+2026-10-31T20:34:39.8066846Z ##[end-action id=__dtolnay_rust-toolchain.__run_10;outcome=success;conclusion=success;duration_ms=14]
+2026-10-31T20:34:39.8143916Z ##[group]Run taiki-e/install-action@v2
+2026-10-31T20:34:39.8144068Z with:
+2026-10-31T20:34:39.8144181Z   tool: cargo-llvm-cov@0.9.1
+2026-10-31T20:34:39.8144307Z   checksum: true
+2026-10-31T20:34:39.8144412Z   fallback: none
+2026-10-31T20:34:39.8144699Z env:
+2026-10-31T20:34:39.8144933Z   CARGO_HOME: /home/runner/.cargo
+2026-10-31T20:34:39.8145071Z   CARGO_INCREMENTAL: 0
+2026-10-31T20:34:39.8145189Z   CARGO_TERM_COLOR: always
+2026-10-31T20:34:39.8145309Z ##[endgroup]
+2026-10-31T20:34:39.8149654Z ##[start-action display=Run bail() {;id=__taiki-e_install-action.__run]
+2026-10-31T20:34:39.8160550Z ##[group]Run bail() {
+2026-10-31T20:34:39.8160702Z [36;1mbail() {[0m
+2026-10-31T20:34:39.8160842Z [36;1m  printf '::error::install-action: %s\n' "$*"[0m
+2026-10-31T20:34:39.8161002Z [36;1m  exit 1[0m
+2026-10-31T20:34:39.8161110Z [36;1m}[0m
+2026-10-31T20:34:39.8161302Z [36;1m# If /bin/sh is dash, environment variable containing % is not imported, but is fine[0m
+2026-10-31T20:34:39.8161605Z [36;1m# because it also means that it will not be exposed to subprocess.[0m
+2026-10-31T20:34:39.8161834Z [36;1mif /usr/bin/env | grep -Eq '^BASH_FUNC_'; then[0m
+2026-10-31T20:34:39.8162113Z [36;1m  bail 'bash function injection via BASH_FUNC_ environment variable is not allowed for security reasons'[0m
+2026-10-31T20:34:39.8162375Z [36;1mfi[0m
+2026-10-31T20:34:39.8162497Z [36;1mif ! command -v bash >/dev/null; then[0m
+2026-10-31T20:34:39.8162680Z [36;1m  if grep -Eq '^ID=alpine' /etc/os-release; then[0m
+2026-10-31T20:34:39.8162918Z [36;1m    printf '::group::Install packages required for install-action (bash)\n'[0m
+2026-10-31T20:34:39.8163150Z [36;1m    # NB: sync with apk_install in main.sh[0m
+2026-10-31T20:34:39.8163324Z [36;1m    if command -v sudo >/dev/null; then[0m
+2026-10-31T20:34:39.8163491Z [36;1m      sudo apk --no-cache add bash[0m
+2026-10-31T20:34:39.8163659Z [36;1m    elif command -v doas >/dev/null; then[0m
+2026-10-31T20:34:39.8163828Z [36;1m      doas apk --no-cache add bash[0m
+2026-10-31T20:34:39.8163970Z [36;1m    else[0m
+2026-10-31T20:34:39.8164091Z [36;1m      apk --no-cache add bash[0m
+2026-10-31T20:34:39.8164227Z [36;1m    fi[0m
+2026-10-31T20:34:39.8164353Z [36;1m    printf '::endgroup::\n'[0m
+2026-10-31T20:34:39.8164653Z [36;1m  else[0m
+2026-10-31T20:34:39.8164807Z [36;1m    bail 'this action requires bash'[0m
+2026-10-31T20:34:39.8164956Z [36;1m  fi[0m
+2026-10-31T20:34:39.8165059Z [36;1mfi[0m
+2026-10-31T20:34:39.8165213Z [36;1mbash --noprofile --norc "${GITHUB_ACTION_PATH:?}/main.sh"[0m
+2026-10-31T20:34:39.8165815Z shell: /usr/bin/env -u ENV -u BASH_ENV -u CDPATH -u SHELLOPTS -u BASHOPTS /bin/sh -eu {0}
+2026-10-31T20:34:39.8166027Z env:
+2026-10-31T20:34:39.8166141Z   CARGO_HOME: /home/runner/.cargo
+2026-10-31T20:34:39.8166283Z   CARGO_INCREMENTAL: 0
+2026-10-31T20:34:39.8166407Z   CARGO_TERM_COLOR: always
+2026-10-31T20:34:39.8166540Z   INPUT_TOOL: cargo-llvm-cov@0.9.1
+2026-10-31T20:34:39.8166679Z   INPUT_CHECKSUM: true
+2026-10-31T20:34:39.8166804Z   INPUT_FALLBACK: none
+2026-10-31T20:34:39.8166924Z   DEFAULT_GITHUB_TOKEN: 
+2026-10-31T20:34:39.8167070Z   ACTION_USER_AGENT: taiki-e/install-action (v2)
+2026-10-31T20:34:39.8167224Z   RUNNER_OS: Linux
+2026-10-31T20:34:39.8167332Z   RUNNER_ARCH: X64
+2026-10-31T20:34:39.8167460Z ##[endgroup]
+2026-10-31T20:34:39.8288940Z info: host platform: x86_64_linux
+2026-10-31T20:34:39.8398168Z info: installing cargo-llvm-cov@0.9.1
+2026-10-31T20:34:39.8560178Z info: downloading https://github.com/taiki-e/cargo-llvm-cov/releases/download/v0.9.1/cargo-llvm-cov-x86_64-unknown-linux-musl.tar.gz
+2026-10-31T20:34:40.1358635Z info: verifying sha256 checksum for cargo-llvm-cov-x86_64-unknown-linux-musl.tar.gz
+2026-10-31T20:34:40.1609389Z info: cargo-llvm-cov installed at /home/runner/.cargo/bin/cargo-llvm-cov
+2026-10-31T20:34:40.1611983Z + cargo-llvm-cov llvm-cov --version
+2026-10-31T20:34:40.1616371Z cargo-llvm-cov 0.9.1
+2026-10-31T20:34:40.1617752Z 
+2026-10-31T20:34:40.1627000Z ##[end-action id=__taiki-e_install-action.__run;outcome=success;conclusion=success;duration_ms=347]
+2026-10-31T20:34:40.1630895Z ##[start-action display=Run Set-StrictMode -Version Latest;id=__taiki-e_install-action.__run_2]
+2026-10-31T20:34:40.1633023Z ##[end-action id=__taiki-e_install-action.__run_2;outcome=skipped;conclusion=skipped;duration_ms=0]
+2026-10-31T20:34:40.1650683Z ##[group]Run git rev-parse HEAD
+2026-10-31T20:34:40.1650871Z [36;1mgit rev-parse HEAD[0m
+2026-10-31T20:34:40.1651006Z [36;1mrustc -vV[0m
+2026-10-31T20:34:40.1651120Z [36;1mcargo -V[0m
+2026-10-31T20:34:40.1651229Z [36;1mnproc[0m
+2026-10-31T20:34:40.1651336Z [36;1mfree -m[0m
+2026-10-31T20:34:40.1651458Z [36;1mdf -h "$GITHUB_WORKSPACE"[0m
+2026-10-31T20:34:40.1676035Z shell: /usr/bin/bash -e {0}
+2026-10-31T20:34:40.1676171Z env:
+2026-10-31T20:34:40.1676288Z   CARGO_HOME: /home/runner/.cargo
+2026-10-31T20:34:40.1676428Z   CARGO_INCREMENTAL: 0
+2026-10-31T20:34:40.1676554Z   CARGO_TERM_COLOR: always
+2026-10-31T20:34:40.1676682Z ##[endgroup]
+2026-10-31T20:34:40.1719117Z b0981ab8da792d7629b630af61264d107679d8d0
+2026-10-31T20:34:40.1801687Z rustc 1.99.1 (58cf8f9c3 2026-10-13)
+2026-10-31T20:34:40.1801928Z binary: rustc
+2026-10-31T20:34:40.1802103Z commit-hash: 58cf8f9c35b355199727627d07ae34a4e2846d67
+2026-10-31T20:34:40.1802460Z commit-date: 2026-10-13
+2026-10-31T20:34:40.1802729Z host: x86_64-unknown-linux-gnu
+2026-10-31T20:34:40.1802900Z release: 1.99.1
+2026-10-31T20:34:40.1803016Z LLVM version: 23.1.1
+2026-10-31T20:34:40.1873815Z cargo 1.99.1 (5f94df478 2026-08-27)
+2026-10-31T20:34:40.1897740Z 4
+2026-10-31T20:34:40.1910505Z                total        used        free      shared  buff/cache   available
+2026-10-31T20:34:40.1910897Z Mem:           15983        1156       13391          45        1774       14826
+2026-10-31T20:34:40.1911197Z Swap:           3071           0        3071
+2026-10-31T20:34:40.1925352Z Filesystem      Size  Used Avail Use% Mounted on
+2026-10-31T20:34:40.1925639Z /dev/root       145G   58G   87G  40% /
+2026-10-31T20:34:40.1949217Z ##[group]Run coverage_environment=$(cargo llvm-cov show-env --sh)
+2026-10-31T20:34:40.1949615Z [36;1mcoverage_environment=$(cargo llvm-cov show-env --sh)[0m
+2026-10-31T20:34:40.1995323Z [36;1meval "$coverage_environment"[0m
+2026-10-31T20:34:40.1995642Z [36;1mcargo test --lib --release --locked --no-run[0m
+2026-10-31T20:34:40.2020144Z shell: /usr/bin/bash -e {0}
+2026-10-31T20:34:40.2020288Z env:
+2026-10-31T20:34:40.2020401Z   CARGO_HOME: /home/runner/.cargo
+2026-10-31T20:34:40.2020542Z   CARGO_INCREMENTAL: 0
+2026-10-31T20:34:40.2020660Z   CARGO_TERM_COLOR: always
+2026-10-31T20:34:40.2020781Z ##[endgroup]
+2026-10-31T20:34:40.2552140Z info: cargo-llvm-cov currently setting cfg(coverage); you can opt-out it by passing --no-cfg-coverage
+2026-10-31T20:34:40.2941874Z [1m[92m    Updating[0m crates.io index
+2026-10-31T20:34:40.3968734Z [1m[92m Downloading[0m crates ...
+2026-10-31T20:34:40.4658387Z [1m[92m  Downloaded[0m getrandom v0.2.17
+2026-10-31T20:34:40.4727576Z [1m[92m  Downloaded[0m cfg-if v1.0.4
+2026-10-31T20:34:40.4740906Z [1m[92m  Downloaded[0m subtle v2.6.1
+2026-10-31T20:34:40.4750210Z [1m[92m  Downloaded[0m webpki-roots v0.26.11
+2026-10-31T20:34:40.4763711Z [1m[92m  Downloaded[0m untrusted v0.9.0
+2026-10-31T20:34:40.4778983Z [1m[92m  Downloaded[0m find-msvc-tools v0.1.9
+2026-10-31T20:34:40.4836316Z [1m[92m  Downloaded[0m cc v1.4.0
+2026-10-31T20:34:40.4864219Z [1m[92m  Downloaded[0m zeroize v1.9.0
+2026-10-31T20:34:40.4879984Z [1m[92m  Downloaded[0m shlex v2.0.1
+2026-10-31T20:34:40.4891964Z [1m[92m  Downloaded[0m rustls-pki-types v1.15.1
+2026-10-31T20:34:40.4916274Z [1m[92m  Downloaded[0m once_cell v1.21.4
+2026-10-31T20:34:40.4945619Z [1m[92m  Downloaded[0m rustls-webpki v0.103.13
+2026-10-31T20:34:40.4978577Z [1m[92m  Downloaded[0m webpki-roots v1.0.9
+2026-10-31T20:34:40.5025238Z [1m[92m  Downloaded[0m rustls v0.23.42
+2026-10-31T20:34:40.5142368Z [1m[92m  Downloaded[0m libc v0.2.186
+2026-10-31T20:34:40.5396999Z [1m[92m  Downloaded[0m ring v0.17.14
+2026-10-31T20:34:40.5839495Z [1m[92m   Compiling[0m shlex v2.0.1
+2026-10-31T20:34:40.5839942Z [1m[92m   Compiling[0m find-msvc-tools v0.1.9
+2026-10-31T20:34:40.5849349Z [1m[92m   Compiling[0m libc v0.2.186
+2026-10-31T20:34:40.5849840Z [1m[92m   Compiling[0m zeroize v1.9.0
+2026-10-31T20:34:40.6557409Z [1m[92m   Compiling[0m cc v1.4.0
+2026-10-31T20:34:40.6558270Z [1m[92m   Compiling[0m rustls-pki-types v1.15.1
+2026-10-31T20:34:40.6775621Z [1m[92m   Compiling[0m cfg-if v1.0.4
+2026-10-31T20:34:40.7005981Z [1m[92m   Compiling[0m untrusted v0.9.0
+2026-10-31T20:34:40.7816600Z [1m[92m   Compiling[0m rustls v0.23.42
+2026-10-31T20:34:40.8349916Z [1m[92m   Compiling[0m once_cell v1.21.4
+2026-10-31T20:34:40.9467013Z [1m[92m   Compiling[0m webpki-roots v1.0.9
+2026-10-31T20:34:40.9873954Z [1m[92m   Compiling[0m pos3ql v0.1.0 (/home/runner/work/pos3ql/pos3ql)
+2026-10-31T20:34:41.0485856Z [1m[92m   Compiling[0m subtle v2.6.1
+2026-10-31T20:34:41.1151436Z [1m[92m   Compiling[0m webpki-roots v0.26.11
+2026-10-31T20:34:41.2862424Z [1m[92m   Compiling[0m ring v0.17.14
+2026-10-31T20:34:41.3394740Z [1m[92m   Compiling[0m getrandom v0.2.17
+2026-10-31T20:34:46.3217541Z [1m[92m   Compiling[0m rustls-webpki v0.103.13
+2026-10-31T20:37:54.9365718Z [1m[92m    Finished[0m `release` profile [optimized] target(s) in 3m 14s
+2026-10-31T20:37:54.9409810Z [1m[92m  Executable[0m unittests src/lib.rs (target/release/deps/pos3ql-4a2cbda25627a85f)
+2026-10-31T20:37:54.9494317Z ##[group]Run coverage_environment=$(cargo llvm-cov show-env --sh)
+2026-10-31T20:37:54.9494836Z [36;1mcoverage_environment=$(cargo llvm-cov show-env --sh)[0m
+2026-10-31T20:37:54.9495032Z [36;1meval "$coverage_environment"[0m
+2026-10-31T20:37:54.9495220Z [36;1m/usr/bin/time -v python3 tools/test_command.py \[0m
+2026-10-31T20:37:54.9495442Z [36;1m  cargo test --lib --release --locked -- \[0m
+2026-10-31T20:37:54.9495730Z [36;1m  --exact sql::tests::remaining_execution_widths_are_allocation_free_and_survive_cold_recovery \[0m
+2026-10-31T20:37:54.9495992Z [36;1m  --test-threads=1[0m
+2026-10-31T20:37:54.9520657Z shell: /usr/bin/bash -e {0}
+2026-10-31T20:37:54.9520797Z env:
+2026-10-31T20:37:54.9520915Z   CARGO_HOME: /home/runner/.cargo
+2026-10-31T20:37:54.9521063Z   CARGO_INCREMENTAL: 0
+2026-10-31T20:37:54.9521190Z   CARGO_TERM_COLOR: always
+2026-10-31T20:37:54.9521336Z ##[endgroup]
+2026-10-31T20:37:55.0083564Z info: cargo-llvm-cov currently setting cfg(coverage); you can opt-out it by passing --no-cfg-coverage
+2026-10-31T20:37:55.0945414Z [1m[92m    Finished[0m `release` profile [optimized] target(s) in 0.01s
+2026-10-31T20:37:55.0952994Z [1m[92m     Running[0m unittests src/lib.rs (target/release/deps/pos3ql-4a2cbda25627a85f)
+2026-10-31T20:37:55.0982890Z 
+2026-10-31T20:37:55.0983096Z running 1 test
+2026-10-31T20:38:14.9156492Z test sql::tests::remaining_execution_widths_are_allocation_free_and_survive_cold_recovery ... ok
+2026-10-31T20:38:14.9156932Z 
+2026-10-31T20:38:14.9157188Z test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2925 filtered out; finished in 19.82s
+2026-10-31T20:38:14.9157512Z 
+2026-10-31T20:38:14.9402790Z 	Command being timed: "python3 tools/test_command.py cargo test --lib --release --locked -- --exact sql::tests::remaining_execution_widths_are_allocation_free_and_survive_cold_recovery --test-threads=1"
+2026-10-31T20:38:14.9403336Z 	User time (seconds): 19.50
+2026-10-31T20:38:14.9403551Z 	System time (seconds): 0.18
+2026-10-31T20:38:14.9403797Z 	Percent of CPU this job got: 99%
+2026-10-31T20:38:14.9404093Z 	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:19.88
+2026-10-31T20:38:14.9406260Z 	Average shared text size (kbytes): 0
+2026-10-31T20:38:14.9406496Z 	Average unshared data size (kbytes): 0
+2026-10-31T20:38:14.9406674Z 	Average stack size (kbytes): 0
+2026-10-31T20:38:14.9406826Z 	Average total size (kbytes): 0
+2026-10-31T20:38:14.9406985Z 	Maximum resident set size (kbytes): 266344
+2026-10-31T20:38:14.9407163Z 	Average resident set size (kbytes): 0
+2026-10-31T20:38:14.9407339Z 	Major (requiring I/O) page faults: 0
+2026-10-31T20:38:14.9407518Z 	Minor (reclaiming a frame) page faults: 89744
+2026-10-31T20:38:14.9407702Z 	Voluntary context switches: 486
+2026-10-31T20:38:14.9407861Z 	Involuntary context switches: 122
+2026-10-31T20:38:14.9408008Z 	Swaps: 0
+2026-10-31T20:38:14.9408529Z 	File system inputs: 3480
+2026-10-31T20:38:14.9409194Z 	File system outputs: 15648
+2026-10-31T20:38:14.9409412Z 	Socket messages sent: 0
+2026-10-31T20:38:14.9409641Z 	Socket messages received: 0
+2026-10-31T20:38:14.9409858Z 	Signals delivered: 0
+2026-10-31T20:38:14.9410051Z 	Page size (bytes): 4096
+2026-10-31T20:38:14.9410252Z 	Exit status: 0

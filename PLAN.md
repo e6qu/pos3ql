@@ -40,8 +40,11 @@ maximum row history independently for every possible table.
 Audit PostgreSQL 18 built-ins by signature and executable behavior. Catalog
 presence alone is not support. Compare values, declared result types, nulls,
 errors and argument effects with PostgreSQL, including seeded hashes.
-Registered routine identities, aggregate kinds and null-call properties must
-match the live reference catalog even while missing routines are being added.
+Retained calls must preserve the selected function, converted inputs, omitted
+defaults and the next input position across storage waits. Reuse the shared
+input preparation for scalar functions, table functions and procedures, preserving
+each context's conversion and strict-null rules. The [architecture](docs/architecture.md)
+describes the implemented binding and one-time set-input behavior.
 Run real SQLAlchemy, Alembic and psycopg2 workflows against both servers.
 Keep their catalog inspection, declared types, streaming and migration checks
 passing as function binding and execution expand; see the
@@ -51,18 +54,12 @@ embedded databases; report the per-table contribution separately. Verify that
 unused wide definition slots stay untouched while live readers prevent slot reuse.
 Remove avoidable per-table metadata reservations through shared startup-owned
 capacity, preserving stable reader identities, rollback and named exhaustion.
-Reserve needed row history before the durable commit boundary; a smaller shared
-pool must never fail for capacity after the commit is already durable.
-The explicit shared `row_history_slots` pool owns capacity with each pending row
-chain. Verify competing transactions, later readers, savepoint undo, prepared
-commit/rollback and cold restoration before closing this memory gate.
-Reclaim obsolete row images while newer readers remain active. A full pool may
-perform one bounded cleanup batch before rejecting an update; retry must keep
-the same owned values and must not issue SQL effects again.
-Reject per-row history exhaustion before writing the commit too; a multirow
-transaction must leave every row unchanged and keep the server usable on error.
+Preserve shared row-history admission before durability, bounded reclamation,
+rollback and prepared/cold recovery while reducing the remaining reservations.
 Include the current execution-stack requirement in embedded measurements and
 reduce avoidable wide construction frames alongside table and history metadata.
+Retained execution must also remove the remaining query-prefix replay; faster
+catalog lookup alone does not preserve a function's execution position.
 The retained [empty-engine measurements](https://github.com/e6qu/pos3ql/blob/6ff1ac865a86a5318cb4934fbf01be0926667811/benchmarks/baselines/2026-10-30-embedded-startup/README.md)
 establish a debug-build starting point; repeat them after memory repairs and add
 populated-table and client-session workloads before claiming an embedded minimum.
@@ -95,38 +92,18 @@ A waiting schema edit must never attach itself to a new object that reused a nam
   cursor over `nextval('order_numbers')` must not issue numbers for rows that
   have not been fetched. Row locks follow fetched rows. Holding a cursor across
   commit saves the required result before releasing its transaction.
-  Simple cursors over one physical table retain their reader,
-  built-in arithmetic/comparisons, `CASE WHEN` expressions, array construction,
-  element access and slices, boolean filters, integer row limits/offsets and
-  captured parameters. Preserve their declared common types through subqueries,
-  null values and result inspection without issuing skipped effects. Preserve
-  enclosing column types in nested table-function inputs, including empty
-  and null arrays; describing a result must not require a sample row.
-  Carry sequence effects through subqueries and row bounds without losing their
-  connection state or repeating completed calls.
-  Bind array-subquery elements from their declared types, including domains over
-  arrays; selecting a domain value must not turn it into an extra array dimension.
-  Forward-only cursors reuse memory per fetch; scrolling cursors retain visited
-  results. Omitted scroll options follow the bound plan’s backward-read support.
-  Operator choices and row-independent filters stay fixed after declaration.
-  Normalize range predicates through the same comparisons and boolean rules:
-  null bounds, repeated operands, custom operators and fetched-row errors must
-  match PostgreSQL, including `BETWEEN SYMMETRIC`.
-  Holdable versions save unread results during commit and release their input
-  owners across simple queries, extended-protocol Sync, COPY and large-object calls.
   Extend retained execution to function calls and effects, joins, ordering and
   row locks. Make commit-time result saving yield during storage
   waits, then reuse the positions for ordinary results after their first flush.
   Keep read counts through savepoint rollback and release; never transfer a
   retired table’s pending counters to a replacement that reuses its slot.
-  Preserve relation ownership, failed-fetch cleanup, scan statistics and
-  PostgreSQL's distinction between fetching, skipping and moving rows.
-  Preserve the existing [cursor input, type and capacity rules](docs/postgresql-18-compatibility.md#capacity-boundaries)
-  while adding execution positions. Later variable assignments must not change
-  captured inputs. Keep issued sequence values in the owned execution state so
-  retries cannot issue them again. Preserve rollback, cleanup and PostgreSQL's errors for
-  invalid fields and utility parameters. Saved dates must still use the
-  settings chosen before `FETCH`, including after commit.
+  Preserve the existing [cursor input, type and capacity rules](docs/postgresql-18-compatibility.md#capacity-boundaries),
+  declared result types, captured inputs and settings, bound operators, reader
+  ownership, failed-fetch cleanup and scan statistics. Fetching, skipping and
+  moving rows must keep their distinct PostgreSQL effects. Sequence values
+  already issued remain owned by the command across retries and rollback.
+  Finishing or saving a result must release its input owners across all wire
+  command paths, including COPY and extended-protocol Sync.
 
 Follow PostgreSQL's distinction between listing an old catalog row and resolving
 an object for current use. After `orders` becomes `sales`, an older report can
@@ -185,6 +162,13 @@ Reject unsupported behavior and stored formats explicitly. Earlier pos3ql
 versions are not compatibility targets.
 Keep native Linux amd64, Linux arm64 and macOS arm64 builds, lint and boundary
 regressions passing; use the platform's declared C types at libc boundaries.
+Run the shared formatting prerequisite before admitting build and test matrices.
+Keep native SQL fixtures in native gates and interpreter ownership cases beside
+their runtime modules, so interpreter startup does not compile irrelevant fixtures.
+Reclaim each polling snapshot's scratch space instead of relying on a favorable
+thread schedule to finish before the arena fills.
+Keep compiler and per-test progress visible through CI cancellation while
+diagnosing deadline overruns; preserve the existing job budgets.
 
 No runtime heap growth, growing pools or allocating sorts. Keep consequential
 settings explicit and avoid needless wrappers and fallbacks. Capacity increases

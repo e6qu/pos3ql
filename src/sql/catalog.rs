@@ -3752,7 +3752,85 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     intrinsic!(6416, "hashdateextended", 20, "1082 20", 2, "i"),
     intrinsic!(6425, "timestamptz_hash", 23, "1184", 1, "i"),
     intrinsic!(6426, "timestamptz_hash_extended", 20, "1184 20", 2, "i"),
+    intrinsic!(2289, "pg_options_to_table", 2249, "1009", 1, "s"),
+    // PostgreSQL 18.6 pg_proc.dat, including every registered series overload.
+    // https://github.com/postgres/postgres/blob/724edf9bde9d356724ad384a2e196edc3c9f80f7/src/include/catalog/pg_proc.dat
+    intrinsic!(1191, "generate_subscripts", 23, "2277 23 16", 3, "i"),
+    intrinsic!(1192, "generate_subscripts", 23, "2277 23", 2, "i"),
+    intrinsic!(1066, "generate_series", 23, "23 23 23", 3, "i"),
+    intrinsic!(1067, "generate_series", 23, "23 23", 2, "i"),
+    intrinsic!(1068, "generate_series", 20, "20 20 20", 3, "i"),
+    intrinsic!(1069, "generate_series", 20, "20 20", 2, "i"),
+    intrinsic!(3259, "generate_series", 1700, "1700 1700 1700", 3, "i"),
+    intrinsic!(3260, "generate_series", 1700, "1700 1700", 2, "i"),
+    intrinsic!(938, "generate_series", 1114, "1114 1114 1186", 3, "i"),
+    intrinsic!(939, "generate_series", 1184, "1184 1184 1186", 3, "s"),
+    intrinsic!(6274, "generate_series", 1184, "1184 1184 1186 25", 4, "i"),
 ];
+
+pub(crate) fn intrinsic_routine_has_name(name: &str) -> bool {
+    INTRINSIC_ROUTINES
+        .iter()
+        .any(|routine| routine_name_matches(name, "pg_catalog", routine.name))
+}
+
+/// Foldability follows the registered catalog contract. Exact inputs win over
+/// coercions when overloads differ; an unresolved mixed family stays at runtime.
+pub(crate) fn intrinsic_routine_evaluation(
+    name: &str,
+    arguments: &[i32],
+    can_coerce: impl Fn(i32, i32) -> bool,
+) -> Option<super::eval::ExpressionEvaluation> {
+    use super::eval::ExpressionEvaluation::{Immutable, Runtime};
+    let mut family = None;
+    let mut mixed = false;
+    let mut best = None;
+    let mut best_exact = 0;
+    for routine in INTRINSIC_ROUTINES {
+        if !routine_name_matches(name, "pg_catalog", routine.name) {
+            continue;
+        }
+        let evaluation = if routine.volatility == "i"
+            && intrinsic_routine_kind(*routine) == "f"
+            && !intrinsic_routine_is_set_returning(*routine)
+        {
+            Immutable
+        } else {
+            Runtime
+        };
+        mixed |= family.is_some_and(|prior| prior != evaluation);
+        family = Some(evaluation);
+        if routine.argument_count as usize != arguments.len() {
+            continue;
+        }
+        let mut exact = 0;
+        let compatible = routine
+            .argument_types
+            .split_ascii_whitespace()
+            .zip(arguments)
+            .all(|(expected, actual)| {
+                let expected: i32 = expected.parse().expect("registered argument OID");
+                exact += usize::from(*actual == expected);
+                *actual == super::types::oid::UNKNOWN
+                    || *actual == expected
+                    || can_coerce(*actual, expected)
+            });
+        if !compatible {
+            continue;
+        }
+        if best.is_none() || exact > best_exact {
+            best = Some(evaluation);
+            best_exact = exact;
+        } else if exact == best_exact && evaluation == Runtime {
+            best = Some(Runtime);
+        }
+    }
+    if mixed {
+        Some(best.unwrap_or(Runtime))
+    } else {
+        family
+    }
+}
 
 // PostgreSQL 18.6 pg_proc.dat; checked against the live built-in inventory.
 // https://github.com/postgres/postgres/blob/REL_18_6/src/include/catalog/pg_proc.dat
@@ -3906,7 +3984,19 @@ fn intrinsic_routine_is_strict(routine: IntrinsicRoutine) -> bool {
 fn intrinsic_routine_is_set_returning(routine: IntrinsicRoutine) -> bool {
     matches!(
         routine.oid,
-        1293 | 1179
+        2289 | 1191
+            | 1192
+            | 1066
+            | 1067
+            | 1068
+            | 1069
+            | 3259
+            | 3260
+            | 938
+            | 939
+            | 6274
+            | 1293
+            | 1179
             | 2947
             | 3205
             | 3475
@@ -3961,6 +4051,17 @@ fn intrinsic_routine_parallel(routine: IntrinsicRoutine) -> &'static str {
 
 fn intrinsic_routine_source(routine: IntrinsicRoutine) -> &'static str {
     match routine.oid {
+        1191 => "generate_subscripts",
+        1192 => "generate_subscripts_nodir",
+        1066 => "generate_series_step_int4",
+        1067 => "generate_series_int4",
+        1068 => "generate_series_step_int8",
+        1069 => "generate_series_int8",
+        3259 => "generate_series_step_numeric",
+        3260 => "generate_series_numeric",
+        938 => "generate_series_timestamp",
+        939 => "generate_series_timestamptz",
+        6274 => "generate_series_timestamptz_at_zone",
         2026 => "pg_backend_pid",
         2561 => "pg_blocking_pids",
         2171 => "pg_cancel_backend",
@@ -4323,6 +4424,7 @@ const OBJECT_ADDRESS_OUTPUT_NAMES: &[&str] = &["classid", "objid", "objsubid"];
 
 fn intrinsic_routine_argument_names(oid: i32) -> Option<&'static [&'static str]> {
     match oid {
+        2289 => Some(&["options_array"]),
         2307 | 3775 => Some(&["target"]),
         2096 => Some(&["pid", "timeout"]),
         2171 => Some(&["pid"]),
@@ -4365,6 +4467,7 @@ fn intrinsic_record_outputs(
     routine: IntrinsicRoutine,
 ) -> Option<(&'static [i32], &'static [&'static str])> {
     match routine.oid {
+        2289 => Some((&[25, 25], &["option_name", "option_value"])),
         6119 => Some((
             PUBLICATION_TABLE_OUTPUT_OIDS,
             PUBLICATION_TABLE_OUTPUT_NAMES,
@@ -26688,6 +26791,7 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 Datum::Null,
                 Datum::Float8(if routine.oid == 6120 { 10.0 } else { 1.0 }),
                 Datum::Float8(match routine.oid {
+                    2289 => 3.0,
                     2763 => 1.0,
                     2764 => 10.0,
                     2765 | 2766 => 1000.0,

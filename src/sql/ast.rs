@@ -5595,6 +5595,8 @@ pub enum Expr<'a> {
     /// (e.g. `string_agg(x, ',' ORDER BY y)`), empty otherwise.
     Call {
         name: &'a str,
+        /// Captured catalog identity for a stored call; SQL text carries names only.
+        bound_oid: Option<i32>,
         args: &'a [&'a Expr<'a>],
         /// Empty for positional calls; otherwise parallel to `args` and
         /// populated only for named notation parsed after positional inputs.
@@ -5894,13 +5896,10 @@ impl Expr<'_> {
             | Expr::Exists(_)
             | Expr::ArraySubquery(_)
             | Expr::DefaultMarker => false,
-            // Catalog-defined casts need the query catalog for both their
-            // validation and their runtime representation. They are not
-            // foldable through the catalog-free evaluator.
+            // User-defined casts retain runtime type/domain validation. Builtin
+            // catalog identifiers use the catalog-aware constant evaluator.
             Expr::Cast { type_name, .. }
-                if type_name.eq_ignore_ascii_case("regclass")
-                    || type_name.eq_ignore_ascii_case("regtype")
-                    || crate::sql::types::ColType::from_sql_name(type_name).is_none() =>
+                if crate::sql::types::ColType::from_sql_name(type_name).is_none() =>
             {
                 false
             }

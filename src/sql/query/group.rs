@@ -530,7 +530,16 @@ pub(super) fn groups_for_mask<'a>(
                 };
                 &row_hooks_store
             };
-            let g = group_of.get(at).copied().unwrap_or(0) as usize;
+            let g = if n_keys == 0 {
+                0
+            } else {
+                *group_of.get(at).ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "group input changed between execution passes"
+                    )
+                })? as usize
+            };
             for (i, (_, node)) in agg_nodes.iter().enumerate() {
                 let index = g * n_aggs + i;
                 if partial_execution && states[index].supports_partial() {
@@ -722,9 +731,8 @@ pub(super) fn groups_for_mask<'a>(
 /// output rows (self-describing-encoded, `width` visible columns followed by
 /// `n_order` hidden ORDER BY key columns) sorted by any ORDER BY. The caller
 /// applies LIMIT/OFFSET and emits. Shared by the wire path (`grouped_select`)
-/// and the row-source path (`select_into_rows`). A single scan collecting
-/// encoded (key, agg-argument) pairs is avoided in favour of one scan per
-/// phase — group keys, then row-by-row aggregate folding — and is sort-based.
+/// and the row-source path (`select_into_rows`). Global aggregates scan once;
+/// keyed groups use separate counting, key sorting and aggregate passes.
 #[expect(clippy::too_many_arguments, reason = "query pipeline plumbing")]
 pub(super) fn grouped_rows<'a>(
     storage: &'a Storage,
@@ -812,37 +820,40 @@ pub(super) fn grouped_rows<'a>(
     let (where_scalars, where_lists) =
         super::subquery::alloc_merge_scratch(hooks.subs, correlated, arena)?;
     let mut row_count = 0usize;
-    scan_source_recycling_with_pax_columns(
-        storage,
-        scope,
-        from,
-        txid,
-        scan_where,
-        arena,
-        params,
-        hooks,
-        outer,
-        pax_columns,
-        &mut |row| {
-            if !row_passes_correlated_where(
-                correlated,
-                statement.where_clause,
-                storage,
-                txid,
-                arena,
-                params,
-                hooks,
-                row,
-                &mut *where_scalars,
-                &mut *where_lists,
-            )? {
-                return Ok(true);
-            }
-            row_count += 1;
-            Ok(true)
-        },
-    )?;
-
+    // A global aggregate has one group even for an empty source. It needs no
+    // per-row group assignments and must not execute its source just to size them.
+    if !statement.group_by.is_empty() {
+        scan_source_recycling_with_pax_columns(
+            storage,
+            scope,
+            from,
+            txid,
+            scan_where,
+            arena,
+            params,
+            hooks,
+            outer,
+            pax_columns,
+            &mut |row| {
+                if !row_passes_correlated_where(
+                    correlated,
+                    statement.where_clause,
+                    storage,
+                    txid,
+                    arena,
+                    params,
+                    hooks,
+                    row,
+                    &mut *where_scalars,
+                    &mut *where_lists,
+                )? {
+                    return Ok(true);
+                }
+                row_count += 1;
+                Ok(true)
+            },
+        )?;
+    }
     let n_keys = statement.group_by.len();
     let width = statement.items.len();
     let n_order = statement.order_by.len();

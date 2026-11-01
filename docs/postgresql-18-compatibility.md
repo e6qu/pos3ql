@@ -40,6 +40,17 @@ pos3ql. For example, an identity column in a non-default schema must still be
 discovered correctly when an inspector queries the catalogs. These fixtures
 cover the recorded workflows, not every application or library feature.
 
+Scalar functions, functions in `FROM`, and `CALL` share input binding with
+explicit rules for their evaluation context. Named arguments and omitted defaults run in the declared
+input order. Defaults share the caller's session: a default using `nextval('order_numbers')` updates that
+connection's `currval('order_numbers')`. Function lookup and missing-function
+errors do not run arguments to discover their types.
+Stored defaults keep the objects and helper overloads chosen at creation, even
+after renames, schema moves or new overloads. Explicit text sequence inputs,
+such as `nextval('order_numbers'::text)`, request lookup when the call runs.
+If a missing-function diagnostic cannot fit the fixed 192-byte SQL error
+message, it returns `54000` naming that capacity before running any arguments.
+
 Catalog column references retain their schema, including in nested queries.
 For example, this form works when an application spells out every name:
 

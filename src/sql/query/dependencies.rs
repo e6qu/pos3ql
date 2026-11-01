@@ -206,6 +206,47 @@ pub(super) fn collect(
     Ok(dependencies)
 }
 
+pub(crate) fn collect_routine_parameter_defaults(
+    parameters: &[crate::storage::RoutineParameterDef],
+    storage: &Storage,
+    txid: u32,
+    path: PathContext,
+    dependencies: &mut StoredQueryDependencies,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    for parameter in parameters {
+        let Some(default) = parameter.mode.default() else {
+            continue;
+        };
+        let source = arena
+            .alloc_str(default.as_str())
+            .map_err(|_| arena_full())?;
+        let expression = crate::sql::parser::parse_expression(source, arena)?;
+        let items = arena
+            .alloc_slice_copy(&[SelectItem::Expr {
+                expression,
+                alias: None,
+            }])
+            .map_err(|_| arena_full())?;
+        let select = arena
+            .alloc(Select {
+                items,
+                ..*crate::sql::parser::parse_query("SELECT NULL", arena)?
+            })
+            .map_err(|_| arena_full())?;
+        collect_select(
+            select,
+            storage,
+            txid,
+            CteNames::EMPTY,
+            dependencies,
+            arena,
+            CollectionContext::ordinary(&path, None),
+        )?;
+    }
+    Ok(())
+}
+
 pub(super) fn collect_routine_program(
     program: &super::RoutineFunctionProgram<'_>,
     storage: &Storage,
@@ -1354,11 +1395,20 @@ impl ColTypeResolver for DependencyTypes<'_, '_, '_> {
     fn routine_result(
         &self,
         name: &str,
+        bound_oid: Option<i32>,
         argument_names: &[Option<&str>],
         variadic: bool,
         arguments: &[i32],
     ) -> Option<StaticTypeMeta> {
-        let routine = if argument_names.is_empty() {
+        let routine = if let Some(oid) = bound_oid {
+            self.storage.function_for_captured_call(
+                oid,
+                argument_names,
+                arguments,
+                variadic,
+                self.txid,
+            )?
+        } else if argument_names.is_empty() {
             self.storage
                 .function_for_call_syntax_oids(name, arguments, variadic, self.txid)?
         } else {
@@ -1383,15 +1433,20 @@ impl ColTypeResolver for DependencyTypes<'_, '_, '_> {
     fn routine_record_field(
         &self,
         name: &str,
+        bound_oid: Option<i32>,
         argument_names: &[Option<&str>],
         variadic: bool,
         arguments: &[i32],
         index: usize,
     ) -> Option<(crate::util::StackStr<64>, StaticTypeMeta)> {
-        if let Some(field) = intrinsic_record_field_meta(name, arguments, index) {
+        if bound_oid.is_none()
+            && let Some(field) = intrinsic_record_field_meta(name, arguments, index)
+        {
             return Some(field);
         }
-        let slot = if argument_names.is_empty() {
+        let slot = if let Some(oid) = bound_oid {
+            self.storage.routine_slot_by_oid(oid, self.txid)?
+        } else if argument_names.is_empty() {
             if variadic {
                 self.storage
                     .routine_slot_for_function_call_syntax_oids(name, arguments, true, self.txid)?
@@ -1584,9 +1639,9 @@ pub(super) fn stored_routine_dependency_for_call(
     let Some(first) = candidates.next() else {
         return Ok(None);
     };
-    let Some(second) = candidates.next() else {
+    if candidates.next().is_none() {
         return Ok(Some(first));
-    };
+    }
     if args.len() > crate::storage::MAX_ROUTINE_ARGUMENTS {
         return Err(sql_err!(
             sqlstate::TOO_MANY_ARGUMENTS,
@@ -1605,9 +1660,6 @@ pub(super) fn stored_routine_dependency_for_call(
     let mut argument_oids = [0_i32; crate::storage::MAX_ROUTINE_ARGUMENTS];
     for (output, argument) in argument_oids.iter_mut().zip(args.iter().copied()) {
         *output = match crate::sql::exec::infer_routine_argument_oid(argument, &resolver) {
-            Ok(crate::sql::types::oid::UNKNOWN) if matches!(argument, Expr::Str(_)) => {
-                ColType::Text.oid()
-            }
             Ok(oid) => oid,
             Err(_) => {
                 return Err(sql_err!(
@@ -1619,35 +1671,20 @@ pub(super) fn stored_routine_dependency_for_call(
         };
     }
     let argument_oids = &argument_oids[..args.len()];
-    for dependency in core::iter::once(first)
-        .chain(core::iter::once(second))
-        .chain(candidates)
-    {
-        let routine = storage.routine_for(dependency.slot as usize, txid);
-        let qualified = crate::stack_format!(
-            192,
-            "{}.{}",
-            routine.schema_for(txid).as_str(),
-            routine.name_for(txid).as_str()
-        );
-        let resolved = if argument_names.is_empty() {
-            storage.routine_slot_for_function_call_syntax_oids(
-                qualified.as_str(),
-                argument_oids,
-                variadic,
-                txid,
-            )
-        } else {
-            storage.routine_slot_for_named_function_call_oids(
-                qualified.as_str(),
-                argument_names,
-                argument_oids,
-                txid,
-            )
-        };
-        if resolved == Some(dependency.slot as usize) {
-            return Ok(Some(dependency));
-        }
+    if let Some(slot) = storage.captured_routine_slot_for_call(
+        dependencies,
+        name,
+        argument_names,
+        argument_oids,
+        variadic,
+        txid,
+    ) {
+        return Ok(dependencies.entries().iter().copied().find(|dependency| {
+            dependency.class == DependencyClass::Routine
+                && usize::from(dependency.slot) == slot
+                && dependency.referenced_schema.as_str() == referenced_schema
+                && dependency.referenced_name.as_str() == referenced_name
+        }));
     }
     Err(sql_err!(
         sqlstate::INVALID_FUNCTION_DEFINITION,
@@ -1765,9 +1802,6 @@ fn record_routine_call(
     let mut argument_oids = [0_i32; crate::storage::MAX_ROUTINE_ARGUMENTS];
     for (slot, argument) in argument_oids.iter_mut().zip(args.iter().copied()) {
         match crate::sql::exec::infer_routine_argument_oid(argument, resolver) {
-            Ok(crate::sql::types::oid::UNKNOWN) if matches!(argument, Expr::Str(_)) => {
-                *slot = ColType::Text.oid();
-            }
             Ok(oid) => *slot = oid,
             Err(_) => {
                 *needs_scope = true;
@@ -2467,16 +2501,7 @@ fn collect_expression<'a>(
         })?;
     }
     if let Expr::Call { name, args, .. } = expression
-        && matches!(*name, "nextval" | "currval" | "setval")
-        && let Some(sequence_name) = args.first().and_then(|argument| match argument {
-            Expr::Str(value)
-            | Expr::Cast {
-                operand: Expr::Str(value),
-                type_name: "regclass",
-                ..
-            } => Some(*value),
-            _ => None,
-        })
+        && let Some(sequence_name) = bound_sequence_literal(name, args)
     {
         collect_sequence(sequence_name, storage, txid, path, dependencies)?;
     }
@@ -2837,6 +2862,26 @@ fn collect_text_search_configuration(
         referenced_schema: SqlName::parse(schema.unwrap_or(""))?,
         referenced_name: SqlName::parse(name)?,
     })
+}
+
+/// A text cast requests lookup at execution time, even if another input
+/// names the same sequence and has a captured dependency.
+pub(super) fn bound_sequence_literal<'a>(function: &str, args: &[&'a Expr<'a>]) -> Option<&'a str> {
+    if !matches!(
+        function.strip_prefix("pg_catalog.").unwrap_or(function),
+        "nextval" | "currval" | "setval"
+    ) {
+        return None;
+    }
+    match args.first().copied()? {
+        Expr::Str(value)
+        | Expr::Cast {
+            operand: Expr::Str(value),
+            type_name: "regclass",
+            ..
+        } => Some(value),
+        _ => None,
+    }
 }
 
 fn collect_sequence(

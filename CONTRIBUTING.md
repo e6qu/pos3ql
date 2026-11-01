@@ -34,6 +34,9 @@ numbers, error codes, and source provenance in the appropriate technical guide.
 Use the documentation index to avoid repeating the same contract across files.
 Preserve dated measurements and upstream licenses; simplify current guidance
 without rewriting historical evidence.
+Link historical benchmark evidence with immutable GitHub URLs. Release archives
+ship the benchmark index; their links must not depend on baseline files being
+installed locally.
 
 Architecture claims must identify current code paths and remaining gaps. Distinguish
 hard encodings, startup reservations, configured examples, calculated ceilings and
@@ -74,6 +77,11 @@ external suites also use Python 3, Docker, and the client tools installed by
 the workflow that owns the check. Native build, lint and boundary checks cover
 Linux amd64, Linux arm64 and macOS arm64. See `Cargo.toml`, `examples/dev.conf`, and
 `.github/workflows/` for the actual build and environment definitions.
+
+Each build or test workflow first calls the shared Rust formatting check.
+A formatting failure keeps its test matrix from starting and retains a
+`formatting-<revision>` artifact containing the correction. Apply that patch
+before pushing again. Build and test jobs start only after formatting passes.
 
 SQL test harnesses prepare their Python clients with
 `tests/external/python_env.py VENV`. Dependencies and wheel hashes are pinned in
@@ -134,6 +142,9 @@ cached SQL remains runnable, and verify retention before deleting any file.
 Verify the invariant or external contract, not a test that merely restates the
 implementation. Boundary changes generally need accepted/rejected capacity,
 rollback, failure cleanup, WAL/checkpoint, and empty-cache recovery coverage.
+Coverage library partitions stream compiler output and each test's progress
+through the native allocation-error reporter. Use those timestamps to locate
+deadline overruns; buffered output must not hide the last running test.
 SQL and wire behavior needs comparison with actual PostgreSQL, including
 SQLSTATEs, types, result shape, and values. SQLSTATE-only and exact-message
 corpora share the same reference connection settings, including UTC and the
@@ -248,6 +259,12 @@ catalog and wire contracts; they do not select pos3ql's object block layout.
 
 CI also exercises shared heap publication and saved row and index file ownership with
 Miri, alongside allocation-forbidden concurrent regressions.
+`tools/test-miri-ownership.sh LOG` runs the shared ownership gate on a suitable
+runner. Its SQL fixture module stays in native tests; put interpreter ownership
+cases beside their runtime modules and shared test helpers outside fixture modules.
+Preserve every selected ownership case when
+reducing interpreter startup work. Polling tests release each snapshot before
+reusing its fixed scratch arena, even when writers are slow.
 Pass the selected ownership filters together to share one interpreter startup;
 [Rust's test harness accepts multiple filters](https://doc.rust-lang.org/src/test/cli.rs.html#161-163).
 Every configured filter must produce passing tests, with none failed or ignored.
@@ -261,8 +278,14 @@ Stack arguments are omitted; protocol coverage installs its debugger explicitly.
 
 PostgreSQL service and client containers use Docker's official image from
 [Google's Docker Hub cache](https://docs.cloud.google.com/artifact-registry/docs/pull-cached-dockerhub-images),
-pinned by manifest digest. Keep service images, container selectors, and client adapters on the
-same digest. Verify updated manifests against Docker Hub's official image and
+pinned to the Linux amd64 image manifest used by these jobs. The PostgreSQL 18.6
+manifest is `sha256:885953109528ad3dfc90362b1a6f50a78620b5315be19f187753d267e484dc5b`,
+selected from official image index
+`sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336`.
+Pin the platform manifest directly: pulling the whole index can fail on mirrored
+attestation descriptors that are unnecessary for running the server.
+Keep service images, container selectors, and client adapters on the same digest.
+Verify updated manifests against Docker Hub's official image and
 retain that comparison in the PR; do not switch registries silently on failure.
 SeaweedFS qualification uses the upstream GHCR release image at the same digest
 as its Docker Hub publication. Registry changes preserve image provenance.

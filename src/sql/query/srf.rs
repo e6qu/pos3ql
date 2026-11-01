@@ -22,39 +22,78 @@ use super::subquery::subquery_witness;
 
 use super::{QueryScope, arena_full, describe_scope_items, record_star_width};
 
+enum SrfArity {
+    Exact(usize),
+    Between(usize, usize),
+}
+
+impl SrfArity {
+    fn accepts(&self, count: usize) -> bool {
+        match *self {
+            Self::Exact(expected) => count == expected,
+            Self::Between(minimum, maximum) => (minimum..=maximum).contains(&count),
+        }
+    }
+}
+
+// Execution contracts cover every supported set function. The public pg_proc
+// inventory is a separate compatibility surface and is still incomplete.
+fn srf_arity(name: &str) -> Option<SrfArity> {
+    let named = |names: &[&str]| {
+        names
+            .iter()
+            .any(|candidate| name.eq_ignore_ascii_case(candidate))
+    };
+    if is_event_trigger_introspection(name) || named(&["pg_cursor", "pg_listening_channels"]) {
+        Some(SrfArity::Exact(0))
+    } else if is_json_each_name(name)
+        || named(&[
+            "_pg_expandarray",
+            "unnest",
+            "jsonb_object_keys",
+            "json_object_keys",
+            "jsonb_array_elements",
+            "json_array_elements",
+            "jsonb_array_elements_text",
+            "json_array_elements_text",
+            "pg_snapshot_xip",
+            "txid_snapshot_xip",
+            "pg_options_to_table",
+            "aclexplode",
+            "pg_get_sequence_data",
+            "ts_token_type",
+        ])
+    {
+        Some(SrfArity::Exact(1))
+    } else if named(&[
+        "jsonb_populate_recordset",
+        "pg_input_error_info",
+        "ts_parse",
+    ]) {
+        Some(SrfArity::Exact(2))
+    } else if regex_srf_name(name).is_some()
+        || named(&[
+            "generate_series",
+            "string_to_table",
+            "generate_subscripts",
+            "json_populate_recordset",
+        ])
+    {
+        Some(SrfArity::Between(2, 3))
+    } else if named(&["jsonb_path_query", "jsonb_path_query_tz"]) {
+        Some(SrfArity::Between(2, 4))
+    } else if named(&["ts_debug", "ts_stat"]) {
+        Some(SrfArity::Between(1, 2))
+    } else if named(&["pg_get_publication_tables"]) {
+        Some(SrfArity::Between(1, crate::storage::MAX_ROUTINE_ARGUMENTS))
+    } else {
+        None
+    }
+}
+
 /// Whether `name` is one of the supported set-returning functions.
 pub(crate) fn is_srf_name(name: &str) -> bool {
-    is_event_trigger_introspection(name)
-        || name.eq_ignore_ascii_case("pg_cursor")
-        || name.eq_ignore_ascii_case("pg_listening_channels")
-        || name.eq_ignore_ascii_case("_pg_expandarray")
-        || name.eq_ignore_ascii_case("unnest")
-        || name.eq_ignore_ascii_case("generate_series")
-        || regex_srf_name(name).is_some()
-        || name.eq_ignore_ascii_case("jsonb_object_keys")
-        || name.eq_ignore_ascii_case("json_object_keys")
-        || name.eq_ignore_ascii_case("jsonb_array_elements")
-        || name.eq_ignore_ascii_case("json_array_elements")
-        || name.eq_ignore_ascii_case("jsonb_array_elements_text")
-        || name.eq_ignore_ascii_case("json_array_elements_text")
-        || name.eq_ignore_ascii_case("jsonb_path_query")
-        || name.eq_ignore_ascii_case("jsonb_path_query_tz")
-        || name.eq_ignore_ascii_case("json_populate_recordset")
-        || name.eq_ignore_ascii_case("jsonb_populate_recordset")
-        || name.eq_ignore_ascii_case("string_to_table")
-        || name.eq_ignore_ascii_case("generate_subscripts")
-        || name.eq_ignore_ascii_case("pg_snapshot_xip")
-        || name.eq_ignore_ascii_case("txid_snapshot_xip")
-        || name.eq_ignore_ascii_case("pg_options_to_table")
-        || name.eq_ignore_ascii_case("aclexplode")
-        || name.eq_ignore_ascii_case("pg_get_sequence_data")
-        || name.eq_ignore_ascii_case("pg_get_publication_tables")
-        || name.eq_ignore_ascii_case("pg_input_error_info")
-        || name.eq_ignore_ascii_case("ts_parse")
-        || name.eq_ignore_ascii_case("ts_token_type")
-        || name.eq_ignore_ascii_case("ts_debug")
-        || name.eq_ignore_ascii_case("ts_stat")
-        || is_json_each_name(name)
+    srf_arity(name).is_some()
 }
 
 fn is_object_address_record_function(name: &str) -> bool {
@@ -1193,18 +1232,27 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
             return Ok(values);
         }
         if is_srf_name(name) {
-            let count = srf_count(expression, arena, params, row, hooks)?;
-            let values = arena
-                .alloc_slice_with(count, |_| Datum::Null)
-                .map_err(|_| arena_full())?;
-            for (offset, value) in values.iter_mut().enumerate() {
-                let indexed_hooks = EvalHooks {
-                    srf_index: Some(offset + 1),
-                    ..*hooks
-                };
-                *value = eval_full(expression, arena, params, row, &indexed_hooks)?;
-            }
-            return Ok(values);
+            return with_bound_srf_inputs(
+                expression,
+                arena,
+                params,
+                row,
+                hooks,
+                |bound, inputs| {
+                    let count = srf_count(bound, arena, inputs, row, hooks)?;
+                    let values = arena
+                        .alloc_slice_with(count, |_| Datum::Null)
+                        .map_err(|_| arena_full())?;
+                    for (offset, value) in values.iter_mut().enumerate() {
+                        let indexed_hooks = EvalHooks {
+                            srf_index: Some(offset + 1),
+                            ..*hooks
+                        };
+                        *value = eval_full(bound, arena, inputs, row, &indexed_hooks)?;
+                    }
+                    Ok(&*values)
+                },
+            );
         }
 
         let (schema, table) = name
@@ -1317,6 +1365,92 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
         values,
         any,
     })
+}
+
+/// Bind one builtin set-returning call's inputs before counting or emitting rows.
+/// Parameter values and their SQL types stay local to this call; row iteration
+/// never replays an argument effect and keeps bounded inputs for large results.
+pub(super) fn with_bound_srf_inputs<'a, R: ColumnLookup<'a>, T>(
+    expression: &'a Expr<'a>,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    row: &R,
+    hooks: &EvalHooks<'_, 'a>,
+    run: impl FnOnce(&'a Expr<'a>, &'a [Datum<'a>]) -> Result<T, SqlError>,
+) -> Result<T, SqlError> {
+    let Expr::Call {
+        name,
+        args,
+        argument_names,
+        ..
+    } = expression
+    else {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "set input binding requires a call"
+        ));
+    };
+    if args.len() > crate::storage::MAX_ROUTINE_ARGUMENTS {
+        return Err(sql_err!(
+            sqlstate::TOO_MANY_ARGUMENTS,
+            "set-returning call has too many arguments"
+        ));
+    }
+    if !srf_arity(name).is_some_and(|arity| arity.accepts(args.len())) {
+        return crate::sql::eval::undefined_function(name, args, arena, row, hooks);
+    }
+    let mut reordered = [&Expr::Null; 3];
+    let arguments = if argument_names.iter().any(Option::is_some) {
+        let Some(regex_name) = regex_srf_name(name) else {
+            return Err(srf_signature_error(name));
+        };
+        let parameters: &[&str] = match args.len() {
+            2 => &["string", "pattern"],
+            3 => &["string", "pattern", "flags"],
+            _ => return Err(srf_signature_error(regex_name)),
+        };
+        crate::sql::eval::reorder_required_arguments(
+            regex_name,
+            args,
+            argument_names,
+            parameters,
+            &mut reordered[..args.len()],
+        )?;
+        &reordered[..args.len()]
+    } else {
+        args
+    };
+    let mut types = [crate::sql::types::oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
+    for (output, argument) in types.iter_mut().zip(arguments) {
+        *output = crate::sql::eval::expression_type_identity(argument, row, hooks)?
+            .routine_argument_oid();
+    }
+    let values = arena
+        .alloc_slice_with(arguments.len(), |_| Datum::Null)
+        .map_err(|_| arena_full())?;
+    let mut bound_arguments = crate::mem::arena::ArenaList::new(arena);
+    for (index, argument) in arguments.iter().enumerate() {
+        let value = eval_full(argument, arena, params, row, hooks)?;
+        let encoded = crate::sql::exec::encode_projected_pub(&[value], arena)?;
+        values[index] = crate::sql::exec::decode_projected_col_record(encoded, 0, arena)?;
+        let parameter: &'a Expr<'a> = arena
+            .alloc(Expr::Param(index as u32 + 1))
+            .map_err(|_| arena_full())?;
+        bound_arguments.push(parameter).map_err(|_| arena_full())?;
+    }
+    let mut bound = *expression;
+    let Expr::Call {
+        args,
+        argument_names,
+        ..
+    } = &mut bound
+    else {
+        unreachable!()
+    };
+    *args = bound_arguments.as_slice();
+    *argument_names = &[];
+    let bound = arena.alloc(bound).map_err(|_| arena_full())?;
+    crate::sql::exec::with_bound_parameter_types(&types[..arguments.len()], || run(bound, values))
 }
 
 /// Number of output rows a set-returning call yields for the current source row.
@@ -2462,7 +2596,6 @@ fn populate_record_append_columns<'a, C: ColumnLookup<'a>>(
     storage: &Storage,
     txid: u32,
     arena: &'a Arena,
-    params: &[Datum<'a>],
     columns: &C,
     output: &mut [ColumnMeta; MAX_COLUMNS],
 ) -> Result<usize, SqlError> {
@@ -2477,7 +2610,10 @@ fn populate_record_append_columns<'a, C: ColumnLookup<'a>>(
     let type_oid = match crate::sql::eval::expression_type_identity(args[0], columns, &hooks)? {
         crate::sql::eval::ExpressionTypeIdentity::Known(oid) => oid,
         crate::sql::eval::ExpressionTypeIdentity::Unresolved => {
-            crate::sql::eval::eval_full(args[0], arena, params, columns, &hooks)?.type_oid()
+            return Err(sql_err!(
+                sqlstate::DATATYPE_MISMATCH,
+                "first argument of populate_record requires a declared row type"
+            ));
         }
     };
     let Some(composite_oid) =
@@ -2653,6 +2789,38 @@ fn json_to_record_append_columns(
         );
     }
     Ok(definitions.len())
+}
+
+fn table_function_input_type<'a>(
+    expression: &'a Expr<'a>,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+    columns: &impl ColumnLookup<'a>,
+) -> Result<Option<ColType>, SqlError> {
+    let catalog = super::storage_catalog(storage, arena, txid);
+    let hooks = EvalHooks {
+        catalog: Some(&catalog),
+        ..crate::sql::eval::NO_HOOKS
+    };
+    let crate::sql::eval::ExpressionTypeIdentity::Known(oid) =
+        crate::sql::eval::expression_type_identity(expression, columns, &hooks)?
+    else {
+        return Ok(None);
+    };
+    if oid == crate::sql::types::oid::UNKNOWN {
+        return Ok(None);
+    }
+    storage
+        .routine_result_for_oid(oid, txid)
+        .map(|result| Some(result.ctype))
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::DATATYPE_MISMATCH,
+                "table function input type with OID {} is unavailable",
+                oid
+            )
+        })
 }
 
 fn table_function_array_element_type(
@@ -2872,15 +3040,7 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
         if let Some(document) = args.get(1) {
             crate::sql::eval::funcs::json::check_json_family_static(tref.table, document)?;
         }
-        populate_record_append_columns(
-            args,
-            storage,
-            txid,
-            arena,
-            params,
-            columns,
-            &mut default_cols,
-        )?
+        populate_record_append_columns(args, storage, txid, arena, columns, &mut default_cols)?
     } else if is_json_table {
         let args = tref.func_args.unwrap_or(&[]);
         if args.len() != 6 {
@@ -3241,11 +3401,8 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
             ));
         }
         let vector_unnest = args.len() == 1
-            && (crate::sql::eval::static_type_pub(args[0], columns) == Some(ColType::TsVector)
-                || matches!(
-                    crate::sql::eval::eval(args[0], arena, params, columns),
-                    Ok(Datum::TsVector(_))
-                ));
+            && table_function_input_type(args[0], storage, txid, arena, columns)?
+                == Some(ColType::TsVector);
         if vector_unnest {
             for (index, (name, ctype)) in [
                 ("lexeme", ColType::Text),
@@ -3275,24 +3432,21 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
                 ));
             }
             for (index, argument) in args.iter().enumerate() {
-                let (ctype, user_type) = match crate::sql::eval::static_type_pub(argument, columns)
-                {
-                    Some(ColType::Array(element)) => {
-                        table_function_array_element_type(storage, txid, element)?
-                    }
-                    Some(ColType::Int2Vector) => (ColType::Int2, None),
-                    Some(ColType::OidVector) => (ColType::Oid, None),
-                    Some(ColType::Multirange(kind)) => (ColType::Range(kind), None),
-                    _ => match crate::sql::eval::eval(argument, arena, params, columns)? {
-                        Datum::Array { element, .. } => {
+                let (ctype, user_type) =
+                    match table_function_input_type(argument, storage, txid, arena, columns)? {
+                        Some(ColType::Array(element)) => {
                             table_function_array_element_type(storage, txid, element)?
                         }
-                        Datum::Int2Vector { .. } => (ColType::Int2, None),
-                        Datum::OidVector { .. } => (ColType::Oid, None),
-                        Datum::Multirange { kind, .. } => (ColType::Range(kind), None),
-                        _ => (ColType::Text, None),
-                    },
-                };
+                        Some(ColType::Int2Vector) => (ColType::Int2, None),
+                        Some(ColType::OidVector) => (ColType::Oid, None),
+                        Some(ColType::Multirange(kind)) => (ColType::Range(kind), None),
+                        _ => {
+                            return Err(sql_err!(
+                                sqlstate::DATATYPE_MISMATCH,
+                                "UNNEST requires an array, vector or multirange input"
+                            ));
+                        }
+                    };
                 let type_mod = match argument {
                     Expr::Cast { type_mod, .. } => *type_mod,
                     _ => -1,
@@ -3320,15 +3474,17 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
     } else {
         let single_type = if is_gs {
             let arguments = tref.func_args.unwrap_or(&[]);
-            let start = arguments
-                .first()
-                .and_then(|argument| crate::sql::eval::static_type_pub(argument, columns));
-            let has_numeric = arguments.iter().any(|argument| {
-                crate::sql::eval::static_type_pub(argument, columns) == Some(ColType::Numeric)
-            });
-            let has_int8 = arguments.iter().any(|argument| {
-                crate::sql::eval::static_type_pub(argument, columns) == Some(ColType::Int8)
-            });
+            let mut start = None;
+            let mut has_numeric = false;
+            let mut has_int8 = false;
+            for (index, argument) in arguments.iter().enumerate() {
+                let ctype = table_function_input_type(argument, storage, txid, arena, columns)?;
+                if index == 0 {
+                    start = ctype;
+                }
+                has_numeric |= ctype == Some(ColType::Numeric);
+                has_int8 |= ctype == Some(ColType::Int8);
+            }
             crate::sql::eval::generate_series_result_type(start, has_numeric, has_int8)
         } else if is_gsub {
             ColType::Int4
@@ -3356,18 +3512,11 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
             }
             ColType::Jsonb
         } else {
-            let args = tref.func_args.unwrap_or(&[]);
-            match args.first() {
-                Some(e) => match crate::sql::eval::static_type_pub(e, columns) {
-                    Some(ColType::Array(element)) => element.to_coltype(),
-                    Some(_) => ColType::Text,
-                    None => match crate::sql::eval::eval(e, arena, params, columns)? {
-                        Datum::Array { element, .. } => element.to_coltype(),
-                        _ => ColType::Text,
-                    },
-                },
-                None => ColType::Text,
-            }
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "table function {} has no supported declared output type",
+                tref.table
+            ));
         };
         // A single-column function's default column name is `value` for
         // array_elements, else the (aliased) function name.
@@ -3517,7 +3666,7 @@ fn table_func_routine<'a, C: ColumnLookup<'a>>(
     _params: &[Datum<'a>],
     columns: &C,
     eval_hooks: Option<&EvalHooks<'_, 'a>>,
-) -> Result<Option<(usize, &'a RoutineDef)>, SqlError> {
+) -> Result<Option<(usize, &'a mut RoutineDef)>, SqlError> {
     use core::fmt::Write as _;
 
     let args = tref.func_args.expect("table function carries arguments");
@@ -4934,78 +5083,42 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                 tref.table
             ));
         };
-        let table_columns = routine.table_columns();
-        let scalar_result = routine.kind.function_result();
         let catalog = super::storage_catalog(storage, arena, txid);
         let hooks = crate::sql::eval::EvalHooks {
             catalog: Some(&catalog),
             ..eval_hooks.copied().unwrap_or(crate::sql::eval::NO_HOOKS)
         };
-        let mut routine_params = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
         let mapping = routine
             .call_input_mapping(tref.func_argument_names, args.len(), tref.func_variadic)
             .expect("resolved table routine call has a valid argument mapping");
-        let mut provided = [false; crate::storage::MAX_ROUTINE_ARGUMENTS];
-        let mut variadic_values = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
-        let mut variadic_count = 0usize;
-        for (call_index, argument) in args.iter().enumerate() {
-            let value = crate::sql::eval::eval_full(argument, arena, params, columns, &hooks)?;
-            let encoded = crate::sql::exec::encode_projected_pub(&[value], arena)?;
-            let value = crate::sql::exec::decode_projected_col_record(encoded, 0, arena)?;
-            let input_index = usize::from(mapping[call_index]);
-            if !tref.func_variadic
-                && matches!(
-                    routine
-                        .parameter_for_input(input_index)
-                        .expect("mapped table routine input has a declared parameter")
-                        .mode,
-                    crate::storage::RoutineParameterMode::Variadic { .. }
-                )
-            {
-                variadic_values[variadic_count] = value;
-                variadic_count += 1;
-                provided[input_index] = true;
-            } else {
-                routine_params[input_index] = value;
-                provided[input_index] = true;
-            }
+        let mut argument_type_oids =
+            [crate::sql::types::oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
+        for (output, argument) in argument_type_oids.iter_mut().zip(args) {
+            *output = crate::sql::eval::expression_type_identity(argument, columns, &hooks)?
+                .routine_argument_oid();
         }
-        if variadic_count != 0 {
-            let input_index = routine.argument_count - 1;
-            let parameter = routine
-                .parameter_for_input(input_index)
-                .expect("variadic table routine input has a declared parameter");
-            let ColType::Array(element) = parameter.ctype else {
-                return Err(sql_err!(
-                    sqlstate::INTERNAL_ERROR,
-                    "variadic table routine parameter is not an array"
-                ));
-            };
-            routine_params[input_index] = Datum::Array {
-                element,
-                raw: crate::sql::array::build(&variadic_values[..variadic_count], arena)?,
-            };
-        }
-        for input_index in 0..routine.argument_count {
-            if provided[input_index] {
-                continue;
-            }
-            let parameter = routine
-                .parameter_for_input(input_index)
-                .expect("table routine input has a declared parameter");
-            let Some(default) = parameter.mode.default() else {
-                return Err(sql_err!(
-                    sqlstate::INTERNAL_ERROR,
-                    "resolved table routine is missing a required argument"
-                ));
-            };
-            let source = arena
-                .alloc_str(default.as_str())
-                .map_err(|_| arena_full())?;
-            let expression = crate::sql::parser::parse_expression(source, arena)?;
-            let value = crate::sql::eval::eval_full(expression, arena, params, columns, &hooks)?;
-            routine_params[input_index] = crate::sql::eval::cast_to(value, parameter.ctype, arena)?;
-        }
+        let Some(routine_params) = catalog.prepare_routine_inputs(
+            routine_slot,
+            routine,
+            super::RoutineCallInputs {
+                arguments: args,
+                argument_type_oids: &argument_type_oids[..args.len()],
+                mapping: &mapping,
+                variadic: tref.func_variadic,
+                context: super::RoutineInputContext::Table,
+            },
+            &mut |argument| {
+                let value = crate::sql::eval::eval_full(argument, arena, params, columns, &hooks)?;
+                let encoded = crate::sql::exec::encode_projected_pub(&[value], arena)?;
+                crate::sql::exec::decode_projected_col_record(encoded, 0, arena)
+            },
+            arena,
+        )?
+        else {
+            return Ok(&[]);
+        };
+        let table_columns = routine.table_columns();
+        let scalar_result = routine.kind.function_result();
         let _formal_scope =
             crate::sql::exec::enter_routine_parameter_types(routine.arguments(), hooks.catalog)?;
         let owner = crate::storage::SessionIdentity::bound(
@@ -5100,7 +5213,7 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                 &query,
                 storage,
                 routine_slot,
-                *routine,
+                routine,
                 txid,
                 arena,
                 &routine_params[..routine.argument_count],
@@ -5127,7 +5240,7 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                 result_query,
                 storage,
                 routine_slot,
-                *routine,
+                routine,
                 txid,
                 arena,
                 &routine_params[..routine.argument_count],
@@ -5145,7 +5258,7 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
             result_query,
             storage,
             routine_slot,
-            *routine,
+            routine,
             txid,
             arena,
             &routine_params[..routine.argument_count],

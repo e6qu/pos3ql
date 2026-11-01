@@ -52,6 +52,47 @@ reads. A cold read on one
 of these paths can occupy that worker. [PLAN.md](../PLAN.md) tracks their
 conversion and the later CPU worker pool separately.
 
+Stored-function dispatch selects the catalog identity and named-input mapping
+and binds input types before evaluating arguments. Constant inputs and their
+conversions are checked before runtime inputs. Reached runtime inputs and
+defaults run in declaration order with the caller's evaluation context.
+Lookup does not run an argument as a probe. For example,
+`setval('order_numbers', nextval('import_numbers'))`
+consumes one import number. A constant null, including an inserted default or
+an explicitly null variadic array, can eliminate a strict scalar call. A null array
+member does not make the array null. A null row value still allows the other
+reached arguments to run.
+Parameter defaults capture managed object references when the function or
+procedure is created. Calls use one copied dependency image to bind omitted
+inputs while preserving the caller's sequence state. For example, renaming the
+sequence selected by `DEFAULT nextval('order_numbers')` does not redirect the
+default to a replacement; `nextval('order_numbers'::text)` requests runtime lookup.
+Helper calls carry their captured catalog identity through expression expansion,
+result type inference, planning and evaluation. Adding an overload cannot redirect
+a stored default. Overloaded stored calls choose only among their captured
+functions, even after names change.
+Captured references share the existing fixed dependency capacity and durable
+records, including replacement rollback and empty-cache recovery.
+Scalar functions, table functions and procedures share input preparation with
+an explicit call context. A strict function in `FROM` evaluates its inputs before
+returning no rows for a null input. `CALL` converts unknown literals before
+execution but evaluates ordinary expressions in declaration order: a later
+division by zero can follow an earlier sequence increment. Lateral functions and
+subqueries inherit the caller's sequence state. Builtin set-returning calls bind
+input values and SQL types once before counting or emitting their rows; external
+row iteration keeps those inputs without materializing the whole result.
+Their execution registration declares accepted argument counts directly; missing
+public `pg_proc` entries cannot disable an implemented function.
+Table-function descriptions use declared input types and never sample an input
+value. Global aggregates use one source scan, avoiding a second execution of
+lateral inputs just to count the rows before aggregation.
+This call boundary supplies retained execution with an explicit target; it
+does not yet make every function body yield during a storage wait.
+Runtime overload checks copy input descriptors rather than whole definitions.
+The selected definition is captured once, bound in place and borrowed by its
+execution helpers. Candidate catalog locks are released before type coercion,
+argument effects or SQL execution.
+
 ## Reads and storage layout
 
 The durable layout is log structured: new transactions and saved generations

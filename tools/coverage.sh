@@ -121,12 +121,10 @@ find target -name '*.profraw' -delete 2>/dev/null || true
 case "$SHARD" in
 "")
     echo "=== in-process tests ==="
-    if ! cargo test --lib --release > "$TMP/lib.log" 2>&1; then
-        tail -80 "$TMP/lib.log"
+    if ! python3 tools/test_command.py cargo test --locked --lib --release; then
         echo "FAIL: in-process tests did not pass; coverage cannot be reported"
         exit 1
     fi
-    grep -E '^test result' "$TMP/lib.log" | tail -1
     ;;
 lib:*)
     partition=${SHARD#lib:}
@@ -144,7 +142,9 @@ lib:*)
     fi
 
     echo "=== in-process tests, partition $partition ==="
-    if ! cargo test --lib --release -- --list > "$TMP/lib.list" 2>&1; then
+    # Keep compilation visible while capturing only the harness's test names.
+    # Buffered build/test output otherwise vanishes at the CI job deadline.
+    if ! cargo test --locked --lib --release -- --list > "$TMP/lib.list"; then
         tail -80 "$TMP/lib.list"
         echo "FAIL: in-process tests could not be enumerated"
         exit 1
@@ -169,12 +169,11 @@ lib:*)
         echo "FAIL: lib partition $partition selected $selected of $ordinal tests"
         exit 1
     fi
-    if ! cargo test --lib --release -- "$@" > "$TMP/lib.log" 2>&1; then
-        tail -80 "$TMP/lib.log"
+    echo "=== executing $selected of $ordinal tests, partition $partition ==="
+    if ! python3 tools/test_command.py cargo test --locked --lib --release -- "$@"; then
         echo "FAIL: in-process test partition $partition did not pass"
         exit 1
     fi
-    grep -E '^test result' "$TMP/lib.log" | tail -1
     ;;
 esac
 # The in-process tests' profiles are the baseline; the external suites must

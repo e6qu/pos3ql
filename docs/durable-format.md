@@ -469,6 +469,9 @@ dependencies. A view recorded before a rename can commit afterward and recover
 the renamed source. Its original spelling cannot select a replacement. Routine
 publication validates these dependencies under the same owners as its signature
 and dependency image.
+The same routine dependency image retains references from parameter defaults.
+Bound call identities in expanded expressions are rebuilt from that image;
+they do not add a separate saved expression format.
 
 ### Type lifetimes and saved references
 

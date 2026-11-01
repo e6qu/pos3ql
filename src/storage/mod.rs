@@ -6745,6 +6745,15 @@ pub(crate) enum RoutineParameterMode {
 }
 
 impl RoutineParameterMode {
+    pub(crate) const fn has_default(&self) -> bool {
+        match self {
+            Self::In { default } | Self::InOut { default } | Self::Variadic { default } => {
+                default.is_some()
+            }
+            Self::Out => false,
+        }
+    }
+
     pub(crate) const fn is_input(self) -> bool {
         !matches!(self, Self::Out)
     }
@@ -7724,6 +7733,94 @@ struct RoutineLookup<'a> {
     kind: RoutineCallKind,
 }
 
+/// Overload checks need input types and default admission, not bodies,
+/// configuration values or the reserved result-column buffers.
+struct RoutineInputSignature {
+    arguments: [RoutineArgumentDef; MAX_ROUTINE_ARGUMENTS],
+    argument_count: usize,
+    parameters: [RoutineParameterDef; MAX_ROUTINE_ARGUMENTS],
+    parameter_count: usize,
+    required_argument_count: usize,
+}
+
+impl RoutineInputSignature {
+    fn from_definition(routine: &RoutineDef, txid: u32) -> Self {
+        let arguments = routine.arguments_for(txid);
+        let parameters = routine.parameters_for(txid);
+        let mut signature = Self {
+            arguments: [RoutineArgumentDef::EMPTY; MAX_ROUTINE_ARGUMENTS],
+            argument_count: arguments.len(),
+            parameters: [RoutineParameterDef::EMPTY; MAX_ROUTINE_ARGUMENTS],
+            parameter_count: parameters.len(),
+            required_argument_count: parameters
+                .iter()
+                .filter(|parameter| parameter.mode.is_input())
+                .take_while(|parameter| !parameter.mode.has_default())
+                .count(),
+        };
+        signature.arguments[..arguments.len()].copy_from_slice(arguments);
+        signature.parameters[..parameters.len()].copy_from_slice(parameters);
+        signature
+    }
+
+    fn arguments(&self) -> &[RoutineArgumentDef] {
+        &self.arguments[..self.argument_count]
+    }
+
+    fn accepts_input_arity(&self, arity: usize) -> bool {
+        self.required_argument_count <= arity && arity <= self.argument_count
+    }
+
+    fn parameter_for_input(&self, input_index: usize) -> Option<&RoutineParameterDef> {
+        self.parameters[..self.parameter_count]
+            .iter()
+            .filter(|parameter| parameter.mode.is_input())
+            .nth(input_index)
+    }
+
+    fn call_input_mapping(
+        &self,
+        argument_names: &[Option<&str>],
+        argument_count: usize,
+        explicit_variadic: bool,
+    ) -> Option<[u8; MAX_ROUTINE_ARGUMENTS]> {
+        RoutineDef::map_input_parameters(
+            &self.parameters[..self.parameter_count],
+            self.argument_count,
+            argument_names,
+            argument_count,
+            explicit_variadic,
+        )
+    }
+}
+
+// Unknown SQL inputs prefer the string category and its preferred type, text.
+// https://www.postgresql.org/docs/18/typeconv-func.html
+struct RoutineStringPreferences {
+    string: [bool; MAX_ROUTINE_ARGUMENTS],
+    text: [bool; MAX_ROUTINE_ARGUMENTS],
+}
+
+impl RoutineStringPreferences {
+    const EMPTY: Self = Self {
+        string: [false; MAX_ROUTINE_ARGUMENTS],
+        text: [false; MAX_ROUTINE_ARGUMENTS],
+    };
+
+    fn observe(&mut self, index: usize, argument: &RoutineArgumentDef) {
+        self.string[index] |= crate::sql::types::type_category(argument.ctype) == "S";
+        self.text[index] |= argument.ctype == ColType::Text && argument.user_type.is_none();
+    }
+
+    fn accepts(&self, index: usize, argument: &RoutineArgumentDef) -> bool {
+        if self.text[index] {
+            argument.ctype == ColType::Text && argument.user_type.is_none()
+        } else {
+            !self.string[index] || crate::sql::types::type_category(argument.ctype) == "S"
+        }
+    }
+}
+
 impl RoutineLookup<'_> {
     fn matches(&self, routine: &RoutineDef) -> bool {
         routine.database == self.database
@@ -7737,7 +7834,6 @@ impl RoutineLookup<'_> {
 struct RoutineIter<'a> {
     catalog: &'a Mutex<FixedVec<RoutineDef>>,
     next_slot: usize,
-    lookup: Option<RoutineLookup<'a>>,
 }
 
 struct CastIter<'a> {
@@ -8012,21 +8108,10 @@ impl Iterator for RoutineIter<'_> {
 
     fn next(&mut self) -> Option<Self::Item> {
         let catalog = self.catalog.lock().expect("routine catalog lock poisoned");
-        while let Some(definition) = catalog.get(self.next_slot) {
-            let slot = self.next_slot;
-            self.next_slot += 1;
-            // Check compact metadata before copying the bounded body and
-            // argument arrays. Release the guard before overload resolution
-            // calls back into other catalogs.
-            if self
-                .lookup
-                .as_ref()
-                .is_none_or(|lookup| lookup.matches(definition))
-            {
-                return Some((slot, *definition));
-            }
-        }
-        None
+        let slot = self.next_slot;
+        let definition = catalog.get(slot)?;
+        self.next_slot += 1;
+        Some((slot, *definition))
     }
 }
 
@@ -8920,6 +9005,7 @@ impl RoutineDef {
 
     pub(super) fn revision_for(&self, transaction: u32) -> u64 {
         self.pending_definition
+            .as_ref()
             .filter(|pending| pending.txid == transaction)
             .map_or(self.version, |pending| pending.version)
             .max(
@@ -8948,6 +9034,13 @@ impl RoutineDef {
         &self.parameters[..self.parameter_count]
     }
 
+    fn parameters_for(&self, txid: u32) -> &[RoutineParameterDef] {
+        match self.pending_definition_for(txid) {
+            Some(pending) => &pending.definition.parameters[..pending.definition.parameter_count],
+            None => self.parameters(),
+        }
+    }
+
     pub(crate) fn configs(&self) -> &[RoutineConfig] {
         &self.configs[..self.config_count]
     }
@@ -8956,7 +9049,7 @@ impl RoutineDef {
         self.parameters()
             .iter()
             .filter(|parameter| parameter.mode.is_input())
-            .take_while(|parameter| parameter.mode.default().is_none())
+            .take_while(|parameter| !parameter.mode.has_default())
             .count()
     }
 
@@ -8996,9 +9089,12 @@ impl RoutineDef {
         let required = parameters
             .iter()
             .filter(|parameter| parameter.mode.is_input())
-            .take_while(|parameter| parameter.mode.default().is_none())
+            .take_while(|parameter| !parameter.mode.has_default())
             .count();
-        required <= arity && arity <= argument_count
+        let variadic = parameters
+            .iter()
+            .any(|parameter| matches!(parameter.mode, RoutineParameterMode::Variadic { .. }));
+        required <= arity && (arity <= argument_count || variadic)
     }
 
     pub(crate) fn parameter_for_input(&self, input_index: usize) -> Option<RoutineParameterDef> {
@@ -9018,19 +9114,38 @@ impl RoutineDef {
         argument_count: usize,
         explicit_variadic: bool,
     ) -> Option<[u8; MAX_ROUTINE_ARGUMENTS]> {
-        let variadic_index = self
-            .arguments()
+        Self::map_input_parameters(
+            self.parameters(),
+            self.argument_count,
+            argument_names,
+            argument_count,
+            explicit_variadic,
+        )
+    }
+
+    fn map_input_parameters(
+        parameters: &[RoutineParameterDef],
+        input_count: usize,
+        argument_names: &[Option<&str>],
+        argument_count: usize,
+        explicit_variadic: bool,
+    ) -> Option<[u8; MAX_ROUTINE_ARGUMENTS]> {
+        let parameter_for_input = |index| {
+            parameters
+                .iter()
+                .filter(|parameter| parameter.mode.is_input())
+                .nth(index)
+        };
+        let variadic_index = parameters
             .iter()
+            .filter(|parameter| parameter.mode.is_input())
             .enumerate()
-            .find_map(|(input_index, _)| {
-                matches!(
-                    self.parameter_for_input(input_index)?.mode,
-                    RoutineParameterMode::Variadic { .. }
-                )
-                .then_some(input_index)
+            .find_map(|(input_index, parameter)| {
+                matches!(parameter.mode, RoutineParameterMode::Variadic { .. })
+                    .then_some(input_index)
             });
         if argument_count > MAX_ROUTINE_ARGUMENTS
-            || (argument_count > self.argument_count && variadic_index.is_none())
+            || (argument_count > input_count && variadic_index.is_none())
             || (!argument_names.is_empty() && argument_names.len() != argument_count)
             || explicit_variadic && !argument_names.is_empty()
         {
@@ -9046,23 +9161,22 @@ impl RoutineDef {
                     variadic_index?
                 }
                 None => call_index,
-                Some(name) => (0..self.argument_count).find(|&input_index| {
-                    self.parameter_for_input(input_index)
+                Some(name) => (0..input_count).find(|&input_index| {
+                    parameter_for_input(input_index)
                         .is_some_and(|parameter| parameter.name.as_str().eq_ignore_ascii_case(name))
                 })?,
             };
             let expanded_variadic =
                 !explicit_variadic && variadic_index == Some(input_index) && occupied[input_index];
-            if input_index >= self.argument_count || occupied[input_index] && !expanded_variadic {
+            if input_index >= input_count || occupied[input_index] && !expanded_variadic {
                 return None;
             }
             occupied[input_index] = true;
             *mapped_input = u8::try_from(input_index).ok()?;
         }
-        for (input_index, occupied) in occupied.iter().enumerate().take(self.argument_count) {
-            if !occupied {
-                let mode = self.parameter_for_input(input_index)?.mode;
-                let _ = mode.default()?;
+        for (input_index, occupied) in occupied.iter().enumerate().take(input_count) {
+            if !occupied && !parameter_for_input(input_index)?.mode.has_default() {
+                return None;
             }
         }
         Some(mapping)
@@ -9109,7 +9223,7 @@ impl RoutineDef {
         for (parameter_index, occupied) in occupied.iter().enumerate().take(self.parameter_count) {
             if !occupied {
                 let parameter = self.parameters[parameter_index];
-                if !parameter.mode.is_input() || parameter.mode.default().is_none() {
+                if !parameter.mode.is_input() || !parameter.mode.has_default() {
                     return None;
                 }
             }
@@ -9118,34 +9232,46 @@ impl RoutineDef {
     }
 
     pub(crate) fn definition_for(&self, txid: u32) -> Self {
-        let mut definition = self
-            .pending_definition
-            .filter(|pending| pending.txid == txid)
-            .map_or(*self, |pending| Self {
-                version: self.revision_for(txid),
-                arguments: pending.definition.arguments,
-                argument_count: pending.definition.argument_count,
-                parameters: pending.definition.parameters,
-                parameter_count: pending.definition.parameter_count,
-                kind: pending.definition.kind,
-                result_columns: pending.definition.result_columns,
-                result_column_count: pending.definition.result_column_count,
-                language: pending.definition.language,
-                attributes: pending.definition.attributes,
-                configs: pending.definition.configs,
-                config_count: pending.definition.config_count,
-                body_kind: pending.definition.body_kind,
-                body: pending.definition.body,
-                creation_path: pending.definition.creation_path,
-                pending_definition: None,
-                ..*self
-            });
-        definition.version = self.revision_for(txid);
-        definition.schema = self.schema_for(txid);
-        definition.name = self.name_for(txid);
-        definition.pending_identity = None;
-        definition.pending_definition = None;
-        definition
+        let pending = self
+            .pending_definition_for(txid)
+            .map(|pending| &pending.definition);
+        // Select references before copying the owned snapshot. Copying the
+        // optional replacement or the whole base record also copies unused
+        // SQL/default/configuration buffers on every lookup.
+        Self {
+            database: self.database,
+            created_at: self.created_at,
+            version: self.revision_for(txid),
+            ddl_version: self.ddl_version,
+            schema: self.schema_for(txid),
+            name: self.name_for(txid),
+            pending_identity: None,
+            pending_definition: None,
+            arguments: *pending.map_or(&self.arguments, |definition| &definition.arguments),
+            argument_count: pending
+                .map_or(self.argument_count, |definition| definition.argument_count),
+            parameters: *pending.map_or(&self.parameters, |definition| &definition.parameters),
+            parameter_count: pending.map_or(self.parameter_count, |definition| {
+                definition.parameter_count
+            }),
+            kind: pending.map_or(self.kind, |definition| definition.kind),
+            result_columns: *pending.map_or(&self.result_columns, |definition| {
+                &definition.result_columns
+            }),
+            result_column_count: pending.map_or(self.result_column_count, |definition| {
+                definition.result_column_count
+            }),
+            language: pending.map_or(self.language, |definition| definition.language),
+            attributes: pending.map_or(self.attributes, |definition| definition.attributes),
+            configs: *pending.map_or(&self.configs, |definition| &definition.configs),
+            config_count: pending.map_or(self.config_count, |definition| definition.config_count),
+            body_kind: pending.map_or(self.body_kind, |definition| definition.body_kind),
+            body: *pending.map_or(&self.body, |definition| &definition.body),
+            creation_path: *pending
+                .map_or(&self.creation_path, |definition| &definition.creation_path),
+            ownership: self.ownership,
+            ddl_state: self.ddl_state,
+        }
     }
 
     pub(crate) fn table_columns(&self) -> Option<&[RoutineArgumentDef]> {
@@ -24301,7 +24427,14 @@ impl Storage {
             AccessClass::Domain => self.domain(slot).ownership,
             AccessClass::Enum => self.enum_for(slot, 0).ownership,
             AccessClass::Index => self.index(slot).ownership,
-            AccessClass::Routine => self.routine(slot).ownership,
+            AccessClass::Routine => {
+                self.routines
+                    .lock()
+                    .expect("routine catalog lock poisoned")
+                    .get(slot)
+                    .expect("routine slot is in range")
+                    .ownership
+            }
             AccessClass::Composite => self.composite(slot).ownership,
             AccessClass::Tablespace => self.tablespace(slot).ownership,
             AccessClass::Statistics => self.extended_statistics(slot).ownership,
@@ -24726,7 +24859,6 @@ impl Storage {
             AccessClass::Routine => RoutineIter {
                 catalog: &self.routines,
                 next_slot: 0,
-                lookup: None,
             }
             .find_map(|(slot, routine)| {
                 (routine.database == current_database()
@@ -25070,7 +25202,6 @@ impl Storage {
                 RoutineIter {
                     catalog: &self.routines,
                     next_slot: 0,
-                    lookup: None,
                 }
                 .find_map(|(slot, candidate)| {
                     (candidate.database == target_database && candidate.created_at == created_at)
@@ -29904,7 +30035,6 @@ impl Storage {
         for (_, definition) in (RoutineIter {
             catalog: &self.routines,
             next_slot: 0,
-            lookup: None,
         })
         .filter(|(_, definition)| {
             definition.database == current_database()
@@ -42915,7 +43045,6 @@ impl Storage {
         RoutineIter {
             catalog: &self.routines,
             next_slot: 0,
-            lookup: None,
         }
     }
 
@@ -42925,18 +43054,28 @@ impl Storage {
         name: &'a str,
         transaction: u32,
         kind: RoutineCallKind,
-    ) -> RoutineIter<'a> {
-        RoutineIter {
-            catalog: &self.routines,
-            next_slot: 0,
-            lookup: Some(RoutineLookup {
-                database: current_database(),
-                schema,
-                name,
-                transaction,
-                kind,
-            }),
-        }
+    ) -> impl Iterator<Item = (usize, RoutineInputSignature)> + 'a {
+        let lookup = RoutineLookup {
+            database: current_database(),
+            schema,
+            name,
+            transaction,
+            kind,
+        };
+        let mut next_slot = 0;
+        std::iter::from_fn(move || {
+            let catalog = self.routines.lock().expect("routine catalog lock poisoned");
+            while let Some(routine) = catalog.get(next_slot) {
+                let slot = next_slot;
+                next_slot += 1;
+                if !lookup.matches(routine) {
+                    continue;
+                }
+                let signature = RoutineInputSignature::from_definition(routine, transaction);
+                return Some((slot, signature));
+            }
+            None
+        })
     }
 
     pub(crate) fn routine_identity_for(
@@ -42979,6 +43118,29 @@ impl Storage {
         self.routine_identity_for(slot, txid).is_some()
     }
 
+    pub(crate) fn routine_call_mapping(
+        &self,
+        slot: usize,
+        argument_names: &[Option<&str>],
+        argument_count: usize,
+        explicit_variadic: bool,
+        txid: u32,
+    ) -> Option<(i32, [u8; MAX_ROUTINE_ARGUMENTS])> {
+        let catalog = self.routines.lock().expect("routine catalog lock poisoned");
+        let routine = catalog.get(slot)?;
+        if routine.database != current_database() || !routine.visible_to(txid) {
+            return None;
+        }
+        let mapping = RoutineDef::map_input_parameters(
+            routine.parameters_for(txid),
+            routine.arguments_for(txid).len(),
+            argument_names,
+            argument_count,
+            explicit_variadic,
+        )?;
+        Some((routine_oid(routine), mapping))
+    }
+
     pub(crate) fn routine(&self, slot: usize) -> RoutineDef {
         self.routine_at(slot).expect("routine slot is in range")
     }
@@ -42995,7 +43157,12 @@ impl Storage {
     /// the catalog slot and object identifier stable while its new definition
     /// is private until commit.
     pub(crate) fn routine_for(&self, slot: usize, txid: u32) -> RoutineDef {
-        self.routine(slot).definition_for(txid)
+        self.routines
+            .lock()
+            .expect("routine catalog lock poisoned")
+            .get(slot)
+            .expect("routine slot is in range")
+            .definition_for(txid)
     }
 
     pub(crate) fn routine_slot_by_oid(&self, oid: i32, txid: u32) -> Option<usize> {
@@ -43090,16 +43257,7 @@ impl Storage {
         let resolve = |schema: &str, routine_name: &str| {
             let mut candidates = self
                 .routine_candidates(schema, routine_name, txid, kind)
-                .filter_map(|(slot, routine)| {
-                    let definition = routine.definition_for(txid);
-                    if routine.database != current_database()
-                        || !routine.visible_to(txid)
-                        || !kind.accepts(definition.kind)
-                        || definition.schema_for(txid).as_str() != schema
-                        || definition.name_for(txid).as_str() != routine_name
-                    {
-                        return None;
-                    }
+                .filter_map(|(slot, definition)| {
                     let variadic_index = definition.arguments().len().checked_sub(1)?;
                     let variadic_parameter = definition.parameter_for_input(variadic_index)?;
                     let RoutineParameterMode::Variadic { .. } = variadic_parameter.mode else {
@@ -43308,6 +43466,81 @@ impl Storage {
         self.routine_for_bound_call(slot, &declared_oids[..routine.argument_count], txid)
     }
 
+    pub(crate) fn captured_routine_slot_for_call(
+        &self,
+        dependencies: StoredQueryDependencyView<'_>,
+        name: &str,
+        argument_names: &[Option<&str>],
+        argument_type_oids: &[i32],
+        explicit_variadic: bool,
+        txid: u32,
+    ) -> Option<usize> {
+        let (schema, name) = name.split_once('.').unwrap_or(("", name));
+        self.routine_slot_in_candidates(
+            argument_names,
+            argument_type_oids,
+            explicit_variadic,
+            txid,
+            || {
+                dependencies.entries().iter().filter_map(|dependency| {
+                    if dependency.class != DependencyClass::Routine
+                        || dependency.referenced_schema.as_str() != schema
+                        || dependency.referenced_name.as_str() != name
+                    {
+                        return None;
+                    }
+                    let catalog = self.routines.lock().expect("routine catalog lock poisoned");
+                    let slot = usize::from(dependency.slot);
+                    let routine = catalog.get(slot)?;
+                    if routine.database != current_database()
+                        || !routine.visible_to(txid)
+                        || dependency.identity
+                            != StoredDependencyIdentity::RoutineOid(routine_oid(routine))
+                    {
+                        return None;
+                    }
+                    Some((slot, RoutineInputSignature::from_definition(routine, txid)))
+                })
+            },
+        )
+    }
+
+    /// Describe a captured function without resolving its name or overload again.
+    pub(crate) fn function_for_captured_call(
+        &self,
+        oid: i32,
+        argument_names: &[Option<&str>],
+        argument_type_oids: &[i32],
+        explicit_variadic: bool,
+        txid: u32,
+    ) -> Option<RoutineDef> {
+        let slot = self.routine_slot_by_oid(oid, txid)?;
+        let mut routine = self.routine_for(slot, txid);
+        routine.kind.function_result()?;
+        let mapping = routine.call_input_mapping(
+            argument_names,
+            argument_type_oids.len(),
+            explicit_variadic,
+        )?;
+        let mut completed = [crate::sql::types::oid::UNKNOWN; MAX_ROUTINE_ARGUMENTS];
+        for (index, argument) in routine.arguments().iter().enumerate() {
+            completed[index] = self.routine_argument_oid(argument, txid)?;
+        }
+        for (index, oid) in argument_type_oids.iter().enumerate() {
+            let input = usize::from(mapping[index]);
+            let expanded = !explicit_variadic
+                && routine.parameter_for_input(input).is_some_and(|parameter| {
+                    matches!(parameter.mode, RoutineParameterMode::Variadic { .. })
+                });
+            if !expanded {
+                completed[input] = *oid;
+            }
+        }
+        let count = routine.argument_count;
+        self.bind_routine_call(&mut routine, &completed[..count], txid)?;
+        Some(routine)
+    }
+
     pub(crate) fn function_for_named_call_oids(
         &self,
         name: &str,
@@ -43450,6 +43683,20 @@ impl Storage {
         txid: u32,
     ) -> Option<RoutineDef> {
         let mut routine = self.routine_for(slot, txid);
+        self.bind_routine_call(&mut routine, argument_type_oids, txid)?;
+        Some(routine)
+    }
+
+    /// Bind an already-owned definition without copying its reserved buffers.
+    pub(crate) fn bind_routine_call(
+        &self,
+        routine: &mut RoutineDef,
+        argument_type_oids: &[i32],
+        txid: u32,
+    ) -> Option<()> {
+        if argument_type_oids.len() > routine.argument_count {
+            return None;
+        }
         if routine.accepts_input_arity(argument_type_oids.len())
             && routine.arguments()[..argument_type_oids.len()]
                 .iter()
@@ -43459,7 +43706,7 @@ impl Storage {
                         .is_some_and(|expected| self.routine_implicit_cast(*oid, expected, txid))
                 })
         {
-            return Some(routine);
+            return Some(());
         }
         let binding = self.polymorphic_call_binding(
             &routine.arguments()[..argument_type_oids.len()],
@@ -43518,7 +43765,7 @@ impl Storage {
             | RoutineKind::EventTrigger
             | RoutineKind::Procedure => {}
         }
-        Some(routine)
+        Some(())
     }
 
     pub(crate) fn routine_slot_for_function_call_oids(
@@ -43576,10 +43823,11 @@ impl Storage {
         name: &str,
         arity: usize,
         txid: u32,
-        accepts: impl Fn(RoutineKind, RoutineAttributes) -> bool,
+        accepts: fn(RoutineKind, RoutineAttributes) -> bool,
     ) -> bool {
         let matches = |schema: &str, routine_name: &str| {
-            self.routine_entries().any(|(_, routine)| {
+            let catalog = self.routines.lock().expect("routine catalog lock poisoned");
+            catalog.iter().any(|routine| {
                 routine.database == current_database()
                     && routine.visible_to(txid)
                     && accepts(routine.kind_for(txid), routine.attributes_for(txid))
@@ -43940,20 +44188,34 @@ impl Storage {
         kind: RoutineCallKind,
     ) -> Option<usize> {
         self.routine_candidates(schema, name, txid, kind)
-            .find_map(|(slot, routine)| {
-                let definition = routine.definition_for(txid);
-                (routine.database == current_database()
-                    && routine.visible_to(txid)
-                    && kind.accepts(definition.kind)
-                    && definition.schema_for(txid).as_str() == schema
-                    && definition.name_for(txid).as_str() == name
-                    && definition.accepts_input_arity(argument_types.len())
+            .find_map(|(slot, definition)| {
+                (definition.accepts_input_arity(argument_types.len())
                     && definition.arguments()[..argument_types.len()]
                         .iter()
                         .zip(argument_types)
                         .all(|(parameter, value)| parameter.ctype == *value))
                 .then_some(slot)
             })
+    }
+
+    // Exact signature dispatch happens first. Ambiguous calls compare domain
+    // inputs with their base type, rather than favoring a domain parameter.
+    fn routine_best_match_input(
+        &self,
+        actual: i32,
+        expected: &RoutineArgumentDef,
+        txid: u32,
+    ) -> bool {
+        if actual == crate::sql::types::oid::UNKNOWN {
+            return false;
+        }
+        let actual = match NamedTypeKind::from_oid(actual) {
+            Some((NamedTypeKind::Domain, _, false)) => self
+                .domain_base_type_for_oid(actual, txid)
+                .and_then(ColType::try_oid),
+            _ => Some(actual),
+        };
+        actual.is_some_and(|actual| self.routine_argument_oid(expected, txid) == Some(actual))
     }
 
     fn routine_slot_in_oids(
@@ -43966,14 +44228,8 @@ impl Storage {
     ) -> Option<usize> {
         let exact =
             self.routine_candidates(schema, name, txid, kind)
-                .find_map(|(slot, routine)| {
-                    let definition = routine.definition_for(txid);
-                    (routine.database == current_database()
-                        && routine.visible_to(txid)
-                        && kind.accepts(definition.kind)
-                        && definition.schema_for(txid).as_str() == schema
-                        && definition.name_for(txid).as_str() == name
-                        && definition.argument_count == argument_type_oids.len()
+                .find_map(|(slot, definition)| {
+                    (definition.argument_count == argument_type_oids.len()
                         && definition.arguments().iter().zip(argument_type_oids).all(
                             |(argument, oid)| {
                                 self.routine_argument_oid(argument, txid) == Some(*oid)
@@ -43984,25 +44240,59 @@ impl Storage {
         if exact.is_some() {
             return exact;
         }
+        let accepts = |definition: &RoutineInputSignature| {
+            definition.accepts_input_arity(argument_type_oids.len())
+                && definition.arguments()[..argument_type_oids.len()]
+                    .iter()
+                    .zip(argument_type_oids)
+                    .all(|(argument, oid)| {
+                        self.routine_argument_oid(argument, txid)
+                            .is_some_and(|expected| {
+                                self.routine_implicit_cast(*oid, expected, txid)
+                            })
+                    })
+        };
+        let score = |definition: &RoutineInputSignature| {
+            definition
+                .arguments()
+                .iter()
+                .zip(argument_type_oids)
+                .filter(|(argument, oid)| self.routine_best_match_input(**oid, argument, txid))
+                .count()
+        };
+        let best_score = self
+            .routine_candidates(schema, name, txid, kind)
+            .filter_map(|(_, definition)| accepts(&definition).then(|| score(&definition)))
+            .max();
+        let mut preferences = RoutineStringPreferences::EMPTY;
+        if argument_type_oids.contains(&crate::sql::types::oid::UNKNOWN) {
+            for (_, definition) in self.routine_candidates(schema, name, txid, kind) {
+                if !accepts(&definition) || Some(score(&definition)) != best_score {
+                    continue;
+                }
+                for (index, (argument, oid)) in definition
+                    .arguments()
+                    .iter()
+                    .zip(argument_type_oids)
+                    .enumerate()
+                {
+                    if *oid == crate::sql::types::oid::UNKNOWN {
+                        preferences.observe(index, argument);
+                    }
+                }
+            }
+        }
         let concrete = self
             .routine_candidates(schema, name, txid, kind)
-            .filter_map(|(slot, routine)| {
-                let definition = routine.definition_for(txid);
-                (routine.database == current_database()
-                    && routine.visible_to(txid)
-                    && kind.accepts(definition.kind)
-                    && definition.schema_for(txid).as_str() == schema
-                    && definition.name_for(txid).as_str() == name
-                    && definition.accepts_input_arity(argument_type_oids.len())
-                    && definition.arguments()[..argument_type_oids.len()]
+            .filter_map(|(slot, definition)| {
+                (accepts(&definition)
+                    && Some(score(&definition)) == best_score
+                    && definition
+                        .arguments()
                         .iter()
-                        .zip(argument_type_oids)
-                        .all(|(argument, oid)| {
-                            self.routine_argument_oid(argument, txid)
-                                .is_some_and(|expected| {
-                                    self.routine_implicit_cast(*oid, expected, txid)
-                                })
-                        }))
+                        .take(argument_type_oids.len())
+                        .enumerate()
+                        .all(|(index, argument)| preferences.accepts(index, argument)))
                 .then_some(slot)
             });
         let mut concrete = concrete;
@@ -44012,14 +44302,8 @@ impl Storage {
         }
         let polymorphic = self
             .routine_candidates(schema, name, txid, kind)
-            .filter_map(|(slot, routine)| {
-                let definition = routine.definition_for(txid);
-                (routine.database == current_database()
-                    && routine.visible_to(txid)
-                    && kind.accepts(definition.kind)
-                    && definition.schema_for(txid).as_str() == schema
-                    && definition.name_for(txid).as_str() == name
-                    && definition.accepts_input_arity(argument_type_oids.len())
+            .filter_map(|(slot, definition)| {
+                (definition.accepts_input_arity(argument_type_oids.len())
                     && self
                         .polymorphic_call_binding(
                             &definition.arguments()[..argument_type_oids.len()],
@@ -44047,25 +44331,50 @@ impl Storage {
         txid: u32,
         call_kind: RoutineCallKind,
     ) -> Option<usize> {
-        let matches = |routine: &RoutineDef, implicit: bool, polymorphic: bool| {
-            let definition = routine.definition_for(txid);
-            if routine.database != current_database()
-                || !routine.visible_to(txid)
-                || !call_kind.accepts(definition.kind)
-                || definition.schema_for(txid).as_str() != schema
-                || definition.name_for(txid).as_str() != name
-            {
-                return false;
-            }
-            let Some(mapping) =
-                definition.call_input_mapping(argument_names, argument_type_oids.len(), false)
-            else {
+        self.routine_slot_in_candidates(argument_names, argument_type_oids, false, txid, || {
+            self.routine_candidates(schema, name, txid, call_kind)
+        })
+    }
+
+    fn routine_slot_in_candidates<F, I>(
+        &self,
+        argument_names: &[Option<&str>],
+        argument_type_oids: &[i32],
+        explicit_variadic: bool,
+        txid: u32,
+        candidates: F,
+    ) -> Option<usize>
+    where
+        F: Fn() -> I,
+        I: Iterator<Item = (usize, RoutineInputSignature)>,
+    {
+        let matches = |definition: &RoutineInputSignature, implicit: bool, polymorphic: bool| {
+            let Some(mapping) = definition.call_input_mapping(
+                argument_names,
+                argument_type_oids.len(),
+                explicit_variadic,
+            ) else {
                 return false;
             };
             let mut binding = PolymorphicBinding::EMPTY;
             let mut saw_polymorphic = false;
             for (call_index, actual_oid) in argument_type_oids.iter().enumerate() {
-                let argument = definition.arguments[usize::from(mapping[call_index])];
+                let input = usize::from(mapping[call_index]);
+                let mut argument = definition.arguments[input];
+                if !explicit_variadic
+                    && argument_names.is_empty()
+                    && definition
+                        .parameter_for_input(input)
+                        .is_some_and(|parameter| {
+                            matches!(parameter.mode, RoutineParameterMode::Variadic { .. })
+                        })
+                    && let ColType::Array(element) = argument.ctype
+                {
+                    let Some(ctype) = ColType::from_oid(element.element_oid()) else {
+                        return false;
+                    };
+                    argument.ctype = ctype;
+                }
                 if let Some(kind) = argument.polymorphic_type() {
                     if !polymorphic || binding.bind(kind, *actual_oid).is_none() {
                         return false;
@@ -44084,12 +44393,70 @@ impl Storage {
             }
             polymorphic == saw_polymorphic
         };
+        let score = |definition: &RoutineInputSignature| {
+            let mapping = definition
+                .call_input_mapping(argument_names, argument_type_oids.len(), explicit_variadic)
+                .expect("matched routine has a valid input mapping");
+            argument_type_oids
+                .iter()
+                .enumerate()
+                .filter(|(index, oid)| {
+                    self.routine_best_match_input(
+                        **oid,
+                        &definition.arguments[usize::from(mapping[*index])],
+                        txid,
+                    )
+                })
+                .count()
+        };
         for (implicit, polymorphic) in [(false, false), (true, false), (true, true)] {
-            let mut candidates = self
-                .routine_candidates(schema, name, txid, call_kind)
-                .filter_map(|(slot, routine)| {
-                    matches(&routine, implicit, polymorphic).then_some(slot)
-                });
+            let best_score = candidates()
+                .filter_map(|(_, definition)| {
+                    matches(&definition, implicit, polymorphic).then(|| score(&definition))
+                })
+                .max();
+            let mut preferences = RoutineStringPreferences::EMPTY;
+            if implicit
+                && !polymorphic
+                && argument_type_oids.contains(&crate::sql::types::oid::UNKNOWN)
+            {
+                for (_, definition) in candidates() {
+                    if !matches(&definition, implicit, polymorphic)
+                        || Some(score(&definition)) != best_score
+                    {
+                        continue;
+                    }
+                    let mapping = definition
+                        .call_input_mapping(
+                            argument_names,
+                            argument_type_oids.len(),
+                            explicit_variadic,
+                        )
+                        .expect("matched routine has a valid input mapping");
+                    for (index, oid) in argument_type_oids.iter().enumerate() {
+                        if *oid == crate::sql::types::oid::UNKNOWN {
+                            preferences
+                                .observe(index, &definition.arguments[usize::from(mapping[index])]);
+                        }
+                    }
+                }
+            }
+            let mut candidates = candidates().filter_map(|(slot, routine)| {
+                if !matches(&routine, implicit, polymorphic) || Some(score(&routine)) != best_score
+                {
+                    return None;
+                }
+                let mapping = routine
+                    .call_input_mapping(argument_names, argument_type_oids.len(), explicit_variadic)
+                    .expect("matched routine has a valid input mapping");
+                argument_type_oids
+                    .iter()
+                    .enumerate()
+                    .all(|(index, _)| {
+                        preferences.accepts(index, &routine.arguments[usize::from(mapping[index])])
+                    })
+                    .then_some(slot)
+            });
             let first = candidates.next();
             if first.is_some() && candidates.next().is_none() {
                 return first;
@@ -44359,17 +44726,23 @@ impl Storage {
         }
     }
 
+    fn routine_pending_dependency_slot(&self, slot: usize, txid: u32) -> Option<u32> {
+        self.routines
+            .lock()
+            .expect("routine catalog lock poisoned")
+            .get(slot)
+            .expect("routine slot is in range")
+            .pending_definition_for(txid)
+            .map(|pending| pending.dependency_slot)
+    }
+
     pub(crate) fn routine_dependencies_for(
         &self,
         slot: usize,
         txid: u32,
     ) -> StoredQueryDependencyImage<'_> {
-        if let Some(pending) = self
-            .routine(slot)
-            .pending_definition
-            .filter(|pending| pending.txid == txid)
-        {
-            return self.pending_dependencies(pending.dependency_slot);
+        if let Some(dependency_slot) = self.routine_pending_dependency_slot(slot, txid) {
+            return self.pending_dependencies(dependency_slot);
         }
         self.committed_dependencies(StoredQueryDependencyOwner::Routine(slot as u16))
     }
@@ -44380,12 +44753,9 @@ impl Storage {
         txid: u32,
         arena: &crate::mem::arena::Arena,
     ) -> Result<StoredQueryDependencies, SqlError> {
-        let image = if let Some(pending) = self
-            .routine(slot)
-            .pending_definition
-            .filter(|pending| pending.txid == txid)
+        let image = if let Some(dependency_slot) = self.routine_pending_dependency_slot(slot, txid)
         {
-            self.stored_query_dependency_pending_base + pending.dependency_slot as usize
+            self.stored_query_dependency_pending_base + dependency_slot as usize
         } else {
             self.committed_dependency_image(StoredQueryDependencyOwner::Routine(slot as u16))
         };
@@ -56510,7 +56880,7 @@ mod tests {
         config.max_stored_query_dependencies_per_object = 1;
         let mut budget = test_budget(&config);
         let storage = Storage::new(&config, &mut budget, 0).unwrap();
-        let arena = Arena::new(&mut budget, "view snapshot test", 1 << 16).unwrap();
+        let mut arena = Arena::new(&mut budget, "view snapshot test", 1 << 16).unwrap();
         let barrier = std::sync::Barrier::new(WORKERS + 1);
         let finished = std::sync::atomic::AtomicUsize::new(0);
         let names = ["worker_a", "worker_b", "worker_c", "worker_d"];
@@ -56554,7 +56924,10 @@ mod tests {
             }
             barrier.wait();
             crate::mem::guard::forbid_alloc(|| {
-                while finished.load(std::sync::atomic::Ordering::Acquire) != WORKERS {
+                let mut polls = 0;
+                while finished.load(std::sync::atomic::Ordering::Acquire) != WORKERS || polls < 1024
+                {
+                    arena.reset();
                     let catalog = storage.view_rule_catalog();
                     for (slot, view) in catalog.views.iter().enumerate() {
                         if view.ddl_state == CatalogDdlState::Absent {
@@ -56583,11 +56956,13 @@ mod tests {
                             CatalogDdlState::Present
                         );
                     }
+                    polls += 1;
                     std::thread::yield_now();
                 }
             });
         });
 
+        arena.reset();
         crate::mem::guard::forbid_alloc(|| {
             assert_eq!(storage.view_count(), WORKERS);
             assert_eq!(storage.rule_count(), WORKERS);
@@ -59564,9 +59939,9 @@ mod tests {
         crate::mem::guard::forbid_alloc(|| {
             let slots = |name, transaction, kind| {
                 let mut candidates = storage.routine_candidates("public", name, transaction, kind);
-                let candidate = candidates.next().map(|(slot, routine)| {
+                let candidate = candidates.next().map(|(slot, _)| {
                     assert!(storage.routines.try_lock().is_ok());
-                    assert!(routine.visible_to(transaction));
+                    assert!(storage.routine_slot_visible_to(slot, transaction));
                     slot
                 });
                 assert!(candidates.next().is_none());
@@ -59612,14 +59987,24 @@ mod tests {
                 ),
                 Some(1)
             );
-            let retained = storage
+            {
+                let mut catalog = storage.routines.lock().unwrap();
+                catalog[1].arguments[0].ctype = ColType::Int4;
+                catalog[1].argument_count = 1;
+                catalog[1].parameters[0].ctype = ColType::Int4;
+                catalog[1].parameter_count = 1;
+            }
+            let (retained_slot, retained) = storage
                 .routine_candidates("public", "renamed", 7, RoutineCallKind::Scalar)
                 .next()
-                .unwrap()
-                .1;
-            storage.routines.lock().unwrap()[1].ddl_state = CatalogDdlState::Absent;
-            assert!(retained.visible_to(7));
-            assert_eq!(retained.name_for(7).as_str(), "renamed");
+                .unwrap();
+            {
+                let mut catalog = storage.routines.lock().unwrap();
+                catalog[1].ddl_state = CatalogDdlState::Absent;
+                catalog[1].arguments[0].ctype = ColType::Text;
+            }
+            assert_eq!(retained_slot, 1);
+            assert_eq!(retained.arguments()[0].ctype, ColType::Int4);
             assert_eq!(slots("renamed", 7, RoutineCallKind::Scalar), None);
             assert_eq!(storage.routine_entries().count(), 4);
         });

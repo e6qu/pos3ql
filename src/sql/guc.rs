@@ -1079,6 +1079,7 @@ fn merge_session_changes(target: &mut GucValues, before: &GucValues, after: &Guc
     changed!(event_triggers);
     changed!(bytea_escape);
     changed!(check_function_bodies);
+    changed!(xml_document);
     changed!(default_transaction_isolation);
     changed!(default_transaction_read_only);
     changed!(default_transaction_deferrable);

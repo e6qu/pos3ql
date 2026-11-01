@@ -1375,6 +1375,10 @@ fn saved_guc_values_preserve_raw_spelling_without_runtime_allocations() {
 #[test]
 fn reset_xmloption_restores_the_connection_default_without_allocating() {
     let guc = GucState::new();
+    let configs = [crate::storage::RoutineConfig {
+        name: crate::storage::SqlName::parse("application_name").unwrap(),
+        value: crate::util::StackStr::from_str("scoped"),
+    }];
     crate::mem::guard::forbid_alloc(|| {
         guc.set_connection_default("xmloption", "document", guc::ConnectionDefaultSource::Role)
             .unwrap();
@@ -1387,6 +1391,14 @@ fn reset_xmloption_restores_the_connection_default_without_allocating() {
         guc.commit_transaction();
         assert_eq!(guc.get_owned("xmloption").unwrap().as_str(), "document");
         assert!(guc.render().xml_document);
+        guc.begin_transaction();
+        {
+            let _scope = guc.enter_routine_configs(&configs).unwrap();
+            guc.set_config("xmloption", Some("content"), false).unwrap();
+        }
+        assert_eq!(guc.get_owned("xmloption").unwrap().as_str(), "content");
+        guc.commit_transaction();
+        assert!(!guc.render().xml_document);
     });
 }
 

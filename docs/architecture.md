@@ -104,7 +104,9 @@ Before this handoff, input preparation retains its own progress. For example,
 conversions reuse their values; a partially evaluated expression reuses completed
 nested calls. Omitted defaults keep their original declaration and dependency
 image even if another argument replaces the function. Constant-input decisions
-also stay fixed. The new body is still selected when execution begins.
+also stay fixed. A reached call keeps its selected function when an argument
+changes `search_path`; another same-named function cannot take over on resumption.
+The new body is still selected when execution begins.
 Input records remain temporary row scratch for calls that finish immediately.
 Only a suspended call copies its live records into statement memory. Function
 bodies and subqueries own separate input scopes so their row-scratch recycling

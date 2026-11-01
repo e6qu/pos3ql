@@ -3707,7 +3707,9 @@ fn table_func_routine<'a, C: ColumnLookup<'a>>(
     } else {
         tref.table
     };
-    let slot = if tref.func_argument_names.is_empty() {
+    let slot = if let Some(oid) = super::input_progress::selected_target() {
+        storage.routine_slot_by_oid(oid, txid)
+    } else if tref.func_argument_names.is_empty() {
         storage.routine_slot_for_function_call_syntax_oids(
             name,
             &argument_type_oids[..args.len()],

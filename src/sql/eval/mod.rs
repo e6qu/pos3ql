@@ -2603,6 +2603,40 @@ pub fn eval_full<'a>(
     hooks: &EvalHooks<'_, 'a>,
 ) -> Result<Datum<'a>, SqlError> {
     let evaluate = || {
+        let position = super::query::input_progress::enter_expression(expression)?;
+        let bound;
+        let expression = if let (
+            Some(oid),
+            Expr::Call {
+                name,
+                args,
+                argument_names,
+                variadic,
+                star,
+                distinct,
+                order_by,
+                over,
+                filter,
+                ..
+            },
+        ) = (position.target, *expression)
+        {
+            bound = Expr::Call {
+                name,
+                bound_oid: Some(oid),
+                args,
+                argument_names,
+                variadic,
+                star,
+                distinct,
+                order_by,
+                over,
+                filter,
+            };
+            &bound
+        } else {
+            expression
+        };
         let _query_inputs = matches!(
             expression,
             Expr::Subquery(_)

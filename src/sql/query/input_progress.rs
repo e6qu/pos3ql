@@ -5,7 +5,7 @@ use crate::storage::{
     RoutineDef, RoutineParameterMode, StoredQueryDependency, StoredQueryDependencyView,
 };
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InputSite<'a> {
     Argument {
         routine: i32,
@@ -29,7 +29,7 @@ pub(crate) enum InputSite<'a> {
     Definition(i32),
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InputQuery {
     Scalar,
     Row,
@@ -372,7 +372,13 @@ impl<'statement: 'query, 'query> InputAttempt<'statement, 'query> {
             .ok_or_else(changed)?
             .frame();
         if frame.site != site {
-            return Err(changed());
+            return Err(sql_err!(
+                sqlstate::SERIALIZATION_FAILURE,
+                "retained input {} changed: {:?} to {:?}",
+                ordinal,
+                frame.site,
+                site
+            ));
         }
         Ok((ordinal, frame))
     }
@@ -497,6 +503,67 @@ type ActiveInput = *const ();
 thread_local! {
     static AVAILABLE_INPUT: Cell<Option<ActiveInput>> = const { Cell::new(None) };
     static ACTIVE_INPUT: Cell<Option<ActiveInput>> = const { Cell::new(None) };
+    static CURRENT_CALL: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+pub(crate) struct ExpressionPosition {
+    previous: Option<usize>,
+    pub(crate) target: Option<i32>,
+}
+impl Drop for ExpressionPosition {
+    fn drop(&mut self) {
+        CURRENT_CALL.with(|current| current.set(self.previous));
+    }
+}
+
+fn definition_oid(frame: InputFrame<'_>) -> Option<i32> {
+    match frame.state {
+        InputState::Definition(definition) => Some(definition.signature.oid),
+        _ => None,
+    }
+}
+
+pub(super) fn selected_target() -> Option<i32> {
+    let active = AVAILABLE_INPUT.with(Cell::get)?;
+    let attempt = unsafe { &*(active as *const InputAttempt<'_, '_>) };
+    attempt
+        .frames
+        .borrow()
+        .as_slice()
+        .get(attempt.next.get())
+        .and_then(|frame| definition_oid(frame.frame()))
+}
+
+pub(crate) fn enter_expression(expression: &Expr<'_>) -> Result<ExpressionPosition, SqlError> {
+    let previous = CURRENT_CALL.with(Cell::get);
+    if !matches!(expression, Expr::Call { .. }) {
+        return Ok(ExpressionPosition {
+            previous,
+            target: None,
+        });
+    }
+    let Some((invocations, _)) = active_routine_invocations() else {
+        return Ok(ExpressionPosition {
+            previous,
+            target: None,
+        });
+    };
+    let registry = &invocations.inputs;
+    let ordinal = registry.next.get();
+    registry.next.set(ordinal.checked_add(1).ok_or_else(full)?);
+    CURRENT_CALL.with(|current| current.set(Some(ordinal)));
+    let target = if ACTIVE_INPUT.with(Cell::get).is_some() {
+        selected_target()
+    } else {
+        let saved = registry.saved.borrow();
+        saved
+            .as_slice()
+            .binary_search_by_key(&ordinal, |entry| entry.ordinal)
+            .ok()
+            .and_then(|index| saved.as_slice()[index].frames.first())
+            .and_then(|frame| definition_oid(**frame))
+    };
+    Ok(ExpressionPosition { previous, target })
 }
 
 pub(super) struct InputScope {
@@ -527,17 +594,20 @@ impl Drop for AvailableScope {
 pub(crate) struct BodyScope {
     active: Option<ActiveInput>,
     available: Option<ActiveInput>,
+    expression: Option<usize>,
 }
 impl Drop for BodyScope {
     fn drop(&mut self) {
         ACTIVE_INPUT.with(|active| active.set(self.active));
         AVAILABLE_INPUT.with(|active| active.set(self.available));
+        CURRENT_CALL.with(|current| current.set(self.expression));
     }
 }
 pub(crate) fn enter_body() -> BodyScope {
     BodyScope {
         active: ACTIVE_INPUT.with(|active| active.replace(None)),
         available: AVAILABLE_INPUT.with(|active| active.replace(None)),
+        expression: CURRENT_CALL.with(|current| current.replace(None)),
     }
 }
 
@@ -552,8 +622,14 @@ pub(super) fn call<T>(
         return execute();
     };
     let registry = &invocations.inputs;
-    let ordinal = registry.next.get();
-    registry.next.set(ordinal.checked_add(1).ok_or_else(full)?);
+    let ordinal = match CURRENT_CALL.with(Cell::get) {
+        Some(ordinal) => ordinal,
+        None => {
+            let ordinal = registry.next.get();
+            registry.next.set(ordinal.checked_add(1).ok_or_else(full)?);
+            ordinal
+        }
+    };
     let mut frames = ArenaList::new(arena);
     {
         let saved = registry.saved.borrow();

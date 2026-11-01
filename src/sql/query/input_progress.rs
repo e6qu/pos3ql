@@ -144,12 +144,29 @@ impl<'a> InputDefinition<'a> {
             crate::storage::RoutineKind::TableFunction => RoutineCallResult::Table,
             _ => return Err(changed()),
         };
-        let signature = RoutineCallContract::copy_signature(routine, result, |values| {
-            arena
-                .alloc_slice_copy(values)
-                .map(|values| &*values)
-                .map_err(|_| full())
-        })?;
+        let signature = RoutineCallContract::copy_signature(
+            routine,
+            result,
+            |values| {
+                arena
+                    .alloc_slice_copy(values)
+                    .map(|values| &*values)
+                    .map_err(|_| full())
+            },
+            |parameters| {
+                arena
+                    .alloc_slice_with(parameters.len(), |index| {
+                        let parameter = &parameters[index];
+                        crate::storage::RoutineArgumentDef {
+                            name: parameter.name,
+                            ctype: parameter.ctype,
+                            user_type: parameter.user_type,
+                        }
+                    })
+                    .map(|values| &*values)
+                    .map_err(|_| full())
+            },
+        )?;
         let defaults = arena
             .alloc_slice_with(routine.parameter_count, |_| ParameterDefault {
                 mode: 0,
@@ -258,7 +275,7 @@ enum InputState<'a> {
         next_invocation: usize,
         next_call: usize,
     },
-    Definition(InputDefinition<'a>),
+    Definition(&'a InputDefinition<'a>),
 }
 
 #[derive(Clone, Copy)]
@@ -434,8 +451,12 @@ impl<'statement: 'query, 'query> InputAttempt<'statement, 'query> {
             self.frame(InputSite::Definition(crate::storage::routine_oid(routine)))?;
         let definition = match frame.state {
             InputState::Pending => {
-                let definition =
-                    InputDefinition::capture(routine, slot, storage, txid, self.arena)?;
+                let definition: &'query InputDefinition<'query> = self
+                    .arena
+                    .alloc(InputDefinition::capture(
+                        routine, slot, storage, txid, self.arena,
+                    )?)
+                    .map_err(|_| full())?;
                 frame.state = InputState::Definition(definition);
                 self.frames
                     .borrow_mut()
@@ -447,7 +468,7 @@ impl<'statement: 'query, 'query> InputAttempt<'statement, 'query> {
             InputState::Value { .. } => return Err(changed()),
         };
         definition.restore(routine)?;
-        Ok(definition)
+        Ok(*definition)
     }
 
     fn retain(&self, ordinal: usize) -> Result<(), SqlError> {
@@ -471,7 +492,12 @@ impl<'statement: 'query, 'query> InputAttempt<'statement, 'query> {
                             next_call,
                         },
                         InputState::Definition(definition) => {
-                            InputState::Definition(definition.retain(arena)?)
+                            let definition = definition.retain(arena)?;
+                            InputState::Definition(
+                                &arena
+                                    .alloc_persistent_slice_with(1, |_| definition)
+                                    .map_err(|_| full())?[0],
+                            )
                         }
                     };
                     let site = frame.site.retain(arena)?;

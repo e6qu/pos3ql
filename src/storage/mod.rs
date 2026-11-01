@@ -9274,6 +9274,24 @@ impl RoutineDef {
         }
     }
 
+    /// A one-column TABLE result is its element type at SQL and wire boundaries.
+    pub(crate) fn function_result_contract(&self) -> Option<RoutineResult> {
+        match self.kind {
+            RoutineKind::Function { result } | RoutineKind::SetFunction { result } => Some(result),
+            RoutineKind::TableFunction if self.result_column_count == 1 => {
+                let column = self.result_columns[0];
+                Some(RoutineResult {
+                    ctype: column.ctype,
+                    user_type: column.user_type,
+                })
+            }
+            RoutineKind::RecordFunction { .. } | RoutineKind::TableFunction => {
+                Some(RoutineResult::builtin(crate::sql::types::ColType::Record))
+            }
+            _ => None,
+        }
+    }
+
     pub(crate) fn table_columns(&self) -> Option<&[RoutineArgumentDef]> {
         matches!(
             self.kind,
@@ -43836,22 +43854,7 @@ impl Storage {
         routine: &RoutineDef,
         txid: u32,
     ) -> Option<i32> {
-        let result = match routine.kind {
-            RoutineKind::Function { result } | RoutineKind::SetFunction { result } => result,
-            RoutineKind::TableFunction if routine.result_column_count == 1 => {
-                let column = routine.result_columns[0];
-                return self.routine_type_oid(column.ctype, column.user_type, txid);
-            }
-            RoutineKind::RecordFunction { .. } | RoutineKind::TableFunction => {
-                return Some(crate::sql::types::oid::RECORD);
-            }
-            RoutineKind::Trigger
-            | RoutineKind::EventTrigger
-            | RoutineKind::Procedure
-            | RoutineKind::Aggregate(_) => {
-                return None;
-            }
-        };
+        let result = routine.function_result_contract()?;
         self.routine_type_oid(result.ctype, result.user_type, txid)
     }
 

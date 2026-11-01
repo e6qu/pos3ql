@@ -64,6 +64,8 @@ TRUNCATE input_pause_audit;
 CREATE FUNCTION retained_reclassify() RETURNS integer LANGUAGE plpgsql AS $$BEGIN EXECUTE 'CREATE OR REPLACE FUNCTION retained_pair(first_arg integer,second_arg integer) RETURNS integer LANGUAGE sql IMMUTABLE AS ''SELECT $1+$2'''; RETURN 1; END$$;
 SELECT retained_variadic(retained_reclassify(),retained_pair(1,2),retained_input(7));
 SELECT value FROM input_pause_audit ORDER BY value;
+SELECT retained_rows(5);
+SELECT pg_typeof(retained_rows(5));
 DROP FUNCTION retained_reclassify();
 DROP FUNCTION retained_replace_argument();
 DROP FUNCTION retained_procedural(integer);

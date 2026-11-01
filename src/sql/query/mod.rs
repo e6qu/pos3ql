@@ -760,12 +760,29 @@ impl<'a> RoutineCallContract<'a> {
                 ));
             }
         };
-        let captured = Self::copy_signature(routine, result, |values| {
-            arena
-                .alloc_persistent_slice_with(values.len(), |index| values[index])
-                .map(|values| &*values)
-                .map_err(|_| full())
-        })?;
+        let captured = Self::copy_signature(
+            routine,
+            result,
+            |values| {
+                arena
+                    .alloc_persistent_slice_with(values.len(), |index| values[index])
+                    .map(|values| &*values)
+                    .map_err(|_| full())
+            },
+            |parameters| {
+                arena
+                    .alloc_persistent_slice_with(parameters.len(), |index| {
+                        let parameter = &parameters[index];
+                        crate::storage::RoutineArgumentDef {
+                            name: parameter.name,
+                            ctype: parameter.ctype,
+                            user_type: parameter.user_type,
+                        }
+                    })
+                    .map(|values| &*values)
+                    .map_err(|_| full())
+            },
+        )?;
         let retained = arena
             .alloc_persistent_slice_with(1, |_| captured)
             .map_err(|_| full())?;
@@ -778,20 +795,15 @@ impl<'a> RoutineCallContract<'a> {
         mut copy: impl FnMut(
             &[crate::storage::RoutineArgumentDef],
         ) -> Result<&'a [crate::storage::RoutineArgumentDef], SqlError>,
+        copy_parameters: impl FnOnce(
+            &[crate::storage::RoutineParameterDef],
+        )
+            -> Result<&'a [crate::storage::RoutineArgumentDef], SqlError>,
     ) -> Result<Self, SqlError> {
-        let mut parameters =
-            [crate::storage::RoutineArgumentDef::EMPTY; crate::storage::MAX_ROUTINE_ARGUMENTS];
-        for (output, parameter) in parameters.iter_mut().zip(routine.parameters()) {
-            *output = crate::storage::RoutineArgumentDef {
-                name: parameter.name,
-                ctype: parameter.ctype,
-                user_type: parameter.user_type,
-            };
-        }
         Ok(Self {
             oid: crate::storage::routine_oid(routine),
             arguments: copy(routine.arguments())?,
-            parameters: copy(&parameters[..routine.parameter_count])?,
+            parameters: copy_parameters(routine.parameters())?,
             result,
             result_columns: copy(&routine.result_columns[..routine.result_column_count])?,
         })
@@ -9960,7 +9972,7 @@ fn user_type_expression_description<'q>(
             if let Some(routine) =
                 storage.routine_for_call_oids(routine_name, &argument_type_oids[..args.len()], txid)
             {
-                let result = routine.kind.function_result()?;
+                let result = routine.function_result_contract()?.ctype;
                 return Some(ColDesc::new(name, result.oid(), result.typlen()));
             }
         }
@@ -10754,14 +10766,7 @@ impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_> {
                 .function_for_named_call_oids(name, argument_names, arguments, self.txid)
         };
         let result = routine
-            .and_then(|routine| match routine.kind {
-                crate::storage::RoutineKind::Function { result }
-                | crate::storage::RoutineKind::SetFunction { result } => Some(result),
-                crate::storage::RoutineKind::RecordFunction { .. } => {
-                    Some(crate::storage::RoutineResult::builtin(ColType::Record))
-                }
-                _ => None,
-            })
+            .and_then(|routine| routine.function_result_contract())
             .or_else(|| {
                 if bound_oid.is_some() {
                     return None;

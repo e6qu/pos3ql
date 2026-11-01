@@ -8,15 +8,18 @@ fn retained_routine_inputs_preserve_argument_effects_across_pending_calls() {
     let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
     let sql =
         include_str!("../../../tests/external/differential_exact/50_retained_routine_inputs.sql");
+    let output = session.success(&mut engine, sql, true);
     assert_eq!(
-        data_rows(&session.success(&mut engine, sql, true)),
+        data_rows(&output),
         [
             "0", "1", "1", "1", "0", "8", "1", "7", "8", "0", "8", "1", "7", "8", "0", "8", "1",
             "7", "8", "0", "8", "1", "7", "8", "0", "17", "1", "7", "9", "17", "0", "8", "1", "7",
             "8", "0", "1", "2", "1", "1", "0", "1", "2", "1", "1", "0", "1", "1", "1", "0", "108",
-            "0", "7", "108", "11", "7", "11",
+            "0", "7", "108", "11", "7", "11", "5", "6", "integer", "integer",
         ]
     );
+    let descriptions = row_description_type_oids(&output);
+    assert_eq!(&descriptions[descriptions.len() - 2..], &[23, 2206]);
 }
 
 #[test]

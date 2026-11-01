@@ -14091,18 +14091,16 @@ impl Engine {
             let encoded = if let Some(output) = table_columns {
                 let mut cast = [Datum::Null; crate::storage::MAX_COLUMNS];
                 for (slot, column) in output.iter().enumerate() {
-                    let projected = exec::encode_projected_pub(&[values[slot]], arena)?;
                     cast[slot] = eval::cast_to(
-                        exec::decode_projected_col_record(projected, 0, arena)?,
+                        exec::detach_routine_datum(values[slot], arena)?,
                         column.ctype,
                         arena,
                     )?;
                 }
                 exec::encode_projected_pub(&cast[..output.len()], arena)?
             } else {
-                let projected = exec::encode_projected_pub(values, arena)?;
                 let value = eval::cast_to(
-                    exec::decode_projected_col_record(projected, 0, arena)?,
+                    exec::detach_routine_datum(values[0], arena)?,
                     result_type,
                     arena,
                 )?;

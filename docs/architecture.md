@@ -137,6 +137,9 @@ and WITH ORDINALITY use that same column layout.
 Routine binding resolves named input and result representations before accepting
 an exact signature match. Table-function result conversion decodes structured
 fields rather than interpreting their rendered text as the original value.
+SQL and PL/pgSQL result conversion use the same structural value copy as pending
+calls. Detached trigger rows use that codec too, preserving named fields in
+conflict updates.
 A saved view or table column needs a concrete type: expand `(pair(1)).*` into
 separate columns or declare the function's result as a named composite type.
 Casting an anonymous function result directly to a named composite fails with

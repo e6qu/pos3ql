@@ -32,6 +32,7 @@ fn named_routine_rows_expose_fields_in_table_sources() {
             "9|sql",
             "10|pl|1",
             "NULL|NULL|2",
+            "11|out",
             "1",
             "7|one|20|1",
             "NULL|NULL|21|2",
@@ -42,6 +43,7 @@ fn named_routine_rows_expose_fields_in_table_sources() {
             "2|NULL|NULL",
             "(7,one)",
             "NULL",
+            "4|new",
         ]
     );
 }

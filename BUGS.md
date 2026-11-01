@@ -30,6 +30,8 @@ Input-retention cases include engine-owned statistics, logical replication and
 large-object builtins; their arguments must not repeat around an engine handoff.
 Routine result conversions must use structural decoding for named and anonymous
 records, including mutable table functions and restored declarations.
+Use the shared structural value copy for SQL and PL/pgSQL results and detached
+trigger rows; test named fields in conflict-update triggers as well as functions.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

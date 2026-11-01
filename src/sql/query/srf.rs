@@ -5458,19 +5458,15 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                     let encoded = if let Some(output) = table_columns {
                         let mut cast = [Datum::Null; MAX_COLUMNS];
                         for (slot, column) in output.iter().enumerate() {
-                            let projected =
-                                crate::sql::exec::encode_projected_pub(&[values[slot]], arena)?;
                             cast[slot] = crate::sql::eval::cast_to(
-                                crate::sql::exec::decode_projected_col_record(projected, 0, arena)?,
+                                crate::sql::exec::detach_routine_datum(values[slot], arena)?,
                                 column.ctype,
                                 arena,
                             )?;
                         }
                         crate::sql::exec::encode_projected_pub(&cast[..output.len()], arena)?
                     } else {
-                        let projected = crate::sql::exec::encode_projected_pub(values, arena)?;
-                        let value =
-                            crate::sql::exec::decode_projected_col_record(projected, 0, arena)?;
+                        let value = crate::sql::exec::detach_routine_datum(values[0], arena)?;
                         let value = crate::sql::eval::cast_to(
                             value,
                             scalar_result.expect("set routine result"),

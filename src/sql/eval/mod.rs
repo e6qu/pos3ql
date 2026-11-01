@@ -2638,32 +2638,40 @@ pub fn eval_full<'a>(
             expression
         };
         let run = || {
-        let _query_inputs = matches!(
-            expression,
-            Expr::Subquery(_)
-                | Expr::RowSubquery { .. }
-                | Expr::ArraySubquery(_)
-                | Expr::Exists(_)
-                | Expr::InSubquery { .. }
-                | Expr::QuantifiedSubquery { .. }
-        )
-        .then(super::query::input_progress::enter_body);
-        let value = materialize_acl_value(
-            eval_full_inner(expression, arena, params, row, hooks)?,
-            hooks,
-            arena,
-        )?;
-        materialize_enum_values(value, hooks.catalog, arena)
+            let _query_inputs = matches!(
+                expression,
+                Expr::Subquery(_)
+                    | Expr::RowSubquery { .. }
+                    | Expr::ArraySubquery(_)
+                    | Expr::Exists(_)
+                    | Expr::InSubquery { .. }
+                    | Expr::QuantifiedSubquery { .. }
+            )
+            .then(super::query::input_progress::enter_body);
+            let value = materialize_acl_value(
+                eval_full_inner(expression, arena, params, row, hooks)?,
+                hooks,
+                arena,
+            )?;
+            materialize_enum_values(value, hooks.catalog, arena)
         };
-        if matches!(expression, Expr::Call { .. }) && hooks.srf_index.is_none() {
+        let bound_set_row = matches!(expression, Expr::Call { name, args, .. }
+            if hooks.srf_index.is_some()
+                && super::query::is_builtin_set_routine(name)
+                && args.iter().all(|argument| matches!(argument, Expr::Param(_))));
+        if matches!(expression, Expr::Call { .. }) && !bound_set_row {
             super::query::input_progress::call(arena, || {
                 let _inputs = super::query::input_progress::enter();
                 run()
             })
-        } else { run() }
+        } else {
+            run()
+        }
     };
     super::query::input_progress::value(
-        super::query::input_progress::expression_site(expression), arena, evaluate,
+        super::query::input_progress::expression_site(expression),
+        arena,
+        evaluate,
     )
 }
 

@@ -29,16 +29,19 @@ fn retained_routine_inputs_preserve_argument_effects_across_pending_calls() {
             &["0", "108", "0", "7", "108"],
             &["11", "7", "11"],
             &["5", "6", "integer", "integer"],
-        ].concat()
+        ]
+        .concat()
     );
     let mut descriptions = Vec::new();
     let mut remaining = output.as_slice();
     while !remaining.is_empty() {
         let length = i32::from_be_bytes(remaining[1..5].try_into().unwrap()) as usize;
-        if remaining[0] == b'T' { descriptions.extend(row_description_type_oids(remaining)); }
-        remaining = &remaining[1+length..];
+        if remaining[0] == b'T' {
+            descriptions.extend(row_description_type_oids(remaining));
+        }
+        remaining = &remaining[1 + length..];
     }
-    assert_eq!(&descriptions[descriptions.len()-2..], &[23, 2206]);
+    assert_eq!(&descriptions[descriptions.len() - 2..], &[23, 2206]);
 }
 
 #[test]

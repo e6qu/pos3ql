@@ -31,7 +31,14 @@ pub(crate) enum InputSite<'a> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum InputNode { Value, Reference, Unary, Binary, Cast, Composite }
+pub(crate) enum InputNode {
+    Value,
+    Reference,
+    Unary,
+    Binary,
+    Cast,
+    Composite,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InputQuery {
@@ -63,10 +70,18 @@ pub(crate) fn expression_site<'a>(expression: &Expr<'a>) -> InputSite<'a> {
         Expr::Exists(_) => InputSite::Query(InputQuery::Exists),
         Expr::InSubquery { .. } => InputSite::Query(InputQuery::In),
         Expr::QuantifiedSubquery { .. } => InputSite::Query(InputQuery::Quantified),
-        Expr::Null | Expr::Bool(_) | Expr::Int(_) | Expr::Float(_) | Expr::NumericLit(_)
-        | Expr::Str(_) | Expr::BitLit(_) => InputSite::Expression(InputNode::Value),
-        Expr::Column { .. } | Expr::RoutineParam { .. } | Expr::Param(_)
-        | Expr::WholeRow(_) | Expr::SchemaColumn { .. } => InputSite::Expression(InputNode::Reference),
+        Expr::Null
+        | Expr::Bool(_)
+        | Expr::Int(_)
+        | Expr::Float(_)
+        | Expr::NumericLit(_)
+        | Expr::Str(_)
+        | Expr::BitLit(_) => InputSite::Expression(InputNode::Value),
+        Expr::Column { .. }
+        | Expr::RoutineParam { .. }
+        | Expr::Param(_)
+        | Expr::WholeRow(_)
+        | Expr::SchemaColumn { .. } => InputSite::Expression(InputNode::Reference),
         Expr::Unary { .. } => InputSite::Expression(InputNode::Unary),
         Expr::Binary { .. } => InputSite::Expression(InputNode::Binary),
         Expr::Cast { .. } => InputSite::Expression(InputNode::Cast),
@@ -444,7 +459,9 @@ impl<'statement: 'query, 'query> InputAttempt<'statement, 'query> {
                         let encoded = output.alloc_slice_copy(encoded).map_err(|_| full())?;
                         super::super::exec::decode_projected_col_record(encoded, 0, output)
                     }
-                    InputValue::Evaluated(value) => super::super::exec::detach_routine_datum(*value, output),
+                    InputValue::Evaluated(value) => {
+                        super::super::exec::detach_routine_datum(*value, output)
+                    }
                 };
             }
             InputState::Pending => {}
@@ -512,7 +529,12 @@ impl<'statement: 'query, 'query> InputAttempt<'statement, 'query> {
                             next_call,
                         } => InputState::Value {
                             value: InputValue::Encoded(match value {
-                                InputValue::Evaluated(value) => super::super::exec::encode_projected_persistent_pub(&[*value], arena)?,
+                                InputValue::Evaluated(value) => {
+                                    super::super::exec::encode_projected_persistent_pub(
+                                        &[*value],
+                                        arena,
+                                    )?
+                                }
                                 InputValue::Encoded(encoded) => copy_bytes(encoded, arena)?,
                             }),
                             next_input,
@@ -650,7 +672,11 @@ pub(crate) fn enter_expression(expression: &Expr<'_>) -> Result<ExpressionPositi
             .and_then(|index| saved.as_slice()[index].frames.first())
             .and_then(|frame| definition_oid(**frame))
     };
-    Ok(ExpressionPosition { previous, target, _thread: core::marker::PhantomData })
+    Ok(ExpressionPosition {
+        previous,
+        target,
+        _thread: core::marker::PhantomData,
+    })
 }
 
 pub(crate) struct InputScope {
@@ -903,16 +929,22 @@ mod tests {
         let work = Arena::new(&mut budget, "input work", 2048).unwrap();
         let invocations = RoutineInvocationState::new(&statement);
         let _scope = enter_routine_invocation_scope(Some(RoutineInvocationContext::new(
-            &invocations, &statement,
+            &invocations,
+            &statement,
         )));
         crate::mem::guard::forbid_alloc(|| {
             let raw = work.alloc_slice_copy(&[b'x'; 1024]).unwrap();
             let text = core::str::from_utf8(raw).unwrap();
             let result = call(&work, || {
                 let _scope = enter();
-                value(InputSite::Query(InputQuery::Scalar), &work, || Ok(Datum::Text(text)))
-            }).unwrap();
-            assert!(matches!(result, Datum::Text(value) if core::ptr::eq(value.as_ptr(), text.as_ptr())));
+                value(InputSite::Query(InputQuery::Scalar), &work, || {
+                    Ok(Datum::Text(text))
+                })
+            })
+            .unwrap();
+            assert!(
+                matches!(result, Datum::Text(value) if core::ptr::eq(value.as_ptr(), text.as_ptr()))
+            );
             assert_eq!(statement.used(), 0);
         });
     }

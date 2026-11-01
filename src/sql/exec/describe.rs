@@ -801,14 +801,7 @@ impl ColTypeResolver for CatalogCols<'_> {
                 .function_for_named_call_oids(name, argument_names, arguments, self.txid)
         };
         let result = routine
-            .and_then(|routine| match routine.kind {
-                crate::storage::RoutineKind::Function { result }
-                | crate::storage::RoutineKind::SetFunction { result } => Some(result),
-                crate::storage::RoutineKind::RecordFunction { .. } => {
-                    Some(crate::storage::RoutineResult::builtin(ColType::Record))
-                }
-                _ => None,
-            })
+            .and_then(|routine| routine.function_result_contract())
             .or_else(|| {
                 if bound_oid.is_some() {
                     return None;

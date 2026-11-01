@@ -3606,41 +3606,41 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                     });
             }
         };
-            let slot = self
-                .storage
-                .routine_slot_by_oid(oid, self.txid)
-                .ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::UNDEFINED_FUNCTION,
-                        "function with OID {} does not exist",
-                        oid
-                    )
-                })?;
-            let mut declared = self.storage.routine_for(slot, self.txid);
-            let Some(completed) = self.prepare_routine_inputs(
-                slot,
-                &mut declared,
-                RoutineCallInputs {
-                    arguments,
-                    argument_type_oids,
-                    mapping: &mapping,
-                    variadic,
-                    context: RoutineInputContext::Scalar,
-                },
-                evaluate,
-                arena,
-            )?
-            else {
-                return Ok(Datum::Null);
-            };
-            let routine = &declared;
-            self.execute_routine(slot, routine, &completed[..declared.argument_count], arena)?
-                .ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::INTERNAL_ERROR,
-                        "resolved routine has no scalar result"
-                    )
-                })
+        let slot = self
+            .storage
+            .routine_slot_by_oid(oid, self.txid)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_FUNCTION,
+                    "function with OID {} does not exist",
+                    oid
+                )
+            })?;
+        let mut declared = self.storage.routine_for(slot, self.txid);
+        let Some(completed) = self.prepare_routine_inputs(
+            slot,
+            &mut declared,
+            RoutineCallInputs {
+                arguments,
+                argument_type_oids,
+                mapping: &mapping,
+                variadic,
+                context: RoutineInputContext::Scalar,
+            },
+            evaluate,
+            arena,
+        )?
+        else {
+            return Ok(Datum::Null);
+        };
+        let routine = &declared;
+        self.execute_routine(slot, routine, &completed[..declared.argument_count], arena)?
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "resolved routine has no scalar result"
+                )
+            })
     }
 
     fn call_routine_oid<'a>(

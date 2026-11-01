@@ -8868,7 +8868,6 @@ impl RoutineKind {
 enum RoutineCallKind {
     Function,
     Scalar,
-    Set,
     Trigger,
     EventTrigger,
     Procedure,
@@ -8880,7 +8879,6 @@ impl RoutineCallKind {
         match self {
             Self::Function => kind.function_result().is_some(),
             Self::Scalar => kind.function_result().is_some() && !kind.is_set_returning(),
-            Self::Set => kind.is_set_returning(),
             Self::Trigger => matches!(kind, RoutineKind::Trigger),
             Self::EventTrigger => matches!(kind, RoutineKind::EventTrigger),
             Self::Procedure => matches!(kind, RoutineKind::Procedure),
@@ -43831,21 +43829,6 @@ impl Storage {
                 name,
             )
         })
-    }
-
-    /// Resolves a set-returning call from declared argument identities.  This
-    /// is distinct from the datum representation because a domain's runtime
-    /// representation is its base type.
-    pub(crate) fn routine_slot_for_table_call_oids(
-        &self,
-        name: &str,
-        argument_type_oids: &[i32],
-        txid: u32,
-    ) -> Option<usize> {
-        if argument_type_oids.len() > MAX_ROUTINE_ARGUMENTS {
-            return None;
-        }
-        self.routine_slot_on_path_oids(name, argument_type_oids, txid, RoutineCallKind::Set)
     }
 
     pub(crate) fn routine_function_result_oid(

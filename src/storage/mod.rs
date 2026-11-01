@@ -9175,7 +9175,7 @@ impl RoutineDef {
                 None => call_index,
                 Some(name) => (0..input_count).find(|&input_index| {
                     parameter_for_input(input_index)
-                        .is_some_and(|parameter| parameter.name.as_str().eq_ignore_ascii_case(name))
+                        .is_some_and(|parameter| parameter.name.as_str() == name)
                 })?,
             };
             let expanded_variadic =
@@ -44057,11 +44057,10 @@ impl Storage {
                         if output_call && input_mapping[call_index] == u8::MAX {
                             let parameter_index =
                                 match argument_names.get(call_index).copied().flatten() {
-                                    Some(name) => {
-                                        routine.parameters().iter().position(|parameter| {
-                                            parameter.name.as_str().eq_ignore_ascii_case(name)
-                                        })?
-                                    }
+                                    Some(name) => routine
+                                        .parameters()
+                                        .iter()
+                                        .position(|parameter| parameter.name.as_str() == name)?,
                                     None => call_index,
                                 };
                             let parameter = *routine.parameters().get(parameter_index)?;
@@ -44321,6 +44320,10 @@ impl Storage {
         }
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "named routine lookup keeps variadic syntax explicit"
+    )]
     fn routine_slot_in_named_oids(
         &self,
         schema: &str,

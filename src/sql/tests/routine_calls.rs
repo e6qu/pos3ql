@@ -26,6 +26,7 @@ fn query_positions_do_not_repeat_completed_projection_effects() {
             &["0|7", "NULL", "7", "0|NULL", "7", "7"],
             &["0|7", "NULL", "7", "0|NULL", "7", "7"],
             &["9", "7", "9", "11"],
+            &["2|2", "9"],
         ]
         .concat()
     );
@@ -38,8 +39,86 @@ fn query_positions_do_not_repeat_completed_projection_effects() {
         completions += usize::from(remaining[0] == b'C');
         remaining = &remaining[length + 1..];
     }
-    assert_eq!(descriptions, 51);
-    assert_eq!(completions, 117);
+    assert_eq!(descriptions, 53);
+    assert_eq!(completions, 125);
+}
+
+#[test]
+fn named_routine_arguments_preserve_quoted_identifier_case() {
+    let config = test_config("quoted-routine-arguments");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE TABLE quoted_argument_source(value integer); \
+         INSERT INTO quoted_argument_source VALUES(2); \
+         CREATE FUNCTION quoted_argument_input(\"Value\" integer) RETURNS integer \
+         LANGUAGE sql VOLATILE AS $$SELECT $1$$; \
+         CREATE FUNCTION folded_argument_input(VALUE integer) RETURNS integer \
+         LANGUAGE sql VOLATILE AS $$SELECT $1$$; \
+         CREATE PROCEDURE quoted_argument_output(OUT \"Result\" integer,\"Value\" integer, \
+         VARIADIC \"Members\" integer[]) LANGUAGE sql AS $$SELECT $1+cardinality($2)$$",
+        true,
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT quoted_argument_input(\"Value\"=>value), \
+             folded_argument_input(VALUE=>value) FROM quoted_argument_source; \
+             CALL quoted_argument_output(\"Result\"=>NULL,\"Value\"=>9, \
+             VARIADIC \"Members\"=>ARRAY[]::integer[])",
+            true,
+        )),
+        ["2|2", "9"]
+    );
+    for sql in [
+        "SELECT quoted_argument_input(value=>value) FROM quoted_argument_source",
+        "SELECT quoted_argument_input(\"value\"=>value) FROM quoted_argument_source",
+        "CALL quoted_argument_output(\"result\"=>NULL,\"Value\"=>9, \
+         VARIADIC \"Members\"=>ARRAY[]::integer[])",
+        "CALL quoted_argument_output(\"Result\"=>NULL,value=>9, \
+         VARIADIC \"Members\"=>ARRAY[]::integer[])",
+        "CALL quoted_argument_output(\"Result\"=>NULL,\"Value\"=>9, \
+         VARIADIC members=>ARRAY[]::integer[])",
+    ] {
+        assert_eq!(
+            error_sqlstates(&session.execute(&mut engine, sql, true)),
+            ["42883"],
+            "{sql}"
+        );
+    }
+    let actual = [
+        types::oid::UNKNOWN,
+        types::oid::INT4,
+        ColType::Array(types::ArrElem::Int4).oid(),
+    ];
+    let expected = engine
+        .storage
+        .procedure_call_parameter_oids(
+            "quoted_argument_output",
+            &[Some("Result"), Some("Value"), Some("Members")],
+            true,
+            &actual,
+            0,
+        )
+        .expect("quoted argument identities resolve protocol types");
+    assert_eq!(
+        &expected[..actual.len()],
+        &[types::oid::INT4, types::oid::INT4, actual[2]]
+    );
+    assert!(
+        engine
+            .storage
+            .procedure_call_parameter_oids(
+                "quoted_argument_output",
+                &[Some("result"), Some("Value"), Some("Members")],
+                true,
+                &actual,
+                0,
+            )
+            .is_none()
+    );
 }
 
 #[test]

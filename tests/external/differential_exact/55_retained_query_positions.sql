@@ -124,6 +124,15 @@ CALL query_position_variadic_procedure(NULL);
 CALL query_position_variadic_procedure(NULL,9,VARIADIC ARRAY[]::integer[]);
 CALL query_position_variadic_procedure(NULL,9,4,5);
 DROP PROCEDURE query_position_variadic_procedure(integer,integer[]);
+
+CREATE FUNCTION query_position_quoted_input("Value" integer) RETURNS integer LANGUAGE sql VOLATILE AS $$SELECT $1$$;
+CREATE FUNCTION query_position_folded_input(VALUE integer) RETURNS integer LANGUAGE sql VOLATILE AS $$SELECT $1$$;
+CREATE PROCEDURE query_position_quoted_output(OUT "Result" integer,"Value" integer,VARIADIC "Members" integer[]) LANGUAGE sql AS $$SELECT $1+cardinality($2)$$;
+SELECT query_position_quoted_input("Value"=>value),query_position_folded_input(VALUE=>value) FROM query_position_source WHERE value=2;
+CALL query_position_quoted_output("Result"=>NULL,"Value"=>9,VARIADIC "Members"=>ARRAY[]::integer[]);
+DROP FUNCTION query_position_quoted_input(integer);
+DROP FUNCTION query_position_folded_input(integer);
+DROP PROCEDURE query_position_quoted_output(integer,integer[]);
 DROP FUNCTION query_position_write(integer);
 DROP TABLE query_position_audit;
 DROP TABLE query_position_source;

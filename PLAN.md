@@ -61,7 +61,7 @@ Linux amd64, Linux arm64 and macOS arm64 coverage.
 ### Share fixed memory and disk capacity according to demand
 
 **Example:** configuring many possible tables must not reserve a large private
-row map for each empty table. If most traffic touches `orders`, it should use
+row lookup structure for each empty table. If most traffic touches `orders`, it should use
 available shared slots. A long report keeps its selected versions until it
 finishes; those slots cannot be reassigned simply because demand changes.
 
@@ -104,7 +104,8 @@ column demand, reuse, update rate and rewrite cost when choosing future immutabl
 row/column output and ranged versus whole-object reads. Avoid rapid layout
 rewrites after short bursts.
 
-Compare simple feedback with PI/PID control using explicit policy, ceilings,
+Compare simple feedback with proportional-integral (PI) and
+proportional-integral-derivative (PID) control using explicit policy, ceilings,
 minimum progress, sample interval/count and maximum batch delay/bytes. Clamp
 changes, filter noisy samples, avoid repeated reversals, and prevent integral
 error accumulating when owned capacity cannot be reclaimed. Choose the policy

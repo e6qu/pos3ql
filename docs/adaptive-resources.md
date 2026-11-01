@@ -6,7 +6,7 @@ the proposed policy and its evidence. [PLAN.md](../PLAN.md) owns the remaining
 work and sequence; [architecture](architecture.md) owns current behavior.
 
 For example, reserving space for many possible tables should not give every
-empty table a large private row buffer. If most requests touch `orders`, that
+empty table tracking space for its maximum possible row count. If most requests touch `orders`, that
 table should borrow available shared capacity. When a report starts reading
 `sales`, capacity that is safe to reuse should follow the new demand. The total
 reserved memory must remain unchanged.
@@ -14,14 +14,15 @@ reserved memory must remain unchanged.
 ## What already exists
 
 - [Storage startup accounting](../src/storage/mod.rs#L19671) still charges
-  `max_tables * RowMap::budget_bytes(table_rows)`. Table construction creates
+  `max_tables * RowMap::budget_bytes(table_rows)` for row lookup structures.
+  Table construction creates
   those maps before serving requests. Removing this multiplication requires
   shared ownership and admission, not merely changing a configuration label.
 - [Row bytes](../src/storage/row_heap.rs) already share two `memtable_bytes`
   buffers for active data and relocation. Committed MVCC history uses the
   instance-wide `row_history_slots`; locking mode reserves no committed history.
-- [Definition images](../src/storage/definition_images.rs) are already leased
-  globally, but reserve `(max_tables + 1) *
+- [Copies of table definitions](../src/storage/definition_images.rs) are already
+  leased globally to readers, but reserve `(max_tables + 1) *
   (max_catalog_versions_per_object + 1) * query_workspace_slots` wide slots.
   [Retained row walks](../src/storage/row_walks.rs) reserve
   `query_workspace_slots * 64` identities, each with

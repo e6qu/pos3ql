@@ -1,6 +1,38 @@
 use super::*;
 
 #[test]
+fn named_routine_rows_expose_fields_in_table_sources() {
+    let config = test_config("named-routine-table-rows");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    let sql =
+        include_str!("../../../tests/external/differential_exact/53_named_routine_table_rows.sql");
+    assert_eq!(
+        data_rows(&session.success(&mut engine, sql, true)),
+        [
+            "7|one|1",
+            "NULL|NULL|2",
+            "8|two|1",
+            "NULL|NULL|2",
+            "9|sql",
+            "10|pl|1",
+            "NULL|NULL|2",
+            "1",
+            "7|one|20|1",
+            "NULL|NULL|21|2",
+            "NULL|NULL|22|3",
+            "1|7|one",
+            "1|NULL|NULL",
+            "2|7|one",
+            "2|NULL|NULL",
+            "(7,one)",
+            "NULL",
+        ]
+    );
+}
+
+#[test]
 fn retained_routine_inputs_preserve_argument_effects_across_pending_calls() {
     let config = test_config("retained-routine-inputs");
     let mut budget = test_engine_budget(&config, 1 << 29);

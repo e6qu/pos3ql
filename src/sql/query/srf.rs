@@ -1297,7 +1297,7 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
                 name
             ));
         };
-        let rows = table_func_rows_outer(
+        let rows = table_func_base_rows_outer(
             source,
             storage,
             txid,
@@ -1307,7 +1307,8 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
             Some(hooks),
             None,
             None,
-        )?;
+        )?
+        .encoded;
         let values = arena
             .alloc_slice_with(rows.len(), |_| Datum::Null)
             .map_err(|_| arena_full())?;
@@ -3306,7 +3307,37 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
         }
         names.len()
     } else if let Some((_, routine)) = routine {
-        if let Some(output) = routine.table_columns() {
+        if let Some(creation) = routine_composite_result(routine, storage, txid)? {
+            let target = crate::storage::TypeDefinitionTarget::by_creation(
+                storage,
+                crate::storage::NamedTypeKind::Composite,
+                creation,
+            )?;
+            let definition = storage
+                .read_composite_definition(target, txid)?
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "composite result type does not exist"
+                    )
+                })?;
+            if definition.active_field_count() > default_cols.len() {
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "table function output exceeds configured column capacity"
+                ));
+            }
+            for (out, field) in default_cols.iter_mut().zip(definition.active_fields()) {
+                *out = table_function_column(
+                    field.name,
+                    field.ctype,
+                    field.user_type,
+                    field.type_mod,
+                    field.collation,
+                );
+            }
+            definition.active_field_count()
+        } else if let Some(output) = routine.table_columns() {
             for (slot, column) in output.iter().enumerate() {
                 default_cols[slot] = table_function_column(
                     column.name,
@@ -3759,6 +3790,31 @@ fn table_func_routine<'a, C: ColumnLookup<'a>>(
     )))
 }
 
+fn routine_composite_result(
+    routine: &RoutineDef,
+    storage: &Storage,
+    txid: u32,
+) -> Result<Option<crate::storage::TypeCreation>, SqlError> {
+    let oid = storage
+        .routine_function_result_oid(routine, txid)
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "routine result type does not exist"
+            )
+        })?;
+    Ok(match crate::storage::NamedTypeKind::from_oid(oid) {
+        Some((crate::storage::NamedTypeKind::Composite, creation, false)) => Some(creation),
+        _ => None,
+    })
+}
+
+struct TableFunctionRows<'a> {
+    // SELECT keeps each named row as a value; FROM exposes its fields.
+    encoded: &'a [&'a [u8]],
+    composite: Option<crate::storage::TypeCreation>,
+}
+
 /// Evaluates a table function's arguments against `columns` — an
 /// outer row, for a `LATERAL func(outer.col)`.
 #[allow(clippy::too_many_arguments)]
@@ -3773,7 +3829,7 @@ pub(crate) fn table_func_rows_outer<'a, C: ColumnLookup<'a>>(
     invocations: Option<&super::RoutineInvocationState<'a>>,
     statement_arena: Option<&'a Arena>,
 ) -> Result<&'a [&'a [u8]], SqlError> {
-    let rows = table_func_base_rows_outer(
+    let produced = table_func_base_rows_outer(
         tref,
         storage,
         txid,
@@ -3784,6 +3840,68 @@ pub(crate) fn table_func_rows_outer<'a, C: ColumnLookup<'a>>(
         invocations,
         statement_arena,
     )?;
+    let rows = if let Some(creation) = produced.composite {
+        let target = crate::storage::TypeDefinitionTarget::by_creation(
+            storage,
+            crate::storage::NamedTypeKind::Composite,
+            creation,
+        )?;
+        let definition = storage
+            .read_composite_definition(target, txid)?
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "composite result type does not exist"
+                )
+            })?;
+        let width = definition.active_field_count();
+        if width > MAX_COLUMNS {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "table function output exceeds configured column capacity"
+            ));
+        }
+        let catalog = super::storage_catalog(storage, arena, txid);
+        let rows = arena
+            .alloc_slice_with(produced.encoded.len(), |_| &[] as &[u8])
+            .map_err(|_| arena_full())?;
+        for (out, encoded) in rows.iter_mut().zip(produced.encoded) {
+            let mut value = crate::sql::exec::decode_projected_col_record(encoded, 0, arena)?;
+            if let Datum::CompositeText {
+                slot,
+                physical_fields,
+                text,
+            } = value
+            {
+                value = crate::sql::eval::CatalogAccess::materialize_composite(
+                    &catalog,
+                    slot,
+                    physical_fields,
+                    text,
+                    arena,
+                )?;
+            }
+            let mut values = [Datum::Null; MAX_COLUMNS];
+            match value {
+                Datum::Composite { slot, fields } if slot == creation && fields.len() == width => {
+                    for (out, field) in values.iter_mut().zip(fields) {
+                        *out = field.value;
+                    }
+                }
+                Datum::Null => {}
+                _ => {
+                    return Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "table function composite result changed its declared shape"
+                    ));
+                }
+            }
+            *out = crate::sql::exec::encode_projected_pub(&values[..width], arena)?;
+        }
+        &*rows
+    } else {
+        produced.encoded
+    };
     if !tref.with_ordinality {
         return Ok(rows);
     }
@@ -3816,7 +3934,7 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
     eval_hooks: Option<&EvalHooks<'_, 'a>>,
     invocations: Option<&super::RoutineInvocationState<'a>>,
     statement_arena: Option<&'a Arena>,
-) -> Result<&'a [&'a [u8]], SqlError> {
+) -> Result<TableFunctionRows<'a>, SqlError> {
     let argument_catalog = super::storage_catalog(storage, arena, txid);
     let argument_hooks = EvalHooks {
         catalog: eval_hooks
@@ -3837,9 +3955,14 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
             eval_hooks,
             invocations,
             statement_arena,
-        );
+        )
+        .map(|encoded| TableFunctionRows {
+            encoded,
+            composite: None,
+        });
     }
-    super::input_progress::call(arena, || -> Result<&'a [&'a [u8]], SqlError> {
+    let mut composite = None;
+    let encoded = super::input_progress::call(arena, || -> Result<&'a [&'a [u8]], SqlError> {
         let written_args = tref.func_args.expect("table function carries arguments");
         let regex_name = tref
             .schema
@@ -5165,6 +5288,7 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                 return Ok(&[]);
             };
             let _input_body = super::input_progress::enter_body();
+            composite = routine_composite_result(routine, storage, txid)?;
             let table_columns = routine.table_columns();
             let scalar_result = routine.kind.function_result();
             let _formal_scope = crate::sql::exec::enter_routine_parameter_types(
@@ -5507,7 +5631,8 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
             v += step;
         }
         Ok(&*rows)
-    })
+    })?;
+    Ok(TableFunctionRows { encoded, composite })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6413,7 +6538,7 @@ fn rows_from_base_rows_outer<'a, C: ColumnLookup<'a>>(
                 "ROWS FROM output exceeds configured column capacity"
             ));
         }
-        rows_by_function[index] = table_func_base_rows_outer(
+        rows_by_function[index] = table_func_rows_outer(
             function,
             storage,
             txid,

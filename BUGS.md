@@ -24,6 +24,8 @@ types, including independent calls and shared set-returning producers.
 Keep small-arena index checks in the full gate: repeated nonsuspending builtin
 expressions must not accumulate routine input records. Compare anonymous-record
 casts with PostgreSQL before using a named type to persist function results.
+Named row function regressions cover SELECT values and FROM columns, including
+null rows, combined producers, lateral inputs and empty-cache recovery.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

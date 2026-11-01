@@ -47857,6 +47857,14 @@ fn rows_from_view_and_named_routine_parameters_survive_object_cold_recovery() {
         data_rows(&run_with(
             &mut recovered,
             &mut budget,
+            "SELECT * FROM durable_named_rows(11) WITH ORDINALITY"
+        )),
+        ["11|one|1", "12|two|2"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut recovered,
+            &mut budget,
             "SELECT matches FROM durable_row_quantified_view"
         )),
         ["t"]

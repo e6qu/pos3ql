@@ -1568,13 +1568,13 @@ impl GucState {
         } else if name.eq_ignore_ascii_case("transaction_read_only") {
             let read_only = match parse_on_off(value) {
                 Some(read_only) => read_only,
-                None => return Some(Err(unsupported_value("transaction_read_only", value))),
+                None => return Some(Err(invalid_setting_value("transaction_read_only", value))),
             };
             characteristics.read_only = Some(read_only);
         } else if name.eq_ignore_ascii_case("transaction_deferrable") {
             let deferrable = match parse_on_off(value) {
                 Some(deferrable) => deferrable,
-                None => return Some(Err(unsupported_value("transaction_deferrable", value))),
+                None => return Some(Err(invalid_setting_value("transaction_deferrable", value))),
             };
             characteristics.deferrable = Some(deferrable);
         } else {
@@ -1607,10 +1607,9 @@ impl GucState {
         if name.eq_ignore_ascii_case("seed") {
             return self.assign("seed", Some("unavailable"), local);
         }
+        self.capture_setting_value(name)?;
         let mut state = self.store.borrow_mut();
         let values = state.current;
-        let mut validation = values;
-        reset_setting(&mut validation, &values, name)?;
         finish_setting_change(&mut state, values, guc_bit(name), local, false);
         Ok(())
     }
@@ -1677,18 +1676,14 @@ impl GucState {
         interval: super::types::Interval,
         local: bool,
     ) -> Result<(), SqlError> {
-        if interval.months != 0 {
-            return Err(unsupported_value("TimeZone", "interval containing months"));
+        if interval.months != 0 || interval.days != 0 {
+            return Err(invalid_setting_value(
+                "TimeZone",
+                "interval containing months or days",
+            ));
         }
-        let micros = i64::from(interval.days)
-            .checked_mul(86_400_000_000)
-            .and_then(|days| days.checked_add(interval.micros))
-            .ok_or_else(|| unsupported_value("TimeZone", "interval"))?;
-        if micros % 1_000_000 != 0 {
-            return Err(unsupported_value("TimeZone", "fractional-second interval"));
-        }
-        let seconds = i32::try_from(micros / 1_000_000)
-            .map_err(|_| unsupported_value("TimeZone", "interval"))?;
+        let seconds = i32::try_from(interval.micros / 1_000_000)
+            .map_err(|_| invalid_setting_value("TimeZone", "interval"))?;
         self.set_time_zone_offset(seconds, local)
     }
 
@@ -1925,28 +1920,35 @@ impl GucState {
         })
     }
 
-    pub(crate) fn validate_setting_value(
-        &self,
-        name: &str,
-        value: Option<&str>,
-    ) -> Result<StackStr<256>, SqlError> {
-        let prior = {
-            let mut state = self.store.borrow_mut();
-            let prior = state.current;
-            let mut values = state.current;
-            change_setting(&mut values, &state.defaults, name, value)?;
-            state.current = values;
-            prior
-        };
+    pub(crate) fn capture_setting_value(&self, name: &str) -> Result<StackStr<256>, SqlError> {
         let value = self.get_owned(name).ok_or_else(|| {
             sql_err!(
                 sqlstate::UNDEFINED_OBJECT,
                 "unrecognized configuration parameter \"{}\"",
                 name
             )
-        });
-        self.store.borrow_mut().current = prior;
-        value
+        })?;
+        self.validate_setting_value(name, Some(value.as_str()))?;
+        Ok(value)
+    }
+
+    pub(crate) fn validate_system_reset(&self, name: &str) -> Result<(), SqlError> {
+        match read_only_parameter_context(name) {
+            Some(ReadOnlyParameterContext::Startup) => Ok(()),
+            Some(ReadOnlyParameterContext::Internal) | None => {
+                self.validate_setting_value(name, None)
+            }
+        }
+    }
+
+    pub(crate) fn validate_setting_value(
+        &self,
+        name: &str,
+        value: Option<&str>,
+    ) -> Result<(), SqlError> {
+        let state = self.store.borrow();
+        let mut values = state.current;
+        change_setting(&mut values, &state.defaults, name, value)
     }
 
     pub(crate) fn enter_routine_configs(
@@ -2157,7 +2159,7 @@ fn apply_setting(
     }
     if name.eq_ignore_ascii_case("check_function_bodies") {
         values.check_function_bodies =
-            parse_on_off(v).ok_or_else(|| unsupported_value("check_function_bodies", v))?;
+            parse_on_off(v).ok_or_else(|| invalid_setting_value("check_function_bodies", v))?;
         return Ok(());
     }
     if name.eq_ignore_ascii_case("xmloption") {
@@ -2166,7 +2168,7 @@ fn apply_setting(
         } else if v.eq_ignore_ascii_case("document") {
             true
         } else {
-            return Err(unsupported_value("xmloption", v));
+            return Err(invalid_setting_value("xmloption", v));
         };
         return Ok(());
     }
@@ -2175,7 +2177,7 @@ fn apply_setting(
     }
     if name.eq_ignore_ascii_case("default_text_search_config") {
         if v.is_empty() {
-            return Err(unsupported_value("default_text_search_config", v));
+            return Err(invalid_setting_value("default_text_search_config", v));
         }
         return store(&mut values.default_text_search_config, v);
     }
@@ -2318,12 +2320,12 @@ fn apply_setting(
         ));
     }
     if name.eq_ignore_ascii_case("row_security") {
-        let on = parse_on_off(v).ok_or_else(|| unsupported_value("row_security", v))?;
+        let on = parse_on_off(v).ok_or_else(|| invalid_setting_value("row_security", v))?;
         return store(&mut values.row_security, if on { "on" } else { "off" });
     }
     if name.eq_ignore_ascii_case("event_triggers") {
         values.event_triggers =
-            parse_on_off(v).ok_or_else(|| unsupported_value("event_triggers", v))?;
+            parse_on_off(v).ok_or_else(|| invalid_setting_value("event_triggers", v))?;
         return Ok(());
     }
     if name.eq_ignore_ascii_case("default_transaction_isolation") {
@@ -2337,13 +2339,13 @@ fn apply_setting(
         return Ok(());
     }
     if name.eq_ignore_ascii_case("default_transaction_read_only") {
-        values.default_transaction_read_only =
-            parse_on_off(v).ok_or_else(|| unsupported_value("default_transaction_read_only", v))?;
+        values.default_transaction_read_only = parse_on_off(v)
+            .ok_or_else(|| invalid_setting_value("default_transaction_read_only", v))?;
         return Ok(());
     }
     if name.eq_ignore_ascii_case("default_transaction_deferrable") {
         values.default_transaction_deferrable = parse_on_off(v)
-            .ok_or_else(|| unsupported_value("default_transaction_deferrable", v))?;
+            .ok_or_else(|| invalid_setting_value("default_transaction_deferrable", v))?;
         return Ok(());
     }
     if name.eq_ignore_ascii_case("password_encryption") {
@@ -2368,7 +2370,7 @@ fn apply_setting(
         } else if v.eq_ignore_ascii_case("all") {
             TrackFunctions::All
         } else {
-            return Err(unsupported_value("track_functions", v));
+            return Err(invalid_setting_value("track_functions", v));
         };
         return Ok(());
     }
@@ -2657,18 +2659,11 @@ fn apply_datestyle(
     value: &str,
 ) -> Result<(DateFormat, Order3), SqlError> {
     use core::fmt::Write as _;
-    let invalid = || {
-        sql_err!(
-            sqlstate::INVALID_PARAMETER_VALUE,
-            "invalid value for parameter \"DateStyle\": \"{}\"",
-            value
-        )
-    };
     let (mut format, mut order) = current;
     let (mut have_style, mut have_order) = (false, false);
     let mut conflict = false;
     for component in search_path_components(value) {
-        let component = component.map_err(|_| invalid())?;
+        let component = component.map_err(|_| invalid_setting_value("DateStyle", value))?;
         let component = component.trim_matches(search_path_space);
         let mut token = StackStr::<63>::new();
         if let Some(quoted) = component.strip_prefix('"') {
@@ -2738,11 +2733,11 @@ fn apply_datestyle(
                 order = reset.1;
             }
         } else {
-            return Err(invalid());
+            return Err(invalid_setting_value("DateStyle", value));
         }
     }
     if conflict {
-        return Err(invalid());
+        return Err(invalid_setting_value("DateStyle", value));
     }
     Ok((format, order))
 }
@@ -2764,6 +2759,30 @@ fn canonical_datestyle(fmt: DateFormat, ord: Order3) -> StackStr<24> {
     s
 }
 
+/// Catalog settings use PostgreSQL's canonical parameter spelling.
+pub(crate) fn canonical_setting_name(name: &str) -> Result<crate::storage::SqlName, SqlError> {
+    let validated = crate::storage::SqlName::parse(name)?;
+    let special = if name.eq_ignore_ascii_case("datestyle") {
+        Some("DateStyle")
+    } else if name.eq_ignore_ascii_case("timezone") {
+        Some("TimeZone")
+    } else if name.eq_ignore_ascii_case("intervalstyle") {
+        Some("IntervalStyle")
+    } else {
+        None
+    };
+    if let Some(special) = special {
+        return crate::storage::SqlName::parse(special);
+    }
+    let mut normalized = StackStr::<63>::new();
+    for character in validated.as_str().chars() {
+        normalized
+            .write_char(character.to_ascii_lowercase())
+            .expect("ASCII case folding preserves the validated name length");
+    }
+    crate::storage::SqlName::parse(normalized.as_str())
+}
+
 fn is_utc(v: &str) -> bool {
     v.eq_ignore_ascii_case("utc")
         || v.eq_ignore_ascii_case("gmt")
@@ -2771,47 +2790,68 @@ fn is_utc(v: &str) -> bool {
         || v.eq_ignore_ascii_case("universal")
 }
 
+// PostgreSQL localtime.c accepts offsets through 167:59:59.
+const TIME_ZONE_MAX_OFFSET_SECONDS: i32 = 167 * 3600 + 59 * 60 + 59;
+
 // Decimal GUC values denote hours east of UTC, including quoted strings.
-// Saved values use the canonical POSIX display produced by apply_time_zone_offset.
+// Canonical POSIX names are parsed separately from numeric input.
 // Bare colon-separated offsets instead follow the timezone parser's POSIX sign.
 fn time_zone_numeric_offset(value: &str) -> Result<Option<i32>, SqlError> {
     let text = value.trim();
     if let Some((east, west)) = text.strip_prefix('<').and_then(|text| text.split_once('>')) {
-        if let Some(seconds) = parse_hms(east)
+        if let Some(seconds) = parse_hms(east, 167)
             && super::datetime::iso_offset_string(seconds).as_str() == east
-            && super::datetime::iso_offset_string(-seconds).as_str() == west
+            && (if seconds == 0 {
+                west == "-00"
+            } else {
+                super::datetime::iso_offset_string(-seconds).as_str() == west
+            })
         {
+            // PostgreSQL rejects second-bearing named zones as leap-second
+            // zones, although its direct numeric-offset path accepts them.
+            if seconds % 60 != 0 {
+                return Err(invalid_setting_value("TimeZone", value));
+            }
             return Ok(Some(seconds));
         }
         return Ok(None);
     }
-    let digits = text.strip_prefix(['+', '-']).unwrap_or(text);
-    if digits.is_empty()
-        || !digits
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || byte == b'.')
-        || digits.bytes().filter(|byte| *byte == b'.').count() > 1
-    {
+    let Ok(hours) = text.parse::<f64>() else {
         return Ok(None);
+    };
+    if hours.is_nan() {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "NaN time zone offsets are not supported"
+        ));
     }
-    let hours = text
-        .parse::<f64>()
-        .map_err(|_| unsupported_value("TimeZone", value))?;
-    let seconds = hours * 3600.0;
-    if !seconds.is_finite() || seconds.fract() != 0.0 || !(-57_599.0..=57_599.0).contains(&seconds)
+    // PostgreSQL converts hours to whole seconds by truncating toward zero.
+    let seconds = (hours * 3600.0).trunc();
+    if !seconds.is_finite()
+        || !(-f64::from(TIME_ZONE_MAX_OFFSET_SECONDS)..=f64::from(TIME_ZONE_MAX_OFFSET_SECONDS))
+            .contains(&seconds)
     {
-        return Err(unsupported_value("TimeZone", value));
+        return Err(invalid_setting_value("TimeZone", value));
     }
     Ok(Some(seconds as i32))
 }
 
 fn apply_time_zone_offset(values: &mut GucValues, seconds_east: i32) -> Result<(), SqlError> {
-    if !(-57_599..=57_599).contains(&seconds_east) {
-        return Err(unsupported_value("TimeZone", "UTC offset"));
+    if !(-TIME_ZONE_MAX_OFFSET_SECONDS..=TIME_ZONE_MAX_OFFSET_SECONDS).contains(&seconds_east) {
+        return Err(invalid_setting_value("TimeZone", "UTC offset"));
     }
     let east = super::datetime::iso_offset_string(seconds_east);
     let west = super::datetime::iso_offset_string(-seconds_east);
-    let display = crate::stack_format!(32, "<{}>{}", east.as_str(), west.as_str());
+    let display = crate::stack_format!(
+        32,
+        "<{}>{}",
+        east.as_str(),
+        if seconds_east == 0 {
+            "-00"
+        } else {
+            west.as_str()
+        }
+    );
     store(&mut values.timezone, display.as_str())?;
     values.parsed_timezone = super::timezone::Timezone::fixed(seconds_east, "", false);
     Ok(())
@@ -2849,7 +2889,7 @@ pub fn parse_timezone(v: &str) -> Option<super::timezone::Timezone> {
         if rest.is_empty() {
             return Some(Timezone::utc());
         }
-        let offset = -parse_hms(rest)?;
+        let offset = -parse_hms(rest, 24)?;
         return Some(Timezone::fixed(
             offset,
             super::datetime::iso_offset_string(offset).as_str(),
@@ -2858,13 +2898,13 @@ pub fn parse_timezone(v: &str) -> Option<super::timezone::Timezone> {
     }
     // Bare numeric offset: POSIX inverted sign, no abbreviation shown.
     if t.starts_with('+') || t.starts_with('-') {
-        return Some(Timezone::fixed(-parse_hms(t)?, "", false));
+        return Some(Timezone::fixed(-parse_hms(t, 24)?, "", false));
     }
     None
 }
 
 /// Parses `±HH[:MM[:SS]]` to signed seconds (sign as written, not inverted).
-fn parse_hms(s: &str) -> Option<i32> {
+fn parse_hms(s: &str, max_hours: i32) -> Option<i32> {
     let (sign, rest) = match s.strip_prefix('-') {
         Some(r) => (-1, r),
         None => (1, s.strip_prefix('+').unwrap_or(s)),
@@ -2880,7 +2920,7 @@ fn parse_hms(s: &str) -> Option<i32> {
         None => 0,
     };
     if parts.next().is_some()
-        || !(0..=24).contains(&hh)
+        || !(0..=max_hours).contains(&hh)
         || !(0..60).contains(&mm)
         || !(0..60).contains(&ss)
     {
@@ -2976,8 +3016,24 @@ pub(crate) fn validate_search_path(value: &str) -> Result<(), SqlError> {
     Ok(())
 }
 
-fn is_read_only(name: &str) -> bool {
-    const READ_ONLY: &[&str] = &[
+#[derive(Clone, Copy)]
+enum ReadOnlyParameterContext {
+    Startup,
+    Internal,
+}
+
+fn read_only_parameter_context(name: &str) -> Option<ReadOnlyParameterContext> {
+    if [
+        "max_connections",
+        "max_locks_per_transaction",
+        "max_prepared_transactions",
+    ]
+    .iter()
+    .any(|parameter| name.eq_ignore_ascii_case(parameter))
+    {
+        return Some(ReadOnlyParameterContext::Startup);
+    }
+    if [
         "server_version",
         "server_version_num",
         "server_encoding",
@@ -2985,17 +3041,23 @@ fn is_read_only(name: &str) -> bool {
         "integer_datetimes",
         "data_directory_mode",
         "in_hot_standby",
-        "max_connections",
-        "max_locks_per_transaction",
-        "max_prepared_transactions",
-    ];
-    READ_ONLY.iter().any(|r| name.eq_ignore_ascii_case(r))
+    ]
+    .iter()
+    .any(|parameter| name.eq_ignore_ascii_case(parameter))
+    {
+        return Some(ReadOnlyParameterContext::Internal);
+    }
+    None
 }
 
-fn unsupported_value(param: &str, v: &str) -> SqlError {
+fn is_read_only(name: &str) -> bool {
+    read_only_parameter_context(name).is_some()
+}
+
+fn invalid_setting_value(param: &str, v: &str) -> SqlError {
     sql_err!(
-        sqlstate::FEATURE_NOT_SUPPORTED,
-        "{} \"{}\" is not supported (only the default is implemented)",
+        sqlstate::INVALID_PARAMETER_VALUE,
+        "invalid value for parameter \"{}\": \"{}\"",
         param,
         v
     )

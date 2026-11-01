@@ -7898,6 +7898,7 @@ mod tests {
         let mut config = Config::default_dev();
         config.data_dir = directory.to_string_lossy().into_owned();
         config.max_connections = 1;
+        config.max_ddl_per_transaction = 1;
         config.max_tables = 2;
         config.max_extended_statistics = 16;
         config.table_rows = 16;
@@ -7985,7 +7986,9 @@ mod tests {
             ),
         ];
         for (index, (parameters, application_name, search_path)) in cases.iter().enumerate() {
-            let mut connection = Conn::new(&config, &mut budget).unwrap();
+            let mut connection_budget = Budget::new(config.memory_plan(0, 0).connections);
+            let mut connection = Conn::new(&config, &mut connection_budget).unwrap();
+            assert_eq!(connection_budget.remaining(), 0);
             connection.id = 80 + index as i32;
             let mut payload = b"user\0postgres\0database\0postgres\0".to_vec();
             for (name, value) in *parameters {

@@ -1242,7 +1242,11 @@ fn sql_setting_strings_are_decoded_once_before_guc_assignment() {
             "9000",
             "+02:00",
             "-7200",
-            "<+02:30>-02:30",
+            "<+02:30>-02:30|TimeZone=2.5",
+            "<+00:00:01>-00:00:01|TimeZone=0.0005",
+            "TimeZone=0.0005|t|DateStyle=sql, dmy",
+            "TimeZone=0.0005",
+            "DateStyle=sql, dmy",
         ]
     );
     for sql in [
@@ -1259,6 +1263,122 @@ fn sql_setting_strings_are_decoded_once_before_guc_assignment() {
             "{sql}"
         );
     }
+    for sql in [
+        "ALTER ROLE postgres SET nonexistent_parameter FROM CURRENT",
+        "ALTER DATABASE postgres SET nonexistent_parameter FROM CURRENT",
+    ] {
+        assert_eq!(
+            error_sqlstates(&session.execute(&mut engine, sql, true)),
+            ["42704"],
+            "{sql}"
+        );
+    }
+
+    for sql in [
+        "ALTER ROLE postgres RESET nonexistent_parameter",
+        "ALTER DATABASE postgres RESET nonexistent_parameter",
+        "ALTER ROLE postgres RESET server_version",
+        "ALTER DATABASE postgres RESET server_version",
+        "ALTER ROLE postgres SET nonexistent_parameter TO DEFAULT",
+        "ALTER DATABASE postgres SET nonexistent_parameter TO DEFAULT",
+        "ALTER ROLE postgres SET server_version TO DEFAULT",
+        "ALTER DATABASE postgres SET server_version TO DEFAULT",
+    ] {
+        session.success(&mut engine, sql, true);
+    }
+    session.success(&mut engine, "CREATE FUNCTION public.current_timezone_source() RETURNS integer LANGUAGE sql AS 'SELECT 1'; SELECT set_config('timezone','0.0005',false)", true);
+    for sql in [
+        "CREATE FUNCTION public.invalid_captured_timezone() RETURNS integer LANGUAGE sql SET timezone FROM CURRENT AS 'SELECT 1'",
+        "ALTER FUNCTION public.current_timezone_source() SET timezone FROM CURRENT",
+        "ALTER ROLE postgres SET timezone FROM CURRENT",
+        "ALTER DATABASE postgres SET timezone FROM CURRENT",
+        "SET timezone FROM CURRENT",
+    ] {
+        assert_eq!(
+            error_sqlstates(&session.execute(&mut engine, sql, true)),
+            ["22023"],
+            "{sql}"
+        );
+        assert_eq!(
+            data_rows(&session.success(&mut engine, "SELECT current_setting('timezone')", true)),
+            ["<+00:00:01>-00:00:01"]
+        );
+    }
+    session.success(&mut engine, "RESET timezone; ALTER FUNCTION public.current_timezone_source() SET application_name TO 'saved-function'; ALTER ROLE postgres SET application_name TO 'saved-role'; ALTER DATABASE postgres SET application_name TO 'saved-database'", true);
+    session.success(
+        &mut engine,
+        "ALTER SYSTEM SET application_name TO 'saved-system'",
+        true,
+    );
+    for (sql, expected) in [
+        (
+            "ALTER ROLE postgres RESET nonexistent_parameter",
+            Some("42704"),
+        ),
+        (
+            "ALTER DATABASE postgres RESET nonexistent_parameter",
+            Some("42704"),
+        ),
+        ("ALTER ROLE postgres RESET max_connections", Some("55P02")),
+        (
+            "ALTER DATABASE postgres RESET max_connections",
+            Some("55P02"),
+        ),
+        ("ALTER SYSTEM RESET max_connections", None),
+        (
+            "ALTER ROLE postgres SET nonexistent_parameter TO DEFAULT",
+            Some("42704"),
+        ),
+        (
+            "ALTER DATABASE postgres SET nonexistent_parameter TO DEFAULT",
+            Some("42704"),
+        ),
+        (
+            "ALTER ROLE postgres SET server_version TO DEFAULT",
+            Some("55P02"),
+        ),
+        (
+            "ALTER DATABASE postgres SET server_version TO DEFAULT",
+            Some("55P02"),
+        ),
+        ("ALTER SYSTEM SET max_connections TO DEFAULT", None),
+        (
+            "ALTER FUNCTION public.current_timezone_source() RESET nonexistent_parameter",
+            Some("42704"),
+        ),
+        ("ALTER SYSTEM RESET nonexistent_parameter", Some("42704")),
+        ("ALTER ROLE postgres RESET server_version", Some("55P02")),
+        (
+            "ALTER DATABASE postgres RESET server_version",
+            Some("55P02"),
+        ),
+        (
+            "ALTER FUNCTION public.current_timezone_source() RESET server_version",
+            Some("55P02"),
+        ),
+        ("ALTER SYSTEM RESET server_version", Some("55P02")),
+    ] {
+        if let Some(expected) = expected {
+            assert_eq!(
+                error_sqlstates(&session.execute(&mut engine, sql, true)),
+                [expected],
+                "{sql}"
+            );
+        } else {
+            session.success(&mut engine, sql, true);
+        }
+        assert_eq!(data_rows(&session.success(&mut engine, "SELECT proconfig[1] FROM pg_proc WHERE proname='current_timezone_source'; SELECT setconfig[1] FROM pg_db_role_setting WHERE setrole='postgres'::regrole AND setdatabase=0; SELECT setconfig[1] FROM pg_db_role_setting WHERE setrole=0 AND setdatabase=(SELECT oid FROM pg_database WHERE datname='postgres')", true)), ["application_name=saved-function", "application_name=saved-role", "application_name=saved-database"]);
+        assert!(
+            engine
+                .storage
+                .system_settings()
+                .any(|(_, setting)| setting.live
+                    && setting.name.as_str() == "application_name"
+                    && setting.value.as_str() == "saved-system")
+        );
+    }
+    session.success(&mut engine, "ALTER SYSTEM RESET application_name", true);
+    session.success(&mut engine, "ALTER ROLE postgres RESET application_name; ALTER DATABASE postgres RESET application_name; DROP FUNCTION public.current_timezone_source()", true);
 }
 
 #[test]
@@ -1599,4 +1719,187 @@ fn datestyle_sql_values_apply_cumulative_components_and_quoted_defaults() {
             ["SQL, DMY"]
         );
     }
+}
+
+#[test]
+fn invalid_setting_values_use_parameter_errors_without_changing_values() {
+    let guc = GucState::new();
+    crate::mem::guard::forbid_alloc(|| {
+        for (name, invalid) in [
+            ("check_function_bodies", "not_a_value"),
+            ("row_security", "not_a_value"),
+            ("event_triggers", "not_a_value"),
+            ("default_transaction_read_only", "not_a_value"),
+            ("default_transaction_deferrable", "not_a_value"),
+            ("xmloption", "not_a_value"),
+            ("track_functions", "not_a_value"),
+            ("default_text_search_config", ""),
+        ] {
+            let prior = guc.get_owned(name).unwrap();
+            assert_eq!(
+                guc.set_config(name, Some(invalid), false)
+                    .unwrap_err()
+                    .sqlstate,
+                "22023",
+                "{name}"
+            );
+            assert_eq!(guc.get_owned(name).unwrap().as_str(), prior.as_str());
+        }
+        for name in ["transaction_read_only", "transaction_deferrable"] {
+            assert_eq!(
+                guc.current_transaction_value(name, Some("not_a_value"))
+                    .unwrap()
+                    .unwrap_err()
+                    .sqlstate,
+                "22023"
+            );
+        }
+    });
+}
+
+#[test]
+fn rendered_routine_definitions_preserve_quoted_names_and_saved_setting_input() {
+    let config = test_config("quoted-routine-definition");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        r#"
+        CREATE SCHEMA "Quoted App";
+        CREATE FUNCTION "Quoted App"."Quoted Routine"("input label" integer)
+        RETURNS TABLE ("output label" integer) LANGUAGE sql
+        SET timezone TO '0.0005'
+        AS $$SELECT $1 + EXTRACT(timezone FROM current_timestamp)::integer$$;
+    "#,
+        true,
+    );
+    let definitions = data_rows(&session.success(
+        &mut engine,
+        r#"SELECT pg_get_functiondef('"Quoted App"."Quoted Routine"(integer)'::regprocedure)"#,
+        true,
+    ));
+    assert_eq!(definitions.len(), 1);
+    let definition = &definitions[0];
+    for quoted in [
+        r#""Quoted App"."Quoted Routine""#,
+        r#""input label""#,
+        r#""output label""#,
+        r#"SET "TimeZone" TO '0.0005'"#,
+    ] {
+        assert!(definition.contains(quoted), "{definition}");
+    }
+    session.success(
+        &mut engine,
+        r#"DROP FUNCTION "Quoted App"."Quoted Routine"(integer)"#,
+        true,
+    );
+    session.success(&mut engine, definition, true);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            r#"SELECT * FROM "Quoted App"."Quoted Routine"(7)"#,
+            true
+        )),
+        ["8"]
+    );
+}
+
+#[test]
+fn timezone_numeric_offsets_and_intervals_use_postgresql_bounds() {
+    let guc = GucState::new();
+    crate::mem::guard::forbid_alloc(|| {
+        for (value, expected) in [
+            ("16", "<+16>-16"),
+            ("24", "<+24>-24"),
+            ("1e1", "<+10>-10"),
+            ("0.0001", "<+00>-00"),
+            ("-0.0005", "<-00:00:01>+00:00:01"),
+            ("167.999999", "<+167:59:59>-167:59:59"),
+            ("<+02:30>-02:30", "<+02:30>-02:30"),
+            ("<+00>-00", "<+00>-00"),
+        ] {
+            guc.set_config("timezone", Some(value), false).unwrap();
+            assert_eq!(
+                guc.get_owned("timezone").unwrap().as_str(),
+                expected,
+                "{value}"
+            );
+        }
+        for value in [
+            "168",
+            "-168",
+            "1000",
+            "Infinity",
+            "<+167:59:59>-167:59:59",
+            "<-167:59:59>+167:59:59",
+        ] {
+            let prior = guc.get_owned("timezone").unwrap();
+            assert_eq!(
+                guc.set_config("timezone", Some(value), false)
+                    .unwrap_err()
+                    .sqlstate,
+                "22023",
+                "{value}"
+            );
+            assert_eq!(guc.get_owned("timezone").unwrap().as_str(), prior.as_str());
+        }
+        let prior = guc.get_owned("timezone").unwrap();
+        assert_eq!(
+            guc.set_config("timezone", Some("NaN"), false)
+                .unwrap_err()
+                .sqlstate,
+            "0A000"
+        );
+        assert_eq!(guc.get_owned("timezone").unwrap().as_str(), prior.as_str());
+        for (micros, expected) in [
+            (500_000, "<+00>-00"),
+            (1_500_000, "<+00:00:01>-00:00:01"),
+            (-1_500_000, "<-00:00:01>+00:00:01"),
+            (604_799_000_000, "<+167:59:59>-167:59:59"),
+            (-604_799_000_000, "<-167:59:59>+167:59:59"),
+        ] {
+            guc.set_time_zone_interval(
+                super::super::types::Interval {
+                    months: 0,
+                    days: 0,
+                    micros,
+                },
+                false,
+            )
+            .unwrap();
+            assert_eq!(guc.get_owned("timezone").unwrap().as_str(), expected);
+        }
+        for interval in [
+            super::super::types::Interval {
+                months: 1,
+                days: 0,
+                micros: 0,
+            },
+            super::super::types::Interval {
+                months: 0,
+                days: 1,
+                micros: 0,
+            },
+            super::super::types::Interval {
+                months: 0,
+                days: 0,
+                micros: 604_800_000_000,
+            },
+            super::super::types::Interval {
+                months: 0,
+                days: 0,
+                micros: -604_800_000_000,
+            },
+        ] {
+            let prior = guc.get_owned("timezone").unwrap();
+            assert_eq!(
+                guc.set_time_zone_interval(interval, false)
+                    .unwrap_err()
+                    .sqlstate,
+                "22023"
+            );
+            assert_eq!(guc.get_owned("timezone").unwrap().as_str(), prior.as_str());
+        }
+    });
 }

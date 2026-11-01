@@ -13410,16 +13410,22 @@ pub fn function_def_text<'a>(
     let mut definition = crate::util::StackStr::<{ crate::storage::ROUTINE_SQL_MAX * 2 }>::new();
     write!(
         definition,
-        "CREATE OR REPLACE {} {}.{}(",
+        "CREATE OR REPLACE {} ",
         if matches!(routine.kind, crate::storage::RoutineKind::Procedure) {
             "PROCEDURE"
         } else {
             "FUNCTION"
-        },
-        routine.schema_for(txid).as_str(),
-        routine.name_for(txid).as_str()
+        }
     )
     .map_err(|_| super::eval::arena_full())?;
+    write_identifier(&mut definition, routine.schema_for(txid).as_str());
+    definition
+        .write_char('.')
+        .map_err(|_| super::eval::arena_full())?;
+    write_identifier(&mut definition, routine.name_for(txid).as_str());
+    definition
+        .write_char('(')
+        .map_err(|_| super::eval::arena_full())?;
     for (index, parameter) in routine.parameters().iter().enumerate() {
         if index != 0 {
             write!(definition, ", ").map_err(|_| super::eval::arena_full())?;
@@ -13441,7 +13447,9 @@ pub fn function_def_text<'a>(
             }
         }
         if !parameter.name.as_str().is_empty() {
-            write!(definition, "{} ", parameter.name.as_str())
+            write_identifier(&mut definition, parameter.name.as_str());
+            definition
+                .write_char(' ')
                 .map_err(|_| super::eval::arena_full())?;
         }
         write_routine_type_name(&mut definition, parameter.ctype, parameter.user_type, true)
@@ -13473,7 +13481,9 @@ pub fn function_def_text<'a>(
                 if index != 0 {
                     write!(definition, ", ").map_err(|_| super::eval::arena_full())?;
                 }
-                write!(definition, "{} ", column.name.as_str())
+                write_identifier(&mut definition, column.name.as_str());
+                definition
+                    .write_char(' ')
                     .map_err(|_| super::eval::arena_full())?;
                 write_routine_type_name(&mut definition, column.ctype, column.user_type, true)
                     .map_err(|_| super::eval::arena_full())?;
@@ -13539,8 +13549,9 @@ pub fn function_def_text<'a>(
             .map_err(|_| super::eval::arena_full())?;
     }
     for config in routine.configs() {
-        write!(definition, " SET {} TO '", config.name.as_str())
-            .map_err(|_| super::eval::arena_full())?;
+        write!(definition, " SET ").map_err(|_| super::eval::arena_full())?;
+        write_identifier(&mut definition, config.name.as_str());
+        write!(definition, " TO '").map_err(|_| super::eval::arena_full())?;
         for character in config.value.as_str().chars() {
             write!(definition, "{character}").map_err(|_| super::eval::arena_full())?;
             if character == '\'' {

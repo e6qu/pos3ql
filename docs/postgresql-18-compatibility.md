@@ -250,6 +250,14 @@ non-ASCII byte becomes literal `\xhh` using lowercase hexadecimal digits.
 Escaping beyond that capacity returns
 `22023` without changing the prior value.
 
+Numeric session timezones use hours east of UTC: `SET timezone TO '2.5'` means
+UTC+02:30. Numeric and interval offsets range from -167:59:59 to +167:59:59;
+fractional seconds truncate toward zero. Nonzero month or day interval fields
+return `22023`, following
+[PostgreSQL's setting rules](https://github.com/postgres/postgres/blob/REL_18_6/src/backend/commands/variable.c#L251)
+and [fixed-offset bounds](https://github.com/postgres/postgres/blob/REL_18_6/src/timezone/localtime.c#L667).
+`NaN` timezone values are unsupported and return `0A000`.
+
 Each cursor reserves `cursor_bytes` for typed rows, `cursor_query_bytes` for its
 query, copied parameters and their
 declared types (a `NULL` date parameter still has the date type),

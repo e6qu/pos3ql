@@ -7662,44 +7662,59 @@ pub fn alter_role_setting(
 
     let result = match action {
         crate::sql::ast::RoleSettingAction::Set { name, value } => {
-            let name = match SqlName::parse(name) {
+            let name = match super::guc::canonical_setting_name(name) {
                 Ok(name) => name,
                 Err(error) => return sql_fail(error),
             };
             let value = match value {
-                crate::sql::ast::RoutineConfigValue::Current => guc.get_owned(name.as_str()),
+                crate::sql::ast::RoutineConfigValue::Current => {
+                    match guc.capture_setting_value(name.as_str()) {
+                        Ok(value) => Some(value),
+                        Err(error) => return sql_fail(error),
+                    }
+                }
                 crate::sql::ast::RoutineConfigValue::Default => {
-                    if let Err(error) = guc.validate_setting_value(name.as_str(), None) {
-                        return sql_fail(error);
+                    // PostgreSQL validates removals only when this scope already has settings.
+                    if storage
+                        .role_settings()
+                        .any(|(_, setting)| setting.visible_to(txn.txid) && setting.scope == scope)
+                    {
+                        if let Err(error) = guc.validate_setting_value(name.as_str(), None) {
+                            return sql_fail(error);
+                        }
                     }
                     None
                 }
                 crate::sql::ast::RoutineConfigValue::Value(value) => {
                     match guc.validate_setting_value(name.as_str(), Some(value)) {
-                        Ok(value) => Some(value),
+                        Ok(()) => Some(crate::util::StackStr::from_str(value)),
                         Err(error) => return sql_fail(error),
                     }
                 }
             };
-            let value = value.map(|value| {
-                let stored = crate::util::StackStr::from_str(value.as_str());
-                if stored.is_truncated() {
-                    Err(sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "role setting value exceeds {} bytes",
-                        crate::storage::ROLE_SETTING_VALUE_MAX
-                    ))
-                } else {
-                    Ok(stored)
-                }
-            });
-            let value = match value.transpose() {
-                Ok(value) => value,
-                Err(error) => return sql_fail(error),
-            };
+            if value
+                .as_ref()
+                .is_some_and(crate::util::StackStr::is_truncated)
+            {
+                return sql_fail(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "role setting value exceeds {} bytes",
+                    crate::storage::ROLE_SETTING_VALUE_MAX
+                ));
+            }
             stage_role_setting(storage, wal, txn, scope, name, value)
         }
         crate::sql::ast::RoleSettingAction::Reset(name) => {
+            if let Some(name) = name {
+                if storage
+                    .role_settings()
+                    .any(|(_, setting)| setting.visible_to(txn.txid) && setting.scope == scope)
+                {
+                    if let Err(error) = guc.validate_setting_value(name, None) {
+                        return sql_fail(error);
+                    }
+                }
+            }
             let mut result = Ok(());
             loop {
                 let next = storage.role_settings().find_map(|(slot, setting)| {
@@ -7841,12 +7856,12 @@ pub fn alter_system(
     }
     match (name, raw) {
         (Some(name), Some(raw)) => {
-            let name = match SqlName::parse(name) {
+            let name = match super::guc::canonical_setting_name(name) {
                 Ok(name) => name,
                 Err(error) => return sql_fail(error),
             };
             let value = match guc.validate_setting_value(name.as_str(), Some(raw)) {
-                Ok(value) => crate::util::StackStr::from_str(value.as_str()),
+                Ok(()) => crate::util::StackStr::from_str(raw),
                 Err(error) => return sql_fail(error),
             };
             if value.is_truncated() {
@@ -7860,7 +7875,10 @@ pub fn alter_system(
             }
         }
         (Some(name), None) => {
-            let name = match SqlName::parse(name) {
+            if let Err(error) = guc.validate_system_reset(name) {
+                return sql_fail(error);
+            }
+            let name = match super::guc::canonical_setting_name(name) {
                 Ok(name) => name,
                 Err(error) => return sql_fail(error),
             };
@@ -33910,7 +33928,7 @@ pub fn create_routine(
     let mut configs = [crate::storage::RoutineConfig::EMPTY; crate::storage::MAX_ROUTINE_CONFIGS];
     let mut config_count = 0;
     for config in routine.configs.iter() {
-        let name = match SqlName::parse(config.name) {
+        let name = match super::guc::canonical_setting_name(config.name) {
             Ok(name) => name,
             Err(error) => return sql_fail(error),
         };
@@ -33923,19 +33941,14 @@ pub fn create_routine(
             }
             super::ast::RoutineConfigValue::Value(value) => {
                 match guc.validate_setting_value(config.name, Some(value)) {
-                    Ok(value) => StackStr::from_str(value.as_str()),
+                    Ok(()) => StackStr::from_str(value),
                     Err(error) => return sql_fail(error),
                 }
             }
-            super::ast::RoutineConfigValue::Current => match guc.get_owned(config.name) {
-                Some(value) => StackStr::from_str(value.as_str()),
-                None => {
-                    return sql_fail(sql_err!(
-                        sqlstate::UNDEFINED_OBJECT,
-                        "unrecognized configuration parameter \"{}\"",
-                        config.name
-                    ));
-                }
+            super::ast::RoutineConfigValue::Current => match guc.capture_setting_value(config.name)
+            {
+                Ok(value) => StackStr::from_str(value.as_str()),
+                Err(error) => return sql_fail(error),
             },
         };
         if value.is_truncated() {
@@ -35925,7 +35938,7 @@ pub fn alter_routine(
                             "routine configuration state is unavailable"
                         ));
                     };
-                    let stored_name = match SqlName::parse(name) {
+                    let stored_name = match super::guc::canonical_setting_name(name) {
                         Ok(name) => name,
                         Err(error) => return sql_fail(error),
                     };
@@ -35949,20 +35962,16 @@ pub fn alter_routine(
                         }
                         super::ast::RoutineConfigValue::Value(value) => {
                             match guc.validate_setting_value(name, Some(value)) {
+                                Ok(()) => StackStr::from_str(value),
+                                Err(error) => return sql_fail(error),
+                            }
+                        }
+                        super::ast::RoutineConfigValue::Current => {
+                            match guc.capture_setting_value(name) {
                                 Ok(value) => StackStr::from_str(value.as_str()),
                                 Err(error) => return sql_fail(error),
                             }
                         }
-                        super::ast::RoutineConfigValue::Current => match guc.get_owned(name) {
-                            Some(value) => StackStr::from_str(value.as_str()),
-                            None => {
-                                return sql_fail(sql_err!(
-                                    sqlstate::UNDEFINED_OBJECT,
-                                    "unrecognized configuration parameter \"{}\"",
-                                    name
-                                ));
-                            }
-                        },
                     };
                     if stored_value.is_truncated() {
                         return sql_fail(sql_err!(
@@ -35993,6 +36002,15 @@ pub fn alter_routine(
                 }
                 crate::sql::ast::AlterRoutineAction::ResetConfig(name) => {
                     if let Some(name) = name {
+                        let Some(guc) = guc else {
+                            return sql_fail(sql_err!(
+                                sqlstate::INTERNAL_ERROR,
+                                "routine configuration state is unavailable"
+                            ));
+                        };
+                        if let Err(error) = guc.validate_setting_value(name, None) {
+                            return sql_fail(error);
+                        }
                         if let Some(index) = configs[..config_count]
                             .iter()
                             .position(|config| config.name.as_str().eq_ignore_ascii_case(name))
@@ -51384,26 +51402,38 @@ pub fn alter_database(
             ));
         }
         crate::sql::ast::AlterDatabaseAction::Set { name, value } => {
-            let name = match SqlName::parse(name) {
+            let name = match super::guc::canonical_setting_name(name) {
                 Ok(name) => name,
                 Err(error) => return sql_fail(error),
             };
             let value = match value {
-                crate::sql::ast::RoutineConfigValue::Current => guc.get_owned(name.as_str()),
+                crate::sql::ast::RoutineConfigValue::Current => {
+                    match guc.capture_setting_value(name.as_str()) {
+                        Ok(value) => Some(value),
+                        Err(error) => return sql_fail(error),
+                    }
+                }
                 crate::sql::ast::RoutineConfigValue::Default => {
-                    if let Err(error) = guc.validate_setting_value(name.as_str(), None) {
-                        return sql_fail(error);
+                    let scope = crate::storage::RoleSettingScope::AllRolesInDatabase(
+                        storage.database(slot).oid,
+                    );
+                    if storage
+                        .role_settings()
+                        .any(|(_, setting)| setting.visible_to(txn.txid) && setting.scope == scope)
+                    {
+                        if let Err(error) = guc.validate_setting_value(name.as_str(), None) {
+                            return sql_fail(error);
+                        }
                     }
                     None
                 }
                 crate::sql::ast::RoutineConfigValue::Value(raw) => {
                     match guc.validate_setting_value(name.as_str(), Some(raw)) {
-                        Ok(value) => Some(value),
+                        Ok(()) => Some(crate::util::StackStr::from_str(raw)),
                         Err(error) => return sql_fail(error),
                     }
                 }
             };
-            let value = value.map(|value| crate::util::StackStr::from_str(value.as_str()));
             if value
                 .as_ref()
                 .is_some_and(crate::util::StackStr::is_truncated)
@@ -51428,6 +51458,17 @@ pub fn alter_database(
         }
         crate::sql::ast::AlterDatabaseAction::Reset(name) => {
             let database = storage.database(slot).oid;
+            if let Some(name) = name {
+                let scope = crate::storage::RoleSettingScope::AllRolesInDatabase(database);
+                if storage
+                    .role_settings()
+                    .any(|(_, setting)| setting.visible_to(txn.txid) && setting.scope == scope)
+                {
+                    if let Err(error) = guc.validate_setting_value(name, None) {
+                        return sql_fail(error);
+                    }
+                }
+            }
             loop {
                 let setting = storage.role_settings().find_map(|(_, setting)| {
                     (setting.visible_to(txn.txid)

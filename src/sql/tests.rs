@@ -67493,18 +67493,10 @@ fn routine_setting_values_and_reset_values_share_one_bounded_definition() {
         },
     ];
     crate::mem::guard::forbid_alloc(|| {
-        assert_eq!(
-            guc.validate_setting_value("standard_conforming_strings", Some("on"))
-                .unwrap()
-                .as_str(),
-            "on"
-        );
-        assert_eq!(
-            guc.validate_setting_value("xmloption", Some("document"))
-                .unwrap()
-                .as_str(),
-            "document"
-        );
+        guc.validate_setting_value("standard_conforming_strings", Some("on"))
+            .unwrap();
+        guc.validate_setting_value("xmloption", Some("document"))
+            .unwrap();
         let scope = guc.enter_routine_configs(&configurations).unwrap();
         assert_eq!(guc.get_owned("xmloption").unwrap().as_str(), "document");
         assert_eq!(guc.reset_owned("xmloption").unwrap().as_str(), "content");

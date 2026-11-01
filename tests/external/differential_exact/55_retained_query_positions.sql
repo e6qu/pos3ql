@@ -1,3 +1,4 @@
+BEGIN;
 CREATE TABLE query_position_source(value integer PRIMARY KEY);
 INSERT INTO query_position_source VALUES(1),(2),(3);
 CREATE TABLE query_position_audit(value integer);
@@ -45,6 +46,8 @@ DROP FUNCTION query_first.query_target_write(integer);
 DROP FUNCTION query_second.query_target_write(integer);
 DROP SCHEMA query_first;
 DROP SCHEMA query_second;
+COMMIT;
+BEGIN;
 
 CREATE FUNCTION query_position_cast_value(value text) RETURNS integer LANGUAGE sql IMMUTABLE AS $$SELECT 777$$;
 CREATE FUNCTION query_position_install_cast(value integer) RETURNS integer LANGUAGE sql VOLATILE AS $$CREATE CAST (text AS integer) WITH FUNCTION public.query_position_cast_value(text) AS ASSIGNMENT; SELECT $1$$;
@@ -53,6 +56,8 @@ SELECT value::text::integer FROM query_position_source WHERE value=2;
 DROP CAST (text AS integer);
 DROP FUNCTION query_position_install_cast(integer);
 DROP FUNCTION query_position_cast_value(text);
+COMMIT;
+BEGIN;
 
 TRUNCATE query_position_audit;
 CREATE FUNCTION query_position_default(value integer DEFAULT 1) RETURNS integer LANGUAGE sql VOLATILE AS $$INSERT INTO public.query_position_audit VALUES($1); SELECT $1$$;
@@ -62,6 +67,8 @@ SELECT query_position_default() FROM query_position_source WHERE value=2;
 SELECT value FROM query_position_audit ORDER BY value;
 DROP FUNCTION query_position_replace_default();
 DROP FUNCTION query_position_default(integer);
+COMMIT;
+BEGIN;
 
 TRUNCATE query_position_audit;
 CREATE FUNCTION query_position_variadic(VARIADIC members integer[]) RETURNS integer LANGUAGE sql VOLATILE AS $$INSERT INTO public.query_position_audit VALUES(cardinality($1)); SELECT cardinality($1)$$;
@@ -76,6 +83,8 @@ SELECT query_position_variadic_default(13,4,5) FROM query_position_source WHERE 
 SELECT value FROM query_position_audit ORDER BY value;
 DROP FUNCTION query_position_variadic(integer[]);
 DROP FUNCTION query_position_variadic_default(integer,integer[]);
+COMMIT;
+BEGIN;
 
 TRUNCATE query_position_audit;
 CREATE TABLE query_position_null_source(value integer);
@@ -117,6 +126,8 @@ TRUNCATE query_position_audit;
 DROP FUNCTION query_position_install_strict();
 DROP FUNCTION query_position_install_nonstrict();
 DROP TABLE query_position_null_source;
+COMMIT;
+BEGIN;
 
 CREATE PROCEDURE query_position_variadic_procedure(OUT result integer,marker integer DEFAULT 7,VARIADIC members integer[] DEFAULT ARRAY[]::integer[]) LANGUAGE sql AS $$SELECT $1+cardinality($2)$$;
 CALL query_position_variadic_procedure(result=>NULL,marker=>9,VARIADIC members=>ARRAY[]::integer[]);
@@ -137,3 +148,4 @@ DROP FUNCTION query_position_write(integer);
 DROP TABLE query_position_audit;
 DROP TABLE query_position_source;
 RESET application_name;
+COMMIT;

@@ -6,6 +6,7 @@ fn query_positions_do_not_repeat_completed_projection_effects() {
     let mut budget = test_engine_budget(&config, 1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    // Independent cases commit retired definitions within the eight routine slots.
     let sql =
         include_str!("../../../tests/external/differential_exact/55_retained_query_positions.sql");
     let output = session.success(&mut engine, sql, true);
@@ -40,7 +41,7 @@ fn query_positions_do_not_repeat_completed_projection_effects() {
         remaining = &remaining[length + 1..];
     }
     assert_eq!(descriptions, 53);
-    assert_eq!(completions, 125);
+    assert_eq!(completions, 137);
 }
 
 #[test]

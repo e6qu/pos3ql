@@ -1,6 +1,20 @@
 use super::*;
 
 #[test]
+fn retained_routine_inputs_preserve_argument_effects_across_pending_calls() {
+    let config = test_config("retained-routine-inputs");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    let sql =
+        include_str!("../../../tests/external/differential_exact/50_retained_routine_inputs.sql");
+    assert_eq!(
+        data_rows(&session.success(&mut engine, sql, true)),
+        ["0", "1", "1", "1"]
+    );
+}
+
+#[test]
 fn constant_catalog_identifier_errors_do_not_depend_on_input_rows() {
     let config = test_config("routine-constant-identifiers");
     let mut budget = test_engine_budget(&config, 1 << 29);

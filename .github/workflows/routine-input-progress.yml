@@ -1,0 +1,28 @@
+name: Routine input progress
+
+on:
+  push:
+    branches: [retain-routine-input-progress]
+
+concurrency:
+  group: routine-input-progress-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  inputs:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+      - name: Rebuild this checkout's crate
+        run: cargo clean -p pos3ql
+      - name: Function argument effects and resumption
+        run: >-
+          cargo test --lib --locked routine_calls:: -- --test-threads=1 --nocapture

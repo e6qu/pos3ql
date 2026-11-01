@@ -1494,6 +1494,7 @@ fn datestyle_assignments_preserve_reset_defaults_and_reject_conflicts_atomically
     )
     .unwrap();
     crate::mem::guard::forbid_alloc(|| {
+        guc.begin_transaction();
         for (value, expected) in [
             ("", "German, DMY"),
             (" \t\n\u{b}", "German, DMY"),
@@ -1555,6 +1556,7 @@ fn datestyle_assignments_preserve_reset_defaults_and_reject_conflicts_atomically
             guc.set_config("DateStyle", None, false).unwrap().as_str(),
             "SQL, YMD"
         );
+        guc.commit_transaction();
     });
 }
 

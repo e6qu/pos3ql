@@ -2657,11 +2657,18 @@ fn apply_datestyle(
     value: &str,
 ) -> Result<(DateFormat, Order3), SqlError> {
     use core::fmt::Write as _;
+    let invalid = || {
+        sql_err!(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "invalid value for parameter \"DateStyle\": \"{}\"",
+            value
+        )
+    };
     let (mut format, mut order) = current;
     let (mut have_style, mut have_order) = (false, false);
     let mut conflict = false;
     for component in search_path_components(value) {
-        let component = component.map_err(|_| unsupported_value("DateStyle", value))?;
+        let component = component.map_err(|_| invalid())?;
         let component = component.trim_matches(search_path_space);
         let mut token = StackStr::<63>::new();
         if let Some(quoted) = component.strip_prefix('"') {
@@ -2731,11 +2738,11 @@ fn apply_datestyle(
                 order = reset.1;
             }
         } else {
-            return Err(unsupported_value("DateStyle", value));
+            return Err(invalid());
         }
     }
     if conflict {
-        return Err(unsupported_value("DateStyle", value));
+        return Err(invalid());
     }
     Ok((format, order))
 }

@@ -25,4 +25,6 @@ jobs:
         run: cargo clean -p pos3ql
       - name: Function argument effects and resumption
         run: >-
-          cargo test --lib --locked routine_calls:: -- --test-threads=1 --nocapture
+          cargo test --lib --locked -- routine_calls:: retained_input_ownership_ --test-threads=1 --nocapture
+      - name: Lint complete implementation
+        run: cargo clippy --all-targets --locked -- -D warnings

@@ -1311,7 +1311,7 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
         let values = arena
             .alloc_slice_with(rows.len(), |_| Datum::Null)
             .map_err(|_| arena_full())?;
-        if let Some(columns) = routine.table_columns() {
+        if let Some(columns) = routine.record_result_columns() {
             for (value, encoded) in values.iter_mut().zip(rows) {
                 let mut decoded = [crate::sql::types::RecordField {
                     name: "",
@@ -5145,6 +5145,7 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
             else {
                 return Ok(&[]);
             };
+            let _input_body = super::input_progress::enter_body();
             let table_columns = routine.table_columns();
             let scalar_result = routine.kind.function_result();
             let _formal_scope = crate::sql::exec::enter_routine_parameter_types(

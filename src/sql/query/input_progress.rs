@@ -4,7 +4,6 @@ use super::*;
 use crate::storage::{
     RoutineDef, RoutineParameterMode, StoredQueryDependency, StoredQueryDependencyView,
 };
-use core::marker::PhantomData;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InputSite<'a> {
@@ -21,8 +20,18 @@ pub(crate) enum InputSite<'a> {
         arity: usize,
         variadic: bool,
     },
-    Query(u8),
+    Query(InputQuery),
     Definition(i32),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InputQuery {
+    Scalar,
+    Row,
+    Array,
+    Exists,
+    In,
+    Quantified,
 }
 
 pub(crate) fn expression_site<'a>(expression: &Expr<'a>) -> Option<InputSite<'a>> {
@@ -39,12 +48,12 @@ pub(crate) fn expression_site<'a>(expression: &Expr<'a>) -> Option<InputSite<'a>
             arity: args.len(),
             variadic: *variadic,
         }),
-        Expr::Subquery(_) => Some(InputSite::Query(0)),
-        Expr::RowSubquery { .. } => Some(InputSite::Query(1)),
-        Expr::ArraySubquery(_) => Some(InputSite::Query(2)),
-        Expr::Exists(_) => Some(InputSite::Query(3)),
-        Expr::InSubquery { .. } => Some(InputSite::Query(4)),
-        Expr::QuantifiedSubquery { .. } => Some(InputSite::Query(5)),
+        Expr::Subquery(_) => Some(InputSite::Query(InputQuery::Scalar)),
+        Expr::RowSubquery { .. } => Some(InputSite::Query(InputQuery::Row)),
+        Expr::ArraySubquery(_) => Some(InputSite::Query(InputQuery::Array)),
+        Expr::Exists(_) => Some(InputSite::Query(InputQuery::Exists)),
+        Expr::InSubquery { .. } => Some(InputSite::Query(InputQuery::In)),
+        Expr::QuantifiedSubquery { .. } => Some(InputSite::Query(InputQuery::Quantified)),
         _ => None,
     }
 }
@@ -293,11 +302,39 @@ struct InputAttempt<'statement, 'query> {
 }
 
 impl<'statement: 'query, 'query> InputAttempt<'statement, 'query> {
-    fn frame(&self, site: InputSite<'query>) -> Result<(usize, InputFrame<'query>), SqlError> {
+    fn frame(&self, site: InputSite<'_>) -> Result<(usize, InputFrame<'query>), SqlError> {
         let ordinal = self.next.get();
         self.next.set(ordinal.checked_add(1).ok_or_else(full)?);
         let mut frames = self.frames.borrow_mut();
         if ordinal == frames.len() {
+            let site = match site {
+                InputSite::Argument {
+                    routine,
+                    parameter,
+                    written,
+                    source,
+                    target,
+                } => InputSite::Argument {
+                    routine,
+                    parameter,
+                    written,
+                    source,
+                    target,
+                },
+                InputSite::Call {
+                    name,
+                    bound_oid,
+                    arity,
+                    variadic,
+                } => InputSite::Call {
+                    name: self.arena.alloc_str(name).map_err(|_| full())?,
+                    bound_oid,
+                    arity,
+                    variadic,
+                },
+                InputSite::Query(kind) => InputSite::Query(kind),
+                InputSite::Definition(oid) => InputSite::Definition(oid),
+            };
             frames
                 .push(AttemptFrame::Temporary(InputFrame {
                     site,
@@ -317,11 +354,12 @@ impl<'statement: 'query, 'query> InputAttempt<'statement, 'query> {
         Ok((ordinal, frame))
     }
 
-    fn value(
+    fn value<'value>(
         &self,
-        site: InputSite<'query>,
-        evaluate: impl FnOnce() -> Result<Datum<'query>, SqlError>,
-    ) -> Result<Datum<'query>, SqlError> {
+        site: InputSite<'_>,
+        output: &'value Arena,
+        evaluate: impl FnOnce() -> Result<Datum<'value>, SqlError>,
+    ) -> Result<Datum<'value>, SqlError> {
         let (ordinal, mut frame) = self.frame(site)?;
         match frame.state {
             InputState::Value {
@@ -333,7 +371,7 @@ impl<'statement: 'query, 'query> InputAttempt<'statement, 'query> {
                 self.next.set(next_input);
                 self.invocation.set(next_invocation);
                 self.registry.next.set(next_call);
-                return super::super::exec::decode_projected_col_record(encoded, 0, self.arena);
+                return super::super::exec::decode_projected_col_record(encoded, 0, output);
             }
             InputState::Pending => {}
             InputState::Definition(_) => return Err(changed()),
@@ -436,21 +474,19 @@ thread_local! {
     static ACTIVE_INPUT: Cell<Option<ActiveInput>> = const { Cell::new(None) };
 }
 
-pub(super) struct InputScope<'a> {
+pub(super) struct InputScope {
     previous: Option<ActiveInput>,
-    _borrow: PhantomData<&'a ()>,
 }
-impl Drop for InputScope<'_> {
+impl Drop for InputScope {
     fn drop(&mut self) {
         ACTIVE_INPUT.with(|active| active.set(self.previous));
     }
 }
 
-pub(super) fn enter() -> InputScope<'static> {
+pub(super) fn enter() -> InputScope {
     let current = AVAILABLE_INPUT.with(Cell::get);
     InputScope {
         previous: ACTIVE_INPUT.with(|active| active.replace(current)),
-        _borrow: PhantomData,
     }
 }
 
@@ -458,6 +494,25 @@ struct AvailableScope(Option<ActiveInput>);
 impl Drop for AvailableScope {
     fn drop(&mut self) {
         AVAILABLE_INPUT.with(|active| active.set(self.0));
+    }
+}
+
+/// A function body and a subquery own their row scratch and nested input roots.
+/// They must not append parent-input frames inside a recycling scan's frontier.
+pub(crate) struct BodyScope {
+    active: Option<ActiveInput>,
+    available: Option<ActiveInput>,
+}
+impl Drop for BodyScope {
+    fn drop(&mut self) {
+        ACTIVE_INPUT.with(|active| active.set(self.active));
+        AVAILABLE_INPUT.with(|active| active.set(self.available));
+    }
+}
+pub(crate) fn enter_body() -> BodyScope {
+    BodyScope {
+        active: ACTIVE_INPUT.with(|active| active.replace(None)),
+        available: AVAILABLE_INPUT.with(|active| active.replace(None)),
     }
 }
 
@@ -520,8 +575,7 @@ pub(crate) fn value<'a>(
     // call owns this attempt until synchronous evaluation returns; enter limits
     // use to its input preparation, and both guards restore nested scopes.
     let attempt = unsafe { &*(active as *const InputAttempt<'_, 'a>) };
-    debug_assert!(core::ptr::eq(arena, attempt.arena));
-    attempt.value(site, evaluate)
+    attempt.value(site, arena, evaluate)
 }
 
 pub(super) fn definition<'a>(
@@ -535,7 +589,7 @@ pub(super) fn definition<'a>(
         return Ok(None);
     };
     let attempt = unsafe { &*(active as *const InputAttempt<'_, 'a>) };
-    debug_assert!(core::ptr::eq(arena, attempt.arena));
+    let _ = arena;
     attempt.definition(routine, slot, storage, txid).map(Some)
 }
 
@@ -550,4 +604,135 @@ fn changed() -> SqlError {
         sqlstate::SERIALIZATION_FAILURE,
         "retained routine input execution changed while waiting"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mem::budget::Budget;
+
+    #[test]
+    fn retained_input_ownership_keeps_nested_values_and_ordinals_after_work_reset() {
+        let mut budget = Budget::new(32768);
+        let statement = Arena::new(&mut budget, "input statement", 16384).unwrap();
+        let mut work = Arena::new(&mut budget, "input work", 8192).unwrap();
+        let invocations = RoutineInvocationState::new(&statement);
+        let _scope = enter_routine_invocation_scope(Some(RoutineInvocationContext::new(
+            &invocations,
+            &statement,
+        )));
+        let effects = Cell::new(0);
+        for attempt in 0..2 {
+            work.reset();
+            invocations.begin_attempt();
+            crate::mem::guard::forbid_alloc(|| {
+                let result = call(&work, || {
+                    let _scope = enter();
+                    value(InputSite::Query(InputQuery::Scalar), &work, || {
+                        let first = value(
+                            InputSite::Call {
+                                name: "input_effect",
+                                bound_oid: None,
+                                arity: 0,
+                                variadic: false,
+                            },
+                            &work,
+                            || {
+                                effects.set(effects.get() + 1);
+                                invocations.next.set(1);
+                                Ok(Datum::Text(work.alloc_str("retained value").unwrap()))
+                            },
+                        )?;
+                        assert_eq!(invocations.next.get(), 1);
+                        assert!(matches!(first, Datum::Text("retained value")));
+                        let second = value(InputSite::Query(InputQuery::Exists), &work, || {
+                            invocations.next.set(2);
+                            if attempt == 0 {
+                                Err(sql_err!(
+                                    sqlstate::INTERNAL_ROUTINE_INVOCATION,
+                                    "test suspension"
+                                ))
+                            } else {
+                                Ok(Datum::Int4(7))
+                            }
+                        })?;
+                        assert!(matches!(second, Datum::Int4(7)));
+                        Ok(first)
+                    })
+                });
+                if attempt == 0 {
+                    assert_eq!(
+                        result.unwrap_err().sqlstate,
+                        sqlstate::INTERNAL_ROUTINE_INVOCATION
+                    );
+                } else {
+                    assert!(matches!(result.unwrap(), Datum::Text("retained value")));
+                }
+                assert_eq!(effects.get(), 1);
+                assert_eq!(invocations.next.get(), 2);
+            });
+        }
+        assert!(ACTIVE_INPUT.with(Cell::get).is_none());
+        assert!(AVAILABLE_INPUT.with(Cell::get).is_none());
+    }
+
+    #[test]
+    fn retained_input_ownership_successful_rows_do_not_consume_statement_memory() {
+        let mut budget = Budget::new(8192);
+        let statement = Arena::new(&mut budget, "input statement", 1024).unwrap();
+        let mut work = Arena::new(&mut budget, "input work", 4096).unwrap();
+        let invocations = RoutineInvocationState::new(&statement);
+        let _scope = enter_routine_invocation_scope(Some(RoutineInvocationContext::new(
+            &invocations,
+            &statement,
+        )));
+        invocations.begin_attempt();
+        let before = statement.used();
+        for row in 0..100 {
+            work.reset();
+            crate::mem::guard::forbid_alloc(|| {
+                let result = call(&work, || {
+                    let _scope = enter();
+                    value(InputSite::Query(InputQuery::Scalar), &work, || {
+                        Ok(Datum::Int4(row))
+                    })
+                })
+                .unwrap();
+                assert!(matches!(result, Datum::Int4(value) if value == row));
+                assert_eq!(statement.used(), before);
+                assert_eq!(invocations.inputs.saved.borrow().len(), 0);
+            });
+        }
+    }
+
+    #[test]
+    fn retained_input_ownership_capacity_failure_restores_scopes() {
+        let mut budget = Budget::new(8192);
+        let statement = Arena::new(&mut budget, "input statement", 1).unwrap();
+        let work = Arena::new(&mut budget, "input work", 4096).unwrap();
+        let invocations = RoutineInvocationState::new(&statement);
+        let _scope = enter_routine_invocation_scope(Some(RoutineInvocationContext::new(
+            &invocations,
+            &statement,
+        )));
+        let error = crate::mem::guard::forbid_alloc(|| {
+            call(&work, || {
+                let _scope = enter();
+                value(InputSite::Query(InputQuery::Scalar), &work, || {
+                    Err(sql_err!(
+                        sqlstate::INTERNAL_ROUTINE_INVOCATION,
+                        "test suspension"
+                    ))
+                })
+            })
+            .unwrap_err()
+        });
+        assert_eq!(error.sqlstate, "54000");
+        assert_eq!(
+            error.message.as_str(),
+            "retained routine inputs exceed statement memory"
+        );
+        assert!(ACTIVE_INPUT.with(Cell::get).is_none());
+        assert!(AVAILABLE_INPUT.with(Cell::get).is_none());
+    }
 }

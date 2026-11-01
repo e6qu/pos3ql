@@ -2603,6 +2603,16 @@ pub fn eval_full<'a>(
     hooks: &EvalHooks<'_, 'a>,
 ) -> Result<Datum<'a>, SqlError> {
     let evaluate = || {
+        let _query_inputs = matches!(
+            expression,
+            Expr::Subquery(_)
+                | Expr::RowSubquery { .. }
+                | Expr::ArraySubquery(_)
+                | Expr::Exists(_)
+                | Expr::InSubquery { .. }
+                | Expr::QuantifiedSubquery { .. }
+        )
+        .then(super::query::input_progress::enter_body);
         let value = materialize_acl_value(
             eval_full_inner(expression, arena, params, row, hooks)?,
             hooks,

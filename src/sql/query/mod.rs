@@ -2326,6 +2326,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
         if routine.attributes.strict && arguments.iter().any(Datum::is_null) {
             return Ok(Some(Datum::Null));
         }
+        let _input_body = input_progress::enter_body();
         let owner = crate::storage::SessionIdentity::bound(
             self.storage
                 .capture_role_slot(routine.ownership.owner_to(self.txid).into(), self.txid)?,

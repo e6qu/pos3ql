@@ -28,6 +28,8 @@ Named row function regressions cover SELECT values and FROM columns, including
 null rows, combined producers, lateral inputs and empty-cache recovery.
 Input-retention cases include engine-owned statistics, logical replication and
 large-object builtins; their arguments must not repeat around an engine handoff.
+Routine result conversions must use structural decoding for named and anonymous
+records, including mutable table functions and restored declarations.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

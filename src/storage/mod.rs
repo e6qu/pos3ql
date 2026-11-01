@@ -43699,6 +43699,19 @@ impl Storage {
         if argument_type_oids.len() > routine.argument_count {
             return None;
         }
+        // Stored declarations can carry unresolved representations. Bind every
+        // named input and result before the direct-match path returns.
+        type_contracts::routine_type_fields(
+            &mut routine.arguments[..routine.argument_count],
+            &mut routine.parameters[..routine.parameter_count],
+            &mut routine.result_columns[..routine.result_column_count],
+            &mut routine.kind,
+            &mut |result| {
+                *result = self.bind_routine_result(*result, txid)?;
+                Ok::<(), SqlError>(())
+            },
+        )
+        .ok()?;
         if routine.accepts_input_arity(argument_type_oids.len())
             && routine.arguments()[..argument_type_oids.len()]
                 .iter()

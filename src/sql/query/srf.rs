@@ -5461,7 +5461,7 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                             let projected =
                                 crate::sql::exec::encode_projected_pub(&[values[slot]], arena)?;
                             cast[slot] = crate::sql::eval::cast_to(
-                                crate::sql::exec::decode_projected_pub(projected, 0),
+                                crate::sql::exec::decode_projected_col_record(projected, 0, arena)?,
                                 column.ctype,
                                 arena,
                             )?;
@@ -5469,7 +5469,8 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                         crate::sql::exec::encode_projected_pub(&cast[..output.len()], arena)?
                     } else {
                         let projected = crate::sql::exec::encode_projected_pub(values, arena)?;
-                        let value = crate::sql::exec::decode_projected_pub(projected, 0);
+                        let value =
+                            crate::sql::exec::decode_projected_col_record(projected, 0, arena)?;
                         let value = crate::sql::eval::cast_to(
                             value,
                             scalar_result.expect("set routine result"),

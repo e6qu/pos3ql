@@ -50,7 +50,7 @@ statistics and large objects, while preserving their distinct conversion
 and strict-null rules. The [architecture](docs/architecture.md) describes the
 implemented input progress, type contracts, record expansion and set inputs.
 Preserve the distinct SELECT-value and FROM-column layouts of named row results
-as execution positions expand.
+and bind their stored type identities before conversion as execution positions expand.
 Run real SQLAlchemy, Alembic and psycopg2 workflows against both servers.
 Keep their catalog inspection, declared types, streaming and migration checks
 passing as function binding and execution expand; see the

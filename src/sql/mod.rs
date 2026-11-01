@@ -14093,7 +14093,7 @@ impl Engine {
                 for (slot, column) in output.iter().enumerate() {
                     let projected = exec::encode_projected_pub(&[values[slot]], arena)?;
                     cast[slot] = eval::cast_to(
-                        exec::decode_projected_pub(projected, 0),
+                        exec::decode_projected_col_record(projected, 0, arena)?,
                         column.ctype,
                         arena,
                     )?;
@@ -14101,8 +14101,11 @@ impl Engine {
                 exec::encode_projected_pub(&cast[..output.len()], arena)?
             } else {
                 let projected = exec::encode_projected_pub(values, arena)?;
-                let value =
-                    eval::cast_to(exec::decode_projected_pub(projected, 0), result_type, arena)?;
+                let value = eval::cast_to(
+                    exec::decode_projected_col_record(projected, 0, arena)?,
+                    result_type,
+                    arena,
+                )?;
                 exec::encode_projected_pub(&[value], arena)?
             };
             if len.get() == cap.get() {

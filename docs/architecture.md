@@ -134,6 +134,9 @@ same distinction.
 Named row results keep their type and fields as SELECT values; in FROM, their
 declared fields become separate columns. Null rows, ROWS FROM, lateral inputs
 and WITH ORDINALITY use that same column layout.
+Routine binding resolves named input and result representations before accepting
+an exact signature match. Table-function result conversion decodes structured
+fields rather than interpreting their rendered text as the original value.
 A saved view or table column needs a concrete type: expand `(pair(1)).*` into
 separate columns or declare the function's result as a named composite type.
 Casting an anonymous function result directly to a named composite fails with

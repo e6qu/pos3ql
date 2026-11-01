@@ -16994,7 +16994,7 @@ mod tests {
                         enabled: crate::storage::RuleEnabled::Origin,
                         source: "NOTHING",
                         condition: None,
-                        actions: [crate::storage::RuleTextSpan::EMPTY;
+                        actions: [crate::storage::RuleTextSpan { start: 0, len: 0 };
                             crate::storage::MAX_RULE_ACTIONS],
                         action_count: 0,
                         returning_action: None,

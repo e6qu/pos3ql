@@ -62,7 +62,8 @@ jobs:
 
       - name: Function call contracts
         if: ${{ matrix.check == 'build and test' }}
-        run: cargo test --lib --locked --target "$NATIVE_TARGET" -- routine_calls:: --test-threads=1
+        run: >-
+          cargo test --lib --locked --target "$NATIVE_TARGET" -- routine_calls:: --test-threads=1
 
       - name: Native SQL, catalog and socket boundaries
         if: ${{ matrix.check == 'build and test' }}

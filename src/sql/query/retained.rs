@@ -816,7 +816,7 @@ impl<'a> RetainedSelect<'a> {
         if storage.row_security_applies(table, role, txid) {
             return Ok(None);
         }
-        check_select_types(statement, &scope, storage, txid, arena)?;
+        check_select_types(statement, &scope, storage, txid, arena, None)?;
         check_select_constants(statement, arena, storage, txid)?;
         let demand = streaming_pax_columns(&scope, from, statement.items, statement.where_clause);
         scan::admit_sources(storage, &scope, txid, demand)?;

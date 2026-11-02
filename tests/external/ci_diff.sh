@@ -251,7 +251,6 @@ max_operator_families = 64
 max_operator_classes = 64
 max_triggers = 64
 max_publications = 64
-table_rows = 8192
 max_value_indexes = 64
 max_prepared_transactions = 8
 ${DIFFERENTIAL_TRANSACTION_CONFIG}

@@ -444,6 +444,26 @@ jobs:
           name: performance-smoke
           path: ${{ runner.temp }}/performance-smoke
 
+  embedded-capacity:
+    needs: formatting
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Measure shared startup capacity and active workloads
+        run: >-
+          python3 tools/measure-embedded-capacity.py
+          --output "$RUNNER_TEMP/embedded-capacity"
+          --budget-limit-bytes 2147483648
+      - name: Retain raw memory evidence and provenance
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: embedded-capacity-${{ github.sha }}
+          path: ${{ runner.temp }}/embedded-capacity
+          if-no-files-found: error
+
   # One fixed range per worker preserves the complete 16-seed sweep within
   # the five-minute job contract, including a cold rebuild.
   storage-vopr:

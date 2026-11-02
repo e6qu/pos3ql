@@ -600,7 +600,7 @@ mod key_definitions {
         config.max_catalog_versions_per_object = 2;
         config.memtable_bytes = 64 * 1024;
         config.max_tables = 4;
-        config.table_rows = 8;
+        config.row_overlay_slots = 8;
         config.max_routines = 2;
         config.max_views = 2;
         config.max_materialized_views = 2;

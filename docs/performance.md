@@ -310,6 +310,31 @@ baselines; the representative qualification in [PLAN.md](../PLAN.md) also
 requires pinned hardware and an independently operated compatible object
 store.
 
+## Measuring shared startup capacity
+
+Run the following on a CI runner, with a new output directory:
+
+```sh
+python3 tools/measure-embedded-capacity.py --output NEW_DIRECTORY \
+  --budget-limit-bytes 2147483648
+```
+
+The explicit 2 GiB ceiling rejects an oversized reservation; it does not allocate
+2 GiB. The matrix uses equal explicit `row_overlay_slots`, `row_work_bytes`, `row_work_leases`
+and `definition_image_slots` for 1/8/32/128 configured tables in both transaction
+modes. Empty, one-hot-table, evenly distributed and moving-demand cases have
+separate samples. The output retains the exact commands, revision, compiler,
+binary digest, named budget draws and raw JSON measurements, with checksums.
+No new measurements have been published for this change yet.
+
+Compare the named shared pools at equal settings. Total memory can still rise
+with table identities, catalog/history structures, connection metadata and
+other independent reservations. Peak resident memory measures touched pages;
+it is different from reserved bytes and the 128 MiB virtual query stack.
+Populated measurements include a separately reported session reservation. These
+small local-only workloads establish neither object-store throughput nor a
+production embedded minimum; retain the historical evidence unchanged.
+
 ## Retained evidence
 
 [The benchmark index](../benchmarks/README.md) links the original raw runs and

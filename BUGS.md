@@ -11,7 +11,8 @@ Follow [CONTRIBUTING.md](CONTRIBUTING.md) for the required comparisons,
 allocation checks and failure diagnostics. Regression details belong in their
 owning tests and technical guides, rather than a second checklist here.
 
-Unfinished features and their acceptance criteria belong in [PLAN.md](PLAN.md).
+Unfinished resource policies and feature goals, with their acceptance criteria,
+belong in [PLAN.md](PLAN.md).
 Current guarantees belong in the [behavior guide](docs/implemented-baseline.md)
 and its [owning technical guides](docs/README.md).
 

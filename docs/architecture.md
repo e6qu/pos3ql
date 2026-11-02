@@ -185,6 +185,15 @@ while idle. Socket readiness resumes blocked network requests; owner contention
 and failed maintenance use the existing one-second retry cadence. A quota of
 64 visited row slots is a work bound, not a latency guarantee for a turn.
 
+Row-location capture and relocation preflight visit the ordinary shared row
+pool once, then the separate large-object pool. History cleanup also visits the
+ordinary pool once and uses the large-object owner's cursor for its separate
+reserve. It does not scan every shared slot again for each configured table.
+Targeted cleanup follows only that table's owned links. Its typed cursor reports
+a current position, a skipped stale position or completion; skipped positions
+still count toward the work limit. Generation checks prevent a reused cell from
+being treated as the earlier row.
+
 A checkpoint writes captured committed versions and publishes a complete
 manifest, the inventory of saved objects and definitions. Later commits remain
 in the journal. Finishing an older checkpoint cannot clear newer writes or
@@ -199,10 +208,31 @@ and [backup rules](backup-restore.md) before scheduling an offline backup comman
 
 ## Memory and physical size
 
-An empty engine still reserves metadata for configured table slots. Row lookup
-positions scale with `max_tables × table_rows`; wide table definitions and other
-metadata also reserve capacity before tables are created. MVCC row history uses
-the explicit shared `row_history_slots` capacity across all tables and large
+`row_overlay_slots` budgets resident row metadata across ordinary tables in all
+databases. It does not multiply by `max_tables`. The internal large-object table
+keeps its separate `large_object_pages` allowance. Empty table identities and
+other catalog structures still cost memory.
+
+`row_work_bytes` is one foreground byte pool for retained row-ID lists and DML
+buffers; `row_work_leases` bounds concurrent owners of that space. The byte
+capacity must be a multiple of 64. Each allocation rounds up to 64-byte alignment,
+using at most 63 alignment-padding bytes per live lease. Exact read captures
+reserve their known row count. Active write buffers grow geometrically within
+the hard pool limit, so their spare capacity also consumes this budget. If a
+growing buffer cannot extend in place, both old and new ranges and both lease
+descriptors remain charged until its data has been copied. Fragmented free
+space or this temporary overlap can prevent a larger contiguous request. The
+named error reports requested bytes, total free bytes, the largest free extent
+and remaining lease descriptors. For example,
+an update and a long report compete for this same budget, rather than each
+reserving a maximum array for every potential table. `definition_image_slots`
+bounds shared copies of wide table definitions retained by readers. A live
+reader, pending write or prepared transaction keeps its ownership until safe
+release. Exhaustion returns a named `54000` error; these pools never grow at
+runtime. Checkpoint and relocation reserves remain separate so foreground work
+cannot consume the capacity needed to release saved rows.
+
+MVCC row history uses the explicit shared `row_history_slots` capacity across all tables and large
 objects; `max_row_versions_per_row` remains a separate per-row bound. Locking
 mode reserves no committed-row history. An update owns its prospective history
 slot with its pending row chain, before durability. Queued and prepared commits
@@ -213,15 +243,13 @@ pressure, write admission examines at most 64 row metadata positions and retries
 with its owned input. Each history chain has the separate per-row version bound.
 It never repeats SQL expressions or drains the whole
 database synchronously; remaining pressure returns the named capacity error.
-Per-table metadata can still make many small embedded tables expensive.
-Row bytes, committed history and immutable block caches already use shared
-startup pools. The remaining row-map reservation includes a fixed slot array
-and hash index for each configured table. Retained row-ID arrays and definition
-images add their own table/row/worker multipliers. They need separate accounting;
-reducing one cache setting does not remove these metadata costs.
-The [adaptive resource design](adaptive-resources.md) proposes shared leases
-and workload-driven admission inside fixed memory and disk limits. It is
-unfinished; no controller currently reallocates these reservations by load.
+Per-table and other catalog metadata can still make many small embedded tables
+expensive. Sharing ordinary row slots, row workspace and definition-image slots
+does not remove every catalog or definition-history reservation. Row bytes,
+committed history and immutable block caches also use shared startup pools.
+The [adaptive resource design](adaptive-resources.md) separates these hard
+capacities from future workload-driven admission and eviction policies. No
+controller currently resizes the startup reservations by load.
 Catalog capacities are independent settings: changing `max_tables` does not
 silently resize indexes, routines, views or extended statistics.
 Pending table definitions reserve their complete payload capacity at startup,
@@ -229,14 +257,15 @@ but initialize only dense occupancy locks. Wide payload pages are touched when
 a definition is staged; its matching read/write guard protects initialization,
 retirement and reuse. Reserving unused slots does not initialize every payload.
 
-The [embedded memory measurement](https://github.com/e6qu/pos3ql/blob/6ff1ac865a86a5318cb4934fbf01be0926667811/examples/embedded-memory.rs) starts one empty
-engine per process and reports the configured reservation, startup budget drawn,
-peak resident memory and startup time. CI records 1, 8 and 32 configured tables
-with both transaction modes and the same explicit memory settings. The current
-helper also fixes extended-statistics capacity independently of table count;
-older samples used implicit table-dependent sizing and must retain that provenance. These are
-empty-engine measurements, separate from a server's connection buffers, query
-workloads and production throughput.
+The [embedded memory helper](../examples/embedded-memory.rs) and
+[runner script](../tools/measure-embedded-capacity.py) measure 1, 8, 32 and 128
+configured tables with the same explicit shared capacities in each transaction
+mode. They retain named startup draws, configured reservation, peak resident
+memory, stack size and startup time. Populated workloads are reported separately
+from empty engines and include their session costs. These results must be
+collected on CI; the script and configuration alone are not measurements.
+The statistics pool is fixed independently of table count. Older samples used
+implicit table-dependent sizing and retain that provenance.
 The retained [empty-engine baseline](https://github.com/e6qu/pos3ql/blob/6ff1ac865a86a5318cb4934fbf01be0926667811/benchmarks/baselines/2026-10-30-embedded-startup/README.md)
 includes raw measurements and their revision; its resident costs must not be
 mistaken for configured byte reservations or a production minimum.
@@ -282,9 +311,12 @@ versions and backups reduce the useful row-data share. It is not a demonstrated
 Increasing a reservation requires a new startup plan and memory; it never grows
 automatically. A larger bucket alone does not fix an exhausted inventory.
 
-`table_rows` limits resident row metadata, not all saved rows. Saved rows can
-stream from immutable generations, but uncommitted changes and needed history
-still consume resident capacity. A single large transaction can exhaust memory
+`row_overlay_slots` limits resident row metadata, not all saved rows. Saved rows
+stream from immutable generations. Restoring a checkpoint installs their saved
+file inventory without loading every row into the pool. Newer journal changes
+still need resident slots and row bytes while startup replays them; a large
+uncheckpointed tail can exhaust those reserves. Uncommitted changes and needed
+history also consume their own resident capacity. A single large transaction can exhaust memory
 while the durable table is small. Named exhaustion usually returns `54000`;
 PostgreSQL-specific width errors retain their own codes. The
 [capacity inventory](postgresql-18-compatibility.md#capacity-boundaries) owns

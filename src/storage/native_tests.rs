@@ -903,7 +903,7 @@ fn table_state_row_map_controls_are_charged_at_startup() {
     for (rows, pages) in [(8, 16), (16, 8)] {
         let mut config = test_config();
         config.query_workspace_slots = 2;
-        config.table_rows = rows;
+        config.row_overlay_slots = rows;
         config.large_object_pages = pages;
         let bytes = config.memtable_bytes + Storage::extra_budget_bytes(&config);
         let mut budget = Budget::new(bytes);
@@ -9793,12 +9793,11 @@ fn table_retirement_batches_keep_maps_valid_and_preserve_retained_versions_throu
         storage.resident_row_state(first, keys[0]).unwrap().unwrap()
     });
     crate::mem::guard::forbid_alloc(|| {
-        let mut cursor = 0;
+        let mut cursor = None;
         let mut done = false;
         let mut turns = 0;
         while !done {
             let before = storage.tables[first].rows.len();
-            let prior_cursor = cursor;
             done = storage.retire_table_row_batch(first, &mut cursor);
             turns += 1;
             let after = storage.tables[first].rows.len();
@@ -9806,7 +9805,10 @@ fn table_retirement_batches_keep_maps_valid_and_preserve_retained_versions_throu
                 before - after <= 64,
                 "one turn retires at most its fixed work allowance"
             );
-            assert!(done || cursor > prior_cursor || after < before);
+            assert!(
+                done || after < before,
+                "owner retirement must make bounded progress"
+            );
             assert!(storage.row_versions.test_write().is_ok());
             assert!(storage.tables[first].rows.test_write().is_ok());
             let dropped = storage.drop_table_in(other, 8).unwrap();
@@ -9816,7 +9818,7 @@ fn table_retirement_batches_keep_maps_valid_and_preserve_retained_versions_throu
                 assert_eq!(
                     rows.get(key),
                     Some(row),
-                    "backshift preserves every remaining lookup"
+                    "cell removal preserves every remaining lookup"
                 );
                 assert_eq!(row.committed_lsn, 7);
             }

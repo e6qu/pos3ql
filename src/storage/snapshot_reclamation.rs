@@ -3,6 +3,7 @@
 use core::num::NonZeroUsize;
 use {crate::mem::mutex::Mutex, std::sync::TryLockError};
 
+use super::row_map::RowCellPosition;
 use super::{Storage, prune_committed_history};
 use crate::mem::budget::{Budget, BudgetError};
 
@@ -31,12 +32,6 @@ enum ReclamationMode {
     SkipBusy,
 }
 
-#[derive(Clone, Copy)]
-enum PressureScan {
-    Start,
-    Continue,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SnapshotCleanup {
     Schedule,
@@ -48,13 +43,6 @@ pub(crate) enum HistoryReclamation {
     Idle,
     Advanced,
     WaitingForOwner,
-}
-
-struct PrunedSlots {
-    next: usize,
-    visited: usize,
-    complete: bool,
-    pressure: bool,
 }
 
 impl SnapshotReclamation {
@@ -93,33 +81,18 @@ impl Storage {
         self.snapshot_state().statement_reclamation_pending = false;
         workspace.cursor = None;
         workspace.retry = false;
-        let mut pressure_started = false;
-        let mut pressure_found = false;
-        for table in 0..self.tables.len() {
-            let mut slot = 0;
-            loop {
-                let batch = self
-                    .prune_snapshot_row_slots(
-                        table,
-                        slot,
-                        SLOTS_PER_BATCH,
-                        ReclamationMode::Wait,
-                        if pressure_started {
-                            PressureScan::Continue
-                        } else {
-                            PressureScan::Start
-                        },
-                    )
-                    .expect("waiting cleanup acquires its owners");
-                pressure_started = true;
-                pressure_found |= batch.pressure;
-                if batch.complete {
-                    break;
-                }
-                slot = batch.next;
-            }
-        }
-        assert!(self.finish_history_pressure(pressure_found, ReclamationMode::Wait));
+        let mut cursor = ReclamationCursor {
+            table: 0,
+            slot: 0,
+            pressure_started: false,
+            pressure_found: false,
+        };
+        while !self
+            .advance_snapshot_cursor(&mut cursor, SLOTS_PER_BATCH, ReclamationMode::Wait)
+            .expect("waiting cleanup acquires its owners")
+            .0
+        {}
+        assert!(self.finish_history_pressure(cursor.pressure_found, ReclamationMode::Wait));
     }
 
     pub(crate) fn history_cleanup_pending(&self) -> bool {
@@ -165,40 +138,14 @@ impl Storage {
             });
         }
         let mut cursor = workspace.cursor.expect("cleanup pass started");
-        let mut remaining = work.get();
-        while remaining != 0 && cursor.table < self.tables.len() {
-            let limit = NonZeroUsize::new(remaining).expect("remaining work is nonzero");
-            match self.prune_snapshot_row_slots(
-                cursor.table,
-                cursor.slot,
-                limit,
-                ReclamationMode::SkipBusy,
-                if cursor.pressure_started {
-                    PressureScan::Continue
-                } else {
-                    PressureScan::Start
-                },
-            ) {
-                Some(batch) => {
-                    cursor.pressure_started = true;
-                    cursor.pressure_found |= batch.pressure;
-                    remaining -= batch.visited.max(1);
-                    if batch.complete {
-                        cursor.table += 1;
-                        cursor.slot = 0;
-                    } else {
-                        cursor.slot = batch.next;
-                    }
-                }
-                None => {
-                    workspace.retry = true;
-                    cursor.table += 1;
-                    cursor.slot = 0;
-                    remaining -= 1;
-                }
-            }
-        }
-        if cursor.table == self.tables.len() {
+        let Some((complete, busy)) =
+            self.advance_snapshot_cursor(&mut cursor, work, ReclamationMode::SkipBusy)
+        else {
+            workspace.cursor = Some(cursor);
+            return HistoryReclamation::WaitingForOwner;
+        };
+        workspace.retry |= busy;
+        if complete {
             if workspace.retry {
                 workspace.cursor = None;
                 return HistoryReclamation::WaitingForOwner;
@@ -213,6 +160,63 @@ impl Storage {
             workspace.cursor = Some(cursor);
             HistoryReclamation::Advanced
         }
+    }
+
+    /// Ordinary cells are visited once, followed by the independent large-object
+    /// pool. A skipped owner schedules another pass without holding any prefix.
+    fn advance_snapshot_cursor(
+        &self,
+        cursor: &mut ReclamationCursor,
+        work: NonZeroUsize,
+        mode: ReclamationMode,
+    ) -> Option<(bool, bool)> {
+        if !cursor.pressure_started {
+            let mut versions = match mode {
+                ReclamationMode::Wait => {
+                    super::row_ownership::acquire(|| self.row_versions.try_write_for_batch())
+                }
+                ReclamationMode::SkipBusy => self.row_versions.try_write_for_batch().ok()?,
+            };
+            versions.history_pressure_changed = false;
+            cursor.pressure_started = true;
+        }
+        let large_objects = self.tables.len() - 1;
+        let mut remaining = work.get();
+        let mut busy = false;
+        while remaining != 0 && cursor.table < self.tables.len() {
+            let shared = cursor.table == 0;
+            let pool = if shared {
+                &self.row_overlay
+            } else {
+                self.tables[large_objects].rows.pool()
+            };
+            if cursor.slot >= pool.scan_end() {
+                cursor.table = if shared {
+                    large_objects
+                } else {
+                    self.tables.len()
+                };
+                cursor.slot = 0;
+                remaining -= 1;
+                continue;
+            }
+            let captured = pool.position_at(cursor.slot);
+            cursor.slot += 1;
+            remaining -= 1;
+            let Some(cell) = captured else {
+                continue;
+            };
+            let table = if shared {
+                cell.owner().index()
+            } else {
+                large_objects
+            };
+            match self.prune_snapshot_cell(table, cell, mode) {
+                Some(pressure) => cursor.pressure_found |= pressure,
+                None => busy = true,
+            }
+        }
+        Some((cursor.table == self.tables.len(), busy))
     }
 
     fn finish_history_pressure(&self, found: bool, mode: ReclamationMode) -> bool {
@@ -256,14 +260,12 @@ impl Storage {
         })
     }
 
-    fn prune_snapshot_row_slots(
+    fn prune_snapshot_cell(
         &self,
         table: usize,
-        start: usize,
-        work: NonZeroUsize,
+        expected: RowCellPosition,
         mode: ReclamationMode,
-        pressure_scan: PressureScan,
-    ) -> Option<PrunedSlots> {
+    ) -> Option<bool> {
         let SnapshotRowOwners {
             snapshots,
             publication,
@@ -276,54 +278,31 @@ impl Storage {
             }
             ReclamationMode::SkipBusy => self.try_snapshot_row_owners(table).ok()?,
         };
-        if matches!(pressure_scan, PressureScan::Start) {
-            versions.history_pressure_changed = false;
-        }
-        assert!(
-            start <= rows.scan_end(),
-            "cleanup cursor exceeds used row slots"
-        );
-        if rows.is_empty() {
-            return Some(PrunedSlots {
-                next: rows.scan_end(),
-                visited: 0,
-                complete: true,
-                pressure: false,
-            });
-        }
-        let end = start.saturating_add(work.get()).min(rows.scan_end());
         let oldest = snapshots.oldest();
         let mut pressure = false;
-        for slot in start..end {
-            let remove = if let Some((rowid, state)) = rows.entry_at_slot_mut(slot) {
-                let obsolete = publication.row_layout.obsolete(state);
-                prune_committed_history(
-                    &mut versions.committed_row_versions,
-                    state,
-                    if obsolete { None } else { oldest },
-                );
-                pressure |= !state.history.is_empty()
-                    && state.history.len().saturating_add(2) >= self.max_row_versions_per_row;
-                ((oldest.is_none_or(|snapshot| state.committed_lsn <= snapshot) || obsolete)
-                    && generations.is_empty()
-                    && std::sync::Arc::strong_count(&self.tables[table].checkpoint_deletions) == 1
-                    && state.committed.is_none()
-                    && state.history.is_empty()
-                    && state.pending.is_none())
-                .then_some(*rowid)
-            } else {
-                None
-            };
-            if let Some(rowid) = remove {
-                rows.remove(&rowid).expect("selected row exists");
-            }
+        let remove = if let Some((rowid, state)) = rows.entry_at_position_mut(expected) {
+            let obsolete = publication.row_layout.obsolete(state);
+            prune_committed_history(
+                &mut versions.committed_row_versions,
+                state,
+                if obsolete { None } else { oldest },
+            );
+            pressure |= !state.history.is_empty()
+                && state.history.len().saturating_add(2) >= self.max_row_versions_per_row;
+            ((oldest.is_none_or(|snapshot| state.committed_lsn <= snapshot) || obsolete)
+                && generations.is_empty()
+                && std::sync::Arc::strong_count(&self.tables[table].checkpoint_deletions) == 1
+                && state.committed.is_none()
+                && state.history.is_empty()
+                && state.pending.is_none())
+            .then_some(*rowid)
+        } else {
+            None
+        };
+        if let Some(rowid) = remove {
+            rows.remove(&rowid).expect("selected row exists");
         }
-        Some(PrunedSlots {
-            next: end,
-            visited: end - start,
-            complete: end == rows.scan_end(),
-            pressure,
-        })
+        Some(pressure)
     }
 }
 
@@ -454,12 +433,10 @@ mod tests {
 
             assert!(
                 storage
-                    .prune_snapshot_row_slots(
+                    .prune_snapshot_cell(
                         first,
-                        0,
-                        SLOTS_PER_BATCH,
+                        storage.tables[first].rows.pool().position_at(0).unwrap(),
                         ReclamationMode::Wait,
-                        PressureScan::Continue
                     )
                     .is_some()
             );
@@ -637,12 +614,10 @@ mod tests {
             let state = storage.resident_row_state(table, 1).unwrap().unwrap();
             assert!(
                 storage
-                    .prune_snapshot_row_slots(
+                    .prune_snapshot_cell(
                         table,
-                        0,
-                        SLOTS_PER_BATCH,
+                        storage.tables[table].rows.pool().position_at(0).unwrap(),
                         ReclamationMode::Wait,
-                        PressureScan::Continue
                     )
                     .is_some()
             );
@@ -682,7 +657,7 @@ mod tests {
     #[test]
     fn snapshot_reclamation_removes_every_deleted_row_across_stable_slots() {
         let mut config = test_config();
-        config.table_rows = 1024;
+        config.row_overlay_slots = 1024;
         config.large_object_pages = 2048;
         let mut budget = test_budget(&config);
         let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
@@ -694,7 +669,7 @@ mod tests {
             .unwrap();
         let pages = storage.large_object_page_table as usize;
         for (slot, count) in [
-            (table, config.table_rows),
+            (table, config.row_overlay_slots),
             (pages, config.large_object_pages),
         ] {
             for rowid in 1..=count as u64 {
@@ -985,12 +960,10 @@ mod tests {
             let rows = storage.tables[table].rows.write();
             assert!(
                 storage
-                    .prune_snapshot_row_slots(
+                    .prune_snapshot_cell(
                         table,
-                        0,
-                        SLOTS_PER_BATCH,
+                        storage.tables[table].rows.pool().position_at(0).unwrap(),
                         ReclamationMode::SkipBusy,
-                        PressureScan::Continue
                     )
                     .is_none()
             );
@@ -1074,7 +1047,7 @@ mod tests {
     fn bounded_snapshot_work_counts_slots_through_lookup_shifts_and_reuse() {
         let mut config = test_config();
         config.max_tables = 1;
-        config.table_rows = 128;
+        config.row_overlay_slots = 128;
         config.large_object_pages = 1;
         let mut budget = test_budget(&config);
         let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
@@ -1281,7 +1254,7 @@ mod tests {
     fn bounded_snapshot_pressure_signal_keeps_publication_after_an_earlier_slot() {
         let mut config = test_config();
         config.max_tables = 1;
-        config.table_rows = 4;
+        config.row_overlay_slots = 4;
         config.large_object_pages = 1;
         config.max_row_versions_per_row = 3;
         let mut budget = test_budget(&config);
@@ -1346,7 +1319,7 @@ mod tests {
     fn bounded_snapshot_obsolete_boundary_does_not_fill_one_version_row() {
         let mut config = test_config();
         config.max_tables = 1;
-        config.table_rows = 4;
+        config.row_overlay_slots = 4;
         config.large_object_pages = 1;
         config.max_row_versions_per_row = 1;
         let mut budget = test_budget(&config);
@@ -1416,6 +1389,81 @@ mod tests {
                     .history
                     .is_empty()
             );
+        });
+    }
+
+    #[test]
+    fn shared_snapshot_pass_visits_pool_once_independent_of_table_capacity() {
+        for max_tables in [2, 32] {
+            let mut config = test_config();
+            config.max_tables = max_tables;
+            config.row_overlay_slots = 8;
+            config.large_object_pages = 1;
+            let mut budget = test_budget(&config);
+            let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
+            let first = storage
+                .create_table(make_def(
+                    "global_history_first",
+                    &[("id", ColType::Int4, true)],
+                ))
+                .unwrap();
+            let second = storage
+                .create_table(make_def(
+                    "global_history_second",
+                    &[("id", ColType::Int4, true)],
+                ))
+                .unwrap();
+            let mut deleted = RowState::committed_only_at(super::super::RowLoc::test(0, 0), 7);
+            deleted.committed = None;
+            storage.set_lsn(7);
+            storage.restore_visible_lsn(7);
+            for table in [first, second] {
+                for rowid in 0..4 {
+                    storage.tables[table].rows.insert(rowid, deleted).unwrap();
+                }
+            }
+            crate::mem::guard::forbid_alloc(|| {
+                let released = storage.retain_statement_snapshot(99, |lsn| lsn).unwrap();
+                drop(released);
+                let bound = storage.row_overlay.scan_end() + 2;
+                let mut turns = 0;
+                while storage.history_cleanup_pending() {
+                    turns += 1;
+                    assert!(
+                        turns <= bound,
+                        "history cleanup rescanned the pool for every table"
+                    );
+                    assert_eq!(
+                        storage.advance_history_cleanup(NonZeroUsize::new(1).unwrap()),
+                        HistoryReclamation::Advanced
+                    );
+                }
+                assert!(storage.tables[first].rows.is_empty());
+                assert!(storage.tables[second].rows.is_empty());
+                assert_eq!(storage.row_overlay.usage().free, 8);
+            });
+        }
+    }
+
+    #[test]
+    fn shared_snapshot_cell_revalidates_generation_after_owner_reuse() {
+        let (mut storage, first, second) = fixture();
+        let captured = storage.row_overlay.position_at(0).unwrap();
+        let mut deleted = storage.tables[first].rows.remove(&1).unwrap();
+        deleted.committed = None;
+        storage.tables[second].rows.insert(2, deleted).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            assert_eq!(
+                storage.prune_snapshot_cell(first, captured, ReclamationMode::Wait),
+                Some(false)
+            );
+            assert!(storage.tables[second].rows.get(&2).is_some());
+            let replacement = storage.row_overlay.position_at(0).unwrap();
+            assert_eq!(
+                storage.prune_snapshot_cell(second, replacement, ReclamationMode::Wait),
+                Some(false)
+            );
+            assert!(storage.tables[second].rows.is_empty());
         });
     }
 }

@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use {crate::mem::mutex::Mutex, std::sync::Arc};
 
 use super::table_definitions::TableIdentity;
-use super::{Storage, TableDef, table_slot_capacity};
+use super::{Storage, TableDef};
 use crate::config::Config;
 use crate::mem::budget::{Budget, BudgetError};
 use crate::sql::eval::{SqlError, sqlstate};
@@ -73,9 +73,7 @@ pub(super) struct TableDefinitionImagePool {
 
 impl TableDefinitionImagePool {
     fn capacity(config: &Config) -> usize {
-        table_slot_capacity(config)
-            .saturating_mul(config.max_catalog_versions_per_object.saturating_add(1))
-            .saturating_mul(config.query_workspace_slots)
+        config.definition_image_slots
     }
 
     fn shared_bytes() -> usize {

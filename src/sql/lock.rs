@@ -70,8 +70,9 @@ pub(crate) struct LockManager {
 
 impl LockManager {
     pub(crate) fn budget_bytes(lock_capacity: usize, connection_capacity: usize) -> usize {
-        lock_capacity * core::mem::size_of::<RowLock>()
-            + connection_capacity * core::mem::size_of::<WaitEdge>()
+        lock_capacity
+            .saturating_mul(core::mem::size_of::<RowLock>())
+            .saturating_add(connection_capacity.saturating_mul(core::mem::size_of::<WaitEdge>()))
     }
 
     pub(crate) fn new(
@@ -482,10 +483,17 @@ pub(crate) struct AdvisoryLockManager {
 
 impl AdvisoryLockManager {
     pub(crate) fn budget_bytes(lock_capacity: usize, connection_capacity: usize) -> usize {
-        lock_capacity * core::mem::size_of::<AdvisoryLock>()
-            + connection_capacity * core::mem::size_of::<AdvisoryWait>()
-            + lock_capacity * core::mem::size_of::<AdvisoryReplayAction>()
-            + connection_capacity * core::mem::size_of::<AdvisoryReplayState>()
+        lock_capacity
+            .saturating_mul(core::mem::size_of::<AdvisoryLock>())
+            .saturating_add(
+                connection_capacity.saturating_mul(core::mem::size_of::<AdvisoryWait>()),
+            )
+            .saturating_add(
+                lock_capacity.saturating_mul(core::mem::size_of::<AdvisoryReplayAction>()),
+            )
+            .saturating_add(
+                connection_capacity.saturating_mul(core::mem::size_of::<AdvisoryReplayState>()),
+            )
     }
 
     pub(crate) fn new(

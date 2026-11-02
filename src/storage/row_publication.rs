@@ -95,6 +95,7 @@ pub(crate) enum RowWriteStatistics {
 enum PendingPublication {
     Written(PendingWriteUndo),
     Retry,
+    OverlayFull(crate::mem::fixed_map::MapFull),
     HistoryFull(SqlError),
     DefinitionBusy,
     Wait(u32, &'static str),
@@ -200,6 +201,11 @@ impl Storage {
             match self.publish_pending_write(prepared)? {
                 PendingPublication::Written(undo) => return Ok(undo),
                 PendingPublication::Retry => continue,
+                PendingPublication::OverlayFull(error) => {
+                    if !self.reclaim_row_overlay_slot(table_index) {
+                        return Err(sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "{}", error));
+                    }
+                }
                 PendingPublication::HistoryFull(error) => {
                     if reclaimed_history {
                         return Err(error);
@@ -463,16 +469,10 @@ impl Storage {
         {
             return Ok(PendingPublication::Retry);
         }
-        if current.is_none() && rows.len() == rows.capacity() {
-            Self::evict_redundant_rows(&mut rows);
-            if rows.len() == rows.capacity() {
-                return Err(sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "table row limit reached ({} rows in memtable)",
-                    rows.capacity()
-                ));
-            }
-        }
+        let mut entry = match rows.prepare_entry(rowid) {
+            Ok(entry) => entry,
+            Err(error) => return Ok(PendingPublication::OverlayFull(error)),
+        };
         let mut state = current.unwrap_or(RowState {
             committed,
             committed_lsn,
@@ -489,7 +489,7 @@ impl Storage {
         // Pruning releases slots, so publish its chain handles even if a later
         // capacity check fails. Readers can never traverse a released chain.
         if current.is_some() {
-            *rows.get_mut(&rowid).expect("validated row") = state;
+            entry.replace_existing_state(state);
         }
         if oldest.is_some()
             && state.pending.is_none()
@@ -528,8 +528,7 @@ impl Storage {
             source: RowTableSource::capture(self, table, definition.identity),
             identity,
         };
-        rows.insert(rowid, state)
-            .expect("map capacity reserved under its owner");
+        entry.publish(state);
         if track_statistics
             && let Err(error) =
                 self.record_relation_write(change.txid, table, existed, change.loc.is_some())
@@ -584,6 +583,7 @@ impl Storage {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn evict_redundant_rows(rows: &mut RowEntries) {
         rows.retain(|_, state| !Self::redundant_spilled_row_state(state));
     }
@@ -1234,7 +1234,7 @@ mod tests {
     fn heap_eviction_preserves_unpublished_heap_deleted_historical_and_pending_rows() {
         const REDUNDANT: usize = 1536;
         let mut config = test_config();
-        config.table_rows = 2048;
+        config.row_overlay_slots = 2048;
         let (mut storage, table) = fixture(&config);
         crate::mem::guard::forbid_alloc(|| {
             let location = storage.heap.append_bytes(b"kept").unwrap();
@@ -2116,7 +2116,7 @@ mod tests {
     #[test]
     fn shared_row_publication_capacity_failures_preserve_reusable_ownership() {
         let mut config = test_config();
-        config.table_rows = 1;
+        config.row_overlay_slots = 1;
         config.txn_rows = 1;
         config.max_row_versions_per_row = 1;
         let (storage, table) = fixture(&config);
@@ -2159,7 +2159,7 @@ mod tests {
         config.max_prepared_transactions = 0;
         config.txn_rows = 1;
         let capacity = pending_row_version_capacity(&config) as u64;
-        config.table_rows = capacity as usize + 1;
+        config.row_overlay_slots = capacity as usize + 1;
         let (storage, table) = fixture(&config);
         let location = storage.heap.append_row(&[Datum::Int4(1)]).unwrap();
         crate::mem::guard::forbid_alloc(|| {

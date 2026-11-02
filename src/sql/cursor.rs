@@ -316,13 +316,19 @@ pub(crate) fn description_columns<'a>(
 impl CursorPool {
     pub fn budget_bytes(config: &Config) -> usize {
         let row_capacity = cursor_row_capacity(config);
-        config.max_cursors
-            * (config.cursor_bytes
-                + config.cursor_query_bytes
-                + DESCRIPTION_BYTES
-                + core::mem::size_of::<CursorSlot>()
-                + row_capacity * core::mem::size_of::<(u32, u32)>())
-            + row_capacity * core::mem::size_of::<u32>()
+        config
+            .max_cursors
+            .saturating_mul(
+                config
+                    .cursor_bytes
+                    .saturating_add(config.cursor_query_bytes)
+                    .saturating_add(DESCRIPTION_BYTES)
+                    .saturating_add(core::mem::size_of::<CursorSlot>())
+                    .saturating_add(
+                        row_capacity.saturating_mul(core::mem::size_of::<(u32, u32)>()),
+                    ),
+            )
+            .saturating_add(row_capacity.saturating_mul(core::mem::size_of::<u32>()))
     }
 
     pub fn new(config: &Config, budget: &mut Budget) -> Result<Self, BudgetError> {
@@ -865,6 +871,19 @@ impl CursorPool {
 #[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn configured_cursor_budget_saturates_before_wrapping() {
+        let mut config = Config::default_dev();
+        config.max_cursors = usize::MAX;
+        assert_eq!(CursorPool::budget_bytes(&config), usize::MAX);
+        config.max_cursors = 1;
+        config.cursor_bytes = usize::MAX;
+        assert_eq!(CursorPool::budget_bytes(&config), usize::MAX);
+        config.cursor_bytes = 0;
+        config.cursor_query_bytes = usize::MAX;
+        assert_eq!(CursorPool::budget_bytes(&config), usize::MAX);
+    }
 
     #[test]
     fn startup_budget_covers_cursor_controls_spans_and_emission() {

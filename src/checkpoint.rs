@@ -1707,9 +1707,9 @@ impl Checkpointer {
             + garbage_index_root_capacity(config) * core::mem::size_of::<BlockId>()
             + CheckpointRowCursor::budget_bytes(
                 config.max_spill_generations_per_table,
-                config.table_rows,
+                config.row_overlay_slots.max(config.large_object_pages),
             )
-            + config.table_rows * core::mem::size_of::<u64>()
+            + config.row_overlay_slots * core::mem::size_of::<u64>()
             + config.max_prepared_transactions
                 * core::mem::size_of::<crate::storage::PreparedTransactionCatalogEntry>()
             + (2usize.saturating_mul(table_capacity) + 1)
@@ -2381,9 +2381,9 @@ impl Checkpointer {
                     + VALUE_SORT_ROWS_PER_CHUNK * core::mem::size_of::<BufferedValueRow>()
                     + CheckpointRowCursor::budget_bytes(
                         config.max_spill_generations_per_table,
-                        config.table_rows,
+                        config.row_overlay_slots.max(config.large_object_pages),
                     )
-                    + config.table_rows * core::mem::size_of::<u64>(),
+                    + config.row_overlay_slots * core::mem::size_of::<u64>(),
                 "checkpoint value-index scheduling",
             )
             .map_err(CheckpointSetupError::Budget)?;
@@ -2568,10 +2568,10 @@ impl Checkpointer {
                 .into_boxed_slice(),
             source_cursor: CheckpointRowCursor::new(
                 config.max_spill_generations_per_table,
-                config.table_rows,
+                config.row_overlay_slots.max(config.large_object_pages),
             ),
             value_sort_reader: ExternalRunReader::new(),
-            value_changed_rowids: Vec::with_capacity(config.table_rows),
+            value_changed_rowids: Vec::with_capacity(config.row_overlay_slots),
             value_base_stream: ValueIndexStream::new(config.checkpoint_live_blocks),
             value_base_entry: vec![0; crate::store::MAX_PAYLOAD].into_boxed_slice(),
             value_entry: vec![0; crate::store::MAX_PAYLOAD].into_boxed_slice(),
@@ -19778,7 +19778,7 @@ mod stored_dependency_tests {
         config.memtable_bytes = 1 << 16;
         config.max_tables = 2;
         config.max_connections = 2;
-        config.table_rows = 16;
+        config.row_overlay_slots = 16;
         config.txn_rows = 16;
         config.max_value_indexes = 2;
         config.value_index_rows = 4;
@@ -20203,7 +20203,7 @@ mod stored_dependency_tests {
                 .into_owned();
             config.max_tables = 2;
             config.max_connections = 2;
-            config.table_rows = 16;
+            config.row_overlay_slots = 16;
             config.max_value_indexes = 2;
             config.block_cache_bytes = 0;
             config.disk_cache_bytes = 0;
@@ -22011,7 +22011,7 @@ mod stored_dependency_tests {
                 config.disk_cache_bytes = 0;
                 config.memtable_bytes = 1 << 16;
                 config.max_tables = 4;
-                config.table_rows = 128;
+                config.row_overlay_slots = 128;
                 config.txn_rows = 128;
                 config.value_index_rows = 512;
                 config.max_value_indexes = 8;
@@ -22160,7 +22160,8 @@ mod stored_dependency_tests {
 
     #[test]
     fn checkpoint_maintenance_capacities_are_exactly_budgeted() {
-        let base = Config::default_dev();
+        let mut base = Config::default_dev();
+        base.large_object_pages = base.row_overlay_slots;
         let base_bytes = Checkpointer::budget_bytes(&base);
 
         let mut prepared = base.clone();
@@ -22201,10 +22202,10 @@ mod stored_dependency_tests {
             3 * core::mem::size_of::<BlockId>()
         );
 
-        let mut table_rows = base.clone();
-        table_rows.table_rows += 1;
+        let mut overlay_slots = base.clone();
+        overlay_slots.row_overlay_slots += 1;
         assert_eq!(
-            Checkpointer::budget_bytes(&table_rows) - base_bytes,
+            Checkpointer::budget_bytes(&overlay_slots) - base_bytes,
             core::mem::size_of::<u64>() + CheckpointRowCursor::budget_bytes(0, 1)
                 - CheckpointRowCursor::budget_bytes(0, 0)
         );
@@ -22931,7 +22932,7 @@ fn parallel_physical_credential_rotation_waits_for_requests_not_retained_bytes()
         .to_string_lossy()
         .into_owned();
     config.max_tables = 2;
-    config.table_rows = 4;
+    config.row_overlay_slots = 4;
     config.block_cache_bytes = 0;
     config.disk_cache_bytes = 0;
     let mut budget = Budget::new(Checkpointer::budget_bytes(&config));

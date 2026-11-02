@@ -129,8 +129,9 @@ pub struct NotifyState {
 
 impl NotifyState {
     pub const fn budget_bytes(max_listeners: usize, outbox_capacity: usize) -> usize {
-        max_listeners * core::mem::size_of::<(i32, Channel)>()
-            + outbox_capacity * core::mem::size_of::<Notification>()
+        max_listeners
+            .saturating_mul(core::mem::size_of::<(i32, Channel)>())
+            .saturating_add(outbox_capacity.saturating_mul(core::mem::size_of::<Notification>()))
     }
 
     pub fn new(

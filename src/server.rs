@@ -911,6 +911,7 @@ impl Server {
         let mut block_read_fds = FixedVec::new(budget, "block_read_fds", block_read_slots)?;
         let mut background_io_fds =
             FixedVec::new(budget, "background_io_fds", background_io_slots)?;
+        let engine = Engine::new(config, budget)?;
         let mut subscriptions =
             FixedVec::new(budget, "subscription_workers", config.max_subscriptions)?;
         let mut operations_slots =
@@ -968,6 +969,7 @@ impl Server {
                         config,
                         0,
                         crate::storage::SubscriptionBehavior::POSTGRESQL_18_DEFAULT,
+                        std::sync::Arc::clone(engine.row_work_pool()),
                     )?,
                     sql: crate::pg::replication_client::ReplicationClient::new_unbound(
                         budget,
@@ -1044,7 +1046,6 @@ impl Server {
         }
 
         let refusal = Self::render_refusal(budget)?;
-        let engine = Engine::new(config, budget)?;
 
         // Self-pipe for graceful shutdown, woken by the signal handler.
         let mut pipe_fds = [0i32; 2];
@@ -1683,6 +1684,7 @@ impl Server {
     }
 
     fn release_query_workspace(&mut self, owner: usize, workspace: QueryWorkspaceId) {
+        self.engine.release_query_workspace_rows(workspace);
         let handoff = self.query_workspaces.release_workspace(owner, workspace);
         self.wake_query_workspace_handoff(handoff);
     }

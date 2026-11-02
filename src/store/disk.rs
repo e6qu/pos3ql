@@ -59,9 +59,10 @@ pub(crate) struct DiskCache<S: BlockStore> {
 
 impl<S: BlockStore> DiskCache<S> {
     pub(crate) fn budget_bytes(slot_count: usize) -> usize {
-        slot_count * size_of::<Slot>()
-            + SLOT_SIZE
-            + FixedMap::<BlockId, usize>::budget_bytes(slot_count)
+        slot_count
+            .saturating_mul(size_of::<Slot>())
+            .saturating_add(SLOT_SIZE)
+            .saturating_add(FixedMap::<BlockId, usize>::budget_bytes(slot_count))
     }
 
     pub(crate) fn inner_mut(&mut self) -> &mut S {

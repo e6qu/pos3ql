@@ -2000,7 +2000,7 @@ mod tests {
         config.max_catalog_versions_per_object = 1;
         config.query_workspace_slots = 1;
         config.memtable_bytes = 1 << 16;
-        config.table_rows = 16;
+        config.row_overlay_slots = 16;
         config.txn_rows = 16;
         config.value_index_rows = 32;
         config.max_value_indexes = 2;

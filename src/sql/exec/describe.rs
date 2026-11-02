@@ -2010,7 +2010,8 @@ fn empty_shape_pool(named_capacity: usize) -> Box<ShapePool> {
 
 /// Heap bytes reserved by the statement-local record-shape registry.
 pub(crate) const fn record_shape_pool_bytes(named_capacity: usize) -> usize {
-    core::mem::size_of::<ShapePool>() + named_capacity * core::mem::size_of::<NamedRecordShape>()
+    core::mem::size_of::<ShapePool>()
+        .saturating_add(named_capacity.saturating_mul(core::mem::size_of::<NamedRecordShape>()))
 }
 
 /// Allocates the shape pool; the server calls this at startup, before the

@@ -64,14 +64,19 @@ row lookup structure for each empty table. If most traffic touches `orders`, it 
 available shared slots. A long report keeps its selected versions until it
 finishes; those slots cannot be reassigned simply because demand changes.
 
-Keep startup allocation and arenas. Separate hard instance capacity from active
-leases. Row bytes, committed history and object caches already share capacity;
-remove the remaining `max_tables * table_rows` row-map reservation, retained
-row-ID multipliers and avoidable wide definition-image reservations. Keep small
-stable table identities and generation-checked handles. Make independent limits
-explicit, including embedded configuration; never silently derive unrelated
-capacities from table count. Preserve prepared transactions, rollback, pending
-publication, snapshots and empty-cache recovery as ownership changes.
+Ordinary row metadata, foreground row work and reader definition images now
+share explicit fixed pools. Account for and reduce remaining per-table catalog
+and definition-history reservations; sharing these pools does not make every
+empty table free. Establish whether cache files need guaranteed physical disk
+reservation, then implement and verify it rather than equating file length with
+reserved disk space.
+
+Keep the [ownership/exhaustion tests](src/sql/tests/shared_row_work.rs) and
+[two-table spill/recovery case](tests/external/run.sh) as regression coverage.
+Saved generations can exceed resident capacity; replaying their newer journal
+tail still needs resident slots and bytes. Extend the
+[measurement matrix](tools/measure-embedded-capacity.py) with realistic populated
+sessions and pinned-reader pressure before claiming an embedded minimum.
 
 Reserve forward progress for commit, rollback, required reads and maintenance.
 Use bounded reclamation and report pinned capacity and named exhaustion.

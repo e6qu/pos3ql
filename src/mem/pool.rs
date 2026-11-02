@@ -7,20 +7,26 @@
 
 use core::fmt;
 use core::mem::MaybeUninit;
+use core::sync::atomic::{AtomicUsize, Ordering};
+
+static NEXT_POOL_ID: AtomicUsize = AtomicUsize::new(1);
 
 use super::budget::{Budget, BudgetError};
 use super::fixed_vec::FixedVec;
 
 pub struct Pool<T> {
     what: &'static str,
+    identity: usize,
     values: Box<[MaybeUninit<T>]>,
     generations: Box<[u32]>,
     occupied: Box<[bool]>,
     free: FixedVec<u32>,
+    live: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Handle {
+    pool: usize,
     index: u32,
     generation: u32,
 }
@@ -50,6 +56,19 @@ impl fmt::Display for PoolExhausted {
 
 impl std::error::Error for PoolExhausted {}
 
+fn allocate_pool_identity(counter: &AtomicUsize, budget: &Budget) -> Result<usize, BudgetError> {
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            value.checked_add(1)
+        })
+        .map_err(|_| BudgetError {
+            what: "pool handle identities",
+            requested: usize::MAX,
+            remaining: budget.remaining(),
+            total: budget.total(),
+        })
+}
+
 impl<T> Pool<T> {
     pub fn new(
         budget: &mut Budget,
@@ -60,6 +79,7 @@ impl<T> Pool<T> {
             capacity <= u32::MAX as usize,
             "pool '{what}' capacity overflows u32"
         );
+        let identity = allocate_pool_identity(&NEXT_POOL_ID, budget)?;
         budget.draw_array(capacity, size_of::<T>() + size_of::<u32>() + 1, what)?;
         let mut free = FixedVec::new(budget, what, capacity)?;
         for index in (0..capacity as u32).rev() {
@@ -67,10 +87,12 @@ impl<T> Pool<T> {
         }
         Ok(Self {
             what,
+            identity,
             values: Box::new_uninit_slice(capacity),
             generations: vec![0; capacity].into_boxed_slice(),
             occupied: vec![false; capacity].into_boxed_slice(),
             free,
+            live: 0,
         })
     }
 
@@ -84,7 +106,9 @@ impl<T> Pool<T> {
         let i = index as usize;
         self.values[i].write(value);
         self.occupied[i] = true;
+        self.live += 1;
         Ok(Handle {
+            pool: self.identity,
             index,
             generation: self.generations[i],
         })
@@ -93,10 +117,15 @@ impl<T> Pool<T> {
     pub fn release(&mut self, handle: Handle) -> T {
         let i = self.check(handle);
         self.occupied[i] = false;
-        self.generations[i] = self.generations[i].wrapping_add(1);
-        self.free
-            .push(handle.index)
-            .expect("free list sized to capacity");
+        self.live -= 1;
+        // Retire exhausted generations permanently: wrapping could revive an
+        // old handle after enough reuse. Retired cells are neither free nor live.
+        if let Some(generation) = self.generations[i].checked_add(1) {
+            self.generations[i] = generation;
+            self.free
+                .push(handle.index)
+                .expect("free list sized to capacity");
+        }
         unsafe { self.values[i].assume_init_read() }
     }
 
@@ -111,7 +140,7 @@ impl<T> Pool<T> {
     }
 
     pub fn len(&self) -> usize {
-        self.values.len() - self.free.len()
+        self.live
     }
 
     pub fn is_empty(&self) -> bool {
@@ -126,7 +155,10 @@ impl<T> Pool<T> {
     fn check(&self, handle: Handle) -> usize {
         let i = handle.index as usize;
         assert!(
-            i < self.values.len() && self.occupied[i] && self.generations[i] == handle.generation,
+            handle.pool == self.identity
+                && i < self.values.len()
+                && self.occupied[i]
+                && self.generations[i] == handle.generation,
             "pool '{}': stale or invalid handle {:?}",
             self.what,
             handle
@@ -220,6 +252,95 @@ mod tests {
             for h in handles {
                 pool.release(h);
             }
+        });
+    }
+}
+
+#[cfg(test)]
+mod ownership_tests {
+    use super::*;
+
+    #[test]
+    fn generation_exhaustion_retires_cells_and_counts_only_live_values() {
+        use core::sync::atomic::{AtomicUsize, Ordering};
+        struct Counted<'a>(&'a AtomicUsize);
+        impl Drop for Counted<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let dropped = AtomicUsize::new(0);
+        let mut budget = Budget::new(4096);
+        let mut pool = Pool::new(&mut budget, "retiring handles", 2).unwrap();
+        pool.generations[0] = u32::MAX - 1;
+        crate::mem::guard::forbid_alloc(|| {
+            let prior = pool.acquire(Counted(&dropped)).unwrap();
+            assert_eq!(prior.generation, u32::MAX - 1);
+            drop(pool.release(prior));
+            let last = pool.acquire(Counted(&dropped)).unwrap();
+            assert_eq!(last.generation, u32::MAX);
+            drop(pool.release(last));
+            assert_eq!(pool.len(), 0);
+            assert!(pool.is_empty());
+            assert_eq!(pool.capacity(), 2);
+            assert_eq!(pool.free.len(), 1);
+            assert!(!pool.occupied[0]);
+            assert_eq!(pool.generations[0], u32::MAX);
+            let survivor = pool.acquire(Counted(&dropped)).unwrap();
+            assert_ne!(survivor.index(), last.index());
+            assert_eq!(pool.len(), 1);
+            let error = pool.acquire(Counted(&dropped)).unwrap_err();
+            assert_eq!(error.what, "retiring handles");
+            assert_eq!(error.capacity, 2);
+            assert_eq!(dropped.load(Ordering::Relaxed), 3);
+        });
+        drop(pool);
+        assert_eq!(dropped.load(Ordering::Relaxed), 4);
+    }
+
+    #[test]
+    fn foreign_handles_cannot_read_mutate_or_release_another_pool() {
+        let mut budget = Budget::new(4096);
+        let mut left = Pool::new(&mut budget, "left owner", 1).unwrap();
+        let mut right = Pool::new(&mut budget, "right owner", 1).unwrap();
+        let first = left.acquire(1u64).unwrap();
+        let second = right.acquire(2u64).unwrap();
+        assert_eq!(first.index(), second.index());
+        assert_eq!(first.generation, second.generation);
+        assert_ne!(first.pool, second.pool);
+        assert!(std::panic::catch_unwind(|| right.get(first)).is_err());
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                right.get_mut(first);
+            }))
+            .is_err()
+        );
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| right.release(first)))
+                .is_err()
+        );
+        crate::mem::guard::forbid_alloc(|| {
+            assert_eq!(*left.get(first), 1);
+            assert_eq!(*right.get(second), 2);
+            assert_eq!(right.len(), 1);
+            assert_eq!(right.release(second), 2);
+            assert_eq!(left.release(first), 1);
+        });
+    }
+
+    #[test]
+    fn exhausted_pool_identity_counter_returns_a_named_startup_error() {
+        let counter = AtomicUsize::new(usize::MAX - 1);
+        let budget = Budget::new(1024);
+        crate::mem::guard::forbid_alloc(|| {
+            assert_eq!(
+                allocate_pool_identity(&counter, &budget).unwrap(),
+                usize::MAX - 1
+            );
+            let error = allocate_pool_identity(&counter, &budget).unwrap_err();
+            assert_eq!(error.what, "pool handle identities");
+            assert_eq!(counter.load(Ordering::Relaxed), usize::MAX);
+            assert_eq!(budget.remaining(), 1024);
         });
     }
 }

@@ -744,7 +744,7 @@ impl TransactionCapacity {
             deferred_constraints: config.max_deferred_constraints_per_transaction,
             deferred_trigger_bytes: config.deferred_trigger_bytes,
             analyze: config.max_analyze_per_transaction,
-            tables: config.max_tables + 1,
+            tables: config.max_tables.saturating_add(1),
         }
     }
 
@@ -829,29 +829,82 @@ impl TxnState {
     }
 
     const fn budget_bytes_with_capacity(capacity: TransactionCapacity) -> usize {
-        capacity.rows * core::mem::size_of::<(u32, u64, PriorPending)>()
-            + capacity.ddl * core::mem::size_of::<TruncateEvent>()
-            + capacity.tables * 128
-            + capacity.ddl * capacity.tables * core::mem::size_of::<u16>()
-            + capacity.ddl * core::mem::size_of::<DdlUndo>()
-            + capacity.ddl * core::mem::size_of::<u32>()
-            + capacity.analyze * core::mem::size_of::<StatisticsUndo>()
-            + capacity.savepoints * core::mem::size_of::<Savepoint>()
-            + crate::sql::notify::PER_TXN
-                * core::mem::size_of::<crate::sql::notify::BufferedNotify>()
-            + crate::sql::notify::PER_TXN_PAYLOAD_BYTES
-            + crate::sql::notify::LISTEN_OPS_PER_TXN
-                * core::mem::size_of::<crate::sql::notify::ListenOp>()
-            + SUBSCRIPTION_ADVANCES_PER_TXN
-                * core::mem::size_of::<crate::storage::SubscriptionAdvance>()
-            + capacity.deferred_constraints * core::mem::size_of::<ConstraintObligation>()
-            + capacity.deferred_constraints * core::mem::size_of::<usize>()
-            + capacity.deferred_constraints * core::mem::size_of::<ConstraintModeChange>()
-            + capacity.deferred_constraints * core::mem::size_of::<ConstraintLifecycle>()
-            + capacity.deferred_constraints * core::mem::size_of::<DeferredTriggerEvent>()
-            + capacity.deferred_constraints * core::mem::size_of::<usize>()
-            + capacity.deferred_trigger_bytes
-            + capacity.descriptors * core::mem::size_of::<LargeObjectDescriptor>()
+        capacity
+            .rows
+            .saturating_mul(core::mem::size_of::<(u32, u64, PriorPending)>())
+            .saturating_add(
+                capacity
+                    .ddl
+                    .saturating_mul(core::mem::size_of::<TruncateEvent>()),
+            )
+            .saturating_add(capacity.tables.saturating_mul(128))
+            .saturating_add(
+                capacity
+                    .ddl
+                    .saturating_mul(capacity.tables)
+                    .saturating_mul(core::mem::size_of::<u16>()),
+            )
+            .saturating_add(capacity.ddl.saturating_mul(core::mem::size_of::<DdlUndo>()))
+            .saturating_add(capacity.ddl.saturating_mul(core::mem::size_of::<u32>()))
+            .saturating_add(
+                capacity
+                    .analyze
+                    .saturating_mul(core::mem::size_of::<StatisticsUndo>()),
+            )
+            .saturating_add(
+                capacity
+                    .savepoints
+                    .saturating_mul(core::mem::size_of::<Savepoint>()),
+            )
+            .saturating_add(
+                crate::sql::notify::PER_TXN
+                    .saturating_mul(core::mem::size_of::<crate::sql::notify::BufferedNotify>()),
+            )
+            .saturating_add(crate::sql::notify::PER_TXN_PAYLOAD_BYTES)
+            .saturating_add(
+                crate::sql::notify::LISTEN_OPS_PER_TXN
+                    .saturating_mul(core::mem::size_of::<crate::sql::notify::ListenOp>()),
+            )
+            .saturating_add(
+                SUBSCRIPTION_ADVANCES_PER_TXN
+                    .saturating_mul(core::mem::size_of::<crate::storage::SubscriptionAdvance>()),
+            )
+            .saturating_add(
+                capacity
+                    .deferred_constraints
+                    .saturating_mul(core::mem::size_of::<ConstraintObligation>()),
+            )
+            .saturating_add(
+                capacity
+                    .deferred_constraints
+                    .saturating_mul(core::mem::size_of::<usize>()),
+            )
+            .saturating_add(
+                capacity
+                    .deferred_constraints
+                    .saturating_mul(core::mem::size_of::<ConstraintModeChange>()),
+            )
+            .saturating_add(
+                capacity
+                    .deferred_constraints
+                    .saturating_mul(core::mem::size_of::<ConstraintLifecycle>()),
+            )
+            .saturating_add(
+                capacity
+                    .deferred_constraints
+                    .saturating_mul(core::mem::size_of::<DeferredTriggerEvent>()),
+            )
+            .saturating_add(
+                capacity
+                    .deferred_constraints
+                    .saturating_mul(core::mem::size_of::<usize>()),
+            )
+            .saturating_add(capacity.deferred_trigger_bytes)
+            .saturating_add(
+                capacity
+                    .descriptors
+                    .saturating_mul(core::mem::size_of::<LargeObjectDescriptor>()),
+            )
     }
 
     pub fn new(budget: &mut Budget, capacity: usize) -> Result<Self, BudgetError> {
@@ -889,7 +942,7 @@ impl TxnState {
         )
     }
 
-    pub(crate) fn new_with_config(
+    pub fn new_with_config(
         budget: &mut Budget,
         config: &crate::config::Config,
     ) -> Result<Self, BudgetError> {
@@ -2590,6 +2643,47 @@ impl TxnState {
 #[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn configured_transaction_budgets_saturate_and_valid_reservations_are_exact() {
+        for field in 0..9 {
+            let mut config = crate::config::Config::default_dev();
+            match field {
+                0 => config.txn_rows = usize::MAX,
+                1 => config.max_ddl_per_transaction = usize::MAX,
+                2 => config.max_tables = usize::MAX,
+                3 => config.max_analyze_per_transaction = usize::MAX,
+                4 => config.max_savepoints_per_transaction = usize::MAX,
+                5 => config.max_deferred_constraints_per_transaction = usize::MAX,
+                6 => config.deferred_trigger_bytes = usize::MAX,
+                7 => config.max_large_object_descriptors = usize::MAX,
+                8 => {
+                    config.max_tables = usize::MAX / 1024;
+                    config.max_ddl_per_transaction = 1024;
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                TxnState::budget_bytes_with_config(&config),
+                usize::MAX,
+                "configured field {field}"
+            );
+        }
+        assert_eq!(TxnState::budget_bytes(usize::MAX), usize::MAX);
+        let mut config = crate::config::Config::default_dev();
+        config.txn_rows = 3;
+        config.max_ddl_per_transaction = 2;
+        config.max_tables = 2;
+        config.max_analyze_per_transaction = 1;
+        config.max_savepoints_per_transaction = 3;
+        config.max_deferred_constraints_per_transaction = 2;
+        config.deferred_trigger_bytes = 73;
+        config.max_large_object_descriptors = 2;
+        let bytes = TxnState::budget_bytes_with_config(&config);
+        let mut budget = Budget::new(bytes);
+        let _transaction = TxnState::new_with_config(&mut budget, &config).unwrap();
+        assert_eq!(budget.remaining(), 0);
+    }
 
     #[test]
     fn visible_row_heap_ownership_command_exhaustion_preserves_snapshot_boundary() {

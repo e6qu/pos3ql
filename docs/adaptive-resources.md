@@ -13,21 +13,27 @@ reserved memory must remain unchanged.
 
 ## What already exists
 
-- [Storage startup accounting](https://github.com/e6qu/pos3ql/blob/b36e100a1d48221d6a06a15ecb68981dc699d26f/src/storage/mod.rs) still charges
-  `max_tables * RowMap::budget_bytes(table_rows)` for row lookup structures.
-  Table construction creates
-  those maps before serving requests. Removing this multiplication requires
-  shared ownership and admission, not merely changing a configuration label.
-- [Row bytes](https://github.com/e6qu/pos3ql/blob/b36e100a1d48221d6a06a15ecb68981dc699d26f/src/storage/row_heap.rs) already share two `memtable_bytes`
+- `row_overlay_slots` budgets ordinary-table resident row metadata across the
+  whole instance. Empty tables share that capacity instead of receiving private
+  row allowances. `large_object_pages` remains a separate reserve.
+- [Row bytes](../src/storage/row_heap.rs) already share two `memtable_bytes`
   buffers for active data and relocation. Committed MVCC history uses the
   instance-wide `row_history_slots`; locking mode reserves no committed history.
-- [Copies of table definitions](https://github.com/e6qu/pos3ql/blob/b36e100a1d48221d6a06a15ecb68981dc699d26f/src/storage/definition_images.rs) are already
-  leased globally to readers, but reserve `(max_tables + 1) *
-  (max_catalog_versions_per_object + 1) * query_workspace_slots` wide slots.
-  [Retained row walks](https://github.com/e6qu/pos3ql/blob/b36e100a1d48221d6a06a15ecb68981dc699d26f/src/storage/row_walks.rs) reserve
-  `query_workspace_slots * 64` identities, each with
-  `max(table_rows, large_object_pages, value_index_rows)` row-ID positions.
-  Reducing per-table maps alone would leave these multipliers in place.
+- Foreground retained row IDs and DML buffers use one `row_work_bytes` pool,
+  bounded by `row_work_leases` owners. Reader table definitions use the explicit
+  `definition_image_slots` pool. These replace hidden row/table/worker sizing;
+  separate catalog and definition-history metadata still needs accounting.
+  Exact read captures reserve their known count. Active write buffers grow
+  geometrically, clamped to the pool maximum; unused active capacity still costs
+  bytes. Each extent rounds to 64 bytes (at most 63 alignment-padding bytes).
+  Moving a buffer charges its old and new extents and descriptors until the copy
+  finishes. That overlap and fragmentation can exhaust the pool even when total
+  free bytes look sufficient; diagnostics name the requested extent, free bytes,
+  largest contiguous extent and available descriptors.
+  Checkpoint and relocation buffers retain independent guaranteed progress
+  capacity, sized from the resident objects they can visit. They do not borrow
+  foreground space needed by a report that may outlive maintenance.
+
 - The [RAM block cache](https://github.com/e6qu/pos3ql/blob/b36e100a1d48221d6a06a15ecb68981dc699d26f/src/store/cache.rs) and
   [disk block cache](https://github.com/e6qu/pos3ql/blob/b36e100a1d48221d6a06a15ecb68981dc699d26f/src/store/disk.rs) already share fixed slots across
   objects. CLOCK eviction gives recently used blocks another chance to remain.
@@ -45,9 +51,9 @@ reserved memory must remain unchanged.
   slots. [Group commit](https://github.com/e6qu/pos3ql/blob/b36e100a1d48221d6a06a15ecb68981dc699d26f/src/server.rs) shares publication work from one
   reactor turn without adding a timer to collect more arrivals.
 
-These mechanisms do not establish workload-driven resource allocation or
-production performance. Existing [measurements](performance.md) retain that
-distinction.
+These fixed pools do not establish a workload controller or production
+performance. Existing [measurements](performance.md) retain that distinction;
+the runner matrix records equal-capacity evidence separately.
 
 ## Keep capacity fixed; change who can use it
 

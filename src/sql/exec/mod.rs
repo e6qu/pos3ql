@@ -6,7 +6,7 @@
 
 use super::txn::{TxnMode, TxnState};
 use crate::mem::arena::{Arena, ArenaList};
-use crate::mem::fixed_vec::FixedVec;
+use crate::mem::lease_pool::{RowWorkLease, RowWorkPool};
 use crate::mem::mutex::Mutex;
 use crate::pg::respond::Responder;
 use crate::pg::wire::WireFull;
@@ -89,7 +89,7 @@ impl PhysicalRow {
     }
 }
 
-pub(crate) type DmlScratch = FixedVec<PhysicalRow>;
+pub(crate) type DmlScratch = RowWorkLease<PhysicalRow>;
 
 #[derive(Clone, Copy)]
 struct DmlRowImage<'arena> {
@@ -21666,20 +21666,19 @@ fn execute_bound_plpgsql_dynamic_dml<'a>(
         }
         Stmt::Update(statement) => {
             let scratch = unsafe { &mut *context.scratch() };
-            let saved = context
-                .arena
-                .alloc_slice_copy(scratch.as_slice())
-                .map_err(|_| {
-                    sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "nested dynamic UPDATE exceeds the statement arena"
-                    )
-                })?;
             let arena = context.arena;
             let params = query.arguments;
             let (storage, txn, _, responder, seq_session) = context.dml_parts_with_sequence();
             let mut command = txn.enter_trigger_sql(storage)?;
             let txn = &mut *command;
+            let nested = scratch.pool().lease(0).map_err(|error| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "nested DML selection: {}",
+                    error
+                )
+            })?;
+            let saved = core::mem::replace(scratch, nested);
             responder.clear_affected_rows();
             let outcome = responder.without_query_output(|responder| {
                 update(
@@ -21698,33 +21697,24 @@ fn execute_bound_plpgsql_dynamic_dml<'a>(
                 )
             });
             drop(command);
-            scratch.clear();
-            for item in saved.iter().copied() {
-                scratch.push(item).map_err(|_| {
-                    sql_err!(
-                        sqlstate::INTERNAL_ERROR,
-                        "dynamic UPDATE workspace restore failed"
-                    )
-                })?;
-            }
+            *scratch = saved;
             dynamic_dml_outcome(responder, outcome, "UPDATE")
         }
         Stmt::Delete(statement) => {
             let scratch = unsafe { &mut *context.scratch() };
-            let saved = context
-                .arena
-                .alloc_slice_copy(scratch.as_slice())
-                .map_err(|_| {
-                    sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "nested dynamic DELETE exceeds the statement arena"
-                    )
-                })?;
             let arena = context.arena;
             let params = query.arguments;
             let (storage, txn, _, responder, seq_session) = context.dml_parts_with_sequence();
             let mut command = txn.enter_trigger_sql(storage)?;
             let txn = &mut *command;
+            let nested = scratch.pool().lease(0).map_err(|error| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "nested DML selection: {}",
+                    error
+                )
+            })?;
+            let saved = core::mem::replace(scratch, nested);
             responder.clear_affected_rows();
             let outcome = responder.without_query_output(|responder| {
                 delete(
@@ -21742,15 +21732,7 @@ fn execute_bound_plpgsql_dynamic_dml<'a>(
                 )
             });
             drop(command);
-            scratch.clear();
-            for item in saved.iter().copied() {
-                scratch.push(item).map_err(|_| {
-                    sql_err!(
-                        sqlstate::INTERNAL_ERROR,
-                        "dynamic DELETE workspace restore failed"
-                    )
-                })?;
-            }
+            *scratch = saved;
             dynamic_dml_outcome(responder, outcome, "DELETE")
         }
         _ => Err(sql_err!(
@@ -25928,16 +25910,6 @@ fn execute_trigger_block<'a>(
                         None => statement,
                     };
                     let scratch = unsafe { &mut *context.scratch() };
-                    let saved =
-                        context
-                            .arena
-                            .alloc_slice_copy(scratch.as_slice())
-                            .map_err(|_| {
-                                sql_err!(
-                                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                                    "nested trigger UPDATE exceeds the statement arena"
-                                )
-                            })?;
                     let transition = TriggerTransition {
                         definition,
                         old,
@@ -25956,6 +25928,14 @@ fn execute_trigger_block<'a>(
                         context.dml_parts_with_sequence();
                     let mut command = txn.enter_trigger_sql(storage)?;
                     let txn = &mut *command;
+                    let nested = scratch.pool().lease(0).map_err(|error| {
+                        sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "nested DML selection: {}",
+                            error
+                        )
+                    })?;
+                    let saved = core::mem::replace(scratch, nested);
                     responder.clear_affected_rows();
                     let outcome = responder.without_command_complete(|responder| {
                         update(
@@ -25974,15 +25954,7 @@ fn execute_trigger_block<'a>(
                         )
                     });
                     drop(command);
-                    scratch.clear();
-                    for item in saved.iter().copied() {
-                        scratch.push(item).map_err(|_| {
-                            sql_err!(
-                                sqlstate::INTERNAL_ERROR,
-                                "trigger DML workspace restore failed"
-                            )
-                        })?;
-                    }
+                    *scratch = saved;
                     match outcome {
                         Ok(Ok(())) => status.set_rows(
                             context
@@ -26034,16 +26006,6 @@ fn execute_trigger_block<'a>(
                         None => statement,
                     };
                     let scratch = unsafe { &mut *context.scratch() };
-                    let saved =
-                        context
-                            .arena
-                            .alloc_slice_copy(scratch.as_slice())
-                            .map_err(|_| {
-                                sql_err!(
-                                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                                    "nested trigger DELETE exceeds the statement arena"
-                                )
-                            })?;
                     let transition = TriggerTransition {
                         definition,
                         old,
@@ -26062,6 +26024,14 @@ fn execute_trigger_block<'a>(
                         context.dml_parts_with_sequence();
                     let mut command = txn.enter_trigger_sql(storage)?;
                     let txn = &mut *command;
+                    let nested = scratch.pool().lease(0).map_err(|error| {
+                        sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "nested DML selection: {}",
+                            error
+                        )
+                    })?;
+                    let saved = core::mem::replace(scratch, nested);
                     responder.clear_affected_rows();
                     let outcome = responder.without_command_complete(|responder| {
                         delete(
@@ -26079,15 +26049,7 @@ fn execute_trigger_block<'a>(
                         )
                     });
                     drop(command);
-                    scratch.clear();
-                    for item in saved.iter().copied() {
-                        scratch.push(item).map_err(|_| {
-                            sql_err!(
-                                sqlstate::INTERNAL_ERROR,
-                                "trigger DML workspace restore failed"
-                            )
-                        })?;
-                    }
+                    *scratch = saved;
                     match outcome {
                         Ok(Ok(())) => status.set_rows(
                             context
@@ -60118,11 +60080,16 @@ pub(crate) fn instead_of_view_dml<'a>(
                         "INSERT has wrong number of expressions"
                     ));
                 }
-                let rows = match arena.alloc_slice_with(scratch.capacity(), |_| &[][..]) {
+                let mut rows = match scratch.pool().lease::<&[u8]>(0) {
                     Ok(rows) => rows,
-                    Err(_) => return sql_fail(super::query::arena_full_pub()),
+                    Err(error) => {
+                        return sql_fail(sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "view INSERT staging: {}",
+                            error
+                        ));
+                    }
                 };
-                let mut count = 0usize;
                 if let Err(error) = super::query::select_into_rows(
                     storage,
                     txn.txid,
@@ -60132,21 +60099,19 @@ pub(crate) fn instead_of_view_dml<'a>(
                     None,
                     None,
                     &mut |values| {
-                        if count == rows.len() {
-                            return Err(sql_err!(
+                        let bytes = encode_projected_pub(values, arena)?;
+                        rows.push(bytes).map_err(|error| {
+                            sql_err!(
                                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                                "statement touches more than {} rows",
-                                rows.len()
-                            ));
-                        }
-                        rows[count] = encode_projected_pub(values, arena)?;
-                        count += 1;
-                        Ok(())
+                                "view INSERT staging: {}",
+                                error
+                            )
+                        })
                     },
                 ) {
                     return sql_fail(error);
                 }
-                for bytes in &rows[..count] {
+                for bytes in rows.as_slice() {
                     let mut selected = [Datum::Null; MAX_COLUMNS];
                     for (index, value) in selected[..source_count].iter_mut().enumerate() {
                         *value = decode_projected_pub(bytes, index);
@@ -60254,15 +60219,14 @@ pub(crate) fn instead_of_view_dml<'a>(
                 txn.txid,
                 view_slot,
                 &def,
-                schema,
                 arena,
                 params,
-                scratch.capacity(),
+                scratch.pool(),
             ) {
                 Ok(rows) => rows,
                 Err(error) => return sql_fail(error),
             };
-            for bytes in rows {
+            for bytes in rows.as_slice() {
                 let mut old = [Datum::Null; MAX_COLUMNS];
                 if let Err(error) = rowenc::decode(bytes, schema, &mut old) {
                     return sql_fail(error);
@@ -60408,15 +60372,14 @@ pub(crate) fn instead_of_view_dml<'a>(
                 txn.txid,
                 view_slot,
                 &def,
-                schema,
                 arena,
                 params,
-                scratch.capacity(),
+                scratch.pool(),
             ) {
                 Ok(rows) => rows,
                 Err(error) => return sql_fail(error),
             };
-            for bytes in rows {
+            for bytes in rows.as_slice() {
                 let mut old = [Datum::Null; MAX_COLUMNS];
                 if let Err(error) = rowenc::decode(bytes, schema, &mut old) {
                     return sql_fail(error);
@@ -60527,20 +60490,15 @@ pub(crate) fn instead_of_view_dml<'a>(
     sql_ok()
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "view-row materialization needs the bounded query execution context"
-)]
 fn materialize_view_rows<'a>(
     storage: &Storage,
     txid: u32,
     view_slot: usize,
     def: &TableDef,
-    schema: &[ColType],
     arena: &'a Arena,
     params: &[Datum<'a>],
-    capacity: usize,
-) -> Result<&'a [&'a [u8]], SqlError> {
+    pool: &std::sync::Arc<RowWorkPool>,
+) -> Result<RowWorkLease<&'a [u8]>, SqlError> {
     let user = crate::sql::eval::funcs::system::session_user_owned();
     let query = storage.snapshot_view_query(view_slot, txid, arena)?;
     let path = storage.compute_path(query.creation_path.as_str(), user.as_str(), txid);
@@ -60551,10 +60509,13 @@ fn materialize_view_rows<'a>(
     let dependencies = query.dependencies;
     let select =
         super::query::expand_stored_query(select, storage, txid, path, dependencies.view(), arena)?;
-    let rows = arena
-        .alloc_slice_with(capacity, |_| &[][..])
-        .map_err(|_| super::query::arena_full_pub())?;
-    let mut count = 0usize;
+    let mut rows = pool.lease::<&[u8]>(0).map_err(|error| {
+        sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "view row staging: {}",
+            error
+        )
+    })?;
     super::query::select_into_rows(
         storage,
         txid,
@@ -60570,24 +60531,20 @@ fn materialize_view_rows<'a>(
                     "view row shape does not match its catalog description"
                 ));
             }
-            if count == rows.len() {
-                return Err(sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "statement touches more than {} rows",
-                    rows.len()
-                ));
-            }
             let encoded = arena
                 .alloc_slice_with(rowenc::encoded_len(values), |_| 0u8)
                 .map_err(|_| super::query::arena_full_pub())?;
             rowenc::encode(values, encoded);
-            rows[count] = encoded;
-            count += 1;
-            Ok(())
+            rows.push(&*encoded).map_err(|error| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "view row staging: {}",
+                    error
+                )
+            })
         },
     )?;
-    let _ = schema;
-    Ok(&rows[..count])
+    Ok(rows)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -66623,11 +66580,11 @@ pub(crate) fn capture_alter_rewrite_rows<'arena>(
     if let Err(error) = source.for_each_home(&mut |rowid, home| {
         scratch
             .push(PhysicalRow::local(table, rowid, home.snapshot()))
-            .map_err(|_| {
+            .map_err(|error| {
                 sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "ALTER touches more than {} rows",
-                    scratch.capacity()
+                    "ALTER row selection: {}",
+                    error
                 )
             })?;
         Ok(core::ops::ControlFlow::Continue(()))
@@ -70495,11 +70452,11 @@ pub(super) fn collect_matches<'a>(
                             table_index,
                             tuple_id,
                         })
-                        .map_err(|_| {
+                        .map_err(|error| {
                             sql_err!(
                                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                                "statement touches more than {} rows",
-                                scratch.capacity()
+                                "statement row selection: {}",
+                                error
                             )
                         })?;
                 }
@@ -70572,11 +70529,11 @@ pub(super) fn collect_matches<'a>(
                 }
                 scratch
                     .push(PhysicalRow::local(leaf, rowid, snapshot))
-                    .map_err(|_| {
+                    .map_err(|error| {
                         sql_err!(
                             sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                            "statement touches more than {} rows",
-                            scratch.capacity()
+                            "statement row selection: {}",
+                            error
                         )
                     })?;
             }
@@ -70670,11 +70627,11 @@ fn collect_join_matches<'a>(
                             table_index,
                             tuple_id,
                         })
-                        .map_err(|_| {
+                        .map_err(|error| {
                             sql_err!(
                                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                                "statement touches more than {} rows",
-                                scratch.capacity()
+                                "statement row selection: {}",
+                                error
                             )
                         })?;
                 }
@@ -70750,11 +70707,11 @@ fn collect_join_matches<'a>(
                     }
                     scratch
                         .push(PhysicalRow::local(leaf, rowid, snapshot))
-                        .map_err(|_| {
+                        .map_err(|error| {
                             sql_err!(
                                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                                "statement touches more than {} rows",
-                                scratch.capacity()
+                                "statement row selection: {}",
+                                error
                             )
                         })?;
                 }
@@ -70838,11 +70795,11 @@ fn collect_join_matches_with_transition<'a>(
                             table_index,
                             tuple_id,
                         })
-                        .map_err(|_| {
+                        .map_err(|error| {
                             sql_err!(
                                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                                "statement touches more than {} rows",
-                                scratch.capacity()
+                                "statement row selection: {}",
+                                error
                             )
                         })?;
                 }
@@ -70920,11 +70877,11 @@ fn collect_join_matches_with_transition<'a>(
                     }
                     scratch
                         .push(PhysicalRow::local(leaf, rowid, snapshot))
-                        .map_err(|_| {
+                        .map_err(|error| {
                             sql_err!(
                                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                                "statement touches more than {} rows",
-                                scratch.capacity()
+                                "statement row selection: {}",
+                                error
                             )
                         })?;
                 }
@@ -73173,7 +73130,7 @@ mod tests {
         config.memtable_bytes = 1 << 16;
         config.max_connections = 2;
         config.max_tables = 2;
-        config.table_rows = 128;
+        config.row_overlay_slots = 128;
         config.txn_rows = 128;
         config.value_index_rows = 512;
         config.max_value_indexes = 8;

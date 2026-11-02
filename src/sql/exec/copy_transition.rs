@@ -22,7 +22,10 @@ pub(crate) struct CopyTransitionRows {
 
 impl CopyTransitionRows {
     pub(crate) const fn budget_bytes(config: &Config) -> usize {
-        config.txn_rows * core::mem::size_of::<EncodedRow>() + config.copy_transition_bytes
+        config
+            .txn_rows
+            .saturating_mul(core::mem::size_of::<EncodedRow>())
+            .saturating_add(config.copy_transition_bytes)
     }
 
     pub(crate) fn new(budget: &mut Budget, rows: usize, bytes: usize) -> Result<Self, BudgetError> {
@@ -89,9 +92,19 @@ mod tests {
     use crate::sql::types::ColType;
 
     #[test]
+    fn configured_copy_transition_budget_saturates_before_wrapping() {
+        let mut config = Config::default_dev();
+        config.txn_rows = usize::MAX;
+        assert_eq!(CopyTransitionRows::budget_bytes(&config), usize::MAX);
+        config.txn_rows = 1;
+        config.copy_transition_bytes = usize::MAX;
+        assert_eq!(CopyTransitionRows::budget_bytes(&config), usize::MAX);
+    }
+
+    #[test]
     fn copy_transition_values_reserve_the_exact_startup_budget() {
         let config = Config::parse(
-            "txn_rows = 3\ncopy_transition_bytes = 73\ntransaction_mode = mvcc\ncatalog_history_bytes = 16777216\nrow_history_slots = 65536\n",
+            "txn_rows = 3\ncopy_transition_bytes = 73\ntransaction_mode = mvcc\ncatalog_history_bytes = 16777216\nrow_history_slots = 65536\nrow_overlay_slots = 8192\nrow_work_bytes = 8388608\nrow_work_leases = 128\ndefinition_image_slots = 256\n",
         ).unwrap();
         assert_eq!(config.copy_transition_bytes, 73);
         let required = CopyTransitionRows::budget_bytes(&config);

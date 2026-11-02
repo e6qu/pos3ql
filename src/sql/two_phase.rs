@@ -75,10 +75,11 @@ impl PreparedTransactionImage {
 
 impl PreparedTransactions {
     pub(crate) fn budget_bytes(config: &Config) -> usize {
-        config.max_prepared_transactions
-            * (core::mem::size_of::<PreparedTransactionSlot>()
-                + TxnState::budget_bytes_with_config(config)
-                + 2 * config.wal_buffer_bytes)
+        config.max_prepared_transactions.saturating_mul(
+            core::mem::size_of::<PreparedTransactionSlot>()
+                .saturating_add(TxnState::budget_bytes_with_config(config))
+                .saturating_add(2usize.saturating_mul(config.wal_buffer_bytes)),
+        )
     }
 
     pub(crate) fn new(config: &Config, budget: &mut Budget) -> Result<Self, BudgetError> {

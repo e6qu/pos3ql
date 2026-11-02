@@ -222,6 +222,7 @@ pub(crate) struct SubscriptionCleanupRuntime {
 #[derive(Debug)]
 pub enum EngineSetupError {
     Configuration(&'static str),
+    ResourceConfiguration(crate::config::ConfigError),
     Budget(BudgetError),
     Wal(WalSetupError),
     Checkpoint(CheckpointSetupError),
@@ -241,6 +242,7 @@ impl std::fmt::Display for EngineSetupError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Configuration(message) => f.write_str(message),
+            Self::ResourceConfiguration(error) => write!(f, "{error}"),
             Self::Budget(e) => write!(f, "{e}"),
             Self::Wal(e) => write!(f, "{e}"),
             Self::Checkpoint(e) => write!(f, "{e}"),
@@ -264,10 +266,24 @@ impl From<BudgetError> for EngineSetupError {
     }
 }
 
+impl From<crate::config::ConfigError> for EngineSetupError {
+    fn from(error: crate::config::ConfigError) -> Self {
+        Self::ResourceConfiguration(error)
+    }
+}
+
 impl From<crate::storage::StorageSetupError> for EngineSetupError {
     fn from(error: crate::storage::StorageSetupError) -> Self {
         match error {
             crate::storage::StorageSetupError::Budget(error) => Self::Budget(error),
+            crate::storage::StorageSetupError::Configuration(error) => {
+                Self::ResourceConfiguration(error)
+            }
+            crate::storage::StorageSetupError::RowWork(error) => Self::Storage(sql_err!(
+                crate::sql::eval::sqlstate::INVALID_PARAMETER_VALUE,
+                "{}",
+                error
+            )),
             crate::storage::StorageSetupError::CatalogIdentitySpaceExhausted => {
                 Self::Storage(sql_err!(
                     crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -337,16 +353,20 @@ struct DmlWorkspaces {
 }
 
 impl DmlWorkspaces {
-    fn new(config: &Config, budget: &mut Budget) -> Result<Self, BudgetError> {
+    fn new(
+        config: &Config,
+        budget: &mut Budget,
+        row_work: &std::sync::Arc<crate::mem::lease_pool::RowWorkPool>,
+    ) -> Result<Self, BudgetError> {
         let mut slots =
             FixedVec::new(budget, "query_dml_workspaces", config.query_workspace_slots)?;
         for _ in 0..config.query_workspace_slots {
             slots
-                .push(FixedVec::new(
-                    budget,
-                    "query_dml_scratch",
-                    config.table_rows,
-                )?)
+                .push(
+                    row_work
+                        .lease(0)
+                        .expect("empty write lease needs no capacity"),
+                )
                 .expect("sized to query_workspace_slots");
         }
         Ok(Self { slots })
@@ -2533,6 +2553,14 @@ impl Engine {
         let _ = self.replace_read_owner(Some(self.execution_identity().read_owner()));
     }
 
+    pub(crate) fn row_work_pool(&self) -> &std::sync::Arc<crate::mem::lease_pool::RowWorkPool> {
+        &self.storage.row_work
+    }
+
+    pub(crate) fn release_query_workspace_rows(&mut self, workspace: QueryWorkspaceId) {
+        self.dml_scratch.slots[workspace.index()].clear();
+    }
+
     pub(crate) fn execution_identity(&self) -> ExecutionIdentity {
         execution_identity()
     }
@@ -3592,65 +3620,72 @@ impl Engine {
 
     /// Bytes drawn beyond the row heap, for the memory plan.
     pub fn extra_budget_bytes(config: &Config) -> usize {
-        Storage::extra_budget_bytes(config)
-            + crate::storage::StatisticsReceiptPool::budget_bytes(config)
-            + exec::record_shape_pool_bytes(config.max_composites)
-            + config.query_workspace_slots.saturating_mul(
-                size_of::<exec::DmlScratch>().saturating_add(
-                    config
-                        .table_rows
-                        .saturating_mul(size_of::<exec::PhysicalRow>()),
-                ),
-            )
-            + crate::storage::HeapRelocationWorkspace::budget_bytes(
+        let storage = Storage::extra_budget_bytes(config);
+        if storage == usize::MAX {
+            return usize::MAX;
+        }
+        [
+            storage,
+            crate::storage::StatisticsReceiptPool::budget_bytes(config),
+            exec::record_shape_pool_bytes(config.max_composites),
+            config
+                .query_workspace_slots
+                .saturating_mul(size_of::<exec::DmlScratch>()),
+            crate::storage::HeapRelocationWorkspace::budget_bytes(
                 crate::storage::row_heap_image_capacity(config),
-            )
-            + size_of::<Option<LocalCleanup>>()
-            + size_of::<commit::PublicationState>()
-            + config.query_workspace_slots.saturating_mul(
+            ),
+            size_of::<Option<LocalCleanup>>(),
+            size_of::<commit::PublicationState>(),
+            config.query_workspace_slots.saturating_mul(
                 config
                     .work_arena_bytes
                     .saturating_add(crate::storage::RowCursorBuffers::allocation_bytes(config))
                     .saturating_add(size_of::<QueryWorkspace>()),
-            )
-            + config.wal_buffer_bytes
-            + config.wal_upload_buffer_bytes
-            + config.table_rows * size_of::<(u64, RowHome)>()
-            + config.max_connections as usize * config.wal_buffer_bytes
-            + config.max_roles * size_of::<RoleConnections>()
-            + config.max_databases * size_of::<u16>()
-            + notify::NotifyState::budget_bytes(
-                config.max_connections as usize * notify::CHANNELS_PER_CONN,
+            ),
+            config.wal_buffer_bytes,
+            config.wal_upload_buffer_bytes,
+            config
+                .row_overlay_slots
+                .saturating_mul(size_of::<(u64, RowHome)>()),
+            (config.max_connections as usize).saturating_mul(config.wal_buffer_bytes),
+            config
+                .max_roles
+                .saturating_mul(size_of::<RoleConnections>()),
+            config.max_databases.saturating_mul(size_of::<u16>()),
+            notify::NotifyState::budget_bytes(
+                (config.max_connections as usize).saturating_mul(notify::CHANNELS_PER_CONN),
                 notify::OUTBOX,
-            )
-            + config.max_ddl_per_transaction.saturating_mul(
-                size_of::<(usize, bool)>() + size_of::<usize>() + size_of::<PendingTruncate>(),
-            )
-            + config.max_tables.saturating_add(1).saturating_mul(
+            ),
+            config.max_ddl_per_transaction.saturating_mul(
+                size_of::<(usize, bool)>()
+                    .saturating_add(size_of::<usize>())
+                    .saturating_add(size_of::<PendingTruncate>()),
+            ),
+            config.max_tables.saturating_add(1).saturating_mul(
                 config
                     .max_ddl_per_transaction
                     .saturating_mul(size_of::<u16>())
                     .saturating_add(size_of::<u32>()),
-            )
-            + two_phase::PreparedTransactions::budget_bytes(config)
-            + if config.object_store_on && config.wal_upload {
+            ),
+            two_phase::PreparedTransactions::budget_bytes(config),
+            if config.object_store_on && config.wal_upload {
                 commit::Queue::budget_bytes(config)
             } else {
                 0
-            }
-            + config.max_foreign_sessions.saturating_mul(
+            },
+            config.max_foreign_sessions.saturating_mul(
                 crate::pg::replication_client::ReplicationClient::budget_bytes(
                     1,
                     config.foreign_receive_bytes,
                     config.foreign_send_bytes,
                 ),
-            )
-            + if config.temporary_spill_bytes == 0 {
+            ),
+            if config.temporary_spill_bytes == 0 {
                 0
             } else {
                 TemporarySpiller::budget_bytes(config)
-            }
-            + if config.object_store_on {
+            },
+            if config.object_store_on {
                 crate::storage::SpillReader::budget_bytes(
                     true,
                     config.max_spill_generations_per_table,
@@ -3662,17 +3697,21 @@ impl Engine {
                 )
             } else {
                 0
-            }
-            + if config.object_store_on {
+            },
+            if config.object_store_on {
                 Checkpointer::budget_bytes(config)
             } else {
                 0
-            }
+            },
+        ]
+        .into_iter()
+        .fold(0usize, usize::saturating_add)
     }
 
     /// Builds storage, loads the latest checkpoint from object storage
     /// (when enabled), and replays the journal tail on top. Startup only.
     pub fn new(config: &Config, budget: &mut Budget) -> Result<Self, EngineSetupError> {
+        config.validate_runtime_resources()?;
         if config.object_store_on
             && config.wal_upload
             && config.wal_upload_buffer_bytes < config.wal_buffer_bytes
@@ -3923,6 +3962,7 @@ impl Engine {
             "transaction publication owner",
         )?;
         storage.restore_visible_lsn(recovered_durable_lsn);
+        let dml_scratch = DmlWorkspaces::new(config, budget, &storage.row_work)?;
         Ok(Self {
             storage,
             wal,
@@ -3950,8 +3990,8 @@ impl Engine {
             },
             read_owner: None,
             wal_seg_buf: Vec::with_capacity(upload_buf),
-            scratch: FixedVec::new(budget, "scan_scratch", config.table_rows)?,
-            dml_scratch: DmlWorkspaces::new(config, budget)?,
+            scratch: FixedVec::new(budget, "scan_scratch", config.row_overlay_slots)?,
+            dml_scratch,
             statistics_receipts: crate::storage::StatisticsReceiptPool::new(config, budget)?,
             compact_scratch: crate::storage::HeapRelocationWorkspace::new(
                 budget,
@@ -10186,10 +10226,12 @@ impl Engine {
     pub fn checkpoint_work_pending(&self) -> bool {
         self.storage.history_cleanup_pending()
             || self.local_cleanup.is_some()
+            || (self.temporary_spiller.is_some() && self.storage.temporary_map_pressure())
             || self.ckpt.as_ref().is_some_and(|c| {
                 c.sweep_active()
                     || c.maintenance_pending(&self.storage)
                     || c.merge_work_pending(&self.storage)
+                    || self.storage.durable_map_pressure()
             })
     }
 
@@ -10200,6 +10242,7 @@ impl Engine {
             || self.storage.heap.used() * 100 >= self.storage.heap.capacity() * 65
             || self.wal.used_bytes() * 100 >= self.wal.capacity_bytes() * 50
             || self.storage.history_pressure()
+            || self.storage.durable_map_pressure()
     }
 
     /// Heap and history cleanup use no object client. Retained output jobs have
@@ -10720,6 +10763,7 @@ impl Engine {
         conn_id: i32,
         lock_timeout_expired: bool,
     ) -> Result<ExecutionStatus, WireFull> {
+        self.dml_scratch.clear();
         self.bind_query_connection(conn_id);
         if txn.concurrent_partition_detach_pending()
             && txn.staged_commit().is_some()
@@ -11079,6 +11123,7 @@ impl Engine {
         conn_id: i32,
         lock_timeout_expired: bool,
     ) -> Result<ExtendedExecutionStatus, WireFull> {
+        self.dml_scratch.clear();
         exec::with_bound_parameter_types(parameter_type_oids, || {
             self.bind_query_connection(conn_id);
             if txn.concurrent_partition_detach_pending()
@@ -13522,6 +13567,7 @@ impl Engine {
                 return Ok(Err(error));
             }
             self.rollback_waiting_statement(txn, statement_mark);
+            self.dml_scratch.clear();
             responder.buffer.truncate_to(output_mark);
             // The failed attempt has emitted or encoded every value it owns.
             // Keep prior invocation results below the mark and reclaim only
@@ -15685,6 +15731,7 @@ impl Engine {
         capture: Option<&'capture mut ReturningCapture<'capture>>,
     ) -> Result<Result<(), SqlError>, WireFull> {
         if reset_workspace {
+            self.dml_scratch.clear();
             if txn.staged_commit().is_some() {
                 query::arm_timeout(0);
             } else if let Some(deadline) = txn.suspended_statement_deadline() {
@@ -15867,6 +15914,9 @@ impl Engine {
                 statement_deadline,
                 routine_transaction_context,
             );
+        }
+        if reset_workspace {
+            self.dml_scratch.clear();
         }
         result
     }

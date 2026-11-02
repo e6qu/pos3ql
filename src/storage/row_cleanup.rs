@@ -1,5 +1,6 @@
 //! Cache cleanup uses current table ownership and preserves reader boundaries.
 
+use super::row_map::{RowCellPosition, RowOwnerCursor, RowOwnerStep};
 use super::row_ownership::{acquire, try_mutex};
 use super::*;
 
@@ -49,6 +50,8 @@ struct RowCleanupPosition {
     table: usize,
     slot: usize,
     selected: Option<bool>,
+    owner_cursor: Option<RowOwnerCursor>,
+    cell: Option<RowCellPosition>,
 }
 
 /// A pass owns positions, never table or allocator guards between turns.
@@ -73,6 +76,8 @@ impl RowCleanup {
                 },
                 slot: 0,
                 selected: None,
+                owner_cursor: None,
+                cell: None,
             },
             retry: None,
             changed: false,
@@ -94,6 +99,7 @@ struct CleanedSlots {
     complete: bool,
     selected: bool,
     changed: bool,
+    owner_cursor: Option<RowOwnerCursor>,
 }
 
 impl Storage {
@@ -109,41 +115,77 @@ impl Storage {
         work: core::num::NonZeroUsize,
         mode: MaintenanceMode,
     ) -> MaintenanceStep {
-        let end = match cleanup.target {
+        let ordinary = matches!(cleanup.target, RowCleanupTarget::AllTables);
+        let large_objects = self.tables.len() - 1;
+        let done = match cleanup.target {
             RowCleanupTarget::AllTables => self.tables.len(),
             RowCleanupTarget::Table(table) => table + 1,
         };
         let mut remaining = work.get();
-        while remaining != 0 && cleanup.position.table < end {
-            let position = cleanup.position;
-            let batch = self.clean_row_slots(
+        while remaining != 0 && cleanup.position.table < done {
+            let mut position = cleanup.position;
+            let shared = ordinary && position.table == 0;
+            if shared {
+                if position.slot >= self.row_overlay.scan_end() {
+                    cleanup.position = RowCleanupPosition {
+                        table: large_objects,
+                        slot: 0,
+                        selected: None,
+                        owner_cursor: None,
+                        cell: None,
+                    };
+                    remaining -= 1;
+                    continue;
+                }
+                let pressure_only = matches!(
+                    cleanup.task,
+                    RowCleanupTask::HeapRows(HeapCleanup::PressuredDurable)
+                        | RowCleanupTask::SavedEntries(EntryCleanup::Pressured)
+                );
+                let selected = *cleanup.position.selected.get_or_insert_with(|| {
+                    let usage = self.row_overlay.usage();
+                    !pressure_only || usage.pressured()
+                });
+                position.selected = Some(selected);
+                let Some(cell) = self.row_overlay.position_at(position.slot) else {
+                    cleanup.position.slot += 1;
+                    remaining -= 1;
+                    continue;
+                };
+                position.table = cell.owner().index();
+                position.cell = Some(cell);
+            }
+            match self.clean_row_slots(
                 cleanup.task,
                 position,
                 core::num::NonZeroUsize::new(remaining).unwrap(),
                 mode,
-            );
-            match batch {
+            ) {
                 Some(batch) => {
                     remaining -= batch.visited.max(1);
                     cleanup.changed |= batch.changed;
-                    if !batch.complete {
+                    if shared {
+                        cleanup.position.slot = batch.next;
+                    } else if batch.complete {
+                        cleanup.position.table = done;
+                    } else {
                         cleanup.position.slot = batch.next;
                         cleanup.position.selected = Some(batch.selected);
-                        continue;
+                        cleanup.position.owner_cursor = batch.owner_cursor;
                     }
                 }
                 None => {
-                    cleanup.retry.get_or_insert(position);
+                    cleanup.retry.get_or_insert(cleanup.position);
                     remaining -= 1;
+                    if shared {
+                        cleanup.position.slot += 1;
+                    } else {
+                        cleanup.position.table = done;
+                    }
                 }
             }
-            cleanup.position = RowCleanupPosition {
-                table: position.table + 1,
-                slot: 0,
-                selected: None,
-            };
         }
-        if cleanup.position.table != end {
+        if cleanup.position.table != done {
             return MaintenanceStep::Advanced;
         }
         if let Some(retry) = cleanup.retry.take() {
@@ -151,6 +193,53 @@ impl Storage {
             MaintenanceStep::WaitingForOwner
         } else {
             MaintenanceStep::Complete
+        }
+    }
+
+    /// The caller has released publication/version owners before reclamation.
+    /// Each pass owns one table at a time; waiting retains only the wait target.
+    pub(super) fn reclaim_row_overlay_slot(&self, table: usize) -> bool {
+        let large_objects = self.tables.len() - 1;
+        let range = if table == large_objects {
+            table..table + 1
+        } else {
+            0..large_objects
+        };
+        let pool = if table == large_objects {
+            self.tables[table].rows.pool()
+        } else {
+            &self.row_overlay
+        };
+        loop {
+            if pool.usage().free != 0 {
+                return true;
+            }
+            let mut busy = None;
+            for slot in range.clone() {
+                let mut rows = match self.tables[slot].rows.try_write_for_batch() {
+                    Ok(rows) => rows,
+                    Err(wait) => {
+                        if busy.is_none() {
+                            busy = Some(wait);
+                        }
+                        continue;
+                    }
+                };
+                let removable = rows.iter().find_map(|(rowid, state)| {
+                    Self::redundant_spilled_row_state(state).then_some(*rowid)
+                });
+                if let Some(rowid) = removable {
+                    rows.remove(&rowid).expect("selected saved row exists");
+                    return true;
+                }
+            }
+            if pool.usage().free != 0 {
+                return true;
+            }
+            match busy {
+                Some(wait) => wait.wait(),
+                None => return false,
+            }
         }
     }
 
@@ -214,27 +303,72 @@ impl Storage {
             RowCleanupTask::HeapRows(HeapCleanup::PressuredDurable)
                 | RowCleanupTask::SavedEntries(EntryCleanup::Pressured)
         );
-        let selected = position
-            .selected
-            .unwrap_or_else(|| !pressure_only || rows.len() * 100 >= rows.capacity() * 50);
-        if !eligible || !selected || rows.is_empty() {
+        let selected = position.selected.unwrap_or_else(|| {
+            let usage = rows.pool_usage();
+            !pressure_only || usage.pressured()
+        });
+        let shared = position.cell.is_some();
+        let mut owner_cursor = position.owner_cursor.unwrap_or_else(|| rows.owner_cursor());
+        let mut next = position.slot;
+        let mut visited = 0;
+        let mut complete = false;
+        let mut changed = false;
+        if !shared && (!eligible || !selected || rows.is_empty()) {
             return Some(CleanedSlots {
-                next: rows.scan_end(),
-                visited: 0,
+                next,
+                visited,
                 complete: true,
                 selected,
-                changed: false,
+                changed,
+                owner_cursor: Some(owner_cursor),
             });
         }
-        let start = position.slot;
-        assert!(
-            start <= rows.scan_end(),
-            "cleanup cursor exceeds used row slots"
-        );
-        let end = start.saturating_add(work.get()).min(rows.scan_end());
-        let mut changed = false;
-        for slot in start..end {
-            let Some((&rowid, state)) = rows.entry_at_slot_mut(slot) else {
+        while visited < work.get() {
+            let cell = if shared {
+                if next >= self.row_overlay.scan_end() {
+                    complete = true;
+                    break;
+                }
+                let captured = if next == position.slot {
+                    position.cell
+                } else {
+                    self.row_overlay.position_at(next)
+                };
+                if captured.is_some_and(|cell| cell.owner() != rows.owner_id()) {
+                    if next == position.slot {
+                        next += 1;
+                        visited += 1;
+                    }
+                    break;
+                }
+                next += 1;
+                visited += 1;
+                captured
+            } else {
+                match rows.step_owner_cursor(&mut owner_cursor) {
+                    RowOwnerStep::Position(cell) => {
+                        visited += 1;
+                        next += 1;
+                        Some(cell)
+                    }
+                    RowOwnerStep::Skipped => {
+                        visited += 1;
+                        next += 1;
+                        continue;
+                    }
+                    RowOwnerStep::Complete => {
+                        complete = true;
+                        break;
+                    }
+                }
+            };
+            if !eligible || !selected {
+                continue;
+            }
+            let Some(cell) = cell else {
+                continue;
+            };
+            let Some((&rowid, state)) = rows.entry_at_position_mut(cell) else {
                 continue;
             };
             match task {
@@ -306,12 +440,16 @@ impl Storage {
                 }
             }
         }
+        if !shared {
+            complete |= owner_cursor.is_finished();
+        }
         Some(CleanedSlots {
-            next: end,
-            visited: end - start,
-            complete: end == rows.scan_end(),
+            next,
+            visited,
+            complete,
             selected,
             changed,
+            owner_cursor: (!shared).then_some(owner_cursor),
         })
     }
 
@@ -339,7 +477,7 @@ mod tests {
 
     fn fixture(persistence: RelationPersistence, table_rows: usize) -> (Storage, usize, usize) {
         let mut config = test_config();
-        config.table_rows = table_rows;
+        config.row_overlay_slots = table_rows;
         let mut budget = test_budget(&config);
         let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let mut definition = make_def("cleanup_owned", &[("id", ColType::Int4, false)]);
@@ -403,9 +541,10 @@ mod tests {
             .unwrap();
     }
 
-    fn bounded_fixture(count: usize) -> (Storage, usize, usize) {
+    fn bounded_fixture(count: usize, max_tables: usize) -> (Storage, usize, usize) {
         let mut config = test_config();
-        config.table_rows = count * 2;
+        config.row_overlay_slots = count * 2;
+        config.max_tables = max_tables;
         let mut budget = test_budget(&config);
         let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let first = storage
@@ -516,7 +655,7 @@ mod tests {
     fn bounded_row_cleanup_limits_every_walk_and_keeps_pressure_selection() {
         const ROWS: usize = 129;
         for task in BOUNDED_TASKS {
-            let (storage, first, second) = bounded_fixture(ROWS);
+            let (storage, first, second) = bounded_fixture(ROWS, 4);
             prepare_task(&storage, first, second, ROWS, task);
             let mut cleanup = RowCleanup::new(task, RowCleanupTarget::Table(first));
             crate::mem::guard::forbid_alloc(|| {
@@ -557,7 +696,7 @@ mod tests {
     #[test]
     fn bounded_row_cleanup_skips_busy_tables_and_releases_every_prefix_owner() {
         for task in BOUNDED_TASKS {
-            let (storage, first, second) = bounded_fixture(3);
+            let (storage, first, second) = bounded_fixture(3, 4);
             prepare_task(&storage, first, second, 3, task);
             let held = storage.tables[first].rows.write();
             let mut cleanup = RowCleanup::new(task, RowCleanupTarget::AllTables);
@@ -609,7 +748,7 @@ mod tests {
 
     #[test]
     fn bounded_row_cleanup_rechecks_later_writes_and_retained_bytes() {
-        let (storage, first, second) = bounded_fixture(4);
+        let (storage, first, second) = bounded_fixture(4, 4);
         let selected = selected(&storage, first, 7);
         let mut cleanup = RowCleanup::new(
             RowCleanupTask::HeapRows(HeapCleanup::Durable),
@@ -645,7 +784,7 @@ mod tests {
                 11
             );
         });
-        let (storage, first, _) = bounded_fixture(4);
+        let (storage, first, _) = bounded_fixture(4, 4);
         for (_, state) in storage.tables[first].rows.write().iter_mut() {
             state.checkpoint_change_lsn = 7;
         }
@@ -713,7 +852,7 @@ mod tests {
 
     #[test]
     fn bounded_row_cleanup_survives_free_slot_reuse() {
-        let (storage, first, _) = bounded_fixture(4);
+        let (storage, first, _) = bounded_fixture(4, 4);
         let mut cleanup = RowCleanup::new(
             RowCleanupTask::SavedEntries(EntryCleanup::AllSaved),
             RowCleanupTarget::Table(first),
@@ -1025,7 +1164,7 @@ mod tests {
     fn row_lock_owners_tombstone_cleanup_keeps_live_pending_and_historical_states() {
         const DELETED: usize = 1536;
         let mut config = test_config();
-        config.table_rows = 2048;
+        config.row_overlay_slots = 2048;
         let mut budget = test_budget(&config);
         let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let table = storage
@@ -1126,6 +1265,102 @@ mod tests {
                 RowCleanupTarget::Table(table),
             );
             assert_eq!(storage.tables[table].rows.len(), retained.len());
+        });
+    }
+
+    #[test]
+    fn shared_cleanup_pass_visits_pool_once_independent_of_table_capacity() {
+        for max_tables in [2, 32] {
+            let (storage, first, second) = bounded_fixture(4, max_tables);
+            let task = RowCleanupTask::SavedEntries(EntryCleanup::AllSaved);
+            prepare_task(&storage, first, second, 4, task);
+            let mut cleanup = RowCleanup::new(task, RowCleanupTarget::AllTables);
+            crate::mem::guard::forbid_alloc(|| {
+                let bound = storage.row_overlay.scan_end() + 2;
+                let mut turns = 0;
+                loop {
+                    turns += 1;
+                    let result = storage.advance_row_cleanup(
+                        &mut cleanup,
+                        core::num::NonZeroUsize::new(1).unwrap(),
+                        MaintenanceMode::Background,
+                    );
+                    assert!(
+                        turns <= bound,
+                        "cleanup rescanned shared cells for each table"
+                    );
+                    if result == MaintenanceStep::Complete {
+                        break;
+                    }
+                    assert_eq!(result, MaintenanceStep::Advanced);
+                }
+                assert!(storage.tables[first].rows.is_empty());
+                assert!(storage.tables[second].rows.is_empty());
+            });
+        }
+    }
+
+    #[test]
+    fn targeted_cleanup_visits_only_owned_rows() {
+        let (storage, first, second) = bounded_fixture(4, 32);
+        let task = RowCleanupTask::SavedEntries(EntryCleanup::AllSaved);
+        prepare_task(&storage, first, second, 4, task);
+        let mut cleanup = RowCleanup::new(task, RowCleanupTarget::Table(second));
+        crate::mem::guard::forbid_alloc(|| {
+            for turn in 1..=4 {
+                let result = storage.advance_row_cleanup(
+                    &mut cleanup,
+                    core::num::NonZeroUsize::new(1).unwrap(),
+                    MaintenanceMode::Background,
+                );
+                assert_eq!(storage.tables[second].rows.len(), 4 - turn);
+                assert_eq!(
+                    result,
+                    if turn == 4 {
+                        MaintenanceStep::Complete
+                    } else {
+                        MaintenanceStep::Advanced
+                    }
+                );
+            }
+            assert_eq!(storage.tables[first].rows.len(), 4);
+        });
+    }
+
+    #[test]
+    fn shared_pressure_reclaims_another_owner_without_holding_a_busy_prefix() {
+        let (storage, first, second) = bounded_fixture(2, 4);
+        let task = RowCleanupTask::SavedEntries(EntryCleanup::AllSaved);
+        prepare_task(&storage, first, second, 2, task);
+        let held = storage.tables[first].rows.write();
+        crate::mem::guard::forbid_alloc(|| {
+            assert_eq!(storage.row_overlay.usage().free, 0);
+            assert!(storage.reclaim_row_overlay_slot(first));
+            assert_eq!(storage.tables[second].rows.len(), 1);
+            assert_eq!(held.len(), 2);
+            assert_eq!(storage.row_overlay.usage().free, 1);
+            assert!(storage.snapshots.try_lock().is_ok());
+            assert!(storage.row_versions.test_write().is_ok());
+        });
+        drop(held);
+        crate::mem::guard::forbid_alloc(|| {
+            let ordinary = storage.row_overlay.usage();
+            let large_objects = storage.tables.len() - 1;
+            assert!(storage.reclaim_row_overlay_slot(large_objects));
+            assert_eq!(storage.row_overlay.usage(), ordinary);
+        });
+    }
+
+    #[test]
+    fn shared_pressure_reports_exhaustion_only_when_ordinary_rows_are_protected() {
+        let (storage, first, second) = bounded_fixture(2, 4);
+        crate::mem::guard::forbid_alloc(|| {
+            assert_eq!(storage.row_overlay.usage().free, 0);
+            assert!(!storage.reclaim_row_overlay_slot(first));
+            assert_eq!(storage.tables[first].rows.len(), 2);
+            assert_eq!(storage.tables[second].rows.len(), 2);
+            assert_eq!(storage.row_overlay.usage().live, 4);
+            assert!(storage.tables.last().unwrap().rows.pool().usage().free != 0);
         });
     }
 }

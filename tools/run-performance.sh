@@ -293,7 +293,10 @@ max_operator_classes = 16
 max_triggers = 16
 max_publications = 16
 max_rules = $MAX_RULES
-table_rows = $TABLE_CAPACITY
+row_overlay_slots = $TABLE_CAPACITY
+row_work_bytes = 8MiB
+row_work_leases = 128
+definition_image_slots = 256
 value_index_rows = $TABLE_CAPACITY
 max_value_indexes = 24
 max_large_objects = 16
@@ -627,6 +630,8 @@ export POS3QL_BENCH_CATALOG_RELATIONS=$CATALOG_RELATIONS
 python3 "$ROOT/tools/benchmark-environment.py" \
   --output "$OUTPUT/environment.json" --binary "$ROOT/target/release/pos3ql" \
   --mode "$MODE" --rows "$ROWS" --table-capacity "$TABLE_CAPACITY" \
+  --row-overlay-slots "$TABLE_CAPACITY" --row-work-bytes 8388608 \
+  --row-work-leases 128 --definition-image-slots 256 \
   --operations "$OPERATIONS" --clients "$CLIENTS" \
   --catalog-relations "$CATALOG_RELATIONS" \
   --replicas "$REPLICA_SETTING" --object-latency-ms "$LATENCY_MS" \

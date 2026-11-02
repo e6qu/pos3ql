@@ -265,7 +265,7 @@ mod tests {
         let mut config = test_config();
         config.memtable_bytes = 256;
         config.max_tables = 2;
-        config.table_rows = 2;
+        config.row_overlay_slots = 2;
         config.txn_rows = 2;
         config.max_catalog_versions_per_object = 1;
         config.catalog_history_bytes = 4096;

@@ -778,7 +778,7 @@ mod tests {
         config.max_prepared_transactions = 0;
         config.txn_rows = 1;
         config.max_tables = 1;
-        config.table_rows = 1;
+        config.row_overlay_slots = 1;
         config.large_object_pages = 1;
         config.max_row_versions_per_row = 2;
         config.row_history_slots = 4;

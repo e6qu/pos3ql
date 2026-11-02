@@ -109,7 +109,7 @@ fn engine_config(run: &str, data_dir: &str) -> Option<(Config, TestDirectory)> {
     config.max_operator_classes = 8;
     config.max_triggers = 8;
     config.max_publications = 8;
-    config.table_rows = 4096;
+    config.row_overlay_slots = 4096;
     config.wal_bytes = 1 << 20;
     config.wal_buffer_bytes = 1 << 14;
     config.object_store_on = true;

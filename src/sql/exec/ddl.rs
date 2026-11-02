@@ -10,7 +10,7 @@ use crate::sql::types::ColType;
 use crate::sql_err;
 use crate::storage::{
     CheckConstraint, ColumnDefault, ColumnMeta, ColumnSet, ForeignKey, MAX_COLUMNS, MAX_INDEX_COLS,
-    MAX_RELATION_COLUMNS, OwnedDatum, SqlName, Storage, TableDef, UniqueKey,
+    MAX_RELATION_COLUMNS, OwnedDatum, SqlName, Storage, TableDefBuilder, UniqueKey,
 };
 use crate::util::StackStr;
 
@@ -22,7 +22,7 @@ pub(super) fn build_def(
     storage: &Storage,
     txid: u32,
     arena: &Arena,
-) -> Result<TableDef, SqlError> {
+) -> Result<TableDefBuilder, SqlError> {
     if columns.len() > MAX_RELATION_COLUMNS {
         return Err(sql_err!(
             sqlstate::TOO_MANY_COLUMNS,
@@ -30,11 +30,11 @@ pub(super) fn build_def(
             MAX_RELATION_COLUMNS
         ));
     }
-    let mut def = TableDef {
+    let mut def = TableDefBuilder {
         name: SqlName::parse(name)?,
         columns: [empty_meta(); MAX_COLUMNS],
         n_columns: columns.len(),
-        ..TableDef::empty()
+        ..TableDefBuilder::empty()
     };
     for (i, c) in columns.iter().enumerate() {
         if columns[..i].iter().any(|prev| prev.name == c.name) {
@@ -57,7 +57,10 @@ pub(super) fn build_def(
 
 /// Enforces that no `GENERATED` column's expression references another generated
 /// column (or itself) — PostgreSQL's `check_nested_generated` rule (42P17).
-pub(super) fn validate_generated_refs(def: &TableDef, arena: &Arena) -> Result<(), SqlError> {
+pub(super) fn validate_generated_refs<Definition0: crate::storage::DefinitionBacking>(
+    def: &crate::storage::TableDefinition<Definition0>,
+    arena: &Arena,
+) -> Result<(), SqlError> {
     for c in def.columns() {
         if !c.default.is_generated() {
             continue;
@@ -540,8 +543,8 @@ fn fk_action_of(a: FkAction) -> crate::storage::FkAction {
 }
 
 /// Resolves a constraint's column names to indices in `def` (42703 if absent).
-pub(super) fn resolve_cols(
-    def: &TableDef,
+pub(super) fn resolve_cols<Definition0: crate::storage::DefinitionBacking>(
+    def: &crate::storage::TableDefinition<Definition0>,
     names: &[&str],
 ) -> Result<([u16; MAX_INDEX_COLS], usize), SqlError> {
     if names.len() > MAX_INDEX_COLS {
@@ -571,18 +574,18 @@ pub(super) fn resolve_cols(
 /// into `cols` (bit `i` = column `i`), so the caller can name the constraint
 /// the way PostgreSQL does — `<table>_<column>_check` when the predicate
 /// references exactly one column, `<table>_check` otherwise.
-pub(crate) fn check_referenced_columns(
+pub(crate) fn check_referenced_columns<Definition0: crate::storage::DefinitionBacking>(
     expression: &Expr,
-    def: &TableDef,
+    def: &crate::storage::TableDefinition<Definition0>,
 ) -> Result<ColumnSet, SqlError> {
     let mut columns = ColumnSet::EMPTY;
     validate_check_refs(expression, def, &mut columns)?;
     Ok(columns)
 }
 
-fn validate_check_refs(
+fn validate_check_refs<Definition0: crate::storage::DefinitionBacking>(
     expression: &Expr,
-    def: &TableDef,
+    def: &crate::storage::TableDefinition<Definition0>,
     cols: &mut ColumnSet,
 ) -> Result<(), SqlError> {
     match expression {
@@ -715,7 +718,7 @@ fn validate_check_refs(
 /// predicates and FOREIGN KEYs are validated and recorded.
 pub(super) fn attach_constraints(
     storage: &Storage,
-    def: &mut TableDef,
+    def: &mut TableDefBuilder,
     constraints: &[TableConstraint],
     merge_equivalent: bool,
     txid: u32,
@@ -996,8 +999,8 @@ pub(super) fn attach_constraints(
 
 /// PostgreSQL's auto-generated constraint name: `<table>_pkey` for a primary
 /// key, otherwise `<table>_<col1>_<col2>_<suffix>` over every key column.
-pub(super) fn auto_key_name(
-    def: &TableDef,
+pub(super) fn auto_key_name<Definition0: crate::storage::DefinitionBacking>(
+    def: &crate::storage::TableDefinition<Definition0>,
     columns: &[u16],
     suffix: &str,
     include_cols: bool,
@@ -1024,8 +1027,8 @@ pub(super) fn auto_key_name(
 /// predicate references exactly one column, `<table>_check` when it references
 /// zero or several — with the smallest numeric suffix (`_check1`, `_check2`, …)
 /// that avoids colliding with a constraint the table already carries.
-pub(super) fn auto_check_name(
-    def: &TableDef,
+pub(super) fn auto_check_name<Definition0: crate::storage::DefinitionBacking>(
+    def: &crate::storage::TableDefinition<Definition0>,
     referenced_cols: ColumnSet,
 ) -> Result<SqlName, SqlError> {
     use core::fmt::Write as _;
@@ -1050,7 +1053,10 @@ pub(super) fn auto_check_name(
 /// `ChooseConstraintName`. Constraint names are unique per table, so this
 /// searches the checks, keys, foreign keys, and the single-column key names
 /// synthesized from column flags.
-fn disambiguate_constraint_name(def: &TableDef, base: &str) -> Result<SqlName, SqlError> {
+fn disambiguate_constraint_name<Definition0: crate::storage::DefinitionBacking>(
+    def: &crate::storage::TableDefinition<Definition0>,
+    base: &str,
+) -> Result<SqlName, SqlError> {
     use core::fmt::Write as _;
     if !constraint_name_taken(def, base) {
         return SqlName::parse(base);
@@ -1080,18 +1086,21 @@ fn disambiguate_constraint_name(def: &TableDef, base: &str) -> Result<SqlName, S
 /// Whether `name` is already the name of any constraint on `def`: a stored
 /// CHECK, unique key, or foreign key, or one of the names synthesized for the
 /// single-column PRIMARY KEY / UNIQUE flags (`<table>_pkey` / `<table>_<col>_key`).
-pub(super) fn constraint_name_taken(def: &TableDef, name: &str) -> bool {
+pub(super) fn constraint_name_taken<Definition0: crate::storage::DefinitionBacking>(
+    def: &crate::storage::TableDefinition<Definition0>,
+    name: &str,
+) -> bool {
     use core::fmt::Write as _;
-    if def.checks[..def.n_checks]
+    if def.checks.as_ref()[..def.n_checks]
         .iter()
         .any(|c| c.name.as_str() == name)
-        || def.uniques[..def.n_uniques]
+        || def.uniques.as_ref()[..def.n_uniques]
             .iter()
             .any(|k| k.name.as_str() == name)
-        || def.fkeys[..def.n_fkeys]
+        || def.fkeys.as_ref()[..def.n_fkeys]
             .iter()
             .any(|f| f.name.as_str() == name)
-        || def.exclusions[..def.n_exclusions]
+        || def.exclusions.as_ref()[..def.n_exclusions]
             .iter()
             .any(|exclusion| exclusion.name.as_str() == name)
         || def
@@ -1118,7 +1127,7 @@ pub(super) fn constraint_name_taken(def: &TableDef, name: &str) -> bool {
 }
 
 pub(super) fn add_unique_key(
-    def: &mut TableDef,
+    def: &mut TableDefBuilder,
     name: Option<&str>,
     suffix: &str,
     indices: &[u16; MAX_INDEX_COLS],
@@ -1155,7 +1164,7 @@ pub(super) fn add_unique_key(
 #[allow(clippy::too_many_arguments)]
 fn attach_fkey(
     storage: &Storage,
-    def: &mut TableDef,
+    def: &mut TableDefBuilder,
     name: Option<&str>,
     child_cols: &[&str],
     parent: &QualName,
@@ -1196,8 +1205,8 @@ fn attach_fkey(
                 true
             }
         };
-    let parent_def: TableDef = if self_ref {
-        *def
+    let parent_owner = if self_ref {
+        None
     } else {
         let Some(pi) = resolved else {
             return Err(match parent.schema {
@@ -1214,7 +1223,11 @@ fn attach_fkey(
                 ),
             });
         };
-        *storage.table_def(pi, txid)
+        Some((*storage.table_def(pi, txid)).clone())
+    };
+    let parent_def = match &parent_owner {
+        Some(owner) => owner.borrowed(),
+        None => def.borrowed(),
     };
     let compatible_persistence = match def.persistence {
         crate::storage::RelationPersistence::Permanent => {
@@ -1350,7 +1363,9 @@ fn attach_fkey(
 
 /// The column indices forming the table's primary key (column flags or a
 /// multi-column PRIMARY KEY constraint); the count is 0 if none.
-pub(super) fn primary_key_cols(def: &TableDef) -> ([u16; MAX_INDEX_COLS], usize) {
+pub(super) fn primary_key_cols<Definition0: crate::storage::DefinitionBacking>(
+    def: &crate::storage::TableDefinition<Definition0>,
+) -> ([u16; MAX_INDEX_COLS], usize) {
     let mut out = [0u16; MAX_INDEX_COLS];
     for uk in def.uniques() {
         if uk.kind.is_primary() {
@@ -1371,7 +1386,11 @@ pub(super) fn primary_key_cols(def: &TableDef) -> ([u16; MAX_INDEX_COLS], usize)
 
 /// Whether `columns` (as a set) exactly matches some unique key of the table: a
 /// single UNIQUE/PRIMARY column flag, or a multi-column key constraint.
-pub(super) fn references_named_key(def: &TableDef, name: &str, columns: &[u16]) -> bool {
+pub(super) fn references_named_key<Definition0: crate::storage::DefinitionBacking>(
+    def: &crate::storage::TableDefinition<Definition0>,
+    name: &str,
+    columns: &[u16],
+) -> bool {
     if columns.len() == 1 {
         let c = &def.columns()[columns[0] as usize];
         if c.primary {
@@ -1395,7 +1414,10 @@ pub(super) fn references_named_key(def: &TableDef, name: &str, columns: &[u16]) 
         .is_some_and(|key| key.name.as_str() == name)
 }
 
-fn is_unique_key(def: &TableDef, columns: &[u16]) -> bool {
+fn is_unique_key<Definition0: crate::storage::DefinitionBacking>(
+    def: &crate::storage::TableDefinition<Definition0>,
+    columns: &[u16],
+) -> bool {
     if columns.len() == 1 {
         let c = &def.columns()[columns[0] as usize];
         if c.unique || c.primary {

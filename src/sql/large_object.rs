@@ -279,7 +279,8 @@ fn create<'a>(
     requested: Option<LargeObjectOid>,
     _arena: &'a Arena,
 ) -> Result<Datum<'a>, SqlError> {
-    let (slot, oid) = storage.create_large_object(requested, txn.txid)?;
+    let (slot, oid) =
+        storage.create_large_object(crate::storage::CatalogCreation::New, requested, txn.txid)?;
     if let Err(error) = txn.record_ddl(DdlUndo::LargeObjectCreated(slot as u32)) {
         storage.rollback_large_object_create(slot);
         return Err(error);

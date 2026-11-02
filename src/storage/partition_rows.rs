@@ -1,13 +1,14 @@
 //! Partition keys are resolved against the definition that owns the values.
 
-use super::{MAX_PARTITION_KEYS, PartitionBound, PartitionScheme, TableDef};
+use super::{
+    DefinitionBacking, MAX_PARTITION_KEYS, PartitionBound, PartitionScheme, TableDefinition,
+};
 use crate::sql::eval::{SqlError, sqlstate};
 use crate::sql::types::Datum;
 use crate::sql_err;
 
-#[derive(Clone, Copy)]
-pub(crate) struct PartitionRow<'row, 'value> {
-    definition: &'row TableDef,
+pub(crate) struct PartitionRow<'row, 'value, B: DefinitionBacking> {
+    definition: &'row TableDefinition<B>,
     values: &'row [Datum<'value>],
 }
 
@@ -17,9 +18,17 @@ pub(crate) struct PartitionKeyRow<'row, 'value> {
     values: &'row [Datum<'value>],
 }
 
-impl<'row, 'value> PartitionRow<'row, 'value> {
+impl<B: DefinitionBacking> Copy for PartitionRow<'_, '_, B> {}
+
+impl<B: DefinitionBacking> Clone for PartitionRow<'_, '_, B> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<'row, 'value, B: DefinitionBacking> PartitionRow<'row, 'value, B> {
     pub(crate) fn new(
-        definition: &'row TableDef,
+        definition: &'row TableDefinition<B>,
         values: &'row [Datum<'value>],
     ) -> Result<Self, SqlError> {
         if values.len() != definition.n_columns {
@@ -33,7 +42,7 @@ impl<'row, 'value> PartitionRow<'row, 'value> {
 
     pub(crate) fn keys(
         self,
-        parent: &TableDef,
+        parent: &TableDefinition<impl DefinitionBacking>,
         mut scheme: PartitionScheme,
     ) -> Result<PartitionKeyRow<'row, 'value>, SqlError> {
         if usize::from(scheme.n_keys) > MAX_PARTITION_KEYS {
@@ -104,11 +113,12 @@ mod tests {
     use crate::sql::types::ColType;
     use crate::storage::{
         ColumnMeta, MAX_PARTITION_LIST_VALUES, OwnedDatum, PartitionStrategy, SqlName,
+        TableDefBuilder,
     };
 
     #[test]
     fn partition_key_rows_match_and_prune_using_the_values_own_column_order() {
-        let mut parent = TableDef::empty();
+        let mut parent = TableDefBuilder::empty();
         parent.n_columns = 2;
         parent.columns[0] = ColumnMeta {
             name: SqlName::parse("id").unwrap(),
@@ -120,7 +130,7 @@ mod tests {
             ctype: ColType::Text,
             ..ColumnMeta::EMPTY
         };
-        let mut child = TableDef::empty();
+        let mut child = TableDefBuilder::empty();
         child.n_columns = 2;
         child.columns[0] = parent.columns[1];
         child.columns[1] = parent.columns[0];

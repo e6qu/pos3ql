@@ -15,9 +15,13 @@ pub(super) struct ValueKeyPreparation {
 }
 
 impl ValueKeyPreparation {
-    pub(super) fn capture(storage: &Storage, table: usize) -> Result<Self, SqlError> {
+    pub(super) fn capture(
+        storage: &Storage,
+        table: usize,
+        transaction: u32,
+    ) -> Result<Self, SqlError> {
         let definitions = storage.table_definition_images();
-        let (target, _) = definitions.selection(storage, table, 0)?;
+        let (target, _) = definitions.selection(storage, table, transaction)?;
         let (definition, publication) = row_ownership::acquire(|| {
             Ok((
                 storage.tables[table].definition.try_read_for_batch()?,
@@ -46,15 +50,14 @@ impl ValueKeyPreparation {
 
     pub(super) fn definition(&self) -> &TableDef {
         self.definitions
-            .retained_definition(self.target.table(), 0)
+            .retained_definition(self.target.table(), self.target.transaction())
             .expect("key preparation owns its selected definition")
     }
 
-    pub(super) fn database(&self) -> DatabaseOid {
-        self.definitions
-            .retained_identity(self.target.table(), 0)
-            .expect("key preparation owns its selected identity")
-            .database
+    pub(super) fn matches_index_source(&self, index: &IndexDef) -> bool {
+        index
+            .table_binding
+            .is_some_and(|binding| binding.source == self.target.source)
     }
 
     pub(super) fn validate_definition(
@@ -72,7 +75,7 @@ impl ValueKeyPreparation {
     pub(super) fn validate_row(&self, home: &RowByteRead) -> Result<(), SqlError> {
         let identity = self
             .definitions
-            .retained_identity(self.target.table(), 0)
+            .retained_identity(self.target.table(), self.target.transaction())
             .expect("key preparation retains its table lifetime");
         validate_row_layout(home, identity.created_at, self.layout)
     }
@@ -90,11 +93,13 @@ impl ValueKeyPreparation {
         indexes
             .iter()
             .find(|index| {
-                index.ddl_state != CatalogDdlState::Absent
+                index.visible_to(self.target.transaction())
                     && index.created_at == created_at
                     && index.database == definition.identity.database
             })
-            .copied()
+            .and_then(|index| {
+                storage.project_index_binding_locked(*index, &definition, self.target.transaction())
+            })
             .ok_or_else(|| {
                 sql_err!(
                     sqlstate::SERIALIZATION_FAILURE,
@@ -105,7 +110,7 @@ impl ValueKeyPreparation {
 }
 
 pub(super) struct ValueBindingRead {
-    enforcer: Enforcer,
+    enforcer: EnforcerSnapshot,
     schema: [ColType; MAX_COLUMNS],
     n_columns: usize,
     created_at: u64,
@@ -119,15 +124,24 @@ impl ValueBindingRead {
         table: usize,
         binding: usize,
     ) -> Result<Self, SqlError> {
-        let definition = storage.table_def(table, 0);
-        let target = storage.table_definition_target(table, 0, &definition);
+        let transaction = storage.tables[table].publication().enforcer_transaction;
+        let definition = storage.table_def(table, transaction);
+        let target = storage.table_definition_target(table, transaction, &definition);
         let (enforcer, layout) = {
             let publication = storage.tables[table].publication();
+            if publication.enforcer_transaction != transaction {
+                return Err(ValueKeyPreparation::changed());
+            }
             let enforcer = publication
                 .enforcers
                 .get(binding)
                 .and_then(Option::as_ref)
                 .cloned()
+                .map(|selected| EnforcerSnapshot {
+                    binding: selected,
+                    state: publication.enforcer_state[binding],
+                    evaluation_txid: publication.enforcer_transaction,
+                })
                 .ok_or_else(|| {
                     sql_err!(
                         sqlstate::SERIALIZATION_FAILURE,
@@ -141,7 +155,7 @@ impl ValueBindingRead {
         let created_at = definition.identity().created_at;
         drop(definition);
         let definition = if enforcer.index_created_at.is_some() {
-            let selection = ValueKeyPreparation::capture(storage, table)?;
+            let selection = ValueKeyPreparation::capture(storage, table, transaction)?;
             let definition = storage.tables[table].definition.read();
             if !target.matches_definition(storage, &definition) {
                 return Err(ValueKeyPreparation::changed());
@@ -174,7 +188,7 @@ impl ValueBindingRead {
         storage: &Storage,
         arena: &Arena,
         values: &[Datum],
-        visit: impl FnOnce(Option<&[Datum]>, &[Datum], &Enforcer) -> Result<R, SqlError>,
+        visit: impl FnOnce(Option<&[Datum]>, &[Datum], &EnforcerSnapshot) -> Result<R, SqlError>,
     ) -> Result<R, SqlError> {
         if values.len() != self.n_columns {
             return Err(sql_err!(
@@ -187,10 +201,15 @@ impl ValueBindingRead {
                 arena,
                 selection,
                 &self.enforcer,
+                self.enforcer.evaluation_txid,
                 values,
-                visit,
+                |key, values, _| visit(key, values, &self.enforcer),
             ),
-            None => Storage::with_plain_value_binding_values(&self.enforcer, values, visit),
+            None => Storage::with_plain_value_binding_values(
+                &self.enforcer,
+                values,
+                |key, values, _| visit(key, values, &self.enforcer),
+            ),
         }
     }
 }
@@ -217,8 +236,10 @@ fn validate_row_layout(
 
 pub(super) struct PreparedRowKeys {
     target: TableDefinitionTarget,
-    bindings: [Option<Enforcer>; MAX_VALUE_ENFORCERS],
-    pub(super) hashes: [(usize, u64); MAX_VALUE_ENFORCERS],
+    columns: SharedSlice<ColumnMeta>,
+    bindings: SharedSlice<Option<Enforcer>>,
+    evaluation_txid: u32,
+    pub(super) hashes: MutableSlice<(usize, u64)>,
     pub(super) count: usize,
 }
 
@@ -228,7 +249,90 @@ pub(super) struct PreparedCommittedRow {
     pub(super) rowid: u64,
     pub(super) transaction: u32,
     pub(super) head: u64,
-    pub(super) keys: Option<PreparedRowKeys>,
+    pub(super) keys: PreparedRowKeyImage,
+    pub(super) rewritten: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct PreparedRowKeyImage {
+    target: TableDefinitionTarget,
+    columns: SharedSlice<ColumnMeta>,
+    bindings: SharedSlice<Option<Enforcer>>,
+    pub(super) hashes: SharedSlice<(usize, u64)>,
+    evaluation_txid: u32,
+}
+
+impl PreparedRowKeyImage {
+    pub(super) fn capture(
+        storage: &Storage,
+        table: usize,
+        rowid: u64,
+        home: Option<VisibleRowHome>,
+        transaction: u32,
+    ) -> Result<Self, SqlError> {
+        let mut prepared = PreparedRowKeys::capture(storage, table, rowid, home, transaction)?;
+        while prepared.hashes.len() > prepared.count {
+            let _ = prepared.hashes.pop();
+        }
+        let hashes = prepared.hashes.freeze();
+        Ok(Self {
+            target: prepared.target,
+            columns: prepared.columns,
+            bindings: prepared.bindings,
+            hashes,
+            evaluation_txid: prepared.evaluation_txid,
+        })
+    }
+
+    pub(super) fn validate_definition(
+        &self,
+        storage: &Storage,
+        definition: &table_definitions::DefinitionState,
+    ) -> Result<(), SqlError> {
+        let same_lifetime = self.target.source.matches(
+            storage,
+            definition.identity.database,
+            definition.identity.created_at,
+            definition.identity.existence,
+        );
+        let promoted = self.target.pending_revision != 0
+            && definition.committed_revision
+                == TableDefinitionRevision::catalog(self.target.pending_revision);
+        // Definition publication precedes row publication. Renames and foreign
+        // key reference moves can also advance dependent definition revisions
+        // without changing their encoded columns or prepared index hashes.
+        let committed_columns = definition.committed().columns();
+        let same_encoding = self.columns.len() == committed_columns.len()
+            && self
+                .columns
+                .iter()
+                .zip(committed_columns)
+                .all(|(selected, current)| {
+                    selected.ctype == current.ctype
+                        && selected.user_type == current.user_type
+                        && selected.type_mod == current.type_mod
+                });
+        if self.target.matches_definition(storage, definition)
+            || (same_lifetime && (promoted || same_encoding))
+        {
+            Ok(())
+        } else {
+            Err(ValueKeyPreparation::changed())
+        }
+    }
+
+    pub(super) fn validate_bindings(&self, publication: &TablePublication) -> Result<(), SqlError> {
+        if self.evaluation_txid == publication.enforcer_transaction
+            && same_bindings(&self.bindings, &publication.enforcers, false)
+        {
+            Ok(())
+        } else {
+            Err(sql_err!(
+                sqlstate::SERIALIZATION_FAILURE,
+                "index bindings changed after row keys were prepared"
+            ))
+        }
+    }
 }
 
 impl PreparedRowKeys {
@@ -237,12 +341,17 @@ impl PreparedRowKeys {
         table: usize,
         rowid: u64,
         home: Option<VisibleRowHome>,
+        transaction: u32,
     ) -> Result<Self, SqlError> {
-        let definition = storage.table_def(table, 0);
-        let target = storage.table_definition_target(table, 0, &definition);
-        let (bindings, layout) = {
+        let definition = storage.table_def(table, transaction);
+        let target = storage.table_definition_target(table, transaction, &definition);
+        let (bindings, layout, evaluation_txid) = {
             let publication = storage.tables[table].publication();
-            (publication.enforcers.clone(), publication.row_layout)
+            (
+                publication.enforcers.clone(),
+                publication.row_layout,
+                publication.enforcer_transaction,
+            )
         };
         let plain = bindings
             .iter()
@@ -255,11 +364,24 @@ impl PreparedRowKeys {
             0
         };
         let created_at = definition.identity().created_at;
+        let columns = definition.columns.clone();
         drop(definition);
+        let hash_capacity = if home.is_some() { bindings.len() } else { 0 };
+        let mut hashes = storage
+            .metadata_pool
+            .lease(hash_capacity)
+            .map_err(|error| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "{}", error))?;
+        for _ in 0..hash_capacity {
+            hashes
+                .push_reserved((0usize, 0u64))
+                .expect("reserved binding hash count");
+        }
         let mut result = Self {
             target,
+            columns,
             bindings,
-            hashes: [(0, 0); MAX_VALUE_ENFORCERS],
+            evaluation_txid,
+            hashes,
             count: 0,
         };
         let count = result
@@ -287,7 +409,7 @@ impl PreparedRowKeys {
                             binding,
                             hash_key_collated_catalog(
                                 storage,
-                                enforcer.evaluation_txid,
+                                result.evaluation_txid,
                                 &values[..n_columns],
                                 enforcer.columns(),
                                 &enforcer.collations[..enforcer.n_cols],
@@ -299,7 +421,7 @@ impl PreparedRowKeys {
                 })?;
                 return Ok(result);
             }
-            let selection = ValueKeyPreparation::capture(storage, table)?;
+            let selection = ValueKeyPreparation::capture(storage, table, transaction)?;
             let definition = storage.tables[table].definition.read();
             result.validate_definition(storage, &definition)?;
             selection.validate_definition(storage, &definition)?;
@@ -309,7 +431,10 @@ impl PreparedRowKeys {
                 rowid,
                 home,
                 &selection,
-                &result.bindings[..count],
+                EnforcerBindings {
+                    entries: &result.bindings[..count],
+                    evaluation_txid: result.evaluation_txid,
+                },
                 &mut result.hashes,
             )?;
         }
@@ -328,6 +453,7 @@ impl PreparedRowKeys {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn validate_bindings(&self, publication: &TablePublication) -> Result<(), SqlError> {
         if same_bindings(&self.bindings, &publication.enforcers, false) {
             Ok(())
@@ -341,22 +467,23 @@ impl PreparedRowKeys {
 }
 
 pub(super) fn same_bindings(
-    selected: &[Option<Enforcer>; MAX_VALUE_ENFORCERS],
-    current: &[Option<Enforcer>; MAX_VALUE_ENFORCERS],
+    selected: &[Option<Enforcer>],
+    current: &[Option<Enforcer>],
     include_publication_state: bool,
 ) -> bool {
-    selected
-        .iter()
-        .zip(current)
-        .all(|(selected, current)| match (selected, current) {
-            (None, None) => true,
-            (Some(selected), Some(current)) => {
-                // Selected leases prevent these pool slots from being reused.
-                selected.cache.slot() == current.cache.slot()
-                    && (!include_publication_state || selected.metadata == current.metadata)
-            }
-            _ => false,
-        })
+    selected.len() == current.len()
+        && selected
+            .iter()
+            .zip(current)
+            .all(|(selected, current)| match (selected, current) {
+                (None, None) => true,
+                (Some(selected), Some(current)) => {
+                    // Selected leases prevent these pool slots from being reused.
+                    selected.cache.slot() == current.cache.slot()
+                        && (!include_publication_state || selected.metadata == current.metadata)
+                }
+                _ => false,
+            })
 }
 
 #[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
@@ -418,6 +545,108 @@ mod tests {
     }
 
     #[test]
+    fn key_preparation_retains_bindings_without_metadata_admission_after_durability() {
+        let (storage, table) = fixture(4);
+        pending(&storage, table, 1, 8, 2);
+        storage
+            .prepare_commit_row_keys(8, core::iter::once((table, 1)))
+            .unwrap();
+        storage
+            .prepare_commit_generations(8, core::iter::once((table, 1)), core::iter::empty())
+            .unwrap();
+        let selected_bindings = storage.tables[table].enforcers();
+        let mut occupied = Vec::new();
+        while let Ok(lease) = storage.metadata_pool.lease::<u8>(64) {
+            occupied.push(lease);
+        }
+        crate::mem::guard::forbid_alloc(|| {
+            let error = storage
+                .build_enforcers_visible(table, None, EnforcerRows::Rebuild, None)
+                .unwrap_err();
+            assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            assert!(error.message.as_str().contains("table metadata"));
+            assert!(same_bindings(
+                &selected_bindings,
+                &storage.tables[table].enforcers(),
+                true
+            ));
+            storage.publish_row(table, 1, 8, 9, false).unwrap();
+            assert_eq!(key_rows(&storage, table, 1), 0);
+            assert_eq!(key_rows(&storage, table, 2), 1);
+        });
+        drop(occupied);
+        crate::mem::guard::forbid_alloc(|| {
+            storage
+                .build_enforcers_visible(table, None, EnforcerRows::Rebuild, None)
+                .unwrap();
+            assert_eq!(key_rows(&storage, table, 2), 1);
+        });
+    }
+
+    #[test]
+    fn key_preparation_index_undo_restores_roots_with_no_metadata_space() {
+        let (mut storage, table) = fixture(4);
+        let original = storage.tables[table].enforcers();
+        let mut index = IndexDef {
+            schema: SqlName::parse("public").unwrap(),
+            table: SqlName::parse("key_orders").unwrap(),
+            name: SqlName::parse("first_amount_index").unwrap(),
+            n_cols: 1,
+            collations: [Collation::None; MAX_INDEX_COLS],
+            ..IndexDef::EMPTY
+        };
+        index.columns[0] = 1;
+        let first = storage.create_index(index, 8).unwrap();
+        storage
+            .prepare_index_enforcers(
+                table,
+                8,
+                BindingChange::IndexCreate {
+                    created_at: storage.index(first).created_at,
+                },
+            )
+            .unwrap();
+        index.name = SqlName::parse("second_amount_index").unwrap();
+        let second = storage.create_index(index, 8).unwrap();
+        storage
+            .prepare_index_enforcers(
+                table,
+                8,
+                BindingChange::IndexCreate {
+                    created_at: storage.index(second).created_at,
+                },
+            )
+            .unwrap();
+        assert_eq!(storage.tables[table].enforcer_count(), 2);
+        let mut occupied = Vec::new();
+        while let Ok(lease) = storage.metadata_pool.lease::<u8>(64) {
+            occupied.push(lease);
+        }
+        crate::mem::guard::forbid_alloc(|| {
+            storage.rollback_index_create(second);
+            assert_eq!(storage.tables[table].enforcer_count(), 2);
+            storage.rollback_index_create(first);
+            assert!(same_bindings(
+                &original,
+                &storage.tables[table].enforcers(),
+                true
+            ));
+            assert_eq!(storage.tables[table].publication().enforcer_transaction, 0);
+            assert!(
+                storage.tables[table]
+                    .publication()
+                    .binding_versions
+                    .is_empty()
+            );
+            assert_eq!(key_rows(&storage, table, 1), 1);
+            let spare: [_; 3] = core::array::from_fn(|_| storage.value_indexes.acquire().unwrap());
+            assert!(storage.value_indexes.acquire().is_none());
+            drop(spare);
+        });
+        drop(occupied);
+    }
+
+    #[test]
     fn key_preparation_failed_rebuild_preserves_working_cache_and_releases_candidates() {
         let (mut storage, table) = fixture(2);
         crate::mem::guard::forbid_alloc(|| {
@@ -433,9 +662,9 @@ mod tests {
             };
             index.columns[0] = 1;
             let slot = storage.create_index(index, 0).unwrap();
-            storage.commit_index_create(slot);
+            storage.commit_index_create(slot).unwrap();
             let error = storage
-                .build_enforcers_visible(table, None, EnforcerRows::Rebuild)
+                .build_enforcers_visible(table, None, EnforcerRows::Rebuild, None)
                 .unwrap_err();
             assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
             assert!(same_bindings(
@@ -455,9 +684,9 @@ mod tests {
                 storage.drop_index("public", "amount_index", 8).unwrap(),
                 Some(slot)
             );
-            storage.commit_index_drop(slot);
+            storage.commit_index_drop(slot).unwrap();
             storage
-                .build_enforcers_visible(table, None, EnforcerRows::Rebuild)
+                .build_enforcers_visible(table, None, EnforcerRows::Rebuild, None)
                 .unwrap();
             assert_eq!(key_rows(&storage, table, 1), 1);
         });
@@ -478,10 +707,10 @@ mod tests {
             };
             index.expressions[0] = Some(index_expression_stackstr("id / (amount - 11)").unwrap());
             let slot = storage.create_index(index, 0).unwrap();
-            storage.commit_index_create(slot);
+            storage.commit_index_create(slot).unwrap();
             assert_eq!(
                 storage
-                    .build_enforcers_visible(table, None, EnforcerRows::Rebuild)
+                    .build_enforcers_visible(table, None, EnforcerRows::Rebuild, None)
                     .unwrap_err()
                     .sqlstate,
                 sqlstate::DIVISION_BY_ZERO
@@ -496,9 +725,9 @@ mod tests {
                 storage.drop_index("public", "bad_expression", 8).unwrap(),
                 Some(slot)
             );
-            storage.commit_index_drop(slot);
+            storage.commit_index_drop(slot).unwrap();
             storage
-                .build_enforcers_visible(table, None, EnforcerRows::Rebuild)
+                .build_enforcers_visible(table, None, EnforcerRows::Rebuild, None)
                 .unwrap();
             assert_eq!(key_rows(&storage, table, 1), 1);
         });
@@ -516,9 +745,12 @@ mod tests {
                     start.wait();
                     crate::mem::guard::forbid_alloc(|| {
                         for _ in 0..16 {
-                            if let Err(error) =
-                                storage.build_enforcers_visible(table, None, EnforcerRows::Rebuild)
-                            {
+                            if let Err(error) = storage.build_enforcers_visible(
+                                table,
+                                None,
+                                EnforcerRows::Rebuild,
+                                None,
+                            ) {
                                 assert!(
                                     error.sqlstate == sqlstate::SERIALIZATION_FAILURE
                                         || error.sqlstate == sqlstate::PROGRAM_LIMIT_EXCEEDED
@@ -532,7 +764,7 @@ mod tests {
         });
         crate::mem::guard::forbid_alloc(|| {
             storage
-                .build_enforcers_visible(table, None, EnforcerRows::Rebuild)
+                .build_enforcers_visible(table, None, EnforcerRows::Rebuild, None)
                 .unwrap();
             assert_eq!(key_rows(&storage, table, 1), 1);
         });
@@ -555,7 +787,7 @@ mod tests {
             .unwrap();
         crate::mem::guard::forbid_alloc(|| {
             assert_eq!(storage.tables[table].enforcer_count(), 0);
-            let prepared = PreparedRowKeys::capture(&storage, table, 1, None).unwrap();
+            let prepared = PreparedRowKeys::capture(&storage, table, 1, None, 0).unwrap();
             assert_eq!(prepared.count, 0);
             prepared
                 .validate_bindings(&storage.tables[table].publication())
@@ -637,7 +869,7 @@ mod tests {
             };
             {
                 let mut publication = storage.tables[table].publication();
-                let enforcer = publication.enforcers[0].as_mut().unwrap();
+                let enforcer = &mut publication.enforcer_state[0];
                 enforcer.durable = Some(handle);
                 enforcer.durable_dirty = false;
                 enforcer.durable_rebuild = false;
@@ -647,9 +879,9 @@ mod tests {
             storage.rebuild_recovered_enforcers().unwrap();
             assert!(!storage.statistics_wal_dirty(table));
             let enforcer = storage.tables[table].enforcer(0).unwrap();
-            assert_eq!(enforcer.durable, Some(handle));
-            assert!(!enforcer.durable_dirty);
-            assert!(!enforcer.durable_rebuild);
+            assert_eq!(enforcer.state.durable, Some(handle));
+            assert!(!enforcer.state.durable_dirty);
+            assert!(!enforcer.state.durable_rebuild);
             assert_eq!(key_rows(&storage, table, 1), 1);
             drop(held);
         });
@@ -735,7 +967,10 @@ mod tests {
                 .unwrap()
                 .unwrap();
             storage
-                .build_enforcers_visible(table, None, EnforcerRows::Rebuild)
+                .prepare_commit_generations(8, core::iter::once((table, 1)), core::iter::empty())
+                .unwrap();
+            storage
+                .build_enforcers_visible(table, None, EnforcerRows::Rebuild, None)
                 .unwrap();
             let before = storage.tables[table].generation();
             let error = storage.publish_prepared_row(9, prepared).unwrap_err();
@@ -748,6 +983,7 @@ mod tests {
             assert_eq!(row.pending_last().unwrap().txid, 8);
             assert!(row.history.is_empty());
             drop(row);
+            storage.release_commit_generations(8);
             storage.commit_row(table, 1, 8, 9).unwrap();
             assert_eq!(key_rows(&storage, table, 1), 0);
             assert_eq!(key_rows(&storage, table, 2), 1);
@@ -767,22 +1003,30 @@ mod tests {
                 ..IndexDef::EMPTY
             };
             let slot = storage.create_index(index, 8).unwrap();
-            storage.prepare_index_enforcers(table, 8).unwrap();
-            storage.commit_index_create(slot);
+            storage
+                .prepare_index_enforcers(
+                    table,
+                    8,
+                    BindingChange::IndexCreate {
+                        created_at: storage.index(slot).created_at,
+                    },
+                )
+                .unwrap();
+            storage.commit_index_create(slot).unwrap();
             pending(&storage, table, 1, 8, 2);
             storage.commit_row(table, 1, 8, 9).unwrap();
             let before = storage.tables[table].enforcers();
             let spare = storage.value_indexes.acquire().unwrap();
             assert!(storage.value_indexes.acquire().is_none());
-            storage.finish_index_enforcers(table).unwrap();
+            storage.finish_bindings(table, 8);
             let after = storage.tables[table].enforcers();
             assert!(same_bindings(&before, &after, false));
-            assert_eq!(after[0].as_ref().unwrap().evaluation_txid, 0);
+            assert_eq!(storage.tables[table].publication().enforcer_transaction, 0);
             assert_eq!(key_rows(&storage, table, 1), 0);
             assert_eq!(key_rows(&storage, table, 2), 1);
             assert_eq!(
                 storage
-                    .build_enforcers_visible(table, None, EnforcerRows::Rebuild)
+                    .build_enforcers_visible(table, None, EnforcerRows::Rebuild, None)
                     .unwrap_err()
                     .sqlstate,
                 sqlstate::PROGRAM_LIMIT_EXCEEDED
@@ -806,8 +1050,16 @@ mod tests {
             };
             index.columns[0] = 1;
             let slot = storage.create_index(index, 8).unwrap();
-            storage.prepare_index_enforcers(table, 8).unwrap();
-            storage.commit_index_create(slot);
+            storage
+                .prepare_index_enforcers(
+                    table,
+                    8,
+                    BindingChange::IndexCreate {
+                        created_at: storage.index(slot).created_at,
+                    },
+                )
+                .unwrap();
+            storage.commit_index_create(slot).unwrap();
             let selected = storage.tables[table].enforcers();
             let held = [
                 storage.value_indexes.acquire().unwrap(),
@@ -820,8 +1072,17 @@ mod tests {
                     .unwrap(),
                 Some(slot)
             );
-            storage.commit_index_drop(slot);
-            storage.finish_index_enforcers(table).unwrap();
+            storage
+                .prepare_index_enforcers(
+                    table,
+                    8,
+                    BindingChange::IndexDrop {
+                        created_at: storage.index(slot).created_at,
+                    },
+                )
+                .unwrap();
+            storage.commit_index_drop(slot).unwrap();
+            storage.finish_bindings(table, 8);
             let current = storage.tables[table].enforcers();
             assert_eq!(storage.tables[table].enforcer_count(), 1);
             assert_eq!(
@@ -854,6 +1115,9 @@ mod tests {
                 .prepare_committed_row(table, 1, 8, false, selected)
                 .unwrap()
                 .unwrap();
+            storage
+                .prepare_commit_generations(8, core::iter::once((table, 1)), core::iter::empty())
+                .unwrap();
             pending(&storage, table, 2, 10, 3);
             storage.commit_row(table, 2, 10, 9).unwrap();
             storage.publish_prepared_row(10, prepared).unwrap();
@@ -874,6 +1138,9 @@ mod tests {
             let prepared = first
                 .prepare_committed_row(table, 1, 8, true, selected)
                 .unwrap()
+                .unwrap();
+            first
+                .prepare_commit_generations(8, core::iter::once((table, 1)), core::iter::empty())
                 .unwrap();
             let generation = second.tables[other].generation();
             assert_eq!(
@@ -900,7 +1167,8 @@ mod tests {
                 .visible_row_home_at(table, 1, state, 0, SNAPSHOT_ALL, 7)
                 .unwrap()
                 .unwrap();
-            let (target, mut definition) = storage.select_table_definition(table, 8);
+            let (target, selected_definition) = storage.select_table_definition(table, 8);
+            let mut definition = TableDefBuilder::from_definition(&selected_definition);
             definition.columns[0].ctype = ColType::Int8;
             let mut mapping = [None; MAX_COLUMNS];
             mapping[0] = Some(definition.columns[0].name);
@@ -908,7 +1176,17 @@ mod tests {
             let change = storage
                 .write_table_def(target, definition, &mapping, true)
                 .unwrap();
-            assert_eq!(storage.commit_table_def(change).unwrap(), Some(true));
+            let rewritten = storage
+                .heap
+                .append_row(&[Datum::Int8(1), Datum::Int4(11)])
+                .unwrap();
+            storage
+                .write_pending(table, 1, 8, 1, Some(rewritten))
+                .unwrap();
+            assert_eq!(
+                crate::storage::tests::publish_table_definition(&storage, change).unwrap(),
+                Some(true)
+            );
             let mut output = [0; 128];
             let error = storage
                 .encode_value_binding_entry(table, 0, 1, selected, &mut output)
@@ -932,11 +1210,12 @@ mod tests {
                 ..IndexDef::EMPTY
             };
             let slot = storage.create_index(index, 0).unwrap();
-            storage.commit_index_create(slot);
+            storage.commit_index_create(slot).unwrap();
             let created_at = storage.index(slot).created_at;
-            let selection = ValueKeyPreparation::capture(&storage, table).unwrap();
+            let selection = ValueKeyPreparation::capture(&storage, table, 0).unwrap();
             assert!(selection.index(&storage, created_at).is_ok());
-            let (target, mut definition) = storage.select_table_definition(table, 8);
+            let (target, selected_definition) = storage.select_table_definition(table, 8);
+            let mut definition = TableDefBuilder::from_definition(&selected_definition);
             definition.name = SqlName::parse("renamed_orders").unwrap();
             let mut mapping = [None; MAX_COLUMNS];
             mapping[0] = Some(definition.columns[0].name);
@@ -944,7 +1223,7 @@ mod tests {
             let change = storage
                 .write_table_def(target, definition, &mapping, false)
                 .unwrap();
-            storage.commit_table_def(change).unwrap();
+            crate::storage::tests::publish_table_definition(&storage, change).unwrap();
             assert_eq!(selection.definition().name.as_str(), "key_orders");
             assert_eq!(
                 selection
@@ -953,6 +1232,55 @@ mod tests {
                     .unwrap()
                     .sqlstate,
                 sqlstate::SERIALIZATION_FAILURE
+            );
+        });
+    }
+
+    #[test]
+    fn key_preparation_selects_the_visible_replacement_of_a_retained_index_identity() {
+        let (mut storage, table) = fixture(4);
+        crate::mem::guard::forbid_alloc(|| {
+            let mut definition = IndexDef {
+                schema: SqlName::parse("public").unwrap(),
+                name: SqlName::parse("selected_expression").unwrap(),
+                table: SqlName::parse("key_orders").unwrap(),
+                n_cols: 1,
+                collations: [Collation::None; MAX_INDEX_COLS],
+                ..IndexDef::EMPTY
+            };
+            definition.expressions[0] = Some(index_expression_stackstr("amount + 1").unwrap());
+            let original = storage.create_index(definition, 0).unwrap();
+            storage.commit_index_create(original).unwrap();
+            let mut replacement = storage.index_visible_to(original, 8).unwrap();
+            let identity = replacement.created_at;
+            let owner = ValueKeyPreparation::capture(&storage, table, 8).unwrap();
+            let reader = ValueKeyPreparation::capture(&storage, table, 9).unwrap();
+            storage
+                .drop_index("public", "selected_expression", 8)
+                .unwrap();
+            replacement.expressions[0] = Some(index_expression_stackstr("amount + 2").unwrap());
+            let new_slot = storage.create_index(replacement, 8).unwrap();
+            assert_ne!(original, new_slot);
+            assert_eq!(storage.index(new_slot).created_at, identity);
+            assert_eq!(
+                owner.index(&storage, identity).unwrap().expressions[0]
+                    .unwrap()
+                    .as_str(),
+                "amount + 2"
+            );
+            assert_eq!(
+                reader.index(&storage, identity).unwrap().expressions[0]
+                    .unwrap()
+                    .as_str(),
+                "amount + 1"
+            );
+            storage.rollback_index_create(new_slot);
+            storage.rollback_index_drop(original, 8);
+            assert_eq!(
+                owner.index(&storage, identity).unwrap().expressions[0]
+                    .unwrap()
+                    .as_str(),
+                "amount + 1"
             );
         });
     }

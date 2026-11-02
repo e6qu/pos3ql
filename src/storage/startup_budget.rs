@@ -146,10 +146,10 @@ fn valid_shared_capacity_changes_preserve_exact_component_costs() {
     assert_eq!(Engine::extra_budget_bytes(&larger) - engine, 64);
     larger = config.clone();
     larger.row_work_leases += 1;
-    let controls = crate::mem::lease_pool::RowWorkPool::budget_bytes(
+    let controls = crate::mem::lease_pool::LeasePool::budget_bytes(
         larger.row_work_bytes,
         larger.row_work_leases,
-    ) - crate::mem::lease_pool::RowWorkPool::budget_bytes(
+    ) - crate::mem::lease_pool::LeasePool::budget_bytes(
         config.row_work_bytes,
         config.row_work_leases,
     );

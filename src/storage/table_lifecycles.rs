@@ -46,21 +46,30 @@ impl Storage {
                     "table drop source no longer exists"
                 ));
             }
-            if let Some(owner) = state
-                .identity
-                .existence
-                .pending_txid()
-                .filter(|owner| *owner != transaction)
-            {
+            if let Some(owner) = state.locked_by_other(transaction) {
                 let name = state.committed().name;
                 drop(state);
                 drop(lifecycle);
                 return Err(self.catalog_ddl_wait_error(transaction, owner, name.as_str()));
             }
+            let mut publication = match row_ownership::try_mutex(
+                &table.publication,
+                "table publication lock poisoned",
+            ) {
+                Ok(publication) => publication,
+                Err(wait) => {
+                    drop(state);
+                    drop(lifecycle);
+                    wait.wait();
+                    continue;
+                }
+            };
+            let generation = publication.preview_unreserved_generation()?;
             let mut comments =
                 match row_ownership::try_mutex(&self.comments, "comment catalog lock poisoned") {
                     Ok(comments) => comments,
                     Err(wait) => {
+                        drop(publication);
                         drop(state);
                         drop(lifecycle);
                         wait.wait();
@@ -73,6 +82,7 @@ impl Storage {
             ) {
                 Ok(rules) => rules,
                 Err(wait) => {
+                    drop(publication);
                     drop(comments);
                     drop(state);
                     drop(lifecycle);
@@ -124,7 +134,8 @@ impl Storage {
                 rule.ddl_state = rule.ddl_state.drop_by(transaction);
                 rule.pending_parent_drop_txid = Some(transaction);
             }
-            table.mark_dirty();
+            publication.generation = generation;
+            publication.dirty = true;
             return Ok(CatalogDdlUndo {
                 source,
                 transaction,
@@ -198,7 +209,13 @@ impl Storage {
                         (state.committed().schema, state.committed().name),
                     )
                 };
-                let _lifecycle = self.retire_table_names(slot, selected)?;
+                let _lifecycle = self
+                    .retire_table_names(
+                        slot,
+                        selected,
+                        publication_generations::RetirementGeneration::Preserve,
+                    )
+                    .expect("committed retirement does not consume generation capacity")?;
                 self.retire_table_data(slot);
                 Some(names)
             }

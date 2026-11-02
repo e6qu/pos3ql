@@ -1687,7 +1687,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn every_exposed_catalog_has_a_bounded_shared_definition() {
+    fn every_exposed_catalog_has_an_actual_width_bounded_definition() {
         let bytes = 64 * 1024;
         let mut budget = crate::mem::budget::Budget::new(bytes);
         let arena =
@@ -1702,9 +1702,31 @@ mod tests {
             );
             let mark = arena.mark();
             crate::mem::guard::forbid_alloc(|| {
+                let before = arena.used();
                 let table =
                     super::super::synthesize_definition(Some("pg_catalog"), name, &arena).unwrap();
-                assert!(arena.used() < core::mem::size_of::<crate::storage::TableDef>() / 4);
+                let explicit_tableoid = definition.relation.is_some();
+                let visible = definition
+                    .columns
+                    .iter()
+                    .filter(|(column, _)| !explicit_tableoid || *column != "tableoid")
+                    .count();
+                let hidden = usize::from(explicit_tableoid)
+                    + hidden_columns(name, false)
+                        .iter()
+                        .filter(|(column, _)| !explicit_tableoid || *column != "tableoid")
+                        .count();
+                assert_eq!(table.def.n_columns, visible, "{name}");
+                assert_eq!(table.hidden_columns, hidden, "{name}");
+                assert_eq!(table.def.columns.len(), visible + hidden, "{name}",);
+                let used = arena.used();
+                let payload = core::mem::size_of_val(table.def.columns);
+                let alignment = core::mem::align_of::<crate::storage::ColumnMeta>();
+                assert!((payload..payload + alignment).contains(&(used - before)));
+                let repeated =
+                    super::super::synthesize_definition(Some("pg_catalog"), name, &arena).unwrap();
+                assert_eq!(table.def.columns, repeated.def.columns);
+                assert!((payload..payload + alignment).contains(&(arena.used() - used)));
                 assert!(table.rows.is_empty());
                 if definition.relation.is_some() {
                     assert_eq!(table.hidden_columns, 1);

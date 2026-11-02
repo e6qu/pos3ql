@@ -79,7 +79,7 @@ pub(crate) fn wire_column_description<'a>(
 
 pub fn describe_items<'q>(
     items: &[SelectItem<'q>],
-    def: Option<&TableDef>,
+    def: Option<crate::storage::RelationDefinition<'_>>,
     table_alias: Option<&str>,
     storage: Option<&'q crate::storage::Storage>,
     txid: u32,
@@ -102,7 +102,7 @@ pub fn describe_items<'q>(
 
 #[derive(Clone, Copy)]
 struct DescribeContext<'q, 'scope> {
-    def: Option<&'scope TableDef>,
+    def: Option<crate::storage::RelationDefinition<'scope>>,
     table_alias: Option<&'scope str>,
     output_aliases: &'scope [&'scope str],
     storage: Option<&'q crate::storage::Storage>,
@@ -433,7 +433,7 @@ pub(crate) fn describe_returning_items<'q, 'storage: 'q>(
     let count = describe_items_with_output_aliases(
         returning.items,
         DescribeContext {
-            def: definition,
+            def: definition.map(crate::storage::RelationDefinition::from_definition),
             table_alias: target_alias,
             output_aliases: &output_aliases,
             storage,
@@ -468,7 +468,7 @@ pub(crate) fn describe_returning_items<'q, 'storage: 'q>(
                 describe_record_star(
                     base,
                     DescribeContext {
-                        def: definition,
+                        def: definition.map(crate::storage::RelationDefinition::from_definition),
                         table_alias: target_alias,
                         output_aliases: &output_aliases,
                         storage: Some(storage),
@@ -489,7 +489,7 @@ pub(crate) fn describe_returning_items<'q, 'storage: 'q>(
                     {
                         scope = Some(super::super::query::QueryScope::for_returning(
                             storage,
-                            definition,
+                            crate::storage::RelationDefinition::from_definition(definition),
                             target_alias,
                             &output_aliases,
                             txid,
@@ -519,7 +519,7 @@ pub(crate) fn describe_returning_items<'q, 'storage: 'q>(
 }
 
 pub(crate) struct CatalogCols<'a> {
-    pub(crate) definition: Option<&'a TableDef>,
+    pub(crate) definition: Option<crate::storage::RelationDefinition<'a>>,
     pub(crate) alias: Option<&'a str>,
     pub(crate) output_aliases: &'a [&'a str],
     pub(crate) storage: &'a crate::storage::Storage,
@@ -3389,7 +3389,7 @@ impl<'a> ColumnLookup<'a> for NoColumnLookup {
 }
 
 /// A single table's columns.
-pub struct DefCols<'d>(pub &'d TableDef);
+pub struct DefCols<'d>(pub crate::storage::RelationDefinition<'d>);
 impl ColTypeResolver for DefCols<'_> {
     fn resolve(&self, q: Option<&str>, name: &str) -> Result<ColType, SqlError> {
         if let Some(q) = q
@@ -3463,7 +3463,7 @@ impl<'a> ColumnLookup<'a> for DefCols<'_> {
 
 /// A single DML target's columns, with its optional PostgreSQL correlation name.
 pub(crate) struct AliasedDefCols<'d, 'a> {
-    pub definition: &'d TableDef,
+    pub definition: crate::storage::RelationDefinition<'d>,
     pub alias: Option<&'a str>,
     pub output_aliases: &'a [&'a str],
 }
@@ -3635,7 +3635,10 @@ fn unary_operator_undefined(operator: &str, operand: ColType) -> SqlError {
 
 pub fn infer_type_pub(expression: &Expr, def: Option<&TableDef>) -> Result<(i32, i16), SqlError> {
     match def {
-        Some(d) => infer_type_res(expression, &DefCols(d)),
+        Some(d) => infer_type_res(
+            expression,
+            &DefCols(crate::storage::RelationDefinition::from_definition(d)),
+        ),
         None => infer_type_res(expression, &NoCols),
     }
 }
@@ -3650,7 +3653,7 @@ pub(crate) fn infer_type_catalog(
     infer_type_res(
         expression,
         &CatalogCols {
-            definition,
+            definition: definition.map(crate::storage::RelationDefinition::from_definition),
             alias: None,
             output_aliases: &[],
             storage,

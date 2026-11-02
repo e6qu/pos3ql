@@ -14,7 +14,9 @@ use crate::sql::exec::MAX_PROJ;
 
 use crate::sql::types::{ColDesc, ColType, Datum};
 use crate::sql_err;
-use crate::storage::{ColumnMeta, ColumnSet, MAX_COLUMNS, RoutineDef, SqlName, Storage, TableDef};
+use crate::storage::{
+    ColumnMeta, ColumnSet, MAX_COLUMNS, RelationDefinition, RoutineDef, SqlName, Storage,
+};
 use crate::util::StackStr;
 
 use super::setops::describe_set_body;
@@ -2057,14 +2059,14 @@ pub(super) fn preserve_projection_type_identities(
 /// Describes a derived table without retaining a maximum-width arena image.
 /// FROM-less LATERAL projections use the preceding tables' column types.
 pub(crate) fn describe_derived_definition<'a>(
-    storage: &'a Storage,
-    sub: &'a Select<'a>,
-    exposed: &'a str,
-    col_alias: Option<&'a [&'a str]>,
+    storage: &Storage,
+    sub: &Select<'_>,
+    exposed: &str,
+    col_alias: Option<&[&str]>,
     txid: u32,
     arena: &'a Arena,
-    outer: Option<&QueryScope<'a>>,
-) -> Result<TableDef, SqlError> {
+    outer: Option<&QueryScope<'_>>,
+) -> Result<RelationDefinition<'a>, SqlError> {
     let outer_schema = outer.map(super::ScopeSchema);
     let outer_columns = outer_schema
         .as_ref()
@@ -2350,16 +2352,18 @@ pub(crate) fn describe_derived_definition<'a>(
             ..blank
         };
     }
-    let def = TableDef {
-        name: SqlName::parse(exposed)?,
-        columns,
-        n_columns: n_cols,
-        ..TableDef::empty()
-    };
-    Ok(def)
+    super::scope::retain_query_definition(
+        RelationDefinition {
+            schema: SqlName::EMPTY,
+            name: SqlName::parse(exposed)?,
+            columns: &columns[..n_cols],
+            n_columns: n_cols,
+        },
+        arena,
+    )
 }
 
-/// Synthesizes the single-column `TableDef` for a supported table function
+/// Describes the actual columns of a supported table function
 /// (`FROM func(args) alias`). The output column is named after the alias (or the
 /// function name), so a bare reference to the alias resolves to the value.
 pub(super) fn table_func_def<'a>(
@@ -2368,7 +2372,7 @@ pub(super) fn table_func_def<'a>(
     txid: u32,
     arena: &'a Arena,
     params: &[Datum<'a>],
-) -> Result<&'a TableDef, SqlError> {
+) -> Result<RelationDefinition<'a>, SqlError> {
     table_func_def_outer(
         tref,
         storage,
@@ -2836,7 +2840,7 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
     arena: &'a Arena,
     params: &[Datum<'a>],
     columns: &C,
-) -> Result<&'a TableDef, SqlError> {
+) -> Result<RelationDefinition<'a>, SqlError> {
     if let Some(functions) = tref.rows_from {
         return rows_from_def_outer(tref, functions, storage, txid, arena, params, columns);
     }
@@ -3593,11 +3597,11 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
             ..ColumnMeta::EMPTY
         };
     }
-    let def = TableDef {
+    let def = RelationDefinition {
+        schema: SqlName::EMPTY,
         name: SqlName::parse(name)?,
-        columns,
+        columns: &columns[..n_out],
         n_columns: n_out,
-        ..TableDef::empty()
     };
     super::scope::retain_query_definition(def, arena)
 }
@@ -3610,7 +3614,7 @@ fn rows_from_def_outer<'a, C: ColumnLookup<'a>>(
     arena: &'a Arena,
     params: &[Datum<'a>],
     columns: &C,
-) -> Result<&'a TableDef, SqlError> {
+) -> Result<RelationDefinition<'a>, SqlError> {
     if functions.is_empty() {
         return Err(sql_err!(
             sqlstate::SYNTAX_ERROR,
@@ -3657,11 +3661,11 @@ fn rows_from_def_outer<'a, C: ColumnLookup<'a>>(
             column.name = SqlName::parse(alias)?;
         }
     }
-    let definition = TableDef {
+    let definition = RelationDefinition {
+        schema: SqlName::EMPTY,
         name: SqlName::parse(tref.alias.unwrap_or(""))?,
-        columns: output,
+        columns: &output[..count],
         n_columns: count,
-        ..TableDef::empty()
     };
     super::scope::retain_query_definition(definition, arena)
 }

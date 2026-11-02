@@ -33,6 +33,8 @@ class BenchmarkEnvironmentTests(unittest.TestCase):
             "--row-work-bytes", "8388608",
             "--row-work-leases", "128",
             "--definition-image-slots", "256",
+            "--table-metadata-bytes", "67108864",
+            "--table-metadata-leases", "8192",
             "--operations",
             "20",
             "--clients",
@@ -86,6 +88,9 @@ class BenchmarkEnvironmentTests(unittest.TestCase):
             directory = pathlib.Path(temporary)
             subprocess.run(self.arguments(directory), cwd=ROOT, check=True)
             result = json.loads((directory / "environment.json").read_text())
+            self.assertEqual(result["schema_version"], 2)
+            self.assertEqual(result["suite"]["table_metadata_bytes"], 67108864)
+            self.assertEqual(result["suite"]["table_metadata_leases"], 8192)
             self.assertEqual({name: result["suite"][name] for name in ["row_overlay_slots", "row_work_bytes", "row_work_leases", "definition_image_slots"]}, {"row_overlay_slots": 512, "row_work_bytes": 8388608, "row_work_leases": 128, "definition_image_slots": 256})
 
         self.assertEqual(result["hardware_description"], "fixed host type")

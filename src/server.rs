@@ -3155,7 +3155,7 @@ impl Server {
             let slot = &mut self.slots[index];
             match self
                 .engine
-                .finish_staged_transaction(&mut slot.conn.txn, &slot.conn.guc)
+                .finish_pending_transaction(&mut slot.conn.txn, &slot.conn.guc)
             {
                 Ok(()) => self.release(index),
                 Err(error) if error.sqlstate == crate::sql::eval::sqlstate::INTERNAL_IO_WAIT => {}

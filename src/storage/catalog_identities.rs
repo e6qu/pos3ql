@@ -852,9 +852,9 @@ mod tests {
                         PendingTableDef {
                             txid: 8,
                             revision: 1,
-                            def: definition,
-                            transition: [u16::MAX; MAX_COLUMNS],
-                            column_mapping: [None; MAX_COLUMNS],
+                            def: definition.freeze(&storage.metadata_pool).unwrap(),
+                            transition: storage.metadata_pool.copy_slice(&[u16::MAX]).unwrap(),
+                            column_mapping: storage.metadata_pool.copy_slice(&[None]).unwrap(),
                             rewrites_rows: false,
                             class_tuple_private: true,
                         },

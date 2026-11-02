@@ -2831,6 +2831,12 @@ impl<'a> Parser<'a> {
         let mut options = CreateDatabaseOptions::EMPTY;
         while !matches!(self.peeked, Tok::Op(";") | Tok::Eof) {
             let option = self.any_ident("database option")?;
+            let option = if option.eq_ignore_ascii_case("connection") {
+                self.expect_ident("limit")?;
+                "connection_limit"
+            } else {
+                option
+            };
             let _ = self.eat_op("=")?;
             if option.eq_ignore_ascii_case("owner") {
                 if options.owner.is_some() {
@@ -2959,12 +2965,24 @@ impl<'a> Parser<'a> {
     pub(super) fn alter_database(&mut self) -> Result<Stmt<'a>, ParseError> {
         use crate::sql::ast::{AlterDatabaseAction, RoutineConfigValue};
         let name = self.any_ident("database name")?;
-        let action = if self.eat_ident("with")? {
+        let options = self.eat_ident("with")?
+            || matches!(self.peeked, Tok::Ident(option) if
+                option.eq_ignore_ascii_case("allow_connections")
+                || option.eq_ignore_ascii_case("connection")
+                || option.eq_ignore_ascii_case("connection_limit")
+                || option.eq_ignore_ascii_case("is_template"));
+        let action = if options {
             let mut allow_connections = None;
             let mut connection_limit = None;
             let mut is_template = None;
             loop {
                 let option = self.any_ident("database option")?;
+                let option = if option.eq_ignore_ascii_case("connection") {
+                    self.expect_ident("limit")?;
+                    "connection_limit"
+                } else {
+                    option
+                };
                 let _ = self.eat_op("=")?;
                 if option.eq_ignore_ascii_case("allow_connections") {
                     if allow_connections

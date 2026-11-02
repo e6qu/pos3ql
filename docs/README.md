@@ -50,7 +50,8 @@ an example of a future goal is labeled as remaining work in the plan.
 ## Designs still to implement
 
 - [Sharing fixed resources according to load](adaptive-resources.md): shared
-  table capacity, read/write demand, row/column layout and bounded batching.
+  workload policies for the existing fixed pools, read/write demand, future
+  row/column layout and bounded batching.
 
 ## Evidence and provenance
 

@@ -1155,14 +1155,17 @@ fn value_cache_owners_failed_candidate_releases_capacity_and_publishes_no_prefix
     let selected = storage.tables[table].enforcer(0).unwrap();
     selected.cache.write().insert(41, 99).unwrap();
     let revision = storage.reserve_table_definition_revision().unwrap();
-    storage.tables[table].definition_mut(revision).columns[1].unique = true;
+    let mut updated = TableDefBuilder::from_definition(&storage.table_def(table, 0));
+    updated.columns[1].unique = true;
+    *storage.tables[table].definition_mut(revision) =
+        updated.freeze(&storage.metadata_pool).unwrap();
     crate::mem::guard::forbid_alloc(|| {
         let error = storage.refresh_enforcers(table).unwrap_err();
         assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
         assert!(error.message.as_str().contains("max_value_indexes"));
         {
             let publication = storage.tables[table].publication();
-            assert_eq!(publication.n_enforcers, 1);
+            assert_eq!(publication.enforcers.len(), 1);
             assert_eq!(
                 publication.enforcers[0].as_ref().unwrap().cache.slot(),
                 selected.cache.slot()
@@ -1176,9 +1179,16 @@ fn value_cache_owners_failed_candidate_releases_capacity_and_publishes_no_prefix
         selected.cache.read().probe(41, |row| original = row);
         assert_eq!(original, 99);
         drop(selected);
-        storage.prepare_index_enforcers(table, 0).unwrap();
+        storage
+            .build_enforcers_visible(
+                table,
+                None,
+                key_preparation::EnforcerRows::ReusePrepared,
+                None,
+            )
+            .unwrap();
         let publication = storage.tables[table].publication();
-        assert_eq!(publication.n_enforcers, 2);
+        assert_eq!(publication.enforcers.len(), 2);
         assert!(publication.enforcers[..2].iter().all(Option::is_some));
     });
 }
@@ -1571,7 +1581,7 @@ fn catalog_creation_missing_actor_preserves_catalogs_and_identifiers() {
             },
             7,
         ));
-        assert_missing_creation_actor(storage.create_large_object(None, 7));
+        assert_missing_creation_actor(storage.create_large_object(CatalogCreation::New, None, 7));
         assert_missing_creation_actor(table_creation::allocate(
             &storage,
             make_def("unowned_table", &[("id", ColType::Int4, false)]),
@@ -1583,7 +1593,9 @@ fn catalog_creation_missing_actor_preserves_catalogs_and_identifiers() {
         assert!(storage.find_table("public", "unowned_table").is_none());
     });
     drop(actor);
-    let (_, oid) = storage.create_large_object(None, 7).unwrap();
+    let (_, oid) = storage
+        .create_large_object(CatalogCreation::New, None, 7)
+        .unwrap();
     assert_eq!(Some(oid), next_oid);
     assert_eq!(storage.catalog_sequence.current(), sequence + 1);
 }
@@ -1636,7 +1648,8 @@ fn cluster_metadata_table_names_reserve_only_within_their_database() {
             storage.ddl_name_locked_by_other("public", "reserved", 9),
             None
         );
-        let (target, mut renamed) = storage.select_table_definition(foreign, 7);
+        let (target, selected_definition) = storage.select_table_definition(foreign, 7);
+        let mut renamed = TableDefBuilder::from_definition(&selected_definition);
         renamed.name = SqlName::parse("pending_name").unwrap();
         assert_eq!(
             storage
@@ -2493,7 +2506,7 @@ fn index_catalog_is_synchronized_and_startup_bounded() {
             WORKERS
         );
         for slot in 0..WORKERS {
-            storage.commit_index_create(slot);
+            storage.commit_index_create(slot).unwrap();
         }
         assert_eq!(storage.checkpoint_indexes().count(), WORKERS);
         assert_eq!(storage.live_indexes().count(), WORKERS);
@@ -2554,9 +2567,9 @@ fn index_slot_retirement_clears_complete_images() {
             maintenance.unsummarized_ranges[0] = 1;
             drop(maintenance);
             if committed {
-                storage.commit_index_create(slot);
+                storage.commit_index_create(slot).unwrap();
                 storage.drop_index("public", "pending_name", 17).unwrap();
-                storage.commit_index_drop(slot);
+                storage.commit_index_drop(slot).unwrap();
             } else {
                 storage.rollback_index_create(slot);
             }
@@ -2596,7 +2609,7 @@ fn index_rename_checks_only_its_database() {
     let foreign = storage
         .create_index(test_index_definition("remote_index"), 18)
         .unwrap();
-    storage.commit_index_create(foreign);
+    storage.commit_index_create(foreign).unwrap();
     storage.index_catalog()[foreign].database = DatabaseOid::TEMPLATE1;
     storage
         .apply_comment(
@@ -2642,7 +2655,7 @@ fn index_rename_checks_only_its_database() {
             sqlstate::INTERNAL_LOCK_WAIT
         );
         storage.release_row_locks(19);
-        storage.commit_index_rename(slot, 17);
+        storage.commit_index_rename(slot, 17).unwrap();
         assert!(
             storage
                 .comment_text(CommentClass::Relation, "public", "remote_pending", 0, 0)
@@ -2794,13 +2807,31 @@ fn view_rule_catalog_is_synchronized_and_startup_bounded() {
     });
 }
 
-fn oversized_test_dependencies() -> StoredQueryDependencies {
+fn test_table_dependency(storage: &Storage, table: usize) -> StoredQueryDependency {
+    let identity = storage
+        .capture_stored_query_relation(ResolvedRelation::Table(table), 0)
+        .unwrap();
+    let definition = storage.table_def(table, 0);
+    StoredQueryDependency {
+        class: DependencyClass::Table,
+        slot: table as u16,
+        identity,
+        referenced_columns: ColumnSet::EMPTY,
+        schema: definition.schema,
+        name: definition.name,
+        referenced_schema: SqlName::EMPTY,
+        referenced_name: definition.name,
+    }
+}
+
+fn oversized_test_dependencies(storage: &Storage, table: usize) -> StoredQueryDependencies {
+    let dependency = test_table_dependency(storage, table);
     let mut dependencies = StoredQueryDependencies::EMPTY;
-    dependencies.push(StoredQueryDependency::EMPTY).unwrap();
+    dependencies.push(dependency).unwrap();
     dependencies
         .push(StoredQueryDependency {
-            slot: 1,
-            ..StoredQueryDependency::EMPTY
+            referenced_schema: dependency.schema,
+            ..dependency
         })
         .unwrap();
     dependencies
@@ -2819,7 +2850,7 @@ fn failed_rule_creation_preserves_capacity_and_dependency_images() {
         target: RuleTarget::Table(table as u16),
         ..RuleDefinition::EMPTY
     };
-    let oversized = oversized_test_dependencies();
+    let oversized = oversized_test_dependencies(&storage, table);
     crate::mem::guard::forbid_alloc(|| {
         assert_eq!(
             storage
@@ -2893,7 +2924,7 @@ fn failed_policy_edits_preserve_roles_definitions_and_pending_capacity() {
         roles: &[PUBLIC_ROLE],
     };
     let empty = StoredQueryDependencies::EMPTY;
-    let oversized = oversized_test_dependencies();
+    let oversized = oversized_test_dependencies(&storage, table);
     let changed = PolicyDefinition {
         using: Some(StackStr::from_str("false")),
         with_check: None,
@@ -3012,6 +3043,7 @@ fn failed_view_creation_and_replacement_leave_both_catalogs_unchanged() {
     config.max_catalog_versions_per_object = 1;
     let mut budget = test_budget(&config);
     let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
+    let table = storage.create_table(make_def("view_source", &[])).unwrap();
     let schema = SqlName::parse("public").unwrap();
     let name = SqlName::parse("test_view").unwrap();
     crate::mem::guard::forbid_alloc(|| {
@@ -3020,7 +3052,7 @@ fn failed_view_creation_and_replacement_leave_both_catalogs_unchanged() {
                 .create_view(
                     schema,
                     name,
-                    test_view_definition(oversized_test_dependencies()),
+                    test_view_definition(oversized_test_dependencies(&storage, table)),
                     false,
                     7,
                 )
@@ -3054,7 +3086,7 @@ fn failed_view_creation_and_replacement_leave_both_catalogs_unchanged() {
                 .create_view(
                     schema,
                     name,
-                    test_view_definition(oversized_test_dependencies()),
+                    test_view_definition(oversized_test_dependencies(&storage, table)),
                     true,
                     8,
                 )
@@ -3205,8 +3237,9 @@ fn failed_rule_replay_preserves_view_link_and_original_dependencies() {
     let table = storage.create_table(make_def("rule_target", &[])).unwrap();
     let schema = SqlName::parse("public").unwrap();
     let name = SqlName::parse("test_view").unwrap();
+    let dependency = test_table_dependency(&storage, table);
     let mut dependencies = StoredQueryDependencies::EMPTY;
-    dependencies.push(StoredQueryDependency::EMPTY).unwrap();
+    dependencies.push(dependency).unwrap();
     storage
         .replay_view(
             ViewCatalogIdentity::new(0, 7, 0, 8).unwrap(),
@@ -3223,7 +3256,12 @@ fn failed_rule_replay_preserves_view_link_and_original_dependencies() {
     crate::mem::guard::forbid_alloc(|| {
         assert_eq!(
             storage
-                .replay_rule(0, 42, definition, oversized_test_dependencies())
+                .replay_rule(
+                    0,
+                    42,
+                    definition,
+                    oversized_test_dependencies(&storage, table)
+                )
                 .unwrap_err()
                 .sqlstate,
             sqlstate::PROGRAM_LIMIT_EXCEEDED
@@ -3231,10 +3269,7 @@ fn failed_rule_replay_preserves_view_link_and_original_dependencies() {
         assert_eq!(storage.view_return_rule(0), 0);
         assert_eq!(storage.view_sql(0).as_str(), "SELECT 1");
         assert_eq!(storage.rule(1).ddl_state, CatalogDdlState::Absent);
-        assert_eq!(
-            storage.rule_dependencies(0, 0).entries(),
-            &[StoredQueryDependency::EMPTY]
-        );
+        assert_eq!(storage.rule_dependencies(0, 0).entries(), &[dependency]);
         assert!(!storage.table_has_rules(table, 0));
         assert_eq!(
             storage
@@ -3248,10 +3283,7 @@ fn failed_rule_replay_preserves_view_link_and_original_dependencies() {
             .unwrap();
         assert_eq!(storage.view_return_rule(0), 0);
         assert_eq!(storage.view_sql(0).as_str(), "SELECT 1");
-        assert_eq!(
-            storage.rule_dependencies(0, 0).entries(),
-            &[StoredQueryDependency::EMPTY]
-        );
+        assert_eq!(storage.rule_dependencies(0, 0).entries(), &[dependency]);
         assert!(storage.rule_dependencies(1, 0).entries().is_empty());
         assert!(storage.table_has_rules(table, 0));
         let renamed = RuleDefinition {
@@ -3622,7 +3654,7 @@ fn table_definition_images_survive_publication_rollback_and_slot_reuse() {
             )
             .unwrap();
         assert_eq!(
-            storage.commit_table_def(second_change).unwrap(),
+            crate::storage::tests::publish_table_definition(&storage, second_change).unwrap(),
             Some(false)
         );
         assert_eq!(original.name.as_str(), "original");
@@ -4985,7 +5017,8 @@ fn relation_identity_statistics_retire_without_growth_or_cross_database_reset() 
         );
         let mut mapping = [None; MAX_COLUMNS];
         mapping[0] = Some(SqlName::parse("id").unwrap());
-        let (target, mut next) = storage.select_table_definition(table, 1);
+        let (target, selected_definition) = storage.select_table_definition(table, 1);
+        let mut next = TableDefBuilder::from_definition(&selected_definition);
         next.columns[0].primary = false;
         let change = storage
             .write_table_def(target, next, &mapping, false)
@@ -5003,12 +5036,16 @@ fn relation_identity_statistics_retire_without_growth_or_cross_database_reset() 
                 .idx_scan,
             2
         );
-        let (target, mut next) = storage.select_table_definition(table, 2);
+        let (target, selected_definition) = storage.select_table_definition(table, 2);
+        let mut next = TableDefBuilder::from_definition(&selected_definition);
         next.columns[0].primary = false;
         let change = storage
             .write_table_def(target, next, &mapping, false)
             .unwrap();
-        assert_eq!(storage.commit_table_def(change).unwrap(), Some(false));
+        assert_eq!(
+            crate::storage::tests::publish_table_definition(&storage, change).unwrap(),
+            Some(false)
+        );
         assert_eq!(storage.cumulative_statistics().indexes.len(), capacity - 1);
         assert_eq!(
             storage
@@ -5022,12 +5059,13 @@ fn relation_identity_statistics_retire_without_growth_or_cross_database_reset() 
                 .idx_scan,
             11
         );
-        let (target, mut next) = storage.select_table_definition(table, 3);
+        let (target, selected_definition) = storage.select_table_definition(table, 3);
+        let mut next = TableDefBuilder::from_definition(&selected_definition);
         next.columns[0].primary = true;
         let change = storage
             .write_table_def(target, next, &mapping, false)
             .unwrap();
-        storage.commit_table_def(change).unwrap();
+        crate::storage::tests::publish_table_definition(&storage, change).unwrap();
         let replacement = storage
             .table_def(table, 0)
             .column_index_identity(0)
@@ -5058,7 +5096,8 @@ fn relation_identity_statistics_retire_without_growth_or_cross_database_reset() 
             11
         );
         // The scanned index exists only in a discarded private version.
-        let (target, mut next) = storage.select_table_definition(table, 4);
+        let (target, selected_definition) = storage.select_table_definition(table, 4);
+        let mut next = TableDefBuilder::from_definition(&selected_definition);
         next.take_column_index_identity(0);
         next.columns[0].primary = false;
         next.columns[0].unique = true;
@@ -5079,12 +5118,13 @@ fn relation_identity_statistics_retire_without_growth_or_cross_database_reset() 
                 crate::sql::datetime::now_micros(),
             )
             .unwrap();
-        let (target, mut next) = storage.select_table_definition(table, 4);
+        let (target, selected_definition) = storage.select_table_definition(table, 4);
+        let mut next = TableDefBuilder::from_definition(&selected_definition);
         next.columns[0].unique = false;
         let change = storage
             .write_table_def(target, next, &mapping, false)
             .unwrap();
-        storage.commit_table_def(change).unwrap();
+        crate::storage::tests::publish_table_definition(&storage, change).unwrap();
         assert_eq!(storage.cumulative_statistics().indexes.len(), capacity - 1);
         assert_eq!(
             storage
@@ -5093,7 +5133,8 @@ fn relation_identity_statistics_retire_without_growth_or_cross_database_reset() 
             0
         );
         // A hidden older savepoint keeps its index counter until discarded.
-        let (target, mut next) = storage.select_table_definition(table, 5);
+        let (target, selected_definition) = storage.select_table_definition(table, 5);
+        let mut next = TableDefBuilder::from_definition(&selected_definition);
         next.columns[0].unique = true;
         let first = storage
             .write_table_def(target, next, &mapping, false)
@@ -5115,12 +5156,14 @@ fn relation_identity_statistics_retire_without_growth_or_cross_database_reset() 
                 .unwrap();
             cumulative.indexes.swap_remove(dummy);
         }
-        let (target, mut next) = storage.select_table_definition(table, 5);
+        let (target, selected_definition) = storage.select_table_definition(table, 5);
+        let mut next = TableDefBuilder::from_definition(&selected_definition);
         next.columns[0].unique = false;
         let second = storage
             .write_table_def(target, next, &mapping, false)
             .unwrap();
-        let (target, mut next) = storage.select_table_definition(table, 5);
+        let (target, selected_definition) = storage.select_table_definition(table, 5);
+        let mut next = TableDefBuilder::from_definition(&selected_definition);
         next.columns[0].unique = true;
         let third = storage
             .write_table_def(target, next, &mapping, false)
@@ -5218,9 +5261,10 @@ fn relation_identity_recovery_rejects_cross_catalog_aliases_without_mutation() {
     }
     let table_identity = storage.table(slot).created_at();
     let revision = storage.reserve_table_definition_revision().unwrap();
-    storage.tables[slot]
-        .definition_mut(revision)
-        .inline_index_identities[0] = RelationIdentity::parse(table_identity);
+    let mut invalid = TableDefBuilder::from_definition(&storage.table_def(slot, 0));
+    invalid.inline_index_identities[0] = RelationIdentity::parse(table_identity);
+    *storage.tables[slot].definition_mut(revision) =
+        invalid.freeze(&storage.metadata_pool).unwrap();
     let before = storage.catalog_identity_sequence();
     let error =
         crate::mem::guard::forbid_alloc(|| storage.validate_restored_relation_identities(before))
@@ -8780,7 +8824,9 @@ fn stored_query_dependency_catalog_is_synchronized_and_startup_bounded() {
                     .push(StoredQueryDependency {
                         class: DependencyClass::Table,
                         slot: worker as u16,
-                        identity: StoredDependencyIdentity::Name,
+                        identity: StoredDependencyIdentity::Table(
+                            RelationReference::from_storage(worker as u64 + 1).unwrap(),
+                        ),
                         referenced_columns: ColumnSet::EMPTY,
                         schema: marker,
                         name: marker,
@@ -9262,7 +9308,7 @@ fn create_find_drop_reuse() {
         s.create_table(def).unwrap_err().sqlstate,
         sqlstate::DUPLICATE_TABLE
     );
-    s.drop_table(index);
+    s.drop_table(index).unwrap();
     assert_eq!(s.find_table("public", "t1"), None);
     // Slot is reusable; capacity is enforced.
     for i in 0..4u32 {
@@ -9291,7 +9337,7 @@ fn published_generation_cleanup_keeps_newer_table_writes_dirty() {
     let _ = storage.tables[slot]
         .rows
         .insert(1, RowState::committed_only_at(RowLoc::test(0, 4), 42));
-    storage.table_mut(slot).mark_dirty();
+    storage.table_mut(slot).mark_dirty().unwrap();
     storage.finish_row_cleanup(
         RowCleanupTask::SavedMarkers {
             through_lsn: 42,
@@ -9651,7 +9697,7 @@ fn table_retirement_waits_for_its_definition_without_reserving_unrelated_tables(
     let replay = storage
         .create_table(make_def("replay_cleanup", &[]))
         .unwrap();
-    let mut updated = *storage.table_def(first, 7);
+    let mut updated = TableDefBuilder::from_definition(&storage.table_def(first, 7));
     updated.name = SqlName::parse("held_pending_cleanup").unwrap();
     let _change = storage
         .write_table_def(
@@ -9708,7 +9754,7 @@ fn table_retirement_waits_for_its_definition_without_reserving_unrelated_tables(
                 storage.commit_drop(second);
                 storage.commit_create(third);
                 storage.rollback_create(third);
-                storage.drop_table(replay);
+                storage.drop_table(replay).unwrap();
             });
             sent.send(()).unwrap();
         });

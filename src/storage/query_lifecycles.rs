@@ -137,8 +137,8 @@ impl MatviewPopulationUndo {
 impl Storage {
     pub(crate) fn view_catalog_identity(&self, slot: usize) -> ViewCatalogIdentity {
         let catalog = self.view_rule_catalog();
-        let view = catalog.views[slot];
-        let rule = catalog.rules[usize::from(view.return_rule)];
+        let view = &catalog.views[slot];
+        let rule = &catalog.rules[usize::from(view.return_rule)];
         ViewCatalogIdentity::new(
             slot as u16,
             view.created_at,
@@ -170,7 +170,7 @@ impl Storage {
             super::type_contracts::CatalogPublicationInput::ViewDefinition,
             None,
         );
-        let view = owners.catalog.views.get(slot).copied().ok_or_else(|| {
+        let view = owners.catalog.views.get(slot).cloned().ok_or_else(|| {
             sql_err!(
                 sqlstate::DATA_EXCEPTION,
                 "journal view slot is out of range"
@@ -322,7 +322,7 @@ impl Storage {
     ) -> Result<(), SqlError> {
         let (schema, name, rule_subid) = match source.slot() {
             CatalogObjectSlot::View(slot) => {
-                let view = owners.catalog.views[slot];
+                let view = owners.catalog.views[slot].clone();
                 (
                     view.schema_for(transaction),
                     view.name_for(transaction),
@@ -1052,7 +1052,7 @@ impl Storage {
             drop(owners);
             return Err(self.catalog_ddl_wait_error(transaction, owner, name));
         }
-        let view = catalog.views[slot];
+        let view = catalog.views[slot].clone();
         let version = self.catalog_sequence.next()?;
         let source = self.catalog_object_identity(
             CatalogObjectSlot::View(slot),
@@ -1403,7 +1403,7 @@ impl Storage {
     ) -> Result<ViewAlterUndo, SqlError> {
         super::validate_stored_search_path(&definition.query.creation_path)?;
         let slot = self.validate_view_edit(&owners.catalog, target, transaction)?;
-        let current = owners.catalog.views[slot];
+        let current = owners.catalog.views[slot].clone();
         let rule_slot = usize::from(current.return_rule);
         let rule = owners.catalog.rules[rule_slot];
         if let Some(pending) = rule.pending.filter(|pending| pending.txid != transaction) {
@@ -1476,7 +1476,7 @@ impl Storage {
             None,
         );
         let slot = self.validate_view_edit(&owners.catalog, target, transaction)?;
-        let current = owners.catalog.views[slot];
+        let current = owners.catalog.views[slot].clone();
         let prior = current.pending_definition;
         let mut pending = prior.unwrap_or(PendingViewDefinition {
             txid: transaction,
@@ -1625,7 +1625,7 @@ impl Storage {
             super::type_contracts::CatalogPublicationInput::MetadataCommit,
             None,
         );
-        let Some(view) = owners.catalog.views.get(slot).copied() else {
+        let Some(view) = owners.catalog.views.get(slot).cloned() else {
             return;
         };
         if !target
@@ -1648,7 +1648,7 @@ impl Storage {
         slot: usize,
         pending: PendingViewDefinition,
     ) {
-        let view = owners.catalog.views[slot];
+        let view = owners.catalog.views[slot].clone();
         let rule_slot = usize::from(view.return_rule);
         self.publish_pending_rule_in(owners, rule_slot, pending.txid);
         let current = &mut owners.catalog.views[slot];
@@ -1710,7 +1710,7 @@ impl Storage {
             super::type_contracts::CatalogPublicationInput::CatalogLifecycle,
             None,
         );
-        let Some(view) = owners.catalog.views.get(slot).copied() else {
+        let Some(view) = owners.catalog.views.get(slot).cloned() else {
             return;
         };
         let committing_create_drop = decision == CatalogDdlDecision::Commit
@@ -1791,7 +1791,7 @@ impl Storage {
             super::type_contracts::CatalogPublicationInput::MetadataCommit,
             None,
         );
-        let Some(view) = owners.catalog.views.get(slot).copied() else {
+        let Some(view) = owners.catalog.views.get(slot).cloned() else {
             return;
         };
         if !target
@@ -1823,7 +1823,7 @@ impl Storage {
             }
         }
         owners.catalog.views[slot].pending_definition = undo.prior;
-        let restored = owners.catalog.views[slot];
+        let restored = owners.catalog.views[slot].clone();
         self.stage_view_comments(
             owners.comments.as_mut().expect("view edits own comments"),
             (pending.schema, pending.name),
@@ -1867,10 +1867,10 @@ mod tests {
     fn stored_creation_paths_are_rejected_before_catalog_publication() {
         let mut storage = fixture(3);
         let backing = storage
-            .create_table(crate::storage::TableDef {
+            .create_table(crate::storage::TableDefBuilder {
                 schema: name("public"),
                 name: name("saved_backing"),
-                ..crate::storage::TableDef::empty()
+                ..crate::storage::TableDefBuilder::empty()
             })
             .unwrap();
         let sequence = storage.catalog_sequence.current();

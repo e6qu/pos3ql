@@ -222,3 +222,56 @@ fn subscription_workers_share_foreground_admission_without_reserving_payload() {
     assert_eq!(data_rows(&session.success(&mut engine,
         "SELECT (SELECT count(*) FROM shared_worker_source), (SELECT amount FROM shared_worker_effect)", true)), ["1|1"]);
 }
+
+#[test]
+fn rewritten_binding_history_survives_later_index_savepoint_rollback() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config("rewrite-binding-savepoints");
+        config.transaction_mode = mode;
+        config.row_history_slots = if mode == crate::config::TransactionMode::Mvcc {
+            64
+        } else {
+            0
+        };
+        config.row_overlay_slots = 16;
+        config.txn_rows = 64;
+        config.value_index_rows = 64;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        session.success(
+            &mut engine,
+            "CREATE TABLE binding_savepoints(id integer, amount integer); \
+             INSERT INTO binding_savepoints VALUES(1,10),(2,20)",
+            true,
+        );
+        let output = session.success(
+            &mut engine,
+            "BEGIN; \
+             SAVEPOINT before_rewrite; \
+             ALTER TABLE binding_savepoints ALTER COLUMN amount TYPE bigint USING(amount + 1); \
+             SAVEPOINT after_rewrite; \
+             CREATE UNIQUE INDEX binding_amount ON binding_savepoints(amount); \
+             ROLLBACK TO after_rewrite; \
+             INSERT INTO binding_savepoints VALUES(3,11); \
+             SELECT sum(amount) FROM binding_savepoints; \
+             ROLLBACK TO before_rewrite; \
+             SELECT pg_typeof(amount)::text FROM binding_savepoints ORDER BY id LIMIT 1; \
+             SELECT sum(amount) FROM binding_savepoints; \
+             COMMIT",
+            true,
+        );
+        assert_eq!(data_rows(&output), ["43", "integer", "30"]);
+        session.success(
+            &mut engine,
+            "INSERT INTO binding_savepoints VALUES(3,10); \
+             CREATE INDEX binding_amount ON binding_savepoints(amount); \
+             DROP INDEX binding_amount",
+            true,
+        );
+        assert_idle(&engine, config.row_work_bytes);
+    }
+}

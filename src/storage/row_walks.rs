@@ -3,13 +3,13 @@
 use std::sync::Arc;
 
 use super::{PendingChange, RowHome, RowMap, Storage, VisibleRowHome};
-use crate::mem::lease_pool::{RowWorkLease, RowWorkPool};
+use crate::mem::lease_pool::{LeasePool, MutableSlice};
 use crate::sql::eval::{SqlError, sqlstate};
 use crate::sql_err;
 
 #[derive(Debug)]
 pub(super) struct RetainedRowIds {
-    rowids: RowWorkLease<u64>,
+    rowids: MutableSlice<u64>,
 }
 
 impl RetainedRowIds {
@@ -409,7 +409,7 @@ type PendingRowVisitor<'a> = dyn FnMut(
     + 'a;
 
 pub(super) struct RowWalkPool {
-    pool: Arc<RowWorkPool>,
+    pool: Arc<LeasePool>,
 }
 
 struct PendingRowRead {
@@ -457,7 +457,7 @@ fn pending_row_image(
 }
 
 impl RowWalkPool {
-    pub(super) fn new(pool: Arc<RowWorkPool>) -> Self {
+    pub(super) fn new(pool: Arc<LeasePool>) -> Self {
         Self { pool }
     }
 
@@ -493,7 +493,7 @@ impl RowWalkPool {
     fn capture(
         &self,
         count: usize,
-        fill: impl FnOnce(&mut RowWorkLease<u64>) -> Result<(), SqlError>,
+        fill: impl FnOnce(&mut MutableSlice<u64>) -> Result<(), SqlError>,
     ) -> Result<RetainedRowIds, SqlError> {
         let mut rowids = self.pool.lease(count).map_err(|error| {
             sql_err!(
@@ -544,6 +544,7 @@ mod tests {
     use super::*;
     use crate::mem::budget::Budget;
     use crate::mem::fixed_vec::FixedVec;
+    use crate::mem::lease_pool::Purpose;
     use crate::sql::types::{ColType, Datum};
     use crate::storage::tests::{make_def, test_budget, test_config};
     use crate::storage::{RowHome, RowState, SNAPSHOT_ALL};
@@ -572,12 +573,18 @@ mod tests {
         config.row_overlay_slots = 3;
         config.large_object_pages = 3;
         config.value_index_rows = 3;
-        let mut budget = Budget::new(RowWorkPool::budget_bytes(
+        let mut budget = Budget::new(LeasePool::budget_bytes(
             config.row_work_bytes,
             config.row_work_leases,
         ));
         let pool = RowWalkPool::new(
-            RowWorkPool::new(&mut budget, config.row_work_bytes, config.row_work_leases).unwrap(),
+            LeasePool::new(
+                &mut budget,
+                Purpose::ROW_WORK,
+                config.row_work_bytes,
+                config.row_work_leases,
+            )
+            .unwrap(),
         );
         assert_eq!(budget.remaining(), 0);
         let mut row_budget = Budget::new(4096);
@@ -650,12 +657,18 @@ mod tests {
         config.row_overlay_slots = 2;
         config.large_object_pages = 2;
         config.value_index_rows = 2;
-        let mut budget = Budget::new(RowWorkPool::budget_bytes(
+        let mut budget = Budget::new(LeasePool::budget_bytes(
             config.row_work_bytes,
             config.row_work_leases,
         ));
         let pool = RowWalkPool::new(
-            RowWorkPool::new(&mut budget, config.row_work_bytes, config.row_work_leases).unwrap(),
+            LeasePool::new(
+                &mut budget,
+                Purpose::ROW_WORK,
+                config.row_work_bytes,
+                config.row_work_leases,
+            )
+            .unwrap(),
         );
         let mut row_budget = Budget::new(8192);
         let mut left = RowMap::new(&mut row_budget, "left owned walk", 2).unwrap();
@@ -1029,7 +1042,10 @@ mod tests {
             assert_eq!(row.pending_last().unwrap().loc, Some(location));
             drop(row);
             let retained = storage.tables[table].enforcer(0).unwrap();
-            assert_eq!(retained.durable_dirty_lsn, binding.durable_dirty_lsn);
+            assert_eq!(
+                retained.state.durable_dirty_lsn,
+                binding.state.durable_dirty_lsn
+            );
             assert!(storage.row_versions.test_write().is_ok());
             assert!(storage.tables[table].rows.test_write().is_ok());
         });
@@ -1503,10 +1519,16 @@ mod tests {
         config.large_object_pages = 3;
         config.row_work_bytes = 192;
         config.row_work_leases = 3;
-        let bytes = RowWorkPool::budget_bytes(config.row_work_bytes, config.row_work_leases);
+        let bytes = LeasePool::budget_bytes(config.row_work_bytes, config.row_work_leases);
         let mut budget = Budget::new(bytes);
         let pool = RowWalkPool::new(
-            RowWorkPool::new(&mut budget, config.row_work_bytes, config.row_work_leases).unwrap(),
+            LeasePool::new(
+                &mut budget,
+                Purpose::ROW_WORK,
+                config.row_work_bytes,
+                config.row_work_leases,
+            )
+            .unwrap(),
         );
         assert_eq!(budget.remaining(), 0);
         let mut row_budget = Budget::new(4096);
@@ -1541,12 +1563,18 @@ mod tests {
         config.value_index_rows = 1;
         config.row_work_bytes = 64;
         config.row_work_leases = 1;
-        let mut budget = Budget::new(RowWorkPool::budget_bytes(
+        let mut budget = Budget::new(LeasePool::budget_bytes(
             config.row_work_bytes,
             config.row_work_leases,
         ));
         let pool = RowWalkPool::new(
-            RowWorkPool::new(&mut budget, config.row_work_bytes, config.row_work_leases).unwrap(),
+            LeasePool::new(
+                &mut budget,
+                Purpose::ROW_WORK,
+                config.row_work_bytes,
+                config.row_work_leases,
+            )
+            .unwrap(),
         );
         let mut row_budget = Budget::new(4096);
         let mut rows = RowMap::new(&mut row_budget, "oversized fixture", 9).unwrap();
@@ -1574,8 +1602,8 @@ mod tests {
 
     #[test]
     fn retained_row_walks_and_write_scratch_share_bytes_and_release_failures() {
-        let mut budget = Budget::new(RowWorkPool::budget_bytes(192, 2));
-        let shared = RowWorkPool::new(&mut budget, 192, 2).unwrap();
+        let mut budget = Budget::new(LeasePool::budget_bytes(192, 2));
+        let shared = LeasePool::new(&mut budget, Purpose::ROW_WORK, 192, 2).unwrap();
         let walks = RowWalkPool::new(Arc::clone(&shared));
         let mut row_budget = Budget::new(8192);
         let mut rows = RowMap::new(&mut row_budget, "shared read-write rows", 9).unwrap();

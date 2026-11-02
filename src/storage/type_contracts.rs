@@ -186,6 +186,7 @@ impl CatalogPublicationDestination for super::PolicyCatalog {}
 impl CatalogPublicationDestination for crate::mem::fixed_vec::FixedVec<super::MatviewDef> {}
 
 pub(super) struct CatalogTypeOwners<'storage, Catalog: CatalogPublicationDestination> {
+    storage: &'storage Storage,
     pub(super) catalog: MutexGuard<'storage, Catalog>,
     types: MutexGuard<'storage, TypeCatalog>,
 }
@@ -196,7 +197,11 @@ impl<Catalog: CatalogPublicationDestination> CatalogTypeOwners<'_, Catalog> {
         definition: &mut T,
         transaction: u32,
     ) -> Result<(), SqlError> {
-        self.types.bind_definition(definition, transaction)
+        self.types.bind_definition(definition, transaction)?;
+        definition.catalog_types().try_for_each(|result| {
+            self.storage
+                .require_type_dependency_access(&self.types, *result, transaction)
+        })
     }
 }
 
@@ -316,6 +321,7 @@ impl CatalogPublicationInput<'_> {
 }
 
 pub(super) struct CatalogDependencyOwners<'storage, Catalog: CatalogPublicationDestination> {
+    storage: &'storage Storage,
     pub(super) catalog: MutexGuard<'storage, Catalog>,
     pub(super) dependencies: MutexGuard<'storage, super::StoredQueryDependencyCatalog>,
     pub(super) types: Option<MutexGuard<'storage, TypeCatalog>>,
@@ -460,10 +466,22 @@ impl<Catalog: CatalogPublicationDestination> CatalogDependencyOwners<'_, Catalog
                     | super::DependencyClass::Enum
                     | super::DependencyClass::Composite
             ) {
-                self.types
+                let catalog = self
+                    .types
                     .as_ref()
-                    .expect("type dependencies request source ownership")
-                    .bind_query_type_dependency(&mut dependency, transaction)?;
+                    .expect("type dependencies request source ownership");
+                catalog.bind_query_type_dependency(&mut dependency, transaction)?;
+                let super::StoredDependencyIdentity::Type(reference) = dependency.identity else {
+                    unreachable!("bound type dependency retains a type identity");
+                };
+                let source = catalog
+                    .resolve_source_reference(reference, super::current_database(), transaction)?
+                    .expect("just-bound type dependency retains its source");
+                catalog.require_definition_publication_access(
+                    self.storage,
+                    source.identity,
+                    transaction,
+                )?;
             }
         }
         Ok(())
@@ -508,6 +526,13 @@ impl CatalogDependencyOwners<'_, crate::mem::fixed_vec::FixedVec<RoutineDef>> {
                 .as_ref()
                 .expect("routine contracts request source ownership")
                 .bind_type_reference(*result, super::current_database(), transaction)?;
+            self.storage.require_type_dependency_access(
+                self.types
+                    .as_ref()
+                    .expect("routine contracts request source ownership"),
+                *result,
+                transaction,
+            )?;
             Ok(())
         })
     }
@@ -691,6 +716,7 @@ impl Storage {
                     None
                 };
                 Ok(CatalogDependencyOwners {
+                    storage: self,
                     catalog,
                     types,
                     permissions,
@@ -725,7 +751,13 @@ impl Storage {
                 .lock()
                 .expect("dependent catalog publication lock poisoned");
             match self.type_catalog.try_lock() {
-                Ok(types) => return CatalogTypeOwners { catalog, types },
+                Ok(types) => {
+                    return CatalogTypeOwners {
+                        storage: self,
+                        catalog,
+                        types,
+                    };
+                }
                 Err(TryLockError::WouldBlock) => {
                     drop(catalog);
                     #[cfg(test)]

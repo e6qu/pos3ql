@@ -2275,7 +2275,7 @@ pub(crate) fn index_access_plan<'a>(
         scope.slots[0],
         txid,
         &[Some(predicate)],
-        scope.defs.get(0).expect("physical table has definition"),
+        scope.defs.stored(0).expect("physical table has definition"),
         &mut resolve_column,
         &operand_is_invariant,
         false,
@@ -2396,7 +2396,10 @@ pub(crate) fn parameterized_index_access_plan<'a>(
         scope.slots[table],
         txid,
         &[where_clause, on],
-        scope.defs.get(table).expect("resolved"),
+        scope
+            .defs
+            .stored(table)
+            .expect("physical table has definition"),
         &mut resolve_column,
         &operand_is_bound,
         false,
@@ -2459,7 +2462,10 @@ pub(crate) fn parameterized_index_access_plan<'a>(
         }
     }
     let slot = scope.slots[table];
-    let definition = scope.defs.get(table).expect("resolved");
+    let definition = scope
+        .defs
+        .stored(table)
+        .expect("physical table has definition");
     let expected_rows = plan.expected_rows(storage, slot, definition, txid);
     let resident_exact = !matches!(
         plan.method,
@@ -2615,7 +2621,7 @@ pub(crate) fn ordered_index_access_plan<'a>(
             selected = Some((score, plan));
         }
     }
-    let definition = scope.defs.get(0).expect("physical table has definition");
+    let definition = scope.defs.stored(0).expect("physical table has definition");
     if let Some(access) = special_index_access_plan(
         storage,
         slot,
@@ -2774,7 +2780,11 @@ pub(crate) fn dml_index_access_plan<'a>(
             return None;
         };
         if qualifier.is_some_and(|qualifier| {
-            !crate::sql::eval::qualifier_answers_target(definition, alias, qualifier)
+            !crate::sql::eval::qualifier_answers_target(
+                crate::storage::RelationDefinition::from_definition(definition),
+                alias,
+                qualifier,
+            )
         }) {
             return None;
         }
@@ -2824,7 +2834,7 @@ fn indexed_candidates<'a>(
         return Ok(None);
     };
     let slot = scope.slots[0];
-    let definition = scope.defs.get(0).expect("physical table has definition");
+    let definition = scope.defs.stored(0).expect("physical table has definition");
     indexed_candidates_for_plan(
         storage, 0, slot, definition, txid, plan, None, None, arena, params, &NoColumns, hooks,
     )
@@ -2842,7 +2852,7 @@ pub(super) fn ordered_indexed_candidates<'a>(
     hooks: &EvalHooks<'_, 'a>,
 ) -> Result<Option<IndexedCandidates<'a>>, SqlError> {
     let slot = scope.slots[0];
-    let definition = scope.defs.get(0).expect("physical table has definition");
+    let definition = scope.defs.stored(0).expect("physical table has definition");
     let rank_window = rank_window.filter(|_| {
         storage.current_role_slot(txid).is_some_and(|current_role| {
             let role = scope.authorization_roles[0].map_or(current_role, usize::from);
@@ -3928,6 +3938,11 @@ fn compare_ordered_index_keys(
     Ok(core::cmp::Ordering::Equal)
 }
 
+struct RowDecodeBuffers<'values> {
+    values: &'values mut [Datum<'values>],
+    offsets: &'values [usize],
+}
+
 /// One assembled source row: per table, decoded values (empty slice =
 /// LEFT-join null row; None = not yet joined).
 #[derive(Clone, Copy)]
@@ -3936,7 +3951,8 @@ pub(crate) enum JoinRowValues<'s, 'v> {
         bound: &'s [Option<BoundRow<'v>>],
         order: &'s [usize],
         count: usize,
-        buffers: &'s [[Datum<'v>; MAX_COLUMNS]],
+        buffers: &'s [Datum<'v>],
+        buffer_offsets: &'s [usize],
     },
     Flat {
         values: &'s [Datum<'v>],
@@ -3982,6 +3998,7 @@ impl<'s, 'v> JoinRow<'s, 'v, '_> {
                 order,
                 count,
                 buffers,
+                buffer_offsets,
             } => {
                 let position = order[..count].iter().position(|source| *source == table)?;
                 match bound[table] {
@@ -3991,7 +4008,8 @@ impl<'s, 'v> JoinRow<'s, 'v, '_> {
                         } else {
                             self.scope.defs.get(table).expect("resolved").n_columns
                         };
-                        Some(&buffers[position][..width])
+                        let start = buffer_offsets[position];
+                        Some(&buffers[start..start + width])
                     }
                     Some(BoundRow::Values(values)) => Some(values),
                     None => Some(&[]),
@@ -5559,7 +5577,7 @@ fn scan_source_mode<'a>(
         }
         let definition = scope
             .defs
-            .get(source)
+            .stored(source)
             .expect("physical source has a definition");
         let row = crate::storage::PartitionRow::new(definition, &values[..definition.n_columns])?;
         let mut current = root;
@@ -5595,14 +5613,15 @@ fn scan_source_mode<'a>(
         bound_rowids: &'s [Option<u64>],
         order: &'s [usize],
         count: usize,
-        buffers: &'s mut [[Datum<'v>; MAX_COLUMNS]],
+        buffers: &'s mut RowDecodeBuffers<'v>,
         arena: &'v Arena,
     ) -> Result<JoinRow<'s, 'v, 'd>, SqlError> {
         // Split buffers so each table borrows a distinct buffer. `order` maps the
         // execution position to the scope-table index.
-        let mut rest: &mut [[Datum<'v>; MAX_COLUMNS]] = buffers;
-        for &t in order.iter().take(count) {
-            let (buffer, tail) = rest.split_first_mut().expect("enough buffers");
+        let mut rest = &mut *buffers.values;
+        for (position, &t) in order.iter().take(count).enumerate() {
+            let width = buffers.offsets[position + 1] - buffers.offsets[position];
+            let (buffer, tail) = rest.split_at_mut(width);
             rest = tail;
             let def = scope.defs.get(t).expect("resolved");
             match bound[t] {
@@ -5637,7 +5656,8 @@ fn scan_source_mode<'a>(
                 bound,
                 order,
                 count,
-                buffers,
+                buffers: buffers.values,
+                buffer_offsets: buffers.offsets,
             },
             rowids: &bound_rowids[..scope.n],
         })
@@ -5682,7 +5702,7 @@ fn scan_source_mode<'a>(
         outer: Option<&dyn ColumnLookup<'a>>,
         order: &[usize],
         plan: HashJoinPlan<'a>,
-        decode_buffers: &mut [[Datum<'a>; MAX_COLUMNS]],
+        decode_buffers: &mut RowDecodeBuffers<'a>,
         recycle_rows: bool,
         pax_demand: PaxReadDemand,
         f: &mut dyn FnMut(&JoinRow<'_, 'a, '_>) -> Result<bool, SqlError>,
@@ -6246,7 +6266,7 @@ fn scan_source_mode<'a>(
         count: usize,
         on: Option<&Expr<'a>>,
         pushdown: &[&Expr<'a>],
-        decode_buffers: &mut [[Datum<'a>; MAX_COLUMNS]],
+        decode_buffers: &mut RowDecodeBuffers<'a>,
         arena: &'a Arena,
         params: &[Datum<'a>],
         hooks: &EvalHooks<'_, 'a>,
@@ -6324,7 +6344,7 @@ fn scan_source_mode<'a>(
         security_plans: &[Option<RowSecurityPlan<'a>>],
         pushdown: &[&[&'a Expr<'a>]],
         order: &[usize],
-        decode_buffers: &mut [[Datum<'a>; MAX_COLUMNS]],
+        decode_buffers: &mut RowDecodeBuffers<'a>,
         on: Option<&'a Expr<'a>>,
     ) -> Result<bool, SqlError> {
         if !sample_includes(sample_plans[order[depth]], rowid)? {
@@ -6418,7 +6438,7 @@ fn scan_source_mode<'a>(
         order: &[usize],
         parameterized: &[Option<IndexAccessPlan<'a>>],
         indexed: Option<&IndexedCandidates<'a>>,
-        decode_buffers: &mut [[Datum<'a>; MAX_COLUMNS]],
+        decode_buffers: &mut RowDecodeBuffers<'a>,
         recycle_rows: bool,
         retain_match: Option<&core::cell::Cell<bool>>,
         pax_demand: PaxReadDemand,
@@ -6710,7 +6730,10 @@ fn scan_source_mode<'a>(
                     storage,
                     order[depth],
                     slot,
-                    scope.defs.get(order[depth]).expect("resolved"),
+                    scope
+                        .defs
+                        .stored(order[depth])
+                        .expect("physical table has definition"),
                     txid,
                     plan,
                     None,
@@ -6792,7 +6815,7 @@ fn scan_source_mode<'a>(
                 let definitions = storage.table_definition_images();
                 let logical = scope
                     .defs
-                    .get(order[depth])
+                    .stored(order[depth])
                     .expect("resolved logical relation");
                 for &leaf in &leaves[..n_leaves] {
                     storage.record_relation_scan(
@@ -7250,9 +7273,21 @@ fn scan_source_mode<'a>(
     let bound_rowids = arena
         .alloc_slice_with(scope.n, |_| None)
         .map_err(|_| arena_full())?;
-    let decode_buffers = arena
-        .alloc_slice_with(scope.n.max(1), |_| [Datum::Null; MAX_COLUMNS])
+    let buffer_offsets = arena
+        .alloc_slice_with(scope.n + 1, |_| 0usize)
         .map_err(|_| arena_full())?;
+    for (position, &table) in order.iter().enumerate() {
+        buffer_offsets[position + 1] = buffer_offsets[position]
+            .checked_add(scope.row_width(table))
+            .ok_or_else(arena_full)?;
+    }
+    let values = arena
+        .alloc_slice_with(buffer_offsets[scope.n], |_| Datum::Null)
+        .map_err(|_| arena_full())?;
+    let decode_buffers = &mut RowDecodeBuffers {
+        values,
+        offsets: buffer_offsets,
+    };
     // A row-security predicate is a security barrier ahead of every user ON
     // and WHERE expression. The nested plan owns that ordering explicitly;
     // the hash plan is selected only when no protected source participates.

@@ -1,6 +1,6 @@
 //! Generated constraint names become durable before a definition is installed.
 
-use super::{DomainSpec, SqlName, Storage, TableDef};
+use super::{DomainSpec, SqlName, Storage};
 use crate::sql::eval::{SqlError, sqlstate};
 use crate::sql_err;
 use crate::util::StackStr;
@@ -74,14 +74,14 @@ fn choose(
     ))
 }
 
-impl TableDef {
+impl super::TableDefBuilder {
     pub(crate) fn set_not_null_constraint_name(&mut self, column: usize, name: SqlName) {
         self.not_null_names[column] = Some(name);
         self.not_null_name_edits.insert(column);
     }
 }
 
-pub(crate) fn table(definition: &mut TableDef) -> Result<(), SqlError> {
+pub(crate) fn table(definition: &mut super::TableDefBuilder) -> Result<(), SqlError> {
     for position in 0..definition.n_columns {
         let column = definition.columns[position];
         if !column.not_null.is_required() {
@@ -152,9 +152,9 @@ pub(crate) fn table(definition: &mut TableDef) -> Result<(), SqlError> {
     Ok(())
 }
 
-pub(crate) fn remap_table(
-    previous: &TableDef,
-    definition: &mut TableDef,
+pub(crate) fn remap_table<B: super::DefinitionBacking>(
+    previous: &super::TableDefinition<B>,
+    definition: &mut super::TableDefBuilder,
     mapping: &[Option<SqlName>; super::MAX_COLUMNS],
 ) -> Result<(), SqlError> {
     let mut names = [None; super::MAX_COLUMNS];
@@ -168,7 +168,7 @@ pub(crate) fn remap_table(
                         "constraint column mapping has no destination"
                     )
                 })?;
-            names[target] = previous.not_null_names[column];
+            names[target] = previous.not_null_names.as_ref()[column];
         }
     }
     for (column, name) in names[..definition.n_columns].iter_mut().enumerate() {
@@ -209,10 +209,14 @@ pub(super) fn domain(name: SqlName, spec: &mut DomainSpec) -> Result<(), SqlErro
 }
 
 impl Storage {
-    pub(crate) fn validate_not_null_names(definition: &TableDef) -> Result<(), SqlError> {
+    pub(crate) fn validate_not_null_names<B: super::DefinitionBacking>(
+        definition: &super::TableDefinition<B>,
+    ) -> Result<(), SqlError> {
         for (position, column) in definition.columns().iter().enumerate() {
-            if column.not_null.is_required() != definition.not_null_names[position].is_some()
-                || definition.not_null_names[position].is_some_and(|name| name.as_str().is_empty())
+            if column.not_null.is_required()
+                != definition.not_null_names.as_ref()[position].is_some()
+                || definition.not_null_names.as_ref()[position]
+                    .is_some_and(|name| name.as_str().is_empty())
             {
                 return Err(sql_err!(
                     sqlstate::DATA_EXCEPTION,
@@ -231,7 +235,7 @@ mod tests {
 
     #[test]
     fn catalog_snapshot_not_null_names_follow_columns_through_compaction() {
-        let mut original = TableDef::empty();
+        let mut original = super::super::TableDefBuilder::empty();
         original.name = SqlName::parse("original").unwrap();
         original.n_columns = 2;
         original.columns[0].name = SqlName::parse("removed").unwrap();

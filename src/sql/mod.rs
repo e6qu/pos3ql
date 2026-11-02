@@ -47,6 +47,13 @@ pub mod numeric;
 mod param_types;
 pub mod parser;
 pub mod prep;
+mod prepared_foreign_replay;
+mod prepared_object_replay;
+mod prepared_query_replay;
+mod prepared_replay;
+mod prepared_replay_rows;
+mod prepared_subscription_replay;
+mod prepared_type_replay;
 pub mod query;
 pub mod range;
 pub mod regex;
@@ -279,11 +286,17 @@ impl From<crate::storage::StorageSetupError> for EngineSetupError {
             crate::storage::StorageSetupError::Configuration(error) => {
                 Self::ResourceConfiguration(error)
             }
-            crate::storage::StorageSetupError::RowWork(error) => Self::Storage(sql_err!(
+            crate::storage::StorageSetupError::LeasePool(error) => Self::Storage(sql_err!(
                 crate::sql::eval::sqlstate::INVALID_PARAMETER_VALUE,
                 "{}",
                 error
             )),
+            crate::storage::StorageSetupError::ValueIndex(error) => Self::Storage(sql_err!(
+                crate::sql::eval::sqlstate::INVALID_PARAMETER_VALUE,
+                "{}",
+                error
+            )),
+            crate::storage::StorageSetupError::Metadata(error) => Self::Storage(error),
             crate::storage::StorageSetupError::CatalogIdentitySpaceExhausted => {
                 Self::Storage(sql_err!(
                     crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -356,7 +369,7 @@ impl DmlWorkspaces {
     fn new(
         config: &Config,
         budget: &mut Budget,
-        row_work: &std::sync::Arc<crate::mem::lease_pool::RowWorkPool>,
+        row_work: &std::sync::Arc<crate::mem::lease_pool::LeasePool>,
     ) -> Result<Self, BudgetError> {
         let mut slots =
             FixedVec::new(budget, "query_dml_workspaces", config.query_workspace_slots)?;
@@ -2496,7 +2509,7 @@ fn publication_row_matches(
         let result = (|| {
             let expression = parser::parse_expr(filter, arena)?;
             let row = exec::RowCtx {
-                def: &definition,
+                def: crate::storage::RelationDefinition::from_definition(&definition),
                 values,
                 alias: None,
             };
@@ -2553,7 +2566,7 @@ impl Engine {
         let _ = self.replace_read_owner(Some(self.execution_identity().read_owner()));
     }
 
-    pub(crate) fn row_work_pool(&self) -> &std::sync::Arc<crate::mem::lease_pool::RowWorkPool> {
+    pub(crate) fn row_work_pool(&self) -> &std::sync::Arc<crate::mem::lease_pool::LeasePool> {
         &self.storage.row_work
     }
 
@@ -3847,7 +3860,11 @@ impl Engine {
             storage.rebind_domain_base_types()?;
             storage.rebind_user_type_declarations()?;
             storage.rebind_routine_types()?;
-            storage.rebind_all_stored_query_dependencies()?;
+            storage.rebind_all_stored_query_dependencies(0)?;
+        }
+        for (_, metadata) in prepared_transactions.entries() {
+            storage.select_database_for_recovery(metadata.database)?;
+            storage.rebind_all_stored_query_dependencies(metadata.transaction_id)?;
         }
         storage.select_database(crate::storage::DatabaseOid::POSTGRES)?;
         wal.select_database(crate::storage::DatabaseOid::POSTGRES);
@@ -5471,6 +5488,33 @@ impl Engine {
         self.finish_txn(txn, guc, txn::CommitTarget::Ordinary)
     }
 
+    fn prepare_transaction_bindings(&mut self, txn: &TxnState) -> Result<(), SqlError> {
+        for (position, undo) in txn.ddl().iter().enumerate() {
+            match *undo {
+                DdlUndo::TableAltered(change) => {
+                    if txn.ddl()[position + 1..].iter().any(|later| {
+                        matches!(later, DdlUndo::TableAltered(later) if later.table() == change.table())
+                    }) {
+                        continue;
+                    }
+                    self.storage.prepare_table_commit_enforcers(change)?;
+                }
+                DdlUndo::IndexCreated(slot) => self.storage.prepare_index_definition_enforcers(
+                    slot as usize,
+                    txn.txid,
+                    crate::storage::IndexBindingOperation::Create,
+                )?,
+                DdlUndo::IndexDropped(slot) => self.storage.prepare_index_definition_enforcers(
+                    slot as usize,
+                    txn.txid,
+                    crate::storage::IndexBindingOperation::Drop,
+                )?,
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
     /// Journals every final transaction image and either commits it or leaves
     /// its typed batch prepared. Only an ordinary commit promotes the
     /// transaction-owned storage overlays here.
@@ -5494,11 +5538,13 @@ impl Engine {
             txn::CommitTarget::Prepare { slot, .. } => Some(slot),
             _ => None,
         };
-        // The next statement starts a fresh transaction clock.
-        datetime::end_transaction();
         if !txn.is_active() {
             return Ok(());
         }
+        let mark = txn.begin_commit_admission(target, self.wal.stage_mark(txn.txid));
+        self.wal.truncate_stage(txn.txid, mark);
+        // The retained admission keeps the completed command's clock on waits.
+        datetime::end_transaction();
         if txn.has_deferred_triggers() {
             return Err(sql_err!(
                 sqlstate::INTERNAL_ERROR,
@@ -5570,6 +5616,60 @@ impl Engine {
             self.rollback_txn(txn, guc);
             return Err(error);
         }
+        if let Err(error) = self.prepare_transaction_bindings(txn) {
+            if error.sqlstate != sqlstate::INTERNAL_LOCK_WAIT
+                && error.sqlstate != sqlstate::INTERNAL_IO_WAIT
+            {
+                self.rollback_txn(txn, guc);
+            }
+            return Err(error);
+        }
+        if let Err(error) = self.storage.prepare_commit_row_keys(
+            txn.txid,
+            txn.touched()
+                .iter()
+                .map(|&(table, rowid, _)| (table as usize, rowid)),
+        ) {
+            if error.sqlstate != sqlstate::INTERNAL_IO_WAIT
+                && error.sqlstate != sqlstate::INTERNAL_LOCK_WAIT
+            {
+                self.rollback_txn(txn, guc);
+            }
+            return Err(error);
+        }
+        if let Err(error) = self.storage.prepare_definition_publication(
+            txn.txid,
+            txn.table_definition_changes(),
+            txn.type_commit_changes(),
+        ) {
+            self.storage.rollback_definition_publication(txn.txid);
+            if error.sqlstate != sqlstate::INTERNAL_LOCK_WAIT {
+                self.rollback_txn(txn, guc);
+            }
+            return Err(error);
+        }
+        if let Err(error) = self.storage.prepare_commit_generations(
+            txn.txid,
+            txn.touched()
+                .iter()
+                .map(|&(table, rowid, _)| (table as usize, rowid)),
+            txn.index_generation_changes(),
+        ) {
+            if error.sqlstate != sqlstate::INTERNAL_IO_WAIT
+                && error.sqlstate != sqlstate::INTERNAL_LOCK_WAIT
+            {
+                self.rollback_txn(txn, guc);
+            }
+            return Err(error);
+        }
+        if let Err(error) = self.stage_prepared_lock_image(txn, target) {
+            if error.sqlstate != sqlstate::INTERNAL_IO_WAIT
+                && error.sqlstate != sqlstate::INTERNAL_LOCK_WAIT
+            {
+                self.rollback_txn(txn, guc);
+            }
+            return Err(error);
+        }
         if let Err(error) = self.storage.validate_row_history_publication(
             txn.txid,
             txn.touched()
@@ -5587,16 +5687,18 @@ impl Engine {
         } else {
             crate::storage::CatalogPublication::Uninterrupted
         };
-        match catalog_snapshot::capture_transaction(
-            &self.storage,
-            txn,
-            catalog_publication,
-            &self.work,
-        ) {
-            Ok(history) => txn.catalog_history = history,
-            Err(error) => {
-                self.rollback_txn(txn, guc);
-                return Err(error);
+        if txn.catalog_history.is_none() {
+            match catalog_snapshot::capture_transaction(
+                &self.storage,
+                txn,
+                catalog_publication,
+                &self.work,
+            ) {
+                Ok(history) => txn.catalog_history = history,
+                Err(error) => {
+                    self.rollback_txn(txn, guc);
+                    return Err(error);
+                }
             }
         }
         for event_index in 0..txn.truncates().len() {
@@ -6690,13 +6792,13 @@ impl Engine {
         self.complete_staged_commit(txn, guc)
     }
 
-    pub(crate) fn finish_staged_transaction(
+    pub(crate) fn finish_pending_transaction(
         &mut self,
         txn: &mut TxnState,
         guc: &GucState,
     ) -> Result<(), SqlError> {
         self.check_publication_health()?;
-        if txn.staged_commit().is_none() {
+        if txn.staged_commit().is_none() && txn.commit_admission().is_none() {
             return Ok(());
         }
         let _atomic_reads = self.atomic_block_read_scope();
@@ -6718,7 +6820,14 @@ impl Engine {
             let name = self.storage.database_definition(database, txn.txid).name;
             eval::funcs::system::set_current_database(name.as_str());
         }
-        let result = self.complete_staged_commit(txn, guc);
+        let result = match txn.commit_admission() {
+            Some(
+                target @ (txn::CommitTarget::CommitPrepared { .. }
+                | txn::CommitTarget::RollbackPrepared { .. }),
+            ) => self.finish_prepared_resolution_admission(txn, guc, target),
+            Some(target) => self.finish_txn(txn, guc, target),
+            None => self.complete_staged_commit(txn, guc),
+        };
         self.storage.swap_path(prior);
         result
     }
@@ -6913,7 +7022,7 @@ impl Engine {
             let prior = self.execution_identity();
             let read_owner = self.read_owner;
             self.restore_execution_identity(work.identity);
-            let result = self.finish_staged_transaction(&mut work.transaction, &work.guc);
+            let result = self.finish_pending_transaction(&mut work.transaction, &work.guc);
             self.restore_execution_identity(prior);
             let _ = self.replace_read_owner(read_owner);
             self.commit_queue
@@ -7010,10 +7119,10 @@ impl Engine {
                 .any(|&(altered, rewrote_rows)| altered == table && rewrote_rows)
             {
                 self.storage
-                    .commit_rewritten_row(table, rowid, txn.txid, commit_lsn)?;
+                    .publish_row(table, rowid, txn.txid, commit_lsn, true)?;
             } else {
                 self.storage
-                    .commit_row(table, rowid, txn.txid, commit_lsn)?;
+                    .publish_row(table, rowid, txn.txid, commit_lsn, false)?;
             }
             #[cfg(test)]
             self.observe_publication(commit::PublicationPoint::RowInstalled { table, rowid })?;
@@ -7038,7 +7147,7 @@ impl Engine {
                         .finish_table_drop(*undo, crate::storage::CatalogDdlDecision::Commit)
                         .is_some()
                     {
-                        self.storage.commit_indexes_for(undo.slot(), txn.txid);
+                        self.storage.commit_indexes_for(undo.slot(), txn.txid)?;
                     }
                 }
                 DdlUndo::TableAltered(_) => {}
@@ -7316,7 +7425,7 @@ impl Engine {
                 DdlUndo::EnumAltered(prior) => self.storage.commit_enum_alter(prior.target())?,
                 DdlUndo::IndexCreated(slot) => {
                     let slot = *slot as usize;
-                    self.storage.commit_index_create(slot);
+                    self.storage.publish_index_create(slot, txn.txid)?;
                     self.storage.commit_object_owner(
                         crate::storage::AccessObject {
                             class: crate::storage::AccessClass::Index,
@@ -7335,7 +7444,7 @@ impl Engine {
                 DdlUndo::IndexDropped(slot) => {
                     let slot = *slot as usize;
                     let table = self.storage.index_table_slot(slot);
-                    self.storage.commit_index_drop(slot);
+                    self.storage.publish_index_drop(slot, txn.txid)?;
                     if let Some(table) = table
                         && !self.commit_index_tables.contains(&table)
                     {
@@ -7344,9 +7453,9 @@ impl Engine {
                             .expect("commit index scratch matches transaction DDL capacity");
                     }
                 }
-                DdlUndo::IndexRenamed { slot, .. } => {
-                    self.storage.commit_index_rename(*slot as usize, txn.txid)
-                }
+                DdlUndo::IndexRenamed { slot, .. } => self
+                    .storage
+                    .publish_index_rename(*slot as usize, txn.txid)?,
                 DdlUndo::IndexAltered { slot, .. } => self
                     .storage
                     .commit_index_definition(*slot as usize, txn.txid),
@@ -7444,33 +7553,25 @@ impl Engine {
                     .commit_comment_identity(*slot as usize, txn.txid),
             }
         }
+        self.storage.finish_definition_publication(txn.txid)?;
         for &advance in txn.subscription_advances() {
             self.storage.apply_subscription_advance(advance, commit_lsn);
         }
-        let mut index_result = Ok(());
         for &(table, rewrote_rows) in self.commit_altered_tables.iter() {
             self.storage.finish_table_def_commit(table, rewrote_rows);
-            if self.storage.table(table).live()
-                && let Err(error) = self.storage.finish_table_enforcers(table, rewrote_rows)
-            {
-                index_result = Err(error);
-                break;
+            if self.storage.table(table).live() {
+                self.storage.finish_bindings(table, txn.txid);
             }
         }
-        if index_result.is_ok() {
-            for &table in self.commit_index_tables.iter() {
-                if self
-                    .commit_altered_tables
-                    .iter()
-                    .any(|&(altered, _)| altered == table)
-                {
-                    continue;
-                }
-                if let Err(error) = self.storage.finish_index_enforcers(table) {
-                    index_result = Err(error);
-                    break;
-                }
+        for &table in self.commit_index_tables.iter() {
+            if self
+                .commit_altered_tables
+                .iter()
+                .any(|&(altered, _)| altered == table)
+            {
+                continue;
             }
+            self.storage.finish_bindings(table, txn.txid);
         }
         for slot in 0..self.storage.table_count() {
             self.storage.commit_table_statistics(slot, txn.txid);
@@ -7482,13 +7583,14 @@ impl Engine {
         // rows and definitions. Failure requires recovery, never row rollback.
         let notify_result = self.flush_committed_notifications(txn);
         let temporary_result = self.storage.apply_temporary_on_commit();
+        self.storage.release_commit_generations(txn.txid);
         if let Some(guc) = guc {
             guc.commit_transaction();
         }
         self.storage.clear_temporary_transaction(txn.txid);
         self.storage.finish_cumulative_transaction(txn.txid, true);
         txn.clear();
-        let result = notify_result.and(index_result).and(temporary_result);
+        let result = notify_result.and(temporary_result);
         #[cfg(test)]
         let result =
             result.and_then(|()| self.observe_publication(commit::PublicationPoint::DataInstalled));
@@ -7606,8 +7708,8 @@ impl Engine {
         let _active_cursors = cursors
             .as_ref()
             .map(|pool| cursor::enter_active(&**pool as *const _));
-        if txn.staged_commit().is_some() {
-            self.complete_staged_commit(txn, guc)?;
+        if txn.staged_commit().is_some() || txn.commit_admission().is_some() {
+            self.finish_pending_transaction(txn, guc)?;
             if let Some(cursors) = cursors {
                 cursors.on_commit();
             }
@@ -7653,15 +7755,16 @@ impl Engine {
         responder: &mut Responder,
     ) -> Result<(), SqlError> {
         let result = if txn.staged_commit().is_some() {
-            self.finish_staged_transaction(txn, guc)
+            self.finish_pending_transaction(txn, guc)
         } else {
             self.commit_txn_with_triggers(txn, guc, Some(cursors), arena, responder)
         };
         if result.is_ok() {
             cursors.on_commit();
         }
-        if matches!(&result, Err(error) if error.sqlstate == sqlstate::INTERNAL_IO_WAIT)
-            && txn.staged_commit().is_some()
+        if matches!(&result, Err(error) if error.sqlstate == sqlstate::INTERNAL_IO_WAIT
+            || error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT)
+            && (txn.staged_commit().is_some() || txn.commit_admission().is_some())
         {
             // Consume this phase's receipt before executing its continuation.
             txn.begin_concurrent_partition_detach();
@@ -7696,6 +7799,26 @@ impl Engine {
         arena: &Arena,
         responder: &mut Responder,
     ) -> Result<(), SqlError> {
+        if let Some(target) = txn.commit_admission() {
+            let txn::CommitTarget::Prepare {
+                gid: admitted_gid, ..
+            } = target
+            else {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "PREPARE changed admitted commit target"
+                ));
+            };
+            if admitted_gid != gid {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "PREPARE changed admitted transaction identity"
+                ));
+            }
+            self.finish_txn(txn, guc, target)?;
+            cursors.on_rollback();
+            return Ok(());
+        }
         if let Some(staged) = txn.staged_commit() {
             let txn::CommitTarget::Prepare {
                 gid: staged_gid, ..
@@ -7848,29 +7971,41 @@ impl Engine {
         // no earlier work, so every successfully prepared transaction has the
         // catalog identity required to resolve it later.
         self.storage.assign_transaction_identity(txn.txid);
-        if let Err(error) = self.storage.encode_transaction_locks(
-            txn.txid,
-            &mut self.prepared_transactions.slot_mut(slot).locks,
-        ) {
-            self.prepared_transactions.release(slot);
-            return Err(fail(self, txn, cursors, error));
-        }
-        let lock_lsn = self.storage.bump_lsn();
-        let lock_record = WalOp::PreparedLocks {
-            transaction_id: txn.txid,
-            encoded: self.prepared_transactions.slot(slot).locks.readable(),
-        };
-        if let Err(error) = self.wal.stage_reserved(txn.txid, lock_lsn, &lock_record) {
-            self.prepared_transactions.release(slot);
-            return Err(fail(self, txn, cursors, error));
-        }
         if let Err(error) = self.finish_txn(txn, guc, txn::CommitTarget::Prepare { slot, gid }) {
-            if txn.staged_commit().is_none() {
+            if txn.staged_commit().is_none() && txn.commit_admission().is_none() {
                 self.prepared_transactions.release(slot);
             }
             return Err(error);
         }
         cursors.on_rollback();
+        Ok(())
+    }
+
+    fn stage_prepared_lock_image(
+        &mut self,
+        txn: &mut TxnState,
+        target: txn::CommitTarget,
+    ) -> Result<(), SqlError> {
+        let txn::CommitTarget::Prepare { slot, .. } = target else {
+            return Ok(());
+        };
+        if txn.prepared_locks_staged() {
+            return Ok(());
+        }
+        self.storage.encode_transaction_locks(
+            txn.txid,
+            &mut self.prepared_transactions.slot_mut(slot).locks,
+        )?;
+        let lock_lsn = self.storage.bump_lsn();
+        self.wal.stage_reserved(
+            txn.txid,
+            lock_lsn,
+            &WalOp::PreparedLocks {
+                transaction_id: txn.txid,
+                encoded: self.prepared_transactions.slot(slot).locks.readable(),
+            },
+        )?;
+        txn.mark_prepared_locks_staged(self.wal.stage_mark(txn.txid));
         Ok(())
     }
 
@@ -7881,6 +8016,25 @@ impl Engine {
         txn: &mut TxnState,
         guc: &GucState,
     ) -> Result<(), SqlError> {
+        if let Some(target) = txn.commit_admission() {
+            let admitted_gid = match target {
+                txn::CommitTarget::CommitPrepared { gid, .. } if commit => gid,
+                txn::CommitTarget::RollbackPrepared { gid, .. } if !commit => gid,
+                _ => {
+                    return Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "prepared resolution changed admitted outcome"
+                    ));
+                }
+            };
+            if admitted_gid != gid {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "prepared resolution changed admitted identity"
+                ));
+            }
+            return self.finish_prepared_resolution_admission(txn, guc, target);
+        }
         if let Some(staged) = txn.staged_commit() {
             let staged_gid = match staged.target {
                 txn::CommitTarget::CommitPrepared { gid, .. } if commit => gid,
@@ -7944,32 +8098,88 @@ impl Engine {
                 "statement is waiting for prepared transaction publication"
             ));
         }
-        if commit {
-            let prepared = &self.prepared_transactions.slot(slot).transaction;
-            self.storage.validate_row_history_publication(
-                prepared.txid,
-                prepared
-                    .touched()
-                    .iter()
-                    .map(|&(table, rowid, _)| (table as usize, rowid)),
-            )?;
-        }
-        let lsn = self.storage.bump_lsn();
-        let operation = if commit {
-            WalOp::CommitPrepared { gid: gid.as_str() }
+        let target = if commit {
+            txn::CommitTarget::CommitPrepared { slot, gid }
         } else {
-            WalOp::RollbackPrepared { gid: gid.as_str() }
+            txn::CommitTarget::RollbackPrepared { slot, gid }
         };
-        self.wal.stage_reserved(txn.txid, lsn, &operation)?;
-        self.finish_txn(
-            txn,
-            guc,
-            if commit {
-                txn::CommitTarget::CommitPrepared { slot, gid }
+        txn.begin_commit_admission(target, self.wal.stage_mark(txn.txid));
+        self.prepared_transactions.claim_resolution(slot, txn.txid);
+        self.finish_prepared_resolution_admission(txn, guc, target)
+    }
+
+    fn finish_prepared_resolution_admission(
+        &mut self,
+        txn: &mut TxnState,
+        guc: &GucState,
+        target: txn::CommitTarget,
+    ) -> Result<(), SqlError> {
+        let (slot, gid, commit) = match target {
+            txn::CommitTarget::CommitPrepared { slot, gid } => (slot, gid, true),
+            txn::CommitTarget::RollbackPrepared { slot, gid } => (slot, gid, false),
+            _ => {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "prepared resolution has an invalid target"
+                ));
+            }
+        };
+        if commit {
+            core::mem::swap(
+                txn,
+                &mut self.prepared_transactions.slot_mut(slot).transaction,
+            );
+            let prepared_transaction = txn.txid;
+            let preparation = (|| {
+                self.prepare_transaction_bindings(txn)?;
+                self.storage.prepare_commit_row_keys(
+                    txn.txid,
+                    txn.touched()
+                        .iter()
+                        .map(|&(table, rowid, _)| (table as usize, rowid)),
+                )?;
+                self.storage.prepare_definition_publication(
+                    txn.txid,
+                    txn.table_definition_changes(),
+                    txn.type_commit_changes(),
+                )?;
+                self.storage.prepare_commit_generations(
+                    txn.txid,
+                    txn.touched()
+                        .iter()
+                        .map(|&(table, rowid, _)| (table as usize, rowid)),
+                    txn.index_generation_changes(),
+                )?;
+                self.storage.validate_row_history_publication(
+                    txn.txid,
+                    txn.touched()
+                        .iter()
+                        .map(|&(table, rowid, _)| (table as usize, rowid)),
+                )
+            })();
+            core::mem::swap(
+                txn,
+                &mut self.prepared_transactions.slot_mut(slot).transaction,
+            );
+            if let Err(error) = preparation {
+                self.storage
+                    .rollback_definition_publication(prepared_transaction);
+                self.storage
+                    .release_commit_generations(prepared_transaction);
+                return Err(error);
+            }
+        }
+        if !txn.prepared_resolution_staged() {
+            let operation = if commit {
+                WalOp::CommitPrepared { gid: gid.as_str() }
             } else {
-                txn::CommitTarget::RollbackPrepared { slot, gid }
-            },
-        )
+                WalOp::RollbackPrepared { gid: gid.as_str() }
+            };
+            self.wal
+                .stage_reserved(txn.txid, self.storage.bump_lsn(), &operation)?;
+            txn.mark_prepared_resolution_staged(self.wal.stage_mark(txn.txid));
+        }
+        self.finish_txn(txn, guc, target)
     }
 
     fn complete_prepared_resolution(
@@ -7979,7 +8189,6 @@ impl Engine {
         txn: &mut TxnState,
         resolution_lsn: u64,
     ) -> Result<(), SqlError> {
-        let recovered = self.prepared_transactions.slot(slot).recovered;
         // The resolution record is durable before the detached transaction is
         // released. Recovery therefore reaches the same outcome if the process
         // stops anywhere in the in-memory promotion below.
@@ -7987,24 +8196,7 @@ impl Engine {
             txn,
             &mut self.prepared_transactions.slot_mut(slot).transaction,
         );
-        let result = if commit && recovered {
-            for &(table, rowid, _) in txn.touched() {
-                self.storage
-                    .retain_prepared_row_history(table as usize, rowid, txn.txid)?;
-            }
-            self.rollback_transaction_state(txn, true);
-            self.prepared_transactions
-                .slot(slot)
-                .visit_records(|_, raw| {
-                    let operation = crate::wal::decode_record(raw).ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::DATA_EXCEPTION,
-                            "prepared transaction WAL is corrupt"
-                        )
-                    })?;
-                    apply_wal_op(&mut self.storage, resolution_lsn, operation, &self.work)
-                })
-        } else if commit {
+        let result = if commit {
             self.storage
                 .end_transaction_snapshots(txn.txid, crate::storage::SnapshotCleanup::Schedule);
             self.promote_transaction_state(txn, resolution_lsn, None)
@@ -8065,6 +8257,24 @@ impl Engine {
         if txn.txid == 0 {
             txn.clear();
             return;
+        }
+        self.storage.rollback_definition_publication(txn.txid);
+        if let Some(txn::CommitTarget::Prepare { slot, .. }) = txn.commit_admission() {
+            self.prepared_transactions.release(slot);
+        }
+        if let Some(
+            txn::CommitTarget::CommitPrepared { slot, .. }
+            | txn::CommitTarget::RollbackPrepared { slot, .. },
+        ) = txn.commit_admission()
+        {
+            let prepared_transaction = self.prepared_transactions.slot(slot).transaction.txid;
+            self.storage
+                .rollback_definition_publication(prepared_transaction);
+            self.storage
+                .release_commit_generations(prepared_transaction);
+            self.prepared_transactions
+                .release_resolution(slot, txn.txid);
+            self.storage.wake_transaction_waiters(txn.txid);
         }
         foreign::abort_session(&self.storage, txn.txid);
         rollback_transaction_overlays(&mut self.storage, txn);
@@ -10089,8 +10299,8 @@ impl Engine {
         let _active_cursors = cursors
             .as_ref()
             .map(|pool| cursor::enter_active(&**pool as *const _));
-        if txn.staged_commit().is_some() {
-            self.complete_staged_commit(txn, guc)?;
+        if txn.staged_commit().is_some() || txn.commit_admission().is_some() {
+            self.finish_pending_transaction(txn, guc)?;
             if let Some(cursors) = cursors {
                 cursors.on_commit();
             }
@@ -10148,6 +10358,9 @@ impl Engine {
         workspace: SubscriptionCopyWorkspace<'_>,
     ) -> Result<(), SqlError> {
         let _atomic_reads = self.atomic_block_read_scope();
+        if txn.staged_commit().is_some() || txn.commit_admission().is_some() {
+            return self.finish_pending_transaction(txn, guc);
+        }
         workspace.arena.reset();
         let boundary = if txn.mode == TxnMode::Implicit {
             exec::TriggerQueueBoundary::Transaction
@@ -10750,6 +10963,34 @@ impl Engine {
         )
     }
 
+    pub(crate) fn check_commit_admission_wait(
+        &mut self,
+        txn: &mut TxnState,
+        guc: &GucState,
+        lock_timeout_expired: bool,
+    ) -> Result<(), SqlError> {
+        if txn.commit_admission().is_none() {
+            return Ok(());
+        }
+        txn.begin_statement_clock();
+        query::restore_statement_deadline(
+            txn.suspended_statement_deadline()
+                .expect("admission retains its deadline"),
+        );
+        let result = if lock_timeout_expired {
+            Err(sql_err!(
+                sqlstate::LOCK_NOT_AVAILABLE,
+                "canceling statement due to lock timeout"
+            ))
+        } else {
+            query::check_timeout()
+        };
+        if result.is_err() {
+            self.rollback_txn(txn, guc);
+        }
+        result
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn execute_simple_from_selected(
         &mut self,
@@ -10766,16 +11007,30 @@ impl Engine {
     ) -> Result<ExecutionStatus, WireFull> {
         self.dml_scratch.clear();
         self.bind_query_connection(conn_id);
+        if let Err(error) = self.check_commit_admission_wait(txn, guc, lock_timeout_expired) {
+            cursors.on_rollback();
+            responder.error(error.sqlstate, error.message.as_str())?;
+            return Ok(ExecutionStatus::Complete);
+        }
         if txn.concurrent_partition_detach_pending()
-            && txn.staged_commit().is_some()
+            && (txn.staged_commit().is_some() || txn.commit_admission().is_some())
             && let Err(error) =
                 self.commit_partition_detach_phase(txn, guc, cursors, arena, responder)
         {
-            if error.sqlstate == sqlstate::INTERNAL_IO_WAIT && txn.staged_commit().is_some() {
+            if (error.sqlstate == sqlstate::INTERNAL_IO_WAIT
+                || error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT)
+                && (txn.staged_commit().is_some() || txn.commit_admission().is_some())
+            {
                 return Ok(ExecutionStatus::Blocked {
                     completed_statements: resume_statement,
                     output_mark: responder.buffer.mark(),
-                    wait: crate::sql::StatementWait::ObjectIo,
+                    wait: if txn.staged_commit().is_some()
+                        || error.sqlstate == sqlstate::INTERNAL_IO_WAIT
+                    {
+                        StatementWait::ObjectIo
+                    } else {
+                        StatementWait::Lock
+                    },
                 });
             }
             responder.error(error.sqlstate, error.message.as_str())?;
@@ -10876,11 +11131,20 @@ impl Engine {
                 && let Err(error) =
                     self.commit_txn_with_triggers(txn, guc, Some(cursors), arena, responder)
             {
-                if error.sqlstate == sqlstate::INTERNAL_IO_WAIT && txn.staged_commit().is_some() {
+                if (error.sqlstate == sqlstate::INTERNAL_IO_WAIT
+                    || error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT)
+                    && (txn.staged_commit().is_some() || txn.commit_admission().is_some())
+                {
                     return Ok(ExecutionStatus::Blocked {
                         completed_statements: statement_index,
                         output_mark: responder.buffer.mark(),
-                        wait: crate::sql::StatementWait::ObjectIo,
+                        wait: if txn.staged_commit().is_some()
+                            || error.sqlstate == sqlstate::INTERNAL_IO_WAIT
+                        {
+                            StatementWait::ObjectIo
+                        } else {
+                            StatementWait::Lock
+                        },
                     });
                 }
                 responder.error(error.sqlstate, error.message.as_str())?;
@@ -10968,12 +11232,18 @@ impl Engine {
                 if e.sqlstate == sqlstate::INTERNAL_LOCK_WAIT
                     || e.sqlstate == sqlstate::INTERNAL_IO_WAIT
                 {
-                    if txn.staged_commit().is_some() {
+                    if txn.staged_commit().is_some() || txn.commit_admission().is_some() {
                         sequence_scope.discard(guc.seq_session());
                         return Ok(ExecutionStatus::Blocked {
                             completed_statements: statement_index,
                             output_mark,
-                            wait: crate::sql::StatementWait::ObjectIo,
+                            wait: if txn.staged_commit().is_some()
+                                || e.sqlstate == sqlstate::INTERNAL_IO_WAIT
+                            {
+                                StatementWait::ObjectIo
+                            } else {
+                                StatementWait::Lock
+                            },
                         });
                     }
                     if txn.owns_statement_mark(statement_mark) {
@@ -11030,12 +11300,20 @@ impl Engine {
                 if let Err(error) =
                     self.commit_partition_detach_phase(txn, guc, cursors, arena, responder)
                 {
-                    if error.sqlstate == sqlstate::INTERNAL_IO_WAIT && txn.staged_commit().is_some()
+                    if (error.sqlstate == sqlstate::INTERNAL_IO_WAIT
+                        || error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT)
+                        && (txn.staged_commit().is_some() || txn.commit_admission().is_some())
                     {
                         return Ok(ExecutionStatus::Blocked {
                             completed_statements: statement_index,
                             output_mark,
-                            wait: crate::sql::StatementWait::ObjectIo,
+                            wait: if txn.staged_commit().is_some()
+                                || error.sqlstate == sqlstate::INTERNAL_IO_WAIT
+                            {
+                                StatementWait::ObjectIo
+                            } else {
+                                StatementWait::Lock
+                            },
                         });
                     }
                     responder.error(error.sqlstate, error.message.as_str())?;
@@ -11058,11 +11336,20 @@ impl Engine {
             && self.pending_copy.is_none()
             && let Err(e) = self.commit_txn_with_triggers(txn, guc, Some(cursors), arena, responder)
         {
-            if e.sqlstate == sqlstate::INTERNAL_IO_WAIT && txn.staged_commit().is_some() {
+            if (e.sqlstate == sqlstate::INTERNAL_IO_WAIT
+                || e.sqlstate == sqlstate::INTERNAL_LOCK_WAIT)
+                && (txn.staged_commit().is_some() || txn.commit_admission().is_some())
+            {
                 return Ok(ExecutionStatus::Blocked {
                     completed_statements: statement_count,
                     output_mark: responder.buffer.mark(),
-                    wait: crate::sql::StatementWait::ObjectIo,
+                    wait: if txn.staged_commit().is_some()
+                        || e.sqlstate == sqlstate::INTERNAL_IO_WAIT
+                    {
+                        StatementWait::ObjectIo
+                    } else {
+                        StatementWait::Lock
+                    },
                 });
             }
             responder.error(e.sqlstate, e.message.as_str())?;
@@ -11125,16 +11412,30 @@ impl Engine {
         lock_timeout_expired: bool,
     ) -> Result<ExtendedExecutionStatus, WireFull> {
         self.dml_scratch.clear();
+        self.bind_query_connection(conn_id);
+        if let Err(error) = self.check_commit_admission_wait(txn, guc, lock_timeout_expired) {
+            cursors.on_rollback();
+            responder.error(error.sqlstate, error.message.as_str())?;
+            return Ok(ExtendedExecutionStatus::Complete(false));
+        }
         exec::with_bound_parameter_types(parameter_type_oids, || {
-            self.bind_query_connection(conn_id);
             if txn.concurrent_partition_detach_pending()
-                && txn.staged_commit().is_some()
+                && (txn.staged_commit().is_some() || txn.commit_admission().is_some())
                 && let Err(error) =
                     self.commit_partition_detach_phase(txn, guc, cursors, arena, responder)
             {
-                if error.sqlstate == sqlstate::INTERNAL_IO_WAIT && txn.staged_commit().is_some() {
+                if (error.sqlstate == sqlstate::INTERNAL_IO_WAIT
+                    || error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT)
+                    && (txn.staged_commit().is_some() || txn.commit_admission().is_some())
+                {
                     return Ok(ExtendedExecutionStatus::Blocked {
-                        wait: crate::sql::StatementWait::ObjectIo,
+                        wait: if txn.staged_commit().is_some()
+                            || error.sqlstate == sqlstate::INTERNAL_IO_WAIT
+                        {
+                            StatementWait::ObjectIo
+                        } else {
+                            StatementWait::Lock
+                        },
                     });
                 }
                 responder.error(error.sqlstate, error.message.as_str())?;
@@ -11274,11 +11575,19 @@ impl Engine {
                         if let Err(error) =
                             self.commit_partition_detach_phase(txn, guc, cursors, arena, responder)
                         {
-                            if error.sqlstate == sqlstate::INTERNAL_IO_WAIT
-                                && txn.staged_commit().is_some()
+                            if (error.sqlstate == sqlstate::INTERNAL_IO_WAIT
+                                || error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT)
+                                && (txn.staged_commit().is_some()
+                                    || txn.commit_admission().is_some())
                             {
                                 return Ok(ExtendedExecutionStatus::Blocked {
-                                    wait: crate::sql::StatementWait::ObjectIo,
+                                    wait: if txn.staged_commit().is_some()
+                                        || error.sqlstate == sqlstate::INTERNAL_IO_WAIT
+                                    {
+                                        StatementWait::ObjectIo
+                                    } else {
+                                        StatementWait::Lock
+                                    },
                                 });
                             }
                             responder.error(error.sqlstate, error.message.as_str())?;
@@ -11303,10 +11612,16 @@ impl Engine {
                     if e.sqlstate == sqlstate::INTERNAL_LOCK_WAIT
                         || e.sqlstate == sqlstate::INTERNAL_IO_WAIT
                     {
-                        if txn.staged_commit().is_some() {
+                        if txn.staged_commit().is_some() || txn.commit_admission().is_some() {
                             sequence_scope.discard(guc.seq_session());
                             return Ok(ExtendedExecutionStatus::Blocked {
-                                wait: crate::sql::StatementWait::ObjectIo,
+                                wait: if txn.staged_commit().is_some()
+                                    || e.sqlstate == sqlstate::INTERNAL_IO_WAIT
+                                {
+                                    StatementWait::ObjectIo
+                                } else {
+                                    StatementWait::Lock
+                                },
                             });
                         }
                         if txn.owns_statement_mark(statement_mark) {
@@ -11492,9 +11807,18 @@ impl Engine {
                 && let Err(error) =
                     self.commit_txn_with_triggers(txn, guc, Some(cursors), arena, responder)
             {
-                if error.sqlstate == sqlstate::INTERNAL_IO_WAIT && txn.staged_commit().is_some() {
+                if (error.sqlstate == sqlstate::INTERNAL_IO_WAIT
+                    || error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT)
+                    && (txn.staged_commit().is_some() || txn.commit_admission().is_some())
+                {
                     return Ok(ExtendedExecutionStatus::Blocked {
-                        wait: crate::sql::StatementWait::ObjectIo,
+                        wait: if txn.staged_commit().is_some()
+                            || error.sqlstate == sqlstate::INTERNAL_IO_WAIT
+                        {
+                            StatementWait::ObjectIo
+                        } else {
+                            StatementWait::Lock
+                        },
                     });
                 }
                 responder.buffer.truncate_to(response_mark);
@@ -15338,7 +15662,11 @@ impl Engine {
             }
             Ok(())
         })();
-        if result.is_err() && txn.is_active() && txn.staged_commit().is_none() {
+        if result.is_err()
+            && txn.is_active()
+            && txn.staged_commit().is_none()
+            && txn.commit_admission().is_none()
+        {
             self.rollback_txn(txn, guc);
         }
         result
@@ -15482,11 +15810,29 @@ impl Engine {
         );
         txn.cache_capacity_wait = None;
         txn.leave_ddl_origin(prior_origin);
+        if txn.commit_admission().is_some()
+            && !matches!(
+                statement,
+                Stmt::Commit
+                    | Stmt::PrepareTransaction(_)
+                    | Stmt::CommitPrepared(_)
+                    | Stmt::RollbackPrepared(_)
+            )
+            && matches!(&result, Ok(Err(error)) if error.sqlstate == sqlstate::INTERNAL_IO_WAIT
+                || error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT)
+        {
+            self.rollback_txn(txn, guc);
+            cursors.on_rollback();
+            result = Ok(Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "a non-atomic routine cannot suspend during commit admission"
+            )));
+        }
         if matches!(&result, Ok(Err(error)) if
             error.sqlstate == sqlstate::INTERNAL_IO_WAIT
             || error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT)
         {
-            if txn.staged_commit().is_some() {
+            if txn.staged_commit().is_some() || txn.commit_admission().is_some() {
                 sequence_scope.discard(guc.seq_session());
             }
             txn.suspend_statement(
@@ -17863,7 +18209,10 @@ impl Engine {
                 Ok(Ok(()))
             }
             Stmt::Commit => {
-                if !txn.is_explicit() {
+                if !txn.is_explicit()
+                    && txn.staged_commit().is_none()
+                    && txn.commit_admission().is_none()
+                {
                     responder.warning("25P01", "there is no transaction in progress")?;
                 }
                 let tag = if txn.failed { "ROLLBACK" } else { "COMMIT" };
@@ -20807,14 +21156,7 @@ fn rollback_catalog_change(storage: &mut Storage, undo: DdlUndo, txid: u32) {
             storage.rollback_enum_alter(prior);
         }
         DdlUndo::IndexCreated(slot) => {
-            let slot = slot as usize;
-            let table = storage.index_table_slot(slot);
-            storage.rollback_index_create(slot);
-            if let Some(table) = table {
-                storage
-                    .refresh_enforcers(table)
-                    .expect("rolling back CREATE INDEX restores its cache binding");
-            }
+            storage.rollback_index_create(slot as usize);
         }
         DdlUndo::IndexDropped(slot) => {
             storage.rollback_index_drop(slot as usize, txid);
@@ -21142,6 +21484,9 @@ fn replay_transaction_batches(
     apply_floor: u64,
     arena: &mut Arena,
 ) -> Result<(), SqlError> {
+    // Replay follows recorded ownership images, not the previous frontend's identity.
+    let _recovery_user =
+        eval::funcs::system::enter_current_user(crate::storage::SessionIdentity::bootstrap());
     let mut batch: Vec<(u64, &[u8])> = Vec::new();
     for (lsn, record) in recovered {
         let operator = crate::wal::decode_record(record).ok_or_else(|| {
@@ -21187,6 +21532,8 @@ fn replay_transaction_batches(
                         "prepared transaction WAL has an invalid database"
                     )
                 })?;
+                // The typed WAL owner remains an identity after its role is
+                // dropped; a replacement account must never inherit it.
                 storage.observe_role_oid(owner);
                 let metadata = two_phase::PreparedTransactionMetadata {
                     gid,
@@ -21215,13 +21562,30 @@ fn replay_transaction_batches(
                     prepared.slot_mut(slot).push_record(*record_lsn, raw)?;
                 }
                 let mut table_rewrite = None;
+                let mut foreign_restored = false;
                 for (record_lsn, raw) in &batch[..batch.len() - 1] {
-                    match crate::wal::decode_record(raw).ok_or_else(|| {
+                    let operation = crate::wal::decode_record(raw).ok_or_else(|| {
                         sql_err!(
                             sqlstate::DATA_EXCEPTION,
                             "prepared transaction WAL is corrupt"
                         )
-                    })? {
+                    })?;
+                    if prepared_foreign_replay::is_foreign_record(&operation) {
+                        if !foreign_restored {
+                            arena.reset();
+                            let result = prepared_foreign_replay::stage_batch(
+                                storage,
+                                &mut prepared.slot_mut(slot).transaction,
+                                &batch[..batch.len() - 1],
+                                arena,
+                            );
+                            arena.reset();
+                            result?;
+                            foreign_restored = true;
+                        }
+                        continue;
+                    }
+                    match operation {
                         WalOp::CreateSchema { identity, name } => {
                             let selected = storage.restore_schema(
                                 identity,
@@ -21704,20 +22068,26 @@ fn replay_transaction_batches(
                             table,
                             statistics,
                         } => {
-                            if *record_lsn > apply_floor {
-                                let table_slot = storage
-                                    .find_visible(schema, table, transaction_id)
-                                    .ok_or_else(|| {
-                                        sql_err!(
-                                            sqlstate::UNDEFINED_TABLE,
-                                            "prepared ANALYZE references an unknown table"
-                                        )
-                                    })?;
-                                storage.write_relation_counts(
-                                    table_slot,
-                                    statistics.materialize()?,
-                                    false,
-                                )?;
+                            let table_slot = storage
+                                .find_visible(schema, table, transaction_id)
+                                .ok_or_else(|| {
+                                    sql_err!(
+                                        sqlstate::UNDEFINED_TABLE,
+                                        "prepared ANALYZE references an unknown table"
+                                    )
+                                })?;
+                            if storage.restore_prepared_table_statistics(
+                                table_slot,
+                                transaction_id,
+                                statistics.materialize()?,
+                                *record_lsn > apply_floor,
+                            )? && let Err(error) = prepared
+                                .slot_mut(slot)
+                                .transaction
+                                .record_statistics(table_slot as u32)
+                            {
+                                storage.rollback_table_statistics(table_slot, transaction_id);
+                                return Err(error);
                             }
                         }
                         WalOp::PreparedCatalogRow { relation, row } => {
@@ -21796,7 +22166,7 @@ fn replay_transaction_batches(
                                         "invalid prepared parameter ACL name"
                                     )
                                 })?;
-                            let prior = storage.reserve_prepared_parameter_acl(
+                            let prior = storage.stage_prepared_parameter_acl(
                                 parameter,
                                 expected,
                                 image,
@@ -21832,7 +22202,7 @@ fn replay_transaction_batches(
                             ..
                         } => {
                             let Some(table_slot) =
-                                storage.find_visible(schema, table, transaction_id)
+                                storage.wal_table_slot(schema, table, transaction_id)
                             else {
                                 continue;
                             };
@@ -21858,7 +22228,7 @@ fn replay_transaction_batches(
                             ..
                         } => {
                             let Some(table_slot) =
-                                storage.find_visible(schema, table, transaction_id)
+                                storage.wal_table_slot(schema, table, transaction_id)
                             else {
                                 continue;
                             };
@@ -21912,7 +22282,19 @@ fn replay_transaction_batches(
                                 transaction_id,
                             )?;
                         }
-                        _ => {}
+                        operation => {
+                            arena.reset();
+                            let result = prepared_replay::stage_catalog_record(
+                                storage,
+                                &mut prepared.slot_mut(slot).transaction,
+                                operation,
+                                *record_lsn,
+                                apply_floor,
+                                arena,
+                            );
+                            arena.reset();
+                            result?;
+                        }
                     }
                 }
                 if table_rewrite.is_some() {
@@ -21921,7 +22303,6 @@ fn replay_transaction_batches(
                         "prepared transaction ends during a table rewrite"
                     ));
                 }
-                prepared.slot_mut(slot).recovered = true;
                 storage.set_lsn(*lsn);
             }
             WalOp::Commit {
@@ -21984,26 +22365,18 @@ fn replay_transaction_batches(
                         TransactionIdentityRelease::Immediate,
                     );
                     if commit && *lsn > apply_floor {
-                        prepared.slot(slot).visit_records(|_, raw| {
-                            let operation = crate::wal::decode_record(raw).ok_or_else(|| {
-                                sql_err!(
-                                    sqlstate::DATA_EXCEPTION,
-                                    "prepared transaction WAL is corrupt"
-                                )
-                            })?;
-                            apply_wal_op(storage, *lsn, operation, arena)
+                        let mut records = Vec::new();
+                        prepared.slot(slot).visit_records(|position, raw| {
+                            records.push((position, raw));
+                            Ok(())
                         })?;
+                        apply_committed_batch(storage, &records, Some(*lsn), arena)?;
                     }
                     prepared.release(slot);
                     storage.set_lsn(*lsn);
                 } else {
                     if *lsn > apply_floor {
-                        for (record_lsn, raw) in &batch {
-                            let operation = crate::wal::decode_record(raw).ok_or_else(|| {
-                                sql_err!(sqlstate::DATA_EXCEPTION, "transaction WAL is corrupt")
-                            })?;
-                            apply_wal_op(storage, *record_lsn, operation, arena)?;
-                        }
+                        apply_committed_batch(storage, &batch, None, arena)?;
                     }
                 }
             }
@@ -22016,6 +22389,34 @@ fn replay_transaction_batches(
             sqlstate::DATA_EXCEPTION,
             "recovery input ends inside a transaction"
         ));
+    }
+    Ok(())
+}
+
+fn apply_committed_batch(
+    storage: &mut Storage,
+    batch: &[(u64, &[u8])],
+    resolved_at: Option<u64>,
+    arena: &mut Arena,
+) -> Result<(), SqlError> {
+    let mut foreign_restored = false;
+    for (position, record) in batch {
+        let operation = crate::wal::decode_record(record)
+            .ok_or_else(|| sql_err!(sqlstate::DATA_EXCEPTION, "transaction WAL is corrupt"))?;
+        let position = resolved_at.unwrap_or(*position);
+        if prepared_foreign_replay::is_foreign_record(&operation) {
+            if !foreign_restored {
+                arena.reset();
+                let result =
+                    prepared_foreign_replay::restore_committed_batch(storage, batch, arena);
+                arena.reset();
+                result?;
+                foreign_restored = true;
+            }
+            storage.set_lsn(position);
+        } else {
+            apply_wal_op(storage, position, operation, arena)?;
+        }
     }
     Ok(())
 }
@@ -22108,7 +22509,7 @@ fn apply_composite_wal_definition(
         definition.fields = spec.fields;
         definition.n_fields = spec.n_fields;
         let prior = storage.stage_composite_alter(edit_target, definition, 0)?;
-        storage.commit_composite_alter(prior.target())?;
+        storage.replay_composite_alter(prior.target())?;
     } else {
         storage.create_composite_at(slot, def.schema, def.name, spec, def.created_at)?;
         storage.restore_type_identity(
@@ -22709,7 +23110,7 @@ fn apply_wal_op(
             column,
             last,
         } => {
-            let Some(index) = storage.wal_table_slot(schema, table) else {
+            let Some(index) = storage.wal_table_slot(schema, table, 0) else {
                 return Err(SqlError {
                     sqlstate: SqlState::known(sqlstate::UNDEFINED_TABLE),
                     message: stack_format!(
@@ -22732,7 +23133,7 @@ fn apply_wal_op(
             table,
             statistics,
         } => {
-            let Some(index) = storage.wal_table_slot(schema, table) else {
+            let Some(index) = storage.wal_table_slot(schema, table, 0) else {
                 return Err(sql_err!(
                     sqlstate::UNDEFINED_TABLE,
                     "journal analyzes unknown table \"{}\"",
@@ -22836,7 +23237,7 @@ fn apply_wal_op(
             let index = storage.table_replay_slot(identity, schema, name, 0)?;
             storage.commit_drop(index);
             storage.drop_indexes_for(index, 0);
-            storage.commit_indexes_for(index, 0);
+            storage.commit_indexes_for(index, 0)?;
         }
         WalOp::Upsert {
             schema,
@@ -22845,7 +23246,7 @@ fn apply_wal_op(
             row,
             ..
         } => {
-            let Some(index) = storage.wal_table_slot(schema, table) else {
+            let Some(index) = storage.wal_table_slot(schema, table, 0) else {
                 return Err(SqlError {
                     sqlstate: SqlState::known(sqlstate::UNDEFINED_TABLE),
                     message: stack_format!(192, "journal writes to unknown table \"{}\"", table),
@@ -22861,7 +23262,7 @@ fn apply_wal_op(
             rowid,
             ..
         } => {
-            let Some(index) = storage.wal_table_slot(schema, table) else {
+            let Some(index) = storage.wal_table_slot(schema, table, 0) else {
                 return Err(SqlError {
                     sqlstate: SqlState::known(sqlstate::UNDEFINED_TABLE),
                     message: stack_format!(192, "journal deletes from unknown table \"{}\"", table),
@@ -23288,7 +23689,7 @@ fn apply_wal_op(
                 0,
             )?;
             storage.restore_subscription_stream_identity(slot, created_at, 1)?;
-            storage.restore_subscription_owner(slot, owner);
+            storage.restore_subscription_owner(slot, owner, 0)?;
             storage.commit_subscription_create(slot);
         }
         WalOp::DropSubscription { name } => {
@@ -23515,7 +23916,7 @@ fn apply_wal_op(
                     name
                 )
             })?;
-            storage.restore_subscription_owner(slot, owner);
+            storage.restore_subscription_owner(slot, owner, 0)?;
         }
         WalOp::RenameSubscription { name, new_name } => {
             let (slot, _) = storage.subscription(name, 0).ok_or_else(|| {
@@ -23542,7 +23943,7 @@ fn apply_wal_op(
                 )
             })?;
             storage.rename_index(slot, crate::storage::SqlName::parse(new_name)?, 0)?;
-            storage.commit_index_rename(slot, 0);
+            storage.commit_index_rename(slot, 0)?;
         }
         WalOp::CreateMatview {
             identity,
@@ -23719,7 +24120,7 @@ fn apply_wal_op(
                 }
                 let (_, edit_target) = storage.prepare_domain_edit(slot, 0)?;
                 let prior = storage.stage_domain_alter(edit_target, spec, 0)?;
-                storage.commit_domain_alter(prior.target())?;
+                storage.replay_domain_alter(prior.target())?;
             } else {
                 let allocated = storage.create_domain_from_journal(
                     def.schema,
@@ -23893,7 +24294,7 @@ fn apply_wal_op(
             definition.schema = crate::storage::SqlName::parse(new_schema)?;
             definition.name = crate::storage::SqlName::parse(new_name)?;
             let prior = storage.stage_composite_alter(edit_target, definition, 0)?;
-            storage.commit_composite_alter(prior.target())?;
+            storage.replay_composite_alter(prior.target())?;
         }
         WalOp::AlterDomainIdentity {
             schema,
@@ -23915,7 +24316,7 @@ fn apply_wal_op(
                 crate::storage::SqlName::parse(new_name)?,
                 0,
             )?;
-            storage.commit_domain_alter(prior.target())?;
+            storage.replay_domain_alter(prior.target())?;
         }
         WalOp::Comment {
             class,
@@ -24004,7 +24405,7 @@ fn apply_wal_op(
                 },
                 0,
             )?;
-            storage.commit_index_create(slot);
+            storage.commit_index_create(slot)?;
         }
         WalOp::BrinMaintenance {
             index_created_at,
@@ -24199,7 +24600,7 @@ fn apply_wal_op(
         }
         WalOp::DropIndex { schema, name } => {
             if let Some(slot) = storage.drop_index(schema, name, 0)? {
-                storage.commit_index_drop(slot);
+                storage.commit_index_drop(slot)?;
             }
         }
         WalOp::CreateSchema { identity, name } => {
@@ -24452,7 +24853,7 @@ fn apply_wal_op(
                 });
             };
             let revision = storage.reserve_table_definition_revision()?;
-            let _ = storage.drop_fk(index, fk_name, revision);
+            let _ = storage.drop_fk(index, fk_name, revision)?;
         }
         WalOp::UpsertRole {
             name,

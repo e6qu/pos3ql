@@ -5,7 +5,7 @@ use crate::mem::mutex::MutexGuard;
 use super::table_names::DefinitionWrite;
 use super::{
     CommentCatalog, CommentClass, CommentEntry, DatabaseOid, MAX_COLUMNS, PendingCommentIdentity,
-    PendingTableDef, SqlError, SqlName, Storage, TableDef,
+    PendingTableDef, SqlError, SqlName, Storage, TableDef, TableDefBuilder,
 };
 use crate::sql::eval::sqlstate;
 use crate::sql_err;
@@ -68,7 +68,7 @@ impl TableDefinitionTarget {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TableDefinitionChange {
     pub(super) source: super::catalog_sources::CatalogObjectIdentity,
     pub(super) transaction: u32,
@@ -137,7 +137,7 @@ impl<'storage> TableDefinitionEdit<'storage> {
     pub(super) fn stage(
         mut self,
         target: TableDefinitionTarget,
-        mut definition: TableDef,
+        mut definition: TableDefBuilder,
         column_mapping: &[Option<SqlName>; MAX_COLUMNS],
         rewrites_rows: bool,
     ) -> Result<TableDefinitionChange, SqlError> {
@@ -151,6 +151,7 @@ impl<'storage> TableDefinitionEdit<'storage> {
             }
             let comments = self.storage.comment_catalog();
             let source = if !definition.requires_type_catalog()
+                && definition.n_fkeys == 0
                 && definition.schema == self.definition.committed().schema
                 && definition.name == self.definition.committed().name
                 && self.definition.pending.is_none()
@@ -171,6 +172,12 @@ impl<'storage> TableDefinitionEdit<'storage> {
                             None,
                         )?;
                         source.bind_table_definition(&mut definition, transaction)?;
+                        self.storage.require_definition_dependency_access(
+                            &source,
+                            &definition,
+                            transaction,
+                            Some(self.table),
+                        )?;
                         Some(source)
                     }
                     Err(wait) => {
@@ -322,13 +329,24 @@ impl<'storage> TableDefinitionEdit<'storage> {
                 })? as u16;
             }
         }
+        let stored = definition.freeze(&self.storage.metadata_pool)?;
+        let transition = self
+            .storage
+            .metadata_pool
+            .copy_slice(&transition[..current.n_columns])
+            .map_err(|error| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "{}", error))?;
+        let composed = self
+            .storage
+            .metadata_pool
+            .copy_slice(&composed[..self.definition.committed().n_columns])
+            .map_err(|error| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "{}", error))?;
         let revision = self.storage.catalog_sequence.next()?;
         self.storage.pending_table_defs.stage_locked(
             &mut self.definition,
             PendingTableDef {
                 txid: transaction,
                 revision,
-                def: definition,
+                def: stored,
                 transition,
                 column_mapping: composed,
                 rewrites_rows: rewrites_rows
@@ -347,12 +365,25 @@ impl<'storage> TableDefinitionEdit<'storage> {
         );
         comment_identity.apply(&mut comments);
         self.definition.publish_names();
-        Ok(TableDefinitionChange {
+        let change = TableDefinitionChange {
             source: target.source,
             transaction,
             revision,
             committed_revision: target.committed_revision,
-        })
+        };
+        let storage = self.storage;
+        let table = self.table;
+        drop(indexes);
+        drop(_source);
+        drop(comments);
+        drop(self);
+        if !rewrites_rows
+            && let Err(error) = storage.prepare_table_enforcers(table, transaction, revision, false)
+        {
+            storage.rollback_table_def(change);
+            return Err(error);
+        }
+        Ok(change)
     }
 
     pub(super) fn rollback(mut self, change: TableDefinitionChange) {
@@ -438,6 +469,7 @@ impl<'storage> TableDefinitionEdit<'storage> {
         drop(indexes);
         drop(comments);
         drop(self);
+        storage.rollback_table_enforcers(table, transaction, change.revision);
         storage.retire_implicit_index_statistics(database, table, &discarded[..discarded_count]);
     }
 }
@@ -453,11 +485,11 @@ struct TableCommentIdentity {
 }
 
 impl TableCommentIdentity {
-    fn new(
+    fn new<B: super::DefinitionBacking>(
         table: usize,
         database: DatabaseOid,
         committed: &TableDef,
-        visible: &TableDef,
+        visible: &super::TableDefinition<B>,
         transaction: u32,
     ) -> Self {
         Self {
@@ -567,7 +599,7 @@ mod tests {
     fn pending_table_definition_wait_keeps_unrelated_edits_and_comments_available() {
         let (storage, first, other) = fixture();
         let held = storage.table_def(first, 7);
-        let mut updated = *held;
+        let mut updated = TableDefBuilder::from_definition(&held);
         updated.name = SqlName::parse("first_pending").unwrap();
         let (send, receive) = std::sync::mpsc::sync_channel(1);
         let first_change = std::thread::scope(|scope| {
@@ -599,7 +631,8 @@ mod tests {
             if waiting {
                 scope.spawn(move || {
                     crate::mem::guard::forbid_alloc(|| {
-                        let mut changed = *storage.table_def(other, 8);
+                        let mut changed =
+                            TableDefBuilder::from_definition(&storage.table_def(other, 8));
                         changed.name = SqlName::parse("other_pending").unwrap();
                         let change = storage
                             .write_table_def(
@@ -674,7 +707,7 @@ mod tests {
             )
             .unwrap();
         crate::mem::guard::forbid_alloc(|| {
-            let mut first = *storage.table_def(table, 7);
+            let mut first = TableDefBuilder::from_definition(&storage.table_def(table, 7));
             first.name = SqlName::parse("first_shape").unwrap();
             first.columns[0].name = SqlName::parse("renamed_id").unwrap();
             let first_change = storage
@@ -685,7 +718,7 @@ mod tests {
                     true,
                 )
                 .unwrap();
-            let mut second = *storage.table_def(table, 7);
+            let mut second = TableDefBuilder::from_definition(&storage.table_def(table, 7));
             second.schema = SqlName::parse("moved").unwrap();
             second.columns[0].name = SqlName::parse("final_id").unwrap();
             let second_change = storage
@@ -768,7 +801,7 @@ mod tests {
             storage
                 .begin_rule_history(RuleTarget::Table(first as u16), 7)
                 .unwrap();
-            let changed = *storage.table_def(first, 7);
+            let changed = TableDefBuilder::from_definition(&storage.table_def(first, 7));
             assert!(
                 storage
                     .write_table_def(
@@ -787,9 +820,12 @@ mod tests {
                     PendingTableDef {
                         txid: 8,
                         revision: 1,
-                        def: changed,
-                        transition: [u16::MAX; MAX_COLUMNS],
-                        column_mapping: mapping("id"),
+                        def: changed.freeze(&storage.metadata_pool).unwrap(),
+                        transition: storage.metadata_pool.copy_slice(&[u16::MAX]).unwrap(),
+                        column_mapping: storage
+                            .metadata_pool
+                            .copy_slice(&mapping("id")[..1])
+                            .unwrap(),
                         rewrites_rows: false,
                         class_tuple_private: false,
                     },
@@ -830,7 +866,7 @@ mod tests {
     #[test]
     fn pending_table_definition_rejects_retired_slots_and_preserves_pending_create() {
         let (storage, first, _) = fixture();
-        let definition = *storage.table_def(first, 0);
+        let definition = TableDefBuilder::from_definition(&storage.table_def(first, 0));
         crate::mem::guard::forbid_alloc(|| {
             storage.commit_drop(first);
             assert_eq!(
@@ -921,7 +957,7 @@ mod tests {
                 assert_eq!(comments.entries[slot].pending_identity.unwrap().txid, 8);
                 assert_eq!(comments.entries[slot].name, name);
             }
-            let mut renamed = *storage.table_def(first, 9);
+            let mut renamed = TableDefBuilder::from_definition(&storage.table_def(first, 9));
             renamed.schema = SqlName::parse("moved").unwrap();
             let error = storage
                 .write_table_def(
@@ -969,8 +1005,10 @@ mod tests {
     fn table_definition_sources_reject_stale_versions_without_touching_other_tables() {
         let (storage, table, other) = fixture();
         crate::mem::guard::forbid_alloc(|| {
-            let (original_target, mut first) = storage.select_table_definition(table, 7);
-            let (other_target, mut other_definition) = storage.select_table_definition(other, 7);
+            let (original_target, first) = storage.select_table_definition(table, 7);
+            let mut first = TableDefBuilder::from_definition(&first);
+            let (other_target, other_definition) = storage.select_table_definition(other, 7);
+            let mut other_definition = TableDefBuilder::from_definition(&other_definition);
             first.columns[0].name = SqlName::parse("first_column").unwrap();
             let first_change = storage
                 .write_table_def(original_target, first, &mapping("first_column"), false)
@@ -979,7 +1017,8 @@ mod tests {
                 .write_table_def(original_target, first, &mapping("first_column"), false)
                 .unwrap_err();
             assert_eq!(error.sqlstate, sqlstate::SERIALIZATION_FAILURE);
-            let (next_target, mut second) = storage.select_table_definition(table, 7);
+            let (next_target, second) = storage.select_table_definition(table, 7);
+            let mut second = TableDefBuilder::from_definition(&second);
             second.columns[0].name = SqlName::parse("second_column").unwrap();
             let second_change = storage
                 .write_table_def(next_target, second, &mapping("second_column"), false)
@@ -998,6 +1037,7 @@ mod tests {
             storage.rollback_table_def(first_change);
             assert!(storage.pending_table_def(table).is_none());
             let (committed_target, committed) = storage.select_table_definition(table, 7);
+            let committed = TableDefBuilder::from_definition(&committed);
             let revision = storage.reserve_table_definition_revision().unwrap();
             storage
                 .move_table_schema(table, SqlName::parse("moved").unwrap(), revision)
@@ -1026,7 +1066,8 @@ mod tests {
         let (storage, table, _) = fixture();
         let (foreign, foreign_table, _) = fixture();
         crate::mem::guard::forbid_alloc(|| {
-            let (target, mut definition) = storage.select_table_definition(table, 7);
+            let (target, definition) = storage.select_table_definition(table, 7);
+            let mut definition = TableDefBuilder::from_definition(&definition);
             definition.name = SqlName::parse("selected_pending").unwrap();
             let change = storage
                 .write_table_def(target, definition, &mapping("id"), false)
@@ -1041,8 +1082,10 @@ mod tests {
             storage.commit_drop(table);
             let replacement = storage.create_table_in(definition, 7).unwrap();
             assert_eq!(replacement, table);
-            let (replacement_target, mut replacement_definition) =
+            let (replacement_target, replacement_definition) =
                 storage.select_table_definition(replacement, 7);
+            let mut replacement_definition =
+                TableDefBuilder::from_definition(&replacement_definition);
             replacement_definition.columns[0].name = SqlName::parse("replacement_column").unwrap();
             let replacement_change = storage
                 .write_table_def(
@@ -1069,7 +1112,8 @@ mod tests {
     #[test]
     fn table_definition_wait_rejects_a_newer_private_shape() {
         let (storage, table, other) = fixture();
-        let (target, mut proposed) = storage.select_table_definition(table, 7);
+        let (target, proposed) = storage.select_table_definition(table, 7);
+        let mut proposed = TableDefBuilder::from_definition(&proposed);
         proposed.name = SqlName::parse("stale_proposal").unwrap();
         let held = storage.type_catalog.lock().unwrap();
         std::thread::scope(|scope| {
@@ -1095,13 +1139,15 @@ mod tests {
             };
             let installed = if waiting {
                 Some(crate::mem::guard::forbid_alloc(|| {
-                    let (new_target, mut newer) = storage.select_table_definition(table, 7);
+                    let (new_target, newer) = storage.select_table_definition(table, 7);
+                    let mut newer = TableDefBuilder::from_definition(&newer);
                     newer.columns[0].name = SqlName::parse("newer_column").unwrap();
                     let change = storage
                         .write_table_def(new_target, newer, &mapping("newer_column"), false)
                         .unwrap();
                     let (other_target, other_definition) =
                         storage.select_table_definition(other, 8);
+                    let other_definition = TableDefBuilder::from_definition(&other_definition);
                     let other_change = storage
                         .write_table_def(other_target, other_definition, &mapping("id"), false)
                         .unwrap();
@@ -1149,12 +1195,14 @@ mod tests {
             crate::sql::txn::TxnState::new_with_config(&mut transaction_budget, &config).unwrap();
         transaction.txid = 7;
         crate::mem::guard::forbid_alloc(|| {
-            let (target, mut first) = storage.select_table_definition(table, 7);
+            let (target, first) = storage.select_table_definition(table, 7);
+            let mut first = TableDefBuilder::from_definition(&first);
             first.name = SqlName::parse("kept_change").unwrap();
             transaction
                 .write_table_definition(&storage, target, first, &mapping("id"), false)
                 .unwrap();
-            let (target, mut second) = storage.select_table_definition(table, 7);
+            let (target, second) = storage.select_table_definition(table, 7);
+            let mut second = TableDefBuilder::from_definition(&second);
             second.name = SqlName::parse("unrecorded_change").unwrap();
             let error = transaction
                 .write_table_definition(&storage, target, second, &mapping("id"), false)
@@ -1163,6 +1211,7 @@ mod tests {
             assert_eq!(storage.table_def(table, 7).name.as_str(), "kept_change");
             assert_eq!(transaction.ddl().len(), 1);
             let (foreign_target, unchanged) = storage.select_table_definition(table, 8);
+            let unchanged = TableDefBuilder::from_definition(&unchanged);
             let error = transaction
                 .write_table_definition(&storage, foreign_target, unchanged, &mapping("id"), false)
                 .unwrap_err();
@@ -1171,7 +1220,10 @@ mod tests {
             let crate::sql::txn::DdlUndo::TableAltered(change) = transaction.ddl()[0] else {
                 panic!("table definition change was not registered");
             };
-            assert_eq!(storage.commit_table_def(change).unwrap(), Some(false));
+            assert_eq!(
+                crate::storage::tests::publish_table_definition(&storage, change).unwrap(),
+                Some(false)
+            );
             assert_eq!(storage.table_def(table, 0).name.as_str(), "kept_change");
         });
     }
@@ -1180,7 +1232,8 @@ mod tests {
     fn table_definition_revision_exhaustion_leaves_no_pending_change() {
         let (storage, table, _) = fixture();
         crate::mem::guard::forbid_alloc(|| {
-            let (target, mut definition) = storage.select_table_definition(table, 7);
+            let (target, definition) = storage.select_table_definition(table, 7);
+            let mut definition = TableDefBuilder::from_definition(&definition);
             definition.name = SqlName::parse("cannot_reserve").unwrap();
             storage
                 .catalog_sequence

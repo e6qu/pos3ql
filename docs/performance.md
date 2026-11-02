@@ -320,10 +320,15 @@ python3 tools/measure-embedded-capacity.py --output NEW_DIRECTORY \
 ```
 
 The explicit 2 GiB ceiling rejects an oversized reservation; it does not allocate
-2 GiB. The matrix uses equal explicit `row_overlay_slots`, `row_work_bytes`, `row_work_leases`
-and `definition_image_slots` for 1/8/32/128 configured tables in both transaction
-modes. Empty, one-hot-table, evenly distributed and moving-demand cases have
-separate samples. The output retains the exact commands, revision, compiler,
+2 GiB. The 48-sample matrix uses equal explicit `row_overlay_slots`,
+`row_work_bytes`, `row_work_leases`, `definition_image_slots`,
+`table_metadata_bytes` (64 MiB) and `table_metadata_leases` (8,192) for
+1/8/32/128 configured tables in both transaction modes. Each combination runs
+empty, one-hot-table, evenly distributed, moving-demand, wide-schema and
+replacement workloads. The wide schema has 64 nullable columns. Replacement
+creates a unique index, adds a column, rolls back to a savepoint, then drops and
+recreates the index before checking row counts and sums. Metadata-pool backing
+and free-range control reservations must stay constant across table counts. The output retains the exact commands, revision, compiler,
 binary digest, named budget draws and raw JSON measurements, with checksums.
 Digests read files in bounded 1 MiB chunks. The script runs the helper's focused
 metric tests before building and sampling it.
@@ -357,8 +362,11 @@ Compare the named shared pools at equal settings. Total memory can still rise
 with table identities, catalog/history structures, connection metadata and
 other independent reservations. Peak resident memory measures touched pages;
 it is different from reserved bytes and the 128 MiB virtual query stack.
-Populated measurements include a separately reported session reservation. These
-small local-only workloads establish neither object-store throughput nor a
+Populated measurements include a separately reported session reservation. This
+single-session matrix does not measure retained-reader pressure; ownership,
+exhaustion and cancellation regressions cover that behavior separately. Fresh CI
+artifacts are still required to accept the current shared-metadata integration.
+These small local-only workloads establish neither object-store throughput nor a
 production embedded minimum; retain the historical evidence unchanged.
 
 ## Retained evidence

@@ -1300,7 +1300,7 @@ fn expand_dml_ctes_with_relations<'a>(
 pub(crate) fn filter_view_rows<'a>(
     select: &'a Select<'a>,
     predicate: Option<&'a Expr<'a>>,
-    definition: &crate::storage::TableDef,
+    definition: crate::storage::RelationDefinition<'_>,
     alias: Option<&str>,
     security_barrier: crate::storage::ViewSecurityBarrier,
     storage: &Storage,
@@ -1530,7 +1530,7 @@ pub(crate) fn filter_view_rows<'a>(
 fn filter_set_view_rows<'a>(
     body: &'a SetTree<'a>,
     predicate: Option<&'a Expr<'a>>,
-    definition: &crate::storage::TableDef,
+    definition: crate::storage::RelationDefinition<'_>,
     alias: Option<&str>,
     security_barrier: crate::storage::ViewSecurityBarrier,
     storage: &Storage,
@@ -1590,7 +1590,7 @@ fn filter_set_view_rows<'a>(
 fn filter_set_view_conjunct<'a>(
     body: &'a SetTree<'a>,
     predicate: &'a Expr<'a>,
-    definition: &crate::storage::TableDef,
+    definition: crate::storage::RelationDefinition<'_>,
     alias: Option<&str>,
     security_barrier: crate::storage::ViewSecurityBarrier,
     storage: &Storage,
@@ -4242,15 +4242,6 @@ fn materialize_recursive<'a>(
         }
         working_column_names[..aliases.len()].copy_from_slice(aliases);
     }
-    let working_definition = super::scope::materialized_definition(
-        storage,
-        txid,
-        cte.name,
-        &working_column_names[..ncols],
-        base_column_types,
-        base_column_collations,
-        arena,
-    )?;
     let decoration = prepare_recursive_decoration(
         cte,
         base_column_names,
@@ -4269,8 +4260,25 @@ fn materialize_recursive<'a>(
     let column_names = decoration.column_names;
     let column_types = decoration.column_types;
     let column_collations = decoration.column_collations;
-    let definition = if !decorated && working_column_names[..ncols] == column_names[..] {
-        working_definition
+    working_column_names[ncols..column_names.len()].copy_from_slice(&column_names[ncols..]);
+    let working_definition = super::scope::materialized_definition(
+        storage,
+        txid,
+        cte.name,
+        &working_column_names[..column_names.len()],
+        column_types,
+        column_collations,
+        arena,
+    )?;
+    let working_definition = crate::storage::RelationDefinition {
+        n_columns: ncols,
+        ..working_definition
+    };
+    let definition = if working_column_names[..column_names.len()] == column_names[..] {
+        crate::storage::RelationDefinition {
+            n_columns: column_names.len(),
+            ..working_definition
+        }
     } else {
         super::scope::materialized_definition(
             storage,
@@ -4988,18 +4996,24 @@ fn rewrite_stored_relation_name<'a>(
     }) else {
         return Ok(name);
     };
-    let (schema, relation) = match dependency.class {
-        crate::storage::DependencyClass::Table => {
-            let definition = context
-                .storage
-                .table_def(dependency.slot as usize, context.txid);
+    let (schema, relation) = match context
+        .storage
+        .resolve_stored_query_relation(dependency, context.txid)?
+    {
+        crate::storage::ResolvedRelation::Table(slot) => {
+            let definition = context.storage.table_def(slot, context.txid);
             (definition.schema, definition.name)
         }
-        crate::storage::DependencyClass::View => {
-            let definition = context.storage.view(dependency.slot as usize);
-            (definition.schema, definition.name)
+        crate::storage::ResolvedRelation::View(slot) => {
+            let definition = context.storage.view(slot);
+            (
+                definition.schema_for(context.txid),
+                definition.name_for(context.txid),
+            )
         }
-        _ => unreachable!("stored relation rewrite only accepts relations"),
+        crate::storage::ResolvedRelation::Catalog => {
+            unreachable!("stored physical relation binding")
+        }
     };
     Ok(crate::sql::ast::QualName {
         schema: Some(arena.alloc_str(schema.as_str()).map_err(|_| arena_full())?),
@@ -5197,24 +5211,23 @@ fn subst_tableref<'a>(
     // by a table earlier in the path) expands to a derived table over the
     // view's stored SELECT, recursively expanded under the view creator's
     // search path.
-    let captured = context.dependencies.and_then(|dependencies| {
-        dependencies.entries().iter().find_map(|dependency| {
-            if dependency.referenced_schema.as_str() != t.schema.unwrap_or("")
-                || dependency.referenced_name.as_str() != t.table
-            {
-                return None;
-            }
-            match dependency.class {
-                crate::storage::DependencyClass::Table => Some(
-                    crate::storage::ResolvedRelation::Table(dependency.slot as usize),
-                ),
-                crate::storage::DependencyClass::View => Some(
-                    crate::storage::ResolvedRelation::View(dependency.slot as usize),
-                ),
-                _ => None,
-            }
+    let captured = context
+        .dependencies
+        .and_then(|dependencies| {
+            dependencies.entries().iter().find(|dependency| {
+                matches!(
+                    dependency.class,
+                    crate::storage::DependencyClass::Table | crate::storage::DependencyClass::View
+                ) && dependency.referenced_schema.as_str() == t.schema.unwrap_or("")
+                    && dependency.referenced_name.as_str() == t.table
+            })
         })
-    });
+        .map(|dependency| {
+            context
+                .storage
+                .resolve_stored_query_relation(dependency, context.txid)
+        })
+        .transpose()?;
     let resolved = captured.or_else(|| match context.path {
         Some(p) => context
             .storage

@@ -546,6 +546,31 @@ impl Storage {
         Ok(())
     }
 
+    /// Private column images survive checkpoints independently of relation counts.
+    pub(crate) fn restore_prepared_table_statistics(
+        &self,
+        table_slot: usize,
+        transaction: u32,
+        mut statistics: TableStatistics,
+        replay_relation_counts: bool,
+    ) -> Result<bool, SqlError> {
+        let current = self.table_statistics(table_slot, 0);
+        if statistics.columns == current.columns {
+            if replay_relation_counts {
+                self.write_relation_counts(table_slot, statistics, false)?;
+            }
+            return Ok(false);
+        }
+        if !replay_relation_counts {
+            statistics.valid = current.valid;
+            statistics.rows = current.rows;
+            statistics.average_row_width = current.average_row_width;
+            statistics.analyzed_generation = current.analyzed_generation;
+        }
+        self.write_table_statistics(table_slot, transaction, statistics)?;
+        Ok(true)
+    }
+
     /// Relation estimates change in place; column statistics keep their owner.
     pub(crate) fn write_relation_counts(
         &self,
@@ -884,6 +909,49 @@ mod tests {
             ))
             .unwrap();
         (storage, budget, table)
+    }
+
+    #[test]
+    fn restored_prepared_analysis_keeps_columns_private_and_preserves_newer_counts() {
+        for replay_counts in [false, true] {
+            for commit in [false, true] {
+                let (storage, _budget, table) = fixture();
+                crate::mem::guard::forbid_alloc(|| {
+                    storage.write_table_statistics(table, 7, image(1)).unwrap();
+                    storage.commit_table_statistics(table, 7);
+                    storage
+                        .write_relation_counts(table, image(99), false)
+                        .unwrap();
+                    assert!(
+                        storage
+                            .restore_prepared_table_statistics(table, 9, image(2), replay_counts)
+                            .unwrap()
+                    );
+                    let rows = if replay_counts { 2 } else { 99 };
+                    assert_eq!(storage.table_statistics(table, 0).columns, image(1).columns);
+                    assert_eq!(storage.table_statistics(table, 9).columns, image(2).columns);
+                    assert_eq!(storage.table_statistics(table, 0).rows, rows);
+                    assert_eq!(storage.table_statistics(table, 9).rows, rows);
+                    if commit {
+                        storage.commit_table_statistics(table, 9);
+                    } else {
+                        storage.rollback_table_statistics(table, 9);
+                    }
+                    assert_eq!(
+                        storage.table_statistics(table, 0).columns,
+                        image(if commit { 2 } else { 1 }).columns
+                    );
+                    assert_eq!(storage.table_statistics(table, 0).rows, rows);
+                    let current = storage.table_statistics(table, 0);
+                    assert!(
+                        !storage
+                            .restore_prepared_table_statistics(table, 11, current, replay_counts)
+                            .unwrap()
+                    );
+                    assert!(storage.pending_table_statistics(table, 11).is_none());
+                });
+            }
+        }
     }
 
     #[test]

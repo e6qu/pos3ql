@@ -3320,7 +3320,7 @@ pub struct MaterializedCte<'a> {
     /// A recursive CTE resolves the same relation once per iteration, so
     /// rebuilding a full PostgreSQL-width definition there would consume the
     /// statement arena in proportion to recursion depth.
-    pub(crate) definition: Option<&'a crate::storage::TableDef>,
+    pub(crate) definition: Option<crate::storage::RelationDefinition<'a>>,
     pub(crate) source: MaterializedCteSource<'a>,
 }
 

@@ -53,7 +53,7 @@ mod type_io;
 /// A materialized catalog relation: its shape plus rows in the arena.
 #[derive(Clone, Copy)]
 pub(crate) struct SynthTable<'a> {
-    pub def: &'a crate::storage::RelationDefinition<'a>,
+    pub def: crate::storage::RelationDefinition<'a>,
     pub rows: &'a [&'a [Datum<'a>]],
     /// Addressable system columns encoded after `def.n_columns`, and therefore
     /// omitted from star expansion and the relation's positive attributes.
@@ -9426,8 +9426,7 @@ pub(crate) fn synthesize_definition<'a>(
         )
     })?;
     let hidden = schema::hidden_columns(name, information_schema);
-    let (definition, hidden_columns) = materialize_with_hidden(specification, hidden)?;
-    let definition = allocate_definition(definition, hidden_columns, arena)?;
+    let (definition, hidden_columns) = materialize_with_hidden(specification, hidden, arena)?;
     Ok(SynthTable {
         def: definition,
         rows: &[],
@@ -10200,7 +10199,7 @@ pub(crate) fn table_row_type_oid(storage: &Storage, slot: usize, array: bool) ->
 }
 
 pub(crate) fn view_row_type_oid(storage: &Storage, slot: usize, array: bool) -> i32 {
-    crate::storage::RelationIdentity::parse(storage.view(slot).created_at)
+    crate::storage::RelationIdentity::parse(storage.view_catalog_identity(slot).created_at())
         .expect("admitted view has a durable relation identity")
         .companion_oid(if array {
             FIRST_VIEW_COMPOSITE_ARRAY_TYPE_OID
@@ -11425,7 +11424,7 @@ pub(crate) fn sequence_state_by_oid(storage: &Storage, oid: i32, txid: u32) -> O
 
 /// A view replacement preserves identity; drop and create reserve a new one.
 pub(crate) fn view_oid(storage: &Storage, slot: usize) -> i32 {
-    crate::storage::RelationIdentity::parse(storage.view(slot).created_at)
+    crate::storage::RelationIdentity::parse(storage.view_catalog_identity(slot).created_at())
         .expect("admitted relation has a durable identity")
         .oid()
 }
@@ -11609,9 +11608,7 @@ pub(crate) fn extended_statistics_expressions_by_oid<'a>(
 }
 
 pub(crate) fn named_composite_relation_oid(storage: &Storage, slot: usize) -> i32 {
-    crate::storage::RelationIdentity::parse(storage.composite(slot).created_at)
-        .expect("admitted relation has a durable identity")
-        .oid()
+    storage.composite_relation_identity(slot).oid()
 }
 
 fn composite_type_oid(storage: &Storage, schema: &str, name: &str, txid: u32) -> Option<i32> {
@@ -12258,6 +12255,57 @@ pub(crate) fn index_identity_by_oid(
     found
 }
 
+pub(crate) struct IndexMaintenanceTarget {
+    pub table: usize,
+    pub oid: i32,
+    pub explicit_slot: Option<usize>,
+}
+
+/// Includes the implicit constraint indexes exposed by the relation catalog.
+pub(crate) fn index_maintenance_target(
+    storage: &Storage,
+    txid: u32,
+    schema: Option<&str>,
+    name: &str,
+) -> Result<Option<IndexMaintenanceTarget>, SqlError> {
+    let Some(oid) = relation_oid_for_name(storage, txid, schema, name) else {
+        return Ok(None);
+    };
+    let mut found = None;
+    visit_indexes(storage, txid, None, |index| {
+        if index.oid == oid {
+            found = Some((
+                index.table_slot,
+                index.name,
+                index.explicit_definition.is_some(),
+            ));
+        }
+    });
+    let Some((table, name, explicit)) = found else {
+        return Ok(None);
+    };
+    let explicit_slot = if explicit {
+        let schema = storage.table_def(table, txid).schema;
+        Some(
+            storage
+                .index_slot(schema.as_str(), name.as_str(), txid)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::SERIALIZATION_FAILURE,
+                        "selected index changed before maintenance"
+                    )
+                })?,
+        )
+    } else {
+        None
+    };
+    Ok(Some(IndexMaintenanceTarget {
+        table,
+        oid,
+        explicit_slot,
+    }))
+}
+
 fn stack_str_64(s: &str) -> StackStr<64> {
     let mut out = StackStr::<64>::new();
     let _ = core::fmt::Write::write_str(&mut out, s);
@@ -12296,14 +12344,11 @@ pub fn relname_text<'a>(
         let sequence = storage.sequence_for(slot, txid);
         return reference(sequence.schema.as_str(), sequence.name.as_str());
     }
-    if let Some(slot) = view_slot_by_oid(storage, txid, oid) {
-        let view = storage.view(slot);
-        return reference(view.schema_for(txid).as_str(), view.name_for(txid).as_str());
+    if let Some((schema, name)) = storage.view_relation_name(oid, txid) {
+        return reference(schema.as_str(), name.as_str());
     }
-    for (slot, composite) in storage.composites_with_slots_visible_to(txid) {
-        if named_composite_relation_oid(storage, slot) == oid {
-            return reference(composite.schema.as_str(), composite.name.as_str());
-        }
+    if let Some((schema, name)) = storage.composite_relation_name(oid, txid) {
+        return reference(schema.as_str(), name.as_str());
     }
     // Other relation families were resolved above. Index names are copied
     // directly, without constructing catalog rows.
@@ -12488,6 +12533,7 @@ pub(crate) fn serial_sequence_name<'a>(
         table_definition.schema.as_str(),
         table_definition.name.as_str(),
         column.name.as_str(),
+        crate::storage::GeneratedSequenceScope::Owned,
         txid,
     ) else {
         return Ok(None);
@@ -12518,9 +12564,7 @@ pub fn relation_oid_is_visible(storage: &Storage, txid: u32, oid: i32) -> bool {
         })
         || (0..storage.view_count())
             .any(|slot| storage.view_slot_visible_to(slot, txid) && view_oid(storage, slot) == oid)
-        || storage
-            .composites_with_slots_visible_to(txid)
-            .any(|(slot, _)| named_composite_relation_oid(storage, slot) == oid)
+        || storage.composite_relation_name(oid, txid).is_some()
 }
 
 pub(crate) fn relation_oid_visibility(storage: &Storage, txid: u32, oid: i32) -> Option<bool> {
@@ -12546,24 +12590,11 @@ pub(crate) fn relation_oid_visibility(storage: &Storage, txid: u32, oid: i32) ->
             );
         }
     }
-    for slot in 0..storage.view_count() {
-        if storage.view_slot_visible_to(slot, txid) && view_oid(storage, slot) == oid {
-            return Some(
-                relation_oid_for_name(
-                    storage,
-                    txid,
-                    None,
-                    storage.view(slot).name_for(txid).as_str(),
-                ) == Some(oid),
-            );
-        }
+    if let Some((_, name)) = storage.view_relation_name(oid, txid) {
+        return Some(relation_oid_for_name(storage, txid, None, name.as_str()) == Some(oid));
     }
-    for (slot, composite) in storage.composites_with_slots_visible_to(txid) {
-        if named_composite_relation_oid(storage, slot) == oid {
-            return Some(
-                relation_oid_for_name(storage, txid, None, composite.name.as_str()) == Some(oid),
-            );
-        }
+    if let Some((_, name)) = storage.composite_relation_name(oid, txid) {
+        return Some(relation_oid_for_name(storage, txid, None, name.as_str()) == Some(oid));
     }
     None
 }
@@ -14112,9 +14143,11 @@ pub fn trigger_def_text<'a>(
             output
                 .write_str(" OF ")
                 .map_err(|_| super::eval::arena_full())?;
+            let retained_table_definition;
             let definition = match render_target {
                 crate::storage::TriggerTarget::Table(table) => {
-                    *storage.table_def(usize::from(table), txid)
+                    retained_table_definition = storage.table_def(usize::from(table), txid);
+                    retained_table_definition.borrowed()
                 }
                 crate::storage::TriggerTarget::View(view) => {
                     super::exec::view_trigger_definition(storage, usize::from(view), txid, arena)?
@@ -16369,8 +16402,8 @@ fn partition_bound_def_text(bound: PartitionBound, arena: &Arena) -> Result<&str
     alloc_rendered(&rendered, "partition bound definition is too long", arena)
 }
 
-fn detached_partition_constraint_def_text<'a>(
-    definition: &TableDef,
+fn detached_partition_constraint_def_text<'a, Definition0: crate::storage::DefinitionBacking>(
+    definition: &crate::storage::TableDefinition<Definition0>,
     constraint: crate::storage::DetachedPartitionBound,
     arena: &'a Arena,
 ) -> Result<&'a str, SqlError> {
@@ -16481,9 +16514,9 @@ fn detached_partition_constraint_def_text<'a>(
     )
 }
 
-fn write_partition_constraint_key(
+fn write_partition_constraint_key<Definition0: crate::storage::DefinitionBacking>(
     out: &mut StackStr<4096>,
-    definition: &TableDef,
+    definition: &crate::storage::TableDefinition<Definition0>,
     scheme: crate::storage::PartitionScheme,
     index: usize,
 ) {
@@ -16498,9 +16531,9 @@ fn write_partition_constraint_key(
 /// Emits the lexicographic half of a range partition check.  The explicit
 /// recursion preserves SQL NULL semantics once the caller has emitted the
 /// required non-NULL checks, including bounds containing MINVALUE/MAXVALUE.
-fn write_range_partition_comparison(
+fn write_range_partition_comparison<Definition0: crate::storage::DefinitionBacking>(
     out: &mut StackStr<4096>,
-    definition: &TableDef,
+    definition: &crate::storage::TableDefinition<Definition0>,
     scheme: crate::storage::PartitionScheme,
     bound: &[PartitionBoundValue],
     lower: bool,
@@ -16685,9 +16718,9 @@ fn write_index_key_metadata(
     }
 }
 
-fn write_index_target(
+fn write_index_target<Definition0: crate::storage::DefinitionBacking>(
     out: &mut impl core::fmt::Write,
-    table: &TableDef,
+    table: &crate::storage::TableDefinition<Definition0>,
     info: &IdxInfo,
     qualify: bool,
 ) {
@@ -16966,35 +16999,6 @@ struct SynthDef<'a> {
     relation: Option<core::num::NonZeroU32>,
 }
 
-fn materialize_def(specification: SynthDef<'_>) -> TableDef {
-    let mut definition = TableDef {
-        schema: SqlName::parse(specification.schema).expect("catalog schema fits"),
-        name: SqlName::parse(specification.name).expect("catalog name fits"),
-        columns: [ColumnMeta::EMPTY; MAX_COLUMNS],
-        n_columns: specification
-            .columns
-            .iter()
-            .filter(|(name, _)| specification.relation.is_none() || *name != "tableoid")
-            .count(),
-        ..TableDef::empty()
-    };
-    for (index, (name, column_type)) in specification
-        .columns
-        .iter()
-        .filter(|(name, _)| specification.relation.is_none() || *name != "tableoid")
-        .enumerate()
-    {
-        definition.columns[index].name = SqlName::parse(name).expect("catalog column fits");
-        definition.columns[index].ctype = *column_type;
-        definition.columns[index].collation = if column_type.is_collatable() {
-            crate::sql::ast::Collation::Default
-        } else {
-            crate::sql::ast::Collation::None
-        };
-    }
-    definition
-}
-
 pub(crate) fn validate_restored_row(
     relation: &super::catalog_snapshot::CatalogSnapshotRelation,
     row: crate::storage::HistoricalCatalogRow<'_>,
@@ -17079,10 +17083,11 @@ fn finish<'a>(
 /// Materializes an exact visible relation shape plus addressable PostgreSQL
 /// system columns. Hidden columns are encoded in each row after the visible
 /// fields but remain outside `n_columns`, so star expansion cannot expose them.
-fn materialize_with_hidden(
+fn materialize_with_hidden<'a>(
     specification: SynthDef<'_>,
     hidden: &[(&str, ColType)],
-) -> Result<(TableDef, usize), SqlError> {
+    arena: &'a Arena,
+) -> Result<(crate::storage::RelationDefinition<'a>, usize), SqlError> {
     let visible = specification
         .columns
         .iter()
@@ -17096,13 +17101,27 @@ fn materialize_with_hidden(
     if visible + system > MAX_COLUMNS {
         return Err(catalog_capacity_exceeded(specification.name));
     }
-    let mut definition = materialize_def(specification);
-    let mut count = 0;
+    let columns = arena
+        .alloc_slice_with(visible + system, |_| ColumnMeta::EMPTY)
+        .map_err(|_| arena_full())?;
+    for (column, (name, column_type)) in columns.iter_mut().zip(
+        specification
+            .columns
+            .iter()
+            .filter(|(name, _)| specification.relation.is_none() || *name != "tableoid"),
+    ) {
+        column.name = SqlName::parse(name).expect("catalog column fits");
+        column.ctype = *column_type;
+        column.collation = if column_type.is_collatable() {
+            crate::sql::ast::Collation::Default
+        } else {
+            crate::sql::ast::Collation::None
+        };
+    }
+    let mut count = visible;
     if specification.relation.is_some() {
-        let column = &mut definition.columns[definition.n_columns];
-        column.name = SqlName::parse("tableoid").expect("system-column name fits");
-        column.ctype = ColType::Oid;
-        column.collation = crate::sql::ast::Collation::None;
+        columns[count].name = SqlName::parse("tableoid").expect("system-column name fits");
+        columns[count].ctype = ColType::Oid;
         count += 1;
     }
     for (name, column_type) in hidden {
@@ -17115,7 +17134,7 @@ fn materialize_with_hidden(
             }
             continue;
         }
-        if definition.columns[..definition.n_columns + count]
+        if columns[..count]
             .iter()
             .any(|column| column.name.as_str() == *name)
         {
@@ -17124,33 +17143,19 @@ fn materialize_with_hidden(
                 "duplicate catalog system-column name"
             ));
         }
-        let column = &mut definition.columns[definition.n_columns + count];
-        column.name = SqlName::parse(name).expect("catalog system-column name fits");
-        column.ctype = *column_type;
-        column.collation = crate::sql::ast::Collation::None;
+        columns[count].name = SqlName::parse(name).expect("catalog system-column name fits");
+        columns[count].ctype = *column_type;
         count += 1;
     }
-    Ok((definition, count))
-}
-
-fn allocate_definition<'a>(
-    definition: TableDef,
-    hidden_columns: usize,
-    arena: &'a Arena,
-) -> Result<&'a crate::storage::RelationDefinition<'a>, SqlError> {
-    let width = definition.n_columns + hidden_columns;
-    let columns = arena
-        .alloc_slice_copy(&definition.columns[..width])
-        .map_err(|_| arena_full())?;
-    arena
-        .alloc(crate::storage::RelationDefinition {
-            schema: definition.schema,
-            name: definition.name,
-            n_columns: definition.n_columns,
+    Ok((
+        crate::storage::RelationDefinition {
+            schema: SqlName::parse(specification.schema).expect("catalog schema fits"),
+            name: SqlName::parse(specification.name).expect("catalog name fits"),
+            n_columns: visible,
             columns,
-        })
-        .map(|definition| &*definition)
-        .map_err(|_| arena_full())
+        },
+        system,
+    ))
 }
 
 fn finish_with_hidden<'a>(
@@ -17159,8 +17164,8 @@ fn finish_with_hidden<'a>(
     rows: &[&'a [Datum<'a>]],
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let (definition, hidden_columns) = materialize_with_hidden(specification, hidden)?;
-    let def = allocate_definition(definition, hidden_columns, arena)?;
+    let (definition, hidden_columns) = materialize_with_hidden(specification, hidden, arena)?;
+    let def = definition;
     let typed = arena
         .alloc_slice_with(rows.len(), |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
@@ -22270,6 +22275,8 @@ fn pg_depend<'a>(
             match dependency.identity {
                 crate::storage::StoredDependencyIdentity::RoutineOid(oid) => oid,
                 crate::storage::StoredDependencyIdentity::Name
+                | crate::storage::StoredDependencyIdentity::Table(_)
+                | crate::storage::StoredDependencyIdentity::View(_)
                 | crate::storage::StoredDependencyIdentity::OperatorOid(_)
                 | crate::storage::StoredDependencyIdentity::Type(_)
                 | crate::storage::StoredDependencyIdentity::Collation(_)
@@ -22283,6 +22290,8 @@ fn pg_depend<'a>(
             match dependency.identity {
                 crate::storage::StoredDependencyIdentity::OperatorOid(oid) => oid,
                 crate::storage::StoredDependencyIdentity::Name
+                | crate::storage::StoredDependencyIdentity::Table(_)
+                | crate::storage::StoredDependencyIdentity::View(_)
                 | crate::storage::StoredDependencyIdentity::RoutineOid(_)
                 | crate::storage::StoredDependencyIdentity::Type(_)
                 | crate::storage::StoredDependencyIdentity::Collation(_)
@@ -22609,9 +22618,9 @@ fn fk_action_char(a: crate::storage::FkAction) -> &'static str {
 
 /// A `Datum::Array` of stable attribute numbers, the form
 /// `conkey`/`confkey`/`indkey`-as-array take in `pg_constraint`.
-fn attnum_array<'a>(
+fn attnum_array<'a, Definition0: crate::storage::DefinitionBacking>(
     columns: &[u16],
-    table: &TableDef,
+    table: &crate::storage::TableDefinition<Definition0>,
     arena: &'a Arena,
 ) -> Result<Datum<'a>, SqlError> {
     let vals = arena
@@ -31992,8 +32001,11 @@ fn view_column_catalog_type(
     })
 }
 
-fn not_null_constraint_name(table: &TableDef, column: &ColumnMeta) -> SqlName {
-    table.not_null_names[table
+fn not_null_constraint_name<Definition0: crate::storage::DefinitionBacking>(
+    table: &crate::storage::TableDefinition<Definition0>,
+    column: &ColumnMeta,
+) -> SqlName {
+    table.not_null_names.as_ref()[table
         .column_index(column.name.as_str())
         .expect("constraint column exists")]
     .expect("stored NOT NULL constraint has a durable name")

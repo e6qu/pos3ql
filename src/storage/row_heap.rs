@@ -2007,7 +2007,7 @@ mod tests {
         }
         assert!(
             crate::config::Config::parse(
-                "transaction_mode = mvcc\ncatalog_history_bytes = 16MiB\nrow_history_slots = 65536\nrow_overlay_slots = 8192\nrow_work_bytes = 8388608\nrow_work_leases = 128\ndefinition_image_slots = 256\nmemtable_bytes = 4GiB"
+                "transaction_mode = mvcc\ncatalog_history_bytes = 16MiB\nrow_history_slots = 65536\nrow_overlay_slots = 8192\nrow_work_bytes = 8388608\nrow_work_leases = 128\ndefinition_image_slots = 256\ntable_metadata_bytes = 64MiB\ntable_metadata_leases = 8192\nmemtable_bytes = 4GiB"
             )
             .unwrap_err()
             .message

@@ -1,15 +1,39 @@
-//! Typed, individually released ranges in one startup-allocated byte pool.
+//! Typed, uniquely mutable or retained immutable ranges in fixed startup backing.
 
 use core::cell::UnsafeCell;
 use core::marker::PhantomData;
-use core::mem::{MaybeUninit, align_of, size_of};
+use core::mem::{ManuallyDrop, MaybeUninit, align_of, size_of};
 use core::ops::{Deref, DerefMut};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use {crate::mem::mutex::Mutex, std::sync::Arc};
 
 use super::budget::{Budget, BudgetError};
 use super::fixed_vec::FixedVec;
 
 const ALIGNMENT: usize = 64;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Purpose {
+    pool: &'static str,
+    bytes: &'static str,
+    leases: &'static str,
+    ranges: &'static str,
+}
+
+impl Purpose {
+    pub(crate) const ROW_WORK: Self = Self {
+        pool: "row work pool",
+        bytes: "row_work_bytes",
+        leases: "row_work_leases",
+        ranges: "row work free ranges",
+    };
+    pub(crate) const TABLE_METADATA: Self = Self {
+        pool: "table metadata pool",
+        bytes: "table_metadata_bytes",
+        leases: "table_metadata_leases",
+        ranges: "table metadata free ranges",
+    };
+}
 
 #[repr(C, align(64))]
 struct Block {
@@ -26,28 +50,29 @@ struct Descriptor {
     generation: u64,
     range: Option<Range>,
 }
-
 struct State {
     descriptors: Box<[Descriptor]>,
     free: FixedVec<Range>,
 }
 
-/// The backing and all allocator metadata are allocated at startup. Ranges
-/// start on 64-byte boundaries; each live lease wastes at most 63 padding bytes.
-pub(crate) struct RowWorkPool {
+/// Allocator locks protect only extent ownership, never payload access or drops.
+/// A descriptor remains occupied while the final payload destructor runs.
+pub(crate) struct LeasePool {
+    purpose: Purpose,
     backing: Box<[Block]>,
     usable_bytes: usize,
+    references: Box<[AtomicUsize]>,
     state: Mutex<State>,
 }
 
-// A live descriptor exclusively owns a disjoint range. Only its typed lease
-// accesses those bytes, and that lease inherits T's Send/Sync requirements.
-// The allocator mutex protects descriptors, never payload access or callbacks.
-unsafe impl Send for RowWorkPool {}
-unsafe impl Sync for RowWorkPool {}
+// Payload access is restricted to typed owners of disjoint occupied ranges.
+// Those owners carry T's Send/Sync constraints; the pool exposes no raw handles.
+unsafe impl Send for LeasePool {}
+unsafe impl Sync for LeasePool {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct LeaseError {
+    pub purpose: Purpose,
     pub requested_bytes: usize,
     pub free_bytes: usize,
     pub largest_range_bytes: usize,
@@ -55,47 +80,47 @@ pub(crate) struct LeaseError {
 }
 
 impl core::fmt::Display for LeaseError {
-    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(
-            formatter,
-            "row work pool exhausted: requested {} bytes, {} free bytes, largest range {} bytes, {} available leases",
-            self.requested_bytes, self.free_bytes, self.largest_range_bytes, self.available_leases
+            f,
+            "{} exhausted ({}, {}): requested {} bytes, {} free bytes, largest range {} bytes, {} available leases",
+            self.purpose.pool,
+            self.purpose.bytes,
+            self.purpose.leases,
+            self.requested_bytes,
+            self.free_bytes,
+            self.largest_range_bytes,
+            self.available_leases
         )
     }
 }
-
 impl std::error::Error for LeaseError {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum RowWorkSetupError {
+pub(crate) enum LeaseSetupError {
     Budget(BudgetError),
-    Alignment { bytes: usize },
+    Alignment { setting: &'static str, bytes: usize },
     CapacityOverflow { what: &'static str },
 }
-
-impl From<BudgetError> for RowWorkSetupError {
+impl From<BudgetError> for LeaseSetupError {
     fn from(error: BudgetError) -> Self {
         Self::Budget(error)
     }
 }
-
-impl core::fmt::Display for RowWorkSetupError {
-    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+impl core::fmt::Display for LeaseSetupError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::Budget(error) => core::fmt::Display::fmt(error, formatter),
-            Self::Alignment { bytes } => write!(
-                formatter,
-                "row_work_bytes must be a multiple of 64 bytes (got {bytes})"
-            ),
-            Self::CapacityOverflow { what } => write!(
-                formatter,
-                "{what} exceeds the supported row work memory layout"
-            ),
+            Self::Budget(error) => core::fmt::Display::fmt(error, f),
+            Self::Alignment { setting, bytes } => {
+                write!(f, "{setting} must be a multiple of 64 bytes (got {bytes})")
+            }
+            Self::CapacityOverflow { what } => {
+                write!(f, "{what} exceeds the supported lease pool memory layout")
+            }
         }
     }
 }
-
-impl std::error::Error for RowWorkSetupError {}
+impl std::error::Error for LeaseSetupError {}
 
 #[derive(Clone, Copy)]
 struct Reservation {
@@ -104,22 +129,38 @@ struct Reservation {
     range: Range,
 }
 
-/// Only the initialized prefix is exposed. Moving or dropping a lease does
-/// not depend on the lifetime or address of the caller that acquired it.
-pub(crate) struct RowWorkLease<T: Copy> {
-    pool: Arc<RowWorkPool>,
+/// Only initialized values are exposed. Growth moves them without cloning or
+/// dropping them; failure preserves the original range and initialized prefix.
+pub(crate) struct MutableSlice<T> {
+    pool: Arc<LeasePool>,
     reservation: Option<Reservation>,
     len: usize,
     capacity: usize,
     value: PhantomData<T>,
 }
 
-impl<T: Copy> core::fmt::Debug for RowWorkLease<T> {
-    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        formatter
-            .debug_struct("RowWorkLease")
+/// References returned by Deref borrow this owner. Clone retains the initialized
+/// allocation, including non-Copy values, without reserving bytes or descriptors.
+pub struct SharedSlice<T> {
+    pool: Option<Arc<LeasePool>>,
+    reservation: Option<Reservation>,
+    len: usize,
+    // Shared owners can reach T concurrently, just as Arc<T> owners can.
+    value: PhantomData<Arc<T>>,
+}
+
+impl<T> core::fmt::Debug for MutableSlice<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("MutableSlice")
             .field("len", &self.len)
             .field("capacity", &self.capacity)
+            .finish_non_exhaustive()
+    }
+}
+impl<T> core::fmt::Debug for SharedSlice<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("SharedSlice")
+            .field("len", &self.len)
             .finish_non_exhaustive()
     }
 }
@@ -130,56 +171,57 @@ fn rounded(bytes: usize) -> Option<usize> {
         .map(|n| n & !(ALIGNMENT - 1))
 }
 
-impl RowWorkPool {
+impl LeasePool {
     pub(crate) fn budget_bytes(bytes: usize, leases: usize) -> usize {
         size_of::<Self>()
             .saturating_add(2 * size_of::<usize>())
             .saturating_add(rounded(bytes).unwrap_or(usize::MAX))
-            .saturating_add(leases.saturating_mul(size_of::<Descriptor>()))
+            .saturating_add(
+                leases.saturating_mul(size_of::<Descriptor>() + size_of::<AtomicUsize>()),
+            )
             .saturating_add(leases.saturating_add(1).saturating_mul(size_of::<Range>()))
     }
 
     pub(crate) fn new(
         budget: &mut Budget,
+        purpose: Purpose,
         bytes: usize,
         leases: usize,
-    ) -> Result<Arc<Self>, RowWorkSetupError> {
+    ) -> Result<Arc<Self>, LeaseSetupError> {
         if !bytes.is_multiple_of(ALIGNMENT) {
-            return Err(RowWorkSetupError::Alignment { bytes });
+            return Err(LeaseSetupError::Alignment {
+                setting: purpose.bytes,
+                bytes,
+            });
         }
-        let overflow = |what| RowWorkSetupError::CapacityOverflow { what };
-        let backing_bytes = rounded(bytes).ok_or_else(|| overflow("row_work_bytes"))?;
+        let overflow = |what| LeaseSetupError::CapacityOverflow { what };
+        let backing_bytes = rounded(bytes).ok_or_else(|| overflow(purpose.bytes))?;
         let free_slots = leases
             .checked_add(1)
-            .ok_or_else(|| overflow("row_work_leases"))?;
+            .ok_or_else(|| overflow(purpose.leases))?;
         std::alloc::Layout::array::<Block>(backing_bytes / ALIGNMENT)
-            .map_err(|_| overflow("row work backing"))?;
-        std::alloc::Layout::array::<Descriptor>(leases)
-            .map_err(|_| overflow("row work lease descriptors"))?;
-        std::alloc::Layout::array::<Range>(free_slots)
-            .map_err(|_| overflow("row work free ranges"))?;
+            .map_err(|_| overflow(purpose.bytes))?;
+        std::alloc::Layout::array::<Descriptor>(leases).map_err(|_| overflow(purpose.leases))?;
+        std::alloc::Layout::array::<AtomicUsize>(leases).map_err(|_| overflow(purpose.leases))?;
+        std::alloc::Layout::array::<Range>(free_slots).map_err(|_| overflow(purpose.ranges))?;
         let descriptors_bytes = leases
-            .checked_mul(size_of::<Descriptor>())
-            .ok_or_else(|| overflow("row work lease descriptors"))?;
+            .checked_mul(size_of::<Descriptor>() + size_of::<AtomicUsize>())
+            .ok_or_else(|| overflow(purpose.leases))?;
         let control_bytes = (size_of::<Self>() + 2 * size_of::<usize>())
             .checked_add(backing_bytes)
             .and_then(|n| n.checked_add(descriptors_bytes))
-            .ok_or_else(|| overflow("row work startup controls"))?;
+            .ok_or_else(|| overflow(purpose.pool))?;
         let free_bytes = free_slots
             .checked_mul(size_of::<Range>())
-            .ok_or_else(|| overflow("row work free ranges"))?;
+            .ok_or_else(|| overflow(purpose.ranges))?;
         control_bytes
             .checked_add(free_bytes)
-            .ok_or_else(|| overflow("row work startup allocation"))?;
-        budget.draw(control_bytes, "row work pool")?;
-        let mut free = FixedVec::new(budget, "row work free ranges", free_slots)?;
-        let usable_bytes = bytes;
-        if usable_bytes != 0 {
-            free.push(Range {
-                start: 0,
-                bytes: usable_bytes,
-            })
-            .expect("one initial free range");
+            .ok_or_else(|| overflow(purpose.pool))?;
+        budget.draw(control_bytes, purpose.pool)?;
+        let mut free = FixedVec::new(budget, purpose.ranges, free_slots)?;
+        if bytes != 0 {
+            free.push(Range { start: 0, bytes })
+                .expect("one initial free range");
         }
         let backing = (0..backing_bytes / ALIGNMENT)
             .map(|_| Block {
@@ -194,14 +236,20 @@ impl RowWorkPool {
             })
             .collect::<Vec<_>>()
             .into_boxed_slice();
+        let references = (0..leases)
+            .map(|_| AtomicUsize::new(0))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
         Ok(Arc::new(Self {
+            purpose,
             backing,
-            usable_bytes,
+            usable_bytes: bytes,
+            references,
             state: Mutex::new(State { descriptors, free }),
         }))
     }
 
-    pub(crate) fn max_entries<T: Copy>(&self) -> usize {
+    pub(crate) fn max_entries<T>(&self) -> usize {
         const {
             assert!(align_of::<T>() <= ALIGNMENT);
             assert!(size_of::<T>() != 0);
@@ -209,15 +257,15 @@ impl RowWorkPool {
         self.usable_bytes / size_of::<T>()
     }
 
-    pub(crate) fn lease<T: Copy>(
+    pub(crate) fn lease<T>(
         self: &Arc<Self>,
         entries: usize,
-    ) -> Result<RowWorkLease<T>, LeaseError> {
+    ) -> Result<MutableSlice<T>, LeaseError> {
         const {
             assert!(align_of::<T>() <= ALIGNMENT);
             assert!(size_of::<T>() != 0);
         }
-        let mut lease = RowWorkLease {
+        let mut lease = MutableSlice {
             pool: Arc::clone(self),
             reservation: None,
             len: 0,
@@ -228,23 +276,31 @@ impl RowWorkPool {
         Ok(lease)
     }
 
+    pub(crate) fn copy_slice<T: Copy>(
+        self: &Arc<Self>,
+        values: &[T],
+    ) -> Result<SharedSlice<T>, LeaseError> {
+        let mut lease = self.lease(values.len())?;
+        lease.extend_from_slice(values)?;
+        Ok(lease.freeze())
+    }
+
     fn pointer<T>(&self, range: Range) -> *mut T {
-        // Box's allocation is stable and 64-byte aligned. Address computation
-        // crosses blocks without deriving a reference covering another lease.
         let base = self.backing.as_ptr().cast::<u8>();
+        // The allocation is stable and aligned; no reference spans other leases.
         unsafe { base.add(range.start).cast_mut().cast::<T>() }
     }
 
     fn reserve(&self, bytes: usize) -> Result<Reservation, LeaseError> {
-        let mut state = self.state.lock().expect("row work pool lock poisoned");
+        let mut state = self.state.lock().expect("lease pool lock poisoned");
         let requested = rounded(bytes).unwrap_or(usize::MAX);
         let slot = state
             .descriptors
             .iter()
             .position(|d| d.range.is_none() && d.generation < u64::MAX);
-        let available = state.free.iter().position(|range| range.bytes >= requested);
+        let available = state.free.iter().position(|r| r.bytes >= requested);
         let (Some(slot), Some(index)) = (slot, available) else {
-            return Err(state.error(requested));
+            return Err(state.error(self.purpose, requested));
         };
         let range = Range {
             start: state.free[index].start,
@@ -258,6 +314,7 @@ impl RowWorkPool {
         let descriptor = &mut state.descriptors[slot];
         descriptor.generation += 1;
         descriptor.range = Some(range);
+        self.references[slot].store(1, Ordering::Relaxed);
         Ok(Reservation {
             slot,
             generation: descriptor.generation,
@@ -272,14 +329,14 @@ impl RowWorkPool {
         if requested <= reservation.range.bytes {
             return true;
         }
-        let mut state = self.state.lock().expect("row work pool lock poisoned");
+        let mut state = self.state.lock().expect("lease pool lock poisoned");
         state.validate(*reservation);
         let extra = requested - reservation.range.bytes;
         let end = reservation.range.start + reservation.range.bytes;
         let Some(index) = state
             .free
             .iter()
-            .position(|range| range.start == end && range.bytes >= extra)
+            .position(|r| r.start == end && r.bytes >= extra)
         else {
             return false;
         };
@@ -294,23 +351,31 @@ impl RowWorkPool {
     }
 
     fn release(&self, reservation: Reservation) {
-        let mut state = self.state.lock().expect("row work pool lock poisoned");
+        let mut state = self.state.lock().expect("lease pool lock poisoned");
         state.validate(reservation);
+        debug_assert_eq!(self.references[reservation.slot].load(Ordering::Relaxed), 0);
         state.descriptors[reservation.slot].range = None;
         state.return_range(reservation.range);
+    }
+
+    fn release_moved(&self, reservation: Reservation) {
+        let prior = self.references[reservation.slot].swap(0, Ordering::Relaxed);
+        debug_assert_eq!(prior, 1);
+        self.release(reservation);
     }
 
     fn error(&self, requested: usize) -> LeaseError {
         self.state
             .lock()
-            .expect("row work pool lock poisoned")
-            .error(requested)
+            .expect("lease pool lock poisoned")
+            .error(self.purpose, requested)
     }
 }
 
 impl State {
-    fn error(&self, requested_bytes: usize) -> LeaseError {
+    fn error(&self, purpose: Purpose, requested_bytes: usize) -> LeaseError {
         LeaseError {
+            purpose,
             requested_bytes,
             free_bytes: self.free.iter().map(|r| r.bytes).sum(),
             largest_range_bytes: self.free.iter().map(|r| r.bytes).max().unwrap_or(0),
@@ -321,27 +386,21 @@ impl State {
                 .count(),
         }
     }
-
     fn validate(&self, reservation: Reservation) {
         let descriptor = &self.descriptors[reservation.slot];
-        assert_eq!(
-            descriptor.generation, reservation.generation,
-            "stale row work lease"
-        );
-        let range = descriptor.range.expect("released row work lease");
+        assert_eq!(descriptor.generation, reservation.generation, "stale lease");
+        let range = descriptor.range.expect("released lease");
         assert_eq!(
             (range.start, range.bytes),
             (reservation.range.start, reservation.range.bytes)
         );
     }
-
     fn remove_free(&mut self, index: usize) {
         for at in index + 1..self.free.len() {
             self.free[at - 1] = self.free[at];
         }
         self.free.pop();
     }
-
     fn return_range(&mut self, range: Range) {
         let index = self
             .free
@@ -371,8 +430,19 @@ impl State {
     }
 }
 
-impl<T: Copy> RowWorkLease<T> {
-    pub(crate) fn pool(&self) -> &Arc<RowWorkPool> {
+/// This guard returns the extent even if dropping its initialized values unwinds.
+struct Reclaim<'a> {
+    pool: &'a LeasePool,
+    reservation: Reservation,
+}
+impl Drop for Reclaim<'_> {
+    fn drop(&mut self) {
+        self.pool.release(self.reservation);
+    }
+}
+
+impl<T> MutableSlice<T> {
+    pub(crate) fn pool(&self) -> &Arc<LeasePool> {
         &self.pool
     }
     pub(crate) fn len(&self) -> usize {
@@ -399,10 +469,11 @@ impl<T: Copy> RowWorkLease<T> {
             self.capacity = entries;
             return Ok(());
         }
-        // Both ranges and both descriptors are charged until the copy is
-        // complete. Failure leaves the previous initialized prefix untouched.
+        // Both extents remain charged until the infallible ownership move finishes.
         let replacement = self.pool.reserve(bytes)?;
         if let Some(prior) = self.reservation {
+            // No references into this exclusive owner can coexist with &mut self.
+            // The source bytes become uninitialized, so they must not be dropped.
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     self.pool.pointer::<T>(prior.range),
@@ -410,7 +481,7 @@ impl<T: Copy> RowWorkLease<T> {
                     self.len,
                 );
             }
-            self.pool.release(prior);
+            self.pool.release_moved(prior);
         }
         self.reservation = Some(replacement);
         self.capacity = entries;
@@ -431,7 +502,17 @@ impl<T: Copy> RowWorkLease<T> {
                 .max(required);
             self.reserve_exact(next)?;
         }
-        let reservation = self.reservation.expect("nonempty row work lease");
+        self.push_reserved(value)
+    }
+
+    /// Appends only inside capacity already reserved before publication effects.
+    pub(crate) fn push_reserved(&mut self, value: T) -> Result<(), LeaseError> {
+        if self.len == self.capacity {
+            return Err(self
+                .pool
+                .error(self.len.saturating_add(1).saturating_mul(size_of::<T>())));
+        }
+        let reservation = self.reservation.expect("nonempty lease");
         unsafe {
             self.pool
                 .pointer::<T>(reservation.range)
@@ -442,13 +523,74 @@ impl<T: Copy> RowWorkLease<T> {
         Ok(())
     }
 
-    /// Returning idle capacity lets another reader or writer use these bytes.
-    pub(crate) fn clear(&mut self) {
-        if let Some(reservation) = self.reservation.take() {
-            self.pool.release(reservation);
+    pub(crate) fn pop(&mut self) -> Option<T> {
+        self.len = self.len.checked_sub(1)?;
+        let reservation = self.reservation.expect("initialized lease has backing");
+        // Moving the last value out removes it from the prefix dropped by us.
+        Some(unsafe {
+            self.pool
+                .pointer::<T>(reservation.range)
+                .add(self.len)
+                .read()
+        })
+    }
+
+    pub(crate) fn extend_from_slice(&mut self, values: &[T]) -> Result<(), LeaseError>
+    where
+        T: Copy,
+    {
+        let len = self
+            .len
+            .checked_add(values.len())
+            .ok_or_else(|| self.pool.error(usize::MAX))?;
+        self.reserve_exact(len)?;
+        if !values.is_empty() {
+            let reservation = self.reservation.expect("nonempty lease");
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    values.as_ptr(),
+                    self.pool.pointer::<T>(reservation.range).add(self.len),
+                    values.len(),
+                );
+            }
         }
-        self.len = 0;
+        self.len = len;
+        Ok(())
+    }
+
+    pub(crate) fn freeze(self) -> SharedSlice<T> {
+        if self.len == 0 {
+            return SharedSlice::EMPTY;
+        }
+        let this = ManuallyDrop::new(self);
+        // Move the sole pool reference and allocation into the immutable owner.
+        SharedSlice {
+            pool: Some(unsafe { core::ptr::read(&this.pool) }),
+            reservation: this.reservation,
+            len: this.len,
+            value: PhantomData,
+        }
+    }
+
+    pub(crate) fn clear(&mut self) {
+        let len = core::mem::take(&mut self.len);
         self.capacity = 0;
+        if let Some(reservation) = self.reservation.take() {
+            let prior = self.pool.references[reservation.slot].swap(0, Ordering::Relaxed);
+            debug_assert_eq!(prior, 1);
+            let _reclaim = Reclaim {
+                pool: &self.pool,
+                reservation,
+            };
+            // Only the initialized prefix owns values. Destructors can use the
+            // pool recursively; this range remains occupied until they finish.
+            unsafe {
+                core::ptr::drop_in_place(core::ptr::slice_from_raw_parts_mut(
+                    self.pool.pointer::<T>(reservation.range),
+                    len,
+                ));
+            }
+        }
     }
 
     pub(crate) fn as_slice(&self) -> &[T] {
@@ -459,7 +601,6 @@ impl<T: Copy> RowWorkLease<T> {
             });
         unsafe { core::slice::from_raw_parts(pointer, self.len) }
     }
-
     pub(crate) fn as_mut_slice(&mut self) -> &mut [T] {
         let pointer = self
             .reservation
@@ -468,29 +609,127 @@ impl<T: Copy> RowWorkLease<T> {
             });
         unsafe { core::slice::from_raw_parts_mut(pointer, self.len) }
     }
-
     #[cfg(test)]
     pub(crate) fn slot(&self) -> Option<usize> {
         self.reservation.map(|r| r.slot)
     }
 }
-
-impl<T: Copy> Deref for RowWorkLease<T> {
+impl<T> Deref for MutableSlice<T> {
     type Target = [T];
     fn deref(&self) -> &Self::Target {
         self.as_slice()
     }
 }
-
-impl<T: Copy> DerefMut for RowWorkLease<T> {
+impl<T> DerefMut for MutableSlice<T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.as_mut_slice()
     }
 }
-
-impl<T: Copy> Drop for RowWorkLease<T> {
+impl<T> AsRef<[T]> for MutableSlice<T> {
+    fn as_ref(&self) -> &[T] {
+        self.as_slice()
+    }
+}
+impl<T> AsMut<[T]> for MutableSlice<T> {
+    fn as_mut(&mut self) -> &mut [T] {
+        self.as_mut_slice()
+    }
+}
+impl<T> Drop for MutableSlice<T> {
     fn drop(&mut self) {
         self.clear();
+    }
+}
+
+impl<T> SharedSlice<T> {
+    pub(crate) const EMPTY: Self = Self {
+        pool: None,
+        reservation: None,
+        len: 0,
+        value: PhantomData,
+    };
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+    pub(crate) fn as_slice(&self) -> &[T] {
+        let pointer = match (&self.pool, self.reservation) {
+            (Some(pool), Some(r)) => pool.pointer::<T>(r.range),
+            (None, None) => core::ptr::NonNull::<T>::dangling().as_ptr(),
+            _ => unreachable!("shared allocation ownership is complete"),
+        };
+        unsafe { core::slice::from_raw_parts(pointer, self.len) }
+    }
+    #[cfg(test)]
+    pub(crate) fn ptr_eq(left: &Self, right: &Self) -> bool {
+        match (&left.pool, left.reservation, &right.pool, right.reservation) {
+            (None, None, None, None) => true,
+            (Some(a), Some(x), Some(b), Some(y)) => {
+                Arc::ptr_eq(a, b)
+                    && x.slot == y.slot
+                    && x.generation == y.generation
+                    && left.len == right.len
+            }
+            _ => false,
+        }
+    }
+}
+impl<T> Clone for SharedSlice<T> {
+    fn clone(&self) -> Self {
+        let Some(pool) = &self.pool else {
+            return Self::EMPTY;
+        };
+        let reservation = self
+            .reservation
+            .expect("shared allocation has a descriptor");
+        let prior = pool.references[reservation.slot].fetch_add(1, Ordering::Relaxed);
+        // Match Arc's infallible retain boundary; never wrap into a reusable cell.
+        if prior == 0 || prior >= isize::MAX as usize {
+            std::process::abort();
+        }
+        Self {
+            pool: Some(Arc::clone(pool)),
+            reservation: Some(reservation),
+            len: self.len,
+            value: PhantomData,
+        }
+    }
+}
+impl<T> Deref for SharedSlice<T> {
+    type Target = [T];
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
+impl<T> AsRef<[T]> for SharedSlice<T> {
+    fn as_ref(&self) -> &[T] {
+        self.as_slice()
+    }
+}
+impl<T: PartialEq> PartialEq for SharedSlice<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+impl<T: Eq> Eq for SharedSlice<T> {}
+impl<T> Drop for SharedSlice<T> {
+    fn drop(&mut self) {
+        let (Some(pool), Some(reservation)) = (&self.pool, self.reservation) else {
+            return;
+        };
+        if pool.references[reservation.slot].fetch_sub(1, Ordering::Release) != 1 {
+            return;
+        }
+        std::sync::atomic::fence(Ordering::Acquire);
+        let _reclaim = Reclaim { pool, reservation };
+        unsafe {
+            core::ptr::drop_in_place(core::ptr::slice_from_raw_parts_mut(
+                pool.pointer::<T>(reservation.range),
+                self.len,
+            ));
+        }
     }
 }
 
@@ -498,9 +737,9 @@ impl<T: Copy> Drop for RowWorkLease<T> {
 mod tests {
     use super::*;
 
-    fn pool(bytes: usize, leases: usize) -> Arc<RowWorkPool> {
-        let mut budget = Budget::new(RowWorkPool::budget_bytes(bytes, leases));
-        let pool = RowWorkPool::new(&mut budget, bytes, leases).unwrap();
+    fn pool(bytes: usize, leases: usize) -> Arc<LeasePool> {
+        let mut budget = Budget::new(LeasePool::budget_bytes(bytes, leases));
+        let pool = LeasePool::new(&mut budget, Purpose::ROW_WORK, bytes, leases).unwrap();
         assert_eq!(budget.remaining(), 0);
         pool
     }
@@ -670,20 +909,25 @@ mod tests {
     fn startup_rejects_misaligned_capacity_before_reserving_any_bytes() {
         let mut budget = Budget::new(1 << 20);
         assert_eq!(
-            RowWorkPool::new(&mut budget, 65, 2).err().unwrap(),
-            RowWorkSetupError::Alignment { bytes: 65 }
+            LeasePool::new(&mut budget, Purpose::ROW_WORK, 65, 2)
+                .err()
+                .unwrap(),
+            LeaseSetupError::Alignment {
+                setting: "row_work_bytes",
+                bytes: 65
+            }
         );
         assert_eq!(budget.used(), 0);
-        let zero_bytes = RowWorkPool::budget_bytes(0, 0);
+        let zero_bytes = LeasePool::budget_bytes(0, 0);
         let mut zero_budget = Budget::new(zero_bytes);
-        let empty = RowWorkPool::new(&mut zero_budget, 0, 0).unwrap();
+        let empty = LeasePool::new(&mut zero_budget, Purpose::ROW_WORK, 0, 0).unwrap();
         assert_eq!(zero_budget.remaining(), 0);
         assert_eq!(empty.max_entries::<u64>(), 0);
         assert!(empty.lease::<u64>(0).is_ok());
         let mut short = Budget::new(0);
         assert!(matches!(
-            RowWorkPool::new(&mut short, 64, 1),
-            Err(RowWorkSetupError::Budget(_))
+            LeasePool::new(&mut short, Purpose::ROW_WORK, 64, 1),
+            Err(LeaseSetupError::Budget(_))
         ));
         assert_eq!(short.used(), 0);
     }
@@ -693,26 +937,31 @@ mod tests {
         let mut budget = Budget::new(1024);
         let too_many_bytes = usize::MAX & !(ALIGNMENT - 1);
         assert!(matches!(
-            RowWorkPool::new(&mut budget, too_many_bytes, 1),
-            Err(RowWorkSetupError::CapacityOverflow { .. })
+            LeasePool::new(&mut budget, Purpose::ROW_WORK, too_many_bytes, 1),
+            Err(LeaseSetupError::CapacityOverflow { .. })
         ));
         assert_eq!(budget.used(), 0);
         assert!(matches!(
-            RowWorkPool::new(&mut budget, 64, usize::MAX),
-            Err(RowWorkSetupError::CapacityOverflow { .. })
+            LeasePool::new(&mut budget, Purpose::ROW_WORK, 64, usize::MAX),
+            Err(LeaseSetupError::CapacityOverflow { .. })
         ));
         assert_eq!(budget.used(), 0);
         let too_many_descriptors = isize::MAX as usize / size_of::<Descriptor>() + 1;
         assert!(matches!(
-            RowWorkPool::new(&mut budget, 64, too_many_descriptors),
-            Err(RowWorkSetupError::CapacityOverflow { .. })
+            LeasePool::new(&mut budget, Purpose::ROW_WORK, 64, too_many_descriptors),
+            Err(LeaseSetupError::CapacityOverflow { .. })
         ));
         assert_eq!(budget.used(), 0);
         let large_backing = ((isize::MAX as usize / 4) * 3) & !(ALIGNMENT - 1);
         let large_descriptors = isize::MAX as usize / size_of::<Descriptor>();
         assert!(matches!(
-            RowWorkPool::new(&mut budget, large_backing, large_descriptors),
-            Err(RowWorkSetupError::CapacityOverflow { .. })
+            LeasePool::new(
+                &mut budget,
+                Purpose::ROW_WORK,
+                large_backing,
+                large_descriptors
+            ),
+            Err(LeaseSetupError::CapacityOverflow { .. })
         ));
         assert_eq!(budget.used(), 0);
         let pool = pool(64, 1);
@@ -721,6 +970,289 @@ mod tests {
             assert_eq!(error.requested_bytes, usize::MAX);
             assert_eq!(error.free_bytes, 64);
             assert!(pool.lease::<u64>(8).is_ok());
+        });
+    }
+
+    struct Counted<'a> {
+        value: u64,
+        drops: &'a AtomicUsize,
+    }
+    impl Drop for Counted<'_> {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn noncopy_growth_moves_initialized_values_and_failed_push_drops_once() {
+        let pool = pool(256, 4);
+        let drops = AtomicUsize::new(0);
+        crate::mem::guard::forbid_alloc(|| {
+            let mut values = pool.lease::<Counted<'_>>(1).unwrap();
+            values
+                .push_reserved(Counted {
+                    value: 17,
+                    drops: &drops,
+                })
+                .unwrap();
+            let failed = values.push_reserved(Counted {
+                value: 99,
+                drops: &drops,
+            });
+            assert!(failed.is_err());
+            assert_eq!(drops.load(Ordering::Relaxed), 1);
+            let blocker = pool.lease::<u8>(64).unwrap();
+            let original = values.slot();
+            values.reserve_exact(8).unwrap();
+            assert_ne!(values.slot(), original);
+            assert_eq!(values[0].value, 17);
+            assert_eq!(drops.load(Ordering::Relaxed), 1);
+            assert!(values.reserve_exact(32).is_err());
+            values
+                .push_reserved(Counted {
+                    value: 23,
+                    drops: &drops,
+                })
+                .unwrap();
+            assert_eq!(values.len(), 2);
+            assert_eq!(values[1].value, 23);
+            drop(values);
+            assert_eq!(drops.load(Ordering::Relaxed), 3);
+            drop(blocker);
+            assert!(pool.lease::<u8>(256).is_ok());
+        });
+    }
+
+    #[test]
+    fn noncopy_pop_moves_one_value_without_drop_or_capacity_change() {
+        let pool = pool(64, 1);
+        let drops = AtomicUsize::new(0);
+        crate::mem::guard::forbid_alloc(|| {
+            let mut values = pool.lease::<Counted<'_>>(2).unwrap();
+            values
+                .push_reserved(Counted {
+                    value: 31,
+                    drops: &drops,
+                })
+                .unwrap();
+            values
+                .push_reserved(Counted {
+                    value: 37,
+                    drops: &drops,
+                })
+                .unwrap();
+            let popped = values.pop().unwrap();
+            assert_eq!(popped.value, 37);
+            assert_eq!((values.len(), values.capacity()), (1, 2));
+            assert_eq!(drops.load(Ordering::Relaxed), 0);
+            drop(values);
+            assert_eq!(drops.load(Ordering::Relaxed), 1);
+            drop(popped);
+            assert_eq!(drops.load(Ordering::Relaxed), 2);
+            let mut empty = pool.lease::<Counted<'_>>(0).unwrap();
+            assert!(empty.pop().is_none());
+            assert!(pool.lease::<u8>(64).is_ok());
+        });
+    }
+
+    #[test]
+    fn frozen_noncopy_pins_share_one_allocation_until_last_owner() {
+        let pool = pool(128, 2);
+        let drops = AtomicUsize::new(0);
+        crate::mem::guard::forbid_alloc(|| {
+            let mut values = pool.lease::<Counted<'_>>(2).unwrap();
+            values
+                .push_reserved(Counted {
+                    value: 41,
+                    drops: &drops,
+                })
+                .unwrap();
+            values
+                .push_reserved(Counted {
+                    value: 43,
+                    drops: &drops,
+                })
+                .unwrap();
+            let frozen = values.freeze();
+            let blocker = pool.lease::<u8>(64).unwrap();
+            assert!(pool.lease::<u8>(1).is_err());
+            let retained = frozen.clone();
+            assert!(SharedSlice::ptr_eq(&frozen, &retained));
+            drop(frozen);
+            assert_eq!(retained[0].value, 41);
+            assert_eq!(retained[1].value, 43);
+            assert_eq!(drops.load(Ordering::Relaxed), 0);
+            drop(retained);
+            assert_eq!(drops.load(Ordering::Relaxed), 2);
+            let reused = pool.lease::<u8>(64).unwrap();
+            drop((reused, blocker));
+            assert!(pool.lease::<u8>(128).is_ok());
+        });
+    }
+
+    #[test]
+    fn frozen_slices_survive_their_allocator_owner_and_empty_slices_are_free() {
+        let empty_pool = pool(64, 1);
+        let pool = pool(64, 1);
+        let drops = AtomicUsize::new(0);
+        let mut values = pool.lease::<Counted<'_>>(1).unwrap();
+        values
+            .push_reserved(Counted {
+                value: 73,
+                drops: &drops,
+            })
+            .unwrap();
+        let frozen = values.freeze();
+        drop(pool);
+        crate::mem::guard::forbid_alloc(|| {
+            let retained = frozen.clone();
+            let empty = SharedSlice::<Counted<'_>>::EMPTY;
+            let empty_clone = empty.clone();
+            assert!(empty_clone.is_empty());
+            assert!(SharedSlice::ptr_eq(&empty, &empty_clone));
+            drop(frozen);
+            assert_eq!(retained[0].value, 73);
+            drop(retained);
+            assert_eq!(drops.load(Ordering::Relaxed), 1);
+            let reserved_empty = empty_pool.lease::<u8>(64).unwrap().freeze();
+            assert!(reserved_empty.is_empty());
+            assert!(empty_pool.lease::<u8>(64).is_ok());
+        });
+    }
+
+    #[test]
+    fn final_shared_drop_is_reentrant_and_does_not_reuse_retiring_extent() {
+        struct Reentrant<'a> {
+            pool: Arc<LeasePool>,
+            drops: &'a AtomicUsize,
+        }
+        impl Drop for Reentrant<'_> {
+            fn drop(&mut self) {
+                assert!(self.pool.lease::<u8>(128).is_err());
+                let mut other = self.pool.lease::<u8>(64).unwrap();
+                other.push_reserved(5).unwrap();
+                assert_eq!(other[0], 5);
+                self.drops.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let pool = pool(128, 2);
+        let drops = AtomicUsize::new(0);
+        crate::mem::guard::forbid_alloc(|| {
+            let mut values = pool.lease::<Reentrant<'_>>(1).unwrap();
+            values
+                .push_reserved(Reentrant {
+                    pool: Arc::clone(&pool),
+                    drops: &drops,
+                })
+                .unwrap();
+            let frozen = values.freeze();
+            let retained = frozen.clone();
+            drop(frozen);
+            assert_eq!(drops.load(Ordering::Relaxed), 0);
+            drop(retained);
+            assert_eq!(drops.load(Ordering::Relaxed), 1);
+            assert!(pool.lease::<u8>(128).is_ok());
+        });
+    }
+
+    #[test]
+    fn unwinding_noncopy_destructors_drop_remaining_prefix_then_reclaim() {
+        struct PanicOnce<'a> {
+            value: usize,
+            drops: &'a AtomicUsize,
+        }
+        impl Drop for PanicOnce<'_> {
+            fn drop(&mut self) {
+                self.drops.fetch_add(1, Ordering::Relaxed);
+                if self.value == 1 {
+                    panic!("unwind the retained initialized prefix");
+                }
+            }
+        }
+        let pool = pool(128, 1);
+        let drops = AtomicUsize::new(0);
+        let mut values = pool.lease::<PanicOnce<'_>>(4).unwrap();
+        for value in 0..3 {
+            values
+                .push_reserved(PanicOnce {
+                    value,
+                    drops: &drops,
+                })
+                .unwrap();
+        }
+        let retained = values.freeze();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(retained)));
+        assert!(result.is_err());
+        assert_eq!(drops.load(Ordering::Relaxed), 3);
+        assert!(pool.lease::<u8>(128).is_ok());
+    }
+
+    #[test]
+    fn parallel_shared_readers_keep_noncopy_values_pinned() {
+        let pool = pool(128, 2);
+        let drops = AtomicUsize::new(0);
+        let mut values = pool.lease::<Counted<'_>>(1).unwrap();
+        values
+            .push_reserved(Counted {
+                value: 83,
+                drops: &drops,
+            })
+            .unwrap();
+        let retained = values.freeze();
+        let together = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            let shared = retained.clone();
+            let worker = scope.spawn(|| {
+                crate::mem::guard::forbid_alloc(|| {
+                    together.wait();
+                    assert_eq!(shared[0].value, 83);
+                    together.wait();
+                    drop(shared);
+                });
+            });
+            crate::mem::guard::forbid_alloc(|| {
+                together.wait();
+                let mut other = pool.lease::<u64>(1).unwrap();
+                other.push_reserved(97).unwrap();
+                assert_eq!(retained[0].value, 83);
+                drop(retained);
+                assert_eq!(drops.load(Ordering::Relaxed), 0);
+                together.wait();
+            });
+            worker.join().unwrap();
+        });
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+        assert!(pool.lease::<u8>(128).is_ok());
+    }
+
+    #[test]
+    fn purpose_labels_name_metadata_limits_and_shared_generation_never_wraps() {
+        let mut budget = Budget::new(LeasePool::budget_bytes(64, 1));
+        assert_eq!(
+            LeasePool::new(&mut budget, Purpose::TABLE_METADATA, 65, 1)
+                .err()
+                .unwrap(),
+            LeaseSetupError::Alignment {
+                setting: "table_metadata_bytes",
+                bytes: 65
+            }
+        );
+        assert_eq!(budget.used(), 0);
+        let pool = LeasePool::new(&mut budget, Purpose::TABLE_METADATA, 64, 1).unwrap();
+        pool.state.lock().unwrap().descriptors[0].generation = u64::MAX - 1;
+        crate::mem::guard::forbid_alloc(|| {
+            let mut values = pool.lease::<u64>(1).unwrap();
+            values.push_reserved(101).unwrap();
+            let retained = values.freeze();
+            let shared = retained.clone();
+            drop(retained);
+            assert_eq!(shared[0], 101);
+            let error = pool.lease::<u64>(1).unwrap_err();
+            assert_eq!(error.purpose, Purpose::TABLE_METADATA);
+            assert_eq!((error.free_bytes, error.available_leases), (0, 0));
+            drop(shared);
+            let error = pool.lease::<u64>(1).unwrap_err();
+            assert_eq!((error.free_bytes, error.available_leases), (64, 0));
         });
     }
 }

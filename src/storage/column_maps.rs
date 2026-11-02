@@ -1,6 +1,6 @@
 //! Column names connect a logical relation to a child's stored row layout.
 
-use super::{ColumnSet, TableDef};
+use super::{ColumnSet, DefinitionBacking, TableDefinition};
 use crate::mem::arena::Arena;
 use crate::sql::eval::{SqlError, arena_full, sqlstate};
 use crate::sql::types::Datum;
@@ -12,7 +12,10 @@ pub(crate) struct RelationColumnMap<'arena> {
 }
 
 impl<'arena> RelationColumnMap<'arena> {
-    pub(crate) fn same_order(logical: &TableDef, physical: &TableDef) -> bool {
+    pub(crate) fn same_order(
+        logical: &TableDefinition<impl DefinitionBacking>,
+        physical: &TableDefinition<impl DefinitionBacking>,
+    ) -> bool {
         logical.n_columns == physical.n_columns
             && logical
                 .columns()
@@ -28,8 +31,8 @@ impl<'arena> RelationColumnMap<'arena> {
     }
 
     pub(crate) fn new(
-        logical: &TableDef,
-        physical: &TableDef,
+        logical: &TableDefinition<impl DefinitionBacking>,
+        physical: &TableDefinition<impl DefinitionBacking>,
         arena: &'arena Arena,
     ) -> Result<Self, SqlError> {
         let columns = arena
@@ -86,7 +89,10 @@ impl<'arena> RelationColumnMap<'arena> {
     }
 }
 
-fn physical_column(expected: &super::ColumnMeta, physical: &TableDef) -> Result<usize, SqlError> {
+fn physical_column(
+    expected: &super::ColumnMeta,
+    physical: &TableDefinition<impl DefinitionBacking>,
+) -> Result<usize, SqlError> {
     let target = physical
         .column_index(expected.name.as_str())
         .ok_or_else(|| {
@@ -122,7 +128,10 @@ pub(crate) struct RelationRowDecoder {
 }
 
 impl RelationRowDecoder {
-    pub(crate) fn new(logical: &TableDef, physical: &TableDef) -> Result<Self, SqlError> {
+    pub(crate) fn new(
+        logical: &TableDefinition<impl DefinitionBacking>,
+        physical: &TableDefinition<impl DefinitionBacking>,
+    ) -> Result<Self, SqlError> {
         let mut decoder = Self {
             schema: [crate::sql::types::ColType::Bool; super::MAX_COLUMNS],
             columns: [0; super::MAX_COLUMNS],
@@ -169,11 +178,11 @@ mod tests {
     use super::*;
     use crate::mem::budget::Budget;
     use crate::sql::types::ColType;
-    use crate::storage::{ColumnMeta, SqlName};
+    use crate::storage::{ColumnMeta, SqlName, TableDefBuilder};
 
     #[test]
     fn relation_column_maps_keep_extra_values_and_reject_missing_or_changed_columns() {
-        let mut logical = TableDef::empty();
+        let mut logical = TableDefBuilder::empty();
         logical.n_columns = 2;
         logical.columns[0] = ColumnMeta {
             name: SqlName::parse("id").unwrap(),
@@ -185,7 +194,7 @@ mod tests {
             ctype: ColType::Text,
             ..ColumnMeta::EMPTY
         };
-        let mut physical = TableDef::empty();
+        let mut physical = TableDefBuilder::empty();
         physical.n_columns = 3;
         physical.columns[0] = ColumnMeta {
             name: SqlName::parse("extra").unwrap(),

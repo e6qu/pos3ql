@@ -1,6 +1,6 @@
 //! Route once, then run leaf work with the definition that owns its bytes.
 
-use super::{MAX_COLUMNS, SqlError, Storage, TableDef};
+use super::{MAX_COLUMNS, SqlError, Storage};
 use crate::mem::arena::Arena;
 use crate::sql::types::Datum;
 use crate::storage::RelationColumnMap;
@@ -8,13 +8,13 @@ use crate::storage::RelationColumnMap;
 pub(super) fn with_partition_insert_row<'arena, R>(
     storage: &mut Storage,
     logical_target: crate::storage::TableDefinitionTarget,
-    definition: &TableDef,
+    definition: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
     values: &mut [Datum<'arena>; MAX_COLUMNS],
     arena: &'arena Arena,
     operation: impl FnOnce(
         &mut Storage,
         crate::storage::TableDefinitionTarget,
-        &TableDef,
+        &crate::storage::TableDefView<'_>,
         &mut [Datum<'arena>; MAX_COLUMNS],
         Option<RelationColumnMap<'arena>>,
     ) -> R,
@@ -25,7 +25,13 @@ pub(super) fn with_partition_insert_row<'arena, R>(
         storage.partition_target(logical, definition, &values[..definition.n_columns], txid)?;
     if target == logical {
         clear_generated(definition, values);
-        return Ok(operation(storage, logical_target, definition, values, None));
+        return Ok(operation(
+            storage,
+            logical_target,
+            &definition.borrowed(),
+            values,
+            None,
+        ));
     }
     storage.lock_table(
         txid,
@@ -40,7 +46,7 @@ pub(super) fn with_partition_insert_row<'arena, R>(
         return Ok(operation(
             storage,
             physical_target,
-            physical_definition,
+            &physical_definition.borrowed(),
             values,
             None,
         ));
@@ -52,7 +58,7 @@ pub(super) fn with_partition_insert_row<'arena, R>(
     let result = operation(
         storage,
         physical_target,
-        physical_definition,
+        &physical_definition.borrowed(),
         &mut physical,
         Some(mapping),
     );
@@ -98,7 +104,10 @@ pub(super) fn logical_insert_row_bytes<'arena>(
 
 // BEFORE INSERT sees the input row; only the destination table's generation
 // expressions run after its triggers have supplied their final base values.
-fn clear_generated(definition: &TableDef, values: &mut [Datum]) {
+fn clear_generated(
+    definition: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
+    values: &mut [Datum],
+) {
     for (column, value) in definition.columns().iter().zip(values) {
         if column.default.is_generated() {
             *value = Datum::Null;

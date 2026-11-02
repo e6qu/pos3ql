@@ -78,10 +78,13 @@ the workflow that owns the check. Native build, lint and boundary checks cover
 Linux amd64, Linux arm64 and macOS arm64. See `Cargo.toml`, `examples/dev.conf`, and
 `.github/workflows/` for the actual build and environment definitions.
 
-Each build or test workflow first calls the shared Rust formatting check.
+Each build or test workflow first calls the shared Rust source checks.
 A formatting failure keeps its test matrix from starting and retains a
 `formatting-<revision>` artifact containing the correction. Apply that patch
-before pushing again. Build and test jobs start only after formatting passes.
+before pushing again. After formatting, `cargo clippy --all-targets` checks that
+the Rust code compiles and passes lint, with warnings treated as failures. Build and test
+matrices start only after both checks pass, so one compiler error does not
+launch dozens of copies of the same failing build.
 
 SQL test harnesses prepare their Python clients with
 `tests/external/python_env.py VENV`. Dependencies and wheel hashes are pinned in

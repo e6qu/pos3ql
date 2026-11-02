@@ -1,6 +1,9 @@
 //! PostgreSQL column numbers survive compaction of the engine's live row schema.
 
-use super::{ColumnMeta, MAX_COLUMNS, MAX_RELATION_COLUMNS, SqlName, TableDef};
+use super::{
+    ColumnMeta, DefinitionBacking, InlineDefinition, MAX_COLUMNS, MAX_RELATION_COLUMNS, SqlName,
+    StoredDefinition, TableDefinition,
+};
 use crate::sql::eval::{SqlError, sqlstate};
 use crate::sql::type_layouts::PhysicalLayout;
 use crate::sql_err;
@@ -70,30 +73,27 @@ impl AttributeSlot {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ColumnAttributes {
+#[derive(Debug, Clone)]
+pub(crate) struct ColumnAttributes<B: DefinitionBacking> {
     pub(crate) count: u16,
-    pub(crate) slots: [AttributeSlot; MAX_RELATION_COLUMNS],
+    pub(crate) slots: B::Slice<AttributeSlot, MAX_RELATION_COLUMNS>,
 }
 
-impl ColumnAttributes {
+impl Copy for ColumnAttributes<InlineDefinition> {}
+impl Copy for ColumnAttributes<super::BorrowedDefinition<'_>> {}
+
+impl<B: DefinitionBacking> PartialEq for ColumnAttributes<B> {
+    fn eq(&self, other: &Self) -> bool {
+        self.count == other.count && self.slots.as_ref() == other.slots.as_ref()
+    }
+}
+impl<B: DefinitionBacking> Eq for ColumnAttributes<B> {}
+
+impl ColumnAttributes<InlineDefinition> {
     pub(crate) const EMPTY: Self = Self {
         count: 0,
         slots: [AttributeSlot::Empty; MAX_RELATION_COLUMNS],
     };
-
-    pub(crate) fn encoded_len(&self) -> usize {
-        2 + usize::from(self.count) * 8
-    }
-
-    pub(crate) fn append(&self, output: &mut crate::mem::buffer::FixedBuf) -> bool {
-        self.slots
-            .get(..usize::from(self.count))
-            .is_some_and(|slots| {
-                output.append(&self.count.to_le_bytes())
-                    && slots.iter().all(|slot| output.append(&slot.encode()))
-            })
-    }
 
     pub(crate) fn decode(bytes: &[u8], at: &mut usize) -> Option<Self> {
         let count = u16::from_le_bytes(bytes.get(*at..*at + 2)?.try_into().ok()?);
@@ -126,49 +126,16 @@ impl ColumnAttributes {
         Ok(())
     }
 
-    pub(crate) fn validate(&self, columns: usize) -> bool {
-        let count = usize::from(self.count);
-        if count > MAX_RELATION_COLUMNS || columns > MAX_RELATION_COLUMNS {
-            return false;
-        }
-        let mut seen = [false; MAX_RELATION_COLUMNS];
-        let mut live = 0;
-        for slot in &self.slots[..count] {
-            match *slot {
-                AttributeSlot::Empty => return false,
-                AttributeSlot::Live(column) => {
-                    let column = usize::from(column);
-                    if column >= columns || seen[column] {
-                        return false;
-                    }
-                    seen[column] = true;
-                    live += 1;
-                }
-                AttributeSlot::Dropped { .. } => {}
-            }
-        }
-        live == columns
-            && self.slots[count..]
-                .iter()
-                .all(|slot| *slot == AttributeSlot::Empty)
+    pub(crate) fn from_attributes<B: DefinitionBacking>(source: &ColumnAttributes<B>) -> Self {
+        let mut result = Self::EMPTY;
+        result.count = source.count;
+        let count = usize::from(source.count);
+        result.slots[..count].copy_from_slice(&source.slots.as_ref()[..count]);
+        result
     }
 
-    pub(crate) fn number(&self, column: usize) -> Option<u16> {
-        self.slots[..usize::from(self.count)]
-            .iter()
-            .position(|slot| *slot == AttributeSlot::Live(column as u16))
-            .map(|position| position as u16 + 1)
-    }
-
-    pub(crate) fn column(&self, number: u16) -> Option<usize> {
-        match *self.slots.get(usize::from(number.checked_sub(1)?))? {
-            AttributeSlot::Live(column) => Some(usize::from(column)),
-            _ => None,
-        }
-    }
-
-    pub(crate) fn rewrite(
-        previous: &TableDef,
+    pub(crate) fn rewrite<B: DefinitionBacking>(
+        previous: &TableDefinition<B>,
         columns: &[ColumnMeta],
         mapping: &[Option<SqlName>; MAX_COLUMNS],
     ) -> Result<Self, SqlError> {
@@ -181,7 +148,7 @@ impl ColumnAttributes {
                 "invalid previous column attribute layout"
             ));
         }
-        let mut result = previous.attributes;
+        let mut result = Self::from_attributes(&previous.attributes);
         let mut seen = [false; MAX_RELATION_COLUMNS];
         for slot in &mut result.slots[..usize::from(result.count)] {
             let AttributeSlot::Live(old) = *slot else {
@@ -207,7 +174,7 @@ impl ColumnAttributes {
                 seen[target] = true;
                 *slot = AttributeSlot::Live(target as u16);
             } else {
-                let column = previous.columns[old];
+                let column = previous.columns.as_ref()[old];
                 let mut layout = column.ctype.physical_layout();
                 layout.storage = column.storage.code();
                 *slot = AttributeSlot::Dropped {
@@ -230,6 +197,83 @@ impl ColumnAttributes {
     }
 }
 
+impl ColumnAttributes<StoredDefinition> {
+    pub(crate) const EMPTY: Self = Self {
+        count: 0,
+        slots: crate::mem::lease_pool::SharedSlice::EMPTY,
+    };
+}
+impl ColumnAttributes<super::BorrowedDefinition<'_>> {
+    pub(crate) const EMPTY: Self = Self {
+        count: 0,
+        slots: &[],
+    };
+}
+
+impl<B: DefinitionBacking> ColumnAttributes<B> {
+    pub(crate) fn encoded_len(&self) -> usize {
+        2 + usize::from(self.count) * 8
+    }
+
+    pub(crate) fn append(&self, output: &mut crate::mem::buffer::FixedBuf) -> bool {
+        self.slots
+            .as_ref()
+            .get(..usize::from(self.count))
+            .is_some_and(|slots| {
+                output.append(&self.count.to_le_bytes())
+                    && slots.iter().all(|slot| output.append(&slot.encode()))
+            })
+    }
+
+    pub(crate) fn validate(&self, columns: usize) -> bool {
+        let count = usize::from(self.count);
+        if count > MAX_RELATION_COLUMNS
+            || count > self.slots.as_ref().len()
+            || columns > MAX_RELATION_COLUMNS
+        {
+            return false;
+        }
+        let mut seen = [false; MAX_RELATION_COLUMNS];
+        let mut live = 0;
+        for slot in &self.slots.as_ref()[..count] {
+            match *slot {
+                AttributeSlot::Empty => return false,
+                AttributeSlot::Live(column) => {
+                    let column = usize::from(column);
+                    if column >= columns || seen[column] {
+                        return false;
+                    }
+                    seen[column] = true;
+                    live += 1;
+                }
+                AttributeSlot::Dropped { .. } => {}
+            }
+        }
+        live == columns
+            && self.slots.as_ref()[count..]
+                .iter()
+                .all(|slot| *slot == AttributeSlot::Empty)
+    }
+
+    pub(crate) fn number(&self, column: usize) -> Option<u16> {
+        self.slots.as_ref()[..usize::from(self.count)]
+            .iter()
+            .position(|slot| *slot == AttributeSlot::Live(column as u16))
+            .map(|position| position as u16 + 1)
+    }
+
+    pub(crate) fn column(&self, number: u16) -> Option<usize> {
+        match *self
+            .slots
+            .as_ref()
+            .get(usize::from(number.checked_sub(1)?))?
+        {
+            AttributeSlot::Live(column) => Some(usize::from(column)),
+            _ => None,
+        }
+    }
+}
+
 fn exhausted() -> SqlError {
     sql_err!(
         sqlstate::TOO_MANY_COLUMNS,
@@ -242,10 +286,11 @@ fn exhausted() -> SqlError {
 mod tests {
     use super::*;
     use crate::sql::types::ColType;
+    use crate::storage::TableDefBuilder;
 
     #[test]
     fn catalog_snapshot_dropped_attributes_still_count_toward_the_table_limit() {
-        let mut table = TableDef::empty();
+        let mut table = TableDefBuilder::empty();
         table.n_columns = MAX_RELATION_COLUMNS;
         table.attributes.initialize(MAX_RELATION_COLUMNS).unwrap();
         let column = SqlName::parse("retained").unwrap();
@@ -270,7 +315,7 @@ mod tests {
 
     #[test]
     fn catalog_snapshot_column_numbers_survive_drop_rename_and_same_name_addition() {
-        let mut table = TableDef::empty();
+        let mut table = TableDefBuilder::empty();
         table.n_columns = 2;
         table.columns[0] = ColumnMeta {
             name: SqlName::parse("a").unwrap(),
@@ -323,6 +368,91 @@ mod tests {
             assert!(AttributeSlot::decode([0; 8]).is_none());
             assert!(AttributeSlot::decode([1, 0, 0, 0, 0, 0, 0, 1]).is_none());
             assert!(AttributeSlot::decode([2, 8, 0, 1, b'z', b'p', 0, 0]).is_none());
+        });
+    }
+}
+
+#[cfg(test)]
+mod ownership_tests {
+    use super::*;
+    use crate::sql::types::ColType;
+    use crate::storage::TableDefBuilder;
+
+    #[test]
+    fn shared_table_definition_copies_actual_fields_and_pins_them_through_clone() {
+        use crate::mem::budget::Budget;
+        use crate::mem::lease_pool::{LeasePool, Purpose};
+        let bytes = 64 * 1024;
+        let mut budget = Budget::new(LeasePool::budget_bytes(bytes, 9));
+        let pool = LeasePool::new(&mut budget, Purpose::TABLE_METADATA, bytes, 9).unwrap();
+        let mut draft = TableDefBuilder::empty();
+        draft.name = SqlName::parse("actual_width").unwrap();
+        draft.n_columns = 1;
+        draft.columns[0].name = SqlName::parse("retained").unwrap();
+        draft.attributes.count = 2;
+        draft.attributes.slots[0] = AttributeSlot::Dropped {
+            layout: ColType::Int4.physical_layout(),
+            compression: draft.columns[0].compression.code(),
+        };
+        draft.attributes.slots[1] = AttributeSlot::Live(0);
+        draft.n_uniques = 1;
+        draft.n_checks = 1;
+        draft.n_fkeys = 1;
+        draft.n_exclusions = 1;
+        crate::mem::guard::forbid_alloc(|| {
+            let saved = draft.freeze(&pool).unwrap();
+            assert_eq!(saved.columns.len(), 1);
+            assert_eq!(saved.not_null_names.len(), 1);
+            assert_eq!(saved.attributes.slots.len(), 2);
+            assert_eq!(saved.not_null_identities.len(), 2);
+            assert_eq!(saved.inline_index_identities.len(), 2);
+            assert_eq!(saved.uniques.len(), 1);
+            assert_eq!(saved.checks.len(), 1);
+            assert_eq!(saved.fkeys.len(), 1);
+            assert_eq!(saved.exclusions.len(), 1);
+            assert_eq!(saved.attribute_number(0), 2);
+            {
+                let borrowed = saved.borrowed();
+                assert!(core::ptr::eq(
+                    borrowed.columns.as_ptr(),
+                    saved.columns.as_ptr()
+                ));
+                assert_eq!(borrowed.columns.len(), 1);
+                assert_eq!(borrowed.not_null_identities.len(), 2);
+                assert_eq!(borrowed.attribute_number(0), 2);
+            }
+            let pinned = saved.clone();
+            drop(saved);
+            assert_eq!(pool.lease::<u8>(1).err().unwrap().available_leases, 0);
+            let restored = TableDefBuilder::from_definition(&pinned);
+            assert_eq!(restored.columns[0].name, draft.columns[0].name);
+            assert_eq!(restored.attributes, draft.attributes);
+            assert_eq!(restored.n_checks, 1);
+            drop(pinned);
+            assert!(pool.lease::<u8>(1).is_ok());
+        });
+    }
+
+    #[test]
+    fn failed_table_definition_freeze_releases_every_partial_reservation() {
+        use crate::mem::budget::Budget;
+        use crate::mem::lease_pool::{LeasePool, Purpose};
+        let bytes = 64 * 1024;
+        let mut budget = Budget::new(LeasePool::budget_bytes(bytes, 3));
+        let pool = LeasePool::new(&mut budget, Purpose::TABLE_METADATA, bytes, 3).unwrap();
+        let mut draft = TableDefBuilder::empty();
+        draft.n_columns = 1;
+        draft.attributes.initialize(1).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            assert_eq!(
+                draft.freeze(&pool).err().unwrap().sqlstate,
+                sqlstate::PROGRAM_LIMIT_EXCEEDED
+            );
+            let one = pool.lease::<u8>(1).unwrap();
+            let two = pool.lease::<u8>(1).unwrap();
+            let three = pool.lease::<u8>(1).unwrap();
+            assert_eq!(pool.lease::<u8>(1).err().unwrap().available_leases, 0);
+            drop((one, two, three));
         });
     }
 }

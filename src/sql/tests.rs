@@ -7,16 +7,22 @@
 use super::*;
 use crate::mem::mutex::Mutex;
 
+mod catalog_identity_lookup;
 mod client_catalog;
 mod cursor_execution;
+mod foreign_parent_admission;
 mod key_preparation;
 mod object_reads;
+mod prepared_object_capacity;
 mod query_execution;
 mod routine_calls;
 mod row_history;
 mod row_layout;
+mod sequence_inheritance;
 mod shared_row_capacity;
 mod shared_row_work;
+mod stored_relation_sources;
+mod table_metadata_capacity;
 mod table_publication;
 mod transaction_publication;
 
@@ -1015,9 +1021,10 @@ fn statement_row_copy_chunks_reject_a_definition_changed_after_copy_begin() {
             .storage
             .find_visible("public", "statement_copy_source", transaction.txid)
             .unwrap();
-        let (target, mut definition) = engine
+        let (target, definition) = engine
             .storage
             .select_table_definition(table, transaction.txid);
+        let mut definition = crate::storage::TableDefBuilder::from_definition(&definition);
         definition.columns[0].name = crate::storage::SqlName::parse("renamed_after_begin").unwrap();
         let mut mapping = [None; crate::storage::MAX_COLUMNS];
         mapping[0] = Some(definition.columns[0].name);
@@ -6224,14 +6231,37 @@ fn cluster_metadata_preparing_transactions_stay_private_until_finalized() {
         assert_eq!(prepared.catalog_entries().count(), 1);
         assert_eq!(prepared.catalog_entries().next().unwrap().1.first_lsn, 1);
         assert_eq!(prepared.catalog_entries().next().unwrap().1.prepared_lsn, 2);
+        prepared
+            .slot_mut(slot)
+            .transaction
+            .restore_prepared_identity(metadata.transaction_id);
+        prepared.slot_mut(slot).transaction.clear();
+        assert_eq!(
+            prepared.slot(slot).transaction.txid,
+            metadata.transaction_id
+        );
         prepared.release(slot);
+        assert_eq!(prepared.slot(slot).transaction.txid, 0);
+        assert!(!prepared.slot(slot).transaction.is_active());
+        assert!(prepared.slot(slot).records.is_empty());
+        assert!(prepared.slot(slot).locks.is_empty());
         assert_eq!(prepared.catalog_entries().count(), 0);
         let recovered = two_phase::PreparedTransactionMetadata {
+            transaction_id: 11,
             first_lsn: 3,
             prepared_lsn: 4,
             ..metadata
         };
-        prepared.reserve(recovered).unwrap().unwrap();
+        let reused = prepared.reserve(recovered).unwrap().unwrap();
+        assert_eq!(reused, slot);
+        prepared
+            .slot_mut(reused)
+            .transaction
+            .restore_prepared_identity(recovered.transaction_id);
+        assert_eq!(
+            prepared.slot(reused).transaction.txid,
+            recovered.transaction_id
+        );
         assert_eq!(prepared.catalog_entries().count(), 1);
         for (first_lsn, prepared_lsn) in [(0, 1), (2, 0), (2, 1)] {
             let invalid = two_phase::PreparedTransactionMetadata {
@@ -6247,6 +6277,9 @@ fn cluster_metadata_preparing_transactions_stay_private_until_finalized() {
             );
             assert_eq!(prepared.catalog_entries().next().unwrap().1, recovered);
         }
+        prepared.slot_mut(reused).transaction.clear();
+        prepared.release(reused);
+        assert_eq!(prepared.slot(reused).transaction.txid, 0);
     });
 }
 
@@ -6322,12 +6355,13 @@ fn query_workspaces_are_startup_bounded_and_isolated() {
         crate::storage::DatabaseOid::POSTGRES
     );
 
-    let mut shared_budget = Budget::new(crate::mem::lease_pool::RowWorkPool::budget_bytes(
+    let mut shared_budget = Budget::new(crate::mem::lease_pool::LeasePool::budget_bytes(
         config.row_work_bytes,
         config.row_work_leases,
     ));
-    let shared = crate::mem::lease_pool::RowWorkPool::new(
+    let shared = crate::mem::lease_pool::LeasePool::new(
         &mut shared_budget,
+        crate::mem::lease_pool::Purpose::ROW_WORK,
         config.row_work_bytes,
         config.row_work_leases,
     )
@@ -10539,6 +10573,66 @@ fn large_objects_survive_checkpoint_wal_and_prepared_transaction_recovery() {
         "{}",
         String::from_utf8_lossy(&committed)
     );
+    for decision in ["ROLLBACK", "COMMIT"] {
+        let staged = run_with(
+            &mut recovered,
+            &mut prepared_budget,
+            "BEGIN; \
+             SELECT lo_put(91002::oid,0::bigint,decode('58','hex')); \
+             SELECT lo_unlink(91003::oid); \
+             PREPARE TRANSACTION 'large_object_page_changes'",
+        );
+        assert!(
+            !String::from_utf8_lossy(&staged).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&staged)
+        );
+        drop(recovered);
+        std::fs::remove_dir_all(&config.data_dir).unwrap();
+        prepared_budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        recovered = Engine::new(&config, &mut prepared_budget).unwrap();
+        assert_eq!(
+            data_rows(&run_with(
+                &mut recovered,
+                &mut prepared_budget,
+                "SELECT encode(lo_get(91002::oid),'hex'); \
+                 SELECT encode(lo_get(91003::oid),'hex')"
+            )),
+            ["636865636b706f696e742d77616c", "7072657061726564"],
+            "prepared page writes and deletes must stay private after recovery"
+        );
+        let command = format!("{decision} PREPARED 'large_object_page_changes'");
+        let resolved = run_with(&mut recovered, &mut prepared_budget, &command);
+        assert!(
+            !String::from_utf8_lossy(&resolved).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&resolved)
+        );
+        let expected = if decision == "COMMIT" {
+            ["586865636b706f696e742d77616c", "0", "0"]
+        } else {
+            ["636865636b706f696e742d77616c", "1", "1"]
+        };
+        for reopen in [false, true] {
+            if reopen {
+                drop(recovered);
+                std::fs::remove_dir_all(&config.data_dir).unwrap();
+                prepared_budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+                recovered = Engine::new(&config, &mut prepared_budget).unwrap();
+            }
+            assert_eq!(
+                data_rows(&run_with(
+                    &mut recovered,
+                    &mut prepared_budget,
+                    "SELECT encode(lo_get(91002::oid),'hex'); \
+                     SELECT count(*) FROM pg_largeobject_metadata WHERE oid=91003::oid; \
+                     SELECT count(*) FROM pg_largeobject WHERE loid=91003::oid"
+                )),
+                expected,
+                "{decision}, reopened={reopen}"
+            );
+        }
+    }
     drop(recovered);
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
@@ -26424,7 +26518,9 @@ fn catalog_creation_prepared_type_owner_locks_survive_disposable_disk_recovery()
                 std::fs::remove_dir_all(&config.data_dir).unwrap();
                 let mut recovered_budget =
                     test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+                let ambient = crate::sql::eval::funcs::system::current_identity();
                 let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+                assert_eq!(crate::sql::eval::funcs::system::current_identity(), ambient);
                 let owner = recovered.storage.find_role("prepared_type_owner").unwrap();
                 let target =
                     crate::storage::ObjectLockTarget::Role(recovered.storage.role(owner).oid());
@@ -27791,9 +27887,9 @@ fn catalog_snapshot_schema_resolution_retains_only_its_owned_definition() {
                     crate::sql::catalog::synthesize_definition(Some(qualifier), catalog, &arena)?;
                 assert!(shape.rows.is_empty());
                 assert_eq!(shape.def.name.as_str(), catalog);
-                assert!(
-                    arena.used() - before < core::mem::size_of::<crate::storage::TableDef>() / 4
-                );
+                let payload = core::mem::size_of_val(shape.def.columns);
+                let alignment = core::mem::align_of::<crate::storage::ColumnMeta>();
+                assert!((payload..payload + alignment).contains(&(arena.used() - before)));
                 let materialized = crate::sql::catalog::synthesize(
                     &engine.storage,
                     Some(qualifier),
@@ -58477,6 +58573,7 @@ fn catalog_composite_rename_captures_selected_fields_through_rollback_and_recove
             CREATE TABLE history_points (value history_point_child);
             INSERT INTO history_points VALUES (ROW(3,4)::history_point);
             CREATE INDEX history_point_index ON history_points (((value).x));
+            CREATE INDEX history_point_offset_index ON history_points (((value).x + 1));
             CREATE VIEW history_point_view AS SELECT (value).x AS observed FROM history_points;
             CREATE TABLE history_point_rules (value history_point,
                 observed integer GENERATED ALWAYS AS ((value).x) STORED, CHECK ((value).x > 0));
@@ -58501,6 +58598,11 @@ fn catalog_composite_rename_captures_selected_fields_through_rollback_and_recove
             String::from_utf8_lossy(&setup)
         );
         assert_eq!(data_rows(&setup), ["3", "3", "3", "6"]);
+        for name in ["history_point_index", "history_point_offset_index"] {
+            let slot = engine.storage.index_slot("public", name, 0).unwrap();
+            let definition = engine.storage.index_visible_to(slot, 0).unwrap();
+            assert!(definition.expressions[0].unwrap().as_str().contains("east"));
+        }
         // View materialization uploads spill objects; the simulated remote
         // store allocates its fixture bytes. DDL and table reads stay guarded.
         assert_eq!(
@@ -64127,13 +64229,22 @@ fn index_creation_cache_failure_releases_partial_bindings_and_preserves_prior_in
         let slot = engine.storage.create_index(second, txid).unwrap();
         let error = engine
             .storage
-            .prepare_index_enforcers(table, txid)
+            .prepare_index_enforcers(
+                table,
+                txid,
+                crate::storage::BindingChange::IndexCreate {
+                    created_at: engine
+                        .storage
+                        .index_visible_to(slot, txid)
+                        .unwrap()
+                        .created_at,
+                },
+            )
             .unwrap_err();
         assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
         assert_eq!(engine.storage.table(table).enforcer_count(), 1);
         assert!(engine.storage.value_cache_complete(table, &[0]));
         engine.storage.rollback_index_create(slot);
-        engine.storage.prepare_index_enforcers(table, txid).unwrap();
         assert_eq!(engine.storage.table(table).enforcer_count(), 1);
         assert!(engine.storage.value_cache_complete(table, &[0]));
     });
@@ -66753,6 +66864,8 @@ fn ranked_knn_navigation_bounds_cold_object_reads_for_gist_and_spgist() {
     config.value_index_rows = 16384;
     config.max_indexes = 8;
     config.max_value_indexes = 8;
+    // One implicit transaction admits 8192 row-hash owners plus catalog/control leases.
+    config.table_metadata_leases = 2 * 4096 + 128;
     config.object_store_bucket = format!("ranked-knn-navigation-{}", std::process::id());
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
@@ -66776,6 +66889,16 @@ fn ranked_knn_navigation_bounds_cold_object_reads_for_gist_and_spgist() {
          ANALYZE ranked_gist;
          ANALYZE ranked_spgist",
         false,
+    );
+    assert!(
+        engine
+            .storage
+            .metadata_pool_for_tests()
+            .lease::<u8>(usize::MAX)
+            .unwrap_err()
+            .available_leases
+            >= 2 * 4096,
+        "committed row-hash owners must release their metadata leases"
     );
     assert!(
         !String::from_utf8_lossy(&setup).contains("ERROR"),
@@ -70514,6 +70637,136 @@ fn reindex_rebuilds_named_index_and_table_cache() {
 }
 
 #[test]
+fn reindex_keeps_committed_cache_ownership_and_private_shape_undo() {
+    let config = test_config("reindex-cache-ownership");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    let setup = session.success(
+        &mut engine,
+        "CREATE TABLE reindex_owners(id integer PRIMARY KEY, value text); \
+         INSERT INTO reindex_owners VALUES(1,'one'),(2,'two')",
+        true,
+    );
+    assert!(error_sqlstates(&setup).is_empty());
+    let table = engine
+        .storage
+        .find_table("public", "reindex_owners")
+        .unwrap();
+    let pending_rows = session.success(
+        &mut engine,
+        "BEGIN; UPDATE reindex_owners SET id=9 WHERE id=1; \
+         REINDEX TABLE reindex_owners; SELECT id FROM reindex_owners ORDER BY id",
+        true,
+    );
+    assert!(error_sqlstates(&pending_rows).is_empty());
+    assert_eq!(data_rows(&pending_rows), ["2", "9"]);
+    assert!(engine.storage.value_binding_is_committed(table, 0));
+    let rollback = session.success(
+        &mut engine,
+        "ROLLBACK; SELECT id FROM reindex_owners WHERE id=1; \
+         SELECT id FROM reindex_owners WHERE id=9",
+        true,
+    );
+    assert!(error_sqlstates(&rollback).is_empty());
+    assert_eq!(data_rows(&rollback), ["1"]);
+    assert!(engine.storage.value_binding_is_committed(table, 0));
+    let pending_shape = session.success(
+        &mut engine,
+        "BEGIN; ALTER TABLE reindex_owners RENAME COLUMN value TO renamed; \
+         ALTER TABLE reindex_owners ALTER COLUMN id TYPE bigint; \
+         REINDEX TABLE reindex_owners; \
+         SELECT renamed, pg_typeof(id)::text FROM reindex_owners WHERE id=1",
+        true,
+    );
+    assert!(error_sqlstates(&pending_shape).is_empty());
+    assert_eq!(data_rows(&pending_shape), ["one|bigint"]);
+    assert!(!engine.storage.value_binding_is_committed(table, 0));
+    let rollback = session.success(
+        &mut engine,
+        "ROLLBACK; SELECT value, pg_typeof(id)::text FROM reindex_owners WHERE id=1",
+        true,
+    );
+    assert!(error_sqlstates(&rollback).is_empty());
+    assert_eq!(data_rows(&rollback), ["one|integer"]);
+    assert!(engine.storage.value_binding_is_committed(table, 0));
+}
+
+#[test]
+fn reindex_validates_own_deferred_keys_only_for_selected_indexes() {
+    let (mut engine, mut budget) = test_engine();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE reindex_deferred(id integer UNIQUE DEFERRABLE INITIALLY DEFERRED, payload integer); \
+         CREATE INDEX reindex_payload ON reindex_deferred(payload); \
+         CREATE UNIQUE INDEX reindex_payload_unique ON reindex_deferred(payload)",
+    );
+    assert!(error_sqlstates(&setup).is_empty());
+    let named = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; INSERT INTO reindex_deferred VALUES(1,10),(1,20); \
+         REINDEX INDEX reindex_payload; SELECT payload FROM reindex_deferred ORDER BY payload",
+    );
+    assert!(error_sqlstates(&named).is_empty());
+    assert_eq!(data_rows(&named), ["10", "20"]);
+    assert!(error_sqlstates(&run_with(&mut engine, &mut budget, "ROLLBACK")).is_empty());
+    let other_unique = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; INSERT INTO reindex_deferred VALUES(1,10),(1,20); \
+         REINDEX INDEX reindex_payload_unique; SELECT payload FROM reindex_deferred ORDER BY payload",
+    );
+    assert!(error_sqlstates(&other_unique).is_empty());
+    assert_eq!(data_rows(&other_unique), ["10", "20"]);
+    assert!(error_sqlstates(&run_with(&mut engine, &mut budget, "ROLLBACK")).is_empty());
+    for target in [
+        "BEGIN; INSERT INTO reindex_deferred VALUES(1,10),(1,20); REINDEX TABLE reindex_deferred",
+        "BEGIN; INSERT INTO reindex_deferred VALUES(1,10),(1,20); REINDEX INDEX reindex_deferred_id_key",
+    ] {
+        let all = run_with(&mut engine, &mut budget, target);
+        assert_eq!(
+            error_sqlstates(&all),
+            ["23505"],
+            "{target}: {}",
+            String::from_utf8_lossy(&all)
+        );
+        assert!(error_sqlstates(&run_with(&mut engine, &mut budget, "ROLLBACK")).is_empty());
+    }
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*) FROM reindex_deferred"
+        )),
+        ["0"]
+    );
+    assert!(
+        error_sqlstates(&run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE TABLE reindex_excluded(r int4range, CONSTRAINT reindex_excluded_key \
+         EXCLUDE USING gist(r WITH &&) DEFERRABLE INITIALLY DEFERRED)",
+        ))
+        .is_empty()
+    );
+    for target in [
+        "BEGIN; INSERT INTO reindex_excluded VALUES('[1,4)'),('[3,6)'); REINDEX TABLE reindex_excluded",
+        "BEGIN; INSERT INTO reindex_excluded VALUES('[1,4)'),('[3,6)'); REINDEX INDEX reindex_excluded_key",
+    ] {
+        let output = run_with(&mut engine, &mut budget, target);
+        assert_eq!(
+            error_sqlstates(&output),
+            ["23P01"],
+            "{target}: {}",
+            String::from_utf8_lossy(&output)
+        );
+        assert!(error_sqlstates(&run_with(&mut engine, &mut budget, "ROLLBACK")).is_empty());
+    }
+}
+
+#[test]
 fn reindex_preserves_indexed_access_after_checkpoint_and_cold_restart() {
     let mut config = test_config("reindex-recovery");
     config.object_store_on = true;
@@ -71807,7 +72060,7 @@ fn database_configuration_and_tablespace_lifecycle_is_typed_and_transactional() 
                 STRATEGY WAL_LOG LOCALE_PROVIDER libc
                 LC_COLLATE 'C' LC_CTYPE 'C'
                 TABLESPACE object_archive ALLOW_CONNECTIONS true
-                CONNECTION_LIMIT 4 IS_TEMPLATE false",
+                CONNECTION LIMIT = 4 IS_TEMPLATE false",
     ] {
         let output = run_with(&mut engine, &mut budget, sql);
         assert!(
@@ -71819,7 +72072,8 @@ fn database_configuration_and_tablespace_lifecycle_is_typed_and_transactional() 
     let output = run_with(
         &mut engine,
         &mut budget,
-        "ALTER DATABASE application WITH ALLOW_CONNECTIONS false CONNECTION_LIMIT 2;
+        "ALTER DATABASE application WITH ALLOW_CONNECTIONS false CONNECTION LIMIT 3;
+         ALTER DATABASE application CONNECTION LIMIT 2;
          CREATE ROLE database_reader;
          GRANT CONNECT, CREATE ON DATABASE application TO database_reader WITH GRANT OPTION;
          ALTER DATABASE application SET application_name TO 'database-default';
@@ -73958,7 +74212,8 @@ fn typed_table_membership_rejects_a_reused_source_lifetime() {
         .storage
         .find_visible("public", "saved_typed_rows", 0)
         .unwrap();
-    let mut saved = *engine.storage.table_def(slot, 0);
+    let mut saved =
+        crate::storage::TableDefBuilder::from_definition(&engine.storage.table_def(slot, 0));
     let source_slot = saved.type_membership.composite_slot().unwrap();
     for statement in [
         "DROP TYPE retired_typed_source CASCADE",
@@ -75092,7 +75347,11 @@ fn database_template_catalogs_diverge_and_survive_object_cold_recovery() {
         &mut budget,
         "ALTER TABLE template_app.items RENAME TO cloned_items",
     );
-    assert!(!String::from_utf8_lossy(&output).contains("ERROR"));
+    assert!(
+        error_sqlstates(&output).is_empty(),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
     assert_eq!(
         engine.storage.table_def(cloned_table, 0).name.as_str(),
         "cloned_items"
@@ -81561,7 +81820,7 @@ fn one_protocol_flush_publishes_many_commits_as_one_immutable_batch() {
     engine.commit_wal().unwrap();
     for session in [&mut first, &mut second, &mut third] {
         engine
-            .finish_staged_transaction(&mut session.transaction, &session.guc)
+            .finish_pending_transaction(&mut session.transaction, &session.guc)
             .unwrap();
     }
 
@@ -81629,7 +81888,7 @@ fn one_protocol_flush_publishes_many_commits_as_one_immutable_batch() {
     stage_without_publication(&mut engine, &mut first, "INSERT INTO batched VALUES (4)");
     engine.commit_wal().unwrap();
     engine
-        .finish_staged_transaction(&mut first.transaction, &first.guc)
+        .finish_pending_transaction(&mut first.transaction, &first.guc)
         .unwrap();
     assert!(engine.checkpoint().unwrap());
     let mut batches = 0;
@@ -83472,7 +83731,7 @@ fn ambiguous_commit_batch_put_is_idempotently_adopted() {
     // the durable bytes and adopt the same batch and root without duplication.
     engine.commit_wal().unwrap();
     engine
-        .finish_staged_transaction(&mut session.transaction, &session.guc)
+        .finish_pending_transaction(&mut session.transaction, &session.guc)
         .unwrap();
     assert_eq!(engine.wal.pending_batch_bytes(), 0);
     namespace.borrow_mut().faults.ambiguous_put_per_mille = 0;
@@ -85214,7 +85473,7 @@ fn named_backup_recovers_to_retained_lsn_and_timestamp_boundaries_body() {
     engine.commit_wal().unwrap();
     for session in [&mut target, &mut later] {
         engine
-            .finish_staged_transaction(&mut session.transaction, &session.guc)
+            .finish_pending_transaction(&mut session.transaction, &session.guc)
             .unwrap();
     }
     assert!(engine.checkpoint().unwrap());
@@ -91919,6 +92178,7 @@ fn retained_dml_descriptions_use_small_statement_buffers_after_cold_recovery() {
     config.wal_upload_sync = false;
     config.object_store_bucket = format!("retained-description-cold-{}", std::process::id());
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let server = object_reads::HttpObjectServer::start(&mut config);
     let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
@@ -91929,7 +92189,6 @@ fn retained_dml_descriptions_use_small_statement_buffers_after_cold_recovery() {
     drop(engine);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
     config.work_arena_bytes = 64 << 10;
-    assert!(size_of::<crate::storage::TableDef>() > config.work_arena_bytes);
     let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let mut session =
@@ -91943,30 +92202,42 @@ fn retained_dml_descriptions_use_small_statement_buffers_after_cold_recovery() {
         data_rows(&session.success(&mut engine, "SELECT id, amount FROM described_cold", true)),
         ["1|11"]
     );
-    // Reading the captured rows needs a separate full-width relation schema.
-    // Its named failure must roll back the update and release description owners.
-    let rejected = session.execute(&mut engine,
+    let projected = session.success(&mut engine,
         "WITH changed AS (UPDATE described_cold SET amount = amount + 1 RETURNING id, amount) SELECT id, amount FROM changed", true);
+    assert_eq!(data_rows(&projected), ["1|12"]);
+    assert_eq!(row_description_names(&projected), ["id", "amount"]);
+    for query in [
+        "SELECT left_row.id, right_row.amount FROM described_cold AS left_row CROSS JOIN described_cold AS right_row",
+        "SELECT id, amount FROM (SELECT id, amount FROM described_cold ORDER BY id + amount) AS ordered",
+    ] {
+        assert_eq!(
+            data_rows(&session.success(&mut engine, query, true)),
+            ["1|12"]
+        );
+    }
+    // A result larger than the fixed arena must undo the update and release its owners.
+    let rejected = session.execute(&mut engine,
+        "WITH changed AS (UPDATE described_cold SET amount = amount + 1 RETURNING id, amount) SELECT id, amount, repeat('x',(65536 + amount - amount)::integer) FROM changed", true);
     let error = String::from_utf8_lossy(&rejected);
     assert!(
-        error.contains("54000") && error.contains("statement arena"),
+        error.contains("54000") && error.contains("SQL arena"),
         "{error}"
     );
     assert_eq!(
         data_rows(&session.success(&mut engine, "SELECT id, amount FROM described_cold", true)),
-        ["1|11"]
+        ["1|12"]
     );
     session.success(&mut engine, narrow, true);
     assert_eq!(
         data_rows(&session.success(&mut engine, "SELECT id, amount FROM described_cold", true)),
-        ["1|12"]
+        ["1|13"]
     );
     session.success(&mut engine, "BEGIN", true);
     session.success(&mut engine, narrow, true);
     session.success(&mut engine, "ROLLBACK", true);
     assert_eq!(
         data_rows(&session.success(&mut engine, "SELECT id, amount FROM described_cold", true)),
-        ["1|12"]
+        ["1|13"]
     );
     assert!(engine.checkpoint().unwrap());
     drop(session);
@@ -91978,10 +92249,11 @@ fn retained_dml_descriptions_use_small_statement_buffers_after_cold_recovery() {
         ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, 64 << 10);
     assert_eq!(
         data_rows(&session.success(&mut engine, "SELECT id, amount FROM described_cold", true)),
-        ["1|12"]
+        ["1|13"]
     );
     drop(session);
     drop(engine);
+    drop(server);
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
@@ -92095,7 +92367,13 @@ fn alter_rewrite_sources_release_failed_capture_and_allow_fixed_capacity_retry()
         .unwrap();
     let arena = Arena::new(&mut budget, "alter capture retry", 2 << 20).unwrap();
     let tiny = Arena::new(&mut budget, "alter tiny arena", 1).unwrap();
-    let short_pool = crate::mem::lease_pool::RowWorkPool::new(&mut budget, 64, 1).unwrap();
+    let short_pool = crate::mem::lease_pool::LeasePool::new(
+        &mut budget,
+        crate::mem::lease_pool::Purpose::ROW_WORK,
+        64,
+        1,
+    )
+    .unwrap();
     let mut short = short_pool.lease(0).unwrap();
     let mut complete = engine.row_work_pool().lease(0).unwrap();
     crate::mem::guard::forbid_alloc(|| {
@@ -94975,7 +95253,7 @@ fn cleanup_download_overlap_wal_retry_precedes_cleanup_and_preserves_pending_pre
         namespace.borrow_mut().faults.fail_from_op = None;
         engine.commit_wal().unwrap();
         engine
-            .finish_staged_transaction(&mut session.transaction, &session.guc)
+            .finish_pending_transaction(&mut session.transaction, &session.guc)
             .unwrap();
         assert!(!engine.durable_retry_pending());
         prepare_sliced_cleanup(&mut engine);
@@ -96846,7 +97124,7 @@ fn parallel_commit_partition_detach_keeps_phase_receipts_before_reader_waits() {
         engine.commit_wal().unwrap();
         if extended {
             crate::mem::guard::forbid_alloc(|| {
-                engine.finish_staged_transaction(&mut detacher.transaction, &detacher.guc)
+                engine.finish_pending_transaction(&mut detacher.transaction, &detacher.guc)
             })
             .unwrap();
         } else {
@@ -98452,6 +98730,7 @@ fn parallel_physical_explicit_reindex_does_not_read_the_retired_corrupt_roster()
         .is_empty()
     );
     assert!(engine.storage.value_binding_requires_rebuild(table, 0));
+    assert!(engine.storage.value_binding_is_committed(table, 0));
     assert!(
         engine.checkpoint().unwrap(),
         "repair must read table data, never the broken old roster"

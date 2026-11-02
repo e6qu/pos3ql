@@ -155,17 +155,40 @@ interface; they do not prescribe pos3ql's object layout.
 
 1. SQL checks permissions, constraints and locks and prepares private row and
    catalog changes. Rollback records and journal staging must fit their pools.
-2. A commit captures immutable journal bytes and a descriptor. Independent
+2. Before durability, admission reserves replacement table/type definitions,
+   index-binding roots and row keys. It retains the completed command while
+   required locks or storage are unavailable.
+3. A commit captures immutable journal bytes and a descriptor. Independent
    uploads can overlap, and several transactions can share the publication.
-3. A conditional update advances the commit head only after the required
+4. A conditional update advances the commit head only after the required
    uploads succeed. It preserves the committed predecessor and writer identity.
-4. The complete transaction installs in memory, its visible position advances,
+5. The complete transaction installs in memory, its visible position advances,
    locks release, and the server can send success.
 
 **Example:** updating an order and its invoice in one transaction cannot expose
 one changed value and one unchanged value during installation. An older report
 can retain its earlier values. A new command waits through the installation
 boundary rather than observing half a transaction.
+
+Admission is still cancellable before durable publication. A wait preserves
+completed defaults, triggers and buffered results; resuming it continues the
+commit instead of executing the command again. Share relation locks protect
+affected tables: ordinary SELECTs and unrelated work can proceed, while
+conflicting writes wait. A prepared transaction captures its lock image after
+admission has acquired those locks. Publication consumes reserved owners rather
+than allocating or rebuilding metadata after durability.
+
+After a restart, saved transactions reconstruct their private row and catalog
+changes from the journal, including types, indexes and stored queries. Other
+transactions still see the committed definitions. Once all startup catalogs
+exist, stored-query references are bound separately for committed definitions
+and each saved transaction's selected private definitions, in its own database.
+For example, a saved schema rename keeps the original function usable until
+commit, then its body reads the renamed table. `COMMIT PREPARED` completes
+admission before making its decision durable, then installs these reserved
+changes through normal publication. It does not replay allocating catalog
+operations after confirming the decision. `ROLLBACK PREPARED` uses the same
+captured identities and ordinary undo records to release them.
 
 The commit head is ordered because confirmed transactions need one recoverable
 history. This does not require serial uploads or serial future CPU execution.
@@ -198,9 +221,17 @@ being treated as the earlier row.
 A checkpoint writes captured committed versions and publishes a complete
 manifest, the inventory of saved objects and definitions. Later commits remain
 in the journal. Finishing an older checkpoint cannot clear newer writes or
-ANALYZE results. Merges combine saved generations, retaining the versions needed
-by readers. Object deletion respects current roots, retained readers and backups.
+ANALYZE results. Index output is eligible only when both its catalog identity
+and its row-decoding context are committed; a committed index name alone cannot
+make a private rewritten table shape safe to save. Merges combine saved
+generations, retaining the versions needed by readers. Object deletion respects
+current roots, retained readers and backups.
 There is no need for an operating-system cron entry to drive this internal work.
+
+`REINDEX` rebuilds from rows using the selected table shape and the existing
+cache's transaction ownership. It does not turn a committed cache into a private
+one or replace another transaction's cache. Rebuilding from rows also avoids
+depending on the damaged saved index that the command is repairing.
 
 Application jobs, migration scheduling and backup schedules are operator work.
 There is no built-in SQL job scheduler or PostgreSQL background-worker ABI.
@@ -226,12 +257,44 @@ space or this temporary overlap can prevent a larger contiguous request. The
 named error reports requested bytes, total free bytes, the largest free extent
 and remaining lease descriptors. For example,
 an update and a long report compete for this same budget, rather than each
-reserving a maximum array for every potential table. `definition_image_slots`
-bounds shared copies of wide table definitions retained by readers. A live
-reader, pending write or prepared transaction keeps its ownership until safe
-release. Exhaustion returns a named `54000` error; these pools never grow at
-runtime. Checkpoint and relocation reserves remain separate so foreground work
-cannot consume the capacity needed to release saved rows.
+reserving a maximum array for every potential table.
+
+`table_metadata_bytes` reserves one shared backing pool for actual-length table
+columns, physical column-number records, constraints, pending edit mappings and
+index-binding collections. Its starter value is 64 MiB;
+`table_metadata_leases` starts at 8,192 concurrently occupied ranges. File
+configurations must name both settings. Bytes must be a positive multiple of 64;
+allocator controls and per-table headers are additional startup reservations.
+Prepared value-index keys also use one range per distinct row alongside schema
+and binding ranges. Thus 8,192 leases is not an 8,192-row transaction limit:
+bulk changes need room for their keys and the other live metadata. Exhaustion
+fails before the journal becomes durable and rolls the changes back.
+Each range rounds to 64 bytes. Fragmentation, retained old versions and the
+overlap with replacement data can exhaust bytes or descriptors independently.
+The named `54000` diagnostic identifies the metadata pool and requested, free
+and largest contiguous bytes plus available descriptors. Pools never grow.
+
+A one-column table stores its actual columns instead of a maximum-width array.
+Dropped columns still retain their PostgreSQL column numbers. Committed schemas,
+pending edits and retained readers share immutable ownership; cloning a reader's
+schema pin neither copies its payload nor reserves another range. Old and new
+metadata remain charged until their last owners release them. Rollback and
+prepared recovery preserve the selected object lifetime, including instance, database,
+creation identity and schema revision; reusing a name or slot cannot redirect it.
+
+`definition_image_slots` bounds retained execution-schema identities. Physical
+images pin stored definitions; synthetic catalog images retain actual columns,
+including their hidden suffix, in a separate typed payload. Image identifiers
+include their owning pool and generation, so a stale or foreign identifier cannot
+select another schema. CTEs, table functions
+and trigger descriptions use borrowed column descriptors and actual statement
+memory. They do not put owning schema leases or maximum-width definitions in
+arenas that do not run destructors. Joined-row decoding also reserves only the
+actual physical fields of each source. Recursive queries retain their internal
+`SEARCH` ordering and `CYCLE` tracking fields in that physical shape while
+exposing only the SQL-visible column prefix where required. Hiding a field
+does not remove the scratch space needed to decode it. Checkpoint and relocation
+reserves remain separate so foreground work cannot consume their progress capacity.
 
 MVCC row history uses the explicit shared `row_history_slots` capacity across all tables and large
 objects; `max_row_versions_per_row` remains a separate per-row bound. Locking
@@ -244,24 +307,23 @@ pressure, write admission examines at most 64 row metadata positions and retries
 with its owned input. Each history chain has the separate per-row version bound.
 It never repeats SQL expressions or drains the whole
 database synchronously; remaining pressure returns the named capacity error.
-Per-table and other catalog metadata can still make many small embedded tables
-expensive. Sharing ordinary row slots, row workspace and definition-image slots
-does not remove every catalog or definition-history reservation. Row bytes,
-committed history and immutable block caches also use shared startup pools.
-The [adaptive resource design](adaptive-resources.md) separates these hard
-capacities from future workload-driven admission and eviction policies. No
-controller currently resizes the startup reservations by load.
-Catalog capacities are independent settings: changing `max_tables` does not
-silently resize indexes, routines, views or extended statistics.
-Pending table definitions reserve their complete payload capacity at startup,
-but initialize only dense occupancy locks. Wide payload pages are touched when
-a definition is staged; its matching read/write guard protects initialization,
-retirement and reuse. Reserving unused slots does not initialize every payload.
+Per-table statistics, serial counters, foreign-table/catalog records and other
+fixed controls still make many small embedded tables expensive. Pending ANALYZE
+and other definition families retain separate bounds. Sharing table payloads
+does not remove these reservations. Row bytes, committed history and immutable
+block caches also use shared startup pools. The
+[adaptive resource design](adaptive-resources.md) separates implemented hard
+capacities from future workload policies; no controller resizes startup backing
+according to load. Catalog capacities remain independent: changing `max_tables`
+does not silently resize indexes, routines, views or extended statistics.
 
-The [embedded memory helper](https://github.com/e6qu/pos3ql/blob/b3aa3099993c351e09a0eb73fd6c1de67228007d/examples/embedded-memory.rs) and
-[runner script](https://github.com/e6qu/pos3ql/blob/b3aa3099993c351e09a0eb73fd6c1de67228007d/tools/measure-embedded-capacity.py) measure 1, 8, 32 and 128
+The [embedded memory helper](https://github.com/e6qu/pos3ql/blob/14e1cdd24e775ea92e2646c07d9671744898e29a/examples/embedded-memory.rs) and
+[runner script](https://github.com/e6qu/pos3ql/blob/14e1cdd24e775ea92e2646c07d9671744898e29a/tools/measure-embedded-capacity.py) measure 1, 8, 32 and 128
 configured tables with the same explicit shared capacities in each transaction
-mode. They retain named startup draws, configured reservation, peak resident
+mode, including `table_metadata_bytes` and `table_metadata_leases`. Its 48 samples
+cover empty, hot, even, moving-demand, 64-column and schema/index replacement
+workloads. The single session does not measure pinned-reader pressure; separate
+ownership regressions cover that behavior. The helper retains named startup draws, configured reservation, peak resident
 memory, stack size and startup time. Populated workloads are reported separately
 from empty engines and include their session costs. These results must be
 collected on CI; the script and configuration alone are not measurements.
@@ -282,8 +344,8 @@ reserved bytes alone do not establish which pages became resident.
 The [before/after measurements](https://github.com/e6qu/pos3ql/blob/4054a6d3c79e916728f8e84d84139eae6d86b501/benchmarks/baselines/2026-10-30-embedded-lazy-definitions/README.md)
 show empty-engine peak memory falling from about 735 MiB to 431 MiB with 32
 configured table slots after unused pending definition payloads were left
-uninitialized. Those debug-build samples establish neither populated-table
-costs nor a production memory minimum.
+uninitialized. Those historical debug-build samples do not measure the current
+shared-schema implementation or establish a production memory minimum.
 
 Capacity is the smallest applicable bound, not just the size of the bucket:
 

@@ -11888,4 +11888,43 @@ mod tests {
             });
         }
     }
+
+    #[test]
+    fn database_connection_limit_requires_the_complete_option_before_its_value() {
+        for sql in [
+            "CREATE DATABASE sample CONNECTION LIMIT 9",
+            "CREATE DATABASE sample WITH CONNECTION LIMIT = 9",
+            "ALTER DATABASE sample CONNECTION LIMIT 9",
+            "ALTER DATABASE sample WITH CONNECTION LIMIT = 9",
+        ] {
+            with_parser(sql, |parser| {
+                match parser.next_stmt().unwrap().unwrap() {
+                    Stmt::CreateDatabase { options, .. } => {
+                        assert_eq!(options.connection_limit, Some(9));
+                    }
+                    Stmt::AlterDatabase {
+                        action:
+                            crate::sql::ast::AlterDatabaseAction::Options {
+                                connection_limit, ..
+                            },
+                        ..
+                    } => assert_eq!(connection_limit, Some(9)),
+                    _ => panic!("unexpected database statement"),
+                }
+                assert!(parser.next_stmt().unwrap().is_none());
+            });
+        }
+        for sql in [
+            "CREATE DATABASE sample CONNECTION = LIMIT 9",
+            "CREATE DATABASE sample CONNECTION LIMIT = = 9",
+            "CREATE DATABASE sample CONNECTION_LIMIT = = 9",
+            "ALTER DATABASE sample CONNECTION = LIMIT 9",
+            "ALTER DATABASE sample WITH CONNECTION LIMIT = = 9",
+            "ALTER DATABASE sample WITH CONNECTION_LIMIT = = 9",
+        ] {
+            with_parser(sql, |parser| {
+                assert!(parser.next_stmt().is_err(), "accepted {sql}");
+            });
+        }
+    }
 }

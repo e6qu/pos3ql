@@ -7,7 +7,7 @@ use crate::mem::arena::Arena;
 use crate::mem::budget::{Budget, BudgetError};
 use crate::mem::buffer::FixedBuf;
 use crate::mem::fixed_vec::FixedVec;
-use crate::mem::lease_pool::RowWorkPool;
+use crate::mem::lease_pool::LeasePool;
 use crate::pg::pginput::{CopyData, Message, Relation, ReplicaIdentity};
 use crate::pg::respond::Responder;
 use crate::sql::ast::ExplainSerialize;
@@ -315,7 +315,7 @@ impl SubscriptionApply {
         config: &crate::config::Config,
         confirmed_lsn: u64,
         behavior: crate::storage::SubscriptionBehavior,
-        row_work: Arc<RowWorkPool>,
+        row_work: Arc<LeasePool>,
     ) -> Result<Self, BudgetError> {
         let guc = GucState::new_with_capacities(
             budget,
@@ -442,7 +442,7 @@ impl SubscriptionApply {
             return Ok(ApplyResult::None);
         };
         self.with_context(engine, |worker, engine| {
-            match engine.finish_staged_transaction(&mut worker.txn, &worker.guc) {
+            match engine.finish_pending_transaction(&mut worker.txn, &worker.guc) {
                 Ok(()) => Ok(worker.finish_remote_commit(end_lsn, clear_skip)),
                 Err(error) if error.sqlstate == sqlstate::INTERNAL_IO_WAIT => {
                     Ok(ApplyResult::AwaitingDurability)
@@ -481,7 +481,7 @@ impl SubscriptionApply {
                         worker.pending_commit = Some((confirmed_lsn, false));
                     }
                     engine.commit_wal()?;
-                    engine.finish_staged_transaction(&mut worker.txn, &worker.guc)?;
+                    engine.finish_pending_transaction(&mut worker.txn, &worker.guc)?;
                     worker.pending_commit = None;
                     Ok(())
                 });
@@ -656,7 +656,7 @@ impl SubscriptionApply {
                 worker.pending_commit = Some((confirmed_lsn, false));
             }
             engine.commit_wal()?;
-            engine.finish_staged_transaction(&mut worker.txn, &worker.guc)?;
+            engine.finish_pending_transaction(&mut worker.txn, &worker.guc)?;
             worker.pending_commit = None;
             worker.confirmed_lsn = confirmed_lsn;
             Ok(())

@@ -33,7 +33,7 @@ use crate::storage::{
     CheckpointRowCursor, ColumnDefault, ColumnMeta, MAX_COLUMNS, MAX_RELATION_COLUMNS,
     MaintenanceMode, MaintenanceStep, OwnedDatum, PartitionBound, PartitionBoundValue,
     PartitionDef, PartitionStrategy, RowCleanup, RowCleanupTarget, RowCleanupTask, RowHome,
-    SerializedStoredQueryDependency, SqlName, Storage, TableDef, TransactionIdentityRecord,
+    SerializedStoredQueryDependency, SqlName, Storage, TableDefBuilder, TransactionIdentityRecord,
 };
 use crate::store::{
     BlockId, BlockStore, BlockType, BlockWriter, MAX_ASSEMBLED, MAX_INLINE_ROW, OwnedObjectStore,
@@ -1620,8 +1620,9 @@ impl Checkpointer {
             + crate::storage::RowReadBuffers::budget_bytes()
             + ValueIndexWriter::budget_bytes()
             + table_bookkeeping
-            + table_capacity.saturating_mul(crate::storage::MAX_VALUE_ENFORCERS)
-                * core::mem::size_of::<ValueInstall>()
+            + config
+                .max_value_indexes
+                .saturating_mul(core::mem::size_of::<ValueInstall>())
             + config.checkpoint_live_blocks * core::mem::size_of::<(BlockId, Option<BlockType>)>()
             + config.checkpoint_garbage_batch_objects
                 * (core::mem::size_of::<StackStr<80>>() + 2 * core::mem::size_of::<StackStr<64>>())
@@ -2492,9 +2493,7 @@ impl Checkpointer {
             pending_installs: Vec::with_capacity(
                 table_capacity.saturating_mul(config.max_spill_generations_per_table),
             ),
-            pending_value_installs: Vec::with_capacity(
-                table_capacity * crate::storage::MAX_VALUE_ENFORCERS,
-            ),
+            pending_value_installs: Vec::with_capacity(config.max_value_indexes),
             merge_scratch: Vec::with_capacity(config.checkpoint_merge_entries),
             roster_scratch: Vec::with_capacity(config.checkpoint_live_blocks),
             garbage_seen: FixedMap::new(
@@ -4163,7 +4162,7 @@ impl Checkpointer {
         let mut pending_def: Option<(
             usize,
             u64,
-            TableDef,
+            TableDefBuilder,
             usize,
             [i64; crate::storage::MAX_COLUMNS],
         )> = None;
@@ -4357,7 +4356,7 @@ impl Checkpointer {
                         return Err(CheckpointSetupError::Corrupt("invalid table fillfactor"));
                     }
                     let name = rest_of(line, 12 + inheritance_count)?;
-                    let def = TableDef {
+                    let def = TableDefBuilder {
                         // The current format omits `tsch` for the public schema.
                         schema: sql_name("public")?,
                         name: sql_name(name)?,
@@ -4365,7 +4364,9 @@ impl Checkpointer {
                         n_columns: n_cols,
                         attributes: crate::storage::column_attributes::ColumnAttributes {
                             count: u16::MAX,
-                            ..crate::storage::column_attributes::ColumnAttributes::EMPTY
+                            ..crate::storage::column_attributes::ColumnAttributes::<
+                                crate::storage::InlineDefinition,
+                            >::EMPTY
                         },
                         has_toast,
                         has_rules,
@@ -4377,7 +4378,7 @@ impl Checkpointer {
                         storage_options: crate::storage::TableStorageOptions {
                             fillfactor: (fillfactor != 0).then_some(fillfactor),
                         },
-                        ..TableDef::empty()
+                        ..TableDefBuilder::empty()
                     };
                     pending_def = Some((
                         mindex,
@@ -4405,7 +4406,7 @@ impl Checkpointer {
                         }
                         def.attributes = ColumnAttributes {
                             count,
-                            ..ColumnAttributes::EMPTY
+                            ..ColumnAttributes::<crate::storage::InlineDefinition>::EMPTY
                         };
                     } else {
                         if def.attributes.count == u16::MAX
@@ -9318,7 +9319,9 @@ impl Checkpointer {
                             ))
                         })?;
                     // Checkpoint load reconstructs committed state.
-                    storage.commit_index_create(slot);
+                    storage
+                        .commit_index_create(slot)
+                        .map_err(CheckpointSetupError::Replay)?;
                     if has_brin_maintenance {
                         storage
                             .restore_brin_maintenance(
@@ -11030,7 +11033,12 @@ impl Checkpointer {
                     format_args!("dsst {slot} 0 0 0 - - -"),
                 )?;
             }
+            // A private replacement has no committed value generation. Row
+            // roots and prepared WAL retain recovery without this accelerator.
             for binding in 0..storage.value_binding_count(slot) {
+                if !storage.value_binding_is_committed(slot, binding) {
+                    continue;
+                }
                 let (columns, n_columns) = storage.value_binding_columns(slot, binding);
                 let index_created_at = storage.value_binding_created_at(slot, binding);
                 let include_mask = storage.value_binding_include_mask(slot, binding);
@@ -17819,7 +17827,7 @@ fn finish_pending(
     pending: &mut Option<(
         usize,
         u64,
-        TableDef,
+        TableDefBuilder,
         usize,
         [i64; crate::storage::MAX_COLUMNS],
     )>,
@@ -17840,7 +17848,8 @@ fn finish_pending(
                 || definition.schema != expected.schema
                 || definition.name != expected.name
                 || definition.n_columns != expected.n_columns
-                || definition.not_null_names != expected.not_null_names
+                || &definition.not_null_names[..definition.n_columns]
+                    != expected.not_null_names.as_ref()
                 || definition.has_toast != expected.has_toast
                 || definition
                     .columns()
@@ -18622,7 +18631,14 @@ fn load_subscription(storage: &mut Storage, line: &str) -> Result<(), Checkpoint
                 error.message.as_str()
             ))
         })?;
-    storage.restore_subscription_owner(slot, owner);
+    storage
+        .restore_subscription_owner(slot, owner, 0)
+        .map_err(|error| {
+            CheckpointSetupError::ObjectStore(format!(
+                "manifest subscription owner rejected: {}",
+                error.message.as_str()
+            ))
+        })?;
     storage.commit_subscription_create(slot);
     storage
         .restore_subscription_stream_identity(slot, created_at, definition_generation)
@@ -19806,11 +19822,11 @@ mod stored_dependency_tests {
         )
         .unwrap();
         storage.attach_spill(reader);
-        let mut definition = TableDef {
+        let mut definition = TableDefBuilder {
             schema: SqlName::parse("public").unwrap(),
             name: SqlName::parse("saved_index").unwrap(),
             n_columns: 1,
-            ..TableDef::empty()
+            ..TableDefBuilder::empty()
         };
         definition.columns[0] = ColumnMeta {
             name: SqlName::parse("id").unwrap(),
@@ -19835,11 +19851,11 @@ mod stored_dependency_tests {
         for writing in [false, true] {
             let (mut checkpoint, mut storage, _, config) =
                 index_gc_fixture(&format!("table-source-wait-{writing}"), 64);
-            let mut definition = TableDef {
+            let mut definition = TableDefBuilder {
                 schema: SqlName::parse("public").unwrap(),
                 name: SqlName::parse("orders").unwrap(),
                 n_columns: 2,
-                ..TableDef::empty()
+                ..TableDefBuilder::empty()
             };
             definition.columns[0] = ColumnMeta {
                 name: SqlName::parse("id").unwrap(),
@@ -22024,7 +22040,7 @@ mod stored_dependency_tests {
                     let mut budget = Budget::new(bytes);
                     let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
                     let mut checkpointer = Checkpointer::new(&config, &mut budget).unwrap();
-                    let mut definition = TableDef::empty();
+                    let mut definition = TableDefBuilder::empty();
                     definition.schema = SqlName::parse("public").unwrap();
                     definition.name = SqlName::parse("schema_manifest_table").unwrap();
                     storage.create_table(definition).unwrap();
@@ -22199,7 +22215,7 @@ mod stored_dependency_tests {
         value_indexes.max_value_indexes += 1;
         assert_eq!(
             Checkpointer::budget_bytes(&value_indexes) - base_bytes,
-            3 * core::mem::size_of::<BlockId>()
+            3 * core::mem::size_of::<BlockId>() + core::mem::size_of::<ValueInstall>()
         );
 
         let mut overlay_slots = base.clone();
@@ -22489,7 +22505,8 @@ mod stored_dependency_tests {
         dependencies
             .serialized_push(SerializedStoredQueryDependency {
                 class: DependencyClass::Table,
-                identity: StoredDependencyIdentity::Name,
+                identity: StoredDependencyIdentity::from_storage(DependencyClass::Table, "t:31")
+                    .unwrap(),
                 schema: SqlName::parse("moved").unwrap(),
                 name: SqlName::parse("current_name").unwrap(),
                 referenced_schema: SqlName::parse("").unwrap(),
@@ -22517,6 +22534,10 @@ mod stored_dependency_tests {
             dependencies
         );
         for (class, key) in [
+            (DependencyClass::Table, "t:41"),
+            (DependencyClass::View, "v:42"),
+            (DependencyClass::Table, "t:9999999"),
+            (DependencyClass::View, "v:9999999"),
             (DependencyClass::Domain, "d:1:41"),
             (DependencyClass::Enum, "e:2:42"),
             (DependencyClass::Composite, "c:3:43"),
@@ -22537,6 +22558,44 @@ mod stored_dependency_tests {
             assert_eq!(
                 parse_stored_query_dependencies(&mut encoded.split(' ')).unwrap(),
                 dependencies
+            );
+        }
+    }
+
+    #[test]
+    fn manifest_relation_dependencies_reject_missing_or_wrong_lifetimes() {
+        for (class, key) in [
+            (DependencyClass::Table, "0"),
+            (DependencyClass::View, "0"),
+            (DependencyClass::Table, "t:0"),
+            (DependencyClass::View, "v:0"),
+            (DependencyClass::Table, "v:31"),
+            (DependencyClass::View, "t:31"),
+            (DependencyClass::Table, "t:10000000"),
+            (DependencyClass::View, "v:18446744073709551616"),
+            (DependencyClass::Table, "t:-1"),
+            (DependencyClass::View, "v:"),
+            (DependencyClass::Table, "t:1:31"),
+        ] {
+            let valid_key = if class == DependencyClass::Table {
+                "t:31"
+            } else {
+                "v:31"
+            };
+            let valid = format!(
+                "1 {} {valid_key} 7075626c6963 6974656d73  6974656d73 {}",
+                class as u8,
+                crate::storage::ColumnSet::EMPTY
+            );
+            assert!(parse_stored_query_dependencies(&mut valid.split(' ')).is_ok());
+            let input = format!(
+                "1 {} {key} 7075626c6963 6974656d73  6974656d73 {}",
+                class as u8,
+                crate::storage::ColumnSet::EMPTY
+            );
+            assert!(
+                parse_stored_query_dependencies(&mut input.split(' ')).is_err(),
+                "{class:?} {key}"
             );
         }
     }

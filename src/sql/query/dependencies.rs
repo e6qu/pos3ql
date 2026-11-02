@@ -77,24 +77,9 @@ impl<'a> CollectionContext<'a> {
                     && dependency.referenced_name.as_str() == name
             })
         }) {
-            let slot = usize::from(dependency.slot);
-            return match dependency.class {
-                DependencyClass::Table
-                    if slot < storage.table_count()
-                        && storage.table_slot_visible_to(slot, txid) =>
-                {
-                    Ok(Some(ResolvedRelation::Table(slot)))
-                }
-                DependencyClass::View
-                    if slot < storage.view_count() && storage.view_slot_visible_to(slot, txid) =>
-                {
-                    Ok(Some(ResolvedRelation::View(slot)))
-                }
-                _ => Err(sql_err!(
-                    sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
-                    "stored relation binding is no longer visible"
-                )),
-            };
+            return storage
+                .resolve_stored_query_relation(dependency, txid)
+                .map(Some);
         }
         Ok(storage.resolve_relation_under(self.path, schema, name, txid))
     }
@@ -448,23 +433,29 @@ fn record_routine_target(
     dependencies: &mut StoredQueryDependencies,
 ) -> Result<(), SqlError> {
     let resolved = storage.resolve_relation_under(path, name.schema, name.name, txid);
-    let Some((class, slot, schema, catalog_name)) = (match resolved {
+    let Some((class, slot, schema, catalog_name, identity)) = (match resolved {
         Some(ResolvedRelation::Table(slot)) => {
+            let identity =
+                storage.capture_stored_query_relation(ResolvedRelation::Table(slot), txid)?;
             let definition = storage.table_def(slot, txid);
             Some((
                 DependencyClass::Table,
                 slot,
                 definition.schema,
                 definition.name,
+                identity,
             ))
         }
         Some(ResolvedRelation::View(slot)) => {
+            let identity =
+                storage.capture_stored_query_relation(ResolvedRelation::View(slot), txid)?;
             let definition = storage.view(slot);
             Some((
                 DependencyClass::View,
                 slot,
                 definition.schema,
                 definition.name,
+                identity,
             ))
         }
         Some(ResolvedRelation::Catalog) | None => None,
@@ -474,7 +465,7 @@ fn record_routine_target(
     dependencies.push(StoredQueryDependency {
         class,
         slot: slot as u16,
-        identity: StoredDependencyIdentity::Name,
+        identity,
         referenced_columns: crate::storage::ColumnSet::EMPTY,
         schema,
         name: catalog_name,
@@ -492,7 +483,7 @@ fn collect_statement(
     context: CollectionContext<'_>,
 ) -> Result<(), SqlError> {
     let path = context.path;
-    let no_excluded: Option<(usize, &crate::storage::TableDef)> = None;
+    let no_excluded: Option<(usize, crate::storage::RelationDefinition<'_>)> = None;
     macro_rules! collect_expr {
         ($expression:expr, $scope:expr, $excluded:expr) => {{
             collect_expression(
@@ -824,7 +815,7 @@ fn collect_dml_routine_calls<'a>(
     storage: &Storage,
     txid: u32,
     scope: Option<&super::QueryScope<'a>>,
-    excluded: Option<&crate::storage::TableDef>,
+    excluded: Option<crate::storage::RelationDefinition<'_>>,
     dependencies: &mut StoredQueryDependencies,
     context: CollectionContext<'a>,
     arena: &Arena,
@@ -851,10 +842,10 @@ fn collect_dml_routine_calls_with_output<'a>(
     storage: &Storage,
     txid: u32,
     scope: Option<&super::QueryScope<'a>>,
-    excluded: Option<&crate::storage::TableDef>,
+    excluded: Option<crate::storage::RelationDefinition<'_>>,
     dependencies: &mut StoredQueryDependencies,
     context: CollectionContext<'a>,
-    returning_output: Option<(&crate::storage::TableDef, [&'a str; 2])>,
+    returning_output: Option<(crate::storage::RelationDefinition<'_>, [&'a str; 2])>,
     arena: &Arena,
 ) -> Result<(), SqlError> {
     let resolver = DependencyTypes {
@@ -923,7 +914,7 @@ fn collect_dml_routine_calls_with_output<'a>(
 fn collect_returning_expression<'a>(
     expression: &Expr<'a>,
     returning: crate::sql::ast::Returning<'a>,
-    target: &crate::storage::TableDef,
+    target: crate::storage::RelationDefinition<'_>,
     target_qualifier: &str,
     storage: &Storage,
     txid: u32,
@@ -980,7 +971,7 @@ fn collect_returning_expression<'a>(
 fn record_dml_column_references(
     expression: &Expr<'_>,
     scope: &super::QueryScope<'_>,
-    excluded: Option<(usize, &crate::storage::TableDef)>,
+    excluded: Option<(usize, crate::storage::RelationDefinition<'_>)>,
     dependencies: &mut StoredQueryDependencies,
     context: CollectionContext<'_>,
 ) -> Result<(), SqlError> {
@@ -1288,11 +1279,14 @@ fn collect_select<'a>(
 
 struct DependencyTypes<'scope, 'definition, 'storage> {
     scope: Option<&'scope super::QueryScope<'definition>>,
-    excluded: Option<&'storage crate::storage::TableDef>,
+    excluded: Option<crate::storage::RelationDefinition<'storage>>,
     transition: Option<&'scope dyn ColTypeResolver>,
     storage: &'storage Storage,
     txid: u32,
-    returning_output: Option<(&'storage crate::storage::TableDef, [&'definition str; 2])>,
+    returning_output: Option<(
+        crate::storage::RelationDefinition<'storage>,
+        [&'definition str; 2],
+    )>,
     arena: &'storage Arena,
 }
 
@@ -2382,11 +2376,13 @@ fn collect_table_ref<'a>(
     {
         match context.resolve_relation(storage, txid, table.schema, table.table)? {
             Some(ResolvedRelation::Table(slot)) => {
+                let identity =
+                    storage.capture_stored_query_relation(ResolvedRelation::Table(slot), txid)?;
                 let definition = storage.table_def(slot, txid);
                 dependencies.push(StoredQueryDependency {
                     class: DependencyClass::Table,
                     slot: slot as u16,
-                    identity: StoredDependencyIdentity::Name,
+                    identity,
                     referenced_columns: crate::storage::ColumnSet::EMPTY,
                     schema: definition.schema,
                     name: definition.name,
@@ -2395,11 +2391,13 @@ fn collect_table_ref<'a>(
                 })?;
             }
             Some(ResolvedRelation::View(slot)) => {
+                let identity =
+                    storage.capture_stored_query_relation(ResolvedRelation::View(slot), txid)?;
                 let view = storage.view(slot);
                 dependencies.push(StoredQueryDependency {
                     class: DependencyClass::View,
                     slot: slot as u16,
-                    identity: StoredDependencyIdentity::Name,
+                    identity,
                     referenced_columns: crate::storage::ColumnSet::EMPTY,
                     schema: view.schema_for(txid),
                     name: view.name_for(txid),

@@ -40,15 +40,10 @@ struct BorrowedRegion {
 #[derive(Clone, Copy)]
 struct InternedAllocation {
     value_type: core::any::TypeId,
+    length: usize,
     value: *const u8,
     end: usize,
     previous: Option<core::ptr::NonNull<InternedAllocation>>,
-}
-
-#[derive(Clone, Copy)]
-pub(crate) struct InternedValue<T> {
-    value: T,
-    identity: InternedAllocation,
 }
 
 static NEXT_RETENTION_IDENTITY: AtomicU64 = AtomicU64::new(1);
@@ -226,41 +221,52 @@ impl Arena {
         }
     }
 
-    /// Shares immutable values already retained by this arena. The linked
-    /// identities consume the same fixed arena reservation as their values;
-    /// rewind discards their entries together with the allocations they describe.
-    pub(crate) fn alloc_interned<T: Copy + Send + Sync + 'static>(
+    /// Shares actual-length immutable slices within the same rewind boundary.
+    pub(crate) fn alloc_interned_slice<T: Copy + PartialEq + Send + Sync + 'static>(
         &self,
-        value: T,
-        mut equivalent: impl FnMut(&T, &T) -> bool,
-    ) -> Result<&T, ArenaFull> {
+        values: &[T],
+    ) -> Result<&[T], ArenaFull> {
+        if values.is_empty() {
+            return Ok(&[]);
+        }
         let mut cursor = self.interned.get();
         while let Some(previous) = cursor {
-            // Only this method installs entries, after initializing their T.
-            // Rewind removes every entry whose allocation it discards.
+            // Cache entries remain initialized until rewind removes their links.
             let previous = unsafe { previous.as_ref() };
-            if previous.value_type == core::any::TypeId::of::<T>() {
-                let previous_value = unsafe { &*previous.value.cast::<T>() };
-                if equivalent(previous_value, &value) {
-                    return Ok(previous_value);
+            if previous.value_type == core::any::TypeId::of::<[T]>()
+                && previous.length == values.len()
+            {
+                let prior = unsafe {
+                    core::slice::from_raw_parts(previous.value.cast::<T>(), previous.length)
+                };
+                if prior == values {
+                    return Ok(prior);
                 }
             }
             cursor = previous.previous;
         }
-        let allocated = self.alloc(InternedValue {
-            value,
-            identity: InternedAllocation {
-                value_type: core::any::TypeId::of::<T>(),
-                value: core::ptr::null(),
-                end: 0,
+        let elements = Layout::array::<T>(values.len()).map_err(|_| self.full(usize::MAX))?;
+        let (layout, elements_offset) = Layout::new::<InternedAllocation>()
+            .extend(elements)
+            .map_err(|_| self.full(usize::MAX))?;
+        let allocation = self.alloc_raw(layout.pad_to_align())?;
+        let identity = allocation.cast::<InternedAllocation>();
+        let elements = unsafe { allocation.add(elements_offset).cast::<T>() };
+        // One disjoint checked allocation contains both the typed elements and
+        // their cache identity. Publish the link only after both are initialized.
+        unsafe {
+            core::ptr::copy_nonoverlapping(values.as_ptr(), elements, values.len());
+            identity.write(InternedAllocation {
+                value_type: core::any::TypeId::of::<[T]>(),
+                length: values.len(),
+                value: elements.cast(),
+                end: self.offset.get(),
                 previous: self.interned.get(),
-            },
-        })?;
-        allocated.identity.value = (&allocated.value as *const T).cast();
-        allocated.identity.end = self.offset.get();
-        self.interned
-            .set(Some(core::ptr::NonNull::from(&mut allocated.identity)));
-        Ok(&allocated.value)
+            });
+            self.interned
+                .set(Some(core::ptr::NonNull::new_unchecked(identity)));
+            Ok(core::slice::from_raw_parts(elements, values.len()))
+        }
     }
 
     pub(crate) fn alloc_atomic_usize(
@@ -1299,32 +1305,75 @@ mod tests {
     use super::*;
 
     #[test]
+    fn interned_slices_are_actual_length_typed_and_rewind_with_their_values() {
+        let mut budget = Budget::new(1024);
+        let arena = Arena::new(&mut budget, "actual schema columns", 1024).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let first = arena.alloc_interned_slice(&[1u32, 2]).unwrap();
+            let initial_used = arena.used();
+            assert!(core::ptr::eq(
+                first,
+                arena.alloc_interned_slice(&[1u32, 2]).unwrap()
+            ));
+            assert_eq!(arena.used(), initial_used);
+            let short = arena.alloc_interned_slice(&[1u32]).unwrap();
+            assert_eq!(short, &[1]);
+            assert!(!core::ptr::eq(first.as_ptr(), short.as_ptr()));
+            let scalar = arena.alloc(1u32).unwrap();
+            assert!(!core::ptr::eq(short.as_ptr(), scalar));
+            let mark = arena.mark();
+            assert_eq!(
+                arena.alloc_interned_slice(&[9u32, 10, 11]).unwrap(),
+                &[9, 10, 11]
+            );
+            // No reference to the discarded suffix is used after this point.
+            unsafe { arena.rewind_to(mark) };
+            let reused = arena.alloc_slice_copy(&[55u32, 56, 57, 58]).unwrap();
+            assert_eq!(
+                arena.alloc_interned_slice(&[9u32, 10, 11]).unwrap(),
+                &[9, 10, 11]
+            );
+            assert_eq!(reused, &[55, 56, 57, 58]);
+            assert!(core::ptr::eq(
+                first,
+                arena.alloc_interned_slice(&[1u32, 2]).unwrap()
+            ));
+            assert!(arena.alloc_interned_slice(&[0u32; 512]).is_err());
+            assert_eq!(arena.alloc_interned_slice(&[1u32, 2]).unwrap(), &[1, 2]);
+        });
+    }
+
+    #[test]
     fn catalog_snapshot_schema_cache_is_typed_bounded_and_survives_failed_allocations() {
         let mut budget = Budget::new(256);
         let arena = Arena::new(&mut budget, "schema cache", 256).unwrap();
         crate::mem::guard::forbid_alloc(|| {
-            let first = arena.alloc_interned(7u64, PartialEq::eq).unwrap();
+            let first = arena.alloc_interned_slice(&[7u64]).unwrap();
             let used = arena.used();
-            let same = arena.alloc_interned(7u64, PartialEq::eq).unwrap();
+            let same = arena.alloc_interned_slice(&[7u64]).unwrap();
             assert!(core::ptr::eq(first, same));
             assert_eq!(arena.used(), used);
-            assert!(arena.alloc_interned([0u8; 512], PartialEq::eq).is_err());
+            assert!(arena.alloc_interned_slice(&[0u8; 512]).is_err());
             assert!(core::ptr::eq(
                 first,
-                arena.alloc_interned(7u64, PartialEq::eq).unwrap()
+                arena.alloc_interned_slice(&[7u64]).unwrap()
             ));
-            let different = arena.alloc_interned(9u64, PartialEq::eq).unwrap();
+            let different = arena.alloc_interned_slice(&[9u64]).unwrap();
             assert!(!core::ptr::eq(first, different));
             assert!(core::ptr::eq(
                 first,
-                arena.alloc_interned(7u64, PartialEq::eq).unwrap()
+                arena.alloc_interned_slice(&[7u64]).unwrap()
             ));
-            let typed = arena
-                .alloc_interned((1u32, 2u32), |_, _| {
+            #[derive(Clone, Copy)]
+            struct DifferentType(u64);
+            impl PartialEq for DifferentType {
+                fn eq(&self, _: &Self) -> bool {
                     panic!("different types cannot share a cache entry")
-                })
-                .unwrap();
-            assert_eq!(*typed, (1, 2));
+                }
+            }
+            let typed = arena.alloc_interned_slice(&[DifferentType(7)]).unwrap();
+            assert_eq!(typed[0].0, 7);
+            assert_ne!(first.as_ptr().cast::<u8>(), typed.as_ptr().cast::<u8>());
         });
     }
 
@@ -1335,26 +1384,26 @@ mod tests {
         let mut arena = Arena::new(&mut budget, "schema rewind", 256).unwrap();
         crate::mem::guard::forbid_alloc(|| {
             let mark = arena.mark();
-            arena.alloc_interned(7u64, PartialEq::eq).unwrap();
+            arena.alloc_interned_slice(&[7u64]).unwrap();
             // No reference to the discarded cached value survives this rewind.
             unsafe { arena.rewind_to(mark) };
             let replacement = arena.alloc([7u8, 0, 0, 0, 0, 0, 0, 0]).unwrap();
-            let current = arena.alloc_interned(7u64, PartialEq::eq).unwrap();
-            assert_ne!(replacement.as_ptr(), (current as *const u64).cast::<u8>());
+            let current = arena.alloc_interned_slice(&[7u64]).unwrap();
+            assert_ne!(replacement.as_ptr(), current.as_ptr().cast::<u8>());
             let retained = arena.mark();
             arena.alloc(123u32).unwrap();
             // Both retained references point below the rewind frontier.
             unsafe { arena.rewind_to(retained) };
             assert!(core::ptr::eq(
                 current,
-                arena.alloc_interned(7u64, PartialEq::eq).unwrap()
+                arena.alloc_interned_slice(&[7u64]).unwrap()
             ));
         });
         arena.reset();
         crate::mem::guard::forbid_alloc(|| {
             let replacement = arena.alloc(7u64).unwrap();
-            let current = arena.alloc_interned(7u64, PartialEq::eq).unwrap();
-            assert!(!core::ptr::eq(replacement, current));
+            let current = arena.alloc_interned_slice(&[7u64]).unwrap();
+            assert!(!core::ptr::eq(replacement, current.as_ptr()));
         });
     }
 

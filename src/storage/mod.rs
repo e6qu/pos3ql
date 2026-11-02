@@ -11,12 +11,17 @@ pub(crate) use catalog_history::{
     CatalogRowImage, HistoricalCatalogRow,
 };
 mod catalog_identities;
+mod catalog_keys;
 mod catalog_sources;
 pub(crate) use catalog_identities::{CatalogCreation, CatalogIdentity};
 mod default_acls;
 mod partition_triggers;
 pub(crate) use partition_triggers::{PartitionTriggerImage, PartitionTriggerState};
 mod parameter_acls;
+mod prepared_catalog;
+#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
+mod prepared_catalog_tests;
+mod prepared_foreign;
 use parameter_acls::ParameterAclGrantIdentity;
 use parameter_acls::ParameterAclRows;
 pub(crate) use parameter_acls::{
@@ -28,6 +33,8 @@ pub(crate) use database_clone_positions::{
 };
 mod matview_lifecycles;
 mod query_lifecycles;
+mod query_relation_sources;
+pub(crate) use query_relation_sources::RelationReference;
 mod routine_lifecycles;
 mod schema_names;
 pub(crate) use matview_lifecycles::MatviewDdlUndo;
@@ -56,7 +63,8 @@ pub(crate) use constraint_identities::{
 mod column_maps;
 pub(crate) use column_maps::{RelationColumnMap, RelationRowDecoder};
 mod definition_images;
-pub(crate) use definition_images::{DefinitionImageId, RelationDefinition};
+pub(crate) use definition_images::DefinitionImageId;
+pub(crate) use definition_images::RelationDefinition;
 mod definition_pool;
 mod index_bindings;
 mod key_preparation;
@@ -73,6 +81,11 @@ pub(crate) use type_edits::{
 mod domain_validation;
 mod relation_identities;
 pub(crate) use relation_identities::{MAX_RELATION_GENERATION, RelationIdentity};
+mod definition_dependencies;
+mod publication_generations;
+pub(crate) use publication_generations::IndexGenerationChange;
+mod prepared_queries;
+mod prepared_types;
 mod table_creation;
 mod table_definitions;
 mod table_edits;
@@ -95,13 +108,16 @@ use enum_images::{EnumImageRead, EnumImageReservation, EnumMemberImages};
 pub(crate) use row_publication::RowWriteStatistics;
 pub(crate) use table_definitions::TableDefinitionRead;
 pub(crate) use table_definitions::TableDefinitionRevision;
-use table_definitions::{DefinitionVersions, PendingDefinitionRead, TableDefinition};
+use table_definitions::{
+    DefinitionVersions, PendingDefinitionRead, TableDefinition as TableDefinitionOwner,
+};
 pub(crate) use table_edits::{TableDefinitionChange, TableDefinitionTarget};
 pub(crate) use type_names::{NamedTypeKind, NamedTypeSlot};
 pub(crate) use type_references::StorageSetupError;
 pub(crate) use type_references::TypeReference;
 pub(crate) mod foreign;
 mod partition_rows;
+mod prepared_objects;
 pub(crate) use partition_rows::{PartitionKeyRow, PartitionRow};
 mod heap_relocation;
 mod row_heap;
@@ -178,6 +194,7 @@ use crate::mem::arena::Arena;
 use crate::mem::budget::{Budget, BudgetError};
 use crate::mem::buffer::FixedBuf;
 use crate::mem::fixed_vec::FixedVec;
+use crate::mem::lease_pool::{MutableSlice, SharedSlice};
 use crate::mem::value_index::{ValueIndexLease, ValueIndexPool};
 use crate::pg::replication_client::{ConnectionInfo, ConnectionInfoError};
 use crate::sql::ast::{Collation, TablespaceCost};
@@ -1931,8 +1948,40 @@ impl ForeignKey {
     }
 }
 
+pub trait DefinitionBacking: Clone + core::fmt::Debug {
+    type Slice<T: Copy + core::fmt::Debug + 'static, const N: usize>: AsRef<[T]>
+        + Clone
+        + core::fmt::Debug;
+}
+
 #[derive(Debug, Clone, Copy)]
-pub struct TableDef {
+pub struct InlineDefinition;
+
+impl DefinitionBacking for InlineDefinition {
+    type Slice<T: Copy + core::fmt::Debug + 'static, const N: usize> = [T; N];
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct StoredDefinition;
+
+impl DefinitionBacking for StoredDefinition {
+    type Slice<T: Copy + core::fmt::Debug + 'static, const N: usize> =
+        crate::mem::lease_pool::SharedSlice<T>;
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct BorrowedDefinition<'a>(core::marker::PhantomData<&'a ()>);
+
+impl<'a> DefinitionBacking for BorrowedDefinition<'a> {
+    type Slice<T: Copy + core::fmt::Debug + 'static, const N: usize> = &'a [T];
+}
+
+pub(crate) type TableDef = TableDefinition<StoredDefinition>;
+pub(crate) type TableDefBuilder = TableDefinition<InlineDefinition>;
+pub(crate) type TableDefView<'a> = TableDefinition<BorrowedDefinition<'a>>;
+
+#[derive(Debug, Clone)]
+pub struct TableDefinition<B: DefinitionBacking> {
     /// The schema the table lives in ("public" unless created qualified or
     /// under a search_path naming another schema).
     pub schema: SqlName,
@@ -1947,20 +1996,20 @@ pub struct TableDef {
     pub storage_options: TableStorageOptions,
     /// Stable tablespace identity; zero is the database default.
     pub tablespace: u16,
-    pub columns: [ColumnMeta; MAX_COLUMNS],
+    pub columns: B::Slice<ColumnMeta, MAX_COLUMNS>,
     pub n_columns: usize,
-    pub(crate) not_null_names: [Option<SqlName>; MAX_COLUMNS],
+    pub(crate) not_null_names: B::Slice<Option<SqlName>, MAX_COLUMNS>,
     pub(crate) not_null_name_edits: ColumnSet,
-    pub(crate) not_null_identities: [Option<ConstraintIdentity>; MAX_RELATION_COLUMNS],
-    pub(crate) attributes: column_attributes::ColumnAttributes,
-    pub(crate) inline_index_identities: [Option<RelationIdentity>; MAX_RELATION_COLUMNS],
-    pub uniques: [UniqueKey; MAX_UNIQUES],
+    pub(crate) not_null_identities: B::Slice<Option<ConstraintIdentity>, MAX_RELATION_COLUMNS>,
+    pub(crate) attributes: column_attributes::ColumnAttributes<B>,
+    pub(crate) inline_index_identities: B::Slice<Option<RelationIdentity>, MAX_RELATION_COLUMNS>,
+    pub uniques: B::Slice<UniqueKey, MAX_UNIQUES>,
     pub n_uniques: usize,
-    pub checks: [CheckConstraint; MAX_CHECKS],
+    pub checks: B::Slice<CheckConstraint, MAX_CHECKS>,
     pub n_checks: usize,
-    pub fkeys: [ForeignKey; MAX_FKEYS],
+    pub fkeys: B::Slice<ForeignKey, MAX_FKEYS>,
     pub n_fkeys: usize,
-    pub exclusions: [ExclusionConstraint; MAX_EXCLUSIONS],
+    pub exclusions: B::Slice<ExclusionConstraint, MAX_EXCLUSIONS>,
     pub n_exclusions: usize,
     /// PostgreSQL retains a table's TOAST relation after the last toastable
     /// column is dropped. This catalog bit records that irreversible creation.
@@ -1980,6 +2029,9 @@ pub struct TableDef {
     pub type_membership: TableTypeMembership,
     pub partition: PartitionDef,
 }
+
+impl Copy for TableDefinition<InlineDefinition> {}
+impl Copy for TableDefinition<BorrowedDefinition<'_>> {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TableStorageOptions {
@@ -2347,7 +2399,47 @@ pub(crate) const MAX_PARTITION_KEYS: usize = 32;
 /// imposing a narrower storage-only limit.
 pub(crate) const MAX_PARTITION_LIST_VALUES: usize = MAX_DEFINITION_ITEMS;
 
-impl TableDef {
+impl<B: DefinitionBacking> TableDefinition<B> {
+    pub(crate) fn borrowed(&self) -> TableDefView<'_> {
+        TableDefinition {
+            schema: self.schema,
+            name: self.name,
+            kind: self.kind,
+            persistence: self.persistence,
+            on_commit: self.on_commit,
+            access_method: self.access_method,
+            storage_options: self.storage_options,
+            tablespace: self.tablespace,
+            n_columns: self.n_columns,
+            not_null_name_edits: self.not_null_name_edits,
+            n_uniques: self.n_uniques,
+            n_checks: self.n_checks,
+            n_fkeys: self.n_fkeys,
+            n_exclusions: self.n_exclusions,
+            has_toast: self.has_toast,
+            has_rules: self.has_rules,
+            row_level_security: self.row_level_security,
+            replica_identity: self.replica_identity,
+            inheritance: self.inheritance,
+            type_membership: self.type_membership,
+            partition: self.partition,
+            columns: &self.columns.as_ref()[..self.n_columns],
+            not_null_names: &self.not_null_names.as_ref()[..self.n_columns],
+            not_null_identities: &self.not_null_identities.as_ref()
+                [..usize::from(self.attributes.count)],
+            inline_index_identities: &self.inline_index_identities.as_ref()
+                [..usize::from(self.attributes.count)],
+            uniques: &self.uniques.as_ref()[..self.n_uniques],
+            checks: &self.checks.as_ref()[..self.n_checks],
+            fkeys: &self.fkeys.as_ref()[..self.n_fkeys],
+            exclusions: &self.exclusions.as_ref()[..self.n_exclusions],
+            attributes: column_attributes::ColumnAttributes {
+                count: self.attributes.count,
+                slots: &self.attributes.slots.as_ref()[..usize::from(self.attributes.count)],
+            },
+        }
+    }
+
     pub(crate) fn attribute_number(&self, column: usize) -> u16 {
         self.attributes
             .number(column)
@@ -2358,10 +2450,165 @@ impl TableDef {
         self.attributes.column(number)
     }
 
+    pub fn columns(&self) -> &[ColumnMeta] {
+        &self.columns.as_ref()[..self.n_columns]
+    }
+
+    pub fn uniques(&self) -> &[UniqueKey] {
+        &self.uniques.as_ref()[..self.n_uniques]
+    }
+
+    pub fn checks(&self) -> &[CheckConstraint] {
+        &self.checks.as_ref()[..self.n_checks]
+    }
+
+    pub fn fkeys(&self) -> &[ForeignKey] {
+        &self.fkeys.as_ref()[..self.n_fkeys]
+    }
+
+    pub fn exclusions(&self) -> &[ExclusionConstraint] {
+        &self.exclusions.as_ref()[..self.n_exclusions]
+    }
+
+    pub fn column_index(&self, name: &str) -> Option<usize> {
+        self.columns().iter().position(|c| c.name.as_str() == name)
+    }
+
+    /// Column types into a caller-provided array, for the row codec.
+    pub fn schema(&self, out: &mut [ColType; MAX_COLUMNS]) -> usize {
+        for (i, c) in self.columns().iter().enumerate() {
+            out[i] = c.ctype;
+        }
+        self.n_columns
+    }
+}
+
+impl TableDefBuilder {
+    /// Copies an admitted definition into bounded edit or codec scratch.
+    pub(crate) fn from_definition<B: DefinitionBacking>(source: &TableDefinition<B>) -> Self {
+        let mut result = Self::empty();
+        let attribute_count = usize::from(source.attributes.count);
+        result.schema = source.schema;
+        result.name = source.name;
+        result.kind = source.kind;
+        result.persistence = source.persistence;
+        result.on_commit = source.on_commit;
+        result.access_method = source.access_method;
+        result.storage_options = source.storage_options;
+        result.tablespace = source.tablespace;
+        result.n_columns = source.n_columns;
+        result.not_null_name_edits = source.not_null_name_edits;
+        result.n_uniques = source.n_uniques;
+        result.n_checks = source.n_checks;
+        result.n_fkeys = source.n_fkeys;
+        result.n_exclusions = source.n_exclusions;
+        result.has_toast = source.has_toast;
+        result.has_rules = source.has_rules;
+        result.row_level_security = source.row_level_security;
+        result.replica_identity = source.replica_identity;
+        result.inheritance = source.inheritance;
+        result.type_membership = source.type_membership;
+        result.partition = source.partition;
+        result.columns[..source.n_columns]
+            .copy_from_slice(&source.columns.as_ref()[..source.n_columns]);
+        result.not_null_names[..source.n_columns]
+            .copy_from_slice(&source.not_null_names.as_ref()[..source.n_columns]);
+        result.not_null_identities[..attribute_count]
+            .copy_from_slice(&source.not_null_identities.as_ref()[..attribute_count]);
+        result.inline_index_identities[..attribute_count]
+            .copy_from_slice(&source.inline_index_identities.as_ref()[..attribute_count]);
+        result.uniques[..source.n_uniques]
+            .copy_from_slice(&source.uniques.as_ref()[..source.n_uniques]);
+        result.checks[..source.n_checks]
+            .copy_from_slice(&source.checks.as_ref()[..source.n_checks]);
+        result.fkeys[..source.n_fkeys].copy_from_slice(&source.fkeys.as_ref()[..source.n_fkeys]);
+        result.exclusions[..source.n_exclusions]
+            .copy_from_slice(&source.exclusions.as_ref()[..source.n_exclusions]);
+        result.attributes =
+            column_attributes::ColumnAttributes::from_attributes(&source.attributes);
+        result
+    }
+
+    /// Reserves the complete immutable candidate before its caller publishes it.
+    pub(crate) fn freeze(
+        &self,
+        pool: &std::sync::Arc<crate::mem::lease_pool::LeasePool>,
+    ) -> Result<TableDef, SqlError> {
+        let attribute_count = usize::from(self.attributes.count);
+        if self.n_columns > MAX_COLUMNS
+            || attribute_count > MAX_RELATION_COLUMNS
+            || self.n_uniques > MAX_UNIQUES
+            || self.n_checks > MAX_CHECKS
+            || self.n_fkeys > MAX_FKEYS
+            || self.n_exclusions > MAX_EXCLUSIONS
+        {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "invalid table definition slice count"
+            ));
+        }
+        let exhausted = |error: crate::mem::lease_pool::LeaseError| {
+            sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "{}", error)
+        };
+        Ok(TableDefinition {
+            schema: self.schema,
+            name: self.name,
+            kind: self.kind,
+            persistence: self.persistence,
+            on_commit: self.on_commit,
+            access_method: self.access_method,
+            storage_options: self.storage_options,
+            tablespace: self.tablespace,
+            n_columns: self.n_columns,
+            not_null_name_edits: self.not_null_name_edits,
+            n_uniques: self.n_uniques,
+            n_checks: self.n_checks,
+            n_fkeys: self.n_fkeys,
+            n_exclusions: self.n_exclusions,
+            has_toast: self.has_toast,
+            has_rules: self.has_rules,
+            row_level_security: self.row_level_security,
+            replica_identity: self.replica_identity,
+            inheritance: self.inheritance,
+            type_membership: self.type_membership,
+            partition: self.partition,
+            columns: pool
+                .copy_slice(&self.columns[..self.n_columns])
+                .map_err(exhausted)?,
+            not_null_names: pool
+                .copy_slice(&self.not_null_names[..self.n_columns])
+                .map_err(exhausted)?,
+            not_null_identities: pool
+                .copy_slice(&self.not_null_identities[..attribute_count])
+                .map_err(exhausted)?,
+            inline_index_identities: pool
+                .copy_slice(&self.inline_index_identities[..attribute_count])
+                .map_err(exhausted)?,
+            uniques: pool
+                .copy_slice(&self.uniques[..self.n_uniques])
+                .map_err(exhausted)?,
+            checks: pool
+                .copy_slice(&self.checks[..self.n_checks])
+                .map_err(exhausted)?,
+            fkeys: pool
+                .copy_slice(&self.fkeys[..self.n_fkeys])
+                .map_err(exhausted)?,
+            exclusions: pool
+                .copy_slice(&self.exclusions[..self.n_exclusions])
+                .map_err(exhausted)?,
+            attributes: column_attributes::ColumnAttributes {
+                count: self.attributes.count,
+                slots: pool
+                    .copy_slice(&self.attributes.slots[..attribute_count])
+                    .map_err(exhausted)?,
+            },
+        })
+    }
+
     /// A table with a name and no columns or constraints, for spread-init of
     /// the constraint arrays at construction sites.
     pub const fn empty() -> Self {
-        TableDef {
+        Self {
             schema: SqlName::EMPTY,
             name: SqlName::EMPTY,
             kind: TableKind::Local,
@@ -2375,7 +2622,7 @@ impl TableDef {
             not_null_names: [None; MAX_COLUMNS],
             not_null_name_edits: ColumnSet::EMPTY,
             not_null_identities: [None; MAX_RELATION_COLUMNS],
-            attributes: column_attributes::ColumnAttributes::EMPTY,
+            attributes: column_attributes::ColumnAttributes::<InlineDefinition>::EMPTY,
             inline_index_identities: [None; MAX_RELATION_COLUMNS],
             uniques: [UniqueKey::EMPTY; MAX_UNIQUES],
             n_uniques: 0,
@@ -2394,37 +2641,80 @@ impl TableDef {
             partition: PartitionDef::NONE,
         }
     }
+}
 
-    pub fn columns(&self) -> &[ColumnMeta] {
-        &self.columns[..self.n_columns]
-    }
-
-    pub fn uniques(&self) -> &[UniqueKey] {
-        &self.uniques[..self.n_uniques]
-    }
-
-    pub fn checks(&self) -> &[CheckConstraint] {
-        &self.checks[..self.n_checks]
-    }
-
-    pub fn fkeys(&self) -> &[ForeignKey] {
-        &self.fkeys[..self.n_fkeys]
-    }
-
-    pub fn exclusions(&self) -> &[ExclusionConstraint] {
-        &self.exclusions[..self.n_exclusions]
-    }
-
-    pub fn column_index(&self, name: &str) -> Option<usize> {
-        self.columns().iter().position(|c| c.name.as_str() == name)
-    }
-
-    /// Column types into a caller-provided array, for the row codec.
-    pub fn schema(&self, out: &mut [ColType; MAX_COLUMNS]) -> usize {
-        for (i, c) in self.columns().iter().enumerate() {
-            out[i] = c.ctype;
+impl TableDef {
+    /// An unused control slot owns no metadata payload.
+    pub const fn empty() -> Self {
+        Self {
+            schema: SqlName::EMPTY,
+            name: SqlName::EMPTY,
+            kind: TableKind::Local,
+            persistence: RelationPersistence::Permanent,
+            on_commit: OnCommitAction::PreserveRows,
+            access_method: TableAccessMethod::Heap,
+            storage_options: TableStorageOptions::DEFAULT,
+            tablespace: 0,
+            columns: crate::mem::lease_pool::SharedSlice::EMPTY,
+            n_columns: 0,
+            not_null_names: crate::mem::lease_pool::SharedSlice::EMPTY,
+            not_null_name_edits: ColumnSet::EMPTY,
+            not_null_identities: crate::mem::lease_pool::SharedSlice::EMPTY,
+            attributes: column_attributes::ColumnAttributes::<StoredDefinition>::EMPTY,
+            inline_index_identities: crate::mem::lease_pool::SharedSlice::EMPTY,
+            uniques: crate::mem::lease_pool::SharedSlice::EMPTY,
+            n_uniques: 0,
+            checks: crate::mem::lease_pool::SharedSlice::EMPTY,
+            n_checks: 0,
+            fkeys: crate::mem::lease_pool::SharedSlice::EMPTY,
+            n_fkeys: 0,
+            exclusions: crate::mem::lease_pool::SharedSlice::EMPTY,
+            n_exclusions: 0,
+            has_toast: false,
+            has_rules: false,
+            row_level_security: RowLevelSecurityState::DISABLED,
+            replica_identity: ReplicaIdentityMode::DEFAULT,
+            inheritance: TableInheritance::NONE,
+            type_membership: TableTypeMembership::NONE,
+            partition: PartitionDef::NONE,
         }
-        self.n_columns
+    }
+}
+impl TableDefView<'_> {
+    /// An unused control slot owns no metadata payload.
+    pub const fn empty() -> Self {
+        Self {
+            schema: SqlName::EMPTY,
+            name: SqlName::EMPTY,
+            kind: TableKind::Local,
+            persistence: RelationPersistence::Permanent,
+            on_commit: OnCommitAction::PreserveRows,
+            access_method: TableAccessMethod::Heap,
+            storage_options: TableStorageOptions::DEFAULT,
+            tablespace: 0,
+            columns: &[],
+            n_columns: 0,
+            not_null_names: &[],
+            not_null_name_edits: ColumnSet::EMPTY,
+            not_null_identities: &[],
+            attributes: column_attributes::ColumnAttributes::<BorrowedDefinition<'_>>::EMPTY,
+            inline_index_identities: &[],
+            uniques: &[],
+            n_uniques: 0,
+            checks: &[],
+            n_checks: 0,
+            fkeys: &[],
+            n_fkeys: 0,
+            exclusions: &[],
+            n_exclusions: 0,
+            has_toast: false,
+            has_rules: false,
+            row_level_security: RowLevelSecurityState::DISABLED,
+            replica_identity: ReplicaIdentityMode::DEFAULT,
+            inheritance: TableInheritance::NONE,
+            type_membership: TableTypeMembership::NONE,
+            partition: PartitionDef::NONE,
+        }
     }
 }
 
@@ -2731,12 +3021,13 @@ impl PendingVersions {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 struct PendingVersionSlot {
     identity: u64,
     used: bool,
     previous: Option<usize>,
     change: PendingChange,
+    prepared_keys: Option<key_preparation::PreparedRowKeyImage>,
 }
 
 /// An append that rollback may remove only while it remains the row's head.
@@ -2803,18 +3094,22 @@ pub(crate) enum ValueIndexInstallation {
 struct TablePublication {
     dirty: bool,
     generation: u64,
+    reserved_generations: u64,
+    generation_reservations: Option<MutableSlice<publication_generations::GenerationReservation>>,
     /// Last committed replacement of row encodings, independent of row updates.
     rewrite_generation: u64,
     row_layout: row_layout::RowLayout,
     /// A complete candidate list and its count publish together.
-    enforcers: [Option<Enforcer>; MAX_VALUE_ENFORCERS],
-    n_enforcers: usize,
+    enforcers: SharedSlice<Option<Enforcer>>,
+    enforcer_state: MutableSlice<EnforcerPublicationState>,
+    enforcer_transaction: u32,
+    binding_versions: MutableSlice<BindingVersion>,
 }
 
 pub struct Table {
     /// Excludes overlapping existence changes and cleanup of this table.
     lifecycle: Mutex<()>,
-    definition: TableDefinition,
+    definition: TableDefinitionOwner,
     pub rows: RowMap,
     /// Changed since the last checkpoint (drives delta checkpoints).
     publication: Mutex<TablePublication>,
@@ -2934,14 +3229,9 @@ impl TableStatistics {
     };
 }
 
-/// The most value indexes one table can carry: one per distinct indexed
-/// column tuple, whether introduced by a constraint or a named index.
-/// Exceeding it at DDL is a loud error.
-/// A table may require one value binding for every inline UNIQUE column,
-/// table-level UNIQUE constraint, and exclusion constraint. Named indexes
-/// share identical tuples and draw from the separately configured global
-/// value-index pool. This roster must never become a narrower constraint
-/// boundary than the table definition it accelerates and enforces.
+/// The implicit index identities addressable by one table's inline, UNIQUE,
+/// and exclusion constraints. Named value bindings use the configured shared
+/// cache and metadata pools rather than this catalog OID envelope.
 pub(crate) const MAX_VALUE_ENFORCERS: usize = MAX_RELATION_COLUMNS + MAX_UNIQUES + MAX_EXCLUSIONS;
 
 /// Extended-statistics objects and their computed values are startup-bounded.
@@ -3917,9 +4207,6 @@ pub(crate) struct EnforcerMetadata {
     /// plain-column indexes keep sharing the column tuple represented by
     /// `None`.
     index_created_at: Option<u64>,
-    /// Catalog snapshot used while evaluating a transaction-private index.
-    /// Committed bindings use zero, the storage catalog's committed view.
-    evaluation_txid: u32,
     key_types: [ColType; MAX_INDEX_COLS],
     collations: [Collation; MAX_INDEX_COLS],
     /// Whether immutable generations use PostgreSQL key order. Non-orderable
@@ -3932,6 +4219,10 @@ pub(crate) struct EnforcerMetadata {
     /// included payload. Expression and partial-index references are folded in
     /// when the binding is built, so commit need not reparse catalog SQL.
     dependency_mask: ColumnSet,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct EnforcerPublicationState {
     durable: Option<crate::store::ValueIndexHandle>,
     /// The committed image differs from `durable`. A clean binding can retain
     /// its immutable generation when an unrelated table column changes.
@@ -3946,16 +4237,73 @@ pub(crate) struct EnforcerMetadata {
     durable_dirty_lsn: u64,
 }
 
+#[derive(Clone)]
+struct EnforcerSnapshot {
+    binding: Enforcer,
+    state: EnforcerPublicationState,
+    evaluation_txid: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BindingChange {
+    IndexCreate { created_at: u64 },
+    IndexDrop { created_at: u64 },
+    TableDefinition { revision: u64 },
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum IndexBindingOperation {
+    Create,
+    Drop,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum ValueCacheRebuild {
+    Committed,
+    Existing { transaction: u32 },
+}
+
+struct BindingVersion {
+    change: BindingChange,
+    transaction: u32,
+    bindings: SharedSlice<Option<Enforcer>>,
+    state: MutableSlice<EnforcerPublicationState>,
+    prior_transaction: u32,
+}
+
+struct BindingCandidate {
+    bindings: MutableSlice<Option<Enforcer>>,
+    state: MutableSlice<EnforcerPublicationState>,
+    transaction: u32,
+    change: Option<BindingChange>,
+}
+
+#[derive(Clone, Copy)]
+struct EnforcerBindings<'a> {
+    entries: &'a [Option<Enforcer>],
+    evaluation_txid: u32,
+}
+
+impl core::ops::Deref for EnforcerBindings<'_> {
+    type Target = [Option<Enforcer>];
+
+    fn deref(&self) -> &Self::Target {
+        self.entries
+    }
+}
+
+impl core::ops::Deref for EnforcerSnapshot {
+    type Target = Enforcer;
+
+    fn deref(&self) -> &Self::Target {
+        &self.binding
+    }
+}
+
 impl core::ops::Deref for Enforcer {
     type Target = EnforcerMetadata;
     fn deref(&self) -> &Self::Target {
         &self.metadata
-    }
-}
-
-impl core::ops::DerefMut for Enforcer {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.metadata
     }
 }
 
@@ -4048,7 +4396,9 @@ impl CatalogDdlState {
 }
 
 fn catalog_transaction_capacity(config: &Config) -> usize {
-    config.max_connections as usize + config.max_prepared_transactions + config.max_subscriptions
+    (config.max_connections as usize)
+        .saturating_add(config.max_prepared_transactions)
+        .saturating_add(config.max_subscriptions)
 }
 
 /// A pending-image pool cannot need more than every eligible object retaining
@@ -4149,24 +4499,24 @@ pub(crate) fn row_heap_image_capacity(config: &Config) -> usize {
         .saturating_add(committed_row_version_capacity(config))
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct PendingTableDef {
     pub txid: u32,
     pub revision: u64,
     pub def: TableDef,
     /// Immediately preceding definition ordinal -> this definition ordinal.
-    pub transition: [u16; MAX_COLUMNS],
+    pub transition: crate::mem::lease_pool::SharedSlice<u16>,
     /// Committed-definition column index → latest column name. `None` means
     /// the committed column was dropped. This composes across ALTER commands
     /// and lets sequence ownership rebind once, atomically, at commit.
-    pub column_mapping: [Option<SqlName>; MAX_COLUMNS],
+    pub column_mapping: crate::mem::lease_pool::SharedSlice<Option<SqlName>>,
     /// Every visible row was re-homed into the heap under this definition, so
     /// the committed spill list becomes obsolete when this version commits.
     pub rewrites_rows: bool,
     pub class_tuple_private: bool,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct PendingTableDefSlot {
     previous: Option<u32>,
     depth: u32,
@@ -4254,24 +4604,28 @@ impl Table {
         self.publication().dirty
     }
     pub(crate) fn enforcer_count(&self) -> usize {
-        self.publication().n_enforcers
+        self.publication().enforcers.len()
     }
 
-    fn enforcer(&self, binding: usize) -> Option<Enforcer> {
-        self.publication().enforcers[binding].clone()
+    fn enforcer(&self, binding: usize) -> Option<EnforcerSnapshot> {
+        let publication = self.publication();
+        let selected = publication.enforcers.get(binding)?.as_ref()?.clone();
+        Some(EnforcerSnapshot {
+            binding: selected,
+            state: publication.enforcer_state[binding],
+            evaluation_txid: publication.enforcer_transaction,
+        })
     }
     #[cfg(test)]
-    fn enforcers(&self) -> [Option<Enforcer>; MAX_VALUE_ENFORCERS] {
+    fn enforcers(&self) -> SharedSlice<Option<Enforcer>> {
         self.publication().enforcers.clone()
     }
 
-    pub fn mark_dirty(&self) {
+    pub fn mark_dirty(&self) -> Result<(), SqlError> {
         let mut publication = self.publication();
-        publication.generation = publication
-            .generation
-            .checked_add(1)
-            .expect("table publication generation exhausted");
+        publication.generation = publication.preview_unreserved_generation()?;
         publication.dirty = true;
+        Ok(())
     }
 
     /// Whether `txid` sees this table exist: its own pending CREATE/DROP,
@@ -4294,6 +4648,7 @@ impl Table {
         let state = self.definition.read();
         state.identity.existence == CatalogDdlState::Absent
             && state.pending.is_none()
+            && state.publication_owner().is_none()
             && self.rows.is_empty()
     }
 }
@@ -4346,6 +4701,8 @@ impl DependencyClass {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StoredDependencyIdentity {
     Name,
+    Table(RelationReference),
+    View(RelationReference),
     RoutineOid(i32),
     OperatorOid(i32),
     Collation(crate::sql::ast::CatalogCollation),
@@ -4360,6 +4717,15 @@ impl StoredDependencyIdentity {
             return source.storage_key();
         }
         let mut key = StackStr::new();
+        if let Self::Table(source) | Self::View(source) = self {
+            let kind = if matches!(self, Self::Table(_)) {
+                't'
+            } else {
+                'v'
+            };
+            write!(key, "{kind}:{}", source.created_at()).expect("bounded relation identity");
+            return key;
+        }
         if let Self::Collation(selected) = self {
             write!(key, "c{}", Collation::Catalog(selected).code())
                 .expect("bounded collation identity");
@@ -4370,7 +4736,7 @@ impl StoredDependencyIdentity {
             Self::RoutineOid(oid)
             | Self::OperatorOid(oid)
             | Self::TextSearchConfigurationOid(oid) => oid,
-            Self::Type(_) | Self::Collation(_) => unreachable!(),
+            Self::Type(_) | Self::Collation(_) | Self::Table(_) | Self::View(_) => unreachable!(),
         };
         write!(key, "{oid}").expect("bounded dependency identity");
         key
@@ -4378,6 +4744,8 @@ impl StoredDependencyIdentity {
 
     pub(crate) fn valid_for(self, class: DependencyClass) -> bool {
         match self {
+            Self::Table(_) => class == DependencyClass::Table,
+            Self::View(_) => class == DependencyClass::View,
             Self::Type(source) => matches!(
                 (class, source.slot()),
                 (DependencyClass::Domain, NamedTypeSlot::Domain(_))
@@ -4386,7 +4754,9 @@ impl StoredDependencyIdentity {
             ),
             Self::Name => !matches!(
                 class,
-                DependencyClass::Routine
+                DependencyClass::Table
+                    | DependencyClass::View
+                    | DependencyClass::Routine
                     | DependencyClass::Operator
                     | DependencyClass::Domain
                     | DependencyClass::Enum
@@ -4413,7 +4783,20 @@ impl StoredDependencyIdentity {
     }
 
     pub(crate) fn from_storage(class: DependencyClass, encoded: &str) -> Option<Self> {
-        let identity = if class == DependencyClass::Collation {
+        let identity = if matches!(class, DependencyClass::Table | DependencyClass::View) {
+            let prefix = if class == DependencyClass::Table {
+                "t:"
+            } else {
+                "v:"
+            };
+            let source =
+                RelationReference::from_storage(encoded.strip_prefix(prefix)?.parse().ok()?)?;
+            if class == DependencyClass::Table {
+                Self::Table(source)
+            } else {
+                Self::View(source)
+            }
+        } else if class == DependencyClass::Collation {
             match Collation::from_code(encoded.strip_prefix('c')?.parse().ok()?)? {
                 Collation::Catalog(selected) => Self::Collation(selected),
                 _ => return None,
@@ -5196,7 +5579,7 @@ impl RuleDefinition {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) enum RuleMetadataChange<'arena> {
     Rename(SqlName),
     SetEnabled(RuleEnabled),
@@ -5559,7 +5942,7 @@ impl ViewCheckOption {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct ViewDef {
     pub(crate) database: DatabaseOid,
     /// Monotonic creation stamp, shared with tables (see `Table::created_at`).
@@ -7695,6 +8078,13 @@ struct TypeCatalog {
     enums: FixedVec<EnumDef>,
     pending_enum_members: FixedVec<PendingEnumMemberSlot>,
     composites: FixedVec<CompositeDef>,
+    publication_claims: FixedVec<Option<TypePublicationClaim>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TypePublicationClaim {
+    source: type_references::TypeIdentity,
+    transaction: u32,
 }
 
 #[derive(Debug)]
@@ -10626,11 +11016,17 @@ pub struct SequenceOwner {
     pub column: SqlName,
 }
 
-pub(crate) fn rebind_sequence_column(
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum GeneratedSequenceScope {
+    Owned,
+    PartitionRoot,
+}
+
+pub(crate) fn rebind_sequence_column<Old: DefinitionBacking, New: DefinitionBacking>(
     link: Option<SequenceOwner>,
-    old: &TableDef,
-    new: &TableDef,
-    column_mapping: &[Option<SqlName>; MAX_COLUMNS],
+    old: &TableDefinition<Old>,
+    new: &TableDefinition<New>,
+    column_mapping: &[Option<SqlName>],
     require_generator: bool,
 ) -> Option<SequenceOwner> {
     let mut link = link?;
@@ -13051,6 +13447,14 @@ pub struct RoleDef {
 }
 
 impl RoleDef {
+    fn name_blocker(&self, name: SqlName, transaction: u32) -> Option<u32> {
+        self.pending
+            .filter(|pending| {
+                pending.txid != transaction && (self.name == name || pending.name == name)
+            })
+            .map(|pending| pending.txid)
+    }
+
     pub(crate) fn oid(&self) -> RoleOid {
         self.lifetime
             .expect("a selected role has a durable identity")
@@ -14719,7 +15123,7 @@ impl<T> ViewRuleIter<'_, T> {
     }
 }
 
-impl<T: Copy> Iterator for ViewRuleIter<'_, T> {
+impl<T: Clone> Iterator for ViewRuleIter<'_, T> {
     type Item = (usize, T);
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -14732,7 +15136,7 @@ impl<T: Copy> Iterator for ViewRuleIter<'_, T> {
             let slot = self.next_slot;
             self.next_slot += 1;
             if (self.accept)(definition, self.txid) {
-                return Some((slot, *definition));
+                return Some((slot, definition.clone()));
             }
         }
         None
@@ -14782,7 +15186,8 @@ pub struct Storage {
     table_definition_images: std::sync::Arc<definition_images::TableDefinitionImagePool>,
     max_row_versions_per_row: usize,
     row_versions: RowVersionPools,
-    pub(crate) row_work: std::sync::Arc<crate::mem::lease_pool::RowWorkPool>,
+    pub(crate) row_work: std::sync::Arc<crate::mem::lease_pool::LeasePool>,
+    metadata_pool: std::sync::Arc<crate::mem::lease_pool::LeasePool>,
     row_overlay: std::sync::Arc<RowOverlayPool>,
     row_walks: RowWalkPool,
     snapshot_reclamation: SnapshotReclamation,
@@ -16555,7 +16960,7 @@ fn rename_column_default_schema(
 }
 
 fn rename_table_sql_identity(
-    definition: &mut TableDef,
+    definition: &mut TableDefBuilder,
     old: SqlName,
     new: SqlName,
     arena: &crate::mem::arena::Arena,
@@ -18140,8 +18545,9 @@ impl Storage {
                 continue;
             }
             self.drop_indexes_for(slot, 0);
-            self.commit_indexes_for(slot, 0);
             self.commit_drop(slot);
+            self.commit_indexes_for(slot, 0)
+                .expect("retired table indexes do not consume generation capacity");
         }
         for slot in 0..self.sequence_count() {
             let sequence = self.sequence(slot);
@@ -18198,7 +18604,12 @@ impl Storage {
                         .statistics
                         .set_image(TableStatistics::EMPTY, None, true);
                     self.set_spill_list(slot, &[]);
-                    self.refresh_enforcers(slot)?;
+                    let publication = self.tables[slot].publication();
+                    for enforcer in publication.enforcers.iter().flatten() {
+                        enforcer.cache.write().clear();
+                    }
+                    drop(publication);
+                    self.mark_value_bindings_rebuild_at(slot, self.lsn());
                 }
                 OnCommitAction::Drop => {
                     let table = {
@@ -18206,7 +18617,8 @@ impl Storage {
                         definition.name
                     };
                     self.drop_indexes_for(slot, 0);
-                    self.commit_indexes_for(slot, 0);
+                    self.commit_drop(slot);
+                    self.commit_indexes_for(slot, 0)?;
                     for sequence in 0..self.sequence_count() {
                         let definition = self.sequence(sequence);
                         if definition.ddl_state == CatalogDdlState::Present
@@ -18221,7 +18633,6 @@ impl Storage {
                             ));
                         }
                     }
-                    self.commit_drop(slot);
                 }
             }
         }
@@ -18237,13 +18648,16 @@ impl Storage {
             {
                 continue;
             }
+            self.tables[slot]
+                .publication()
+                .preview_unreserved_generation()?;
             self.clear_table_rows(slot);
             self.install_table_serial_values(slot, [0; MAX_COLUMNS]);
             self.tables[slot]
                 .statistics
                 .set_image(TableStatistics::EMPTY, None, true);
             self.set_spill_list(slot, &[]);
-            self.tables[slot].mark_dirty();
+            self.tables[slot].mark_dirty()?;
             self.refresh_enforcers(slot)?;
             self.mark_value_bindings_dirty(slot);
         }
@@ -18359,6 +18773,22 @@ impl Storage {
 
     fn foreign_catalog(&self) -> MutexGuard<'_, foreign::ForeignCatalog> {
         self.foreign.lock().expect("foreign catalog lock poisoned")
+    }
+
+    fn foreign_catalog_with_parent(
+        &self,
+        class: foreign::ForeignObjectClass,
+        parent: usize,
+        transaction: u32,
+    ) -> Result<MutexGuard<'_, foreign::ForeignCatalog>, SqlError> {
+        let catalog = self.foreign_catalog();
+        if let Some(owner) =
+            catalog.parent_reference_owner(class, parent, current_database(), transaction)?
+        {
+            drop(catalog);
+            return Err(self.catalog_ddl_wait_error(transaction, owner, "foreign catalog parent"));
+        }
+        Ok(catalog)
     }
 
     pub(crate) fn foreign_wrapper(
@@ -18803,16 +19233,17 @@ impl Storage {
         txid: u32,
     ) -> Result<usize, SqlError> {
         let ownership = self.initial_ownership(txid)?;
+        let mut catalog = self.foreign_catalog_with_parent(
+            foreign::ForeignObjectClass::Wrapper,
+            usize::from(definition.wrapper),
+            txid,
+        )?;
         let created_at = self
             .catalog_sequence
             .next_bounded(MAX_CATALOG_CREATION, "catalog object")?;
-        let slot = self.foreign_catalog().create_server(
-            current_database(),
-            created_at,
-            definition,
-            ownership,
-            txid,
-        )?;
+        let slot =
+            catalog.create_server(current_database(), created_at, definition, ownership, txid)?;
+        drop(catalog);
         self.clear_object_acl_entries(AccessObject {
             class: AccessClass::ForeignServer,
             slot: slot as u16,
@@ -18828,11 +19259,15 @@ impl Storage {
         if let foreign::ForeignMappingUser::Role(role) = definition.user {
             self.role_reference_ready(usize::from(role), txid)?;
         }
+        let mut catalog = self.foreign_catalog_with_parent(
+            foreign::ForeignObjectClass::Server,
+            usize::from(definition.server),
+            txid,
+        )?;
         let created_at = self
             .catalog_sequence
             .next_bounded(MAX_CATALOG_CREATION, "catalog object")?;
-        self.foreign_catalog()
-            .create_mapping(current_database(), created_at, definition, txid)
+        catalog.create_mapping(current_database(), created_at, definition, txid)
     }
 
     pub(crate) fn create_foreign_table_binding(
@@ -18841,16 +19276,15 @@ impl Storage {
         txid: u32,
     ) -> Result<usize, SqlError> {
         let ownership = self.initial_ownership(txid)?;
+        let mut catalog = self.foreign_catalog_with_parent(
+            foreign::ForeignObjectClass::Server,
+            usize::from(definition.server),
+            txid,
+        )?;
         let created_at = self
             .catalog_sequence
             .next_bounded(MAX_CATALOG_CREATION, "catalog object")?;
-        self.foreign_catalog().create_table(
-            current_database(),
-            created_at,
-            definition,
-            ownership,
-            txid,
-        )
+        catalog.create_table(current_database(), created_at, definition, ownership, txid)
     }
 
     pub(crate) fn alter_foreign_wrapper(
@@ -18872,7 +19306,12 @@ impl Storage {
         txid: u32,
     ) -> Result<Option<foreign::PendingForeignDefinition<foreign::ForeignServerDefinition>>, SqlError>
     {
-        self.foreign_catalog().alter_server(slot, definition, txid)
+        self.foreign_catalog_with_parent(
+            foreign::ForeignObjectClass::Wrapper,
+            usize::from(definition.wrapper),
+            txid,
+        )?
+        .alter_server(slot, definition, txid)
     }
 
     pub(crate) fn alter_foreign_user_mapping(
@@ -18885,7 +19324,12 @@ impl Storage {
         if let foreign::ForeignMappingUser::Role(role) = definition.user {
             self.role_reference_ready(usize::from(role), txid)?;
         }
-        self.foreign_catalog().alter_mapping(slot, definition, txid)
+        self.foreign_catalog_with_parent(
+            foreign::ForeignObjectClass::Server,
+            usize::from(definition.server),
+            txid,
+        )?
+        .alter_mapping(slot, definition, txid)
     }
 
     pub(crate) fn alter_foreign_table_binding(
@@ -18895,7 +19339,12 @@ impl Storage {
         txid: u32,
     ) -> Result<Option<foreign::PendingForeignDefinition<foreign::ForeignTableDefinition>>, SqlError>
     {
-        self.foreign_catalog().alter_table(slot, definition, txid)
+        self.foreign_catalog_with_parent(
+            foreign::ForeignObjectClass::Server,
+            usize::from(definition.server),
+            txid,
+        )?
+        .alter_table(slot, definition, txid)
     }
 
     pub(crate) fn foreign_catalog_commit_create(
@@ -19402,6 +19851,12 @@ impl Storage {
     ) -> Result<StoredQueryDependency, SqlError> {
         if matches!(
             dependency.class,
+            DependencyClass::Table | DependencyClass::View
+        ) {
+            return self.rebind_stored_query_relation(dependency, txid);
+        }
+        if matches!(
+            dependency.class,
             DependencyClass::Domain | DependencyClass::Enum | DependencyClass::Composite
         ) {
             self.type_catalog
@@ -19413,13 +19868,9 @@ impl Storage {
         let schema = dependency.schema.as_str();
         let name = dependency.name.as_str();
         let slot = match dependency.class {
-            DependencyClass::Table => self.find_visible(schema, name, txid),
-            DependencyClass::View => self.view_rule_catalog().views.iter().position(|view| {
-                view.database == current_database()
-                    && view.visible_to(txid)
-                    && view.schema_for(txid).as_str() == schema
-                    && view.name_for(txid).as_str() == name
-            }),
+            DependencyClass::Table | DependencyClass::View => {
+                unreachable!("relation source handled above")
+            }
             DependencyClass::Domain | DependencyClass::Enum | DependencyClass::Composite => {
                 unreachable!("type source handled above")
             }
@@ -19427,6 +19878,8 @@ impl Storage {
             DependencyClass::Routine => match dependency.identity {
                 StoredDependencyIdentity::RoutineOid(oid) => self.routine_slot_by_oid(oid, txid),
                 StoredDependencyIdentity::Name
+                | StoredDependencyIdentity::Table(_)
+                | StoredDependencyIdentity::View(_)
                 | StoredDependencyIdentity::OperatorOid(_)
                 | StoredDependencyIdentity::Type(_)
                 | StoredDependencyIdentity::Collation(_)
@@ -19435,6 +19888,8 @@ impl Storage {
             DependencyClass::Operator => match dependency.identity {
                 StoredDependencyIdentity::OperatorOid(oid) => self.operator_slot_by_oid(oid, txid),
                 StoredDependencyIdentity::Name
+                | StoredDependencyIdentity::Table(_)
+                | StoredDependencyIdentity::View(_)
                 | StoredDependencyIdentity::RoutineOid(_)
                 | StoredDependencyIdentity::Type(_)
                 | StoredDependencyIdentity::Collation(_)
@@ -19498,7 +19953,7 @@ impl Storage {
                 .stored_query_dependencies
                 .lock()
                 .expect("stored-query dependency catalog lock poisoned");
-            let count = catalog.counts[image];
+            let count = catalog.image_count(image);
             snapshot[..usize::from(count)].copy_from_slice(catalog.image(
                 image,
                 count,
@@ -19509,6 +19964,7 @@ impl Storage {
         let dependencies = &mut snapshot[..usize::from(count)];
         for dependency in dependencies.iter_mut() {
             if let Some(source) = template_source {
+                self.clone_stored_query_relation(dependency, source)?;
                 self.type_catalog
                     .lock()
                     .expect("type catalog lock poisoned")
@@ -19526,8 +19982,11 @@ impl Storage {
         Ok(())
     }
 
-    pub fn rebind_all_stored_query_dependencies(&mut self) -> Result<(), SqlError> {
-        self.rebind_all_stored_query_dependencies_to(0, None)
+    pub fn rebind_all_stored_query_dependencies(
+        &mut self,
+        transaction: u32,
+    ) -> Result<(), SqlError> {
+        self.rebind_all_stored_query_dependencies_to(transaction, None)
     }
 
     fn rebind_all_stored_query_dependencies_to(
@@ -19536,42 +19995,84 @@ impl Storage {
         template_source: Option<DatabaseOid>,
     ) -> Result<(), SqlError> {
         for slot in 0..self.rule_count() {
-            if self.rule(slot).database == current_database() && self.rule(slot).visible_to(txid) {
+            let rule = self.rule(slot);
+            let pending = rule.pending.filter(|pending| pending.txid == txid);
+            if rule.database == current_database()
+                && rule.visible_to(txid)
+                && (txid == 0
+                    || pending.is_some()
+                    || rule.ddl_state == (CatalogDdlState::PendingCreate { txid }))
+            {
                 let owner = StoredQueryDependencyOwner::Rule(slot as u16);
-                self.rebind_stored_query_dependency_image(
-                    self.committed_dependency_image(owner),
-                    txid,
-                    template_source,
-                )?;
+                let image = pending.map_or_else(
+                    || self.committed_dependency_image(owner),
+                    |pending| {
+                        self.stored_query_dependency_pending_base + pending.dependency_slot as usize
+                    },
+                );
+                self.rebind_stored_query_dependency_image(image, txid, template_source)?;
             }
         }
         for slot in 0..self.matview_count() {
             let definition = self.matview(slot);
-            if definition.database == current_database() && definition.visible_to(txid) {
-                let image = self.matview_dependency_image(slot);
+            let pending = definition
+                .pending_query
+                .filter(|pending| pending.transaction == txid);
+            if definition.database == current_database()
+                && definition.visible_to(txid)
+                && (txid == 0
+                    || pending.is_some()
+                    || definition.ddl_state == (CatalogDdlState::PendingCreate { txid }))
+            {
+                let image = pending.map_or_else(
+                    || self.matview_dependency_image(slot),
+                    |pending| {
+                        self.stored_query_dependency_pending_base + pending.dependency_slot as usize
+                    },
+                );
                 self.rebind_stored_query_dependency_image(image, txid, template_source)?;
             }
         }
         for slot in 0..self.policy_count() {
             let policy = self.policy(slot);
-            if policy.database == current_database() && policy.visible_to(txid) {
+            let pending = policy
+                .pending_definition
+                .filter(|pending| pending.txid == txid);
+            if policy.database == current_database()
+                && policy.visible_to(txid)
+                && (txid == 0
+                    || pending.is_some()
+                    || policy.ddl_state == (CatalogDdlState::PendingCreate { txid }))
+            {
                 let owner = StoredQueryDependencyOwner::Policy(slot as u16);
-                self.rebind_stored_query_dependency_image(
-                    self.committed_dependency_image(owner),
-                    txid,
-                    template_source,
-                )?;
+                let image = pending.map_or_else(
+                    || self.committed_dependency_image(owner),
+                    |pending| {
+                        self.stored_query_dependency_pending_base + pending.dependency_slot as usize
+                    },
+                );
+                self.rebind_stored_query_dependency_image(image, txid, template_source)?;
             }
         }
         for slot in 0..self.routine_count() {
             let routine = self.routine(slot);
-            if routine.database == current_database() && routine.visible_to(txid) {
+            let pending = routine
+                .pending_definition
+                .filter(|pending| pending.txid == txid);
+            if routine.database == current_database()
+                && routine.visible_to(txid)
+                && (txid == 0
+                    || pending.is_some()
+                    || routine.ddl_state == (CatalogDdlState::PendingCreate { txid }))
+            {
                 let owner = StoredQueryDependencyOwner::Routine(slot as u16);
-                self.rebind_stored_query_dependency_image(
-                    self.committed_dependency_image(owner),
-                    txid,
-                    template_source,
-                )?;
+                let image = pending.map_or_else(
+                    || self.committed_dependency_image(owner),
+                    |pending| {
+                        self.stored_query_dependency_pending_base + pending.dependency_slot as usize
+                    },
+                );
+                self.rebind_stored_query_dependency_image(image, txid, template_source)?;
             }
         }
         Ok(())
@@ -19709,14 +20210,23 @@ impl Storage {
             config.memtable_bytes,
             RowVersionPools::control_bytes(),
             RowVersionPools::metadata_budget_bytes(config),
-            crate::mem::lease_pool::RowWorkPool::budget_bytes(
+            crate::mem::lease_pool::LeasePool::budget_bytes(
                 config.row_work_bytes,
                 config.row_work_leases,
+            ),
+            crate::mem::lease_pool::LeasePool::budget_bytes(
+                config.table_metadata_bytes,
+                config.table_metadata_leases,
             ),
             SnapshotReclamation::budget_bytes(),
             row_ownership::HeapRowOwnership::budget_bytes(config),
             type_reference_moves::DefinitionPublication::budget_bytes(config),
             type_edits::TypeRevisions::budget_bytes(config),
+            config
+                .max_domains
+                .saturating_add(config.max_enums)
+                .saturating_add(config.max_composites)
+                .saturating_mul(size_of::<Option<TypePublicationClaim>>()),
             type_identities::TypeIdentityIndex::budget_bytes(
                 config.max_domains,
                 config.max_enums,
@@ -19958,14 +20468,21 @@ impl Storage {
         let foreign = foreign::ForeignCatalog::new(config, budget)?;
         let table_capacity = table_slot_capacity(config);
         let mut tables = FixedVec::new(budget, "tables", table_capacity)?;
-        let table_definition_images =
-            definition_images::TableDefinitionImagePool::new(config, budget)?;
         let row_versions = RowVersionPools::new(config, budget)?;
-        let row_work = crate::mem::lease_pool::RowWorkPool::new(
+        let row_work = crate::mem::lease_pool::LeasePool::new(
             budget,
+            crate::mem::lease_pool::Purpose::ROW_WORK,
             config.row_work_bytes,
             config.row_work_leases,
         )?;
+        let metadata_pool = crate::mem::lease_pool::LeasePool::new(
+            budget,
+            crate::mem::lease_pool::Purpose::TABLE_METADATA,
+            config.table_metadata_bytes,
+            config.table_metadata_leases,
+        )?;
+        let table_definition_images =
+            definition_images::TableDefinitionImagePool::new(config, budget, &metadata_pool)?;
         let row_walks = RowWalkPool::new(std::sync::Arc::clone(&row_work));
         let row_overlay =
             RowOverlayPool::new(budget, "row_overlay_slots", config.row_overlay_slots)?;
@@ -20000,20 +20517,23 @@ impl Storage {
             tables
                 .push(Table {
                     lifecycle: Mutex::new(()),
-                    definition: TableDefinition::new(TableDef {
-                        name: SqlName::parse("").expect("empty name fits"),
-                        columns: [ColumnMeta::EMPTY; MAX_COLUMNS],
-                        n_columns: 0,
-                        ..TableDef::empty()
-                    }),
+                    definition: TableDefinitionOwner::new(TableDef::empty()),
                     rows,
                     publication: Mutex::new(TablePublication {
                         dirty: false,
                         generation: 1,
+                        reserved_generations: 0,
+                        generation_reservations: None,
                         rewrite_generation: 0,
                         row_layout: row_layout::RowLayout::initial(),
-                        enforcers: [const { None }; MAX_VALUE_ENFORCERS],
-                        n_enforcers: 0,
+                        enforcers: SharedSlice::EMPTY,
+                        enforcer_state: metadata_pool
+                            .lease(0)
+                            .expect("empty binding state needs no capacity"),
+                        enforcer_transaction: 0,
+                        binding_versions: metadata_pool
+                            .lease(0)
+                            .expect("empty binding history needs no capacity"),
                     }),
                     checkpoint_deletions: std::sync::Arc::new(()),
                     statistics: TableStatisticsOwner::new(budget)?,
@@ -20028,7 +20548,7 @@ impl Storage {
         let large_object_page_table = config.max_tables as u32;
         {
             let table = &mut tables[large_object_page_table as usize];
-            let mut definition = TableDef::empty();
+            let mut definition = TableDefBuilder::empty();
             definition.schema =
                 SqlName::parse(INTERNAL_LARGE_OBJECT_SCHEMA).expect("internal schema name fits");
             definition.name =
@@ -20053,6 +20573,9 @@ impl Storage {
                 .initialize(definition.n_columns)
                 .expect("internal column attributes fit");
             constraint_names::table(&mut definition).expect("internal NOT NULL names are valid");
+            let definition = definition
+                .freeze(&metadata_pool)
+                .map_err(StorageSetupError::Metadata)?;
             let mut state = table.definition.write();
             let mut identity = state.identity;
             identity.existence = CatalogDdlState::Present;
@@ -20760,6 +21283,7 @@ impl Storage {
             max_row_versions_per_row: config.max_row_versions_per_row,
             row_versions,
             row_work,
+            metadata_pool,
             row_overlay,
             row_walks,
             snapshot_reclamation,
@@ -20841,6 +21365,14 @@ impl Storage {
                 enums,
                 pending_enum_members,
                 composites,
+                publication_claims: FixedVec::new(
+                    budget,
+                    "type publication claims",
+                    config
+                        .max_domains
+                        .saturating_add(config.max_enums)
+                        .saturating_add(config.max_composites),
+                )?,
             }),
             type_definition_images,
             enum_members_per_image,
@@ -22391,7 +22923,8 @@ impl Storage {
                         "template database has uncommitted relation state"
                     ));
                 }
-                let mut definition = *self.tables[source_slot].definition();
+                let mut definition =
+                    TableDefBuilder::from_definition(&self.tables[source_slot].definition());
                 for column in definition.columns.iter_mut().take(definition.n_columns) {
                     if let Collation::Catalog(selected) = column.collation {
                         self.collation_definition(selected, txid)?;
@@ -22502,7 +23035,7 @@ impl Storage {
             {
                 let mut catalog = self.view_rule_catalog();
                 for source_slot in 0..catalog.views.len() {
-                    let source_definition = catalog.views[source_slot];
+                    let source_definition = catalog.views[source_slot].clone();
                     if source_definition.database != source
                         || source_definition.ddl_state != CatalogDdlState::Present
                         || source_definition.persistence == RelationPersistence::Temporary
@@ -22961,7 +23494,8 @@ impl Storage {
                 {
                     continue;
                 }
-                let source_table = *self.tables[usize::from(definition.table)].definition();
+                let source_table =
+                    (*self.tables[usize::from(definition.table)].definition()).clone();
                 definition.table = self
                     .find_visible(
                         source_table.schema.as_str(),
@@ -23016,7 +23550,8 @@ impl Storage {
                 }
                 definition.target = match definition.target {
                     TriggerTarget::Table(source_table) => {
-                        let source_table = *self.tables[usize::from(source_table)].definition();
+                        let source_table =
+                            (*self.tables[usize::from(source_table)].definition()).clone();
                         TriggerTarget::Table(
                             self.find_visible(
                                 source_table.schema.as_str(),
@@ -23091,7 +23626,8 @@ impl Storage {
                 {
                     continue;
                 }
-                let source_table = *self.tables[usize::from(definition.table)].definition();
+                let source_table =
+                    (*self.tables[usize::from(definition.table)].definition()).clone();
                 definition.table = self
                     .find_visible(
                         source_table.schema.as_str(),
@@ -24763,6 +25299,7 @@ impl Storage {
 
     pub(crate) fn create_large_object(
         &mut self,
+        creation: CatalogCreation,
         requested: Option<LargeObjectOid>,
         txid: u32,
     ) -> Result<(usize, LargeObjectOid), SqlError> {
@@ -24773,6 +25310,18 @@ impl Storage {
                 .large_objects
                 .lock()
                 .expect("large object catalog lock poisoned");
+            if let CatalogCreation::Restore(identity) = creation
+                && catalog.definitions.iter().any(|object| {
+                    object.database == database
+                        && object.ddl_state != CatalogDdlState::Absent
+                        && object.created_at == identity.created_at()
+                })
+            {
+                return Err(sql_err!(
+                    sqlstate::DATA_EXCEPTION,
+                    "large object creation identity is duplicated"
+                ));
+            }
             let (oid, allocated) = match requested {
                 Some(oid) => {
                     if catalog.definitions.iter().any(|object| {
@@ -24817,11 +25366,11 @@ impl Storage {
                     )
                 })?
         };
+        let created_at = creation.resolve(&self.catalog_sequence)?;
         self.clear_object_acl_entries(AccessObject {
             class: AccessClass::LargeObject,
             slot: slot as u16,
         });
-        let created_at = self.catalog_sequence.next()?;
         self.large_objects
             .lock()
             .expect("large object catalog lock poisoned")
@@ -24837,6 +25386,7 @@ impl Storage {
                 CatalogDdlState::PendingCreate { txid }
             },
         };
+        self.catalog_sequence.observe(created_at);
         Ok((slot, oid))
     }
 
@@ -24924,11 +25474,16 @@ impl Storage {
         schema == INTERNAL_LARGE_OBJECT_SCHEMA && name == INTERNAL_LARGE_OBJECT_TABLE
     }
 
-    pub(crate) fn wal_table_slot(&self, schema: &str, name: &str) -> Option<usize> {
+    pub(crate) fn wal_table_slot(
+        &self,
+        schema: &str,
+        name: &str,
+        transaction: u32,
+    ) -> Option<usize> {
         if self.is_large_object_page_relation(schema, name) {
             Some(self.large_object_page_table())
         } else {
-            self.find_table(schema, name)
+            self.find_visible(schema, name, transaction)
         }
     }
 
@@ -24942,7 +25497,11 @@ impl Storage {
         created_at: u64,
         allocated: bool,
     ) -> Result<usize, SqlError> {
-        let (slot, _) = self.create_large_object(Some(oid), 0)?;
+        let (slot, _) = self.create_large_object(
+            CatalogCreation::Restore(CatalogIdentity::require(created_at)?),
+            Some(oid),
+            0,
+        )?;
         {
             let mut catalog = self
                 .large_objects
@@ -28137,20 +28696,13 @@ impl Storage {
                 name.as_str()
             ));
         }
-        if let Some(owner) = catalog.roles.iter().find_map(|role| {
-            (role.name == name)
-                .then_some(role.pending)
-                .flatten()
-                .filter(|pending| pending.txid != txid)
-                .map(|pending| pending.txid)
-        }) {
+        if let Some(owner) = catalog
+            .roles
+            .iter()
+            .find_map(|role| role.name_blocker(name, txid))
+        {
             drop(catalog);
-            self.wait_for_transaction(txid, owner)?;
-            return Err(sql_err!(
-                sqlstate::INTERNAL_LOCK_WAIT,
-                "statement is waiting for concurrent DDL on role \"{}\"",
-                name.as_str()
-            ));
+            return Err(self.catalog_ddl_wait_error(txid, owner, name.as_str()));
         }
         let Some(slot) = catalog
             .roles
@@ -28234,6 +28786,14 @@ impl Storage {
                 "role \"{}\" already exists",
                 name.as_str()
             ));
+        }
+        if let Some(owner) = catalog.roles.iter().enumerate().find_map(|(other, role)| {
+            (other != slot)
+                .then(|| role.name_blocker(name, txid))
+                .flatten()
+        }) {
+            drop(catalog);
+            return Err(self.catalog_ddl_wait_error(txid, owner, name.as_str()));
         }
         if let Some(pending) = catalog.roles[slot].pending
             && pending.txid != txid
@@ -28712,11 +29272,14 @@ impl Storage {
             .enumerate()
             .any(|(other, entry)| {
                 other != slot
-                    && entry.live
+                    && (entry.live || entry.pending.is_some())
                     && ((entry.role as usize == role
                         && entry.member as usize == member
                         && entry.grantor as usize == grantor)
-                        || entry.created_at == identity.created_at())
+                        || entry
+                            .pending
+                            .map_or(entry.created_at, |pending| pending.created_at)
+                            == identity.created_at())
             })
         {
             return Err(sql_err!(
@@ -28727,7 +29290,7 @@ impl Storage {
         let occupied = catalog.memberships[slot];
         if occupied.pending.is_some()
             || (occupied.live
-                && (occupied.created_at != identity.created_at()
+                && (occupied.created_at > identity.created_at()
                     || occupied.role as usize != role
                     || occupied.member as usize != member
                     || occupied.grantor as usize != grantor))
@@ -29946,7 +30509,7 @@ impl Storage {
     pub(crate) fn restore_table(
         &mut self,
         position: CatalogPosition,
-        mut definition: TableDef,
+        mut definition: TableDefBuilder,
         creation: TableCreation,
     ) -> Result<usize, SqlError> {
         definition.has_toast |= definition
@@ -30268,21 +30831,58 @@ impl Storage {
                 }
             }
         }
+        let eligible_tables = self
+            .tables
+            .iter()
+            .filter(|table| {
+                table.database() == current_database()
+                    && table.existence() != CatalogDdlState::Absent
+            })
+            .count();
+        let mut table_renames = self
+            .metadata_pool
+            .lease(eligible_tables)
+            .map_err(|error| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "{}", error))?;
         for table_slot in 0..self.tables.len() {
             let table = &self.tables[table_slot];
-            if table.database() != current_database()
-                || (table.existence() == CatalogDdlState::Absent)
+            let state = table.definition.read();
+            if state.identity.database != current_database()
+                || state.identity.existence == CatalogDdlState::Absent
             {
                 continue;
             }
-            let mut definition = *table.definition();
-            rename_table_sql_identity(&mut definition, prior, name, arena)?;
-            self.pending_table_defs.validate_schema_rename(
-                &table.definition,
-                prior,
-                name,
-                arena,
+            let source = self.catalog_object_identity(
+                catalog_sources::CatalogObjectSlot::Table(table_slot),
+                state.identity.database,
+                state.identity.created_at,
+            );
+            let replacement = self.pending_table_defs.prepare_replacements_locked(
+                &state,
+                source,
+                &self.metadata_pool,
+                |definition| {
+                    let mut changed = TableDefBuilder::from_definition(definition);
+                    let mut renamed = rename_schema_name(&mut changed.schema, prior, name);
+                    for column in changed.columns.iter_mut().take(changed.n_columns) {
+                        renamed |= rename_user_type_schema(&mut column.user_type, prior, name);
+                    }
+                    for key in changed.fkeys.iter_mut().take(changed.n_fkeys) {
+                        renamed |= rename_schema_name(&mut key.parent_schema, prior, name);
+                    }
+                    renamed |= rename_table_sql_identity(&mut changed, prior, name, arena)?;
+                    if renamed {
+                        Ok(Some(changed.freeze(&self.metadata_pool)?))
+                    } else {
+                        Ok(None)
+                    }
+                },
             )?;
+            if replacement.changed() {
+                table.publication().preview_unreserved_generation()?;
+                table_renames
+                    .push_reserved((table_slot, source, replacement))
+                    .map_err(|error| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "{}", error))?;
+            }
         }
         for (_, definition) in (DomainIter {
             catalog: &self.type_catalog,
@@ -30350,28 +30950,17 @@ impl Storage {
         schemas[slot].name = name;
         drop(schemas);
 
-        for table_slot in 0..self.tables.len() {
-            if self.tables[table_slot].database() != current_database() {
-                continue;
-            }
-            let table = &mut self.tables[table_slot];
-            if table.existence() == CatalogDdlState::Absent {
-                continue;
-            }
-            rename_schema_name(&mut table.definition_mut(revision).schema, prior, name);
-            let mut definition_owner = table.definition_mut(revision);
-            let definition = &mut *definition_owner;
-            for column in definition.columns.iter_mut().take(definition.n_columns) {
-                rename_user_type_schema(&mut column.user_type, prior, name);
-            }
-            for key in definition.fkeys.iter_mut().take(definition.n_fkeys) {
-                rename_schema_name(&mut key.parent_schema, prior, name);
-            }
-            drop(definition_owner);
-            rename_table_sql_identity(&mut table.definition_mut(revision), prior, name, arena)?;
-            table.mark_dirty();
-            self.pending_table_defs
-                .rename_schema(&mut table.definition, prior, name, arena)?;
+        while let Some((table_slot, source, replacement)) = table_renames.pop() {
+            let table = &self.tables[table_slot];
+            let mut state = table.definition.write();
+            self.pending_table_defs.apply_replacements_locked(
+                &mut state,
+                source,
+                replacement,
+                revision,
+            );
+            drop(state);
+            table.mark_dirty()?;
         }
 
         {
@@ -33922,7 +34511,7 @@ impl Storage {
             corrected.round().max(0.0) as u64
         }
 
-        let definition = *self.table_def(table_slot, txid);
+        let definition = (*self.table_def(table_slot, txid)).clone();
         let mut schema = [ColType::Bool; MAX_COLUMNS];
         let n_columns = definition.schema(&mut schema);
         let mut selected = [false; MAX_COLUMNS];
@@ -34398,7 +34987,7 @@ impl Storage {
     pub fn partition_target(
         &self,
         table: usize,
-        definition: &TableDef,
+        definition: &TableDefinition<impl DefinitionBacking>,
         values: &[crate::sql::types::Datum],
         txid: u32,
     ) -> Result<usize, SqlError> {
@@ -34433,7 +35022,7 @@ impl Storage {
     pub(crate) fn validate_partition_target(
         &self,
         leaf: usize,
-        definition: &TableDef,
+        definition: &TableDefinition<impl DefinitionBacking>,
         values: &[crate::sql::types::Datum],
         txid: u32,
     ) -> Result<(), SqlError> {
@@ -34507,7 +35096,7 @@ impl Storage {
         parent: usize,
         child: usize,
         bound: PartitionBound,
-        definition: &TableDef,
+        definition: &TableDefinition<impl DefinitionBacking>,
         values: &[crate::sql::types::Datum],
         txid: u32,
     ) -> Result<bool, SqlError> {
@@ -34525,7 +35114,7 @@ impl Storage {
         parent: usize,
         child: usize,
         bound: PartitionBound,
-        row: PartitionRow<'_, '_>,
+        row: PartitionRow<'_, '_, impl DefinitionBacking>,
         txid: u32,
     ) -> Result<bool, SqlError> {
         let keys = {
@@ -34886,6 +35475,9 @@ impl Storage {
         image: Option<RowLoc>,
         commit_lsn: u64,
     ) -> Result<(), SqlError> {
+        self.tables[table_index]
+            .publication()
+            .preview_unreserved_generation()?;
         let generation = self.tables[table_index].generation();
         let mut state = match self.tables[table_index].rows.get(&rowid) {
             Some(state) => state,
@@ -34911,7 +35503,7 @@ impl Storage {
         {
             if self.remove_row_state(table_index, rowid).is_some() {
                 self.mark_value_bindings_changed_at(table_index, commit_lsn);
-                self.tables[table_index].mark_dirty();
+                self.tables[table_index].mark_dirty()?;
             }
             return Ok(());
         }
@@ -34929,7 +35521,7 @@ impl Storage {
         })?;
         self.mark_value_bindings_changed_at(table_index, commit_lsn);
         let table = &mut self.tables[table_index];
-        table.mark_dirty();
+        table.mark_dirty()?;
         Ok(())
     }
 
@@ -34990,8 +35582,8 @@ impl Storage {
         Ok(())
     }
 
-    /// WAL durability precedes publication. Snapshot, table, version, row, and
-    /// cache ownership are acquired in that order after encoding the new keys.
+    /// Storage-only tests prepare their logical commit before publishing it.
+    #[cfg(test)]
     pub fn commit_row(
         &self,
         table_index: usize,
@@ -35002,6 +35594,7 @@ impl Storage {
         self.commit_selected_row(table_index, rowid, txid, commit_lsn, false)
     }
 
+    #[cfg(test)]
     pub fn commit_rewritten_row(
         &self,
         table_index: usize,
@@ -35012,6 +35605,7 @@ impl Storage {
         self.commit_selected_row(table_index, rowid, txid, commit_lsn, true)
     }
 
+    #[cfg(test)]
     fn commit_selected_row(
         &self,
         table_index: usize,
@@ -35026,6 +35620,7 @@ impl Storage {
         self.publish_selected_row(table_index, rowid, txid, commit_lsn, rewritten, selected)
     }
 
+    #[cfg(test)]
     fn publish_selected_row(
         &self,
         table_index: usize,
@@ -35040,7 +35635,26 @@ impl Storage {
         else {
             return Ok(());
         };
-        self.publish_prepared_row(commit_lsn, prepared)
+        let prior_generations = {
+            let mut publication = self.tables[table_index].publication();
+            let prior = publication.generation_reservation(txid);
+            let reserved = prior.checked_add(1).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "table publication generation count exhausted"
+                )
+            })?;
+            publication.reserve_generations(&self.metadata_pool, txid, reserved)?;
+            prior
+        };
+        let result = self.publish_prepared_row(commit_lsn, prepared);
+        if result.is_err() {
+            self.tables[table_index]
+                .publication()
+                .reserve_generations(&self.metadata_pool, txid, prior_generations)
+                .expect("canceling a test publication only releases reserved capacity");
+        }
+        result
     }
 
     fn prepare_committed_row(
@@ -35069,17 +35683,8 @@ impl Storage {
             )),
         )?;
         drop(selected);
-        let prepared_keys = if !rewritten {
-            Some(key_preparation::PreparedRowKeys::capture(
-                self,
-                table_index,
-                rowid,
-                image,
-            )?)
-        } else {
-            drop(image);
-            None
-        };
+        let prepared_keys =
+            key_preparation::PreparedRowKeyImage::capture(self, table_index, rowid, image, txid)?;
 
         Ok(Some(key_preparation::PreparedCommittedRow {
             origin: self.catalog_sources.origin(),
@@ -35088,7 +35693,128 @@ impl Storage {
             transaction: txid,
             head,
             keys: prepared_keys,
+            rewritten,
         }))
+    }
+
+    fn selected_prepared_row_keys(
+        &self,
+        table: usize,
+        rowid: u64,
+        transaction: u32,
+    ) -> Option<(u64, Option<key_preparation::PreparedRowKeyImage>)> {
+        let (versions, rows) = row_ownership::acquire(|| {
+            Ok((
+                self.row_versions.try_read_for_batch()?,
+                self.tables[table].rows.try_read_for_batch()?,
+            ))
+        });
+        let slot = rows.get(&rowid)?.pending.tail?;
+        let pending = &versions.pending_row_versions[slot];
+        (pending.change.txid == transaction)
+            .then(|| (pending.identity, pending.prepared_keys.clone()))
+    }
+
+    /// Freeze each final pending row's index hashes before durability. Retried
+    /// commits reuse the same owned result while row and binding identities match.
+    pub(crate) fn prepare_commit_row_keys(
+        &self,
+        transaction: u32,
+        touched: impl Iterator<Item = (usize, u64)>,
+    ) -> Result<(), SqlError> {
+        for (table, rowid) in touched {
+            let Some((_, ready)) = self.selected_prepared_row_keys(table, rowid, transaction)
+            else {
+                continue;
+            };
+            if let Some(ready) = ready {
+                let (definition, publication) = row_ownership::acquire(|| {
+                    Ok((
+                        self.tables[table].definition.try_read_for_batch()?,
+                        row_ownership::try_mutex(
+                            &self.tables[table].publication,
+                            "table publication lock poisoned",
+                        )?,
+                    ))
+                });
+                if ready.validate_definition(self, &definition).is_ok()
+                    && ready.validate_bindings(&publication).is_ok()
+                {
+                    continue;
+                }
+            }
+            let Some(selected) = self.resident_row_state(table, rowid)? else {
+                continue;
+            };
+            let rewritten = self.pending_table_rows_rewritten(table, transaction);
+            let Some(prepared) =
+                self.prepare_committed_row(table, rowid, transaction, rewritten, selected)?
+            else {
+                continue;
+            };
+            let (definition, publication, mut versions, rows) = row_ownership::acquire(|| {
+                Ok((
+                    self.tables[table].definition.try_read_for_batch()?,
+                    row_ownership::try_mutex(
+                        &self.tables[table].publication,
+                        "table publication lock poisoned",
+                    )?,
+                    self.row_versions.try_write_for_batch()?,
+                    self.tables[table].rows.try_read_for_batch()?,
+                ))
+            });
+            prepared.keys.validate_definition(self, &definition)?;
+            prepared.keys.validate_bindings(&publication)?;
+            let slot = rows
+                .get(&rowid)
+                .and_then(|state| state.pending.tail)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::SERIALIZATION_FAILURE,
+                        "pending row disappeared while index keys were prepared"
+                    )
+                })?;
+            if versions.pending_row_versions[slot].identity != prepared.head {
+                return Err(sql_err!(
+                    sqlstate::SERIALIZATION_FAILURE,
+                    "pending row changed while index keys were prepared"
+                ));
+            }
+            versions.pending_row_versions[slot].prepared_keys = Some(prepared.keys);
+        }
+        Ok(())
+    }
+
+    /// Durable publication consumes only pre-admitted metadata and hashes.
+    pub(crate) fn publish_row(
+        &self,
+        table: usize,
+        rowid: u64,
+        transaction: u32,
+        commit_lsn: u64,
+        rewritten: bool,
+    ) -> Result<(), SqlError> {
+        let Some((head, ready)) = self.selected_prepared_row_keys(table, rowid, transaction) else {
+            return Ok(());
+        };
+        let keys = ready.ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "row index keys were not prepared before WAL durability"
+            )
+        })?;
+        self.publish_prepared_row(
+            commit_lsn,
+            key_preparation::PreparedCommittedRow {
+                origin: self.catalog_sources.origin(),
+                table,
+                rowid,
+                transaction,
+                head,
+                keys,
+                rewritten,
+            },
+        )
     }
 
     fn publish_prepared_row(
@@ -35103,6 +35829,7 @@ impl Storage {
             transaction: txid,
             head,
             keys: prepared_keys,
+            rewritten,
         } = prepared;
         if origin != self.catalog_sources.origin() {
             return Err(sql_err!(
@@ -35111,7 +35838,6 @@ impl Storage {
             ));
         }
         let table = &self.tables[table_index];
-        let rewritten = prepared_keys.is_none();
 
         let (snapshots, definition, mut publication, generations, mut versions, mut rows) =
             row_ownership::acquire(|| {
@@ -35127,17 +35853,10 @@ impl Storage {
                     table.rows.try_write_for_batch()?,
                 ))
             });
-        if let Some(prepared) = &prepared_keys {
-            prepared.validate_definition(self, &definition)?;
-            prepared.validate_bindings(&publication)?;
-        }
-        let n_enforcers = publication.n_enforcers;
-        let generation = publication.generation.checked_add(1).ok_or_else(|| {
-            sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "table publication generation exhausted"
-            )
-        })?;
+        prepared_keys.validate_definition(self, &definition)?;
+        prepared_keys.validate_bindings(&publication)?;
+        let n_enforcers = publication.enforcers.len();
+        let generation = publication.preview_reserved_generation(txid)?;
         let state = rows.get_mut(&rowid).ok_or_else(|| {
             sql_err!(
                 sqlstate::SERIALIZATION_FAILURE,
@@ -35171,31 +35890,37 @@ impl Storage {
         } else {
             prune_committed_history(&mut versions.committed_row_versions, state, None);
         }
+        let TablePublication {
+            enforcers,
+            enforcer_state,
+            ..
+        } = &mut *publication;
         if rewritten {
-            for enforcer in publication.enforcers[..n_enforcers].iter_mut().flatten() {
-                enforcer.durable_dirty = true;
-                enforcer.durable_rebuild = true;
-                enforcer.durable_dirty_lsn = commit_lsn;
+            for state in enforcer_state.as_mut_slice() {
+                state.durable_dirty = true;
+                state.durable_rebuild = true;
+                state.durable_dirty_lsn = commit_lsn;
             }
-        } else {
-            for (binding, enforcer) in publication.enforcers[..n_enforcers]
-                .iter_mut()
-                .enumerate()
-                .filter_map(|(binding, enforcer)| {
-                    enforcer.as_mut().map(|enforcer| (binding, enforcer))
-                })
+        }
+        {
+            for (binding, enforcer) in
+                enforcers[..n_enforcers]
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(binding, enforcer)| {
+                        enforcer.as_ref().map(|enforcer| (binding, enforcer))
+                    })
             {
-                if !pending.changes_existence
+                if !rewritten
+                    && !pending.changes_existence
                     && !enforcer.dependency_mask.intersects(pending.changed_columns)
                 {
                     continue;
                 }
                 let mut index = enforcer.cache.write();
                 index.remove_rowid(rowid);
-                let prepared = prepared_keys
-                    .as_ref()
-                    .expect("ordinary publication prepared keys");
-                for &(_, hash) in prepared.hashes[..prepared.count]
+                for &(_, hash) in prepared_keys
+                    .hashes
                     .iter()
                     .filter(|&&(candidate, _)| candidate == binding)
                 {
@@ -35205,8 +35930,8 @@ impl Storage {
                 }
                 index.publish_at(commit_lsn);
                 drop(index);
-                enforcer.durable_dirty = true;
-                enforcer.durable_dirty_lsn = commit_lsn;
+                enforcer_state[binding].durable_dirty = true;
+                enforcer_state[binding].durable_dirty_lsn = commit_lsn;
             }
         }
         state.committed = pending.loc.map(RowHome::Heap);
@@ -35221,8 +35946,8 @@ impl Storage {
         {
             rows.remove(&rowid);
         }
-        publication.generation = generation;
-        publication.dirty = true;
+        let installed = publication.publish_reserved_generation(txid);
+        debug_assert_eq!(installed, generation);
         Ok(())
     }
 
@@ -35236,9 +35961,9 @@ impl Storage {
         table_index: usize,
         rowid: u64,
         home: impl Into<RowByteRead>,
-        out: &mut [(usize, u64); MAX_VALUE_ENFORCERS],
+        out: &mut [(usize, u64)],
     ) -> Result<usize, SqlError> {
-        let selection = key_preparation::ValueKeyPreparation::capture(self, table_index)?;
+        let selection = key_preparation::ValueKeyPreparation::capture(self, table_index, 0)?;
         let bindings = self.tables[table_index].enforcers();
         let count = bindings.iter().take_while(|entry| entry.is_some()).count();
         self.row_enforcer_hashes_for(
@@ -35246,7 +35971,10 @@ impl Storage {
             rowid,
             home,
             &selection,
-            &bindings[..count],
+            EnforcerBindings {
+                entries: &bindings[..count],
+                evaluation_txid: self.tables[table_index].publication().enforcer_transaction,
+            },
             out,
         )
     }
@@ -35257,8 +35985,8 @@ impl Storage {
         rowid: u64,
         home: impl Into<RowByteRead>,
         selection: &key_preparation::ValueKeyPreparation,
-        bindings: &[Option<Enforcer>],
-        out: &mut [(usize, u64); MAX_VALUE_ENFORCERS],
+        bindings: EnforcerBindings<'_>,
+        out: &mut [(usize, u64)],
     ) -> Result<usize, SqlError> {
         let mut schema = [ColType::Bool; MAX_COLUMNS];
         let n_columns = selection.definition().schema(&mut schema);
@@ -35284,9 +36012,9 @@ impl Storage {
         &self,
         arena: &Arena,
         selection: &key_preparation::ValueKeyPreparation,
-        bindings: &[Option<Enforcer>],
+        bindings: EnforcerBindings<'_>,
         values: &[Datum],
-        out: &mut [(usize, u64); MAX_VALUE_ENFORCERS],
+        out: &mut [(usize, u64)],
     ) -> Result<usize, SqlError> {
         let mut n_out = 0;
         for (binding, selected) in bindings.iter().enumerate() {
@@ -35297,6 +36025,7 @@ impl Storage {
                 arena,
                 selection,
                 selected,
+                bindings.evaluation_txid,
                 values,
                 |key, _, enforcer| {
                     let Some(key) = key else { return Ok(()) };
@@ -35309,7 +36038,7 @@ impl Storage {
                         binding,
                         hash_key_collated_catalog(
                             self,
-                            enforcer.evaluation_txid,
+                            bindings.evaluation_txid,
                             key,
                             &compact[..enforcer.n_cols],
                             &enforcer.collations[..enforcer.n_cols],
@@ -35329,7 +36058,7 @@ impl Storage {
         binding: usize,
         rowid: u64,
         home: impl Into<RowByteRead>,
-        visit: impl FnOnce(Option<&[Datum]>, &[Datum], &Enforcer) -> Result<R, SqlError>,
+        visit: impl FnOnce(Option<&[Datum]>, &[Datum], &EnforcerSnapshot) -> Result<R, SqlError>,
     ) -> Result<R, SqlError> {
         let selection = key_preparation::ValueBindingRead::capture(self, table_index, binding)?;
         let schema = selection.schema();
@@ -35357,7 +36086,7 @@ impl Storage {
         table_index: usize,
         binding: usize,
         values: &[Datum],
-        visit: impl FnOnce(Option<&[Datum]>, &[Datum], &Enforcer) -> Result<R, SqlError>,
+        visit: impl FnOnce(Option<&[Datum]>, &[Datum], &EnforcerSnapshot) -> Result<R, SqlError>,
     ) -> Result<R, SqlError> {
         let selection = key_preparation::ValueBindingRead::capture(self, table_index, binding)?;
         selection.with_values(self, arena, values, visit)
@@ -35368,6 +36097,7 @@ impl Storage {
         arena: &Arena,
         selection: &key_preparation::ValueKeyPreparation,
         enforcer: &Enforcer,
+        evaluation_txid: u32,
         values: &[Datum],
         visit: impl FnOnce(Option<&[Datum]>, &[Datum], &Enforcer) -> Result<R, SqlError>,
     ) -> Result<R, SqlError> {
@@ -35378,7 +36108,7 @@ impl Storage {
                 let predicate = crate::sql::parser::parse_expr(source.as_str(), arena)?;
                 if !crate::sql::exec::constraints::index_predicate_matches(
                     self,
-                    enforcer.evaluation_txid,
+                    evaluation_txid,
                     selection.definition(),
                     values,
                     predicate,
@@ -35396,7 +36126,7 @@ impl Storage {
             }
             crate::sql::exec::constraints::index_key_values(
                 self,
-                enforcer.evaluation_txid,
+                evaluation_txid,
                 selection.definition(),
                 values,
                 &index.columns[..index.n_cols],
@@ -35455,19 +36185,21 @@ impl Storage {
         let publication = self.tables[table_index].publication();
         let binding = match selection {
             ValueIndexSelection::Binding(binding) => {
-                if binding >= publication.n_enforcers {
+                if binding >= publication.enforcers.len() {
                     return Ok(None);
                 }
                 binding
             }
             ValueIndexSelection::Columns(columns) => {
-                let Some(binding) = publication.enforcers[..publication.n_enforcers]
+                let Some(binding) = publication
+                    .enforcers
                     .iter()
-                    .position(|enforcer| {
+                    .zip(publication.enforcer_state.iter())
+                    .position(|(enforcer, state)| {
                         enforcer.as_ref().is_some_and(|enforcer| {
                             enforcer.index_created_at.is_none()
                                 && enforcer.columns() == columns
-                                && enforcer.durable.is_some()
+                                && state.durable.is_some()
                         })
                     })
                 else {
@@ -35476,10 +36208,7 @@ impl Storage {
                 binding
             }
         };
-        let Some(handle) = publication.enforcers[binding]
-            .as_ref()
-            .and_then(|enforcer| enforcer.durable)
-        else {
+        let Some(handle) = publication.enforcer_state[binding].durable else {
             return Ok(None);
         };
         if self.commit_snapshot() < handle.published_lsn {
@@ -35606,6 +36335,7 @@ impl Storage {
                 && enforcer.columns() == columns
                 && (enforcer.cache.read().is_complete_at(self.commit_snapshot())
                     || enforcer
+                        .state
                         .durable
                         .is_some_and(|handle| self.commit_snapshot() >= handle.published_lsn))
         })
@@ -35618,6 +36348,7 @@ impl Storage {
             enforcer.index_created_at.is_none()
                 && enforcer.columns() == columns
                 && enforcer
+                    .state
                     .durable
                     .is_some_and(|handle| self.commit_snapshot() >= handle.published_lsn)
         })
@@ -35918,15 +36649,12 @@ impl Storage {
     pub(crate) fn value_indexes_match_snapshot(&self, table_index: usize) -> bool {
         let snapshot = self.commit_snapshot();
         let publication = self.tables[table_index].publication();
-        publication.enforcers[..publication.n_enforcers]
-            .iter()
-            .flatten()
-            .all(|enforcer| {
-                (!enforcer.durable_dirty || enforcer.durable_dirty_lsn <= snapshot)
-                    && enforcer
-                        .durable
-                        .is_none_or(|handle| handle.published_lsn <= snapshot)
-            })
+        publication.enforcer_state.iter().all(|state| {
+            (!state.durable_dirty || state.durable_dirty_lsn <= snapshot)
+                && state
+                    .durable
+                    .is_none_or(|handle| handle.published_lsn <= snapshot)
+        })
     }
 
     pub(crate) fn value_binding_probe_complete(&self, table_index: usize, binding: usize) -> bool {
@@ -35935,6 +36663,7 @@ impl Storage {
             .is_some_and(|enforcer| {
                 enforcer.cache.read().is_complete_at(self.commit_snapshot())
                     || enforcer
+                        .state
                         .durable
                         .is_some_and(|handle| self.commit_snapshot() >= handle.published_lsn)
             })
@@ -35952,6 +36681,7 @@ impl Storage {
                 .enforcer(binding)
                 .is_some_and(|enforcer| {
                     enforcer
+                        .state
                         .durable
                         .is_some_and(|handle| self.commit_snapshot() >= handle.published_lsn)
                 })
@@ -36448,7 +37178,7 @@ impl Storage {
     ) -> Result<bool, SqlError> {
         let root = self.tables[table_index]
             .enforcer(binding)
-            .and_then(|enforcer| enforcer.durable)
+            .and_then(|enforcer| enforcer.state.durable)
             .map(|handle| handle.roster);
         let Some(spill) = &self.spill else {
             return Ok(false);
@@ -36679,6 +37409,7 @@ impl Storage {
         self.tables[table_index]
             .enforcer(binding)
             .expect("binding")
+            .state
             .durable
     }
 
@@ -36686,6 +37417,7 @@ impl Storage {
         self.tables[table_index]
             .enforcer(binding)
             .expect("binding")
+            .state
             .durable_dirty
     }
 
@@ -36695,7 +37427,10 @@ impl Storage {
         binding: usize,
     ) -> Option<u64> {
         let enforcer = self.tables[table_index].enforcer(binding).expect("binding");
-        enforcer.durable_dirty.then_some(enforcer.durable_dirty_lsn)
+        enforcer
+            .state
+            .durable_dirty
+            .then_some(enforcer.state.durable_dirty_lsn)
     }
 
     pub(crate) fn value_binding_requires_rebuild(
@@ -36706,6 +37441,7 @@ impl Storage {
         self.tables[table_index]
             .enforcer(binding)
             .expect("binding")
+            .state
             .durable_rebuild
     }
 
@@ -36718,29 +37454,28 @@ impl Storage {
     }
 
     pub(crate) fn mark_value_bindings_changed_at(&mut self, table_index: usize, dirty_lsn: u64) {
-        let n_enforcers = self.tables[table_index].enforcer_count();
-        for enforcer in self.tables[table_index].publication().enforcers[..n_enforcers]
-            .iter_mut()
-            .flatten()
-        {
-            enforcer.durable_dirty = true;
-            enforcer.durable_dirty_lsn = dirty_lsn;
+        let mut publication = self.tables[table_index].publication();
+        for state in publication.enforcer_state.as_mut_slice() {
+            state.durable_dirty = true;
+            state.durable_dirty_lsn = dirty_lsn;
         }
     }
 
     fn mark_value_bindings_rebuild_at(&mut self, table_index: usize, dirty_lsn: u64) {
         self.mark_value_bindings_changed_at(table_index, dirty_lsn);
-        let n_enforcers = self.tables[table_index].enforcer_count();
-        for enforcer in self.tables[table_index].publication().enforcers[..n_enforcers]
-            .iter_mut()
-            .flatten()
-        {
-            enforcer.durable_rebuild = true;
+        let mut publication = self.tables[table_index].publication();
+        for state in publication.enforcer_state.as_mut_slice() {
+            state.durable_rebuild = true;
         }
     }
 
     pub(crate) fn value_binding_is_committed(&self, table_index: usize, binding: usize) -> bool {
         let enforcer = self.tables[table_index].enforcer(binding).expect("binding");
+        // A committed index identity can still belong to a private rewritten
+        // shape. Maintenance must not decode committed rows with that shape.
+        if enforcer.evaluation_txid != 0 {
+            return false;
+        }
         if let Some(created_at) = enforcer.index_created_at {
             let table = &self.tables[table_index];
             return self.index_catalog().iter().any(|index| {
@@ -36797,32 +37532,30 @@ impl Storage {
         handle: Option<crate::store::ValueIndexHandle>,
         installation: ValueIndexInstallation,
     ) -> Result<(), SqlError> {
-        let n_enforcers = self.tables[table_index].enforcer_count();
         let mut publication = self.tables[table_index].publication();
-        let Some(enforcer) = publication.enforcers[..n_enforcers]
-            .iter_mut()
-            .flatten()
-            .find(|enforcer| {
+        let Some(binding) = publication.enforcers.iter().position(|enforcer| {
+            enforcer.as_ref().is_some_and(|enforcer| {
                 enforcer.columns() == columns
                     && enforcer.index_created_at == index_created_at
                     && enforcer.include_mask == include_mask
             })
-        else {
+        }) else {
             return Err(sql_err!(
                 sqlstate::INTERNAL_ERROR,
                 "manifest value index has no catalog binding"
             ));
         };
-        enforcer.durable = handle;
+        let state = &mut publication.enforcer_state[binding];
+        state.durable = handle;
         let captured_current = match installation {
             ValueIndexInstallation::Recovery => true,
             ValueIndexInstallation::Checkpoint { dirty_lsn } => {
-                enforcer.durable_dirty_lsn == dirty_lsn
+                state.durable_dirty_lsn == dirty_lsn
             }
         };
         if captured_current {
-            enforcer.durable_dirty = false;
-            enforcer.durable_rebuild = false;
+            state.durable_dirty = false;
+            state.durable_rebuild = false;
         }
         Ok(())
     }
@@ -36874,7 +37607,7 @@ impl Storage {
         &self,
         key: Option<&[Datum]>,
         values: &[Datum],
-        enforcer: &Enforcer,
+        enforcer: &EnforcerSnapshot,
         output: &mut [u8],
     ) -> Result<Option<(usize, usize, u64)>, SqlError> {
         let Some(key) = key else { return Ok(None) };
@@ -37058,8 +37791,302 @@ impl Storage {
     /// dropped.
     fn release_enforcers(&self, table_index: usize) {
         let mut publication = self.tables[table_index].publication();
-        publication.enforcers = [const { None }; MAX_VALUE_ENFORCERS];
-        publication.n_enforcers = 0;
+        publication.enforcers = SharedSlice::EMPTY;
+        publication.enforcer_state.clear();
+        publication.enforcer_transaction = 0;
+        publication.binding_versions.clear();
+    }
+
+    fn install_binding_candidate(
+        &self,
+        table: usize,
+        created_at: u64,
+        publication: &mut TablePublication,
+        candidate: BindingCandidate,
+    ) -> Result<(), SqlError> {
+        if candidate.change.is_some() {
+            if publication
+                .binding_versions
+                .iter()
+                .any(|version| version.transaction != candidate.transaction)
+            {
+                return Err(sql_err!(
+                    sqlstate::SERIALIZATION_FAILURE,
+                    "index bindings are owned by another transaction"
+                ));
+            }
+            let capacity = publication
+                .binding_versions
+                .len()
+                .checked_add(1)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "index binding history length exhausted"
+                    )
+                })?;
+            publication
+                .binding_versions
+                .reserve_exact(capacity)
+                .map_err(|error| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "{}", error))?;
+        }
+        if candidate.transaction == 0
+            && let Err(error) = self.tables[table]
+                .statistics
+                .set_index_hint(created_at, true, true)
+        {
+            if publication.binding_versions.is_empty() {
+                publication.binding_versions.clear();
+            }
+            return Err(error);
+        }
+        let bindings = core::mem::replace(&mut publication.enforcers, candidate.bindings.freeze());
+        let state = core::mem::replace(&mut publication.enforcer_state, candidate.state);
+        let prior_transaction =
+            core::mem::replace(&mut publication.enforcer_transaction, candidate.transaction);
+        if let Some(change) = candidate.change {
+            publication
+                .binding_versions
+                .push_reserved(BindingVersion {
+                    change,
+                    transaction: candidate.transaction,
+                    bindings,
+                    state,
+                    prior_transaction,
+                })
+                .expect("binding history was admitted before publication");
+        }
+        Ok(())
+    }
+
+    fn rollback_binding_change(&self, table: usize, transaction: u32, change: BindingChange) {
+        let mut publication = self.tables[table].publication();
+        let Some(position) = publication
+            .binding_versions
+            .iter()
+            .rposition(|version| version.transaction == transaction && version.change == change)
+        else {
+            // A failed stage can retire its catalog entry before any binding published.
+            return;
+        };
+        assert_eq!(
+            position + 1,
+            publication.binding_versions.len(),
+            "binding undo must follow savepoint order"
+        );
+        let prior = publication
+            .binding_versions
+            .pop()
+            .expect("selected binding version exists");
+        publication.enforcers = prior.bindings;
+        publication.enforcer_state = prior.state;
+        publication.enforcer_transaction = prior.prior_transaction;
+        if publication.binding_versions.is_empty() {
+            publication.binding_versions.clear();
+        }
+    }
+
+    pub(crate) fn prepare_table_enforcers(
+        &self,
+        table: usize,
+        transaction: u32,
+        revision: u64,
+        rewrote_rows: bool,
+    ) -> Result<(), SqlError> {
+        self.build_enforcers_visible(
+            table,
+            Some(transaction),
+            if rewrote_rows {
+                key_preparation::EnforcerRows::Rebuild
+            } else {
+                key_preparation::EnforcerRows::ReusePrepared
+            },
+            Some(BindingChange::TableDefinition { revision }),
+        )
+    }
+
+    /// Completes the binding root only after the selected shape's rows exist.
+    pub(crate) fn prepare_table_commit_enforcers(
+        &self,
+        change: TableDefinitionChange,
+    ) -> Result<(), SqlError> {
+        let table = self.tables.get(change.table()).ok_or_else(|| {
+            sql_err!(
+                sqlstate::SERIALIZATION_FAILURE,
+                "table binding source no longer exists"
+            )
+        })?;
+        let target = {
+            let state = table.definition.read();
+            if !table_publication::DefinitionSource::Pending(change).matches(self, &state) {
+                return Err(sql_err!(
+                    sqlstate::SERIALIZATION_FAILURE,
+                    "table binding change no longer belongs to its transaction"
+                ));
+            }
+            TableDefinitionTarget {
+                source: change.source,
+                transaction: change.transaction,
+                committed_revision: state.committed_revision,
+                pending_revision: self
+                    .pending_table_defs
+                    .selected_revision(&state, change.transaction),
+            }
+        };
+        self.prepare_table_definition_enforcers(target)
+    }
+
+    /// Row input retains the exact definition that prepared its values.
+    pub(crate) fn prepare_table_definition_enforcers(
+        &self,
+        target: TableDefinitionTarget,
+    ) -> Result<(), SqlError> {
+        let table = self.tables.get(target.table()).ok_or_else(|| {
+            sql_err!(
+                sqlstate::SERIALIZATION_FAILURE,
+                "table binding source no longer exists"
+            )
+        })?;
+        let rewritten = {
+            let state = table.definition.read();
+            if !target.matches_definition(self, &state) {
+                return Err(sql_err!(
+                    sqlstate::SERIALIZATION_FAILURE,
+                    "table definition changed before binding preparation"
+                ));
+            }
+            if state.identity.existence.pending_drop_txid() == Some(target.transaction) {
+                return Ok(());
+            }
+            let pending = self
+                .pending_table_defs
+                .latest_locked(&state)
+                .filter(|version| {
+                    version.txid == target.transaction
+                        && version.revision == target.pending_revision
+                })
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::SERIALIZATION_FAILURE,
+                        "selected table definition has no pending binding source"
+                    )
+                })?;
+            pending.rewrites_rows
+        };
+        self.prepare_table_enforcers(
+            target.table(),
+            target.transaction,
+            target.pending_revision,
+            rewritten,
+        )
+    }
+
+    /// Recovered prepared DDL admits roots from its retained index lifetime,
+    /// including a pending drop whose entry is hidden from ordinary queries.
+    pub(crate) fn prepare_index_definition_enforcers(
+        &mut self,
+        slot: usize,
+        transaction: u32,
+        operation: IndexBindingOperation,
+    ) -> Result<(), SqlError> {
+        let index = self.index_catalog().get(slot).copied().ok_or_else(|| {
+            sql_err!(
+                sqlstate::SERIALIZATION_FAILURE,
+                "index binding source no longer exists"
+            )
+        })?;
+        let owned = match operation {
+            IndexBindingOperation::Create => matches!(index.ddl_state,
+                CatalogDdlState::PendingCreate { txid } | CatalogDdlState::PendingCreateDrop { txid }
+                    if txid == transaction),
+            IndexBindingOperation::Drop => index.ddl_state.pending_drop_txid() == Some(transaction),
+        };
+        if index.database != current_database() || !owned || index.created_at == 0 {
+            return Err(sql_err!(
+                sqlstate::SERIALIZATION_FAILURE,
+                "index binding preparation belongs to a different source or transaction"
+            ));
+        }
+        let binding = index.table_binding.ok_or_else(|| {
+            sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "pending index has no retained table binding"
+            )
+        })?;
+        let catalog_sources::CatalogObjectSlot::Table(table) = binding.source.slot() else {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "pending index binding is not a table source"
+            ));
+        };
+        {
+            let owner = self
+                .tables
+                .get(table)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::SERIALIZATION_FAILURE,
+                        "index table binding source no longer exists"
+                    )
+                })?
+                .definition
+                .read();
+            if !binding.source.matches_lifetime(
+                self,
+                owner.identity.database,
+                owner.identity.created_at,
+                owner.identity.existence,
+            ) {
+                return Err(sql_err!(
+                    sqlstate::SERIALIZATION_FAILURE,
+                    "index table binding belongs to a different table lifetime"
+                ));
+            }
+            if owner.identity.existence.pending_drop_txid() == Some(transaction) {
+                return Ok(());
+            }
+            if !owner.identity.existence.visible_to(transaction) {
+                return Err(sql_err!(
+                    sqlstate::SERIALIZATION_FAILURE,
+                    "index table binding is not visible to its transaction"
+                ));
+            }
+        }
+        let change = match operation {
+            IndexBindingOperation::Create => BindingChange::IndexCreate {
+                created_at: index.created_at,
+            },
+            IndexBindingOperation::Drop => BindingChange::IndexDrop {
+                created_at: index.created_at,
+            },
+        };
+        self.prepare_index_enforcers(table, transaction, change)
+    }
+
+    pub(crate) fn rollback_table_enforcers(&self, table: usize, transaction: u32, revision: u64) {
+        self.rollback_binding_change(
+            table,
+            transaction,
+            BindingChange::TableDefinition { revision },
+        );
+    }
+
+    pub(crate) fn finish_bindings(&self, table: usize, transaction: u32) {
+        let mut publication = self.tables[table].publication();
+        assert!(
+            publication
+                .binding_versions
+                .iter()
+                .all(|version| version.transaction == transaction),
+            "committed binding versions belong to their transaction"
+        );
+        assert!(
+            publication.enforcer_transaction == 0
+                || publication.enforcer_transaction == transaction,
+            "committed binding context belongs to its transaction"
+        );
+        publication.enforcer_transaction = 0;
+        publication.binding_versions.clear();
     }
 
     /// Rebuilds every live table's value-index enforcers from its committed
@@ -37076,6 +38103,7 @@ impl Storage {
                         i,
                         None,
                         key_preparation::EnforcerRows::RebuildRecovered,
+                        None,
                     )?;
                 }
             }
@@ -37099,21 +38127,21 @@ impl Storage {
     /// change outside the per-row [`Self::commit_row`] maintenance (ALTER, a
     /// committed CREATE, CREATE/DROP INDEX, cold-start replay).
     pub fn refresh_enforcers(&mut self, table_index: usize) -> Result<(), SqlError> {
-        self.refresh_enforcers_visible(table_index, None)
+        self.rebuild_value_caches(table_index, ValueCacheRebuild::Committed)
     }
 
-    /// Builds the cache shape visible to the owner of a pending CREATE INDEX
-    /// before its WAL record becomes durable. Pool exhaustion is therefore a
-    /// pre-commit DDL error, never a committed index followed by an error.
-    pub fn prepare_index_enforcers(
+    /// Admits the pending index's cache before its WAL becomes durable.
+    pub(crate) fn prepare_index_enforcers(
         &mut self,
         table_index: usize,
         txid: u32,
+        change: BindingChange,
     ) -> Result<(), SqlError> {
         self.build_enforcers_visible(
             table_index,
             Some(txid),
             key_preparation::EnforcerRows::ReusePrepared,
+            Some(change),
         )?;
         if !self.relation_catalog_tuple_is_private(table_index, txid) {
             self.tables[table_index]
@@ -37123,46 +38151,34 @@ impl Storage {
         Ok(())
     }
 
-    fn refresh_enforcers_visible(
+    /// Explicit maintenance preserves the selected cache root's ownership.
+    pub(crate) fn rebuild_value_caches(
         &self,
         table_index: usize,
-        txid: Option<u32>,
+        context: ValueCacheRebuild,
     ) -> Result<(), SqlError> {
-        self.build_enforcers_visible(table_index, txid, key_preparation::EnforcerRows::Rebuild)
-    }
-
-    /// Row publication already updated prepared index caches. Finalize their
-    /// catalog owner without rescanning rows when the complete shape matches.
-    pub(crate) fn finish_index_enforcers(&self, table_index: usize) -> Result<(), SqlError> {
+        // Maintenance replaces an existing cache, not its owning SQL shape.
+        // A committed cache must keep reading committed rows even when the
+        // caller has private row updates; pending shapes retain their undo.
+        let txid = match context {
+            ValueCacheRebuild::Existing { transaction } => {
+                let owner = self.tables[table_index].publication().enforcer_transaction;
+                if owner != 0 && owner != transaction {
+                    return Err(sql_err!(
+                        sqlstate::SERIALIZATION_FAILURE,
+                        "index bindings are owned by another transaction"
+                    ));
+                }
+                (owner != 0).then_some(owner)
+            }
+            ValueCacheRebuild::Committed => None,
+        };
         self.build_enforcers_visible(
             table_index,
+            txid,
+            key_preparation::EnforcerRows::Rebuild,
             None,
-            key_preparation::EnforcerRows::ReusePrepared,
         )
-    }
-
-    pub(crate) fn finish_table_enforcers(
-        &mut self,
-        table_index: usize,
-        rewrote_rows: bool,
-    ) -> Result<(), SqlError> {
-        let empty = self.tables[table_index].rows.is_empty()
-            && self.tables[table_index].spill_generations().is_empty();
-        let empty_caches = if empty {
-            let bindings = self.tables[table_index].publication().enforcers.clone();
-            bindings
-                .iter()
-                .flatten()
-                .all(|enforcer| enforcer.cache.read().is_empty())
-        } else {
-            false
-        };
-        let rows = if rewrote_rows && !(empty && empty_caches) {
-            key_preparation::EnforcerRows::Rebuild
-        } else {
-            key_preparation::EnforcerRows::ReusePrepared
-        };
-        self.build_enforcers_visible(table_index, None, rows)
     }
 
     fn build_enforcers_visible(
@@ -37170,7 +38186,17 @@ impl Storage {
         table_index: usize,
         txid: Option<u32>,
         rows: key_preparation::EnforcerRows,
+        change: Option<BindingChange>,
     ) -> Result<(), SqlError> {
+        if let (Some(transaction), Some(change)) = (txid, change)
+            && self.tables[table_index]
+                .publication()
+                .binding_versions
+                .iter()
+                .any(|version| version.transaction == transaction && version.change == change)
+        {
+            return Ok(());
+        }
         {
             let table = &self.tables[table_index];
             let (definition, mut publication, indexes) = row_ownership::acquire(|| {
@@ -37183,6 +38209,15 @@ impl Storage {
                     row_ownership::try_mutex(&self.index_catalog, "index catalog lock poisoned")?,
                 ))
             });
+            if change.is_none()
+                && publication.enforcer_transaction != txid.unwrap_or(0)
+                && !matches!(rows, key_preparation::EnforcerRows::RebuildRecovered)
+            {
+                return Err(sql_err!(
+                    sqlstate::SERIALIZATION_FAILURE,
+                    "index binding context changed before maintenance"
+                ));
+            }
             let has_constraints = definition
                 .committed()
                 .columns()
@@ -37202,17 +38237,24 @@ impl Storage {
                         )
                 })
             });
-            if !has_constraints && !has_indexes {
-                publication.enforcers = [const { None }; MAX_VALUE_ENFORCERS];
-                publication.n_enforcers = 0;
+            if !has_constraints && !has_indexes && change.is_none() {
+                publication.enforcers = SharedSlice::EMPTY;
+                publication.enforcer_state.clear();
                 return Ok(());
             }
         }
-        let selection = key_preparation::ValueKeyPreparation::capture(self, table_index)?;
+        let selection =
+            key_preparation::ValueKeyPreparation::capture(self, table_index, txid.unwrap_or(0))?;
         let new_dirty_lsn = self.lsn().saturating_add(1);
         // DDL reshapes the cache slots, but an unchanged column tuple keeps
         // its manifest-published object generation.
-        let (published, prior_metadata, n_published, expected_generation) = {
+        #[derive(Clone, Copy)]
+        struct PriorBinding {
+            metadata: EnforcerMetadata,
+            state: EnforcerPublicationState,
+        }
+        let recovering = matches!(rows, key_preparation::EnforcerRows::RebuildRecovered);
+        let (published, prior_metadata, n_published, expected_generation, expected_transaction) = {
             let (definition, mut publication) = row_ownership::acquire(|| {
                 Ok((
                     self.tables[table_index].definition.try_read_for_batch()?,
@@ -37223,23 +38265,51 @@ impl Storage {
                 ))
             });
             selection.validate_definition(self, &definition)?;
-            let count = publication.n_enforcers;
-            let metadata: [Option<EnforcerMetadata>; MAX_VALUE_ENFORCERS] =
-                core::array::from_fn(|index| {
-                    publication.enforcers[index]
-                        .as_ref()
-                        .map(|enforcer| enforcer.metadata)
-                });
-            let published = if matches!(rows, key_preparation::EnforcerRows::RebuildRecovered) {
-                // Recovery has exclusive access before serving clients. Keep
-                // durable identities while recycling its unexposed buffers.
-                publication.enforcers = [const { None }; MAX_VALUE_ENFORCERS];
-                publication.n_enforcers = 0;
-                [const { None }; MAX_VALUE_ENFORCERS]
+            if change.is_none()
+                && publication.enforcer_transaction != txid.unwrap_or(0)
+                && !recovering
+            {
+                return Err(sql_err!(
+                    sqlstate::SERIALIZATION_FAILURE,
+                    "index binding context changed before maintenance"
+                ));
+            }
+            let count = publication.enforcers.len();
+            let mut metadata = self
+                .metadata_pool
+                .lease(count)
+                .map_err(|error| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "{}", error))?;
+            for (enforcer, state) in publication
+                .enforcers
+                .iter()
+                .zip(publication.enforcer_state.iter())
+            {
+                metadata
+                    .push_reserved(PriorBinding {
+                        metadata: enforcer
+                            .as_ref()
+                            .expect("published binding is initialized")
+                            .metadata,
+                        state: *state,
+                    })
+                    .expect("reserved binding metadata fits captured count");
+            }
+            let published = if recovering {
+                // Recovery has exclusive access before serving clients. Copy
+                // durable identities, then recycle the unexposed cache owners.
+                publication.enforcers = SharedSlice::EMPTY;
+                publication.enforcer_state.clear();
+                SharedSlice::EMPTY
             } else {
                 publication.enforcers.clone()
             };
-            (published, metadata, count, publication.generation)
+            (
+                published,
+                metadata,
+                count,
+                publication.generation,
+                publication.enforcer_transaction,
+            )
         };
         #[derive(Clone, Copy)]
         struct WantedBinding {
@@ -37274,20 +38344,42 @@ impl Storage {
             include_mask: ColumnSet::EMPTY,
             dependency_mask: ColumnSet::EMPTY,
         };
-        let mut want = [EMPTY_BINDING; MAX_VALUE_ENFORCERS];
+        let table_definition = selection.definition();
+        let wanted_capacity = table_definition
+            .columns()
+            .iter()
+            .filter(|column| column.unique)
+            .count()
+            .saturating_add(table_definition.uniques().len())
+            .saturating_add(
+                self.matching_indexes(|index| {
+                    txid.map_or(index.ddl_state == CatalogDdlState::Present, |owner| {
+                        index.visible_to(owner)
+                    }) && selection.matches_index_source(index)
+                        && !index.mutable_for(txid.unwrap_or(0)).kind.is_partitioned()
+                })
+                .count(),
+            );
+        let mut want = self
+            .metadata_pool
+            .lease(wanted_capacity)
+            .map_err(|error| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "{}", error))?;
+        for _ in 0..wanted_capacity {
+            want.push_reserved(EMPTY_BINDING)
+                .expect("reserved binding candidates fit counted inputs");
+        }
         let mut n_want = 0usize;
         let too_many = || {
             sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "a table can have at most {} distinct value-indexed column tuples",
-                MAX_VALUE_ENFORCERS
+                sqlstate::SERIALIZATION_FAILURE,
+                "index set changed while binding metadata was being prepared"
             )
         };
         {
             let def = selection.definition();
             for (i, col) in def.columns().iter().enumerate() {
                 if col.unique {
-                    if n_want == MAX_VALUE_ENFORCERS {
+                    if n_want == want.len() {
                         return Err(too_many());
                     }
                     want[n_want].columns[0] = i as u16;
@@ -37299,7 +38391,7 @@ impl Storage {
                 }
             }
             for uk in def.uniques() {
-                if n_want == MAX_VALUE_ENFORCERS {
+                if n_want == want.len() {
                     return Err(too_many());
                 }
                 let cols = uk.columns();
@@ -37317,22 +38409,16 @@ impl Storage {
         // share one enforcer: PostgreSQL permits redundant indexes, but a
         // second copy cannot improve the equality probe and would waste a
         // startup-reserved pool slot.
-        let table_definition = selection.definition();
-        let table_schema = table_definition.schema;
-        let table_name = table_definition.name;
-        let table_database = selection.database();
         for index in self
             .matching_indexes(|index| {
                 txid.map_or(index.ddl_state == CatalogDdlState::Present, |owner| {
                     index.visible_to(owner)
-                }) && index.database == table_database
-                    && index.schema == table_schema
-                    && index.table == table_name
+                }) && selection.matches_index_source(index)
                     && !index.mutable_for(txid.unwrap_or(0)).kind.is_partitioned()
             })
             .map(|(_, index)| index)
         {
-            selection.index(self, index.created_at)?;
+            let index = selection.index(self, index.created_at)?;
             let uses_catalog_comparison = index.resolved_operator_classes[..index.n_cols]
                 .iter()
                 .any(|class| matches!(class, Some(IndexOperatorClass::Catalog(_))));
@@ -37381,7 +38467,7 @@ impl Storage {
                 cached.dependency_mask |= include_mask;
                 continue;
             }
-            if n_want == MAX_VALUE_ENFORCERS {
+            if n_want == want.len() {
                 return Err(too_many());
             }
             want[n_want].columns[..columns.len()].copy_from_slice(columns);
@@ -37446,11 +38532,45 @@ impl Storage {
             want[n_want].include_mask = include_mask;
             n_want += 1;
         }
-        let mut candidate: [Option<Enforcer>; MAX_VALUE_ENFORCERS] =
-            [const { None }; MAX_VALUE_ENFORCERS];
-        let mut populate = [true; MAX_VALUE_ENFORCERS];
+        let mut candidate = self
+            .metadata_pool
+            .lease(n_want)
+            .map_err(|error| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "{}", error))?;
+        let mut candidate_state = self
+            .metadata_pool
+            .lease(n_want)
+            .map_err(|error| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "{}", error))?;
+        for _ in 0..n_want {
+            candidate
+                .push_reserved(None::<Enforcer>)
+                .expect("reserved binding count");
+            candidate_state
+                .push_reserved(EnforcerPublicationState {
+                    durable: None,
+                    durable_dirty: true,
+                    durable_rebuild: true,
+                    durable_dirty_lsn: new_dirty_lsn,
+                })
+                .expect("reserved binding state count");
+        }
+        let mut populate = self
+            .metadata_pool
+            .lease(n_want)
+            .map_err(|error| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "{}", error))?;
+        for _ in 0..n_want {
+            populate
+                .push_reserved(true)
+                .expect("reserved binding population count");
+        }
         if matches!(rows, key_preparation::EnforcerRows::ReusePrepared) {
-            let mut used = [false; MAX_VALUE_ENFORCERS];
+            let mut used = self
+                .metadata_pool
+                .lease(n_published)
+                .map_err(|error| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "{}", error))?;
+            for _ in 0..n_published {
+                used.push_reserved(false)
+                    .expect("reserved prior binding count");
+            }
             let mut count = 0;
             for (position, wanted) in want[..n_want].iter().enumerate() {
                 let Some((slot, enforcer)) =
@@ -37469,9 +38589,9 @@ impl Storage {
                     continue;
                 };
                 used[slot] = true;
-                let mut enforcer = enforcer.clone();
-                enforcer.evaluation_txid = txid.unwrap_or(0);
+                let enforcer = enforcer.clone();
                 candidate[position] = Some(enforcer);
+                candidate_state[position] = prior_metadata[slot].state;
                 populate[position] = false;
                 count += 1;
             }
@@ -37487,23 +38607,37 @@ impl Storage {
                 });
                 selection.validate_definition(self, &definition)?;
                 if publication.generation != expected_generation
+                    || publication.enforcer_transaction != expected_transaction
                     || !key_preparation::same_bindings(&published, &publication.enforcers, true)
+                    || (!recovering
+                        && (prior_metadata.len() != publication.enforcer_state.len()
+                            || prior_metadata
+                                .iter()
+                                .zip(publication.enforcer_state.iter())
+                                .any(|(prior, current)| prior.state != *current)))
+                    || (recovering && !publication.enforcer_state.is_empty())
                 {
                     return Err(sql_err!(
                         sqlstate::SERIALIZATION_FAILURE,
                         "table changed while its prepared index caches were being finalized"
                     ));
                 }
-                if txid.is_none() {
-                    self.tables[table_index].statistics.set_index_hint(
-                        definition.identity.created_at,
-                        true,
-                        true,
-                    )?;
-                }
-                publication.enforcers = candidate;
-                publication.n_enforcers = n_want;
-                return Ok(());
+                drop(used);
+                drop(populate);
+                drop(want);
+                drop(prior_metadata);
+                drop(published);
+                return self.install_binding_candidate(
+                    table_index,
+                    definition.identity.created_at,
+                    &mut publication,
+                    BindingCandidate {
+                        bindings: candidate,
+                        state: candidate_state,
+                        transaction: txid.unwrap_or(0),
+                        change,
+                    },
+                );
             }
         }
         for (w, wanted) in want.iter().take(n_want).enumerate() {
@@ -37521,8 +38655,7 @@ impl Storage {
             };
             let prior = prior_metadata[..n_published]
                 .iter()
-                .flatten()
-                .find(|enforcer| wanted.matches(enforcer))
+                .find(|enforcer| wanted.matches(&enforcer.metadata))
                 .copied();
             candidate[w] = Some(Enforcer {
                 cache,
@@ -37530,28 +38663,41 @@ impl Storage {
                     columns: wanted.columns,
                     n_cols: wanted.n_columns,
                     index_created_at: wanted.index_created_at,
-                    evaluation_txid: txid.unwrap_or(0),
                     key_types: wanted.key_types,
                     collations: wanted.collations,
                     ordered: wanted.ordered,
                     include_mask: wanted.include_mask,
                     dependency_mask: wanted.dependency_mask,
-                    durable: prior.and_then(|enforcer| enforcer.durable),
-                    durable_dirty: prior.is_none_or(|enforcer| enforcer.durable_dirty),
-                    durable_rebuild: prior.is_none_or(|enforcer| enforcer.durable_rebuild),
-                    durable_dirty_lsn: prior
-                        .map_or(new_dirty_lsn, |enforcer| enforcer.durable_dirty_lsn),
                 },
             });
-        }
-        let fresh: [Option<Enforcer>; MAX_VALUE_ENFORCERS] = core::array::from_fn(|index| {
-            if populate[index] {
-                candidate[index].clone()
-            } else {
-                None
+            if let Some(prior) = prior {
+                candidate_state[w] = prior.state;
             }
-        });
-        self.populate_enforcers(table_index, &selection, &fresh[..n_want])?;
+        }
+        let mut fresh = self
+            .metadata_pool
+            .lease(n_want)
+            .map_err(|error| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "{}", error))?;
+        for index in 0..n_want {
+            fresh
+                .push_reserved(if populate[index] {
+                    candidate[index].clone()
+                } else {
+                    None
+                })
+                .expect("reserved binding population count");
+        }
+        self.populate_enforcers(
+            table_index,
+            &selection,
+            EnforcerBindings {
+                entries: &fresh[..n_want],
+                evaluation_txid: txid.unwrap_or(0),
+            },
+        )?;
+        drop(fresh);
+        drop(populate);
+        drop(want);
         let (definition, mut publication) = row_ownership::acquire(|| {
             Ok((
                 self.tables[table_index].definition.try_read_for_batch()?,
@@ -37563,23 +38709,34 @@ impl Storage {
         });
         selection.validate_definition(self, &definition)?;
         if publication.generation != expected_generation
+            || publication.enforcer_transaction != expected_transaction
             || !key_preparation::same_bindings(&published, &publication.enforcers, true)
+            || (!recovering
+                && (prior_metadata.len() != publication.enforcer_state.len()
+                    || prior_metadata
+                        .iter()
+                        .zip(publication.enforcer_state.iter())
+                        .any(|(prior, current)| prior.state != *current)))
+            || (recovering && !publication.enforcer_state.is_empty())
         {
             return Err(sql_err!(
                 sqlstate::SERIALIZATION_FAILURE,
                 "table changed while its value caches were being built"
             ));
         }
-        if txid.is_none() {
-            self.tables[table_index].statistics.set_index_hint(
-                definition.identity.created_at,
-                true,
-                true,
-            )?;
-        }
-        publication.enforcers = candidate;
-        publication.n_enforcers = n_want;
-        Ok(())
+        drop(prior_metadata);
+        drop(published);
+        self.install_binding_candidate(
+            table_index,
+            definition.identity.created_at,
+            &mut publication,
+            BindingCandidate {
+                bindings: candidate,
+                state: candidate_state,
+                transaction: txid.unwrap_or(0),
+                change,
+            },
+        )
     }
 
     /// Populates a private replacement set before publishing any binding.
@@ -37587,29 +38744,34 @@ impl Storage {
         &self,
         table_index: usize,
         selection: &key_preparation::ValueKeyPreparation,
-        bindings: &[Option<Enforcer>],
+        bindings: EnforcerBindings<'_>,
     ) -> Result<(), SqlError> {
-        let n_enf = bindings.len();
         if bindings.iter().all(Option::is_none) {
             return Ok(());
-        }
-        let mut slots: [Option<ValueIndexLease>; MAX_VALUE_ENFORCERS] =
-            [const { None }; MAX_VALUE_ENFORCERS];
-        for (i, s) in slots.iter_mut().enumerate().take(n_enf) {
-            *s = bindings[i].as_ref().map(|enforcer| enforcer.cache.clone());
         }
         let boundary = self.tables[table_index]
             .rows
             .iter()
             .fold(self.lsn(), |lsn, (_, state)| lsn.max(state.committed_lsn));
-        for slot in slots[..n_enf].iter().flatten() {
-            slot.write().publish_at(boundary);
+        for binding in bindings.iter().flatten() {
+            binding.cache.write().publish_at(boundary);
         }
         let mut incomplete = false;
-        let mut buf = [(0usize, 0u64); MAX_VALUE_ENFORCERS];
+        let mut buf = self
+            .metadata_pool
+            .lease(bindings.len())
+            .map_err(|error| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "{}", error))?;
+        for _ in 0..bindings.len() {
+            buf.push_reserved((0usize, 0u64))
+                .expect("reserved binding hash count");
+        }
         let mut insert_hashes = |rowid: u64, lsn: u64, hashes: &[(usize, u64)]| {
             for &(binding, hash) in hashes {
-                let mut index = slots[binding].as_ref().expect("selected cache").write();
+                let mut index = bindings[binding]
+                    .as_ref()
+                    .expect("selected cache")
+                    .cache
+                    .write();
                 index.publish_at(lsn);
                 if index.insert(hash, rowid).is_err() {
                     incomplete = true;
@@ -37618,6 +38780,37 @@ impl Storage {
             }
             core::ops::ControlFlow::Continue(())
         };
+        if bindings.evaluation_txid != 0 {
+            let read = self.validation_read();
+            read.for_each_row_state(self, table_index, &mut |rowid, state| {
+                let lsn = state.committed_lsn;
+                let Some(home) = read.visible_row_home(
+                    self,
+                    table_index,
+                    rowid,
+                    state,
+                    bindings.evaluation_txid,
+                )?
+                else {
+                    return Ok(core::ops::ControlFlow::Continue(()));
+                };
+                let count = self.row_enforcer_hashes_for(
+                    table_index,
+                    rowid,
+                    home,
+                    selection,
+                    bindings,
+                    &mut buf,
+                )?;
+                Ok(insert_hashes(rowid, lsn, &buf[..count]))
+            })?;
+            if incomplete {
+                for binding in bindings.iter().flatten() {
+                    binding.cache.write().mark_incomplete();
+                }
+            }
+            return Ok(());
+        }
         let scan = self.row_scan(table_index)?;
         let overlay = scan.for_each_overlay(&mut |rowid, state| {
             let lsn = state.committed_lsn;
@@ -37682,8 +38875,8 @@ impl Storage {
         if incomplete {
             // A stopped walk can leave any cache without later rows, including
             // one that still had room when another binding filled.
-            for slot in slots[..n_enf].iter().flatten() {
-                slot.write().mark_incomplete();
+            for binding in bindings.iter().flatten() {
+                binding.cache.write().mark_incomplete();
             }
         }
         Ok(())
@@ -37885,6 +39078,7 @@ impl Storage {
         };
     }
 
+    #[track_caller]
     pub fn table_def(&self, index: usize, txid: u32) -> TableDefinitionRead<'_> {
         TableDefinitionRead::visible(
             &self.tables[index].definition,
@@ -37929,12 +39123,19 @@ impl Storage {
         let definition = self.table_def(index, transaction);
         (
             self.table_definition_target(index, transaction, &definition),
-            *definition,
+            (*definition).clone(),
         )
     }
 
     pub(crate) fn table_definition_images(&self) -> TableDefinitionImages {
         TableDefinitionImages::new(&self.table_definition_images)
+    }
+
+    #[cfg(all(test, not(miri)))]
+    pub(crate) fn metadata_pool_for_tests(
+        &self,
+    ) -> &std::sync::Arc<crate::mem::lease_pool::LeasePool> {
+        &self.metadata_pool
     }
 
     pub fn has_pending_table_def(&self, index: usize, txid: u32) -> bool {
@@ -37961,7 +39162,7 @@ impl Storage {
     pub(crate) fn write_table_def(
         &self,
         target: TableDefinitionTarget,
-        def: TableDef,
+        def: TableDefBuilder,
         column_mapping: &[Option<SqlName>; MAX_COLUMNS],
         rewrites_rows: bool,
     ) -> Result<TableDefinitionChange, SqlError> {
@@ -38008,7 +39209,11 @@ impl Storage {
     }
 
     /// Bind saved source lifetimes and refresh their cached SQL spelling.
-    fn bind_user_type_columns_to(&self, def: &mut TableDef, txid: u32) -> Result<(), SqlError> {
+    fn bind_user_type_columns_to(
+        &self,
+        def: &mut TableDefBuilder,
+        txid: u32,
+    ) -> Result<(), SqlError> {
         if !def.requires_type_catalog() {
             return Ok(());
         }
@@ -38019,12 +39224,12 @@ impl Storage {
         catalog.bind_table_definition(def, txid)
     }
 
-    fn bind_user_type_columns(&self, def: &mut TableDef) -> Result<(), SqlError> {
+    fn bind_user_type_columns(&self, def: &mut TableDefBuilder) -> Result<(), SqlError> {
         self.bind_user_type_columns_to(def, 0)
     }
 
     /// Journal replay installs a committed table under exclusive storage access.
-    pub fn create_table(&mut self, mut def: TableDef) -> Result<usize, SqlError> {
+    pub fn create_table(&mut self, mut def: TableDefBuilder) -> Result<usize, SqlError> {
         if def.n_columns > MAX_RELATION_COLUMNS {
             return Err(sql_err!(
                 sqlstate::TOO_MANY_COLUMNS,
@@ -38075,7 +39280,7 @@ impl Storage {
     pub(crate) fn complete_replay_table_rewrite(
         &mut self,
         position: CatalogPosition,
-        mut def: TableDef,
+        mut def: TableDefBuilder,
     ) -> Result<bool, SqlError> {
         let Some(rewrite) = self.replay_table_rewrite.take() else {
             return Ok(false);
@@ -38116,7 +39321,13 @@ impl Storage {
             definition.has_rules
         };
         let revision = self.reserve_table_definition_revision()?;
-        self.set_table_def(index, def, &column_mapping, revision, false)?;
+        self.set_table_def(
+            index,
+            def.freeze(&self.metadata_pool)?,
+            &column_mapping,
+            revision,
+            false,
+        )?;
         if !rewrite.preserve_rows {
             self.clear_table_rows(index);
             self.tables[index]
@@ -38141,7 +39352,7 @@ impl Storage {
     /// Transactional create: the table exists only for `txid` until commit.
     /// A name already visible to `txid` is a duplicate (42P07); a name held by
     /// another transaction's uncommitted DDL joins the shared wait graph.
-    pub fn create_table_in(&self, mut def: TableDef, txid: u32) -> Result<usize, SqlError> {
+    pub fn create_table_in(&self, mut def: TableDefBuilder, txid: u32) -> Result<usize, SqlError> {
         def.has_toast |= def
             .columns()
             .iter()
@@ -38196,7 +39407,8 @@ impl Storage {
         &self,
         index: usize,
         selected: table_definitions::TableIdentity,
-    ) -> Option<MutexGuard<'_, ()>> {
+        generation: publication_generations::RetirementGeneration,
+    ) -> Result<Option<MutexGuard<'_, ()>>, SqlError> {
         loop {
             let lifecycle = self.tables[index].lifecycle();
             let mut state = self.tables[index].definition.write();
@@ -38206,9 +39418,18 @@ impl Storage {
                 || state.identity.existence != selected.existence
                 || state.identity.existence == CatalogDdlState::Absent
             {
-                return None;
+                return Ok(None);
             }
             let attempt: Result<_, row_ownership::LockWait<'_>> = (|| {
+                let publication = match generation {
+                    publication_generations::RetirementGeneration::Preserve => None,
+                    publication_generations::RetirementGeneration::Advance => {
+                        Some(row_ownership::try_mutex(
+                            &self.tables[index].publication,
+                            "table publication lock poisoned",
+                        )?)
+                    }
+                };
                 let types =
                     row_ownership::try_mutex(&self.type_catalog, "type catalog lock poisoned")?;
                 let comments =
@@ -38219,21 +39440,26 @@ impl Storage {
                     &self.extension_catalog,
                     "extension catalog lock poisoned",
                 )?;
-                Ok((types, comments, permissions, extensions))
+                Ok((types, comments, permissions, extensions, publication))
             })();
-            let (types, mut comments, mut permissions, mut extensions) = match attempt {
-                Ok(owners) => owners,
-                Err(wait) => {
-                    drop(state);
-                    drop(lifecycle);
-                    #[cfg(test)]
-                    self.definition_publication
-                        .waits
-                        .fetch_add(1, core::sync::atomic::Ordering::Release);
-                    wait.wait();
-                    continue;
-                }
-            };
+            let (types, mut comments, mut permissions, mut extensions, mut publication) =
+                match attempt {
+                    Ok(owners) => owners,
+                    Err(wait) => {
+                        drop(state);
+                        drop(lifecycle);
+                        #[cfg(test)]
+                        self.definition_publication
+                            .waits
+                            .fetch_add(1, core::sync::atomic::Ordering::Release);
+                        wait.wait();
+                        continue;
+                    }
+                };
+            let next_generation = publication
+                .as_ref()
+                .map(|owner| owner.preview_unreserved_generation())
+                .transpose()?;
             let source = self.catalog_object_identity(
                 catalog_sources::CatalogObjectSlot::Table(index),
                 selected.database,
@@ -38269,28 +39495,40 @@ impl Storage {
             Self::clear_object_acl_entries_locked(&mut permissions, object);
             Self::clear_extension_dependencies_for_object_locked(&mut extensions, object);
             state.identity.existence = CatalogDdlState::Absent;
+            if let Some(next) = next_generation {
+                let owner = publication
+                    .as_mut()
+                    .expect("advancing retirement owns publication");
+                owner.generation = next;
+                owner.dirty = true;
+            }
             drop(state);
             drop(types);
             drop(comments);
             drop(permissions);
             drop(extensions);
-            return Some(lifecycle);
+            return Ok(Some(lifecycle));
         }
     }
 
     /// Committed drop (journal replay): rows are retained until checkpoint.
-    pub fn drop_table(&self, index: usize) {
+    pub fn drop_table(&self, index: usize) -> Result<(), SqlError> {
         let selected = self.tables[index].definition.read().identity;
-        let Some(_lifecycle) = self.retire_table_names(index, selected) else {
-            return;
+        let Some(_lifecycle) = self.retire_table_names(
+            index,
+            selected,
+            publication_generations::RetirementGeneration::Advance,
+        )?
+        else {
+            return Ok(());
         };
         self.release_enforcers(index);
         self.clear_pending_table_defs(index);
         self.clear_pending_table_statistics(index);
-        self.tables[index].mark_dirty();
         self.commit_triggers_for_table(index);
         self.commit_policies_for_table(index);
         self.commit_extended_statistics_for_table(index);
+        Ok(())
     }
 
     /// Promotes an uncommitted CREATE to the committed image.
@@ -38309,7 +39547,14 @@ impl Storage {
                 | CatalogDdlState::Present
                 | CatalogDdlState::PendingDrop { .. }
         ));
-        let Some(_lifecycle) = self.retire_table_names(index, selected) else {
+        let Some(_lifecycle) = self
+            .retire_table_names(
+                index,
+                selected,
+                publication_generations::RetirementGeneration::Preserve,
+            )
+            .expect("committed retirement does not consume generation capacity")
+        else {
             return;
         };
         self.retire_table_data(index);
@@ -38409,11 +39654,23 @@ impl Storage {
     }
 
     pub(crate) fn view(&self, slot: usize) -> ViewDef {
-        self.view_rule_catalog().views[slot]
+        self.view_rule_catalog().views[slot].clone()
+    }
+
+    pub(crate) fn view_relation_name(&self, oid: i32, txid: u32) -> Option<(SqlName, SqlName)> {
+        let catalog = self.view_rule_catalog();
+        catalog.views.iter().find_map(|view| {
+            (view.database == current_database()
+                && view.visible_to(txid)
+                && RelationIdentity::parse(view.created_at)
+                    .is_some_and(|identity| identity.oid() == oid))
+            .then(|| (view.schema_for(txid), view.name_for(txid)))
+        })
     }
 
     pub(crate) fn view_slot_visible_to(&self, slot: usize, txid: u32) -> bool {
-        let view = self.view(slot);
+        let catalog = self.view_rule_catalog();
+        let view = &catalog.views[slot];
         view.database == current_database() && view.visible_to(txid)
     }
 
@@ -39383,7 +40640,13 @@ impl Storage {
         Ok(())
     }
 
-    pub(crate) fn restore_subscription_owner(&mut self, slot: usize, owner: u16) {
+    pub(crate) fn restore_subscription_owner(
+        &mut self,
+        slot: usize,
+        owner: u16,
+        reference_transaction: u32,
+    ) -> Result<(), SqlError> {
+        self.role_reference_ready(usize::from(owner), reference_transaction)?;
         self.subscription_catalog
             .lock()
             .expect("subscription catalog lock poisoned")
@@ -39392,6 +40655,7 @@ impl Storage {
             owner,
             pending: None,
         };
+        Ok(())
     }
 
     pub(crate) fn set_subscription_owner(
@@ -40582,7 +41846,7 @@ impl Storage {
                     && v.schema_for(txid).as_str() == schema
                     && v.name_for(txid).as_str() == name
             })
-            .copied()
+            .cloned()
     }
 
     // --- Materialized-view catalog (parallel to views; data lives in a
@@ -40780,8 +42044,49 @@ impl Storage {
         table_schema: &str,
         table: &str,
         column: &str,
+        scope: GeneratedSequenceScope,
         txid: u32,
     ) -> Option<usize> {
+        if scope == GeneratedSequenceScope::PartitionRoot {
+            if let Some(sequence) = self.generated_sequence_slot(
+                table_schema,
+                table,
+                column,
+                GeneratedSequenceScope::Owned,
+                txid,
+            ) {
+                return Some(sequence);
+            }
+            let mut table = self.find_visible(table_schema, table, txid)?;
+            for _ in 0..self.table_count() {
+                let definition = self.table_def(table, txid);
+                let selected = definition.column_index(column)?;
+                if !definition.columns()[selected].is_identity {
+                    return None;
+                }
+                let parent = usize::from(definition.partition.attachment?.parent);
+                drop(definition);
+                if parent >= self.table_count() || !self.table_slot_visible_to(parent, txid) {
+                    return None;
+                }
+                let definition = self.table_def(parent, txid);
+                let selected = definition.column_index(column)?;
+                if !definition.columns()[selected].is_identity {
+                    return None;
+                }
+                if let Some(sequence) = self.generated_sequence_slot(
+                    definition.schema.as_str(),
+                    definition.name.as_str(),
+                    column,
+                    GeneratedSequenceScope::Owned,
+                    txid,
+                ) {
+                    return Some(sequence);
+                }
+                table = parent;
+            }
+            return None;
+        }
         let direct = self
             .sequence_catalog()
             .definitions
@@ -40813,7 +42118,7 @@ impl Storage {
         let pending = self
             .pending_table_def(table_slot)
             .filter(|pending| pending.txid == txid)?;
-        let committed = *self.tables[table_slot].definition();
+        let committed = (*self.tables[table_slot].definition()).clone();
         let committed_column = pending
             .column_mapping
             .iter()
@@ -41300,6 +42605,7 @@ impl Storage {
             txid,
             type_identities::TypeCreationAdmission::Fresh,
             false,
+            None,
         )
     }
 
@@ -41319,6 +42625,7 @@ impl Storage {
             0,
             type_identities::TypeCreationAdmission::restored(created_at)?,
             true,
+            None,
         )
         .map(TypeDdlUndo::slot)
     }
@@ -41337,10 +42644,12 @@ impl Storage {
             0,
             type_identities::TypeCreationAdmission::restored(created_at)?,
             false,
+            None,
         )
         .map(TypeDdlUndo::slot)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn create_domain_with_binding(
         &self,
         schema: SqlName,
@@ -41349,6 +42658,7 @@ impl Storage {
         txid: u32,
         creation: type_identities::TypeCreationAdmission,
         defer_manifest_binding: bool,
+        requested_slot: Option<usize>,
     ) -> Result<TypeDdlUndo, SqlError> {
         constraint_names::domain(name, &mut spec)?;
         self.require_schema_create(schema.as_str(), txid)?;
@@ -41356,11 +42666,15 @@ impl Storage {
         let created_at = creation.stamp(&self.catalog_sequence, u64::MAX, "domain")?;
         let (mut permissions, mut catalog) = self.type_creation_catalogs();
         if !defer_manifest_binding {
-            catalog.bind_domain_spec(&mut spec, txid)?;
+            catalog.bind_domain_spec(self, &mut spec, txid)?;
         }
         self.require_named_type_name(&catalog, schema, name, txid, None)?;
         let Some(new) = catalog.domains.iter().enumerate().position(|(slot, d)| {
-            d.ddl_state == CatalogDdlState::Absent
+            requested_slot.is_none_or(|requested| requested == slot)
+                && d.ddl_state == CatalogDdlState::Absent
+                && catalog
+                    .definition_publication_owner(NamedTypeSlot::Domain(slot))
+                    .is_none()
                 && !self
                     .type_definition_images
                     .retains(NamedTypeSlot::Domain(slot))
@@ -41568,9 +42882,21 @@ impl Storage {
             {
                 continue;
             }
-            let mut definition = *self.tables[table].definition();
+            let mut definition = TableDefBuilder::from_definition(&self.tables[table].definition());
+            if !definition.requires_type_catalog() {
+                continue;
+            }
             self.bind_user_type_columns_to(&mut definition, txid)?;
-            *self.tables[table].definition_mut(revision) = definition;
+            let definition = definition.freeze(&self.metadata_pool)?;
+            let mut state = self.tables[table].definition.write();
+            // Startup restores local type references without changing the SQL shape
+            // retained by reconstructed prepared-transaction targets.
+            let revision = if txid == 0 {
+                state.committed_revision
+            } else {
+                revision
+            };
+            *state.edit_committed(revision) = definition;
         }
         for composite in 0..self.composite_count() {
             let definition = self.composite_for(composite, txid);
@@ -41645,7 +42971,7 @@ impl Storage {
             return Err(self.catalog_ddl_wait_error(txid, owner, name.as_str()));
         }
         catalog.validate_type_edit(target, txid)?;
-        catalog.bind_domain_spec(&mut spec, txid)?;
+        catalog.bind_domain_spec(self, &mut spec, txid)?;
         let version = catalog.versions.next()?;
         let origin = catalog.origin;
         let domain = &mut catalog.domains[slot];
@@ -41739,6 +43065,24 @@ impl Storage {
     }
 
     pub(crate) fn commit_domain_alter(&self, target: TypeEditTarget) -> Result<(), SqlError> {
+        self.publish_domain_alter(
+            target,
+            type_reference_moves::TypePublicationSource::Pending(target),
+        )
+    }
+
+    pub(crate) fn replay_domain_alter(&self, target: TypeEditTarget) -> Result<(), SqlError> {
+        self.publish_domain_alter(
+            target,
+            type_reference_moves::TypePublicationSource::journal(target)?,
+        )
+    }
+
+    fn publish_domain_alter(
+        &self,
+        target: TypeEditTarget,
+        source: type_reference_moves::TypePublicationSource,
+    ) -> Result<(), SqlError> {
         let slot = target
             .slot(NamedTypeKind::Domain)
             .expect("domain publication identifies its source kind");
@@ -41777,15 +43121,11 @@ impl Storage {
                 UserTypeName::declaration(definition.schema, definition.name),
             )
         };
-        self.publish_type_move(
-            movement,
-            type_reference_moves::TypePublicationSource::Pending(target),
-            |catalog, _members| {
-                let version = catalog.type_definition_version(NamedTypeSlot::Domain(slot), txid);
-                catalog.versions.set(NamedTypeSlot::Domain(slot), version);
-                catalog.domains[slot] = catalog.domains[slot].definition_for(txid);
-            },
-        )
+        self.publish_type_move(movement, source, |catalog, _members| {
+            let version = catalog.type_definition_version(NamedTypeSlot::Domain(slot), txid);
+            catalog.versions.set(NamedTypeSlot::Domain(slot), version);
+            catalog.domains[slot] = catalog.domains[slot].definition_for(txid);
+        })
     }
 
     pub(crate) fn rollback_domain_alter(&self, undo: DomainAlterUndo) {
@@ -42108,7 +43448,14 @@ impl Storage {
             (slot, version)
         } else {
             let slot = self
-                .create_enum_with_creation(schema, name, EnumSpec { members: &[] }, 0, creation)?
+                .create_enum_with_creation(
+                    schema,
+                    name,
+                    EnumSpec { members: &[] },
+                    0,
+                    creation,
+                    None,
+                )?
                 .slot();
             let version = self
                 .type_catalog
@@ -42150,6 +43497,7 @@ impl Storage {
             spec,
             txid,
             type_identities::TypeCreationAdmission::Fresh,
+            None,
         )
     }
 
@@ -42160,6 +43508,7 @@ impl Storage {
         spec: EnumSpec<'_>,
         txid: u32,
         creation: type_identities::TypeCreationAdmission,
+        requested_slot: Option<usize>,
     ) -> Result<TypeDdlUndo, SqlError> {
         self.require_schema_create(schema.as_str(), txid)?;
         let ownership = self.initial_ownership(txid)?;
@@ -42167,7 +43516,11 @@ impl Storage {
         let (mut permissions, mut catalog) = self.type_creation_catalogs();
         self.require_named_type_name(&catalog, schema, name, txid, None)?;
         let Some(new) = catalog.enums.iter().enumerate().position(|(slot, e)| {
-            e.ddl_state == CatalogDdlState::Absent
+            requested_slot.is_none_or(|requested| requested == slot)
+                && e.ddl_state == CatalogDdlState::Absent
+                && catalog
+                    .definition_publication_owner(NamedTypeSlot::Enum(slot))
+                    .is_none()
                 && !self
                     .type_definition_images
                     .retains(NamedTypeSlot::Enum(slot))
@@ -42178,12 +43531,20 @@ impl Storage {
                 catalog.enums.len()
             ));
         };
-        let image = EnumImageReservation::write(
-            &self.enum_member_images,
-            spec.members,
-            &self.catalog_sequence,
-            None,
-        )?;
+        let image = match creation {
+            type_identities::TypeCreationAdmission::Fresh => EnumImageReservation::write(
+                &self.enum_member_images,
+                spec.members,
+                &self.catalog_sequence,
+                None,
+            )?,
+            type_identities::TypeCreationAdmission::Restored(_) => EnumImageReservation::restore(
+                &self.enum_member_images,
+                spec.members,
+                None,
+                created_at,
+            )?,
+        };
         let member_count = image.count();
         catalog
             .identities
@@ -42233,6 +43594,18 @@ impl Storage {
         members: &[EnumMember],
         txid: u32,
     ) -> Result<EnumAlterUndo, SqlError> {
+        self.stage_enum_definition(target, schema, name, members, txid, false)
+    }
+
+    fn stage_enum_definition(
+        &self,
+        target: TypeEditTarget,
+        schema: SqlName,
+        name: SqlName,
+        members: &[EnumMember],
+        txid: u32,
+        restored: bool,
+    ) -> Result<EnumAlterUndo, SqlError> {
         let slot = target.slot(NamedTypeKind::Enum)?;
         let mut catalog = self
             .type_catalog
@@ -42278,23 +43651,43 @@ impl Storage {
             catalog.pending_enum_members[previous as usize].depth + 1
         });
         let version = catalog.versions.next()?;
-        let image = EnumImageReservation::write(
-            &self.enum_member_images,
-            members,
-            &self.catalog_sequence,
-            Some((
-                prior.map_or(
-                    catalog.enums[slot]
-                        .member_image
-                        .expect("live enum owns members"),
-                    |pending| pending.image,
-                ),
-                prior.map_or(catalog.enums[slot].member_count as usize, |pending| {
-                    pending.member_count as usize
-                }),
-            )),
-        )?;
+        let previous_image = Some((
+            prior.map_or(
+                catalog.enums[slot]
+                    .member_image
+                    .expect("live enum owns members"),
+                |pending| pending.image,
+            ),
+            prior.map_or(catalog.enums[slot].member_count as usize, |pending| {
+                pending.member_count as usize
+            }),
+        ));
+        let image = if restored {
+            EnumImageReservation::restore(
+                &self.enum_member_images,
+                members,
+                previous_image,
+                catalog.enums[slot].created_at,
+            )?
+        } else {
+            EnumImageReservation::write(
+                &self.enum_member_images,
+                members,
+                &self.catalog_sequence,
+                previous_image,
+            )?
+        };
         let member_count = image.count();
+        if restored {
+            for member in members {
+                self.catalog_sequence.observe(
+                    member
+                        .identity
+                        .expect("validated restored enum member")
+                        .created_at(),
+                );
+            }
+        }
         let image = image.publish();
         catalog.pending_enum_members[member_slot] = PendingEnumMemberSlot {
             image: Some(image),
@@ -42645,6 +44038,33 @@ impl Storage {
         }
     }
 
+    pub(crate) fn composite_relation_identity(&self, slot: usize) -> RelationIdentity {
+        let catalog = self
+            .type_catalog
+            .lock()
+            .expect("type catalog lock poisoned");
+        RelationIdentity::parse(catalog.composites[slot].created_at)
+            .expect("admitted composite relation has a durable identity")
+    }
+
+    pub(crate) fn composite_relation_name(
+        &self,
+        oid: i32,
+        txid: u32,
+    ) -> Option<(SqlName, SqlName)> {
+        let catalog = self
+            .type_catalog
+            .lock()
+            .expect("type catalog lock poisoned");
+        catalog.composites.iter().find_map(|definition| {
+            (definition.database == current_database()
+                && definition.visible_to(txid)
+                && RelationIdentity::parse(definition.created_at)
+                    .is_some_and(|identity| identity.oid() == oid))
+            .then(|| definition.names_for(txid))
+        })
+    }
+
     pub fn composite(&self, slot: usize) -> CompositeDef {
         self.type_catalog
             .lock()
@@ -42716,7 +44136,7 @@ impl Storage {
             return Err(self.catalog_ddl_wait_error(txid, owner, name.as_str()));
         }
         catalog.validate_type_edit(target, txid)?;
-        catalog.bind_composite_fields(&mut definition.fields[..definition.n_fields], txid)?;
+        catalog.bind_composite_fields(self, &mut definition.fields[..definition.n_fields], txid)?;
         self.require_named_type_name(
             &catalog,
             definition.schema,
@@ -42751,6 +44171,24 @@ impl Storage {
     }
 
     pub(crate) fn commit_composite_alter(&self, target: TypeEditTarget) -> Result<(), SqlError> {
+        self.publish_composite_alter(
+            target,
+            type_reference_moves::TypePublicationSource::Pending(target),
+        )
+    }
+
+    pub(crate) fn replay_composite_alter(&self, target: TypeEditTarget) -> Result<(), SqlError> {
+        self.publish_composite_alter(
+            target,
+            type_reference_moves::TypePublicationSource::journal(target)?,
+        )
+    }
+
+    fn publish_composite_alter(
+        &self,
+        target: TypeEditTarget,
+        source: type_reference_moves::TypePublicationSource,
+    ) -> Result<(), SqlError> {
         let slot = target
             .slot(NamedTypeKind::Composite)
             .expect("composite publication identifies its source kind");
@@ -42785,13 +44223,9 @@ impl Storage {
                 UserTypeName::declaration(pending.schema, pending.name),
             )
         };
-        self.publish_type_move(
-            movement,
-            type_reference_moves::TypePublicationSource::Pending(target),
-            |catalog, _members| {
-                Self::install_composite_alter_locked(catalog, slot, txid);
-            },
-        )
+        self.publish_type_move(movement, source, |catalog, _members| {
+            Self::install_composite_alter_locked(catalog, slot, txid);
+        })
     }
 
     fn install_composite_alter_locked(catalog: &mut TypeCatalog, slot: usize, txid: u32) {
@@ -42848,6 +44282,7 @@ impl Storage {
             txid,
             type_identities::TypeCreationAdmission::Fresh,
             false,
+            None,
         )
     }
 
@@ -42865,10 +44300,12 @@ impl Storage {
             0,
             type_identities::TypeCreationAdmission::restored(created_at)?,
             true,
+            None,
         )
         .map(TypeDdlUndo::slot)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn create_composite_with_binding(
         &self,
         schema: SqlName,
@@ -42877,6 +44314,7 @@ impl Storage {
         txid: u32,
         creation: type_identities::TypeCreationAdmission,
         defer_manifest_binding: bool,
+        requested_slot: Option<usize>,
     ) -> Result<TypeDdlUndo, SqlError> {
         self.require_schema_create(schema.as_str(), txid)?;
         let ownership = self.initial_ownership(txid)?;
@@ -42884,7 +44322,7 @@ impl Storage {
             creation.stamp(&self.catalog_sequence, MAX_RELATION_GENERATION, "relation")?;
         let (mut permissions, mut catalog) = self.type_creation_catalogs();
         if !defer_manifest_binding {
-            catalog.bind_composite_fields(&mut spec.fields[..spec.n_fields], txid)?;
+            catalog.bind_composite_fields(self, &mut spec.fields[..spec.n_fields], txid)?;
         }
         self.require_named_type_name(&catalog, schema, name, txid, None)?;
         let Some(slot) = catalog
@@ -42892,7 +44330,11 @@ impl Storage {
             .iter()
             .enumerate()
             .position(|(slot, definition)| {
-                definition.ddl_state == CatalogDdlState::Absent
+                requested_slot.is_none_or(|requested| requested == slot)
+                    && definition.ddl_state == CatalogDdlState::Absent
+                    && catalog
+                        .definition_publication_owner(NamedTypeSlot::Composite(slot))
+                        .is_none()
                     && !self
                         .type_definition_images
                         .retains(NamedTypeSlot::Composite(slot))
@@ -42963,9 +44405,12 @@ impl Storage {
         let created_at =
             creation.stamp(&self.catalog_sequence, MAX_RELATION_GENERATION, "relation")?;
         let (mut permissions, mut catalog) = self.type_creation_catalogs();
-        catalog.bind_composite_fields(&mut spec.fields[..spec.n_fields], txid)?;
+        catalog.bind_composite_fields(self, &mut spec.fields[..spec.n_fields], txid)?;
         if slot >= catalog.composites.len()
             || catalog.composites[slot].ddl_state != CatalogDdlState::Absent
+            || catalog
+                .definition_publication_owner(NamedTypeSlot::Composite(slot))
+                .is_some()
             || self
                 .type_definition_images
                 .retains(NamedTypeSlot::Composite(slot))
@@ -47118,15 +48563,39 @@ impl Storage {
         Ok(prior)
     }
 
-    pub(crate) fn commit_index_rename(&mut self, slot: usize, txid: u32) {
+    pub(crate) fn commit_index_rename(&mut self, slot: usize, txid: u32) -> Result<(), SqlError> {
+        self.install_index_rename(slot, txid, None)
+    }
+
+    pub(crate) fn publish_index_rename(&mut self, slot: usize, txid: u32) -> Result<(), SqlError> {
+        self.install_index_rename(slot, txid, Some(txid))
+    }
+
+    fn install_index_rename(
+        &mut self,
+        slot: usize,
+        txid: u32,
+        admitted: Option<u32>,
+    ) -> Result<(), SqlError> {
+        if !self
+            .index(slot)
+            .pending_name
+            .is_some_and(|pending| pending.txid == txid)
+        {
+            return Ok(());
+        }
+        let table = self.index_table_slot(slot);
+        if let Some(table) = table {
+            self.preview_index_generation(table, admitted)?;
+        }
         let (database, schema, old_name, new_name) = {
             let mut catalog = self.index_catalog();
             let index = &mut catalog[slot];
             let Some(pending) = index.pending_name else {
-                return;
+                return Ok(());
             };
             if pending.txid != txid {
-                return;
+                return Ok(());
             }
             let old_name = index.name;
             index.name = pending.name;
@@ -47154,9 +48623,10 @@ impl Storage {
                 }
             }
         }
-        if let Some(table) = self.index_table_slot(slot) {
-            self.tables[table].mark_dirty();
+        if let Some(table) = table {
+            self.publish_index_generation(table, admitted)?;
         }
+        Ok(())
     }
 
     pub(crate) fn rollback_index_rename(&mut self, slot: usize, prior: Option<PendingIndexName>) {
@@ -47746,7 +49216,7 @@ impl Storage {
 
     /// Promotes this transaction's pending index drops on a table (cascaded
     /// from its DROP TABLE) into the committed catalog.
-    pub fn commit_indexes_for(&mut self, table: usize, txid: u32) {
+    pub fn commit_indexes_for(&mut self, table: usize, txid: u32) -> Result<(), SqlError> {
         let identity = self.tables[table].identity();
         let source = self.catalog_object_identity(
             catalog_sources::CatalogObjectSlot::Table(table),
@@ -47761,9 +49231,10 @@ impl Storage {
                     .is_some_and(|binding| binding.source == source)
                 && index.ddl_state.pending_drop_txid() == Some(txid)
             {
-                self.commit_index_drop(slot);
+                self.commit_index_drop(slot)?;
             }
         }
+        Ok(())
     }
 
     /// Discards this transaction's pending index drops on a table (a rolled
@@ -47823,8 +49294,22 @@ impl Storage {
     }
 
     /// Promotes an uncommitted CREATE INDEX into the committed catalog.
-    pub fn commit_index_create(&mut self, slot: usize) {
-        if let Some(table) = self.index_table_slot(slot) {
+    pub fn commit_index_create(&mut self, slot: usize) -> Result<(), SqlError> {
+        self.install_index_create(slot, None)
+    }
+
+    pub(crate) fn publish_index_create(
+        &mut self,
+        slot: usize,
+        transaction: u32,
+    ) -> Result<(), SqlError> {
+        self.install_index_create(slot, Some(transaction))
+    }
+
+    fn install_index_create(&mut self, slot: usize, admitted: Option<u32>) -> Result<(), SqlError> {
+        let table = self.index_table_slot(slot);
+        if let Some(table) = table {
+            self.preview_index_generation(table, admitted)?;
             self.tables[table]
                 .statistics
                 .mark_index_created(self.tables[table].identity().created_at);
@@ -47833,15 +49318,31 @@ impl Storage {
             let mut catalog = self.index_catalog();
             catalog[slot].ddl_state = catalog[slot].ddl_state.commit_create();
         }
-        if let Some(table) = self.index_table_slot(slot) {
-            self.tables[table].mark_dirty();
+        if let Some(table) = table {
+            self.publish_index_generation(table, admitted)?;
         }
+        Ok(())
     }
 
     /// Promotes an uncommitted DROP INDEX into the committed catalog.
-    pub fn commit_index_drop(&mut self, slot: usize) {
+    pub fn commit_index_drop(&mut self, slot: usize) -> Result<(), SqlError> {
+        self.install_index_drop(slot, None)
+    }
+
+    pub(crate) fn publish_index_drop(
+        &mut self,
+        slot: usize,
+        transaction: u32,
+    ) -> Result<(), SqlError> {
+        self.install_index_drop(slot, Some(transaction))
+    }
+
+    fn install_index_drop(&mut self, slot: usize, admitted: Option<u32>) -> Result<(), SqlError> {
         let index = self.index(slot);
         let table = self.index_table_slot(slot);
+        if let Some(table) = table {
+            self.preview_index_generation(table, admitted)?;
+        }
         self.drop_object_comments(
             CommentClass::Relation,
             index.schema.as_str(),
@@ -47853,8 +49354,9 @@ impl Storage {
         });
         self.retire_index(slot, false);
         if let Some(table) = table {
-            self.tables[table].mark_dirty();
+            self.publish_index_generation(table, admitted)?;
         }
+        Ok(())
     }
 
     fn retire_index(&self, slot: usize, rollback_create: bool) {
@@ -47900,12 +49402,34 @@ impl Storage {
 
     /// Discards an uncommitted CREATE INDEX (rollback): the slot is freed.
     pub fn rollback_index_create(&self, slot: usize) {
+        let index = self.index(slot);
+        if let Some(transaction) = index.ddl_state.pending_txid()
+            && let Some(table) = self.index_binding_table(index, transaction)
+        {
+            self.rollback_binding_change(
+                table,
+                transaction,
+                BindingChange::IndexCreate {
+                    created_at: index.created_at,
+                },
+            );
+        }
         self.retire_index(slot, true);
     }
 
     /// Discards an uncommitted DROP INDEX (rollback); a same-transaction
     /// pending-create reverts to pending-create.
     pub fn rollback_index_drop(&mut self, slot: usize, txid: u32) {
+        let index = self.index(slot);
+        if let Some(table) = self.index_binding_table(index, txid) {
+            self.rollback_binding_change(
+                table,
+                txid,
+                BindingChange::IndexDrop {
+                    created_at: index.created_at,
+                },
+            );
+        }
         let mut catalog = self.index_catalog();
         let x = &mut catalog[slot];
         x.ddl_state = x.ddl_state.rollback_drop(txid);
@@ -48761,7 +50285,7 @@ impl Storage {
         revision: TableDefinitionRevision,
     ) -> Result<(), SqlError> {
         let state = self.tables[index].definition.read();
-        let mut definition = *state.committed();
+        let mut definition = state.committed().clone();
         let source = self.catalog_object_identity(
             catalog_sources::CatalogObjectSlot::Table(index),
             state.identity.database,
@@ -48795,26 +50319,42 @@ impl Storage {
         Ok(())
     }
 
-    /// Removes one foreign key from a table's definition by constraint name
-    /// (DROP SCHEMA CASCADE severing an inbound reference), returning it for
-    /// transactional undo.
+    /// Replays removal of an inbound foreign key after reserving its replacement.
     pub(crate) fn drop_fk(
         &mut self,
         index: usize,
         fk_name: &str,
         revision: TableDefinitionRevision,
-    ) -> Option<ForeignKey> {
-        let mut definition_owner = self.tables[index].definition_mut(revision);
-        let def = &mut *definition_owner;
-        let at = (0..def.n_fkeys).find(|&f| def.fkeys[f].name.as_str() == fk_name)?;
-        let removed = def.fkeys[at];
-        for f in at..def.n_fkeys - 1 {
-            def.fkeys[f] = def.fkeys[f + 1];
+    ) -> Result<Option<ForeignKey>, SqlError> {
+        let definition = self.tables[index].definition();
+        let Some(at) =
+            (0..definition.n_fkeys).find(|&f| definition.fkeys[f].name.as_str() == fk_name)
+        else {
+            return Ok(None);
+        };
+        let removed = definition.fkeys[at];
+        self.tables[index]
+            .publication()
+            .preview_unreserved_generation()?;
+        let count = definition.n_fkeys - 1;
+        let mut replacement = self
+            .metadata_pool
+            .lease(count)
+            .map_err(|error| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "{}", error))?;
+        for (column, key) in definition.fkeys().iter().enumerate() {
+            if column != at {
+                replacement
+                    .push_reserved(*key)
+                    .map_err(|error| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "{}", error))?;
+            }
         }
-        def.n_fkeys -= 1;
-        drop(definition_owner);
-        self.tables[index].mark_dirty();
-        Some(removed)
+        drop(definition);
+        let mut definition = self.tables[index].definition_mut(revision);
+        definition.fkeys = replacement.freeze();
+        definition.n_fkeys = count;
+        drop(definition);
+        self.tables[index].mark_dirty()?;
+        Ok(Some(removed))
     }
 
     /// Runtime publication and replay share the same catalog installation.
@@ -50185,18 +51725,24 @@ impl Storage {
     }
 
     fn validate_cast_definition(&self, definition: CastDef, txid: u32) -> Result<(), SqlError> {
-        if self
-            .routine_type_oid(definition.source.ctype, definition.source.user_type, txid)
-            .is_none()
-            || self
-                .routine_type_oid(definition.target.ctype, definition.target.user_type, txid)
-                .is_none()
-        {
+        if definition.source == definition.target {
             return Err(sql_err!(
-                sqlstate::UNDEFINED_OBJECT,
-                "cast source or target type does not exist"
+                sqlstate::DUPLICATE_OBJECT,
+                "source data type and target data type are the same"
             ));
         }
+        let missing = || {
+            sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "cast source or target type does not exist"
+            )
+        };
+        let source_oid = self
+            .routine_type_oid(definition.source.ctype, definition.source.user_type, txid)
+            .ok_or_else(missing)?;
+        let target_oid = self
+            .routine_type_oid(definition.target.ctype, definition.target.user_type, txid)
+            .ok_or_else(missing)?;
         match definition.method {
             CastMethod::Binary
                 if !self.routine_results_binary_coercible(
@@ -50246,7 +51792,11 @@ impl Storage {
                 Ok(())
             }
             CastMethod::Binary | CastMethod::InOut => Ok(()),
+        }?;
+        if Self::builtin_cast_exists(source_oid, target_oid) {
+            return Err(sql_err!(sqlstate::DUPLICATE_OBJECT, "cast already exists"));
         }
+        Ok(())
     }
 
     pub(crate) fn routine_results_binary_coercible(
@@ -50406,12 +51956,6 @@ impl Storage {
     ) -> Result<usize, SqlError> {
         let source = self.bind_routine_result(source, txid)?;
         let target = self.bind_routine_result(target, txid)?;
-        if source == target {
-            return Err(sql_err!(
-                sqlstate::DUPLICATE_OBJECT,
-                "source data type and target data type are the same"
-            ));
-        }
         self.validate_cast_definition(
             CastDef {
                 database: current_database(),
@@ -50424,15 +51968,6 @@ impl Storage {
             },
             txid,
         )?;
-        let source_oid = self
-            .routine_type_oid(source.ctype, source.user_type, txid)
-            .expect("validated cast source type");
-        let target_oid = self
-            .routine_type_oid(target.ctype, target.user_type, txid)
-            .expect("validated cast target type");
-        if Self::builtin_cast_exists(source_oid, target_oid) {
-            return Err(sql_err!(sqlstate::DUPLICATE_OBJECT, "cast already exists"));
-        }
         let mut definition = CastDef {
             database: current_database(),
             created_at: 0,
@@ -50503,6 +52038,16 @@ impl Storage {
         let mut owners = self.catalog_type_owners(&self.casts);
         owners.bind_definition(&mut definition, 0)?;
         let casts = &mut owners.catalog;
+        if casts.iter().any(|candidate| {
+            candidate.database == current_database()
+                && candidate.ddl_state != CatalogDdlState::Absent
+                && candidate.created_at == identity.created_at()
+        }) {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "stored cast creation identity is duplicated"
+            ));
+        }
         if casts.iter().any(|candidate| {
             candidate.database == current_database()
                 && candidate.visible_to(0)
@@ -50884,6 +52429,12 @@ impl Storage {
                 definition.name.as_str()
             ));
         }
+        if let Some(owner) = catalog.collations.iter().find_map(|candidate| {
+            candidate.pending_key_owner(txid, |selected| selected.shares_catalog_key(definition))
+        }) {
+            drop(catalog);
+            return Err(self.catalog_ddl_wait_error(txid, owner, definition.name.as_str()));
+        }
         let slot = catalog
             .collations
             .iter()
@@ -50948,6 +52499,12 @@ impl Storage {
                 definition.destination.name()
             ));
         }
+        if let Some(owner) = catalog.conversions.iter().find_map(|candidate| {
+            candidate.pending_key_owner(txid, |selected| selected.shares_catalog_key(definition))
+        }) {
+            drop(catalog);
+            return Err(self.catalog_ddl_wait_error(txid, owner, definition.name.as_str()));
+        }
         let slot = catalog
             .conversions
             .iter()
@@ -51002,6 +52559,12 @@ impl Storage {
                 definition.kind().noun(),
                 definition.name().as_str()
             ));
+        }
+        if let Some(owner) = catalog.text_search_objects.iter().find_map(|candidate| {
+            candidate.pending_key_owner(txid, |selected| selected.shares_catalog_key(definition))
+        }) {
+            drop(catalog);
+            return Err(self.catalog_ddl_wait_error(txid, owner, definition.name().as_str()));
         }
         let slot = catalog
             .text_search_objects
@@ -51065,13 +52628,28 @@ impl Storage {
                 definition.kind().noun()
             ));
         }
+        if let Some(owner) =
+            catalog
+                .text_search_objects
+                .iter()
+                .enumerate()
+                .find_map(|(other, candidate)| {
+                    (other != slot)
+                        .then(|| {
+                            candidate.pending_key_owner(txid, |selected| {
+                                selected.shares_catalog_key(definition)
+                            })
+                        })
+                        .flatten()
+                })
+        {
+            drop(catalog);
+            return Err(self.catalog_ddl_wait_error(txid, owner, definition.name().as_str()));
+        }
         let prior = catalog.text_search_objects[slot].pending;
-        if prior.is_some_and(|pending| pending.txid != txid) {
-            return Err(sql_err!(
-                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
-                "{} is being altered by another transaction",
-                definition.kind().noun()
-            ));
+        if let Some(owner) = catalog.text_search_objects[slot].pending_key_owner(txid, |_| true) {
+            drop(catalog);
+            return Err(self.catalog_ddl_wait_error(txid, owner, definition.name().as_str()));
         }
         catalog.text_search_objects[slot].pending =
             Some(PendingTextSearchDefinition { txid, definition });
@@ -51330,12 +52908,27 @@ impl Storage {
                 "collation already exists"
             ));
         }
+        if let Some(owner) = catalog
+            .collations
+            .iter()
+            .enumerate()
+            .find_map(|(other, candidate)| {
+                (other != slot)
+                    .then(|| {
+                        candidate.pending_key_owner(txid, |selected| {
+                            selected.shares_catalog_key(definition)
+                        })
+                    })
+                    .flatten()
+            })
+        {
+            drop(catalog);
+            return Err(self.catalog_ddl_wait_error(txid, owner, definition.name.as_str()));
+        }
         let prior = catalog.collations[slot].pending;
-        if prior.is_some_and(|pending| pending.txid != txid) {
-            return Err(sql_err!(
-                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
-                "collation is being altered by another transaction"
-            ));
+        if let Some(owner) = catalog.collations[slot].pending_key_owner(txid, |_| true) {
+            drop(catalog);
+            return Err(self.catalog_ddl_wait_error(txid, owner, definition.name.as_str()));
         }
         catalog.collations[slot].pending = Some(PendingCollationDefinition { txid, definition });
         drop(catalog);
@@ -51379,12 +52972,49 @@ impl Storage {
                 "conversion already exists"
             ));
         }
-        let prior = catalog.conversions[slot].pending;
-        if prior.is_some_and(|pending| pending.txid != txid) {
+        if definition.default
+            && catalog
+                .conversions
+                .iter()
+                .enumerate()
+                .any(|(other, entry)| {
+                    let candidate = entry.definition_for(txid);
+                    other != slot
+                        && entry.database == current_database()
+                        && entry.visible_to(txid)
+                        && candidate.default
+                        && candidate.schema == definition.schema
+                        && candidate.source == definition.source
+                        && candidate.destination == definition.destination
+                })
+        {
             return Err(sql_err!(
-                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
-                "conversion is being altered by another transaction"
+                sqlstate::DUPLICATE_OBJECT,
+                "default conversion already exists"
             ));
+        }
+        if let Some(owner) =
+            catalog
+                .conversions
+                .iter()
+                .enumerate()
+                .find_map(|(other, candidate)| {
+                    (other != slot)
+                        .then(|| {
+                            candidate.pending_key_owner(txid, |selected| {
+                                selected.shares_catalog_key(definition)
+                            })
+                        })
+                        .flatten()
+                })
+        {
+            drop(catalog);
+            return Err(self.catalog_ddl_wait_error(txid, owner, definition.name.as_str()));
+        }
+        let prior = catalog.conversions[slot].pending;
+        if let Some(owner) = catalog.conversions[slot].pending_key_owner(txid, |_| true) {
+            drop(catalog);
+            return Err(self.catalog_ddl_wait_error(txid, owner, definition.name.as_str()));
         }
         catalog.conversions[slot].pending = Some(PendingConversionDefinition { txid, definition });
         drop(catalog);
@@ -52479,36 +54109,24 @@ impl Storage {
             .event_triggers
             .lock()
             .expect("event trigger catalog lock poisoned");
-        let same_name = |candidate: &EventTriggerDef| {
+        if event_triggers.iter().any(|candidate| {
             candidate.database == current_database()
-                && (candidate.definition.name == definition.name
-                    || candidate
-                        .pending
-                        .is_some_and(|pending| pending.definition.name == definition.name))
-        };
-        if let Some(blocker) = event_triggers.iter().find_map(|candidate| {
-            same_name(candidate)
-                .then(|| {
-                    candidate
-                        .pending
-                        .map(|pending| pending.txid)
-                        .or_else(|| candidate.ddl_state.pending_txid())
-                })
-                .flatten()
-                .filter(|owner| *owner != txid)
+                && candidate.visible_to(txid)
+                && candidate
+                    .definition_for(txid)
+                    .shares_catalog_key(definition)
         }) {
-            drop(event_triggers);
-            return Err(self.catalog_ddl_wait_error(txid, blocker, definition.name.as_str()));
-        }
-        if event_triggers
-            .iter()
-            .any(|candidate| same_name(candidate) && candidate.visible_to(txid))
-        {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_OBJECT,
                 "event trigger \"{}\" already exists",
                 definition.name.as_str()
             ));
+        }
+        if let Some(owner) = event_triggers.iter().find_map(|candidate| {
+            candidate.pending_key_owner(txid, |selected| selected.shares_catalog_key(definition))
+        }) {
+            drop(event_triggers);
+            return Err(self.catalog_ddl_wait_error(txid, owner, definition.name.as_str()));
         }
         let slot = event_triggers
             .iter()
@@ -52550,29 +54168,6 @@ impl Storage {
             .map(|pending| pending.txid)
             .or_else(|| event_triggers[slot].ddl_state.pending_txid())
             .filter(|owner| *owner != txid);
-        let name_blocker = event_triggers
-            .iter()
-            .enumerate()
-            .find_map(|(other, candidate)| {
-                (other != slot
-                    && candidate.database == current_database()
-                    && (candidate.definition.name == definition.name
-                        || candidate
-                            .pending
-                            .is_some_and(|pending| pending.definition.name == definition.name)))
-                .then(|| {
-                    candidate
-                        .pending
-                        .map(|pending| pending.txid)
-                        .or_else(|| candidate.ddl_state.pending_txid())
-                })
-                .flatten()
-                .filter(|owner| *owner != txid)
-            });
-        if let Some(blocker) = target_blocker.or(name_blocker) {
-            drop(event_triggers);
-            return Err(self.catalog_ddl_wait_error(txid, blocker, definition.name.as_str()));
-        }
         if event_triggers.iter().enumerate().any(|(other, candidate)| {
             other != slot
                 && candidate.database == current_database()
@@ -52584,6 +54179,22 @@ impl Storage {
                 "event trigger \"{}\" already exists",
                 definition.name.as_str()
             ));
+        }
+        let name_blocker = event_triggers
+            .iter()
+            .enumerate()
+            .find_map(|(other, candidate)| {
+                (other != slot)
+                    .then(|| {
+                        candidate.pending_key_owner(txid, |selected| {
+                            selected.shares_catalog_key(definition)
+                        })
+                    })
+                    .flatten()
+            });
+        if let Some(blocker) = target_blocker.or(name_blocker) {
+            drop(event_triggers);
+            return Err(self.catalog_ddl_wait_error(txid, blocker, definition.name.as_str()));
         }
         let prior = event_triggers[slot].pending;
         event_triggers[slot].pending = Some(PendingEventTriggerDefinition { txid, definition });
@@ -53129,9 +54740,6 @@ impl Storage {
         definition = self.bind_catalog_definition(definition, txid)?;
         self.require_schema_create(definition.schema.as_str(), txid)?;
         self.validate_operator_definition(definition, txid, None)?;
-        let created_at = self
-            .catalog_sequence
-            .next_bounded(MAX_CATALOG_CREATION, "catalog object")?;
         let mut owners = self.catalog_type_owners(&self.operator_catalog);
         owners.bind_definition(&mut definition, txid)?;
         let catalog = &mut owners.catalog;
@@ -53147,6 +54755,12 @@ impl Storage {
                 "operator already exists with the same argument types"
             ));
         }
+        if let Some(owner) = catalog.operators.iter().find_map(|candidate| {
+            candidate.pending_key_owner(txid, |selected| selected.shares_catalog_key(definition))
+        }) {
+            drop(owners);
+            return Err(self.catalog_ddl_wait_error(txid, owner, definition.name.as_str()));
+        }
         let Some(slot) = catalog
             .operators
             .iter()
@@ -53158,6 +54772,9 @@ impl Storage {
                 catalog.operators.len()
             ));
         };
+        let created_at = self
+            .catalog_sequence
+            .next_bounded(MAX_CATALOG_CREATION, "catalog object")?;
         catalog.operators[slot] = OperatorDef {
             database: current_database(),
             created_at,
@@ -53270,10 +54887,45 @@ impl Storage {
                 "operator changed before publication"
             ));
         }
-        let prior = catalog.operators[slot].pending;
-        if let Some(pending) = prior.filter(|pending| pending.txid != txid) {
+        if catalog
+            .operators
+            .iter()
+            .enumerate()
+            .any(|(other, candidate)| {
+                other != slot
+                    && candidate.database == current_database()
+                    && candidate.visible_to(txid)
+                    && candidate
+                        .definition_for(txid)
+                        .shares_catalog_key(definition)
+            })
+        {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_FUNCTION,
+                "operator already exists with the same argument types"
+            ));
+        }
+        if let Some(owner) = catalog
+            .operators
+            .iter()
+            .enumerate()
+            .find_map(|(other, candidate)| {
+                (other != slot)
+                    .then(|| {
+                        candidate.pending_key_owner(txid, |selected| {
+                            selected.shares_catalog_key(definition)
+                        })
+                    })
+                    .flatten()
+            })
+        {
             drop(owners);
-            return Err(self.catalog_ddl_wait_error(txid, pending.txid, definition.name.as_str()));
+            return Err(self.catalog_ddl_wait_error(txid, owner, definition.name.as_str()));
+        }
+        let prior = catalog.operators[slot].pending;
+        if let Some(owner) = catalog.operators[slot].pending_key_owner(txid, |_| true) {
+            drop(owners);
+            return Err(self.catalog_ddl_wait_error(txid, owner, definition.name.as_str()));
         }
         catalog.operators[slot].pending = Some(PendingOperatorDefinition { txid, definition });
         Ok(prior)
@@ -53564,6 +55216,12 @@ impl Storage {
                 definition.name.as_str()
             ));
         }
+        if let Some(owner) = catalog.families.iter().find_map(|candidate| {
+            candidate.pending_key_owner(txid, |selected| selected.shares_catalog_key(definition))
+        }) {
+            drop(owners);
+            return Err(self.catalog_ddl_wait_error(txid, owner, definition.name.as_str()));
+        }
         let Some(slot) = catalog
             .families
             .iter()
@@ -53680,10 +55338,45 @@ impl Storage {
                 "operator family changed before publication"
             ));
         }
-        let prior = catalog.families[slot].pending;
-        if let Some(pending) = prior.filter(|pending| pending.txid != txid) {
+        if catalog
+            .families
+            .iter()
+            .enumerate()
+            .any(|(other, candidate)| {
+                other != slot
+                    && candidate.database == current_database()
+                    && candidate.visible_to(txid)
+                    && candidate
+                        .definition_for(txid)
+                        .shares_catalog_key(definition)
+            })
+        {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_OBJECT,
+                "operator family already exists"
+            ));
+        }
+        if let Some(owner) = catalog
+            .families
+            .iter()
+            .enumerate()
+            .find_map(|(other, candidate)| {
+                (other != slot)
+                    .then(|| {
+                        candidate.pending_key_owner(txid, |selected| {
+                            selected.shares_catalog_key(definition)
+                        })
+                    })
+                    .flatten()
+            })
+        {
             drop(owners);
-            return Err(self.catalog_ddl_wait_error(txid, pending.txid, definition.name.as_str()));
+            return Err(self.catalog_ddl_wait_error(txid, owner, definition.name.as_str()));
+        }
+        let prior = catalog.families[slot].pending;
+        if let Some(owner) = catalog.families[slot].pending_key_owner(txid, |_| true) {
+            drop(owners);
+            return Err(self.catalog_ddl_wait_error(txid, owner, definition.name.as_str()));
         }
         catalog.families[slot].pending = Some(PendingOperatorFamilyDefinition { txid, definition });
         Ok(prior)
@@ -54090,6 +55783,12 @@ impl Storage {
                 definition.name.as_str()
             ));
         }
+        if let Some(owner) = catalog.classes.iter().find_map(|candidate| {
+            candidate.pending_key_owner(txid, |selected| selected.shares_catalog_key(definition))
+        }) {
+            drop(owners);
+            return Err(self.catalog_ddl_wait_error(txid, owner, definition.name.as_str()));
+        }
         let Some(slot) = catalog
             .classes
             .iter()
@@ -54141,6 +55840,22 @@ impl Storage {
                 && candidate.ddl_state == CatalogDdlState::Present
                 && candidate.created_at == created_at
         });
+        if definition.default
+            && (crate::sql::types::BtreeOperatorClass::for_type(definition.input.ctype).is_some()
+                || catalog.classes.iter().enumerate().any(|(slot, candidate)| {
+                    let selected = candidate.definition_for(0);
+                    Some(slot) != existing
+                        && candidate.database == current_database()
+                        && candidate.ddl_state != CatalogDdlState::Absent
+                        && selected.default
+                        && selected.input == definition.input
+                }))
+        {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "stored default operator class is duplicated"
+            ));
+        }
         if catalog.classes.iter().enumerate().any(|(slot, candidate)| {
             candidate.database == current_database()
                 && candidate.visible_to(0)
@@ -54203,10 +55918,47 @@ impl Storage {
                 "operator class changed before publication"
             ));
         }
-        let prior = catalog.classes[slot].pending;
-        if let Some(pending) = prior.filter(|pending| pending.txid != txid) {
+        if definition.default
+            && crate::sql::types::BtreeOperatorClass::for_type(definition.input.ctype).is_some()
+            || catalog
+                .classes
+                .iter()
+                .enumerate()
+                .any(|(other, candidate)| {
+                    other != slot
+                        && candidate.database == current_database()
+                        && candidate.visible_to(txid)
+                        && candidate
+                            .definition_for(txid)
+                            .shares_catalog_key(definition)
+                })
+        {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_OBJECT,
+                "operator class already exists with the same name or default input type"
+            ));
+        }
+        if let Some(owner) = catalog
+            .classes
+            .iter()
+            .enumerate()
+            .find_map(|(other, candidate)| {
+                (other != slot)
+                    .then(|| {
+                        candidate.pending_key_owner(txid, |selected| {
+                            selected.shares_catalog_key(definition)
+                        })
+                    })
+                    .flatten()
+            })
+        {
             drop(owners);
-            return Err(self.catalog_ddl_wait_error(txid, pending.txid, definition.name.as_str()));
+            return Err(self.catalog_ddl_wait_error(txid, owner, definition.name.as_str()));
+        }
+        let prior = catalog.classes[slot].pending;
+        if let Some(owner) = catalog.classes[slot].pending_key_owner(txid, |_| true) {
+            drop(owners);
+            return Err(self.catalog_ddl_wait_error(txid, owner, definition.name.as_str()));
         }
         catalog.classes[slot].pending = Some(PendingOperatorClassDefinition { txid, definition });
         Ok(prior)
@@ -54334,6 +56086,46 @@ mod tests {
         Budget::new(config.memtable_bytes + Storage::extra_budget_bytes(config) + (1 << 20))
     }
 
+    pub(super) fn publish_table_definition(
+        storage: &Storage,
+        change: TableDefinitionChange,
+    ) -> Result<Option<bool>, SqlError> {
+        let Some(table) = storage.tables.get(change.table()) else {
+            return Ok(None);
+        };
+        if !table_publication::DefinitionSource::Pending(change)
+            .matches(storage, &table.definition.read())
+        {
+            return Ok(None);
+        }
+        let result = (|| {
+            storage.prepare_table_commit_enforcers(change)?;
+            storage.prepare_definition_publication(
+                change.transaction,
+                [change].into_iter(),
+                core::iter::empty(),
+            )?;
+            storage.prepare_commit_generations(
+                change.transaction,
+                core::iter::empty(),
+                core::iter::empty(),
+            )?;
+            let result = storage.commit_table_def(change)?;
+            if result.is_some() {
+                storage.finish_definition_publication(change.transaction)?;
+                storage.finish_bindings(change.table(), change.transaction);
+            }
+            Ok(result)
+        })();
+        if !matches!(result, Ok(Some(_))) {
+            storage.rollback_definition_publication(change.transaction);
+        }
+        storage.release_commit_generations(change.transaction);
+        storage.release_object_locks(change.transaction);
+        storage.release_row_locks(change.transaction);
+        result
+    }
+
     pub(super) fn test_view_definition(dependencies: StoredQueryDependencies) -> ViewDefinition {
         ViewDefinition {
             persistence: RelationPersistence::Permanent,
@@ -54351,13 +56143,13 @@ mod tests {
         DatabaseDefinition::builtin(name, false, true, "C")
     }
 
-    pub(super) fn make_def(name: &str, columns: &[(&str, ColType, bool)]) -> TableDef {
-        let mut def = TableDef {
+    pub(super) fn make_def(name: &str, columns: &[(&str, ColType, bool)]) -> TableDefBuilder {
+        let mut def = TableDefBuilder {
             schema: SqlName::parse("public").unwrap(),
             name: SqlName::parse(name).unwrap(),
             columns: [ColumnMeta::EMPTY; MAX_COLUMNS],
             n_columns: columns.len(),
-            ..TableDef::empty()
+            ..TableDefBuilder::empty()
         };
         for (i, (n, t, nn)) in columns.iter().enumerate() {
             def.columns[i] = ColumnMeta {

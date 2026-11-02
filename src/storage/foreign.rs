@@ -192,7 +192,7 @@ pub(crate) enum ForeignDataValidator {
     Postgres,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ForeignDataWrapperDefinition {
     pub name: SqlName,
     pub handler: ForeignDataHandler,
@@ -209,7 +209,7 @@ impl ForeignDataWrapperDefinition {
     };
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ForeignServerDefinition {
     pub name: SqlName,
     pub wrapper: u16,
@@ -234,7 +234,7 @@ pub(crate) enum ForeignMappingUser {
     Role(u16),
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct UserMappingDefinition {
     pub server: u16,
     pub user: ForeignMappingUser,
@@ -249,7 +249,7 @@ impl UserMappingDefinition {
     };
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ForeignColumnOption {
     pub column: u16,
     pub option: ForeignOption,
@@ -262,7 +262,7 @@ impl ForeignColumnOption {
     };
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ForeignColumnOptions {
     entries: [ForeignColumnOption; MAX_FOREIGN_COLUMN_OPTIONS],
     count: u8,
@@ -333,7 +333,7 @@ impl ForeignColumnOptions {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ForeignTableDefinition {
     pub table: u16,
     pub server: u16,
@@ -400,6 +400,45 @@ impl<D: Copy> ForeignCatalogEntry<D> {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PreparedForeignKey {
+    Wrapper(SqlName),
+    Server(SqlName),
+    Mapping {
+        server: u16,
+        user: ForeignMappingUser,
+    },
+    Table(u16),
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct PreparedForeignNamespace {
+    pub class: ForeignObjectClass,
+    pub slot: usize,
+    pub created_at: u64,
+    pub key: Option<PreparedForeignKey>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum PreparedForeignChange<D: Copy> {
+    Unchanged,
+    Created,
+    Dropped,
+    Changed {
+        // Outer None means unchanged; inner None means no prior private image.
+        definition: Option<Option<PendingForeignDefinition<D>>>,
+        ownership: Option<Option<PendingOwnership>>,
+    },
+}
+
+pub(crate) struct PreparedForeignImage<D: Copy> {
+    pub database: DatabaseOid,
+    pub created_at: u64,
+    pub owner: Option<u16>,
+    pub definition: Option<D>,
+    pub transaction: u32,
+}
+
 pub(crate) struct ForeignCatalog {
     wrappers: FixedVec<ForeignCatalogEntry<ForeignDataWrapperDefinition>>,
     servers: FixedVec<ForeignCatalogEntry<ForeignServerDefinition>>,
@@ -408,6 +447,51 @@ pub(crate) struct ForeignCatalog {
 }
 
 impl ForeignCatalog {
+    pub(crate) fn parent_reference_owner(
+        &self,
+        class: ForeignObjectClass,
+        slot: usize,
+        database: DatabaseOid,
+        transaction: u32,
+    ) -> Result<Option<u32>, SqlError> {
+        let selected = match class {
+            ForeignObjectClass::Wrapper => self.wrappers.get(slot).map(|entry| {
+                (
+                    entry.database,
+                    entry.ddl_state,
+                    entry.pending_owner_other_than(transaction),
+                )
+            }),
+            ForeignObjectClass::Server => self.servers.get(slot).map(|entry| {
+                (
+                    entry.database,
+                    entry.ddl_state,
+                    entry.pending_owner_other_than(transaction),
+                )
+            }),
+            ForeignObjectClass::Mapping | ForeignObjectClass::Table => None,
+        }
+        .filter(|(selected_database, existence, _)| {
+            *selected_database == database && *existence != CatalogDdlState::Absent
+        })
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "referenced foreign catalog parent does not exist"
+            )
+        })?;
+        if let Some(owner) = selected.2 {
+            return Ok(Some(owner));
+        }
+        if !selected.1.visible_to(transaction) {
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "referenced foreign catalog parent does not exist"
+            ));
+        }
+        Ok(None)
+    }
+
     fn entry_blocks_create<D: Copy>(
         entry: &ForeignCatalogEntry<D>,
         database: DatabaseOid,
@@ -939,6 +1023,247 @@ impl ForeignCatalog {
             }
         }
         Ok(())
+    }
+
+    fn stage_prepared_entry<D: Copy + PartialEq>(
+        entries: &mut FixedVec<ForeignCatalogEntry<D>>,
+        slot: usize,
+        image: PreparedForeignImage<D>,
+        class: ForeignObjectClass,
+        key: impl Fn(D) -> PreparedForeignKey,
+        namespace: &[PreparedForeignNamespace],
+    ) -> Result<PreparedForeignChange<D>, SqlError> {
+        CatalogIdentity::require(image.created_at)?;
+        if let Some(definition) = image.definition
+            && entries.iter().enumerate().any(|(other, entry)| {
+                if other == slot
+                    || entry.database != image.database
+                    || entry.ddl_state == CatalogDdlState::Absent
+                {
+                    return false;
+                }
+                if entry.pending_owner_other_than(image.transaction).is_some() {
+                    key(entry.definition) == key(definition)
+                        || entry
+                            .pending
+                            .is_some_and(|pending| key(pending.definition) == key(definition))
+                } else if let Some(projected) = namespace
+                    .iter()
+                    .find(|projected| projected.class == class && projected.slot == other)
+                {
+                    projected.key == Some(key(definition))
+                } else {
+                    entry.visible_to(image.transaction)
+                        && key(entry.definition_for(image.transaction)) == key(definition)
+                }
+            })
+        {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "prepared foreign catalog key is already reserved"
+            ));
+        }
+        if image.definition.is_some()
+            && entries.iter().enumerate().any(|(other, entry)| {
+                other != slot
+                    && entry.database == image.database
+                    && entry.ddl_state != CatalogDdlState::Absent
+                    && entry.created_at == image.created_at
+            })
+        {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "prepared foreign catalog creation identity is duplicated"
+            ));
+        }
+        let entry = entries.get_mut(slot).ok_or_else(|| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "prepared foreign catalog slot is out of range"
+            )
+        })?;
+        if entry.ddl_state == CatalogDdlState::Absent {
+            let Some(definition) = image.definition else {
+                return Ok(PreparedForeignChange::Unchanged);
+            };
+            *entry = ForeignCatalogEntry {
+                database: image.database,
+                created_at: image.created_at,
+                definition,
+                pending: None,
+                ownership: image.owner.map_or(Ownership::BOOTSTRAP, |owner| Ownership {
+                    owner,
+                    pending: None,
+                }),
+                ddl_state: CatalogDdlState::PendingCreate {
+                    txid: image.transaction,
+                },
+            };
+            return Ok(PreparedForeignChange::Created);
+        }
+        if entry.database != image.database
+            || entry.created_at != image.created_at
+            || entry.pending_owner_other_than(image.transaction).is_some()
+        {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "prepared foreign catalog image selects another lifetime or owner"
+            ));
+        }
+        let Some(definition) = image.definition else {
+            entry.ddl_state = entry.ddl_state.drop_by(image.transaction);
+            return Ok(PreparedForeignChange::Dropped);
+        };
+        let prior_definition = (entry.definition_for(image.transaction) != definition).then(|| {
+            let prior = entry.pending;
+            entry.pending = Some(PendingForeignDefinition {
+                txid: image.transaction,
+                definition,
+            });
+            prior
+        });
+        let prior_ownership = image
+            .owner
+            .filter(|owner| *owner != entry.ownership.owner_to(image.transaction))
+            .map(|owner| {
+                let prior = entry.ownership.pending;
+                entry.ownership.pending = Some(PendingOwnership {
+                    txid: image.transaction,
+                    owner,
+                });
+                prior
+            });
+        if prior_definition.is_none() && prior_ownership.is_none() {
+            Ok(PreparedForeignChange::Unchanged)
+        } else {
+            Ok(PreparedForeignChange::Changed {
+                definition: prior_definition,
+                ownership: prior_ownership,
+            })
+        }
+    }
+
+    pub(crate) fn stage_prepared_wrapper(
+        &mut self,
+        slot: usize,
+        image: PreparedForeignImage<ForeignDataWrapperDefinition>,
+        namespace: &[PreparedForeignNamespace],
+    ) -> Result<PreparedForeignChange<ForeignDataWrapperDefinition>, SqlError> {
+        if image.definition.is_some() && image.owner.is_none() {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "prepared foreign wrapper owner is missing"
+            ));
+        }
+        Self::stage_prepared_entry(
+            &mut self.wrappers,
+            slot,
+            image,
+            ForeignObjectClass::Wrapper,
+            |definition| PreparedForeignKey::Wrapper(definition.name),
+            namespace,
+        )
+    }
+
+    pub(crate) fn stage_prepared_server(
+        &mut self,
+        slot: usize,
+        image: PreparedForeignImage<ForeignServerDefinition>,
+        namespace: &[PreparedForeignNamespace],
+    ) -> Result<PreparedForeignChange<ForeignServerDefinition>, SqlError> {
+        if let Some(definition) = image.definition {
+            if image.owner.is_none() {
+                return Err(sql_err!(
+                    sqlstate::DATA_EXCEPTION,
+                    "prepared foreign server owner is missing"
+                ));
+            }
+            Self::validate_prepared_parent(
+                &self.wrappers,
+                usize::from(definition.wrapper),
+                image.database,
+                image.transaction,
+            )?;
+        }
+        Self::stage_prepared_entry(
+            &mut self.servers,
+            slot,
+            image,
+            ForeignObjectClass::Server,
+            |definition| PreparedForeignKey::Server(definition.name),
+            namespace,
+        )
+    }
+
+    pub(crate) fn stage_prepared_mapping(
+        &mut self,
+        slot: usize,
+        image: PreparedForeignImage<UserMappingDefinition>,
+        namespace: &[PreparedForeignNamespace],
+    ) -> Result<PreparedForeignChange<UserMappingDefinition>, SqlError> {
+        if let Some(definition) = image.definition {
+            Self::validate_prepared_parent(
+                &self.servers,
+                usize::from(definition.server),
+                image.database,
+                image.transaction,
+            )?;
+        }
+        Self::stage_prepared_entry(
+            &mut self.mappings,
+            slot,
+            image,
+            ForeignObjectClass::Mapping,
+            |definition| PreparedForeignKey::Mapping {
+                server: definition.server,
+                user: definition.user,
+            },
+            namespace,
+        )
+    }
+
+    pub(crate) fn stage_prepared_table(
+        &mut self,
+        slot: usize,
+        image: PreparedForeignImage<ForeignTableDefinition>,
+        namespace: &[PreparedForeignNamespace],
+    ) -> Result<PreparedForeignChange<ForeignTableDefinition>, SqlError> {
+        if let Some(definition) = image.definition {
+            Self::validate_prepared_parent(
+                &self.servers,
+                usize::from(definition.server),
+                image.database,
+                image.transaction,
+            )?;
+        }
+        Self::stage_prepared_entry(
+            &mut self.tables,
+            slot,
+            image,
+            ForeignObjectClass::Table,
+            |definition| PreparedForeignKey::Table(definition.table),
+            namespace,
+        )
+    }
+
+    fn validate_prepared_parent<D: Copy>(
+        entries: &FixedVec<ForeignCatalogEntry<D>>,
+        slot: usize,
+        database: DatabaseOid,
+        transaction: u32,
+    ) -> Result<(), SqlError> {
+        if entries.get(slot).is_some_and(|parent| {
+            parent.database == database
+                && parent.visible_to(transaction)
+                && parent.pending_owner_other_than(transaction).is_none()
+        }) {
+            Ok(())
+        } else {
+            Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "prepared foreign catalog parent is unavailable"
+            ))
+        }
     }
 
     pub(crate) fn replay_set_wrapper(
@@ -1600,5 +1925,151 @@ impl ForeignCatalog {
         clear(&mut self.servers, database, ForeignServerDefinition::EMPTY);
         clear(&mut self.mappings, database, UserMappingDefinition::EMPTY);
         clear(&mut self.tables, database, ForeignTableDefinition::EMPTY);
+    }
+}
+
+#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
+mod prepared_tests {
+    use super::*;
+
+    fn image<D: Copy>(
+        definition: D,
+        created_at: u64,
+        transaction: u32,
+        owner: Option<u16>,
+    ) -> PreparedForeignImage<D> {
+        PreparedForeignImage {
+            database: DatabaseOid::POSTGRES,
+            created_at,
+            owner,
+            definition: Some(definition),
+            transaction,
+        }
+    }
+
+    #[test]
+    fn prepared_foreign_images_reject_reserved_keys_and_invalid_parents_before_mutation() {
+        let mut config = Config::default_dev();
+        config.max_foreign_data_wrappers = 3;
+        config.max_foreign_servers = 3;
+        config.max_user_mappings = 3;
+        config.max_tables = 3;
+        let mut budget = Budget::new(ForeignCatalog::budget_bytes(&config));
+        let mut catalog = ForeignCatalog::new(&config, &mut budget).unwrap();
+        let wrapper = ForeignDataWrapperDefinition {
+            name: SqlName::parse("duplicate").unwrap(),
+            ..ForeignDataWrapperDefinition::EMPTY
+        };
+        crate::mem::guard::forbid_alloc(|| {
+            assert!(matches!(
+                catalog
+                    .stage_prepared_wrapper(0, image(wrapper, 41, 7, Some(0)), &[])
+                    .unwrap(),
+                PreparedForeignChange::Created
+            ));
+            let Err(error) = catalog.stage_prepared_wrapper(1, image(wrapper, 42, 9, Some(0)), &[])
+            else {
+                panic!("duplicate wrapper was accepted");
+            };
+            assert_eq!(error.sqlstate, sqlstate::DATA_EXCEPTION);
+            assert_eq!(catalog.wrappers[1].ddl_state, CatalogDdlState::Absent);
+            catalog.commit_create(ForeignObjectClass::Wrapper, 0);
+            let renamed = ForeignDataWrapperDefinition {
+                name: SqlName::parse("renamed").unwrap(),
+                ..wrapper
+            };
+            catalog.alter_wrapper(0, renamed, 7).unwrap();
+            for name in [wrapper.name, renamed.name] {
+                assert!(
+                    catalog
+                        .stage_prepared_wrapper(
+                            1,
+                            image(
+                                ForeignDataWrapperDefinition { name, ..wrapper },
+                                42,
+                                9,
+                                Some(0)
+                            ),
+                            &[]
+                        )
+                        .is_err()
+                );
+                assert_eq!(catalog.wrappers[1].ddl_state, CatalogDdlState::Absent);
+            }
+            catalog.commit_alter(ForeignObjectClass::Wrapper, 0, 7);
+            let server = ForeignServerDefinition {
+                name: SqlName::parse("server").unwrap(),
+                wrapper: 0,
+                ..ForeignServerDefinition::EMPTY
+            };
+            catalog
+                .stage_prepared_server(0, image(server, 43, 7, Some(0)), &[])
+                .unwrap();
+            assert!(
+                catalog
+                    .stage_prepared_server(1, image(server, 44, 9, Some(0)), &[])
+                    .is_err()
+            );
+            assert_eq!(catalog.servers[1].ddl_state, CatalogDdlState::Absent);
+            let missing_parent = ForeignServerDefinition {
+                name: SqlName::parse("bad_parent").unwrap(),
+                wrapper: u16::MAX,
+                ..server
+            };
+            assert!(
+                catalog
+                    .stage_prepared_server(1, image(missing_parent, 44, 9, Some(0)), &[])
+                    .is_err()
+            );
+            assert_eq!(catalog.servers[1].ddl_state, CatalogDdlState::Absent);
+            catalog.commit_create(ForeignObjectClass::Server, 0);
+            let mapping = UserMappingDefinition {
+                server: 0,
+                user: ForeignMappingUser::Public,
+                ..UserMappingDefinition::EMPTY
+            };
+            catalog
+                .stage_prepared_mapping(0, image(mapping, 45, 7, None), &[])
+                .unwrap();
+            assert!(
+                catalog
+                    .stage_prepared_mapping(1, image(mapping, 46, 9, None), &[])
+                    .is_err()
+            );
+            assert_eq!(catalog.mappings[1].ddl_state, CatalogDdlState::Absent);
+            let table = ForeignTableDefinition {
+                table: 1,
+                server: 0,
+                ..ForeignTableDefinition::EMPTY
+            };
+            catalog
+                .stage_prepared_table(0, image(table, 47, 7, None), &[])
+                .unwrap();
+            assert!(
+                catalog
+                    .stage_prepared_table(1, image(table, 48, 9, None), &[])
+                    .is_err()
+            );
+            assert_eq!(catalog.tables[1].ddl_state, CatalogDdlState::Absent);
+            assert!(
+                catalog
+                    .stage_prepared_table(
+                        1,
+                        image(
+                            ForeignTableDefinition {
+                                table: 2,
+                                server: u16::MAX,
+                                ..table
+                            },
+                            48,
+                            9,
+                            None
+                        ),
+                        &[]
+                    )
+                    .is_err()
+            );
+            assert_eq!(catalog.tables[1].ddl_state, CatalogDdlState::Absent);
+        });
     }
 }

@@ -38,7 +38,7 @@ fn table_name_publication_remaps_index_keys_and_includes_before_rebinding() {
         index.columns[0] = 1;
         index.include_columns[0] = 2;
         let slot = storage.create_index(index, 7).unwrap();
-        storage.commit_index_create(slot);
+        storage.commit_index_create(slot).unwrap();
         crate::mem::guard::forbid_alloc(|| {
             let mut definition = make_def(
                 name,
@@ -73,7 +73,10 @@ fn table_name_publication_remaps_index_keys_and_includes_before_rebinding() {
                     true,
                 )
                 .unwrap();
-            assert_eq!(storage.commit_table_def(second_change).unwrap(), Some(true));
+            assert_eq!(
+                crate::storage::tests::publish_table_definition(&storage, second_change).unwrap(),
+                Some(true)
+            );
             let committed = storage.index_visible_to(slot, 8).unwrap();
             assert_eq!(
                 (committed.schema.as_str(), committed.table.as_str()),
@@ -208,7 +211,7 @@ fn table_name_lookup_tracks_create_rename_rollback_and_drop_visibility() {
         );
         assert_eq!(storage.find_visible("public", "private_lookup", 8), None);
         assert_eq!(storage.find_table("public", "private_lookup"), None);
-        let mut updated = *storage.table_def(created, 7);
+        let mut updated = TableDefBuilder::from_definition(&storage.table_def(created, 7));
         updated.name = SqlName::parse("first_lookup").unwrap();
         let first_change = storage
             .write_table_def(
@@ -268,7 +271,7 @@ fn table_name_lookup_tracks_create_rename_rollback_and_drop_visibility() {
         );
         storage.rollback_create(replacement);
 
-        let mut committed = *storage.table_def(target, 9);
+        let mut committed = TableDefBuilder::from_definition(&storage.table_def(target, 9));
         committed.name = SqlName::parse("committed_lookup").unwrap();
         let mut mapping = [None; MAX_COLUMNS];
         mapping[0] = Some(SqlName::parse("id").unwrap());
@@ -290,7 +293,10 @@ fn table_name_lookup_tracks_create_rename_rollback_and_drop_visibility() {
             storage.find_visible("public", "committed_lookup", 9),
             Some(target)
         );
-        assert_eq!(storage.commit_table_def(third_change).unwrap(), Some(false));
+        assert_eq!(
+            crate::storage::tests::publish_table_definition(&storage, third_change).unwrap(),
+            Some(false)
+        );
         assert_eq!(storage.find_table("public", "lookup_target"), None);
         assert_eq!(
             storage.find_table("public", "committed_lookup"),

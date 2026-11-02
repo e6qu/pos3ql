@@ -570,7 +570,7 @@ impl Storage {
         let Some(slot) = state.pending.tail else {
             return;
         };
-        let head = versions.pending_row_versions[slot];
+        let head = &versions.pending_row_versions[slot];
         if head.identity != undo.identity || head.change.txid != txid {
             return;
         }
@@ -615,7 +615,8 @@ mod tests {
         txid: u32,
         name: &str,
     ) -> TableDefinitionChange {
-        let (target, mut definition) = storage.select_table_definition(table, txid);
+        let (target, selected_definition) = storage.select_table_definition(table, txid);
+        let mut definition = TableDefBuilder::from_definition(&selected_definition);
         definition.columns[0].name = SqlName::parse(name).unwrap();
         let mut mapping = [None; MAX_COLUMNS];
         for (column, mapped) in mapping.iter_mut().enumerate().take(definition.n_columns) {
@@ -844,7 +845,11 @@ mod tests {
                             .unwrap();
                         let change = rename_definition(&storage, table, 7, "renamed");
                         if committed {
-                            assert_eq!(storage.commit_table_def(change).unwrap(), Some(false));
+                            assert_eq!(
+                                crate::storage::tests::publish_table_definition(&storage, change)
+                                    .unwrap(),
+                                Some(false)
+                            );
                         }
                         let error = storage.publish_pending_write(prepared).err().unwrap();
                         assert_eq!(error.sqlstate, sqlstate::SERIALIZATION_FAILURE);
@@ -1782,7 +1787,7 @@ mod tests {
                 match retirement {
                     0 => storage.commit_drop(table),
                     1 => storage.rollback_create(table),
-                    _ => storage.drop_table(table),
+                    _ => storage.drop_table(table).unwrap(),
                 }
                 let error = storage.publish_pending_write(retired).err().unwrap();
                 assert_eq!(error.sqlstate, sqlstate::SERIALIZATION_FAILURE);
@@ -2203,7 +2208,7 @@ mod tests {
         let stale = storage
             .prepare_pending_write(table, 1, 7, 1, Some(location), true)
             .unwrap();
-        storage.drop_table(table);
+        storage.drop_table(table).unwrap();
         let replacement = storage
             .create_table(make_def("replacement", &[("id", ColType::Int4, false)]))
             .unwrap();

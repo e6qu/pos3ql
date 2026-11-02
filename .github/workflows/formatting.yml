@@ -6,7 +6,7 @@ on:
 jobs:
   check:
     name: Rust formatting
-    runs-on: ubuntu-24.04-arm
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
       contents: read
@@ -29,3 +29,27 @@ jobs:
           name: formatting-${{ github.sha }}
           path: ${{ runner.temp }}/formatting.patch
           if-no-files-found: ignore
+
+  compile:
+    name: Rust type checks
+    needs: check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Cache Rust dependencies
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-source-check-dependencies-${{ hashFiles('Cargo.lock') }}
+      - name: Check and lint all Rust targets before test matrices
+        env:
+          RUSTFLAGS: -Dwarnings
+        run: cargo clippy --locked --all-targets --jobs 1 -- -Dwarnings

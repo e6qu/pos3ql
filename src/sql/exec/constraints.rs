@@ -16,7 +16,7 @@ use crate::sql::eval::{
 use crate::sql::txn::TxnState;
 use crate::sql::types::{ColType, Datum};
 use crate::sql_err;
-use crate::storage::{ColumnMeta, MAX_COLUMNS, Storage, TableDef, ValidationRead, rowenc};
+use crate::storage::{ColumnMeta, MAX_COLUMNS, Storage, ValidationRead, rowenc};
 
 use super::{RowCtx, check_not_null};
 
@@ -285,7 +285,7 @@ pub(crate) fn column_domain_target(
 /// domain's own rules, binding `VALUE` to each column's value.
 pub(crate) fn check_domain_constraints(
     storage: &Storage,
-    def: &TableDef,
+    def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
     values: &[Datum],
     txid: u32,
     arena: &Arena,
@@ -313,7 +313,10 @@ pub(crate) enum ConstraintName<'a> {
     Named(&'a str),
 }
 
-fn unique_violation(def: &TableDef, name: &ConstraintName) -> SqlError {
+fn unique_violation(
+    def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
+    name: &ConstraintName,
+) -> SqlError {
     match name {
         ConstraintName::PrimaryFlag => sql_err!(
             sqlstate::UNIQUE_VIOLATION,
@@ -343,7 +346,7 @@ fn unique_violation(def: &TableDef, name: &ConstraintName) -> SqlError {
 fn committed_key_matches(
     storage: &Storage,
     table_index: usize,
-    def: &TableDef,
+    def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
     _schema: &[ColType],
     columns: &[u16],
     values: &[Datum],
@@ -378,7 +381,7 @@ fn committed_key_matches(
 fn key_equal(
     storage: &Storage,
     txid: u32,
-    def: &TableDef,
+    def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
     columns: &[u16],
     values: &[Datum],
     other: &[Datum],
@@ -413,7 +416,7 @@ fn key_equal(
 fn encoded_key_equal(
     storage: &Storage,
     txid: u32,
-    def: &TableDef,
+    def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
     columns: &[u16],
     values: &[Datum],
     encoded: &[u8],
@@ -567,14 +570,14 @@ fn resolve_index_operator_classes(
 pub(crate) fn index_key_collations(
     storage: &Storage,
     txid: u32,
-    def: &TableDef,
+    def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
     columns: &[u16],
     expressions: &[Option<&Expr<'_>>],
     arena: &Arena,
 ) -> Result<[crate::sql::ast::Collation; crate::storage::MAX_INDEX_COLS], SqlError> {
     let mut collations = [crate::sql::ast::Collation::None; crate::storage::MAX_INDEX_COLS];
     let row = RowCtx {
-        def,
+        def: crate::storage::RelationDefinition::from_definition(def),
         values: &[],
         alias: None,
     };
@@ -593,7 +596,7 @@ pub(crate) fn index_key_collations(
 pub(crate) fn index_key_values<'a>(
     storage: &Storage,
     txid: u32,
-    def: &TableDef,
+    def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
     row: &[Datum<'a>],
     columns: &[u16],
     expressions: &[Option<&'a Expr<'a>>],
@@ -612,7 +615,7 @@ pub(crate) fn index_key_values<'a>(
                 arena,
                 crate::sql::eval::NO_PARAMS,
                 &RowCtx {
-                    def,
+                    def: crate::storage::RelationDefinition::from_definition(def),
                     values: row,
                     alias: None,
                 },
@@ -631,7 +634,7 @@ pub(crate) fn index_key_values<'a>(
 fn enforce_expression_index_uniqueness<'a>(
     storage: &Storage,
     table_index: usize,
-    def: &TableDef,
+    def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
     _schema: &[ColType],
     values: &[Datum<'a>],
     self_rowid: Option<u64>,
@@ -736,7 +739,7 @@ fn enforce_expression_index_uniqueness<'a>(
 fn enforce_key_uniqueness(
     storage: &Storage,
     table_index: usize,
-    def: &TableDef,
+    def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
     schema: &[ColType],
     values: &[Datum],
     self_rowid: Option<u64>,
@@ -744,9 +747,36 @@ fn enforce_key_uniqueness(
     columns: &[u16],
     nulls_not_distinct: bool,
     name: &ConstraintName,
+    source: UniqueKeySource,
 ) -> Result<(), SqlError> {
     if !nulls_not_distinct && columns.iter().any(|&c| values[c as usize].is_null()) {
         return Ok(());
+    }
+    if matches!(source, UniqueKeySource::Rows) {
+        committed_scan_uniqueness(
+            storage,
+            table_index,
+            schema,
+            columns,
+            nulls_not_distinct,
+            values,
+            self_rowid,
+            txid,
+            def,
+            name,
+        )?;
+        return pending_scan_uniqueness(
+            storage,
+            table_index,
+            schema,
+            columns,
+            nulls_not_distinct,
+            values,
+            self_rowid,
+            txid,
+            def,
+            name,
+        );
     }
     if storage.has_pending_table_def(table_index, txid) {
         if !storage.pending_table_rows_rewritten(table_index, txid) {
@@ -871,6 +901,12 @@ fn enforce_key_uniqueness(
     )
 }
 
+#[derive(Clone, Copy)]
+enum UniqueKeySource {
+    Cache,
+    Rows,
+}
+
 /// The committed-image check when a key has no value-cache binding: a full
 /// scan of committed rows preserves the authoritative uniqueness verdict.
 #[allow(clippy::too_many_arguments)]
@@ -883,7 +919,7 @@ fn committed_scan_uniqueness(
     values: &[Datum],
     self_rowid: Option<u64>,
     txid: u32,
-    def: &TableDef,
+    def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
     name: &ConstraintName,
 ) -> Result<(), SqlError> {
     let decoder =
@@ -934,7 +970,7 @@ fn pending_scan_uniqueness(
     values: &[Datum],
     self_rowid: Option<u64>,
     txid: u32,
-    def: &TableDef,
+    def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
     name: &ConstraintName,
 ) -> Result<(), SqlError> {
     let decoder =
@@ -984,7 +1020,7 @@ fn pending_scan_uniqueness(
 pub(crate) fn enforce_partial_index_uniqueness(
     storage: &Storage,
     table_index: usize,
-    def: &TableDef,
+    def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
     _schema: &[ColType],
     values: &[Datum],
     self_rowid: Option<u64>,
@@ -1070,7 +1106,7 @@ pub(crate) fn enforce_partial_index_uniqueness(
 pub(crate) fn index_predicate_matches(
     storage: &Storage,
     txid: u32,
-    def: &TableDef,
+    def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
     values: &[Datum],
     predicate: &Expr,
     arena: &Arena,
@@ -1085,7 +1121,7 @@ pub(crate) fn index_predicate_matches(
         arena,
         crate::sql::eval::NO_PARAMS,
         &RowCtx {
-            def,
+            def: crate::storage::RelationDefinition::from_definition(def),
             values,
             alias: None,
         },
@@ -1106,7 +1142,7 @@ pub(crate) fn index_predicate_matches(
 pub fn check_unique(
     storage: &Storage,
     table_index: usize,
-    def: &TableDef,
+    def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
     schema: &[ColType],
     values: &[Datum],
     self_rowid: Option<u64>,
@@ -1132,6 +1168,7 @@ pub fn check_unique(
             &[i as u16],
             false,
             &name,
+            UniqueKeySource::Cache,
         )?;
     }
     Ok(())
@@ -1142,7 +1179,7 @@ pub fn check_unique(
 pub fn check_all_unique(
     storage: &Storage,
     table_index: usize,
-    def: &TableDef,
+    def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
     schema: &[ColType],
     values: &[Datum],
     self_rowid: Option<u64>,
@@ -1159,6 +1196,7 @@ pub fn check_all_unique(
         self_rowid,
         txid,
         arena,
+        UniqueIndexCheck::Cache,
     )
 }
 
@@ -1248,7 +1286,7 @@ fn check_index_key_tuple_size(
 /// non-unique named indexes (which uniqueness-only enforcement does not walk).
 pub(crate) fn check_index_tuple_sizes(
     storage: &Storage,
-    def: &TableDef,
+    def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
     values: &[Datum],
     txid: u32,
     arena: &Arena,
@@ -1263,7 +1301,7 @@ pub(crate) fn check_index_tuple_sizes(
 
 fn check_index_tuple_sizes_inner(
     storage: &Storage,
-    def: &TableDef,
+    def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
     values: &[Datum],
     txid: u32,
     arena: &Arena,
@@ -1371,25 +1409,136 @@ fn check_index_tuple_sizes_inner(
     Ok(())
 }
 
-/// Enforces every UNIQUE index on the table: a candidate row conflicts if some
-/// other visible row has an equal key under that index's NULL-equality rule
-/// (23505; a conflicting uncommitted row from another transaction waits).
-/// Named indexes share the same bounded acceleration cache as table
-/// constraints. CREATE INDEX validates against authoritative rows before its
-/// pending cache binding is prepared, and subsequent writes may use that
-/// binding while the creating transaction remains open.
+#[derive(Clone, Copy)]
+pub enum UniqueIndexCheck {
+    Cache,
+    Rebuild { selected: Option<i32> },
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn check_reindex_constraints(
+    storage: &Storage,
+    table_index: usize,
+    def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
+    schema: &[ColType],
+    values: &[Datum],
+    rowid: u64,
+    txid: u32,
+    arena: &Arena,
+    selected: Option<i32>,
+) -> Result<(), SqlError> {
+    for (column, metadata) in def.columns().iter().enumerate() {
+        if !metadata.unique
+            || selected.is_some_and(|oid| {
+                def.column_index_identity(column)
+                    .is_none_or(|identity| identity.oid() != oid)
+            })
+        {
+            continue;
+        }
+        let name = if metadata.primary {
+            ConstraintName::PrimaryFlag
+        } else {
+            ConstraintName::UniqueFlag(metadata.name.as_str())
+        };
+        enforce_key_uniqueness(
+            storage,
+            table_index,
+            def,
+            schema,
+            values,
+            Some(rowid),
+            txid,
+            &[column as u16],
+            false,
+            &name,
+            UniqueKeySource::Rows,
+        )?;
+    }
+    for key in def.uniques() {
+        if selected.is_some_and(|oid| {
+            key.index_identity
+                .is_none_or(|identity| identity.oid() != oid)
+        }) {
+            continue;
+        }
+        enforce_key_uniqueness(
+            storage,
+            table_index,
+            def,
+            schema,
+            values,
+            Some(rowid),
+            txid,
+            key.columns(),
+            key.kind.nulls_not_distinct(),
+            &ConstraintName::Named(key.name.as_str()),
+            UniqueKeySource::Rows,
+        )?;
+    }
+    for exclusion in def.exclusions() {
+        if selected.is_some_and(|oid| {
+            exclusion
+                .index_identity
+                .is_none_or(|identity| identity.oid() != oid)
+        }) {
+            continue;
+        }
+        let predicate = exclusion
+            .predicate
+            .map(|source| {
+                let source = arena
+                    .alloc_str(source.as_str())
+                    .map_err(|_| crate::sql::eval::arena_full())?;
+                crate::sql::parser::parse_expr(source, arena)
+            })
+            .transpose()?;
+        enforce_exclusion_constraint(
+            storage,
+            table_index,
+            def,
+            schema,
+            values,
+            Some(rowid),
+            txid,
+            exclusion,
+            predicate,
+            arena,
+            Some(storage.validation_read()),
+        )?;
+    }
+    check_unique_indexes(
+        storage,
+        table_index,
+        def,
+        schema,
+        values,
+        Some(rowid),
+        txid,
+        arena,
+        UniqueIndexCheck::Rebuild { selected },
+    )
+}
+
+/// Normal writes may probe the derived cache. Explicit rebuilding validates
+/// only its selected indexes against authoritative rows, including own writes.
 #[allow(clippy::too_many_arguments)]
 pub fn check_unique_indexes(
     storage: &Storage,
     table_index: usize,
-    def: &TableDef,
+    def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
     schema: &[ColType],
     values: &[Datum],
     self_rowid: Option<u64>,
     txid: u32,
     arena: &Arena,
+    check: UniqueIndexCheck,
 ) -> Result<(), SqlError> {
     for index in storage.unique_indexes_for(def.schema.as_str(), def.name.as_str(), txid) {
+        if matches!(check, UniqueIndexCheck::Rebuild { selected: Some(oid) } if oid != crate::sql::catalog::explicit_index_oid(&index))
+        {
+            continue;
+        }
         let icols = &index.columns[..index.n_cols];
         let index_name = index.name_for(txid);
         let name = ConstraintName::Named(index_name.as_str());
@@ -1411,9 +1560,10 @@ pub fn check_unique_indexes(
                 .iter()
                 .enumerate()
                 .any(|(position, column)| {
-                    index.collations[position] != def.columns[*column as usize].collation
+                    index.collations[position] != def.columns()[*column as usize].collation
                 });
-        if custom
+        if matches!(check, UniqueIndexCheck::Rebuild { .. })
+            || custom
             || custom_collation
             || index.expressions[..index.n_cols]
                 .iter()
@@ -1481,6 +1631,7 @@ pub fn check_unique_indexes(
                 icols,
                 index.nulls_not_distinct,
                 &name,
+                UniqueKeySource::Cache,
             )?;
         }
     }
@@ -1493,7 +1644,7 @@ pub(crate) type ParsedChecks<'a> =
 
 /// Re-parses every stored CHECK predicate once per statement into the arena.
 pub(crate) fn parse_checks<'a>(
-    def: &TableDef,
+    def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
     arena: &'a Arena,
 ) -> Result<ParsedChecks<'a>, SqlError> {
     let mut out: ParsedChecks<'a> =
@@ -1524,7 +1675,7 @@ pub(crate) type ParsedDefaults<'a> = [Option<&'a Expr<'a>>; MAX_COLUMNS];
 /// Generated columns are excluded — they are computed from the row by
 /// [`parse_generated`], not defaulted.
 pub(crate) fn parse_defaults<'a>(
-    def: &TableDef,
+    def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
     arena: &'a Arena,
     storage: &Storage,
     txid: u32,
@@ -1558,7 +1709,7 @@ pub(crate) fn parse_defaults<'a>(
 /// statement (indexed by column); `None` for non-generated columns. Evaluated
 /// against the row's other columns after they are filled.
 pub(crate) fn parse_generated<'a>(
-    def: &TableDef,
+    def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
     arena: &'a Arena,
 ) -> Result<ParsedDefaults<'a>, SqlError> {
     let mut out: ParsedDefaults<'a> = [None; MAX_COLUMNS];
@@ -1634,7 +1785,7 @@ impl ConstraintRow {
 pub(crate) fn enforce_row_constraints(
     storage: &Storage,
     table_index: usize,
-    def: &TableDef,
+    def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
     schema: &[ColType],
     values: &[Datum],
     row: ConstraintRow,
@@ -1741,7 +1892,7 @@ pub(crate) fn enforce_row_constraints(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn check_row_content(
     storage: &Storage,
-    def: &TableDef,
+    def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
     values: &[Datum],
     checks: &ParsedChecks,
     arena: &Arena,
@@ -1758,7 +1909,10 @@ pub(crate) fn check_row_content(
     Ok(())
 }
 
-fn check_detached_partition_bound(def: &TableDef, values: &[Datum]) -> Result<(), SqlError> {
+fn check_detached_partition_bound(
+    def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
+    values: &[Datum],
+) -> Result<(), SqlError> {
     if let Some(detached) = def.partition.detached_bound
         && !crate::storage::partition_bound_matches(
             detached.scheme.strategy,
@@ -1781,7 +1935,7 @@ fn check_detached_partition_bound(def: &TableDef, values: &[Datum]) -> Result<()
 /// is FALSE raises 23514; NULL and TRUE both pass, per SQL three-valued logic.
 fn check_row_checks(
     storage: &Storage,
-    def: &TableDef,
+    def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
     checks: &ParsedChecks,
     values: &[Datum],
     txid: u32,
@@ -1789,7 +1943,7 @@ fn check_row_checks(
     params: &[Datum],
 ) -> Result<(), SqlError> {
     let context = RowCtx {
-        def,
+        def: crate::storage::RelationDefinition::from_definition(def),
         values,
         alias: None,
     };
@@ -1825,7 +1979,7 @@ fn check_row_checks(
 /// column satisfies the constraint). Missing referent raises 23503.
 fn check_fk_child(
     storage: &Storage,
-    def: &TableDef,
+    def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
     values: &[Datum],
     txid: u32,
     read: ValidationRead,
@@ -1848,7 +2002,7 @@ fn check_or_defer_unique_keys(
     storage: &Storage,
     table_index: usize,
     constraint_table: usize,
-    def: &TableDef,
+    def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
     schema: &[ColType],
     values: &[Datum],
     row: ConstraintRow,
@@ -1876,6 +2030,7 @@ fn check_or_defer_unique_keys(
             key.columns(),
             key.kind.nulls_not_distinct(),
             &ConstraintName::Named(key.name.as_str()),
+            UniqueKeySource::Cache,
         )?;
     }
     Ok(())
@@ -1886,7 +2041,7 @@ fn check_or_defer_exclusions(
     storage: &Storage,
     table_index: usize,
     constraint_table: usize,
-    def: &TableDef,
+    def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
     schema: &[ColType],
     values: &[Datum],
     row: ConstraintRow,
@@ -1926,7 +2081,7 @@ fn check_or_defer_exclusions(
 fn enforce_exclusion_constraint(
     storage: &Storage,
     table_index: usize,
-    def: &TableDef,
+    def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
     _schema: &[ColType],
     values: &[Datum],
     self_rowid: Option<u64>,
@@ -1948,7 +2103,7 @@ fn enforce_exclusion_constraint(
             return Ok(true);
         };
         let context = RowCtx {
-            def,
+            def: crate::storage::RelationDefinition::from_definition(def),
             values: row,
             alias: None,
         };
@@ -2023,7 +2178,7 @@ fn enforce_exclusion_constraint(
 fn check_or_defer_fk_child(
     storage: &Storage,
     constraint_table: usize,
-    def: &TableDef,
+    def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
     values: &[Datum],
     row: ConstraintRow,
     txid: u32,
@@ -2053,7 +2208,7 @@ fn check_or_defer_fk_child(
 
 fn check_fk_child_one(
     storage: &Storage,
-    def: &TableDef,
+    def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
     fk: &crate::storage::ForeignKey,
     values: &[Datum],
     txid: u32,
@@ -2063,7 +2218,7 @@ fn check_fk_child_one(
 
 fn check_fk_child_one_at(
     storage: &Storage,
-    def: &TableDef,
+    def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
     fk: &crate::storage::ForeignKey,
     values: &[Datum],
     txid: u32,
@@ -2079,7 +2234,7 @@ fn check_fk_child_one_at(
             fk.name.as_str()
         ));
     };
-    let parent = *storage.table_def(parent_index, txid);
+    let parent = storage.table_def(parent_index, txid).clone();
     let mut schema = [ColType::Bool; MAX_COLUMNS];
     parent.schema(&mut schema);
     if parent_has_key(
@@ -2121,7 +2276,7 @@ pub(crate) fn validate_constraint_obligation(
     if table_index >= storage.table_count() || !storage.table(table_index).visible_to(txid) {
         return Ok(None);
     }
-    let definition = *storage.table_def(table_index, txid);
+    let definition = storage.table_def(table_index, txid).clone();
     let mut schema = [ColType::Bool; MAX_COLUMNS];
     definition.schema(&mut schema);
     let schema = &schema[..definition.n_columns];
@@ -2183,6 +2338,7 @@ pub(crate) fn validate_constraint_obligation(
                     key.columns(),
                     key.kind.nulls_not_distinct(),
                     &ConstraintName::Named(key.name.as_str()),
+                    UniqueKeySource::Cache,
                 )?;
             } else if let Some(foreign_key) = foreign_key {
                 if foreign_key.validation.enforced()
@@ -2241,7 +2397,7 @@ fn constraint_row_tables(
 pub(crate) fn validate_foreign_key_constraint(
     storage: &Storage,
     table_index: usize,
-    definition: &TableDef,
+    definition: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
     foreign_key: &crate::storage::ForeignKey,
     txid: u32,
     arena: &Arena,
@@ -2284,7 +2440,7 @@ pub(crate) fn validate_foreign_key_constraint(
 pub(crate) fn validate_check_constraint(
     storage: &Storage,
     table_index: usize,
-    definition: &TableDef,
+    definition: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
     check: &crate::storage::CheckConstraint,
     txid: u32,
     arena: &Arena,
@@ -2311,7 +2467,7 @@ pub(crate) fn validate_check_constraint(
                 arena,
                 &mut |_, values| {
                     let context = RowCtx {
-                        def: definition,
+                        def: crate::storage::RelationDefinition::from_definition(definition),
                         values,
                         alias: None,
                     };
@@ -2412,7 +2568,7 @@ pub(crate) fn constraint_timing(
 }
 
 fn named_constraint_timing(
-    definition: &TableDef,
+    definition: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
     name: &str,
 ) -> Option<crate::storage::ConstraintTiming> {
     if let Some(key) = definition
@@ -2580,13 +2736,13 @@ fn parent_has_key(
     txid: u32,
     read: Option<ValidationRead>,
 ) -> Result<bool, SqlError> {
-    let parent_definition = *storage.table_def(parent_index, txid);
+    let parent_definition = storage.table_def(parent_index, txid).clone();
     let mut found = false;
     constraint_row_tables(storage, parent_index, txid, |row_table| {
         if found {
             return Ok(());
         }
-        let physical = *storage.table_def(row_table, txid);
+        let physical = storage.table_def(row_table, txid).clone();
         let mapped = super::remap_columns(&physical, &parent_definition, parent_cols)?;
         let mut schema = [ColType::Bool; MAX_COLUMNS];
         physical.schema(&mut schema);
@@ -2684,7 +2840,7 @@ pub(crate) fn apply_fk_parent_actions(
                 "foreign key parent is not visible"
             )
         })?;
-    let physical_parent = *storage.table_def(parent_index, txn.txid);
+    let physical_parent = storage.table_def(parent_index, txn.txid).clone();
     for child_index in 0..storage.table_count() {
         if !storage.table(child_index).visible_to(txn.txid) {
             continue;
@@ -2709,7 +2865,7 @@ pub(crate) fn apply_fk_parent_actions(
                         "foreign key parent is not visible"
                     )
                 })?;
-            let declared_parent = *storage.table_def(declared_parent, txn.txid);
+            let declared_parent = storage.table_def(declared_parent, txn.txid).clone();
             let mapped =
                 super::remap_columns(&physical_parent, &declared_parent, fk.parent_cols())?;
             let parent_columns = &mapped[..fk.parent_cols().len()];
@@ -3043,12 +3199,12 @@ pub(crate) fn referenced_key_changed(
                 "foreign key parent is not visible"
             )
         })?;
-    let physical_parent = *storage.table_def(parent_index, txid);
+    let physical_parent = storage.table_def(parent_index, txid).clone();
     for column_index in 0..storage.table_count() {
         if !storage.table(column_index).visible_to(txid) {
             continue;
         }
-        let cdef = *storage.table_def(column_index, txid);
+        let cdef = storage.table_def(column_index, txid).clone();
         for fk in cdef.fkeys() {
             if !references_parent(storage, fk, parent_schema, parent_name, txid) {
                 continue;
@@ -3061,7 +3217,7 @@ pub(crate) fn referenced_key_changed(
                         "foreign key parent is not visible"
                     )
                 })?;
-            let declared_parent = *storage.table_def(declared_parent, txid);
+            let declared_parent = storage.table_def(declared_parent, txid).clone();
             let mapped =
                 super::remap_columns(&physical_parent, &declared_parent, fk.parent_cols())?;
             for (&child_column, &pc) in fk.columns().iter().zip(&mapped) {

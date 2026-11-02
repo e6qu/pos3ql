@@ -7228,7 +7228,7 @@ pub(crate) fn lock_result_row(
             };
             let slot = if scope
                 .defs
-                .get(table)
+                .stored(table)
                 .expect("locked source is resolved")
                 .partition
                 .is_partitioned()
@@ -9457,9 +9457,9 @@ fn materialize_composite_outputs<'a>(
 /// Column descriptions across the whole scope (wildcards expand every
 /// table).
 pub fn describe_scope_items<'q>(
-    items: &[SelectItem<'q>],
-    scope: &QueryScope<'q>,
-    outer_scope: Option<&QueryScope<'q>>,
+    items: &[SelectItem<'_>],
+    scope: &QueryScope<'_>,
+    outer_scope: Option<&QueryScope<'_>>,
     storage: &Storage,
     txid: u32,
     arena: &'q Arena,
@@ -9477,13 +9477,18 @@ pub fn describe_scope_items<'q>(
                         ));
                     }
                     let entry = scope.qualified_star_entry(q, index)?;
-                    out[n] = ColDesc::of_type(scope.output_name(entry), scope.output_type(entry))
-                        .with_type_mod(match entry {
-                            ResolvedColumn::Table(table, column) => {
-                                scope.defs.get(table).expect("resolved").columns[column].type_mod
-                            }
-                            ResolvedColumn::Merged(_) => -1,
-                        });
+                    out[n] = ColDesc::of_type(
+                        arena
+                            .alloc_str(scope.output_name(entry))
+                            .map_err(|_| arena_full())?,
+                        scope.output_type(entry),
+                    )
+                    .with_type_mod(match entry {
+                        ResolvedColumn::Table(table, column) => {
+                            scope.defs.get(table).expect("resolved").columns[column].type_mod
+                        }
+                        ResolvedColumn::Merged(_) => -1,
+                    });
                     out[n].collation = scope.output_collation(entry);
                     n += 1;
                 }
@@ -9497,13 +9502,18 @@ pub fn describe_scope_items<'q>(
                         ));
                     }
                     let entry = scope.star_entry(k);
-                    out[n] = ColDesc::of_type(scope.output_name(entry), scope.output_type(entry))
-                        .with_type_mod(match entry {
-                            ResolvedColumn::Table(t, c) => {
-                                scope.defs.get(t).expect("resolved").columns[c].type_mod
-                            }
-                            ResolvedColumn::Merged(_) => -1,
-                        });
+                    out[n] = ColDesc::of_type(
+                        arena
+                            .alloc_str(scope.output_name(entry))
+                            .map_err(|_| arena_full())?,
+                        scope.output_type(entry),
+                    )
+                    .with_type_mod(match entry {
+                        ResolvedColumn::Table(t, c) => {
+                            scope.defs.get(t).expect("resolved").columns[c].type_mod
+                        }
+                        ResolvedColumn::Merged(_) => -1,
+                    });
                     out[n].collation = scope.output_collation(entry);
                     n += 1;
                 }
@@ -9567,6 +9577,7 @@ pub fn describe_scope_items<'q>(
                     Expr::Cast { type_mod, .. } => *type_mod,
                     _ => field_meta.map_or(-1, |meta| meta.type_mod),
                 };
+                let name = arena.alloc_str(name).map_err(|_| arena_full())?;
                 out[n] = ColDesc::new(name, oid, typlen)
                     .with_type_mod(user_type.map_or(type_mod, |description| description.type_mod));
                 if let Some(ctype) = super::exec::coltype_of_oid(oid)
@@ -9603,12 +9614,20 @@ pub fn describe_catalog_items<'q>(
     arena: &'q Arena,
     out: &mut [ColDesc<'q>],
 ) -> Result<usize, SqlError> {
-    describe_catalog_items_as(items, definition, None, storage, txid, arena, out)
+    describe_catalog_items_as(
+        items,
+        definition.map(crate::storage::RelationDefinition::from_definition),
+        None,
+        storage,
+        txid,
+        arena,
+        out,
+    )
 }
 
 pub fn describe_catalog_items_as<'q>(
     items: &[SelectItem<'q>],
-    definition: Option<&'q TableDef>,
+    definition: Option<crate::storage::RelationDefinition<'q>>,
     alias: Option<&str>,
     storage: &'q Storage,
     txid: u32,
@@ -10396,22 +10415,29 @@ fn matching_user_type_description<'q>(
 /// scope, resolving whole-row bases to their table's columns. Returns the new
 /// column count.
 fn describe_scope_record_star<'q>(
-    base: &Expr<'q>,
-    scope: &QueryScope<'q>,
+    base: &Expr<'_>,
+    scope: &QueryScope<'_>,
     storage: &Storage,
     txid: u32,
     arena: &'q Arena,
     out: &mut [ColDesc<'q>],
     mut n: usize,
 ) -> Result<usize, SqlError> {
-    let mut push = |desc: ColDesc<'q>, n: &mut usize| -> Result<(), SqlError> {
+    let mut push = |desc: ColDesc<'_>, n: &mut usize| -> Result<(), SqlError> {
         if *n == out.len() {
             return Err(sql_err!(
                 sqlstate::TOO_MANY_COLUMNS,
                 "target lists can have at most 1664 entries"
             ));
         }
-        out[*n] = desc;
+        out[*n] = ColDesc {
+            name: arena.alloc_str(desc.name).map_err(|_| arena_full())?,
+            type_oid: desc.type_oid,
+            typlen: desc.typlen,
+            type_mod: desc.type_mod,
+            collation: desc.collation,
+            collation_derivation: desc.collation_derivation,
+        };
         *n += 1;
         Ok(())
     };
@@ -10526,11 +10552,8 @@ fn describe_scope_record_star<'q>(
                 &argument_oids[..args.len()],
                 index,
             ) {
-                let field_name = arena
-                    .alloc_str(field_name.as_str())
-                    .map_err(|_| arena_full())?;
                 push(
-                    ColDesc::of_type(field_name, meta.ctype)
+                    ColDesc::of_type(field_name.as_str(), meta.ctype)
                         .with_type_mod(meta.type_mod)
                         .with_collation(meta.collation),
                     &mut n,
@@ -10578,11 +10601,8 @@ fn describe_scope_record_star<'q>(
                         )
                     })?;
                 for field in definition.active_fields() {
-                    let name = arena
-                        .alloc_str(field.name.as_str())
-                        .map_err(|_| arena_full())?;
                     push(
-                        ColDesc::of_type(name, field.ctype)
+                        ColDesc::of_type(field.name.as_str(), field.ctype)
                             .with_type_mod(field.type_mod)
                             .with_collation(field.collation),
                         &mut n,
@@ -10601,18 +10621,13 @@ fn describe_scope_record_star<'q>(
                 if push_err.is_some() {
                     return;
                 }
-                match arena.alloc_str(field_name) {
-                    Ok(name) => {
-                        if let Err(error) = push(
-                            ColDesc::of_type(name, meta.ctype)
-                                .with_type_mod(meta.type_mod)
-                                .with_collation(meta.collation),
-                            &mut n,
-                        ) {
-                            push_err = Some(error);
-                        }
-                    }
-                    Err(_) => push_err = Some(arena_full()),
+                if let Err(error) = push(
+                    ColDesc::of_type(field_name, meta.ctype)
+                        .with_type_mod(meta.type_mod)
+                        .with_collation(meta.collation),
+                    &mut n,
+                ) {
+                    push_err = Some(error);
                 }
             });
             if let Some(error) = push_err {
@@ -10692,15 +10707,15 @@ impl super::exec::ColTypeResolver for ScopeCols<'_, '_> {
     }
 }
 
-pub(crate) struct CatalogScopeCols<'scope, 'definition, 'storage> {
+pub(crate) struct CatalogScopeCols<'scope, 'definition, 'outer_definition, 'storage> {
     pub(crate) scope: &'scope QueryScope<'definition>,
-    pub(crate) outer_scope: Option<&'scope QueryScope<'definition>>,
+    pub(crate) outer_scope: Option<&'scope QueryScope<'outer_definition>>,
     pub(crate) storage: &'storage Storage,
     pub(crate) txid: u32,
     pub(crate) arena: &'storage Arena,
 }
 
-impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_> {
+impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_, '_> {
     fn operator_first_argument_type(
         &self,
         name: &str,
@@ -10762,31 +10777,18 @@ impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_> {
         qualifier: Option<&str>,
         name: &str,
     ) -> Option<super::exec::StaticTypeMeta> {
-        let (scope, entry) = match self.scope.find_column(qualifier, name) {
-            Ok(entry) => (self.scope, entry),
+        match self.scope.find_column(qualifier, name) {
+            Ok(entry) => scope_column_metadata(self.scope, entry, self.storage, self.txid),
             Err(_) => {
                 let outer = self.outer_scope?;
-                (outer, outer.find_column(qualifier, name).ok()?)
-            }
-        };
-        let ctype = scope.output_type(entry);
-        let (type_oid, type_mod) = match entry {
-            scope::ResolvedColumn::Table(table, column) => {
-                let column = scope.defs.get(table)?.columns.get(column)?;
-                (
-                    self.storage
-                        .routine_type_oid(column.ctype, column.user_type, self.txid)?,
-                    column.type_mod,
+                scope_column_metadata(
+                    outer,
+                    outer.find_column(qualifier, name).ok()?,
+                    self.storage,
+                    self.txid,
                 )
             }
-            scope::ResolvedColumn::Merged(_) => (ctype.oid(), -1),
-        };
-        Some(super::exec::StaticTypeMeta {
-            ctype,
-            type_oid,
-            type_mod,
-            collation: scope.output_collation(entry),
-        })
+        }
     }
 
     fn domain_base_type(&self, type_oid: i32) -> Option<ColType> {
@@ -11056,92 +11058,113 @@ impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_> {
         name: &str,
         index: usize,
     ) -> Option<(crate::util::StackStr<64>, super::exec::StaticTypeMeta)> {
-        let scope = if self.scope.qualified_star_columns(name).is_ok() {
-            self.scope
+        fn field(
+            scope: &QueryScope<'_>,
+            name: &str,
+            index: usize,
+            storage: &Storage,
+            txid: u32,
+        ) -> Option<(crate::util::StackStr<64>, super::exec::StaticTypeMeta)> {
+            let entry = scope.qualified_star_entry(name, index).ok()?;
+            Some((
+                crate::util::StackStr::from_str(scope.output_name(entry)),
+                scope_column_metadata(scope, entry, storage, txid)?,
+            ))
+        }
+        if self.scope.qualified_star_columns(name).is_ok() {
+            field(self.scope, name, index, self.storage, self.txid)
         } else {
             let outer = self.outer_scope?;
             outer.qualified_star_columns(name).ok()?;
-            outer
-        };
-        let entry = scope.qualified_star_entry(name, index).ok()?;
-        let field_name = scope.output_name(entry);
-        let ctype = scope.output_type(entry);
-        let (type_oid, type_mod) = match entry {
-            scope::ResolvedColumn::Table(table, column) => {
-                let column = scope.defs.get(table)?.columns.get(column)?;
-                (
-                    self.storage
-                        .routine_type_oid(column.ctype, column.user_type, self.txid)?,
-                    column.type_mod,
-                )
-            }
-            scope::ResolvedColumn::Merged(_) => (ctype.oid(), -1),
-        };
-        Some((
-            crate::util::StackStr::from_str(field_name),
-            super::exec::StaticTypeMeta {
-                ctype,
-                type_oid,
-                type_mod,
-                collation: scope.output_collation(entry),
-            },
-        ))
+            field(outer, name, index, self.storage, self.txid)
+        }
     }
 
     fn record_column_handle(&self, qualifier: Option<&str>, name: &str) -> Option<i32> {
-        let (scope, entry) = match self.scope.find_column(qualifier, name) {
-            Ok(entry) => (self.scope, entry),
+        fn handle(scope: &QueryScope<'_>, entry: ResolvedColumn) -> Option<i32> {
+            if scope.output_type(entry) != ColType::Record {
+                return None;
+            }
+            match entry {
+                ResolvedColumn::Table(table, column) => {
+                    Some(scope.defs.get(table)?.columns[column].type_mod)
+                }
+                ResolvedColumn::Merged(_) => None,
+            }
+        }
+        match self.scope.find_column(qualifier, name) {
+            Ok(entry) => handle(self.scope, entry),
             Err(error)
                 if matches!(
                     error.sqlstate.as_str(),
                     sqlstate::UNDEFINED_COLUMN | sqlstate::UNDEFINED_TABLE
                 ) =>
             {
-                let scope = self.outer_scope?;
-                (scope, scope.find_column(qualifier, name).ok()?)
+                let outer = self.outer_scope?;
+                handle(outer, outer.find_column(qualifier, name).ok()?)
             }
-            Err(_) => return None,
-        };
-        if scope.output_type(entry) != ColType::Record {
-            return None;
-        }
-        match entry {
-            scope::ResolvedColumn::Table(table, column) => {
-                Some(scope.defs.get(table)?.columns[column].type_mod)
-            }
-            _ => None,
+            Err(_) => None,
         }
     }
 }
 
-fn scope_column_type_mod<'a>(
-    scope: &QueryScope<'a>,
-    outer_scope: Option<&QueryScope<'a>>,
+fn scope_column_metadata(
+    scope: &QueryScope<'_>,
+    entry: ResolvedColumn,
+    storage: &Storage,
+    txid: u32,
+) -> Option<super::exec::StaticTypeMeta> {
+    let ctype = scope.output_type(entry);
+    let (type_oid, type_mod) = match entry {
+        ResolvedColumn::Table(table, column) => {
+            let column = scope.defs.get(table)?.columns.get(column)?;
+            (
+                storage.routine_type_oid(column.ctype, column.user_type, txid)?,
+                column.type_mod,
+            )
+        }
+        ResolvedColumn::Merged(_) => (ctype.oid(), -1),
+    };
+    Some(super::exec::StaticTypeMeta {
+        ctype,
+        type_oid,
+        type_mod,
+        collation: scope.output_collation(entry),
+    })
+}
+
+fn scope_column_type_mod(
+    scope: &QueryScope<'_>,
+    outer_scope: Option<&QueryScope<'_>>,
     qualifier: Option<&str>,
     name: &str,
 ) -> i32 {
-    let found = match scope.find_column(qualifier, name) {
-        Ok(entry) => Some((scope, entry)),
+    fn modifier(scope: &QueryScope<'_>, entry: ResolvedColumn) -> i32 {
+        match entry {
+            ResolvedColumn::Table(table, column) => {
+                scope.defs.get(table).expect("resolved").columns[column].type_mod
+            }
+            ResolvedColumn::Merged(_) => -1,
+        }
+    }
+    match scope.find_column(qualifier, name) {
+        Ok(entry) => modifier(scope, entry),
         Err(error)
             if matches!(
                 error.sqlstate.as_str(),
                 sqlstate::UNDEFINED_COLUMN | sqlstate::UNDEFINED_TABLE
             ) =>
         {
-            outer_scope.and_then(|scope| {
-                scope
-                    .find_column(qualifier, name)
-                    .ok()
-                    .map(|entry| (scope, entry))
-            })
+            outer_scope
+                .and_then(|outer| {
+                    outer
+                        .find_column(qualifier, name)
+                        .ok()
+                        .map(|entry| modifier(outer, entry))
+                })
+                .unwrap_or(-1)
         }
-        Err(_) => None,
-    };
-    match found {
-        Some((scope, ResolvedColumn::Table(table, column))) => {
-            scope.defs.get(table).expect("resolved").columns[column].type_mod
-        }
-        _ => -1,
+        Err(_) => -1,
     }
 }
 

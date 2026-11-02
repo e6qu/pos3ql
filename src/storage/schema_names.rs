@@ -133,7 +133,7 @@ impl SchemaNameTarget {
     pub(crate) fn rewrite_table(
         self,
         name: SqlName,
-        definition: &mut super::TableDef,
+        definition: &mut super::TableDefBuilder,
         arena: &crate::mem::arena::Arena,
     ) -> Result<bool, SqlError> {
         let mut changed = super::rename_schema_name(&mut definition.schema, self.name, name);
@@ -630,7 +630,7 @@ mod tests {
         let mut budget = test_budget(&config);
         let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let public = storage.find_schema("public").unwrap();
-        let mut definition = super::super::TableDef::empty();
+        let mut definition = super::super::TableDefBuilder::empty();
         definition.schema = SqlName::parse("public").unwrap();
         definition.name = SqlName::parse("namespace_bound_table").unwrap();
         let table = storage.create_table(definition).unwrap();

@@ -13,6 +13,8 @@ use super::table_names::{
     DefinitionWrite, IdentityWrite, NameIdentity, TableNameScope, TableNames,
 };
 
+#[cfg(test)]
+use super::TableDefBuilder;
 use super::{
     CatalogDdlState, DatabaseOid, MAX_COLUMNS, Ownership, PendingTableDef, PendingTableDefSlot,
     TableDef,
@@ -29,6 +31,7 @@ pub(super) struct DefinitionState {
     pub(super) pending: Option<PendingDefinitionHead>,
     /// A CREATE RULE changes the visible history only for its transaction.
     pub(super) pending_has_rules_txid: Option<u32>,
+    publication_owner: Option<u32>,
 }
 
 impl DefinitionState {
@@ -54,6 +57,26 @@ impl DefinitionState {
         self.committed.has_rules = true;
     }
 
+    pub(super) fn claim_publication(&mut self, transaction: u32) -> Result<(), u32> {
+        if let Some(owner) = self.publication_owner
+            && owner != transaction
+        {
+            return Err(owner);
+        }
+        self.publication_owner = Some(transaction);
+        Ok(())
+    }
+
+    pub(super) fn release_publication(&mut self, transaction: u32) {
+        if self.publication_owner == Some(transaction) {
+            self.publication_owner = None;
+        }
+    }
+
+    pub(super) fn publication_owner(&self) -> Option<u32> {
+        self.publication_owner
+    }
+
     pub(super) fn locked_by_other(&self, transaction: u32) -> Option<u32> {
         self.identity
             .existence
@@ -61,6 +84,7 @@ impl DefinitionState {
             .into_iter()
             .chain(self.pending.map(|head| head.transaction))
             .chain(self.pending_has_rules_txid)
+            .chain(self.publication_owner)
             .find(|&owner| owner != transaction)
     }
 }
@@ -111,6 +135,7 @@ impl TableDefinition {
             committed_revision: TableDefinitionRevision::INITIAL,
             pending: None,
             pending_has_rules_txid: None,
+            publication_owner: None,
         };
         let names = TableNames::from_state(&state);
         Self {
@@ -242,6 +267,29 @@ struct DefinitionVersionCell(UnsafeCell<MaybeUninit<PendingTableDefSlot>>);
 // occupied bit is published; read guards prevent retirement and reuse.
 unsafe impl Sync for DefinitionVersionCell {}
 
+struct PreparedPendingDefinition {
+    slot: u32,
+    revision: u64,
+    replacement: Option<TableDef>,
+}
+
+pub(super) struct PreparedDefinitionReplacements {
+    source: super::catalog_sources::CatalogObjectIdentity,
+    database: DatabaseOid,
+    created_at: u64,
+    ddl_version: u64,
+    existence: CatalogDdlState,
+    committed_revision: TableDefinitionRevision,
+    committed: Option<TableDef>,
+    pending: crate::mem::lease_pool::SharedSlice<PreparedPendingDefinition>,
+}
+
+impl PreparedDefinitionReplacements {
+    pub(super) fn changed(&self) -> bool {
+        self.committed.is_some() || self.pending.iter().any(|entry| entry.replacement.is_some())
+    }
+}
+
 /// Dense locks initialize at startup; wide payload pages are touched only by
 /// staged definitions. The complete payload capacity is still startup-charged.
 pub(super) struct DefinitionVersions {
@@ -256,8 +304,9 @@ impl DefinitionVersions {
     }
 
     pub(super) const fn budget_bytes(capacity: usize) -> usize {
-        Self::control_bytes()
-            + capacity * (size_of::<RwLock<bool>>() + size_of::<DefinitionVersionCell>())
+        Self::control_bytes().saturating_add(capacity.saturating_mul(
+            size_of::<RwLock<bool>>().saturating_add(size_of::<DefinitionVersionCell>()),
+        ))
     }
 
     pub(super) fn new(budget: &mut Budget, capacity: usize) -> Result<Self, BudgetError> {
@@ -303,36 +352,6 @@ impl DefinitionVersions {
         }
     }
 
-    fn exclusive_slot(&mut self, slot: usize) -> &mut PendingTableDefSlot {
-        assert!(
-            *self.slots[slot]
-                .get_mut()
-                .expect("definition slot lock poisoned"),
-            "published definition slot exists"
-        );
-        // SAFETY: exclusive pool ownership excludes all slot guards; occupancy
-        // proves this payload was initialized before its link was published.
-        unsafe { self.images[slot].0.get_mut().assume_init_mut() }
-    }
-
-    pub(super) fn validate_schema_rename(
-        &self,
-        definition: &TableDefinition,
-        prior: super::SqlName,
-        name: super::SqlName,
-        arena: &crate::mem::arena::Arena,
-    ) -> Result<(), SqlError> {
-        let state = definition.read();
-        let mut tail = state.pending.map(|head| head.tail);
-        while let Some(slot) = tail {
-            let entry = self.read(slot as usize);
-            let mut copied = entry.version.def;
-            super::rename_table_sql_identity(&mut copied, prior, name, arena)?;
-            tail = entry.previous;
-        }
-        Ok(())
-    }
-
     pub(super) fn references_type(
         &self,
         state: &DefinitionState,
@@ -371,72 +390,130 @@ impl DefinitionVersions {
         false
     }
 
-    pub(super) fn move_table_references_locked(
+    /// Allocates every replacement while the original definition owner is held.
+    /// The caller must retain this complete plan through its durability boundary.
+    pub(super) fn prepare_replacements_locked(
         &self,
-        state: &mut DefinitionState,
-        movement: super::table_publication::TableReferenceMove,
-        revision: TableDefinitionRevision,
-    ) -> bool {
-        let mut changed = movement.rewrite(state.edit_committed(revision));
+        state: &DefinitionState,
+        source: super::catalog_sources::CatalogObjectIdentity,
+        pool: &std::sync::Arc<crate::mem::lease_pool::LeasePool>,
+        mut rewrite: impl FnMut(&TableDef) -> Result<Option<TableDef>, SqlError>,
+    ) -> Result<PreparedDefinitionReplacements, SqlError> {
+        let committed = rewrite(state.committed())?;
+        let count = state
+            .pending
+            .map_or(0, |head| self.read(head.tail as usize).depth as usize);
+        let mut pending = pool
+            .lease(count)
+            .map_err(|error| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "{}", error))?;
         let mut tail = state.pending.map(|head| head.tail);
         while let Some(slot) = tail {
-            let mut owner = self.write(slot as usize);
-            let entry = owner.as_mut().expect("published definition slot exists");
-            changed |= movement.rewrite(&mut entry.version.def);
+            let entry = self.read(slot as usize);
+            let replacement = rewrite(&entry.version.def)?;
+            pending
+                .push_reserved(PreparedPendingDefinition {
+                    slot,
+                    revision: entry.version.revision,
+                    replacement,
+                })
+                .expect("reserved pending-definition count covers the locked chain");
             tail = entry.previous;
         }
-        changed
+        Ok(PreparedDefinitionReplacements {
+            source,
+            database: state.identity.database,
+            created_at: state.identity.created_at,
+            ddl_version: state.identity.ddl_version,
+            existence: state.identity.existence,
+            committed_revision: state.committed_revision,
+            committed,
+            pending: pending.freeze(),
+        })
     }
 
-    pub(super) fn move_type_references_locked(
+    pub(super) fn validate_replacements_locked(
         &self,
-        state: &mut DefinitionState,
-        movement: super::type_reference_moves::TypeReferenceMove,
-        revision: TableDefinitionRevision,
-    ) -> bool {
-        let mut changed = movement.rewrite_definition(state.edit_committed(revision));
-        let mut tail = state.pending.map(|head| head.tail);
-        while let Some(slot) = tail {
-            let mut owner = self.write(slot as usize);
-            let entry = owner.as_mut().expect("published definition slot exists");
-            changed |= movement.rewrite_definition(&mut entry.version.def);
-            tail = entry.previous;
-        }
-        changed
-    }
-
-    /// Exclusive rewriting keeps the cached latest name aligned with its slot.
-    pub(super) fn rename_schema(
-        &mut self,
-        definition: &mut TableDefinition,
-        prior: super::SqlName,
-        name: super::SqlName,
-        arena: &crate::mem::arena::Arena,
+        state: &DefinitionState,
+        expected_source: super::catalog_sources::CatalogObjectIdentity,
+        prepared: &PreparedDefinitionReplacements,
     ) -> Result<(), SqlError> {
-        let mut state = definition.exclusive();
-        let result: Result<(), SqlError> = (|| {
-            let mut tail = state.pending.map(|head| head.tail);
-            while let Some(slot) = tail {
-                let entry = self.exclusive_slot(slot as usize);
-                let pending = &mut entry.version;
-                super::rename_schema_name(&mut pending.def.schema, prior, name);
-                for column in pending.def.columns.iter_mut().take(pending.def.n_columns) {
-                    super::rename_user_type_schema(&mut column.user_type, prior, name);
-                }
-                for key in pending.def.fkeys.iter_mut().take(pending.def.n_fkeys) {
-                    super::rename_schema_name(&mut key.parent_schema, prior, name);
-                }
-                super::rename_table_sql_identity(&mut pending.def, prior, name, arena)?;
-                tail = entry.previous;
+        if expected_source != prepared.source
+            || state.identity.database != prepared.database
+            || state.identity.created_at != prepared.created_at
+            || state.identity.ddl_version != prepared.ddl_version
+            || (state.identity.existence != prepared.existence
+                && !matches!((prepared.existence, state.identity.existence),
+                    (CatalogDdlState::PendingCreate { txid }, CatalogDdlState::Present)
+                        if state.publication_owner() == Some(txid)))
+            || state.committed_revision != prepared.committed_revision
+        {
+            return Err(sql_err!(
+                sqlstate::SERIALIZATION_FAILURE,
+                "table definition changed after replacement preparation"
+            ));
+        }
+        let mut tail = state.pending.map(|head| head.tail);
+        let mut captured = prepared.pending.iter();
+        while let Some(slot) = tail {
+            let current = self.read(slot as usize);
+            if !captured
+                .any(|entry| entry.slot == slot && entry.revision == current.version.revision)
+            {
+                return Err(sql_err!(
+                    sqlstate::SERIALIZATION_FAILURE,
+                    "pending table definition changed after replacement preparation"
+                ));
             }
-            Ok(())
-        })();
+            tail = current.previous;
+        }
+        Ok(())
+    }
+
+    /// Applies only fully reserved replacements under the validated owner.
+    pub(super) fn apply_replacements_locked(
+        &self,
+        state: &mut DefinitionState,
+        expected_source: super::catalog_sources::CatalogObjectIdentity,
+        prepared: PreparedDefinitionReplacements,
+        revision: TableDefinitionRevision,
+    ) -> bool {
+        self.validate_replacements_locked(state, expected_source, &prepared)
+            .expect("prepared definitions retain their validated publication owner");
+        let mut changed = prepared.committed.is_some();
+        if let Some(committed) = prepared.committed {
+            *state.edit_committed(revision) = committed;
+        }
+        let mut tail = state.pending.map(|head| head.tail);
+        while let Some(slot) = tail {
+            let current = self.read(slot as usize);
+            let selected_revision = current.version.revision;
+            let next = current.previous;
+            drop(current);
+            let captured = prepared
+                .pending
+                .iter()
+                .find(|entry| entry.slot == slot && entry.revision == selected_revision)
+                .expect("validated pending definition has a captured source");
+            if let Some(replacement) = &captured.replacement {
+                let mut owner = self.write(slot as usize);
+                owner
+                    .as_mut()
+                    .expect("validated pending definition exists")
+                    .version
+                    .def = replacement.clone();
+                changed = true;
+            }
+            tail = next;
+        }
+        if changed {
+            state.committed_revision = revision;
+        }
         if let Some(head) = &mut state.pending {
             let latest = self.read(head.tail as usize);
             head.schema = latest.version.def.schema;
             head.name = latest.version.def.name;
         }
-        result
+        changed
     }
 
     #[cfg(test)]
@@ -494,6 +571,8 @@ impl DefinitionVersions {
                 )
             })?;
             let transaction = version.txid;
+            let schema = version.def.schema;
+            let name = version.def.name;
             self.write(slot).install(PendingTableDefSlot {
                 previous,
                 depth,
@@ -502,8 +581,8 @@ impl DefinitionVersions {
             state.pending = Some(PendingDefinitionHead {
                 tail,
                 transaction,
-                schema: version.def.schema,
-                name: version.def.name,
+                schema,
+                name,
             });
             *cursor = (slot + 1) % self.slots.len();
             return Ok(());
@@ -517,7 +596,7 @@ impl DefinitionVersions {
     pub(super) fn latest_locked(&self, state: &DefinitionState) -> Option<PendingTableDef> {
         state
             .pending
-            .map(|head| self.read(head.tail as usize).version)
+            .map(|head| self.read(head.tail as usize).version.clone())
     }
 
     pub(super) fn try_for_each_locked(
@@ -714,6 +793,17 @@ impl DefinitionVersions {
     #[cfg(test)]
     pub(super) fn capacity(&self) -> usize {
         self.slots.len()
+    }
+}
+
+impl Drop for DefinitionVersions {
+    fn drop(&mut self) {
+        for (occupied, image) in self.slots.iter_mut().zip(self.images.iter_mut()) {
+            if *occupied.get_mut().expect("definition slot lock poisoned") {
+                // Exclusive pool ownership excludes every slot guard.
+                unsafe { image.0.get_mut().assume_init_drop() };
+            }
+        }
     }
 }
 
@@ -919,13 +1009,24 @@ mod tests {
     use super::super::{ColumnMeta, MAX_COLUMNS, SqlName};
     use super::*;
 
-    fn definition(epoch: usize) -> TableDef {
-        let mut definition = TableDef::empty();
+    fn metadata_pool() -> std::sync::Arc<crate::mem::lease_pool::LeasePool> {
+        use crate::mem::lease_pool::{LeasePool, Purpose};
+        let bytes = 4 * 1024 * 1024;
+        let mut budget = Budget::new(LeasePool::budget_bytes(bytes, 1024));
+        LeasePool::new(&mut budget, Purpose::TABLE_METADATA, bytes, 1024).unwrap()
+    }
+
+    fn definition(
+        epoch: usize,
+        pool: &std::sync::Arc<crate::mem::lease_pool::LeasePool>,
+    ) -> TableDef {
+        let mut definition = TableDefBuilder::empty();
         definition.name = SqlName::parse("guarded").unwrap();
         definition.n_columns = epoch;
         definition.has_toast = epoch % 2 == 1;
         definition.columns[0] = ColumnMeta::EMPTY;
-        definition
+        definition.attributes.initialize(epoch).unwrap();
+        definition.freeze(pool).unwrap()
     }
 
     fn versions(capacity: usize) -> DefinitionVersions {
@@ -936,13 +1037,17 @@ mod tests {
         versions
     }
 
-    fn pending(epoch: usize, transaction: u32) -> PendingTableDef {
+    fn pending(
+        epoch: usize,
+        transaction: u32,
+        pool: &std::sync::Arc<crate::mem::lease_pool::LeasePool>,
+    ) -> PendingTableDef {
         PendingTableDef {
             txid: transaction,
             revision: epoch as u64 + 1,
-            def: definition(epoch),
-            transition: [u16::MAX; MAX_COLUMNS],
-            column_mapping: [None; MAX_COLUMNS],
+            def: definition(epoch, pool),
+            transition: crate::mem::lease_pool::SharedSlice::EMPTY,
+            column_mapping: crate::mem::lease_pool::SharedSlice::EMPTY,
             rewrites_rows: false,
             class_tuple_private: true,
         }
@@ -979,7 +1084,7 @@ mod tests {
             let (slot, prior) = storage
                 .stage_constraint_comment_rename(table, schema, original, renamed, 7)
                 .unwrap();
-            let mut changed = *storage.table_def(table, 7);
+            let mut changed = TableDefBuilder::from_definition(&storage.table_def(table, 7));
             changed.schema = SqlName::parse("moved").unwrap();
             let mut mapping = [None; MAX_COLUMNS];
             mapping[0] = Some(SqlName::parse("id").unwrap());
@@ -1043,16 +1148,17 @@ mod tests {
 
     #[test]
     fn table_definition_cells_keep_readers_initialized_through_retirement_and_reuse() {
+        let pool = metadata_pool();
         let versions = versions(1);
-        let first = TableDefinition::new(definition(1));
-        let other = TableDefinition::new(definition(1));
+        let first = TableDefinition::new(definition(1, &pool));
+        let other = TableDefinition::new(definition(1, &pool));
         crate::mem::guard::forbid_alloc(|| {
-            versions.stage(&first, pending(2, 7), 8).unwrap();
+            versions.stage(&first, pending(2, 7, &pool), 8).unwrap();
             let retained = PendingDefinitionRead::current(&first, &versions).unwrap();
             assert_eq!(retained.def.n_columns, 2);
             assert_eq!(
                 versions
-                    .stage(&other, pending(3, 9), 8)
+                    .stage(&other, pending(3, 9, &pool), 8)
                     .unwrap_err()
                     .sqlstate,
                 sqlstate::PROGRAM_LIMIT_EXCEEDED
@@ -1063,7 +1169,7 @@ mod tests {
             drop(retained);
             assert!(versions.rollback(&first, 7));
             assert!(!*versions.slots[slot].read().unwrap());
-            versions.stage(&other, pending(3, 9), 8).unwrap();
+            versions.stage(&other, pending(3, 9, &pool), 8).unwrap();
             assert_eq!(
                 PendingDefinitionRead::current(&other, &versions)
                     .unwrap()
@@ -1078,10 +1184,11 @@ mod tests {
 
     #[test]
     fn live_definition_ownership_retains_committed_and_transaction_views() {
+        let pool = metadata_pool();
         let versions = versions(2);
-        let table = TableDefinition::new(definition(1));
+        let table = TableDefinition::new(definition(1, &pool));
         crate::mem::guard::forbid_alloc(|| {
-            versions.stage(&table, pending(2, 7), 8).unwrap();
+            versions.stage(&table, pending(2, 7, &pool), 8).unwrap();
             let committed = TableDefinitionRead::visible(&table, &versions, 8);
             assert_eq!(committed.n_columns, 1);
             assert!(table.test_write().is_err());
@@ -1106,13 +1213,14 @@ mod tests {
 
     #[test]
     fn live_definition_ownership_exhaustion_rollback_and_slot_reuse_are_atomic() {
+        let pool = metadata_pool();
         let versions = versions(2);
-        let table = TableDefinition::new(definition(1));
-        let other = TableDefinition::new(definition(1));
+        let table = TableDefinition::new(definition(1, &pool));
+        let other = TableDefinition::new(definition(1, &pool));
         crate::mem::guard::forbid_alloc(|| {
-            versions.stage(&table, pending(2, 7), 2).unwrap();
-            versions.stage(&table, pending(3, 7), 2).unwrap();
-            let error = versions.stage(&table, pending(4, 7), 2).unwrap_err();
+            versions.stage(&table, pending(2, 7, &pool), 2).unwrap();
+            versions.stage(&table, pending(3, 7, &pool), 2).unwrap();
+            let error = versions.stage(&table, pending(4, 7, &pool), 2).unwrap_err();
             assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
             assert!(
                 error
@@ -1124,7 +1232,7 @@ mod tests {
                 TableDefinitionRead::visible(&table, &versions, 7).n_columns,
                 3
             );
-            let error = versions.stage(&other, pending(5, 9), 2).unwrap_err();
+            let error = versions.stage(&other, pending(5, 9, &pool), 2).unwrap_err();
             assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
             assert!(
                 error
@@ -1139,22 +1247,22 @@ mod tests {
                 TableDefinitionRead::visible(&table, &versions, 7).n_columns,
                 2
             );
-            versions.stage(&other, pending(5, 9), 2).unwrap();
+            versions.stage(&other, pending(5, 9, &pool), 2).unwrap();
             assert!(versions.rollback(&table, 7));
             assert_eq!(
                 TableDefinitionRead::visible(&table, &versions, 7).n_columns,
                 1
             );
-            let error = versions.stage(&other, pending(6, 8), 2).unwrap_err();
+            let error = versions.stage(&other, pending(6, 8, &pool), 2).unwrap_err();
             assert_eq!(error.sqlstate, sqlstate::SERIALIZATION_FAILURE);
             assert_eq!(
                 TableDefinitionRead::visible(&other, &versions, 9).n_columns,
                 5
             );
-            versions.stage(&other, pending(6, 9), 2).unwrap();
+            versions.stage(&other, pending(6, 9, &pool), 2).unwrap();
             versions.clear(&other);
             assert!(PendingDefinitionRead::current(&other, &versions).is_none());
-            versions.stage(&table, pending(7, 11), 2).unwrap();
+            versions.stage(&table, pending(7, 11, &pool), 2).unwrap();
             assert_eq!(
                 TableDefinitionRead::visible(&table, &versions, 7).n_columns,
                 1
@@ -1170,25 +1278,28 @@ mod tests {
 
     #[test]
     fn live_definition_ownership_reader_allows_unrelated_publication_and_retirement() {
+        let pool = metadata_pool();
         use std::sync::mpsc;
         use std::time::Duration;
         let versions = versions(4);
-        let retained_table = TableDefinition::new(definition(1));
-        let other = TableDefinition::new(definition(1));
-        versions.stage(&retained_table, pending(2, 7), 8).unwrap();
+        let retained_table = TableDefinition::new(definition(1, &pool));
+        let other = TableDefinition::new(definition(1, &pool));
+        versions
+            .stage(&retained_table, pending(2, 7, &pool), 8)
+            .unwrap();
         let retained = PendingDefinitionRead::current(&retained_table, &versions).unwrap();
         let (sender, receiver) = mpsc::sync_channel(1);
         std::thread::scope(|scope| {
             let writer = scope.spawn(|| {
                 let result = crate::mem::guard::forbid_alloc(|| {
                     for epoch in 2..=50 {
-                        versions.stage(&other, pending(epoch, 9), 8)?;
+                        versions.stage(&other, pending(epoch, 9, &pool), 8)?;
                         assert_eq!(
                             TableDefinitionRead::visible(&other, &versions, 9).n_columns,
                             epoch
                         );
                         assert!(versions.rollback(&other, 9));
-                        versions.stage(&other, pending(epoch + 1, 9), 8)?;
+                        versions.stage(&other, pending(epoch + 1, 9, &pool), 8)?;
                         versions.clear(&other);
                     }
                     Ok::<(), SqlError>(())
@@ -1206,15 +1317,16 @@ mod tests {
 
     #[test]
     fn table_catalog_lifecycle_concurrent_readers_retain_one_identity_and_definition() {
+        let pool = metadata_pool();
         let versions = versions(2);
-        let table = TableDefinition::new(definition(1));
+        let table = TableDefinition::new(definition(1, &pool));
         {
             let mut state = table.write();
             state.identity.created_at = 1;
             state.identity.ownership.owner = 1;
             state.identity.existence = CatalogDdlState::Present;
         }
-        versions.stage(&table, pending(2, 7), 8).unwrap();
+        versions.stage(&table, pending(2, 7, &pool), 8).unwrap();
         let start = std::sync::Barrier::new(4);
         std::thread::scope(|scope| {
             for _ in 0..3 {
@@ -1288,7 +1400,7 @@ mod tests {
                     versions.clear_locked(&mut state);
                     let stamp = epoch * 2 + 1;
                     *state.edit_committed(TableDefinitionRevision::catalog(stamp as u64)) =
-                        definition(stamp);
+                        definition(stamp, &pool);
                     state.identity.created_at = stamp as u64;
                     state.identity.ownership.owner = (stamp % 4) as u16;
                     state.identity.database = if stamp % 4 == 1 {
@@ -1305,7 +1417,7 @@ mod tests {
                         _ => CatalogDdlState::Absent,
                     };
                     versions
-                        .stage_locked(&mut state, pending(stamp + 1, transaction), 8)
+                        .stage_locked(&mut state, pending(stamp + 1, transaction, &pool), 8)
                         .unwrap();
                 }
             });
@@ -1323,15 +1435,17 @@ mod tests {
 
     #[test]
     fn live_definition_ownership_independent_writers_share_capacity_without_aliasing() {
+        let pool = metadata_pool();
         const WRITERS: usize = 4;
         let versions = versions(WRITERS * 2);
         let tables: [TableDefinition; WRITERS] =
-            std::array::from_fn(|_| TableDefinition::new(definition(1)));
+            std::array::from_fn(|_| TableDefinition::new(definition(1, &pool)));
         let start = std::sync::Barrier::new(WRITERS);
         std::thread::scope(|scope| {
             for (worker, table) in tables.iter().enumerate() {
                 let versions = &versions;
                 let start = &start;
+                let pool = &pool;
                 scope.spawn(move || {
                     start.wait();
                     crate::mem::guard::forbid_alloc(|| {
@@ -1339,10 +1453,10 @@ mod tests {
                         for epoch in 1..=100 {
                             let width = (worker + 1) * 100 + epoch;
                             versions
-                                .stage(table, pending(width, transaction), 2)
+                                .stage(table, pending(width, transaction, pool), 2)
                                 .unwrap();
                             versions
-                                .stage(table, pending(width + 1, transaction), 2)
+                                .stage(table, pending(width + 1, transaction, pool), 2)
                                 .unwrap();
                             assert_eq!(
                                 TableDefinitionRead::visible(table, versions, transaction)
@@ -1374,6 +1488,7 @@ mod tests {
 
     #[test]
     fn live_definition_ownership_controls_and_pending_capacity_are_exactly_charged() {
+        let pool = metadata_pool();
         let _ = versions(2);
         let mut short = Budget::new(DefinitionVersions::control_bytes() - 1);
         let error = match DefinitionVersions::new(&mut short, 0) {
@@ -1388,9 +1503,9 @@ mod tests {
         };
         assert_eq!(error.what, "pending_table_defs");
         let empty = versions(0);
-        let table = TableDefinition::new(definition(1));
+        let table = TableDefinition::new(definition(1, &pool));
         crate::mem::guard::forbid_alloc(|| {
-            let error = empty.stage(&table, pending(2, 7), 8).unwrap_err();
+            let error = empty.stage(&table, pending(2, 7, &pool), 8).unwrap_err();
             assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
             assert!(
                 error
@@ -1399,6 +1514,178 @@ mod tests {
                     .contains("pending table-definition pool")
             );
             assert!(table.read().pending.is_none());
+        });
+    }
+
+    #[test]
+    fn prepared_definition_replacements_preserve_old_pins_and_validate_the_source() {
+        use super::super::tests::{make_def, test_budget, test_config};
+        use crate::sql::types::ColType;
+        let config = test_config();
+        let mut first_budget = test_budget(&config);
+        let mut first_storage = super::super::Storage::new(&config, &mut first_budget, 0).unwrap();
+        let mut second_budget = test_budget(&config);
+        let mut second_storage =
+            super::super::Storage::new(&config, &mut second_budget, 0).unwrap();
+        let first = first_storage
+            .create_table(make_def("guarded", &[("id", ColType::Int4, false)]))
+            .unwrap();
+        let second = second_storage
+            .create_table(make_def("guarded", &[("id", ColType::Int4, false)]))
+            .unwrap();
+        let identity = first_storage.tables[first].identity();
+        let source = first_storage.catalog_object_identity(
+            super::super::catalog_sources::CatalogObjectSlot::Table(first),
+            identity.database,
+            identity.created_at,
+        );
+        let other_slot = first_storage.catalog_object_identity(
+            super::super::catalog_sources::CatalogObjectSlot::Table(first + 1),
+            identity.database,
+            identity.created_at,
+        );
+        let second_identity = second_storage.tables[second].identity();
+        assert_eq!(first, second);
+        assert_eq!(identity.database, second_identity.database);
+        assert_eq!(identity.created_at, second_identity.created_at);
+        let other_origin = second_storage.catalog_object_identity(
+            super::super::catalog_sources::CatalogObjectSlot::Table(second),
+            second_identity.database,
+            second_identity.created_at,
+        );
+        let pool = &first_storage.metadata_pool;
+        let versions = &first_storage.pending_table_defs;
+        let table = &first_storage.tables[first].definition;
+        versions.stage(table, pending(2, 7, pool), 8).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let prior = {
+                let owner = TableDefinitionRead::visible(table, versions, 7);
+                (*owner).clone()
+            };
+            let mut state = table.write();
+            let prepared = versions
+                .prepare_replacements_locked(&state, source, pool, |original| {
+                    let mut candidate = TableDefBuilder::from_definition(original);
+                    candidate.name = SqlName::parse("replacement").unwrap();
+                    Ok(Some(candidate.freeze(pool)?))
+                })
+                .unwrap();
+            assert!(prepared.changed());
+            for wrong_source in [other_slot, other_origin] {
+                assert_eq!(
+                    versions
+                        .validate_replacements_locked(&state, wrong_source, &prepared)
+                        .err()
+                        .unwrap()
+                        .sqlstate,
+                    sqlstate::SERIALIZATION_FAILURE
+                );
+            }
+            let original_revision = state.committed_revision;
+            state.committed_revision = TableDefinitionRevision::catalog(99);
+            assert_eq!(
+                versions
+                    .validate_replacements_locked(&state, source, &prepared)
+                    .err()
+                    .unwrap()
+                    .sqlstate,
+                sqlstate::SERIALIZATION_FAILURE
+            );
+            state.committed_revision = original_revision;
+            versions
+                .validate_replacements_locked(&state, source, &prepared)
+                .unwrap();
+            assert!(versions.apply_replacements_locked(
+                &mut state,
+                source,
+                prepared,
+                TableDefinitionRevision::catalog(100)
+            ));
+            assert_eq!(state.committed().name.as_str(), "replacement");
+            assert_eq!(prior.name.as_str(), "guarded");
+            assert_eq!(prior.n_columns, 2);
+            assert_eq!(
+                versions.latest_locked(&state).unwrap().def.name.as_str(),
+                "replacement"
+            );
+
+            state.claim_publication(9).unwrap();
+            assert_eq!(state.claim_publication(8), Err(9));
+            assert_eq!(state.locked_by_other(8), Some(7));
+            let retired_slot = state.pending.unwrap().tail;
+            let rollback_plan = versions
+                .prepare_replacements_locked(&state, source, pool, |original| {
+                    if original.n_columns != 2 {
+                        return Ok(None);
+                    }
+                    let mut candidate = TableDefBuilder::from_definition(original);
+                    candidate.name = SqlName::parse("must_not_rewrite_reused_slot").unwrap();
+                    Ok(Some(candidate.freeze(pool)?))
+                })
+                .unwrap();
+            assert!(versions.rollback_locked(&mut state, 7));
+            assert_eq!(state.publication_owner(), Some(9));
+            assert_eq!(state.locked_by_other(8), Some(9));
+            let unrelated = TableDefinition::new(definition(1, pool));
+            for _ in 0..versions.capacity() {
+                versions.stage(&unrelated, pending(3, 11, pool), 8).unwrap();
+                if unrelated.read().pending.unwrap().tail == retired_slot {
+                    break;
+                }
+                assert!(versions.rollback(&unrelated, 11));
+            }
+            assert_eq!(unrelated.read().pending.unwrap().tail, retired_slot);
+            versions
+                .validate_replacements_locked(&state, source, &rollback_plan)
+                .unwrap();
+            assert!(!versions.apply_replacements_locked(
+                &mut state,
+                source,
+                rollback_plan,
+                TableDefinitionRevision::catalog(101)
+            ));
+            assert_eq!(
+                versions
+                    .latest_locked(&unrelated.read())
+                    .unwrap()
+                    .def
+                    .name
+                    .as_str(),
+                "guarded"
+            );
+            state.release_publication(8);
+            assert_eq!(state.publication_owner(), Some(9));
+            state.release_publication(9);
+            assert_eq!(state.publication_owner(), None);
+            versions.clear(&unrelated);
+            state.identity.existence = CatalogDdlState::PendingCreate { txid: 9 };
+            let creation = versions
+                .prepare_replacements_locked(&state, source, pool, |_| Ok(None))
+                .unwrap();
+            state.identity.existence = CatalogDdlState::Present;
+            assert!(
+                versions
+                    .validate_replacements_locked(&state, source, &creation)
+                    .is_err()
+            );
+            state.claim_publication(8).unwrap();
+            assert!(
+                versions
+                    .validate_replacements_locked(&state, source, &creation)
+                    .is_err()
+            );
+            state.release_publication(8);
+            state.claim_publication(9).unwrap();
+            versions
+                .validate_replacements_locked(&state, source, &creation)
+                .unwrap();
+            assert!(!versions.apply_replacements_locked(
+                &mut state,
+                source,
+                creation,
+                TableDefinitionRevision::catalog(102)
+            ));
+            state.release_publication(9);
         });
     }
 }

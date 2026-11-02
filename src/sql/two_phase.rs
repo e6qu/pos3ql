@@ -29,7 +29,6 @@ pub(crate) struct PreparedTransactionSlot {
     /// same bytes to rebuild a prepared transaction or resolve it later.
     pub records: FixedBuf,
     pub locks: FixedBuf,
-    pub recovered: bool,
 }
 
 pub(crate) struct PreparedTransactions {
@@ -103,7 +102,6 @@ impl PreparedTransactions {
                     "prepared transaction locks",
                     config.wal_buffer_bytes,
                 )?,
-                recovered: false,
             });
         }
         Ok(Self { slots })
@@ -140,10 +138,17 @@ impl PreparedTransactions {
             return Ok(None);
         };
         let slot = &mut self.slots[index];
+        assert_eq!(
+            slot.transaction.txid, 0,
+            "a reusable prepared slot has no transaction identity"
+        );
+        assert!(
+            !slot.transaction.is_active(),
+            "a reusable prepared slot is idle"
+        );
         slot.metadata = Some(metadata);
         slot.records.clear();
         slot.locks.clear();
-        slot.recovered = false;
         Ok(Some(index))
     }
 
@@ -223,13 +228,41 @@ impl PreparedTransactions {
         });
     }
 
+    pub(crate) fn release_resolution(&mut self, index: usize, transaction: u32) {
+        let Some(PreparedTransactionImage::Prepared { metadata, resolver }) =
+            self.slots[index].metadata
+        else {
+            panic!("resolution release requires a prepared transaction");
+        };
+        assert!(
+            resolver.is_none_or(|owner| owner == transaction),
+            "one prepared resolver owns its admission"
+        );
+        self.slots[index].metadata = Some(PreparedTransactionImage::Prepared {
+            metadata,
+            resolver: None,
+        });
+    }
+
     pub(crate) fn release(&mut self, index: usize) {
         let slot = &mut self.slots[index];
-        slot.metadata = None;
+        assert!(
+            !slot.transaction.is_active()
+                && slot.transaction.touched().is_empty()
+                && slot.transaction.ddl().is_empty()
+                && slot.transaction.statistics_undo().is_empty()
+                && slot.transaction.catalog_history.is_none()
+                && slot.transaction.staged_commit().is_none()
+                && slot.transaction.commit_admission().is_none(),
+            "prepared transaction owners must be resolved before releasing their slot"
+        );
         slot.transaction.clear();
+        // Frontend state may retain its last XID while idle. A detached slot
+        // instead becomes a fresh identity owner for the next PREPARE.
+        slot.transaction.txid = 0;
         slot.records.clear();
         slot.locks.clear();
-        slot.recovered = false;
+        slot.metadata = None;
     }
 }
 
@@ -261,9 +294,9 @@ impl PreparedTransactionSlot {
             .map(|bytes| u64::from_le_bytes(bytes.try_into().unwrap()))
     }
 
-    pub(crate) fn visit_records(
-        &self,
-        mut visit: impl FnMut(u64, &[u8]) -> Result<(), SqlError>,
+    pub(crate) fn visit_records<'records>(
+        &'records self,
+        mut visit: impl FnMut(u64, &'records [u8]) -> Result<(), SqlError>,
     ) -> Result<(), SqlError> {
         let bytes = self.records.readable();
         let mut at = 0usize;

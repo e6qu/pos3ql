@@ -872,22 +872,16 @@ impl Storage {
         if count == source.len() {
             return Ok(None);
         }
-        let mut columns = self.reserve_statistics_columns(count)?;
-        for &record in source.iter().filter(retain) {
-            columns
-                .push_reserved(record)
-                .expect("filtered statistics count was reserved");
-        }
-        let depth = state
-            .pending
-            .map_or(1, |head| versions[head.tail].depth + 1);
-        if depth > self.max_catalog_versions_per_object {
+        let previous = state.pending.map(|head| head.tail);
+        if previous.is_some_and(|slot| versions[slot].depth >= self.max_catalog_versions_per_object)
+        {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "table statistics exceeds max_catalog_versions_per_object ({})",
                 self.max_catalog_versions_per_object
             ));
         }
+        let depth = previous.map_or(1, |slot| versions[slot].depth + 1);
         let slot = versions
             .iter()
             .position(|entry| !entry.used)
@@ -897,6 +891,12 @@ impl Storage {
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "pending table-statistics pool is exhausted"
             ));
+        }
+        let mut columns = self.reserve_statistics_columns(count)?;
+        for &record in source.iter().filter(retain) {
+            columns
+                .push_reserved(record)
+                .expect("filtered statistics count was reserved");
         }
         Ok(Some(PreparedDefinitionStatistics {
             state,
@@ -1519,15 +1519,16 @@ mod tests {
         });
         let (replacement, _, replacement_table) = fixture();
         crate::mem::guard::forbid_alloc(|| {
+            let replacement_image = image(&replacement, 99);
             replacement
-                .write_table_statistics(replacement_table, 7, image(&storage, 99))
+                .write_table_statistics(replacement_table, 7, replacement_image.clone())
                 .unwrap();
             drop(pool);
             saved.acknowledge();
             assert!(replacement.statistics_wal_dirty(replacement_table));
             assert_eq!(
                 replacement.table_statistics(replacement_table, 7),
-                image(&storage, 99)
+                replacement_image
             );
             drop(saved);
         });
@@ -1746,6 +1747,87 @@ mod tests {
             storage.rollback_table_statistics(table, 9);
             assert_eq!(storage.table_statistics(table, 9).columns, old.columns);
             assert_eq!(storage.table_def(table, 9).columns[1].ctype, ColType::Int4);
+        });
+    }
+
+    #[test]
+    fn shared_statistics_definition_depth_exhaustion_precedes_payload_reservation() {
+        let mut config = super::super::tests::test_config();
+        config.statistics_bytes = 128;
+        config.statistics_leases = 2;
+        let mut budget = super::super::tests::test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
+        let table = storage
+            .create_table(super::super::tests::make_def(
+                "statistics_depth",
+                &[
+                    ("id", ColType::Int4, true),
+                    ("payload", ColType::Int4, true),
+                ],
+            ))
+            .unwrap();
+        storage.max_catalog_versions_per_object = u32::MAX;
+        crate::mem::guard::forbid_alloc(|| {
+            let mut columns = storage.reserve_statistics_columns(2).unwrap();
+            for attribute in [1, 2] {
+                columns
+                    .push_reserved(
+                        AnalyzedColumn::new(
+                            attribute,
+                            ColumnStatistics {
+                                valid: true,
+                                distinct_values: 1,
+                                ..ColumnStatistics::EMPTY
+                            },
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+            }
+            let mut statistics = TableStatistics::EMPTY;
+            statistics.valid = true;
+            statistics.columns = columns.freeze();
+            storage
+                .write_table_statistics(table, 7, statistics)
+                .unwrap();
+            let tail = storage.tables[table]
+                .statistics
+                .read()
+                .pending
+                .unwrap()
+                .tail;
+            storage.pending_table_statistics.state.write().unwrap()[tail].depth = u32::MAX;
+            let (_, before) = storage.select_table_definition(table, 7);
+            let mut after = super::super::TableDefBuilder::from_definition(&before);
+            after.columns[0].ctype = ColType::Int8;
+            let occupied = storage.statistics_pool.lease::<u8>(64).unwrap();
+            let error = storage
+                .prepare_definition_statistics(
+                    table,
+                    7,
+                    &before,
+                    &after,
+                    super::super::ColumnSet::EMPTY,
+                )
+                .err()
+                .unwrap();
+            assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            assert!(
+                error
+                    .message
+                    .as_str()
+                    .contains("max_catalog_versions_per_object")
+            );
+            assert_eq!(storage.table_def(table, 7).columns[0].ctype, ColType::Int4);
+            assert_eq!(storage.table_statistics(table, 7).columns.len(), 2);
+            assert_eq!(
+                storage.pending_table_statistics.state.read().unwrap()[tail].depth,
+                u32::MAX
+            );
+            storage.rollback_table_statistics(table, 7);
+            assert!(storage.pending_table_statistics(table, 7).is_none());
+            assert!(storage.reserve_statistics_columns(1).is_ok());
+            drop(occupied);
         });
     }
 }

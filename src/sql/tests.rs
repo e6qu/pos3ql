@@ -52619,7 +52619,8 @@ fn analyze_retained_sources_preserve_pending_changes_rollback_and_cold_recovery(
         engine
             .storage
             .table_statistics(table, session.transaction.txid)
-            .columns[3]
+            .column(4)
+            .unwrap()
             .null_fraction_ppm,
         1_000_000
     );

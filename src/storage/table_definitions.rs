@@ -13,9 +13,11 @@ use super::table_names::{
     DefinitionWrite, IdentityWrite, NameIdentity, TableNameScope, TableNames,
 };
 
+#[cfg(test)]
+use super::TableDefBuilder;
 use super::{
     CatalogDdlState, DatabaseOid, MAX_COLUMNS, Ownership, PendingTableDef, PendingTableDefSlot,
-    TableDef, TableDefBuilder,
+    TableDef,
 };
 use crate::mem::budget::{Budget, BudgetError};
 use crate::mem::fixed_vec::FixedVec;
@@ -348,24 +350,6 @@ impl DefinitionVersions {
                 .expect("definition slot lock poisoned"),
             image: &self.images[slot],
         }
-    }
-
-    pub(super) fn validate_schema_rename(
-        &self,
-        definition: &TableDefinition,
-        prior: super::SqlName,
-        name: super::SqlName,
-        arena: &crate::mem::arena::Arena,
-    ) -> Result<(), SqlError> {
-        let state = definition.read();
-        let mut tail = state.pending.map(|head| head.tail);
-        while let Some(slot) = tail {
-            let entry = self.read(slot as usize);
-            let mut copied = TableDefBuilder::from_definition(&entry.version.def);
-            super::rename_table_sql_identity(&mut copied, prior, name, arena)?;
-            tail = entry.previous;
-        }
-        Ok(())
     }
 
     pub(super) fn references_type(

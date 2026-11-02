@@ -95,6 +95,7 @@ impl TablePublication {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(super) fn generation_reservation(&self, transaction: u32) -> u64 {
         self.generation_reservations
             .as_ref()

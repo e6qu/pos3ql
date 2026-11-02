@@ -46,12 +46,6 @@ struct InternedAllocation {
     previous: Option<core::ptr::NonNull<InternedAllocation>>,
 }
 
-#[derive(Clone, Copy)]
-pub(crate) struct InternedValue<T> {
-    value: T,
-    identity: InternedAllocation,
-}
-
 static NEXT_RETENTION_IDENTITY: AtomicU64 = AtomicU64::new(1);
 
 fn retention_identity() -> u64 {
@@ -225,44 +219,6 @@ impl Arena {
             ptr.write(value);
             Ok(&mut *ptr)
         }
-    }
-
-    /// Shares immutable values already retained by this arena. The linked
-    /// identities consume the same fixed arena reservation as their values;
-    /// rewind discards their entries together with the allocations they describe.
-    pub(crate) fn alloc_interned<T: Copy + Send + Sync + 'static>(
-        &self,
-        value: T,
-        mut equivalent: impl FnMut(&T, &T) -> bool,
-    ) -> Result<&T, ArenaFull> {
-        let mut cursor = self.interned.get();
-        while let Some(previous) = cursor {
-            // Only this method installs entries, after initializing their T.
-            // Rewind removes every entry whose allocation it discards.
-            let previous = unsafe { previous.as_ref() };
-            if previous.value_type == core::any::TypeId::of::<T>() {
-                let previous_value = unsafe { &*previous.value.cast::<T>() };
-                if equivalent(previous_value, &value) {
-                    return Ok(previous_value);
-                }
-            }
-            cursor = previous.previous;
-        }
-        let allocated = self.alloc(InternedValue {
-            value,
-            identity: InternedAllocation {
-                value_type: core::any::TypeId::of::<T>(),
-                length: 1,
-                value: core::ptr::null(),
-                end: 0,
-                previous: self.interned.get(),
-            },
-        })?;
-        allocated.identity.value = (&allocated.value as *const T).cast();
-        allocated.identity.end = self.offset.get();
-        self.interned
-            .set(Some(core::ptr::NonNull::from(&mut allocated.identity)));
-        Ok(&allocated.value)
     }
 
     /// Shares actual-length immutable slices within the same rewind boundary.
@@ -1363,7 +1319,7 @@ mod tests {
             let short = arena.alloc_interned_slice(&[1u32]).unwrap();
             assert_eq!(short, &[1]);
             assert!(!core::ptr::eq(first.as_ptr(), short.as_ptr()));
-            let scalar = arena.alloc_interned(1u32, PartialEq::eq).unwrap();
+            let scalar = arena.alloc(1u32).unwrap();
             assert!(!core::ptr::eq(short.as_ptr(), scalar));
             let mark = arena.mark();
             assert_eq!(
@@ -1392,28 +1348,32 @@ mod tests {
         let mut budget = Budget::new(256);
         let arena = Arena::new(&mut budget, "schema cache", 256).unwrap();
         crate::mem::guard::forbid_alloc(|| {
-            let first = arena.alloc_interned(7u64, PartialEq::eq).unwrap();
+            let first = arena.alloc_interned_slice(&[7u64]).unwrap();
             let used = arena.used();
-            let same = arena.alloc_interned(7u64, PartialEq::eq).unwrap();
+            let same = arena.alloc_interned_slice(&[7u64]).unwrap();
             assert!(core::ptr::eq(first, same));
             assert_eq!(arena.used(), used);
-            assert!(arena.alloc_interned([0u8; 512], PartialEq::eq).is_err());
+            assert!(arena.alloc_interned_slice(&[0u8; 512]).is_err());
             assert!(core::ptr::eq(
                 first,
-                arena.alloc_interned(7u64, PartialEq::eq).unwrap()
+                arena.alloc_interned_slice(&[7u64]).unwrap()
             ));
-            let different = arena.alloc_interned(9u64, PartialEq::eq).unwrap();
+            let different = arena.alloc_interned_slice(&[9u64]).unwrap();
             assert!(!core::ptr::eq(first, different));
             assert!(core::ptr::eq(
                 first,
-                arena.alloc_interned(7u64, PartialEq::eq).unwrap()
+                arena.alloc_interned_slice(&[7u64]).unwrap()
             ));
-            let typed = arena
-                .alloc_interned((1u32, 2u32), |_, _| {
+            #[derive(Clone, Copy)]
+            struct DifferentType(u64);
+            impl PartialEq for DifferentType {
+                fn eq(&self, _: &Self) -> bool {
                     panic!("different types cannot share a cache entry")
-                })
-                .unwrap();
-            assert_eq!(*typed, (1, 2));
+                }
+            }
+            let typed = arena.alloc_interned_slice(&[DifferentType(7)]).unwrap();
+            assert_eq!(typed[0].0, 7);
+            assert_ne!(first.as_ptr().cast::<u8>(), typed.as_ptr().cast::<u8>());
         });
     }
 
@@ -1424,26 +1384,26 @@ mod tests {
         let mut arena = Arena::new(&mut budget, "schema rewind", 256).unwrap();
         crate::mem::guard::forbid_alloc(|| {
             let mark = arena.mark();
-            arena.alloc_interned(7u64, PartialEq::eq).unwrap();
+            arena.alloc_interned_slice(&[7u64]).unwrap();
             // No reference to the discarded cached value survives this rewind.
             unsafe { arena.rewind_to(mark) };
             let replacement = arena.alloc([7u8, 0, 0, 0, 0, 0, 0, 0]).unwrap();
-            let current = arena.alloc_interned(7u64, PartialEq::eq).unwrap();
-            assert_ne!(replacement.as_ptr(), (current as *const u64).cast::<u8>());
+            let current = arena.alloc_interned_slice(&[7u64]).unwrap();
+            assert_ne!(replacement.as_ptr(), current.as_ptr().cast::<u8>());
             let retained = arena.mark();
             arena.alloc(123u32).unwrap();
             // Both retained references point below the rewind frontier.
             unsafe { arena.rewind_to(retained) };
             assert!(core::ptr::eq(
                 current,
-                arena.alloc_interned(7u64, PartialEq::eq).unwrap()
+                arena.alloc_interned_slice(&[7u64]).unwrap()
             ));
         });
         arena.reset();
         crate::mem::guard::forbid_alloc(|| {
             let replacement = arena.alloc(7u64).unwrap();
-            let current = arena.alloc_interned(7u64, PartialEq::eq).unwrap();
-            assert!(!core::ptr::eq(replacement, current));
+            let current = arena.alloc_interned_slice(&[7u64]).unwrap();
+            assert!(!core::ptr::eq(replacement, current.as_ptr()));
         });
     }
 

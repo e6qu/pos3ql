@@ -169,50 +169,6 @@ impl RowVersionPools {
     }
 }
 
-impl super::Storage {
-    /// Recovered prepared transactions replay catalog operations after undoing
-    /// their startup overlays. Retain old row images before that undo so live
-    /// snapshots survive the same replay of inserts, updates and deletes.
-    pub(crate) fn retain_prepared_row_history(
-        &self,
-        table: usize,
-        rowid: u64,
-        transaction: u32,
-    ) -> Result<(), SqlError> {
-        if self.transaction_mode == crate::config::TransactionMode::Locking
-            || self.pending_table_rows_rewritten(table, transaction)
-        {
-            return Ok(());
-        }
-        let (snapshots, mut versions, mut rows) = super::row_ownership::acquire(|| {
-            Ok((
-                super::row_ownership::try_mutex(&self.snapshots, "snapshot state lock poisoned")?,
-                self.row_versions.try_write_for_batch()?,
-                self.tables[table].rows.try_write_for_batch()?,
-            ))
-        });
-        if !snapshots.retains_for(transaction) {
-            return Ok(());
-        }
-        let Some(row) = rows.get_mut(&rowid) else {
-            return Ok(());
-        };
-        if !row.has_committed_version()
-            || pending_last(&versions.pending_row_versions, row.pending)
-                .is_none_or(|pending| pending.txid != transaction)
-        {
-            return Ok(());
-        }
-        versions.retain_current_row(row, self.max_row_versions_per_row)?;
-        if versions.history_pressure_changed {
-            self.row_versions
-                .history_pressure
-                .store(true, std::sync::atomic::Ordering::Release);
-        }
-        Ok(())
-    }
-}
-
 pub(super) fn pending_last(
     pool: &RowVersionPool<PendingVersionSlot>,
     versions: PendingVersions,

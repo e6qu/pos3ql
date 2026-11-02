@@ -1127,9 +1127,14 @@ impl<'d> QueryScope<'d> {
         }
         let default_names = ["last_value", "log_cnt", "is_called"];
         let types = [ColType::Int8, ColType::Int8, ColType::Bool];
-        let mut columns = [ColumnMeta::EMPTY; MAX_COLUMNS];
+        let mut definition = TableDef {
+            schema: sequence.schema,
+            name: sequence.name,
+            n_columns: default_names.len(),
+            ..TableDef::empty()
+        };
         for index in 0..3 {
-            columns[index] = ColumnMeta {
+            definition.columns[index] = ColumnMeta {
                 name: SqlName::parse(
                     tref.col_alias
                         .and_then(|aliases| aliases.get(index).copied())
@@ -1139,15 +1144,7 @@ impl<'d> QueryScope<'d> {
                 ..ColumnMeta::EMPTY
             };
         }
-        let definition = arena
-            .alloc(TableDef {
-                schema: sequence.schema,
-                name: sequence.name,
-                columns,
-                n_columns: 3,
-                ..TableDef::empty()
-            })
-            .map_err(|_| arena_full())?;
+        self.defs.set_relation(self.n, &definition, arena)?;
         let rows: &'a [&'a [u8]] = if materialize {
             let role = storage.current_role_slot(txid).ok_or_else(|| {
                 sql_err!(
@@ -1190,7 +1187,6 @@ impl<'d> QueryScope<'d> {
             &[]
         };
         self.names[self.n] = exposed;
-        self.defs.set_arena(self.n, &*definition);
         self.derived[self.n] = Some(rows);
         self.slots[self.n] = usize::MAX;
         self.n += 1;
@@ -2045,6 +2041,76 @@ mod tests {
             };
         }
         definition
+    }
+
+    #[test]
+    fn sequence_schema_and_rows_fit_actual_columns_in_small_arena() {
+        let config = config();
+        let mut budget = Budget::new(Storage::extra_budget_bytes(&config) + config.memtable_bytes);
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
+        let change = storage
+            .create_sequence(
+                crate::storage::SequenceCreateSpec {
+                    allocation: crate::storage::CatalogAllocation::New,
+                    schema: SqlName::parse("public").unwrap(),
+                    name: SqlName::parse("narrow_sequence").unwrap(),
+                    spec: crate::storage::SeqSpec {
+                        data_type: crate::storage::SeqType::Bigint,
+                        increment: 1,
+                        min_value: 1,
+                        max_value: i64::MAX,
+                        start_value: 1,
+                        cache: 1,
+                        cycle: false,
+                    },
+                    owner: None,
+                    generator_for: None,
+                    persistence: crate::storage::RelationPersistence::Permanent,
+                },
+                0,
+            )
+            .unwrap();
+        storage.finish_sequence_change(change, crate::storage::CatalogDdlDecision::Commit);
+        for materialize in [false, true] {
+            let mut arena_budget = Budget::new(16 << 10);
+            let arena = Arena::new(&mut arena_budget, "narrow sequence scope", 16 << 10).unwrap();
+            crate::mem::guard::forbid_alloc(|| {
+                let query = crate::sql::parser::parse_query(
+                    "SELECT s.saved,s.called FROM public.narrow_sequence AS s(saved,logged,called)",
+                    &arena,
+                )
+                .unwrap();
+                let from = query.from.as_ref().unwrap();
+                let scope = if materialize {
+                    QueryScope::resolve_exec(&storage, from, None, 0, &arena, &[], None).unwrap()
+                } else {
+                    QueryScope::resolve_schema(&storage, from, 0, &arena, None).unwrap()
+                };
+                assert_eq!(scope.defs.get(0).unwrap().n_columns, 3);
+                assert_eq!(scope.defs.get(0).unwrap().schema.as_str(), "public");
+                assert_eq!(
+                    scope.find_column(Some("s"), "saved").unwrap(),
+                    ResolvedColumn::Table(0, 0)
+                );
+                assert_eq!(
+                    scope.find_column(Some("s"), "called").unwrap(),
+                    ResolvedColumn::Table(0, 2)
+                );
+                let rows = scope.derived[0].unwrap();
+                assert_eq!(rows.len(), usize::from(materialize));
+                if let Some(row) = rows.first() {
+                    assert!(matches!(
+                        crate::sql::exec::decode_projected_pub(row, 0),
+                        Datum::Int8(1)
+                    ));
+                    assert!(matches!(
+                        crate::sql::exec::decode_projected_pub(row, 2),
+                        Datum::Bool(false)
+                    ));
+                }
+                assert!(arena.used() < 16 << 10);
+            });
+        }
     }
 
     #[test]

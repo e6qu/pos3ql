@@ -73,25 +73,23 @@ owners; a change reserves its replacement definitions, bindings and row keys
 before durability. [Architecture](docs/architecture.md#memory-and-physical-size)
 owns the current limits and admission behavior.
 
-Complete the current CI and equal-capacity evidence before accepting this
-integration. Cover narrow/wide schemas, retained readers, overlapping replacements,
-savepoints, private catalog reconstruction after prepared recovery, cancellation
-and waits that preserve completed SQL effects. Keep joined and recursive input
-decoding proportional to the complete physical shape, including hidden fields;
-a successful small-arena regression does not establish an embedded minimum.
-Exercise prepared resolution with no spare metadata after admission, binding
-private stored queries only after their startup catalogs exist. Preserve old
-definitions on rollback. For example, if adding an `orders.note` column cannot
-reserve metadata, `orders` must keep its previous usable definition; waiting to
-commit must not run an audit trigger again.
+Retain the ownership, exhaustion, prepared recovery and once-only SQL tests as
+shared resources change. Reserve replacements before effects and preserve old
+images on rollback. For example, if analyzing `orders` cannot reserve statistics
+space, its previous statistics must remain usable. A waiting commit must not
+run an audit trigger again. Joined and recursive row decoding must continue to
+include its complete physical shape, including hidden fields.
 
 Next, share statistics storage using actual analyzed columns and explicit global
 byte and owner limits. Keep column identity stable through table changes, retain
 old images for readers and checkpoints, and reserve replacements before effects.
-Give index counters an independent global limit. Remove duplicate per-table
-sequence counters only after every SQL generator uses its catalog sequence,
-including copied tables and partition children. Compare the same global limits
-at 1/8/32/128 tables, with populated, replacement and exhausted-pool cases.
+Give index counters an independent global limit and keep source identity through
+late readers, drop/reuse and database copies. Remove duplicate per-table sequence
+counters only after every SQL generator uses its catalog sequence, including
+copied tables, partition children and defaults whose sequence ownership changes.
+Preserve COPY, replication, rollback, restart and prepared resolution. Compare
+the same global limits at 1/8/32/128 tables, with populated, replacement and
+exhausted-pool cases; verify exact startup accounting and zero runtime heap growth.
 
 Reduce other catalog reservations using measured component costs. Empty tables
 still have a cost; shared schema storage does not establish an embedded memory

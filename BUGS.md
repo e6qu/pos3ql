@@ -5,7 +5,8 @@ No known defects are blocked by an external dependency or an intractable problem
 Fix reproducible defects in the PR that finds them, including incidental defects.
 Record an entry here only with its reproducer, observed behavior and the exact
 external blocker or reason it cannot be repaired. Capacity, ownership and recovery
-regressions, query-source binding failures and resolved investigations belong
+regressions, statistics and generator ownership, query-source binding failures
+and resolved investigations belong
 in their fixing PR, tests and evidence.
 
 Follow [CONTRIBUTING.md](CONTRIBUTING.md) for the required comparisons,

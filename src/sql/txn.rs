@@ -586,14 +586,6 @@ pub(crate) enum DdlUndo {
         prior_owner: Option<crate::storage::PendingOwnership>,
     },
     DatabaseDropped(u32),
-    /// TRUNCATE ... RESTART IDENTITY reset one column's sequence — undo by
-    /// restoring the prior counter. (A plain advance is *not* undone: a
-    /// rolled-back insert still consumes its number, as PostgreSQL has it.)
-    SequenceReset {
-        table: u32,
-        column: u16,
-        prior: i64,
-    },
     /// CREATE SCHEMA at this slot — undo by dropping it.
     SchemaCreated(u32),
     /// DROP SCHEMA at this slot — undo by reviving it.
@@ -2541,6 +2533,7 @@ impl TxnState {
         definition: crate::storage::TableDefBuilder,
         column_mapping: &[Option<crate::storage::SqlName>; crate::storage::MAX_COLUMNS],
         rewrites_rows: bool,
+        invalidated_statistics: crate::storage::ColumnSet,
     ) -> Result<crate::storage::TableDefinitionTarget, SqlError> {
         if target.transaction() != self.txid {
             return Err(sql_err!(
@@ -2548,7 +2541,13 @@ impl TxnState {
                 "table definition selection belongs to another transaction"
             ));
         }
-        let change = storage.write_table_def(target, definition, column_mapping, rewrites_rows)?;
+        let change = storage.write_table_def(
+            target,
+            definition,
+            column_mapping,
+            rewrites_rows,
+            invalidated_statistics,
+        )?;
         if let Err(error) = self.record_ddl(DdlUndo::TableAltered(change)) {
             storage.rollback_table_def(change);
             return Err(error);

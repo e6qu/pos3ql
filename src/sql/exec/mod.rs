@@ -752,6 +752,8 @@ struct OwnedSequencePlan {
     schema: SqlName,
     name: SqlName,
     spec: SeqSpec,
+    identity: bool,
+    explicit_name: bool,
     owner: crate::storage::SequenceOwner,
 }
 
@@ -798,16 +800,39 @@ fn plan_identity_sequence_alteration(
 }
 
 fn default_owned_sequence_name(table: &str, column: &str) -> Result<SqlName, SqlError> {
-    use core::fmt::Write as _;
-    let mut name = crate::util::StackStr::<64>::new();
-    let _ = write!(name, "{}_{}_seq", table, column);
-    if name.is_truncated() {
-        return Err(sql_err!(
-            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "generated sequence name is too long"
-        ));
+    crate::storage::constraint_names::generated(table, Some(column), "seq")
+}
+
+fn available_owned_sequence_name(
+    storage: &Storage,
+    owner: crate::storage::SequenceOwner,
+    transaction: u32,
+) -> Result<SqlName, SqlError> {
+    use core::fmt::Write;
+    let bound = storage
+        .table_count()
+        .saturating_add(storage.view_count())
+        .saturating_add(storage.sequence_count())
+        .saturating_add(storage.index_count())
+        .saturating_add(storage.composite_count());
+    for suffix in 0..=bound {
+        let mut label = StackStr::<32>::from_str("seq");
+        if suffix != 0 {
+            write!(label, "{suffix}").expect("catalog-count suffix fits");
+        }
+        let name = crate::storage::constraint_names::generated(
+            owner.table.as_str(),
+            Some(owner.column.as_str()),
+            label.as_str(),
+        )?;
+        if !storage.relation_name_taken(owner.table_schema.as_str(), name.as_str(), transaction) {
+            return Ok(name);
+        }
     }
-    SqlName::parse(name.as_str())
+    Err(sql_err!(
+        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+        "generated sequence names exhausted"
+    ))
 }
 
 fn owned_sequence_plan<Definition0: crate::storage::DefinitionBacking>(
@@ -845,6 +870,10 @@ fn owned_sequence_plan<Definition0: crate::storage::DefinitionBacking>(
         schema,
         name,
         spec,
+        identity: column.is_identity,
+        explicit_name: identity
+            .and_then(|identity| identity.sequence_name)
+            .is_some(),
         owner: crate::storage::SequenceOwner {
             table_schema: def.schema,
             table: def.name,
@@ -903,38 +932,21 @@ fn like_identity_sequence_plan(
     ))
 }
 
-fn inherited_serial_default(
+fn sequence_column_default(
     storage: &Storage,
-    source: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
-    column: &ColumnMeta,
-    txid: u32,
+    sequence: usize,
 ) -> Result<crate::storage::ColumnDefault, SqlError> {
     use core::fmt::Write;
-    let sequence = storage
-        .generated_sequence_slot(
-            source.schema.as_str(),
-            source.name.as_str(),
-            column.name.as_str(),
-            crate::storage::GeneratedSequenceScope::Owned,
-            txid,
-        )
-        .ok_or_else(|| {
-            sql_err!(
-                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
-                "serial column \"{}\" has no generator sequence",
-                column.name.as_str()
-            )
-        })?;
     let mut expression = StackStr::new();
     let _ = write!(
         expression,
-        "pg_catalog.nextval({}::regclass)",
+        "\"pg_catalog\".nextval('{}'::pg_catalog.regclass)",
         crate::sql::catalog::sequence_oid(storage, sequence)
     );
     if expression.is_truncated() {
         return Err(sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "inherited serial default is too long"
+            "sequence default is too long"
         ));
     }
     Ok(crate::storage::ColumnDefault::Expression(expression))
@@ -943,10 +955,13 @@ fn inherited_serial_default(
 fn create_owned_sequence(
     storage: &mut Storage,
     wal: &mut Wal,
-    plan: OwnedSequencePlan,
+    mut plan: OwnedSequencePlan,
     persistence: crate::storage::RelationPersistence,
     txid: u32,
 ) -> Result<crate::storage::SequenceChange, SqlError> {
+    if !plan.explicit_name {
+        plan.name = available_owned_sequence_name(storage, plan.owner, txid)?;
+    }
     if storage.relation_name_taken(plan.schema.as_str(), plan.name.as_str(), txid) {
         return Err(sql_err!(
             sqlstate::DUPLICATE_TABLE,
@@ -961,7 +976,7 @@ fn create_owned_sequence(
             name: plan.name,
             spec: plan.spec,
             owner: Some(plan.owner),
-            generator_for: Some(plan.owner),
+            generator_for: plan.identity.then_some(plan.owner),
             persistence,
         },
         txid,
@@ -986,7 +1001,7 @@ fn create_owned_sequence(
                 cache: plan.spec.cache,
                 cycle: plan.spec.cycle,
                 owner: Some(plan.owner),
-                generator_for: Some(plan.owner),
+                generator_for: plan.identity.then_some(plan.owner),
                 persistence,
             },
         )
@@ -1188,6 +1203,52 @@ fn create_table_kind(
             });
         }
     }
+    if statement.if_not_exists
+        && storage.relation_name_taken(def.schema.as_str(), def.name.as_str(), txn.txid)
+    {
+        responder.notice(
+            sqlstate::DUPLICATE_TABLE,
+            stack_format!(
+                128,
+                "relation \"{}\" already exists, skipping",
+                statement.name.name
+            )
+            .as_str(),
+        )?;
+        responder.command_complete(tag)?;
+        return sql_ok();
+    }
+    for plan in sequence_plans.iter().flatten() {
+        let sequence_slot =
+            match create_owned_sequence(storage, wal, *plan, def.persistence, txn.txid) {
+                Ok(sequence_slot) => sequence_slot,
+                Err(error) => return sql_fail(error),
+            };
+        if let Err(error) = txn.record_sequence_change(storage, sequence_slot) {
+            return sql_fail(error);
+        }
+        if let Err(error) = apply_default_privileges_to_new_object(
+            storage,
+            txn,
+            crate::storage::AccessObject {
+                class: crate::storage::AccessClass::Sequence,
+                slot: sequence_slot.slot() as u16,
+            },
+        ) {
+            return sql_fail(error);
+        }
+        let column = def
+            .column_index(plan.owner.column.as_str())
+            .expect("sequence plan names its column");
+        if !def.columns[column].is_identity {
+            def.columns[column].default =
+                match sequence_column_default(storage, sequence_slot.slot()) {
+                    Ok(default) => default,
+                    Err(error) => return sql_fail(error),
+                };
+            def.columns[column].auto_increment = false;
+        }
+    }
     let created_slot = match storage.create_table_in(def, txn.txid) {
         Ok(slot) => {
             let foreign_slot = if let Some(foreign) = foreign {
@@ -1262,26 +1323,6 @@ fn create_table_kind(
                 },
             ) {
                 return sql_fail(error);
-            }
-            for plan in sequence_plans.iter().flatten() {
-                let sequence_slot =
-                    match create_owned_sequence(storage, wal, *plan, def.persistence, txn.txid) {
-                        Ok(sequence_slot) => sequence_slot,
-                        Err(error) => return sql_fail(error),
-                    };
-                if let Err(error) = txn.record_sequence_change(storage, sequence_slot) {
-                    return sql_fail(error);
-                }
-                if let Err(error) = apply_default_privileges_to_new_object(
-                    storage,
-                    txn,
-                    crate::storage::AccessObject {
-                        class: crate::storage::AccessClass::Sequence,
-                        slot: sequence_slot.slot() as u16,
-                    },
-                ) {
-                    return sql_fail(error);
-                }
             }
             slot
         }
@@ -2995,11 +3036,6 @@ fn build_partitioned_table_def(
                 storage.creation_schema(statement.name.schema, statement.name.name, txid)?;
             def.not_null_names = [None; MAX_COLUMNS];
             for column in def.columns.iter_mut().take(def.n_columns) {
-                if column.auto_increment && !column.is_identity {
-                    column.default = inherited_serial_default(storage, &parent_def, column, txid)?;
-                    column.auto_increment = false;
-                    column.auto_increment_step = 1;
-                }
                 column.not_null = if column.not_null.is_required() {
                     crate::storage::NotNullOrigin::Inherited
                 } else {
@@ -3095,10 +3131,6 @@ fn build_inherited_table_def(
         }
         for parent_column in parent_definition.columns() {
             let mut inherited = *parent_column;
-            if parent_column.auto_increment && !parent_column.is_identity {
-                inherited.default =
-                    inherited_serial_default(storage, &parent_definition, parent_column, txid)?;
-            }
             inherited.not_null =
                 if inherited.not_null.is_required() && inherited.not_null_inheritable {
                     crate::storage::NotNullOrigin::Inherited
@@ -3115,7 +3147,6 @@ fn build_inherited_table_def(
             inherited.auto_increment = false;
             inherited.is_identity = false;
             inherited.identity_always = false;
-            inherited.auto_increment_step = 1;
             if let Some(existing) = definition.column_index(inherited.name.as_str()) {
                 let current = definition.columns[existing];
                 if current.ctype != inherited.ctype
@@ -3916,14 +3947,6 @@ fn build_def_with_likes(
                     copied.auto_increment = false;
                     copied.is_identity = false;
                     copied.identity_always = false;
-                    copied.auto_increment_step = 1;
-                }
-                if column.auto_increment && !column.is_identity {
-                    copied.auto_increment = false;
-                    copied.auto_increment_step = 1;
-                    if like.defaults {
-                        copied.default = inherited_serial_default(storage, &source, column, txid)?;
-                    }
                 }
                 // Without INCLUDING GENERATED a generated column is copied as a
                 // plain column (its generation expression is dropped).
@@ -4541,30 +4564,6 @@ fn next_auto_value<'x>(
         crate::storage::GeneratedSequenceScope::PartitionRoot,
         txid,
     ) {
-        let role = storage.current_role_slot(txid).ok_or_else(|| {
-            sql_err!(
-                sqlstate::INSUFFICIENT_PRIVILEGE,
-                "current role is not present in the role catalog"
-            )
-        })?;
-        let object = crate::storage::AccessObject {
-            class: crate::storage::AccessClass::Sequence,
-            slot: slot as u16,
-        };
-        if !storage.has_object_privilege(object, role, crate::storage::PrivilegeSet::USAGE, txid)
-            && !storage.has_object_privilege(
-                object,
-                role,
-                crate::storage::PrivilegeSet::UPDATE,
-                txid,
-            )
-        {
-            return Err(sql_err!(
-                sqlstate::INSUFFICIENT_PRIVILEGE,
-                "permission denied for sequence {}",
-                storage.sequence_for(slot, txid).name.as_str()
-            ));
-        }
         let next = crate::sql::sequence::next_cached(storage, seq_session, slot, txid)?;
         return match ctype {
             ColType::Int8 => Ok(Datum::Int8(next)),
@@ -4576,21 +4575,11 @@ fn next_auto_value<'x>(
                 .map_err(|_| sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "integer out of range")),
         };
     }
-    if column.is_identity {
-        return Err(sql_err!(
-            sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
-            "identity column \"{}\" has no generator sequence",
-            column.name.as_str()
-        ));
-    }
-    let step = def.columns()[col].auto_increment_step;
-    let next = storage.next_table_serial_value(table_index, col, step, ctype)?;
-    let out = match ctype {
-        ColType::Int8 => Datum::Int8(next),
-        ColType::Int2 => Datum::Int2(next as i16),
-        _ => Datum::Int4(next as i32),
-    };
-    Ok(out)
+    Err(sql_err!(
+        sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+        "generated column \"{}\" has no generator sequence",
+        column.name.as_str()
+    ))
 }
 
 /// The unique constraint or index an `ON CONFLICT` clause arbitrates on.
@@ -6184,6 +6173,7 @@ fn drop_table_kind(
                         updated,
                         &identity_mapping,
                         false,
+                        crate::storage::ColumnSet::EMPTY,
                     ) {
                         return sql_fail(error);
                     }
@@ -13711,6 +13701,7 @@ pub(crate) fn drop_schema(
                     updated,
                     &identity_mapping,
                     false,
+                    crate::storage::ColumnSet::EMPTY,
                 ) {
                     return sql_fail(error);
                 }
@@ -40115,7 +40106,6 @@ pub fn create_table_as(
             default: crate::storage::ColumnDefault::NONE,
             is_identity: false,
             identity_always: false,
-            auto_increment_step: 1,
             user_type,
             statistics_target: -1,
             statistics_options: crate::sql::ast::ColumnStatisticsOptions::DEFAULT,
@@ -41231,7 +41221,14 @@ fn rewrite_sequence_default_references(
             mapping[position] = Some(column.name);
             wal_mapping[position] = position as u16;
         }
-        txn.write_table_definition(storage, edit_target, altered, &mapping, false)?;
+        txn.write_table_definition(
+            storage,
+            edit_target,
+            altered,
+            &mapping,
+            false,
+            crate::storage::ColumnSet::EMPTY,
+        )?;
         let lsn = storage.bump_lsn();
         wal.stage_reserved(
             txn.txid,
@@ -41515,6 +41512,139 @@ pub fn alter_sequence(
     sql_ok()
 }
 
+pub(super) fn column_default_dependencies(
+    storage: &Storage,
+    transaction: u32,
+    column: &ColumnMeta,
+    arena: &Arena,
+) -> Result<crate::storage::StoredQueryDependencies, SqlError> {
+    use core::fmt::Write;
+    if column.default.constant().is_some() || column.default.is_generated() {
+        return Ok(crate::storage::StoredQueryDependencies::EMPTY);
+    }
+    let Some(expression) = super::enum_values::default_expression(
+        &column.default,
+        Some(column.ctype),
+        storage,
+        transaction,
+        arena,
+    )?
+    else {
+        return Ok(crate::storage::StoredQueryDependencies::EMPTY);
+    };
+    let mut query = StackStr::<{ crate::storage::DEFAULT_EXPR_MAX + 8 }>::new();
+    write!(query, "SELECT {}", expression).map_err(|_| arena_full())?;
+    super::query::stored_query_dependencies(
+        query.as_str(),
+        storage,
+        transaction,
+        storage.path(),
+        None,
+        arena,
+    )
+}
+
+fn column_default_uses_sequence(
+    storage: &Storage,
+    transaction: u32,
+    column: &ColumnMeta,
+    sequence: usize,
+    arena: &Arena,
+) -> Result<bool, SqlError> {
+    let mark = arena.mark();
+    let result =
+        column_default_dependencies(storage, transaction, column, arena).map(|dependencies| {
+            dependencies.entries().iter().any(|dependency| {
+                dependency.class == crate::storage::DependencyClass::Sequence
+                    && usize::from(dependency.slot) == sequence
+            })
+        });
+    // The predicate retains no parsed expression or dependency slice.
+    unsafe { arena.rewind_to(mark) };
+    result
+}
+
+fn remove_sequence_column_defaults(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    sequence: usize,
+    cascade: bool,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    for table in 0..storage.table_count() {
+        if !storage.table_slot_visible_to(table, txn.txid) {
+            continue;
+        }
+        let (target, current) = storage.select_table_definition(table, txn.txid);
+        let mut changed = false;
+        let mut replacement = TableDefBuilder::from_definition(&current);
+        for column in replacement.columns.iter_mut().take(replacement.n_columns) {
+            if !column_default_uses_sequence(storage, txn.txid, column, sequence, arena)? {
+                continue;
+            }
+            if !cascade {
+                return Err(sql_err!(
+                    sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+                    "cannot drop sequence because default for column \"{}\" of table \"{}\" depends on it",
+                    column.name.as_str(),
+                    current.name.as_str()
+                ));
+            }
+            column.default = crate::storage::ColumnDefault::NONE;
+            column.auto_increment = false;
+            changed = true;
+        }
+        if !changed {
+            continue;
+        }
+        storage.lock_object(
+            txn.txid,
+            crate::storage::ObjectLockTarget::Table(table),
+            crate::sql::ast::TableLockMode::AccessExclusive,
+            false,
+        )?;
+        let mut mapping = [None; MAX_COLUMNS];
+        let mut wal_mapping = [u16::MAX; MAX_COLUMNS];
+        for (column, metadata) in current.columns().iter().enumerate() {
+            mapping[column] = Some(metadata.name);
+            wal_mapping[column] = column as u16;
+        }
+        txn.write_table_definition(
+            storage,
+            target,
+            replacement,
+            &mapping,
+            false,
+            crate::storage::ColumnSet::EMPTY,
+        )?;
+        if current.persistence == crate::storage::RelationPersistence::Temporary {
+            continue;
+        }
+        let lsn = storage.bump_lsn();
+        wal.stage_reserved(
+            txn.txid,
+            lsn,
+            &WalOp::BeginTableRewrite {
+                previous_schema: current.schema.as_str(),
+                previous_name: current.name.as_str(),
+                preserve_rows: true,
+                column_mapping: wal_mapping,
+            },
+        )?;
+        let lsn = storage.bump_lsn();
+        wal.stage_reserved(
+            txn.txid,
+            lsn,
+            &WalOp::CreateTable {
+                identity: storage.table_position(table),
+                definition: (&*storage.table_def(table, txn.txid)).into(),
+            },
+        )?;
+    }
+    Ok(())
+}
+
 /// DROP SEQUENCE [IF EXISTS].
 #[allow(clippy::too_many_arguments)]
 pub fn drop_sequence(
@@ -41563,10 +41693,10 @@ pub fn drop_sequence(
         }
         let (schema, sname, persistence) = {
             let s = storage.sequence_for(slot, txn.txid);
-            if let Some(owner) = s.owner {
+            if let Some(owner) = s.generator_for {
                 return sql_fail(sql_err!(
                     sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
-                    "cannot drop sequence \"{}\" because column {}.{}.{} requires it",
+                    "cannot drop identity sequence \"{}\" because column {}.{}.{} requires it",
                     s.name.as_str(),
                     owner.table_schema.as_str(),
                     owner.table.as_str(),
@@ -41575,6 +41705,10 @@ pub fn drop_sequence(
             }
             (s.schema, s.name, s.persistence)
         };
+        if let Err(error) = remove_sequence_column_defaults(storage, wal, txn, slot, cascade, arena)
+        {
+            return sql_fail(error);
+        }
         let closure = stored_query_dependent_closure(storage, txn.txid, arena, |dependency| {
             dependency.class == crate::storage::DependencyClass::Sequence
                 && dependency.slot as usize == slot
@@ -47575,7 +47709,14 @@ fn rewrite_composite_dependent_tables(
         for (position, column) in current.columns().iter().enumerate() {
             mapping[position] = Some(column.name);
         }
-        txn.write_table_definition(storage, edit_target, altered, &mapping, false)?;
+        txn.write_table_definition(
+            storage,
+            edit_target,
+            altered,
+            &mapping,
+            false,
+            crate::storage::ColumnSet::EMPTY,
+        )?;
         if current.persistence != crate::storage::RelationPersistence::Temporary {
             let mut wal_mapping = [u16::MAX; MAX_COLUMNS];
             for (position, target) in wal_mapping.iter_mut().enumerate().take(current.n_columns) {
@@ -51143,7 +51284,14 @@ fn stage_table_definition(
             },
         )?;
     }
-    txn.write_table_definition(storage, edit_target, next, &mapping, false)?;
+    txn.write_table_definition(
+        storage,
+        edit_target,
+        next,
+        &mapping,
+        false,
+        crate::storage::ColumnSet::EMPTY,
+    )?;
     Ok(())
 }
 
@@ -54380,6 +54528,15 @@ pub(crate) fn apply_replication_insert(
         &explicit,
         arena,
     )?;
+    fill_auto_increment(
+        storage,
+        table_index,
+        &definition,
+        &mut values,
+        &explicit,
+        context.seq_session,
+        txn.txid,
+    )?;
     apply_replication_insert_values(
         storage,
         txn,
@@ -55115,6 +55272,49 @@ pub(crate) fn apply_replication_update(
     Ok(())
 }
 
+fn restart_owned_sequences(
+    storage: &mut Storage,
+    txn: &mut TxnState,
+    table: usize,
+) -> Result<(), SqlError> {
+    let definition = (*storage.table_def(table, txn.txid)).clone();
+    for column in definition.columns() {
+        let Some(slot) = storage.generated_sequence_slot(
+            definition.schema.as_str(),
+            definition.name.as_str(),
+            column.name.as_str(),
+            crate::storage::GeneratedSequenceScope::Owned,
+            txn.txid,
+        ) else {
+            continue;
+        };
+        let sequence = storage.sequence_for(slot, txn.txid);
+        let change = storage.stage_sequence_alter(
+            storage.prepare_sequence_edit(slot, txn.txid)?,
+            crate::storage::SequenceAlteration {
+                schema: sequence.schema,
+                name: sequence.name,
+                spec: SeqSpec {
+                    data_type: sequence.data_type,
+                    increment: sequence.increment,
+                    min_value: sequence.min_value,
+                    max_value: sequence.max_value,
+                    start_value: sequence.start_value,
+                    cache: sequence.cache,
+                    cycle: sequence.cycle,
+                },
+                owner: sequence.owner,
+                generator_for: sequence.generator_for,
+                persistence: sequence.persistence,
+                restart: Some(sequence.start_value),
+            },
+            txn.txid,
+        )?;
+        txn.record_sequence_change(storage, change)?;
+    }
+    Ok(())
+}
+
 /// Applies one pgoutput TRUNCATE set transactionally.  The publisher supplies
 /// the complete cascade closure, which must also be closed under local foreign
 /// keys; accepting a partial closure would leave replicas observably divergent.
@@ -55212,51 +55412,7 @@ pub fn apply_replication_truncate(
             }
         }
         if restart_identity {
-            let definition = (*storage.table_def(table, txn.txid)).clone();
-            for column in 0..definition.n_columns {
-                if !definition.columns()[column].auto_increment {
-                    continue;
-                }
-                if let Some(sequence) = storage.generated_sequence_slot(
-                    definition.schema.as_str(),
-                    definition.name.as_str(),
-                    definition.columns()[column].name.as_str(),
-                    crate::storage::GeneratedSequenceScope::Owned,
-                    txn.txid,
-                ) {
-                    let definition = storage.sequence_for(sequence, txn.txid);
-                    let change = storage.stage_sequence_alter(
-                        storage.prepare_sequence_edit(sequence, txn.txid)?,
-                        crate::storage::SequenceAlteration {
-                            schema: definition.schema,
-                            name: definition.name,
-                            spec: crate::storage::SeqSpec {
-                                data_type: definition.data_type,
-                                increment: definition.increment,
-                                min_value: definition.min_value,
-                                max_value: definition.max_value,
-                                start_value: definition.start_value,
-                                cache: definition.cache,
-                                cycle: definition.cycle,
-                            },
-                            owner: definition.owner,
-                            generator_for: definition.generator_for,
-                            persistence: definition.persistence,
-                            restart: Some(definition.start_value),
-                        },
-                        txn.txid,
-                    )?;
-                    txn.record_sequence_change(storage, change)?;
-                } else if !definition.columns()[column].is_identity {
-                    let prior = storage.table_serial_value(table, column);
-                    txn.record_ddl(crate::sql::txn::DdlUndo::SequenceReset {
-                        table: table as u32,
-                        column: column as u16,
-                        prior,
-                    })?;
-                    storage.set_table_serial_value(table, column, 0);
-                }
-            }
+            restart_owned_sequences(storage, txn, table)?;
         }
     }
     txn.record_truncate(tables, cascade, restart_identity, txn.command_id())?;
@@ -60180,7 +60336,6 @@ pub(crate) fn view_trigger_definition<'a>(
             default: crate::storage::ColumnDefault::NONE,
             is_identity: false,
             identity_always: false,
-            auto_increment_step: 1,
             user_type,
             statistics_target: -1,
             statistics_options: crate::sql::ast::ColumnStatisticsOptions::DEFAULT,
@@ -64304,66 +64459,8 @@ pub(crate) fn truncate(
                 }
             }
         }
-        if restart_identity {
-            let def = (*storage.table_def(table_index, txn.txid)).clone();
-            for c in 0..def.n_columns {
-                if !def.columns()[c].auto_increment {
-                    continue;
-                }
-                if let Some(sequence_slot) = storage.generated_sequence_slot(
-                    def.schema.as_str(),
-                    def.name.as_str(),
-                    def.columns()[c].name.as_str(),
-                    crate::storage::GeneratedSequenceScope::Owned,
-                    txn.txid,
-                ) {
-                    let definition = storage.sequence_for(sequence_slot, txn.txid);
-                    let target = match storage.prepare_sequence_edit(sequence_slot, txn.txid) {
-                        Ok(target) => target,
-                        Err(error) => return sql_fail(error),
-                    };
-                    let change = match storage.stage_sequence_alter(
-                        target,
-                        crate::storage::SequenceAlteration {
-                            schema: definition.schema,
-                            name: definition.name,
-                            spec: crate::storage::SeqSpec {
-                                data_type: definition.data_type,
-                                increment: definition.increment,
-                                min_value: definition.min_value,
-                                max_value: definition.max_value,
-                                start_value: definition.start_value,
-                                cache: definition.cache,
-                                cycle: definition.cycle,
-                            },
-                            owner: definition.owner,
-                            generator_for: definition.generator_for,
-                            persistence: definition.persistence,
-                            restart: Some(definition.start_value),
-                        },
-                        txn.txid,
-                    ) {
-                        Ok(change) => change,
-                        Err(error) => return sql_fail(error),
-                    };
-                    if let Err(error) = txn.record_sequence_change(storage, change) {
-                        return sql_fail(error);
-                    }
-                    continue;
-                }
-                if def.columns()[c].is_identity {
-                    continue;
-                }
-                let prior = storage.table_serial_value(table_index, c);
-                if let Err(e) = txn.record_ddl(crate::sql::txn::DdlUndo::SequenceReset {
-                    table: table_index as u32,
-                    column: c as u16,
-                    prior,
-                }) {
-                    return sql_fail(e);
-                }
-                storage.set_table_serial_value(table_index, c, 0);
-            }
+        if restart_identity && let Err(error) = restart_owned_sequences(storage, txn, table_index) {
+            return sql_fail(error);
         }
     }
     for (&table_index, &target) in list[..n].iter().zip(targets.iter()) {
@@ -64903,7 +65000,14 @@ fn rename_attached_index_constraint(
             definition: (&altered).into(),
         },
     )?;
-    txn.write_table_definition(storage, edit_target, altered, &mapping, false)?;
+    txn.write_table_definition(
+        storage,
+        edit_target,
+        altered,
+        &mapping,
+        false,
+        crate::storage::ColumnSet::EMPTY,
+    )?;
     Ok(())
 }
 
@@ -64985,7 +65089,14 @@ fn drop_dependent_foreign_keys(
                 definition: (&altered).into(),
             },
         )?;
-        txn.write_table_definition(storage, edit_target, altered, &mapping, false)?;
+        txn.write_table_definition(
+            storage,
+            edit_target,
+            altered,
+            &mapping,
+            false,
+            crate::storage::ColumnSet::EMPTY,
+        )?;
     }
     Ok(())
 }
@@ -65712,12 +65823,10 @@ fn inherit_partition_constraints<Definition0: crate::storage::DefinitionBacking>
             child.columns[index].auto_increment = true;
             child.columns[index].is_identity = true;
             child.columns[index].identity_always = expected.identity_always;
-            child.columns[index].auto_increment_step = expected.auto_increment_step;
         } else if matches!(mode, PartitionInheritance::ParentAlter) && actual.is_identity {
             child.columns[index].auto_increment = false;
             child.columns[index].is_identity = false;
             child.columns[index].identity_always = false;
-            child.columns[index].auto_increment_step = 1;
         }
     }
     for constraint in parent.uniques() {
@@ -66106,12 +66215,10 @@ fn stage_partition_identity_modes(
                 let actual = &mut replacement.columns[child];
                 changed |= actual.auto_increment != expected.auto_increment
                     || actual.is_identity != expected.is_identity
-                    || actual.identity_always != expected.identity_always
-                    || actual.auto_increment_step != expected.auto_increment_step;
+                    || actual.identity_always != expected.identity_always;
                 actual.auto_increment = expected.auto_increment;
                 actual.is_identity = expected.is_identity;
                 actual.identity_always = expected.identity_always;
-                actual.auto_increment_step = expected.auto_increment_step;
             }
             if changed {
                 stage_table_definition(storage, wal, txn, target, current, replacement)?;
@@ -66298,8 +66405,14 @@ fn alter_table_inheritance(
     ) {
         return sql_fail(error);
     }
-    if let Err(error) = txn.write_table_definition(storage, child_target, updated, &mapping, false)
-    {
+    if let Err(error) = txn.write_table_definition(
+        storage,
+        child_target,
+        updated,
+        &mapping,
+        false,
+        crate::storage::ColumnSet::EMPTY,
+    ) {
         return sql_fail(error);
     }
     if emit_completion {
@@ -66588,7 +66701,6 @@ fn alter_partition_attachment(
                     column.auto_increment = false;
                     column.is_identity = false;
                     column.identity_always = false;
-                    column.auto_increment_step = 1;
                 }
             }
         };
@@ -66739,8 +66851,14 @@ fn alter_partition_attachment(
     ) {
         return sql_fail(error);
     }
-    if let Err(error) = txn.write_table_definition(storage, child_target, new_def, &mapping, false)
-    {
+    if let Err(error) = txn.write_table_definition(
+        storage,
+        child_target,
+        new_def,
+        &mapping,
+        false,
+        crate::storage::ColumnSet::EMPTY,
+    ) {
         return sql_fail(error);
     }
     if child_def.partition.is_partitioned() {
@@ -66806,6 +66924,7 @@ fn alter_partition_attachment(
                     dependent,
                     &mapping,
                     false,
+                    crate::storage::ColumnSet::EMPTY,
                 ) {
                     return sql_fail(error);
                 }
@@ -67380,9 +67499,14 @@ fn alter_table_relation(
         for (column, target) in mapping.iter_mut().enumerate().take(def.n_columns) {
             *target = Some(def.columns()[column].name);
         }
-        if let Err(error) =
-            txn.write_table_definition(storage, edit_target, new_def, &mapping, false)
-        {
+        if let Err(error) = txn.write_table_definition(
+            storage,
+            edit_target,
+            new_def,
+            &mapping,
+            false,
+            crate::storage::ColumnSet::EMPTY,
+        ) {
             return sql_fail(error);
         }
         if let Err(error) =
@@ -67871,9 +67995,6 @@ fn alter_table_relation(
                     ) {
                         return sql_fail(error);
                     }
-                    if let Some(increment) = options.increment {
-                        new_def.columns[column].auto_increment_step = increment;
-                    }
                 }
                 _ => unreachable!("metadata-only ALTER action"),
             }
@@ -67992,9 +68113,14 @@ fn alter_table_relation(
             }
             seq_session.invalidate_cache(alteration.slot);
         }
-        if let Err(error) =
-            txn.write_table_definition(storage, edit_target, new_def, &mapping, false)
-        {
+        if let Err(error) = txn.write_table_definition(
+            storage,
+            edit_target,
+            new_def,
+            &mapping,
+            false,
+            crate::storage::ColumnSet::EMPTY,
+        ) {
             return sql_fail(error);
         }
         if let Err(error) = stage_partition_identity_modes(
@@ -68041,6 +68167,7 @@ fn alter_table_relation(
     // Build the new definition and the composed per-column rewrite source.
     // Names resolve against the running definition, so an ADD CONSTRAINT can
     // reference a column ADDed earlier in the pass-ordered list.
+    let mut invalidated_statistics = ColumnSet::EMPTY;
     let mut new_def = TableDefBuilder::from_definition(&def);
     let mut source = [ColSource::Keep(0usize); MAX_COLUMNS];
     for (i, s) in source.iter_mut().enumerate().take(def.n_columns) {
@@ -68271,6 +68398,46 @@ fn alter_table_relation(
                 {
                     meta.not_null = crate::storage::NotNullOrigin::Inherited;
                 }
+                if meta.auto_increment {
+                    let index = new_def.n_columns;
+                    new_def.columns[index] = meta;
+                    new_def.n_columns += 1;
+                    let plan = match owned_sequence_plan(&new_def, index, c.identity) {
+                        Ok(plan) => plan,
+                        Err(error) => return sql_fail(error),
+                    };
+                    new_def.n_columns -= 1;
+                    let sequence = match create_owned_sequence(
+                        storage,
+                        wal,
+                        plan,
+                        new_def.persistence,
+                        txn.txid,
+                    ) {
+                        Ok(sequence) => sequence,
+                        Err(error) => return sql_fail(error),
+                    };
+                    if let Err(error) = txn.record_sequence_change(storage, sequence) {
+                        return sql_fail(error);
+                    }
+                    if let Err(error) = apply_default_privileges_to_new_object(
+                        storage,
+                        txn,
+                        crate::storage::AccessObject {
+                            class: crate::storage::AccessClass::Sequence,
+                            slot: sequence.slot() as u16,
+                        },
+                    ) {
+                        return sql_fail(error);
+                    }
+                    meta.default = match sequence_column_default(storage, sequence.slot()) {
+                        Ok(default) => default,
+                        Err(error) => return sql_fail(error),
+                    };
+                    if !meta.is_identity {
+                        meta.auto_increment = false;
+                    }
+                }
                 // NOT NULL without a default over a non-empty table is a
                 // constraint violation, as in PostgreSQL.
                 if matches!(meta.default, crate::storage::ColumnDefault::None)
@@ -68427,6 +68594,14 @@ fn alter_table_relation(
                 let Some(i) = new_def.column_index(column) else {
                     return sql_fail(undefined_column(column));
                 };
+                if new_def.columns[i].is_identity {
+                    return sql_fail(sql_err!(
+                        sqlstate::SYNTAX_ERROR,
+                        "column \"{}\" of relation \"{}\" is an identity column",
+                        column,
+                        statement.table.name
+                    ));
+                }
                 if new_def.columns[i].default.is_generated() {
                     return sql_fail(sql_err!(
                         sqlstate::SYNTAX_ERROR,
@@ -68452,11 +68627,20 @@ fn alter_table_relation(
                     Err(e) => return sql_fail(e),
                 };
                 new_def.columns[i].default = default;
+                new_def.columns[i].auto_increment = false;
             }
             AlterAction::DropDefault { column } => {
                 let Some(i) = new_def.column_index(column) else {
                     return sql_fail(undefined_column(column));
                 };
+                if new_def.columns[i].is_identity {
+                    return sql_fail(sql_err!(
+                        sqlstate::SYNTAX_ERROR,
+                        "column \"{}\" of relation \"{}\" is an identity column",
+                        column,
+                        statement.table.name
+                    ));
+                }
                 if new_def.columns[i].default.is_generated() {
                     return sql_fail(sql_err!(
                         sqlstate::SYNTAX_ERROR,
@@ -68466,7 +68650,7 @@ fn alter_table_relation(
                     ));
                 }
                 new_def.columns[i].default = crate::storage::ColumnDefault::NONE;
-                // Dropping a serial column's default detaches its auto-increment.
+                // SERIAL is an ordinary nextval default; ownership remains unchanged.
                 new_def.columns[i].auto_increment = false;
             }
             AlterAction::AddIdentity { column, spec } => {
@@ -68498,20 +68682,26 @@ fn alter_table_relation(
                         statement.table.name
                     ));
                 }
-                let step = spec.options.increment.unwrap_or(1);
                 new_def.columns[i].is_identity = true;
                 new_def.columns[i].identity_always = spec.always;
                 new_def.columns[i].auto_increment = true;
-                new_def.columns[i].auto_increment_step = step;
                 let plan = match owned_sequence_plan(&new_def, i, Some(*spec)) {
                     Ok(plan) => plan,
                     Err(error) => return sql_fail(error),
                 };
-                if storage.relation_name_taken(plan.schema.as_str(), plan.name.as_str(), txn.txid)
-                    || identity_sequences[..n_identity_sequences]
+                if plan.explicit_name
+                    && (storage.relation_name_taken(
+                        plan.schema.as_str(),
+                        plan.name.as_str(),
+                        txn.txid,
+                    ) || identity_sequences[..n_identity_sequences]
                         .iter()
                         .flatten()
-                        .any(|other| other.schema == plan.schema && other.name == plan.name)
+                        .any(|other| {
+                            other.explicit_name
+                                && other.schema == plan.schema
+                                && other.name == plan.name
+                        }))
                 {
                     return sql_fail(sql_err!(
                         sqlstate::DUPLICATE_TABLE,
@@ -68573,7 +68763,6 @@ fn alter_table_relation(
                 new_def.columns[i].is_identity = false;
                 new_def.columns[i].identity_always = false;
                 new_def.columns[i].auto_increment = false;
-                new_def.columns[i].auto_increment_step = 1;
             }
             AlterAction::SetIdentityMode { column, always } => {
                 let Some(i) = new_def.column_index(column) else {
@@ -68636,9 +68825,6 @@ fn alter_table_relation(
                     base,
                 ) {
                     return sql_fail(error);
-                }
-                if let Some(increment) = options.increment {
-                    new_def.columns[i].auto_increment_step = increment;
                 }
             }
             AlterAction::SetGeneratedExpression {
@@ -68785,6 +68971,15 @@ fn alter_table_relation(
                 let Some(i) = new_def.column_index(column) else {
                     return sql_fail(undefined_column(column));
                 };
+                if let ColSource::Keep(original) | ColSource::Cast { orig: original, .. } =
+                    source[i]
+                {
+                    let attribute = def
+                        .attributes
+                        .number(original)
+                        .expect("original ALTER column has an attribute number");
+                    invalidated_statistics.insert(usize::from(attribute - 1));
+                }
                 let Some(target) = ColType::from_sql_name(type_name) else {
                     return sql_fail(sql_err!(
                         sqlstate::UNDEFINED_OBJECT,
@@ -69529,6 +69724,19 @@ fn alter_table_relation(
         rewritten_images[i] = Some(image);
     }
 
+    // Identity backfill uses its newly created sequence, but identity columns
+    // expose no ordinary DEFAULT expression in the stored catalog shape.
+    for (column, source) in new_def
+        .columns
+        .iter_mut()
+        .zip(source.iter())
+        .take(new_def.n_columns)
+    {
+        if column.is_identity && matches!(source, ColSource::FillDefault(_)) {
+            column.default = crate::storage::ColumnDefault::NONE;
+        }
+    }
+
     // Cross-row constraints must see the transformed image set rather than the
     // old rows still installed in storage.
     if has_rewrite {
@@ -69801,6 +70009,7 @@ fn alter_table_relation(
         new_def,
         &column_mapping,
         has_rewrite,
+        invalidated_statistics,
     ) {
         Ok(target) => target,
         Err(error) => return sql_fail(error),
@@ -70163,6 +70372,7 @@ fn alter_table_relation(
                     dependent,
                     &mapping,
                     false,
+                    crate::storage::ColumnSet::EMPTY,
                 ) {
                     return sql_fail(error);
                 }
@@ -70240,7 +70450,14 @@ pub(super) fn stage_inbound_foreign_key_moves<
         for (column, target) in mapping.iter_mut().enumerate().take(current.n_columns) {
             *target = Some(current.columns()[column].name);
         }
-        txn.write_table_definition(storage, target, dependent, &mapping, false)?;
+        txn.write_table_definition(
+            storage,
+            target,
+            dependent,
+            &mapping,
+            false,
+            crate::storage::ColumnSet::EMPTY,
+        )?;
     }
     Ok(())
 }
@@ -70560,7 +70777,14 @@ fn alter_table_replica_identity(
             return sql_fail(error);
         }
     }
-    if let Err(error) = txn.write_table_definition(storage, edit_target, next, &mapping, false) {
+    if let Err(error) = txn.write_table_definition(
+        storage,
+        edit_target,
+        next,
+        &mapping,
+        false,
+        crate::storage::ColumnSet::EMPTY,
+    ) {
         return sql_fail(error);
     }
     if emit_completion {
@@ -71041,7 +71265,7 @@ pub(super) fn collect_matches<'a>(
             storage.record_relation_scan(
                 txid,
                 leaf,
-                access.map(|access| access.index_oid()),
+                access.map(|access| access.statistics()),
                 access.map_or(0, |access| access.index_entries()),
                 crate::sql::datetime::now_micros(),
             )?;
@@ -71056,7 +71280,7 @@ pub(super) fn collect_matches<'a>(
             storage.record_relation_tuple_read(
                 txid,
                 leaf,
-                access.map(|access| access.index_oid()),
+                access.map(|access| access.statistics()),
             )?;
             let snapshot = loc.snapshot();
             if let Some(image) = row_matches(
@@ -72016,7 +72240,6 @@ fn coerce_composite_value_inner<'a>(
             default: crate::storage::ColumnDefault::NONE,
             is_identity: false,
             identity_always: false,
-            auto_increment_step: 1,
             user_type: field.user_type,
             statistics_target: -1,
             statistics_options: crate::sql::ast::ColumnStatisticsOptions::DEFAULT,
@@ -73757,7 +73980,13 @@ mod tests {
             let mut mapping = [None; MAX_COLUMNS];
             mapping[0] = Some(changed.columns[0].name);
             let change = storage
-                .write_table_def(target, changed, &mapping, false)
+                .write_table_def(
+                    target,
+                    changed,
+                    &mapping,
+                    false,
+                    crate::storage::ColumnSet::EMPTY,
+                )
                 .unwrap();
             let original = row.write_target(&storage, table, 7).unwrap();
             let definition = row.definition();

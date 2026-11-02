@@ -2553,3 +2553,60 @@ fn timezone_numeric_offsets_and_intervals_use_postgresql_bounds() {
         }
     });
 }
+
+#[test]
+fn qualified_catalog_calls_keep_their_namespace_and_sql_syntax_boundaries() {
+    let config = test_config("qualified-catalog-call-boundaries");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    let fixture =
+        include_str!("../../../tests/external/differential_exact/60_qualified_routine_calls.sql");
+    let mut requests = fixture.split("-- next request");
+    let valid = session.success(&mut engine, requests.next().unwrap(), true);
+    assert_eq!(
+        data_rows(&valid),
+        [
+            "999|999|shadow",
+            "1|2|3|3|t|t",
+            "3",
+            "103|3|3|2|2",
+            "1|1|1",
+            "2|2|2",
+            "2|0|0|t|t",
+            "t|t|t|x",
+            "7|8|1.25",
+            "qualified_call_values",
+            "17",
+        ]
+    );
+    for request in requests {
+        let output = session.execute(&mut engine, request, true);
+        if request.contains("SELECT pg_catalog.nextval('qualified_error_values')") {
+            assert!(
+                error_sqlstates(&output).is_empty(),
+                "{}",
+                String::from_utf8_lossy(&output)
+            );
+            assert_eq!(data_rows(&output), ["1"]);
+            continue;
+        }
+        let expected = if request.contains("'x':1") {
+            "42601"
+        } else if request.contains("pg_catalog.array[")
+            || request.contains("pg_catalog.current_date;")
+            || request.contains("AS hidden")
+        {
+            "42P01"
+        } else {
+            "42883"
+        };
+        assert_eq!(
+            error_sqlstates(&output),
+            [expected],
+            "{}: {}",
+            request,
+            String::from_utf8_lossy(&output)
+        );
+    }
+}

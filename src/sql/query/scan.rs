@@ -594,7 +594,7 @@ struct IndexKeyCandidate {
 
 pub(crate) struct IndexedCandidates<'a> {
     table: usize,
-    index_oid: i32,
+    statistics: crate::storage::IndexStatisticsCapture<'a>,
     scan_executed: bool,
     index_entries: usize,
     preserves_order: bool,
@@ -610,8 +610,8 @@ pub(crate) struct IndexedCandidates<'a> {
 }
 
 impl<'a> IndexedCandidates<'a> {
-    pub(crate) const fn index_oid(&self) -> i32 {
-        self.index_oid
+    pub(crate) fn statistics(&self) -> &crate::storage::IndexStatisticsCapture<'a> {
+        &self.statistics
     }
 
     pub(crate) const fn scan_executed(&self) -> bool {
@@ -1100,13 +1100,17 @@ impl IndexAccessPlan<'_> {
             let Some(constraint) = self.constraints[position] else {
                 continue;
             };
+            let column_statistics = definition
+                .attributes
+                .number(column)
+                .and_then(|attribute| statistics.column(attribute));
             if self.expression_mask & (1 << position) == 0
                 && statistics.valid
-                && statistics.columns[column].valid
+                && let Some(column_statistics) = column_statistics
             {
                 let distinct = crate::storage::column_distinct_estimate(
                     &definition.columns[column],
-                    statistics.columns[column],
+                    column_statistics,
                     statistics.rows,
                     false,
                 );
@@ -3043,10 +3047,11 @@ fn ranked_knn_candidates<'a>(
     if !storage.value_binding_durable_complete(slot, plan.binding) {
         return Ok(None);
     }
+    let statistics = storage.capture_index_statistics(txid, slot, ordered.index_oid)?;
     if window == 0 {
         return Ok(Some(IndexedCandidates {
             table,
-            index_oid: ordered.index_oid,
+            statistics,
             scan_executed: false,
             index_entries: 0,
             preserves_order: true,
@@ -3230,7 +3235,7 @@ fn ranked_knn_candidates<'a>(
     debug_assert_eq!(entry_at, entry_bytes);
     Ok(Some(IndexedCandidates {
         table,
-        index_oid: ordered.index_oid,
+        statistics,
         scan_executed: true,
         index_entries: scanned,
         preserves_order: true,
@@ -3262,6 +3267,7 @@ fn indexed_candidates_for_plan<'a>(
     hooks: &EvalHooks<'_, 'a>,
 ) -> Result<Option<IndexedCandidates<'a>>, SqlError> {
     let index_oid = ordered_plan.map_or(plan.index_oid, |ordered| ordered.index_oid);
+    let statistics = storage.capture_index_statistics(txid, slot, index_oid)?;
     let expected_rows = plan.expected_rows(storage, slot, definition, txid);
     let selective_brin = plan.method == crate::sql::ast::IndexAccessMethod::Brin
         && expected_rows.saturating_mul(8) <= storage.planning_row_estimate(slot);
@@ -3312,7 +3318,7 @@ fn indexed_candidates_for_plan<'a>(
             if raw.is_null() {
                 return Ok(Some(IndexedCandidates {
                     table,
-                    index_oid,
+                    statistics,
                     scan_executed: false,
                     index_entries: 0,
                     preserves_order: ordered_plan.is_some(),
@@ -3858,7 +3864,7 @@ fn indexed_candidates_for_plan<'a>(
     }
     Ok(Some(IndexedCandidates {
         table,
-        index_oid,
+        statistics,
         scan_executed: true,
         index_entries: count,
         preserves_order: ordered_plan.is_some(),
@@ -6750,7 +6756,7 @@ fn scan_source_mode<'a>(
                     storage.record_relation_scan(
                         txid,
                         slot,
-                        Some(access.index_oid),
+                        Some(access.statistics()),
                         access.index_entries,
                         crate::sql::datetime::now_micros(),
                     )?;
@@ -6763,7 +6769,7 @@ fn scan_source_mode<'a>(
                     let Some(home) = storage.visible_row_home(slot, rowid, state, txid)? else {
                         continue;
                     };
-                    storage.record_relation_tuple_read(txid, slot, Some(access.index_oid))?;
+                    storage.record_relation_tuple_read(txid, slot, Some(access.statistics()))?;
                     let keep_scanning = recycled(arena, recycle_rows, retain_match, || {
                         let bytes = storage.row_bytes(slot, rowid, home, arena)?;
                         visit_candidate!(index, BoundRow::Encoded(bytes), Some(rowid))
@@ -6891,7 +6897,7 @@ fn scan_source_mode<'a>(
                 storage.record_relation_scan(
                     txid,
                     slot,
-                    access.map(|access| access.index_oid),
+                    access.map(|access| access.statistics()),
                     access.map_or(0, |access| access.index_entries),
                     crate::sql::datetime::now_micros(),
                 )?;
@@ -6981,7 +6987,7 @@ fn scan_source_mode<'a>(
                     let Some(home) = storage.visible_row_home(slot, rowid, state, txid)? else {
                         continue;
                     };
-                    storage.record_relation_tuple_read(txid, slot, Some(access.index_oid))?;
+                    storage.record_relation_tuple_read(txid, slot, Some(access.statistics()))?;
                     let keep_scanning = recycled(arena, recycle_rows, retain_match, || {
                         let bytes = storage.row_bytes(slot, rowid, home, arena)?;
                         visit_candidate!(this, BoundRow::Encoded(bytes), Some(rowid))
@@ -7036,7 +7042,7 @@ fn scan_source_mode<'a>(
                 storage.record_relation_tuple_read(
                     txid,
                     slot,
-                    access.map(|access| access.index_oid),
+                    access.map(|access| access.statistics()),
                 )?;
                 let keep_scanning = recycled(arena, recycle_rows, retain_match, || {
                     let bytes = storage.row_bytes(scope.slots[order[depth]], rowid, home, arena)?;

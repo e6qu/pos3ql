@@ -145,6 +145,9 @@ fn measure() -> Result<(), Box<dyn std::error::Error>> {
         "--budget-limit-bytes",
         "--table-metadata-bytes",
         "--table-metadata-leases",
+        "--statistics-bytes",
+        "--statistics-leases",
+        "--index-statistics-slots",
     ];
     if arguments.len() != flags.len() * 2
         || flags
@@ -152,7 +155,7 @@ fn measure() -> Result<(), Box<dyn std::error::Error>> {
             .enumerate()
             .any(|(index, flag)| arguments[index * 2] != *flag)
     {
-        return Err("usage: embedded-memory --tables N --row-overlay-slots N --row-work-bytes N --row-work-leases N --definition-image-slots N --mode mvcc|locking --row-history-slots N --workload empty|hot|even|moving|wide|replacement --rows N --data-dir NEW_DIRECTORY --budget-limit-bytes N --table-metadata-bytes N --table-metadata-leases N".into());
+        return Err("usage: embedded-memory --tables N --row-overlay-slots N --row-work-bytes N --row-work-leases N --definition-image-slots N --mode mvcc|locking --row-history-slots N --workload empty|hot|even|moving|wide|replacement|statistics|statistics-wide --rows N --data-dir NEW_DIRECTORY --budget-limit-bytes N --table-metadata-bytes N --table-metadata-leases N --statistics-bytes N --statistics-leases N --index-statistics-slots N".into());
     }
     let mut config = Config::default_dev();
     config.max_tables = arguments[1].parse()?;
@@ -169,6 +172,9 @@ fn measure() -> Result<(), Box<dyn std::error::Error>> {
     config.row_history_slots = arguments[13].parse()?;
     config.table_metadata_bytes = arguments[23].parse()?;
     config.table_metadata_leases = arguments[25].parse()?;
+    config.statistics_bytes = arguments[27].parse()?;
+    config.statistics_leases = arguments[29].parse()?;
+    config.index_statistics_slots = arguments[31].parse()?;
     config.validate_runtime_resources()?;
     if config.max_tables == 0 {
         return Err("tables must be positive".into());
@@ -182,11 +188,18 @@ fn measure() -> Result<(), Box<dyn std::error::Error>> {
     let rows: usize = arguments[17].parse()?;
     if !matches!(
         workload,
-        "empty" | "hot" | "even" | "moving" | "wide" | "replacement"
+        "empty"
+            | "hot"
+            | "even"
+            | "moving"
+            | "wide"
+            | "replacement"
+            | "statistics"
+            | "statistics-wide"
     ) || (workload == "empty") != (rows == 0)
         || rows > config.row_overlay_slots
     {
-        return Err("choose empty with zero rows, or hot/even/moving/wide/replacement with positive rows fitting the global overlay".into());
+        return Err("choose empty with zero rows, or a populated workload with positive rows fitting the global overlay".into());
     }
     config.catalog_history_bytes = if config.transaction_mode == TransactionMode::Mvcc {
         1 << 20
@@ -237,7 +250,7 @@ fn measure() -> Result<(), Box<dyn std::error::Error>> {
     if workload != "empty" {
         let mut session = Session::new(&config, &mut session_budget)?;
         let mut columns = String::from("id integer, payload text");
-        if workload == "wide" {
+        if matches!(workload, "wide" | "statistics-wide") {
             for column in 2..64 {
                 columns.push_str(&format!(", field_{column} integer"));
             }
@@ -262,7 +275,7 @@ fn measure() -> Result<(), Box<dyn std::error::Error>> {
             }
             Ok(())
         };
-        if workload == "even" {
+        if matches!(workload, "even" | "statistics" | "statistics-wide") {
             let mut first = 0;
             for (table, (expected_count, expected_sum)) in
                 counts.iter_mut().zip(&mut sums).enumerate()
@@ -308,6 +321,21 @@ fn measure() -> Result<(), Box<dyn std::error::Error>> {
                 None,
             )?;
         }
+        if matches!(workload, "statistics" | "statistics-wide") {
+            for table in 0..config.max_tables {
+                session.execute(&mut engine, &format!("ANALYZE measured_{table}"), None)?;
+            }
+            if workload == "statistics-wide" {
+                session.execute(
+                    &mut engine,
+                    "BEGIN; SAVEPOINT original_statistics; \
+                     ALTER TABLE measured_0 ALTER COLUMN id TYPE bigint; \
+                     ANALYZE measured_0(id); \
+                     ROLLBACK TO original_statistics; COMMIT",
+                    None,
+                )?;
+            }
+        }
         for (table, (&count, &sum)) in counts.iter().zip(&sums).enumerate() {
             session.execute(
                 &mut engine,
@@ -328,7 +356,7 @@ fn measure() -> Result<(), Box<dyn std::error::Error>> {
         .current_bytes
         .map_or("null".to_string(), |bytes| bytes.to_string());
     println!(
-        "{{\"rss_metric_version\":2,\"rss_unit\":\"bytes\",\"rss_peak_source\":\"{}\",\"rss_current_source\":{},\"getrusage_maxrss_source\":\"getrusage_rusage_self_ru_maxrss\",\"startup_current_rss_bytes\":{},\"final_current_rss_bytes\":{},\"startup_getrusage_maxrss_bytes\":{},\"final_getrusage_maxrss_bytes\":{},\"os\":\"{}\",\"arch\":\"{}\",\"mode\":\"{}\",\"workload\":\"{}\",\"rows\":{},\"max_tables\":{},\"row_overlay_slots\":{},\"row_work_bytes\":{},\"row_work_leases\":{},\"definition_image_slots\":{},\"table_metadata_bytes\":{},\"table_metadata_leases\":{},\"max_connections\":1,\"query_workspace_slots\":1,\"max_prepared_transactions\":0,\"max_subscriptions\":1,\"max_ddl_per_transaction\":16,\"max_catalog_versions_per_object\":2,\"memtable_bytes\":{},\"work_arena_bytes\":{},\"sql_arena_bytes\":{},\"catalog_history_bytes\":{},\"row_history_slots\":{},\"max_row_versions_per_row\":{},\"large_object_pages\":{},\"startup_stack_bytes\":{},\"planned_engine_bytes\":{},\"drawn_engine_bytes\":{},\"planned_session_ceiling_bytes\":{},\"drawn_session_bytes\":{},\"startup_peak_rss_bytes\":{},\"final_peak_rss_bytes\":{},\"startup_microseconds\":{},\"workload_microseconds\":{}}}",
+        "{{\"rss_metric_version\":2,\"rss_unit\":\"bytes\",\"rss_peak_source\":\"{}\",\"rss_current_source\":{},\"getrusage_maxrss_source\":\"getrusage_rusage_self_ru_maxrss\",\"startup_current_rss_bytes\":{},\"final_current_rss_bytes\":{},\"startup_getrusage_maxrss_bytes\":{},\"final_getrusage_maxrss_bytes\":{},\"os\":\"{}\",\"arch\":\"{}\",\"mode\":\"{}\",\"workload\":\"{}\",\"rows\":{},\"max_tables\":{},\"row_overlay_slots\":{},\"row_work_bytes\":{},\"row_work_leases\":{},\"definition_image_slots\":{},\"table_metadata_bytes\":{},\"table_metadata_leases\":{},\"statistics_bytes\":{},\"statistics_leases\":{},\"index_statistics_slots\":{},\"max_connections\":1,\"query_workspace_slots\":1,\"max_prepared_transactions\":0,\"max_subscriptions\":1,\"max_ddl_per_transaction\":16,\"max_catalog_versions_per_object\":2,\"memtable_bytes\":{},\"work_arena_bytes\":{},\"sql_arena_bytes\":{},\"catalog_history_bytes\":{},\"row_history_slots\":{},\"max_row_versions_per_row\":{},\"large_object_pages\":{},\"startup_stack_bytes\":{},\"planned_engine_bytes\":{},\"drawn_engine_bytes\":{},\"planned_session_ceiling_bytes\":{},\"drawn_session_bytes\":{},\"startup_peak_rss_bytes\":{},\"final_peak_rss_bytes\":{},\"startup_microseconds\":{},\"workload_microseconds\":{}}}",
         startup_memory.peak_source,
         current_source,
         startup_current,
@@ -347,6 +375,9 @@ fn measure() -> Result<(), Box<dyn std::error::Error>> {
         config.definition_image_slots,
         config.table_metadata_bytes,
         config.table_metadata_leases,
+        config.statistics_bytes,
+        config.statistics_leases,
+        config.index_statistics_slots,
         config.memtable_bytes,
         config.work_arena_bytes,
         config.sql_arena_bytes,

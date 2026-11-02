@@ -623,7 +623,13 @@ mod tests {
             *mapped = Some(definition.columns[column].name);
         }
         storage
-            .write_table_def(target, definition, &mapping, false)
+            .write_table_def(
+                target,
+                definition,
+                &mapping,
+                false,
+                crate::storage::ColumnSet::EMPTY,
+            )
             .unwrap()
     }
 
@@ -747,7 +753,14 @@ mod tests {
             let mut mapping = [None; MAX_COLUMNS];
             mapping[0] = Some(expanded.columns[0].name);
             let installed = transaction
-                .write_table_definition(&storage, original, expanded, &mapping, true)
+                .write_table_definition(
+                    &storage,
+                    original,
+                    expanded,
+                    &mapping,
+                    true,
+                    crate::storage::ColumnSet::EMPTY,
+                )
                 .unwrap();
             let input = storage
                 .heap
@@ -965,7 +978,13 @@ mod tests {
             let mut mapping = [None; MAX_COLUMNS];
             mapping[0] = Some(expanded.columns[0].name);
             let change = storage
-                .write_table_def(target, expanded, &mapping, true)
+                .write_table_def(
+                    target,
+                    expanded,
+                    &mapping,
+                    true,
+                    crate::storage::ColumnSet::EMPTY,
+                )
                 .unwrap();
             let input = storage
                 .heap

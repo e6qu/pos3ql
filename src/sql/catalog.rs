@@ -11630,6 +11630,8 @@ struct IdxInfo {
     oid: i32,
     table_oid: i32,
     table_slot: usize,
+    table_database: crate::storage::DatabaseOid,
+    table_created_at: u64,
     name: StackStr<64>,
     method: crate::sql::ast::IndexAccessMethod,
     columns: [u16; crate::storage::MAX_INDEX_COLS],
@@ -11768,6 +11770,8 @@ fn visit_indexes(
                 oid,
                 table_oid: toid,
                 table_slot: slot,
+                table_database: def.identity().database,
+                table_created_at: def.identity().created_at,
                 name,
                 method: crate::sql::ast::IndexAccessMethod::Btree,
                 columns: c,
@@ -11946,21 +11950,26 @@ fn visit_indexes(
 }
 
 /// Counters belong to the index's table, which may be a scanned child partition.
-pub(crate) fn index_statistics_owner(
+pub(crate) fn index_statistics_source(
     storage: &Storage,
     transaction: u32,
     oid: i32,
-) -> Option<crate::storage::IndexStatisticsOwner> {
+) -> Option<(
+    crate::storage::IndexStatisticsOwner,
+    crate::storage::DatabaseOid,
+    u64,
+)> {
     let mut owner = None;
     visit_indexes(storage, transaction, None, |index| {
         if index.oid == oid {
             let table =
                 u16::try_from(index.table_slot).expect("startup table capacity is representable");
-            owner = Some(if index.explicit_definition.is_some() {
+            let selected = if index.explicit_definition.is_some() {
                 crate::storage::IndexStatisticsOwner::Explicit(table)
             } else {
                 crate::storage::IndexStatisticsOwner::Implicit(table)
-            });
+            };
+            owner = Some((selected, index.table_database, index.table_created_at));
         }
     });
     owner
@@ -12136,6 +12145,8 @@ fn empty_index() -> IdxInfo {
         oid: 0,
         table_oid: 0,
         table_slot: 0,
+        table_database: crate::storage::DatabaseOid::POSTGRES,
+        table_created_at: 0,
         name: StackStr::new(),
         method: crate::sql::ast::IndexAccessMethod::Btree,
         columns: [0; crate::storage::MAX_INDEX_COLS],
@@ -17346,11 +17357,7 @@ fn pg_stats<'a>(
         .map(|slot| {
             let statistics = storage.table_statistics(slot, txid);
             if statistics.valid {
-                statistics
-                    .columns
-                    .iter()
-                    .filter(|column| column.valid)
-                    .count()
+                statistics.columns.len()
             } else {
                 0
             }
@@ -17368,10 +17375,13 @@ fn pg_stats<'a>(
         }
         let table_definition = storage.table_def(slot, txid);
         for (column, metadata) in table_definition.columns().iter().enumerate() {
-            let column_statistics = statistics.columns[column];
-            if !column_statistics.valid {
+            let Some(column_statistics) = table_definition
+                .attributes
+                .number(column)
+                .and_then(|attribute| statistics.column(attribute))
+            else {
                 continue;
-            }
+            };
             if count == rows.len() {
                 return Err(sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -21800,6 +21810,29 @@ fn pg_depend<'a>(
                 && storage.sequence_for(*slot, txid).owner.is_some()
         })
         .count();
+    let mut default_sequence_dependencies = 0;
+    for table in 0..storage.table_count() {
+        if !storage.table_slot_visible_to(table, txid) {
+            continue;
+        }
+        let definition = storage.table_def(table, txid);
+        for column in definition.columns() {
+            let mark = arena.mark();
+            let dependencies =
+                super::exec::column_default_dependencies(storage, txid, column, arena);
+            let count = dependencies.map(|dependencies| {
+                dependencies
+                    .entries()
+                    .iter()
+                    .filter(|dependency| {
+                        dependency.class == crate::storage::DependencyClass::Sequence
+                    })
+                    .count()
+            });
+            unsafe { arena.rewind_to(mark) };
+            default_sequence_dependencies += count?;
+        }
+    }
     let domain_dependencies = (0..storage.domain_count())
         .filter(|slot| storage.domain_slot_visible_to(*slot, txid))
         .count();
@@ -21866,6 +21899,7 @@ fn pg_depend<'a>(
     let out = catalog_rows(
         arena,
         sequence_dependencies
+            + default_sequence_dependencies
             + constraint_dependencies.len()
             + domain_dependencies
             + cast_dependencies
@@ -21944,6 +21978,43 @@ fn pg_depend<'a>(
                 "a"
             },
         )?;
+    }
+
+    for table in 0..storage.table_count() {
+        if !storage.table_slot_visible_to(table, txid) {
+            continue;
+        }
+        let definition = storage.table_def(table, txid);
+        for (column_index, column) in definition.columns().iter().enumerate() {
+            let mark = arena.mark();
+            let dependencies =
+                super::exec::column_default_dependencies(storage, txid, column, arena);
+            let mut sequences = [0usize; crate::storage::MAX_STORED_QUERY_DEPENDENCIES];
+            let count = dependencies.map(|dependencies| {
+                let mut count = 0;
+                for dependency in dependencies.entries() {
+                    if dependency.class == crate::storage::DependencyClass::Sequence {
+                        sequences[count] = usize::from(dependency.slot);
+                        count += 1;
+                    }
+                }
+                count
+            });
+            unsafe { arena.rewind_to(mark) };
+            for sequence in &sequences[..count?] {
+                push(
+                    2604,
+                    400_000_000
+                        + table as i32 * crate::storage::MAX_RELATION_COLUMNS as i32
+                        + i32::from(definition.attribute_number(column_index))
+                        - 1,
+                    PG_CLASS_OID,
+                    sequence_oid(storage, *sequence),
+                    0,
+                    "n",
+                )?;
+            }
+        }
     }
 
     // A domain is ordered after its parent domain or direct user-defined base
@@ -23270,7 +23341,6 @@ fn pg_attribute<'a>(
                 default: crate::storage::ColumnDefault::NONE,
                 is_identity: false,
                 identity_always: false,
-                auto_increment_step: 1,
                 user_type: field.user_type,
                 statistics_target: -1,
                 statistics_options: crate::sql::ast::ColumnStatisticsOptions::DEFAULT,
@@ -32216,7 +32286,6 @@ fn info_column_type_usage<'a>(
                 default: crate::storage::ColumnDefault::NONE,
                 is_identity: false,
                 identity_always: false,
-                auto_increment_step: 1,
                 user_type,
                 statistics_target: -1,
                 statistics_options: crate::sql::ast::ColumnStatisticsOptions::DEFAULT,

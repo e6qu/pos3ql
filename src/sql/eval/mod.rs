@@ -5360,6 +5360,29 @@ fn call<'a>(
     } else {
         args
     };
+    if written_name.starts_with("pg_catalog.")
+        && matches!(
+            written_name.strip_prefix("pg_catalog."),
+            Some(
+                "coalesce"
+                    | "greatest"
+                    | "least"
+                    | "nullif"
+                    | "row"
+                    | "trim"
+                    | "current_date"
+                    | "current_time"
+                    | "current_timestamp"
+                    | "localtime"
+                    | "localtimestamp"
+                    | "current_role"
+                    | "user"
+                    | "current_catalog"
+            )
+        )
+    {
+        return undefined_function(written_name, args, arena, row, hooks);
+    }
     let name = written_name
         .strip_prefix("pg_catalog.")
         .unwrap_or(written_name);

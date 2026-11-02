@@ -326,12 +326,18 @@ fn column_selectivity(
         return default;
     }
     let statistics = storage.table_statistics(scope.slots[table], txid);
-    let column_statistics = statistics.columns[column];
-    if !statistics.valid || !column_statistics.valid || statistics.rows == 0 {
+    let definition = storage.table_def(scope.slots[table], txid);
+    let Some(column_statistics) = definition
+        .attributes
+        .number(column)
+        .and_then(|attribute| statistics.column(attribute))
+    else {
+        return default;
+    };
+    if !statistics.valid || statistics.rows == 0 {
         return default;
     }
     let non_null = 1.0 - f64::from(column_statistics.null_fraction_ppm) / 1_000_000.0;
-    let definition = storage.table_def(scope.slots[table], txid);
     let distinct = crate::storage::column_distinct_estimate(
         &definition.columns()[column],
         column_statistics,
@@ -635,10 +641,14 @@ fn predicate_selectivity<'a>(
                 return 1.0;
             }
             let statistics = storage.table_statistics(scope.slots[table], txid);
-            let column_statistics = statistics.columns[column];
-            if !statistics.valid || !column_statistics.valid {
+            let definition = storage.table_def(scope.slots[table], txid);
+            let column_statistics = definition
+                .attributes
+                .number(column)
+                .and_then(|attribute| statistics.column(attribute));
+            let Some(column_statistics) = column_statistics.filter(|_| statistics.valid) else {
                 return if *negated { 0.995 } else { 0.005 };
-            }
+            };
             let fraction = f64::from(column_statistics.null_fraction_ppm) / 1_000_000.0;
             if *negated { 1.0 - fraction } else { fraction }
         }

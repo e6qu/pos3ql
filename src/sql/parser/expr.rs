@@ -917,20 +917,6 @@ impl<'a> Parser<'a> {
                 // so the word's own offset is kept for the error.
                 let name_at = self.peek_at;
                 self.advance()?;
-                // Qualified name: the pg_catalog / information_schema schemas are
-                // transparent (pg_catalog.version() == version()), so a leading
-                // recognized schema qualifier is dropped.
-                let (name, stripped_schema) = if (name == "pg_catalog"
-                    || name == "information_schema")
-                    && self.peeked == Tok::Op(".")
-                {
-                    let stripped = name;
-                    self.record_namespace(namespace_source)?;
-                    self.advance()?;
-                    (self.any_ident("function or column name")?, Some(stripped))
-                } else {
-                    (name, None)
-                };
                 // `ARRAY[...]` array constructor.
                 if name.eq_ignore_ascii_case("array") && self.peeked == Tok::Op("[") {
                     self.advance()?;
@@ -1083,14 +1069,16 @@ impl<'a> Parser<'a> {
                         return self.arena_expr(Expr::WholeRow(name));
                     }
                     let column = self.any_ident("column name")?;
+                    if let Some(literal) = self.qualified_builtin_type_literal(name, column)? {
+                        self.record_namespace(namespace_source)?;
+                        return Ok(literal);
+                    }
                     if self.peeked == Tok::Op("(") {
                         self.record_namespace(namespace_source)?;
                         let routine = self.composed_qualifier(name, column)?;
                         return self.call(routine);
                     }
-                    // A third part makes it `schema.table.column` — as does a
-                    // transparently stripped `pg_catalog.`/`information_schema.`
-                    // prefix, which must still validate as the schema part.
+                    // A third part makes it `schema.table.column`.
                     if self.peeked == Tok::Op(".") {
                         self.record_namespace(namespace_source)?;
                         self.advance()?;
@@ -1108,13 +1096,6 @@ impl<'a> Parser<'a> {
                             schema: name,
                             table: column,
                             name: third,
-                        });
-                    }
-                    if let Some(schema) = stripped_schema {
-                        return self.arena_expr(Expr::SchemaColumn {
-                            schema,
-                            table: name,
-                            name: column,
                         });
                     }
                     if let Some((index, source)) = self.qualified_routine_parameter(name, column) {
@@ -1209,6 +1190,10 @@ impl<'a> Parser<'a> {
                         return self.arena_expr(Expr::WholeRow(name));
                     }
                     let column = self.any_ident("column name")?;
+                    if let Some(literal) = self.qualified_builtin_type_literal(name, column)? {
+                        self.record_namespace(namespace_source)?;
+                        return Ok(literal);
+                    }
                     if self.peeked == Tok::Op("(") {
                         self.record_namespace(namespace_source)?;
                         let routine = self.composed_qualifier(name, column)?;
@@ -2118,7 +2103,7 @@ impl<'a> Parser<'a> {
             self.expect_op(")")?;
             return self.plain_call("overlay", &cargs[..cn]);
         }
-        if name.eq_ignore_ascii_case("make_interval") {
+        if name.eq_ignore_ascii_case("make_interval") || name == "pg_catalog.make_interval" {
             // `make_interval([years =>] i, [months =>] i, [weeks =>] i,
             //  [days =>] i, [hours =>] i, [mins =>] i, [secs =>] d)` — the seven
             // named fields, any subset, positional or `field => value`. Desugar
@@ -2169,7 +2154,7 @@ impl<'a> Parser<'a> {
                 }
             }
             self.expect_op(")")?;
-            return self.plain_call("make_interval", &slots);
+            return self.plain_call(name, &slots);
         }
         // `agg(DISTINCT expression)` — deduplicate argument values before aggregating.
         let distinct = if self.peeked == Tok::Ident("distinct") {
@@ -2670,6 +2655,52 @@ impl<'a> Parser<'a> {
             } => Ok(precision),
             _ => unreachable!("interval precision parser returns an interval modifier"),
         }
+    }
+
+    /// Catalog-qualified builtin literals share the ordinary type parser;
+    /// schema qualification never enables SQL constructors or column aliases.
+    fn qualified_builtin_type_literal(
+        &mut self,
+        schema: &str,
+        name: &'a str,
+    ) -> Result<Option<&'a Expr<'a>>, ParseError> {
+        if schema != "pg_catalog" || crate::sql::types::ColType::from_sql_name(name).is_none() {
+            return Ok(None);
+        }
+        let modified =
+            self.peeked == Tok::Op("(") && self.typed_literal_with_modifier_ahead(name)?;
+        if (modified || matches!(self.peeked, Tok::Str(_)))
+            && crate::sql::catalog::builtin_type_identity(name, false).is_none()
+        {
+            return Err(ParseError {
+                at: self.peek_at,
+                message: crate::stack_format!(96, "type \"pg_catalog.{}\" does not exist", name),
+                sqlstate: crate::sql::eval::sqlstate::UNDEFINED_OBJECT,
+            });
+        }
+        if modified {
+            return self.modified_typed_literal(name).map(Some);
+        }
+        let Tok::Str(literal) = self.peeked else {
+            return Ok(None);
+        };
+        let source = super::NamespaceSource {
+            start: self.peek_at,
+            end: self.lexer.token_end(),
+        };
+        self.advance()?;
+        let operand = self.arena_expr(Expr::Str(literal))?;
+        self.record_string_literal(operand, source)?;
+        if let Some(kind) = super::CatalogLiteralKind::for_cast(name) {
+            self.record_catalog_literal(operand, kind)?;
+        }
+        self.arena_expr(Expr::Cast {
+            binding: CastBinding::Resolve,
+            operand,
+            type_name: name,
+            type_mod: -1,
+        })
+        .map(Some)
     }
 
     /// A modifier-bearing typed constant and a function call share the same

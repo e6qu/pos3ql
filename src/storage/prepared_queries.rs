@@ -535,7 +535,13 @@ mod tests {
             let mut mapping = [None; MAX_COLUMNS];
             mapping[0] = Some(replacement.columns[0].name);
             let change = storage
-                .write_table_def(target, replacement, &mapping, false)
+                .write_table_def(
+                    target,
+                    replacement,
+                    &mapping,
+                    false,
+                    crate::storage::ColumnSet::EMPTY,
+                )
                 .unwrap();
             assert!(
                 storage

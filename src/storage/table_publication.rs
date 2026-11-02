@@ -1317,7 +1317,13 @@ mod tests {
         definition.schema = SqlName::parse("publication_destination").unwrap();
         definition.name = SqlName::parse("publication_renamed").unwrap();
         storage
-            .write_table_def(target, definition, &mapping(), false)
+            .write_table_def(
+                target,
+                definition,
+                &mapping(),
+                false,
+                crate::storage::ColumnSet::EMPTY,
+            )
             .unwrap()
     }
 
@@ -1403,7 +1409,13 @@ mod tests {
         let mut definition = TableDefBuilder::from_definition(&definition);
         definition.name = SqlName::parse("other_renamed").unwrap();
         let second = storage
-            .write_table_def(target, definition, &mapping(), false)
+            .write_table_def(
+                target,
+                definition,
+                &mapping(),
+                false,
+                crate::storage::ColumnSet::EMPTY,
+            )
             .unwrap();
         let before = storage.tables[child].publication().generation;
         crate::mem::guard::forbid_alloc(|| {
@@ -1551,7 +1563,13 @@ mod tests {
             definition.name = SqlName::parse("publication_other").unwrap();
             assert_eq!(
                 storage
-                    .write_table_def(selected, definition, &mapping(), false)
+                    .write_table_def(
+                        selected,
+                        definition,
+                        &mapping(),
+                        false,
+                        crate::storage::ColumnSet::EMPTY,
+                    )
                     .unwrap_err()
                     .sqlstate,
                 sqlstate::INTERNAL_LOCK_WAIT
@@ -1559,7 +1577,13 @@ mod tests {
             assert!(storage.pending_table_def(other).is_none());
             definition.fkeys[0].parent = definition.name;
             let self_reference = storage
-                .write_table_def(selected, definition, &mapping(), false)
+                .write_table_def(
+                    selected,
+                    definition,
+                    &mapping(),
+                    false,
+                    crate::storage::ColumnSet::EMPTY,
+                )
                 .unwrap();
             storage.rollback_table_def(self_reference);
             storage.rollback_definition_publication(7);
@@ -1648,13 +1672,25 @@ mod tests {
             let mut definition = TableDefBuilder::from_definition(&definition);
             definition.columns[0].not_null = super::super::NotNullOrigin::Local;
             let first = storage
-                .write_table_def(target, definition, &mapping(), false)
+                .write_table_def(
+                    target,
+                    definition,
+                    &mapping(),
+                    false,
+                    crate::storage::ColumnSet::EMPTY,
+                )
                 .unwrap();
             let (target, definition) = storage.select_table_definition(child, 9);
             let mut definition = TableDefBuilder::from_definition(&definition);
             definition.columns[0].not_null = super::super::NotNullOrigin::Nullable;
             let second = storage
-                .write_table_def(target, definition, &mapping(), false)
+                .write_table_def(
+                    target,
+                    definition,
+                    &mapping(),
+                    false,
+                    crate::storage::ColumnSet::EMPTY,
+                )
                 .unwrap();
             let change = rename(&storage, parent);
             assert_eq!(publish_change(&storage, change).unwrap(), Some(false));
@@ -1854,7 +1890,13 @@ mod tests {
                             (storage.create_table_in(definition, 9).unwrap(), None)
                         } else {
                             let change = storage
-                                .write_table_def(target, definition, &mapping(), false)
+                                .write_table_def(
+                                    target,
+                                    definition,
+                                    &mapping(),
+                                    false,
+                                    crate::storage::ColumnSet::EMPTY,
+                                )
                                 .unwrap();
                             (other, Some(change))
                         }
@@ -1930,7 +1972,13 @@ mod tests {
             let mut columns = [None; MAX_COLUMNS];
             columns[0] = Some(definition.columns[0].name);
             let change = storage
-                .write_table_def(target, definition, &columns, false)
+                .write_table_def(
+                    target,
+                    definition,
+                    &columns,
+                    false,
+                    crate::storage::ColumnSet::EMPTY,
+                )
                 .unwrap();
             let index = storage
                 .create_index(
@@ -2014,7 +2062,13 @@ mod tests {
                 ..ForeignKey::EMPTY
             };
             let change = storage
-                .write_table_def(target, definition, &mapping(), false)
+                .write_table_def(
+                    target,
+                    definition,
+                    &mapping(),
+                    false,
+                    crate::storage::ColumnSet::EMPTY,
+                )
                 .unwrap();
             assert_eq!(publish_change(&storage, change).unwrap(), Some(false));
         });

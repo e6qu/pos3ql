@@ -40,9 +40,15 @@ reserved memory must remain unchanged.
   with `table_metadata_leases` limiting occupied ranges (8,192). Retained schemas
   share ownership without another payload copy. Replacement data and old versions
   stay charged together until their owners release them. Pool descriptors,
-  per-table headers, statistics and serial state still add startup cost.
+  per-table headers and other catalog families still add startup cost.
   Metadata, binding roots and row keys are reserved before durability; commit
   does not build replacements afterward.
+
+- Analyzed columns share explicit `statistics_bytes` and `statistics_leases`.
+  Unanalyzed tables own no column payload. Old images stay charged while
+  readers, undo or checkpoints retain them. Index counters have the independent
+  `index_statistics_slots` limit and remain owned through late readers.
+  SERIAL and identity generation use the shared sequence catalog.
 
 - The [RAM block cache](https://github.com/e6qu/pos3ql/blob/b36e100a1d48221d6a06a15ecb68981dc699d26f/src/store/cache.rs) and
   [disk block cache](https://github.com/e6qu/pos3ql/blob/b36e100a1d48221d6a06a15ecb68981dc699d26f/src/store/disk.rs) already share fixed slots across

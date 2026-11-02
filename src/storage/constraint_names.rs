@@ -6,7 +6,7 @@ use crate::sql_err;
 use crate::util::StackStr;
 use core::fmt::Write;
 
-fn generated(left: &str, right: Option<&str>, label: &str) -> Result<SqlName, SqlError> {
+pub(crate) fn generated(left: &str, right: Option<&str>, label: &str) -> Result<SqlName, SqlError> {
     let right = right.unwrap_or("");
     let overhead = label.len() + 1 + usize::from(!right.is_empty());
     let available = 63usize.checked_sub(overhead).ok_or_else(|| {

@@ -490,7 +490,8 @@ mod tests {
                         storage.select_table_definition(table, 7).0,
                         moved,
                         &mapping,
-                        false
+                        false,
+                        crate::storage::ColumnSet::EMPTY,
                     )
                     .unwrap_err()
                     .sqlstate,
@@ -511,6 +512,7 @@ mod tests {
                     moved,
                     &mapping,
                     false,
+                    crate::storage::ColumnSet::EMPTY,
                 )
                 .unwrap();
             let mut second = index("second_binding_index", "binding_source", 0, 1);
@@ -774,6 +776,7 @@ mod tests {
                     first,
                     &first_mapping,
                     false,
+                    crate::storage::ColumnSet::EMPTY,
                 )
                 .unwrap();
             let during = storage
@@ -798,6 +801,7 @@ mod tests {
                         second,
                         &second_mapping,
                         false,
+                        crate::storage::ColumnSet::EMPTY,
                     )
                     .unwrap();
                 for (slot, expected) in [(before, (1, 0)), (during, (2, 0))] {
@@ -884,6 +888,7 @@ mod tests {
                     replacement,
                     &mapping,
                     false,
+                    crate::storage::ColumnSet::EMPTY,
                 )
                 .unwrap();
             assert_eq!(storage.value_binding_count(table), 1);

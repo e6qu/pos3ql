@@ -67,6 +67,9 @@ pub(crate) use definition_images::DefinitionImageId;
 pub(crate) use definition_images::RelationDefinition;
 mod definition_pool;
 mod index_bindings;
+mod index_statistics;
+use index_statistics::IndexCounterSlot;
+pub(crate) use index_statistics::IndexStatisticsCapture;
 mod key_preparation;
 use index_bindings::{IndexTableBinding, PendingIndexTable};
 mod log_positions;
@@ -150,6 +153,7 @@ pub(crate) mod constraint_names;
 mod statistics;
 mod subscription_targets;
 pub(crate) use statistics::StatisticsReceiptPool;
+pub(crate) use statistics::{AnalyzedColumn, StatisticsOrigin};
 use statistics::{StatisticsVersions, TableStatisticsOwner};
 mod spill_generations;
 use snapshot_leases::{
@@ -1419,8 +1423,8 @@ pub struct ColumnMeta {
     pub not_null_inheritable: bool,
     pub unique: bool,
     pub primary: bool,
-    /// `serial`/`bigserial`/`smallserial` or GENERATED AS IDENTITY: an omitted
-    /// or DEFAULT value advances its generator, independently of stored rows.
+    /// Implicit identity generation in stored shapes. The SQL builder also
+    /// uses this flag before lowering SERIAL to a bound nextval default.
     pub auto_increment: bool,
     /// DEFAULT or `GENERATED ALWAYS AS (...) STORED`, including its source for
     /// catalog rendering and replay.
@@ -1430,8 +1434,6 @@ pub struct ColumnMeta {
     pub is_identity: bool,
     /// `GENERATED ALWAYS AS IDENTITY` (reject explicit inserts) vs `BY DEFAULT`.
     pub identity_always: bool,
-    /// The auto-increment step: 1 for `serial`, or the identity `INCREMENT BY`.
-    pub auto_increment_step: i64,
     /// When the column was declared with a user-defined type, its stable
     /// schema-qualified identity. Runtime enum/domain slots are rebound from
     /// this identity after restart.
@@ -1638,7 +1640,6 @@ impl ColumnMeta {
         default: ColumnDefault::NONE,
         is_identity: false,
         identity_always: false,
-        auto_increment_step: 1,
         user_type: None,
         statistics_target: -1,
         statistics_options: crate::sql::ast::ColumnStatisticsOptions::DEFAULT,
@@ -3064,28 +3065,6 @@ impl RowState {
     }
 }
 
-struct TableSerialState {
-    values: [i64; MAX_COLUMNS],
-    dirty: bool,
-    /// Only the transaction that captured unchanged absolute positions may
-    /// acknowledge them. Every subsequent mutation invalidates this claim.
-    staged_by: Option<u32>,
-}
-
-impl TableSerialState {
-    const EMPTY: Self = Self {
-        values: [0; MAX_COLUMNS],
-        dirty: false,
-        staged_by: None,
-    };
-
-    fn set(&mut self, column: usize, value: i64) {
-        self.values[column] = value;
-        self.dirty = true;
-        self.staged_by = None;
-    }
-}
-
 pub(crate) enum ValueIndexInstallation {
     Recovery,
     Checkpoint { dirty_lsn: u64 },
@@ -3117,12 +3096,6 @@ pub struct Table {
     checkpoint_deletions: std::sync::Arc<()>,
     /// Planner estimates, transaction-private column versions, and save markers.
     statistics: TableStatisticsOwner,
-    /// Per-column sequence state for serial/identity columns: the last value
-    /// a *default* assignment handed out. PostgreSQL's sequence, not a max
-    /// scan — explicit inserts do not advance it, deletes and TRUNCATE
-    /// (without RESTART IDENTITY) do not rewind it, and a rolled-back insert
-    /// still consumes its number.
-    serial: Mutex<TableSerialState>,
     /// Ordered immutable row generations and their eviction boundaries.
     /// Capture and replacement share ownership until reader roots are retained.
     spill_generations: SpillGenerationRoster,
@@ -3202,21 +3175,34 @@ pub(crate) fn column_distinct_catalog_value(
 }
 
 /// Table cardinality and width statistics used by the storage-aware planner.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub(crate) struct TableStatistics {
     pub(crate) valid: bool,
     pub(crate) rows: u64,
     pub(crate) average_row_width: u32,
     pub(crate) analyzed_generation: u64,
-    pub(crate) columns: [ColumnStatistics; MAX_COLUMNS],
+    pub(crate) columns: SharedSlice<AnalyzedColumn>,
 }
 
-#[derive(Debug, Clone, Copy)]
+impl PartialEq for TableStatistics {
+    fn eq(&self, other: &Self) -> bool {
+        self.valid == other.valid
+            && self.rows == other.rows
+            && self.average_row_width == other.average_row_width
+            && self.analyzed_generation == other.analyzed_generation
+            && self.columns.as_ref() == other.columns.as_ref()
+    }
+}
+
+impl Eq for TableStatistics {}
+
+#[derive(Debug, Clone)]
 struct PendingTableStatisticsSlot {
     used: bool,
     previous: Option<usize>,
     depth: u32,
-    columns: [ColumnStatistics; MAX_COLUMNS],
+    columns: SharedSlice<AnalyzedColumn>,
+    owner: statistics::StatisticsVersionOwner,
 }
 
 impl TableStatistics {
@@ -3225,8 +3211,15 @@ impl TableStatistics {
         rows: 0,
         average_row_width: 0,
         analyzed_generation: 0,
-        columns: [ColumnStatistics::EMPTY; MAX_COLUMNS],
+        columns: SharedSlice::EMPTY,
     };
+
+    pub(crate) fn column(&self, attribute: u16) -> Option<ColumnStatistics> {
+        self.columns
+            .binary_search_by_key(&attribute, |column| column.attribute())
+            .ok()
+            .map(|index| self.columns[index].statistics())
+    }
 }
 
 /// The implicit index identities addressable by one table's inline, UNIQUE,
@@ -4415,7 +4408,11 @@ fn pending_table_statistics_capacity(config: &Config) -> usize {
     table_slot_capacity(config)
         .saturating_mul(config.max_catalog_versions_per_object)
         .min(
-            catalog_transaction_capacity(config).saturating_mul(config.max_analyze_per_transaction),
+            catalog_transaction_capacity(config).saturating_mul(
+                config
+                    .max_analyze_per_transaction
+                    .saturating_add(config.max_ddl_per_transaction),
+            ),
         )
 }
 
@@ -10840,10 +10837,8 @@ pub struct SequenceDef {
     /// slots, keep the dependency stable across checkpoint restore and
     /// catalog-slot reuse.
     pub owner: Option<SequenceOwner>,
-    /// The serial/identity column whose omitted values this sequence generates.
-    /// This is deliberately separate from `owner`: PostgreSQL permits a serial
-    /// sequence's OWNED BY dependency to be removed without changing the
-    /// column's `nextval` default.
+    /// The identity column using this implicit generator. SERIAL instead
+    /// stores a bound nextval default, independently of the OWNED BY link.
     pub generator_for: Option<SequenceOwner>,
     pub(crate) pending_definition: Option<PendingSequenceDefinition>,
     ddl_state: CatalogDdlState,
@@ -10886,7 +10881,7 @@ struct SequenceValue {
     /// nontransactional when the surrounding transaction rolls back.
     dirty: bool,
     generation: u64,
-    staged_generation: u64,
+    staged_generation: Option<(u32, u64)>,
 }
 
 impl SequenceValue {
@@ -10897,7 +10892,7 @@ impl SequenceValue {
             log_count: 0,
             dirty: false,
             generation: 0,
-            staged_generation: 0,
+            staged_generation: None,
         }
     }
 }
@@ -11170,6 +11165,12 @@ impl SequenceDef {
         let reserved = requested.min(available);
         let last = i128::from(first) + (reserved - 1) * step;
         let reserved = i64::try_from(reserved).expect("requested cache count is i64");
+        let generation = value.generation.checked_add(1).ok_or_else(|| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "sequence value generation exhausted"
+            )
+        })?;
         value.last_value = i64::try_from(last).expect("sequence bounds constrain reserved value");
         value.is_called = true;
         let previous_log_count = value.log_count;
@@ -11185,7 +11186,7 @@ impl SequenceDef {
             previous_log_count - reserved
         };
         value.dirty = true;
-        value.generation = value.generation.wrapping_add(1);
+        value.generation = generation;
         Ok((first, reserved, prelogged))
     }
 
@@ -11212,11 +11213,17 @@ impl SequenceDef {
         state: &mut SequenceValue,
     ) -> Result<i64, SqlError> {
         self.check_setval(value)?;
+        let generation = state.generation.checked_add(1).ok_or_else(|| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "sequence value generation exhausted"
+            )
+        })?;
         state.last_value = value;
         state.is_called = is_called;
         state.log_count = 0;
         state.dirty = true;
-        state.generation = state.generation.wrapping_add(1);
+        state.generation = generation;
         Ok(value)
     }
 }
@@ -14952,7 +14959,7 @@ struct CumulativeStatistics {
     relations: FixedVec<RelationCumulativeStatistics>,
     relation_transactions: FixedVec<RelationTransactionStatistics>,
     transaction_nesting: FixedVec<(u32, usize)>,
-    indexes: FixedVec<IndexCumulativeStatistics>,
+    indexes: FixedVec<IndexCounterSlot>,
     databases: FixedVec<DatabaseCumulativeStatistics>,
     functions: FixedVec<FunctionCumulativeStatistics>,
     function_transactions: FixedVec<FunctionTransactionStatistics>,
@@ -15188,6 +15195,7 @@ pub struct Storage {
     row_versions: RowVersionPools,
     pub(crate) row_work: std::sync::Arc<crate::mem::lease_pool::LeasePool>,
     metadata_pool: std::sync::Arc<crate::mem::lease_pool::LeasePool>,
+    statistics_pool: std::sync::Arc<crate::mem::lease_pool::LeasePool>,
     row_overlay: std::sync::Arc<RowOverlayPool>,
     row_walks: RowWalkPool,
     snapshot_reclamation: SnapshotReclamation,
@@ -17075,12 +17083,12 @@ impl Storage {
         &self,
         txid: u32,
         table: usize,
+        (database, created_at): (DatabaseOid, u64),
         update: impl FnOnce(&mut RelationTransactionStatistics),
     ) -> Result<(), SqlError> {
         if txid == 0 || table == self.large_object_page_table as usize {
             return Ok(());
         }
-        let identity = self.tables[table].identity();
         let mut cumulative = self.cumulative_statistics();
         let nest_level = cumulative
             .transaction_nesting
@@ -17091,19 +17099,15 @@ impl Storage {
         let position = if let Some(position) = statistics.iter().position(|entry| {
             entry.txid == txid
                 && entry.table as usize == table
-                && entry.database == identity.database
-                && entry.created_at == identity.created_at
+                && entry.database == database
+                && entry.created_at == created_at
                 && entry.nest_level == nest_level
         }) {
             position
         } else {
             statistics
                 .push(RelationTransactionStatistics::new(
-                    txid,
-                    table,
-                    nest_level,
-                    identity.database,
-                    identity.created_at,
+                    txid, table, nest_level, database, created_at,
                 ))
                 .map_err(|_| {
                     sql_err!(
@@ -17121,13 +17125,26 @@ impl Storage {
         &self,
         txid: u32,
         table: usize,
-        index_oid: Option<i32>,
+        index: Option<&IndexStatisticsCapture<'_>>,
         index_entries: usize,
         observed_at: i64,
     ) -> Result<(), SqlError> {
+        if let Some(index) = index
+            && !index.matches_table(self, table)?
+        {
+            index.record_scan(index_entries, observed_at);
+            return Ok(());
+        }
         self.record_serializable_read(txid, table);
-        self.with_relation_transaction_statistics(txid, table, |statistics| {
-            if index_oid.is_some() {
+        let source = index.map_or_else(
+            || {
+                let identity = self.tables[table].identity();
+                (identity.database, identity.created_at)
+            },
+            IndexStatisticsCapture::table_identity,
+        );
+        self.with_relation_transaction_statistics(txid, table, source, |statistics| {
+            if index.is_some() {
                 statistics.idx_scan = statistics.idx_scan.saturating_add(1);
                 statistics.last_idx_scan = Some(observed_at);
                 statistics.idx_tup_read =
@@ -17137,59 +17154,8 @@ impl Storage {
                 statistics.last_seq_scan = Some(observed_at);
             }
         })?;
-        if let Some(oid) = index_oid {
-            let database = self.tables[table].database();
-            let mut selected_owner = None;
-            loop {
-                let mut cumulative = self.cumulative_statistics();
-                let indexes = &mut cumulative.indexes;
-                let position = if let Some(position) = indexes
-                    .iter()
-                    .position(|entry| entry.database == database && entry.oid == oid)
-                {
-                    if indexes[position].owner.is_none() {
-                        return Err(sql_err!(
-                            sqlstate::SERIALIZATION_FAILURE,
-                            "index statistics source changed"
-                        ));
-                    }
-                    position
-                } else if let Some(owner) = selected_owner {
-                    indexes
-                        .push(IndexCumulativeStatistics {
-                            owner: Some(owner),
-                            oid,
-                            database,
-                            ..IndexCumulativeStatistics::EMPTY
-                        })
-                        .map_err(|_| {
-                            sql_err!(
-                                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                                "index statistics capacity exhausted"
-                            )
-                        })?;
-                    indexes.len() - 1
-                } else {
-                    drop(cumulative);
-                    selected_owner = Some(
-                        crate::sql::catalog::index_statistics_owner(self, txid, oid).ok_or_else(
-                            || {
-                                sql_err!(
-                                    sqlstate::SERIALIZATION_FAILURE,
-                                    "index statistics source changed"
-                                )
-                            },
-                        )?,
-                    );
-                    continue;
-                };
-                let statistics = &mut indexes[position];
-                statistics.idx_scan = statistics.idx_scan.saturating_add(1);
-                statistics.last_idx_scan = Some(observed_at);
-                statistics.idx_tup_read =
-                    statistics.idx_tup_read.saturating_add(index_entries as u64);
-                break;
-            }
+        if let Some(index) = index {
+            index.record_scan(index_entries, observed_at);
         }
         Ok(())
     }
@@ -17198,25 +17164,30 @@ impl Storage {
         &self,
         txid: u32,
         table: usize,
-        index_oid: Option<i32>,
+        index: Option<&IndexStatisticsCapture<'_>>,
     ) -> Result<(), SqlError> {
-        self.with_relation_transaction_statistics(txid, table, |statistics| {
-            if index_oid.is_some() {
+        if let Some(index) = index
+            && !index.matches_table(self, table)?
+        {
+            index.record_tuple();
+            return Ok(());
+        }
+        let source = index.map_or_else(
+            || {
+                let identity = self.tables[table].identity();
+                (identity.database, identity.created_at)
+            },
+            IndexStatisticsCapture::table_identity,
+        );
+        self.with_relation_transaction_statistics(txid, table, source, |statistics| {
+            if index.is_some() {
                 statistics.idx_tup_fetch = statistics.idx_tup_fetch.saturating_add(1);
             } else {
                 statistics.seq_tup_read = statistics.seq_tup_read.saturating_add(1);
             }
         })?;
-        if let Some(oid) = index_oid {
-            let database = self.tables[table].database();
-            if let Some(statistics) = self
-                .cumulative_statistics()
-                .indexes
-                .iter_mut()
-                .find(|statistics| statistics.database == database && statistics.oid == oid)
-            {
-                statistics.idx_tup_fetch = statistics.idx_tup_fetch.saturating_add(1);
-            }
+        if let Some(index) = index {
+            index.record_tuple();
         }
         Ok(())
     }
@@ -17231,14 +17202,18 @@ impl Storage {
         if existed == exists && !exists {
             return Ok(());
         }
-        self.with_relation_transaction_statistics(txid, table, |statistics| {
-            match (existed, exists) {
+        let identity = self.tables[table].identity();
+        self.with_relation_transaction_statistics(
+            txid,
+            table,
+            (identity.database, identity.created_at),
+            |statistics| match (existed, exists) {
                 (false, true) => statistics.n_tup_ins = statistics.n_tup_ins.saturating_add(1),
                 (true, true) => statistics.n_tup_upd = statistics.n_tup_upd.saturating_add(1),
                 (true, false) => statistics.n_tup_del = statistics.n_tup_del.saturating_add(1),
                 (false, false) => {}
-            }
-        })
+            },
+        )
     }
 
     pub(crate) fn record_relation_transaction_truncate(
@@ -17246,17 +17221,23 @@ impl Storage {
         txid: u32,
         table: usize,
     ) -> Result<(), SqlError> {
-        self.with_relation_transaction_statistics(txid, table, |statistics| {
-            if !statistics.truncated {
-                statistics.pre_truncate_n_tup_ins = statistics.n_tup_ins;
-                statistics.pre_truncate_n_tup_upd = statistics.n_tup_upd;
-                statistics.pre_truncate_n_tup_del = statistics.n_tup_del;
-                statistics.truncated = true;
-            }
-            statistics.n_tup_ins = 0;
-            statistics.n_tup_upd = 0;
-            statistics.n_tup_del = 0;
-        })
+        let identity = self.tables[table].identity();
+        self.with_relation_transaction_statistics(
+            txid,
+            table,
+            (identity.database, identity.created_at),
+            |statistics| {
+                if !statistics.truncated {
+                    statistics.pre_truncate_n_tup_ins = statistics.n_tup_ins;
+                    statistics.pre_truncate_n_tup_upd = statistics.n_tup_upd;
+                    statistics.pre_truncate_n_tup_del = statistics.n_tup_del;
+                    statistics.truncated = true;
+                }
+                statistics.n_tup_ins = 0;
+                statistics.n_tup_upd = 0;
+                statistics.n_tup_del = 0;
+            },
+        )
     }
 
     pub(crate) fn finish_cumulative_subtransactions(
@@ -17782,8 +17763,12 @@ impl Storage {
         self.cumulative_statistics()
             .indexes
             .iter()
-            .find(|statistics| statistics.database == database && statistics.oid == oid)
-            .copied()
+            .find(|entry| {
+                entry.catalog_owned
+                    && entry.statistics.database == database
+                    && entry.statistics.oid == oid
+            })
+            .map(|entry| entry.statistics)
             .unwrap_or(IndexCumulativeStatistics {
                 database,
                 oid,
@@ -17818,13 +17803,14 @@ impl Storage {
                 cumulative.relations[slot] = RelationCumulativeStatistics::EMPTY;
             }
         }
-        let indexes = &mut cumulative.indexes;
-        let mut position = 0usize;
-        while position < indexes.len() {
-            if indexes[position].database == database {
-                indexes.swap_remove(position);
-            } else {
-                position += 1;
+        for entry in cumulative.indexes.iter_mut() {
+            if entry.statistics.database == database {
+                entry.statistics = IndexCumulativeStatistics {
+                    database,
+                    oid: entry.statistics.oid,
+                    owner: entry.statistics.owner,
+                    ..IndexCumulativeStatistics::EMPTY
+                };
             }
         }
         let functions = &mut cumulative.functions;
@@ -17847,12 +17833,28 @@ impl Storage {
 
     pub(crate) fn reset_index_statistics(&self, database: DatabaseOid, oid: i32) {
         let mut cumulative = self.cumulative_statistics();
-        let statistics = &mut cumulative.indexes;
-        if let Some(position) = statistics
-            .iter()
-            .position(|entry| entry.database == database && entry.oid == oid)
-        {
-            statistics.swap_remove(position);
+        for entry in cumulative.indexes.iter_mut() {
+            if entry.catalog_owned
+                && entry.statistics.database == database
+                && entry.statistics.oid == oid
+            {
+                entry.statistics = IndexCumulativeStatistics {
+                    database,
+                    oid,
+                    owner: entry.statistics.owner,
+                    ..IndexCumulativeStatistics::EMPTY
+                };
+            }
+        }
+    }
+
+    fn retire_index_statistics(&self, database: DatabaseOid, oid: i32) {
+        let mut cumulative = self.cumulative_statistics();
+        for entry in cumulative.indexes.iter_mut() {
+            if entry.statistics.database == database && entry.statistics.oid == oid {
+                entry.catalog_owned = false;
+                entry.reclaim();
+            }
         }
     }
 
@@ -17872,14 +17874,16 @@ impl Storage {
         let mut position = 0usize;
         while position < statistics.len() {
             let entry = &statistics[position];
-            if entry.database == database
-                && entry.owner == Some(IndexStatisticsOwner::Implicit(table as u16))
+            if entry.statistics.database == database
+                && entry.statistics.owner == Some(IndexStatisticsOwner::Implicit(table as u16))
                 && !live
                     .iter()
                     .flatten()
-                    .any(|identity| identity.oid() == entry.oid)
+                    .any(|identity| identity.oid() == entry.statistics.oid)
             {
-                statistics.swap_remove(position);
+                statistics[position].catalog_owned = false;
+                statistics[position].reclaim();
+                position += 1;
             } else {
                 position += 1;
             }
@@ -17900,14 +17904,16 @@ impl Storage {
         let mut position = 0usize;
         while position < statistics.len() {
             let entry = &statistics[position];
-            if entry.database == database
-                && entry.owner == Some(IndexStatisticsOwner::Implicit(table as u16))
+            if entry.statistics.database == database
+                && entry.statistics.owner == Some(IndexStatisticsOwner::Implicit(table as u16))
                 && retired
                     .iter()
                     .flatten()
-                    .any(|identity| identity.oid() == entry.oid)
+                    .any(|identity| identity.oid() == entry.statistics.oid)
             {
-                statistics.swap_remove(position);
+                statistics[position].catalog_owned = false;
+                statistics[position].reclaim();
+                position += 1;
             } else {
                 position += 1;
             }
@@ -18652,7 +18658,6 @@ impl Storage {
                 .publication()
                 .preview_unreserved_generation()?;
             self.clear_table_rows(slot);
-            self.install_table_serial_values(slot, [0; MAX_COLUMNS]);
             self.tables[slot]
                 .statistics
                 .set_image(TableStatistics::EMPTY, None, true);
@@ -20218,6 +20223,10 @@ impl Storage {
                 config.table_metadata_bytes,
                 config.table_metadata_leases,
             ),
+            crate::mem::lease_pool::LeasePool::budget_bytes(
+                config.statistics_bytes,
+                config.statistics_leases,
+            ),
             SnapshotReclamation::budget_bytes(),
             row_ownership::HeapRowOwnership::budget_bytes(config),
             type_reference_moves::DefinitionPublication::budget_bytes(config),
@@ -20382,14 +20391,9 @@ impl Storage {
             (config.max_connections as usize)
                 .saturating_add(config.max_prepared_transactions)
                 .saturating_mul(size_of::<(u32, usize)>()),
-            table_slot_capacity(config)
-                .saturating_mul(
-                    MAX_COLUMNS
-                        .saturating_add(MAX_UNIQUES)
-                        .saturating_add(MAX_EXCLUSIONS),
-                )
-                .saturating_add(config.max_value_indexes)
-                .saturating_mul(size_of::<IndexCumulativeStatistics>()),
+            config
+                .index_statistics_slots
+                .saturating_mul(size_of::<IndexCounterSlot>()),
             config
                 .max_databases
                 .saturating_mul(size_of::<DatabaseCumulativeStatistics>()),
@@ -20481,6 +20485,12 @@ impl Storage {
             config.table_metadata_bytes,
             config.table_metadata_leases,
         )?;
+        let statistics_pool = crate::mem::lease_pool::LeasePool::new(
+            budget,
+            crate::mem::lease_pool::Purpose::STATISTICS,
+            config.statistics_bytes,
+            config.statistics_leases,
+        )?;
         let table_definition_images =
             definition_images::TableDefinitionImagePool::new(config, budget, &metadata_pool)?;
         let row_walks = RowWalkPool::new(std::sync::Arc::clone(&row_work));
@@ -20537,7 +20547,6 @@ impl Storage {
                     }),
                     checkpoint_deletions: std::sync::Arc::new(()),
                     statistics: TableStatisticsOwner::new(budget)?,
-                    serial: Mutex::new(TableSerialState::EMPTY),
                     spill_generations: SpillGenerationRoster::new(
                         budget,
                         config.max_spill_generations_per_table,
@@ -21233,12 +21242,16 @@ impl Storage {
             "cumulative_transaction_nesting",
             transaction_capacity,
         )?;
-        let index_cumulative_statistics = FixedVec::new(
+        let mut index_cumulative_statistics = FixedVec::new(
             budget,
             "index_cumulative_statistics",
-            table_capacity * (MAX_COLUMNS + MAX_UNIQUES + MAX_EXCLUSIONS)
-                + config.max_value_indexes,
+            config.index_statistics_slots,
         )?;
+        for _ in 0..config.index_statistics_slots {
+            index_cumulative_statistics
+                .push(IndexCounterSlot::EMPTY)
+                .expect("index counter slots are sized at startup");
+        }
         let mut database_cumulative_statistics = FixedVec::new(
             budget,
             "database_cumulative_statistics",
@@ -21284,6 +21297,7 @@ impl Storage {
             row_versions,
             row_work,
             metadata_pool,
+            statistics_pool,
             row_overlay,
             row_walks,
             snapshot_reclamation,
@@ -22936,7 +22950,6 @@ impl Storage {
                 let statistics = self.table_statistics(source_slot, 0);
                 let has_index =
                     self.relation_has_index(CatalogPosition::new(source_slot, created_at)?, 0);
-                let serial_values = self.table_serial_values(source_slot);
                 let target_slot = allocation.select(
                     DatabaseCloneKind::Table,
                     created_at,
@@ -22959,13 +22972,6 @@ impl Storage {
                     target_table
                         .statistics
                         .set_index_hint(created_at, has_index, true)?;
-                    *target_table
-                        .serial
-                        .get_mut()
-                        .expect("table serial state lock poisoned") = TableSerialState {
-                        values: serial_values,
-                        ..TableSerialState::EMPTY
-                    };
                 }
                 self.tables[target_slot]
                     .spill_generations
@@ -23446,6 +23452,12 @@ impl Storage {
                         self.collation_definition(selected, txid)?;
                     }
                 }
+                let statistics_admission = self.reserve_explicit_index_statistics(
+                    copied_table,
+                    target,
+                    self.tables[copied_table].identity().created_at,
+                    definition.created_at,
+                )?;
                 maintenance.states[target_slot] = maintenance.states[source_slot];
                 let ranges_per_index = self.brin_unsummarized_ranges_per_index;
                 for range in 0..ranges_per_index {
@@ -23453,6 +23465,7 @@ impl Storage {
                         maintenance.unsummarized_ranges[source_slot * ranges_per_index + range];
                 }
                 indexes[target_slot] = definition;
+                statistics_admission.commit();
             }
             for target_slot in 0..indexes.len() {
                 if indexes[target_slot].database != target
@@ -24125,6 +24138,15 @@ impl Storage {
     }
 
     fn clear_database_catalog(&mut self, database: DatabaseOid) {
+        {
+            let mut statistics = self.cumulative_statistics();
+            for entry in statistics.indexes.iter_mut() {
+                if entry.statistics.database == database {
+                    entry.catalog_owned = false;
+                    entry.reclaim();
+                }
+            }
+        }
         for slot in 0..self.acl_entry_count() {
             let prior = self.acl_entry(slot);
             let entry = prior;
@@ -34519,6 +34541,12 @@ impl Storage {
             selected[..n_columns].fill(true);
         } else {
             for &column in selected_columns {
+                if column >= n_columns {
+                    return Err(sql_err!(
+                        sqlstate::DATA_EXCEPTION,
+                        "ANALYZE column position is outside the table definition"
+                    ));
+                }
                 selected[column] = true;
             }
         }
@@ -34589,6 +34617,24 @@ impl Storage {
         let analyzed_generation = scan.publication_generation(self, table_slot)?;
         drop(scan);
         let mut statistics = self.table_statistics(table_slot, txid);
+        let retained = |record: &&AnalyzedColumn| {
+            definition.columns().iter().enumerate().any(|(column, _)| {
+                !selected[column]
+                    && definition.attributes.number(column) == Some(record.attribute())
+            })
+        };
+        let retained_count = statistics.columns.iter().filter(retained).count();
+        let analyzed_count = if rows == 0 {
+            0
+        } else {
+            selected[..n_columns].iter().filter(|&&value| value).count()
+        };
+        let mut columns = self.reserve_statistics_columns(retained_count + analyzed_count)?;
+        for &record in statistics.columns.iter().filter(retained) {
+            columns
+                .push_reserved(record)
+                .expect("statistics merge reserved its retained records");
+        }
         statistics.valid = true;
         statistics.rows = rows;
         statistics.average_row_width = row_bytes
@@ -34597,12 +34643,12 @@ impl Storage {
             .min(u64::from(u32::MAX)) as u32;
         statistics.analyzed_generation = analyzed_generation;
         for column in 0..n_columns {
-            if !selected[column] {
+            if !selected[column] || rows == 0 {
                 continue;
             }
             let distinct_values = distinct_estimate(&registers[column]).min(non_nulls[column]);
-            statistics.columns[column] = ColumnStatistics {
-                valid: rows != 0,
+            let image = ColumnStatistics {
+                valid: true,
                 null_fraction_ppm: nulls[column]
                     .saturating_mul(1_000_000)
                     .checked_div(rows)
@@ -34623,8 +34669,19 @@ impl Storage {
                     .unwrap_or(0)
                     .min(u64::from(u32::MAX)) as u32,
             };
+            columns
+                .push_reserved(AnalyzedColumn::new(
+                    definition
+                        .attributes
+                        .number(column)
+                        .expect("analyzed live column has an attribute"),
+                    image,
+                )?)
+                .expect("statistics merge reserved its selected records");
         }
-        self.write_table_statistics(table_slot, txid, statistics)?;
+        columns.sort_unstable_by_key(|column| column.attribute());
+        statistics.columns = columns.freeze();
+        self.write_table_statistics(table_slot, txid, statistics.clone())?;
         Ok(statistics)
     }
 
@@ -38962,122 +39019,6 @@ impl Storage {
         &mut self.tables[index]
     }
 
-    pub(crate) fn table_serial_value(&self, index: usize, column: usize) -> i64 {
-        self.tables[index]
-            .serial
-            .lock()
-            .expect("table serial state lock poisoned")
-            .values[column]
-    }
-
-    pub(crate) fn table_serial_values(&self, index: usize) -> [i64; MAX_COLUMNS] {
-        self.tables[index]
-            .serial
-            .lock()
-            .expect("table serial state lock poisoned")
-            .values
-    }
-
-    pub(crate) fn set_table_serial_value(&self, index: usize, column: usize, value: i64) {
-        self.tables[index]
-            .serial
-            .lock()
-            .expect("table serial state lock poisoned")
-            .set(column, value);
-    }
-
-    pub(crate) fn next_table_serial_value(
-        &self,
-        index: usize,
-        column: usize,
-        step: i64,
-        ctype: ColType,
-    ) -> Result<i64, SqlError> {
-        let (minimum, maximum, type_name) = match ctype {
-            ColType::Int2 => (i64::from(i16::MIN), i64::from(i16::MAX), "smallint"),
-            ColType::Int4 => (i64::from(i32::MIN), i64::from(i32::MAX), "integer"),
-            ColType::Int8 => (i64::MIN, i64::MAX, "bigint"),
-            _ => {
-                return Err(sql_err!(
-                    sqlstate::DATATYPE_MISMATCH,
-                    "table serial counter requires an integer column"
-                ));
-            }
-        };
-        let mut serial = self.tables[index]
-            .serial
-            .lock()
-            .expect("table serial state lock poisoned");
-        let next = serial.values[column]
-            .checked_add(step)
-            .filter(|value| (minimum..=maximum).contains(value))
-            .ok_or_else(|| {
-                sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "{} out of range", type_name)
-            })?;
-        serial.set(column, next);
-        Ok(next)
-    }
-
-    pub(crate) fn stage_table_serial_values(
-        &self,
-        index: usize,
-        txid: u32,
-    ) -> Option<[i64; MAX_COLUMNS]> {
-        let mut serial = self.tables[index]
-            .serial
-            .lock()
-            .expect("table serial state lock poisoned");
-        if !serial.dirty {
-            return None;
-        }
-        serial.staged_by = Some(txid);
-        Some(serial.values)
-    }
-
-    pub(crate) fn acknowledge_table_serial_values(&self, index: usize, txid: u32) {
-        let mut serial = self.tables[index]
-            .serial
-            .lock()
-            .expect("table serial state lock poisoned");
-        if serial.staged_by == Some(txid) {
-            serial.dirty = false;
-            serial.staged_by = None;
-        }
-    }
-
-    pub(crate) fn replay_table_serial_value(
-        &mut self,
-        index: usize,
-        column: usize,
-        value: i64,
-        txid: u32,
-    ) -> Result<(), SqlError> {
-        if column >= self.table_def(index, txid).n_columns {
-            return Err(sql_err!(
-                sqlstate::INTERNAL_ERROR,
-                "journal serial column {} is outside the table definition",
-                column
-            ));
-        }
-        let serial = self.tables[index]
-            .serial
-            .get_mut()
-            .expect("table serial state lock poisoned");
-        serial.values[column] = value;
-        serial.staged_by = None;
-        Ok(())
-    }
-
-    pub(crate) fn install_table_serial_values(&mut self, index: usize, values: [i64; MAX_COLUMNS]) {
-        *self.tables[index]
-            .serial
-            .get_mut()
-            .expect("table serial state lock poisoned") = TableSerialState {
-            values,
-            ..TableSerialState::EMPTY
-        };
-    }
-
     #[track_caller]
     pub fn table_def(&self, index: usize, txid: u32) -> TableDefinitionRead<'_> {
         TableDefinitionRead::visible(
@@ -39165,6 +39106,7 @@ impl Storage {
         def: TableDefBuilder,
         column_mapping: &[Option<SqlName>; MAX_COLUMNS],
         rewrites_rows: bool,
+        invalidated_statistics: ColumnSet,
     ) -> Result<TableDefinitionChange, SqlError> {
         if self.tables.get(target.table()).is_none() {
             return Err(sql_err!(
@@ -39177,6 +39119,7 @@ impl Storage {
             def,
             column_mapping,
             rewrites_rows,
+            invalidated_statistics,
         )
     }
 
@@ -42095,7 +42038,7 @@ impl Storage {
                 sequence.database == current_database()
                     && sequence.visible_to(txid)
                     && matches!(
-                        sequence.definition_for(txid).generator_for,
+                        sequence.definition_for(txid).owner,
                         Some(owner)
                             if owner.table_schema.as_str() == table_schema
                                 && owner.table.as_str() == table
@@ -42136,7 +42079,7 @@ impl Storage {
                 sequence.database == current_database()
                     && sequence.visible_to(txid)
                     && matches!(
-                        sequence.definition_for(txid).generator_for,
+                        sequence.definition_for(txid).owner,
                         Some(owner)
                             if owner.table_schema == committed.schema
                                 && owner.table == committed.name
@@ -42282,7 +42225,7 @@ impl Storage {
             &mut catalog.values[slot].committed
         };
         if value.generation == generation {
-            value.staged_generation = generation;
+            value.staged_generation = Some((txid, generation));
         }
     }
 
@@ -42301,9 +42244,9 @@ impl Storage {
         } else {
             &mut catalog.values[slot].committed
         };
-        if temporary || value.generation == value.staged_generation {
+        if temporary || value.staged_generation == Some((txid, value.generation)) {
             value.dirty = false;
-            value.staged_generation = 0;
+            value.staged_generation = None;
         }
     }
 
@@ -42324,7 +42267,7 @@ impl Storage {
             log_count,
             dirty: false,
             generation: 0,
-            staged_generation: 0,
+            staged_generation: None,
         };
     }
 
@@ -42359,7 +42302,7 @@ impl Storage {
             log_count: 0,
             dirty: false,
             generation: 0,
-            staged_generation: 0,
+            staged_generation: None,
         };
         Ok(())
     }
@@ -48998,6 +48941,12 @@ impl Storage {
                 .catalog_sequence
                 .next_bounded(MAX_INDEX_OID_GENERATION, "index")?,
         };
+        let statistics_admission = self.reserve_explicit_index_statistics(
+            table,
+            def.database,
+            self.tables[table].identity().created_at,
+            created_at,
+        )?;
         let mut maintenance = self.brin_maintenance();
         let (state, ranges) =
             Self::brin_entry_mut(&mut maintenance, i, self.brin_unsummarized_ranges_per_index);
@@ -49018,6 +48967,7 @@ impl Storage {
             ddl_state: CatalogDdlState::PendingCreate { txid },
             ..def
         };
+        statistics_admission.commit();
         Ok(i)
     }
 
@@ -49381,10 +49331,17 @@ impl Storage {
         *state = BrinMaintenanceState::EMPTY;
         ranges.fill(0);
         catalog[slot] = IndexDef::EMPTY;
+        let retained = identity.is_some_and(|identity| {
+            catalog.iter().any(|index| {
+                index.database == database
+                    && index.ddl_state != CatalogDdlState::Absent
+                    && RelationIdentity::parse(index.created_at) == Some(identity)
+            })
+        });
         drop(maintenance);
         drop(catalog);
-        if let Some(identity) = identity {
-            self.reset_index_statistics(database, identity.oid());
+        if !retained && let Some(identity) = identity {
+            self.retire_index_statistics(database, identity.oid());
         }
     }
 
@@ -50374,6 +50331,12 @@ impl Storage {
             state.identity.created_at,
         );
         let committed_revision = state.committed_revision;
+        let statistics_admission = self.reserve_implicit_index_statistics(
+            index,
+            state.identity.database,
+            state.identity.created_at,
+            &definition,
+        )?;
         drop(state);
         self.definition_publication
             .publish_table(
@@ -50393,6 +50356,7 @@ impl Storage {
                     "table definition source changed before replay publication"
                 )
             })?;
+        statistics_admission.commit();
         Ok(())
     }
 
@@ -56171,7 +56135,6 @@ mod tests {
                 default: ColumnDefault::NONE,
                 is_identity: false,
                 identity_always: false,
-                auto_increment_step: 1,
                 user_type: None,
                 statistics_target: -1,
                 statistics_options: crate::sql::ast::ColumnStatisticsOptions::DEFAULT,

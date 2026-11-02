@@ -27,7 +27,7 @@ use crc32c::crc32c;
 
 /// On-disk record header length shared by recovery and logical decoding.
 pub(crate) const HEADER_LEN: usize = 24;
-pub(crate) const RECORD_VERSION: u8 = 22;
+pub(crate) const RECORD_VERSION: u8 = 23;
 
 /// One contiguous, committed journal range ready for immutable publication.
 /// Construction is private to the journal, so callers cannot pair an LSN with
@@ -52,8 +52,11 @@ impl CommittedBatch {
         self.start
     }
 }
+#[cfg(test)]
 const TABLE_STATISTICS_V3: u8 = u8::MAX - 1;
+#[cfg(test)]
 const TABLE_STATISTICS_V4: u8 = u8::MAX - 2;
+const TABLE_STATISTICS_V5: u8 = 251;
 
 // One registry defines both durable discriminants and startup recognition.
 macro_rules! wal_record_kinds {
@@ -87,7 +90,6 @@ wal_record_kinds! {
     KIND_DROP_VIEW = 6;
     KIND_CREATE_INDEX = 7;
     KIND_DROP_INDEX = 8;
-    KIND_SEQUENCE_SET = 9;
     KIND_CREATE_SCHEMA = 10;
     KIND_DROP_SCHEMA = 11;
     KIND_SET_TABLE_SCHEMA = 12;
@@ -255,7 +257,7 @@ wal_record_kinds! {
 /// A table definition is an independently versioned payload inside the
 /// object-native logical WAL. Replays reject a definition from an incompatible
 /// schema instead of assigning later bytes to a different column property.
-const TABLE_DEF_PAYLOAD_VERSION: u8 = 13;
+const TABLE_DEF_PAYLOAD_VERSION: u8 = 14;
 const DOMAIN_PAYLOAD_VERSION: u8 = u8::MAX - 3;
 const NO_DOMAIN_BASE_CREATION: u32 = 0;
 
@@ -536,16 +538,7 @@ impl WalTableStatistics<'_> {
     fn encoded_len(self) -> usize {
         match self {
             Self::Captured(statistics) => {
-                1 + 8
-                    + 4
-                    + 8
-                    + 2
-                    + statistics
-                        .columns
-                        .iter()
-                        .filter(|column| column.valid)
-                        .count()
-                        * (2 + 4 + 8 + 4 + 4)
+                2 + 8 + 4 + 8 + 2 + statistics.columns.len() * (2 + 4 + 8 + 4 + 4)
             }
             Self::Encoded(bytes) => bytes.len(),
         }
@@ -554,21 +547,16 @@ impl WalTableStatistics<'_> {
     fn append(self, buffer: &mut FixedBuf) -> bool {
         match self {
             Self::Captured(statistics) => {
-                let valid_columns = statistics
-                    .columns
-                    .iter()
-                    .filter(|column| column.valid)
-                    .count();
-                let mut ok = buffer.append(&[TABLE_STATISTICS_V4])
+                let valid_columns = statistics.columns.len();
+                let mut ok = buffer.append(&[TABLE_STATISTICS_V5])
+                    && buffer.append(&[u8::from(statistics.valid)])
                     && buffer.append(&statistics.rows.to_le_bytes())
                     && buffer.append(&statistics.average_row_width.to_le_bytes())
                     && buffer.append(&statistics.analyzed_generation.to_le_bytes())
                     && buffer.append(&(valid_columns as u16).to_le_bytes());
-                for (index, column) in statistics.columns.iter().enumerate() {
-                    if !column.valid {
-                        continue;
-                    }
-                    ok &= buffer.append(&(index as u16).to_le_bytes())
+                for record in statistics.columns.iter() {
+                    let column = record.statistics();
+                    ok &= buffer.append(&record.attribute().to_le_bytes())
                         && buffer.append(&column.null_fraction_ppm.to_le_bytes())
                         && buffer.append(&column.distinct_values.to_le_bytes())
                         && buffer.append(&column.distinct_fraction_ppm.to_le_bytes())
@@ -580,15 +568,14 @@ impl WalTableStatistics<'_> {
         }
     }
 
-    pub(crate) fn materialize(self) -> Result<TableStatistics, SqlError> {
+    pub(crate) fn materialize(
+        self,
+        pool: &std::sync::Arc<crate::mem::lease_pool::LeasePool>,
+        reuse: Option<&TableStatistics>,
+    ) -> Result<TableStatistics, SqlError> {
         match self {
-            Self::Captured(statistics) => Ok(*statistics),
-            Self::Encoded(bytes) => decode_table_statistics(bytes).ok_or_else(|| {
-                sql_err!(
-                    sqlstate::INTERNAL_ERROR,
-                    "corrupt table statistics in journal"
-                )
-            }),
+            Self::Captured(statistics) => Ok(statistics.clone()),
+            Self::Encoded(bytes) => decode_table_statistics(bytes, pool, reuse),
         }
     }
 }
@@ -999,8 +986,6 @@ fn table_payload_len<B: DefinitionBacking>(def: &TableDefinition<B>) -> usize {
             .expression()
             .map(|e| e.as_str().len())
             .unwrap_or(0);
-        // auto_increment_step (i64).
-        n += 8;
         n += 2; // attstattarget
         n += 9; // attoptions presence byte plus two float4 bit patterns
         n += 2; // attstorage + attcompression
@@ -1125,7 +1110,6 @@ fn append_table_payload<B: DefinitionBacking>(
         let de = c.default.expression().map_or("", |e| e.as_str());
         ok &= buffer.append(&(de.len() as u16).to_le_bytes());
         ok &= buffer.append(de.as_bytes());
-        ok &= buffer.append(&c.auto_increment_step.to_le_bytes());
         ok &= buffer.append(&c.statistics_target.to_le_bytes());
         let (option_flags, n_distinct, n_distinct_inherited) = c.statistics_options.encoded();
         ok &= buffer.append(&[option_flags]);
@@ -1717,15 +1701,6 @@ pub(crate) enum WalOp<'a> {
         name: &'a str,
         new_name: &'a str,
     },
-    /// A serial/identity column's sequence position: the last value handed
-    /// out. Absolute, so replay is idempotent and order-tolerant within a
-    /// table's records.
-    SequenceSet {
-        schema: &'a str,
-        table: &'a str,
-        column: u16,
-        last: i64,
-    },
     CreateSchema {
         identity: crate::storage::SchemaIdentity,
         name: &'a str,
@@ -2040,6 +2015,7 @@ pub(crate) enum WalOp<'a> {
         schema: &'a str,
         table: &'a str,
         statistics: WalTableStatistics<'a>,
+        origin: crate::storage::StatisticsOrigin,
     },
     /// Complete catalog image for CREATE and every ALTER. Names identify the
     /// table during cold replay; keys are already parsed into durable forms.
@@ -3067,7 +3043,6 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::DropDatabase { .. } => KIND_DROP_DATABASE,
         WalOp::DropIndex { .. } => KIND_DROP_INDEX,
         WalOp::RenameIndex { .. } => KIND_RENAME_INDEX,
-        WalOp::SequenceSet { .. } => KIND_SEQUENCE_SET,
         WalOp::CreateSchema { .. } => KIND_CREATE_SCHEMA,
         WalOp::DropSchema { .. } => KIND_DROP_SCHEMA,
         WalOp::RenameSchema { .. } => KIND_RENAME_SCHEMA,
@@ -3762,7 +3737,6 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             name,
             new_name,
         } => 1 + schema.len() + 1 + name.len() + 1 + new_name.len(),
-        WalOp::SequenceSet { schema, table, .. } => 1 + table.len() + 2 + 8 + 1 + schema.len(),
         WalOp::CreateSchema { name, .. } | WalOp::DropSchema { name, .. } => 8 + 1 + name.len(),
         WalOp::RenameSchema { name, new_name, .. } => 8 + 1 + name.len() + 1 + new_name.len(),
         WalOp::UpsertExtension {
@@ -4299,7 +4273,8 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             schema,
             table,
             statistics,
-        } => 1 + table.len() + 1 + schema.len() + statistics.encoded_len(),
+            ..
+        } => 1 + table.len() + 1 + schema.len() + 1 + statistics.encoded_len(),
         WalOp::SetExtendedStatistics {
             schema,
             name,
@@ -5697,18 +5672,6 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             name,
             new_name,
         } => name_bytes(buffer, schema) && name_bytes(buffer, name) && name_bytes(buffer, new_name),
-        WalOp::SequenceSet {
-            schema,
-            table,
-            column,
-            last,
-        } => {
-            let mut ok = name_bytes(buffer, table);
-            ok &= buffer.append(&column.to_le_bytes());
-            ok &= buffer.append(&last.to_le_bytes());
-            ok &= name_bytes(buffer, schema);
-            ok
-        }
         WalOp::CreateSchema { identity, name } | WalOp::DropSchema { identity, name } => {
             buffer.append(&identity.created_at().to_le_bytes()) && name_bytes(buffer, name)
         }
@@ -6705,7 +6668,13 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             schema,
             table,
             statistics,
-        } => name_bytes(buffer, table) && name_bytes(buffer, schema) && statistics.append(buffer),
+            origin,
+        } => {
+            name_bytes(buffer, table)
+                && name_bytes(buffer, schema)
+                && buffer.append(&[*origin as u8])
+                && statistics.append(buffer)
+        }
         WalOp::SetExtendedStatistics {
             created_at,
             schema,
@@ -6971,73 +6940,96 @@ fn decode_stored_query_dependencies(payload: &[u8]) -> Option<StoredQueryDepende
     Some(dependencies)
 }
 
-fn decode_table_statistics(payload: &[u8]) -> Option<TableStatistics> {
-    let format = payload.first().copied()?;
-    if !matches!(format, TABLE_STATISTICS_V3 | TABLE_STATISTICS_V4) {
-        return None;
-    }
-    let mut at = 1usize;
-    let rows = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
-    at += 8;
-    let average_row_width = u32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
-    at += 4;
-    let analyzed_generation = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
-    at += 8;
-    let count = if format == TABLE_STATISTICS_V4 {
-        let count = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?) as usize;
-        at += 2;
-        count
-    } else {
-        let count = *payload.get(at)? as usize;
-        at += 1;
-        count
-    };
-    if count > MAX_COLUMNS {
-        return None;
-    }
-    let mut statistics = TableStatistics {
-        valid: true,
-        rows,
-        average_row_width,
-        analyzed_generation,
-        columns: [ColumnStatistics::EMPTY; MAX_COLUMNS],
-    };
-    for _ in 0..count {
-        let column = if format == TABLE_STATISTICS_V4 {
-            let column = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?) as usize;
-            at += 2;
-            column
-        } else {
-            let column = *payload.get(at)? as usize;
-            at += 1;
-            column
-        };
-        if column >= MAX_COLUMNS || statistics.columns[column].valid {
-            return None;
-        }
-        let null_fraction_ppm = u32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
-        at += 4;
-        if null_fraction_ppm > 1_000_000 {
-            return None;
-        }
-        let distinct_values = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
-        at += 8;
-        let distinct_fraction_ppm = u32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
-        at += 4;
-        if distinct_fraction_ppm > 1_000_000 {
-            return None;
-        }
-        let average_width = u32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
-        at += 4;
-        statistics.columns[column] = ColumnStatistics {
+fn decode_statistics_column(
+    payload: &[u8],
+    at: &mut usize,
+) -> Option<crate::storage::AnalyzedColumn> {
+    let attribute = u16::from_le_bytes(payload.get(*at..*at + 2)?.try_into().ok()?);
+    *at += 2;
+    let null_fraction_ppm = u32::from_le_bytes(payload.get(*at..*at + 4)?.try_into().ok()?);
+    *at += 4;
+    let distinct_values = u64::from_le_bytes(payload.get(*at..*at + 8)?.try_into().ok()?);
+    *at += 8;
+    let distinct_fraction_ppm = u32::from_le_bytes(payload.get(*at..*at + 4)?.try_into().ok()?);
+    *at += 4;
+    let average_width = u32::from_le_bytes(payload.get(*at..*at + 4)?.try_into().ok()?);
+    *at += 4;
+    crate::storage::AnalyzedColumn::new(
+        attribute,
+        ColumnStatistics {
             valid: true,
             null_fraction_ppm,
             distinct_values,
             distinct_fraction_ppm,
             average_width,
-        };
+        },
+    )
+    .ok()
+}
+
+fn validate_table_statistics_payload(payload: &[u8]) -> Option<usize> {
+    if payload.len() < 24 || payload[0] != TABLE_STATISTICS_V5 || payload[1] > 1 {
+        return None;
     }
-    (at == payload.len()).then_some(statistics)
+    let count = usize::from(u16::from_le_bytes(payload[22..24].try_into().ok()?));
+    if count > crate::storage::MAX_RELATION_COLUMNS || payload.len() != 24 + count * 22 {
+        return None;
+    }
+    let mut at = 24;
+    let mut previous = 0;
+    for _ in 0..count {
+        let column = decode_statistics_column(payload, &mut at)?;
+        if column.attribute() <= previous {
+            return None;
+        }
+        previous = column.attribute();
+    }
+    Some(count)
+}
+
+fn decode_table_statistics(
+    payload: &[u8],
+    pool: &std::sync::Arc<crate::mem::lease_pool::LeasePool>,
+    reuse: Option<&TableStatistics>,
+) -> Result<TableStatistics, SqlError> {
+    let invalid = || {
+        sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "corrupt or unsupported table statistics in journal"
+        )
+    };
+    let count = validate_table_statistics_payload(payload).ok_or_else(invalid)?;
+    let reusable = reuse.filter(|image| {
+        if image.columns.len() != count {
+            return false;
+        }
+        let mut at = 24;
+        image
+            .columns
+            .iter()
+            .all(|column| decode_statistics_column(payload, &mut at).as_ref() == Some(column))
+    });
+    let columns = if let Some(image) = reusable {
+        image.columns.clone()
+    } else {
+        let mut columns = pool
+            .lease(count)
+            .map_err(|error| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "{}", error))?;
+        let mut at = 24;
+        for _ in 0..count {
+            columns
+                .push_reserved(decode_statistics_column(payload, &mut at).ok_or_else(invalid)?)
+                .expect("validated statistics count was reserved");
+        }
+        columns.freeze()
+    };
+    Ok(TableStatistics {
+        valid: payload[1] == 1,
+        rows: u64::from_le_bytes(payload[2..10].try_into().map_err(|_| invalid())?),
+        average_row_width: u32::from_le_bytes(payload[10..14].try_into().map_err(|_| invalid())?),
+        analyzed_generation: u64::from_le_bytes(payload[14..22].try_into().map_err(|_| invalid())?),
+        columns,
+    })
 }
 
 fn decode_extended_statistics_data(payload: &[u8]) -> Option<ExtendedStatisticsData> {
@@ -8022,9 +8014,6 @@ fn decode_op_inner<'a>(
                 } else {
                     None
                 };
-                let auto_increment_step =
-                    i64::from_le_bytes(payload.get(at..at + 8)?.try_into().unwrap());
-                at += 8;
                 let statistics_target =
                     i16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
                 at += 2;
@@ -8078,7 +8067,6 @@ fn decode_op_inner<'a>(
                     default,
                     is_identity: meta[1] & 32 != 0,
                     identity_always: meta[1] & 64 != 0,
-                    auto_increment_step,
                     user_type,
                     statistics_target,
                     statistics_options,
@@ -9985,20 +9973,6 @@ fn decode_op_inner<'a>(
                 new_name,
             })
         }),
-        KIND_SEQUENCE_SET => decode_large_op(|| {
-            let table = take_name(&mut at)?;
-            let column = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().unwrap());
-            at += 2;
-            let last = i64::from_le_bytes(payload.get(at..at + 8)?.try_into().unwrap());
-            at += 8;
-            let schema = take_name(&mut at)?;
-            (at == payload.len()).then_some(WalOp::SequenceSet {
-                schema,
-                table,
-                column,
-                last,
-            })
-        }),
         KIND_CREATE_SEQUENCE => decode_large_op(|| {
             let identity = take_catalog_position(payload, &mut at)?;
             let name = take_name(&mut at)?;
@@ -11568,12 +11542,20 @@ fn decode_op_inner<'a>(
         KIND_ANALYZE => decode_large_op(|| {
             let table = take_name(&mut at)?;
             let schema = take_name(&mut at)?;
+            let origin = match *payload.get(at)? {
+                0 => crate::storage::StatisticsOrigin::Analyze,
+                1 => crate::storage::StatisticsOrigin::Definition,
+                2 => crate::storage::StatisticsOrigin::RelationCounts,
+                _ => return None,
+            };
+            at += 1;
             let encoded = payload.get(at..)?;
-            decode_table_statistics(encoded)?;
+            validate_table_statistics_payload(encoded)?;
             Some(WalOp::Analyze {
                 schema,
                 table,
                 statistics: WalTableStatistics::Encoded(encoded),
+                origin,
             })
         }),
         KIND_SET_EXTENDED_STATISTICS => decode_large_op(|| {
@@ -14878,7 +14860,6 @@ mod tests {
             default: ColumnDefault::NONE,
             is_identity: false,
             identity_always: false,
-            auto_increment_step: 1,
             user_type: None,
             statistics_target: -1,
             statistics_options: crate::sql::ast::ColumnStatisticsOptions::DEFAULT,
@@ -14901,7 +14882,6 @@ mod tests {
             },
             is_identity: false,
             identity_always: false,
-            auto_increment_step: 1,
             user_type: None,
             statistics_target: -1,
             statistics_options: crate::sql::ast::ColumnStatisticsOptions::DEFAULT,
@@ -15185,6 +15165,31 @@ mod tests {
         ));
         let truncated_len = payload.len() - definition.n_columns;
         assert!(decode_op(KIND_CREATE, &payload.readable()[..truncated_len]).is_none());
+    }
+
+    #[test]
+    fn table_payload_rejects_versions_with_the_removed_increment_cache() {
+        let definition = sample_def();
+        let mut budget = Budget::new(8192);
+        let mut current = FixedBuf::new(&mut budget, "current table payload", 4096).unwrap();
+        let mut incompatible = FixedBuf::new(&mut budget, "old table payload", 4096).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            assert!(append_payload(
+                &mut current,
+                &WalOp::CreateTable {
+                    identity: crate::storage::CatalogPosition::new(0, 1).unwrap(),
+                    definition: (&definition).into(),
+                }
+            ));
+            assert_eq!(current.readable()[0], 14);
+            assert!(decode_table_payload(current.readable()).is_some());
+            for version in [0, 1, 13, 15, u8::MAX] {
+                incompatible.clear();
+                assert!(incompatible.append(&[version]));
+                assert!(incompatible.append(&current.readable()[1..]));
+                assert!(decode_table_payload(incompatible.readable()).is_none());
+            }
+        });
     }
 
     #[test]
@@ -17426,45 +17431,102 @@ mod tests {
     }
 
     #[test]
-    fn wide_table_statistics_round_trip_high_column_ordinals() {
+    fn wide_table_statistics_round_trip_stable_attributes_and_rejects_old_formats() {
+        use crate::mem::lease_pool::{LeasePool, Purpose};
+        let mut pool_budget = Budget::new(LeasePool::budget_bytes(4096, 16));
+        let pool = LeasePool::new(&mut pool_budget, Purpose::STATISTICS, 4096, 16).unwrap();
         let mut statistics = TableStatistics::EMPTY;
         statistics.valid = true;
         statistics.rows = 7;
         statistics.average_row_width = 12;
         statistics.analyzed_generation = 9;
-        statistics.columns[1599] = ColumnStatistics {
-            valid: true,
-            null_fraction_ppm: 125_000,
-            distinct_values: 6,
-            distinct_fraction_ppm: 0,
-            average_width: 4,
-        };
-        let captured = WalTableStatistics::Captured(&statistics);
+        let mut columns = pool.lease(1).unwrap();
+        columns
+            .push_reserved(
+                crate::storage::AnalyzedColumn::new(
+                    1600,
+                    ColumnStatistics {
+                        valid: true,
+                        null_fraction_ppm: 125_000,
+                        distinct_values: 6,
+                        distinct_fraction_ppm: 0,
+                        average_width: 4,
+                    },
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        statistics.columns = columns.freeze();
+        let mut tight_budget = Budget::new(LeasePool::budget_bytes(64, 1));
+        let tight_pool = LeasePool::new(&mut tight_budget, Purpose::STATISTICS, 64, 1).unwrap();
+        let mut admitted = statistics.clone();
+        admitted.columns = tight_pool.copy_slice(statistics.columns.as_ref()).unwrap();
         let mut budget = Budget::new(1024);
         let mut payload = FixedBuf::new(&mut budget, "wide table statistics", 1024).unwrap();
-        assert!(captured.append(&mut payload));
-        assert_eq!(payload.readable()[0], TABLE_STATISTICS_V4);
-        let decoded = WalTableStatistics::Encoded(payload.readable())
-            .materialize()
-            .unwrap();
-        assert_eq!(decoded, statistics);
-
-        let mut legacy_budget = Budget::new(128);
-        let mut legacy = FixedBuf::new(&mut legacy_budget, "legacy table statistics", 128).unwrap();
-        assert!(legacy.append(&[TABLE_STATISTICS_V3]));
-        assert!(legacy.append(&7u64.to_le_bytes()));
-        assert!(legacy.append(&12u32.to_le_bytes()));
-        assert!(legacy.append(&9u64.to_le_bytes()));
-        assert!(legacy.append(&[1, 63]));
-        assert!(legacy.append(&125_000u32.to_le_bytes()));
-        assert!(legacy.append(&6u64.to_le_bytes()));
-        assert!(legacy.append(&0u32.to_le_bytes()));
-        assert!(legacy.append(&4u32.to_le_bytes()));
-        let legacy = WalTableStatistics::Encoded(legacy.readable())
-            .materialize()
-            .unwrap();
-        assert!(legacy.columns[63].valid);
-        assert_eq!(legacy.columns[63].distinct_values, 6);
+        crate::mem::guard::forbid_alloc(|| {
+            assert!(WalTableStatistics::Captured(&statistics).append(&mut payload));
+            assert_eq!(payload.readable()[0], TABLE_STATISTICS_V5);
+            assert_eq!(
+                WalTableStatistics::Encoded(payload.readable())
+                    .materialize(&pool, None)
+                    .unwrap(),
+                statistics
+            );
+            assert!(
+                WalTableStatistics::Encoded(payload.readable())
+                    .materialize(&tight_pool, None)
+                    .is_err()
+            );
+            let pinned = WalTableStatistics::Encoded(payload.readable())
+                .materialize(&tight_pool, Some(&admitted))
+                .unwrap();
+            assert_eq!(pinned, statistics);
+            assert!(tight_pool.lease::<u8>(1).is_err());
+            for old in [TABLE_STATISTICS_V3, TABLE_STATISTICS_V4] {
+                let mut bytes = [0u8; 24];
+                bytes[0] = old;
+                assert!(
+                    WalTableStatistics::Encoded(&bytes)
+                        .materialize(&pool, None)
+                        .is_err()
+                );
+            }
+            let mut malformed = [0u8; 46];
+            malformed.copy_from_slice(payload.readable());
+            for attribute in [0u16, 1601] {
+                malformed[24..26].copy_from_slice(&attribute.to_le_bytes());
+                assert!(
+                    WalTableStatistics::Encoded(&malformed)
+                        .materialize(&pool, None)
+                        .is_err()
+                );
+            }
+            malformed.copy_from_slice(payload.readable());
+            malformed[26..30].copy_from_slice(&1_000_001u32.to_le_bytes());
+            assert!(
+                WalTableStatistics::Encoded(&malformed)
+                    .materialize(&pool, None)
+                    .is_err()
+            );
+            let mut duplicate = [0u8; 68];
+            duplicate[..46].copy_from_slice(payload.readable());
+            duplicate[46..].copy_from_slice(&payload.readable()[24..]);
+            duplicate[22..24].copy_from_slice(&2u16.to_le_bytes());
+            assert!(
+                WalTableStatistics::Encoded(&duplicate)
+                    .materialize(&pool, None)
+                    .is_err()
+            );
+            assert!(validate_table_statistics_payload(&payload.readable()[..45]).is_none());
+            payload.clear();
+            assert!(WalTableStatistics::Captured(&TableStatistics::EMPTY).append(&mut payload));
+            assert_eq!(
+                WalTableStatistics::Encoded(payload.readable())
+                    .materialize(&pool, None)
+                    .unwrap(),
+                TableStatistics::EMPTY
+            );
+        });
     }
 
     #[test]

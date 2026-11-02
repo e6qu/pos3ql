@@ -783,6 +783,8 @@ fn compute_window<'a>(
     else {
         return Err(sql_err!(sqlstate::INTERNAL_ERROR, "not a window function"));
     };
+    let builtin_name = name.strip_prefix("pg_catalog.").unwrap_or(name);
+    let name = &builtin_name;
     let n = rows.len();
     let out = arena
         .alloc_slice_with(n, |_| Datum::Null)

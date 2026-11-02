@@ -425,7 +425,13 @@ mod tests {
             let mut mapping = [None; MAX_COLUMNS];
             mapping[0] = Some(SqlName::parse("id").unwrap());
             let change = storage
-                .write_table_def(target, definition, &mapping, false)
+                .write_table_def(
+                    target,
+                    definition,
+                    &mapping,
+                    false,
+                    crate::storage::ColumnSet::EMPTY,
+                )
                 .unwrap();
             crate::mem::guard::forbid_alloc(|| {
                 storage

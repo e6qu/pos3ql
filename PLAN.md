@@ -67,10 +67,11 @@ row lookup structure for each empty table. If most traffic touches `orders`, it 
 available shared slots. A long report keeps its selected versions until it
 finishes; those slots cannot be reassigned simply because demand changes.
 
-Ordinary row metadata, foreground row work, actual table definitions and index
-bindings now share explicit fixed pools. Readers keep their selected schema
-owners; a change reserves its replacement definitions, bindings and row keys
-before durability. [Architecture](docs/architecture.md#memory-and-physical-size)
+Ordinary row metadata, foreground row work, actual table definitions, index
+bindings and analyzed columns share explicit fixed pools. Index counters have
+an independent global limit, and SQL generators use the shared sequence catalog.
+Readers keep their selected owners; a change reserves replacements before
+durability. [Architecture](docs/architecture.md#memory-and-physical-size)
 owns the current limits and admission behavior.
 
 Retain the ownership, exhaustion, prepared recovery and once-only SQL tests as
@@ -79,17 +80,6 @@ images on rollback. For example, if analyzing `orders` cannot reserve statistics
 space, its previous statistics must remain usable. A waiting commit must not
 run an audit trigger again. Joined and recursive row decoding must continue to
 include its complete physical shape, including hidden fields.
-
-Next, share statistics storage using actual analyzed columns and explicit global
-byte and owner limits. Keep column identity stable through table changes, retain
-old images for readers and checkpoints, and reserve replacements before effects.
-Give index counters an independent global limit and keep source identity through
-late readers, drop/reuse and database copies. Remove duplicate per-table sequence
-counters only after every SQL generator uses its catalog sequence, including
-copied tables, partition children and defaults whose sequence ownership changes.
-Preserve COPY, replication, rollback, restart and prepared resolution. Compare
-the same global limits at 1/8/32/128 tables, with populated, replacement and
-exhausted-pool cases; verify exact startup accounting and zero runtime heap growth.
 
 Reduce other catalog reservations using measured component costs. Empty tables
 still have a cost; shared schema storage does not establish an embedded memory
@@ -101,7 +91,7 @@ Keep the [ownership/exhaustion tests](https://github.com/e6qu/pos3ql/blob/b3aa30
 [two-table spill/recovery case](https://github.com/e6qu/pos3ql/blob/b3aa3099993c351e09a0eb73fd6c1de67228007d/tests/external/run.sh) as regression coverage.
 Saved generations can exceed resident capacity; replaying their newer journal
 tail still needs resident slots and bytes. Extend the
-[measurement matrix](https://github.com/e6qu/pos3ql/blob/14e1cdd24e775ea92e2646c07d9671744898e29a/tools/measure-embedded-capacity.py) with realistic populated
+[measurement matrix](https://github.com/e6qu/pos3ql/blob/main/tools/measure-embedded-capacity.py) with realistic populated
 sessions and pinned-reader pressure before claiming an embedded minimum.
 
 Reserve forward progress for commit, rollback, required reads and maintenance.

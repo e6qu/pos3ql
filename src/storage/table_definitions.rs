@@ -1094,6 +1094,7 @@ mod tests {
                     changed,
                     &mapping,
                     false,
+                    crate::storage::ColumnSet::EMPTY,
                 )
                 .unwrap();
             assert!(

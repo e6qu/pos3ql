@@ -2320,7 +2320,6 @@ pub(crate) fn describe_derived_definition<'a>(
         default: crate::storage::ColumnDefault::NONE,
         is_identity: false,
         identity_always: false,
-        auto_increment_step: 1,
         user_type: None,
         statistics_target: -1,
         statistics_options: crate::sql::ast::ColumnStatisticsOptions::DEFAULT,

@@ -7,6 +7,7 @@
 use super::*;
 use crate::mem::mutex::Mutex;
 
+mod canonical_sequences;
 mod catalog_identity_lookup;
 mod client_catalog;
 mod cursor_execution;
@@ -21,6 +22,7 @@ mod row_layout;
 mod sequence_inheritance;
 mod shared_row_capacity;
 mod shared_row_work;
+mod shared_statistics;
 mod stored_relation_sources;
 mod table_metadata_capacity;
 mod table_publication;
@@ -1029,7 +1031,14 @@ fn statement_row_copy_chunks_reject_a_definition_changed_after_copy_begin() {
         let mut mapping = [None; crate::storage::MAX_COLUMNS];
         mapping[0] = Some(definition.columns[0].name);
         transaction
-            .write_table_definition(&engine.storage, target, definition, &mapping, false)
+            .write_table_definition(
+                &engine.storage,
+                target,
+                definition,
+                &mapping,
+                false,
+                crate::storage::ColumnSet::EMPTY,
+            )
             .unwrap();
         let result = if binary {
             copy_binary_row(
@@ -25579,7 +25588,12 @@ fn catalog_snapshot_relation_estimates_comments_and_hints_survive_cold_recovery(
         );
     }
     assert_eq!(
-        engine.storage.table_statistics(table, 0).columns[1].null_fraction_ppm,
+        engine
+            .storage
+            .table_statistics(table, 0)
+            .column(2)
+            .unwrap()
+            .null_fraction_ppm,
         500_000
     );
     let retained = run_session_transaction(&mut engine, &mut budget, &mut reader, &mut guc,
@@ -34588,9 +34602,11 @@ fn serial_recovery_keeps_saved_counters_independent_of_rows() {
                 let mut engine = Engine::new(&config, &mut budget).unwrap();
                 let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
                 session.success(&mut engine, "CREATE TABLE serial_saved (id serial)", false);
-                let table = engine.storage.find_table("public", "serial_saved").unwrap();
-                // Both saved counter layers are independent of explicitly inserted values.
-                engine.storage.set_table_serial_value(table, 0, 21);
+                session.success(
+                    &mut engine,
+                    "SELECT setval('serial_saved_id_seq',21,false)",
+                    false,
+                );
                 session.success(&mut engine, "INSERT INTO serial_saved VALUES (100)", false);
                 assert_eq!(
                     data_rows(&session.success(
@@ -34598,7 +34614,7 @@ fn serial_recovery_keeps_saved_counters_independent_of_rows() {
                         "INSERT INTO serial_saved DEFAULT VALUES RETURNING id",
                         false
                     )),
-                    ["1"]
+                    ["21"]
                 );
                 if checkpoint {
                     assert!(engine.checkpoint().unwrap());
@@ -34610,10 +34626,13 @@ fn serial_recovery_keeps_saved_counters_independent_of_rows() {
                 let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
                 let mut engine = Engine::new(&config, &mut budget).unwrap();
                 let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
-                let table = engine.storage.find_table("public", "serial_saved").unwrap();
                 assert_eq!(
-                    engine.storage.table_serial_value(table, 0),
-                    21,
+                    data_rows(&session.success(
+                        &mut engine,
+                        "SELECT last_value,is_called FROM serial_saved_id_seq",
+                        false
+                    )),
+                    ["21|t"],
                     "checkpoint={checkpoint}, mode={mode:?}"
                 );
                 assert_eq!(
@@ -34622,7 +34641,7 @@ fn serial_recovery_keeps_saved_counters_independent_of_rows() {
                         "INSERT INTO serial_saved DEFAULT VALUES RETURNING id",
                         false
                     )),
-                    ["2"]
+                    ["22"]
                 );
                 assert_eq!(
                     data_rows(&session.success(
@@ -34630,7 +34649,7 @@ fn serial_recovery_keeps_saved_counters_independent_of_rows() {
                         "SELECT id FROM serial_saved ORDER BY id",
                         false
                     )),
-                    ["1", "2", "100"]
+                    ["21", "22", "100"]
                 );
             }
             std::fs::remove_dir_all(&config.data_dir).unwrap();
@@ -34640,65 +34659,63 @@ fn serial_recovery_keeps_saved_counters_independent_of_rows() {
 }
 
 #[test]
-fn table_serial_state_wal_recovery_rejects_unknown_positions() {
+fn sequence_wal_recovery_rejects_wrong_names_slots_and_reused_lifetimes() {
     let (mut engine, mut budget) = test_engine();
     run_with(
         &mut engine,
         &mut budget,
-        "CREATE TABLE serial_replay (id bigint)",
+        "CREATE SEQUENCE serial_replay AS BIGINT",
     );
-    let table = engine
+    let slot = engine
         .storage
-        .find_table("public", "serial_replay")
+        .sequence_slot("public", "serial_replay", 0)
         .unwrap();
+    let position = engine.storage.sequence_position(slot);
     crate::mem::guard::forbid_alloc(|| {
         apply_wal_op(
             &mut engine.storage,
             1,
-            WalOp::SequenceSet {
+            WalOp::SequenceAdvance {
+                identity: position,
                 schema: "public",
-                table: "serial_replay",
-                column: 0,
+                name: "serial_replay",
                 last: 81,
+                is_called: true,
             },
             &engine.work,
         )
         .unwrap();
-        for column in [1, u16::MAX] {
+        for (identity, name) in [
+            (
+                crate::storage::CatalogPosition::new(usize::from(u16::MAX), position.created_at())
+                    .unwrap(),
+                "serial_replay",
+            ),
+            (position, "missing_serial"),
+            (
+                crate::storage::CatalogPosition::new(slot, position.created_at() + 1).unwrap(),
+                "serial_replay",
+            ),
+        ] {
             assert_eq!(
                 apply_wal_op(
                     &mut engine.storage,
                     2,
-                    WalOp::SequenceSet {
+                    WalOp::SequenceAdvance {
+                        identity,
                         schema: "public",
-                        table: "serial_replay",
-                        column,
-                        last: 99
+                        name,
+                        last: 99,
+                        is_called: true,
                     },
-                    &engine.work,
+                    &engine.work
                 )
                 .unwrap_err()
                 .sqlstate,
-                sqlstate::INTERNAL_ERROR
+                sqlstate::DATA_EXCEPTION
             );
         }
-        assert_eq!(
-            apply_wal_op(
-                &mut engine.storage,
-                2,
-                WalOp::SequenceSet {
-                    schema: "public",
-                    table: "missing_serial",
-                    column: 0,
-                    last: 99
-                },
-                &engine.work,
-            )
-            .unwrap_err()
-            .sqlstate,
-            sqlstate::UNDEFINED_TABLE
-        );
-        assert_eq!(engine.storage.table_serial_value(table, 0), 81);
+        assert_eq!(engine.storage.sequence_value_for(slot, 0), (81, true));
     });
 }
 
@@ -52356,7 +52373,7 @@ fn analyze_current_rows_preserves_repeatable_read_for_base_and_extended_statisti
         .storage
         .extended_statistics_data(extended, reader.txid);
     assert_eq!(statistics.rows, 3);
-    assert_eq!(statistics.columns[3].null_fraction_ppm, 333_333);
+    assert_eq!(statistics.column(4).unwrap().null_fraction_ppm, 333_333);
     assert_eq!(data.rows, 3);
     assert_eq!(data.mcv[0].count, 2);
     assert_eq!(data.mcv[0].values.as_str(), "{1,1}");
@@ -52406,7 +52423,12 @@ fn analyze_current_rows_preserves_repeatable_read_for_base_and_extended_statisti
     assert_eq!(data.mcv[0].values.as_str(), "{4,4}");
     assert_eq!(data.mcv[0].count, 2);
     assert_eq!(
-        engine.storage.table_statistics(table, reader.txid).columns[3].null_fraction_ppm,
+        engine
+            .storage
+            .table_statistics(table, reader.txid)
+            .column(4)
+            .unwrap()
+            .null_fraction_ppm,
         1_000_000
     );
     run_txn(
@@ -52616,7 +52638,12 @@ fn analyze_retained_sources_preserve_pending_changes_rollback_and_cold_recovery(
         true,
     );
     assert_eq!(
-        engine.storage.table_statistics(table, 0).columns[3].null_fraction_ppm,
+        engine
+            .storage
+            .table_statistics(table, 0)
+            .column(4)
+            .unwrap()
+            .null_fraction_ppm,
         333_333
     );
     assert_eq!(
@@ -52712,9 +52739,9 @@ fn vacuum_and_analyze() {
     let statistics = e.storage.table_statistics(slot, 0);
     assert!(statistics.valid);
     assert_eq!(statistics.rows, 2);
-    assert_eq!(statistics.columns[0].distinct_values, 2);
-    assert_eq!(statistics.columns[1].distinct_values, 2);
-    assert_eq!(statistics.columns[0].null_fraction_ppm, 0);
+    assert_eq!(statistics.column(1).unwrap().distinct_values, 2);
+    assert_eq!(statistics.column(2).unwrap().distinct_values, 2);
+    assert_eq!(statistics.column(1).unwrap().null_fraction_ppm, 0);
     assert!(statistics.average_row_width > 0);
     let inheritance = run_with(
         &mut e,
@@ -80044,7 +80071,7 @@ fn object_store_checkpoint_preserves_snapshot_and_survives_cold_cache() {
     let restarted_statistics = restarted.storage.table_statistics(restarted_slot, 0);
     assert!(restarted_statistics.valid);
     assert_eq!(restarted_statistics.rows, 2);
-    assert_eq!(restarted_statistics.columns[0].distinct_values, 2);
+    assert_eq!(restarted_statistics.column(1).unwrap().distinct_values, 2);
     let composite_slot = restarted
         .storage
         .extended_statistics_slot("public", "snapshot_rows_id_value_stats", 0)
@@ -81349,7 +81376,7 @@ fn analyze_and_index_refresh_coalesce_wide_pax_reads_after_cold_recovery() {
         .unwrap();
     let statistics = recovered.storage.table_statistics(slot, 0);
     assert_eq!(statistics.rows, 512);
-    assert!(statistics.columns[1].distinct_values > 100);
+    assert!(statistics.column(2).unwrap().distinct_values > 100);
     assert!(statistics.average_row_width > 8_000);
 
     let before = recovered.storage.block_io_stats();
@@ -89005,6 +89032,8 @@ fn copy_from_applies_expression_defaults_sequences_and_generated_columns() {
          CREATE TABLE copy_defaults (
              input integer,
              sequence_value bigint DEFAULT nextval('copy_sequence'),
+             serial_value serial,
+             identity_value bigint GENERATED ALWAYS AS IDENTITY (START WITH 20 INCREMENT BY 2),
              numbers integer[] DEFAULT ARRAY[1, 2],
              doubled integer GENERATED ALWAYS AS (input * 2) STORED,
              state copy_mood DEFAULT 'ready'::copy_mood
@@ -89060,9 +89089,9 @@ fn copy_from_applies_expression_defaults_sequences_and_generated_columns() {
     let rows = data_rows(&run_with(
         &mut engine,
         &mut budget,
-        "SELECT input, sequence_value, numbers, doubled, state FROM copy_defaults",
+        "SELECT input, sequence_value, serial_value, identity_value, numbers, doubled, state FROM copy_defaults",
     ));
-    assert_eq!(rows, ["5|10|{1,2}|10|ready"]);
+    assert_eq!(rows, ["5|10|1|20|{1,2}|10|ready"]);
 
     let rejected = run_with(&mut engine, &mut budget, "COPY copy_defaults FROM STDIN");
     assert!(

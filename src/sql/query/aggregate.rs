@@ -823,7 +823,8 @@ impl<'a> AggState<'a> {
             }
             return Ok(());
         }
-        self.kind = match *name {
+        let builtin_name = name.strip_prefix("pg_catalog.").unwrap_or(name);
+        self.kind = match builtin_name {
             "count" => AggKind::Count,
             "sum" => AggKind::Sum,
             "avg" => AggKind::Avg,

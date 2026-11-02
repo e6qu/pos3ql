@@ -125,7 +125,14 @@ pub(crate) fn rename(
             for (entry, column) in mapping.iter_mut().zip(definition.columns()) {
                 *entry = Some(column.name);
             }
-            txn.write_table_definition(storage, target, definition, &mapping, false)?;
+            txn.write_table_definition(
+                storage,
+                target,
+                definition,
+                &mapping,
+                false,
+                crate::storage::ColumnSet::EMPTY,
+            )?;
         }
     }
     for slot in 0..storage.index_count() {

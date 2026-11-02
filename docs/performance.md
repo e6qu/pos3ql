@@ -320,15 +320,24 @@ python3 tools/measure-embedded-capacity.py --output NEW_DIRECTORY \
 ```
 
 The explicit 2 GiB ceiling rejects an oversized reservation; it does not allocate
-2 GiB. The 48-sample matrix uses equal explicit `row_overlay_slots`,
+2 GiB. The 64-sample matrix uses equal explicit `row_overlay_slots`,
 `row_work_bytes`, `row_work_leases`, `definition_image_slots`,
-`table_metadata_bytes` (64 MiB) and `table_metadata_leases` (8,192) for
+`table_metadata_bytes` (64 MiB), `table_metadata_leases` (8,192),
+`statistics_bytes` (1 MiB), `statistics_leases` (1,024) and
+`index_statistics_slots` (4,096) for
 1/8/32/128 configured tables in both transaction modes. Each combination runs
 empty, one-hot-table, evenly distributed, moving-demand, wide-schema and
 replacement workloads. The wide schema has 64 nullable columns. Replacement
 creates a unique index, adds a column, rolls back to a savepoint, then drops and
 recreates the index before checking row counts and sums. Metadata-pool backing
-and free-range control reservations must stay constant across table counts. The output retains the exact commands, revision, compiler,
+and free-range control reservations must stay constant across table counts.
+Two additional profiles distribute rows across all tables and analyze every
+column, using two-column and 64-column schemas. The latter also changes a
+column's type, analyzes that column, then rolls back to a savepoint. These
+profiles exercise statistics ownership separately from the original six;
+historical samples do not contain them. Statistics backing, free-range controls
+and index-counter reservations must also remain constant.
+The output retains the exact commands, revision, compiler,
 binary digest, named budget draws and raw JSON measurements, with checksums.
 Digests read files in bounded 1 MiB chunks. The script runs the helper's focused
 metric tests before building and sampling it.

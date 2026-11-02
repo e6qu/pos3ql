@@ -2185,6 +2185,7 @@ mod tests {
                     definition("pending", 1),
                     &[None; MAX_COLUMNS],
                     false,
+                    crate::storage::ColumnSet::EMPTY,
                 )
                 .unwrap();
             let pending = storage.table_definition_images();
@@ -2200,6 +2201,7 @@ mod tests {
                     definition("published", 1),
                     &[None; MAX_COLUMNS],
                     false,
+                    crate::storage::ColumnSet::EMPTY,
                 )
                 .unwrap();
             storage
@@ -2434,6 +2436,7 @@ mod tests {
                 definition("source", 2),
                 &[None; MAX_COLUMNS],
                 false,
+                crate::storage::ColumnSet::EMPTY,
             )
             .unwrap();
         let mut arena_budget = Budget::new(1 << 17);

@@ -2887,7 +2887,7 @@ pub(super) fn bound_sequence_literal<'a>(function: &str, args: &[&'a Expr<'a>]) 
         Expr::Str(value)
         | Expr::Cast {
             operand: Expr::Str(value),
-            type_name: "regclass",
+            type_name: "regclass" | "pg_catalog.regclass",
             ..
         } => Some(value),
         _ => None,

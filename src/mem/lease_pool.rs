@@ -33,6 +33,12 @@ impl Purpose {
         leases: "table_metadata_leases",
         ranges: "table metadata free ranges",
     };
+    pub(crate) const STATISTICS: Self = Self {
+        pool: "statistics pool",
+        bytes: "statistics_bytes",
+        leases: "statistics_leases",
+        ranges: "statistics free ranges",
+    };
 }
 
 #[repr(C, align(64))]

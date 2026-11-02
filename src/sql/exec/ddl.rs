@@ -106,7 +106,6 @@ fn empty_meta() -> ColumnMeta {
         default: ColumnDefault::NONE,
         is_identity: false,
         identity_always: false,
-        auto_increment_step: 1,
         user_type: None,
         statistics_target: -1,
         statistics_options: crate::sql::ast::ColumnStatisticsOptions::DEFAULT,
@@ -277,15 +276,13 @@ pub(super) fn build_column(
             column_default
         }
     };
-    // serial/bigserial/smallserial are int4/int8/int2 with an auto-increment
-    // default and an implicit NOT NULL. A GENERATED ... AS IDENTITY column is
-    // also auto-increment, but tracked distinctly (attidentity) and with its own
-    // step; both imply NOT NULL.
+    // SERIAL requests a bound nextval default during table creation.
+    // IDENTITY retains implicit generation; both imply NOT NULL.
     let serial = matches!(
         c.type_name,
         "serial" | "serial4" | "bigserial" | "serial8" | "smallserial" | "serial2"
     );
-    let (is_identity, identity_always, auto_increment_step) = match c.identity {
+    let (is_identity, identity_always) = match c.identity {
         Some(spec) => {
             if default.is_generated() {
                 return Err(sql_err!(
@@ -294,9 +291,9 @@ pub(super) fn build_column(
                     c.name
                 ));
             }
-            (true, spec.always, spec.options.increment.unwrap_or(1))
+            (true, spec.always)
         }
-        None => (false, false, 1),
+        None => (false, false),
     };
     let auto_increment = serial || is_identity;
     let collatable = ctype.is_collatable();
@@ -329,7 +326,6 @@ pub(super) fn build_column(
         default,
         is_identity,
         identity_always,
-        auto_increment_step,
         user_type,
         statistics_target: -1,
         statistics_options: crate::sql::ast::ColumnStatisticsOptions::DEFAULT,

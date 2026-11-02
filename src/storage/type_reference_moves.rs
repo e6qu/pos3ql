@@ -980,6 +980,7 @@ mod tests {
                                         definition,
                                         &mapping("id"),
                                         false,
+                                        crate::storage::ColumnSet::EMPTY,
                                     )
                                     .map(|_change| unrelated)
                             };
@@ -1463,7 +1464,13 @@ mod tests {
                     movement.current
                 );
                 let error = storage
-                    .write_table_def(selected_table, selected_definition, &mapping("id"), false)
+                    .write_table_def(
+                        selected_table,
+                        selected_definition,
+                        &mapping("id"),
+                        false,
+                        crate::storage::ColumnSet::EMPTY,
+                    )
                     .unwrap_err();
                 assert_eq!(
                     error.sqlstate,
@@ -1533,7 +1540,13 @@ mod tests {
                 definition.name = SqlName::parse("unrelated").unwrap();
                 assert_eq!(
                     storage
-                        .write_table_def(selected, definition, &mapping("id"), false)
+                        .write_table_def(
+                            selected,
+                            definition,
+                            &mapping("id"),
+                            false,
+                            crate::storage::ColumnSet::EMPTY,
+                        )
                         .unwrap_err()
                         .sqlstate,
                     sqlstate::INTERNAL_LOCK_WAIT
@@ -2440,6 +2453,7 @@ mod tests {
                                         definition,
                                         &mapping("id"),
                                         false,
+                                        crate::storage::ColumnSet::EMPTY,
                                     )
                                     .map(|_change| related)
                             }
@@ -2500,7 +2514,8 @@ mod tests {
                             storage.select_table_definition(table, 9).0,
                             captured,
                             &mapping("id"),
-                            false
+                            false,
+                            crate::storage::ColumnSet::EMPTY,
                         )
                         .unwrap_err()
                         .sqlstate,
@@ -2513,6 +2528,7 @@ mod tests {
                         captured,
                         &mapping("id"),
                         false,
+                        crate::storage::ColumnSet::EMPTY,
                     )
                     .unwrap();
                 assert_identity(&storage, table, 9, movement.current);
@@ -2715,7 +2731,8 @@ mod tests {
                                 storage.select_table_definition(table, 7).0,
                                 submitted,
                                 &mapping("id"),
-                                false
+                                false,
+                                crate::storage::ColumnSet::EMPTY,
                             )
                             .unwrap_err()
                             .sqlstate,
@@ -3059,6 +3076,7 @@ mod tests {
                             pending,
                             &mapping("id"),
                             false,
+                            crate::storage::ColumnSet::EMPTY,
                         )
                     }))
                 } else {
@@ -3203,6 +3221,7 @@ mod tests {
                             definition,
                             &mapping(name),
                             false,
+                            crate::storage::ColumnSet::EMPTY,
                         )
                         .unwrap()
                 });
@@ -3261,6 +3280,7 @@ mod tests {
                                         definition,
                                         &mapping("id"),
                                         false,
+                                        crate::storage::ColumnSet::EMPTY,
                                     )
                                     .unwrap();
                                 storage.rollback_table_def(change);
@@ -3345,6 +3365,7 @@ mod tests {
                     pending,
                     &mapping("id"),
                     false,
+                    crate::storage::ColumnSet::EMPTY,
                 )
                 .unwrap();
             crate::mem::guard::forbid_alloc(|| {

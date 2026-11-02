@@ -1,4 +1,4 @@
-//! Bind durable enum member identities to the selected catalog image.
+//! Resolve durable enum and sequence identities in selected catalog images.
 
 pub(crate) mod checks;
 
@@ -505,7 +505,7 @@ impl core::fmt::Display for SqlString<'_> {
 }
 
 /// Catalog SQL must follow a frozen value's identity, just like execution.
-/// Re-render only changed enum constants; preserve other expression sources.
+/// Render captured enum and sequence identities with their current SQL names.
 pub(crate) fn default_expression<'a>(
     default: &crate::storage::ColumnDefault,
     base: Option<crate::sql::types::ColType>,
@@ -516,6 +516,41 @@ pub(crate) fn default_expression<'a>(
     let Some(expression) = default.expression() else {
         return Ok(None);
     };
+    if default.constant().is_none() && !checks::is_bound(expression.as_str()) {
+        let parsed = crate::sql::parser::parse_expr(expression.as_str(), arena)?;
+        if let crate::sql::ast::Expr::Call {
+            name: "pg_catalog.nextval",
+            args: [argument],
+            ..
+        } = parsed
+            && let crate::sql::ast::Expr::Cast {
+                operand: crate::sql::ast::Expr::Str(reference),
+                type_name: "regclass" | "pg_catalog.regclass",
+                ..
+            } = argument
+            && let Ok(oid) = reference.parse::<u32>()
+        {
+            if super::catalog::sequence_slot_by_oid(storage, txid, oid as i32).is_none() {
+                return Err(sql_err!(
+                    sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                    "column default sequence identity is no longer present"
+                ));
+            }
+            let name = super::catalog::relname_text(storage, txid, oid as i32, arena)?.ok_or_else(
+                || {
+                    sql_err!(
+                        sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                        "column default sequence identity is no longer present"
+                    )
+                },
+            )?;
+            let literal = super::eval::quote_literal_str(name, arena)?;
+            return arena
+                .alloc_str_display(format_args!("nextval({literal}::regclass)"))
+                .map(Some)
+                .map_err(|_| super::query::arena_full_pub());
+        }
+    }
     if default.constant().is_none() {
         if let Some(base) = base {
             return checks::describe_default(expression.as_str(), base, storage, txid, arena)

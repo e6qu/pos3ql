@@ -5825,44 +5825,6 @@ impl Engine {
                 return Err(e);
             }
         }
-        // Journal any sequence advances (this transaction's or ones a
-        // rolled-back transaction left dirty): absolute positions, so replay
-        // is idempotent.
-        for i in 0..self.storage.table_count() {
-            if !self.storage.table(i).visible_to(txn.txid) {
-                continue;
-            }
-            let def = self.storage.table_def(i, txn.txid);
-            if def.persistence == crate::storage::RelationPersistence::Temporary {
-                continue;
-            }
-            let Some(serial_values) = self.storage.stage_table_serial_values(i, txn.txid) else {
-                continue;
-            };
-            let name = def.name;
-            let schema = def.schema;
-            let n_columns = def.n_columns;
-            drop(def);
-            for (c, &last) in serial_values.iter().enumerate().take(n_columns) {
-                if !self.storage.table_def(i, txn.txid).columns()[c].auto_increment {
-                    continue;
-                }
-                let lsn = self.storage.bump_lsn();
-                if let Err(e) = self.wal.stage_reserved(
-                    txn.txid,
-                    lsn,
-                    &WalOp::SequenceSet {
-                        schema: schema.as_str(),
-                        table: name.as_str(),
-                        column: c as u16,
-                        last,
-                    },
-                ) {
-                    self.rollback_txn(txn, guc);
-                    return Err(e);
-                }
-            }
-        }
         // Journal sequence advances (this transaction's or ones a rolled-back
         // transaction left dirty). Absolute positions, like serial advances, are
         // deliberately non-transactional: a `nextval` in a rolled-back
@@ -5977,6 +5939,7 @@ impl Engine {
                     schema: image.schema.as_str(),
                     table: image.name.as_str(),
                     statistics: crate::wal::WalTableStatistics::Captured(&image.statistics),
+                    origin: image.origin,
                 },
             ) {
                 self.rollback_txn(txn, guc);
@@ -6723,15 +6686,7 @@ impl Engine {
             );
         }
         self.storage.observe_lsn(commit_lsn);
-        // Publication accepted every staged absolute sequence position.
-        // Clear retry markers only now: a staging or journal-capacity error
-        // rolls the transaction back but PostgreSQL sequence advances remain
-        // nontransactional and must be journaled by a later commit.
-        for i in 0..self.storage.table_count() {
-            if self.storage.table(i).visible_to(txn.txid) {
-                self.storage.acknowledge_table_serial_values(i, txn.txid);
-            }
-        }
+        // Acknowledge only the sequence generation this publication captured.
         for i in 0..self.storage.sequence_count() {
             self.storage.clear_sequence_value_dirty(i, txn.txid);
         }
@@ -7482,7 +7437,6 @@ impl Engine {
                 }
                 DdlUndo::DatabaseDropped(slot) => self.storage.commit_database_drop(*slot as usize),
                 // The reset already happened in place; committing keeps it.
-                DdlUndo::SequenceReset { .. } => {}
                 DdlUndo::TemporaryNamespaceCreated(identity) => {
                     self.storage.finish_temporary_namespace(
                         *identity,
@@ -21199,13 +21153,6 @@ fn rollback_catalog_change(storage: &mut Storage, undo: DdlUndo, txid: u32) {
             storage.restore_object_owner(object, prior_owner);
         }
         DdlUndo::DatabaseDropped(slot) => storage.rollback_database_drop(slot as usize, txid),
-        DdlUndo::SequenceReset {
-            table,
-            column,
-            prior,
-        } => {
-            storage.set_table_serial_value(table as usize, column as usize, prior);
-        }
         DdlUndo::TemporaryNamespaceCreated(identity) => storage.finish_temporary_namespace(
             identity,
             txid,
@@ -21389,6 +21336,7 @@ fn apply_prepared_table_wal_payload(
                 definition,
                 &mapping,
                 !rewrite.preserve_rows,
+                crate::storage::ColumnSet::EMPTY,
             )?;
         return Ok(());
     }
@@ -22067,6 +22015,7 @@ fn replay_transaction_batches(
                             schema,
                             table,
                             statistics,
+                            origin,
                         } => {
                             let table_slot = storage
                                 .find_visible(schema, table, transaction_id)
@@ -22079,8 +22028,12 @@ fn replay_transaction_batches(
                             if storage.restore_prepared_table_statistics(
                                 table_slot,
                                 transaction_id,
-                                statistics.materialize()?,
+                                statistics.materialize(
+                                    storage.statistics_pool(),
+                                    Some(&storage.table_statistics(table_slot, transaction_id)),
+                                )?,
                                 *record_lsn > apply_floor,
+                                origin,
                             )? && let Err(error) = prepared
                                 .slot_mut(slot)
                                 .transaction
@@ -22242,28 +22195,6 @@ fn replay_transaction_batches(
                                 command_id,
                                 None,
                                 crate::storage::RowWriteStatistics::Untracked,
-                            )?;
-                        }
-                        WalOp::SequenceSet {
-                            schema,
-                            table,
-                            column,
-                            last,
-                        } => {
-                            let table_slot = storage
-                                .find_visible(schema, table, transaction_id)
-                                .ok_or_else(|| {
-                                    sql_err!(
-                                        sqlstate::UNDEFINED_TABLE,
-                                        "journal sets a sequence of unknown table \"{}\"",
-                                        table
-                                    )
-                                })?;
-                            storage.replay_table_serial_value(
-                                table_slot,
-                                usize::from(column),
-                                last,
-                                transaction_id,
                             )?;
                         }
                         WalOp::SequenceAdvance {
@@ -23104,24 +23035,6 @@ fn apply_wal_op(
                 column_mapping,
             )?;
         }
-        WalOp::SequenceSet {
-            schema,
-            table,
-            column,
-            last,
-        } => {
-            let Some(index) = storage.wal_table_slot(schema, table, 0) else {
-                return Err(SqlError {
-                    sqlstate: SqlState::known(sqlstate::UNDEFINED_TABLE),
-                    message: stack_format!(
-                        192,
-                        "journal sets a sequence of unknown table \"{}\"",
-                        table
-                    ),
-                });
-            };
-            storage.replay_table_serial_value(index, column as usize, last, 0)?;
-        }
         WalOp::SetRelationIndexHint {
             position,
             has_index,
@@ -23132,6 +23045,7 @@ fn apply_wal_op(
             schema,
             table,
             statistics,
+            ..
         } => {
             let Some(index) = storage.wal_table_slot(schema, table, 0) else {
                 return Err(sql_err!(
@@ -23140,7 +23054,10 @@ fn apply_wal_op(
                     table
                 ));
             };
-            storage.replay_table_statistics(index, statistics.materialize()?);
+            storage.replay_table_statistics(
+                index,
+                statistics.materialize(storage.statistics_pool(), None)?,
+            )?;
         }
         WalOp::SetExtendedStatistics {
             created_at,

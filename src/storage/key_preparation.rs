@@ -1174,7 +1174,13 @@ mod tests {
             mapping[0] = Some(definition.columns[0].name);
             mapping[1] = Some(definition.columns[1].name);
             let change = storage
-                .write_table_def(target, definition, &mapping, true)
+                .write_table_def(
+                    target,
+                    definition,
+                    &mapping,
+                    true,
+                    crate::storage::ColumnSet::EMPTY,
+                )
                 .unwrap();
             let rewritten = storage
                 .heap
@@ -1221,7 +1227,13 @@ mod tests {
             mapping[0] = Some(definition.columns[0].name);
             mapping[1] = Some(definition.columns[1].name);
             let change = storage
-                .write_table_def(target, definition, &mapping, false)
+                .write_table_def(
+                    target,
+                    definition,
+                    &mapping,
+                    false,
+                    crate::storage::ColumnSet::EMPTY,
+                )
                 .unwrap();
             crate::storage::tests::publish_table_definition(&storage, change).unwrap();
             assert_eq!(selection.definition().name.as_str(), "key_orders");

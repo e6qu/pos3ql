@@ -823,6 +823,7 @@ mod tests {
                 pending,
                 &mapping,
                 false,
+                crate::storage::ColumnSet::EMPTY,
             )
             .unwrap();
         crate::mem::guard::forbid_alloc(|| {

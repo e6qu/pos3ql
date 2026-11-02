@@ -2,8 +2,8 @@
 
 use super::{
     AccessClass, AccessObject, CatalogDdlState, DependencyClass, Ownership,
-    RelationCumulativeStatistics, SqlError, Storage, TableDef, TableDefBuilder, TableSerialState,
-    TableStatistics, current_database, table_definitions,
+    RelationCumulativeStatistics, SqlError, Storage, TableDef, TableDefBuilder, TableStatistics,
+    current_database, table_definitions,
 };
 use crate::sql::eval::sqlstate;
 use crate::sql_err;
@@ -193,6 +193,12 @@ pub(super) fn allocate(
             storage.catalog_sequence.observe(created_at);
         }
         let definition = def.freeze(&storage.metadata_pool)?;
+        let statistics_admission = storage.reserve_implicit_index_statistics(
+            slot,
+            current_database(),
+            created_at,
+            &definition,
+        )?;
         drop(state);
         // A reused slot must not keep the dropped table's value indexes.
         storage.release_enforcers(slot);
@@ -234,6 +240,7 @@ pub(super) fn allocate(
                 },
             },
         );
+        statistics_admission.commit();
         publication.row_layout = super::row_layout::RowLayout::initial();
         publication.generation = generation;
         publication.dirty = true;
@@ -243,12 +250,6 @@ pub(super) fn allocate(
         table
             .statistics
             .set_image(TableStatistics::EMPTY, Some(false), true);
-        // A reused slot must not inherit the dropped table's sequences or
-        // spilled rows.
-        *table
-            .serial
-            .lock()
-            .expect("table serial state lock poisoned") = TableSerialState::EMPTY;
         table.spill_generations.write().clear();
         let schema = {
             let definition = table.definition();

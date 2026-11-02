@@ -1653,14 +1653,26 @@ fn cluster_metadata_table_names_reserve_only_within_their_database() {
         renamed.name = SqlName::parse("pending_name").unwrap();
         assert_eq!(
             storage
-                .write_table_def(target, renamed, &[None; MAX_COLUMNS], false)
+                .write_table_def(
+                    target,
+                    renamed,
+                    &[None; MAX_COLUMNS],
+                    false,
+                    crate::storage::ColumnSet::EMPTY,
+                )
                 .unwrap_err()
                 .sqlstate,
             sqlstate::SERIALIZATION_FAILURE,
         );
         crate::sql::set_execution_database_oid(DatabaseOid::TEMPLATE1);
         storage.commit_create(foreign);
-        let change = storage.write_table_def(target, renamed, &[None; MAX_COLUMNS], false);
+        let change = storage.write_table_def(
+            target,
+            renamed,
+            &[None; MAX_COLUMNS],
+            false,
+            crate::storage::ColumnSet::EMPTY,
+        );
         crate::sql::set_execution_database_oid(prior_database);
         let _change = change.unwrap();
         assert_eq!(
@@ -3430,14 +3442,43 @@ fn database_removal_clears_view_rules_and_pending_dependency_chains() {
     });
 }
 
+fn create_native_sequence(storage: &mut Storage, name: &str, spec: SeqSpec) -> usize {
+    let change = storage
+        .create_sequence(
+            SequenceCreateSpec {
+                allocation: CatalogAllocation::New,
+                schema: SqlName::parse("public").unwrap(),
+                name: SqlName::parse(name).unwrap(),
+                spec,
+                owner: None,
+                generator_for: None,
+                persistence: RelationPersistence::Permanent,
+            },
+            0,
+        )
+        .unwrap();
+    storage.finish_sequence_change(change, CatalogDdlDecision::Commit);
+    change.slot()
+}
+
+fn native_sequence_spec() -> SeqSpec {
+    SeqSpec {
+        data_type: SeqType::Bigint,
+        increment: 1,
+        min_value: 1,
+        max_value: i64::MAX,
+        start_value: 1,
+        cache: 1,
+        cycle: false,
+    }
+}
+
 #[test]
-fn table_serial_state_concurrent_advances_are_unique_and_allocation_free() {
+fn sequence_values_concurrent_advances_are_unique_and_allocation_free() {
     let config = test_config();
     let mut budget = test_budget(&config);
     let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
-    let table = storage
-        .create_table(make_def("serial_counter", &[("id", ColType::Int8, true)]))
-        .unwrap();
+    let sequence = create_native_sequence(&mut storage, "serial_counter", native_sequence_spec());
     let barrier = std::sync::Barrier::new(4);
     let seen: [std::sync::atomic::AtomicBool; 256] =
         core::array::from_fn(|_| std::sync::atomic::AtomicBool::new(false));
@@ -3450,9 +3491,9 @@ fn table_serial_state_concurrent_advances_are_unique_and_allocation_free() {
                 barrier.wait();
                 crate::mem::guard::forbid_alloc(|| {
                     for _ in 0..64 {
-                        let value = storage
-                            .next_table_serial_value(table, 0, 1, ColType::Int8)
-                            .unwrap();
+                        let (value, reserved, _) =
+                            storage.reserve_sequence_values(sequence, 0, 1).unwrap();
+                        assert_eq!(reserved, 1);
                         assert!(
                             !seen[value as usize - 1]
                                 .swap(true, std::sync::atomic::Ordering::Relaxed)
@@ -3466,134 +3507,156 @@ fn table_serial_state_concurrent_advances_are_unique_and_allocation_free() {
         seen.iter()
             .all(|value| value.load(std::sync::atomic::Ordering::Relaxed))
     );
-    assert_eq!(storage.table_serial_value(table, 0), 256);
+    assert_eq!(storage.sequence_value_for(sequence, 0), (256, true));
 }
 
 #[test]
-fn table_serial_state_staging_preserves_later_advances_and_retry_positions() {
+fn sequence_values_staging_preserves_other_publishers_and_later_advances() {
     let config = test_config();
     let mut budget = test_budget(&config);
     let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
-    let table = storage
-        .create_table(make_def("serial_staging", &[("id", ColType::Int8, true)]))
-        .unwrap();
+    let sequence = create_native_sequence(&mut storage, "serial_staging", native_sequence_spec());
     crate::mem::guard::forbid_alloc(|| {
-        assert!(storage.stage_table_serial_values(table, 10).is_none());
-        storage.set_table_serial_value(table, 0, 7);
-        let captured = storage.stage_table_serial_values(table, 10).unwrap();
-        assert_eq!(captured[0], 7);
-        storage
-            .next_table_serial_value(table, 0, 1, ColType::Int8)
-            .unwrap();
-        storage.acknowledge_table_serial_values(table, 10);
-        assert_eq!(storage.stage_table_serial_values(table, 11).unwrap()[0], 8);
-        assert_eq!(captured[0], 7);
-        storage.acknowledge_table_serial_values(table, 10);
-        // A failed staging attempt receives no acknowledgement. The next
-        // transaction captures the same nontransactional position.
-        assert_eq!(storage.stage_table_serial_values(table, 12).unwrap()[0], 8);
-        storage.acknowledge_table_serial_values(table, 11);
-        assert_eq!(storage.stage_table_serial_values(table, 12).unwrap()[0], 8);
-        storage.acknowledge_table_serial_values(table, 12);
-        assert!(storage.stage_table_serial_values(table, 13).is_none());
-        storage.set_table_serial_value(table, 0, 0);
-        assert_eq!(storage.stage_table_serial_values(table, 13).unwrap()[0], 0);
-        storage.set_table_serial_value(table, 0, 8);
-        storage.acknowledge_table_serial_values(table, 13);
-        assert_eq!(storage.stage_table_serial_values(table, 14).unwrap()[0], 8);
+        assert!(!storage.sequence_value_image_for(sequence, 0).3);
+        storage.set_sequence_value(sequence, 0, 7, true).unwrap();
+        let captured = storage.sequence_value_image_for(sequence, 0);
+        storage.mark_sequence_value_staged(sequence, 10, captured.4);
+        storage.reserve_sequence_values(sequence, 0, 1).unwrap();
+        let advanced = storage.sequence_value_image_for(sequence, 0);
+        storage.mark_sequence_value_staged(sequence, 11, advanced.4);
+        storage.clear_sequence_value_dirty(sequence, 10);
+        assert!(storage.sequence_value_image_for(sequence, 0).3);
+        assert_eq!(captured.0, 7);
+        assert_eq!(advanced.0, 8);
+        storage.clear_sequence_value_dirty(sequence, 11);
+        assert!(!storage.sequence_value_image_for(sequence, 0).3);
+        storage.reserve_sequence_values(sequence, 0, 1).unwrap();
+        storage.mark_sequence_value_staged(sequence, 10, advanced.4);
+        storage.clear_sequence_value_dirty(sequence, 10);
+        storage.clear_sequence_value_dirty(sequence, 11);
+        assert!(storage.sequence_value_image_for(sequence, 0).3);
+        let retried = storage.sequence_value_image_for(sequence, 0);
+        storage.mark_sequence_value_staged(sequence, 12, retried.4);
+        storage.clear_sequence_value_dirty(sequence, 10);
+        assert!(storage.sequence_value_image_for(sequence, 0).3);
+        storage.clear_sequence_value_dirty(sequence, 12);
+        assert!(!storage.sequence_value_image_for(sequence, 0).3);
     });
 }
 
 #[test]
-fn table_serial_state_slot_reuse_and_replay_do_not_inherit_staging() {
-    let config = test_config();
+fn sequence_values_slot_reuse_and_replay_reject_stale_creation_and_receipts() {
+    let mut config = test_config();
+    config.max_sequences = 1;
     let mut budget = test_budget(&config);
     let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
-    let table = storage
-        .create_table(make_def("old_serial", &[("id", ColType::Int8, true)]))
-        .unwrap();
+    let sequence = create_native_sequence(&mut storage, "old_serial", native_sequence_spec());
     crate::mem::guard::forbid_alloc(|| {
-        storage.set_table_serial_value(table, 0, 91);
-        let old_image = storage.stage_table_serial_values(table, 10).unwrap();
-        storage.commit_drop(table);
-        let replacement = storage
-            .create_table(make_def("new_serial", &[("id", ColType::Int8, true)]))
+        storage.set_sequence_value(sequence, 0, 91, true).unwrap();
+        let old_position = storage.sequence_position(sequence);
+        let old_image = storage.sequence_value_image_for(sequence, 0);
+        storage.mark_sequence_value_staged(sequence, 10, old_image.4);
+        let dropped = storage
+            .drop_sequence("public", "old_serial", 0)
+            .unwrap()
             .unwrap();
-        assert_eq!(replacement, table);
-        assert_eq!(storage.table_serial_value(replacement, 0), 0);
-        assert_eq!(old_image[0], 91);
-        assert!(storage.stage_table_serial_values(replacement, 11).is_none());
-        storage.set_table_serial_value(replacement, 0, 3);
-        storage.stage_table_serial_values(replacement, 11).unwrap();
-        storage.acknowledge_table_serial_values(replacement, 10);
-        storage
-            .replay_table_serial_value(replacement, 0, 6, 0)
-            .unwrap();
-        storage.acknowledge_table_serial_values(replacement, 11);
+        storage.finish_sequence_change(dropped, CatalogDdlDecision::Commit);
+        let replacement =
+            create_native_sequence(&mut storage, "new_serial", native_sequence_spec());
+        assert_eq!(replacement, sequence);
+        assert_eq!(storage.sequence_value_for(replacement, 0), (1, false));
+        assert!(!storage.sequence_value_image_for(replacement, 0).3);
+        storage.set_sequence_value(replacement, 0, 3, true).unwrap();
+        let generation = storage.sequence_value_image_for(replacement, 0).4;
+        storage.mark_sequence_value_staged(replacement, 11, generation);
+        storage.clear_sequence_value_dirty(replacement, 10);
+        assert!(storage.sequence_value_image_for(replacement, 0).3);
         assert_eq!(
-            storage.stage_table_serial_values(replacement, 12).unwrap()[0],
-            6
+            storage
+                .apply_sequence_advance(old_position, "public", "new_serial", 99, true, 0)
+                .unwrap_err()
+                .sqlstate,
+            sqlstate::DATA_EXCEPTION
         );
-        storage.install_table_serial_values(replacement, [14; MAX_COLUMNS]);
-        storage.acknowledge_table_serial_values(replacement, 12);
-        assert_eq!(storage.table_serial_value(replacement, 0), 14);
-        assert!(storage.stage_table_serial_values(replacement, 13).is_none());
+        assert_eq!(storage.sequence_value_for(replacement, 0), (3, true));
+        storage.clear_sequence_value_dirty(replacement, 11);
+        assert!(!storage.sequence_value_image_for(replacement, 0).3);
+        storage.restore_sequence_value_image(replacement, 14, true, 0);
+        assert_eq!(storage.sequence_value_for(replacement, 0), (14, true));
+        assert!(!storage.sequence_value_image_for(replacement, 0).3);
     });
 }
 
 #[test]
-fn table_serial_state_range_errors_leave_counters_and_staging_unchanged() {
-    let config = test_config();
+fn sequence_values_range_and_generation_exhaustion_do_not_change_values_or_receipts() {
+    let mut config = test_config();
+    config.max_sequences = 1;
     let mut budget = test_budget(&config);
     let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
-    let table = storage
-        .create_table(make_def("serial_limits", &[("id", ColType::Int8, true)]))
-        .unwrap();
     crate::mem::guard::forbid_alloc(|| {
-        for (ctype, minimum, maximum) in [
-            (ColType::Int2, i64::from(i16::MIN), i64::from(i16::MAX)),
-            (ColType::Int4, i64::from(i32::MIN), i64::from(i32::MAX)),
-            (ColType::Int8, i64::MIN, i64::MAX),
+        for (data_type, minimum, maximum) in [
+            (SeqType::Smallint, i64::from(i16::MIN), i64::from(i16::MAX)),
+            (SeqType::Integer, i64::from(i32::MIN), i64::from(i32::MAX)),
+            (SeqType::Bigint, i64::MIN, i64::MAX),
         ] {
-            for (value, step) in [(minimum, -1), (maximum, 1)] {
-                storage.set_table_serial_value(table, 0, value);
-                storage.stage_table_serial_values(table, 10).unwrap();
+            for (value, increment) in [(minimum, -1), (maximum, 1)] {
+                let sequence = create_native_sequence(
+                    &mut storage,
+                    "serial_limits",
+                    SeqSpec {
+                        data_type,
+                        increment,
+                        min_value: minimum,
+                        max_value: maximum,
+                        start_value: value,
+                        cache: 1,
+                        cycle: false,
+                    },
+                );
+                storage
+                    .set_sequence_value(sequence, 0, value, true)
+                    .unwrap();
+                let before = storage.sequence_value_image_for(sequence, 0);
+                storage.mark_sequence_value_staged(sequence, 10, before.4);
                 assert_eq!(
                     storage
-                        .next_table_serial_value(table, 0, step, ctype)
+                        .reserve_sequence_values(sequence, 0, 1)
                         .unwrap_err()
                         .sqlstate,
-                    sqlstate::NUMERIC_OUT_OF_RANGE
+                    sqlstate::SEQUENCE_GENERATOR_LIMIT_EXCEEDED
                 );
-                assert_eq!(storage.table_serial_value(table, 0), value);
-                storage.acknowledge_table_serial_values(table, 10);
-                assert!(storage.stage_table_serial_values(table, 11).is_none());
+                assert_eq!(storage.sequence_value_image_for(sequence, 0), before);
+                storage.clear_sequence_value_dirty(sequence, 10);
+                assert!(!storage.sequence_value_image_for(sequence, 0).3);
+                let dropped = storage
+                    .drop_sequence("public", "serial_limits", 0)
+                    .unwrap()
+                    .unwrap();
+                storage.finish_sequence_change(dropped, CatalogDdlDecision::Commit);
             }
         }
+        let sequence =
+            create_native_sequence(&mut storage, "serial_generation", native_sequence_spec());
+        storage.sequence_catalog().values[sequence]
+            .committed
+            .generation = u64::MAX;
+        let before = storage.sequence_value_image_for(sequence, 0);
         assert_eq!(
             storage
-                .next_table_serial_value(table, 0, 1, ColType::Text)
+                .reserve_sequence_values(sequence, 0, 1)
                 .unwrap_err()
                 .sqlstate,
-            sqlstate::DATATYPE_MISMATCH
+            sqlstate::PROGRAM_LIMIT_EXCEEDED
         );
-        assert_eq!(storage.table_serial_value(table, 0), i64::MAX);
+        assert_eq!(
+            storage
+                .set_sequence_value(sequence, 0, 7, true)
+                .unwrap_err()
+                .sqlstate,
+            sqlstate::PROGRAM_LIMIT_EXCEEDED
+        );
+        assert_eq!(storage.sequence_value_image_for(sequence, 0), before);
     });
-    storage.install_table_serial_values(table, [19; MAX_COLUMNS]);
-    assert!(storage.stage_table_serial_values(table, 12).is_none());
-    storage.replay_table_serial_value(table, 0, 25, 0).unwrap();
-    assert_eq!(storage.table_serial_value(table, 0), 25);
-    assert!(storage.stage_table_serial_values(table, 12).is_none());
-    for column in [1, MAX_COLUMNS, usize::MAX] {
-        assert_eq!(
-            storage
-                .replay_table_serial_value(table, column, 99, 0)
-                .unwrap_err()
-                .sqlstate,
-            sqlstate::INTERNAL_ERROR
-        );
-    }
-    assert_eq!(storage.table_serial_value(table, 0), 25);
 }
 
 #[test]
@@ -3617,6 +3680,7 @@ fn table_definition_images_survive_publication_rollback_and_slot_reuse() {
                 make_def("pending", &[("id", ColType::Int8, true)]),
                 &[None; MAX_COLUMNS],
                 false,
+                crate::storage::ColumnSet::EMPTY,
             )
             .unwrap();
         let pending = storage.table_definition_images();
@@ -3651,6 +3715,7 @@ fn table_definition_images_survive_publication_rollback_and_slot_reuse() {
                 make_def("published", &[("id", ColType::Int8, true)]),
                 &[None; MAX_COLUMNS],
                 false,
+                crate::storage::ColumnSet::EMPTY,
             )
             .unwrap();
         assert_eq!(
@@ -4832,10 +4897,20 @@ fn cursor_read_statistics_survive_nested_savepoints_without_double_counting() {
                             .unwrap();
                         storage.record_relation_tuple_read(7, table, None).unwrap();
                         storage
-                            .record_relation_scan(7, table, Some(index), 3, level as i64)
+                            .record_relation_scan(
+                                7,
+                                table,
+                                Some(&storage.capture_index_statistics(7, table, index).unwrap()),
+                                3,
+                                level as i64,
+                            )
                             .unwrap();
                         storage
-                            .record_relation_tuple_read(7, table, Some(index))
+                            .record_relation_tuple_read(
+                                7,
+                                table,
+                                Some(&storage.capture_index_statistics(7, table, index).unwrap()),
+                            )
                             .unwrap();
                     }
                     storage.finish_cumulative_subtransactions(7, 3, release_inner);
@@ -4910,279 +4985,192 @@ fn cursor_read_statistics_never_follow_a_reused_table_slot() {
 }
 
 #[test]
-fn relation_identity_statistics_retire_without_growth_or_cross_database_reset() {
-    let config = test_config();
+fn relation_identity_statistics_follow_savepoint_and_index_lifetimes() {
+    let mut config = test_config();
+    config.index_statistics_slots = 3;
     let mut budget = test_budget(&config);
     let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
     let mut definition = make_def("identity_statistics", &[("id", ColType::Int4, true)]);
     definition.columns[0].primary = true;
     let table = storage.create_table(definition).unwrap();
     let database = storage.table(table).database();
-    let other_database = DatabaseOid::parse(USER_DATABASE_OID_BASE + 1).unwrap();
     let original = storage
         .table_def(table, 0)
         .column_index_identity(0)
         .unwrap()
         .oid();
-    storage
-        .record_relation_scan(
-            1,
-            table,
-            Some(original),
-            1,
-            crate::sql::datetime::now_micros(),
-        )
-        .unwrap();
-    storage
-        .record_relation_tuple_read(1, table, Some(original))
-        .unwrap();
-    storage
-        .cumulative_statistics()
-        .indexes
-        .push(IndexCumulativeStatistics {
-            database: other_database,
-            oid: original,
-            idx_scan: 11,
-            ..IndexCumulativeStatistics::EMPTY
-        })
-        .unwrap();
-    storage.reset_index_statistics(database, original);
-    assert_eq!(
-        storage
-            .index_cumulative_statistics(other_database, original)
-            .idx_scan,
-        11
-    );
-    storage
-        .record_relation_scan(
-            1,
-            table,
-            Some(original),
-            1,
-            crate::sql::datetime::now_micros(),
-        )
-        .unwrap();
-    storage
-        .record_relation_tuple_read(1, table, Some(original))
-        .unwrap();
-    let capacity = {
-        let mut cumulative = storage.cumulative_statistics();
-        let capacity = cumulative.indexes.capacity();
-        while cumulative.indexes.len() < capacity {
-            let oid = i32::MAX - cumulative.indexes.len() as i32;
-            cumulative
-                .indexes
-                .push(IndexCumulativeStatistics {
-                    database: other_database,
-                    oid,
-                    ..IndexCumulativeStatistics::EMPTY
-                })
-                .unwrap();
-        }
-        capacity
-    };
+    let mut mapping = [None; MAX_COLUMNS];
+    mapping[0] = Some(SqlName::parse("id").unwrap());
     crate::mem::guard::forbid_alloc(|| {
+        let capture = storage
+            .capture_index_statistics(1, table, original)
+            .unwrap();
         storage
-            .record_relation_scan(
-                1,
-                table,
-                Some(original),
-                1,
-                crate::sql::datetime::now_micros(),
-            )
+            .record_relation_scan(1, table, Some(&capture), 3, 1)
+            .unwrap();
+        storage
+            .record_relation_tuple_read(1, table, Some(&capture))
+            .unwrap();
+        storage.reset_index_statistics(database, original);
+        storage
+            .record_relation_scan(1, table, Some(&capture), 3, 2)
             .unwrap();
         assert_eq!(
             storage
                 .index_cumulative_statistics(database, original)
                 .idx_scan,
-            2
-        );
-        assert_eq!(
-            storage
-                .index_cumulative_statistics(database, original)
-                .idx_tup_fetch,
             1
         );
-        assert_eq!(
-            storage
-                .index_cumulative_statistics(other_database, original)
-                .idx_tup_fetch,
-            0
-        );
-        assert_eq!(
-            storage
-                .index_cumulative_statistics(other_database, original)
-                .idx_scan,
-            11
-        );
-        let mut mapping = [None; MAX_COLUMNS];
-        mapping[0] = Some(SqlName::parse("id").unwrap());
-        let (target, selected_definition) = storage.select_table_definition(table, 1);
-        let mut next = TableDefBuilder::from_definition(&selected_definition);
+        let (target, selected) = storage.select_table_definition(table, 1);
+        let mut next = TableDefBuilder::from_definition(&selected);
         next.columns[0].primary = false;
         let change = storage
-            .write_table_def(target, next, &mapping, false)
+            .write_table_def(
+                target,
+                next,
+                &mapping,
+                false,
+                crate::storage::ColumnSet::EMPTY,
+            )
             .unwrap();
-        assert_eq!(
-            storage
-                .index_cumulative_statistics(database, original)
-                .idx_scan,
-            2
-        );
         storage.rollback_table_def(change);
         assert_eq!(
             storage
                 .index_cumulative_statistics(database, original)
                 .idx_scan,
-            2
+            1
         );
-        let (target, selected_definition) = storage.select_table_definition(table, 2);
-        let mut next = TableDefBuilder::from_definition(&selected_definition);
+        let (target, selected) = storage.select_table_definition(table, 2);
+        let mut next = TableDefBuilder::from_definition(&selected);
         next.columns[0].primary = false;
         let change = storage
-            .write_table_def(target, next, &mapping, false)
+            .write_table_def(
+                target,
+                next,
+                &mapping,
+                false,
+                crate::storage::ColumnSet::EMPTY,
+            )
             .unwrap();
-        assert_eq!(
-            crate::storage::tests::publish_table_definition(&storage, change).unwrap(),
-            Some(false)
-        );
-        assert_eq!(storage.cumulative_statistics().indexes.len(), capacity - 1);
+        crate::storage::tests::publish_table_definition(&storage, change).unwrap();
         assert_eq!(
             storage
                 .index_cumulative_statistics(database, original)
                 .idx_scan,
             0
         );
-        assert_eq!(
-            storage
-                .index_cumulative_statistics(other_database, original)
-                .idx_scan,
-            11
-        );
-        let (target, selected_definition) = storage.select_table_definition(table, 3);
-        let mut next = TableDefBuilder::from_definition(&selected_definition);
-        next.columns[0].primary = true;
-        let change = storage
-            .write_table_def(target, next, &mapping, false)
-            .unwrap();
-        crate::storage::tests::publish_table_definition(&storage, change).unwrap();
-        let replacement = storage
-            .table_def(table, 0)
-            .column_index_identity(0)
-            .unwrap()
-            .oid();
-        assert_ne!(replacement, original);
+        // A reader which selected the retired source keeps its own counter.
         storage
-            .record_relation_scan(
-                3,
-                table,
-                Some(replacement),
-                1,
-                crate::sql::datetime::now_micros(),
-            )
+            .record_relation_scan(1, table, Some(&capture), 3, 3)
             .unwrap();
-        assert_eq!(storage.cumulative_statistics().indexes.len(), capacity);
         assert_eq!(
             storage
-                .index_cumulative_statistics(database, replacement)
+                .index_cumulative_statistics(database, original)
                 .idx_scan,
-            1
+            0
         );
-        storage.reset_index_statistics(database, replacement);
-        assert_eq!(
-            storage
-                .index_cumulative_statistics(other_database, original)
-                .idx_scan,
-            11
-        );
-        // The scanned index exists only in a discarded private version.
-        let (target, selected_definition) = storage.select_table_definition(table, 4);
-        let mut next = TableDefBuilder::from_definition(&selected_definition);
-        next.take_column_index_identity(0);
-        next.columns[0].primary = false;
+        drop(capture);
+        // Committing a later version without the private key retires its hidden predecessor.
+        let (target, selected) = storage.select_table_definition(table, 7);
+        let mut next = TableDefBuilder::from_definition(&selected);
         next.columns[0].unique = true;
         storage
-            .write_table_def(target, next, &mapping, false)
+            .write_table_def(
+                target,
+                next,
+                &mapping,
+                false,
+                crate::storage::ColumnSet::EMPTY,
+            )
             .unwrap();
         let transient = storage
-            .table_def(table, 4)
+            .table_def(table, 7)
             .column_index_identity(0)
             .unwrap()
             .oid();
-        storage
-            .record_relation_scan(
-                4,
-                table,
-                Some(transient),
-                1,
-                crate::sql::datetime::now_micros(),
-            )
+        let transient_reader = storage
+            .capture_index_statistics(7, table, transient)
             .unwrap();
-        let (target, selected_definition) = storage.select_table_definition(table, 4);
-        let mut next = TableDefBuilder::from_definition(&selected_definition);
+        storage
+            .record_relation_scan(7, table, Some(&transient_reader), 1, 3)
+            .unwrap();
+        let (target, selected) = storage.select_table_definition(table, 7);
+        let mut next = TableDefBuilder::from_definition(&selected);
         next.columns[0].unique = false;
         let change = storage
-            .write_table_def(target, next, &mapping, false)
+            .write_table_def(
+                target,
+                next,
+                &mapping,
+                false,
+                crate::storage::ColumnSet::EMPTY,
+            )
             .unwrap();
         crate::storage::tests::publish_table_definition(&storage, change).unwrap();
-        assert_eq!(storage.cumulative_statistics().indexes.len(), capacity - 1);
         assert_eq!(
             storage
                 .index_cumulative_statistics(database, transient)
                 .idx_scan,
             0
         );
-        // A hidden older savepoint keeps its index counter until discarded.
-        let (target, selected_definition) = storage.select_table_definition(table, 5);
-        let mut next = TableDefBuilder::from_definition(&selected_definition);
+        drop(transient_reader);
+        let (target, selected) = storage.select_table_definition(table, 3);
+        let mut next = TableDefBuilder::from_definition(&selected);
         next.columns[0].unique = true;
         let first = storage
-            .write_table_def(target, next, &mapping, false)
-            .unwrap();
-        let saved = storage
-            .table_def(table, 5)
-            .column_index_identity(0)
-            .unwrap()
-            .oid();
-        storage
-            .record_relation_scan(5, table, Some(saved), 1, crate::sql::datetime::now_micros())
-            .unwrap();
-        {
-            let mut cumulative = storage.cumulative_statistics();
-            let dummy = cumulative
-                .indexes
-                .iter()
-                .position(|entry| entry.database == other_database && entry.oid != original)
-                .unwrap();
-            cumulative.indexes.swap_remove(dummy);
-        }
-        let (target, selected_definition) = storage.select_table_definition(table, 5);
-        let mut next = TableDefBuilder::from_definition(&selected_definition);
-        next.columns[0].unique = false;
-        let second = storage
-            .write_table_def(target, next, &mapping, false)
-            .unwrap();
-        let (target, selected_definition) = storage.select_table_definition(table, 5);
-        let mut next = TableDefBuilder::from_definition(&selected_definition);
-        next.columns[0].unique = true;
-        let third = storage
-            .write_table_def(target, next, &mapping, false)
-            .unwrap();
-        let discarded = storage
-            .table_def(table, 5)
-            .column_index_identity(0)
-            .unwrap()
-            .oid();
-        storage
-            .record_relation_scan(
-                5,
-                table,
-                Some(discarded),
-                1,
-                crate::sql::datetime::now_micros(),
+            .write_table_def(
+                target,
+                next,
+                &mapping,
+                false,
+                crate::storage::ColumnSet::EMPTY,
             )
             .unwrap();
-        assert_eq!(storage.cumulative_statistics().indexes.len(), capacity);
+        let saved = storage
+            .table_def(table, 3)
+            .column_index_identity(0)
+            .unwrap()
+            .oid();
+        assert_ne!(saved, original);
+        let capture = storage.capture_index_statistics(3, table, saved).unwrap();
+        storage
+            .record_relation_scan(3, table, Some(&capture), 1, 4)
+            .unwrap();
+        let (target, selected) = storage.select_table_definition(table, 3);
+        let mut next = TableDefBuilder::from_definition(&selected);
+        next.columns[0].unique = false;
+        let second = storage
+            .write_table_def(
+                target,
+                next,
+                &mapping,
+                false,
+                crate::storage::ColumnSet::EMPTY,
+            )
+            .unwrap();
+        let (target, selected) = storage.select_table_definition(table, 3);
+        let mut next = TableDefBuilder::from_definition(&selected);
+        next.columns[0].unique = true;
+        let third = storage
+            .write_table_def(
+                target,
+                next,
+                &mapping,
+                false,
+                crate::storage::ColumnSet::EMPTY,
+            )
+            .unwrap();
+        let discarded = storage
+            .table_def(table, 3)
+            .column_index_identity(0)
+            .unwrap()
+            .oid();
+        let discarded_capture = storage
+            .capture_index_statistics(3, table, discarded)
+            .unwrap();
+        storage
+            .record_relation_scan(3, table, Some(&discarded_capture), 1, 5)
+            .unwrap();
         storage.rollback_table_def(third);
         assert_eq!(
             storage
@@ -5210,13 +5198,15 @@ fn relation_identity_statistics_retire_without_growth_or_cross_database_reset() 
                 .idx_scan,
             0
         );
-        assert_eq!(storage.cumulative_statistics().indexes.len(), capacity - 2);
+        drop(discarded_capture);
+        drop(capture);
         let mut explicit = test_index_definition("statistics_explicit");
         explicit.table = SqlName::parse("identity_statistics").unwrap();
         let slot = storage.create_index(explicit, 6).unwrap();
         let oid = crate::sql::catalog::explicit_index_oid(&storage.index(slot));
+        let capture = storage.capture_index_statistics(6, table, oid).unwrap();
         storage
-            .record_relation_scan(6, table, Some(oid), 1, crate::sql::datetime::now_micros())
+            .record_relation_scan(6, table, Some(&capture), 1, 6)
             .unwrap();
         assert_eq!(
             storage.index_cumulative_statistics(database, oid).idx_scan,
@@ -5227,12 +5217,234 @@ fn relation_identity_statistics_retire_without_growth_or_cross_database_reset() 
             storage.index_cumulative_statistics(database, oid).idx_scan,
             0
         );
-        assert_eq!(storage.cumulative_statistics().indexes.len(), capacity - 2);
+    });
+}
+
+#[test]
+fn index_statistics_admission_exhaustion_preserves_catalogs_and_active_readers() {
+    let mut config = test_config();
+    config.index_statistics_slots = 2;
+    let mut budget = test_budget(&config);
+    let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
+    let mut definition = make_def(
+        "counter_slots",
+        &[("id", ColType::Int4, true), ("extra", ColType::Int4, false)],
+    );
+    definition.columns[0].primary = true;
+    let table = storage.create_table(definition).unwrap();
+    let database = storage.table(table).database();
+    let original = storage
+        .table_def(table, 0)
+        .column_index_identity(0)
+        .unwrap()
+        .oid();
+    let mut mapping = [None; MAX_COLUMNS];
+    mapping[0] = Some(SqlName::parse("id").unwrap());
+    mapping[1] = Some(SqlName::parse("extra").unwrap());
+    crate::mem::guard::forbid_alloc(|| {
+        // One new key fits; the complete two-key cohort does not. Neither is installed.
+        let (target, selected) = storage.select_table_definition(table, 1);
+        let mut next = TableDefBuilder::from_definition(&selected);
+        next.take_column_index_identity(0);
+        next.columns[0].primary = false;
+        next.columns[0].unique = true;
+        next.columns[1].unique = true;
+        let error = storage
+            .write_table_def(
+                target,
+                next,
+                &mapping,
+                false,
+                crate::storage::ColumnSet::EMPTY,
+            )
+            .unwrap_err();
+        assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+        assert!(error.message.as_str().contains("index_statistics_slots=2"));
+        assert!(storage.table_def(table, 1).columns()[0].primary);
+        assert!(!storage.table_def(table, 1).columns()[1].unique);
+        let mut index = test_index_definition("counter_extra");
+        index.table = SqlName::parse("counter_slots").unwrap();
+        let explicit = storage.create_index(index, 2).unwrap();
+        let explicit_oid = crate::sql::catalog::explicit_index_oid(&storage.index(explicit));
+        let reader = storage
+            .capture_index_statistics(2, table, explicit_oid)
+            .unwrap();
+        let mut overflow = index;
+        overflow.name = SqlName::parse("counter_overflow").unwrap();
+        let error = storage.create_index(overflow, 2).unwrap_err();
+        assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+        assert!(
+            !storage
+                .indexes_for("public", "counter_slots", 2)
+                .any(|definition| definition.name == overflow.name)
+        );
+        let mut table_definition =
+            make_def("counter_table_overflow", &[("id", ColType::Int4, true)]);
+        table_definition.columns[0].primary = true;
+        let error = table_creation::allocate(
+            &storage,
+            table_definition,
+            CatalogAllocation::New,
+            table_creation::TableCreation::Committed,
+        )
+        .unwrap_err();
+        assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+        assert!(
+            storage
+                .find_table("public", "counter_table_overflow")
+                .is_none()
+        );
+        // Reset does not discard the admission needed by an already selected reader.
+        storage.reset_index_statistics(database, explicit_oid);
+        storage
+            .record_relation_scan(2, table, Some(&reader), 4, 1)
+            .unwrap();
+        storage
+            .record_relation_tuple_read(2, table, Some(&reader))
+            .unwrap();
         assert_eq!(
             storage
-                .index_cumulative_statistics(other_database, original)
+                .index_cumulative_statistics(database, explicit_oid)
+                .idx_scan,
+            1
+        );
+        storage.reset_current_database_statistics();
+        storage
+            .record_relation_scan(2, table, Some(&reader), 4, 2)
+            .unwrap();
+        assert_eq!(
+            storage
+                .index_cumulative_statistics(database, explicit_oid)
+                .idx_scan,
+            1
+        );
+        storage.rollback_index_create(explicit);
+        assert_eq!(
+            storage
+                .index_cumulative_statistics(database, explicit_oid)
+                .idx_scan,
+            0
+        );
+        // Catalog removal alone cannot recycle a counter retained by a late reader.
+        assert_eq!(
+            storage.create_index(overflow, 2).unwrap_err().sqlstate,
+            sqlstate::PROGRAM_LIMIT_EXCEEDED
+        );
+        storage
+            .record_relation_scan(2, table, Some(&reader), 4, 2)
+            .unwrap();
+        drop(reader);
+        let replacement = storage.create_index(overflow, 2).unwrap();
+        let replacement_oid = crate::sql::catalog::explicit_index_oid(&storage.index(replacement));
+        assert_ne!(replacement_oid, explicit_oid);
+        assert_eq!(
+            storage
+                .index_cumulative_statistics(database, replacement_oid)
+                .idx_scan,
+            0
+        );
+        storage.rollback_index_create(replacement);
+        let reader = storage
+            .capture_index_statistics(3, table, original)
+            .unwrap();
+        storage
+            .record_relation_scan(3, table, Some(&reader), 1, 3)
+            .unwrap();
+        assert_eq!(
+            storage
+                .index_cumulative_statistics(database, original)
+                .idx_scan,
+            1
+        );
+    });
+}
+
+#[test]
+fn index_statistics_source_pins_survive_table_slot_reuse_without_cross_database_reset() {
+    let mut config = test_config();
+    config.index_statistics_slots = 3;
+    let mut budget = test_budget(&config);
+    let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
+    let mut definition = make_def("old_counter_source", &[("id", ColType::Int4, true)]);
+    definition.columns[0].primary = true;
+    let old = storage.create_table(definition).unwrap();
+    let old_identity = storage.table(old).identity();
+    let old_index_identity = storage.table_def(old, 0).column_index_identity(0).unwrap();
+    let old_oid = old_index_identity.oid();
+    let other_database = DatabaseOid::parse(USER_DATABASE_OID_BASE + 1).unwrap();
+    // Database clones preserve births and OIDs but own independent counter slots.
+    storage
+        .reserve_explicit_index_statistics(
+            old,
+            other_database,
+            old_identity.created_at,
+            old_index_identity.created_at(),
+        )
+        .unwrap()
+        .commit();
+    {
+        let mut counters = storage.cumulative_statistics();
+        let other = counters
+            .indexes
+            .iter_mut()
+            .find(|entry| entry.statistics.database == other_database)
+            .unwrap();
+        other.statistics.idx_scan = 11;
+    }
+    crate::mem::guard::forbid_alloc(|| {
+        let reader = storage.capture_index_statistics(1, old, old_oid).unwrap();
+        storage.reset_index_statistics(old_identity.database, old_oid);
+        assert_eq!(
+            storage
+                .index_cumulative_statistics(other_database, old_oid)
                 .idx_scan,
             11
+        );
+        storage.rollback_create(old);
+        let mut definition = make_def("new_counter_source", &[("id", ColType::Int4, true)]);
+        definition.columns[0].primary = true;
+        let new = table_creation::allocate(
+            &storage,
+            definition,
+            CatalogAllocation::New,
+            table_creation::TableCreation::Committed,
+        )
+        .unwrap();
+        assert_eq!(new, old);
+        let new_oid = storage
+            .table_def(new, 0)
+            .column_index_identity(0)
+            .unwrap()
+            .oid();
+        assert_ne!(new_oid, old_oid);
+        storage
+            .record_relation_scan(1, old, Some(&reader), 5, 1)
+            .unwrap();
+        storage
+            .record_relation_tuple_read(1, old, Some(&reader))
+            .unwrap();
+        assert_eq!(storage.relation_transaction_statistics(1, new).idx_scan, 0);
+        assert_eq!(
+            storage
+                .index_cumulative_statistics(old_identity.database, new_oid)
+                .idx_scan,
+            0
+        );
+        assert_eq!(
+            storage
+                .index_cumulative_statistics(other_database, old_oid)
+                .idx_scan,
+            11
+        );
+        let current = storage.capture_index_statistics(2, new, new_oid).unwrap();
+        storage
+            .record_relation_scan(2, new, Some(&current), 2, 2)
+            .unwrap();
+        assert_eq!(
+            storage
+                .index_cumulative_statistics(old_identity.database, new_oid)
+                .idx_scan,
+            1
         );
     });
 }
@@ -9705,6 +9917,7 @@ fn table_retirement_waits_for_its_definition_without_reserving_unrelated_tables(
             updated,
             &[None; MAX_COLUMNS],
             false,
+            crate::storage::ColumnSet::EMPTY,
         )
         .unwrap();
     let target = RuleTarget::Table(second as u16);

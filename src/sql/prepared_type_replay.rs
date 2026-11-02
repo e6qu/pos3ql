@@ -302,7 +302,14 @@ pub(super) fn stage_type_record(
             for (to, column) in mapping.iter_mut().zip(current.columns()) {
                 *to = Some(column.name);
             }
-            transaction.write_table_definition(storage, target, definition, &mapping, false)?;
+            transaction.write_table_definition(
+                storage,
+                target,
+                definition,
+                &mapping,
+                false,
+                crate::storage::ColumnSet::EMPTY,
+            )?;
             super::exec::stage_inbound_foreign_key_moves(
                 storage,
                 transaction,
@@ -332,7 +339,14 @@ pub(super) fn stage_type_record(
             for (to, column) in mapping.iter_mut().zip(current.columns()) {
                 *to = Some(column.name);
             }
-            transaction.write_table_definition(storage, target, definition, &mapping, false)?;
+            transaction.write_table_definition(
+                storage,
+                target,
+                definition,
+                &mapping,
+                false,
+                crate::storage::ColumnSet::EMPTY,
+            )?;
         }
         WalOp::CreateTable {
             identity,

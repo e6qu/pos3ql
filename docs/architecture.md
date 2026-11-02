@@ -274,6 +274,29 @@ overlap with replacement data can exhaust bytes or descriptors independently.
 The named `54000` diagnostic identifies the metadata pool and requested, free
 and largest contiguous bytes plus available descriptors. Pools never grow.
 
+`statistics_bytes` and `statistics_leases` reserve a separate shared pool for
+analyzed-column records. The starter configuration uses 1 MiB and 1,024 ranges.
+Each immutable image stores only its analyzed columns, identified by their
+original PostgreSQL column numbers. Readers, pending changes and checkpoints
+retain selected images until they release them. `ANALYZE orders(total)` merges
+that column's new statistics with the other columns' existing records. It
+reserves the replacement before changing visible state. DDL removes statistics
+for dropped or altered columns with the same admission and rollback rules.
+Retained images and replacement overlap can return named `54000` exhaustion;
+commit and rollback use the already admitted ownership.
+
+`index_statistics_slots` independently bounds index activity counters; the
+starter configuration uses 4,096 slots. Index creation reserves a counter
+before catalog publication. Readers pin the selected index's qualified counter,
+so a dropped index cannot redirect a late update to a replacement object.
+Counter reset preserves catalog admission. A retired counter becomes reusable
+after its readers release it. A table without indexes owns no such counter.
+
+SERIAL defaults and identity columns use the shared sequence catalog rather
+than another maximum-width counter array for every table. Sequence ownership
+and the default expression are distinct: `OWNED BY NONE` removes the ownership
+dependency while the column can continue calling that sequence.
+
 A one-column table stores its actual columns instead of a maximum-width array.
 Dropped columns still retain their PostgreSQL column numbers. Committed schemas,
 pending edits and retained readers share immutable ownership; cloning a reader's
@@ -307,22 +330,24 @@ pressure, write admission examines at most 64 row metadata positions and retries
 with its owned input. Each history chain has the separate per-row version bound.
 It never repeats SQL expressions or drains the whole
 database synchronously; remaining pressure returns the named capacity error.
-Per-table statistics, serial counters, foreign-table/catalog records and other
-fixed controls still make many small embedded tables expensive. Pending ANALYZE
-and other definition families retain separate bounds. Sharing table payloads
-does not remove these reservations. Row bytes, committed history and immutable
+Foreign-table/catalog records and other fixed controls still add per-table
+startup cost. Pending statistics and other definition families retain bounded
+control slots, while column payloads share the independent statistics pool.
+Row bytes, committed history and immutable
 block caches also use shared startup pools. The
 [adaptive resource design](adaptive-resources.md) separates implemented hard
 capacities from future workload policies; no controller resizes startup backing
 according to load. Catalog capacities remain independent: changing `max_tables`
 does not silently resize indexes, routines, views or extended statistics.
 
-The [embedded memory helper](https://github.com/e6qu/pos3ql/blob/14e1cdd24e775ea92e2646c07d9671744898e29a/examples/embedded-memory.rs) and
-[runner script](https://github.com/e6qu/pos3ql/blob/14e1cdd24e775ea92e2646c07d9671744898e29a/tools/measure-embedded-capacity.py) measure 1, 8, 32 and 128
+The [embedded memory helper](https://github.com/e6qu/pos3ql/blob/main/examples/embedded-memory.rs) and
+[runner script](https://github.com/e6qu/pos3ql/blob/main/tools/measure-embedded-capacity.py) measure 1, 8, 32 and 128
 configured tables with the same explicit shared capacities in each transaction
-mode, including `table_metadata_bytes` and `table_metadata_leases`. Its 48 samples
+mode, including table metadata, statistics backing and index-counter capacity. Its 64 samples
 cover empty, hot, even, moving-demand, 64-column and schema/index replacement
-workloads. The single session does not measure pinned-reader pressure; separate
+workloads, plus narrow/wide statistics collection and targeted statistics
+replacement through a type change and savepoint rollback. The single session
+does not measure pinned-reader pressure; separate
 ownership regressions cover that behavior. The helper retains named startup draws, configured reservation, peak resident
 memory, stack size and startup time. Populated workloads are reported separately
 from empty engines and include their session costs. These results must be

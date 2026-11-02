@@ -297,8 +297,8 @@ capacities from future workload policies; no controller resizes startup backing
 according to load. Catalog capacities remain independent: changing `max_tables`
 does not silently resize indexes, routines, views or extended statistics.
 
-The [embedded memory helper](../examples/embedded-memory.rs) and
-[runner script](../tools/measure-embedded-capacity.py) measure 1, 8, 32 and 128
+The [embedded memory helper](https://github.com/e6qu/pos3ql/blob/14e1cdd24e775ea92e2646c07d9671744898e29a/examples/embedded-memory.rs) and
+[runner script](https://github.com/e6qu/pos3ql/blob/14e1cdd24e775ea92e2646c07d9671744898e29a/tools/measure-embedded-capacity.py) measure 1, 8, 32 and 128
 configured tables with the same explicit shared capacities in each transaction
 mode, including `table_metadata_bytes` and `table_metadata_leases`. Its 48 samples
 cover empty, hot, even, moving-demand, 64-column and schema/index replacement

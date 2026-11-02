@@ -91,7 +91,7 @@ Keep the [ownership/exhaustion tests](https://github.com/e6qu/pos3ql/blob/b3aa30
 [two-table spill/recovery case](https://github.com/e6qu/pos3ql/blob/b3aa3099993c351e09a0eb73fd6c1de67228007d/tests/external/run.sh) as regression coverage.
 Saved generations can exceed resident capacity; replaying their newer journal
 tail still needs resident slots and bytes. Extend the
-[measurement matrix](tools/measure-embedded-capacity.py) with realistic populated
+[measurement matrix](https://github.com/e6qu/pos3ql/blob/14e1cdd24e775ea92e2646c07d9671744898e29a/tools/measure-embedded-capacity.py) with realistic populated
 sessions and pinned-reader pressure before claiming an embedded minimum.
 
 Reserve forward progress for commit, rollback, required reads and maintenance.

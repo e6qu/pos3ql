@@ -85,11 +85,19 @@ definitions on rollback. For example, if adding an `orders.note` column cannot
 reserve metadata, `orders` must keep its previous usable definition; waiting to
 commit must not run an audit trigger again.
 
-Reduce the remaining per-table statistics, serial-state and other catalog
-reservations using measured component costs. Empty tables still have a cost;
-shared schema storage does not establish an embedded memory minimum. Establish
-whether cache files need guaranteed physical disk reservation, then implement
-and verify it rather than equating file length with reserved disk space.
+Next, share statistics storage using actual analyzed columns and explicit global
+byte and owner limits. Keep column identity stable through table changes, retain
+old images for readers and checkpoints, and reserve replacements before effects.
+Give index counters an independent global limit. Remove duplicate per-table
+sequence counters only after every SQL generator uses its catalog sequence,
+including copied tables and partition children. Compare the same global limits
+at 1/8/32/128 tables, with populated, replacement and exhausted-pool cases.
+
+Reduce other catalog reservations using measured component costs. Empty tables
+still have a cost; shared schema storage does not establish an embedded memory
+minimum. Establish whether cache files need guaranteed physical disk reservation,
+then implement and verify it rather than equating file length with reserved disk
+space.
 
 Keep the [ownership/exhaustion tests](https://github.com/e6qu/pos3ql/blob/b3aa3099993c351e09a0eb73fd6c1de67228007d/src/sql/tests/shared_row_work.rs) and
 [two-table spill/recovery case](https://github.com/e6qu/pos3ql/blob/b3aa3099993c351e09a0eb73fd6c1de67228007d/tests/external/run.sh) as regression coverage.

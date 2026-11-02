@@ -1598,7 +1598,6 @@ pub fn check_unique_indexes(
                 &classes[..index.n_cols],
                 index.nulls_not_distinct,
                 &name,
-                UniqueKeySource::Cache,
                 predicate,
                 arena,
             )?;
@@ -1632,6 +1631,7 @@ pub fn check_unique_indexes(
                 icols,
                 index.nulls_not_distinct,
                 &name,
+                UniqueKeySource::Cache,
             )?;
         }
     }

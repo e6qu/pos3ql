@@ -10986,6 +10986,12 @@ pub struct SequenceOwner {
     pub column: SqlName,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum GeneratedSequenceScope {
+    Owned,
+    PartitionRoot,
+}
+
 pub(crate) fn rebind_sequence_column<Old: DefinitionBacking, New: DefinitionBacking>(
     link: Option<SequenceOwner>,
     old: &TableDefinition<Old>,
@@ -42034,8 +42040,49 @@ impl Storage {
         table_schema: &str,
         table: &str,
         column: &str,
+        scope: GeneratedSequenceScope,
         txid: u32,
     ) -> Option<usize> {
+        if scope == GeneratedSequenceScope::PartitionRoot {
+            if let Some(sequence) = self.generated_sequence_slot(
+                table_schema,
+                table,
+                column,
+                GeneratedSequenceScope::Owned,
+                txid,
+            ) {
+                return Some(sequence);
+            }
+            let mut table = self.find_visible(table_schema, table, txid)?;
+            for _ in 0..self.table_count() {
+                let definition = self.table_def(table, txid);
+                let selected = definition.column_index(column)?;
+                if !definition.columns()[selected].is_identity {
+                    return None;
+                }
+                let parent = usize::from(definition.partition.attachment?.parent);
+                drop(definition);
+                if parent >= self.table_count() || !self.table_slot_visible_to(parent, txid) {
+                    return None;
+                }
+                let definition = self.table_def(parent, txid);
+                let selected = definition.column_index(column)?;
+                if !definition.columns()[selected].is_identity {
+                    return None;
+                }
+                if let Some(sequence) = self.generated_sequence_slot(
+                    definition.schema.as_str(),
+                    definition.name.as_str(),
+                    column,
+                    GeneratedSequenceScope::Owned,
+                    txid,
+                ) {
+                    return Some(sequence);
+                }
+                table = parent;
+            }
+            return None;
+        }
         let direct = self
             .sequence_catalog()
             .definitions

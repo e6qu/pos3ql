@@ -17,6 +17,7 @@ mod query_execution;
 mod routine_calls;
 mod row_history;
 mod row_layout;
+mod sequence_inheritance;
 mod shared_row_capacity;
 mod shared_row_work;
 mod table_metadata_capacity;

@@ -12538,6 +12538,7 @@ pub(crate) fn serial_sequence_name<'a>(
         table_definition.schema.as_str(),
         table_definition.name.as_str(),
         column.name.as_str(),
+        crate::storage::GeneratedSequenceScope::Owned,
         txid,
     ) else {
         return Ok(None);

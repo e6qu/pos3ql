@@ -388,8 +388,12 @@ fn partition_identity_modes_follow_the_root_through_rollback_and_cold_recovery()
         config.object_store_on = true;
         config.wal_upload = false;
         config.wal_upload_sync = false;
+        let mode_name = match mode {
+            crate::config::TransactionMode::Mvcc => "mvcc",
+            crate::config::TransactionMode::Locking => "locking",
+        };
         config.object_store_bucket =
-            format!("partition-identity-mode-{mode:?}-{}", std::process::id());
+            format!("partition-identity-mode-{mode_name}-{}", std::process::id());
         crate::object_store::sim::drop_namespace(&config.object_store_bucket);
         let server = object_reads::HttpObjectServer::start(&mut config);
         let mut budget = test_engine_budget(&config, 1 << 29);

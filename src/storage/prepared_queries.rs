@@ -576,6 +576,38 @@ mod tests {
                     .is_ok()
             );
             assert!(storage.resolve_stored_query_relation(&pending, 7).is_ok());
+            let mut recovered_clone = StoredQueryDependency {
+                slot: u16::MAX,
+                ..unresolved
+            };
+            assert!(
+                storage
+                    .resolve_stored_query_relation(&recovered_clone, 0)
+                    .is_err()
+            );
+            storage
+                .clone_stored_query_relation(&mut recovered_clone, DatabaseOid::POSTGRES)
+                .unwrap();
+            assert!(
+                storage
+                    .resolve_stored_query_relation(&recovered_clone, 0)
+                    .is_err()
+            );
+            let rebound_clone = storage
+                .rebind_stored_query_relation(recovered_clone, 0)
+                .unwrap();
+            assert!(
+                storage
+                    .resolve_stored_query_relation(&rebound_clone, 0)
+                    .is_ok()
+            );
+            let before = recovered_clone;
+            assert!(
+                storage
+                    .clone_stored_query_relation(&mut recovered_clone, DatabaseOid::TEMPLATE1)
+                    .is_err()
+            );
+            assert_eq!(recovered_clone, before);
             storage.commit_drop(table);
             let reused = storage
                 .create_table(make_def("bound_items", &[("id", ColType::Int4, false)]))
@@ -635,6 +667,13 @@ mod tests {
                 sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE
             );
             assert!(second.rebind_stored_query_relation(dependency, 0).is_err());
+            let mut foreign_clone = dependency;
+            assert!(
+                second
+                    .clone_stored_query_relation(&mut foreign_clone, DatabaseOid::POSTGRES)
+                    .is_err()
+            );
+            assert_eq!(foreign_clone, dependency);
         });
     }
 }

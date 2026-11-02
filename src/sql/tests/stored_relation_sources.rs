@@ -25,11 +25,12 @@ fn captured_view_lifetimes_reject_same_name_slot_reuse() {
         referenced_schema: crate::storage::SqlName::EMPTY,
         referenced_name: crate::storage::SqlName::parse("same_view").unwrap(),
     };
+    assert!(error_sqlstates(&run_with(&mut engine, &mut budget, "DROP VIEW same_view")).is_empty());
     assert!(
         error_sqlstates(&run_with(
             &mut engine,
             &mut budget,
-            "DROP VIEW same_view; CREATE VIEW same_view AS SELECT 2 AS id"
+            "CREATE VIEW same_view AS SELECT 2 AS id"
         ))
         .is_empty()
     );

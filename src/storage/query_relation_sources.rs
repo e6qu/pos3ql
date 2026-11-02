@@ -3,7 +3,7 @@
 use super::type_references::CatalogOrigin;
 use super::{
     CatalogDdlState, CatalogIdentity, DatabaseOid, DependencyClass, ResolvedRelation, SqlError,
-    Storage, StoredDependencyIdentity, StoredQueryDependency, current_database,
+    SqlName, Storage, StoredDependencyIdentity, StoredQueryDependency, current_database,
 };
 use crate::sql::eval::sqlstate;
 use crate::sql_err;
@@ -20,6 +20,13 @@ enum ReferenceIdentity {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RelationReference(ReferenceIdentity);
+
+struct RelationSelection {
+    slot: usize,
+    schema: SqlName,
+    name: SqlName,
+    state: CatalogDdlState,
+}
 
 impl RelationReference {
     pub(crate) fn from_storage(created_at: u64) -> Option<Self> {
@@ -165,11 +172,36 @@ impl Storage {
         transaction: u32,
     ) -> Result<StoredQueryDependency, SqlError> {
         let source = reference(&dependency)?;
-        if !source.permits_rebind(self, current_database()) {
+        let selected = self.select_stored_relation_source(
+            dependency.class,
+            source,
+            current_database(),
+            transaction,
+        )?;
+        let relation = if dependency.class == DependencyClass::Table {
+            ResolvedRelation::Table(selected.slot)
+        } else {
+            ResolvedRelation::View(selected.slot)
+        };
+        dependency.slot = u16::try_from(selected.slot).map_err(|_| invalid())?;
+        dependency.identity = self.capture_stored_query_relation(relation, transaction)?;
+        dependency.schema = selected.schema;
+        dependency.name = selected.name;
+        Ok(dependency)
+    }
+
+    fn select_stored_relation_source(
+        &self,
+        class: DependencyClass,
+        source: RelationReference,
+        database: DatabaseOid,
+        transaction: u32,
+    ) -> Result<RelationSelection, SqlError> {
+        if !source.permits_rebind(self, database) {
             return Err(invalid());
         }
         let mut found = None;
-        match dependency.class {
+        match class {
             DependencyClass::Table => {
                 for (slot, table) in self.tables.iter().enumerate() {
                     let definition = super::TableDefinitionRead::visible(
@@ -178,14 +210,19 @@ impl Storage {
                         transaction,
                     );
                     let identity = definition.identity();
-                    if identity.database != current_database()
+                    if identity.database != database
                         || identity.created_at != source.created_at()
                         || !identity.existence.visible_to(transaction)
                     {
                         continue;
                     }
                     if found
-                        .replace((slot, definition.schema, definition.name))
+                        .replace(RelationSelection {
+                            slot,
+                            schema: definition.schema,
+                            name: definition.name,
+                            state: identity.existence,
+                        })
                         .is_some()
                     {
                         return Err(invalid());
@@ -195,18 +232,19 @@ impl Storage {
             DependencyClass::View => {
                 let catalog = self.view_rule_catalog();
                 for (slot, view) in catalog.views.iter().enumerate() {
-                    if view.database != current_database()
+                    if view.database != database
                         || view.created_at != source.created_at()
                         || !view.visible_to(transaction)
                     {
                         continue;
                     }
                     if found
-                        .replace((
+                        .replace(RelationSelection {
                             slot,
-                            view.schema_for(transaction),
-                            view.name_for(transaction),
-                        ))
+                            schema: view.schema_for(transaction),
+                            name: view.name_for(transaction),
+                            state: view.ddl_state,
+                        })
                         .is_some()
                     {
                         return Err(invalid());
@@ -215,17 +253,7 @@ impl Storage {
             }
             _ => return Err(invalid()),
         }
-        let (slot, schema, name) = found.ok_or_else(invalid)?;
-        let relation = if dependency.class == DependencyClass::Table {
-            ResolvedRelation::Table(slot)
-        } else {
-            ResolvedRelation::View(slot)
-        };
-        dependency.slot = u16::try_from(slot).map_err(|_| invalid())?;
-        dependency.identity = self.capture_stored_query_relation(relation, transaction)?;
-        dependency.schema = schema;
-        dependency.name = name;
-        Ok(dependency)
+        found.ok_or_else(invalid)
     }
 
     pub(super) fn clone_stored_query_relation(
@@ -240,26 +268,12 @@ impl Storage {
             return Ok(());
         }
         let source = reference(dependency)?;
-        let slot = usize::from(dependency.slot);
-        let (database, creation, state) = match dependency.class {
-            DependencyClass::Table => {
-                let identity = self.tables.get(slot).ok_or_else(invalid)?.identity();
-                (identity.database, identity.created_at, identity.existence)
-            }
-            DependencyClass::View => {
-                let catalog = self.view_rule_catalog();
-                let view = catalog.views.get(slot).ok_or_else(invalid)?;
-                (view.database, view.created_at, view.ddl_state)
-            }
-            _ => return Err(invalid()),
-        };
-        if database != source_database
-            || state != CatalogDdlState::Present
-            || !source.matches(self, database, creation)
-        {
+        let selected =
+            self.select_stored_relation_source(dependency.class, source, source_database, 0)?;
+        if selected.state != CatalogDdlState::Present {
             return Err(invalid());
         }
-        let stored = RelationReference::from_storage(creation).ok_or_else(invalid)?;
+        let stored = RelationReference::from_storage(source.created_at()).ok_or_else(invalid)?;
         dependency.identity = if dependency.class == DependencyClass::Table {
             StoredDependencyIdentity::Table(stored)
         } else {

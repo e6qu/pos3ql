@@ -2807,13 +2807,31 @@ fn view_rule_catalog_is_synchronized_and_startup_bounded() {
     });
 }
 
-fn oversized_test_dependencies() -> StoredQueryDependencies {
+fn test_table_dependency(storage: &Storage, table: usize) -> StoredQueryDependency {
+    let identity = storage
+        .capture_stored_query_relation(ResolvedRelation::Table(table), 0)
+        .unwrap();
+    let definition = storage.table_def(table, 0);
+    StoredQueryDependency {
+        class: DependencyClass::Table,
+        slot: table as u16,
+        identity,
+        referenced_columns: ColumnSet::EMPTY,
+        schema: definition.schema,
+        name: definition.name,
+        referenced_schema: SqlName::EMPTY,
+        referenced_name: definition.name,
+    }
+}
+
+fn oversized_test_dependencies(storage: &Storage, table: usize) -> StoredQueryDependencies {
+    let dependency = test_table_dependency(storage, table);
     let mut dependencies = StoredQueryDependencies::EMPTY;
-    dependencies.push(StoredQueryDependency::EMPTY).unwrap();
+    dependencies.push(dependency).unwrap();
     dependencies
         .push(StoredQueryDependency {
-            slot: 1,
-            ..StoredQueryDependency::EMPTY
+            referenced_schema: dependency.schema,
+            ..dependency
         })
         .unwrap();
     dependencies
@@ -2832,7 +2850,7 @@ fn failed_rule_creation_preserves_capacity_and_dependency_images() {
         target: RuleTarget::Table(table as u16),
         ..RuleDefinition::EMPTY
     };
-    let oversized = oversized_test_dependencies();
+    let oversized = oversized_test_dependencies(&storage, table);
     crate::mem::guard::forbid_alloc(|| {
         assert_eq!(
             storage
@@ -2906,7 +2924,7 @@ fn failed_policy_edits_preserve_roles_definitions_and_pending_capacity() {
         roles: &[PUBLIC_ROLE],
     };
     let empty = StoredQueryDependencies::EMPTY;
-    let oversized = oversized_test_dependencies();
+    let oversized = oversized_test_dependencies(&storage, table);
     let changed = PolicyDefinition {
         using: Some(StackStr::from_str("false")),
         with_check: None,
@@ -3025,6 +3043,7 @@ fn failed_view_creation_and_replacement_leave_both_catalogs_unchanged() {
     config.max_catalog_versions_per_object = 1;
     let mut budget = test_budget(&config);
     let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
+    let table = storage.create_table(make_def("view_source", &[])).unwrap();
     let schema = SqlName::parse("public").unwrap();
     let name = SqlName::parse("test_view").unwrap();
     crate::mem::guard::forbid_alloc(|| {
@@ -3033,7 +3052,7 @@ fn failed_view_creation_and_replacement_leave_both_catalogs_unchanged() {
                 .create_view(
                     schema,
                     name,
-                    test_view_definition(oversized_test_dependencies()),
+                    test_view_definition(oversized_test_dependencies(&storage, table)),
                     false,
                     7,
                 )
@@ -3067,7 +3086,7 @@ fn failed_view_creation_and_replacement_leave_both_catalogs_unchanged() {
                 .create_view(
                     schema,
                     name,
-                    test_view_definition(oversized_test_dependencies()),
+                    test_view_definition(oversized_test_dependencies(&storage, table)),
                     true,
                     8,
                 )
@@ -3218,8 +3237,9 @@ fn failed_rule_replay_preserves_view_link_and_original_dependencies() {
     let table = storage.create_table(make_def("rule_target", &[])).unwrap();
     let schema = SqlName::parse("public").unwrap();
     let name = SqlName::parse("test_view").unwrap();
+    let dependency = test_table_dependency(&storage, table);
     let mut dependencies = StoredQueryDependencies::EMPTY;
-    dependencies.push(StoredQueryDependency::EMPTY).unwrap();
+    dependencies.push(dependency).unwrap();
     storage
         .replay_view(
             ViewCatalogIdentity::new(0, 7, 0, 8).unwrap(),
@@ -3236,7 +3256,12 @@ fn failed_rule_replay_preserves_view_link_and_original_dependencies() {
     crate::mem::guard::forbid_alloc(|| {
         assert_eq!(
             storage
-                .replay_rule(0, 42, definition, oversized_test_dependencies())
+                .replay_rule(
+                    0,
+                    42,
+                    definition,
+                    oversized_test_dependencies(&storage, table)
+                )
                 .unwrap_err()
                 .sqlstate,
             sqlstate::PROGRAM_LIMIT_EXCEEDED
@@ -3244,10 +3269,7 @@ fn failed_rule_replay_preserves_view_link_and_original_dependencies() {
         assert_eq!(storage.view_return_rule(0), 0);
         assert_eq!(storage.view_sql(0).as_str(), "SELECT 1");
         assert_eq!(storage.rule(1).ddl_state, CatalogDdlState::Absent);
-        assert_eq!(
-            storage.rule_dependencies(0, 0).entries(),
-            &[StoredQueryDependency::EMPTY]
-        );
+        assert_eq!(storage.rule_dependencies(0, 0).entries(), &[dependency]);
         assert!(!storage.table_has_rules(table, 0));
         assert_eq!(
             storage
@@ -3261,10 +3283,7 @@ fn failed_rule_replay_preserves_view_link_and_original_dependencies() {
             .unwrap();
         assert_eq!(storage.view_return_rule(0), 0);
         assert_eq!(storage.view_sql(0).as_str(), "SELECT 1");
-        assert_eq!(
-            storage.rule_dependencies(0, 0).entries(),
-            &[StoredQueryDependency::EMPTY]
-        );
+        assert_eq!(storage.rule_dependencies(0, 0).entries(), &[dependency]);
         assert!(storage.rule_dependencies(1, 0).entries().is_empty());
         assert!(storage.table_has_rules(table, 0));
         let renamed = RuleDefinition {

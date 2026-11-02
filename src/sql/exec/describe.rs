@@ -855,6 +855,15 @@ impl ColTypeResolver for CatalogCols<'_> {
         })
     }
 
+    fn operator_first_argument_type(
+        &self,
+        name: &str,
+        left: i32,
+        right: i32,
+    ) -> Result<Option<StaticTypeMeta>, SqlError> {
+        catalog_operator_first_argument_type(self.storage, self.txid, name, left, right)
+    }
+
     fn routine_record_field(
         &self,
         name: &str,
@@ -1617,7 +1626,68 @@ pub(crate) fn intrinsic_record_field_meta(
 
 /// Resolves a column reference's type during static analysis. Returns an
 /// error for an unknown column (or absent FROM clause).
+pub(crate) fn catalog_operator_first_argument_type(
+    storage: &crate::storage::Storage,
+    txid: u32,
+    name: &str,
+    left: i32,
+    right: i32,
+) -> Result<Option<StaticTypeMeta>, SqlError> {
+    let Some(slot) = storage.operator_slot_for_oids(None, name, Some(left), Some(right), txid)?
+    else {
+        return Ok(None);
+    };
+    let operator = storage.operator_for(slot, txid);
+    let result = operator.implementation.result().ok_or_else(|| {
+        sql_err!(
+            sqlstate::UNDEFINED_FUNCTION,
+            "selected NULLIF equality operator has no implementation"
+        )
+    })?;
+    if name == "="
+        && storage.routine_type_oid(result.ctype, result.user_type, txid) != Some(oid::BOOL)
+    {
+        return Err(sql_err!(
+            sqlstate::DATATYPE_MISMATCH,
+            "NULLIF requires = operator to yield boolean"
+        ));
+    }
+    let input = operator.signature.left.ok_or_else(|| {
+        sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "selected binary operator has no left input"
+        )
+    })?;
+    let type_oid = storage
+        .routine_type_oid(input.ctype, input.user_type, txid)
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "selected operator input type is unavailable"
+            )
+        })?;
+    Ok(Some(StaticTypeMeta {
+        ctype: input.ctype,
+        type_oid,
+        type_mod: -1,
+        collation: if input.ctype.is_collatable() {
+            crate::sql::ast::Collation::Default
+        } else {
+            crate::sql::ast::Collation::None
+        },
+    }))
+}
+
 pub trait ColTypeResolver {
+    fn operator_first_argument_type(
+        &self,
+        _name: &str,
+        _left: i32,
+        _right: i32,
+    ) -> Result<Option<StaticTypeMeta>, SqlError> {
+        Ok(None)
+    }
+
     fn resolve(&self, qualifier: Option<&str>, name: &str) -> Result<ColType, SqlError>;
 
     fn column_meta(&self, qualifier: Option<&str>, name: &str) -> Option<StaticTypeMeta> {
@@ -2010,7 +2080,8 @@ fn empty_shape_pool(named_capacity: usize) -> Box<ShapePool> {
 
 /// Heap bytes reserved by the statement-local record-shape registry.
 pub(crate) const fn record_shape_pool_bytes(named_capacity: usize) -> usize {
-    core::mem::size_of::<ShapePool>() + named_capacity * core::mem::size_of::<NamedRecordShape>()
+    core::mem::size_of::<ShapePool>()
+        .saturating_add(named_capacity.saturating_mul(core::mem::size_of::<NamedRecordShape>()))
 }
 
 /// Allocates the shape pool; the server calls this at startup, before the
@@ -4116,6 +4187,25 @@ pub fn infer_type_res(
     {
         return result;
     }
+    if let Expr::Call {
+        name,
+        args,
+        star,
+        variadic,
+        argument_names,
+        ..
+    } = expression
+        && let Some(result) = crate::sql::eval::funcs::array::describe_comparison(
+            name,
+            args,
+            *star,
+            *variadic,
+            argument_names,
+            columns,
+        )
+    {
+        return result;
+    }
     if let Expr::Call { name, args, .. } = expression
         && let Some(result) = crate::sql::engine_intrinsic_result_type(name, args.len())
     {
@@ -5066,10 +5156,26 @@ pub fn infer_type_res(
                 }
                 best.unwrap_or(of(ColType::Int8))
             }
-            // `abs`/`nullif` take their first argument's type. `coalesce`
+            "nullif" => {
+                if args.len() != 2 {
+                    return Err(super::super::eval::arity_err(name, args.len()));
+                }
+                let left = infer_routine_argument_oid(args[0], columns)?;
+                let right = infer_routine_argument_oid(args[1], columns)?;
+                if let Some(input) = columns.operator_first_argument_type("=", left, right)? {
+                    (input.type_oid, input.ctype.typlen())
+                } else {
+                    let left_base = columns.domain_base_type(left).map_or(left, ColType::oid);
+                    let right_base = columns.domain_base_type(right).map_or(right, ColType::oid);
+                    let (input, _) =
+                        super::super::catalog::builtin_nullif_input_oids(left_base, right_base)?;
+                    (input, coltype_of_oid(input).map_or(-1, ColType::typlen))
+                }
+            }
+            // `abs` takes its first argument's type. `coalesce`
             // unifies across all of them, so an untyped NULL in front must not
             // decide the result: `coalesce(NULL, 1)` is integer, not text.
-            "coalesce" | "abs" | "nullif" => {
+            "coalesce" | "abs" => {
                 let mut chosen = None;
                 for a in args.iter() {
                     let t = infer_type_res(a, columns)?;

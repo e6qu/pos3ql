@@ -371,7 +371,7 @@ fn held_query_read(mode: crate::config::TransactionMode, saved: SavedRows, cance
     config.block_cache_bytes = 0;
     config.disk_cache_bytes = 0;
     config.max_tables = 4;
-    config.table_rows = 512;
+    config.row_overlay_slots = 512;
     config.max_spill_generations_per_table = 2;
     config.memtable_bytes = 8 << 20;
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
@@ -433,9 +433,11 @@ fn held_query_read(mode: crate::config::TransactionMode, saved: SavedRows, cance
         config.object_store_prefix,
         core::str::from_utf8(&foreground_hash).unwrap()
     );
-    let state_bytes =
-        RowCursor::position_bytes(config.table_rows, config.max_spill_generations_per_table)
-            .unwrap();
+    let state_bytes = RowCursor::position_bytes(
+        config.row_overlay_slots,
+        config.max_spill_generations_per_table,
+    )
+    .unwrap();
     let mut reader_budget =
         Budget::new(RowCursorBuffers::allocation_bytes(&config) + state_bytes + (1 << 20));
     let mut cursor = RowCursor::closed();

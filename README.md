@@ -78,6 +78,21 @@ Also set both history reservations explicitly: for example,
 `catalog_history_bytes = 16MiB` and `row_history_slots = 65536` in `mvcc` mode,
 or zero for both in `locking` mode. Catalog history keeps older definitions;
 row history shares its slots across all tables while readers need earlier values.
+Also choose the shared hard capacities explicitly:
+
+```conf
+row_overlay_slots = 8192
+row_work_bytes = 8MiB
+row_work_leases = 128
+definition_image_slots = 256
+```
+
+These settings budget resident row metadata, foreground row workspace and copies
+of table definitions for the whole instance. A busy table can use available
+shared capacity; creating empty tables does not give each its own row allowance.
+Large objects retain their separate `large_object_pages` reservation. The
+[architecture](docs/architecture.md#memory-and-physical-size) explains the
+remaining per-table costs and the limits of this work.
 
 - `mvcc` retains older row values while readers need them. For example, a
   repeatable-read report can keep seeing an order's earlier status while

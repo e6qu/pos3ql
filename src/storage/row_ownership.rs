@@ -375,7 +375,7 @@ mod tests {
     fn row_lock_owners_storage_partial_acquisition_allows_unrelated_write_and_undo() {
         let mut config = test_config();
         config.max_tables = 3;
-        config.table_rows = 1;
+        config.row_overlay_slots = 1;
         config.txn_rows = 1;
         config.large_object_pages = 1;
         config.max_connections = 1;
@@ -452,7 +452,7 @@ mod tests {
     fn row_lock_owners_heap_partial_acquisition_error_and_exhaustion_release_all() {
         let mut config = test_config();
         config.max_tables = 2;
-        config.table_rows = 1;
+        config.row_overlay_slots = 1;
         config.txn_rows = 1;
         config.large_object_pages = 1;
         config.max_connections = 1;

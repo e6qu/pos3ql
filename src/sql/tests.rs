@@ -15,6 +15,8 @@ mod query_execution;
 mod routine_calls;
 mod row_history;
 mod row_layout;
+mod shared_row_capacity;
+mod shared_row_work;
 mod table_publication;
 mod transaction_publication;
 
@@ -5703,6 +5705,7 @@ fn live_definition_ownership_checkpoint_exhaustion_retries_and_recovers() {
     let mut config = test_config("definition-checkpoint-exhaustion");
     config.max_tables = 1;
     config.max_catalog_versions_per_object = 1;
+    config.definition_image_slots = 4;
     config.object_store_on = true;
     config.object_store_sim = true;
     config.wal_upload = true;
@@ -5721,9 +5724,7 @@ fn live_definition_ownership_checkpoint_exhaustion_retries_and_recovers() {
         .storage
         .find_table("public", "definition_checkpoint")
         .unwrap();
-    let capacity = crate::storage::table_slot_capacity(&config)
-        * (config.max_catalog_versions_per_object + 1)
-        * config.query_workspace_slots;
+    let capacity = config.definition_image_slots;
     let mut owners = Vec::with_capacity(capacity);
     for _ in 0..capacity {
         let definitions = engine.storage.table_definition_images();
@@ -6068,6 +6069,7 @@ fn table_definition_images_nested_trigger_exhaustion_rolls_back_and_retries() {
     let mut config = test_config("definition-image-exhaustion");
     config.max_tables = 2;
     config.max_catalog_versions_per_object = 1;
+    config.definition_image_slots = 6;
     let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 27));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     for statement in [
@@ -6087,9 +6089,7 @@ fn table_definition_images_nested_trigger_exhaustion_rolls_back_and_retries() {
         .storage
         .find_visible("public", "image_target", 0)
         .unwrap();
-    let capacity = crate::storage::table_slot_capacity(&config)
-        * (config.max_catalog_versions_per_object + 1)
-        * config.query_workspace_slots;
+    let capacity = config.definition_image_slots;
     let mut owners = Vec::with_capacity(capacity - 1);
     for _ in 1..capacity {
         let definitions = engine.storage.table_definition_images();
@@ -6272,8 +6272,7 @@ fn query_workspaces_are_startup_bounded_and_isolated() {
     config.work_arena_bytes = 256;
     let mut one = config.clone();
     one.query_workspace_slots = 1;
-    let dml_workspace_bytes = core::mem::size_of::<exec::DmlScratch>()
-        + config.table_rows * core::mem::size_of::<exec::PhysicalRow>();
+    let dml_workspace_bytes = core::mem::size_of::<exec::DmlScratch>();
     assert_eq!(
         Engine::extra_budget_bytes(&config) - Engine::extra_budget_bytes(&one),
         2 * (config.work_arena_bytes
@@ -6323,8 +6322,19 @@ fn query_workspaces_are_startup_bounded_and_isolated() {
         crate::storage::DatabaseOid::POSTGRES
     );
 
+    let mut shared_budget = Budget::new(crate::mem::lease_pool::RowWorkPool::budget_bytes(
+        config.row_work_bytes,
+        config.row_work_leases,
+    ));
+    let shared = crate::mem::lease_pool::RowWorkPool::new(
+        &mut shared_budget,
+        config.row_work_bytes,
+        config.row_work_leases,
+    )
+    .unwrap();
+    assert_eq!(shared_budget.remaining(), 0);
     let mut budget = Budget::new(config.query_workspace_slots * dml_workspace_bytes);
-    let mut dml_workspaces = DmlWorkspaces::new(&config, &mut budget).unwrap();
+    let mut dml_workspaces = DmlWorkspaces::new(&config, &mut budget, &shared).unwrap();
     assert_eq!(budget.remaining(), 0);
 
     workspaces.select(QueryWorkspaceId::from_index(0));
@@ -6335,7 +6345,10 @@ fn query_workspaces_are_startup_bounded_and_isolated() {
         })
         .unwrap();
     assert_eq!(dml_workspaces.len(), 1);
-    assert_eq!(dml_workspaces.capacity(), config.table_rows);
+    assert_eq!(
+        dml_workspaces.max_entries(),
+        shared.max_entries::<exec::PhysicalRow>()
+    );
 
     workspaces.select(QueryWorkspaceId::from_index(1));
     assert!(dml_workspaces.is_empty());
@@ -17427,8 +17440,7 @@ fn test_config(name: &str) -> Config {
     let mut config = Config::default_dev();
     config.data_dir = dir.to_str().unwrap().to_string();
     config.memtable_bytes = 1 << 20;
-    // Most tests exercise the historical resident-only mode so their exact
-    // fixed budgets remain meaningful. Dedicated spill tests opt in below.
+    // Temporary rows stay resident unless a spill test opts in.
     config.temporary_spill_bytes = 0;
     config.max_connections = 8;
     config.max_tables = 8;
@@ -17453,7 +17465,7 @@ fn test_config(name: &str) -> Config {
     config.max_user_mappings = 8;
     config.foreign_receive_bytes = 16 << 10;
     config.foreign_send_bytes = 8 << 10;
-    config.table_rows = 1024;
+    config.row_overlay_slots = 8192;
     config.txn_rows = 2048;
     config.value_index_rows = 2048;
     config.max_value_indexes = 8;
@@ -17725,31 +17737,60 @@ fn instead_of_view_trigger_survives_checkpoint_recovery() {
 }
 
 #[test]
-fn view_trigger_is_a_drop_dependency_and_cascades_transactionally() {
-    let (mut engine, mut budget) = test_engine();
-    run_with(
-        &mut engine,
-        &mut budget,
-        "CREATE TABLE drop_view_trigger_base (id integer); \
-         CREATE VIEW drop_view_trigger_target AS SELECT id FROM drop_view_trigger_base; \
-         CREATE FUNCTION drop_view_trigger_function() RETURNS trigger LANGUAGE plpgsql AS \
-           'BEGIN RETURN NEW; END'; \
-         CREATE TRIGGER drop_view_trigger INSTEAD OF INSERT ON drop_view_trigger_target \
-           FOR EACH ROW EXECUTE FUNCTION drop_view_trigger_function();",
-    );
-    let restricted = run_with(
-        &mut engine,
-        &mut budget,
-        "DROP VIEW drop_view_trigger_target",
-    );
-    assert!(String::from_utf8_lossy(&restricted).contains("2BP01"));
-    let dropped = run_with(
-        &mut engine,
-        &mut budget,
-        "DROP VIEW drop_view_trigger_target CASCADE; \
-         SELECT count(*) FROM pg_trigger WHERE tgname = 'drop_view_trigger'",
-    );
-    assert_eq!(data_rows(&dropped), ["0"]);
+fn view_owned_triggers_drop_automatically_and_restore_on_rollback() {
+    let config = test_config("view-owned-trigger-drop");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 27));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    let script =
+        include_str!("../../tests/external/differential_exact/59_view_owned_trigger_drop.sql");
+    for (request, sql) in script.split("-- next request").enumerate() {
+        if request == 1 {
+            let output = session.execute(&mut engine, sql, true);
+            assert_eq!(error_sqlstates(&output), ["2BP01"]);
+            assert!(
+                String::from_utf8_lossy(&output).contains(
+                    "cannot drop view owned_view_parent because other objects depend on it"
+                )
+            );
+            continue;
+        }
+        if request == 4 {
+            let mut limited_config = config.clone();
+            limited_config.max_ddl_per_transaction = 1;
+            let mut limited = ConfiguredTransactionSession::new(&limited_config, &mut budget)
+                .with_connection_id(2);
+            limited.success(
+                &mut engine,
+                "BEGIN; COMMENT ON VIEW owned_view_parent IS 'undo admission'",
+                true,
+            );
+            let output = limited.execute(&mut engine, "DROP VIEW owned_view_parent", true);
+            assert_eq!(error_sqlstates(&output), ["54000"]);
+            let view = engine
+                .storage
+                .view_slot("public", "owned_view_parent", limited.transaction.txid)
+                .unwrap();
+            assert_eq!(
+                engine
+                    .storage
+                    .triggers_for_view(view, limited.transaction.txid)
+                    .count(),
+                1
+            );
+            limited.success(&mut engine, "ROLLBACK", true);
+            assert_eq!(data_rows(&session.success(&mut engine, "INSERT INTO owned_view_parent VALUES(8) RETURNING id; SELECT id FROM owned_view_base ORDER BY id", true)), ["8", "5", "7", "8"]);
+        }
+        let output = session.success(&mut engine, sql, true);
+        let expected: &[&str] = match request {
+            0 => &[],
+            2 => &["1", "2", "5", "5"],
+            3 => &["0", "1", "7", "5", "7"],
+            4 => &["0"],
+            _ => panic!("unexpected view ownership fixture request"),
+        };
+        assert_eq!(data_rows(&output), expected);
+    }
 }
 
 #[test]
@@ -18152,14 +18193,17 @@ fn statement_arena_scales_event_graphs_ddl_and_sequence_effects_through_cold_rec
     use core::fmt::Write;
 
     const TABLES_PER_SCHEMA: usize = 260;
+    const VISIBLE_TABLES: usize = TABLES_PER_SCHEMA * 2 + 1;
     const DROPPED_OBJECTS: usize = 1 + TABLES_PER_SCHEMA * 3;
 
     let mut config = test_config("arena-backed-execution-effects");
     config.max_catalog_versions_per_object = 1;
-    config.max_tables = TABLES_PER_SCHEMA * 2 + 1;
+    config.max_tables = VISIBLE_TABLES;
+    // A wide cascade reuses scan images while the audit nests target/SRF images.
+    config.definition_image_slots = 4;
     config.max_ddl_per_transaction = 1_024;
     config.txn_rows = 2_048;
-    config.table_rows = 8;
+    config.row_overlay_slots = 8;
     config.memtable_bytes = 8 << 20;
     config.wal_bytes = 32 << 20;
     config.wal_buffer_bytes = 8 << 20;
@@ -18316,7 +18360,8 @@ fn configured_transaction_capacity_covers_bulk_analyze_undo_and_exhaustion() {
     const TABLES: usize = 129;
     let mut config = test_config("bulk-analyze-transaction-capacity");
     config.max_tables = TABLES;
-    config.table_rows = 8;
+    // All two-row relations remain resident throughout the ANALYZE undo checks.
+    config.row_overlay_slots = 2 * TABLES;
     config.value_index_rows = 8;
     config.max_analyze_per_transaction = 2 * (TABLES + 1);
     config.wal_bytes = 8 << 20;
@@ -18352,7 +18397,7 @@ fn configured_catalog_version_pools_cover_one_object_and_savepoint_reuse() {
     config.max_catalog_versions_per_object = 40;
     config.max_analyze_per_transaction = 40;
     config.max_savepoints_per_transaction = 8;
-    config.table_rows = 16;
+    config.row_overlay_slots = 16;
     config.value_index_rows = 16;
     config.wal_bytes = 8 << 20;
     config.wal_buffer_bytes = 2 << 20;
@@ -18490,7 +18535,7 @@ fn configured_row_version_pools_cover_command_history_snapshots_and_cold_recover
     let mut config = test_config("configured-row-version-pools");
     config.max_row_versions_per_row = 12;
     config.txn_rows = 64;
-    config.table_rows = 32;
+    config.row_overlay_slots = 32;
     config.value_index_rows = 32;
     config.memtable_bytes = 4 << 20;
     config.wal_bytes = 8 << 20;
@@ -18620,7 +18665,7 @@ fn configured_catalog_version_pools_do_not_allocate_while_serving() {
     config.max_catalog_versions_per_object = 10;
     config.max_analyze_per_transaction = 40;
     config.max_savepoints_per_transaction = 8;
-    config.table_rows = 16;
+    config.row_overlay_slots = 16;
     config.value_index_rows = 16;
     let mut budget = test_engine_budget(&config, 1 << 30);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -18763,6 +18808,45 @@ fn configured_transaction_capacity_covers_deferred_exhaustion_and_reuse() {
 }
 
 #[test]
+fn truncate_fanout_releases_definition_images_before_statement_triggers() {
+    let mut config = test_config("truncate-scoped-trigger-definitions");
+    config.definition_image_slots = 2;
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 27));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE TABLE scoped_truncate_parent(id integer PRIMARY KEY); \
+         CREATE TABLE scoped_truncate_child(id integer REFERENCES scoped_truncate_parent(id)); \
+         CREATE TABLE scoped_truncate_audit(timing text); \
+         INSERT INTO scoped_truncate_parent VALUES(1); \
+         INSERT INTO scoped_truncate_child VALUES(1); \
+         CREATE FUNCTION scoped_truncate_log() RETURNS trigger LANGUAGE plpgsql AS $$ \
+           BEGIN INSERT INTO scoped_truncate_audit VALUES(TG_WHEN); RETURN NULL; END $$; \
+         CREATE TRIGGER scoped_truncate_before BEFORE TRUNCATE ON scoped_truncate_parent \
+           FOR EACH STATEMENT EXECUTE FUNCTION scoped_truncate_log(); \
+         CREATE TRIGGER scoped_truncate_after AFTER TRUNCATE ON scoped_truncate_parent \
+           FOR EACH STATEMENT EXECUTE FUNCTION scoped_truncate_log()",
+        true,
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "BEGIN; SAVEPOINT before_truncate; TRUNCATE scoped_truncate_parent CASCADE; \
+             SELECT timing FROM scoped_truncate_audit ORDER BY timing; \
+             SELECT count(*) FROM scoped_truncate_parent; \
+             SELECT count(*) FROM scoped_truncate_child; \
+             ROLLBACK TO before_truncate; \
+             SELECT count(*) FROM scoped_truncate_parent; \
+             SELECT count(*) FROM scoped_truncate_child; \
+             SELECT count(*) FROM scoped_truncate_audit; COMMIT",
+            true,
+        )),
+        ["AFTER", "BEFORE", "0", "0", "1", "1", "0"]
+    );
+}
+
+#[test]
 fn configured_transaction_capacity_covers_truncate_fanout_and_prepared_cold_recovery() {
     const TABLES: usize = 300;
     let mut config = test_config("truncate-fanout-prepared-cold-recovery");
@@ -18771,8 +18855,12 @@ fn configured_transaction_capacity_covers_truncate_fanout_and_prepared_cold_reco
     config.max_indexes = TABLES;
     config.max_value_indexes = TABLES;
     config.max_prepared_transactions = 2;
+    // The closure retains compact source targets; full definitions are scoped
+    // to one relation instead of consuming one image per affected table.
+    config.definition_image_slots = 2;
     config.subscription_relation_capacity = TABLES;
-    config.table_rows = 4;
+    // The fanout retains one row per relation before truncate and refill.
+    config.row_overlay_slots = TABLES;
     config.value_index_rows = 4;
     config.txn_rows = 1024;
     config.memtable_bytes = 8 << 20;
@@ -18865,6 +18953,7 @@ fn configured_transaction_capacity_covers_truncate_fanout_and_prepared_cold_reco
         &config,
         0,
         crate::storage::SubscriptionBehavior::POSTGRESQL_18_DEFAULT,
+        std::sync::Arc::clone(&engine.storage.row_work),
     )
     .unwrap();
     assert_eq!(
@@ -18979,7 +19068,7 @@ fn configured_transaction_capacity_covers_truncate_fanout_and_prepared_cold_reco
 fn critical_cache_pressure_parks_writers_while_checkpoint_turns_make_progress() {
     let mut config = test_config("critical-cache-checkpoint-progress");
     config.max_tables = 32;
-    config.table_rows = 512;
+    config.row_overlay_slots = 512;
     config.value_index_rows = 512;
     config.memtable_bytes = 256 << 10;
     config.wal_bytes = 8 << 20;
@@ -19001,7 +19090,7 @@ fn critical_cache_pressure_parks_writers_while_checkpoint_turns_make_progress() 
     assert!(engine.maybe_checkpoint());
     let mut parked_writes = 0;
     let mut waiting_turns = 0;
-    let turn_bound = config.max_tables * (config.table_rows.div_ceil(64) * 8 + 16)
+    let turn_bound = config.max_tables * (config.row_overlay_slots.div_ceil(64) * 8 + 16)
         + config.memtable_bytes.div_ceil(64 << 10) * 4;
     for id in 1..=300 {
         let sql =
@@ -22286,7 +22375,7 @@ fn maximum_definition_lists_survive_wal_checkpoint_and_cold_recovery() {
     config.max_operators = WIDTH + 8;
     config.max_subscriptions = 2;
     config.max_event_triggers = 2;
-    config.table_rows = 128;
+    config.row_overlay_slots = 128;
     config.wal_bytes = 8 << 20;
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
@@ -22511,7 +22600,7 @@ fn maximum_statement_width_executes_before_and_after_object_cold_recovery() {
     config.wal_upload_sync = true;
     config.object_store_bucket = format!("maximum-statement-width-{}", std::process::id());
     config.max_tables = 8;
-    config.table_rows = 128;
+    config.row_overlay_slots = 128;
     config.max_locks_per_transaction = WIDTH * 2;
     config.wal_bytes = 8 << 20;
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
@@ -41800,17 +41889,20 @@ fn sql_standard_routine_bodies_keep_creation_time_catalog_identity() {
 fn configured_stored_query_dependency_pool_crosses_old_inline_limit_and_recovers_cold() {
     use core::fmt::Write as _;
 
-    const DEPENDENCIES: usize = 70;
+    const TABLE_DEPENDENCIES: usize = 64;
+    const ROUTINE_DEPENDENCIES: usize = 6;
+    const DEPENDENCIES: usize = TABLE_DEPENDENCIES + ROUTINE_DEPENDENCIES;
 
     let mut config = test_config("stored-query-dependency-pool");
     config.max_connections = 1;
-    config.max_tables = 64;
+    config.max_tables = TABLE_DEPENDENCIES;
     config.max_routines = 8;
     config.max_rules = 4;
     config.max_policies = 2;
     config.max_ddl_per_transaction = 96;
     config.max_stored_query_dependencies_per_object = DEPENDENCIES;
-    config.table_rows = 8;
+    // One inserted row per dependency table remains resident until the checkpoint.
+    config.row_overlay_slots = TABLE_DEPENDENCIES;
     config.txn_rows = 128;
     config.wal_bytes = 8 << 20;
     config.wal_buffer_bytes = 2 << 20;
@@ -41825,9 +41917,9 @@ fn configured_stored_query_dependency_pool_crosses_old_inline_limit_and_recovers
 
     let mut budget = test_engine_budget(&config, 2 << 30);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
-    for first in (0..64).step_by(16) {
+    for first in (0..TABLE_DEPENDENCIES).step_by(16) {
         let mut tables = String::new();
-        for dependency in first..(first + 16).min(64) {
+        for dependency in first..(first + 16).min(TABLE_DEPENDENCIES) {
             writeln!(
                 tables,
                 "CREATE TABLE pooled_dependency_{dependency}(value integer); \
@@ -41843,7 +41935,7 @@ fn configured_stored_query_dependency_pool_crosses_old_inline_limit_and_recovers
         );
     }
     let mut setup = String::new();
-    for dependency in 0..6 {
+    for dependency in 0..ROUTINE_DEPENDENCIES {
         writeln!(
             setup,
             "CREATE FUNCTION pooled_dependency_helper_{dependency}() RETURNS integer \
@@ -41857,7 +41949,7 @@ fn configured_stored_query_dependency_pool_crosses_old_inline_limit_and_recovers
          pooled_dependency_helper_2() + pooled_dependency_helper_3() + \
          pooled_dependency_helper_4() + pooled_dependency_helper_5() FROM ",
     );
-    for dependency in 0..64 {
+    for dependency in 0..TABLE_DEPENDENCIES {
         if dependency != 0 {
             main_definition.push_str(", ");
         }
@@ -41916,7 +42008,7 @@ fn configured_stored_query_dependency_pool_crosses_old_inline_limit_and_recovers
          pooled_dependency_helper_4() + pooled_dependency_helper_5() + \
          pooled_dependency_helper_6() FROM ",
     );
-    for dependency in 0..64 {
+    for dependency in 0..TABLE_DEPENDENCIES {
         if dependency != 0 {
             replacement.push_str(", ");
         }
@@ -41994,7 +42086,7 @@ fn configured_dependency_plans_cross_old_catalog_ceiling_and_recover_cold() {
     config.max_rules = VIEW_COUNT + 3;
     config.max_policies = 2;
     config.max_ddl_per_transaction = 256;
-    config.table_rows = 8;
+    config.row_overlay_slots = 8;
     config.txn_rows = 512;
     config.wal_bytes = 8 << 20;
     config.wal_buffer_bytes = 2 << 20;
@@ -48882,7 +48974,7 @@ fn configured_transaction_ddl_capacity_drives_commit_and_index_scratch() {
     config.max_tables = RELATIONS;
     config.max_indexes = RELATIONS;
     config.max_value_indexes = RELATIONS;
-    config.table_rows = 8;
+    config.row_overlay_slots = 8;
     config.value_index_rows = 8;
     config.txn_rows = 256;
     config.max_ddl_per_transaction = 2 * RELATIONS + 16;
@@ -52253,7 +52345,8 @@ fn analyze_reclaims_each_target_capture_within_the_fixed_work_arena() {
     let mut config = test_config("analysis-target-recycling");
     config.work_arena_bytes = 12 << 10;
     config.max_tables = 4;
-    config.table_rows = 512;
+    // Three resident relations each retain 256 rows during per-target ANALYZE.
+    config.row_overlay_slots = 3 * 256;
     config.value_index_rows = 512;
     let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -53995,7 +54088,7 @@ fn parameterized_range_join_reads_cold_object_index_generations() {
     config.wal_bytes = 8 << 20;
     config.memtable_bytes = 8 << 20;
     config.txn_rows = 10_000;
-    config.table_rows = 10_000;
+    config.row_overlay_slots = 10_000;
     config.value_index_rows = 10_000;
     config.object_store_bucket = format!("parameterized-range-join-{}", std::process::id());
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
@@ -64570,7 +64663,7 @@ fn hash_indexes_drive_exact_queries_joins_dml_and_cold_recovery() {
     config.wal_buffer_bytes = 1 << 20;
     config.wal_bytes = 8 << 20;
     config.memtable_bytes = 8 << 20;
-    config.table_rows = 4096;
+    config.row_overlay_slots = 4096;
     config.value_index_rows = 8192;
     config.object_store_bucket = format!("physical-hash-indexes-{}", std::process::id());
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
@@ -64765,7 +64858,7 @@ fn configured_statistics_and_brin_ranges_cross_old_per_object_bounds() {
     const TRIGGERS: usize = 70;
     let mut config = test_config("configured-statistics-brin-capacities");
     config.max_tables = 1;
-    config.table_rows = 10_000;
+    config.row_overlay_slots = 10_000;
     config.txn_rows = 10_000;
     config.max_indexes = 1;
     config.max_routines = 1;
@@ -64927,7 +65020,7 @@ fn brin_indexes_drive_range_expression_dml_and_cold_object_scans() {
     config.wal_buffer_bytes = 1 << 20;
     config.wal_bytes = 8 << 20;
     config.memtable_bytes = 8 << 20;
-    config.table_rows = 8192;
+    config.row_overlay_slots = 8192;
     config.value_index_rows = 16384;
     config.object_store_bucket = format!("physical-brin-indexes-{}", std::process::id());
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
@@ -65365,7 +65458,6 @@ fn geometric_navigation_prunes_cold_objects_across_every_builtin_spatial_class()
     config.wal_buffer_bytes = 2 << 20;
     config.wal_bytes = 32 << 20;
     config.memtable_bytes = 32 << 20;
-    config.table_rows = 4096;
     config.txn_rows = 8192;
     config.value_index_rows = 8192;
     config.max_tables = 16;
@@ -65393,6 +65485,8 @@ fn geometric_navigation_prunes_cold_objects_across_every_builtin_spatial_class()
             "poly_ops",
         ),
     ];
+    // Every spatial fixture stays resident until their common checkpoint.
+    config.row_overlay_slots = classes.len() * 3_000;
     let mut budget = test_engine_budget(&config, 1 << 30);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
@@ -65643,7 +65737,7 @@ fn inverted_index_navigation_prunes_cold_objects_and_merges_mvcc_overlays() {
     config.wal_buffer_bytes = 2 << 20;
     config.wal_bytes = 32 << 20;
     config.memtable_bytes = 32 << 20;
-    config.table_rows = 4096;
+    config.row_overlay_slots = 4096;
     config.txn_rows = 8192;
     config.value_index_rows = 32768;
     config.max_indexes = 16;
@@ -65813,7 +65907,7 @@ fn gin_postings_route_exact_tokens_and_conservatively_decline_unbounded_queries(
     config.wal_buffer_bytes = 2 << 20;
     config.wal_bytes = 16 << 20;
     config.memtable_bytes = 16 << 20;
-    config.table_rows = 1024;
+    config.row_overlay_slots = 1024;
     config.txn_rows = 2048;
     config.value_index_rows = 16384;
     config.max_indexes = 8;
@@ -65997,7 +66091,7 @@ fn network_and_range_navigation_prunes_every_builtin_interval_family() {
     config.wal_buffer_bytes = 4 << 20;
     config.wal_bytes = 48 << 20;
     config.memtable_bytes = 48 << 20;
-    config.table_rows = 4096;
+    config.row_overlay_slots = 4096;
     config.txn_rows = 8192;
     config.value_index_rows = 65536;
     config.max_indexes = 16;
@@ -66194,7 +66288,7 @@ fn gist_indexes_drive_predicates_catalogs_dml_and_cold_object_scans() {
     config.wal_buffer_bytes = 1 << 20;
     config.wal_bytes = 8 << 20;
     config.memtable_bytes = 8 << 20;
-    config.table_rows = 8192;
+    config.row_overlay_slots = 8192;
     config.txn_rows = 8192;
     config.value_index_rows = 16384;
     config.object_store_bucket = format!("physical-gist-indexes-{}", std::process::id());
@@ -66430,7 +66524,7 @@ fn gist_and_spgist_knn_ordering_covers_parameters_overlays_mvcc_and_cold_recover
     config.wal_buffer_bytes = 1 << 20;
     config.wal_bytes = 8 << 20;
     config.memtable_bytes = 8 << 20;
-    config.table_rows = 8192;
+    config.row_overlay_slots = 8192;
     config.txn_rows = 8192;
     config.max_indexes = 16;
     config.value_index_rows = 16384;
@@ -66654,7 +66748,7 @@ fn ranked_knn_navigation_bounds_cold_object_reads_for_gist_and_spgist() {
     config.wal_buffer_bytes = 16 << 20;
     config.wal_bytes = 32 << 20;
     config.memtable_bytes = 32 << 20;
-    config.table_rows = 8192;
+    config.row_overlay_slots = 8192;
     config.txn_rows = 16384;
     config.value_index_rows = 16384;
     config.max_indexes = 8;
@@ -66765,7 +66859,7 @@ fn gin_and_spgist_indexes_drive_predicates_catalogs_dml_and_cold_object_scans() 
     config.wal_buffer_bytes = 1 << 20;
     config.wal_bytes = 8 << 20;
     config.memtable_bytes = 8 << 20;
-    config.table_rows = 8192;
+    config.row_overlay_slots = 8192;
     config.txn_rows = 8192;
     config.value_index_rows = 32768;
     config.object_store_bucket = format!("physical-gin-spgist-indexes-{}", std::process::id());
@@ -67378,7 +67472,7 @@ fn startup_sized_policy_catalog_executes_above_old_cluster_and_table_bounds() {
     const CAPACITY: usize = 1025;
     let mut config = test_config("policy-catalog-capacity");
     config.max_tables = 1;
-    config.table_rows = 4;
+    config.row_overlay_slots = 4;
     config.max_policies = CAPACITY;
     config.max_routines = 1;
     config.max_triggers = 1;
@@ -67527,7 +67621,7 @@ fn wide_routines_triggers_and_policy_catalog_survive_object_cold_recovery() {
     const POLICIES: usize = 40;
     let mut config = test_config("wide-callable-policy");
     config.max_tables = 2;
-    config.table_rows = 8;
+    config.row_overlay_slots = 8;
     config.max_routines = 4;
     config.max_triggers = 1;
     config.max_policies = POLICIES;
@@ -67841,7 +67935,7 @@ fn wide_schema_objects_cover_full_definition_bounds_and_object_cold_recovery() {
     config.max_indexes = 4;
     config.max_value_indexes = 132;
     config.value_index_rows = 8;
-    config.table_rows = 16;
+    config.row_overlay_slots = 16;
     config.wal_buffer_bytes = 64 << 20;
     config.wal_upload_buffer_bytes = 64 << 20;
     config.checkpoint_manifest_bytes = 64 << 20;
@@ -68454,7 +68548,8 @@ fn configured_table_capacity_survives_checkpoint_retry_and_object_cold_recovery(
     // Two spare catalog slots let the dropped identities remain transactionally
     // observable while their replacements take fresh slots above the old cap.
     config.max_tables = TABLES + 2;
-    config.table_rows = 1;
+    config.row_overlay_slots = TABLES + 2;
+    config.definition_image_slots = TABLES + 4;
     config.txn_rows = 8;
     config.memtable_bytes = 16 << 20;
     config.work_arena_bytes = 256 << 20;
@@ -68878,7 +68973,7 @@ fn brin_inclusion_indexes_execute_range_and_network_predicates() {
     config.wal_buffer_bytes = 1 << 20;
     config.wal_bytes = 8 << 20;
     config.memtable_bytes = 8 << 20;
-    config.table_rows = 8192;
+    config.row_overlay_slots = 8192;
     config.txn_rows = 8192;
     config.value_index_rows = 16384;
     config.object_store_bucket = format!("brin-inclusion-indexes-{}", std::process::id());
@@ -69041,7 +69136,7 @@ fn composite_index_access_is_parameterized_prefix_aware_and_durable() {
     config.wal_bytes = 8 << 20;
     config.memtable_bytes = 8 << 20;
     config.txn_rows = 8192;
-    config.table_rows = 8192;
+    config.row_overlay_slots = 8192;
     config.value_index_rows = 8192;
     config.object_store_bucket = format!("composite-index-access-{}", std::process::id());
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
@@ -69977,7 +70072,7 @@ fn expression_and_partial_indexes_drive_queries_joins_dml_and_cold_ordering() {
     config.wal_buffer_bytes = 2 << 20;
     config.wal_bytes = 8 << 20;
     config.memtable_bytes = 8 << 20;
-    config.table_rows = 1024;
+    config.row_overlay_slots = 1024;
     config.value_index_rows = 3072;
     config.object_store_bucket = format!("expression-partial-access-{}", std::process::id());
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
@@ -70956,7 +71051,7 @@ fn index_file_owners_unrelated_commits_preserve_index_access_for_an_older_snapsh
 #[test]
 fn uniqueness_cache_capacity_never_limits_table_correctness() {
     let mut config = test_config("value-index-cache-capacity");
-    config.table_rows = 32;
+    config.row_overlay_slots = 32;
     config.value_index_rows = 1;
     let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 27));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -70998,7 +71093,7 @@ fn durable_value_probe_is_not_capped_by_the_resident_overlay() {
     config.object_store_sim = true;
     config.wal_upload = true;
     config.wal_upload_sync = true;
-    config.table_rows = 4;
+    config.row_overlay_slots = 4;
     config.txn_rows = 4;
     config.value_index_rows = 1;
     config.object_store_bucket = format!("durable-value-probe-{}", std::process::id());
@@ -72610,7 +72705,7 @@ fn checkpoint_does_not_carry_spilled_rows_across_reused_table_slots() {
     config.object_store_bucket = format!("reused-spill-slot-{}-{sequence}", std::process::id());
     config.object_store_response_bytes = 1 << 20;
     config.memtable_bytes = 64 * 1024;
-    config.table_rows = 512;
+    config.row_overlay_slots = 512;
     config.wal_buffer_bytes = 256 * 1024;
     config.wal_upload_buffer_bytes = 256 * 1024;
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
@@ -72751,7 +72846,7 @@ fn configured_spill_generation_rosters_survive_more_than_eight_cold_deltas() {
     config.wal_upload = true;
     config.wal_upload_sync = true;
     config.object_store_bucket = format!("spill-generation-rosters-{}", std::process::id());
-    config.table_rows = 32;
+    config.row_overlay_slots = 32;
     config.value_index_rows = 32;
     config.memtable_bytes = 2 << 20;
     config.wal_bytes = 8 << 20;
@@ -72832,7 +72927,7 @@ fn temporary_rows_spill_locally_without_object_publication() {
     config.object_store_sim = true;
     config.object_store_bucket = format!("temporary-local-spill-{}-{sequence}", std::process::id());
     config.memtable_bytes = 256 * 1024;
-    config.table_rows = 512;
+    config.row_overlay_slots = 512;
     config.temporary_spill_bytes = 64 * crate::store::BLOCK_SIZE;
     let namespace = crate::object_store::sim::open_namespace(&config.object_store_bucket, 0);
     let mut budget = test_engine_budget(&config, (1 << 29) + (96 << 20));
@@ -72983,7 +73078,7 @@ fn temporary_rows_spill_with_durable_object_storage_disabled() {
     let mut config = test_config("temporary-local-spill-object-off");
     config.object_store_on = false;
     config.memtable_bytes = 128 * 1024;
-    config.table_rows = 256;
+    config.row_overlay_slots = 256;
     config.temporary_spill_bytes = 32 * crate::store::BLOCK_SIZE;
     let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 28));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -77176,6 +77271,7 @@ fn pgoutput_apply_is_typed_transactional_and_acknowledges_only_after_commit() {
         &config,
         engine.subscription_confirmed_lsn("apply_changes").unwrap(),
         crate::storage::SubscriptionBehavior::POSTGRESQL_18_DEFAULT,
+        std::sync::Arc::clone(&engine.storage.row_work),
     )
     .unwrap();
     let relation = [
@@ -77524,6 +77620,7 @@ fn pgoutput_apply_is_typed_transactional_and_acknowledges_only_after_commit() {
         &config,
         121,
         no_origin_behavior,
+        std::sync::Arc::clone(&engine.storage.row_work),
     )
     .unwrap();
     begin[8] = 130;
@@ -77602,7 +77699,15 @@ fn streamed_pgoutput_and_skip_share_the_exact_durable_frontier() {
         .unwrap()
         .1
         .behavior;
-    let mut apply = SubscriptionApply::new(&mut budget, stream, &config, 0, behavior).unwrap();
+    let mut apply = SubscriptionApply::new(
+        &mut budget,
+        stream,
+        &config,
+        0,
+        behavior,
+        std::sync::Arc::clone(&engine.storage.row_work),
+    )
+    .unwrap();
     let relation = [
         b'R', 0, 0, 0, 1, b'p', b'u', b'b', b'l', b'i', b'c', 0, b's', b't', b'r', b'e', b'a',
         b'm', b'e', b'd', b'_', b'r', b'o', b'w', b's', 0, b'd', 0, 2, 1, b'i', b'd', 0, 0, 0, 0,
@@ -77875,6 +77980,7 @@ fn pgoutput_root_relation_apply_routes_moves_and_deletes_partition_rows() {
         &config,
         0,
         crate::storage::SubscriptionBehavior::POSTGRESQL_18_DEFAULT,
+        std::sync::Arc::clone(&engine.storage.row_work),
     )
     .unwrap();
     assert_eq!(
@@ -79838,7 +79944,7 @@ fn checkpoint_retained_rows_preserve_sst_partition_after_eviction_between_beats(
     engine.storage.set_commit_snapshot(0);
     let mut cursor = crate::storage::CheckpointRowCursor::new(
         config.max_spill_generations_per_table,
-        config.table_rows,
+        config.row_overlay_slots,
     );
     let mut arena =
         crate::mem::arena::Arena::new(&mut budget, "checkpoint retained source", 1 << 20).unwrap();
@@ -80081,7 +80187,7 @@ fn retained_sst_durable_reader_survives_retirement_and_releases_garbage() {
     );
     let mut cursor = crate::storage::CheckpointRowCursor::new(
         config.max_spill_generations_per_table,
-        config.table_rows,
+        config.row_overlay_slots,
     );
     let mut arena =
         crate::mem::arena::Arena::new(&mut budget, "retained SST test", 1 << 20).unwrap();
@@ -80169,7 +80275,7 @@ fn retained_sst_temporary_reader_survives_retirement_and_releases_blocks() {
     };
     let mut cursor = crate::storage::CheckpointRowCursor::new(
         config.max_spill_generations_per_table,
-        config.table_rows,
+        config.row_overlay_slots,
     );
     let mut arena =
         crate::mem::arena::Arena::new(&mut budget, "retained temporary SST test", 1 << 20).unwrap();
@@ -80243,7 +80349,7 @@ fn checkpoint_value_source_resumes_inside_a_spilled_pax_block() {
     config.wal_upload_sync = true;
     config.wal_bytes = 32 << 20;
     config.wal_buffer_bytes = 2 << 20;
-    config.table_rows = 3072;
+    config.row_overlay_slots = 3072;
     config.value_index_rows = 3072;
     config.memtable_bytes = 16 << 20;
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
@@ -80379,7 +80485,7 @@ fn checkpoint_value_index_writes_are_bounded_restartable_and_recoverable() {
     config.object_store_response_bytes = 1 << 20;
     config.wal_upload = true;
     config.wal_upload_sync = true;
-    config.table_rows = 4096;
+    config.row_overlay_slots = 4096;
     config.txn_rows = 4096;
     config.value_index_rows = 4096;
     config.work_arena_bytes = 32 << 20;
@@ -80766,7 +80872,7 @@ fn checkpoint_value_index_merges_changed_rows_with_cold_navigation_base() {
     config.wal_upload = true;
     config.wal_upload_buffer_bytes = 33554432;
     config.wal_upload_sync = true;
-    config.table_rows = 4096;
+    config.row_overlay_slots = 4096;
     config.txn_rows = 4096;
     config.value_index_rows = 4096;
     config.work_arena_bytes = 64 << 20;
@@ -80913,7 +81019,7 @@ fn analyze_and_index_refresh_coalesce_wide_pax_reads_after_cold_recovery() {
     config.object_store_bucket = format!("sql-analyze-pax-container-{}", std::process::id());
     config.object_store_response_bytes = 1 << 20;
     config.txn_rows = 1024;
-    config.table_rows = 1024;
+    config.row_overlay_slots = 1024;
     config.value_index_rows = 1024;
     config.work_arena_bytes = 96 << 20;
     config.memtable_bytes = 8 << 20;
@@ -81020,7 +81126,7 @@ fn checkpoint_reuses_published_index_blocks_after_small_update() {
     config.wal_upload_sync = true;
     config.wal_bytes = 4 << 20;
     config.wal_buffer_bytes = 1 << 20;
-    config.table_rows = 2048;
+    config.row_overlay_slots = 2048;
     config.value_index_rows = 2048;
     config.block_cache_bytes = 0;
     config.disk_cache_bytes = 0;
@@ -81894,7 +82000,7 @@ fn checkpoint_compaction_retains_every_overlay_generation() {
         format!("sql-checkpoint-overlay-generations-{}", std::process::id());
     config.object_store_response_bytes = 1 << 20;
     config.memtable_bytes = 512 << 10;
-    config.table_rows = 1024;
+    config.row_overlay_slots = 1024;
     config.wal_buffer_bytes = 1 << 20;
     config.work_arena_bytes = 96 << 20;
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
@@ -81961,7 +82067,7 @@ fn checkpoint_reports_publication_before_paced_maintenance() {
         format!("sql-checkpoint-publication-handoff-{}", std::process::id());
     config.object_store_response_bytes = 1 << 20;
     config.memtable_bytes = 256 << 10;
-    config.table_rows = 512;
+    config.row_overlay_slots = 512;
     config.wal_buffer_bytes = 1 << 20;
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
@@ -82112,7 +82218,7 @@ fn checkpoint_reslice_appends_only_commits_after_the_prior_slice() {
     config.object_store_response_bytes = 1 << 20;
     config.block_cache_bytes = 0;
     config.disk_cache_bytes = 0;
-    config.table_rows = 512;
+    config.row_overlay_slots = 512;
     config.value_index_rows = 512;
     config.memtable_bytes = 8 << 20;
     config.wal_bytes = 8 << 20;
@@ -82388,7 +82494,7 @@ fn packed_row_delta_bounds_publication_objects_and_recovers() {
     config.object_store_sim = true;
     config.object_store_bucket = format!("sql-checkpoint-packed-row-delta-{}", std::process::id());
     config.object_store_response_bytes = 1 << 20;
-    config.table_rows = 512;
+    config.row_overlay_slots = 512;
     config.memtable_bytes = 4 << 20;
     config.wal_bytes = 8 << 20;
     config.wal_buffer_bytes = 2 << 20;
@@ -82463,7 +82569,7 @@ fn dirty_full_roster_merges_across_bounded_checkpoint_beats() {
         format!("sql-checkpoint-full-roster-pacing-{}", std::process::id());
     config.object_store_response_bytes = 1 << 20;
     config.max_spill_generations_per_table = 2;
-    config.table_rows = 512;
+    config.row_overlay_slots = 512;
     config.value_index_rows = 512;
     config.memtable_bytes = 4 << 20;
     config.wal_bytes = 8 << 20;
@@ -82636,7 +82742,7 @@ fn row_merge_reuses_unchanged_wide_pax_groups_across_beats() {
         format!("sql-checkpoint-retained-pax-merge-{}", std::process::id());
     config.object_store_response_bytes = 1 << 20;
     config.max_spill_generations_per_table = 2;
-    config.table_rows = 512;
+    config.row_overlay_slots = 512;
     config.memtable_bytes = 4 << 20;
     config.wal_bytes = 8 << 20;
     config.wal_buffer_bytes = 2 << 20;
@@ -84015,7 +84121,7 @@ fn external_runs_use_object_storage_after_cold_cache(phase: ExternalRunPhase) {
     config.wal_bytes = 16 << 20;
     config.block_cache_bytes = crate::store::BLOCK_SIZE;
     config.disk_cache_bytes = crate::store::BLOCK_SIZE;
-    config.table_rows = 4096;
+    config.row_overlay_slots = 4096;
     config.memtable_bytes = 8 << 20;
     // The sorted projection is about 6 MiB. This bound proves execution
     // recycles batches instead of retaining the result in the work arena.
@@ -85638,7 +85744,7 @@ fn external_windows_spill_through_the_provider_neutral_block_store() {
     config.disk_cache_bytes = crate::store::BLOCK_SIZE;
     // Reserve row maps and version capacity for the two fixture relations.
     config.max_tables = 2;
-    config.table_rows = 24576;
+    config.row_overlay_slots = 24576;
     config.memtable_bytes = 4 << 20;
     // The 20000-row fixture is ~160 KiB of rows, so the memtable holds it;
     // window spill pressure comes from the external sorter, not the memtable.
@@ -90374,7 +90480,7 @@ fn remaining_execution_widths_are_allocation_free_and_survive_cold_recovery() {
     let mut config = test_config("postgresql-remaining-execution-widths-fixture");
     config.cursor_bytes = 4 << 20;
     config.txn_rows = 4_096;
-    config.table_rows = 4_096;
+    config.row_overlay_slots = 4_096;
     config.memtable_bytes = 16 << 20;
     config.wal_bytes = 16 << 20;
     config.wal_buffer_bytes = 4 << 20;
@@ -90448,7 +90554,8 @@ fn cte_ctas_sequence_effects_survive_row_scratch_rewinds() {
 fn remaining_inline_widths_are_allocation_free_and_survive_cold_recovery() {
     let mut config = test_config("remaining-inline-widths");
     config.max_schemas = 32;
-    config.table_rows = 2_048;
+    // The included fixture retains 1,100 split rows and one path-target row.
+    config.row_overlay_slots = 1_100 + 1 + 1_200;
     config.txn_rows = 2_048;
     config.memtable_bytes = 16 << 20;
     config.wal_bytes = 16 << 20;
@@ -90538,7 +90645,7 @@ fn remaining_inline_widths_are_allocation_free_and_survive_cold_recovery() {
 #[test]
 fn array_value_width_is_allocation_free_and_survives_cold_recovery() {
     let mut config = test_config("array-value-width");
-    config.table_rows = 2_048;
+    config.row_overlay_slots = 2_048;
     config.txn_rows = 2_048;
     config.memtable_bytes = 16 << 20;
     config.wal_bytes = 16 << 20;
@@ -90613,7 +90720,7 @@ fn array_value_width_is_allocation_free_and_survives_cold_recovery() {
 fn statement_list_width_is_allocation_free_and_survives_cold_recovery() {
     let mut config = test_config("statement-list-width");
     config.max_roles = 128;
-    config.table_rows = 2_048;
+    config.row_overlay_slots = 2_048;
     config.txn_rows = 2_048;
     config.memtable_bytes = 16 << 20;
     config.wal_bytes = 16 << 20;
@@ -90912,7 +91019,7 @@ fn on_conflict_where_false_retains_lock_strength_and_savepoint_releases_it() {
 #[test]
 fn on_conflict_reuses_expression_scratch_in_fixed_execution_memory() {
     let mut config = test_config("conflict-fixed-arena");
-    config.table_rows = 1024;
+    config.row_overlay_slots = 1024;
     config.work_arena_bytes = 16 << 10;
     let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -91033,7 +91140,7 @@ fn dml_target_bytes_survive_rollback_table_reuse_and_storage_removal() {
     );
     session.transaction.begin_command().unwrap();
     let capture_arena = Arena::new(&mut budget, "retained DML test", 1 << 20).unwrap();
-    let mut scratch = FixedVec::new(&mut budget, "retained DML test rows", 128).unwrap();
+    let mut scratch = engine.row_work_pool().lease(0).unwrap();
     let images = crate::mem::guard::forbid_alloc(|| {
         crate::sql::exec::collect_matches(
             &engine.storage,
@@ -91906,8 +92013,7 @@ fn alter_rewrite_sources_keep_selected_pending_and_saved_bytes_after_rollback_an
         session.success(&mut engine,
             "BEGIN; UPDATE alter_source SET amount = amount + 100 WHERE id = 2; DELETE FROM alter_source WHERE id = 3", true);
         let table = engine.storage.find_table("public", "alter_source").unwrap();
-        let mut scratch =
-            crate::mem::fixed_vec::FixedVec::new(&mut budget, "alter selected rows", 3).unwrap();
+        let mut scratch = engine.row_work_pool().lease(0).unwrap();
         let arena = Arena::new(&mut budget, "alter selected source", 2 << 20).unwrap();
         let source = crate::mem::guard::forbid_alloc(|| {
             exec::capture_alter_rewrite_rows(
@@ -91989,10 +92095,9 @@ fn alter_rewrite_sources_release_failed_capture_and_allow_fixed_capacity_retry()
         .unwrap();
     let arena = Arena::new(&mut budget, "alter capture retry", 2 << 20).unwrap();
     let tiny = Arena::new(&mut budget, "alter tiny arena", 1).unwrap();
-    let mut short =
-        crate::mem::fixed_vec::FixedVec::new(&mut budget, "alter short scratch", 2).unwrap();
-    let mut complete =
-        crate::mem::fixed_vec::FixedVec::new(&mut budget, "alter complete scratch", 3).unwrap();
+    let short_pool = crate::mem::lease_pool::RowWorkPool::new(&mut budget, 64, 1).unwrap();
+    let mut short = short_pool.lease(0).unwrap();
+    let mut complete = engine.row_work_pool().lease(0).unwrap();
     crate::mem::guard::forbid_alloc(|| {
         let error = exec::capture_alter_rewrite_rows(
             &engine.storage,
@@ -92009,7 +92114,7 @@ fn alter_rewrite_sources_release_failed_capture_and_allow_fixed_capacity_retry()
             error
                 .message
                 .as_str()
-                .contains("ALTER touches more than 2 rows")
+                .contains("ALTER row selection: row work pool exhausted")
         );
         assert!(short.is_empty());
         let error = exec::capture_alter_rewrite_rows(
@@ -92049,7 +92154,7 @@ fn alter_rewrite_sources_release_failed_capture_and_allow_fixed_capacity_retry()
 #[test]
 fn alter_rewrite_sources_metadata_changes_stream_saved_rows_beyond_update_capacity() {
     let mut config = test_config("alter-saved-definition");
-    config.table_rows = 8;
+    config.row_overlay_slots = 8;
     config.object_store_on = true;
     config.object_store_sim = true;
     config.wal_upload = false;
@@ -92172,6 +92277,7 @@ fn subscription_copy_transition_values_survive_worker_rewinds_and_abort() {
         &config,
         0,
         crate::storage::SubscriptionBehavior::POSTGRESQL_18_DEFAULT,
+        std::sync::Arc::clone(&engine.storage.row_work),
     )
     .unwrap();
     let schema = SqlName::parse("public").unwrap();
@@ -92722,6 +92828,7 @@ fn pgoutput_descriptors_refresh_after_local_ddl_without_new_relation_frames() {
         &config,
         0,
         crate::storage::SubscriptionBehavior::POSTGRESQL_18_DEFAULT,
+        std::sync::Arc::clone(&engine.storage.row_work),
     )
     .unwrap();
     receive(
@@ -95759,7 +95866,7 @@ fn bounded_snapshot_history_advances_between_queries_without_object_store() {
     config.wal_upload = false;
     config.wal_upload_sync = false;
     config.max_tables = 2;
-    config.table_rows = 512;
+    config.row_overlay_slots = 512;
     config.large_object_pages = 1;
     config.memtable_bytes = 4 << 20;
     let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
@@ -95988,7 +96095,7 @@ fn sliced_heap_capture_queries_and_writes_run_between_one_slot_turns() {
     assert!(!message_types(&output).contains(&b'E'));
     assert!(engine.compact_scratch.active());
     crate::mem::guard::forbid_alloc(|| {
-        let bound = config.max_tables + config.table_rows + 32;
+        let bound = config.max_tables + config.row_overlay_slots + 32;
         let mut finished = false;
         for _ in 0..bound {
             if engine
@@ -96131,7 +96238,7 @@ fn sliced_heap_capture_database_clone_behind_cursor_survives_source_removal() {
     );
     crate::mem::guard::forbid_alloc(|| {
         let mut finished = false;
-        for _ in 0..config.max_tables + config.table_rows + 32 {
+        for _ in 0..config.max_tables + config.row_overlay_slots + 32 {
             if engine
                 .compact_scratch
                 .step(
@@ -96327,7 +96434,7 @@ fn parallel_commit_prepared_receipts_survive_slot_release_and_reuse() {
         config.max_ddl_per_transaction = 4;
         config.max_prepared_transactions = 1;
         config.txn_rows = 8;
-        config.table_rows = 8;
+        config.row_overlay_slots = 8;
         config.work_arena_bytes = 4 << 20;
         config.object_store_bucket = format!("prepared-receipts-{}-{commit}", std::process::id());
         crate::object_store::sim::drop_namespace(&config.object_store_bucket);
@@ -96511,7 +96618,7 @@ fn parallel_commit_begin_boundary_preserves_prefixes_and_sequence_gaps() {
         config.wal_upload_sync = true;
         config.max_ddl_per_transaction = 4;
         config.txn_rows = 8;
-        config.table_rows = 8;
+        config.row_overlay_slots = 8;
         config.work_arena_bytes = 4 << 20;
         config.object_store_bucket = format!("begin-boundary-{label}-{}", std::process::id());
         crate::object_store::sim::drop_namespace(&config.object_store_bucket);
@@ -96656,7 +96763,7 @@ fn parallel_commit_partition_detach_keeps_phase_receipts_before_reader_waits() {
         config.wal_upload_sync = true;
         config.max_ddl_per_transaction = 8;
         config.txn_rows = 8;
-        config.table_rows = 8;
+        config.row_overlay_slots = 8;
         config.work_arena_bytes = 4 << 20;
         config.object_store_bucket =
             format!("detach-phase-receipt-{extended}-{}", std::process::id());
@@ -96780,7 +96887,7 @@ fn parallel_physical_table_slices_preserve_interleaved_changes_in_both_modes() {
         config.object_store_sim = true;
         config.object_store_bucket = format!("physical-table-slice-{label}-{}", std::process::id());
         config.max_tables = 8;
-        config.table_rows = 256;
+        config.row_overlay_slots = 256;
         config.block_cache_bytes = 0;
         config.disk_cache_bytes = 0;
         crate::object_store::sim::drop_namespace(&config.object_store_bucket);
@@ -96866,7 +96973,7 @@ fn parallel_physical_table_slices_discard_replaced_encodings_and_keep_truncation
         config.object_store_bucket =
             format!("physical-table-replacement-{change}-{}", std::process::id());
         config.max_tables = 8;
-        config.table_rows = 256;
+        config.row_overlay_slots = 256;
         config.block_cache_bytes = 0;
         config.disk_cache_bytes = 0;
         crate::object_store::sim::drop_namespace(&config.object_store_bucket);
@@ -96946,7 +97053,7 @@ fn parallel_physical_table_write_capacity_names_the_limit_before_publication() {
     config.object_store_sim = true;
     config.object_store_bucket = format!("physical-table-write-capacity-{}", std::process::id());
     config.max_tables = 4;
-    config.table_rows = 8;
+    config.row_overlay_slots = 8;
     config.checkpoint_write_entries = 1;
     config.block_cache_bytes = 0;
     config.disk_cache_bytes = 0;
@@ -97009,7 +97116,7 @@ fn parallel_physical_columnar_generations_preserve_overflow_rows_on_cold_recover
     config.object_store_sim = true;
     config.object_store_bucket = format!("physical-columnar-overflow-{}", std::process::id());
     config.max_tables = 4;
-    config.table_rows = 8;
+    config.row_overlay_slots = 8;
     config.memtable_bytes = 8 << 20;
     config.sql_arena_bytes = 4 << 20;
     config.work_arena_bytes = 4 << 20;
@@ -97058,7 +97165,7 @@ fn parallel_physical_table_handles_stay_private_until_uploads_complete() {
     config.object_store_bucket = format!("physical-table-pending-output-{}", std::process::id());
     config.object_store_block_put_slots = 1;
     config.max_tables = 4;
-    config.table_rows = 8;
+    config.row_overlay_slots = 8;
     config.block_cache_bytes = 0;
     config.disk_cache_bytes = 0;
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
@@ -97144,7 +97251,7 @@ fn parallel_physical_table_capture_releases_deletion_owners_on_failure_and_drop(
         config.object_store_bucket =
             format!("physical-deletion-owner-{captured}-{}", std::process::id());
         config.max_tables = 4;
-        config.table_rows = 4;
+        config.row_overlay_slots = 4;
         config.checkpoint_write_entries = if captured { 4 } else { 1 };
         config.block_cache_bytes = 0;
         config.disk_cache_bytes = 0;
@@ -97227,7 +97334,7 @@ fn parallel_physical_index_files_wait_for_uploads_and_recover_without_caches() {
             format!("physical-index-batches-{slots}-{}", std::process::id());
         config.object_store_block_put_slots = slots;
         config.max_tables = 4;
-        config.table_rows = 512;
+        config.row_overlay_slots = 512;
         config.txn_rows = 512;
         config.value_index_rows = 512;
         config.memtable_bytes = 8 << 20;
@@ -97343,7 +97450,7 @@ fn parallel_physical_merge_source_failures_retry_the_same_pair_without_losing_ro
             std::process::id()
         );
         config.max_tables = 4;
-        config.table_rows = 32;
+        config.row_overlay_slots = 32;
         config.max_spill_generations_per_table = 2;
         config.block_cache_bytes = 0;
         config.disk_cache_bytes = 0;
@@ -97455,7 +97562,7 @@ fn held_maintenance_read(mode: crate::config::TransactionMode, phase: &str) {
     config.block_cache_bytes = 0;
     config.disk_cache_bytes = 0;
     config.max_tables = 4;
-    config.table_rows = if phase.starts_with("index_") { 512 } else { 32 };
+    config.row_overlay_slots = if phase.starts_with("index_") { 512 } else { 32 };
     config.max_spill_generations_per_table = 2;
     config.memtable_bytes = 8 << 20;
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
@@ -97969,7 +98076,7 @@ fn parallel_physical_index_changes_cancel_unready_uploads_in_both_modes() {
             format!("physical-index-cancel-{label}-{}", std::process::id());
         config.object_store_block_put_slots = 1;
         config.max_tables = 4;
-        config.table_rows = 8;
+        config.row_overlay_slots = 8;
         config.value_index_rows = 8;
         config.block_cache_bytes = 0;
         config.disk_cache_bytes = 0;
@@ -98065,7 +98172,7 @@ fn parallel_physical_manifest_completion_preserves_later_rows_and_indexes() {
         config.wal_upload_sync = true;
         config.object_store_bucket = format!("manifest-late-rows-{label}-{}", std::process::id());
         config.max_tables = 4;
-        config.table_rows = 16;
+        config.row_overlay_slots = 16;
         config.value_index_rows = 16;
         config.block_cache_bytes = 0;
         config.disk_cache_bytes = 0;
@@ -98186,7 +98293,7 @@ fn parallel_physical_manifest_completion_skips_rewritten_and_replaced_tables() {
         config.object_store_bucket =
             format!("manifest-new-layout-{replacement}-{}", std::process::id());
         config.max_tables = 4;
-        config.table_rows = 16;
+        config.row_overlay_slots = 16;
         config.value_index_rows = 16;
         config.block_cache_bytes = 0;
         config.disk_cache_bytes = 0;
@@ -98288,7 +98395,7 @@ fn parallel_physical_explicit_reindex_does_not_read_the_retired_corrupt_roster()
     config.object_store_sim = true;
     config.object_store_bucket = format!("reindex-corrupt-roster-{}", std::process::id());
     config.max_tables = 4;
-    config.table_rows = 16;
+    config.row_overlay_slots = 16;
     config.value_index_rows = 16;
     config.block_cache_bytes = 0;
     config.disk_cache_bytes = 0;
@@ -98377,7 +98484,7 @@ fn parallel_physical_manifest_install_failure_resumes_without_republishing_or_re
     config.wal_upload_sync = true;
     config.object_store_bucket = format!("manifest-install-retry-{}", std::process::id());
     config.max_tables = 4;
-    config.table_rows = 16;
+    config.row_overlay_slots = 16;
     config.max_spill_generations_per_table = 2;
     config.block_cache_bytes = 0;
     config.disk_cache_bytes = 0;
@@ -98516,7 +98623,7 @@ fn parallel_checkpoint_requests_finish_their_own_snapshot_without_chasing_later_
     config.wal_upload_sync = true;
     config.object_store_bucket = format!("checkpoint-request-receipts-{}", std::process::id());
     config.max_tables = 4;
-    config.table_rows = 16;
+    config.row_overlay_slots = 16;
     config.block_cache_bytes = 0;
     config.disk_cache_bytes = 0;
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
@@ -98701,7 +98808,7 @@ fn parallel_checkpoint_failures_reach_waiters_and_do_not_poison_new_or_cancelled
     config.wal_upload_sync = true;
     config.object_store_bucket = format!("checkpoint-request-errors-{}", std::process::id());
     config.max_tables = 4;
-    config.table_rows = 16;
+    config.row_overlay_slots = 16;
     config.value_index_rows = 16;
     config.block_cache_bytes = 0;
     config.disk_cache_bytes = 0;
@@ -98886,10 +98993,8 @@ fn parallel_checkpoint_failures_reach_waiters_and_do_not_poison_new_or_cancelled
 #[test]
 fn atomic_block_reads_function_and_sequence_effects_survive_cold_http_reads_once() {
     use crate::store::BlockStore;
-    use std::io::{Read, Write};
-    use std::net::TcpListener;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::Ordering;
     use std::time::Duration;
 
     for extended in [false, true] {
@@ -98912,7 +99017,7 @@ fn atomic_block_reads_function_and_sequence_effects_survive_cold_http_reads_once
         config.block_cache_bytes = 0;
         config.disk_cache_bytes = 0;
         config.max_tables = 4;
-        config.table_rows = 16;
+        config.row_overlay_slots = 16;
         crate::object_store::sim::drop_namespace(&config.object_store_bucket);
         let mut budget = test_engine_budget(&config, 1 << 29);
         let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -98957,155 +99062,10 @@ fn atomic_block_reads_function_and_sequence_effects_survive_cold_http_reads_once
             RowCleanupTarget::Table(table),
         );
 
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
-        config.object_store_sim = false;
-        config.object_store_endpoint = listener.local_addr().unwrap().to_string();
-        config.object_store_access_key = "test-access".to_string();
-        config.object_store_secret_key = "test-secret".to_string();
-        let prefix = format!("/{}/", config.object_store_bucket);
-        let mut fixture_config = config.clone();
-        fixture_config.object_store_sim = true;
-        // HTTP paths already contain the configured object prefix.
-        fixture_config.object_store_prefix.clear();
-        let stop = Arc::new(AtomicBool::new(false));
-        let requests = Arc::new(AtomicUsize::new(0));
-        let uploads = Arc::new(AtomicUsize::new(0));
-        let hold_response = Arc::new(AtomicBool::new(false));
-        let server_stop = Arc::clone(&stop);
-        let server_requests = Arc::clone(&requests);
-        let server_uploads = Arc::clone(&uploads);
-        let server_hold_response = Arc::clone(&hold_response);
-        let server = std::thread::spawn(move || {
-            let mut fixture_budget =
-                Budget::new(crate::object_store::Client::budget_bytes(&fixture_config));
-            let mut backing =
-                crate::object_store::Client::new(&fixture_config, &mut fixture_budget).unwrap();
-            while !server_stop.load(Ordering::Acquire) {
-                let mut stream = match listener.accept() {
-                    Ok((stream, _)) => stream,
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(Duration::from_millis(1));
-                        continue;
-                    }
-                    Err(error) => panic!("accept object read: {error}"),
-                };
-                stream.set_nonblocking(false).unwrap();
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(2)))
-                    .unwrap();
-                stream
-                    .set_write_timeout(Some(Duration::from_secs(2)))
-                    .unwrap();
-                let mut request = [0u8; 8192];
-                let mut received = 0;
-                let header_end = loop {
-                    if let Some(at) = request[..received]
-                        .windows(4)
-                        .position(|bytes| bytes == b"\r\n\r\n")
-                    {
-                        break at + 4;
-                    }
-                    assert!(
-                        received < request.len(),
-                        "fixture request headers are too large"
-                    );
-                    let n = stream.read(&mut request[received..]).unwrap();
-                    assert_ne!(n, 0, "request ended before its headers");
-                    received += n;
-                };
-                let headers = std::str::from_utf8(&request[..header_end]).unwrap();
-                let mut words = headers.lines().next().unwrap().split_whitespace();
-                let method = words.next().unwrap();
-                let key = words.next().unwrap().strip_prefix(&prefix).unwrap();
-                let mut content_length = None;
-                let mut range = None;
-                let mut if_none_match = None;
-                let mut if_match = None;
-                for line in headers.lines().skip(1).filter(|line| !line.is_empty()) {
-                    let (name, value) = line.split_once(':').expect("HTTP header field");
-                    let value = value.trim();
-                    if name.eq_ignore_ascii_case("Content-Length") {
-                        content_length = Some(value.parse::<usize>().unwrap());
-                    } else if name.eq_ignore_ascii_case("Range") {
-                        range = Some(value);
-                    } else if name.eq_ignore_ascii_case("If-None-Match") {
-                        if_none_match = Some(value);
-                    } else if name.eq_ignore_ascii_case("If-Match") {
-                        if_match = Some(crate::object_store::EntityTag::parse(value).unwrap());
-                    }
-                }
-                let length = match content_length {
-                    Some(length) => length,
-                    None => {
-                        assert_ne!(method, "PUT", "PUT requires Content-Length");
-                        0
-                    }
-                };
-                assert!(
-                    length <= backing.response_capacity(),
-                    "fixture request body is too large"
-                );
-                let mut body = vec![0u8; length];
-                let buffered = received - header_end;
-                assert!(
-                    buffered <= length,
-                    "unexpected bytes after the request body"
-                );
-                body[..buffered].copy_from_slice(&request[header_end..received]);
-                stream.read_exact(&mut body[buffered..]).unwrap();
-                match method {
-                    "PUT" => {
-                        let condition = match (if_none_match, if_match.as_ref()) {
-                            (Some("*"), None) => crate::object_store::Precondition::IfNoneMatchAny,
-                            (None, Some(tag)) => crate::object_store::Precondition::IfMatch(tag),
-                            (None, None) => crate::object_store::Precondition::None,
-                            _ => panic!("unsupported conditional request"),
-                        };
-                        match backing.put(key, &body, condition) {
-                            Ok(tag) => {
-                                server_uploads.fetch_add(1, Ordering::Relaxed);
-                                write!(stream, "HTTP/1.1 200 OK\r\nETag: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", tag.as_str()).unwrap();
-                            }
-                            Err(crate::object_store::Error::Status { code: 412, .. }) => {
-                                stream.write_all(b"HTTP/1.1 412 Precondition Failed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
-                            }
-                            Err(error) => panic!("fixture object upload failed: {error}"),
-                        }
-                    }
-                    "DELETE" => {
-                        backing.delete(key).unwrap();
-                        stream.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
-                    }
-                    "GET" => {
-                        let metadata = backing.get(key, None).unwrap();
-                        let data = backing.body_bytes();
-                        server_requests.fetch_add(1, Ordering::Relaxed);
-                        while server_hold_response.load(Ordering::Acquire)
-                            && !server_stop.load(Ordering::Acquire)
-                        {
-                            std::thread::sleep(Duration::from_millis(1));
-                        }
-                        if let Some(range) = range {
-                            let (first, last) = range
-                                .strip_prefix("bytes=")
-                                .unwrap()
-                                .split_once('-')
-                                .unwrap();
-                            let first: usize = first.parse().unwrap();
-                            let last: usize = last.parse().unwrap();
-                            let selected = &data[first..=last];
-                            write!(stream, "HTTP/1.1 206 Partial Content\r\nETag: {}\r\nContent-Length: {}\r\nContent-Range: bytes {first}-{last}/{}\r\nConnection: close\r\n\r\n", metadata.etag.as_str(), selected.len(), data.len()).unwrap();
-                            stream.write_all(selected).unwrap();
-                        } else {
-                            write!(stream, "HTTP/1.1 200 OK\r\nETag: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", metadata.etag.as_str(), data.len()).unwrap();
-                            stream.write_all(data).unwrap();
-                        }
-                    }
-                    _ => panic!("unsupported fixture method: {method}"),
-                }
-            }
-        });
+        let server = object_reads::HttpObjectServer::start(&mut config);
+        let requests = &server.requests;
+        let uploads = &server.uploads;
+        let hold_response = &server.hold_response;
         let mut io_budget = Budget::new(
             Checkpointer::budget_bytes(&config)
                 + crate::storage::SpillReader::budget_bytes(
@@ -99299,8 +99259,7 @@ fn atomic_block_reads_function_and_sequence_effects_survive_cold_http_reads_once
                 .is_ok()
         );
         drop((session, engine, blocks));
-        stop.store(true, Ordering::Release);
-        server.join().unwrap();
+        drop(server);
         crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     }
 }
@@ -99434,7 +99393,7 @@ fn bounded_local_cleanup_row_stages_allow_queries_and_rollback_between_batches()
     config.object_store_sim = true;
     config.wal_upload = false;
     config.wal_upload_sync = false;
-    config.table_rows = 128;
+    config.row_overlay_slots = 128;
     config.memtable_bytes = 1 << 20;
     config.object_store_bucket = format!("bounded-row-cleanup-turns-{}", std::process::id());
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
@@ -99534,7 +99493,7 @@ fn bounded_local_cleanup_checkpoint_markers_preserve_later_deletes_and_cold_reco
     config.wal_upload = true;
     config.wal_upload_sync = true;
     config.max_tables = 4;
-    config.table_rows = 256;
+    config.row_overlay_slots = 256;
     config.block_cache_bytes = 0;
     config.disk_cache_bytes = 0;
     config.object_store_bucket = format!("bounded-checkpoint-markers-{}", std::process::id());

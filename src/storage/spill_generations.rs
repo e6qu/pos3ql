@@ -453,7 +453,9 @@ impl SpillPublication {
 
 impl SpillGenerationRoster {
     pub(super) fn member_budget_bytes(capacity: usize) -> usize {
-        2 * capacity * size_of::<SpillGeneration>()
+        2usize
+            .saturating_mul(capacity)
+            .saturating_mul(size_of::<SpillGeneration>())
     }
 
     pub(super) fn new(budget: &mut Budget, capacity: usize) -> Result<Self, BudgetError> {
@@ -1458,10 +1460,16 @@ impl QueryRootPool {
 
     pub(super) fn budget_bytes(config: &Config) -> usize {
         size_of::<Self>()
-            + 2 * size_of::<std::sync::atomic::AtomicUsize>()
-            + 2 * Self::slot_count(config)
-                * (size_of::<QueryRootSlot>()
-                    + SpillGenerationSnapshot::budget_bytes(config.max_spill_generations_per_table))
+            .saturating_add(2usize.saturating_mul(size_of::<std::sync::atomic::AtomicUsize>()))
+            .saturating_add(
+                2usize
+                    .saturating_mul(Self::slot_count(config))
+                    .saturating_mul(size_of::<QueryRootSlot>().saturating_add(
+                        SpillGenerationSnapshot::budget_bytes(
+                            config.max_spill_generations_per_table,
+                        ),
+                    )),
+            )
     }
 
     pub(super) fn new(config: &Config, budget: &mut Budget) -> Result<Arc<Self>, BudgetError> {
@@ -2190,7 +2198,9 @@ impl DerefMut for SpillGenerationSnapshot {
 
 impl SpillGenerationSnapshot {
     pub(super) fn budget_bytes(max_generations: usize) -> usize {
-        max_generations * (size_of::<SstHandle>() + size_of::<SpillGenerationRange>())
+        max_generations.saturating_mul(
+            size_of::<SstHandle>().saturating_add(size_of::<SpillGenerationRange>()),
+        )
     }
 
     pub(super) fn new(max_generations: usize) -> Self {

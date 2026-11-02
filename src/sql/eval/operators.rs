@@ -1144,7 +1144,13 @@ pub(crate) fn compare_datums_as(
             // PostgreSQL compares contents first, then dimensionality and bounds.
             let (length_a, length_b) = (array::len(ra), array::len(rb));
             for (x, y) in array::elements(ra, *element).zip(array::elements(rb, *element)) {
-                let c = compare_datums(&x, &y)?;
+                // Within an array, NULL equals NULL and follows present values.
+                let c = match (x, y) {
+                    (Datum::Null, Datum::Null) => Ordering::Equal,
+                    (Datum::Null, _) => Ordering::Greater,
+                    (_, Datum::Null) => Ordering::Less,
+                    _ => compare_datums(&x, &y)?,
+                };
                 if !c.is_eq() {
                     return Ok(c);
                 }
@@ -1155,17 +1161,23 @@ pub(crate) fn compare_datums_as(
             }
             let shape_a = array::shape(ra).expect("array datum invariant");
             let shape_b = array::shape(rb).expect("array datum invariant");
-            for index in 0..shape_a.dimension_count().min(shape_b.dimension_count()) {
+            let dimensions = shape_a.dimension_count().cmp(&shape_b.dimension_count());
+            if !dimensions.is_eq() {
+                return Ok(dimensions);
+            }
+            for index in 0..shape_a.dimension_count() {
                 let dimensions = shape_a.dimension(index).cmp(&shape_b.dimension(index));
                 if !dimensions.is_eq() {
                     return Ok(dimensions);
                 }
+            }
+            for index in 0..shape_a.dimension_count() {
                 let bounds = shape_a.lower_bound(index).cmp(&shape_b.lower_bound(index));
                 if !bounds.is_eq() {
                     return Ok(bounds);
                 }
             }
-            shape_a.dimension_count().cmp(&shape_b.dimension_count())
+            Ordering::Equal
         }
         (Datum::Date(a), Datum::Timestamp(b)) => date_timestamp_for_compare(*a).cmp(b),
         (Datum::Timestamp(a), Datum::Date(b)) => a.cmp(&date_timestamp_for_compare(*b)),

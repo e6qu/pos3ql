@@ -156,6 +156,42 @@ uses its captured values and files. A new read can select the replacement.
 These storage protections do not yet establish every later catalog lookup's
 coherence; the remaining cases are explicit in the plan.
 
+Sorting postpones volatile output expressions until the result order is known.
+For example, `SELECT id, nextval('order_numbers') FROM orders ORDER BY id LIMIT 1`
+issues one number. Adding `OFFSET 1` issues two: PostgreSQL also evaluates the
+skipped row. If the generated number is itself the sort key, every candidate
+needs a number before sorting, and output reuses those values. Sorting can use
+the configured memory or temporary-disk path without changing these effects.
+With `FETCH FIRST ... WITH TIES`, finding the end of the tied group also
+evaluates the first following row, even though that row is not returned.
+A sorted nested query with `LIMIT 0` validates names and types without consuming
+sequence values from its input.
+Sorting also preserves whether each joined row existed. For example,
+`row_to_json(profile)` distinguishes a missing profile from a present record
+whose fields are all null; delaying an output expression keeps that distinction.
+
+`LIMIT` bounds returned rows. Expressions evaluated before sorting can still
+fail on later input rows. SQL constructs such as `GREATEST`, `COALESCE`, JSON
+constructors and XML constructors follow PostgreSQL's expression effects and
+cost boundaries; an explicit sequence call can change their evaluation timing.
+
+`NULLIF` uses the selected equality operator and its input conversions.
+For example, `pg_typeof(NULLIF(1, 2.2))` returns `numeric`. Enum labels are
+validated through the catalog, and null operands skip the comparison.
+Conversions from `real` and `double precision` to `numeric` use PostgreSQL's
+six and fifteen significant digits, including NaN and infinities. For example,
+`1.2345678::real::numeric` returns `1.23457`.
+SQL JSON constructors use registered enum-to-JSON conversions, including inside
+arrays and records. Arrays and records retain their structural representation
+instead of invoking a cast registered for the whole container.
+
+`array_eq`, `array_ne`, `array_lt`, `array_le`, `array_gt`, `array_ge` and
+`btarraycmp` use the array comparison rules of the SQL operators. They accept
+arrays wrapped in domains (types with extra checks), preserving dimensions and
+lower bounds. Input types and enum labels are checked before null handling.
+Within arrays, null elements compare equal to each other and follow non-null
+elements. For example, `ARRAY[NULL::integer] > ARRAY[1]` returns `true`.
+
 Statements, transaction snapshots, scans and point reads have separate startup
 reservations. Their [exact capacities](postgresql-18-compatibility.md#capacity-boundaries)
 are independent of total durable row count. Completion, cancellation, errors

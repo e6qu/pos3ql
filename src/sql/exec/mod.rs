@@ -6,7 +6,7 @@
 
 use super::txn::{TxnMode, TxnState};
 use crate::mem::arena::{Arena, ArenaList};
-use crate::mem::fixed_vec::FixedVec;
+use crate::mem::lease_pool::{RowWorkLease, RowWorkPool};
 use crate::mem::mutex::Mutex;
 use crate::pg::respond::Responder;
 use crate::pg::wire::WireFull;
@@ -89,7 +89,7 @@ impl PhysicalRow {
     }
 }
 
-pub(crate) type DmlScratch = FixedVec<PhysicalRow>;
+pub(crate) type DmlScratch = RowWorkLease<PhysicalRow>;
 
 #[derive(Clone, Copy)]
 struct DmlRowImage<'arena> {
@@ -697,8 +697,9 @@ pub(super) use schema::rename as stage_schema_rename;
 
 mod describe;
 pub(crate) use describe::{
-    CatalogCols, builtin_binary_type, catalog_composite_field, catalog_routine_record_field,
-    expand_record_call_items, numeric_log_type, resolved_set_call, visit_catalog_composite_fields,
+    CatalogCols, builtin_binary_type, catalog_composite_field,
+    catalog_operator_first_argument_type, catalog_routine_record_field, expand_record_call_items,
+    numeric_log_type, resolved_set_call, visit_catalog_composite_fields,
     visit_catalog_rowtype_fields,
 };
 pub use describe::{
@@ -12301,20 +12302,35 @@ pub(crate) fn drop_schema(
         *n_objects += 1;
         Ok(())
     };
-    let definitions = storage.table_definition_images();
-    for t in 0..storage.table_count() {
+    #[derive(Clone, Copy)]
+    struct TableDropSelection {
+        source: crate::storage::TableDefinitionTarget,
+        mode: Option<crate::sql::ast::TableLockMode>,
+    }
+    let table_locks =
+        match arena.alloc_slice_with(storage.table_count(), |_| None::<TableDropSelection>) {
+            Ok(locks) => locks,
+            Err(_) => return sql_fail(arena_full()),
+        };
+    for (t, selected) in table_locks.iter_mut().enumerate() {
         if !storage.table_slot_visible_to(t, txn.txid) {
             continue;
         }
-        let def = match definitions.definition(storage, t, txn.txid) {
-            Ok(definition) => definition,
-            Err(error) => return sql_fail(error),
+        let (source, schema, name) = {
+            let definitions = storage.table_definition_images();
+            let (source, definition) = match definitions.selection(storage, t, txn.txid) {
+                Ok(selection) => selection,
+                Err(error) => return sql_fail(error),
+            };
+            (source, definition.schema, definition.name)
         };
-        if !in_listed(storage, def.schema.as_str()) {
+        // Keep the original identity/revision for lock validation, releasing
+        // the wide image before the next table or any catalog callback.
+        *selected = Some(TableDropSelection { source, mode: None });
+        if !in_listed(storage, schema.as_str()) {
             continue;
         }
-        let def = *def;
-        let object = match storage.matview_slot(def.schema.as_str(), def.name.as_str(), txn.txid) {
+        let object = match storage.matview_slot(schema.as_str(), name.as_str(), txn.txid) {
             Some(catalog) => SchemaObject::Matview { table: t, catalog },
             None => SchemaObject::Table(t),
         };
@@ -13301,37 +13317,47 @@ pub(crate) fn drop_schema(
             storage.schema_def_for(first, txn.txid).name.as_str()
         ));
     }
-    let table_locks = match arena.alloc_slice_with(storage.table_count(), |_| None) {
-        Ok(locks) => locks,
-        Err(_) => return sql_fail(arena_full()),
-    };
     let view_locks = match arena.alloc_slice_with(storage.view_count(), |_| false) {
         Ok(locks) => locks,
         Err(_) => return sql_fail(arena_full()),
     };
     for object in objects[..n_objects].iter().flatten() {
-        match object {
+        let requested = match object {
             SchemaObject::Table(table)
             | SchemaObject::Matview { table, .. }
             | SchemaObject::InboundFk { table, .. } => {
-                table_locks[*table] = Some(crate::sql::ast::TableLockMode::AccessExclusive);
+                Some((*table, crate::sql::ast::TableLockMode::AccessExclusive))
             }
-            SchemaObject::View(view) => view_locks[*view] = true,
+            SchemaObject::View(view) => {
+                view_locks[*view] = true;
+                None
+            }
             SchemaObject::Policy { slot, .. } => {
                 let table = usize::from(storage.policy(*slot).table);
-                if table_locks[table].is_none() {
-                    table_locks[table] = Some(crate::sql::ast::TableLockMode::ShareRowExclusive);
-                }
+                Some((table, crate::sql::ast::TableLockMode::ShareRowExclusive))
             }
-            _ => {}
+            _ => None,
+        };
+        if let Some((table, mode)) = requested {
+            let Some(selection) = table_locks[table].as_mut() else {
+                return sql_fail(sql_err!(
+                    sqlstate::SERIALIZATION_FAILURE,
+                    "schema drop selected a table without its original definition source"
+                ));
+            };
+            if selection.mode.is_none() || mode == crate::sql::ast::TableLockMode::AccessExclusive {
+                selection.mode = Some(mode);
+            }
         }
     }
     // Resolve all waits before cascade notices, journal writes or catalog edits.
-    for (table, mode) in table_locks.iter().copied().enumerate() {
-        let Some(mode) = mode else { continue };
-        let (source, _) = match definitions.selection(storage, table, txn.txid) {
-            Ok(selection) => selection,
-            Err(error) => return sql_fail(error),
+    for (table, selection) in table_locks.iter().copied().enumerate() {
+        let Some(TableDropSelection {
+            source,
+            mode: Some(mode),
+        }) = selection
+        else {
+            continue;
         };
         if let Err(error) = storage
             .lock_table(txn.txid, table, mode, false)
@@ -21666,20 +21692,19 @@ fn execute_bound_plpgsql_dynamic_dml<'a>(
         }
         Stmt::Update(statement) => {
             let scratch = unsafe { &mut *context.scratch() };
-            let saved = context
-                .arena
-                .alloc_slice_copy(scratch.as_slice())
-                .map_err(|_| {
-                    sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "nested dynamic UPDATE exceeds the statement arena"
-                    )
-                })?;
             let arena = context.arena;
             let params = query.arguments;
             let (storage, txn, _, responder, seq_session) = context.dml_parts_with_sequence();
             let mut command = txn.enter_trigger_sql(storage)?;
             let txn = &mut *command;
+            let nested = scratch.pool().lease(0).map_err(|error| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "nested DML selection: {}",
+                    error
+                )
+            })?;
+            let saved = core::mem::replace(scratch, nested);
             responder.clear_affected_rows();
             let outcome = responder.without_query_output(|responder| {
                 update(
@@ -21698,33 +21723,24 @@ fn execute_bound_plpgsql_dynamic_dml<'a>(
                 )
             });
             drop(command);
-            scratch.clear();
-            for item in saved.iter().copied() {
-                scratch.push(item).map_err(|_| {
-                    sql_err!(
-                        sqlstate::INTERNAL_ERROR,
-                        "dynamic UPDATE workspace restore failed"
-                    )
-                })?;
-            }
+            *scratch = saved;
             dynamic_dml_outcome(responder, outcome, "UPDATE")
         }
         Stmt::Delete(statement) => {
             let scratch = unsafe { &mut *context.scratch() };
-            let saved = context
-                .arena
-                .alloc_slice_copy(scratch.as_slice())
-                .map_err(|_| {
-                    sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "nested dynamic DELETE exceeds the statement arena"
-                    )
-                })?;
             let arena = context.arena;
             let params = query.arguments;
             let (storage, txn, _, responder, seq_session) = context.dml_parts_with_sequence();
             let mut command = txn.enter_trigger_sql(storage)?;
             let txn = &mut *command;
+            let nested = scratch.pool().lease(0).map_err(|error| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "nested DML selection: {}",
+                    error
+                )
+            })?;
+            let saved = core::mem::replace(scratch, nested);
             responder.clear_affected_rows();
             let outcome = responder.without_query_output(|responder| {
                 delete(
@@ -21742,15 +21758,7 @@ fn execute_bound_plpgsql_dynamic_dml<'a>(
                 )
             });
             drop(command);
-            scratch.clear();
-            for item in saved.iter().copied() {
-                scratch.push(item).map_err(|_| {
-                    sql_err!(
-                        sqlstate::INTERNAL_ERROR,
-                        "dynamic DELETE workspace restore failed"
-                    )
-                })?;
-            }
+            *scratch = saved;
             dynamic_dml_outcome(responder, outcome, "DELETE")
         }
         _ => Err(sql_err!(
@@ -25928,16 +25936,6 @@ fn execute_trigger_block<'a>(
                         None => statement,
                     };
                     let scratch = unsafe { &mut *context.scratch() };
-                    let saved =
-                        context
-                            .arena
-                            .alloc_slice_copy(scratch.as_slice())
-                            .map_err(|_| {
-                                sql_err!(
-                                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                                    "nested trigger UPDATE exceeds the statement arena"
-                                )
-                            })?;
                     let transition = TriggerTransition {
                         definition,
                         old,
@@ -25956,6 +25954,14 @@ fn execute_trigger_block<'a>(
                         context.dml_parts_with_sequence();
                     let mut command = txn.enter_trigger_sql(storage)?;
                     let txn = &mut *command;
+                    let nested = scratch.pool().lease(0).map_err(|error| {
+                        sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "nested DML selection: {}",
+                            error
+                        )
+                    })?;
+                    let saved = core::mem::replace(scratch, nested);
                     responder.clear_affected_rows();
                     let outcome = responder.without_command_complete(|responder| {
                         update(
@@ -25974,15 +25980,7 @@ fn execute_trigger_block<'a>(
                         )
                     });
                     drop(command);
-                    scratch.clear();
-                    for item in saved.iter().copied() {
-                        scratch.push(item).map_err(|_| {
-                            sql_err!(
-                                sqlstate::INTERNAL_ERROR,
-                                "trigger DML workspace restore failed"
-                            )
-                        })?;
-                    }
+                    *scratch = saved;
                     match outcome {
                         Ok(Ok(())) => status.set_rows(
                             context
@@ -26034,16 +26032,6 @@ fn execute_trigger_block<'a>(
                         None => statement,
                     };
                     let scratch = unsafe { &mut *context.scratch() };
-                    let saved =
-                        context
-                            .arena
-                            .alloc_slice_copy(scratch.as_slice())
-                            .map_err(|_| {
-                                sql_err!(
-                                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                                    "nested trigger DELETE exceeds the statement arena"
-                                )
-                            })?;
                     let transition = TriggerTransition {
                         definition,
                         old,
@@ -26062,6 +26050,14 @@ fn execute_trigger_block<'a>(
                         context.dml_parts_with_sequence();
                     let mut command = txn.enter_trigger_sql(storage)?;
                     let txn = &mut *command;
+                    let nested = scratch.pool().lease(0).map_err(|error| {
+                        sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "nested DML selection: {}",
+                            error
+                        )
+                    })?;
+                    let saved = core::mem::replace(scratch, nested);
                     responder.clear_affected_rows();
                     let outcome = responder.without_command_complete(|responder| {
                         delete(
@@ -26079,15 +26075,7 @@ fn execute_trigger_block<'a>(
                         )
                     });
                     drop(command);
-                    scratch.clear();
-                    for item in saved.iter().copied() {
-                        scratch.push(item).map_err(|_| {
-                            sql_err!(
-                                sqlstate::INTERNAL_ERROR,
-                                "trigger DML workspace restore failed"
-                            )
-                        })?;
-                    }
+                    *scratch = saved;
                     match outcome {
                         Ok(Ok(())) => status.set_rows(
                             context
@@ -36729,16 +36717,7 @@ pub fn drop_routine(
             let Some((trigger_slot, trigger)) = dependency else {
                 break;
             };
-            if let Err(error) = stage_trigger_drop(storage, wal, txn, trigger_slot, trigger) {
-                return sql_fail(error);
-            }
-            if let Err(error) = storage.drop_trigger(trigger_slot, txn.txid) {
-                return sql_fail(error);
-            }
-            if let Err(error) =
-                txn.record_ddl(super::txn::DdlUndo::TriggerDropped(trigger_slot as u32))
-            {
-                storage.rollback_trigger_drop(trigger_slot, txn.txid);
+            if let Err(error) = drop_trigger_with_undo(storage, wal, txn, trigger_slot, trigger) {
                 return sql_fail(error);
             }
         }
@@ -42125,9 +42104,7 @@ fn drop_type_dependent_routines(
         let Some((slot, trigger)) = dependency else {
             break;
         };
-        stage_trigger_drop(storage, wal, txn, slot, trigger)?;
-        storage.drop_trigger(slot, txn.txid)?;
-        txn.record_ddl(super::txn::DdlUndo::TriggerDropped(slot as u32))?;
+        drop_trigger_with_undo(storage, wal, txn, slot, trigger)?;
     }
 
     for slot in (0..storage.routine_count()).rev() {
@@ -45785,9 +45762,7 @@ fn drop_selected_stored_queries(
         let Some((slot, trigger)) = dependency else {
             break;
         };
-        stage_trigger_drop(storage, wal, txn, slot, trigger)?;
-        storage.drop_trigger(slot, txn.txid)?;
-        txn.record_ddl(super::txn::DdlUndo::TriggerDropped(slot as u32))?;
+        drop_trigger_with_undo(storage, wal, txn, slot, trigger)?;
     }
     for slot in (0..storage.routine_count()).rev() {
         if !routines[slot] || !storage.routine(slot).visible_to(txn.txid) {
@@ -45841,42 +45816,47 @@ fn stage_rule_drop(
     )
 }
 
-fn stage_trigger_drop(
+fn drop_trigger_with_undo(
     storage: &mut Storage,
     wal: &mut Wal,
-    txn: &TxnState,
+    txn: &mut TxnState,
     slot: usize,
     trigger: crate::storage::TriggerDef,
 ) -> Result<(), SqlError> {
-    if storage.access_object_is_temporary(trigger.target.access_object(), txn.txid) {
-        return Ok(());
+    if !storage.access_object_is_temporary(trigger.target.access_object(), txn.txid) {
+        let (target, schema, relation) = match trigger.target {
+            crate::storage::TriggerTarget::Table(table) => {
+                let table = storage.table_def(usize::from(table), txn.txid);
+                (
+                    crate::wal::TriggerTargetKind::Table,
+                    table.schema,
+                    table.name,
+                )
+            }
+            crate::storage::TriggerTarget::View(view) => {
+                let (schema, name) = storage.view(usize::from(view)).names_for(txn.txid);
+                (crate::wal::TriggerTargetKind::View, schema, name)
+            }
+        };
+        let lsn = storage.bump_lsn();
+        wal.stage_reserved(
+            txn.txid,
+            lsn,
+            &WalOp::DropTrigger {
+                identity: storage.trigger_position(slot),
+                name: trigger.name_to(txn.txid).as_str(),
+                target,
+                table_schema: schema.as_str(),
+                table: relation.as_str(),
+            },
+        )?;
     }
-    let (target, schema, relation) = match trigger.target {
-        crate::storage::TriggerTarget::Table(table) => {
-            let table = storage.table_def(usize::from(table), txn.txid);
-            (
-                crate::wal::TriggerTargetKind::Table,
-                table.schema,
-                table.name,
-            )
-        }
-        crate::storage::TriggerTarget::View(view) => {
-            let view = storage.view(usize::from(view));
-            (crate::wal::TriggerTargetKind::View, view.schema, view.name)
-        }
-    };
-    let lsn = storage.bump_lsn();
-    wal.stage_reserved(
-        txn.txid,
-        lsn,
-        &WalOp::DropTrigger {
-            identity: storage.trigger_position(slot),
-            name: trigger.name_to(txn.txid).as_str(),
-            target,
-            table_schema: schema.as_str(),
-            table: relation.as_str(),
-        },
-    )
+    storage.drop_trigger(slot, txn.txid)?;
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::TriggerDropped(slot as u32)) {
+        storage.rollback_trigger_drop(slot, txn.txid);
+        return Err(error);
+    }
+    Ok(())
 }
 
 fn drop_view_slot(
@@ -45931,26 +45911,7 @@ fn drop_view_trigger_dependencies(
         let Some((slot, trigger)) = dependency else {
             return Ok(());
         };
-        let (schema, name) = {
-            let view = storage.view(view_slot);
-            view.names_for(txn.txid)
-        };
-        if storage.view(view_slot).persistence != crate::storage::RelationPersistence::Temporary {
-            let lsn = storage.bump_lsn();
-            wal.stage_reserved(
-                txn.txid,
-                lsn,
-                &WalOp::DropTrigger {
-                    identity: storage.trigger_position(slot),
-                    name: trigger.name_to(txn.txid).as_str(),
-                    target: crate::wal::TriggerTargetKind::View,
-                    table_schema: schema.as_str(),
-                    table: name.as_str(),
-                },
-            )?;
-        }
-        storage.drop_trigger(slot, txn.txid)?;
-        txn.record_ddl(super::txn::DdlUndo::TriggerDropped(slot as u32))?;
+        drop_trigger_with_undo(storage, wal, txn, slot, trigger)?;
     }
 }
 
@@ -48111,11 +48072,10 @@ pub fn drop_view(
                     dependent_matviews,
                     dependent_routines,
                 );
-            let has_triggers = storage.triggers_for_view(slot, txn.txid).next().is_some();
-            if (has_dependents || has_triggers) && !cascade {
+            if has_dependents && !cascade {
                 return sql_fail(sql_err!(
                     sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
-                    "cannot drop view {} because dependent objects exist",
+                    "cannot drop view {} because other objects depend on it",
                     view_name.as_str()
                 ));
             }
@@ -48143,7 +48103,7 @@ pub fn drop_view(
                     return sql_fail(error);
                 }
             }
-            if cascade && let Err(error) = drop_view_trigger_dependencies(storage, wal, txn, slot) {
+            if let Err(error) = drop_view_trigger_dependencies(storage, wal, txn, slot) {
                 return sql_fail(error);
             }
             if !temporary {
@@ -54879,6 +54839,7 @@ pub fn apply_replication_truncate(
     tables: &[usize],
     cascade: bool,
     restart_identity: bool,
+    arena: &Arena,
 ) -> Result<(), SqlError> {
     if tables.is_empty() || tables.len() > txn.truncate_table_capacity() {
         return Err(sql_err!(
@@ -54898,7 +54859,6 @@ pub fn apply_replication_truncate(
             "subscription TRUNCATE repeats a local table"
         ));
     }
-    let definitions = storage.table_definition_images();
     for &table in tables {
         storage.lock_table(
             txn.txid,
@@ -54906,8 +54866,14 @@ pub fn apply_replication_truncate(
             crate::sql::ast::TableLockMode::AccessExclusive,
             false,
         )?;
-        definitions.definition(storage, table, txn.txid)?;
     }
+    let targets = arena
+        .alloc_slice_with(tables.len(), |position| {
+            let table = tables[position];
+            let definition = storage.table_def(table, txn.txid);
+            storage.table_definition_target(table, txn.txid, &definition)
+        })
+        .map_err(|_| super::query::arena_full_pub())?;
     for other in 0..storage.table_count() {
         if !storage.table(other).visible_to(txn.txid) || tables.contains(&other) {
             continue;
@@ -54926,8 +54892,8 @@ pub fn apply_replication_truncate(
             ));
         }
     }
-    for &table in tables {
-        let (row_target, _) = definitions.selection(storage, table, txn.txid)?;
+    for (&table, &row_target) in tables.iter().zip(targets.iter()) {
+        row_target.validate(storage)?;
         let mut rowids = [0_u64; 4096];
         loop {
             let mut count = 0;
@@ -60118,11 +60084,16 @@ pub(crate) fn instead_of_view_dml<'a>(
                         "INSERT has wrong number of expressions"
                     ));
                 }
-                let rows = match arena.alloc_slice_with(scratch.capacity(), |_| &[][..]) {
+                let mut rows = match scratch.pool().lease::<&[u8]>(0) {
                     Ok(rows) => rows,
-                    Err(_) => return sql_fail(super::query::arena_full_pub()),
+                    Err(error) => {
+                        return sql_fail(sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "view INSERT staging: {}",
+                            error
+                        ));
+                    }
                 };
-                let mut count = 0usize;
                 if let Err(error) = super::query::select_into_rows(
                     storage,
                     txn.txid,
@@ -60130,23 +60101,25 @@ pub(crate) fn instead_of_view_dml<'a>(
                     arena,
                     params,
                     None,
-                    None,
+                    Some(&crate::sql::sequence::SeqEval::new(
+                        storage,
+                        seq_session,
+                        txn.txid,
+                    )),
                     &mut |values| {
-                        if count == rows.len() {
-                            return Err(sql_err!(
+                        let bytes = encode_projected_pub(values, arena)?;
+                        rows.push(bytes).map_err(|error| {
+                            sql_err!(
                                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                                "statement touches more than {} rows",
-                                rows.len()
-                            ));
-                        }
-                        rows[count] = encode_projected_pub(values, arena)?;
-                        count += 1;
-                        Ok(())
+                                "view INSERT staging: {}",
+                                error
+                            )
+                        })
                     },
                 ) {
                     return sql_fail(error);
                 }
-                for bytes in &rows[..count] {
+                for bytes in rows.as_slice() {
                     let mut selected = [Datum::Null; MAX_COLUMNS];
                     for (index, value) in selected[..source_count].iter_mut().enumerate() {
                         *value = decode_projected_pub(bytes, index);
@@ -60204,6 +60177,14 @@ pub(crate) fn instead_of_view_dml<'a>(
                             "INSERT has more expressions than target columns"
                         ));
                     }
+                    let sequences =
+                        crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
+                    let catalog = super::query::storage_catalog(storage, arena, txn.txid);
+                    let hooks = EvalHooks {
+                        catalog: Some(&catalog),
+                        sequences: Some(&sequences),
+                        ..NO_HOOKS
+                    };
                     for (index, expression) in row.iter().enumerate() {
                         let column = if insert.columns.is_empty() {
                             index
@@ -60213,11 +60194,10 @@ pub(crate) fn instead_of_view_dml<'a>(
                                 None => return sql_fail(undefined_column(insert.columns[index])),
                             }
                         };
-                        let value =
-                            match eval_full(expression, arena, params, &NoColumns, &NO_HOOKS) {
-                                Ok(value) => value,
-                                Err(error) => return sql_fail(error),
-                            };
+                        let value = match eval_full(expression, arena, params, &NoColumns, &hooks) {
+                            Ok(value) => value,
+                            Err(error) => return sql_fail(error),
+                        };
                         values[column] =
                             match coerce(value, &def.columns[column], storage, txn.txid, arena) {
                                 Ok(value) => value,
@@ -60249,20 +60229,26 @@ pub(crate) fn instead_of_view_dml<'a>(
             }
         }
         Stmt::Update(update) => {
-            let rows = match materialize_view_rows(
+            let (rows, predicate) = match materialize_view_rows(
                 storage,
                 txn.txid,
                 view_slot,
-                &def,
-                schema,
+                ViewRowSelection {
+                    definition: &def,
+                    predicate: update.where_clause.filter(|_| update.from.is_none()),
+                    alias: update.alias,
+                },
                 arena,
-                params,
-                scratch.capacity(),
+                TriggerQueryExecution {
+                    params,
+                    seq_session,
+                },
+                scratch.pool(),
             ) {
                 Ok(rows) => rows,
                 Err(error) => return sql_fail(error),
             };
-            for bytes in rows {
+            for bytes in rows.as_slice() {
                 let mut old = [Datum::Null; MAX_COLUMNS];
                 if let Err(error) = rowenc::decode(bytes, schema, &mut old) {
                     return sql_fail(error);
@@ -60320,7 +60306,15 @@ pub(crate) fn instead_of_view_dml<'a>(
                         continue;
                     }
                 } else {
-                    if let Some(predicate) = update.where_clause {
+                    let sequences =
+                        crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
+                    let catalog = super::query::storage_catalog(storage, arena, txn.txid);
+                    let hooks = EvalHooks {
+                        catalog: Some(&catalog),
+                        sequences: Some(&sequences),
+                        ..NO_HOOKS
+                    };
+                    if let Some(predicate) = predicate {
                         match row_matches_values(
                             storage,
                             txn.txid,
@@ -60330,7 +60324,7 @@ pub(crate) fn instead_of_view_dml<'a>(
                             Some(predicate),
                             arena,
                             params,
-                            &NO_HOOKS,
+                            &hooks,
                             None,
                             None,
                         ) {
@@ -60343,8 +60337,7 @@ pub(crate) fn instead_of_view_dml<'a>(
                         let Some(column) = def.column_index(name) else {
                             return sql_fail(undefined_column(name));
                         };
-                        let value = match eval_full(expression, arena, params, &context, &NO_HOOKS)
-                        {
+                        let value = match eval_full(expression, arena, params, &context, &hooks) {
                             Ok(value) => value,
                             Err(error) => return sql_fail(error),
                         };
@@ -60403,20 +60396,26 @@ pub(crate) fn instead_of_view_dml<'a>(
             }
         }
         Stmt::Delete(delete) => {
-            let rows = match materialize_view_rows(
+            let (rows, predicate) = match materialize_view_rows(
                 storage,
                 txn.txid,
                 view_slot,
-                &def,
-                schema,
+                ViewRowSelection {
+                    definition: &def,
+                    predicate: delete.where_clause.filter(|_| delete.using.is_none()),
+                    alias: delete.alias,
+                },
                 arena,
-                params,
-                scratch.capacity(),
+                TriggerQueryExecution {
+                    params,
+                    seq_session,
+                },
+                scratch.pool(),
             ) {
                 Ok(rows) => rows,
                 Err(error) => return sql_fail(error),
             };
-            for bytes in rows {
+            for bytes in rows.as_slice() {
                 let mut old = [Datum::Null; MAX_COLUMNS];
                 if let Err(error) = rowenc::decode(bytes, schema, &mut old) {
                     return sql_fail(error);
@@ -60446,7 +60445,15 @@ pub(crate) fn instead_of_view_dml<'a>(
                         Ok(matched) => matched,
                         Err(error) => return sql_fail(error),
                     }
-                } else if let Some(predicate) = delete.where_clause {
+                } else if let Some(predicate) = predicate {
+                    let sequences =
+                        crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
+                    let catalog = super::query::storage_catalog(storage, arena, txn.txid);
+                    let hooks = EvalHooks {
+                        catalog: Some(&catalog),
+                        sequences: Some(&sequences),
+                        ..NO_HOOKS
+                    };
                     match row_matches_values(
                         storage,
                         txn.txid,
@@ -60456,7 +60463,7 @@ pub(crate) fn instead_of_view_dml<'a>(
                         Some(predicate),
                         arena,
                         params,
-                        &NO_HOOKS,
+                        &hooks,
                         None,
                         None,
                     ) {
@@ -60527,20 +60534,21 @@ pub(crate) fn instead_of_view_dml<'a>(
     sql_ok()
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "view-row materialization needs the bounded query execution context"
-)]
+struct ViewRowSelection<'definition, 'a> {
+    definition: &'definition TableDef,
+    predicate: Option<&'a Expr<'a>>,
+    alias: Option<&'a str>,
+}
+
 fn materialize_view_rows<'a>(
     storage: &Storage,
     txid: u32,
     view_slot: usize,
-    def: &TableDef,
-    schema: &[ColType],
+    selection: ViewRowSelection<'_, 'a>,
     arena: &'a Arena,
-    params: &[Datum<'a>],
-    capacity: usize,
-) -> Result<&'a [&'a [u8]], SqlError> {
+    execution: TriggerQueryExecution<'_, '_, 'a>,
+    pool: &std::sync::Arc<RowWorkPool>,
+) -> Result<(RowWorkLease<&'a [u8]>, Option<&'a Expr<'a>>), SqlError> {
     let user = crate::sql::eval::funcs::system::session_user_owned();
     let query = storage.snapshot_view_query(view_slot, txid, arena)?;
     let path = storage.compute_path(query.creation_path.as_str(), user.as_str(), txid);
@@ -60551,43 +60559,56 @@ fn materialize_view_rows<'a>(
     let dependencies = query.dependencies;
     let select =
         super::query::expand_stored_query(select, storage, txid, path, dependencies.view(), arena)?;
-    let rows = arena
-        .alloc_slice_with(capacity, |_| &[][..])
-        .map_err(|_| super::query::arena_full_pub())?;
-    let mut count = 0usize;
+    let (select, predicate) = super::query::filter_view_rows(
+        select,
+        selection.predicate,
+        selection.definition,
+        selection.alias,
+        storage.view(view_slot).security_barrier_for(txid),
+        storage,
+        txid,
+        arena,
+    )?;
+    let mut rows = pool.lease::<&[u8]>(0).map_err(|error| {
+        sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "view row staging: {}",
+            error
+        )
+    })?;
     super::query::select_into_rows(
         storage,
         txid,
         select,
         arena,
-        params,
+        execution.params,
         None,
-        None,
+        Some(&crate::sql::sequence::SeqEval::new(
+            storage,
+            execution.seq_session,
+            txid,
+        )),
         &mut |values| {
-            if values.len() != def.n_columns {
+            if values.len() != selection.definition.n_columns {
                 return Err(sql_err!(
                     sqlstate::INTERNAL_ERROR,
                     "view row shape does not match its catalog description"
-                ));
-            }
-            if count == rows.len() {
-                return Err(sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "statement touches more than {} rows",
-                    rows.len()
                 ));
             }
             let encoded = arena
                 .alloc_slice_with(rowenc::encoded_len(values), |_| 0u8)
                 .map_err(|_| super::query::arena_full_pub())?;
             rowenc::encode(values, encoded);
-            rows[count] = encoded;
-            count += 1;
-            Ok(())
+            rows.push(&*encoded).map_err(|error| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "view row staging: {}",
+                    error
+                )
+            })
         },
     )?;
-    let _ = schema;
-    Ok(&rows[..count])
+    Ok((rows, predicate))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -63831,17 +63852,21 @@ pub(crate) fn truncate(
             return sql_fail(error);
         }
     }
-    let definitions = storage.table_definition_images();
-    for &table_index in &list[..n] {
-        if let Err(error) = definitions.definition(storage, table_index, txn.txid) {
+    // Keep original identities and revisions across trigger callbacks without
+    // retaining a maximum-width schema image for every table in the closure.
+    let targets = match arena.alloc_slice_with(n, |position| {
+        let table = list[position];
+        let definition = storage.table_def(table, txn.txid);
+        storage.table_definition_target(table, txn.txid, &definition)
+    }) {
+        Ok(targets) => targets,
+        Err(_) => return sql_fail(super::query::arena_full_pub()),
+    };
+    for (&table_index, &target) in list[..n].iter().zip(targets.iter()) {
+        let definition = *storage.table_def(table_index, txn.txid);
+        if let Err(error) = target.validate(storage) {
             return sql_fail(error);
         }
-    }
-    for &table_index in &list[..n] {
-        let definition = match definitions.definition(storage, table_index, txn.txid) {
-            Ok(definition) => *definition,
-            Err(error) => return sql_fail(error),
-        };
         if let Err(error) = fire_statement_triggers(
             TriggerExecContext {
                 host: PlpgsqlExecHost::Atomic {
@@ -63860,6 +63885,11 @@ pub(crate) fn truncate(
             true,
             ColumnSet::EMPTY,
         ) {
+            return sql_fail(error);
+        }
+    }
+    for &target in targets.iter() {
+        if let Err(error) = target.validate(storage) {
             return sql_fail(error);
         }
     }
@@ -63885,8 +63915,11 @@ pub(crate) fn truncate(
         ) {
             return sql_fail(error);
         }
-        for &table_index in &list[..n] {
+        for (&table_index, &target) in list[..n].iter().zip(targets.iter()) {
             let definition = *storage.table_def(table_index, txn.txid);
+            if let Err(error) = target.validate(storage) {
+                return sql_fail(error);
+            }
             if let Err(error) = fire_statement_triggers(
                 TriggerExecContext {
                     host: PlpgsqlExecHost::Atomic {
@@ -63912,11 +63945,10 @@ pub(crate) fn truncate(
         return sql_ok();
     }
     // Remove every visible row, transactionally.
-    for &table_index in &list[..n] {
-        let (row_target, _) = match definitions.selection(storage, table_index, txn.txid) {
-            Ok(selection) => selection,
-            Err(error) => return sql_fail(error),
-        };
+    for (&table_index, &row_target) in list[..n].iter().zip(targets.iter()) {
+        if let Err(error) = row_target.validate(storage) {
+            return sql_fail(error);
+        }
         let mut rowids: [u64; 4096] = [0; 4096];
         loop {
             let mut count = 0usize;
@@ -64012,8 +64044,11 @@ pub(crate) fn truncate(
             }
         }
     }
-    for &table_index in &list[..n] {
+    for (&table_index, &target) in list[..n].iter().zip(targets.iter()) {
         let definition = *storage.table_def(table_index, txn.txid);
+        if let Err(error) = target.validate(storage) {
+            return sql_fail(error);
+        }
         if let Err(error) = fire_statement_triggers(
             TriggerExecContext {
                 host: PlpgsqlExecHost::Atomic {
@@ -66623,11 +66658,11 @@ pub(crate) fn capture_alter_rewrite_rows<'arena>(
     if let Err(error) = source.for_each_home(&mut |rowid, home| {
         scratch
             .push(PhysicalRow::local(table, rowid, home.snapshot()))
-            .map_err(|_| {
+            .map_err(|error| {
                 sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "ALTER touches more than {} rows",
-                    scratch.capacity()
+                    "ALTER row selection: {}",
+                    error
                 )
             })?;
         Ok(core::ops::ControlFlow::Continue(()))
@@ -70495,11 +70530,11 @@ pub(super) fn collect_matches<'a>(
                             table_index,
                             tuple_id,
                         })
-                        .map_err(|_| {
+                        .map_err(|error| {
                             sql_err!(
                                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                                "statement touches more than {} rows",
-                                scratch.capacity()
+                                "statement row selection: {}",
+                                error
                             )
                         })?;
                 }
@@ -70572,11 +70607,11 @@ pub(super) fn collect_matches<'a>(
                 }
                 scratch
                     .push(PhysicalRow::local(leaf, rowid, snapshot))
-                    .map_err(|_| {
+                    .map_err(|error| {
                         sql_err!(
                             sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                            "statement touches more than {} rows",
-                            scratch.capacity()
+                            "statement row selection: {}",
+                            error
                         )
                     })?;
             }
@@ -70670,11 +70705,11 @@ fn collect_join_matches<'a>(
                             table_index,
                             tuple_id,
                         })
-                        .map_err(|_| {
+                        .map_err(|error| {
                             sql_err!(
                                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                                "statement touches more than {} rows",
-                                scratch.capacity()
+                                "statement row selection: {}",
+                                error
                             )
                         })?;
                 }
@@ -70750,11 +70785,11 @@ fn collect_join_matches<'a>(
                     }
                     scratch
                         .push(PhysicalRow::local(leaf, rowid, snapshot))
-                        .map_err(|_| {
+                        .map_err(|error| {
                             sql_err!(
                                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                                "statement touches more than {} rows",
-                                scratch.capacity()
+                                "statement row selection: {}",
+                                error
                             )
                         })?;
                 }
@@ -70838,11 +70873,11 @@ fn collect_join_matches_with_transition<'a>(
                             table_index,
                             tuple_id,
                         })
-                        .map_err(|_| {
+                        .map_err(|error| {
                             sql_err!(
                                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                                "statement touches more than {} rows",
-                                scratch.capacity()
+                                "statement row selection: {}",
+                                error
                             )
                         })?;
                 }
@@ -70920,11 +70955,11 @@ fn collect_join_matches_with_transition<'a>(
                     }
                     scratch
                         .push(PhysicalRow::local(leaf, rowid, snapshot))
-                        .map_err(|_| {
+                        .map_err(|error| {
                             sql_err!(
                                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                                "statement touches more than {} rows",
-                                scratch.capacity()
+                                "statement row selection: {}",
+                                error
                             )
                         })?;
                 }
@@ -73173,7 +73208,7 @@ mod tests {
         config.memtable_bytes = 1 << 16;
         config.max_connections = 2;
         config.max_tables = 2;
-        config.table_rows = 128;
+        config.row_overlay_slots = 128;
         config.txn_rows = 128;
         config.value_index_rows = 512;
         config.max_value_indexes = 8;

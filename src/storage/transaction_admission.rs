@@ -174,7 +174,7 @@ mod tests {
         let mut config = test_config();
         config.transaction_mode = mode;
         config.max_tables = 2;
-        config.table_rows = 2;
+        config.row_overlay_slots = 2;
         config.txn_rows = 2;
         // This row-publication fixture does not stage catalog edits.
         config.max_ddl_per_transaction = 1;

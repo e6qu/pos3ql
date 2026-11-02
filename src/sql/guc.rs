@@ -500,9 +500,12 @@ impl SeqSession {
     }
 
     pub(crate) const fn extra_budget_bytes(sequence_capacity: usize) -> usize {
-        sequence_capacity.saturating_sub(INLINE_SEQUENCE_SLOTS)
-            * (core::mem::size_of::<Cell<(u64, i64)>>()
-                + core::mem::size_of::<Cell<SequenceCache>>())
+        sequence_capacity
+            .saturating_sub(INLINE_SEQUENCE_SLOTS)
+            .saturating_mul(
+                core::mem::size_of::<Cell<(u64, i64)>>()
+                    .saturating_add(core::mem::size_of::<Cell<SequenceCache>>()),
+            )
     }
 
     fn with_capacity(budget: &mut Budget, sequence_capacity: usize) -> Result<Self, BudgetError> {
@@ -1108,10 +1111,10 @@ impl GucState {
     }
 
     pub(crate) const fn extra_savepoint_budget_bytes(capacity: usize) -> usize {
-        capacity * core::mem::size_of::<Option<GucSavepoint>>()
+        capacity.saturating_mul(core::mem::size_of::<Option<GucSavepoint>>())
     }
 
-    pub(crate) fn new_with_capacities(
+    pub fn new_with_capacities(
         budget: &mut Budget,
         sequence_capacity: usize,
         savepoint_capacity: usize,
@@ -3065,4 +3068,39 @@ fn invalid_setting_value(param: &str, v: &str) -> SqlError {
         param,
         v
     )
+}
+
+#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
+mod budget_tests {
+    use super::*;
+
+    #[test]
+    fn configured_guc_capacities_saturate_and_valid_reservations_remain_exact() {
+        let mut config = crate::config::Config::default_dev();
+        config.max_sequences = usize::MAX;
+        config.max_savepoints_per_transaction = usize::MAX;
+        assert_eq!(
+            SeqSession::extra_budget_bytes(config.max_sequences),
+            usize::MAX
+        );
+        assert_eq!(
+            GucState::extra_savepoint_budget_bytes(config.max_savepoints_per_transaction),
+            usize::MAX
+        );
+        for sequences in [0, INLINE_SEQUENCE_SLOTS, INLINE_SEQUENCE_SLOTS + 3] {
+            for savepoints in [0, 1, 3] {
+                let bytes = SeqSession::extra_budget_bytes(sequences)
+                    + GucState::extra_savepoint_budget_bytes(savepoints);
+                let mut budget = Budget::new(bytes);
+                let _state = GucState::new_with_capacities(
+                    &mut budget,
+                    sequences,
+                    savepoints,
+                    config.transaction_mode,
+                )
+                .unwrap();
+                assert_eq!(budget.remaining(), 0);
+            }
+        }
+    }
 }

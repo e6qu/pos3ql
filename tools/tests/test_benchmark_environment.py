@@ -29,6 +29,10 @@ class BenchmarkEnvironmentTests(unittest.TestCase):
             "100",
             "--table-capacity",
             "512",
+            "--row-overlay-slots", "512",
+            "--row-work-bytes", "8388608",
+            "--row-work-leases", "128",
+            "--definition-image-slots", "256",
             "--operations",
             "20",
             "--clients",
@@ -82,6 +86,7 @@ class BenchmarkEnvironmentTests(unittest.TestCase):
             directory = pathlib.Path(temporary)
             subprocess.run(self.arguments(directory), cwd=ROOT, check=True)
             result = json.loads((directory / "environment.json").read_text())
+            self.assertEqual({name: result["suite"][name] for name in ["row_overlay_slots", "row_work_bytes", "row_work_leases", "definition_image_slots"]}, {"row_overlay_slots": 512, "row_work_bytes": 8388608, "row_work_leases": 128, "definition_image_slots": 256})
 
         self.assertEqual(result["hardware_description"], "fixed host type")
         self.assertEqual(result["suite"]["catalog_relations"], 128)

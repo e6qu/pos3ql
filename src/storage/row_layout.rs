@@ -51,7 +51,7 @@ mod tests {
 
     fn fixture(persistence: RelationPersistence, count: usize) -> (Storage, usize, usize) {
         let mut config = test_config();
-        config.table_rows = count * 2;
+        config.row_overlay_slots = count * 2;
         let mut budget = test_budget(&config);
         let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let mut definition = make_def("layout_orders", &[("id", ColType::Int4, false)]);

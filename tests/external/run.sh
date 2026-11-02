@@ -269,7 +269,10 @@ max_triggers = 64
 max_publications = 64
 # The spill-ingest scenario writes 24,000 rows; this is the fixed per-table
 # capacity, not a cache bound, so it must cover the declared workload.
-table_rows = 32768
+row_overlay_slots = 32768
+row_work_bytes = 8MiB
+row_work_leases = 128
+definition_image_slots = 256
 max_value_indexes = 64
 max_prepared_transactions = 8
 max_subscriptions = 2
@@ -616,6 +619,10 @@ cat > "$WORK/rpo0.conf" <<EOF
 transaction_mode = mvcc
 catalog_history_bytes = 16MiB
 row_history_slots = 65536
+row_overlay_slots = 8192
+row_work_bytes = 8MiB
+row_work_leases = 128
+definition_image_slots = 256
 listen_addr = 127.0.0.1:$((PG_PORT + 2))
 data_dir = ${WORK}/rpo0-data
 object_store = on
@@ -696,8 +703,8 @@ fi # dur
 
 if want overlay; then
 
-step "row count beyond table_rows: the map is an overlay, the bucket is the table"
-# A table_rows far below the dataset: the row map holds only the working
+step "two tables grow beyond one shared resident row pool"
+# A row_overlay_slots budget far below the dataset holds only the working
 # set, and reads, counts, updates, deletes and the cold start below all
 # reach entry-less rows through the spill list.
 cat > "$WORK/overlay.conf" <<EOF
@@ -707,7 +714,10 @@ row_history_slots = 65536
 listen_addr = 127.0.0.1:$((PG_PORT + 3))
 data_dir = ${WORK}/overlay-data
 memtable_bytes = 512KiB
-table_rows = 1024
+row_overlay_slots = 1024
+row_work_bytes = 8MiB
+row_work_leases = 128
+definition_image_slots = 256
 object_store = on
 object_store_endpoint = 127.0.0.1:${S3_TEST_PORT}
 object_store_bucket = ${S3_TEST_BUCKET}
@@ -726,12 +736,13 @@ OVERLAY_PID=$START_PID
 # (count, point read, update, delete, cold start) over a constrained dataset far
 # larger than the map.
 "$PSQL" -h 127.0.0.1 -p $((PG_PORT + 3)) -U postgres -X -q \
-  -c "CREATE TABLE big (id int PRIMARY KEY, v text)"
-# 5000 rows through a 1024-entry map: batches with checkpoints between, so
-# entries spill and evict as the data outgrows the overlay.
-for batch in 0 1 2 3 4; do
+  -c "CREATE TABLE big (id int PRIMARY KEY, v text); CREATE TABLE peer_big (id int PRIMARY KEY, v text)"
+# Each table grows to 5000 rows. Both batches share the same 1024 slots;
+# checkpoints release saved entries before the next 1000-row combined batch.
+for batch in 0 1 2 3 4 5 6 7 8 9; do
   "$PSQL" -h 127.0.0.1 -p $((PG_PORT + 3)) -U postgres -X -q \
-    -c "INSERT INTO big SELECT $batch * 1000 + g, 'r' || ($batch * 1000 + g) FROM generate_series(0, 999) g" \
+    -c "INSERT INTO big SELECT $batch * 500 + g, 'r' || ($batch * 500 + g) FROM generate_series(0, 499) g" \
+    -c "INSERT INTO peer_big SELECT $batch * 500 + g, 'peer' || ($batch * 500 + g) FROM generate_series(0, 499) g" \
     -c "CHECKPOINT"
 done
 "$PSQL" -h 127.0.0.1 -p $((PG_PORT + 3)) -U postgres -X -q \
@@ -739,8 +750,12 @@ done
   -c "UPDATE big SET v = 'updated' WHERE id = 4321" \
   -c "CHECKPOINT"
 out=$("$PSQL" -h 127.0.0.1 -p $((PG_PORT + 3)) -U postgres -X -t -A -F'|' \
+  -c "SELECT count(*), min(v) FILTER (WHERE id = 4321) FROM peer_big" 2>&1)
+[[ "$out" == "5000|peer4321" ]] && ok "second table uses the same 1024-slot global pool" \
+  || bad "shared overlay peer rows: '$out'"
+out=$("$PSQL" -h 127.0.0.1 -p $((PG_PORT + 3)) -U postgres -X -t -A -F'|' \
   -c "SELECT (SELECT count(*) FROM big), (SELECT v FROM big WHERE id = 4321), (SELECT count(*) FROM big WHERE id % 100 = 7), (SELECT v FROM big WHERE id = 2500)" 2>&1)
-[[ "$out" == "4950|updated|0|r2500" ]] && ok "5000 rows through a 1024-entry map" \
+[[ "$out" == "4950|updated|0|r2500" ]] && ok "5000 saved rows with a 1024-slot global pool" \
   || bad "overlay row count: '$out'"
 out=$("$PSQL" -h 127.0.0.1 -p $((PG_PORT + 3)) -U postgres -X -t -A -F'|' \
   -c "BEGIN" \
@@ -773,14 +788,18 @@ uniq_count=$("$PSQL" -h 127.0.0.1 -p $((PG_PORT + 3)) -U postgres -X -t -A \
   && ok "uniqueness enforced across the spill boundary at scale" \
   || bad "spill-boundary uniqueness: dup='$dup_spilled' fresh='$dup_fresh' count='$uniq_count'"
 
+# Commit more rows without requesting another checkpoint. Cold recovery must
+# combine saved generations with any newer committed journal records.
+"$PSQL" -h 127.0.0.1 -p $((PG_PORT + 3)) -U postgres -X -q \
+  -c "INSERT INTO big VALUES (5002, 'tail-big'); INSERT INTO peer_big VALUES (5002, 'tail-peer')"
 kill -9 $OVERLAY_PID 2>/dev/null; wait $OVERLAY_PID 2>/dev/null
 rm -rf "$WORK/overlay-data"
 start_pos3ql "$WORK/overlay.conf" "$WORK/overlay.log" $((PG_PORT + 3))
 OVERLAY_PID=$START_PID
 out=$("$PSQL" -h 127.0.0.1 -p $((PG_PORT + 3)) -U postgres -X -t -A -F'|' \
-  -c "SELECT count(*), (SELECT v FROM big WHERE id = 4321) FROM big" 2>&1 | head -1)
+  -c "SELECT (SELECT count(*) FROM big), (SELECT v FROM big WHERE id = 4321), (SELECT count(*) FROM peer_big), (SELECT v FROM peer_big WHERE id = 5002), (SELECT v FROM big WHERE id = 5002)" 2>&1 | head -1)
 kill -9 $OVERLAY_PID 2>/dev/null; wait $OVERLAY_PID 2>/dev/null
-[[ "$out" == "4950|updated" ]] && ok "wiped-disk cold start of a dataset larger than table_rows" \
+[[ "$out" == "4951|updated|5001|tail-peer|tail-big" ]] && ok "wiped-disk recovery of both tables and newer committed rows" \
   || bad "overlay cold start: '$out'"
 
 fi # overlay
@@ -1168,7 +1187,10 @@ max_operator_families = 16
 max_operator_classes = 16
 max_triggers = 16
 max_publications = 16
-table_rows = 4096
+row_overlay_slots = 4096
+row_work_bytes = 8MiB
+row_work_leases = 128
+definition_image_slots = 256
 max_value_indexes = 16
 max_replication_slots = 4
 work_arena_bytes = 16MiB
@@ -1492,6 +1514,10 @@ cat > "$WORK/server-tls.conf" <<EOF
 transaction_mode = mvcc
 catalog_history_bytes = 16MiB
 row_history_slots = 65536
+row_overlay_slots = 8192
+row_work_bytes = 8MiB
+row_work_leases = 128
+definition_image_slots = 256
 listen_addr = 127.0.0.1:${STLS_PORT}
 data_dir = ${WORK}/server-tls-data
 object_store = off

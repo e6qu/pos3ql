@@ -573,8 +573,8 @@ mod tests {
             config.max_tables = 1;
             config.max_catalog_versions_per_object = 1;
             config.query_workspace_slots = 1;
-            let capacity =
-                table_slot_capacity(&config) * (config.max_catalog_versions_per_object + 1);
+            config.definition_image_slots = 2;
+            let capacity = config.definition_image_slots;
             let mut budget = test_budget(&config);
             let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
             let mut definition = make_def(
@@ -596,13 +596,10 @@ mod tests {
                     readers.push(reader);
                 }
                 let exhausted = storage.table_definition_images();
-                assert_eq!(
-                    exhausted
-                        .definition(&storage, table, 0)
-                        .unwrap_err()
-                        .sqlstate,
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED
-                );
+                let Err(error) = exhausted.definition(&storage, table, 0) else {
+                    panic!("all definition images are held by readers");
+                };
+                assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
                 pending(&storage, table, 1, 8, 2);
                 storage.commit_row(table, 1, 8, 7).unwrap();
                 if indexed {

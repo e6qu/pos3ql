@@ -1971,20 +1971,6 @@ fn srf_count_positional<'a, R: ColumnLookup<'a>>(
     }
 }
 
-/// Synthesizes a `TableDef` for a derived table (`FROM (SELECT ...) exposed`)
-/// from the subquery's output column names and inferred types. Schema only —
-/// no rows are produced, so it needs neither a txid nor bound parameters.
-pub(crate) fn synth_derived_def<'a>(
-    storage: &'a Storage,
-    sub: &'a Select<'a>,
-    exposed: &'a str,
-    col_alias: Option<&'a [&'a str]>,
-    txid: u32,
-    arena: &'a Arena,
-) -> Result<&'a TableDef, SqlError> {
-    synth_derived_def_outer(storage, sub, exposed, col_alias, txid, arena, None)
-}
-
 pub(super) fn preserve_projection_type_identities(
     items: &[SelectItem<'_>],
     scope: Option<&QueryScope<'_>>,
@@ -2068,25 +2054,8 @@ pub(super) fn preserve_projection_type_identities(
     Ok(())
 }
 
-/// [`synth_derived_def`] with an optional outer scope, for a `LATERAL` body: a
-/// FROM-less lateral projection (`SELECT t.a * 2`) types its columns against the
-/// tables to the item's left. A lateral body with its own FROM is typed from
-/// that FROM (its outer references are correlation in WHERE/ON, not in the
-/// projected column types).
-pub(crate) fn synth_derived_def_outer<'a>(
-    storage: &'a Storage,
-    sub: &'a Select<'a>,
-    exposed: &'a str,
-    col_alias: Option<&'a [&'a str]>,
-    txid: u32,
-    arena: &'a Arena,
-    outer: Option<&QueryScope<'a>>,
-) -> Result<&'a TableDef, SqlError> {
-    let definition =
-        describe_derived_definition(storage, sub, exposed, col_alias, txid, arena, outer)?;
-    super::scope::retain_query_definition(definition, arena)
-}
-
+/// Describes a derived table without retaining a maximum-width arena image.
+/// FROM-less LATERAL projections use the preceding tables' column types.
 pub(crate) fn describe_derived_definition<'a>(
     storage: &'a Storage,
     sub: &'a Select<'a>,

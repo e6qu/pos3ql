@@ -747,7 +747,10 @@ impl ReplicationClient {
         receive_bytes: usize,
         send_bytes: usize,
     ) -> usize {
-        publication_capacity * core::mem::size_of::<SqlName>() + receive_bytes + send_bytes
+        publication_capacity
+            .saturating_mul(core::mem::size_of::<SqlName>())
+            .saturating_add(receive_bytes)
+            .saturating_add(send_bytes)
     }
 
     #[cfg(test)]

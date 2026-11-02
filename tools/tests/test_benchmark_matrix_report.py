@@ -35,6 +35,10 @@ class BenchmarkMatrixReportTest(unittest.TestCase):
                 "mode": mode,
                 "rows": 100,
                 "table_capacity": 200,
+                "row_overlay_slots": 200,
+                "row_work_bytes": 8388608,
+                "row_work_leases": 128,
+                "definition_image_slots": 256,
                 "operations_per_client": 10,
                 "clients": 2,
                 "catalog_relations": 128 if mode == "full" else 0,
@@ -212,6 +216,19 @@ class BenchmarkMatrixReportTest(unittest.TestCase):
             "| seaweedfs | PostgreSQL 18 resource matched | catalog lookup",
             completed.stdout,
         )
+
+    def test_rejects_different_shared_row_capacity(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = pathlib.Path(temporary)
+            for backend in ["fixture", "minio", "seaweedfs"]:
+                self.write_run(directory, backend)
+            environment = directory / "seaweedfs" / "environment.json"
+            value = json.loads(environment.read_text())
+            value["suite"]["row_work_bytes"] = 16777216
+            environment.write_text(json.dumps(value))
+            completed = subprocess.run(["python3", str(SCRIPT), str(directory)], text=True, capture_output=True)
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("different suite row_work_bytes", completed.stderr)
 
 
 if __name__ == "__main__":

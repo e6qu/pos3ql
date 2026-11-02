@@ -42,6 +42,9 @@ projection positions through mutable function handoffs, using the existing
 physical reader and startup arenas. Temporary call state belongs to active rows.
 Calls retain selected identities, original defaults and null handling; explicit
 variadic arrays remain distinct from expanded arguments.
+Keep sequence effects aligned with PostgreSQL through sorting, skipped rows
+and tied groups, including nested queries and disk-backed sorts. A zero-row
+limit must validate the query without evaluating its input.
 
 Extend those positions through function bodies and object-store waits, complex
 plans, named/custom casts, SQL cursors and results already sent to the client.
@@ -64,14 +67,22 @@ row lookup structure for each empty table. If most traffic touches `orders`, it 
 available shared slots. A long report keeps its selected versions until it
 finishes; those slots cannot be reassigned simply because demand changes.
 
-Keep startup allocation and arenas. Separate hard instance capacity from active
-leases. Row bytes, committed history and object caches already share capacity;
-remove the remaining `max_tables * table_rows` row-map reservation, retained
-row-ID multipliers and avoidable wide definition-image reservations. Keep small
-stable table identities and generation-checked handles. Make independent limits
-explicit, including embedded configuration; never silently derive unrelated
-capacities from table count. Preserve prepared transactions, rollback, pending
-publication, snapshots and empty-cache recovery as ownership changes.
+Ordinary row metadata, foreground row work and reader definition images now
+share explicit fixed pools. Account for and reduce remaining per-table catalog
+and definition-history reservations; sharing these pools does not make every
+empty table free. Next, store a table's actual columns and index bindings in
+shared startup capacity, so a one-column table does not reserve the metadata
+for a maximum-width table. Preserve object identities, unfinished schema edits,
+retained readers, rollback and cold recovery. Establish whether cache files need
+guaranteed physical disk reservation, then implement and verify it rather than
+equating file length with reserved disk space.
+
+Keep the [ownership/exhaustion tests](https://github.com/e6qu/pos3ql/blob/b3aa3099993c351e09a0eb73fd6c1de67228007d/src/sql/tests/shared_row_work.rs) and
+[two-table spill/recovery case](https://github.com/e6qu/pos3ql/blob/b3aa3099993c351e09a0eb73fd6c1de67228007d/tests/external/run.sh) as regression coverage.
+Saved generations can exceed resident capacity; replaying their newer journal
+tail still needs resident slots and bytes. Extend the
+[measurement matrix](https://github.com/e6qu/pos3ql/blob/b3aa3099993c351e09a0eb73fd6c1de67228007d/tools/measure-embedded-capacity.py) with realistic populated
+sessions and pinned-reader pressure before claiming an embedded minimum.
 
 Reserve forward progress for commit, rollback, required reads and maintenance.
 Use bounded reclamation and report pinned capacity and named exhaustion.
@@ -80,11 +91,13 @@ durability. Keep memory, cache-disk and temporary/journal limits distinct.
 The [resource design](docs/adaptive-resources.md) records candidate policies and
 code evidence; proposed controls are not current settings.
 
-Measure 1/8/32/128 configured tables at equal explicit global capacity: empty,
-one hot table, evenly hot tables, moving demand and populated sessions in both
-transaction modes. Report named startup reservations, resident pages, stack and
-TLS costs separately. Keep controller state within startup budgets and prove
-capacity conservation, no runtime heap growth and safe release after errors.
+Keep the 1/8/32/128-table comparisons at equal explicit global capacity in both
+transaction modes. Identify memory counters and their units; separate named
+startup reservations, resident pages, stack and TLS costs. Old unlabelled RSS
+peaks are not comparable to the corrected current-program measurements described
+in the [performance guide](docs/performance.md). Keep controller state within
+startup budgets and prove capacity conservation, no runtime heap growth and safe
+release after errors.
 Preserve the [historical embedded measurements](https://github.com/e6qu/pos3ql/blob/4054a6d3c79e916728f8e84d84139eae6d86b501/benchmarks/baselines/2026-10-30-embedded-lazy-definitions/README.md);
 repeat with independent statistics capacity and populated workloads before
 claiming a current embedded minimum.

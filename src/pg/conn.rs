@@ -5488,7 +5488,7 @@ mod tests {
         let mut config = Config::default_dev();
         config.data_dir = directory.to_string_lossy().into_owned();
         config.max_tables = 8;
-        config.table_rows = 128;
+        config.row_overlay_slots = 128;
         config.wal_bytes = 1 << 20;
         config.wal_buffer_bytes = 1 << 16;
         config.remove_test_data_dir_on_drop();
@@ -5610,7 +5610,7 @@ mod tests {
             let mut config = Config::default_dev();
             config.data_dir = directory.to_string_lossy().into_owned();
             config.max_tables = 8;
-            config.table_rows = 128;
+            config.row_overlay_slots = 128;
             config.max_prepared = 2;
             config.wal_bytes = 1 << 20;
             config.wal_buffer_bytes = 1 << 16;
@@ -5724,7 +5724,7 @@ mod tests {
                 config.transaction_mode = mode;
                 config.data_dir = directory.to_string_lossy().into_owned();
                 config.max_tables = 8;
-                config.table_rows = 64;
+                config.row_overlay_slots = 64;
                 config.max_connections = 4;
                 config.wal_bytes = 1 << 20;
                 config.wal_buffer_bytes = 1 << 16;
@@ -5906,7 +5906,7 @@ mod tests {
             config.data_dir = directory.to_string_lossy().into_owned();
             config.memtable_bytes = 1 << 20;
             config.max_tables = 4;
-            config.table_rows = 64;
+            config.row_overlay_slots = 64;
             config.max_connections = 2;
             config.max_prepared = 2;
             config.max_portals = 2;
@@ -6055,7 +6055,7 @@ mod tests {
                 assert!(!conn.parked);
                 assert!(conn.txn.suspended_statement_deadline().is_none());
             } else {
-                let turn_bound = config.max_tables * config.table_rows * 8
+                let turn_bound = config.max_tables * config.row_overlay_slots * 8
                     + config.memtable_bytes / (64 << 10) * 4;
                 for _ in 0..turn_bound {
                     let before_durable = engine.durable_lsn();
@@ -6114,7 +6114,7 @@ mod tests {
             let mut config = Config::default_dev();
             config.data_dir = directory.to_string_lossy().into_owned();
             config.max_tables = 4;
-            config.table_rows = 16;
+            config.row_overlay_slots = 16;
             config.max_connections = 2;
             config.max_prepared = 2;
             config.max_portals = 2;
@@ -6383,7 +6383,7 @@ mod tests {
             let mut config = Config::default_dev();
             config.data_dir = directory.to_string_lossy().into_owned();
             config.max_tables = 8;
-            config.table_rows = 64;
+            config.row_overlay_slots = 64;
             config.max_connections = 4;
             config.max_prepared = 2;
             config.max_portals = 2;
@@ -6570,7 +6570,7 @@ mod tests {
         let mut config = Config::default_dev();
         config.data_dir = directory.to_string_lossy().into_owned();
         config.max_tables = 8;
-        config.table_rows = 64;
+        config.row_overlay_slots = 64;
         config.copy_transition_bytes = 32;
         config.wal_bytes = 1 << 20;
         config.wal_buffer_bytes = 1 << 16;
@@ -6731,7 +6731,7 @@ mod tests {
         let mut config = Config::default_dev();
         config.data_dir = directory.to_string_lossy().into_owned();
         config.max_tables = 8;
-        config.table_rows = 128;
+        config.row_overlay_slots = 128;
         config.wal_bytes = 1 << 20;
         config.wal_buffer_bytes = 1 << 16;
         config.conn_recv_buffer_bytes = 2 << 20;
@@ -6944,7 +6944,7 @@ mod tests {
             format!("fast-path-large-object-{}-{suffix}", std::process::id());
         crate::object_store::sim::drop_namespace(&config.object_store_bucket);
         config.max_tables = 8;
-        config.table_rows = 256;
+        config.row_overlay_slots = 256;
         config.large_object_pages = 64;
         config.wal_bytes = 1 << 20;
         config.wal_buffer_bytes = 1 << 16;
@@ -7034,7 +7034,7 @@ mod tests {
             config.wal_upload = false;
             config.max_connections = 2;
             config.max_tables = 2;
-            config.table_rows = 16;
+            config.row_overlay_slots = 16;
             config.txn_rows = 16;
             let mut budget = crate::sql::test_engine_budget(&config, 1 << 30);
             let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -7163,7 +7163,7 @@ mod tests {
         crate::object_store::sim::drop_namespace(&config.object_store_bucket);
         config.max_connections = 1;
         config.max_tables = 8;
-        config.table_rows = 256;
+        config.row_overlay_slots = 256;
         config.wal_bytes = 1 << 20;
         config.wal_buffer_bytes = 1 << 16;
         let plan = config.memory_plan(0, Engine::extra_budget_bytes(&config));
@@ -7249,7 +7249,7 @@ mod tests {
         let mut config = Config::default_dev();
         config.data_dir = directory.to_string_lossy().into_owned();
         config.max_tables = 8;
-        config.table_rows = 256;
+        config.row_overlay_slots = 256;
         let mut budget = crate::sql::test_engine_budget(&config, 1 << 30);
         let mut engine = Engine::new(&config, &mut budget).expect("engine");
         let mut connection = Conn::new(&config, &mut budget).expect("connection");
@@ -7332,7 +7332,7 @@ mod tests {
         let mut config = Config::default_dev();
         config.data_dir = directory.to_string_lossy().into_owned();
         config.max_tables = 8;
-        config.table_rows = 256;
+        config.row_overlay_slots = 256;
         let mut budget = crate::sql::test_engine_budget(&config, 1 << 30);
         let mut engine = Engine::new(&config, &mut budget).expect("engine");
         let mut connection = Conn::new(&config, &mut budget).expect("connection");
@@ -7457,7 +7457,7 @@ mod tests {
         let mut config = Config::default_dev();
         config.data_dir = directory.to_string_lossy().into_owned();
         config.max_tables = 8;
-        config.table_rows = 256;
+        config.row_overlay_slots = 256;
         let mut budget = crate::sql::test_engine_budget(&config, 1 << 30);
         let mut engine = Engine::new(&config, &mut budget).expect("engine");
         let mut connection = Conn::new(&config, &mut budget).expect("connection");
@@ -7561,7 +7561,7 @@ mod tests {
         let mut config = Config::default_dev();
         config.data_dir = directory.to_string_lossy().into_owned();
         config.max_tables = 8;
-        config.table_rows = 256;
+        config.row_overlay_slots = 256;
         let mut budget = crate::sql::test_engine_budget(&config, 1 << 30);
         let mut engine = Engine::new(&config, &mut budget).expect("engine");
         let mut connection = Conn::new(&config, &mut budget).expect("connection");
@@ -7663,7 +7663,7 @@ mod tests {
         let mut config = Config::default_dev();
         config.data_dir = directory.to_string_lossy().into_owned();
         config.max_tables = 8;
-        config.table_rows = 256;
+        config.row_overlay_slots = 256;
         let mut budget = crate::sql::test_engine_budget(&config, 1 << 30);
         let mut engine = Engine::new(&config, &mut budget).expect("engine");
         let mut connection = Conn::new(&config, &mut budget).expect("connection");
@@ -7740,7 +7740,7 @@ mod tests {
             config.transaction_mode = mode;
             config.data_dir = directory.to_string_lossy().into_owned();
             config.max_tables = 4;
-            config.table_rows = 16;
+            config.row_overlay_slots = 16;
             config.max_connections = 2;
             config.max_prepared = 2;
             config.max_portals = 2;
@@ -7901,7 +7901,7 @@ mod tests {
         config.max_ddl_per_transaction = 1;
         config.max_tables = 2;
         config.max_extended_statistics = 16;
-        config.table_rows = 16;
+        config.row_overlay_slots = 16;
         config.txn_rows = 16;
         config.memtable_bytes = 1 << 20;
         config.wal_bytes = 1 << 20;
@@ -8151,7 +8151,7 @@ mod tests {
     fn canceling_a_parked_statement_emits_query_canceled() {
         let mut config = Config::default_dev();
         config.max_tables = 8;
-        config.table_rows = 256;
+        config.row_overlay_slots = 256;
         let mut budget = crate::sql::test_engine_budget(&config, 1 << 30);
         let mut engine = Engine::new(&config, &mut budget).expect("engine budget");
         let mut connection = Conn::new(&config, &mut budget).expect("connection budget");

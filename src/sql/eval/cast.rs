@@ -18,6 +18,41 @@ use super::{
 
 const MICROS_PER_DAY: i64 = 86_400_000_000;
 
+fn float_to_numeric<'a>(
+    value: f64,
+    fractional_digits: usize,
+    arena: &'a Arena,
+) -> Result<Numeric<'a>, SqlError> {
+    if value.is_nan() {
+        return Ok(Numeric::NAN);
+    }
+    if value.is_infinite() {
+        return Ok(if value.is_sign_negative() {
+            Numeric::NEG_INFINITY
+        } else {
+            Numeric::POS_INFINITY
+        });
+    }
+    // PostgreSQL numeric.c uses FLT_DIG/DBL_DIG significant digits. Scientific
+    // formatting supplies that rounding without depending on the host locale.
+    let formatted = crate::stack_format!(64, "{:.*e}", fractional_digits, value);
+    if formatted.is_truncated() {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "numeric float conversion exceeds its fixed buffer"
+        ));
+    }
+    let (mantissa, exponent) = formatted.as_str().split_once('e').ok_or_else(|| {
+        sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "numeric float conversion lacks an exponent"
+        )
+    })?;
+    let mantissa = mantissa.trim_end_matches('0').trim_end_matches('.');
+    let decimal = crate::stack_format!(64, "{}e{}", mantissa, exponent);
+    Numeric::parse(decimal.as_str(), arena)
+}
+
 fn date_to_timestamp(date: i32) -> Result<i64, SqlError> {
     match date {
         crate::sql::datetime::DATE_INFINITY => Ok(crate::sql::datetime::TIMESTAMP_INFINITY),
@@ -682,19 +717,12 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
         ColType::Numeric => match v {
             Datum::Numeric(_) => v,
             Datum::Money(value) => Datum::Numeric(crate::sql::money::to_numeric(value, arena)?),
+            Datum::Int2(x) => Datum::Numeric(Numeric::from_i64(i64::from(x), arena)?),
             Datum::Int4(x) => Datum::Numeric(Numeric::from_i64(i64::from(x), arena)?),
             Datum::Oid(x) => Datum::Numeric(Numeric::from_i64(i64::from(x), arena)?),
             Datum::Int8(x) => Datum::Numeric(Numeric::from_i64(x, arena)?),
-            Datum::Float8(x) => {
-                // float8 -> numeric via the shortest round-trip decimal.
-                let text = crate::stack_format!(64, "{}", x);
-                Datum::Numeric(Numeric::parse(text.as_str(), arena)?)
-            }
-            Datum::Float4(x) => {
-                // real -> numeric via the shortest single-precision decimal.
-                let text = crate::stack_format!(64, "{}", x);
-                Datum::Numeric(Numeric::parse(text.as_str(), arena)?)
-            }
+            Datum::Float8(x) => Datum::Numeric(float_to_numeric(x, 14, arena)?),
+            Datum::Float4(x) => Datum::Numeric(float_to_numeric(f64::from(x), 5, arena)?),
             Datum::Text(s) => Datum::Numeric(Numeric::parse(s, arena)?),
             _ => return Err(cast_unsupported(&v, "numeric")),
         },
@@ -1355,6 +1383,62 @@ mod tests {
     fn err(s: &str, lo: i64, hi: i64, ty: &'static str) -> (String, String) {
         let e = parse_int_bounded(s, lo, hi, ty).unwrap_err();
         (e.sqlstate.to_string(), e.message.as_str().to_string())
+    }
+
+    #[test]
+    fn numeric_casts_preserve_integer_width_boundaries_without_heap_allocations() {
+        let mut budget = crate::mem::Budget::new(1 << 14);
+        let arena = Arena::new(&mut budget, "numeric integer casts", 1 << 14).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            for (input, expected) in [
+                (Datum::Int2(i16::MIN), i64::from(i16::MIN)),
+                (Datum::Int2(-1), -1),
+                (Datum::Int2(0), 0),
+                (Datum::Int2(i16::MAX), i64::from(i16::MAX)),
+                (Datum::Int4(i32::MIN), i64::from(i32::MIN)),
+                (Datum::Int4(i32::MAX), i64::from(i32::MAX)),
+                (Datum::Int8(i64::MIN), i64::MIN),
+                (Datum::Int8(i64::MAX), i64::MAX),
+            ] {
+                let Datum::Numeric(value) = cast_to(input, ColType::Numeric, &arena).unwrap()
+                else {
+                    panic!("numeric cast returned a different type");
+                };
+                assert_eq!(value.to_i64().unwrap(), expected);
+            }
+            assert_eq!(
+                cast_to(Datum::Null, ColType::Numeric, &arena).unwrap(),
+                Datum::Null
+            );
+        });
+    }
+
+    #[test]
+    fn numeric_float_casts_match_postgresql_significant_digits_and_special_values() {
+        let mut budget = crate::mem::Budget::new(1 << 14);
+        let arena = Arena::new(&mut budget, "numeric float casts", 1 << 14).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            for (input, expected) in [
+                (Datum::Float4(1.2345678), "1.23457"),
+                (Datum::Float8(1.2345678901234567), "1.23456789012346"),
+                (Datum::Float8(1.0), "1"),
+                (Datum::Float4(0.000001), "0.000001"),
+                (Datum::Float4(-0.0), "0"),
+                (Datum::Float8(-0.0), "0"),
+                (Datum::Float4(f32::INFINITY), "Infinity"),
+                (Datum::Float4(f32::NEG_INFINITY), "-Infinity"),
+                (Datum::Float8(f64::INFINITY), "Infinity"),
+                (Datum::Float8(f64::NEG_INFINITY), "-Infinity"),
+                (Datum::Float4(f32::NAN), "NaN"),
+                (Datum::Float8(f64::NAN), "NaN"),
+            ] {
+                let Datum::Numeric(value) = cast_to(input, ColType::Numeric, &arena).unwrap()
+                else {
+                    panic!("numeric cast returned a different type");
+                };
+                assert_eq!(crate::stack_format!(128, "{}", value).as_str(), expected);
+            }
+        });
     }
 
     #[test]

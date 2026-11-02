@@ -14,6 +14,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[derive(Debug)]
 pub(crate) enum StorageSetupError {
     Budget(BudgetError),
+    Configuration(crate::config::ConfigError),
+    RowWork(crate::mem::lease_pool::RowWorkSetupError),
     CatalogIdentitySpaceExhausted,
 }
 
@@ -23,10 +25,27 @@ impl From<BudgetError> for StorageSetupError {
     }
 }
 
+impl From<crate::config::ConfigError> for StorageSetupError {
+    fn from(error: crate::config::ConfigError) -> Self {
+        Self::Configuration(error)
+    }
+}
+
+impl From<crate::mem::lease_pool::RowWorkSetupError> for StorageSetupError {
+    fn from(error: crate::mem::lease_pool::RowWorkSetupError) -> Self {
+        match error {
+            crate::mem::lease_pool::RowWorkSetupError::Budget(error) => Self::Budget(error),
+            error => Self::RowWork(error),
+        }
+    }
+}
+
 impl std::fmt::Display for StorageSetupError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Budget(error) => write!(formatter, "{error}"),
+            Self::Configuration(error) => write!(formatter, "{error}"),
+            Self::RowWork(error) => write!(formatter, "{error}"),
             Self::CatalogIdentitySpaceExhausted => {
                 formatter.write_str("catalog reference identity space exhausted")
             }
@@ -38,6 +57,8 @@ impl std::error::Error for StorageSetupError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Budget(error) => Some(error),
+            Self::Configuration(error) => Some(error),
+            Self::RowWork(error) => Some(error),
             Self::CatalogIdentitySpaceExhausted => None,
         }
     }

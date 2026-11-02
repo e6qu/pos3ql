@@ -1,6 +1,597 @@
 use super::*;
 
 #[test]
+fn sorted_and_paged_projection_effects_follow_postgresql_in_memory() {
+    sorted_and_paged_projection_effects(false);
+}
+
+#[test]
+fn sorted_and_paged_projection_effects_follow_postgresql_through_http() {
+    sorted_and_paged_projection_effects(true);
+}
+
+fn sorted_and_paged_projection_effects(external: bool) {
+    let mut config = test_config(if external {
+        "projection-window-external"
+    } else {
+        "projection-window-ram"
+    });
+    config.object_store_on = external;
+    config.object_store_sim = external;
+    config.object_store_bucket = format!("projection-window-{}-{external}", std::process::id());
+    // All nine fixture relations coexist; statement work remains 256 KiB.
+    config.max_tables = 9;
+    config.work_arena_bytes = 256 << 10;
+    config.block_cache_bytes = 0;
+    config.disk_cache_bytes = 0;
+    let server = external.then(|| object_reads::HttpObjectServer::start(&mut config));
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    assert_eq!(engine.storage.spill_attached(), external);
+    let initial_uploads = server
+        .as_ref()
+        .map(|server| server.uploads.load(std::sync::atomic::Ordering::Relaxed));
+    let mut session =
+        ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, 256 << 10);
+    session.success(&mut engine,
+            "CREATE TABLE projection_inputs(id integer,payload text); \
+             CREATE TABLE projection_outer(id integer); INSERT INTO projection_outer VALUES(10); \
+             CREATE SEQUENCE projection_calls; \
+             CREATE FUNCTION projection_default(value bigint DEFAULT nextval('public.projection_calls')) \
+             RETURNS bigint IMMUTABLE LANGUAGE sql SET search_path TO pg_catalog AS $$ SELECT value $$", true);
+    for id in [2, 1, 3] {
+        session.success(
+            &mut engine,
+            &format!("INSERT INTO projection_inputs VALUES({id},repeat('p',65536))"),
+            true,
+        );
+    }
+    for (query, expected) in [
+        (
+            "SELECT id,nextval('projection_calls') AS marker FROM projection_inputs ORDER BY id LIMIT 1",
+            &["1|1", "1"][..],
+        ),
+        (
+            "SELECT id,nextval('projection_calls') AS marker FROM projection_inputs ORDER BY id",
+            &["1|1", "2|2", "3|3", "3"][..],
+        ),
+        (
+            "SELECT * FROM (SELECT id,nextval('projection_calls') AS marker FROM projection_inputs LIMIT 1) AS selected",
+            &["2|1", "1"][..],
+        ),
+        (
+            "SELECT id,nextval('projection_calls') AS marker FROM projection_inputs ORDER BY id OFFSET 1 LIMIT 1",
+            &["2|2", "2"][..],
+        ),
+        (
+            "SELECT * FROM (SELECT id,nextval('projection_calls') AS marker FROM projection_inputs OFFSET 1 LIMIT 1) AS selected",
+            &["1|2", "2"][..],
+        ),
+        (
+            "SELECT id,nextval('projection_calls') AS marker FROM projection_inputs ORDER BY marker LIMIT 1",
+            &["2|1", "3"][..],
+        ),
+        (
+            "SELECT id,nextval('projection_calls') AS marker FROM projection_inputs ORDER BY nextval('projection_calls') OFFSET 1 LIMIT 1",
+            &["1|2", "3"][..],
+        ),
+        (
+            "SELECT id,projection_default() AS marker FROM projection_inputs ORDER BY id LIMIT 1",
+            &["1|1", "1"][..],
+        ),
+        (
+            "SELECT * FROM (SELECT id,projection_default() AS marker FROM projection_inputs ORDER BY id LIMIT 1) AS selected",
+            &["1|1", "1"][..],
+        ),
+        (
+            "SELECT source.id,selected.marker FROM projection_outer AS source CROSS JOIN LATERAL (SELECT source.id+nextval('projection_calls') AS marker FROM projection_inputs ORDER BY id LIMIT 1) AS selected",
+            &["10|11", "1"][..],
+        ),
+    ] {
+        let command = format!(
+            "ALTER SEQUENCE projection_calls RESTART WITH 1; {query}; SELECT currval('projection_calls')"
+        );
+        let output = session.success(&mut engine, &command, true);
+        assert_eq!(data_rows(&output), expected, "external={external}: {query}");
+    }
+    let ties = session.success(
+        &mut engine,
+        "CREATE TABLE projection_ties(id integer); INSERT INTO projection_ties VALUES(2),(1),(1); \
+             ALTER SEQUENCE projection_calls RESTART WITH 1; \
+             SELECT * FROM (SELECT id,nextval('projection_calls') AS marker FROM projection_ties \
+                 ORDER BY id FETCH FIRST 1 ROW WITH TIES) AS selected; \
+             SELECT currval('projection_calls')",
+        true,
+    );
+    assert_eq!(data_rows(&ties), ["1|1", "1|2", "3"], "external={external}");
+    let offset_ties = session.success(
+        &mut engine,
+        "ALTER SEQUENCE projection_calls RESTART WITH 1; \
+             SELECT * FROM (SELECT id,nextval('projection_calls') AS marker FROM projection_ties \
+                 ORDER BY id OFFSET 1 FETCH FIRST 1 ROW WITH TIES) AS selected; \
+             SELECT currval('projection_calls')",
+        true,
+    );
+    assert_eq!(data_rows(&offset_ties), ["1|2", "3"], "external={external}");
+    let zero_limit = session.success(
+        &mut engine,
+        "ALTER SEQUENCE projection_calls RESTART WITH 1; \
+             SELECT * FROM (SELECT id,nextval('projection_calls') AS marker FROM projection_inputs \
+                 ORDER BY nextval('projection_calls') LIMIT 0) AS selected; \
+             SELECT nextval('projection_calls')",
+        true,
+    );
+    assert_eq!(data_rows(&zero_limit), ["1"], "external={external}");
+    let nested_zero_limit = session.success(
+        &mut engine,
+        "ALTER SEQUENCE projection_calls RESTART WITH 1; \
+             SELECT * FROM (SELECT * FROM (SELECT nextval('projection_calls') AS marker \
+                 FROM projection_inputs) AS source ORDER BY 1 LIMIT 0) AS selected; \
+             SELECT nextval('projection_calls')",
+        true,
+    );
+    assert_eq!(data_rows(&nested_zero_limit), ["1"], "external={external}");
+    session.success(
+        &mut engine,
+        "CREATE TABLE projection_locks(row_id integer PRIMARY KEY,order_key integer); \
+             INSERT INTO projection_locks VALUES(1,1),(2,1),(3,2); \
+             ALTER SEQUENCE projection_calls RESTART WITH 1; BEGIN",
+        true,
+    );
+    let locked = session.success(&mut engine,
+            "SELECT order_key,marker FROM (SELECT row_id,order_key,nextval('projection_calls') AS marker \
+                 FROM projection_locks ORDER BY order_key FETCH FIRST 1 ROW WITH TIES FOR UPDATE) AS selected; \
+             SELECT currval('projection_calls')", true);
+    assert_eq!(
+        data_rows(&locked),
+        ["1|1", "1|2", "3"],
+        "external={external}"
+    );
+    let mut other = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+    assert_eq!(
+        error_sqlstates(&other.execute(
+            &mut engine,
+            "SELECT row_id FROM projection_locks WHERE row_id=3 FOR UPDATE NOWAIT",
+            true
+        )),
+        ["55P03"]
+    );
+    session.success(&mut engine, "ROLLBACK", true);
+    assert_eq!(
+        data_rows(&other.success(
+            &mut engine,
+            "SELECT row_id FROM projection_locks WHERE row_id=3 FOR UPDATE NOWAIT",
+            true
+        )),
+        ["3"]
+    );
+    session.success(
+        &mut engine,
+        "ALTER SEQUENCE projection_calls RESTART WITH 1; BEGIN; \
+             SELECT row_id FROM projection_locks WHERE row_id=3 FOR UPDATE",
+        true,
+    );
+    let waiting_query = "SELECT order_key,marker FROM (SELECT row_id,order_key,nextval('projection_calls') AS marker \
+            FROM projection_locks ORDER BY order_key FETCH FIRST 1 ROW WITH TIES FOR UPDATE) AS selected";
+    let blocked = other.execute(&mut engine, waiting_query, true);
+    assert!(
+        blocked.is_empty(),
+        "nested lock wait emitted a partial result: external={external}"
+    );
+    session.success(&mut engine, "ROLLBACK", true);
+    let status = crate::mem::guard::forbid_alloc(|| {
+        engine.execute_simple_from(
+            waiting_query,
+            0,
+            &other.arena,
+            &mut other.transaction,
+            &mut other.pool,
+            &mut other.cursors,
+            &mut other.guc,
+            &mut Responder::new(&mut other.send),
+            2,
+            false,
+        )
+    })
+    .unwrap();
+    assert_eq!(status, ExecutionStatus::Complete);
+    assert_eq!(
+        data_rows(other.send.readable()),
+        ["1|1", "1|2"],
+        "external={external}"
+    );
+    assert_eq!(
+        data_rows(&other.success(&mut engine, "SELECT currval('projection_calls')", true)),
+        ["3"]
+    );
+    session.success(&mut engine,
+            "CREATE TABLE projection_left(id integer); INSERT INTO projection_left VALUES(1),(2); \
+             CREATE TABLE projection_right(id integer,payload text); INSERT INTO projection_right VALUES(NULL,NULL); \
+             CREATE TABLE projection_empty(); INSERT INTO projection_empty DEFAULT VALUES", true);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT right_row::text FROM projection_empty AS right_row",
+            true
+        )),
+        ["()"]
+    );
+    for (query, expected) in [
+        (
+            "SELECT left_row::text||nextval('projection_calls')::text \
+              FROM projection_left AS left_row ORDER BY left_row.id",
+            &["(1)1", "(2)2", "2"][..],
+        ),
+        (
+            "SELECT COALESCE(right_row::text,'missing')||nextval('projection_calls')::text \
+              FROM projection_left AS left_row LEFT JOIN projection_right AS right_row ON left_row.id=1 \
+              ORDER BY left_row.id",
+            &["(,)1", "missing2", "2"][..],
+        ),
+        (
+            "SELECT COALESCE(right_row::text,'missing')||nextval('projection_calls')::text \
+              FROM projection_left AS left_row LEFT JOIN projection_empty AS right_row ON left_row.id=1 \
+              ORDER BY left_row.id",
+            &["()1", "missing2", "2"][..],
+        ),
+        (
+            "SELECT ROW(merged.*,nextval('projection_calls'))::text FROM projection_left AS left_row \
+              LEFT JOIN projection_right AS right_row USING(id) AS merged ORDER BY left_row.id",
+            &["(1,1)", "(2,2)", "2"][..],
+        ),
+    ] {
+        let command = format!(
+            "ALTER SEQUENCE projection_calls RESTART WITH 1; {query}; SELECT currval('projection_calls')"
+        );
+        let output = session.success(&mut engine, &command, true);
+        assert_eq!(data_rows(&output), expected, "external={external}: {query}");
+    }
+    session.success(
+        &mut engine,
+        "CREATE TABLE projection_special_forms(id integer,z integer,f double precision,n numeric); \
+         INSERT INTO projection_special_forms VALUES \
+           (1,5,1.5,2.5),(2,4,2.5,3.5),(3,3,3.5,4.5),(9,0,9.5,9.5)",
+        true,
+    );
+    for expression in [
+        "greatest(100/z,f)",
+        "greatest(100/z,f,n)",
+        "least(100/z,f,n,id)",
+        "coalesce(100/z,id)",
+        "coalesce(100/z+f*2-f/3+f*4,n)",
+        "nullif(100/z,id)",
+        "(current_date-current_date)+100/z",
+        "json_object('n':100/z)",
+        "json_object('n':100/z+f*2-f/3+f*4-f/5)",
+        "row(100/z+f*2-f/3+f*4-f/5)",
+        "xmlparse(document('<n>'||(100/z)::text||'</n>'))",
+    ] {
+        let query =
+            format!("SELECT {expression} FROM projection_special_forms ORDER BY id LIMIT 2");
+        let output = session.execute(&mut engine, &query, true);
+        assert_eq!(
+            error_sqlstates(&output),
+            ["22012"],
+            "external={external}: {query}"
+        );
+    }
+    for expression in [
+        "greatest(100/z+f*2-f/3+f*4-f/5,n,id)",
+        "coalesce(100/z+f*2-f/3+f*4-f/5,n)",
+        "json_object('n':100/z+f*2-f/3+f*2-f/3+f*2-f/3+f*2-f/3+f*2-f/3)",
+        "xmlparse(document('<n>'||(100/z+f*2-f/3+f*4-f/5)::text||'</n>'))",
+        "row(100/z+f*2-f/3+f*4-f/5)::text",
+    ] {
+        let query =
+            format!("SELECT {expression} FROM projection_special_forms ORDER BY id LIMIT 2");
+        let output = session.success(&mut engine, &query, true);
+        assert_eq!(data_rows(&output).len(), 2, "external={external}: {query}");
+    }
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "ALTER SEQUENCE projection_calls RESTART WITH 1; \
+             SELECT id,greatest(100/z,nextval('projection_calls')) \
+               FROM projection_special_forms ORDER BY id LIMIT 2; \
+             SELECT nextval('projection_calls')",
+            true,
+        )),
+        ["1|20", "2|25", "3"],
+        "external={external}",
+    );
+    for (expression, expected) in [
+        (
+            "json_object('n':nextval('projection_calls'))->>'n'",
+            &["1|1", "2|2", "3"][..],
+        ),
+        (
+            "xmlserialize(content xmlelement(name n,nextval('projection_calls')) as text)",
+            &["1|<n>1</n>", "2|<n>2</n>", "3"][..],
+        ),
+    ] {
+        let query = format!(
+            "ALTER SEQUENCE projection_calls RESTART WITH 1; \
+             SELECT id,{expression} FROM projection_special_forms ORDER BY id LIMIT 2; \
+             SELECT nextval('projection_calls')"
+        );
+        let output = session.success(&mut engine, &query, true);
+        assert_eq!(data_rows(&output), expected, "external={external}: {query}");
+    }
+    let promoted_nullif = session.success(
+        &mut engine,
+        "SELECT NULLIF(1::smallint,2.0),pg_typeof(NULLIF(1::smallint,2.0)), \
+                NULLIF(1::smallint,2::integer),pg_typeof(NULLIF(1::smallint,2::integer)), \
+                NULLIF(1,2.2),pg_typeof(NULLIF(1,2.2))",
+        true,
+    );
+    assert_eq!(
+        data_rows(&promoted_nullif),
+        ["1|numeric|1|smallint|1|numeric"],
+        "external={external}"
+    );
+    assert_eq!(
+        row_description_type_oids(&promoted_nullif),
+        [1700, 2206, 21, 2206, 1700, 2206]
+    );
+    session.success(
+        &mut engine,
+        "CREATE TYPE projection_pair AS(value integer); \
+         CREATE SEQUENCE projection_equality_calls; \
+         CREATE FUNCTION projection_pair_equals(projection_pair,projection_pair) RETURNS boolean \
+           VOLATILE LANGUAGE sql SET search_path TO pg_catalog \
+           AS $$ SELECT nextval('public.projection_equality_calls')<0 $$; \
+         CREATE OPERATOR public.= (FUNCTION=projection_pair_equals, \
+           LEFTARG=projection_pair,RIGHTARG=projection_pair); \
+         CREATE TABLE projection_pairs(id integer,value projection_pair); \
+         INSERT INTO projection_pairs VALUES(2,ROW(2)),(1,ROW(1)),(3,ROW(3))",
+        true,
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT id,NULLIF(value,ROW(0)::projection_pair)::text FROM projection_pairs \
+               ORDER BY id LIMIT 1; SELECT currval('projection_equality_calls')",
+            true,
+        )),
+        ["1|(1)", "1"],
+        "external={external}",
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "ALTER SEQUENCE projection_equality_calls RESTART WITH 1; \
+             SELECT NULLIF(NULL::projection_pair,ROW(0)::projection_pair)::text; \
+             SELECT nextval('projection_equality_calls')",
+            true,
+        )),
+        ["NULL", "1"],
+        "external={external}",
+    );
+    session.success(
+        &mut engine,
+        "CREATE TYPE projection_mood AS ENUM('x','y'); \
+         ALTER TABLE projection_pairs ADD COLUMN mood projection_mood DEFAULT 'x'; \
+         CREATE FUNCTION projection_enum_json(projection_mood) RETURNS json \
+           VOLATILE LANGUAGE sql SET search_path TO pg_catalog \
+           AS $$ SELECT json_build_object('value',$1::text, \
+                    'call',nextval('public.projection_equality_calls')) $$; \
+         CREATE CAST(projection_mood AS json) WITH FUNCTION projection_enum_json(projection_mood); \
+         CREATE FUNCTION projection_pair_json(projection_pair) RETURNS json \
+           VOLATILE LANGUAGE sql SET search_path TO pg_catalog \
+           AS $$ SELECT json_build_object('value',($1).value, \
+                    'call',nextval('public.projection_equality_calls')) $$; \
+         CREATE CAST(projection_pair AS json) WITH FUNCTION projection_pair_json(projection_pair)",
+        true,
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "ALTER SEQUENCE projection_equality_calls RESTART WITH 1; \
+             SELECT id,json_object('n':mood)->'n'->>'call' FROM projection_pairs \
+               ORDER BY id LIMIT 1; SELECT currval('projection_equality_calls')",
+            true,
+        )),
+        ["1|2", "3"],
+        "external={external}",
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "ALTER SEQUENCE projection_equality_calls RESTART WITH 1; \
+             SELECT id,json_object('n':value)->'n'->>'value' FROM projection_pairs \
+               ORDER BY id LIMIT 1; SELECT last_value,is_called FROM projection_equality_calls; \
+             SELECT (value::json)->>'call' FROM projection_pairs WHERE id=1; \
+             SELECT currval('projection_equality_calls')",
+            true,
+        )),
+        ["1|1", "1|f", "1", "1"],
+        "external={external}",
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "ALTER SEQUENCE projection_equality_calls RESTART WITH 1; \
+             SELECT (mood::json)->>'call' FROM projection_pairs WHERE id=1; \
+             SELECT currval('projection_equality_calls')",
+            true,
+        )),
+        ["1", "1"],
+        "external={external}",
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT NULLIF(mood,'x'),NULLIF(mood,'y'),NULLIF('x',mood), \
+                    NULLIF(NULL::projection_mood,'x'),NULLIF('x',NULL::projection_mood) \
+               FROM projection_pairs WHERE id=1",
+            true,
+        )),
+        ["NULL|x|NULL|NULL|x"],
+        "external={external}",
+    );
+    assert_eq!(
+        error_sqlstates(&session.execute(
+            &mut engine,
+            "SELECT NULLIF(mood,'missing') FROM projection_pairs WHERE id=1",
+            true,
+        )),
+        ["22P02"],
+        "external={external}",
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "ALTER SEQUENCE projection_equality_calls RESTART WITH 1; \
+             SELECT json_array(mood)->0->>'call', \
+                    json_object('n':ARRAY[mood])->'n'->0->>'call', \
+                    json_object('n':ROW(mood))->'n'->'f1'->>'call' \
+               FROM projection_pairs WHERE id=1; SELECT currval('projection_equality_calls')",
+            true,
+        )),
+        ["1|2|3", "3"],
+        "external={external}",
+    );
+    session.success(
+        &mut engine,
+        "CREATE OR REPLACE FUNCTION projection_enum_json(projection_mood) RETURNS json \
+           VOLATILE LANGUAGE sql SET search_path TO pg_catalog AS $$ SELECT NULL::json $$",
+        true,
+    );
+    assert_eq!(
+        error_sqlstates(&session.execute(
+            &mut engine,
+            "SELECT json_object('n':mood) FROM projection_pairs WHERE id=1",
+            true,
+        )),
+        ["XX000"],
+        "external={external}",
+    );
+    let array_comparisons = session.success(
+        &mut engine,
+        "SELECT array_eq(ARRAY[1,NULL],ARRAY[1,NULL]),array_ne(ARRAY[1],ARRAY[2]), \
+                array_lt(ARRAY[1],ARRAY[2]),array_le(ARRAY[1],ARRAY[1]), \
+                array_gt(ARRAY[2],ARRAY[1]),array_ge(ARRAY[1],ARRAY[1]), \
+                btarraycmp(ARRAY[1],ARRAY[2]),btarraycmp(ARRAY[1,2],ARRAY[1]); \
+         SELECT array_eq(NULL::integer[],ARRAY[1]); \
+         SELECT array_eq('{1}',ARRAY[1]),array_eq(ARRAY['x']::projection_mood[],'{x}'); \
+         SELECT array_eq('[0:1]={1,2}'::integer[],ARRAY[1,2]), \
+                array_lt('[0:1]={1,2}'::integer[],ARRAY[1,2]), \
+                btarraycmp('[0:1]={1,2}'::integer[],ARRAY[1,2]); \
+         SELECT array_eq('[1:2][1:1][1:3]={{{1,2,3}},{{4,5,6}}}'::integer[], \
+                         '[1:2][1:3][1:1]={{{1},{2},{3}},{{4},{5},{6}}}'::integer[]), \
+                btarraycmp('[1:2][1:1][1:3]={{{1,2,3}},{{4,5,6}}}'::integer[], \
+                           '[1:2][1:3][1:1]={{{1},{2},{3}},{{4},{5},{6}}}'::integer[])",
+        true,
+    );
+    assert_eq!(
+        data_rows(&array_comparisons),
+        ["t|t|t|t|t|t|-1|1", "NULL", "t|t", "f|t|-1", "f|-1"],
+        "external={external}",
+    );
+    let mut comparison_types = Vec::new();
+    let mut remaining = array_comparisons.as_slice();
+    while !remaining.is_empty() {
+        let length = i32::from_be_bytes(remaining[1..5].try_into().unwrap()) as usize;
+        if remaining[0] == b'T' {
+            comparison_types.extend(row_description_type_oids(&remaining[..1 + length]));
+        }
+        remaining = &remaining[1 + length..];
+    }
+    assert_eq!(
+        comparison_types,
+        [
+            16, 16, 16, 16, 16, 16, 23, 23, 16, 16, 16, 16, 16, 23, 16, 23
+        ],
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT array_gt(ARRAY[NULL::integer],ARRAY[1]), \
+                    array_lt(ARRAY[1],ARRAY[NULL::integer]), \
+                    btarraycmp(ARRAY[NULL::integer],ARRAY[NULL::integer]), \
+                    ARRAY[NULL::integer]=ARRAY[NULL::integer], \
+                    ARRAY[NULL::integer]>ARRAY[1],ARRAY[1]<ARRAY[NULL::integer]; \
+             SELECT ARRAY[1,2,3,4,5,6]<'{{1,2,3},{4,5,6}}'::integer[], \
+                    array_lt(ARRAY[1,2,3,4,5,6],'{{1,2,3},{4,5,6}}'::integer[]), \
+                    btarraycmp(ARRAY[1,2,3,4,5,6],'{{1,2,3},{4,5,6}}'::integer[]), \
+                    '[1:2][1:1][1:3]={{{1,2,3}},{{4,5,6}}}'::integer[] \
+                        <'[0:1][1:3][1:1]={{{1},{2},{3}},{{4},{5},{6}}}'::integer[], \
+                    array_lt('[1:2][1:1][1:3]={{{1,2,3}},{{4,5,6}}}'::integer[], \
+                             '[0:1][1:3][1:1]={{{1},{2},{3}},{{4},{5},{6}}}'::integer[]), \
+                    btarraycmp('[1:2][1:1][1:3]={{{1,2,3}},{{4,5,6}}}'::integer[], \
+                               '[0:1][1:3][1:1]={{{1},{2},{3}},{{4},{5},{6}}}'::integer[])",
+            true,
+        )),
+        ["t|t|0|t|t|t", "t|t|-1|t|t|-1"],
+        "external={external}",
+    );
+    for (query, state) in [
+        ("SELECT array_eq(NULL,NULL)", "42804"),
+        ("SELECT array_eq(NULL::integer[],NULL::text[])", "42883"),
+        (
+            "SELECT array_eq(ARRAY[1]::integer[],ARRAY[1]::bigint[])",
+            "42883",
+        ),
+        (
+            "SELECT array_eq(NULL::projection_mood[],'{missing}')",
+            "22P02",
+        ),
+    ] {
+        assert_eq!(
+            error_sqlstates(&session.execute(&mut engine, query, true)),
+            [state],
+            "external={external}: {query}"
+        );
+    }
+    session.success(
+        &mut engine,
+        "CREATE DOMAIN projection_array AS integer[]; \
+         CREATE FUNCTION projection_array_value(integer,integer) RETURNS projection_array \
+           VOLATILE LANGUAGE plpgsql AS $$ DECLARE value projection_array; BEGIN \
+             PERFORM nextval('public.projection_equality_calls'); value:=ARRAY[$1,$2]; RETURN value; END $$; \
+         CREATE FUNCTION projection_array_equals(projection_array,projection_array) RETURNS boolean \
+           LANGUAGE plpgsql AS $$ BEGIN RETURN pg_catalog.array_eq($1,$2); END $$; \
+         CREATE OPERATOR public.= (FUNCTION=projection_array_equals, \
+           LEFTARG=projection_array,RIGHTARG=projection_array)",
+        true,
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT array_eq(ARRAY[1]::projection_array,ARRAY[1]), \
+                    array_eq(NULL::projection_array,NULL::integer[]); \
+             ALTER SEQUENCE projection_equality_calls RESTART WITH 1; \
+             SELECT CASE projection_array_value(1,2) \
+               WHEN ARRAY[2,4]::projection_array THEN 'wrong' \
+               WHEN ARRAY[2,5]::projection_array THEN 'still wrong' \
+               WHEN ARRAY[1,2]::projection_array THEN 'right' END; \
+             SELECT currval('projection_equality_calls'); \
+             ALTER SEQUENCE projection_equality_calls RESTART WITH 1; \
+             SELECT NULLIF(projection_array_value(1,2),ARRAY[2,3]::projection_array); \
+             SELECT currval('projection_equality_calls')",
+            true,
+        )),
+        ["t|NULL", "right", "1", "{1,2}", "1"],
+        "external={external}",
+    );
+    if let Some(server) = server.as_ref() {
+        assert!(
+            server.uploads.load(std::sync::atomic::Ordering::Relaxed) > initial_uploads.unwrap(),
+            "sort must upload through the HTTP provider"
+        );
+        assert!(
+            server.requests.load(std::sync::atomic::Ordering::Relaxed) > 0,
+            "sort must read through the HTTP provider"
+        );
+    }
+    drop((session, other, engine));
+    drop(server);
+    if external {
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    }
+}
+
+#[test]
 fn query_positions_do_not_repeat_completed_projection_effects() {
     let config = test_config("retained-query-positions");
     let mut budget = test_engine_budget(&config, 1 << 29);

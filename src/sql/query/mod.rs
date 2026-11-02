@@ -42,9 +42,7 @@ pub(crate) use setops::set_query_into_rows;
 
 mod materialize;
 pub(crate) use materialize::ScopeSchema;
-use materialize::{
-    external_materialized_into, finalize_projected_row, materialized_rows, materialized_select,
-};
+use materialize::{external_materialized_into, materialized_rows, materialized_select};
 
 mod scan;
 pub(crate) use plan::plan_time_bool;
@@ -72,7 +70,9 @@ pub use scope::{MergedColumn, QueryScope, ResolvedColumn};
 mod cte;
 pub(crate) use cte::captured_type_oid;
 mod dependencies;
+pub(super) mod predicate_safety;
 use cte::expand_set_tree_exec;
+pub(crate) use cte::filter_view_rows;
 pub(crate) use cte::{
     RuleTransitionType, attach_rule_source, expand_set_tree, expand_stored_query,
     expand_stored_query_exec, expand_stored_rule_action_exec, expand_stored_rule_expression_exec,
@@ -623,7 +623,7 @@ use aggregate::{AggState, fold_aggregates};
 mod srf;
 pub(crate) use srf::{
     describe_derived_definition, expression_has_project_set, is_srf_name as is_builtin_set_routine,
-    synth_derived_def, synth_derived_def_outer, table_func_rows_outer,
+    table_func_rows_outer,
 };
 use srf::{find_srf, has_project_set, prepare_project_set, table_func_def, table_func_def_outer};
 
@@ -2208,8 +2208,9 @@ impl StorageCatalog<'_, '_, '_, '_> {
         name: &str,
         arguments: &[Datum<'a>],
         argument_type_oids: &[i32],
+        nulls: super::eval::OperatorNulls,
         arena: &'a Arena,
-    ) -> Result<Option<Datum<'a>>, SqlError> {
+    ) -> Result<Option<super::eval::OperatorEvaluation<'a>>, SqlError> {
         if arguments.len() != argument_type_oids.len() || !(1..=2).contains(&arguments.len()) {
             return Err(sql_err!(
                 sqlstate::INTERNAL_ERROR,
@@ -2263,7 +2264,12 @@ impl StorageCatalog<'_, '_, '_, '_> {
                 arena,
             )
         {
-            return result.map(Some);
+            return result.map(|value| {
+                Some(super::eval::OperatorEvaluation {
+                    value,
+                    first_argument: builtin_arguments[0],
+                })
+            });
         }
         let (left_oid, right_oid) = if argument_type_oids.len() == 1 {
             (None, Some(argument_type_oids[0]))
@@ -2331,6 +2337,14 @@ impl StorageCatalog<'_, '_, '_, '_> {
                 )
             })?;
         self.storage.require_routine_execute(function, self.txid)?;
+        if nulls == super::eval::OperatorNulls::ReturnNull
+            && coerced[..expected_count].iter().any(Datum::is_null)
+        {
+            return Ok(Some(super::eval::OperatorEvaluation {
+                value: Datum::Null,
+                first_argument: coerced[0],
+            }));
+        }
         self.execute_routine(
             function,
             &self.storage.routine_for(function, self.txid),
@@ -2343,7 +2357,12 @@ impl StorageCatalog<'_, '_, '_, '_> {
                 "operator function produced no scalar result"
             )
         })
-        .map(Some)
+        .map(|value| {
+            Some(super::eval::OperatorEvaluation {
+                value,
+                first_argument: coerced[0],
+            })
+        })
     }
 
     fn execute_routine<'a>(
@@ -3599,7 +3618,15 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                     *value = evaluate(expression)?;
                 }
                 return self
-                    .execute_catalog_operator(schema, name, values, argument_type_oids, arena)?
+                    .execute_catalog_operator(
+                        schema,
+                        name,
+                        values,
+                        argument_type_oids,
+                        super::eval::OperatorNulls::RoutineStrictness,
+                        arena,
+                    )?
+                    .map(|evaluation| evaluation.value)
                     .ok_or_else(|| {
                         sql_err!(
                             sqlstate::UNDEFINED_FUNCTION,
@@ -3659,7 +3686,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         let Some(slot) = self.storage.routine_slot_by_oid(oid, self.txid) else {
             return Err(sql_err!(
                 sqlstate::UNDEFINED_FUNCTION,
-                "aggregate support function with OID {} does not exist",
+                "bound support function with OID {} does not exist",
                 oid
             ));
         };
@@ -3668,7 +3695,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         {
             return Err(sql_err!(
                 sqlstate::INTERNAL_ERROR,
-                "aggregate support function argument contract changed"
+                "bound support function argument contract changed"
             ));
         }
         let routine = self
@@ -3677,7 +3704,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             .ok_or_else(|| {
                 sql_err!(
                     sqlstate::INTERNAL_ERROR,
-                    "aggregate support function polymorphic contract does not match its arguments"
+                    "bound support function polymorphic contract does not match its arguments"
                 )
             })?;
         self.execute_routine(slot, &routine, arguments, arena)
@@ -3727,6 +3754,61 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         }))
     }
 
+    fn json_serialization_cast(
+        &self,
+        type_oid: i32,
+    ) -> Result<Option<super::eval::JsonSerializationCast>, SqlError> {
+        let mut source = type_oid;
+        while matches!(
+            crate::storage::NamedTypeKind::from_oid(source),
+            Some((crate::storage::NamedTypeKind::Domain, _, false))
+        ) {
+            source = self
+                .storage
+                .domain_base_type_for_oid(source, self.txid)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "JSON source domain is unavailable"
+                    )
+                })?
+                .oid();
+        }
+        // PostgreSQL json_categorize_type checks user casts only for Other
+        // types, after domains and the builtin/array/composite categories.
+        if source < 16_384 {
+            return Ok(None);
+        }
+        let physical = self
+            .storage
+            .routine_result_for_oid(source, self.txid)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "JSON source type is unavailable"
+                )
+            })?
+            .ctype;
+        if matches!(physical, ColType::Array(_) | ColType::Composite(_)) {
+            return Ok(None);
+        }
+        let Some((_, cast)) =
+            self.storage
+                .cast_for_oids(source, super::types::oid::JSON, self.txid)
+        else {
+            return Ok(None);
+        };
+        match cast.method {
+            crate::storage::CastMethod::Function(function_oid) => {
+                Ok(Some(super::eval::JsonSerializationCast {
+                    source_type_oid: source,
+                    function_oid,
+                }))
+            }
+            crate::storage::CastMethod::Binary | crate::storage::CastMethod::InOut => Ok(None),
+        }
+    }
+
     fn cast_defined<'a>(
         &self,
         source_oid: i32,
@@ -3738,16 +3820,31 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         self.execute_defined_cast(source_oid, target_oid, value, context, arena)
     }
 
+    fn operator_first_argument_type(
+        &self,
+        name: &str,
+        left: i32,
+        right: i32,
+    ) -> Result<Option<i32>, SqlError> {
+        super::exec::catalog_operator_first_argument_type(
+            self.storage,
+            self.txid,
+            name,
+            left,
+            right,
+        )
+        .map(|meta| meta.map(|meta| meta.type_oid))
+    }
+
     fn call_operator<'a>(
         &self,
         name: &str,
-        left: Datum<'a>,
-        right: Datum<'a>,
-        left_oid: i32,
-        right_oid: i32,
+        arguments: [Datum<'a>; 2],
+        argument_type_oids: [i32; 2],
+        nulls: super::eval::OperatorNulls,
         arena: &'a Arena,
-    ) -> Result<Option<Datum<'a>>, SqlError> {
-        self.execute_catalog_operator(None, name, &[left, right], &[left_oid, right_oid], arena)
+    ) -> Result<Option<super::eval::OperatorEvaluation<'a>>, SqlError> {
+        self.execute_catalog_operator(None, name, &arguments, &argument_type_oids, nulls, arena)
     }
 
     fn subquery_type(
@@ -5965,7 +6062,7 @@ pub(super) fn resolve_sort_key<'a>(
 fn resolve_position_target<'a>(
     expression: &'a Expr<'a>,
     items: &'a [SelectItem<'a>],
-    scope: Option<&QueryScope<'a>>,
+    scope: Option<&QueryScope<'_>>,
     arena: &'a Arena,
     clause: &str,
 ) -> Result<&'a Expr<'a>, SqlError> {
@@ -5984,7 +6081,12 @@ fn resolve_position_target<'a>(
     if index < 1 {
         return Err(position_error());
     }
-    let column_ref = |qualifier: Option<&'a str>, name: &'a str| {
+    let column_ref = |qualifier: Option<&str>, name: &str| {
+        let qualifier = qualifier
+            .map(|name| arena.alloc_str(name))
+            .transpose()
+            .map_err(|_| arena_full())?;
+        let name = arena.alloc_str(name).map_err(|_| arena_full())?;
         Ok(&*arena
             .alloc(Expr::Column { qualifier, name })
             .map_err(|_| arena_full())?)
@@ -6873,19 +6975,35 @@ fn check_select_types<'a>(
     storage: &Storage,
     txid: u32,
     arena: &'a Arena,
+    outer: Option<&dyn ColumnLookup<'a>>,
 ) -> Result<(), SqlError> {
-    let columns = CatalogScopeCols {
+    let catalog_columns = CatalogScopeCols {
         scope,
         outer_scope: None,
         storage,
         txid,
         arena,
     };
+    let schema = ScopeSchema(scope);
+    let row = Chained {
+        inner: &schema,
+        outer,
+    };
+    let catalog = storage_catalog(storage, arena, txid);
+    let runtime_columns = super::eval::RuntimeColumnTypes {
+        row: &row,
+        catalog: Some(&catalog),
+    };
+    let columns: &dyn crate::sql::exec::ColTypeResolver = if outer.is_some() {
+        &runtime_columns
+    } else {
+        &catalog_columns
+    };
     let check = |e: &Expr| -> Result<(), SqlError> {
         if user_type_expression_description(e, "", storage, txid).is_some() {
             Ok(())
         } else {
-            super::exec::infer_type_res(e, &columns).map(|_| ())
+            super::exec::infer_type_res(e, columns).map(|_| ())
         }
     };
     // SELECT-list items first: PostgreSQL analyzes types before it folds
@@ -6898,7 +7016,7 @@ fn check_select_types<'a>(
     }
     if let Some(w) = statement.where_clause {
         check(w)?;
-        let (oid, _) = super::exec::infer_type_res(w, &columns)?;
+        let (oid, _) = super::exec::infer_type_res(w, columns)?;
         let catalog = storage_catalog(storage, arena, txid);
         let boolean = oid == super::types::oid::BOOL
             || oid == super::types::oid::UNKNOWN
@@ -7360,7 +7478,7 @@ pub(crate) fn select_query_resumable<'a, 'statement>(
         merge_action: None,
     };
 
-    if let Err(error) = check_select_types(statement, &scope, storage, txid, arena) {
+    if let Err(error) = check_select_types(statement, &scope, storage, txid, arena, None) {
         return sql_fail(error);
     }
 
@@ -8770,6 +8888,24 @@ fn select_into_rows_mode<'a>(
         return Ok(());
     };
 
+    let offset = super::exec::eval_offset_pub(statement.offset, arena, params, &bound_hooks)?;
+    let limit = super::exec::eval_limit_pub(statement.limit, arena, params, &bound_hooks)?;
+    if limit == 0 {
+        // Plan the schema without materializing derived inputs or evaluating
+        // subqueries/projections that Limit will never request.
+        let scope = QueryScope::resolve_schema(storage, from, txid, arena, outer)?;
+        check_select_types(statement, &scope, storage, txid, arena, outer)?;
+        check_key_types(statement, &scope, arena)?;
+        materialize::prepare_materialization(storage, txid, statement, &scope, &[], outer, arena)?;
+        scan::validate_materialized_view_reads(
+            storage,
+            &scope,
+            statement.where_clause,
+            arena,
+            txid,
+        )?;
+        return Ok(());
+    }
     collect_table_sample_expressions(from, &mut sub_exprs[1 + statement.items.len()..]);
     let scope = QueryScope::resolve_exec_outer(
         storage,
@@ -8833,9 +8969,6 @@ fn select_into_rows_mode<'a>(
             );
         }
         if storage.spill_attached() {
-            let offset =
-                super::exec::eval_offset_pub(statement.offset, arena, params, &bound_hooks)?;
-            let limit = super::exec::eval_limit_pub(statement.limit, arena, params, &bound_hooks)?;
             external_window_into(
                 storage,
                 txid,
@@ -8901,8 +9034,6 @@ fn select_into_rows_mode<'a>(
                 }
             }
         }
-        let offset = super::exec::eval_offset_pub(statement.offset, arena, params, &bound_hooks)?;
-        let limit = super::exec::eval_limit_pub(statement.limit, arena, params, &bound_hooks)?;
         let start = (offset as usize).min(count);
         let n = ((count - start) as u64).min(limit) as usize;
         for &i in &order[start..start + n] {
@@ -8911,17 +9042,10 @@ fn select_into_rows_mode<'a>(
         return Ok(());
     }
 
-    // DISTINCT / ORDER BY / LIMIT / OFFSET need the whole set materialized
-    // (so top-N and dedup are correct), then paged.
-    if statement.distinct
-        || !statement.order_by.is_empty()
-        || statement.limit.is_some()
-        || statement.offset.is_some()
-    {
+    // Sorting, deduplication and row locks need a materialized source. Plain
+    // LIMIT/OFFSET use the streaming path so later rows are never evaluated.
+    if statement.distinct || !statement.order_by.is_empty() || !statement.locking.is_empty() {
         if storage.spill_attached() {
-            let offset =
-                super::exec::eval_offset_pub(statement.offset, arena, params, &bound_hooks)?;
-            let limit = super::exec::eval_limit_pub(statement.limit, arena, params, &bound_hooks)?;
             external_materialized_into(
                 storage,
                 &scope,
@@ -8943,9 +9067,7 @@ fn select_into_rows_mode<'a>(
             )?;
             return Ok(());
         }
-        let offset = super::exec::eval_offset_pub(statement.offset, arena, params, &bound_hooks)?;
-        let limit = super::exec::eval_limit_pub(statement.limit, arena, params, &bound_hooks)?;
-        let (rows, width, deferred, _identities_at) = materialized_rows(
+        let (rows, width, deferred, identities_at) = materialized_rows(
             storage,
             &scope,
             from,
@@ -8963,32 +9085,29 @@ fn select_into_rows_mode<'a>(
                 && statement.locking.is_empty())
             .then_some(offset.saturating_add(limit).min(usize::MAX as u64) as usize),
         )?;
-        // OFFSET rows flow through PostgreSQL's projection before Limit
-        // discards them, so deferred items are evaluated for them too (their
-        // errors surface); only rows past the offset are emitted.
-        let window = offset.saturating_add(limit).min(usize::MAX as u64) as usize;
-        for (index, row) in rows.iter().take(window).enumerate() {
-            let mut out = [Datum::Null; MAX_PROJ];
-            finalize_projected_row(
-                row,
-                width,
-                deferred.as_ref(),
-                statement,
-                &scope,
-                arena,
-                params,
-                &hooks,
-                &mut out,
-            )?;
-            if (index as u64) >= offset {
-                emit(&out[..width])?;
-            }
-        }
+        materialize::materialized_rows_into(
+            storage,
+            &scope,
+            txid,
+            statement,
+            rows,
+            width,
+            deferred.as_ref(),
+            identities_at,
+            arena,
+            params,
+            &hooks,
+            outer,
+            limit,
+            offset,
+            &mut |values| {
+                emit(values)?;
+                Ok(true)
+            },
+        )?;
         return Ok(());
     }
     let where_in_scan = correlated_scan_conjuncts(statement.where_clause, where_correlated, arena)?;
-    let offset = super::exec::eval_offset_pub(statement.offset, arena, params, &bound_hooks)?;
-    let limit = super::exec::eval_limit_pub(statement.limit, arena, params, &bound_hooks)?;
     let stop_after = offset.saturating_add(limit);
     if stop_after == 0 {
         return Ok(());
@@ -10582,6 +10701,21 @@ pub(crate) struct CatalogScopeCols<'scope, 'definition, 'storage> {
 }
 
 impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_> {
+    fn operator_first_argument_type(
+        &self,
+        name: &str,
+        left: i32,
+        right: i32,
+    ) -> Result<Option<super::exec::StaticTypeMeta>, SqlError> {
+        super::exec::catalog_operator_first_argument_type(
+            self.storage,
+            self.txid,
+            name,
+            left,
+            right,
+        )
+    }
+
     fn subquery_type(&self, expression: &Expr<'_>) -> Result<Option<(i32, i16)>, SqlError> {
         let schema = ScopeSchema(self.scope);
         let outer_schema = self.outer_scope.map(ScopeSchema);

@@ -129,7 +129,7 @@ fn vopr_config(seed: u64) -> Config {
     // Far below the live row count the workload sustains (hundreds): the
     // overlay must constantly shed entries and serve entry-less rows from
     // the bucket, or nothing here passes.
-    config.table_rows = 384;
+    config.row_overlay_slots = 384;
     config.txn_rows = 1024;
     config.max_prepared = 4;
     config.prepared_bytes = 1024;

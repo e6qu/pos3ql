@@ -20,8 +20,7 @@ use crate::util::StackStr;
 
 use super::{
     Chained, arena_full, collect_aggs, collect_windows, common_using_type, select_into_rows,
-    synth_derived_def, synth_derived_def_outer, table_func_def, table_func_def_outer,
-    table_func_rows_outer,
+    table_func_def, table_func_def_outer, table_func_rows_outer,
 };
 
 fn catalog_scan(
@@ -279,6 +278,32 @@ impl<'a> QueryDefinitions<'a> {
         self.sources[index] = Some(ScopeDefinition::Arena(definition));
     }
 
+    fn set_relation(
+        &mut self,
+        index: usize,
+        definition: &TableDef,
+        arena: &'a Arena,
+    ) -> Result<(), SqlError> {
+        // The owner pins the full image in its startup pool. Only actual
+        // output columns and escaped names consume statement-arena bytes.
+        let columns = arena
+            .alloc_slice_copy(definition.columns())
+            .map_err(|_| arena_full())?;
+        let names = arena
+            .alloc_slice_with(columns.len(), |column| columns[column].name.as_str())
+            .map_err(|_| arena_full())?;
+        let image = self
+            .images
+            .retain_relation(&crate::storage::RelationDefinition {
+                schema: definition.schema,
+                name: definition.name,
+                n_columns: definition.n_columns,
+                columns,
+            })?;
+        self.sources[index] = Some(ScopeDefinition::Relation { image, names });
+        Ok(())
+    }
+
     pub(crate) fn column_name(&self, index: usize, column: usize) -> &'a str {
         match self.sources[index].expect("source is resolved") {
             ScopeDefinition::Arena(definition) => definition.columns[column].name.as_str(),
@@ -471,18 +496,6 @@ impl<'d> QueryScope<'d> {
         from: &FromClause<'d>,
     ) -> Result<Self, SqlError> {
         let table_count = from.joins.len() + 1;
-        let merged_capacity = from
-            .joins
-            .iter()
-            .map(|join| {
-                if join.natural {
-                    MAX_COLUMNS
-                } else {
-                    join.using.map_or(0, |using| using.columns.len())
-                }
-            })
-            .sum::<usize>();
-        let has_merges = merged_capacity != 0;
         let names = arena
             .alloc_slice_with(table_count, |_| "")
             .map_err(|_| arena_full())?;
@@ -514,21 +527,14 @@ impl<'d> QueryScope<'d> {
             .alloc_slice_with(table_count, |_| false)
             .map_err(|_| arena_full())?;
         let merged = arena
-            .alloc_slice_with(merged_capacity.max(1), |_| MergedColumn {
+            .alloc_slice_with(0, |_| MergedColumn {
                 name: "",
                 parts: &[],
                 ctype: ColType::Bool,
             })
             .map_err(|_| arena_full())?;
         let output = arena
-            .alloc_slice_with(
-                if has_merges {
-                    table_count.saturating_mul(MAX_COLUMNS)
-                } else {
-                    1
-                },
-                |_| ResolvedColumn::Table(0, 0),
-            )
+            .alloc_slice_with(0, |_| ResolvedColumn::Table(0, 0))
             .map_err(|_| arena_full())?;
         let join_on = arena
             .alloc_slice_with(from.joins.len().max(1), |_| None)
@@ -782,18 +788,18 @@ impl<'d> QueryScope<'d> {
         // (a body may project an outer column); a plain derived table is typed
         // on its own. Its rows are materialized per outer row by the scan, so
         // register an empty placeholder here rather than running it now.
+        let definition = super::srf::describe_derived_definition(
+            storage,
+            sub,
+            exposed,
+            tref.col_alias,
+            txid,
+            arena,
+            tref.lateral.then_some(&*self),
+        )?;
+        self.defs.set_relation(self.n, &definition, arena)?;
         if tref.lateral {
-            let def_reference = synth_derived_def_outer(
-                storage,
-                sub,
-                exposed,
-                tref.col_alias,
-                txid,
-                arena,
-                Some(self),
-            )?;
             self.names[self.n] = exposed;
-            self.defs.set_arena(self.n, def_reference);
             self.derived[self.n] = Some(&[]);
             self.lateral[self.n] = true;
             self.slots[self.n] = usize::MAX;
@@ -801,7 +807,6 @@ impl<'d> QueryScope<'d> {
             self.n += 1;
             return Ok(());
         }
-        let def_reference = synth_derived_def(storage, sub, exposed, tref.col_alias, txid, arena)?;
         let rows: &'a [&'a [u8]];
         let external_run;
         if storage.spill_attached() {
@@ -877,7 +882,6 @@ impl<'d> QueryScope<'d> {
             external_run = None;
         }
         self.names[self.n] = exposed;
-        self.defs.set_arena(self.n, def_reference);
         self.derived[self.n] = Some(rows);
         self.external_runs[self.n] = external_run;
         self.slots[self.n] = usize::MAX;
@@ -980,21 +984,17 @@ impl<'d> QueryScope<'d> {
                 exposed
             ));
         }
-        let def_reference = if tref.lateral {
-            synth_derived_def_outer(
-                storage,
-                sub,
-                exposed,
-                tref.col_alias,
-                txid,
-                arena,
-                Some(self),
-            )?
-        } else {
-            synth_derived_def(storage, sub, exposed, tref.col_alias, txid, arena)?
-        };
+        let definition = super::srf::describe_derived_definition(
+            storage,
+            sub,
+            exposed,
+            tref.col_alias,
+            txid,
+            arena,
+            tref.lateral.then_some(&*self),
+        )?;
         self.names[self.n] = exposed;
-        self.defs.set_arena(self.n, def_reference);
+        self.defs.set_relation(self.n, &definition, arena)?;
         // No rows: this scope is never scanned, only described. An empty row
         // set keeps a stray scan safe rather than reading a physical slot.
         self.derived[self.n] = Some(&[]);
@@ -1127,9 +1127,14 @@ impl<'d> QueryScope<'d> {
         }
         let default_names = ["last_value", "log_cnt", "is_called"];
         let types = [ColType::Int8, ColType::Int8, ColType::Bool];
-        let mut columns = [ColumnMeta::EMPTY; MAX_COLUMNS];
+        let mut definition = TableDef {
+            schema: sequence.schema,
+            name: sequence.name,
+            n_columns: default_names.len(),
+            ..TableDef::empty()
+        };
         for index in 0..3 {
-            columns[index] = ColumnMeta {
+            definition.columns[index] = ColumnMeta {
                 name: SqlName::parse(
                     tref.col_alias
                         .and_then(|aliases| aliases.get(index).copied())
@@ -1139,15 +1144,7 @@ impl<'d> QueryScope<'d> {
                 ..ColumnMeta::EMPTY
             };
         }
-        let definition = arena
-            .alloc(TableDef {
-                schema: sequence.schema,
-                name: sequence.name,
-                columns,
-                n_columns: 3,
-                ..TableDef::empty()
-            })
-            .map_err(|_| arena_full())?;
+        self.defs.set_relation(self.n, &definition, arena)?;
         let rows: &'a [&'a [u8]] = if materialize {
             let role = storage.current_role_slot(txid).ok_or_else(|| {
                 sql_err!(
@@ -1190,7 +1187,6 @@ impl<'d> QueryScope<'d> {
             &[]
         };
         self.names[self.n] = exposed;
-        self.defs.set_arena(self.n, &*definition);
         self.derived[self.n] = Some(rows);
         self.slots[self.n] = usize::MAX;
         self.n += 1;
@@ -1437,9 +1433,30 @@ impl<'d> QueryScope<'d> {
         if !from.joins.iter().any(|j| j.natural || j.using.is_some()) {
             return Ok(());
         }
+        // Definitions are now available: a merged join needs capacity for its
+        // actual columns, not the maximum relation width for every source.
+        let merged_capacity = from
+            .joins
+            .iter()
+            .enumerate()
+            .map(|(index, join)| {
+                if join.natural {
+                    self.defs.get(index + 1).expect("resolved").n_columns
+                } else {
+                    join.using.map_or(0, |using| using.columns.len())
+                }
+            })
+            .sum();
+        self.merged = scratch_arena
+            .alloc_slice_with(merged_capacity, |_| MergedColumn {
+                name: "",
+                parts: &[],
+                ctype: ColType::Bool,
+            })
+            .map_err(|_| arena_full())?;
         // The left join tree's output columns, updated join by join.
         let out = scratch_arena
-            .alloc_slice_with(self.output.len(), |_| ResolvedColumn::Table(0, 0))
+            .alloc_slice_with(self.total_columns(), |_| ResolvedColumn::Table(0, 0))
             .map_err(|_| arena_full())?;
         let mut n_out = 0usize;
         for c in 0..self.defs.get(0).expect("resolved").n_columns {
@@ -1605,7 +1622,7 @@ impl<'d> QueryScope<'d> {
             }
             self.join_on[join_index] = predicate;
         }
-        self.output[..n_out].copy_from_slice(&out[..n_out]);
+        self.output = out;
         self.n_output = n_out;
         Ok(())
     }
@@ -2000,7 +2017,7 @@ mod tests {
         config.max_catalog_versions_per_object = 1;
         config.query_workspace_slots = 1;
         config.memtable_bytes = 1 << 16;
-        config.table_rows = 16;
+        config.row_overlay_slots = 16;
         config.txn_rows = 16;
         config.value_index_rows = 32;
         config.max_value_indexes = 2;
@@ -2024,6 +2041,76 @@ mod tests {
             };
         }
         definition
+    }
+
+    #[test]
+    fn sequence_schema_and_rows_fit_actual_columns_in_small_arena() {
+        let config = config();
+        let mut budget = Budget::new(Storage::extra_budget_bytes(&config) + config.memtable_bytes);
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
+        let change = storage
+            .create_sequence(
+                crate::storage::SequenceCreateSpec {
+                    allocation: crate::storage::CatalogAllocation::New,
+                    schema: SqlName::parse("public").unwrap(),
+                    name: SqlName::parse("narrow_sequence").unwrap(),
+                    spec: crate::storage::SeqSpec {
+                        data_type: crate::storage::SeqType::Bigint,
+                        increment: 1,
+                        min_value: 1,
+                        max_value: i64::MAX,
+                        start_value: 1,
+                        cache: 1,
+                        cycle: false,
+                    },
+                    owner: None,
+                    generator_for: None,
+                    persistence: crate::storage::RelationPersistence::Permanent,
+                },
+                0,
+            )
+            .unwrap();
+        storage.finish_sequence_change(change, crate::storage::CatalogDdlDecision::Commit);
+        for materialize in [false, true] {
+            let mut arena_budget = Budget::new(16 << 10);
+            let arena = Arena::new(&mut arena_budget, "narrow sequence scope", 16 << 10).unwrap();
+            crate::mem::guard::forbid_alloc(|| {
+                let query = crate::sql::parser::parse_query(
+                    "SELECT s.saved,s.called FROM public.narrow_sequence AS s(saved,logged,called)",
+                    &arena,
+                )
+                .unwrap();
+                let from = query.from.as_ref().unwrap();
+                let scope = if materialize {
+                    QueryScope::resolve_exec(&storage, from, None, 0, &arena, &[], None).unwrap()
+                } else {
+                    QueryScope::resolve_schema(&storage, from, 0, &arena, None).unwrap()
+                };
+                assert_eq!(scope.defs.get(0).unwrap().n_columns, 3);
+                assert_eq!(scope.defs.get(0).unwrap().schema.as_str(), "public");
+                assert_eq!(
+                    scope.find_column(Some("s"), "saved").unwrap(),
+                    ResolvedColumn::Table(0, 0)
+                );
+                assert_eq!(
+                    scope.find_column(Some("s"), "called").unwrap(),
+                    ResolvedColumn::Table(0, 2)
+                );
+                let rows = scope.derived[0].unwrap();
+                assert_eq!(rows.len(), usize::from(materialize));
+                if let Some(row) = rows.first() {
+                    assert!(matches!(
+                        crate::sql::exec::decode_projected_pub(row, 0),
+                        Datum::Int8(1)
+                    ));
+                    assert!(matches!(
+                        crate::sql::exec::decode_projected_pub(row, 2),
+                        Datum::Bool(false)
+                    ));
+                }
+                assert!(arena.used() < 16 << 10);
+            });
+        }
     }
 
     #[test]
@@ -2084,7 +2171,8 @@ mod tests {
 
     #[test]
     fn query_definition_ownership_wide_aliases_share_one_image_and_keep_names() {
-        let config = config();
+        let mut config = config();
+        config.definition_image_slots = 3;
         let mut budget = Budget::new(Storage::extra_budget_bytes(&config) + config.memtable_bytes);
         let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let table = storage
@@ -2093,8 +2181,7 @@ mod tests {
                 crate::storage::MAX_RELATION_COLUMNS,
             ))
             .unwrap();
-        let capacity = crate::storage::table_slot_capacity(&config)
-            * (config.max_catalog_versions_per_object + 1);
+        let capacity = config.definition_image_slots;
         let mut owners = Vec::with_capacity(capacity - 1);
         let mut arena_budget = Budget::new(1 << 17);
         let arena = Arena::new(&mut arena_budget, "query definition names", 1 << 17).unwrap();
@@ -2137,6 +2224,86 @@ mod tests {
     }
 
     #[test]
+    fn query_definition_ownership_nested_schema_uses_actual_column_arena_bytes() {
+        let mut config = config();
+        config.definition_image_slots = 4;
+        let mut budget = Budget::new(Storage::extra_budget_bytes(&config) + config.memtable_bytes);
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
+        storage.create_table(definition("source", 2)).unwrap();
+        let mut arena_budget = Budget::new(256 << 10);
+        let arena = Arena::new(&mut arena_budget, "nested schema columns", 256 << 10).unwrap();
+        assert!(core::mem::size_of::<TableDef>() > arena.capacity());
+        let query = crate::sql::parser::parse_query(
+            "SELECT output.c0 FROM (SELECT * FROM \
+             (SELECT c0,c1 FROM source) AS inner_output) AS output",
+            &arena,
+        )
+        .unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let scope =
+                QueryScope::resolve_schema(&storage, query.from.as_ref().unwrap(), 0, &arena, None)
+                    .unwrap();
+            let definition = scope.defs.get(0).unwrap();
+            assert_eq!(definition.n_columns, 2);
+            assert_eq!(definition.columns()[0].ctype, ColType::Int8);
+            assert_eq!(definition.columns()[1].ctype, ColType::Int8);
+            let name = scope.output_name(ResolvedColumn::Table(0, 1));
+            assert_eq!(name, "c1");
+            drop(scope);
+            let execution = QueryScope::resolve_exec(
+                &storage,
+                query.from.as_ref().unwrap(),
+                None,
+                0,
+                &arena,
+                crate::sql::eval::NO_PARAMS,
+                None,
+            )
+            .unwrap();
+            assert_eq!(execution.total_columns(), 2);
+            assert_eq!(
+                execution.defs.get(0).unwrap().columns()[0].ctype,
+                ColType::Int8
+            );
+            drop(execution);
+            assert_eq!(name, "c1");
+        });
+    }
+
+    #[test]
+    fn query_definition_ownership_merged_joins_size_buffers_from_actual_columns() {
+        let mut config = config();
+        config.definition_image_slots = 2;
+        let mut budget = Budget::new(Storage::extra_budget_bytes(&config) + config.memtable_bytes);
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
+        storage.create_table(definition("left_source", 1)).unwrap();
+        storage.create_table(definition("right_source", 1)).unwrap();
+        for sql in [
+            "SELECT merged.* FROM left_source JOIN right_source USING(c0) AS merged",
+            "SELECT * FROM left_source NATURAL JOIN right_source",
+        ] {
+            let mut arena_budget = Budget::new(16 << 10);
+            let arena = Arena::new(&mut arena_budget, "actual merged columns", 16 << 10).unwrap();
+            let query = crate::sql::parser::parse_query(sql, &arena).unwrap();
+            crate::mem::guard::forbid_alloc(|| {
+                let scope = QueryScope::resolve_schema(
+                    &storage,
+                    query.from.as_ref().unwrap(),
+                    0,
+                    &arena,
+                    None,
+                )
+                .unwrap();
+                assert_eq!(scope.output.len(), 2);
+                assert_eq!(scope.merged.len(), 1);
+                assert_eq!(scope.star_columns(), 1);
+                assert_eq!(scope.output_name(scope.star_entry(0)), "c0");
+                assert_eq!(scope.output_type(scope.star_entry(0)), ColType::Int8);
+            });
+        }
+    }
+
+    #[test]
     fn query_definition_ownership_keeps_transaction_visible_shapes() {
         let config = config();
         let mut budget = Budget::new(Storage::extra_budget_bytes(&config) + config.memtable_bytes);
@@ -2172,13 +2339,13 @@ mod tests {
 
     #[test]
     fn query_definition_ownership_failed_resolution_releases_capacity() {
-        let config = config();
+        let mut config = config();
+        config.definition_image_slots = 3;
         let mut budget = Budget::new(Storage::extra_budget_bytes(&config) + config.memtable_bytes);
         let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let table = storage.create_table(definition("first", 1)).unwrap();
         storage.create_table(definition("second", 1)).unwrap();
-        let capacity = crate::storage::table_slot_capacity(&config)
-            * (config.max_catalog_versions_per_object + 1);
+        let capacity = config.definition_image_slots;
         let mut owners = Vec::with_capacity(capacity - 1);
         let mut arena_budget = Budget::new(1 << 17);
         let arena = Arena::new(&mut arena_budget, "query resolution", 1 << 17).unwrap();

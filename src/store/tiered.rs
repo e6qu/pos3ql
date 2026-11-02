@@ -64,7 +64,7 @@ impl StackPlan {
         } else {
             DiskCache::<super::object::OwnedObjectStore>::budget_bytes(self.disk.units)
         };
-        ram + disk
+        ram.saturating_add(disk)
     }
 
     pub(crate) fn resolve(block_cache_bytes: usize, disk_cache_bytes: usize) -> Self {
@@ -572,6 +572,23 @@ mod tests {
         let (n, _) = s.get(id, &mut out).expect("reads");
         out.truncate(n);
         out
+    }
+
+    #[test]
+    fn configured_cache_budgets_saturate_before_wrapping() {
+        let mut config = crate::config::Config::default_dev();
+        config.block_cache_bytes = usize::MAX;
+        config.disk_cache_bytes = usize::MAX;
+        let plan = StackPlan::resolve(config.block_cache_bytes, config.disk_cache_bytes);
+        assert_eq!(plan.ram_budget_bytes(), usize::MAX);
+        assert_eq!(
+            BlockCache::<super::super::object::OwnedObjectStore>::budget_bytes(usize::MAX),
+            usize::MAX
+        );
+        assert_eq!(
+            DiskCache::<super::super::object::OwnedObjectStore>::budget_bytes(usize::MAX),
+            usize::MAX
+        );
     }
 
     #[test]

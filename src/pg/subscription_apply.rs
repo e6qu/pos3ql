@@ -7,6 +7,7 @@ use crate::mem::arena::Arena;
 use crate::mem::budget::{Budget, BudgetError};
 use crate::mem::buffer::FixedBuf;
 use crate::mem::fixed_vec::FixedVec;
+use crate::mem::lease_pool::RowWorkPool;
 use crate::pg::pginput::{CopyData, Message, Relation, ReplicaIdentity};
 use crate::pg::respond::Responder;
 use crate::sql::ast::ExplainSerialize;
@@ -15,6 +16,7 @@ use crate::sql::guc::GucState;
 use crate::sql::txn::TxnState;
 use crate::sql_err;
 use crate::storage::{MAX_COLUMNS, SqlName, Storage};
+use std::sync::Arc;
 
 /// Internal trigger execution never exposes query output to the publisher.
 /// This fixed buffer only retains protocol framing required by the shared
@@ -71,7 +73,7 @@ pub struct RelationMap {
 
 impl RelationMap {
     pub const fn budget_bytes(capacity: usize) -> usize {
-        capacity * core::mem::size_of::<RelationEntry>()
+        capacity.saturating_mul(core::mem::size_of::<RelationEntry>())
     }
 
     pub fn new(budget: &mut Budget, capacity: usize) -> Result<Self, BudgetError> {
@@ -295,13 +297,16 @@ pub struct SubscriptionApply {
 impl SubscriptionApply {
     pub const fn budget_bytes(config: &crate::config::Config) -> usize {
         RelationMap::budget_bytes(config.subscription_relation_capacity)
-            + TxnState::budget_bytes_with_config(config)
-            + GucState::extra_savepoint_budget_bytes(config.max_savepoints_per_transaction)
-            + config.subscription_arena_bytes
-            + TRIGGER_RESPONSE_BYTES
-            + config.txn_rows * core::mem::size_of::<crate::sql::exec::PhysicalRow>()
-            + crate::sql::exec::CopyTransitionRows::budget_bytes(config)
-            + crate::sql::guc::SeqSession::extra_budget_bytes(config.max_sequences)
+            .saturating_add(TxnState::budget_bytes_with_config(config))
+            .saturating_add(GucState::extra_savepoint_budget_bytes(
+                config.max_savepoints_per_transaction,
+            ))
+            .saturating_add(config.subscription_arena_bytes)
+            .saturating_add(TRIGGER_RESPONSE_BYTES)
+            .saturating_add(crate::sql::exec::CopyTransitionRows::budget_bytes(config))
+            .saturating_add(crate::sql::guc::SeqSession::extra_budget_bytes(
+                config.max_sequences,
+            ))
     }
 
     pub(crate) fn new(
@@ -310,6 +315,7 @@ impl SubscriptionApply {
         config: &crate::config::Config,
         confirmed_lsn: u64,
         behavior: crate::storage::SubscriptionBehavior,
+        row_work: Arc<RowWorkPool>,
     ) -> Result<Self, BudgetError> {
         let guc = GucState::new_with_capacities(
             budget,
@@ -334,11 +340,9 @@ impl SubscriptionApply {
                 "subscription_trigger_response",
                 TRIGGER_RESPONSE_BYTES,
             )?,
-            trigger_scratch: FixedVec::new(
-                budget,
-                "subscription_trigger_scratch",
-                config.txn_rows,
-            )?,
+            trigger_scratch: row_work
+                .lease(0)
+                .expect("empty worker write lease needs no capacity"),
             copy_transition_scratch: crate::sql::exec::CopyTransitionRows::new(
                 budget,
                 config.txn_rows,
@@ -356,6 +360,7 @@ impl SubscriptionApply {
         engine: &mut crate::sql::Engine,
         operation: impl FnOnce(&mut Self, &mut crate::sql::Engine) -> Result<R, SqlError>,
     ) -> Result<R, SqlError> {
+        self.trigger_scratch.clear();
         let _published = crate::sql::eval::funcs::system::retain_session_evaluation();
         engine.select_database(self.stream.database_oid())?;
         if !self.txn.is_active() {
@@ -373,6 +378,7 @@ impl SubscriptionApply {
         );
         let prior_owner = engine.replace_read_owner(Some(owner));
         let result = operation(self, engine);
+        self.trigger_scratch.clear();
         if result.is_err() || !self.txn.is_active() || self.txn.staged_commit().is_some() {
             engine.cancel_read_owner(owner);
         }
@@ -706,6 +712,7 @@ impl SubscriptionApply {
     }
 
     fn abort(&mut self, engine: &mut crate::sql::Engine) {
+        self.trigger_scratch.clear();
         engine.cancel_read_owner(crate::store::ReadOwner(
             (2u128 << 96)
                 | ((self.stream.database_oid().get() as u32 as u128) << 64)

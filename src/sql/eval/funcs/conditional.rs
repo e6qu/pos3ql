@@ -185,34 +185,44 @@ pub(crate) fn dispatch<'a>(
             }
             "nullif" => {
                 arity(2)?;
-                let a = eval_full(args[0], arena, params, row, hooks)?;
-                let b = eval_full(args[1], arena, params, row, hooks)?;
-                let (a, b) = if a.is_null() || b.is_null() {
-                    (a, b)
-                } else {
-                    let a2 = crate::sql::eval::coerce_unknown_pub(a, &b)?;
-                    let b2 = crate::sql::eval::coerce_unknown_pub(b, &a2)?;
-                    (a2, b2)
-                };
                 let collation = crate::sql::eval::resolve_comparison_collation(
                     args[0],
                     args[1],
                     row,
                     hooks.catalog,
                 )?;
-                if !a.is_null()
-                    && !b.is_null()
-                    && crate::sql::eval::compare_datums_with_catalog(
-                        collation,
-                        hooks.catalog,
-                        &a,
-                        &b,
-                    )?
-                    .is_eq()
-                {
-                    Ok(Datum::Null)
-                } else {
-                    Ok(a)
+                let left = super::super::materialize_named_composite(
+                    eval_full(args[0], arena, params, row, hooks)?,
+                    hooks,
+                    arena,
+                )?;
+                let right = super::super::materialize_named_composite(
+                    eval_full(args[1], arena, params, row, hooks)?,
+                    hooks,
+                    arena,
+                )?;
+                let equality = super::super::eval_binary_values(
+                    super::super::BinaryExpression {
+                        operator: crate::sql::ast::BinaryOp::Eq,
+                        left: args[0],
+                        right: args[1],
+                        search_catalog: true,
+                        nulls: super::super::OperatorNulls::ReturnNull,
+                    },
+                    left,
+                    right,
+                    Some(collation),
+                    arena,
+                    row,
+                    hooks,
+                )?;
+                match equality.value {
+                    Datum::Bool(true) => Ok(Datum::Null),
+                    Datum::Bool(false) | Datum::Null => Ok(equality.first_argument),
+                    _ => Err(sql_err!(
+                        sqlstate::DATATYPE_MISMATCH,
+                        "NULLIF requires = operator to yield boolean"
+                    )),
                 }
             }
             _ => unreachable!("dispatch guard admitted an unhandled name"),

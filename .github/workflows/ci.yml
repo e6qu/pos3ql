@@ -60,15 +60,17 @@ jobs:
         if: ${{ matrix.check == 'build and test' }}
         run: cargo build --all-targets --locked --target "$NATIVE_TARGET"
 
-      - name: Function call contracts
+      - name: Function and HTTP fixture contracts
         if: ${{ matrix.check == 'build and test' }}
         run: >-
-          cargo test --lib --locked --target "$NATIVE_TARGET" -- routine_calls:: --test-threads=1
+          python3 tools/test_command.py cargo test --lib --locked --target "$NATIVE_TARGET" --
+          routine_calls:: object_reads::http_object_fixture_preserves_missing_keys_conditions_ranges_and_listing
+          --test-threads=1
 
       - name: Native SQL, catalog and socket boundaries
         if: ${{ matrix.check == 'build and test' }}
         run: >-
-          cargo test --lib --locked --target "$NATIVE_TARGET" -- io:: mem::mutex::tests type_ domain_ enum_ composite_ table_name catalog_creation_
+          python3 tools/test_command.py cargo test --lib --locked --target "$NATIVE_TARGET" -- io:: mem::mutex::tests type_ domain_ enum_ composite_ table_name catalog_creation_
           timezone_abbreviation_ fixed_default_abbreviations_ degree_special_and_random_math_
           maintenance_metadata_ cleanup_download_overlap_ object_store::http::tests::
           reader_scratch_is_synchronized_and_startup_bounded database_default_collation_is_bounded_
@@ -196,6 +198,7 @@ jobs:
           tools/tests/test_benchmark.py
           tools/tests/test_benchmark_environment.py
           tools/tests/test_benchmark_matrix_report.py
+          tools/tests/test_measure_embedded_capacity.py
           tools/tests/test_benchmark_postgresql.py
           tools/tests/test_benchmark_report.py
           tools/tests/test_run_performance.py
@@ -443,6 +446,26 @@ jobs:
         with:
           name: performance-smoke
           path: ${{ runner.temp }}/performance-smoke
+
+  embedded-capacity:
+    needs: formatting
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Measure shared startup capacity and active workloads
+        run: >-
+          python3 tools/measure-embedded-capacity.py
+          --output "$RUNNER_TEMP/embedded-capacity"
+          --budget-limit-bytes 2147483648
+      - name: Retain raw memory evidence and provenance
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: embedded-capacity-${{ github.sha }}
+          path: ${{ runner.temp }}/embedded-capacity
+          if-no-files-found: error
 
   # One fixed range per worker preserves the complete 16-seed sweep within
   # the five-minute job contract, including a cold rebuild.

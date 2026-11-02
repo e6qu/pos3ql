@@ -10,7 +10,7 @@ fn row_layout_sql_rewrites_rollback_temporary_reuse_and_cold_recovery() {
             let name = format!("row-layout-sql-{checkpoint}-{mode:?}");
             let mut config = test_config(&name);
             config.transaction_mode = mode;
-            config.table_rows = 512;
+            config.row_overlay_slots = 512;
             config.txn_rows = 512;
             config.object_store_on = true;
             config.object_store_sim = true;
@@ -67,7 +67,7 @@ fn row_layout_retained_history_survives_saved_publication_and_prepared_rewrite()
         let name = format!("row-layout-history-{checkpoint}");
         let mut config = test_config(&name);
         config.transaction_mode = crate::config::TransactionMode::Mvcc;
-        config.table_rows = 512;
+        config.row_overlay_slots = 512;
         config.txn_rows = 512;
         config.max_prepared_transactions = 1;
         config.object_store_on = true;

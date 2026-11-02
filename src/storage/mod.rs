@@ -152,7 +152,7 @@ pub(crate) use row_images::{
     OrderedRowSnapshot, RowByteRead, RowSnapshot, TableRowSnapshot, VisibleRowHome,
 };
 use row_images::{RowByteSource, RowVersionIdentity, VisibleRowBytes};
-pub(crate) use row_map::{RowEntries, RowMap};
+pub(crate) use row_map::{RowEntries, RowMap, RowOverlayPool};
 pub(crate) use row_reads::{RowRead, RowSelfChange};
 use row_reads::{RowReadView, RowReadVisitor};
 pub(crate) use row_scans::cursor::{CursorRow, RowCursor, RowCursorBuffers};
@@ -4143,8 +4143,7 @@ pub(crate) fn committed_row_version_capacity(config: &Config) -> usize {
 
 pub(crate) fn row_heap_image_capacity(config: &Config) -> usize {
     config
-        .max_tables
-        .saturating_mul(config.table_rows)
+        .row_overlay_slots
         .saturating_add(config.large_object_pages)
         .saturating_add(pending_row_version_capacity(config))
         .saturating_add(committed_row_version_capacity(config))
@@ -13885,8 +13884,13 @@ impl From<RuleTarget> for ObjectLockTarget {
 }
 
 fn object_lock_capacity(config: &Config) -> usize {
-    (config.max_connections as usize + config.max_prepared_transactions)
-        * (table_slot_capacity(config) + config.max_views + config.max_roles)
+    (config.max_connections as usize)
+        .saturating_add(config.max_prepared_transactions)
+        .saturating_mul(
+            table_slot_capacity(config)
+                .saturating_add(config.max_views)
+                .saturating_add(config.max_roles),
+        )
 }
 
 #[derive(Clone, Copy)]
@@ -14081,8 +14085,11 @@ impl ForeignStatementContextGuard<'_> {
 }
 
 pub(crate) fn foreign_statement_context_workspace_bytes(config: &Config) -> usize {
-    size_of::<Mutex<ForeignStatementContext>>()
-        + config.max_savepoints_per_transaction * size_of::<crate::util::StackStr<63>>()
+    size_of::<Mutex<ForeignStatementContext>>().saturating_add(
+        config
+            .max_savepoints_per_transaction
+            .saturating_mul(size_of::<crate::util::StackStr<63>>()),
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -14775,7 +14782,9 @@ pub struct Storage {
     table_definition_images: std::sync::Arc<definition_images::TableDefinitionImagePool>,
     max_row_versions_per_row: usize,
     row_versions: RowVersionPools,
-    row_walks: std::sync::Arc<RowWalkPool>,
+    pub(crate) row_work: std::sync::Arc<crate::mem::lease_pool::RowWorkPool>,
+    row_overlay: std::sync::Arc<RowOverlayPool>,
+    row_walks: RowWalkPool,
     snapshot_reclamation: SnapshotReclamation,
     heap_row_ownership: row_ownership::HeapRowOwnership,
     definition_publication: type_reference_moves::DefinitionPublication,
@@ -15386,18 +15395,18 @@ impl CheckpointRowCursor {
         )
     }
 
-    pub(crate) fn budget_bytes(max_spill_generations: usize, table_rows: usize) -> usize {
+    pub(crate) fn budget_bytes(max_spill_generations: usize, row_capacity: usize) -> usize {
         max_spill_generations * size_of::<MemberCursor>()
             + ScanContext::budget_bytes(max_spill_generations)
             + size_of::<Option<u64>>()
             + SpillGenerationSnapshot::budget_bytes(max_spill_generations)
-            + table_rows * core::mem::size_of::<CheckpointRowIdentity>()
+            + row_capacity * core::mem::size_of::<CheckpointRowIdentity>()
     }
 
-    pub(crate) fn new(max_spill_generations: usize, table_rows: usize) -> Self {
+    pub(crate) fn new(max_spill_generations: usize, row_capacity: usize) -> Self {
         Self {
             resident_position: 0,
-            resident_rowids: Vec::with_capacity(table_rows),
+            resident_rowids: Vec::with_capacity(row_capacity),
             resident_initialized: false,
             members: vec![MemberCursor::EMPTY; max_spill_generations].into_boxed_slice(),
             spill_progress: SpillWalkProgress::START,
@@ -15989,13 +15998,18 @@ pub(crate) fn stored_query_dependency_budget_bytes(config: &Config) -> usize {
     stored_query_dependency_image_capacity(config)
         .saturating_mul(config.max_stored_query_dependencies_per_object)
         .saturating_mul(size_of::<StoredQueryDependency>())
-        + (config.max_rules
-            + config.max_policies
-            + config.max_routines
-            + config.max_materialized_views)
-            * size_of::<u8>()
-        + pending_stored_query_dependency_capacity(config)
-            * size_of::<PendingStoredQueryDependencies>()
+        .saturating_add(
+            config
+                .max_rules
+                .saturating_add(config.max_policies)
+                .saturating_add(config.max_routines)
+                .saturating_add(config.max_materialized_views)
+                .saturating_mul(size_of::<u8>()),
+        )
+        .saturating_add(
+            pending_stored_query_dependency_capacity(config)
+                .saturating_mul(size_of::<PendingStoredQueryDependencies>()),
+        )
 }
 
 pub(crate) fn rename_schema_name(value: &mut SqlName, old: SqlName, new: SqlName) -> bool {
@@ -16584,13 +16598,17 @@ impl Storage {
         if self.tables[slot].rows.is_empty() {
             return;
         }
-        let mut cursor = 0;
+        let mut cursor = None;
         while !self.retire_table_row_batch(slot, &mut cursor) {}
     }
 
     /// Version ownership precedes map ownership, as for a row read. Bound
     /// each turn so an unrelated relation can use the shared version pools.
-    fn retire_table_row_batch(&self, slot: usize, cursor: &mut usize) -> bool {
+    fn retire_table_row_batch(
+        &self,
+        slot: usize,
+        cursor: &mut Option<row_map::RowOwnerCursor>,
+    ) -> bool {
         const WORK_PER_TURN: usize = 64;
         let (mut versions, mut rows) = row_ownership::acquire(|| {
             Ok((
@@ -16598,22 +16616,25 @@ impl Storage {
                 self.tables[slot].rows.try_write_for_batch()?,
             ))
         });
+        let cursor = cursor.get_or_insert_with(|| rows.owner_cursor());
         for _ in 0..WORK_PER_TURN {
-            if *cursor == rows.scan_end() {
-                debug_assert!(rows.is_empty());
-                return true;
-            }
-            let Some((&rowid, _)) = rows.entry_at_slot(*cursor) else {
-                *cursor += 1;
-                continue;
+            let position = match rows.step_owner_cursor(cursor) {
+                row_map::RowOwnerStep::Complete => {
+                    debug_assert!(rows.is_empty());
+                    return true;
+                }
+                row_map::RowOwnerStep::Skipped => continue,
+                row_map::RowOwnerStep::Position(position) => position,
             };
+            let rowid = *rows
+                .entry_at_position(position)
+                .expect("owned row position")
+                .0;
             let state = rows.remove(&rowid).expect("selected row exists");
             release_pending_chain(&mut versions, state.pending);
             release_committed_chain(&mut versions.committed_row_versions, state.history.tail);
-            // Lookup backshifts never move a different row's stable slot.
-            *cursor += 1;
         }
-        false
+        rows.is_empty()
     }
 
     fn remove_row_state(&mut self, table: usize, rowid: u64) -> Option<RowState> {
@@ -19657,167 +19678,256 @@ impl Storage {
         self.spill_roots.take_reclamation_pending()
     }
 
-    pub(crate) fn retained_row_walk_budget_bytes(config: &Config) -> usize {
-        RowWalkPool::budget_bytes(config)
-    }
-
     pub fn extra_budget_bytes(config: &Config) -> usize {
-        INDEX_ARENA_BYTES
-            + CatalogHistory::budget_bytes(
+        [
+            INDEX_ARENA_BYTES,
+            CatalogHistory::budget_bytes(
                 config.catalog_history_bytes,
                 catalog_transaction_capacity(config),
-            )
-            + log_positions::LogPositions::budget_bytes()
-            + size_of::<CatalogSequence>()
-            + size_of::<usize>()
-            + size_of::<Mutex<()>>()
-            + snapshot_owner_bytes()
-            + config.max_connections as usize * size_of::<ExportedSnapshot>()
-            + statement_snapshot_capacity(config) * size_of::<StatementSnapshot>()
-            + config.query_workspace_slots * foreign_statement_context_workspace_bytes(config)
-            + 2 * config.collation_scratch_bytes
-            + table_slot_capacity(config) * size_of::<Table>()
-            + table_slot_capacity(config) * 2 * size_of::<usize>()
-            + config.max_tables * RowMap::budget_bytes(config.table_rows)
-            + RowMap::budget_bytes(config.large_object_pages)
-            + table_slot_capacity(config).saturating_mul(
-                SpillGenerationRoster::member_budget_bytes(config.max_spill_generations_per_table),
-            )
-            + RowHeap::control_bytes()
-            + config.memtable_bytes
-            + RowVersionPools::control_bytes()
-            + RowVersionPools::metadata_budget_bytes(config)
-            + Self::retained_row_walk_budget_bytes(config)
-            + SnapshotReclamation::budget_bytes()
-            + row_ownership::HeapRowOwnership::budget_bytes(config)
-            + type_reference_moves::DefinitionPublication::budget_bytes(config)
-            + type_edits::TypeRevisions::budget_bytes(config)
-            + type_identities::TypeIdentityIndex::budget_bytes(
+            ),
+            log_positions::LogPositions::budget_bytes(),
+            size_of::<CatalogSequence>(),
+            size_of::<usize>(),
+            size_of::<Mutex<()>>(),
+            snapshot_owner_bytes(),
+            (config.max_connections as usize).saturating_mul(size_of::<ExportedSnapshot>()),
+            statement_snapshot_capacity(config).saturating_mul(size_of::<StatementSnapshot>()),
+            config
+                .query_workspace_slots
+                .saturating_mul(foreign_statement_context_workspace_bytes(config)),
+            2usize.saturating_mul(config.collation_scratch_bytes),
+            table_slot_capacity(config).saturating_mul(size_of::<Table>()),
+            table_slot_capacity(config)
+                .saturating_mul(2)
+                .saturating_mul(size_of::<usize>()),
+            RowOverlayPool::budget_bytes(config.row_overlay_slots),
+            RowMap::budget_bytes(config.large_object_pages),
+            table_slot_capacity(config).saturating_mul(SpillGenerationRoster::member_budget_bytes(
+                config.max_spill_generations_per_table,
+            )),
+            RowHeap::control_bytes(),
+            config.memtable_bytes,
+            RowVersionPools::control_bytes(),
+            RowVersionPools::metadata_budget_bytes(config),
+            crate::mem::lease_pool::RowWorkPool::budget_bytes(
+                config.row_work_bytes,
+                config.row_work_leases,
+            ),
+            SnapshotReclamation::budget_bytes(),
+            row_ownership::HeapRowOwnership::budget_bytes(config),
+            type_reference_moves::DefinitionPublication::budget_bytes(config),
+            type_edits::TypeRevisions::budget_bytes(config),
+            type_identities::TypeIdentityIndex::budget_bytes(
                 config.max_domains,
                 config.max_enums,
                 config.max_composites,
-            )
-            + Self::type_definition_image_budget_bytes(config)
-            + size_of::<type_references::CatalogOrigin>()
-            + size_of::<catalog_sources::CatalogSources>()
-            + SpillRootRegistry::budget_bytes(config)
-            + QueryRootPool::budget_bytes(config)
-            + pending_row_version_capacity(config).saturating_mul(size_of::<PendingVersionSlot>())
-            + Self::table_definition_image_budget_bytes(config)
-            + committed_row_version_capacity(config)
-                .saturating_mul(size_of::<CommittedVersionSlot>())
-            + config.max_views * size_of::<ViewDef>()
-            + config.max_routines * size_of::<RoutineDef>()
-            + stored_query_dependency_budget_bytes(config)
-            + config.max_casts * size_of::<CastDef>()
-            + config.max_operators * size_of::<OperatorDef>()
-            + config.max_operator_families * size_of::<OperatorFamilyDef>()
-            + config.max_operator_classes * size_of::<OperatorClassDef>()
-            + config.max_triggers
-                * (size_of::<TriggerDef>() + config.max_tables * size_of::<PartitionTriggerState>())
-            + config.max_policies * size_of::<PolicyDef>()
-            + policy_role_budget_bytes(config)
-            + config.max_extended_statistics * size_of::<ExtendedStatisticsDef>()
-            + config.max_publications * size_of::<PublicationDef>()
-            + config.max_materialized_views * size_of::<MatviewDef>()
-            + config.max_indexes * (size_of::<IndexDef>() + size_of::<BrinMaintenanceState>())
-            + config
+            ),
+            Self::type_definition_image_budget_bytes(config),
+            size_of::<type_references::CatalogOrigin>(),
+            size_of::<catalog_sources::CatalogSources>(),
+            SpillRootRegistry::budget_bytes(config),
+            QueryRootPool::budget_bytes(config),
+            pending_row_version_capacity(config).saturating_mul(size_of::<PendingVersionSlot>()),
+            Self::table_definition_image_budget_bytes(config),
+            committed_row_version_capacity(config)
+                .saturating_mul(size_of::<CommittedVersionSlot>()),
+            config.max_views.saturating_mul(size_of::<ViewDef>()),
+            config.max_routines.saturating_mul(size_of::<RoutineDef>()),
+            stored_query_dependency_budget_bytes(config),
+            config.max_casts.saturating_mul(size_of::<CastDef>()),
+            config
+                .max_operators
+                .saturating_mul(size_of::<OperatorDef>()),
+            config
+                .max_operator_families
+                .saturating_mul(size_of::<OperatorFamilyDef>()),
+            config
+                .max_operator_classes
+                .saturating_mul(size_of::<OperatorClassDef>()),
+            config.max_triggers.saturating_mul(
+                size_of::<TriggerDef>().saturating_add(
+                    config
+                        .max_tables
+                        .saturating_mul(size_of::<PartitionTriggerState>()),
+                ),
+            ),
+            config.max_policies.saturating_mul(size_of::<PolicyDef>()),
+            policy_role_budget_bytes(config),
+            config
+                .max_extended_statistics
+                .saturating_mul(size_of::<ExtendedStatisticsDef>()),
+            config
+                .max_publications
+                .saturating_mul(size_of::<PublicationDef>()),
+            config
+                .max_materialized_views
+                .saturating_mul(size_of::<MatviewDef>()),
+            config.max_indexes.saturating_mul(
+                size_of::<IndexDef>().saturating_add(size_of::<BrinMaintenanceState>()),
+            ),
+            config
                 .max_indexes
                 .saturating_mul(config.max_brin_unsummarized_ranges_per_index)
-                .saturating_mul(size_of::<u64>())
-            + config.max_rules * size_of::<RuleDef>()
-            + config.max_collations * size_of::<CollationDef>()
-            + config.max_conversions * size_of::<ConversionDef>()
-            + config.max_text_search_objects * size_of::<TextSearchDef>()
-            + config.max_event_triggers * size_of::<EventTriggerDef>()
-            + config.max_replication_slots * size_of::<ReplicationSlotDef>()
-            + config.max_subscriptions * size_of::<SubscriptionDef>()
-            + config.max_subscriptions
-                * config.subscription_relation_capacity
-                * size_of::<SubscriptionRelation>()
-            + foreign::ForeignCatalog::budget_bytes(config)
-            + config.max_foreign_sessions * foreign_session_slot_bytes()
-            + DefinitionVersions::budget_bytes(pending_table_definition_capacity(config))
-            + StatisticsVersions::budget_bytes(config)
-            + table_slot_capacity(config) * TableStatisticsOwner::allocation_bytes()
-            + config.max_large_objects * size_of::<LargeObjectDef>()
-            + pending_extended_statistics_capacity(config)
-                * size_of::<PendingExtendedStatisticsDataSlot>()
-            + config.max_schemas * size_of::<SchemaDef>()
-            + MAX_EXTENSIONS * size_of::<ExtensionDef>()
-            + MAX_EXTENSION_DEPENDENCIES * size_of::<ExtensionDependency>()
-            + MAX_EXTENSION_CONFIG_RELATIONS * size_of::<ExtensionConfig>()
-            + MAX_EXTENSIONS * size_of::<ExtensionPackage>()
-            + config.max_extension_scripts * size_of::<ExtensionScript>()
-            + config.extension_script_bytes
-            + config.max_roles * size_of::<RoleDef>()
-            + config.max_role_memberships * size_of::<RoleMembership>()
-            + config.max_role_settings * size_of::<RoleSetting>()
-            + config.query_workspace_slots
-                * (size_of::<Mutex<FixedVec<bool>>>() + config.max_roles * size_of::<bool>())
-            + MAX_SYSTEM_SETTINGS * size_of::<SystemSetting>()
-            + 2 * config.max_prepared_transactions * size_of::<PreparedTransactionCatalogEntry>()
-            + config.max_acl_entries * size_of::<AclEntry>()
-            + 2 * size_of::<u64>()
-            + config.max_column_acl_entries * size_of::<ColumnAclEntry>()
-            + config.max_default_acl_entries * size_of::<DefaultAclEntry>()
-            + config.max_parameter_acl_entries * size_of::<ParameterAclEntry>()
-            + ParameterAclRows::budget_bytes(config)
-            + config.max_sequences * (size_of::<SequenceDef>() + size_of::<SequenceValues>())
-            + config.max_domains * size_of::<DomainDef>()
-            + config.max_enums * size_of::<EnumDef>()
-            + enum_member_budget_bytes(config)
-            + config.max_composites * size_of::<CompositeDef>()
-            + config.max_domains * size_of::<u8>()
-            + MAX_ACCESS_METHODS * size_of::<AccessMethodDef>()
-            + config.max_databases * size_of::<DatabaseDef>()
-            + config.max_tablespaces * size_of::<TablespaceDef>()
-            + config.max_comments * size_of::<CommentEntry>()
-            + size_of::<core::num::NonZeroU64>()
-            + config.max_connections as usize * size_of::<BackendActivity>()
-            + config.max_connections as usize * size_of::<BackendSignal>()
-            + table_slot_capacity(config) * size_of::<RelationCumulativeStatistics>()
-            + (config.max_connections as usize + config.max_prepared_transactions)
-                * table_slot_capacity(config)
-                * (config.max_savepoints_per_transaction + 1)
-                * size_of::<RelationTransactionStatistics>()
-            + (config.max_connections as usize + config.max_prepared_transactions)
-                * size_of::<(u32, usize)>()
-            + (table_slot_capacity(config) * (MAX_COLUMNS + MAX_UNIQUES + MAX_EXCLUSIONS)
-                + config.max_value_indexes)
-                * size_of::<IndexCumulativeStatistics>()
-            + config.max_databases * size_of::<DatabaseCumulativeStatistics>()
-            + (config.max_connections as usize + config.max_prepared_transactions)
-                * size_of::<(u32, u64)>()
-            + (config.max_connections as usize + config.max_prepared_transactions)
-                * size_of::<ActiveTransactionIdentity>()
-            + (config.max_connections as usize + config.max_prepared_transactions)
+                .saturating_mul(size_of::<u64>()),
+            config.max_rules.saturating_mul(size_of::<RuleDef>()),
+            config
+                .max_collations
+                .saturating_mul(size_of::<CollationDef>()),
+            config
+                .max_conversions
+                .saturating_mul(size_of::<ConversionDef>()),
+            config
+                .max_text_search_objects
+                .saturating_mul(size_of::<TextSearchDef>()),
+            config
+                .max_event_triggers
+                .saturating_mul(size_of::<EventTriggerDef>()),
+            config
+                .max_replication_slots
+                .saturating_mul(size_of::<ReplicationSlotDef>()),
+            config
+                .max_subscriptions
+                .saturating_mul(size_of::<SubscriptionDef>()),
+            config
+                .max_subscriptions
+                .saturating_mul(config.subscription_relation_capacity)
+                .saturating_mul(size_of::<SubscriptionRelation>()),
+            foreign::ForeignCatalog::budget_bytes(config),
+            config
+                .max_foreign_sessions
+                .saturating_mul(foreign_session_slot_bytes()),
+            DefinitionVersions::budget_bytes(pending_table_definition_capacity(config)),
+            StatisticsVersions::budget_bytes(config),
+            table_slot_capacity(config).saturating_mul(TableStatisticsOwner::allocation_bytes()),
+            config
+                .max_large_objects
+                .saturating_mul(size_of::<LargeObjectDef>()),
+            pending_extended_statistics_capacity(config)
+                .saturating_mul(size_of::<PendingExtendedStatisticsDataSlot>()),
+            config.max_schemas.saturating_mul(size_of::<SchemaDef>()),
+            MAX_EXTENSIONS.saturating_mul(size_of::<ExtensionDef>()),
+            MAX_EXTENSION_DEPENDENCIES.saturating_mul(size_of::<ExtensionDependency>()),
+            MAX_EXTENSION_CONFIG_RELATIONS.saturating_mul(size_of::<ExtensionConfig>()),
+            MAX_EXTENSIONS.saturating_mul(size_of::<ExtensionPackage>()),
+            config
+                .max_extension_scripts
+                .saturating_mul(size_of::<ExtensionScript>()),
+            config.extension_script_bytes,
+            config.max_roles.saturating_mul(size_of::<RoleDef>()),
+            config
+                .max_role_memberships
+                .saturating_mul(size_of::<RoleMembership>()),
+            config
+                .max_role_settings
+                .saturating_mul(size_of::<RoleSetting>()),
+            config.query_workspace_slots.saturating_mul(
+                size_of::<Mutex<FixedVec<bool>>>()
+                    .saturating_add(config.max_roles.saturating_mul(size_of::<bool>())),
+            ),
+            MAX_SYSTEM_SETTINGS.saturating_mul(size_of::<SystemSetting>()),
+            2usize
+                .saturating_mul(config.max_prepared_transactions)
+                .saturating_mul(size_of::<PreparedTransactionCatalogEntry>()),
+            config.max_acl_entries.saturating_mul(size_of::<AclEntry>()),
+            2usize.saturating_mul(size_of::<u64>()),
+            config
+                .max_column_acl_entries
+                .saturating_mul(size_of::<ColumnAclEntry>()),
+            config
+                .max_default_acl_entries
+                .saturating_mul(size_of::<DefaultAclEntry>()),
+            config
+                .max_parameter_acl_entries
+                .saturating_mul(size_of::<ParameterAclEntry>()),
+            ParameterAclRows::budget_bytes(config),
+            config.max_sequences.saturating_mul(
+                size_of::<SequenceDef>().saturating_add(size_of::<SequenceValues>()),
+            ),
+            config.max_domains.saturating_mul(size_of::<DomainDef>()),
+            config.max_enums.saturating_mul(size_of::<EnumDef>()),
+            enum_member_budget_bytes(config),
+            config
+                .max_composites
+                .saturating_mul(size_of::<CompositeDef>()),
+            config.max_domains.saturating_mul(size_of::<u8>()),
+            MAX_ACCESS_METHODS.saturating_mul(size_of::<AccessMethodDef>()),
+            config
+                .max_databases
+                .saturating_mul(size_of::<DatabaseDef>()),
+            config
+                .max_tablespaces
+                .saturating_mul(size_of::<TablespaceDef>()),
+            config
+                .max_comments
+                .saturating_mul(size_of::<CommentEntry>()),
+            size_of::<core::num::NonZeroU64>(),
+            (config.max_connections as usize).saturating_mul(size_of::<BackendActivity>()),
+            (config.max_connections as usize).saturating_mul(size_of::<BackendSignal>()),
+            table_slot_capacity(config).saturating_mul(size_of::<RelationCumulativeStatistics>()),
+            (config.max_connections as usize)
+                .saturating_add(config.max_prepared_transactions)
+                .saturating_mul(table_slot_capacity(config))
+                .saturating_mul(config.max_savepoints_per_transaction.saturating_add(1))
+                .saturating_mul(size_of::<RelationTransactionStatistics>()),
+            (config.max_connections as usize)
+                .saturating_add(config.max_prepared_transactions)
+                .saturating_mul(size_of::<(u32, usize)>()),
+            table_slot_capacity(config)
+                .saturating_mul(
+                    MAX_COLUMNS
+                        .saturating_add(MAX_UNIQUES)
+                        .saturating_add(MAX_EXCLUSIONS),
+                )
+                .saturating_add(config.max_value_indexes)
+                .saturating_mul(size_of::<IndexCumulativeStatistics>()),
+            config
+                .max_databases
+                .saturating_mul(size_of::<DatabaseCumulativeStatistics>()),
+            (config.max_connections as usize)
+                .saturating_add(config.max_prepared_transactions)
+                .saturating_mul(size_of::<(u32, u64)>()),
+            (config.max_connections as usize)
+                .saturating_add(config.max_prepared_transactions)
+                .saturating_mul(size_of::<ActiveTransactionIdentity>()),
+            (config.max_connections as usize)
+                .saturating_add(config.max_prepared_transactions)
                 .saturating_mul(8)
                 .max(64)
-                * size_of::<RecentTransactionStatus>()
-            + (config.max_connections as usize + config.max_prepared_transactions)
-                * size_of::<u32>()
-            + (config.max_connections as usize + config.max_subscriptions)
-                * size_of::<TemporaryNamespace>()
-            + config.max_routines * size_of::<FunctionCumulativeStatistics>()
-            + (config.max_connections as usize + config.max_prepared_transactions)
-                * config.max_routines
-                * size_of::<FunctionTransactionStatistics>()
-            + object_lock_capacity(config) * size_of::<ObjectLock>()
-            + crate::sql::lock::LockManager::budget_bytes(
-                (config.max_connections as usize + config.max_prepared_transactions)
-                    * config.txn_rows,
+                .saturating_mul(size_of::<RecentTransactionStatus>()),
+            (config.max_connections as usize)
+                .saturating_add(config.max_prepared_transactions)
+                .saturating_mul(size_of::<u32>()),
+            (config.max_connections as usize)
+                .saturating_add(config.max_subscriptions)
+                .saturating_mul(size_of::<TemporaryNamespace>()),
+            config
+                .max_routines
+                .saturating_mul(size_of::<FunctionCumulativeStatistics>()),
+            (config.max_connections as usize)
+                .saturating_add(config.max_prepared_transactions)
+                .saturating_mul(config.max_routines)
+                .saturating_mul(size_of::<FunctionTransactionStatistics>()),
+            object_lock_capacity(config).saturating_mul(size_of::<ObjectLock>()),
+            crate::sql::lock::LockManager::budget_bytes(
+                (config.max_connections as usize)
+                    .saturating_add(config.max_prepared_transactions)
+                    .saturating_mul(config.txn_rows),
                 config.max_connections as usize,
-            )
-            + crate::sql::lock::AdvisoryLockManager::budget_bytes(
-                (config.max_connections as usize + config.max_prepared_transactions)
-                    * config.max_locks_per_transaction,
+            ),
+            crate::sql::lock::AdvisoryLockManager::budget_bytes(
+                (config.max_connections as usize)
+                    .saturating_add(config.max_prepared_transactions)
+                    .saturating_mul(config.max_locks_per_transaction),
                 config.max_connections as usize,
-            )
-            + (config.max_connections as usize + config.max_prepared_transactions)
-                * table_slot_capacity(config)
-                * size_of::<(u32, u32, u64, bool)>()
-            + ValueIndexPool::budget_bytes(config.max_value_indexes, config.value_index_rows)
+            ),
+            (config.max_connections as usize)
+                .saturating_add(config.max_prepared_transactions)
+                .saturating_mul(table_slot_capacity(config))
+                .saturating_mul(size_of::<(u32, u32, u64, bool)>()),
+            ValueIndexPool::budget_bytes(config.max_value_indexes, config.value_index_rows),
+        ]
+        .into_iter()
+        .fold(0usize, usize::saturating_add)
     }
 
     pub(crate) fn new(
@@ -19825,6 +19935,7 @@ impl Storage {
         budget: &mut Budget,
         initial_statistics_micros: i64,
     ) -> Result<Self, StorageSetupError> {
+        config.validate_runtime_resources()?;
         let catalog_origin = type_references::CatalogOrigin::new()?;
         budget.draw(
             size_of::<type_references::CatalogOrigin>(),
@@ -19850,7 +19961,14 @@ impl Storage {
         let table_definition_images =
             definition_images::TableDefinitionImagePool::new(config, budget)?;
         let row_versions = RowVersionPools::new(config, budget)?;
-        let row_walks = RowWalkPool::new(config, budget)?;
+        let row_work = crate::mem::lease_pool::RowWorkPool::new(
+            budget,
+            config.row_work_bytes,
+            config.row_work_leases,
+        )?;
+        let row_walks = RowWalkPool::new(std::sync::Arc::clone(&row_work));
+        let row_overlay =
+            RowOverlayPool::new(budget, "row_overlay_slots", config.row_overlay_slots)?;
         let snapshot_reclamation = SnapshotReclamation::new(budget)?;
         let heap_row_ownership = row_ownership::HeapRowOwnership::new(config, budget)?;
         let definition_publication =
@@ -19868,6 +19986,17 @@ impl Storage {
             "checkpoint deletion guard owners",
         )?;
         for slot in 0..table_capacity {
+            let rows = if slot == config.max_tables {
+                RowMap::new(budget, "large_object_pages", config.large_object_pages)?
+            } else {
+                let rows = RowMap::from_pool(std::sync::Arc::clone(&row_overlay));
+                assert_eq!(
+                    rows.owner_id().index(),
+                    slot,
+                    "ordinary row owner registration"
+                );
+                rows
+            };
             tables
                 .push(Table {
                     lifecycle: Mutex::new(()),
@@ -19877,15 +20006,7 @@ impl Storage {
                         n_columns: 0,
                         ..TableDef::empty()
                     }),
-                    rows: RowMap::new(
-                        budget,
-                        "table_rows",
-                        if slot == config.max_tables {
-                            config.large_object_pages
-                        } else {
-                            config.table_rows
-                        },
-                    )?,
+                    rows,
                     publication: Mutex::new(TablePublication {
                         dirty: false,
                         generation: 1,
@@ -20638,6 +20759,8 @@ impl Storage {
             table_definition_images,
             max_row_versions_per_row: config.max_row_versions_per_row,
             row_versions,
+            row_work,
+            row_overlay,
             row_walks,
             snapshot_reclamation,
             heap_row_ownership,
@@ -33032,7 +33155,7 @@ impl Storage {
                     if cursor.resident_rowids.len() == cursor.resident_rowids.capacity() {
                         return Err(sql_err!(
                             sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                            "checkpoint retained row identities exceed table_rows ({})",
+                            "checkpoint retained row identity capacity exhausted ({})",
                             cursor.resident_rowids.capacity()
                         ));
                     }
@@ -33105,7 +33228,7 @@ impl Storage {
                     if changed_rowids.len() == changed_rowids.capacity() {
                         return Err(sql_err!(
                             sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                            "checkpoint value-index changed-row set exceeds table_rows ({})",
+                            "checkpoint changed-row identity capacity exhausted ({})",
                             changed_rowids.capacity()
                         ));
                     }
@@ -33125,7 +33248,7 @@ impl Storage {
             if changed_rowids.len() == changed_rowids.capacity() {
                 return Err(sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "checkpoint value-index changed-row set exceeds table_rows ({})",
+                    "checkpoint changed-row identity capacity exhausted ({})",
                     changed_rowids.capacity()
                 ));
             }
@@ -34704,27 +34827,45 @@ impl Storage {
         self.with_row_bytes(table_index, rowid, committed, compare)
     }
 
-    /// Whether any live table's overlay is at least half full — the map's
-    /// analogue of heap pressure. Rows are counted against entries, not
-    /// bytes: a table of tiny rows fills its map long before its heap.
+    /// Shared row identities can fill before their row-byte heap, including
+    /// before the first saved generation exists.
     pub fn map_pressure(&self) -> bool {
-        self.tables.iter().any(|t| {
-            t.live()
-                && !t.spill_generations().is_empty()
-                && t.rows.len() * 100 >= t.rows.capacity() * 50
-        })
+        self.row_overlay.usage().pressured()
+            || self
+                .tables
+                .last()
+                .unwrap()
+                .rows
+                .read()
+                .pool_usage()
+                .pressured()
+    }
+
+    pub(crate) fn durable_map_pressure(&self) -> bool {
+        self.map_pressure()
+            && self.tables.iter().any(|table| {
+                table.live()
+                    && table.dirty()
+                    && table.definition().persistence != RelationPersistence::Temporary
+                    && table
+                        .rows
+                        .read()
+                        .iter()
+                        .any(|(_, state)| state.checkpoint_change_lsn != 0)
+            })
     }
 
     pub(crate) fn temporary_map_pressure(&self) -> bool {
-        self.tables.iter().any(|table| {
-            table.live()
-                && {
-                    let definition = table.definition();
-                    definition.persistence
-                } == RelationPersistence::Temporary
-                && table.dirty()
-                && table.rows.len() * 100 >= table.rows.capacity() * 50
-        })
+        self.row_overlay.usage().pressured()
+            && self.tables.iter().any(|table| {
+                table.live()
+                    && {
+                        let definition = table.definition();
+                        definition.persistence
+                    } == RelationPersistence::Temporary
+                    && table.dirty()
+                    && !table.rows.is_empty()
+            })
     }
 
     /// Starts an object flush before the resident safety window can fill.
@@ -37760,7 +37901,7 @@ impl Storage {
             .map(TableDefinitionRevision::catalog)
     }
 
-    fn table_definition_target(
+    pub(crate) fn table_definition_target(
         &self,
         index: usize,
         transaction: u32,
@@ -54180,7 +54321,7 @@ mod tests {
         c.max_connections = 2;
         c.max_tables = 4;
         c.max_extended_statistics = 32;
-        c.table_rows = 128;
+        c.row_overlay_slots = 128;
         c.txn_rows = 128;
         c.value_index_rows = 512;
         c.max_value_indexes = 8;
@@ -54253,3 +54394,6 @@ mod tests {
 
 #[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 mod table_name_tests;
+
+#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
+mod startup_budget;

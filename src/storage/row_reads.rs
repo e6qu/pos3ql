@@ -237,7 +237,7 @@ impl RowMetadataPool {
         };
         let mut slot = state.pending.tail;
         while let Some(index) = slot {
-            let entry = versions.pending_row_versions[index];
+            let entry = &versions.pending_row_versions[index];
             image
                 .pending
                 .push((entry.identity, entry.change))

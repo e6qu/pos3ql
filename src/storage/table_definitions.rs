@@ -29,6 +29,7 @@ pub(super) struct DefinitionState {
     pub(super) pending: Option<PendingDefinitionHead>,
     /// A CREATE RULE changes the visible history only for its transaction.
     pub(super) pending_has_rules_txid: Option<u32>,
+    publication_owner: Option<u32>,
 }
 
 impl DefinitionState {
@@ -54,6 +55,26 @@ impl DefinitionState {
         self.committed.has_rules = true;
     }
 
+    pub(super) fn claim_publication(&mut self, transaction: u32) -> Result<(), u32> {
+        if let Some(owner) = self.publication_owner
+            && owner != transaction
+        {
+            return Err(owner);
+        }
+        self.publication_owner = Some(transaction);
+        Ok(())
+    }
+
+    pub(super) fn release_publication(&mut self, transaction: u32) {
+        if self.publication_owner == Some(transaction) {
+            self.publication_owner = None;
+        }
+    }
+
+    pub(super) fn publication_owner(&self) -> Option<u32> {
+        self.publication_owner
+    }
+
     pub(super) fn locked_by_other(&self, transaction: u32) -> Option<u32> {
         self.identity
             .existence
@@ -61,6 +82,7 @@ impl DefinitionState {
             .into_iter()
             .chain(self.pending.map(|head| head.transaction))
             .chain(self.pending_has_rules_txid)
+            .chain(self.publication_owner)
             .find(|&owner| owner != transaction)
     }
 }
@@ -111,6 +133,7 @@ impl TableDefinition {
             committed_revision: TableDefinitionRevision::INITIAL,
             pending: None,
             pending_has_rules_txid: None,
+            publication_owner: None,
         };
         let names = TableNames::from_state(&state);
         Self {
@@ -255,7 +278,6 @@ pub(super) struct PreparedDefinitionReplacements {
     ddl_version: u64,
     existence: CatalogDdlState,
     committed_revision: TableDefinitionRevision,
-    pending_head: Option<(u32, u32)>,
     committed: Option<TableDef>,
     pending: crate::mem::lease_pool::SharedSlice<PreparedPendingDefinition>,
 }
@@ -420,7 +442,6 @@ impl DefinitionVersions {
             ddl_version: state.identity.ddl_version,
             existence: state.identity.existence,
             committed_revision: state.committed_revision,
-            pending_head: state.pending.map(|head| (head.tail, head.transaction)),
             committed,
             pending: pending.freeze(),
         })
@@ -436,22 +457,30 @@ impl DefinitionVersions {
             || state.identity.database != prepared.database
             || state.identity.created_at != prepared.created_at
             || state.identity.ddl_version != prepared.ddl_version
-            || state.identity.existence != prepared.existence
+            || (state.identity.existence != prepared.existence
+                && !matches!((prepared.existence, state.identity.existence),
+                    (CatalogDdlState::PendingCreate { txid }, CatalogDdlState::Present)
+                        if state.publication_owner() == Some(txid)))
             || state.committed_revision != prepared.committed_revision
-            || state.pending.map(|head| (head.tail, head.transaction)) != prepared.pending_head
         {
             return Err(sql_err!(
                 sqlstate::SERIALIZATION_FAILURE,
                 "table definition changed after replacement preparation"
             ));
         }
-        for pending in prepared.pending.iter() {
-            if self.read(pending.slot as usize).version.revision != pending.revision {
+        let mut tail = state.pending.map(|head| head.tail);
+        let mut captured = prepared.pending.iter();
+        while let Some(slot) = tail {
+            let current = self.read(slot as usize);
+            if !captured
+                .any(|entry| entry.slot == slot && entry.revision == current.version.revision)
+            {
                 return Err(sql_err!(
                     sqlstate::SERIALIZATION_FAILURE,
                     "pending table definition changed after replacement preparation"
                 ));
             }
+            tail = current.previous;
         }
         Ok(())
     }
@@ -466,21 +495,34 @@ impl DefinitionVersions {
     ) -> bool {
         self.validate_replacements_locked(state, expected_source, &prepared)
             .expect("prepared definitions retain their validated publication owner");
-        let changed = prepared.changed();
+        let mut changed = prepared.committed.is_some();
         if let Some(committed) = prepared.committed {
             *state.edit_committed(revision) = committed;
-        } else if changed {
-            state.committed_revision = revision;
         }
-        for pending in prepared.pending.iter() {
-            if let Some(replacement) = &pending.replacement {
-                let mut owner = self.write(pending.slot as usize);
+        let mut tail = state.pending.map(|head| head.tail);
+        while let Some(slot) = tail {
+            let current = self.read(slot as usize);
+            let selected_revision = current.version.revision;
+            let next = current.previous;
+            drop(current);
+            let captured = prepared
+                .pending
+                .iter()
+                .find(|entry| entry.slot == slot && entry.revision == selected_revision)
+                .expect("validated pending definition has a captured source");
+            if let Some(replacement) = &captured.replacement {
+                let mut owner = self.write(slot as usize);
                 owner
                     .as_mut()
                     .expect("validated pending definition exists")
                     .version
                     .def = replacement.clone();
+                changed = true;
             }
+            tail = next;
+        }
+        if changed {
+            state.committed_revision = revision;
         }
         if let Some(head) = &mut state.pending {
             let latest = self.read(head.tail as usize);
@@ -1582,6 +1624,84 @@ mod tests {
                 versions.latest_locked(&state).unwrap().def.name.as_str(),
                 "replacement"
             );
+
+            state.claim_publication(9).unwrap();
+            assert_eq!(state.claim_publication(8), Err(9));
+            assert_eq!(state.locked_by_other(8), Some(7));
+            let retired_slot = state.pending.unwrap().tail;
+            let rollback_plan = versions
+                .prepare_replacements_locked(&state, source, pool, |original| {
+                    if original.n_columns != 2 {
+                        return Ok(None);
+                    }
+                    let mut candidate = TableDefBuilder::from_definition(original);
+                    candidate.name = SqlName::parse("must_not_rewrite_reused_slot").unwrap();
+                    Ok(Some(candidate.freeze(pool)?))
+                })
+                .unwrap();
+            assert!(versions.rollback_locked(&mut state, 7));
+            assert_eq!(state.publication_owner(), Some(9));
+            assert_eq!(state.locked_by_other(8), Some(9));
+            let unrelated = TableDefinition::new(definition(1, pool));
+            for _ in 0..versions.capacity() {
+                versions.stage(&unrelated, pending(3, 11, pool), 8).unwrap();
+                if unrelated.read().pending.unwrap().tail == retired_slot {
+                    break;
+                }
+                assert!(versions.rollback(&unrelated, 11));
+            }
+            assert_eq!(unrelated.read().pending.unwrap().tail, retired_slot);
+            versions
+                .validate_replacements_locked(&state, source, &rollback_plan)
+                .unwrap();
+            assert!(!versions.apply_replacements_locked(
+                &mut state,
+                source,
+                rollback_plan,
+                TableDefinitionRevision::catalog(101)
+            ));
+            assert_eq!(
+                versions
+                    .latest_locked(&unrelated.read())
+                    .unwrap()
+                    .def
+                    .name
+                    .as_str(),
+                "guarded"
+            );
+            state.release_publication(8);
+            assert_eq!(state.publication_owner(), Some(9));
+            state.release_publication(9);
+            assert_eq!(state.publication_owner(), None);
+            versions.clear(&unrelated);
+            state.identity.existence = CatalogDdlState::PendingCreate { txid: 9 };
+            let creation = versions
+                .prepare_replacements_locked(&state, source, pool, |_| Ok(None))
+                .unwrap();
+            state.identity.existence = CatalogDdlState::Present;
+            assert!(
+                versions
+                    .validate_replacements_locked(&state, source, &creation)
+                    .is_err()
+            );
+            state.claim_publication(8).unwrap();
+            assert!(
+                versions
+                    .validate_replacements_locked(&state, source, &creation)
+                    .is_err()
+            );
+            state.release_publication(8);
+            state.claim_publication(9).unwrap();
+            versions
+                .validate_replacements_locked(&state, source, &creation)
+                .unwrap();
+            assert!(!versions.apply_replacements_locked(
+                &mut state,
+                source,
+                creation,
+                TableDefinitionRevision::catalog(102)
+            ));
+            state.release_publication(9);
         });
     }
 }

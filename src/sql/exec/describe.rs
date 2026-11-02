@@ -3403,14 +3403,11 @@ impl<'a> ColumnLookup<'a> for NoColumnLookup {
 }
 
 /// A single table's columns.
-pub struct DefCols<'d>(pub &'d TableDef);
+pub struct DefCols<'d>(pub crate::storage::RelationDefinition<'d>);
 impl ColTypeResolver for DefCols<'_> {
     fn resolve(&self, q: Option<&str>, name: &str) -> Result<ColType, SqlError> {
         if let Some(q) = q
-            && !crate::sql::eval::qualifier_answers_single(
-                crate::storage::RelationDefinition::from_definition(self.0),
-                q,
-            )
+            && !crate::sql::eval::qualifier_answers_single(self.0, q)
         {
             return Err(sql_err!(
                 sqlstate::UNDEFINED_TABLE,
@@ -3652,7 +3649,10 @@ fn unary_operator_undefined(operator: &str, operand: ColType) -> SqlError {
 
 pub fn infer_type_pub(expression: &Expr, def: Option<&TableDef>) -> Result<(i32, i16), SqlError> {
     match def {
-        Some(d) => infer_type_res(expression, &DefCols(d)),
+        Some(d) => infer_type_res(
+            expression,
+            &DefCols(crate::storage::RelationDefinition::from_definition(d)),
+        ),
         None => infer_type_res(expression, &NoCols),
     }
 }

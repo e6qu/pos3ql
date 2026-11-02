@@ -5569,7 +5569,7 @@ fn scan_source_mode<'a>(
         }
         let definition = scope
             .defs
-            .get(source)
+            .stored(source)
             .expect("physical source has a definition");
         let row = crate::storage::PartitionRow::new(definition, &values[..definition.n_columns])?;
         let mut current = root;
@@ -6805,7 +6805,7 @@ fn scan_source_mode<'a>(
                 let definitions = storage.table_definition_images();
                 let logical = scope
                     .defs
-                    .get(order[depth])
+                    .stored(order[depth])
                     .expect("resolved logical relation");
                 for &leaf in &leaves[..n_leaves] {
                     storage.record_relation_scan(

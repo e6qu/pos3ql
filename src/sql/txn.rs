@@ -239,6 +239,14 @@ pub(crate) struct StagedCommit {
 }
 
 #[derive(Clone, Copy)]
+struct CommitAdmission {
+    target: CommitTarget,
+    clock: super::datetime::StatementClock,
+    deadline: i64,
+    prepared_locks_staged: bool,
+}
+
+#[derive(Clone, Copy)]
 pub(super) struct CommitControl {
     mode: TxnMode,
     txid: u32,
@@ -262,6 +270,7 @@ pub(super) struct CacheCapacityWait {
 
 pub struct TxnState {
     staged_commit: Option<StagedCommit>,
+    commit_admission: Option<CommitAdmission>,
     pub(super) catalog_history: Option<crate::storage::CatalogHistoryBatch>,
     pub mode: TxnMode,
     /// An error occurred inside an explicit block: everything until
@@ -962,6 +971,7 @@ impl TxnState {
         }
         Ok(Self {
             staged_commit: None,
+            commit_admission: None,
             catalog_history: None,
             mode: TxnMode::Idle,
             failed: false,
@@ -1195,7 +1205,9 @@ impl TxnState {
     }
 
     pub(crate) fn begin_statement_clock(&self) {
-        if let Some(suspended) = &self.suspended_statement {
+        if let Some(admission) = &self.commit_admission {
+            super::datetime::restore_statement_clock(admission.clock);
+        } else if let Some(suspended) = &self.suspended_statement {
             super::datetime::restore_statement_clock(suspended.clock);
         } else if let Some(wait) = &self.cache_capacity_wait {
             super::datetime::restore_statement_clock(wait.clock);
@@ -1253,11 +1265,56 @@ impl TxnState {
         self.staged_commit
     }
 
+    /// SQL effects are complete, but admission may still wait before WAL is
+    /// committed. Unlike a staged commit, this phase remains cancellable.
+    pub(crate) fn begin_commit_admission(&mut self, target: CommitTarget) {
+        assert!(self.is_active() && self.staged_commit.is_none());
+        if let Some(admission) = &self.commit_admission {
+            assert_eq!(
+                admission.target, target,
+                "commit admission target is retained"
+            );
+        } else {
+            self.commit_admission = Some(CommitAdmission {
+                target,
+                clock: super::datetime::statement_clock(),
+                deadline: super::query::statement_deadline(),
+                prepared_locks_staged: false,
+            });
+        }
+    }
+
+    pub(crate) fn commit_admission(&self) -> Option<CommitTarget> {
+        self.commit_admission.map(|admission| admission.target)
+    }
+
+    pub(super) fn prepared_locks_staged(&self) -> bool {
+        self.commit_admission
+            .as_ref()
+            .expect("prepared lock image requires admission")
+            .prepared_locks_staged
+    }
+
+    pub(super) fn mark_prepared_locks_staged(&mut self) {
+        let admission = self
+            .commit_admission
+            .as_mut()
+            .expect("prepared lock image requires admission");
+        assert!(matches!(admission.target, CommitTarget::Prepare { .. }));
+        admission.prepared_locks_staged = true;
+    }
+
     pub(crate) fn stage_commit(&mut self, lsn: u64, target: CommitTarget, barrier: CommitBarrier) {
         assert!(
             self.staged_commit.is_none(),
             "commit staging is performed once"
         );
+        if let Some(admission) = self.commit_admission.take() {
+            assert_eq!(
+                admission.target, target,
+                "admitted commit target is retained"
+            );
+        }
         self.staged_commit = Some(StagedCommit {
             queue: None,
             lsn,
@@ -1271,9 +1328,14 @@ impl TxnState {
     }
 
     pub(crate) fn suspended_statement_deadline(&self) -> Option<i64> {
-        self.suspended_statement
+        self.commit_admission
             .as_ref()
-            .map(|suspended| suspended.deadline)
+            .map(|admission| admission.deadline)
+            .or_else(|| {
+                self.suspended_statement
+                    .as_ref()
+                    .map(|suspended| suspended.deadline)
+            })
             .or_else(|| self.cache_capacity_wait.as_ref().map(|wait| wait.deadline))
     }
 
@@ -2461,6 +2523,35 @@ impl TxnState {
         Ok(change.row_target())
     }
 
+    pub(crate) fn table_definition_changes(
+        &self,
+    ) -> impl Iterator<Item = crate::storage::TableDefinitionChange> + Clone {
+        self.ddl().iter().filter_map(|undo| match undo {
+            DdlUndo::TableAltered(change) => Some(*change),
+            _ => None,
+        })
+    }
+
+    pub(crate) fn type_commit_changes(
+        &self,
+    ) -> impl Iterator<Item = crate::storage::TypeCommitChange> + Clone {
+        self.ddl().iter().filter_map(|undo| {
+            use crate::storage::TypeCommitChange;
+            Some(match undo {
+                DdlUndo::DomainCreated(undo)
+                | DdlUndo::DomainDropped(undo)
+                | DdlUndo::EnumCreated(undo)
+                | DdlUndo::EnumDropped(undo)
+                | DdlUndo::CompositeCreated(undo)
+                | DdlUndo::CompositeDropped(undo) => TypeCommitChange::Lifecycle(*undo),
+                DdlUndo::DomainAltered(undo) => TypeCommitChange::Definition(undo.target()),
+                DdlUndo::EnumAltered(undo) => TypeCommitChange::Definition(undo.target()),
+                DdlUndo::CompositeAltered(undo) => TypeCommitChange::Definition(undo.target()),
+                _ => return None,
+            })
+        })
+    }
+
     pub(crate) fn write_row(
         &mut self,
         storage: &crate::storage::Storage,
@@ -2594,6 +2685,7 @@ impl TxnState {
 
     pub fn clear(&mut self) {
         self.staged_commit = None;
+        self.commit_admission = None;
         self.catalog_history = None;
         self.mode = TxnMode::Idle;
         self.command_id = 0;

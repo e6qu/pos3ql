@@ -4677,10 +4677,13 @@ fn append_database_definition(
         && buffer.append(&definition.tablespace.to_le_bytes())
 }
 
+fn name_bytes(buffer: &mut FixedBuf, name: &str) -> bool {
+    name.len() <= u8::MAX as usize
+        && buffer.append(&[name.len() as u8])
+        && buffer.append(name.as_bytes())
+}
+
 fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
-    let name_bytes = |buffer: &mut FixedBuf, s: &str| -> bool {
-        buffer.append(&[s.len() as u8]) && buffer.append(s.as_bytes())
-    };
     fn append_routine_result(buffer: &mut FixedBuf, result: crate::storage::RoutineResult) -> bool {
         let mut ok = buffer.append(&[result.ctype.code()]);
         match result.user_type {

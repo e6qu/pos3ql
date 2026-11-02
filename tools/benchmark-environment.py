@@ -107,7 +107,7 @@ def main():
         tls_ca_sha256 = hashlib.sha256(tls_ca_bytes).hexdigest()
     status = command("git", "status", "--porcelain")
     result = {
-        "schema_version": 1,
+        "schema_version": 2,
         "artifact_type": "environment",
         "generated_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "git_commit": command("git", "rev-parse", "HEAD"),

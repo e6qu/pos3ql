@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use super::{PendingChange, RowHome, RowMap, Storage, VisibleRowHome};
-use crate::mem::lease_pool::{LeasePool, MutableSlice, Purpose};
+use crate::mem::lease_pool::{LeasePool, MutableSlice};
 use crate::sql::eval::{SqlError, sqlstate};
 use crate::sql_err;
 
@@ -544,6 +544,7 @@ mod tests {
     use super::*;
     use crate::mem::budget::Budget;
     use crate::mem::fixed_vec::FixedVec;
+    use crate::mem::lease_pool::Purpose;
     use crate::sql::types::{ColType, Datum};
     use crate::storage::tests::{make_def, test_budget, test_config};
     use crate::storage::{RowHome, RowState, SNAPSHOT_ALL};

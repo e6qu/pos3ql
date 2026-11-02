@@ -158,6 +158,7 @@ pub(super) fn allocate(
             None,
         )?;
         source.bind_table_definition(&mut def, transaction)?;
+        storage.require_definition_dependency_access(&source, &def, transaction, Some(slot))?;
         let created_at = match allocation {
             super::CatalogAllocation::New => storage
                 .catalog_sequence

@@ -13,7 +13,7 @@ use super::type_references::{TypeBinding, TypeIdentity};
 use super::{
     ArrElem, CatalogDdlState, ColType, CommentClass, DependencyClass, EnumMemberImages,
     OperatorClassDefinition, OperatorDefinition, OperatorFamilyDefinition, RoutineResult, Storage,
-    TableDef, TablePublication, TypeCatalog, TypeEditTarget, UserTypeName,
+    TableDef, TableDefBuilder, TablePublication, TypeCatalog, TypeEditTarget, UserTypeName,
 };
 use crate::config::Config;
 use crate::mem::arena::Arena;
@@ -188,7 +188,7 @@ impl TypeReferenceMove {
             .any(|column| self.matches(column.ctype, column.user_type))
     }
 
-    pub(super) fn rewrite_definition(self, definition: &mut TableDef) -> bool {
+    pub(super) fn rewrite_definition(self, definition: &mut TableDefBuilder) -> bool {
         let mut changed = false;
         for column in definition.columns.iter_mut().take(definition.n_columns) {
             changed |= self.rewrite(column.ctype, &mut column.user_type);
@@ -244,6 +244,8 @@ impl TypeReferenceMove {
 /// Ordinary reads and row writes do not acquire its mutex.
 pub(super) struct DefinitionPublication {
     pub(super) scratch: Mutex<Arena>,
+    pub(super) prepared:
+        Mutex<crate::mem::FixedVec<super::table_publication::PreparedDefinitionTransaction>>,
     #[cfg(test)]
     pub(super) waits: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
@@ -261,7 +263,7 @@ pub(super) struct TableOwner<'storage> {
 pub(super) struct TableAttempt<'slots, 'storage> {
     pub(super) slots: &'slots mut [Option<TableOwner<'storage>>],
     #[cfg(test)]
-    pub(super) pause_after_release: &'slots std::sync::atomic::AtomicU8,
+    pub(super) pause_after_release: Option<&'slots std::sync::atomic::AtomicU8>,
 }
 
 impl Drop for TableAttempt<'_, '_> {
@@ -270,21 +272,17 @@ impl Drop for TableAttempt<'_, '_> {
             if let Some(owner) = owner.take() {
                 drop(owner);
                 #[cfg(test)]
-                if self
-                    .pause_after_release
-                    .compare_exchange(
-                        1,
-                        2,
-                        std::sync::atomic::Ordering::AcqRel,
-                        std::sync::atomic::Ordering::Acquire,
-                    )
-                    .is_ok()
+                if let Some(pause) = self.pause_after_release
+                    && pause
+                        .compare_exchange(
+                            1,
+                            2,
+                            std::sync::atomic::Ordering::AcqRel,
+                            std::sync::atomic::Ordering::Acquire,
+                        )
+                        .is_ok()
                 {
-                    while self
-                        .pause_after_release
-                        .load(std::sync::atomic::Ordering::Acquire)
-                        == 2
-                    {
+                    while pause.load(std::sync::atomic::Ordering::Acquire) == 2 {
                         std::thread::yield_now();
                     }
                 }
@@ -358,12 +356,23 @@ impl DefinitionPublication {
     }
 
     pub(super) fn budget_bytes(config: &Config) -> usize {
-        size_of::<Self>().saturating_add(Self::scratch_bytes(config))
+        size_of::<Self>()
+            .saturating_add(Self::scratch_bytes(config))
+            .saturating_add(
+                super::catalog_transaction_capacity(config).saturating_mul(size_of::<
+                    super::table_publication::PreparedDefinitionTransaction,
+                >()),
+            )
     }
 
     pub(super) fn new(config: &Config, budget: &mut Budget) -> Result<Self, BudgetError> {
         budget.draw(size_of::<Self>(), "definition publication controls")?;
         Ok(Self {
+            prepared: Mutex::new(crate::mem::FixedVec::new(
+                budget,
+                "definition publication owners",
+                super::catalog_transaction_capacity(config),
+            )?),
             scratch: Mutex::new(Arena::new(
                 budget,
                 "definition publication",
@@ -378,7 +387,7 @@ impl DefinitionPublication {
         })
     }
 
-    fn acquire_tables<'storage>(
+    pub(super) fn acquire_tables<'storage>(
         storage: &'storage Storage,
         movement: TypeReferenceMove,
         owners: &mut TableAttempt<'_, 'storage>,
@@ -426,6 +435,20 @@ impl DefinitionPublication {
             .scratch
             .lock()
             .expect("definition publication scratch poisoned");
+        let registry = self
+            .prepared
+            .lock()
+            .expect("definition publication registry poisoned");
+        if let TypePublicationSource::Pending(target) = source
+            && !registry
+                .iter()
+                .any(|plan| plan.transaction() == target.transaction())
+        {
+            return Err(crate::sql_err!(
+                sqlstate::SERIALIZATION_FAILURE,
+                "type publication was not prepared before durability"
+            ));
+        }
         scratch.reset();
         // Startup reserves one slot per physical table, including the internal
         // relation. This is the only allocation from the reset workspace.
@@ -436,10 +459,12 @@ impl DefinitionPublication {
             let mut owners = TableAttempt {
                 slots: &mut slots,
                 #[cfg(test)]
-                pause_after_release: &self.release_pause,
+                pause_after_release: Some(&self.release_pause),
             };
             let attempt: Result<_, LockWait<'_>> = (|| {
-                Self::acquire_tables(storage, movement, &mut owners)?;
+                if matches!(source, TypePublicationSource::Committed { .. }) {
+                    Self::acquire_tables(storage, movement, &mut owners)?;
+                }
                 #[cfg(test)]
                 self.pause_after_scan();
                 try_mutex(&storage.type_catalog, "type catalog lock poisoned")
@@ -461,7 +486,9 @@ impl DefinitionPublication {
             let attempt: Result<_, LockWait<'_>> = (|| {
                 // Dependent creation and edits bind while owning this catalog.
                 // Catch submissions that arrived after the first table scan.
-                Self::acquire_tables(storage, movement, &mut owners)?;
+                if matches!(source, TypePublicationSource::Committed { .. }) {
+                    Self::acquire_tables(storage, movement, &mut owners)?;
+                }
                 let members = try_mutex(
                     &storage.enum_member_images,
                     "enum member-image lock poisoned",
@@ -510,13 +537,60 @@ impl DefinitionPublication {
                             storage.reserve_table_definition_revision()?
                         }
                     };
+                    let mut replacements =
+                        if matches!(source, TypePublicationSource::Committed { .. }) {
+                            let mut prepared = storage
+                                .metadata_pool
+                                .lease(owners.slots.iter().flatten().count())
+                                .map_err(|error| {
+                                    crate::sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "{}", error)
+                                })?;
+                            for (slot, owner) in owners.slots.iter().enumerate() {
+                                let Some(owner) = owner else { continue };
+                                let identity = owner.definition.identity;
+                                let source = storage.catalog_object_identity(
+                                    super::catalog_sources::CatalogObjectSlot::Table(slot),
+                                    identity.database,
+                                    identity.created_at,
+                                );
+                                let plan = storage.pending_table_defs.prepare_replacements_locked(
+                                    &owner.definition,
+                                    source,
+                                    &storage.metadata_pool,
+                                    |original| {
+                                        let mut replacement =
+                                            TableDefBuilder::from_definition(original);
+                                        movement
+                                            .rewrite_definition(&mut replacement)
+                                            .then(|| replacement.freeze(&storage.metadata_pool))
+                                            .transpose()
+                                    },
+                                )?;
+                                prepared
+                                    .push_reserved((slot, source, Some(plan)))
+                                    .expect("immediate type publication reserves every dependent");
+                            }
+                            Some(prepared)
+                        } else {
+                            None
+                        };
                     install_source(&mut types, &mut members);
-                    for owner in owners.slots.iter_mut().flatten() {
-                        assert!(storage.pending_table_defs.move_type_references_locked(
+                    for (slot, owner) in owners.slots.iter_mut().enumerate() {
+                        let Some(owner) = owner else { continue };
+                        let (_, source, replacement) = replacements
+                            .as_mut()
+                            .expect("immediate publication owns dependent replacements")
+                            .iter_mut()
+                            .find(|(table, _, _)| *table == slot)
+                            .expect("every owned dependent retains its replacement");
+                        storage.pending_table_defs.apply_replacements_locked(
                             &mut owner.definition,
-                            movement,
-                            revision
-                        ));
+                            *source,
+                            replacement
+                                .take()
+                                .expect("dependent replacement is applied once"),
+                            revision,
+                        );
                         owner.publication.generation += 1;
                         owner.publication.dirty = true;
                     }
@@ -741,11 +815,24 @@ mod tests {
         kind: TypeReferenceKind,
         target: TypeEditTarget,
     ) -> Result<(), SqlError> {
-        match kind {
+        storage.prepare_definition_publication(
+            target.transaction(),
+            core::iter::empty(),
+            [super::super::TypeCommitChange::Definition(target)].into_iter(),
+        )?;
+        let result = match kind {
             TypeReferenceKind::Domain => storage.commit_domain_alter(target),
             TypeReferenceKind::Enum => storage.commit_enum_alter(target),
             TypeReferenceKind::Composite => storage.commit_composite_alter(target),
+        };
+        if let Err(error) = result {
+            storage.rollback_definition_publication(target.transaction());
+            return Err(error);
         }
+        let result = storage.finish_definition_publication(target.transaction());
+        storage.release_object_locks(target.transaction());
+        storage.release_row_locks(target.transaction());
+        result
     }
 
     struct ResumeScan<'a>(&'a std::sync::atomic::AtomicU8);
@@ -771,7 +858,8 @@ mod tests {
                     7,
                 );
                 let target = undo.target();
-                let mut definition = *storage.table_def(related, 0);
+                let mut definition =
+                    TableDefBuilder::from_definition(&storage.table_def(related, 0));
                 definition.name = SqlName::parse(if submission == 0 {
                     "arrived_late"
                 } else {
@@ -1236,12 +1324,7 @@ mod tests {
                         .sqlstate,
                     crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED
                 );
-                let error = match kind {
-                    TypeReferenceKind::Domain => storage.commit_domain_alter(target),
-                    TypeReferenceKind::Enum => storage.commit_enum_alter(target),
-                    TypeReferenceKind::Composite => storage.commit_composite_alter(target),
-                }
-                .unwrap_err();
+                let error = commit_move(&storage, kind, target).unwrap_err();
                 assert_eq!(
                     error.sqlstate,
                     crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED
@@ -1261,16 +1344,12 @@ mod tests {
                 storage.tables[related].publication().generation = 0;
                 let (selected_table, selected_definition) =
                     storage.select_table_definition(related, 7);
+                let selected_definition = TableDefBuilder::from_definition(&selected_definition);
                 storage
                     .catalog_sequence
                     .0
                     .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
-                match kind {
-                    TypeReferenceKind::Domain => storage.commit_domain_alter(target),
-                    TypeReferenceKind::Enum => storage.commit_enum_alter(target),
-                    TypeReferenceKind::Composite => storage.commit_composite_alter(target),
-                }
-                .unwrap();
+                commit_move(&storage, kind, target).unwrap();
                 assert_eq!(
                     source_identity(&storage.type_catalog.lock().unwrap(), movement),
                     movement.current
@@ -1283,6 +1362,248 @@ mod tests {
                     crate::sql::eval::sqlstate::SERIALIZATION_FAILURE
                 );
                 assert!(storage.pending_table_def(related).is_none());
+            });
+        }
+    }
+
+    #[test]
+    fn admitted_type_publication_blocks_new_declarations_but_keeps_query_binding_available() {
+        use super::super::{
+            CastContext, CastDef, CastMethod, RoutineArgumentDef, RoutineKind, RoutineParameterDef,
+        };
+        for kind in KINDS {
+            let (storage, related, unrelated, movement) = fixture(kind);
+            let column = storage.table_def(related, 0).columns()[0];
+            let result = RoutineResult {
+                ctype: column.ctype,
+                user_type: column.user_type,
+            };
+            let undo = stage_move(
+                &storage,
+                kind,
+                movement.identity.slot().index(),
+                movement.current,
+                7,
+            );
+            let target = undo.target();
+            crate::mem::guard::forbid_alloc(|| {
+                storage
+                    .prepare_definition_publication(
+                        7,
+                        core::iter::empty(),
+                        [super::super::TypeCommitChange::Definition(target)].into_iter(),
+                    )
+                    .unwrap();
+                assert_eq!(storage.bind_routine_result(result, 9).unwrap(), result);
+                let mut definition =
+                    TableDefBuilder::from_definition(&storage.table_def(related, 0));
+                definition.name = SqlName::parse("blocked_type_table").unwrap();
+                assert_eq!(
+                    storage.create_table_in(definition, 9).unwrap_err().sqlstate,
+                    sqlstate::INTERNAL_LOCK_WAIT
+                );
+                assert!(
+                    storage
+                        .find_visible("public", "blocked_type_table", 9)
+                        .is_none()
+                );
+                if matches!(kind, TypeReferenceKind::Composite) {
+                    let mut typed =
+                        make_def("blocked_typed_table", &[("value", ColType::Int4, false)]);
+                    typed.type_membership = super::super::TableTypeMembership::Composite(
+                        super::super::type_references::TypeReference::from_bound_name(
+                            result.user_type.unwrap(),
+                        )
+                        .unwrap(),
+                    );
+                    assert_eq!(
+                        storage.create_table_in(typed, 9).unwrap_err().sqlstate,
+                        sqlstate::INTERNAL_LOCK_WAIT
+                    );
+                }
+                let selected = storage.select_table_definition(unrelated, 9).0;
+                definition.name = SqlName::parse("unrelated").unwrap();
+                assert_eq!(
+                    storage
+                        .write_table_def(selected, definition, &mapping("id"), false)
+                        .unwrap_err()
+                        .sqlstate,
+                    sqlstate::INTERNAL_LOCK_WAIT
+                );
+                assert!(storage.pending_table_def(unrelated).is_none());
+                let mut cast = CastDef {
+                    database: storage.current_database_oid(),
+                    created_at: 0,
+                    source: result,
+                    target: RoutineResult::builtin(ColType::Text),
+                    method: CastMethod::InOut,
+                    context: CastContext::Explicit,
+                    ddl_state: CatalogDdlState::PendingCreate { txid: 9 },
+                };
+                {
+                    let owners = storage.catalog_type_owners(&storage.casts);
+                    assert_eq!(
+                        owners.bind_definition(&mut cast, 9).unwrap_err().sqlstate,
+                        sqlstate::INTERNAL_LOCK_WAIT
+                    );
+                }
+                {
+                    let owners = storage.catalog_dependency_owners(
+                        &storage.routines,
+                        super::super::type_contracts::CatalogPublicationInput::RoutineContract,
+                        None,
+                    );
+                    let mut arguments = [RoutineArgumentDef {
+                        name: SqlName::parse("value").unwrap(),
+                        ctype: result.ctype,
+                        user_type: result.user_type,
+                    }];
+                    let mut parameters: [RoutineParameterDef; 0] = [];
+                    let mut columns: [RoutineArgumentDef; 0] = [];
+                    let mut routine_kind = RoutineKind::Function { result };
+                    assert_eq!(
+                        owners
+                            .bind_routine_contract(
+                                &mut arguments,
+                                &mut parameters,
+                                &mut columns,
+                                &mut routine_kind,
+                                9
+                            )
+                            .unwrap_err()
+                            .sqlstate,
+                        sqlstate::INTERNAL_LOCK_WAIT
+                    );
+                }
+                let mut dependencies = super::super::StoredQueryDependencies::EMPTY;
+                dependencies
+                    .push(query_dependency(&storage, movement))
+                    .unwrap();
+                assert_eq!(
+                    storage
+                        .create_view(
+                            SqlName::parse("public").unwrap(),
+                            SqlName::parse("blocked_type_view").unwrap(),
+                            super::super::tests::test_view_definition(dependencies),
+                            false,
+                            9
+                        )
+                        .unwrap_err()
+                        .sqlstate,
+                    sqlstate::INTERNAL_LOCK_WAIT
+                );
+                let mut fields = [CompositeFieldDef::EMPTY; MAX_COMPOSITE_FIELDS];
+                fields[0] = CompositeFieldDef {
+                    attribute_number: 1,
+                    name: SqlName::parse("value").unwrap(),
+                    ctype: result.ctype,
+                    user_type: result.user_type,
+                    dropped: false,
+                    ..CompositeFieldDef::EMPTY
+                };
+                assert_eq!(
+                    storage
+                        .create_composite(
+                            SqlName::parse("public").unwrap(),
+                            SqlName::parse("blocked_type_composite").unwrap(),
+                            CompositeSpec {
+                                fields,
+                                n_fields: 1
+                            },
+                            9
+                        )
+                        .unwrap_err()
+                        .sqlstate,
+                    sqlstate::INTERNAL_LOCK_WAIT
+                );
+                let domain = DomainSpec {
+                    base_domain: matches!(kind, TypeReferenceKind::Domain)
+                        .then_some(result.user_type.unwrap()),
+                    base_user_type: (!matches!(kind, TypeReferenceKind::Domain))
+                        .then_some(result.user_type.unwrap()),
+                    base: result.ctype,
+                    base_type_mod: -1,
+                    not_null: false,
+                    not_null_name: None,
+                    not_null_identity: None,
+                    default_expr: None,
+                    checks: [CheckConstraint::EMPTY; MAX_DOMAIN_CHECKS],
+                    n_checks: 0,
+                };
+                assert_eq!(
+                    storage
+                        .create_domain(
+                            SqlName::parse("public").unwrap(),
+                            SqlName::parse("blocked_type_domain").unwrap(),
+                            domain,
+                            9
+                        )
+                        .unwrap_err()
+                        .sqlstate,
+                    sqlstate::INTERNAL_LOCK_WAIT
+                );
+                storage.rollback_definition_publication(7);
+                storage.release_object_locks(7);
+                definition.name = SqlName::parse("admitted_type_table").unwrap();
+                let admitted = storage.create_table_in(definition, 9).unwrap();
+                storage.rollback_create(admitted);
+                undo.rollback(&storage);
+                storage.release_row_locks(9);
+            });
+        }
+    }
+
+    #[test]
+    fn admitted_type_source_slots_cannot_be_reused_until_claim_release() {
+        for kind in KINDS {
+            let (mut storage, _, _, movement) = fixture(kind);
+            let undo = stage_move(
+                &storage,
+                kind,
+                movement.identity.slot().index(),
+                movement.current,
+                7,
+            );
+            crate::mem::guard::forbid_alloc(|| {
+                storage
+                    .prepare_definition_publication(
+                        7,
+                        core::iter::empty(),
+                        [super::super::TypeCommitChange::Definition(undo.target())].into_iter(),
+                    )
+                    .unwrap();
+                let dropped = storage
+                    .stage_type_drop(
+                        movement.identity.slot().kind(),
+                        movement.current.schema.as_str(),
+                        movement.current.name.as_str(),
+                        7,
+                    )
+                    .unwrap()
+                    .unwrap();
+                storage.finish_type_ddl(dropped, super::super::TypeDdlDecision::Commit);
+                let held_slot = create_kind(
+                    &mut storage,
+                    kind,
+                    UserTypeName::declaration(
+                        movement.prior.schema,
+                        SqlName::parse("replacement_during_claim").unwrap(),
+                    ),
+                )
+                .0;
+                assert_ne!(held_slot, movement.identity.slot().index());
+                storage.rollback_definition_publication(7);
+                storage.release_object_locks(7);
+                let released_slot = create_kind(
+                    &mut storage,
+                    kind,
+                    UserTypeName::declaration(
+                        movement.prior.schema,
+                        SqlName::parse("replacement_after_claim").unwrap(),
+                    ),
+                )
+                .0;
+                assert_eq!(released_slot, movement.identity.slot().index());
             });
         }
     }
@@ -1993,7 +2314,8 @@ mod tests {
         for kind in KINDS {
             for create in [false, true] {
                 let (storage, related, _, movement) = fixture(kind);
-                let mut definition = *storage.table_def(related, 0);
+                let mut definition =
+                    TableDefBuilder::from_definition(&storage.table_def(related, 0));
                 definition.name = SqlName::parse("submitted_table").unwrap();
                 let database = storage.current_database_oid();
                 let source = storage.type_catalog.lock().unwrap();
@@ -2041,7 +2363,7 @@ mod tests {
                 movement.identity.slot(),
             )
             .unwrap();
-            let mut captured = *storage.table_def(table, 0);
+            let mut captured = TableDefBuilder::from_definition(&storage.table_def(table, 0));
             let originals = [captured.columns[0].user_type, captured.columns[1].user_type];
             let oids = captured
                 .columns()
@@ -2205,7 +2527,7 @@ mod tests {
     fn captured_type_references_reject_retired_and_reused_source_lifetimes() {
         for kind in KINDS {
             let (mut storage, table, _, movement) = fixture(kind);
-            let captured = *storage.table_def(table, 0);
+            let captured = TableDefBuilder::from_definition(&storage.table_def(table, 0));
             let key = movement.identity;
             match kind {
                 TypeReferenceKind::Domain => {
@@ -2307,7 +2629,7 @@ mod tests {
         for kind in KINDS {
             let (mut storage, table, _, _) = fixture(kind);
             let (other, _, _, _) = fixture(kind);
-            let definition = *storage.table_def(table, 0);
+            let definition = TableDefBuilder::from_definition(&storage.table_def(table, 0));
             crate::mem::guard::forbid_alloc(|| {
                 for column in definition.columns() {
                     let result = RoutineResult {
@@ -2573,7 +2895,7 @@ mod tests {
                 movement.identity.slot(),
             )
             .unwrap();
-            let mut definition = *storage.table_def(first, 0);
+            let mut definition = TableDefBuilder::from_definition(&storage.table_def(first, 0));
             definition.name = SqlName::parse("last_dependency").unwrap();
             let last = storage.create_table(definition).unwrap();
             let held = storage.table_def(last, 0);
@@ -2609,7 +2931,7 @@ mod tests {
                 movement.identity.slot(),
             )
             .unwrap();
-            let mut pending = *storage.table_def(related, 0);
+            let mut pending = TableDefBuilder::from_definition(&storage.table_def(related, 0));
             pending.name = storage.table_def(unrelated, 0).name;
             let blocker = storage.casts.lock().unwrap();
             let change = std::thread::scope(|scope| {
@@ -2764,7 +3086,8 @@ mod tests {
                 )
                 .unwrap();
                 let [first_change, second_change] = ["first_id", "second_id"].map(|name| {
-                    let mut definition = *storage.table_def(related, 7);
+                    let mut definition =
+                        TableDefBuilder::from_definition(&storage.table_def(related, 7));
                     definition.columns[0].name = SqlName::parse(name).unwrap();
                     storage
                         .write_table_def(
@@ -2820,7 +3143,9 @@ mod tests {
                                 return false;
                             }
                             for _ in 0..16 {
-                                let mut definition = *storage.table_def(unrelated, 9);
+                                let mut definition = TableDefBuilder::from_definition(
+                                    &storage.table_def(unrelated, 9),
+                                );
                                 definition.name = SqlName::parse("other_pending").unwrap();
                                 let change = storage
                                     .write_table_def(
@@ -2894,15 +3219,17 @@ mod tests {
                 movement.identity.slot(),
             )
             .unwrap();
-            let pending = *storage.table_def(related, 0);
+            let pending = TableDefBuilder::from_definition(&storage.table_def(related, 0));
             {
                 let revision = storage.reserve_table_definition_revision().unwrap();
                 let mut definition = storage.tables[related].definition_mut(revision);
-                definition.columns[0].ctype = ColType::Int4;
-                definition.columns[1].ctype = ColType::Array(ArrElem::Int4);
-                for column in definition.columns.iter_mut().take(2) {
+                let mut replacement = TableDefBuilder::from_definition(&definition);
+                replacement.columns[0].ctype = ColType::Int4;
+                replacement.columns[1].ctype = ColType::Array(ArrElem::Int4);
+                for column in replacement.columns.iter_mut().take(2) {
                     column.user_type = None;
                 }
+                *definition = replacement.freeze(&storage.metadata_pool).unwrap();
             }
             let change = storage
                 .write_table_def(
@@ -2946,7 +3273,8 @@ mod tests {
             .unwrap();
             let retired = storage
                 .create_table({
-                    let mut definition = *storage.table_def(related, 0);
+                    let mut definition =
+                        TableDefBuilder::from_definition(&storage.table_def(related, 0));
                     definition.name = SqlName::parse("retired").unwrap();
                     definition
                 })

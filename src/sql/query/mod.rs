@@ -7228,7 +7228,7 @@ pub(crate) fn lock_result_row(
             };
             let slot = if scope
                 .defs
-                .get(table)
+                .stored(table)
                 .expect("locked source is resolved")
                 .partition
                 .is_partitioned()

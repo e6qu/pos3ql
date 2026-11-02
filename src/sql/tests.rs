@@ -17,6 +17,7 @@ mod row_history;
 mod row_layout;
 mod shared_row_capacity;
 mod shared_row_work;
+mod table_metadata_capacity;
 mod table_publication;
 mod transaction_publication;
 

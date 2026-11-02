@@ -442,7 +442,7 @@ impl SubscriptionApply {
             return Ok(ApplyResult::None);
         };
         self.with_context(engine, |worker, engine| {
-            match engine.finish_staged_transaction(&mut worker.txn, &worker.guc) {
+            match engine.finish_pending_transaction(&mut worker.txn, &worker.guc) {
                 Ok(()) => Ok(worker.finish_remote_commit(end_lsn, clear_skip)),
                 Err(error) if error.sqlstate == sqlstate::INTERNAL_IO_WAIT => {
                     Ok(ApplyResult::AwaitingDurability)
@@ -481,7 +481,7 @@ impl SubscriptionApply {
                         worker.pending_commit = Some((confirmed_lsn, false));
                     }
                     engine.commit_wal()?;
-                    engine.finish_staged_transaction(&mut worker.txn, &worker.guc)?;
+                    engine.finish_pending_transaction(&mut worker.txn, &worker.guc)?;
                     worker.pending_commit = None;
                     Ok(())
                 });
@@ -656,7 +656,7 @@ impl SubscriptionApply {
                 worker.pending_commit = Some((confirmed_lsn, false));
             }
             engine.commit_wal()?;
-            engine.finish_staged_transaction(&mut worker.txn, &worker.guc)?;
+            engine.finish_pending_transaction(&mut worker.txn, &worker.guc)?;
             worker.pending_commit = None;
             worker.confirmed_lsn = confirmed_lsn;
             Ok(())

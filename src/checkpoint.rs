@@ -1620,8 +1620,9 @@ impl Checkpointer {
             + crate::storage::RowReadBuffers::budget_bytes()
             + ValueIndexWriter::budget_bytes()
             + table_bookkeeping
-            + table_capacity.saturating_mul(crate::storage::MAX_VALUE_ENFORCERS)
-                * core::mem::size_of::<ValueInstall>()
+            + config
+                .max_value_indexes
+                .saturating_mul(core::mem::size_of::<ValueInstall>())
             + config.checkpoint_live_blocks * core::mem::size_of::<(BlockId, Option<BlockType>)>()
             + config.checkpoint_garbage_batch_objects
                 * (core::mem::size_of::<StackStr<80>>() + 2 * core::mem::size_of::<StackStr<64>>())
@@ -2492,9 +2493,7 @@ impl Checkpointer {
             pending_installs: Vec::with_capacity(
                 table_capacity.saturating_mul(config.max_spill_generations_per_table),
             ),
-            pending_value_installs: Vec::with_capacity(
-                table_capacity * crate::storage::MAX_VALUE_ENFORCERS,
-            ),
+            pending_value_installs: Vec::with_capacity(config.max_value_indexes),
             merge_scratch: Vec::with_capacity(config.checkpoint_merge_entries),
             roster_scratch: Vec::with_capacity(config.checkpoint_live_blocks),
             garbage_seen: FixedMap::new(
@@ -22202,7 +22201,7 @@ mod stored_dependency_tests {
         value_indexes.max_value_indexes += 1;
         assert_eq!(
             Checkpointer::budget_bytes(&value_indexes) - base_bytes,
-            3 * core::mem::size_of::<BlockId>()
+            3 * core::mem::size_of::<BlockId>() + core::mem::size_of::<ValueInstall>()
         );
 
         let mut overlay_slots = base.clone();

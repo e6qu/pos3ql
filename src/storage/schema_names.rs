@@ -133,7 +133,7 @@ impl SchemaNameTarget {
     pub(crate) fn rewrite_table(
         self,
         name: SqlName,
-        definition: &mut super::TableDef,
+        definition: &mut super::TableDefBuilder,
         arena: &crate::mem::arena::Arena,
     ) -> Result<bool, SqlError> {
         let mut changed = super::rename_schema_name(&mut definition.schema, self.name, name);

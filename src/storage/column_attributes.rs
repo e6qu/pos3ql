@@ -80,6 +80,7 @@ pub(crate) struct ColumnAttributes<B: DefinitionBacking> {
 }
 
 impl Copy for ColumnAttributes<InlineDefinition> {}
+impl Copy for ColumnAttributes<super::BorrowedDefinition<'_>> {}
 
 impl<B: DefinitionBacking> PartialEq for ColumnAttributes<B> {
     fn eq(&self, other: &Self) -> bool {
@@ -200,6 +201,12 @@ impl ColumnAttributes<StoredDefinition> {
     pub(crate) const EMPTY: Self = Self {
         count: 0,
         slots: crate::mem::lease_pool::SharedSlice::EMPTY,
+    };
+}
+impl ColumnAttributes<super::BorrowedDefinition<'_>> {
+    pub(crate) const EMPTY: Self = Self {
+        count: 0,
+        slots: &[],
     };
 }
 
@@ -397,6 +404,16 @@ mod tests {
             assert_eq!(saved.fkeys.len(), 1);
             assert_eq!(saved.exclusions.len(), 1);
             assert_eq!(saved.attribute_number(0), 2);
+            {
+                let borrowed = saved.borrowed();
+                assert!(core::ptr::eq(
+                    borrowed.columns.as_ptr(),
+                    saved.columns.as_ptr()
+                ));
+                assert_eq!(borrowed.columns.len(), 1);
+                assert_eq!(borrowed.not_null_identities.len(), 2);
+                assert_eq!(borrowed.attribute_number(0), 2);
+            }
             let pinned = saved.clone();
             drop(saved);
             assert_eq!(pool.lease::<u8>(1).err().unwrap().available_leases, 0);

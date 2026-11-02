@@ -705,9 +705,12 @@ mod tests {
                             PendingTableDef {
                                 txid: 7,
                                 revision: 999,
-                                def: definition,
-                                transition: core::array::from_fn(|column| column as u16),
-                                column_mapping: mapping,
+                                def: definition.freeze(&storage.metadata_pool).unwrap(),
+                                transition: storage.metadata_pool.copy_slice(&[0u16, 1]).unwrap(),
+                                column_mapping: storage
+                                    .metadata_pool
+                                    .copy_slice(&mapping[..2])
+                                    .unwrap(),
                                 rewrites_rows: false,
                                 class_tuple_private: false,
                             },

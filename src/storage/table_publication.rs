@@ -2,12 +2,15 @@
 
 use super::catalog_sources::{CatalogObjectIdentity, CatalogObjectSlot};
 use super::row_ownership::{LockWait, try_mutex};
-use super::table_definitions::{DefinitionState, TableDefinitionRevision, TableIdentity};
+use super::table_definitions::{
+    DefinitionState, PreparedDefinitionReplacements, TableDefinitionRevision, TableIdentity,
+};
 use super::type_reference_moves::{DefinitionPublication, TableAttempt, TableOwner};
 use super::{
     CatalogDdlState, CommentClass, DatabaseOid, DependencyClass, MAX_COLUMNS, SqlName, Storage,
-    TableDef, TableDefinitionChange, rebind_sequence_column,
+    TableDef, TableDefBuilder, TableDefinitionChange, TypeCommitChange, rebind_sequence_column,
 };
+use crate::mem::lease_pool::{MutableSlice, SharedSlice};
 use crate::sql::eval::{SqlError, sqlstate};
 use crate::sql_err;
 
@@ -74,7 +77,7 @@ impl TableReferenceMove {
                 .any(|key| key.parent_schema == self.prior_schema && key.parent == self.prior_name)
     }
 
-    pub(super) fn rewrite(self, definition: &mut TableDef) -> bool {
+    pub(super) fn rewrite(self, definition: &mut TableDefBuilder) -> bool {
         let mut changed = false;
         for key in definition.fkeys.iter_mut().take(definition.n_fkeys) {
             if key.parent_schema == self.prior_schema && key.parent == self.prior_name {
@@ -87,7 +90,544 @@ impl TableReferenceMove {
     }
 }
 
+#[derive(Clone)]
+pub(super) struct PreparedPrimaryTable {
+    change: TableDefinitionChange,
+    revision: TableDefinitionRevision,
+    definition: TableDef,
+    mapping: SharedSlice<Option<SqlName>>,
+    rewrites_rows: bool,
+}
+
+pub(super) struct PreparedTablePublication {
+    source: CatalogObjectIdentity,
+    replacements: Option<PreparedDefinitionReplacements>,
+    primary: Option<PreparedPrimaryTable>,
+    retiring: bool,
+    applied: bool,
+}
+
+pub(super) struct PreparedDefinitionTransaction {
+    transaction: u32,
+    revision: Option<TableDefinitionRevision>,
+    table_changes: SharedSlice<TableDefinitionChange>,
+    type_changes: SharedSlice<TypeCommitChange>,
+    tables: MutableSlice<PreparedTablePublication>,
+}
+
+impl PreparedDefinitionTransaction {
+    pub(super) fn transaction(&self) -> u32 {
+        self.transaction
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PreparedTableMove {
+    change: TableDefinitionChange,
+    movement: TableReferenceMove,
+}
+
+fn metadata_error(error: crate::mem::lease_pool::LeaseError) -> SqlError {
+    sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "{}", error)
+}
+
+fn rewrite_definition(
+    original: &TableDef,
+    table_moves: &[PreparedTableMove],
+    type_moves: &[super::type_reference_moves::TypeReferenceMove],
+    pool: &std::sync::Arc<crate::mem::lease_pool::LeasePool>,
+) -> Result<Option<TableDef>, SqlError> {
+    let mut replacement = TableDefBuilder::from_definition(original);
+    let mut changed = false;
+    // Match every foreign key against its original spelling. A rename to an
+    // earlier source's old name must not redirect it a second time.
+    for (key, prior) in replacement.fkeys.iter_mut().zip(original.fkeys()) {
+        if let Some(selected) = table_moves.iter().find(|selected| {
+            prior.parent_schema == selected.movement.prior_schema
+                && prior.parent == selected.movement.prior_name
+        }) {
+            key.parent_schema = selected.movement.schema;
+            key.parent = selected.movement.name;
+            changed |= key.parent_schema != prior.parent_schema || key.parent != prior.parent;
+        }
+    }
+    for movement in type_moves {
+        changed |= movement.rewrite_definition(&mut replacement);
+    }
+    changed.then(|| replacement.freeze(pool)).transpose()
+}
+
 impl DefinitionPublication {
+    fn prepare_transaction(
+        &self,
+        storage: &Storage,
+        transaction: u32,
+        table_changes: impl Iterator<Item = TableDefinitionChange> + Clone,
+        type_changes: impl Iterator<Item = TypeCommitChange> + Clone,
+    ) -> Result<(), SqlError> {
+        if table_changes
+            .clone()
+            .any(|change| change.transaction != transaction)
+        {
+            return Err(sql_err!(
+                sqlstate::SERIALIZATION_FAILURE,
+                "table publication change belongs to another transaction"
+            ));
+        }
+        let mut scratch = self
+            .scratch
+            .lock()
+            .expect("definition publication scratch poisoned");
+        let mut prepared = self
+            .prepared
+            .lock()
+            .expect("definition publication registry poisoned");
+        if let Some(existing) = prepared
+            .iter()
+            .find(|entry| entry.transaction == transaction)
+        {
+            if existing
+                .table_changes
+                .iter()
+                .copied()
+                .eq(table_changes.clone())
+                && existing
+                    .type_changes
+                    .iter()
+                    .copied()
+                    .eq(type_changes.clone())
+                && existing
+                    .tables
+                    .iter()
+                    .filter_map(|target| target.primary.as_ref())
+                    .all(|primary| {
+                        let state = storage.tables[primary.change.table()].definition.read();
+                        TableDefinitionRevision::catalog(
+                            storage
+                                .pending_table_defs
+                                .selected_revision(&state, transaction),
+                        ) == primary.revision
+                    })
+            {
+                return Ok(());
+            }
+            return Err(sql_err!(
+                sqlstate::SERIALIZATION_FAILURE,
+                "transaction definitions changed after publication preparation"
+            ));
+        }
+        if table_changes.clone().next().is_none() && type_changes.clone().next().is_none() {
+            return Ok(());
+        }
+        if prepared.len() == prepared.capacity() {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "definition publication owners exhausted"
+            ));
+        }
+        scratch.reset();
+        let mut slots = scratch
+            .alloc_owned_slice_with(storage.tables.len(), |_| None)
+            .expect("startup definition publication reservation covers every table");
+        loop {
+            let mut owners = TableAttempt {
+                slots: &mut slots,
+                #[cfg(test)]
+                pause_after_release: None,
+            };
+            #[cfg(test)]
+            self.pause_after_scan();
+            let attempt: Result<_, LockWait<'_>> = (|| {
+                for (slot, _) in storage.tables.iter().enumerate() {
+                    if table_changes.clone().any(|change| change.table() == slot) {
+                        Self::acquire_table(storage, slot, &mut owners)?;
+                    }
+                }
+                let types = try_mutex(&storage.type_catalog, "type catalog lock poisoned")?;
+                let comments = try_mutex(&storage.comments, "comment catalog lock poisoned")?;
+                Ok((types, comments))
+            })();
+            let (mut types, _comments) = match attempt {
+                Ok(value) => value,
+                Err(wait) => {
+                    drop(owners);
+                    #[cfg(test)]
+                    self.waits
+                        .fetch_add(1, std::sync::atomic::Ordering::Release);
+                    wait.wait();
+                    continue;
+                }
+            };
+            let table_count = table_changes
+                .clone()
+                .enumerate()
+                .filter(|(index, change)| {
+                    !table_changes
+                        .clone()
+                        .take(*index)
+                        .any(|prior| prior.table() == change.table())
+                })
+                .count();
+            let mut table_moves = storage
+                .metadata_pool
+                .lease(table_count)
+                .map_err(metadata_error)?;
+            for change in table_changes.clone() {
+                if table_moves
+                    .iter()
+                    .any(|entry: &PreparedTableMove| entry.change.table() == change.table())
+                {
+                    continue;
+                }
+                let state = &owners.slots[change.table()]
+                    .as_ref()
+                    .expect("source table is owned")
+                    .definition;
+                if !DefinitionSource::Pending(change).matches(storage, state) {
+                    return Err(sql_err!(
+                        sqlstate::SERIALIZATION_FAILURE,
+                        "table publication source changed before preparation"
+                    ));
+                }
+                let pending = storage
+                    .pending_table_defs
+                    .latest_locked(state)
+                    .expect("validated table change retains a pending source");
+                table_moves
+                    .push_reserved(PreparedTableMove {
+                        change,
+                        movement: TableReferenceMove {
+                            database: state.identity.database,
+                            prior_schema: state.committed().schema,
+                            prior_name: state.committed().name,
+                            schema: pending.def.schema,
+                            name: pending.def.name,
+                        },
+                    })
+                    .expect("table move reservation covers the input changes");
+            }
+            let type_count = type_changes
+                .clone()
+                .filter_map(|change| match change {
+                    TypeCommitChange::Definition(target) => target.identity_move(&types),
+                    TypeCommitChange::Lifecycle(_) => None,
+                })
+                .count();
+            let mut type_moves = storage
+                .metadata_pool
+                .lease(type_count)
+                .map_err(metadata_error)?;
+            for change in type_changes.clone() {
+                if let TypeCommitChange::Definition(target) = change
+                    && let Some(movement) = target.identity_move(&types)
+                {
+                    type_moves
+                        .push_reserved(movement)
+                        .expect("type move reservation covers the input changes");
+                }
+            }
+            let attempt: Result<(), LockWait<'_>> = (|| {
+                for selected in table_moves.iter() {
+                    Self::acquire_table_dependents(storage, selected.movement, &mut owners)?;
+                }
+                for movement in type_moves.iter() {
+                    Self::acquire_tables(storage, *movement, &mut owners)?;
+                }
+                Ok(())
+            })();
+            if let Err(wait) = attempt {
+                drop(_comments);
+                drop(types);
+                drop(owners);
+                #[cfg(test)]
+                self.waits
+                    .fetch_add(1, std::sync::atomic::Ordering::Release);
+                wait.wait();
+                continue;
+            }
+            // SQL relation ownership spans WAL admission and promotion. It
+            // excludes foreign writers while readers of immutable shapes and
+            // operations on independent tables continue.
+            for (slot, owner) in owners.slots.iter().enumerate() {
+                if owner.is_some() {
+                    storage.lock_table(
+                        transaction,
+                        slot,
+                        crate::sql::ast::TableLockMode::Share,
+                        false,
+                    )?;
+                }
+            }
+            let count = owners.slots.iter().flatten().count();
+            let mut targets = storage.metadata_pool.lease(count).map_err(metadata_error)?;
+            let mut captured_tables = storage
+                .metadata_pool
+                .lease(table_changes.clone().count())
+                .map_err(metadata_error)?;
+            for change in table_changes.clone() {
+                captured_tables
+                    .push_reserved(change)
+                    .expect("table input reservation covers the iterator");
+            }
+            let mut captured_types = storage
+                .metadata_pool
+                .lease(type_changes.clone().count())
+                .map_err(metadata_error)?;
+            for change in type_changes.clone() {
+                captured_types
+                    .push_reserved(change)
+                    .expect("type input reservation covers the iterator");
+            }
+            let revision = table_moves
+                .first()
+                .map(|selected| TableDefinitionRevision::catalog(selected.change.revision))
+                .or_else(|| {
+                    type_changes.clone().find_map(|change| match change {
+                        TypeCommitChange::Definition(target) => {
+                            Some(target.dependent_table_revision())
+                        }
+                        TypeCommitChange::Lifecycle(_) => None,
+                    })
+                });
+            assert!(
+                count == 0 || revision.is_some(),
+                "table replacements retain a staged source revision"
+            );
+            for (slot, owner) in owners.slots.iter().enumerate() {
+                let Some(owner) = owner else { continue };
+                if let Some(blocker) = owner
+                    .definition
+                    .publication_owner()
+                    .filter(|owner| *owner != transaction)
+                {
+                    return Err(storage.catalog_ddl_wait_error(
+                        transaction,
+                        blocker,
+                        owner.definition.committed().name.as_str(),
+                    ));
+                }
+                owner.publication.generation.checked_add(1).ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "table publication generation exhausted"
+                    )
+                })?;
+                let identity = owner.definition.identity;
+                let source = storage.catalog_object_identity(
+                    CatalogObjectSlot::Table(slot),
+                    identity.database,
+                    identity.created_at,
+                );
+                let replacements = storage.pending_table_defs.prepare_replacements_locked(
+                    &owner.definition,
+                    source,
+                    &storage.metadata_pool,
+                    |definition| {
+                        rewrite_definition(
+                            definition,
+                            table_moves.as_slice(),
+                            type_moves.as_slice(),
+                            &storage.metadata_pool,
+                        )
+                    },
+                )?;
+                let primary = if let Some(selected) = table_moves
+                    .iter()
+                    .find(|entry| entry.change.table() == slot)
+                {
+                    let pending = storage
+                        .pending_table_defs
+                        .latest_locked(&owner.definition)
+                        .expect("owned primary retains the pending source");
+                    let mut definition = rewrite_definition(
+                        &pending.def,
+                        table_moves.as_slice(),
+                        type_moves.as_slice(),
+                        &storage.metadata_pool,
+                    )?
+                    .unwrap_or_else(|| pending.def.clone());
+                    definition.has_toast |= owner.definition.committed().has_toast;
+                    definition.has_rules |= owner.definition.committed().has_rules;
+                    definition.not_null_name_edits = super::ColumnSet::EMPTY;
+                    Some(PreparedPrimaryTable {
+                        change: selected.change,
+                        revision: TableDefinitionRevision::catalog(pending.revision),
+                        definition,
+                        mapping: pending.column_mapping.clone(),
+                        rewrites_rows: pending.rewrites_rows,
+                    })
+                } else {
+                    None
+                };
+                targets
+                    .push_reserved(PreparedTablePublication {
+                        source,
+                        replacements: Some(replacements),
+                        primary,
+                        retiring: identity.existence.pending_drop_txid() == Some(transaction),
+                        applied: false,
+                    })
+                    .expect("target reservation covers all owned tables");
+            }
+            types.claim_definition_publication(storage, transaction, type_changes.clone())?;
+            for owner in owners.slots.iter_mut().flatten() {
+                owner
+                    .definition
+                    .claim_publication(transaction)
+                    .expect("all table claim conflicts were checked under their owners");
+            }
+            prepared
+                .push(PreparedDefinitionTransaction {
+                    transaction,
+                    revision,
+                    table_changes: captured_tables.freeze(),
+                    type_changes: captured_types.freeze(),
+                    tables: targets,
+                })
+                .expect("publication owner slot was reserved before metadata preparation");
+            return Ok(());
+        }
+    }
+
+    fn finish_transaction(&self, storage: &Storage, transaction: u32) -> Result<(), SqlError> {
+        let mut scratch = self
+            .scratch
+            .lock()
+            .expect("definition publication scratch poisoned");
+        let mut registry = self
+            .prepared
+            .lock()
+            .expect("definition publication registry poisoned");
+        let Some(index) = registry
+            .iter()
+            .position(|plan| plan.transaction == transaction)
+        else {
+            return Ok(());
+        };
+        scratch.reset();
+        let mut slots = scratch
+            .alloc_owned_slice_with(storage.tables.len(), |_| None)
+            .expect("startup definition publication reservation covers every table");
+        loop {
+            let mut owners = TableAttempt {
+                slots: &mut slots,
+                #[cfg(test)]
+                pause_after_release: Some(&self.release_pause),
+            };
+            let attempt: Result<_, LockWait<'_>> = (|| {
+                for target in registry[index].tables.iter() {
+                    let CatalogObjectSlot::Table(slot) = target.source.slot() else {
+                        unreachable!()
+                    };
+                    Self::acquire_table(storage, slot, &mut owners)?;
+                }
+                try_mutex(&storage.type_catalog, "type catalog lock poisoned")
+            })();
+            let mut types = match attempt {
+                Ok(value) => value,
+                Err(wait) => {
+                    drop(owners);
+                    wait.wait();
+                    continue;
+                }
+            };
+            for target in registry[index].tables.iter() {
+                let CatalogObjectSlot::Table(slot) = target.source.slot() else {
+                    unreachable!()
+                };
+                let state = &owners.slots[slot]
+                    .as_ref()
+                    .expect("planned table is owned")
+                    .definition;
+                if state.publication_owner() != Some(transaction)
+                    || storage.catalog_object_identity(
+                        CatalogObjectSlot::Table(slot),
+                        state.identity.database,
+                        state.identity.created_at,
+                    ) != target.source
+                    || (target.primary.is_some() && !target.applied)
+                {
+                    return Err(sql_err!(
+                        sqlstate::SERIALIZATION_FAILURE,
+                        "prepared definition publication lost its source owner"
+                    ));
+                }
+                if !target.applied
+                    && !(target.retiring && state.identity.existence == CatalogDdlState::Absent)
+                {
+                    storage.pending_table_defs.validate_replacements_locked(
+                        state,
+                        target.source,
+                        target
+                            .replacements
+                            .as_ref()
+                            .expect("unapplied target retains its replacements"),
+                    )?;
+                }
+            }
+            let mut plan = registry.swap_remove(index);
+            for target in plan.tables.iter_mut() {
+                let CatalogObjectSlot::Table(slot) = target.source.slot() else {
+                    unreachable!()
+                };
+                let owner = owners.slots[slot].as_mut().expect("planned table is owned");
+                if !target.applied
+                    && !(target.retiring
+                        && owner.definition.identity.existence == CatalogDdlState::Absent)
+                    && storage.pending_table_defs.apply_replacements_locked(
+                        &mut owner.definition,
+                        target.source,
+                        target
+                            .replacements
+                            .take()
+                            .expect("unapplied target retains its replacements"),
+                        plan.revision
+                            .expect("table replacements retain a staged source revision"),
+                    )
+                {
+                    owner.publication.generation += 1;
+                    owner.publication.dirty = true;
+                    owner.definition.publish_names();
+                }
+                owner.definition.release_publication(transaction);
+            }
+            types.release_definition_publication(transaction);
+            return Ok(());
+        }
+    }
+
+    fn rollback_transaction(&self, storage: &Storage, transaction: u32) {
+        let _scratch = self
+            .scratch
+            .lock()
+            .expect("definition publication scratch poisoned");
+        let mut registry = self
+            .prepared
+            .lock()
+            .expect("definition publication registry poisoned");
+        let Some(index) = registry
+            .iter()
+            .position(|plan| plan.transaction == transaction)
+        else {
+            return;
+        };
+        let plan = registry.swap_remove(index);
+        for target in plan.tables.iter() {
+            let CatalogObjectSlot::Table(slot) = target.source.slot() else {
+                unreachable!()
+            };
+            storage.tables[slot]
+                .definition
+                .write()
+                .release_publication(transaction);
+        }
+        storage
+            .type_catalog
+            .lock()
+            .expect("type catalog lock poisoned")
+            .release_definition_publication(transaction);
+    }
+
     fn acquire_table<'storage>(
         storage: &'storage Storage,
         slot: usize,
@@ -154,6 +694,33 @@ impl DefinitionPublication {
             .scratch
             .lock()
             .expect("definition publication scratch poisoned");
+        let mut registry = self
+            .prepared
+            .lock()
+            .expect("definition publication registry poisoned");
+        let primary = match source {
+            DefinitionSource::Pending(change) => Some(
+                registry
+                    .iter()
+                    .find(|plan| plan.transaction == change.transaction)
+                    .and_then(|plan| {
+                        plan.tables.iter().find_map(|target| {
+                            target
+                                .primary
+                                .as_ref()
+                                .filter(|primary| primary.change.source == change.source)
+                        })
+                    })
+                    .cloned()
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::SERIALIZATION_FAILURE,
+                            "table publication was not prepared before durability"
+                        )
+                    })?,
+            ),
+            DefinitionSource::Committed { .. } => None,
+        };
         scratch.reset();
         let mut slots = scratch
             .alloc_owned_slice_with(storage.tables.len(), |_| None)
@@ -162,7 +729,8 @@ impl DefinitionPublication {
             let mut owners = TableAttempt {
                 slots: &mut slots,
                 #[cfg(test)]
-                pause_after_release: &self.release_pause,
+                pause_after_release: matches!(source, DefinitionSource::Committed { .. })
+                    .then_some(&self.release_pause),
             };
             let attempt: Result<_, LockWait<'_>> = (|| {
                 Self::acquire_table(storage, table, &mut owners)?;
@@ -172,15 +740,12 @@ impl DefinitionPublication {
                 }
                 let (mut definition, mapping, revision, rewrites_rows, transaction) = match source {
                     DefinitionSource::Pending(change) => {
-                        let pending = storage
-                            .pending_table_defs
-                            .latest_locked(selected)
-                            .expect("validated pending definition exists");
+                        let primary = primary.as_ref().expect("pending publication is prepared");
                         (
-                            pending.def,
-                            pending.column_mapping,
-                            TableDefinitionRevision::catalog(pending.revision),
-                            pending.rewrites_rows,
+                            primary.definition.clone(),
+                            Ok(primary.mapping.clone()),
+                            primary.revision,
+                            primary.rewrites_rows,
                             Some(change.transaction),
                         )
                     }
@@ -190,7 +755,16 @@ impl DefinitionPublication {
                         revision,
                         rewrites_rows,
                         ..
-                    } => (*definition, *column_mapping, revision, rewrites_rows, None),
+                    } => (
+                        definition.clone(),
+                        storage
+                            .metadata_pool
+                            .copy_slice(&column_mapping[..selected.committed().n_columns])
+                            .map_err(metadata_error),
+                        revision,
+                        rewrites_rows,
+                        None,
+                    ),
                 };
                 definition.has_toast |= selected.committed().has_toast;
                 definition.has_rules |= selected.committed().has_rules;
@@ -201,14 +775,18 @@ impl DefinitionPublication {
                     schema: definition.schema,
                     name: definition.name,
                 };
-                Self::acquire_table_dependents(storage, movement, &mut owners)?;
+                if transaction.is_none() {
+                    Self::acquire_table_dependents(storage, movement, &mut owners)?;
+                }
                 #[cfg(test)]
                 self.pause_after_scan();
                 // Creation binds under the type catalog; every private table edit
                 // owns comments. Rescan while both submission gates are held.
                 let types = try_mutex(&storage.type_catalog, "type catalog lock poisoned")?;
                 let comments = try_mutex(&storage.comments, "comment catalog lock poisoned")?;
-                Self::acquire_table_dependents(storage, movement, &mut owners)?;
+                if transaction.is_none() {
+                    Self::acquire_table_dependents(storage, movement, &mut owners)?;
+                }
                 let indexes = try_mutex(&storage.index_catalog, "index catalog lock poisoned")?;
                 let sequences =
                     try_mutex(&storage.sequence_catalog, "sequence catalog lock poisoned")?;
@@ -256,16 +834,64 @@ impl DefinitionPublication {
             else {
                 return Ok(None);
             };
+            let mapping = mapping?;
             definition.not_null_name_edits = super::ColumnSet::EMPTY;
+            let mut local_replacements = if transaction.is_none() {
+                Some(
+                    storage
+                        .metadata_pool
+                        .lease(owners.slots.iter().flatten().count().saturating_sub(1))
+                        .map_err(metadata_error)?,
+                )
+            } else {
+                None
+            };
+            if transaction.is_none() {
+                let mut builder = TableDefBuilder::from_definition(&definition);
+                if movement.rewrite(&mut builder) {
+                    definition = builder.freeze(&storage.metadata_pool)?;
+                }
+                for (slot, owner) in owners.slots.iter().enumerate() {
+                    let Some(owner) = owner else { continue };
+                    if slot == table {
+                        continue;
+                    }
+                    let identity = owner.definition.identity;
+                    let source = storage.catalog_object_identity(
+                        CatalogObjectSlot::Table(slot),
+                        identity.database,
+                        identity.created_at,
+                    );
+                    let replacements = storage.pending_table_defs.prepare_replacements_locked(
+                        &owner.definition,
+                        source,
+                        &storage.metadata_pool,
+                        |prior| {
+                            let mut builder = TableDefBuilder::from_definition(prior);
+                            movement
+                                .rewrite(&mut builder)
+                                .then(|| builder.freeze(&storage.metadata_pool))
+                                .transpose()
+                        },
+                    )?;
+                    local_replacements
+                        .as_mut()
+                        .expect("immediate publication owns local replacements")
+                        .push_reserved((slot, source, Some(replacements)))
+                        .expect("local replacement reservation covers all dependent owners");
+                }
+            }
             // Every affected definition is published once. No catalog entry
             // changes before all counters and owners have been admitted.
-            for owner in owners.slots.iter().flatten() {
-                owner.publication.generation.checked_add(1).ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "table publication generation exhausted"
-                    )
-                })?;
+            if transaction.is_none() {
+                for owner in owners.slots.iter().flatten() {
+                    owner.publication.generation.checked_add(1).ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "table publication generation exhausted"
+                        )
+                    })?;
+                }
             }
             let selected = &owners.slots[table].as_ref().unwrap().definition;
             let mut live_index_identities = [None; super::MAX_VALUE_ENFORCERS];
@@ -300,14 +926,17 @@ impl DefinitionPublication {
                     }
                     for key in 0..index.n_cols {
                         if index.expressions[key].is_none()
-                            && let Some(name) = mapping[usize::from(index.columns[key])]
+                            && let Some(name) = mapping
+                                .get(usize::from(index.columns[key]))
+                                .copied()
+                                .flatten()
                             && let Some(column) = definition.column_index(name.as_str())
                         {
                             index.columns[key] = column as u16;
                         }
                     }
                     for column in index.include_columns.iter_mut().take(index.n_include_cols) {
-                        if let Some(name) = mapping[usize::from(*column)]
+                        if let Some(name) = mapping.get(usize::from(*column)).copied().flatten()
                             && let Some(target) = definition.column_index(name.as_str())
                         {
                             *column = target as u16;
@@ -345,14 +974,14 @@ impl DefinitionPublication {
                     sequence.owner,
                     selected.committed(),
                     &definition,
-                    &mapping,
+                    mapping.as_slice(),
                     false,
                 );
                 sequence.generator_for = rebind_sequence_column(
                     sequence.generator_for,
                     selected.committed(),
                     &definition,
-                    &mapping,
+                    mapping.as_slice(),
                     true,
                 );
                 if let Some(pending) = &mut sequence.pending_definition {
@@ -367,14 +996,14 @@ impl DefinitionPublication {
                         pending.owner,
                         selected.committed(),
                         &definition,
-                        &mapping,
+                        mapping.as_slice(),
                         false,
                     );
                     pending.generator_for = rebind_sequence_column(
                         pending.generator_for,
                         selected.committed(),
                         &definition,
-                        &mapping,
+                        mapping.as_slice(),
                         true,
                     );
                 }
@@ -414,13 +1043,12 @@ impl DefinitionPublication {
                     comment.name = identity.name;
                 }
             }
-            movement.rewrite(&mut definition);
             for (slot, owner) in owners.slots.iter_mut().enumerate() {
                 let Some(owner) = owner else {
                     continue;
                 };
                 if slot == table {
-                    *owner.definition.edit_committed(revision) = definition;
+                    *owner.definition.edit_committed(revision) = definition.clone();
                     if transaction.is_some() {
                         storage
                             .pending_table_defs
@@ -432,14 +1060,36 @@ impl DefinitionPublication {
                         );
                     }
                 } else {
-                    assert!(storage.pending_table_defs.move_table_references_locked(
+                    let (_, identity, replacement) = local_replacements
+                        .as_mut()
+                        .expect("immediate publication owns local replacements")
+                        .iter_mut()
+                        .find(|(target, _, _)| *target == slot)
+                        .expect("every immediate dependent retains its prepared replacement");
+                    storage.pending_table_defs.apply_replacements_locked(
                         &mut owner.definition,
-                        movement,
-                        revision
-                    ));
+                        *identity,
+                        replacement
+                            .take()
+                            .expect("dependent replacement applies once"),
+                        revision,
+                    );
                 }
                 owner.publication.generation += 1;
                 owner.publication.dirty = true;
+            }
+            if let Some(transaction) = transaction {
+                let plan = registry
+                    .iter_mut()
+                    .find(|plan| plan.transaction == transaction)
+                    .expect("pending publication retains its prepared transaction");
+                let target = plan
+                    .tables
+                    .iter_mut()
+                    .find(|target| target.source == source.identity())
+                    .expect("pending publication retains its prepared primary table");
+                target.applied = true;
+                target.replacements = None;
             }
             storage.rename_stored_query_dependency_locked(
                 &mut dependencies,
@@ -471,6 +1121,33 @@ impl DefinitionPublication {
             );
             return Ok(Some(rewrites_rows));
         }
+    }
+}
+
+impl Storage {
+    /// Reserve the transaction's complete dependent shapes before submitting WAL.
+    pub(crate) fn prepare_definition_publication(
+        &self,
+        transaction: u32,
+        table_changes: impl Iterator<Item = TableDefinitionChange> + Clone,
+        type_changes: impl Iterator<Item = TypeCommitChange> + Clone,
+    ) -> Result<(), SqlError> {
+        self.definition_publication.prepare_transaction(
+            self,
+            transaction,
+            table_changes,
+            type_changes,
+        )
+    }
+
+    pub(crate) fn finish_definition_publication(&self, transaction: u32) -> Result<(), SqlError> {
+        self.definition_publication
+            .finish_transaction(self, transaction)
+    }
+
+    pub(crate) fn rollback_definition_publication(&self, transaction: u32) {
+        self.definition_publication
+            .rollback_transaction(self, transaction);
     }
 }
 
@@ -520,12 +1197,282 @@ mod tests {
     }
 
     fn rename(storage: &Storage, table: usize) -> TableDefinitionChange {
-        let (target, mut definition) = storage.select_table_definition(table, 7);
+        let (target, definition) = storage.select_table_definition(table, 7);
+        let mut definition = TableDefBuilder::from_definition(&definition);
         definition.schema = SqlName::parse("publication_destination").unwrap();
         definition.name = SqlName::parse("publication_renamed").unwrap();
         storage
             .write_table_def(target, definition, &mapping(), false)
             .unwrap()
+    }
+
+    fn publish_change(
+        storage: &Storage,
+        change: TableDefinitionChange,
+    ) -> Result<Option<bool>, SqlError> {
+        let Some(table) = storage.tables.get(change.table()) else {
+            return Ok(None);
+        };
+        if !DefinitionSource::Pending(change).matches(storage, &table.definition.read()) {
+            return Ok(None);
+        }
+        storage.prepare_definition_publication(
+            change.transaction,
+            [change].into_iter(),
+            core::iter::empty(),
+        )?;
+        let result = storage.commit_table_def(change);
+        if matches!(result, Ok(Some(_))) {
+            storage.finish_definition_publication(change.transaction)?;
+        } else {
+            storage.rollback_definition_publication(change.transaction);
+        }
+        storage.release_object_locks(change.transaction);
+        storage.release_row_locks(change.transaction);
+        result
+    }
+
+    fn fill_metadata(storage: &Storage) -> [Option<MutableSlice<u8>>; 128] {
+        let mut held = core::array::from_fn(|_| None);
+        for entry in &mut held {
+            let available = storage.metadata_pool.lease::<u8>(usize::MAX).unwrap_err();
+            if available.largest_range_bytes == 0 || available.available_leases == 0 {
+                return held;
+            }
+            *entry = Some(
+                storage
+                    .metadata_pool
+                    .lease(available.largest_range_bytes)
+                    .unwrap(),
+            );
+        }
+        panic!("small publication fixture has more than 128 free metadata ranges")
+    }
+
+    #[test]
+    fn dependent_publication_reserves_before_effects_and_finishes_with_no_metadata_free() {
+        let (storage, parent, child, _) = fixture();
+        let change = rename(&storage, parent);
+        let retained = (*storage.table_def(child, 0)).clone();
+        crate::mem::guard::forbid_alloc(|| {
+            let held = fill_metadata(&storage);
+            let error = storage
+                .prepare_definition_publication(7, [change].into_iter(), core::iter::empty())
+                .unwrap_err();
+            assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            for slot in [parent, child] {
+                assert_eq!(
+                    storage.tables[slot].definition.read().publication_owner(),
+                    None
+                );
+            }
+            assert_eq!(
+                storage.table_def(parent, 0).name.as_str(),
+                "publication_parent"
+            );
+            assert_eq!(
+                storage.table_def(child, 0).fkeys()[0].parent.as_str(),
+                "publication_parent"
+            );
+            drop(held);
+            storage
+                .prepare_definition_publication(7, [change].into_iter(), core::iter::empty())
+                .unwrap();
+            let held = fill_metadata(&storage);
+            assert_eq!(storage.commit_table_def(change).unwrap(), Some(false));
+            storage.finish_definition_publication(7).unwrap();
+            assert_eq!(
+                storage.table_def(child, 0).fkeys()[0].parent.as_str(),
+                "publication_renamed"
+            );
+            assert_eq!(retained.fkeys()[0].parent.as_str(), "publication_parent");
+            assert_eq!(
+                storage.tables[child].definition.read().publication_owner(),
+                None
+            );
+            drop(held);
+        });
+    }
+
+    #[test]
+    fn dependent_publication_composes_two_sources_into_one_target_generation() {
+        let (storage, parent, child, other) = fixture();
+        {
+            let revision = storage.reserve_table_definition_revision().unwrap();
+            let mut owner = storage.tables[child].definition_mut(revision);
+            let mut definition = TableDefBuilder::from_definition(&owner);
+            definition.n_fkeys = 2;
+            definition.fkeys[1] = definition.fkeys[0];
+            definition.fkeys[1].parent = SqlName::parse("publication_other").unwrap();
+            *owner = definition.freeze(&storage.metadata_pool).unwrap();
+        }
+        let first = rename(&storage, parent);
+        let (target, definition) = storage.select_table_definition(other, 7);
+        let mut definition = TableDefBuilder::from_definition(&definition);
+        definition.name = SqlName::parse("other_renamed").unwrap();
+        let second = storage
+            .write_table_def(target, definition, &mapping(), false)
+            .unwrap();
+        let before = storage.tables[child].publication().generation;
+        crate::mem::guard::forbid_alloc(|| {
+            storage
+                .prepare_definition_publication(7, [first, second].into_iter(), core::iter::empty())
+                .unwrap();
+            let held = fill_metadata(&storage);
+            storage.commit_table_def(first).unwrap();
+            storage.commit_table_def(second).unwrap();
+            storage.finish_definition_publication(7).unwrap();
+            let definition = storage.table_def(child, 0);
+            assert_eq!(definition.fkeys()[0].parent.as_str(), "publication_renamed");
+            assert_eq!(definition.fkeys()[1].parent.as_str(), "other_renamed");
+            assert_eq!(storage.tables[child].publication().generation, before + 1);
+            drop(held);
+        });
+    }
+
+    #[test]
+    fn canceling_dependent_publication_releases_claims_and_keeps_original_definitions() {
+        let (storage, parent, child, _) = fixture();
+        let change = rename(&storage, parent);
+        crate::mem::guard::forbid_alloc(|| {
+            storage
+                .prepare_definition_publication(7, [change].into_iter(), core::iter::empty())
+                .unwrap();
+            assert_eq!(
+                storage.tables[child].definition.read().publication_owner(),
+                Some(7)
+            );
+            storage.rollback_definition_publication(7);
+            storage.rollback_table_def(change);
+            for slot in [parent, child] {
+                assert_eq!(
+                    storage.tables[slot].definition.read().publication_owner(),
+                    None
+                );
+            }
+            assert_eq!(
+                storage.table_def(parent, 0).name.as_str(),
+                "publication_parent"
+            );
+            assert_eq!(
+                storage.table_def(child, 0).fkeys()[0].parent.as_str(),
+                "publication_parent"
+            );
+            assert!(
+                storage
+                    .definition_publication
+                    .prepared
+                    .lock()
+                    .unwrap()
+                    .is_empty()
+            );
+        });
+    }
+
+    #[test]
+    fn dependent_publication_waits_for_writers_before_claims_and_allows_readers() {
+        use crate::sql::ast::TableLockMode;
+        let (storage, parent, child, other) = fixture();
+        let change = rename(&storage, parent);
+        crate::mem::guard::forbid_alloc(|| {
+            storage
+                .lock_table(9, child, TableLockMode::RowExclusive, false)
+                .unwrap();
+            assert_eq!(
+                storage
+                    .prepare_definition_publication(7, [change].into_iter(), core::iter::empty())
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::INTERNAL_LOCK_WAIT
+            );
+            assert!(storage.definition_publication.scratch.try_lock().is_ok());
+            assert!(storage.definition_publication.prepared.try_lock().is_ok());
+            assert!(storage.type_catalog.try_lock().is_ok());
+            for slot in [parent, child] {
+                assert_eq!(
+                    storage.tables[slot].definition.read().publication_owner(),
+                    None
+                );
+                assert!(storage.tables[slot].lifecycle.try_lock().is_ok());
+                assert!(storage.tables[slot].publication.try_lock().is_ok());
+            }
+            storage
+                .lock_table(10, child, TableLockMode::AccessShare, false)
+                .unwrap();
+            storage
+                .lock_table(11, other, TableLockMode::RowExclusive, false)
+                .unwrap();
+            storage.release_object_locks(9);
+            storage
+                .prepare_definition_publication(7, [change].into_iter(), core::iter::empty())
+                .unwrap();
+            assert_eq!(
+                storage
+                    .lock_table(12, child, TableLockMode::RowExclusive, true)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::LOCK_NOT_AVAILABLE
+            );
+            assert_eq!(
+                storage.table_def(child, 0).fkeys()[0].parent.as_str(),
+                "publication_parent"
+            );
+            storage.commit_table_def(change).unwrap();
+            storage.finish_definition_publication(7).unwrap();
+            storage.release_object_locks(7);
+            storage.release_row_locks(7);
+            storage
+                .lock_table(12, child, TableLockMode::RowExclusive, true)
+                .unwrap();
+            for transaction in [10, 11, 12] {
+                storage.release_object_locks(transaction);
+            }
+        });
+    }
+
+    #[test]
+    fn admitted_parent_publication_blocks_new_foreign_keys_without_blocking_self_references() {
+        let (storage, parent, child, other) = fixture();
+        let change = rename(&storage, parent);
+        crate::mem::guard::forbid_alloc(|| {
+            storage
+                .prepare_definition_publication(7, [change].into_iter(), core::iter::empty())
+                .unwrap();
+            let mut definition = TableDefBuilder::from_definition(&storage.table_def(child, 0));
+            definition.name = SqlName::parse("blocked_fk_child").unwrap();
+            assert_eq!(
+                storage.create_table_in(definition, 9).unwrap_err().sqlstate,
+                sqlstate::INTERNAL_LOCK_WAIT
+            );
+            assert!(
+                storage
+                    .find_visible("public", "blocked_fk_child", 9)
+                    .is_none()
+            );
+            let selected = storage.select_table_definition(other, 9).0;
+            definition.name = SqlName::parse("publication_other").unwrap();
+            assert_eq!(
+                storage
+                    .write_table_def(selected, definition, &mapping(), false)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::INTERNAL_LOCK_WAIT
+            );
+            assert!(storage.pending_table_def(other).is_none());
+            definition.fkeys[0].parent = definition.name;
+            let self_reference = storage
+                .write_table_def(selected, definition, &mapping(), false)
+                .unwrap();
+            storage.rollback_table_def(self_reference);
+            storage.rollback_definition_publication(7);
+            storage.rollback_table_def(change);
+            storage.release_object_locks(7);
+            definition.name = SqlName::parse("admitted_fk_child").unwrap();
+            definition.fkeys[0].parent = SqlName::parse("publication_parent").unwrap();
+            let admitted = storage.create_table_in(definition, 9).unwrap();
+            storage.rollback_create(admitted);
+            storage.release_row_locks(9);
+        });
     }
 
     fn waited(storage: &Storage, before: usize) -> bool {
@@ -553,7 +1500,7 @@ mod tests {
                 (blocked == 4).then(|| storage.stored_query_dependencies.lock().unwrap());
             std::thread::scope(|scope| {
                 let writer = scope
-                    .spawn(|| crate::mem::guard::forbid_alloc(|| storage.commit_table_def(change)));
+                    .spawn(|| crate::mem::guard::forbid_alloc(|| publish_change(&storage, change)));
                 let waiting = waited(&storage, before);
                 let released = waiting
                     && [parent, child].into_iter().all(|slot| {
@@ -599,18 +1546,20 @@ mod tests {
     fn table_publication_updates_every_private_foreign_key_version_and_rollback() {
         let (storage, parent, child, _) = fixture();
         crate::mem::guard::forbid_alloc(|| {
-            let (target, mut definition) = storage.select_table_definition(child, 9);
+            let (target, definition) = storage.select_table_definition(child, 9);
+            let mut definition = TableDefBuilder::from_definition(&definition);
             definition.columns[0].not_null = super::super::NotNullOrigin::Local;
             let first = storage
                 .write_table_def(target, definition, &mapping(), false)
                 .unwrap();
-            let (target, mut definition) = storage.select_table_definition(child, 9);
+            let (target, definition) = storage.select_table_definition(child, 9);
+            let mut definition = TableDefBuilder::from_definition(&definition);
             definition.columns[0].not_null = super::super::NotNullOrigin::Nullable;
             let second = storage
                 .write_table_def(target, definition, &mapping(), false)
                 .unwrap();
             let change = rename(&storage, parent);
-            assert_eq!(storage.commit_table_def(change).unwrap(), Some(false));
+            assert_eq!(publish_change(&storage, change).unwrap(), Some(false));
             for transaction in [0, 9] {
                 let child = storage.table_def(child, transaction);
                 assert_eq!(child.fkeys()[0].parent.as_str(), "publication_renamed");
@@ -628,7 +1577,7 @@ mod tests {
                 storage.table_def(child, 9).fkeys()[0].parent.as_str(),
                 "publication_renamed"
             );
-            assert_eq!(storage.commit_table_def(first).unwrap(), Some(false));
+            assert_eq!(publish_change(&storage, first).unwrap(), Some(false));
             assert!(storage.pending_table_def(child).is_none());
             assert_eq!(
                 storage.table_def(child, 0).fkeys()[0].parent.as_str(),
@@ -645,7 +1594,7 @@ mod tests {
         let retained = storage.table_def(child, 0);
         std::thread::scope(|scope| {
             let writer = scope
-                .spawn(|| crate::mem::guard::forbid_alloc(|| storage.commit_table_def(change)));
+                .spawn(|| crate::mem::guard::forbid_alloc(|| publish_change(&storage, change)));
             let waiting = waited(&storage, before);
             let released = waiting
                 && storage.tables[parent].definition.test_write().is_ok()
@@ -672,7 +1621,7 @@ mod tests {
         let held = storage.sequence_catalog.lock().unwrap();
         std::thread::scope(|scope| {
             let writer = scope
-                .spawn(|| crate::mem::guard::forbid_alloc(|| storage.commit_table_def(change)));
+                .spawn(|| crate::mem::guard::forbid_alloc(|| publish_change(&storage, change)));
             let waiting = waited(&storage, before);
             if waiting {
                 crate::mem::guard::forbid_alloc(|| storage.rollback_table_def(change));
@@ -714,7 +1663,7 @@ mod tests {
             let generation = storage.tables[child].generation();
             storage.tables[child].publication().generation = u64::MAX;
             assert_eq!(
-                storage.commit_table_def(change).err().unwrap().sqlstate,
+                publish_change(&storage, change).err().unwrap().sqlstate,
                 sqlstate::PROGRAM_LIMIT_EXCEEDED
             );
             assert_eq!(storage.table_def(parent, 0).name, name);
@@ -731,7 +1680,7 @@ mod tests {
             assert!(storage.tables[child].definition.test_write().is_ok());
             assert!(storage.definition_publication.scratch.try_lock().is_ok());
             storage.tables[child].publication().generation = generation;
-            assert_eq!(storage.commit_table_def(change).unwrap(), Some(false));
+            assert_eq!(publish_change(&storage, change).unwrap(), Some(false));
             assert!(
                 storage
                     .comment_text(
@@ -764,7 +1713,7 @@ mod tests {
                 .store(1, Ordering::Release);
             std::thread::scope(|scope| {
                 let writer = scope
-                    .spawn(|| crate::mem::guard::forbid_alloc(|| storage.commit_table_def(change)));
+                    .spawn(|| crate::mem::guard::forbid_alloc(|| publish_change(&storage, change)));
                 let resume = ResumeScan(&storage.definition_publication.scan_pause);
                 let deadline = Instant::now() + Duration::from_secs(5);
                 while storage
@@ -783,7 +1732,8 @@ mod tests {
                     == 2;
                 let submitted = if paused {
                     crate::mem::guard::forbid_alloc(|| {
-                        let (target, mut definition) = storage.select_table_definition(other, 9);
+                        let (target, definition) = storage.select_table_definition(other, 9);
+                        let mut definition = TableDefBuilder::from_definition(&definition);
                         definition.n_fkeys = 1;
                         definition.fkeys[0] = ForeignKey {
                             identity: None,
@@ -818,7 +1768,7 @@ mod tests {
                 );
                 drop(selected);
                 if let Some(change) = submitted.1 {
-                    assert_eq!(storage.commit_table_def(change).unwrap(), Some(false));
+                    assert_eq!(publish_change(&storage, change).unwrap(), Some(false));
                 } else {
                     storage.commit_create(submitted.0);
                 }
@@ -836,7 +1786,7 @@ mod tests {
         let (foreign, foreign_parent, _, _) = fixture();
         crate::mem::guard::forbid_alloc(|| {
             let change = rename(&storage, parent);
-            assert_eq!(foreign.commit_table_def(change).unwrap(), None);
+            assert_eq!(publish_change(&foreign, change).unwrap(), None);
             assert_eq!(
                 foreign.table_def(foreign_parent, 0).name.as_str(),
                 "publication_parent"
@@ -851,7 +1801,7 @@ mod tests {
                 .unwrap();
             assert_eq!(replacement, parent);
             storage.commit_create(replacement);
-            assert_eq!(storage.commit_table_def(change).unwrap(), None);
+            assert_eq!(publish_change(&storage, change).unwrap(), None);
             assert_eq!(
                 storage.table_def(replacement, 0).name.as_str(),
                 "publication_replacement"
@@ -868,7 +1818,8 @@ mod tests {
     fn table_publication_exhaustion_does_not_promote_private_index_bindings() {
         let (storage, parent, _, _) = fixture();
         crate::mem::guard::forbid_alloc(|| {
-            let (target, mut definition) = storage.select_table_definition(parent, 7);
+            let (target, definition) = storage.select_table_definition(parent, 7);
+            let mut definition = TableDefBuilder::from_definition(&definition);
             definition.columns[0].name = SqlName::parse("renamed_id").unwrap();
             let mut columns = [None; MAX_COLUMNS];
             columns[0] = Some(definition.columns[0].name);
@@ -892,7 +1843,7 @@ mod tests {
             let generation = storage.tables[parent].generation();
             storage.tables[parent].publication().generation = u64::MAX;
             assert_eq!(
-                storage.commit_table_def(change).err().unwrap().sqlstate,
+                publish_change(&storage, change).err().unwrap().sqlstate,
                 sqlstate::PROGRAM_LIMIT_EXCEEDED
             );
             let binding = storage.index_catalog()[index].table_binding.unwrap();
@@ -906,7 +1857,7 @@ mod tests {
                 "id"
             );
             storage.tables[parent].publication().generation = generation;
-            assert_eq!(storage.commit_table_def(change).unwrap(), Some(false));
+            assert_eq!(publish_change(&storage, change).unwrap(), Some(false));
             let binding = storage.index_catalog()[index].table_binding.unwrap();
             assert!(binding.matches_selected(
                 &storage,
@@ -944,7 +1895,8 @@ mod tests {
         let parent = storage.create_table(parent_definition).unwrap();
         assert!(child < parent);
         crate::mem::guard::forbid_alloc(|| {
-            let (target, mut definition) = storage.select_table_definition(child, 8);
+            let (target, definition) = storage.select_table_definition(child, 8);
+            let mut definition = TableDefBuilder::from_definition(&definition);
             definition.n_fkeys = 1;
             definition.fkeys[0] = ForeignKey {
                 identity: None,
@@ -958,7 +1910,7 @@ mod tests {
             let change = storage
                 .write_table_def(target, definition, &mapping(), false)
                 .unwrap();
-            assert_eq!(storage.commit_table_def(change).unwrap(), Some(false));
+            assert_eq!(publish_change(&storage, change).unwrap(), Some(false));
         });
         let change = rename(&storage, parent);
         let database = storage.current_database_oid();
@@ -974,7 +1926,7 @@ mod tests {
         std::thread::scope(|scope| {
             let writer = scope.spawn(|| {
                 crate::sql::set_execution_database_oid(database);
-                crate::mem::guard::forbid_alloc(|| storage.commit_table_def(change))
+                crate::mem::guard::forbid_alloc(|| publish_change(&storage, change))
             });
             let resume = ResumeRelease(&storage.definition_publication.release_pause);
             let deadline = Instant::now() + Duration::from_secs(5);

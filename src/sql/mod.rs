@@ -289,6 +289,7 @@ impl From<crate::storage::StorageSetupError> for EngineSetupError {
                 "{}",
                 error
             )),
+            crate::storage::StorageSetupError::Metadata(error) => Self::Storage(error),
             crate::storage::StorageSetupError::CatalogIdentitySpaceExhausted => {
                 Self::Storage(sql_err!(
                     crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -5476,6 +5477,34 @@ impl Engine {
         self.finish_txn(txn, guc, txn::CommitTarget::Ordinary)
     }
 
+    fn prepare_transaction_bindings(&mut self, txn: &TxnState) -> Result<(), SqlError> {
+        for (position, undo) in txn.ddl().iter().enumerate() {
+            match *undo {
+                DdlUndo::TableAltered(change) => {
+                    if txn.ddl()[position + 1..].iter().any(|later| {
+                        matches!(later, DdlUndo::TableAltered(later) if later.table() == change.table())
+                    }) {
+                        continue;
+                    }
+                    self.storage
+                        .prepare_table_definition_enforcers(change.row_target())?;
+                }
+                DdlUndo::IndexCreated(slot) => self.storage.prepare_index_definition_enforcers(
+                    slot as usize,
+                    txn.txid,
+                    crate::storage::IndexBindingOperation::Create,
+                )?,
+                DdlUndo::IndexDropped(slot) => self.storage.prepare_index_definition_enforcers(
+                    slot as usize,
+                    txn.txid,
+                    crate::storage::IndexBindingOperation::Drop,
+                )?,
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
     /// Journals every final transaction image and either commits it or leaves
     /// its typed batch prepared. Only an ordinary commit promotes the
     /// transaction-owned storage overlays here.
@@ -5499,11 +5528,12 @@ impl Engine {
             txn::CommitTarget::Prepare { slot, .. } => Some(slot),
             _ => None,
         };
-        // The next statement starts a fresh transaction clock.
-        datetime::end_transaction();
         if !txn.is_active() {
             return Ok(());
         }
+        txn.begin_commit_admission(target);
+        // The retained admission keeps the completed command's clock on waits.
+        datetime::end_transaction();
         if txn.has_deferred_triggers() {
             return Err(sql_err!(
                 sqlstate::INTERNAL_ERROR,
@@ -5575,13 +5605,44 @@ impl Engine {
             self.rollback_txn(txn, guc);
             return Err(error);
         }
+        if let Err(error) = self.prepare_transaction_bindings(txn) {
+            if error.sqlstate != sqlstate::INTERNAL_LOCK_WAIT
+                && error.sqlstate != sqlstate::INTERNAL_IO_WAIT
+            {
+                self.rollback_txn(txn, guc);
+            }
+            return Err(error);
+        }
         if let Err(error) = self.storage.prepare_commit_row_keys(
             txn.txid,
             txn.touched()
                 .iter()
                 .map(|&(table, rowid, _)| (table as usize, rowid)),
         ) {
-            self.rollback_txn(txn, guc);
+            if error.sqlstate != sqlstate::INTERNAL_IO_WAIT
+                && error.sqlstate != sqlstate::INTERNAL_LOCK_WAIT
+            {
+                self.rollback_txn(txn, guc);
+            }
+            return Err(error);
+        }
+        if let Err(error) = self.storage.prepare_definition_publication(
+            txn.txid,
+            txn.table_definition_changes(),
+            txn.type_commit_changes(),
+        ) {
+            self.storage.rollback_definition_publication(txn.txid);
+            if error.sqlstate != sqlstate::INTERNAL_LOCK_WAIT {
+                self.rollback_txn(txn, guc);
+            }
+            return Err(error);
+        }
+        if let Err(error) = self.stage_prepared_lock_image(txn, target) {
+            if error.sqlstate != sqlstate::INTERNAL_IO_WAIT
+                && error.sqlstate != sqlstate::INTERNAL_LOCK_WAIT
+            {
+                self.rollback_txn(txn, guc);
+            }
             return Err(error);
         }
         if let Err(error) = self.storage.validate_row_history_publication(
@@ -6704,13 +6765,13 @@ impl Engine {
         self.complete_staged_commit(txn, guc)
     }
 
-    pub(crate) fn finish_staged_transaction(
+    pub(crate) fn finish_pending_transaction(
         &mut self,
         txn: &mut TxnState,
         guc: &GucState,
     ) -> Result<(), SqlError> {
         self.check_publication_health()?;
-        if txn.staged_commit().is_none() {
+        if txn.staged_commit().is_none() && txn.commit_admission().is_none() {
             return Ok(());
         }
         let _atomic_reads = self.atomic_block_read_scope();
@@ -6732,7 +6793,10 @@ impl Engine {
             let name = self.storage.database_definition(database, txn.txid).name;
             eval::funcs::system::set_current_database(name.as_str());
         }
-        let result = self.complete_staged_commit(txn, guc);
+        let result = match txn.commit_admission() {
+            Some(target) => self.finish_txn(txn, guc, target),
+            None => self.complete_staged_commit(txn, guc),
+        };
         self.storage.swap_path(prior);
         result
     }
@@ -6927,7 +6991,7 @@ impl Engine {
             let prior = self.execution_identity();
             let read_owner = self.read_owner;
             self.restore_execution_identity(work.identity);
-            let result = self.finish_staged_transaction(&mut work.transaction, &work.guc);
+            let result = self.finish_pending_transaction(&mut work.transaction, &work.guc);
             self.restore_execution_identity(prior);
             let _ = self.replace_read_owner(read_owner);
             self.commit_queue
@@ -7458,6 +7522,7 @@ impl Engine {
                     .commit_comment_identity(*slot as usize, txn.txid),
             }
         }
+        self.storage.finish_definition_publication(txn.txid)?;
         for &advance in txn.subscription_advances() {
             self.storage.apply_subscription_advance(advance, commit_lsn);
         }
@@ -7611,8 +7676,8 @@ impl Engine {
         let _active_cursors = cursors
             .as_ref()
             .map(|pool| cursor::enter_active(&**pool as *const _));
-        if txn.staged_commit().is_some() {
-            self.complete_staged_commit(txn, guc)?;
+        if txn.staged_commit().is_some() || txn.commit_admission().is_some() {
+            self.finish_pending_transaction(txn, guc)?;
             if let Some(cursors) = cursors {
                 cursors.on_commit();
             }
@@ -7658,15 +7723,16 @@ impl Engine {
         responder: &mut Responder,
     ) -> Result<(), SqlError> {
         let result = if txn.staged_commit().is_some() {
-            self.finish_staged_transaction(txn, guc)
+            self.finish_pending_transaction(txn, guc)
         } else {
             self.commit_txn_with_triggers(txn, guc, Some(cursors), arena, responder)
         };
         if result.is_ok() {
             cursors.on_commit();
         }
-        if matches!(&result, Err(error) if error.sqlstate == sqlstate::INTERNAL_IO_WAIT)
-            && txn.staged_commit().is_some()
+        if matches!(&result, Err(error) if error.sqlstate == sqlstate::INTERNAL_IO_WAIT
+            || error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT)
+            && (txn.staged_commit().is_some() || txn.commit_admission().is_some())
         {
             // Consume this phase's receipt before executing its continuation.
             txn.begin_concurrent_partition_detach();
@@ -7701,6 +7767,26 @@ impl Engine {
         arena: &Arena,
         responder: &mut Responder,
     ) -> Result<(), SqlError> {
+        if let Some(target) = txn.commit_admission() {
+            let txn::CommitTarget::Prepare {
+                gid: admitted_gid, ..
+            } = target
+            else {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "PREPARE changed admitted commit target"
+                ));
+            };
+            if admitted_gid != gid {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "PREPARE changed admitted transaction identity"
+                ));
+            }
+            self.finish_txn(txn, guc, target)?;
+            cursors.on_rollback();
+            return Ok(());
+        }
         if let Some(staged) = txn.staged_commit() {
             let txn::CommitTarget::Prepare {
                 gid: staged_gid, ..
@@ -7853,29 +7939,41 @@ impl Engine {
         // no earlier work, so every successfully prepared transaction has the
         // catalog identity required to resolve it later.
         self.storage.assign_transaction_identity(txn.txid);
-        if let Err(error) = self.storage.encode_transaction_locks(
-            txn.txid,
-            &mut self.prepared_transactions.slot_mut(slot).locks,
-        ) {
-            self.prepared_transactions.release(slot);
-            return Err(fail(self, txn, cursors, error));
-        }
-        let lock_lsn = self.storage.bump_lsn();
-        let lock_record = WalOp::PreparedLocks {
-            transaction_id: txn.txid,
-            encoded: self.prepared_transactions.slot(slot).locks.readable(),
-        };
-        if let Err(error) = self.wal.stage_reserved(txn.txid, lock_lsn, &lock_record) {
-            self.prepared_transactions.release(slot);
-            return Err(fail(self, txn, cursors, error));
-        }
         if let Err(error) = self.finish_txn(txn, guc, txn::CommitTarget::Prepare { slot, gid }) {
-            if txn.staged_commit().is_none() {
+            if txn.staged_commit().is_none() && txn.commit_admission().is_none() {
                 self.prepared_transactions.release(slot);
             }
             return Err(error);
         }
         cursors.on_rollback();
+        Ok(())
+    }
+
+    fn stage_prepared_lock_image(
+        &mut self,
+        txn: &mut TxnState,
+        target: txn::CommitTarget,
+    ) -> Result<(), SqlError> {
+        let txn::CommitTarget::Prepare { slot, .. } = target else {
+            return Ok(());
+        };
+        if txn.prepared_locks_staged() {
+            return Ok(());
+        }
+        self.storage.encode_transaction_locks(
+            txn.txid,
+            &mut self.prepared_transactions.slot_mut(slot).locks,
+        )?;
+        let lock_lsn = self.storage.bump_lsn();
+        self.wal.stage_reserved(
+            txn.txid,
+            lock_lsn,
+            &WalOp::PreparedLocks {
+                transaction_id: txn.txid,
+                encoded: self.prepared_transactions.slot(slot).locks.readable(),
+            },
+        )?;
+        txn.mark_prepared_locks_staged();
         Ok(())
     }
 
@@ -7886,6 +7984,25 @@ impl Engine {
         txn: &mut TxnState,
         guc: &GucState,
     ) -> Result<(), SqlError> {
+        if let Some(target) = txn.commit_admission() {
+            let admitted_gid = match target {
+                txn::CommitTarget::CommitPrepared { gid, .. } if commit => gid,
+                txn::CommitTarget::RollbackPrepared { gid, .. } if !commit => gid,
+                _ => {
+                    return Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "prepared resolution changed admitted outcome"
+                    ));
+                }
+            };
+            if admitted_gid != gid {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "prepared resolution changed admitted identity"
+                ));
+            }
+            return self.finish_txn(txn, guc, target);
+        }
         if let Some(staged) = txn.staged_commit() {
             let staged_gid = match staged.target {
                 txn::CommitTarget::CommitPrepared { gid, .. } if commit => gid,
@@ -8070,6 +8187,10 @@ impl Engine {
         if txn.txid == 0 {
             txn.clear();
             return;
+        }
+        self.storage.rollback_definition_publication(txn.txid);
+        if let Some(txn::CommitTarget::Prepare { slot, .. }) = txn.commit_admission() {
+            self.prepared_transactions.release(slot);
         }
         foreign::abort_session(&self.storage, txn.txid);
         rollback_transaction_overlays(&mut self.storage, txn);
@@ -10094,8 +10215,8 @@ impl Engine {
         let _active_cursors = cursors
             .as_ref()
             .map(|pool| cursor::enter_active(&**pool as *const _));
-        if txn.staged_commit().is_some() {
-            self.complete_staged_commit(txn, guc)?;
+        if txn.staged_commit().is_some() || txn.commit_admission().is_some() {
+            self.finish_pending_transaction(txn, guc)?;
             if let Some(cursors) = cursors {
                 cursors.on_commit();
             }
@@ -10153,6 +10274,9 @@ impl Engine {
         workspace: SubscriptionCopyWorkspace<'_>,
     ) -> Result<(), SqlError> {
         let _atomic_reads = self.atomic_block_read_scope();
+        if txn.staged_commit().is_some() || txn.commit_admission().is_some() {
+            return self.finish_pending_transaction(txn, guc);
+        }
         workspace.arena.reset();
         let boundary = if txn.mode == TxnMode::Implicit {
             exec::TriggerQueueBoundary::Transaction
@@ -10755,6 +10879,34 @@ impl Engine {
         )
     }
 
+    pub(crate) fn check_commit_admission_wait(
+        &mut self,
+        txn: &mut TxnState,
+        guc: &GucState,
+        lock_timeout_expired: bool,
+    ) -> Result<(), SqlError> {
+        if txn.commit_admission().is_none() {
+            return Ok(());
+        }
+        txn.begin_statement_clock();
+        query::restore_statement_deadline(
+            txn.suspended_statement_deadline()
+                .expect("admission retains its deadline"),
+        );
+        let result = if lock_timeout_expired {
+            Err(sql_err!(
+                sqlstate::LOCK_NOT_AVAILABLE,
+                "canceling statement due to lock timeout"
+            ))
+        } else {
+            query::check_timeout()
+        };
+        if result.is_err() {
+            self.rollback_txn(txn, guc);
+        }
+        result
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn execute_simple_from_selected(
         &mut self,
@@ -10771,16 +10923,30 @@ impl Engine {
     ) -> Result<ExecutionStatus, WireFull> {
         self.dml_scratch.clear();
         self.bind_query_connection(conn_id);
+        if let Err(error) = self.check_commit_admission_wait(txn, guc, lock_timeout_expired) {
+            cursors.on_rollback();
+            responder.error(error.sqlstate, error.message.as_str())?;
+            return Ok(ExecutionStatus::Complete);
+        }
         if txn.concurrent_partition_detach_pending()
-            && txn.staged_commit().is_some()
+            && (txn.staged_commit().is_some() || txn.commit_admission().is_some())
             && let Err(error) =
                 self.commit_partition_detach_phase(txn, guc, cursors, arena, responder)
         {
-            if error.sqlstate == sqlstate::INTERNAL_IO_WAIT && txn.staged_commit().is_some() {
+            if (error.sqlstate == sqlstate::INTERNAL_IO_WAIT
+                || error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT)
+                && (txn.staged_commit().is_some() || txn.commit_admission().is_some())
+            {
                 return Ok(ExecutionStatus::Blocked {
                     completed_statements: resume_statement,
                     output_mark: responder.buffer.mark(),
-                    wait: crate::sql::StatementWait::ObjectIo,
+                    wait: if txn.staged_commit().is_some()
+                        || error.sqlstate == sqlstate::INTERNAL_IO_WAIT
+                    {
+                        StatementWait::ObjectIo
+                    } else {
+                        StatementWait::Lock
+                    },
                 });
             }
             responder.error(error.sqlstate, error.message.as_str())?;
@@ -10881,11 +11047,20 @@ impl Engine {
                 && let Err(error) =
                     self.commit_txn_with_triggers(txn, guc, Some(cursors), arena, responder)
             {
-                if error.sqlstate == sqlstate::INTERNAL_IO_WAIT && txn.staged_commit().is_some() {
+                if (error.sqlstate == sqlstate::INTERNAL_IO_WAIT
+                    || error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT)
+                    && (txn.staged_commit().is_some() || txn.commit_admission().is_some())
+                {
                     return Ok(ExecutionStatus::Blocked {
                         completed_statements: statement_index,
                         output_mark: responder.buffer.mark(),
-                        wait: crate::sql::StatementWait::ObjectIo,
+                        wait: if txn.staged_commit().is_some()
+                            || error.sqlstate == sqlstate::INTERNAL_IO_WAIT
+                        {
+                            StatementWait::ObjectIo
+                        } else {
+                            StatementWait::Lock
+                        },
                     });
                 }
                 responder.error(error.sqlstate, error.message.as_str())?;
@@ -10973,12 +11148,18 @@ impl Engine {
                 if e.sqlstate == sqlstate::INTERNAL_LOCK_WAIT
                     || e.sqlstate == sqlstate::INTERNAL_IO_WAIT
                 {
-                    if txn.staged_commit().is_some() {
+                    if txn.staged_commit().is_some() || txn.commit_admission().is_some() {
                         sequence_scope.discard(guc.seq_session());
                         return Ok(ExecutionStatus::Blocked {
                             completed_statements: statement_index,
                             output_mark,
-                            wait: crate::sql::StatementWait::ObjectIo,
+                            wait: if txn.staged_commit().is_some()
+                                || e.sqlstate == sqlstate::INTERNAL_IO_WAIT
+                            {
+                                StatementWait::ObjectIo
+                            } else {
+                                StatementWait::Lock
+                            },
                         });
                     }
                     if txn.owns_statement_mark(statement_mark) {
@@ -11035,12 +11216,20 @@ impl Engine {
                 if let Err(error) =
                     self.commit_partition_detach_phase(txn, guc, cursors, arena, responder)
                 {
-                    if error.sqlstate == sqlstate::INTERNAL_IO_WAIT && txn.staged_commit().is_some()
+                    if (error.sqlstate == sqlstate::INTERNAL_IO_WAIT
+                        || error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT)
+                        && (txn.staged_commit().is_some() || txn.commit_admission().is_some())
                     {
                         return Ok(ExecutionStatus::Blocked {
                             completed_statements: statement_index,
                             output_mark,
-                            wait: crate::sql::StatementWait::ObjectIo,
+                            wait: if txn.staged_commit().is_some()
+                                || error.sqlstate == sqlstate::INTERNAL_IO_WAIT
+                            {
+                                StatementWait::ObjectIo
+                            } else {
+                                StatementWait::Lock
+                            },
                         });
                     }
                     responder.error(error.sqlstate, error.message.as_str())?;
@@ -11063,11 +11252,20 @@ impl Engine {
             && self.pending_copy.is_none()
             && let Err(e) = self.commit_txn_with_triggers(txn, guc, Some(cursors), arena, responder)
         {
-            if e.sqlstate == sqlstate::INTERNAL_IO_WAIT && txn.staged_commit().is_some() {
+            if (e.sqlstate == sqlstate::INTERNAL_IO_WAIT
+                || e.sqlstate == sqlstate::INTERNAL_LOCK_WAIT)
+                && (txn.staged_commit().is_some() || txn.commit_admission().is_some())
+            {
                 return Ok(ExecutionStatus::Blocked {
                     completed_statements: statement_count,
                     output_mark: responder.buffer.mark(),
-                    wait: crate::sql::StatementWait::ObjectIo,
+                    wait: if txn.staged_commit().is_some()
+                        || e.sqlstate == sqlstate::INTERNAL_IO_WAIT
+                    {
+                        StatementWait::ObjectIo
+                    } else {
+                        StatementWait::Lock
+                    },
                 });
             }
             responder.error(e.sqlstate, e.message.as_str())?;
@@ -11130,16 +11328,30 @@ impl Engine {
         lock_timeout_expired: bool,
     ) -> Result<ExtendedExecutionStatus, WireFull> {
         self.dml_scratch.clear();
+        self.bind_query_connection(conn_id);
+        if let Err(error) = self.check_commit_admission_wait(txn, guc, lock_timeout_expired) {
+            cursors.on_rollback();
+            responder.error(error.sqlstate, error.message.as_str())?;
+            return Ok(ExtendedExecutionStatus::Complete(false));
+        }
         exec::with_bound_parameter_types(parameter_type_oids, || {
-            self.bind_query_connection(conn_id);
             if txn.concurrent_partition_detach_pending()
-                && txn.staged_commit().is_some()
+                && (txn.staged_commit().is_some() || txn.commit_admission().is_some())
                 && let Err(error) =
                     self.commit_partition_detach_phase(txn, guc, cursors, arena, responder)
             {
-                if error.sqlstate == sqlstate::INTERNAL_IO_WAIT && txn.staged_commit().is_some() {
+                if (error.sqlstate == sqlstate::INTERNAL_IO_WAIT
+                    || error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT)
+                    && (txn.staged_commit().is_some() || txn.commit_admission().is_some())
+                {
                     return Ok(ExtendedExecutionStatus::Blocked {
-                        wait: crate::sql::StatementWait::ObjectIo,
+                        wait: if txn.staged_commit().is_some()
+                            || error.sqlstate == sqlstate::INTERNAL_IO_WAIT
+                        {
+                            StatementWait::ObjectIo
+                        } else {
+                            StatementWait::Lock
+                        },
                     });
                 }
                 responder.error(error.sqlstate, error.message.as_str())?;
@@ -11279,11 +11491,19 @@ impl Engine {
                         if let Err(error) =
                             self.commit_partition_detach_phase(txn, guc, cursors, arena, responder)
                         {
-                            if error.sqlstate == sqlstate::INTERNAL_IO_WAIT
-                                && txn.staged_commit().is_some()
+                            if (error.sqlstate == sqlstate::INTERNAL_IO_WAIT
+                                || error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT)
+                                && (txn.staged_commit().is_some()
+                                    || txn.commit_admission().is_some())
                             {
                                 return Ok(ExtendedExecutionStatus::Blocked {
-                                    wait: crate::sql::StatementWait::ObjectIo,
+                                    wait: if txn.staged_commit().is_some()
+                                        || error.sqlstate == sqlstate::INTERNAL_IO_WAIT
+                                    {
+                                        StatementWait::ObjectIo
+                                    } else {
+                                        StatementWait::Lock
+                                    },
                                 });
                             }
                             responder.error(error.sqlstate, error.message.as_str())?;
@@ -11308,10 +11528,16 @@ impl Engine {
                     if e.sqlstate == sqlstate::INTERNAL_LOCK_WAIT
                         || e.sqlstate == sqlstate::INTERNAL_IO_WAIT
                     {
-                        if txn.staged_commit().is_some() {
+                        if txn.staged_commit().is_some() || txn.commit_admission().is_some() {
                             sequence_scope.discard(guc.seq_session());
                             return Ok(ExtendedExecutionStatus::Blocked {
-                                wait: crate::sql::StatementWait::ObjectIo,
+                                wait: if txn.staged_commit().is_some()
+                                    || e.sqlstate == sqlstate::INTERNAL_IO_WAIT
+                                {
+                                    StatementWait::ObjectIo
+                                } else {
+                                    StatementWait::Lock
+                                },
                             });
                         }
                         if txn.owns_statement_mark(statement_mark) {
@@ -11497,9 +11723,18 @@ impl Engine {
                 && let Err(error) =
                     self.commit_txn_with_triggers(txn, guc, Some(cursors), arena, responder)
             {
-                if error.sqlstate == sqlstate::INTERNAL_IO_WAIT && txn.staged_commit().is_some() {
+                if (error.sqlstate == sqlstate::INTERNAL_IO_WAIT
+                    || error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT)
+                    && (txn.staged_commit().is_some() || txn.commit_admission().is_some())
+                {
                     return Ok(ExtendedExecutionStatus::Blocked {
-                        wait: crate::sql::StatementWait::ObjectIo,
+                        wait: if txn.staged_commit().is_some()
+                            || error.sqlstate == sqlstate::INTERNAL_IO_WAIT
+                        {
+                            StatementWait::ObjectIo
+                        } else {
+                            StatementWait::Lock
+                        },
                     });
                 }
                 responder.buffer.truncate_to(response_mark);
@@ -15343,7 +15578,11 @@ impl Engine {
             }
             Ok(())
         })();
-        if result.is_err() && txn.is_active() && txn.staged_commit().is_none() {
+        if result.is_err()
+            && txn.is_active()
+            && txn.staged_commit().is_none()
+            && txn.commit_admission().is_none()
+        {
             self.rollback_txn(txn, guc);
         }
         result
@@ -15487,11 +15726,29 @@ impl Engine {
         );
         txn.cache_capacity_wait = None;
         txn.leave_ddl_origin(prior_origin);
+        if txn.commit_admission().is_some()
+            && !matches!(
+                statement,
+                Stmt::Commit
+                    | Stmt::PrepareTransaction(_)
+                    | Stmt::CommitPrepared(_)
+                    | Stmt::RollbackPrepared(_)
+            )
+            && matches!(&result, Ok(Err(error)) if error.sqlstate == sqlstate::INTERNAL_IO_WAIT
+                || error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT)
+        {
+            self.rollback_txn(txn, guc);
+            cursors.on_rollback();
+            result = Ok(Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "a non-atomic routine cannot suspend during commit admission"
+            )));
+        }
         if matches!(&result, Ok(Err(error)) if
             error.sqlstate == sqlstate::INTERNAL_IO_WAIT
             || error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT)
         {
-            if txn.staged_commit().is_some() {
+            if txn.staged_commit().is_some() || txn.commit_admission().is_some() {
                 sequence_scope.discard(guc.seq_session());
             }
             txn.suspend_statement(
@@ -17868,7 +18125,10 @@ impl Engine {
                 Ok(Ok(()))
             }
             Stmt::Commit => {
-                if !txn.is_explicit() {
+                if !txn.is_explicit()
+                    && txn.staged_commit().is_none()
+                    && txn.commit_admission().is_none()
+                {
                     responder.warning("25P01", "there is no transaction in progress")?;
                 }
                 let tag = if txn.failed { "ROLLBACK" } else { "COMMIT" };
@@ -24450,7 +24710,7 @@ fn apply_wal_op(
                 });
             };
             let revision = storage.reserve_table_definition_revision()?;
-            let _ = storage.drop_fk(index, fk_name, revision);
+            let _ = storage.drop_fk(index, fk_name, revision)?;
         }
         WalOp::UpsertRole {
             name,

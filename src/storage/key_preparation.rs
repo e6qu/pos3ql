@@ -233,9 +233,10 @@ fn validate_row_layout(
 
 pub(super) struct PreparedRowKeys {
     target: TableDefinitionTarget,
+    columns: SharedSlice<ColumnMeta>,
     bindings: SharedSlice<Option<Enforcer>>,
     evaluation_txid: u32,
-    pub(super) hashes: [(usize, u64); MAX_VALUE_ENFORCERS],
+    pub(super) hashes: MutableSlice<(usize, u64)>,
     pub(super) count: usize,
 }
 
@@ -252,6 +253,7 @@ pub(super) struct PreparedCommittedRow {
 #[derive(Debug, Clone)]
 pub(super) struct PreparedRowKeyImage {
     target: TableDefinitionTarget,
+    columns: SharedSlice<ColumnMeta>,
     bindings: SharedSlice<Option<Enforcer>>,
     pub(super) hashes: SharedSlice<(usize, u64)>,
     evaluation_txid: u32,
@@ -265,13 +267,14 @@ impl PreparedRowKeyImage {
         home: Option<VisibleRowHome>,
         transaction: u32,
     ) -> Result<Self, SqlError> {
-        let prepared = PreparedRowKeys::capture(storage, table, rowid, home, transaction)?;
-        let hashes = storage
-            .metadata_pool
-            .copy_slice(&prepared.hashes[..prepared.count])
-            .map_err(|error| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "{}", error))?;
+        let mut prepared = PreparedRowKeys::capture(storage, table, rowid, home, transaction)?;
+        while prepared.hashes.len() > prepared.count {
+            let _ = prepared.hashes.pop();
+        }
+        let hashes = prepared.hashes.freeze();
         Ok(Self {
             target: prepared.target,
+            columns: prepared.columns,
             bindings: prepared.bindings,
             hashes,
             evaluation_txid: prepared.evaluation_txid,
@@ -283,7 +286,32 @@ impl PreparedRowKeyImage {
         storage: &Storage,
         definition: &table_definitions::DefinitionState,
     ) -> Result<(), SqlError> {
-        if self.target.matches_definition(storage, definition) {
+        let same_lifetime = self.target.source.matches(
+            storage,
+            definition.identity.database,
+            definition.identity.created_at,
+            definition.identity.existence,
+        );
+        let promoted = self.target.pending_revision != 0
+            && definition.committed_revision
+                == TableDefinitionRevision::catalog(self.target.pending_revision);
+        // Definition publication precedes row publication. Renames and foreign
+        // key reference moves can also advance dependent definition revisions
+        // without changing their encoded columns or prepared index hashes.
+        let committed_columns = definition.committed().columns();
+        let same_encoding = self.columns.len() == committed_columns.len()
+            && self
+                .columns
+                .iter()
+                .zip(committed_columns)
+                .all(|(selected, current)| {
+                    selected.ctype == current.ctype
+                        && selected.user_type == current.user_type
+                        && selected.type_mod == current.type_mod
+                });
+        if self.target.matches_definition(storage, definition)
+            || (same_lifetime && (promoted || same_encoding))
+        {
             Ok(())
         } else {
             Err(ValueKeyPreparation::changed())
@@ -333,12 +361,24 @@ impl PreparedRowKeys {
             0
         };
         let created_at = definition.identity().created_at;
+        let columns = definition.columns.clone();
         drop(definition);
+        let hash_capacity = if home.is_some() { bindings.len() } else { 0 };
+        let mut hashes = storage
+            .metadata_pool
+            .lease(hash_capacity)
+            .map_err(|error| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "{}", error))?;
+        for _ in 0..hash_capacity {
+            hashes
+                .push_reserved((0usize, 0u64))
+                .expect("reserved binding hash count");
+        }
         let mut result = Self {
             target,
+            columns,
             bindings,
             evaluation_txid,
-            hashes: [(0, 0); MAX_VALUE_ENFORCERS],
+            hashes,
             count: 0,
         };
         let count = result
@@ -1021,6 +1061,15 @@ mod tests {
                     .unwrap(),
                 Some(slot)
             );
+            storage
+                .prepare_index_enforcers(
+                    table,
+                    8,
+                    BindingChange::IndexDrop {
+                        created_at: storage.index(slot).created_at,
+                    },
+                )
+                .unwrap();
             storage.commit_index_drop(slot);
             storage.finish_bindings(table, 8);
             let current = storage.tables[table].enforcers();
@@ -1101,7 +1150,8 @@ mod tests {
                 .visible_row_home_at(table, 1, state, 0, SNAPSHOT_ALL, 7)
                 .unwrap()
                 .unwrap();
-            let (target, mut definition) = storage.select_table_definition(table, 8);
+            let (target, selected_definition) = storage.select_table_definition(table, 8);
+            let mut definition = TableDefBuilder::from_definition(&selected_definition);
             definition.columns[0].ctype = ColType::Int8;
             let mut mapping = [None; MAX_COLUMNS];
             mapping[0] = Some(definition.columns[0].name);
@@ -1137,7 +1187,8 @@ mod tests {
             let created_at = storage.index(slot).created_at;
             let selection = ValueKeyPreparation::capture(&storage, table, 0).unwrap();
             assert!(selection.index(&storage, created_at).is_ok());
-            let (target, mut definition) = storage.select_table_definition(table, 8);
+            let (target, selected_definition) = storage.select_table_definition(table, 8);
+            let mut definition = TableDefBuilder::from_definition(&selected_definition);
             definition.name = SqlName::parse("renamed_orders").unwrap();
             let mut mapping = [None; MAX_COLUMNS];
             mapping[0] = Some(definition.columns[0].name);

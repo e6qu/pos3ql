@@ -73,6 +73,7 @@ pub(crate) use type_edits::{
 mod domain_validation;
 mod relation_identities;
 pub(crate) use relation_identities::{MAX_RELATION_GENERATION, RelationIdentity};
+mod definition_dependencies;
 mod table_creation;
 mod table_definitions;
 mod table_edits;
@@ -1935,25 +1936,36 @@ impl ForeignKey {
 }
 
 pub(crate) trait DefinitionBacking: Clone + core::fmt::Debug {
-    type Slice<T: Copy + core::fmt::Debug, const N: usize>: AsRef<[T]> + Clone + core::fmt::Debug;
+    type Slice<T: Copy + core::fmt::Debug + 'static, const N: usize>: AsRef<[T]>
+        + Clone
+        + core::fmt::Debug;
 }
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct InlineDefinition;
 
 impl DefinitionBacking for InlineDefinition {
-    type Slice<T: Copy + core::fmt::Debug, const N: usize> = [T; N];
+    type Slice<T: Copy + core::fmt::Debug + 'static, const N: usize> = [T; N];
 }
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct StoredDefinition;
 
 impl DefinitionBacking for StoredDefinition {
-    type Slice<T: Copy + core::fmt::Debug, const N: usize> = crate::mem::lease_pool::SharedSlice<T>;
+    type Slice<T: Copy + core::fmt::Debug + 'static, const N: usize> =
+        crate::mem::lease_pool::SharedSlice<T>;
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BorrowedDefinition<'a>(core::marker::PhantomData<&'a ()>);
+
+impl<'a> DefinitionBacking for BorrowedDefinition<'a> {
+    type Slice<T: Copy + core::fmt::Debug + 'static, const N: usize> = &'a [T];
 }
 
 pub(crate) type TableDef = TableDefinition<StoredDefinition>;
 pub(crate) type TableDefBuilder = TableDefinition<InlineDefinition>;
+pub(crate) type TableDefView<'a> = TableDefinition<BorrowedDefinition<'a>>;
 
 #[derive(Debug, Clone)]
 pub(crate) struct TableDefinition<B: DefinitionBacking> {
@@ -2006,6 +2018,7 @@ pub(crate) struct TableDefinition<B: DefinitionBacking> {
 }
 
 impl Copy for TableDefinition<InlineDefinition> {}
+impl Copy for TableDefinition<BorrowedDefinition<'_>> {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TableStorageOptions {
@@ -2374,6 +2387,46 @@ pub(crate) const MAX_PARTITION_KEYS: usize = 32;
 pub(crate) const MAX_PARTITION_LIST_VALUES: usize = MAX_DEFINITION_ITEMS;
 
 impl<B: DefinitionBacking> TableDefinition<B> {
+    pub(crate) fn borrowed(&self) -> TableDefView<'_> {
+        TableDefinition {
+            schema: self.schema,
+            name: self.name,
+            kind: self.kind,
+            persistence: self.persistence,
+            on_commit: self.on_commit,
+            access_method: self.access_method,
+            storage_options: self.storage_options,
+            tablespace: self.tablespace,
+            n_columns: self.n_columns,
+            not_null_name_edits: self.not_null_name_edits,
+            n_uniques: self.n_uniques,
+            n_checks: self.n_checks,
+            n_fkeys: self.n_fkeys,
+            n_exclusions: self.n_exclusions,
+            has_toast: self.has_toast,
+            has_rules: self.has_rules,
+            row_level_security: self.row_level_security,
+            replica_identity: self.replica_identity,
+            inheritance: self.inheritance,
+            type_membership: self.type_membership,
+            partition: self.partition,
+            columns: &self.columns.as_ref()[..self.n_columns],
+            not_null_names: &self.not_null_names.as_ref()[..self.n_columns],
+            not_null_identities: &self.not_null_identities.as_ref()
+                [..usize::from(self.attributes.count)],
+            inline_index_identities: &self.inline_index_identities.as_ref()
+                [..usize::from(self.attributes.count)],
+            uniques: &self.uniques.as_ref()[..self.n_uniques],
+            checks: &self.checks.as_ref()[..self.n_checks],
+            fkeys: &self.fkeys.as_ref()[..self.n_fkeys],
+            exclusions: &self.exclusions.as_ref()[..self.n_exclusions],
+            attributes: column_attributes::ColumnAttributes {
+                count: self.attributes.count,
+                slots: &self.attributes.slots.as_ref()[..usize::from(self.attributes.count)],
+            },
+        }
+    }
+
     pub(crate) fn attribute_number(&self, column: usize) -> u16 {
         self.attributes
             .number(column)
@@ -2603,6 +2656,43 @@ impl TableDef {
             fkeys: crate::mem::lease_pool::SharedSlice::EMPTY,
             n_fkeys: 0,
             exclusions: crate::mem::lease_pool::SharedSlice::EMPTY,
+            n_exclusions: 0,
+            has_toast: false,
+            has_rules: false,
+            row_level_security: RowLevelSecurityState::DISABLED,
+            replica_identity: ReplicaIdentityMode::DEFAULT,
+            inheritance: TableInheritance::NONE,
+            type_membership: TableTypeMembership::NONE,
+            partition: PartitionDef::NONE,
+        }
+    }
+}
+impl TableDefView<'_> {
+    /// An unused control slot owns no metadata payload.
+    pub const fn empty() -> Self {
+        Self {
+            schema: SqlName::EMPTY,
+            name: SqlName::EMPTY,
+            kind: TableKind::Local,
+            persistence: RelationPersistence::Permanent,
+            on_commit: OnCommitAction::PreserveRows,
+            access_method: TableAccessMethod::Heap,
+            storage_options: TableStorageOptions::DEFAULT,
+            tablespace: 0,
+            columns: &[],
+            n_columns: 0,
+            not_null_names: &[],
+            not_null_name_edits: ColumnSet::EMPTY,
+            not_null_identities: &[],
+            attributes: column_attributes::ColumnAttributes::<BorrowedDefinition<'_>>::EMPTY,
+            inline_index_identities: &[],
+            uniques: &[],
+            n_uniques: 0,
+            checks: &[],
+            n_checks: 0,
+            fkeys: &[],
+            n_fkeys: 0,
+            exclusions: &[],
             n_exclusions: 0,
             has_toast: false,
             has_rules: false,
@@ -3124,14 +3214,9 @@ impl TableStatistics {
     };
 }
 
-/// The most value indexes one table can carry: one per distinct indexed
-/// column tuple, whether introduced by a constraint or a named index.
-/// Exceeding it at DDL is a loud error.
-/// A table may require one value binding for every inline UNIQUE column,
-/// table-level UNIQUE constraint, and exclusion constraint. Named indexes
-/// share identical tuples and draw from the separately configured global
-/// value-index pool. This roster must never become a narrower constraint
-/// boundary than the table definition it accelerates and enforces.
+/// The implicit index identities addressable by one table's inline, UNIQUE,
+/// and exclusion constraints. Named value bindings use the configured shared
+/// cache and metadata pools rather than this catalog OID envelope.
 pub(crate) const MAX_VALUE_ENFORCERS: usize = MAX_RELATION_COLUMNS + MAX_UNIQUES + MAX_EXCLUSIONS;
 
 /// Extended-statistics objects and their computed values are startup-bounded.
@@ -4151,6 +4236,12 @@ pub(crate) enum BindingChange {
     TableDefinition { revision: u64 },
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum IndexBindingOperation {
+    Create,
+    Drop,
+}
+
 struct BindingVersion {
     change: BindingChange,
     transaction: u32,
@@ -4192,12 +4283,6 @@ impl core::ops::Deref for Enforcer {
     type Target = EnforcerMetadata;
     fn deref(&self) -> &Self::Target {
         &self.metadata
-    }
-}
-
-impl core::ops::DerefMut for Enforcer {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.metadata
     }
 }
 
@@ -4290,7 +4375,9 @@ impl CatalogDdlState {
 }
 
 fn catalog_transaction_capacity(config: &Config) -> usize {
-    config.max_connections as usize + config.max_prepared_transactions + config.max_subscriptions
+    (config.max_connections as usize)
+        .saturating_add(config.max_prepared_transactions)
+        .saturating_add(config.max_subscriptions)
 }
 
 /// A pending-image pool cannot need more than every eligible object retaining
@@ -4542,6 +4629,7 @@ impl Table {
         let state = self.definition.read();
         state.identity.existence == CatalogDdlState::Absent
             && state.pending.is_none()
+            && state.publication_owner().is_none()
             && self.rows.is_empty()
     }
 }
@@ -7943,6 +8031,13 @@ struct TypeCatalog {
     enums: FixedVec<EnumDef>,
     pending_enum_members: FixedVec<PendingEnumMemberSlot>,
     composites: FixedVec<CompositeDef>,
+    publication_claims: FixedVec<Option<TypePublicationClaim>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TypePublicationClaim {
+    source: type_references::TypeIdentity,
+    transaction: u32,
 }
 
 #[derive(Debug)]
@@ -10874,11 +10969,11 @@ pub struct SequenceOwner {
     pub column: SqlName,
 }
 
-pub(crate) fn rebind_sequence_column(
+pub(crate) fn rebind_sequence_column<Old: DefinitionBacking, New: DefinitionBacking>(
     link: Option<SequenceOwner>,
-    old: &TableDef,
-    new: &TableDef,
-    column_mapping: &[Option<SqlName>; MAX_COLUMNS],
+    old: &TableDefinition<Old>,
+    new: &TableDefinition<New>,
+    column_mapping: &[Option<SqlName>],
     require_generator: bool,
 ) -> Option<SequenceOwner> {
     let mut link = link?;
@@ -14967,7 +15062,7 @@ impl<T> ViewRuleIter<'_, T> {
     }
 }
 
-impl<T: Copy> Iterator for ViewRuleIter<'_, T> {
+impl<T: Clone> Iterator for ViewRuleIter<'_, T> {
     type Item = (usize, T);
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -14980,7 +15075,7 @@ impl<T: Copy> Iterator for ViewRuleIter<'_, T> {
             let slot = self.next_slot;
             self.next_slot += 1;
             if (self.accept)(definition, self.txid) {
-                return Some((slot, *definition));
+                return Some((slot, definition.clone()));
             }
         }
         None
@@ -16804,7 +16899,7 @@ fn rename_column_default_schema(
 }
 
 fn rename_table_sql_identity(
-    definition: &mut TableDef,
+    definition: &mut TableDefBuilder,
     old: SqlName,
     new: SqlName,
     arena: &crate::mem::arena::Arena,
@@ -19970,6 +20065,11 @@ impl Storage {
             row_ownership::HeapRowOwnership::budget_bytes(config),
             type_reference_moves::DefinitionPublication::budget_bytes(config),
             type_edits::TypeRevisions::budget_bytes(config),
+            config
+                .max_domains
+                .saturating_add(config.max_enums)
+                .saturating_add(config.max_composites)
+                .saturating_mul(size_of::<Option<TypePublicationClaim>>()),
             type_identities::TypeIdentityIndex::budget_bytes(
                 config.max_domains,
                 config.max_enums,
@@ -20289,7 +20389,7 @@ impl Storage {
         let large_object_page_table = config.max_tables as u32;
         {
             let table = &mut tables[large_object_page_table as usize];
-            let mut definition = TableDef::empty();
+            let mut definition = TableDefBuilder::empty();
             definition.schema =
                 SqlName::parse(INTERNAL_LARGE_OBJECT_SCHEMA).expect("internal schema name fits");
             definition.name =
@@ -20314,6 +20414,9 @@ impl Storage {
                 .initialize(definition.n_columns)
                 .expect("internal column attributes fit");
             constraint_names::table(&mut definition).expect("internal NOT NULL names are valid");
+            let definition = definition
+                .freeze(&metadata_pool)
+                .map_err(StorageSetupError::Metadata)?;
             let mut state = table.definition.write();
             let mut identity = state.identity;
             identity.existence = CatalogDdlState::Present;
@@ -21103,6 +21206,14 @@ impl Storage {
                 enums,
                 pending_enum_members,
                 composites,
+                publication_claims: FixedVec::new(
+                    budget,
+                    "type publication claims",
+                    config
+                        .max_domains
+                        .saturating_add(config.max_enums)
+                        .saturating_add(config.max_composites),
+                )?,
             }),
             type_definition_images,
             enum_members_per_image,
@@ -22653,7 +22764,8 @@ impl Storage {
                         "template database has uncommitted relation state"
                     ));
                 }
-                let mut definition = *self.tables[source_slot].definition();
+                let mut definition =
+                    TableDefBuilder::from_definition(&self.tables[source_slot].definition());
                 for column in definition.columns.iter_mut().take(definition.n_columns) {
                     if let Collation::Catalog(selected) = column.collation {
                         self.collation_definition(selected, txid)?;
@@ -23223,7 +23335,8 @@ impl Storage {
                 {
                     continue;
                 }
-                let source_table = *self.tables[usize::from(definition.table)].definition();
+                let source_table =
+                    (*self.tables[usize::from(definition.table)].definition()).clone();
                 definition.table = self
                     .find_visible(
                         source_table.schema.as_str(),
@@ -23278,7 +23391,8 @@ impl Storage {
                 }
                 definition.target = match definition.target {
                     TriggerTarget::Table(source_table) => {
-                        let source_table = *self.tables[usize::from(source_table)].definition();
+                        let source_table =
+                            (*self.tables[usize::from(source_table)].definition()).clone();
                         TriggerTarget::Table(
                             self.find_visible(
                                 source_table.schema.as_str(),
@@ -23353,7 +23467,8 @@ impl Storage {
                 {
                     continue;
                 }
-                let source_table = *self.tables[usize::from(definition.table)].definition();
+                let source_table =
+                    (*self.tables[usize::from(definition.table)].definition()).clone();
                 definition.table = self
                     .find_visible(
                         source_table.schema.as_str(),
@@ -30530,21 +30645,57 @@ impl Storage {
                 }
             }
         }
+        let eligible_tables = self
+            .tables
+            .iter()
+            .filter(|table| {
+                table.database() == current_database()
+                    && table.existence() != CatalogDdlState::Absent
+            })
+            .count();
+        let mut table_renames = self
+            .metadata_pool
+            .lease(eligible_tables)
+            .map_err(|error| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "{}", error))?;
         for table_slot in 0..self.tables.len() {
             let table = &self.tables[table_slot];
-            if table.database() != current_database()
-                || (table.existence() == CatalogDdlState::Absent)
+            let state = table.definition.read();
+            if state.identity.database != current_database()
+                || state.identity.existence == CatalogDdlState::Absent
             {
                 continue;
             }
-            let mut definition = *table.definition();
-            rename_table_sql_identity(&mut definition, prior, name, arena)?;
-            self.pending_table_defs.validate_schema_rename(
-                &table.definition,
-                prior,
-                name,
-                arena,
+            let source = self.catalog_object_identity(
+                catalog_sources::CatalogObjectSlot::Table(table_slot),
+                state.identity.database,
+                state.identity.created_at,
+            );
+            let replacement = self.pending_table_defs.prepare_replacements_locked(
+                &state,
+                source,
+                &self.metadata_pool,
+                |definition| {
+                    let mut changed = TableDefBuilder::from_definition(definition);
+                    let mut renamed = rename_schema_name(&mut changed.schema, prior, name);
+                    for column in changed.columns.iter_mut().take(changed.n_columns) {
+                        renamed |= rename_user_type_schema(&mut column.user_type, prior, name);
+                    }
+                    for key in changed.fkeys.iter_mut().take(changed.n_fkeys) {
+                        renamed |= rename_schema_name(&mut key.parent_schema, prior, name);
+                    }
+                    renamed |= rename_table_sql_identity(&mut changed, prior, name, arena)?;
+                    if renamed {
+                        Ok(Some(changed.freeze(&self.metadata_pool)?))
+                    } else {
+                        Ok(None)
+                    }
+                },
             )?;
+            if replacement.changed() {
+                table_renames
+                    .push_reserved((table_slot, source, replacement))
+                    .map_err(|error| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "{}", error))?;
+            }
         }
         for (_, definition) in (DomainIter {
             catalog: &self.type_catalog,
@@ -30612,28 +30763,17 @@ impl Storage {
         schemas[slot].name = name;
         drop(schemas);
 
-        for table_slot in 0..self.tables.len() {
-            if self.tables[table_slot].database() != current_database() {
-                continue;
-            }
-            let table = &mut self.tables[table_slot];
-            if table.existence() == CatalogDdlState::Absent {
-                continue;
-            }
-            rename_schema_name(&mut table.definition_mut(revision).schema, prior, name);
-            let mut definition_owner = table.definition_mut(revision);
-            let definition = &mut *definition_owner;
-            for column in definition.columns.iter_mut().take(definition.n_columns) {
-                rename_user_type_schema(&mut column.user_type, prior, name);
-            }
-            for key in definition.fkeys.iter_mut().take(definition.n_fkeys) {
-                rename_schema_name(&mut key.parent_schema, prior, name);
-            }
-            drop(definition_owner);
-            rename_table_sql_identity(&mut table.definition_mut(revision), prior, name, arena)?;
+        while let Some((table_slot, source, replacement)) = table_renames.pop() {
+            let table = &self.tables[table_slot];
+            let mut state = table.definition.write();
+            self.pending_table_defs.apply_replacements_locked(
+                &mut state,
+                source,
+                replacement,
+                revision,
+            );
+            drop(state);
             table.mark_dirty();
-            self.pending_table_defs
-                .rename_schema(&mut table.definition, prior, name, arena)?;
         }
 
         {
@@ -34787,7 +34927,7 @@ impl Storage {
         parent: usize,
         child: usize,
         bound: PartitionBound,
-        row: PartitionRow<'_, '_>,
+        row: PartitionRow<'_, '_, StoredDefinition>,
         txid: u32,
     ) -> Result<bool, SqlError> {
         let keys = {
@@ -35617,7 +35757,7 @@ impl Storage {
         table_index: usize,
         rowid: u64,
         home: impl Into<RowByteRead>,
-        out: &mut [(usize, u64); MAX_VALUE_ENFORCERS],
+        out: &mut [(usize, u64)],
     ) -> Result<usize, SqlError> {
         let selection = key_preparation::ValueKeyPreparation::capture(self, table_index, 0)?;
         let bindings = self.tables[table_index].enforcers();
@@ -35642,7 +35782,7 @@ impl Storage {
         home: impl Into<RowByteRead>,
         selection: &key_preparation::ValueKeyPreparation,
         bindings: EnforcerBindings<'_>,
-        out: &mut [(usize, u64); MAX_VALUE_ENFORCERS],
+        out: &mut [(usize, u64)],
     ) -> Result<usize, SqlError> {
         let mut schema = [ColType::Bool; MAX_COLUMNS];
         let n_columns = selection.definition().schema(&mut schema);
@@ -35670,7 +35810,7 @@ impl Storage {
         selection: &key_preparation::ValueKeyPreparation,
         bindings: EnforcerBindings<'_>,
         values: &[Datum],
-        out: &mut [(usize, u64); MAX_VALUE_ENFORCERS],
+        out: &mut [(usize, u64)],
     ) -> Result<usize, SqlError> {
         let mut n_out = 0;
         for (binding, selected) in bindings.iter().enumerate() {
@@ -37482,9 +37622,15 @@ impl Storage {
                 .map_err(|error| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "{}", error))?;
         }
         if candidate.transaction == 0 {
-            self.tables[table]
+            if let Err(error) = self.tables[table]
                 .statistics
-                .set_index_hint(created_at, true, true)?;
+                .set_index_hint(created_at, true, true)
+            {
+                if publication.binding_versions.is_empty() {
+                    publication.binding_versions.clear();
+                }
+                return Err(error);
+            }
         }
         let bindings = core::mem::replace(&mut publication.enforcers, candidate.bindings.freeze());
         let state = core::mem::replace(&mut publication.enforcer_state, candidate.state);
@@ -37549,6 +37695,133 @@ impl Storage {
             },
             Some(BindingChange::TableDefinition { revision }),
         )
+    }
+
+    /// Completes the binding root only after the selected shape's rows exist.
+    pub(crate) fn prepare_table_definition_enforcers(
+        &self,
+        target: TableDefinitionTarget,
+    ) -> Result<(), SqlError> {
+        let table = self.tables.get(target.table()).ok_or_else(|| {
+            sql_err!(
+                sqlstate::SERIALIZATION_FAILURE,
+                "table binding source no longer exists"
+            )
+        })?;
+        let rewritten = {
+            let state = table.definition.read();
+            if !target.matches_definition(self, &state) {
+                return Err(sql_err!(
+                    sqlstate::SERIALIZATION_FAILURE,
+                    "table definition changed before binding preparation"
+                ));
+            }
+            if state.identity.existence.pending_drop_txid() == Some(target.transaction) {
+                return Ok(());
+            }
+            let pending = self
+                .pending_table_defs
+                .latest_locked(&state)
+                .filter(|version| {
+                    version.txid == target.transaction
+                        && version.revision == target.pending_revision
+                })
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::SERIALIZATION_FAILURE,
+                        "selected table definition has no pending binding source"
+                    )
+                })?;
+            pending.rewrites_rows
+        };
+        self.prepare_table_enforcers(
+            target.table(),
+            target.transaction,
+            target.pending_revision,
+            rewritten,
+        )
+    }
+
+    /// Recovered prepared DDL admits roots from its retained index lifetime,
+    /// including a pending drop whose entry is hidden from ordinary queries.
+    pub(crate) fn prepare_index_definition_enforcers(
+        &mut self,
+        slot: usize,
+        transaction: u32,
+        operation: IndexBindingOperation,
+    ) -> Result<(), SqlError> {
+        let index = self.index_catalog().get(slot).copied().ok_or_else(|| {
+            sql_err!(
+                sqlstate::SERIALIZATION_FAILURE,
+                "index binding source no longer exists"
+            )
+        })?;
+        let owned = match operation {
+            IndexBindingOperation::Create => matches!(index.ddl_state,
+                CatalogDdlState::PendingCreate { txid } | CatalogDdlState::PendingCreateDrop { txid }
+                    if txid == transaction),
+            IndexBindingOperation::Drop => index.ddl_state.pending_drop_txid() == Some(transaction),
+        };
+        if index.database != current_database() || !owned || index.created_at == 0 {
+            return Err(sql_err!(
+                sqlstate::SERIALIZATION_FAILURE,
+                "index binding preparation belongs to a different source or transaction"
+            ));
+        }
+        let binding = index.table_binding.ok_or_else(|| {
+            sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "pending index has no retained table binding"
+            )
+        })?;
+        let catalog_sources::CatalogObjectSlot::Table(table) = binding.source.slot() else {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "pending index binding is not a table source"
+            ));
+        };
+        {
+            let owner = self
+                .tables
+                .get(table)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::SERIALIZATION_FAILURE,
+                        "index table binding source no longer exists"
+                    )
+                })?
+                .definition
+                .read();
+            if !binding.source.matches_lifetime(
+                self,
+                owner.identity.database,
+                owner.identity.created_at,
+                owner.identity.existence,
+            ) {
+                return Err(sql_err!(
+                    sqlstate::SERIALIZATION_FAILURE,
+                    "index table binding belongs to a different table lifetime"
+                ));
+            }
+            if owner.identity.existence.pending_drop_txid() == Some(transaction) {
+                return Ok(());
+            }
+            if !owner.identity.existence.visible_to(transaction) {
+                return Err(sql_err!(
+                    sqlstate::SERIALIZATION_FAILURE,
+                    "index table binding is not visible to its transaction"
+                ));
+            }
+        }
+        let change = match operation {
+            IndexBindingOperation::Create => BindingChange::IndexCreate {
+                created_at: index.created_at,
+            },
+            IndexBindingOperation::Drop => BindingChange::IndexDrop {
+                created_at: index.created_at,
+            },
+        };
+        self.prepare_index_enforcers(table, transaction, change)
     }
 
     pub(crate) fn rollback_table_enforcers(&self, table: usize, transaction: u32, revision: u64) {
@@ -37819,8 +38092,7 @@ impl Storage {
                         && !index.mutable_for(txid.unwrap_or(0)).kind.is_partitioned()
                 })
                 .count(),
-            )
-            .min(MAX_VALUE_ENFORCERS);
+            );
         let mut want = self
             .metadata_pool
             .lease(wanted_capacity)
@@ -37832,16 +38104,15 @@ impl Storage {
         let mut n_want = 0usize;
         let too_many = || {
             sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "a table can have at most {} distinct value-indexed column tuples",
-                MAX_VALUE_ENFORCERS
+                sqlstate::SERIALIZATION_FAILURE,
+                "index set changed while binding metadata was being prepared"
             )
         };
         {
             let def = selection.definition();
             for (i, col) in def.columns().iter().enumerate() {
                 if col.unique {
-                    if n_want == MAX_VALUE_ENFORCERS || n_want == want.len() {
+                    if n_want == want.len() {
                         return Err(too_many());
                     }
                     want[n_want].columns[0] = i as u16;
@@ -37853,7 +38124,7 @@ impl Storage {
                 }
             }
             for uk in def.uniques() {
-                if n_want == MAX_VALUE_ENFORCERS || n_want == want.len() {
+                if n_want == want.len() {
                     return Err(too_many());
                 }
                 let cols = uk.columns();
@@ -37931,7 +38202,7 @@ impl Storage {
                 cached.dependency_mask |= include_mask;
                 continue;
             }
-            if n_want == MAX_VALUE_ENFORCERS || n_want == want.len() {
+            if n_want == want.len() {
                 return Err(too_many());
             }
             want[n_want].columns[..columns.len()].copy_from_slice(columns);
@@ -38017,9 +38288,24 @@ impl Storage {
                 })
                 .expect("reserved binding state count");
         }
-        let mut populate = [true; MAX_VALUE_ENFORCERS];
+        let mut populate = self
+            .metadata_pool
+            .lease(n_want)
+            .map_err(|error| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "{}", error))?;
+        for _ in 0..n_want {
+            populate
+                .push_reserved(true)
+                .expect("reserved binding population count");
+        }
         if matches!(rows, key_preparation::EnforcerRows::ReusePrepared) {
-            let mut used = [false; MAX_VALUE_ENFORCERS];
+            let mut used = self
+                .metadata_pool
+                .lease(n_published)
+                .map_err(|error| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "{}", error))?;
+            for _ in 0..n_published {
+                used.push_reserved(false)
+                    .expect("reserved prior binding count");
+            }
             let mut count = 0;
             for (position, wanted) in want[..n_want].iter().enumerate() {
                 let Some((slot, enforcer)) =
@@ -38071,6 +38357,11 @@ impl Storage {
                         "table changed while its prepared index caches were being finalized"
                     ));
                 }
+                drop(used);
+                drop(populate);
+                drop(want);
+                drop(prior_metadata);
+                drop(published);
                 return self.install_binding_candidate(
                     table_index,
                     definition.identity.created_at,
@@ -38139,6 +38430,9 @@ impl Storage {
                 evaluation_txid: txid.unwrap_or(0),
             },
         )?;
+        drop(fresh);
+        drop(populate);
+        drop(want);
         let (definition, mut publication) = row_ownership::acquire(|| {
             Ok((
                 self.tables[table_index].definition.try_read_for_batch()?,
@@ -38165,6 +38459,8 @@ impl Storage {
                 "table changed while its value caches were being built"
             ));
         }
+        drop(prior_metadata);
+        drop(published);
         self.install_binding_candidate(
             table_index,
             definition.identity.created_at,
@@ -38196,7 +38492,14 @@ impl Storage {
             binding.cache.write().publish_at(boundary);
         }
         let mut incomplete = false;
-        let mut buf = [(0usize, 0u64); MAX_VALUE_ENFORCERS];
+        let mut buf = self
+            .metadata_pool
+            .lease(bindings.len())
+            .map_err(|error| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "{}", error))?;
+        for _ in 0..bindings.len() {
+            buf.push_reserved((0usize, 0u64))
+                .expect("reserved binding hash count");
+        }
         let mut insert_hashes = |rowid: u64, lsn: u64, hashes: &[(usize, u64)]| {
             for &(binding, hash) in hashes {
                 let mut index = bindings[binding]
@@ -39044,7 +39347,7 @@ impl Storage {
     }
 
     pub(crate) fn view(&self, slot: usize) -> ViewDef {
-        self.view_rule_catalog().views[slot]
+        self.view_rule_catalog().views[slot].clone()
     }
 
     pub(crate) fn view_slot_visible_to(&self, slot: usize, txid: u32) -> bool {
@@ -41217,7 +41520,7 @@ impl Storage {
                     && v.schema_for(txid).as_str() == schema
                     && v.name_for(txid).as_str() == name
             })
-            .copied()
+            .cloned()
     }
 
     // --- Materialized-view catalog (parallel to views; data lives in a
@@ -41991,11 +42294,14 @@ impl Storage {
         let created_at = creation.stamp(&self.catalog_sequence, u64::MAX, "domain")?;
         let (mut permissions, mut catalog) = self.type_creation_catalogs();
         if !defer_manifest_binding {
-            catalog.bind_domain_spec(&mut spec, txid)?;
+            catalog.bind_domain_spec(self, &mut spec, txid)?;
         }
         self.require_named_type_name(&catalog, schema, name, txid, None)?;
         let Some(new) = catalog.domains.iter().enumerate().position(|(slot, d)| {
             d.ddl_state == CatalogDdlState::Absent
+                && catalog
+                    .definition_publication_owner(NamedTypeSlot::Domain(slot))
+                    .is_none()
                 && !self
                     .type_definition_images
                     .retains(NamedTypeSlot::Domain(slot))
@@ -42203,8 +42509,9 @@ impl Storage {
             {
                 continue;
             }
-            let mut definition = *self.tables[table].definition();
+            let mut definition = TableDefBuilder::from_definition(&self.tables[table].definition());
             self.bind_user_type_columns_to(&mut definition, txid)?;
+            let definition = definition.freeze(&self.metadata_pool)?;
             *self.tables[table].definition_mut(revision) = definition;
         }
         for composite in 0..self.composite_count() {
@@ -42280,7 +42587,7 @@ impl Storage {
             return Err(self.catalog_ddl_wait_error(txid, owner, name.as_str()));
         }
         catalog.validate_type_edit(target, txid)?;
-        catalog.bind_domain_spec(&mut spec, txid)?;
+        catalog.bind_domain_spec(self, &mut spec, txid)?;
         let version = catalog.versions.next()?;
         let origin = catalog.origin;
         let domain = &mut catalog.domains[slot];
@@ -42803,6 +43110,9 @@ impl Storage {
         self.require_named_type_name(&catalog, schema, name, txid, None)?;
         let Some(new) = catalog.enums.iter().enumerate().position(|(slot, e)| {
             e.ddl_state == CatalogDdlState::Absent
+                && catalog
+                    .definition_publication_owner(NamedTypeSlot::Enum(slot))
+                    .is_none()
                 && !self
                     .type_definition_images
                     .retains(NamedTypeSlot::Enum(slot))
@@ -43351,7 +43661,7 @@ impl Storage {
             return Err(self.catalog_ddl_wait_error(txid, owner, name.as_str()));
         }
         catalog.validate_type_edit(target, txid)?;
-        catalog.bind_composite_fields(&mut definition.fields[..definition.n_fields], txid)?;
+        catalog.bind_composite_fields(self, &mut definition.fields[..definition.n_fields], txid)?;
         self.require_named_type_name(
             &catalog,
             definition.schema,
@@ -43519,7 +43829,7 @@ impl Storage {
             creation.stamp(&self.catalog_sequence, MAX_RELATION_GENERATION, "relation")?;
         let (mut permissions, mut catalog) = self.type_creation_catalogs();
         if !defer_manifest_binding {
-            catalog.bind_composite_fields(&mut spec.fields[..spec.n_fields], txid)?;
+            catalog.bind_composite_fields(self, &mut spec.fields[..spec.n_fields], txid)?;
         }
         self.require_named_type_name(&catalog, schema, name, txid, None)?;
         let Some(slot) = catalog
@@ -43528,6 +43838,9 @@ impl Storage {
             .enumerate()
             .position(|(slot, definition)| {
                 definition.ddl_state == CatalogDdlState::Absent
+                    && catalog
+                        .definition_publication_owner(NamedTypeSlot::Composite(slot))
+                        .is_none()
                     && !self
                         .type_definition_images
                         .retains(NamedTypeSlot::Composite(slot))
@@ -43598,9 +43911,12 @@ impl Storage {
         let created_at =
             creation.stamp(&self.catalog_sequence, MAX_RELATION_GENERATION, "relation")?;
         let (mut permissions, mut catalog) = self.type_creation_catalogs();
-        catalog.bind_composite_fields(&mut spec.fields[..spec.n_fields], txid)?;
+        catalog.bind_composite_fields(self, &mut spec.fields[..spec.n_fields], txid)?;
         if slot >= catalog.composites.len()
             || catalog.composites[slot].ddl_state != CatalogDdlState::Absent
+            || catalog
+                .definition_publication_owner(NamedTypeSlot::Composite(slot))
+                .is_some()
             || self
                 .type_definition_images
                 .retains(NamedTypeSlot::Composite(slot))
@@ -48454,20 +48770,6 @@ impl Storage {
             return Err(self.catalog_ddl_wait_error(txid, owner, name));
         }
         catalog[i].ddl_state = catalog[i].ddl_state.drop_by(txid);
-        let index = catalog[i];
-        drop(catalog);
-        if let Some(table) = self.index_binding_table(index, txid) {
-            if let Err(error) = self.prepare_index_enforcers(
-                table,
-                txid,
-                BindingChange::IndexDrop {
-                    created_at: index.created_at,
-                },
-            ) {
-                self.rollback_index_drop(i, txid);
-                return Err(error);
-            }
-        }
         Ok(Some(i))
     }
 
@@ -49432,7 +49734,7 @@ impl Storage {
         revision: TableDefinitionRevision,
     ) -> Result<(), SqlError> {
         let state = self.tables[index].definition.read();
-        let mut definition = *state.committed();
+        let mut definition = state.committed().clone();
         let source = self.catalog_object_identity(
             catalog_sources::CatalogObjectSlot::Table(index),
             state.identity.database,
@@ -49466,26 +49768,39 @@ impl Storage {
         Ok(())
     }
 
-    /// Removes one foreign key from a table's definition by constraint name
-    /// (DROP SCHEMA CASCADE severing an inbound reference), returning it for
-    /// transactional undo.
+    /// Replays removal of an inbound foreign key after reserving its replacement.
     pub(crate) fn drop_fk(
         &mut self,
         index: usize,
         fk_name: &str,
         revision: TableDefinitionRevision,
-    ) -> Option<ForeignKey> {
-        let mut definition_owner = self.tables[index].definition_mut(revision);
-        let def = &mut *definition_owner;
-        let at = (0..def.n_fkeys).find(|&f| def.fkeys[f].name.as_str() == fk_name)?;
-        let removed = def.fkeys[at];
-        for f in at..def.n_fkeys - 1 {
-            def.fkeys[f] = def.fkeys[f + 1];
+    ) -> Result<Option<ForeignKey>, SqlError> {
+        let definition = self.tables[index].definition();
+        let Some(at) =
+            (0..definition.n_fkeys).find(|&f| definition.fkeys[f].name.as_str() == fk_name)
+        else {
+            return Ok(None);
+        };
+        let removed = definition.fkeys[at];
+        let count = definition.n_fkeys - 1;
+        let mut replacement = self
+            .metadata_pool
+            .lease(count)
+            .map_err(|error| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "{}", error))?;
+        for (column, key) in definition.fkeys().iter().enumerate() {
+            if column != at {
+                replacement
+                    .push_reserved(*key)
+                    .map_err(|error| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "{}", error))?;
+            }
         }
-        def.n_fkeys -= 1;
-        drop(definition_owner);
+        drop(definition);
+        let mut definition = self.tables[index].definition_mut(revision);
+        definition.fkeys = replacement.freeze();
+        definition.n_fkeys = count;
+        drop(definition);
         self.tables[index].mark_dirty();
-        Some(removed)
+        Ok(Some(removed))
     }
 
     /// Runtime publication and replay share the same catalog installation.

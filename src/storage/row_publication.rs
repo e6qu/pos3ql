@@ -570,7 +570,7 @@ impl Storage {
         let Some(slot) = state.pending.tail else {
             return;
         };
-        let head = versions.pending_row_versions[slot];
+        let head = &versions.pending_row_versions[slot];
         if head.identity != undo.identity || head.change.txid != txid {
             return;
         }
@@ -615,7 +615,8 @@ mod tests {
         txid: u32,
         name: &str,
     ) -> TableDefinitionChange {
-        let (target, mut definition) = storage.select_table_definition(table, txid);
+        let (target, selected_definition) = storage.select_table_definition(table, txid);
+        let mut definition = TableDefBuilder::from_definition(&selected_definition);
         definition.columns[0].name = SqlName::parse(name).unwrap();
         let mut mapping = [None; MAX_COLUMNS];
         for (column, mapped) in mapping.iter_mut().enumerate().take(definition.n_columns) {

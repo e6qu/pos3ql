@@ -17,6 +17,7 @@ pub(crate) enum StorageSetupError {
     Configuration(crate::config::ConfigError),
     LeasePool(crate::mem::lease_pool::LeaseSetupError),
     ValueIndex(crate::mem::value_index::ValueIndexSetupError),
+    Metadata(SqlError),
     CatalogIdentitySpaceExhausted,
 }
 
@@ -57,6 +58,7 @@ impl std::fmt::Display for StorageSetupError {
             Self::Configuration(error) => write!(formatter, "{error}"),
             Self::LeasePool(error) => write!(formatter, "{error}"),
             Self::ValueIndex(error) => write!(formatter, "{error}"),
+            Self::Metadata(error) => write!(formatter, "{}", error.message.as_str()),
             Self::CatalogIdentitySpaceExhausted => {
                 formatter.write_str("catalog reference identity space exhausted")
             }
@@ -71,7 +73,99 @@ impl std::error::Error for StorageSetupError {
             Self::Configuration(error) => Some(error),
             Self::LeasePool(error) => Some(error),
             Self::ValueIndex(error) => Some(error),
+            Self::Metadata(_) => None,
             Self::CatalogIdentitySpaceExhausted => None,
+        }
+    }
+}
+
+impl TypeCatalog {
+    pub(super) fn definition_publication_owner(&self, source: NamedTypeSlot) -> Option<u32> {
+        self.publication_claims
+            .iter()
+            .flatten()
+            .find(|claim| claim.source.slot() == source)
+            .map(|claim| claim.transaction)
+    }
+
+    pub(super) fn require_definition_publication_access(
+        &self,
+        storage: &super::Storage,
+        source: TypeIdentity,
+        transaction: u32,
+    ) -> Result<(), SqlError> {
+        if let Some(owner) = self.definition_publication_owner(source.slot())
+            && owner != transaction
+        {
+            return Err(storage.catalog_ddl_wait_error(transaction, owner, "type metadata"));
+        }
+        Ok(())
+    }
+
+    pub(super) fn claim_definition_publication(
+        &mut self,
+        storage: &super::Storage,
+        transaction: u32,
+        changes: impl Iterator<Item = super::TypeCommitChange> + Clone,
+    ) -> Result<(), SqlError> {
+        let mut needed = 0usize;
+        for (index, change) in changes.clone().enumerate() {
+            let source = change.source();
+            if change.transaction() != transaction || !self.contains_type_source(source) {
+                return Err(sql_err!(
+                    sqlstate::SERIALIZATION_FAILURE,
+                    "type publication source no longer belongs to its transaction"
+                ));
+            }
+            self.require_definition_publication_access(storage, source, transaction)?;
+            if self.definition_publication_owner(source.slot()).is_none()
+                && !changes
+                    .clone()
+                    .take(index)
+                    .any(|prior| prior.source() == source)
+            {
+                needed = needed.checked_add(1).ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "type publication claim count overflow"
+                    )
+                })?;
+            }
+        }
+        let active = self.publication_claims.iter().flatten().count();
+        if needed > self.publication_claims.capacity() - active {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "type publication claims exhausted (capacity {})",
+                self.publication_claims.capacity()
+            ));
+        }
+        // Admission above covers the complete source set before any claim changes.
+        for change in changes {
+            let source = change.source();
+            if self.definition_publication_owner(source.slot()).is_some() {
+                continue;
+            }
+            let claim = Some(super::TypePublicationClaim {
+                source,
+                transaction,
+            });
+            if let Some(index) = self.publication_claims.iter().position(Option::is_none) {
+                self.publication_claims[index] = claim;
+            } else {
+                self.publication_claims
+                    .push(claim)
+                    .expect("complete claim admission reserved a slot");
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn release_definition_publication(&mut self, transaction: u32) {
+        for claim in self.publication_claims.iter_mut() {
+            if claim.is_some_and(|claim| claim.transaction == transaction) {
+                *claim = None;
+            }
         }
     }
 }
@@ -720,6 +814,7 @@ impl TypeCatalog {
 
     pub(super) fn bind_domain_spec(
         &self,
+        storage: &super::Storage,
         spec: &mut super::DomainSpec,
         transaction: u32,
     ) -> Result<(), SqlError> {
@@ -733,6 +828,7 @@ impl TypeCatalog {
                     super::current_database(),
                     transaction,
                 )?;
+                storage.require_type_dependency_access(self, result, transaction)?;
                 spec.base = result.ctype;
                 *identity = result.user_type;
             }
@@ -742,6 +838,7 @@ impl TypeCatalog {
 
     pub(super) fn bind_composite_fields(
         &self,
+        storage: &super::Storage,
         fields: &mut [super::CompositeFieldDef],
         transaction: u32,
     ) -> Result<(), SqlError> {
@@ -754,6 +851,7 @@ impl TypeCatalog {
                 super::current_database(),
                 transaction,
             )?;
+            storage.require_type_dependency_access(self, result, transaction)?;
             field.ctype = result.ctype;
             field.user_type = result.user_type;
         }
@@ -762,7 +860,7 @@ impl TypeCatalog {
 
     pub(super) fn bind_table_definition(
         &self,
-        definition: &mut super::TableDef,
+        definition: &mut super::TableDefBuilder,
         transaction: u32,
     ) -> Result<(), SqlError> {
         for column in definition.columns.iter_mut().take(definition.n_columns) {
@@ -1061,7 +1159,7 @@ impl TypeCatalog {
     }
 }
 
-impl super::TableDef {
+impl<B: super::DefinitionBacking> super::TableDefinition<B> {
     pub(super) fn requires_type_catalog(&self) -> bool {
         self.type_membership != super::TableTypeMembership::None
             || self.columns().iter().any(|column| {
@@ -1244,7 +1342,7 @@ impl super::Storage {
 
     pub(super) fn rebind_template_table_types(
         &self,
-        definition: &mut super::TableDef,
+        definition: &mut super::TableDefBuilder,
         source: DatabaseOid,
         target: DatabaseOid,
         transaction: u32,

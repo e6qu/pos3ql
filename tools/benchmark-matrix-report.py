@@ -66,6 +66,14 @@ def number(value, digits=2):
 
 def load_run(directory):
     environment = json.loads((directory / "environment.json").read_text(encoding="utf-8"))
+    if environment.get("schema_version") != 2:
+        raise SystemExit(f"{directory.name} has an unsupported environment version; expected 2")
+    suite = environment.get("suite")
+    if not isinstance(suite, dict):
+        raise SystemExit(f"{directory.name} is missing its suite identity")
+    for field in SUITE_IDENTITY_FIELDS:
+        if field not in suite:
+            raise SystemExit(f"{directory.name} is missing suite {field}")
     results = {}
     for path in directory.glob("*.json"):
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -105,7 +113,7 @@ def main():
         if environment["pos3ql_binary_sha256"] != reference_environment["pos3ql_binary_sha256"]:
             raise SystemExit(f"{backend} used a different pos3ql binary")
         for field in SUITE_IDENTITY_FIELDS:
-            if environment["suite"].get(field) != reference_suite.get(field):
+            if environment["suite"][field] != reference_suite[field]:
                 raise SystemExit(f"{backend} used a different suite {field}")
 
     pairs = CHECKPOINT_PAIRS if reference_suite["mode"] == "checkpoint" else FULL_PAIRS

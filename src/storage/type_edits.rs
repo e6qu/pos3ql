@@ -11,7 +11,7 @@ use crate::mem::budget::{Budget, BudgetError};
 use crate::sql::eval::{SqlError, sqlstate};
 use crate::sql_err;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TypeEditTarget {
     source: TypeIdentity,
     transaction: u32,
@@ -129,10 +129,26 @@ pub(crate) enum TypeDdlDecision {
     Rollback,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TypeCommitChange {
     Definition(TypeEditTarget),
     Lifecycle(TypeDdlUndo),
+}
+
+impl TypeCommitChange {
+    pub(super) fn source(self) -> TypeIdentity {
+        match self {
+            Self::Definition(target) => target.source,
+            Self::Lifecycle(undo) => undo.source,
+        }
+    }
+
+    pub(super) fn transaction(self) -> u32 {
+        match self {
+            Self::Definition(target) => target.transaction,
+            Self::Lifecycle(undo) => undo.transaction,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -447,6 +463,10 @@ impl super::TypeCatalog {
             .into_iter()
             .flatten()
             .find(|&owner| owner != transaction)
+            .or_else(|| {
+                self.definition_publication_owner(source)
+                    .filter(|&owner| owner != transaction)
+            })
     }
 }
 

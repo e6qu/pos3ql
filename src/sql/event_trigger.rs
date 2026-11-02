@@ -658,10 +658,10 @@ impl EventObjectRef {
                 table,
                 name,
             } => {
-                let detached = crate::storage::TableDef {
+                let detached = crate::storage::TableDefView {
                     schema,
                     name: table,
-                    ..crate::storage::TableDef::empty()
+                    ..crate::storage::TableDefView::empty()
                 };
                 constraint_object(oid, name.as_str(), &detached)?
             }
@@ -1328,10 +1328,10 @@ fn array_type_object(schema: &str, name: &str, oid: i32) -> Result<EventObject, 
     ))
 }
 
-fn constraint_object(
+fn constraint_object<Definition0: crate::storage::DefinitionBacking>(
     oid: i32,
     name: &str,
-    table: &crate::storage::TableDef,
+    table: &crate::storage::TableDefinition<Definition0>,
 ) -> Result<EventObject, SqlError> {
     let mut identity = EventIdentity::new();
     write!(
@@ -1357,10 +1357,10 @@ fn constraint_object(
     Ok(object)
 }
 
-fn index_object(
+fn index_object<Definition0: crate::storage::DefinitionBacking>(
     oid: i32,
     name: &str,
-    table: &crate::storage::TableDef,
+    table: &crate::storage::TableDefinition<Definition0>,
 ) -> Result<EventObject, SqlError> {
     Ok(base_object(
         catalog::PG_CLASS_OID,
@@ -1373,19 +1373,21 @@ fn index_object(
     ))
 }
 
-fn inline_primary_name(table: &crate::storage::TableDef) -> StackStr<128> {
+fn inline_primary_name<Definition0: crate::storage::DefinitionBacking>(
+    table: &crate::storage::TableDefinition<Definition0>,
+) -> StackStr<128> {
     crate::stack_format!(128, "{}_pkey", table.name.as_str())
 }
 
-fn inline_unique_name(
-    table: &crate::storage::TableDef,
+fn inline_unique_name<Definition0: crate::storage::DefinitionBacking>(
+    table: &crate::storage::TableDefinition<Definition0>,
     column: &crate::storage::ColumnMeta,
 ) -> StackStr<128> {
     crate::stack_format!(128, "{}_{}_key", table.name.as_str(), column.name.as_str())
 }
 
-fn foreign_key_references_named_key(
-    table: &crate::storage::TableDef,
+fn foreign_key_references_named_key<Definition0: crate::storage::DefinitionBacking>(
+    table: &crate::storage::TableDefinition<Definition0>,
     name: &str,
     parent_columns: &[u16],
 ) -> bool {
@@ -1410,12 +1412,12 @@ fn foreign_key_references_named_key(
     false
 }
 
-fn not_null_name(
-    table: &crate::storage::TableDef,
+fn not_null_name<Definition0: crate::storage::DefinitionBacking>(
+    table: &crate::storage::TableDefinition<Definition0>,
     column: &crate::storage::ColumnMeta,
 ) -> StackStr<128> {
     StackStr::from_str(
-        table.not_null_names[table
+        table.not_null_names.as_ref()[table
             .column_index(column.name.as_str())
             .expect("constraint column exists")]
         .expect("required column has a durable constraint name")
@@ -3110,8 +3112,8 @@ fn push_drop_once(
     push_drop(output, count, reference, original, normal)
 }
 
-fn detached_constraint(
-    table: &crate::storage::TableDef,
+fn detached_constraint<Definition0: crate::storage::DefinitionBacking>(
+    table: &crate::storage::TableDefinition<Definition0>,
     oid: i32,
     name: impl AsRef<str>,
 ) -> EventObjectRef {
@@ -3123,8 +3125,8 @@ fn detached_constraint(
     }
 }
 
-fn detached_index(
-    table: &crate::storage::TableDef,
+fn detached_index<Definition0: crate::storage::DefinitionBacking>(
+    table: &crate::storage::TableDefinition<Definition0>,
     oid: i32,
     name: impl AsRef<str>,
 ) -> EventObjectRef {
@@ -3135,8 +3137,8 @@ fn detached_index(
     }
 }
 
-fn foreign_key_trigger_reference(
-    child: &crate::storage::TableDef,
+fn foreign_key_trigger_reference<Definition0: crate::storage::DefinitionBacking>(
+    child: &crate::storage::TableDefinition<Definition0>,
     foreign_key: &crate::storage::ForeignKey,
     trigger: crate::storage::ForeignKeyTrigger,
 ) -> EventObjectRef {
@@ -3159,8 +3161,8 @@ fn foreign_key_trigger_reference(
     }
 }
 
-fn push_foreign_key_trigger_drops(
-    child: &crate::storage::TableDef,
+fn push_foreign_key_trigger_drops<Definition0: crate::storage::DefinitionBacking>(
+    child: &crate::storage::TableDefinition<Definition0>,
     foreign_key: &crate::storage::ForeignKey,
     output: &mut ArenaList<'_, DroppedObject>,
     count: &mut usize,
@@ -3177,8 +3179,8 @@ fn push_foreign_key_trigger_drops(
     Ok(())
 }
 
-fn table_index_positions(
-    table: &crate::storage::TableDef,
+fn table_index_positions<Definition0: crate::storage::DefinitionBacking>(
+    table: &crate::storage::TableDefinition<Definition0>,
 ) -> ([Option<u16>; crate::storage::MAX_COLUMNS], usize) {
     let mut inline = [None; crate::storage::MAX_COLUMNS];
     let mut position = 0usize;

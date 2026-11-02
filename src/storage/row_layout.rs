@@ -46,7 +46,9 @@ mod tests {
     use crate::sql::eval::sqlstate;
     use crate::sql::types::{ColType, Datum};
     use crate::storage::tests::{make_def, test_budget, test_config};
-    use crate::storage::{HistoryReclamation, RelationPersistence, SNAPSHOT_ALL, Storage};
+    use crate::storage::{
+        HistoryReclamation, RelationPersistence, SNAPSHOT_ALL, Storage, TableDefBuilder,
+    };
     use core::num::NonZeroUsize;
 
     fn fixture(persistence: RelationPersistence, count: usize) -> (Storage, usize, usize) {
@@ -81,7 +83,7 @@ mod tests {
         ty: ColType,
         rewrite: bool,
     ) -> crate::storage::TableDefinitionChange {
-        let mut definition = *storage.table_def(table, 0);
+        let mut definition = TableDefBuilder::from_definition(&storage.table_def(table, 0));
         definition.columns[0].ctype = ty;
         let mut mapping = [None; crate::storage::MAX_COLUMNS];
         mapping[0] = Some(definition.columns[0].name);
@@ -435,7 +437,8 @@ mod tests {
                 };
             }
             crate::mem::guard::forbid_alloc(|| {
-                let (target, mut definition) = storage.select_table_definition(table, 8);
+                let (target, selected_definition) = storage.select_table_definition(table, 8);
+                let mut definition = TableDefBuilder::from_definition(&selected_definition);
                 let original_name = definition.name;
                 let original_schema = definition.schema;
                 definition.schema = destination;

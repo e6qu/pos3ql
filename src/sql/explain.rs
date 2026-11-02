@@ -738,7 +738,7 @@ fn scan_node<'a>(
         plan.expected_rows(
             storage,
             slot,
-            scope.defs.get(table).expect("base table"),
+            scope.defs.stored(table).expect("base table"),
             txid,
         )
     });

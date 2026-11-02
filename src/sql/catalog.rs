@@ -53,7 +53,7 @@ mod type_io;
 /// A materialized catalog relation: its shape plus rows in the arena.
 #[derive(Clone, Copy)]
 pub(crate) struct SynthTable<'a> {
-    pub def: &'a crate::storage::RelationDefinition<'a>,
+    pub def: crate::storage::RelationDefinition<'a>,
     pub rows: &'a [&'a [Datum<'a>]],
     /// Addressable system columns encoded after `def.n_columns`, and therefore
     /// omitted from star expansion and the relation's positive attributes.
@@ -9426,8 +9426,7 @@ pub(crate) fn synthesize_definition<'a>(
         )
     })?;
     let hidden = schema::hidden_columns(name, information_schema);
-    let (definition, hidden_columns) = materialize_with_hidden(specification, hidden)?;
-    let definition = allocate_definition(definition, hidden_columns, arena)?;
+    let (definition, hidden_columns) = materialize_with_hidden(specification, hidden, arena)?;
     Ok(SynthTable {
         def: definition,
         rows: &[],
@@ -14112,9 +14111,11 @@ pub fn trigger_def_text<'a>(
             output
                 .write_str(" OF ")
                 .map_err(|_| super::eval::arena_full())?;
+            let retained_table_definition;
             let definition = match render_target {
                 crate::storage::TriggerTarget::Table(table) => {
-                    *storage.table_def(usize::from(table), txid)
+                    retained_table_definition = storage.table_def(usize::from(table), txid);
+                    retained_table_definition.borrowed()
                 }
                 crate::storage::TriggerTarget::View(view) => {
                     super::exec::view_trigger_definition(storage, usize::from(view), txid, arena)?
@@ -16369,8 +16370,8 @@ fn partition_bound_def_text(bound: PartitionBound, arena: &Arena) -> Result<&str
     alloc_rendered(&rendered, "partition bound definition is too long", arena)
 }
 
-fn detached_partition_constraint_def_text<'a>(
-    definition: &TableDef,
+fn detached_partition_constraint_def_text<'a, Definition0: crate::storage::DefinitionBacking>(
+    definition: &crate::storage::TableDefinition<Definition0>,
     constraint: crate::storage::DetachedPartitionBound,
     arena: &'a Arena,
 ) -> Result<&'a str, SqlError> {
@@ -16481,9 +16482,9 @@ fn detached_partition_constraint_def_text<'a>(
     )
 }
 
-fn write_partition_constraint_key(
+fn write_partition_constraint_key<Definition0: crate::storage::DefinitionBacking>(
     out: &mut StackStr<4096>,
-    definition: &TableDef,
+    definition: &crate::storage::TableDefinition<Definition0>,
     scheme: crate::storage::PartitionScheme,
     index: usize,
 ) {
@@ -16498,9 +16499,9 @@ fn write_partition_constraint_key(
 /// Emits the lexicographic half of a range partition check.  The explicit
 /// recursion preserves SQL NULL semantics once the caller has emitted the
 /// required non-NULL checks, including bounds containing MINVALUE/MAXVALUE.
-fn write_range_partition_comparison(
+fn write_range_partition_comparison<Definition0: crate::storage::DefinitionBacking>(
     out: &mut StackStr<4096>,
-    definition: &TableDef,
+    definition: &crate::storage::TableDefinition<Definition0>,
     scheme: crate::storage::PartitionScheme,
     bound: &[PartitionBoundValue],
     lower: bool,
@@ -16685,9 +16686,9 @@ fn write_index_key_metadata(
     }
 }
 
-fn write_index_target(
+fn write_index_target<Definition0: crate::storage::DefinitionBacking>(
     out: &mut impl core::fmt::Write,
-    table: &TableDef,
+    table: &crate::storage::TableDefinition<Definition0>,
     info: &IdxInfo,
     qualify: bool,
 ) {
@@ -16966,35 +16967,6 @@ struct SynthDef<'a> {
     relation: Option<core::num::NonZeroU32>,
 }
 
-fn materialize_def(specification: SynthDef<'_>) -> TableDef {
-    let mut definition = TableDef {
-        schema: SqlName::parse(specification.schema).expect("catalog schema fits"),
-        name: SqlName::parse(specification.name).expect("catalog name fits"),
-        columns: [ColumnMeta::EMPTY; MAX_COLUMNS],
-        n_columns: specification
-            .columns
-            .iter()
-            .filter(|(name, _)| specification.relation.is_none() || *name != "tableoid")
-            .count(),
-        ..TableDef::empty()
-    };
-    for (index, (name, column_type)) in specification
-        .columns
-        .iter()
-        .filter(|(name, _)| specification.relation.is_none() || *name != "tableoid")
-        .enumerate()
-    {
-        definition.columns[index].name = SqlName::parse(name).expect("catalog column fits");
-        definition.columns[index].ctype = *column_type;
-        definition.columns[index].collation = if column_type.is_collatable() {
-            crate::sql::ast::Collation::Default
-        } else {
-            crate::sql::ast::Collation::None
-        };
-    }
-    definition
-}
-
 pub(crate) fn validate_restored_row(
     relation: &super::catalog_snapshot::CatalogSnapshotRelation,
     row: crate::storage::HistoricalCatalogRow<'_>,
@@ -17079,10 +17051,11 @@ fn finish<'a>(
 /// Materializes an exact visible relation shape plus addressable PostgreSQL
 /// system columns. Hidden columns are encoded in each row after the visible
 /// fields but remain outside `n_columns`, so star expansion cannot expose them.
-fn materialize_with_hidden(
+fn materialize_with_hidden<'a>(
     specification: SynthDef<'_>,
     hidden: &[(&str, ColType)],
-) -> Result<(TableDef, usize), SqlError> {
+    arena: &'a Arena,
+) -> Result<(crate::storage::RelationDefinition<'a>, usize), SqlError> {
     let visible = specification
         .columns
         .iter()
@@ -17096,13 +17069,27 @@ fn materialize_with_hidden(
     if visible + system > MAX_COLUMNS {
         return Err(catalog_capacity_exceeded(specification.name));
     }
-    let mut definition = materialize_def(specification);
-    let mut count = 0;
+    let columns = arena
+        .alloc_slice_with(visible + system, |_| ColumnMeta::EMPTY)
+        .map_err(|_| arena_full())?;
+    for (column, (name, column_type)) in columns.iter_mut().zip(
+        specification
+            .columns
+            .iter()
+            .filter(|(name, _)| specification.relation.is_none() || *name != "tableoid"),
+    ) {
+        column.name = SqlName::parse(name).expect("catalog column fits");
+        column.ctype = *column_type;
+        column.collation = if column_type.is_collatable() {
+            crate::sql::ast::Collation::Default
+        } else {
+            crate::sql::ast::Collation::None
+        };
+    }
+    let mut count = visible;
     if specification.relation.is_some() {
-        let column = &mut definition.columns[definition.n_columns];
-        column.name = SqlName::parse("tableoid").expect("system-column name fits");
-        column.ctype = ColType::Oid;
-        column.collation = crate::sql::ast::Collation::None;
+        columns[count].name = SqlName::parse("tableoid").expect("system-column name fits");
+        columns[count].ctype = ColType::Oid;
         count += 1;
     }
     for (name, column_type) in hidden {
@@ -17115,7 +17102,7 @@ fn materialize_with_hidden(
             }
             continue;
         }
-        if definition.columns[..definition.n_columns + count]
+        if columns[..count]
             .iter()
             .any(|column| column.name.as_str() == *name)
         {
@@ -17124,33 +17111,19 @@ fn materialize_with_hidden(
                 "duplicate catalog system-column name"
             ));
         }
-        let column = &mut definition.columns[definition.n_columns + count];
-        column.name = SqlName::parse(name).expect("catalog system-column name fits");
-        column.ctype = *column_type;
-        column.collation = crate::sql::ast::Collation::None;
+        columns[count].name = SqlName::parse(name).expect("catalog system-column name fits");
+        columns[count].ctype = *column_type;
         count += 1;
     }
-    Ok((definition, count))
-}
-
-fn allocate_definition<'a>(
-    definition: TableDef,
-    hidden_columns: usize,
-    arena: &'a Arena,
-) -> Result<&'a crate::storage::RelationDefinition<'a>, SqlError> {
-    let width = definition.n_columns + hidden_columns;
-    let columns = arena
-        .alloc_slice_copy(&definition.columns[..width])
-        .map_err(|_| arena_full())?;
-    arena
-        .alloc(crate::storage::RelationDefinition {
-            schema: definition.schema,
-            name: definition.name,
-            n_columns: definition.n_columns,
+    Ok((
+        crate::storage::RelationDefinition {
+            schema: SqlName::parse(specification.schema).expect("catalog schema fits"),
+            name: SqlName::parse(specification.name).expect("catalog name fits"),
+            n_columns: visible,
             columns,
-        })
-        .map(|definition| &*definition)
-        .map_err(|_| arena_full())
+        },
+        system,
+    ))
 }
 
 fn finish_with_hidden<'a>(
@@ -17159,8 +17132,8 @@ fn finish_with_hidden<'a>(
     rows: &[&'a [Datum<'a>]],
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let (definition, hidden_columns) = materialize_with_hidden(specification, hidden)?;
-    let def = allocate_definition(definition, hidden_columns, arena)?;
+    let (definition, hidden_columns) = materialize_with_hidden(specification, hidden, arena)?;
+    let def = definition;
     let typed = arena
         .alloc_slice_with(rows.len(), |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
@@ -22609,9 +22582,9 @@ fn fk_action_char(a: crate::storage::FkAction) -> &'static str {
 
 /// A `Datum::Array` of stable attribute numbers, the form
 /// `conkey`/`confkey`/`indkey`-as-array take in `pg_constraint`.
-fn attnum_array<'a>(
+fn attnum_array<'a, Definition0: crate::storage::DefinitionBacking>(
     columns: &[u16],
-    table: &TableDef,
+    table: &crate::storage::TableDefinition<Definition0>,
     arena: &'a Arena,
 ) -> Result<Datum<'a>, SqlError> {
     let vals = arena
@@ -31992,8 +31965,11 @@ fn view_column_catalog_type(
     })
 }
 
-fn not_null_constraint_name(table: &TableDef, column: &ColumnMeta) -> SqlName {
-    table.not_null_names[table
+fn not_null_constraint_name<Definition0: crate::storage::DefinitionBacking>(
+    table: &crate::storage::TableDefinition<Definition0>,
+    column: &ColumnMeta,
+) -> SqlName {
+    table.not_null_names.as_ref()[table
         .column_index(column.name.as_str())
         .expect("constraint column exists")]
     .expect("stored NOT NULL constraint has a durable name")

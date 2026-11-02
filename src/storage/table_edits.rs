@@ -68,7 +68,7 @@ impl TableDefinitionTarget {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TableDefinitionChange {
     pub(super) source: super::catalog_sources::CatalogObjectIdentity,
     pub(super) transaction: u32,
@@ -151,6 +151,7 @@ impl<'storage> TableDefinitionEdit<'storage> {
             }
             let comments = self.storage.comment_catalog();
             let source = if !definition.requires_type_catalog()
+                && definition.n_fkeys == 0
                 && definition.schema == self.definition.committed().schema
                 && definition.name == self.definition.committed().name
                 && self.definition.pending.is_none()
@@ -171,6 +172,12 @@ impl<'storage> TableDefinitionEdit<'storage> {
                             None,
                         )?;
                         source.bind_table_definition(&mut definition, transaction)?;
+                        self.storage.require_definition_dependency_access(
+                            &source,
+                            &definition,
+                            transaction,
+                            Some(self.table),
+                        )?;
                         Some(source)
                     }
                     Err(wait) => {

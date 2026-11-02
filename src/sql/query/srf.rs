@@ -2363,7 +2363,7 @@ pub(crate) fn describe_derived_definition<'a>(
     )
 }
 
-/// Synthesizes the single-column `TableDef` for a supported table function
+/// Describes the actual columns of a supported table function
 /// (`FROM func(args) alias`). The output column is named after the alias (or the
 /// function name), so a bare reference to the alias resolves to the value.
 pub(super) fn table_func_def<'a>(

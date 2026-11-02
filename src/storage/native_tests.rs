@@ -1155,7 +1155,10 @@ fn value_cache_owners_failed_candidate_releases_capacity_and_publishes_no_prefix
     let selected = storage.tables[table].enforcer(0).unwrap();
     selected.cache.write().insert(41, 99).unwrap();
     let revision = storage.reserve_table_definition_revision().unwrap();
-    storage.tables[table].definition_mut(revision).columns[1].unique = true;
+    let mut updated = TableDefBuilder::from_definition(&storage.table_def(table, 0));
+    updated.columns[1].unique = true;
+    *storage.tables[table].definition_mut(revision) =
+        updated.freeze(&storage.metadata_pool).unwrap();
     crate::mem::guard::forbid_alloc(|| {
         let error = storage.refresh_enforcers(table).unwrap_err();
         assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
@@ -1643,7 +1646,8 @@ fn cluster_metadata_table_names_reserve_only_within_their_database() {
             storage.ddl_name_locked_by_other("public", "reserved", 9),
             None
         );
-        let (target, mut renamed) = storage.select_table_definition(foreign, 7);
+        let (target, selected_definition) = storage.select_table_definition(foreign, 7);
+        let mut renamed = TableDefBuilder::from_definition(&selected_definition);
         renamed.name = SqlName::parse("pending_name").unwrap();
         assert_eq!(
             storage
@@ -4992,7 +4996,8 @@ fn relation_identity_statistics_retire_without_growth_or_cross_database_reset() 
         );
         let mut mapping = [None; MAX_COLUMNS];
         mapping[0] = Some(SqlName::parse("id").unwrap());
-        let (target, mut next) = storage.select_table_definition(table, 1);
+        let (target, selected_definition) = storage.select_table_definition(table, 1);
+        let mut next = TableDefBuilder::from_definition(&selected_definition);
         next.columns[0].primary = false;
         let change = storage
             .write_table_def(target, next, &mapping, false)
@@ -5010,7 +5015,8 @@ fn relation_identity_statistics_retire_without_growth_or_cross_database_reset() 
                 .idx_scan,
             2
         );
-        let (target, mut next) = storage.select_table_definition(table, 2);
+        let (target, selected_definition) = storage.select_table_definition(table, 2);
+        let mut next = TableDefBuilder::from_definition(&selected_definition);
         next.columns[0].primary = false;
         let change = storage
             .write_table_def(target, next, &mapping, false)
@@ -5029,7 +5035,8 @@ fn relation_identity_statistics_retire_without_growth_or_cross_database_reset() 
                 .idx_scan,
             11
         );
-        let (target, mut next) = storage.select_table_definition(table, 3);
+        let (target, selected_definition) = storage.select_table_definition(table, 3);
+        let mut next = TableDefBuilder::from_definition(&selected_definition);
         next.columns[0].primary = true;
         let change = storage
             .write_table_def(target, next, &mapping, false)
@@ -5065,7 +5072,8 @@ fn relation_identity_statistics_retire_without_growth_or_cross_database_reset() 
             11
         );
         // The scanned index exists only in a discarded private version.
-        let (target, mut next) = storage.select_table_definition(table, 4);
+        let (target, selected_definition) = storage.select_table_definition(table, 4);
+        let mut next = TableDefBuilder::from_definition(&selected_definition);
         next.take_column_index_identity(0);
         next.columns[0].primary = false;
         next.columns[0].unique = true;
@@ -5086,7 +5094,8 @@ fn relation_identity_statistics_retire_without_growth_or_cross_database_reset() 
                 crate::sql::datetime::now_micros(),
             )
             .unwrap();
-        let (target, mut next) = storage.select_table_definition(table, 4);
+        let (target, selected_definition) = storage.select_table_definition(table, 4);
+        let mut next = TableDefBuilder::from_definition(&selected_definition);
         next.columns[0].unique = false;
         let change = storage
             .write_table_def(target, next, &mapping, false)
@@ -5100,7 +5109,8 @@ fn relation_identity_statistics_retire_without_growth_or_cross_database_reset() 
             0
         );
         // A hidden older savepoint keeps its index counter until discarded.
-        let (target, mut next) = storage.select_table_definition(table, 5);
+        let (target, selected_definition) = storage.select_table_definition(table, 5);
+        let mut next = TableDefBuilder::from_definition(&selected_definition);
         next.columns[0].unique = true;
         let first = storage
             .write_table_def(target, next, &mapping, false)
@@ -5122,12 +5132,14 @@ fn relation_identity_statistics_retire_without_growth_or_cross_database_reset() 
                 .unwrap();
             cumulative.indexes.swap_remove(dummy);
         }
-        let (target, mut next) = storage.select_table_definition(table, 5);
+        let (target, selected_definition) = storage.select_table_definition(table, 5);
+        let mut next = TableDefBuilder::from_definition(&selected_definition);
         next.columns[0].unique = false;
         let second = storage
             .write_table_def(target, next, &mapping, false)
             .unwrap();
-        let (target, mut next) = storage.select_table_definition(table, 5);
+        let (target, selected_definition) = storage.select_table_definition(table, 5);
+        let mut next = TableDefBuilder::from_definition(&selected_definition);
         next.columns[0].unique = true;
         let third = storage
             .write_table_def(target, next, &mapping, false)
@@ -5225,9 +5237,10 @@ fn relation_identity_recovery_rejects_cross_catalog_aliases_without_mutation() {
     }
     let table_identity = storage.table(slot).created_at();
     let revision = storage.reserve_table_definition_revision().unwrap();
-    storage.tables[slot]
-        .definition_mut(revision)
-        .inline_index_identities[0] = RelationIdentity::parse(table_identity);
+    let mut invalid = TableDefBuilder::from_definition(&storage.table_def(slot, 0));
+    invalid.inline_index_identities[0] = RelationIdentity::parse(table_identity);
+    *storage.tables[slot].definition_mut(revision) =
+        invalid.freeze(&storage.metadata_pool).unwrap();
     let before = storage.catalog_identity_sequence();
     let error =
         crate::mem::guard::forbid_alloc(|| storage.validate_restored_relation_identities(before))
@@ -9658,7 +9671,7 @@ fn table_retirement_waits_for_its_definition_without_reserving_unrelated_tables(
     let replay = storage
         .create_table(make_def("replay_cleanup", &[]))
         .unwrap();
-    let mut updated = *storage.table_def(first, 7);
+    let mut updated = TableDefBuilder::from_definition(&storage.table_def(first, 7));
     updated.name = SqlName::parse("held_pending_cleanup").unwrap();
     let _change = storage
         .write_table_def(

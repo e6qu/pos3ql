@@ -798,7 +798,7 @@ impl<'a> RetainedSelect<'a> {
         }
         let binding_columns = (mode == RetainedMode::Statement).then_some(&columns);
         let table = scope.slots[0];
-        let definition = scope.defs.get(0).expect("resolved physical source");
+        let definition = scope.defs.stored(0).expect("resolved physical source");
         if definition.kind != crate::storage::TableKind::Local
             || definition.partition.is_partitioned()
             || (from.base.inheritance == crate::sql::ast::RelationInheritance::Descendants
@@ -1048,7 +1048,11 @@ impl<'a> RetainedSelect<'a> {
         each: impl FnOnce(&scan::JoinRow<'_, 'work, '_>) -> Result<R, SqlError>,
     ) -> Result<R, SqlError> {
         let pending = self.pending.as_ref().expect("prepared statement row");
-        let definition = self.scope.defs.get(0).expect("retained source definition");
+        let definition = self
+            .scope
+            .defs
+            .stored(0)
+            .expect("retained source definition");
         let mut values = [Datum::Null; MAX_COLUMNS];
         pending.decode(definition, &mut values)?;
         let rowids = [Some(pending.row.rowid)];
@@ -1213,7 +1217,11 @@ impl<'a> RetainedSelect<'a> {
                 return Ok(false);
             }
             let pending = self.pending.as_ref().expect("captured cursor input row");
-            let definition = self.scope.defs.get(0).expect("retained source definition");
+            let definition = self
+                .scope
+                .defs
+                .stored(0)
+                .expect("retained source definition");
             let mut values = [Datum::Null; MAX_COLUMNS];
             pending.decode(definition, &mut values)?;
             let rowids = [Some(pending.row.rowid)];

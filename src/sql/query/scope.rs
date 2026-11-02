@@ -260,18 +260,11 @@ impl<'a> QueryDefinitions<'a> {
     pub(crate) fn get(&self, index: usize) -> Option<RelationDefinition<'_>> {
         match self.sources.get(index).copied().flatten()? {
             ScopeDefinition::Synthetic { definition, .. } => Some(definition),
-            ScopeDefinition::Relation { image, .. } => {
-                let definition = self
-                    .images
+            ScopeDefinition::Relation { image, .. } => Some(
+                self.images
                     .retained_relation(image)
-                    .expect("scope retains its catalog definition");
-                Some(RelationDefinition {
-                    schema: definition.schema,
-                    name: definition.name,
-                    n_columns: definition.n_columns,
-                    columns: &definition.columns,
-                })
-            }
+                    .expect("scope retains its catalog definition"),
+            ),
             ScopeDefinition::Retained { table, .. } => Some(RelationDefinition::from_definition(
                 self.images
                     .retained_definition(table, self.transaction)
@@ -288,7 +281,7 @@ impl<'a> QueryDefinitions<'a> {
             | ScopeDefinition::Retained { table, .. } => {
                 self.images.retained_definition(table, self.transaction)
             }
-            ScopeDefinition::Relation { image, .. } => self.images.retained_relation(image),
+            ScopeDefinition::Relation { .. } => None,
             ScopeDefinition::Synthetic { table: None, .. } => None,
         }
     }
@@ -498,6 +491,14 @@ impl<'d> QueryScope<'d> {
         let mut scope = Self::empty(storage, txid, arena, from)?;
         scope.names[0] = alias.unwrap_or(table);
         scope.defs.set_relation(0, definition, arena)?;
+        scope.type_sources = storage.select_type_definition_graph(
+            definition
+                .columns()
+                .iter()
+                .filter_map(|column| column.user_type),
+            txid,
+            arena,
+        )?;
         scope.slots[0] = usize::MAX;
         scope.n = 1;
         scope.returning_aliases = arena
@@ -587,9 +588,8 @@ impl<'d> QueryScope<'d> {
         })
     }
 
-    /// Like `resolve`, but materializes any derived table (`FROM (SELECT ...)`)
-    /// by running its subquery once and synthesizing a `TableDef` for its
-    /// output columns. Used by the executors that actually scan rows.
+    /// Resolves execution sources, materializing derived rows once and keeping
+    /// only their actual output-column metadata.
     pub fn resolve_exec<'a>(
         storage: &'a Storage,
         from: &'a FromClause<'a>,
@@ -648,8 +648,7 @@ impl<'d> QueryScope<'d> {
         Ok(scope)
     }
 
-    /// Registers a materialized recursive CTE reference: a synthesized
-    /// `TableDef` from the CTE's column names/types, plus its precomputed rows.
+    /// Registers a materialized recursive CTE's actual output columns and rows.
     /// `materialize` false = schema only (Describe path).
     fn add_materialized<'a>(
         &mut self,
@@ -907,7 +906,7 @@ impl<'d> QueryScope<'d> {
         Ok(())
     }
 
-    /// Like `resolve`, but synthesizes a `TableDef` for each derived table
+    /// Resolves schema-only sources, including actual derived-table columns
     /// (`FROM (SELECT ...)`) without materializing its rows. Used where only
     /// the output schema is needed. An enclosing row supplies declared types
     /// for correlated table-function arguments without executing the functions.
@@ -1050,7 +1049,7 @@ impl<'d> QueryScope<'d> {
                 exposed
             ));
         }
-        let mut definition = *synth.def;
+        let mut definition = synth.def;
         if let Some(aliases) = tref.col_alias {
             if aliases.len() > definition.n_columns {
                 return Err(sql_err!(

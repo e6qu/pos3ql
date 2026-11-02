@@ -729,7 +729,16 @@ impl Conn {
         if !self.parked || self.txn.staged_commit().is_some() {
             return false;
         }
-        let extended = self.recv.readable().first() != Some(&wire::FMSG_QUERY);
+        let extended = self.copy.as_ref().map_or_else(
+            || {
+                !matches!(
+                    self.recv.readable().first().copied(),
+                    Some(wire::FMSG_QUERY | wire::FMSG_FUNCTION_CALL)
+                )
+            },
+            |copy| copy.extended,
+        );
+        let parked_sync = self.recv.readable().first() == Some(&wire::FMSG_SYNC);
         // The parked Query/Execute remains at the front of `recv`. Consume
         // only that message: an extended client commonly pipelines Sync
         // behind Execute, and dropping it would leave the client waiting for
@@ -746,14 +755,22 @@ impl Conn {
         self.recv.consume(message_bytes);
         self.finish_lock_wait();
         engine.cancel_backend_wait(self.id);
-        if self.txn.is_explicit() {
+        if self.copy.take().is_some() {
+            engine.copy_abort(&mut self.txn, &self.guc);
+            self.copy_transition_scratch.clear();
+        } else if self.txn.commit_admission().is_some() {
+            engine.rollback_txn(&mut self.txn, &self.guc);
+        } else if self.txn.is_explicit() {
             self.txn.failed = true;
         } else {
             engine.rollback_txn(&mut self.txn, &self.guc);
         }
+        if !self.txn.is_active() {
+            self.cursors.on_rollback();
+        }
         engine.finish_backend_statement(&self.txn, self.id);
-        let mut synchronized = false;
-        while extended && self.recv.len() >= 5 {
+        let mut synchronized = extended && parked_sync;
+        while extended && !synchronized && self.recv.len() >= 5 {
             let bytes = self.recv.readable();
             let Some(length) = bytes
                 .get(1..5)
@@ -1512,8 +1529,11 @@ impl Conn {
             self.authenticated_role = Some(login);
             self.authenticated_database = Some(database.slot);
         }
+        let lock_timeout_expired = self.lock_timeout_expired();
         let login_trigger_result = if self.phase == Phase::AwaitLoginCommit {
-            engine.finish_staged_transaction(&mut self.txn, &self.guc)
+            engine
+                .check_commit_admission_wait(&mut self.txn, &self.guc, lock_timeout_expired)
+                .and_then(|()| engine.finish_pending_transaction(&mut self.txn, &self.guc))
         } else {
             self.arena.reset();
             let mut responder = Responder::new(&mut self.send);
@@ -1527,14 +1547,21 @@ impl Conn {
             )
         };
         if let Err(error) = login_trigger_result {
-            if error.sqlstate == sqlstate::INTERNAL_IO_WAIT && self.txn.staged_commit().is_some() {
+            if (error.sqlstate == sqlstate::INTERNAL_IO_WAIT
+                || error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT)
+                && (self.txn.staged_commit().is_some() || self.txn.commit_admission().is_some())
+            {
                 // Retain the login transaction without re-running its triggers.
                 // Credential installation and journal publication need reactor turns.
                 self.phase = Phase::AwaitLoginCommit;
-                self.park(
-                    crate::sql::StatementWait::ObjectIo,
-                    engine.lock_generation(),
-                );
+                let wait = if self.txn.staged_commit().is_some()
+                    || error.sqlstate == sqlstate::INTERNAL_IO_WAIT
+                {
+                    crate::sql::StatementWait::ObjectIo
+                } else {
+                    crate::sql::StatementWait::Lock
+                };
+                self.park(wait, engine.statement_wait_generation(wait, self.id));
                 return Step::Parked;
             }
             let mut responder = Responder::new(&mut self.send);
@@ -1874,39 +1901,56 @@ impl Conn {
             wire::FMSG_QUERY => self.handle_query(engine, total),
             wire::FMSG_TERMINATE => Step::Close,
             wire::FMSG_SYNC => {
-                let mut responder = Responder::new(&mut self.send);
-                if self.txn.mode == crate::sql::txn::TxnMode::Implicit
-                    && let Err(error) = engine.commit_txn_with_triggers(
-                        &mut self.txn,
-                        &self.guc,
-                        Some(&mut self.cursors),
-                        &self.arena,
-                        &mut responder,
-                    )
-                {
-                    if error.sqlstate == sqlstate::INTERNAL_IO_WAIT
-                        && self.txn.staged_commit().is_some()
+                let lock_timeout_expired = self.lock_timeout_expired();
+                let result = if self.txn.mode == crate::sql::txn::TxnMode::Implicit {
+                    engine
+                        .check_commit_admission_wait(&mut self.txn, &self.guc, lock_timeout_expired)
+                        .and_then(|()| {
+                            let mut responder = Responder::new(&mut self.send);
+                            engine.commit_txn_with_triggers(
+                                &mut self.txn,
+                                &self.guc,
+                                Some(&mut self.cursors),
+                                &self.arena,
+                                &mut responder,
+                            )
+                        })
+                } else {
+                    Ok(())
+                };
+                if let Err(error) = result {
+                    if (error.sqlstate == sqlstate::INTERNAL_IO_WAIT
+                        || error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT)
+                        && (self.txn.staged_commit().is_some()
+                            || self.txn.commit_admission().is_some())
                     {
-                        let generation = engine.lock_generation();
-                        self.park(crate::sql::StatementWait::ObjectIo, generation);
-                        engine.park_backend_statement(self.id, crate::sql::StatementWait::ObjectIo);
+                        let wait = if self.txn.staged_commit().is_some()
+                            || error.sqlstate == sqlstate::INTERNAL_IO_WAIT
+                        {
+                            crate::sql::StatementWait::ObjectIo
+                        } else {
+                            crate::sql::StatementWait::Lock
+                        };
+                        self.park(wait, engine.statement_wait_generation(wait, self.id));
+                        engine.park_backend_statement(self.id, wait);
                         return Step::Parked;
                     }
                     self.cursors.on_rollback();
-                    if responder
+                    if Responder::new(&mut self.send)
                         .error(error.sqlstate, error.message.as_str())
                         .is_err()
                     {
                         return Step::Close;
                     }
                 }
+                self.finish_lock_wait();
                 if self.txn.mode == crate::sql::txn::TxnMode::Idle {
                     for portal in &mut self.portals {
                         portal.active = false;
                     }
                 }
                 let status = self.txn.status_byte();
-                match responder.ready_for_query(status) {
+                match Responder::new(&mut self.send).ready_for_query(status) {
                     Ok(()) => Step::Continue,
                     Err(WireFull) => Step::Close,
                 }
@@ -1934,8 +1978,13 @@ impl Conn {
     }
 
     fn handle_function_call(&mut self, engine: &mut Engine, total: usize) -> Step {
-        if self.txn.staged_commit().is_some() {
-            match engine.finish_staged_transaction(&mut self.txn, &self.guc) {
+        if self.txn.staged_commit().is_some() || self.txn.commit_admission().is_some() {
+            let admitting = self.txn.commit_admission().is_some();
+            let lock_timeout_expired = self.lock_timeout_expired();
+            match engine
+                .check_commit_admission_wait(&mut self.txn, &self.guc, lock_timeout_expired)
+                .and_then(|()| engine.finish_pending_transaction(&mut self.txn, &self.guc))
+            {
                 Ok(()) => {
                     return if Responder::new(&mut self.send)
                         .ready_for_query(self.txn.status_byte())
@@ -1947,14 +1996,31 @@ impl Conn {
                         Step::Close
                     };
                 }
-                Err(error) if error.sqlstate == sqlstate::INTERNAL_IO_WAIT => {
-                    self.park(
-                        crate::sql::StatementWait::ObjectIo,
-                        engine.lock_generation(),
-                    );
+                Err(error)
+                    if (error.sqlstate == sqlstate::INTERNAL_IO_WAIT
+                        || error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT)
+                        && (self.txn.staged_commit().is_some()
+                            || self.txn.commit_admission().is_some()) =>
+                {
+                    let wait = if self.txn.staged_commit().is_some()
+                        || error.sqlstate == sqlstate::INTERNAL_IO_WAIT
+                    {
+                        crate::sql::StatementWait::ObjectIo
+                    } else {
+                        crate::sql::StatementWait::Lock
+                    };
+                    self.park(wait, engine.statement_wait_generation(wait, self.id));
+                    engine.park_backend_statement(self.id, wait);
                     return Step::Parked;
                 }
                 Err(error) => {
+                    if admitting {
+                        return self.function_call_error(
+                            engine,
+                            error.sqlstate,
+                            error.message.as_str(),
+                        );
+                    }
                     let _ = Responder::new(&mut self.send)
                         .error(error.sqlstate, error.message.as_str());
                     return Step::Close;
@@ -2629,6 +2695,12 @@ impl Conn {
     }
 
     fn copy_finish(&mut self, engine: &mut Engine) -> Step {
+        let lock_timeout_expired = self.lock_timeout_expired();
+        if let Err(error) =
+            engine.check_commit_admission_wait(&mut self.txn, &self.guc, lock_timeout_expired)
+        {
+            self.copy.as_mut().expect("in copy-in mode").failed = Some(error);
+        }
         // Binary rows are fully consumed as they complete in copy_binary_chunk;
         // any leftover at CopyDone is a truncated stream, but the count already
         // reflects the rows that landed, so nothing more is decoded here.
@@ -2705,15 +2777,21 @@ impl Conn {
                     .map(|()| copy.count)
             }
         };
-        if matches!(&outcome, Err(error) if error.sqlstate == sqlstate::INTERNAL_IO_WAIT)
-            && self.txn.staged_commit().is_some()
+        if let Err(error) = &outcome
+            && (error.sqlstate == sqlstate::INTERNAL_IO_WAIT
+                || error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT)
+            && (self.txn.staged_commit().is_some() || self.txn.commit_admission().is_some())
         {
+            let wait = if self.txn.staged_commit().is_some()
+                || error.sqlstate == sqlstate::INTERNAL_IO_WAIT
+            {
+                crate::sql::StatementWait::ObjectIo
+            } else {
+                crate::sql::StatementWait::Lock
+            };
             self.copy = Some(copy);
-            self.park(
-                crate::sql::StatementWait::ObjectIo,
-                engine.lock_generation(),
-            );
-            engine.park_backend_statement(self.id, crate::sql::StatementWait::ObjectIo);
+            self.park(wait, engine.statement_wait_generation(wait, self.id));
+            engine.park_backend_statement(self.id, wait);
             return Step::Parked;
         }
         self.copy_transition_scratch.clear();
@@ -9113,5 +9191,210 @@ mod tests {
         assert!(!hot_standby_feedback(&feedback[..24]));
         feedback[0] = b'r';
         assert!(!hot_standby_feedback(&feedback));
+    }
+
+    #[test]
+    fn commit_admission_protocol_resumes_cancels_and_times_out_before_durability() {
+        fn request(conn: &mut Conn, engine: &mut Engine, sql: &str) {
+            conn.send.clear();
+            let mut payload = sql.as_bytes().to_vec();
+            payload.push(0);
+            assert!(conn.recv.append(&frontend(wire::FMSG_QUERY, &payload)));
+            assert!(matches!(
+                crate::mem::guard::forbid_alloc(|| conn.process_message(engine)),
+                Step::Continue
+            ));
+            assert!(
+                !has_backend_message(conn.send.readable(), wire::MSG_ERROR_RESPONSE),
+                "{sql}: {}",
+                String::from_utf8_lossy(conn.send.readable())
+            );
+        }
+        fn count(mut bytes: &[u8], kind: u8) -> usize {
+            let mut found = 0;
+            while !bytes.is_empty() {
+                let length = u32::from_be_bytes(bytes[1..5].try_into().unwrap()) as usize + 1;
+                found += usize::from(bytes[0] == kind);
+                bytes = &bytes[length..];
+            }
+            found
+        }
+        for extended in [false, true] {
+            for outcome in ["resume", "cancel", "timeout"] {
+                let directory = std::env::temp_dir().join(format!(
+                    "commit-admission-protocol-{extended}-{outcome}-{}",
+                    std::process::id()
+                ));
+                let mut config = Config::default_dev();
+                config.data_dir = directory.to_string_lossy().into_owned();
+                config.max_connections = 2;
+                config.max_tables = 3;
+                config.max_sequences = 1;
+                config.max_routines = 1;
+                config.row_overlay_slots = 16;
+                config.txn_rows = 8;
+                config.max_ddl_per_transaction = 16;
+                config.max_value_indexes = 4;
+                config.value_index_rows = 16;
+                let mut budget = crate::sql::test_engine_budget(&config, 1 << 29);
+                let mut engine = Engine::new(&config, &mut budget).unwrap();
+                let mut conn = Conn::new(&config, &mut budget).unwrap();
+                let mut blocker = Conn::new(&config, &mut budget).unwrap();
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+                let other_client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+                let role = engine.role_login("postgres").unwrap().identity;
+                for (connection, id) in [(&mut conn, 73), (&mut blocker, 74)] {
+                    let (socket, _) = listener.accept().unwrap();
+                    socket.set_nonblocking(true).unwrap();
+                    connection.open(socket, id);
+                    connection.phase = Phase::Ready;
+                    engine
+                        .register_backend(
+                            id,
+                            crate::storage::DatabaseOid::POSTGRES,
+                            role,
+                            "",
+                            None,
+                            -1,
+                            connection.backend_start,
+                            false,
+                            None,
+                            None,
+                            None,
+                        )
+                        .unwrap();
+                }
+                request(
+                    &mut conn,
+                    &mut engine,
+                    "CREATE SEQUENCE protocol_admission_calls; \
+                     CREATE TABLE protocol_admission_parent(id integer PRIMARY KEY DEFAULT nextval('protocol_admission_calls')); \
+                     CREATE TABLE protocol_admission_child(parent_id integer REFERENCES protocol_admission_parent(id)); \
+                     CREATE TABLE protocol_admission_audit(id integer); \
+                     CREATE FUNCTION protocol_admission_trigger() RETURNS trigger LANGUAGE plpgsql AS \
+                     $$BEGIN INSERT INTO protocol_admission_audit VALUES(nextval('protocol_admission_calls')); RETURN NEW; END$$; \
+                     CREATE CONSTRAINT TRIGGER protocol_admission_deferred AFTER INSERT ON protocol_admission_parent \
+                     DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION protocol_admission_trigger()",
+                );
+                request(
+                    &mut blocker,
+                    &mut engine,
+                    "BEGIN; LOCK TABLE protocol_admission_child IN ROW EXCLUSIVE MODE",
+                );
+                conn.send.clear();
+                if extended {
+                    for (sql, describe) in [
+                        (
+                            "INSERT INTO protocol_admission_parent DEFAULT VALUES RETURNING id",
+                            true,
+                        ),
+                        (
+                            "ALTER TABLE protocol_admission_parent RENAME TO protocol_admission_renamed",
+                            false,
+                        ),
+                    ] {
+                        let mut parse = vec![0];
+                        parse.extend_from_slice(sql.as_bytes());
+                        parse.extend_from_slice(&[0, 0, 0]);
+                        conn.recv.append(&frontend(wire::FMSG_PARSE, &parse));
+                        conn.recv
+                            .append(&frontend(wire::FMSG_BIND, b"\0\0\0\0\0\0\0\0"));
+                        if describe {
+                            conn.recv.append(&frontend(wire::FMSG_DESCRIBE, b"P\0"));
+                        }
+                        conn.recv
+                            .append(&frontend(wire::FMSG_EXECUTE, b"\0\0\0\0\0"));
+                    }
+                    conn.recv.append(&frontend(wire::FMSG_SYNC, &[]));
+                } else {
+                    conn.recv.append(&frontend(wire::FMSG_QUERY,
+                        b"INSERT INTO protocol_admission_parent DEFAULT VALUES RETURNING id; ALTER TABLE protocol_admission_parent RENAME TO protocol_admission_renamed\0"));
+                }
+                loop {
+                    match crate::mem::guard::forbid_alloc(|| conn.process_message(&mut engine)) {
+                        Step::Continue => assert!(
+                            !conn.recv.is_empty(),
+                            "admission must park before consuming the boundary"
+                        ),
+                        Step::Parked => break,
+                        Step::NeedMoreData | Step::Close => panic!(
+                            "query did not reach admission: {}",
+                            String::from_utf8_lossy(conn.send.readable())
+                        ),
+                    }
+                }
+                assert_eq!(conn.parked_wait, crate::sql::StatementWait::Lock);
+                assert!(
+                    conn.txn.commit_admission().is_some() && conn.txn.staged_commit().is_none()
+                );
+                let sequence = engine
+                    .storage
+                    .sequence_slot("public", "protocol_admission_calls", conn.txn.txid)
+                    .unwrap();
+                assert_eq!(
+                    engine.storage.sequence_value_for(sequence, conn.txn.txid),
+                    (2, true)
+                );
+                let prefix = conn.send.readable().to_vec();
+                let generation = engine.lock_generation();
+                let pending = crate::mem::guard::forbid_alloc(|| {
+                    conn.retry_parked(&mut engine, &[0; 16], generation.wrapping_add(1), true)
+                        .unwrap()
+                });
+                assert_eq!(pending.after, After::Continue);
+                assert!(conn.parked);
+                assert_eq!(conn.send.readable(), prefix);
+                assert_eq!(
+                    engine.storage.sequence_value_for(sequence, conn.txn.txid),
+                    (2, true)
+                );
+                if outcome == "cancel" {
+                    assert!(crate::mem::guard::forbid_alloc(
+                        || conn.cancel_parked(&mut engine)
+                    ));
+                } else {
+                    if outcome == "resume" {
+                        request(&mut blocker, &mut engine, "ROLLBACK");
+                    } else {
+                        conn.parked_deadline = Some(Instant::now());
+                    }
+                    let generation = engine.lock_generation();
+                    let pending = crate::mem::guard::forbid_alloc(|| {
+                        conn.retry_parked(&mut engine, &[0; 16], generation, true)
+                            .unwrap()
+                    });
+                    assert_eq!(pending.after, After::Continue);
+                }
+                assert!(!conn.parked && conn.recv.is_empty());
+                assert_eq!(conn.phase, Phase::Ready);
+                assert!(!conn.txn.is_active());
+                assert!(conn.txn.commit_admission().is_none());
+                assert_eq!(count(conn.send.readable(), wire::MSG_ROW_DESCRIPTION), 1);
+                assert_eq!(count(conn.send.readable(), wire::MSG_DATA_ROW), 1);
+                assert_eq!(count(conn.send.readable(), wire::MSG_COMMAND_COMPLETE), 2);
+                assert_eq!(count(conn.send.readable(), wire::MSG_READY_FOR_QUERY), 1);
+                assert_eq!(
+                    has_backend_message(conn.send.readable(), wire::MSG_ERROR_RESPONSE),
+                    outcome != "resume"
+                );
+                assert_eq!(
+                    engine
+                        .storage
+                        .find_table("public", "protocol_admission_renamed")
+                        .is_some(),
+                    outcome == "resume"
+                );
+                assert_eq!(engine.storage.sequence_value_for(sequence, 0), (2, true));
+                if blocker.txn.is_active() {
+                    request(&mut blocker, &mut engine, "ROLLBACK");
+                }
+                assert!(engine.fatal_commit_failure().is_none());
+                engine.drop_connection(73);
+                engine.drop_connection(74);
+                drop((conn, blocker, client, other_client, engine));
+                std::fs::remove_dir_all(directory).unwrap();
+            }
+        }
     }
 }

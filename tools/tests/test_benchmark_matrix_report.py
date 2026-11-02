@@ -26,7 +26,7 @@ class BenchmarkMatrixReportTest(unittest.TestCase):
         directory.mkdir()
         request_metrics = backend == "fixture"
         environment = {
-            "schema_version": 1,
+            "schema_version": 2,
             "artifact_type": "environment",
             "git_commit": "commit",
             "pos3ql_binary_sha256": binary,
@@ -219,18 +219,45 @@ class BenchmarkMatrixReportTest(unittest.TestCase):
             completed.stdout,
         )
 
-    def test_rejects_different_shared_row_capacity(self):
+    def test_rejects_different_shared_capacities(self):
+        for field in ("row_work_bytes", "table_metadata_bytes", "table_metadata_leases"):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as temporary:
+                directory = pathlib.Path(temporary)
+                for backend in ["fixture", "minio", "seaweedfs"]:
+                    self.write_run(directory, backend)
+                environment = directory / "seaweedfs" / "environment.json"
+                value = json.loads(environment.read_text())
+                value["suite"][field] *= 2
+                environment.write_text(json.dumps(value))
+                completed = subprocess.run(["python3", str(SCRIPT), str(directory)], text=True, capture_output=True)
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertIn(f"different suite {field}", completed.stderr)
+
+    def test_rejects_shared_metadata_capacity_missing_from_every_backend(self):
         with tempfile.TemporaryDirectory() as temporary:
             directory = pathlib.Path(temporary)
-            for backend in ["fixture", "minio", "seaweedfs"]:
+            for backend in ("fixture", "minio", "seaweedfs"):
                 self.write_run(directory, backend)
-            environment = directory / "seaweedfs" / "environment.json"
-            value = json.loads(environment.read_text())
-            value["suite"]["row_work_bytes"] = 16777216
-            environment.write_text(json.dumps(value))
+                environment = directory / backend / "environment.json"
+                value = json.loads(environment.read_text())
+                del value["suite"]["table_metadata_bytes"]
+                environment.write_text(json.dumps(value))
             completed = subprocess.run(["python3", str(SCRIPT), str(directory)], text=True, capture_output=True)
             self.assertNotEqual(completed.returncode, 0)
-            self.assertIn("different suite row_work_bytes", completed.stderr)
+            self.assertIn("missing suite table_metadata_bytes", completed.stderr)
+
+    def test_rejects_old_environment_version_explicitly(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = pathlib.Path(temporary)
+            for backend in ("fixture", "minio", "seaweedfs"):
+                self.write_run(directory, backend)
+                environment = directory / backend / "environment.json"
+                value = json.loads(environment.read_text())
+                value["schema_version"] = 1
+                environment.write_text(json.dumps(value))
+            completed = subprocess.run(["python3", str(SCRIPT), str(directory)], text=True, capture_output=True)
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("unsupported environment version; expected 2", completed.stderr)
 
 
 if __name__ == "__main__":

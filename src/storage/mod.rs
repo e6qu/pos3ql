@@ -38971,7 +38971,9 @@ impl Storage {
     }
 
     #[cfg(all(test, not(miri)))]
-    pub(crate) fn metadata_pool_for_tests(&self) -> &Arc<crate::mem::lease_pool::LeasePool> {
+    pub(crate) fn metadata_pool_for_tests(
+        &self,
+    ) -> &std::sync::Arc<crate::mem::lease_pool::LeasePool> {
         &self.metadata_pool
     }
 

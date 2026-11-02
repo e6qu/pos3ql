@@ -780,7 +780,7 @@ impl Storage {
             .write()
             .expect("statistics versions lock poisoned");
         let mut current = Some(head.tail);
-        let mut newer = None;
+        let mut newer: Option<usize> = None;
         while let Some(slot) = current {
             let previous = versions[slot].previous;
             if versions[slot].owner == owner {

@@ -1687,7 +1687,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn every_exposed_catalog_has_a_bounded_shared_definition() {
+    fn every_exposed_catalog_has_an_actual_width_bounded_definition() {
         let bytes = 64 * 1024;
         let mut budget = crate::mem::budget::Budget::new(bytes);
         let arena =
@@ -1702,6 +1702,7 @@ mod tests {
             );
             let mark = arena.mark();
             crate::mem::guard::forbid_alloc(|| {
+                let before = arena.used();
                 let table =
                     super::super::synthesize_definition(Some("pg_catalog"), name, &arena).unwrap();
                 assert_eq!(
@@ -1709,10 +1710,13 @@ mod tests {
                     definition.columns.len() + hidden_columns(name, false).len(),
                 );
                 let used = arena.used();
+                let payload = core::mem::size_of_val(table.def.columns);
+                let alignment = core::mem::align_of::<crate::storage::ColumnMeta>();
+                assert!((payload..payload + alignment).contains(&(used - before)));
                 let repeated =
                     super::super::synthesize_definition(Some("pg_catalog"), name, &arena).unwrap();
-                assert!(core::ptr::eq(table.def.columns, repeated.def.columns));
-                assert_eq!(arena.used(), used);
+                assert_eq!(table.def.columns, repeated.def.columns);
+                assert!((payload..payload + alignment).contains(&(arena.used() - used)));
                 assert!(table.rows.is_empty());
                 if definition.relation.is_some() {
                     assert_eq!(table.hidden_columns, 1);

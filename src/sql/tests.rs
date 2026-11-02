@@ -10544,6 +10544,66 @@ fn large_objects_survive_checkpoint_wal_and_prepared_transaction_recovery() {
         "{}",
         String::from_utf8_lossy(&committed)
     );
+    for decision in ["ROLLBACK", "COMMIT"] {
+        let staged = run_with(
+            &mut recovered,
+            &mut prepared_budget,
+            "BEGIN; \
+             SELECT lo_put(91002::oid,0::bigint,decode('58','hex')); \
+             SELECT lo_unlink(91003::oid); \
+             PREPARE TRANSACTION 'large_object_page_changes'",
+        );
+        assert!(
+            !String::from_utf8_lossy(&staged).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&staged)
+        );
+        drop(recovered);
+        std::fs::remove_dir_all(&config.data_dir).unwrap();
+        prepared_budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        recovered = Engine::new(&config, &mut prepared_budget).unwrap();
+        assert_eq!(
+            data_rows(&run_with(
+                &mut recovered,
+                &mut prepared_budget,
+                "SELECT encode(lo_get(91002::oid),'hex'); \
+                 SELECT encode(lo_get(91003::oid),'hex')"
+            )),
+            ["636865636b706f696e742d77616c", "7072657061726564"],
+            "prepared page writes and deletes must stay private after recovery"
+        );
+        let command = format!("{decision} PREPARED 'large_object_page_changes'");
+        let resolved = run_with(&mut recovered, &mut prepared_budget, &command);
+        assert!(
+            !String::from_utf8_lossy(&resolved).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&resolved)
+        );
+        let expected = if decision == "COMMIT" {
+            ["586865636b706f696e742d77616c", "0", "0"]
+        } else {
+            ["636865636b706f696e742d77616c", "1", "1"]
+        };
+        for reopen in [false, true] {
+            if reopen {
+                drop(recovered);
+                std::fs::remove_dir_all(&config.data_dir).unwrap();
+                prepared_budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+                recovered = Engine::new(&config, &mut prepared_budget).unwrap();
+            }
+            assert_eq!(
+                data_rows(&run_with(
+                    &mut recovered,
+                    &mut prepared_budget,
+                    "SELECT encode(lo_get(91002::oid),'hex'); \
+                     SELECT count(*) FROM pg_largeobject_metadata WHERE oid=91003::oid; \
+                     SELECT count(*) FROM pg_largeobject WHERE loid=91003::oid"
+                )),
+                expected,
+                "{decision}, reopened={reopen}"
+            );
+        }
+    }
     drop(recovered);
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
@@ -27798,9 +27858,9 @@ fn catalog_snapshot_schema_resolution_retains_only_its_owned_definition() {
                     crate::sql::catalog::synthesize_definition(Some(qualifier), catalog, &arena)?;
                 assert!(shape.rows.is_empty());
                 assert_eq!(shape.def.name.as_str(), catalog);
-                assert!(
-                    arena.used() - before < core::mem::size_of::<crate::storage::TableDef>() / 4
-                );
+                let payload = core::mem::size_of_val(shape.def.columns);
+                let alignment = core::mem::align_of::<crate::storage::ColumnMeta>();
+                assert!((payload..payload + alignment).contains(&(arena.used() - before)));
                 let materialized = crate::sql::catalog::synthesize(
                     &engine.storage,
                     Some(qualifier),
@@ -58484,6 +58544,7 @@ fn catalog_composite_rename_captures_selected_fields_through_rollback_and_recove
             CREATE TABLE history_points (value history_point_child);
             INSERT INTO history_points VALUES (ROW(3,4)::history_point);
             CREATE INDEX history_point_index ON history_points (((value).x));
+            CREATE INDEX history_point_offset_index ON history_points (((value).x + 1));
             CREATE VIEW history_point_view AS SELECT (value).x AS observed FROM history_points;
             CREATE TABLE history_point_rules (value history_point,
                 observed integer GENERATED ALWAYS AS ((value).x) STORED, CHECK ((value).x > 0));
@@ -58508,6 +58569,11 @@ fn catalog_composite_rename_captures_selected_fields_through_rollback_and_recove
             String::from_utf8_lossy(&setup)
         );
         assert_eq!(data_rows(&setup), ["3", "3", "3", "6"]);
+        for name in ["history_point_index", "history_point_offset_index"] {
+            let slot = engine.storage.index_slot("public", name, 0).unwrap();
+            let definition = engine.storage.index_visible_to(slot, 0).unwrap();
+            assert!(definition.expressions[0].unwrap().as_str().contains("east"));
+        }
         // View materialization uploads spill objects; the simulated remote
         // store allocates its fixture bytes. DDL and table reads stay guarded.
         assert_eq!(
@@ -91976,6 +92042,15 @@ fn retained_dml_descriptions_use_small_statement_buffers_after_cold_recovery() {
         "WITH changed AS (UPDATE described_cold SET amount = amount + 1 RETURNING id, amount) SELECT id, amount FROM changed", true);
     assert_eq!(data_rows(&projected), ["1|12"]);
     assert_eq!(row_description_names(&projected), ["id", "amount"]);
+    for query in [
+        "SELECT left_row.id, right_row.amount FROM described_cold AS left_row CROSS JOIN described_cold AS right_row",
+        "SELECT id, amount FROM (SELECT id, amount FROM described_cold ORDER BY id + amount) AS ordered",
+    ] {
+        assert_eq!(
+            data_rows(&session.success(&mut engine, query, true)),
+            ["1|12"]
+        );
+    }
     // A result larger than the fixed arena must undo the update and release its owners.
     let rejected = session.execute(&mut engine,
         "WITH changed AS (UPDATE described_cold SET amount = amount + 1 RETURNING id, amount) SELECT id, amount, repeat('x',(65536 + amount - amount)::integer) FROM changed", true);

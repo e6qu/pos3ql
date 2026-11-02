@@ -47591,6 +47591,7 @@ fn rewrite_composite_dependent_indexes(
     rename: CompositeFieldRename,
     arena: &Arena,
 ) -> Result<(), SqlError> {
+    let mut replacements = ArenaList::new(arena);
     for index_slot in 0..storage.index_count() {
         let Some(current) = storage.index_visible_to(index_slot, txn.txid) else {
             continue;
@@ -47633,83 +47634,66 @@ fn rewrite_composite_dependent_indexes(
             continue;
         }
 
+        altered.name = current.name_for(txn.txid);
+        replacements
+            .push((index_slot, table_slot, altered))
+            .map_err(|_| arena_full())?;
+    }
+    let created = arena
+        .alloc_slice_with(replacements.len(), |_| 0usize)
+        .map_err(|_| arena_full())?;
+    // Reserve undo ownership for the whole cohort before any key expression
+    // can observe a mixture of old and renamed field selectors.
+    for ((old_slot, _, definition), new_slot) in
+        replacements.as_slice().iter().zip(created.iter_mut())
+    {
         let dropped = storage
-            .drop_index(current.schema.as_str(), current.name.as_str(), txn.txid)?
+            .drop_index(
+                definition.schema.as_str(),
+                definition.name.as_str(),
+                txn.txid,
+            )?
             .ok_or_else(|| {
                 sql_err!(
-                    sqlstate::INTERNAL_ERROR,
+                    sqlstate::UNDEFINED_OBJECT,
                     "stored index replacement lost its prior definition"
                 )
             })?;
-        let new_slot = match storage.create_index(altered, txn.txid) {
-            Ok(slot) => slot,
-            Err(error) => {
-                storage.rollback_index_drop(dropped, txn.txid);
-                return Err(error);
-            }
-        };
+        if dropped != *old_slot {
+            storage.rollback_index_drop(dropped, txn.txid);
+            return Err(sql_err!(
+                sqlstate::SERIALIZATION_FAILURE,
+                "stored index replacement selected another source"
+            ));
+        }
+        txn.record_catalog_change(storage, super::txn::DdlUndo::IndexDropped(dropped as u32))?;
+        *new_slot = storage.create_index(*definition, txn.txid)?;
+        txn.record_catalog_change(storage, super::txn::DdlUndo::IndexCreated(*new_slot as u32))?;
+    }
+    for ((old_slot, table, definition), new_slot) in
+        replacements.as_slice().iter().zip(created.iter())
+    {
+        finish_index_drop(
+            storage,
+            wal,
+            txn,
+            *old_slot,
+            definition.schema,
+            definition.name,
+        )?;
+        prepare_index_creation(storage, txn, *new_slot, *table, arena)?;
+        journal_index_creation(storage, wal, txn, *new_slot, *table)?;
         let old_object = crate::storage::AccessObject {
             class: crate::storage::AccessClass::Index,
-            slot: dropped as u16,
+            slot: *old_slot as u16,
         };
         let new_object = crate::storage::AccessObject {
             class: crate::storage::AccessClass::Index,
-            slot: new_slot as u16,
+            slot: *new_slot as u16,
         };
         let owner = storage.object_owner(old_object, txn.txid);
         storage.set_object_owner(new_object, owner, txn.txid);
         preserve_object_acl(storage, txn, old_object, new_object)?;
-
-        let drop_lsn = storage.bump_lsn();
-        if let Err(error) = wal.stage_reserved(
-            txn.txid,
-            drop_lsn,
-            &WalOp::DropIndex {
-                schema: current.schema.as_str(),
-                name: current.name.as_str(),
-            },
-        ) {
-            storage.rollback_index_create(new_slot);
-            storage.rollback_index_drop(dropped, txn.txid);
-            return Err(error);
-        }
-        let create_lsn = storage.bump_lsn();
-        if let Err(error) = wal.stage_reserved(
-            txn.txid,
-            create_lsn,
-            &WalOp::CreateIndex {
-                created_at: altered.created_at,
-                schema: altered.schema.as_str(),
-                name: altered.name.as_str(),
-                table: altered.table.as_str(),
-                method: altered.method,
-                columns: altered.columns,
-                expressions: altered
-                    .expressions
-                    .each_ref()
-                    .map(|expression| expression.as_ref().map(|text| text.as_str())),
-                include_columns: altered.include_columns,
-                collations: altered.collations,
-                explicit_collations: altered.explicit_collations,
-                operator_classes: altered.operator_classes,
-                resolved_operator_classes: altered.resolved_operator_classes,
-                operator_class_options: altered.operator_class_options,
-                descending: altered.descending,
-                nulls_first: altered.nulls_first,
-                n_cols: altered.n_cols,
-                n_include_cols: altered.n_include_cols,
-                nulls_not_distinct: altered.nulls_not_distinct,
-                predicate: altered.predicate.as_ref().map(|text| text.as_str()),
-                unique: altered.unique,
-                definition: altered.mutable_for(txn.txid),
-            },
-        ) {
-            storage.rollback_index_create(new_slot);
-            storage.rollback_index_drop(dropped, txn.txid);
-            return Err(error);
-        }
-        txn.record_ddl(super::txn::DdlUndo::IndexDropped(dropped as u32))?;
-        txn.record_ddl(super::txn::DdlUndo::IndexCreated(new_slot as u32))?;
     }
     Ok(())
 }
@@ -50125,66 +50109,88 @@ fn finish_index_creation(
     table: usize,
     arena: &Arena,
 ) -> Result<(), SqlError> {
-    let index = storage
-        .index_visible_to(slot, txn.txid)
-        .expect("new index is visible to its creator");
-    let statistics = match validate_index_rows(storage, table, txn.txid, index.unique, arena) {
-        Ok(statistics) => statistics,
-        Err(error) => {
-            storage.rollback_index_create(slot);
-            return Err(error);
-        }
-    };
     let result = (|| {
-        storage.prepare_index_enforcers(
-            table,
-            txn.txid,
-            crate::storage::BindingChange::IndexCreate {
-                created_at: index.created_at,
-            },
-        )?;
-        storage.write_relation_counts(table, statistics, true)?;
-        if storage.table_def(table, txn.txid).persistence
-            != crate::storage::RelationPersistence::Temporary
-        {
-            let lsn = storage.bump_lsn();
-            wal.stage_reserved(
-                txn.txid,
-                lsn,
-                &WalOp::CreateIndex {
-                    created_at: index.created_at,
-                    schema: index.schema.as_str(),
-                    name: index.name_for(txn.txid).as_str(),
-                    table: index.table.as_str(),
-                    method: index.method,
-                    columns: index.columns,
-                    expressions: index
-                        .expressions
-                        .each_ref()
-                        .map(|value| value.as_ref().map(|text| text.as_str())),
-                    include_columns: index.include_columns,
-                    collations: index.collations,
-                    explicit_collations: index.explicit_collations,
-                    operator_classes: index.operator_classes,
-                    resolved_operator_classes: index.resolved_operator_classes,
-                    operator_class_options: index.operator_class_options,
-                    descending: index.descending,
-                    nulls_first: index.nulls_first,
-                    n_cols: index.n_cols,
-                    n_include_cols: index.n_include_cols,
-                    nulls_not_distinct: index.nulls_not_distinct,
-                    predicate: index.predicate.as_ref().map(|text| text.as_str()),
-                    unique: index.unique,
-                    definition: index.mutable_for(txn.txid),
-                },
-            )?;
-        }
+        prepare_index_creation(storage, txn, slot, table, arena)?;
+        journal_index_creation(storage, wal, txn, slot, table)?;
         txn.record_ddl(super::txn::DdlUndo::IndexCreated(slot as u32))
     })();
     if result.is_err() {
         storage.rollback_index_create(slot);
     }
     result
+}
+
+fn prepare_index_creation(
+    storage: &mut Storage,
+    txn: &TxnState,
+    slot: usize,
+    table: usize,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    let index = storage.index_visible_to(slot, txn.txid).ok_or_else(|| {
+        sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "new index is not visible to its creator"
+        )
+    })?;
+    let statistics = validate_index_rows(storage, table, txn.txid, index.unique, arena)?;
+    storage.prepare_index_definition_enforcers(
+        slot,
+        txn.txid,
+        crate::storage::IndexBindingOperation::Create,
+    )?;
+    storage.write_relation_counts(table, statistics, true)
+}
+
+fn journal_index_creation(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &TxnState,
+    slot: usize,
+    table: usize,
+) -> Result<(), SqlError> {
+    let index = storage.index_visible_to(slot, txn.txid).ok_or_else(|| {
+        sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "new index is not visible to its creator"
+        )
+    })?;
+    if storage.table_def(table, txn.txid).persistence
+        != crate::storage::RelationPersistence::Temporary
+    {
+        let lsn = storage.bump_lsn();
+        wal.stage_reserved(
+            txn.txid,
+            lsn,
+            &WalOp::CreateIndex {
+                created_at: index.created_at,
+                schema: index.schema.as_str(),
+                name: index.name_for(txn.txid).as_str(),
+                table: index.table.as_str(),
+                method: index.method,
+                columns: index.columns,
+                expressions: index
+                    .expressions
+                    .each_ref()
+                    .map(|value| value.as_ref().map(|text| text.as_str())),
+                include_columns: index.include_columns,
+                collations: index.collations,
+                explicit_collations: index.explicit_collations,
+                operator_classes: index.operator_classes,
+                resolved_operator_classes: index.resolved_operator_classes,
+                operator_class_options: index.operator_class_options,
+                descending: index.descending,
+                nulls_first: index.nulls_first,
+                n_cols: index.n_cols,
+                n_include_cols: index.n_include_cols,
+                nulls_not_distinct: index.nulls_not_distinct,
+                predicate: index.predicate.as_ref().map(|text| text.as_str()),
+                unique: index.unique,
+                definition: index.mutable_for(txn.txid),
+            },
+        )?;
+    }
+    Ok(())
 }
 
 /// Validate current committed rows and earlier own changes through retained
@@ -52126,44 +52132,48 @@ fn stage_index_drop(
         .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "index does not exist"))?;
     let schema = index.schema;
     let name = index.name_for(txn.txid);
+    let dropped = storage
+        .drop_index(schema.as_str(), name.as_str(), txn.txid)?
+        .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "index does not exist"))?;
+    let result = (|| {
+        finish_index_drop(storage, wal, txn, dropped, schema, name)?;
+        txn.record_ddl(super::txn::DdlUndo::IndexDropped(dropped as u32))
+    })();
+    if result.is_err() {
+        storage.rollback_index_drop(dropped, txn.txid);
+    }
+    result
+}
+
+fn finish_index_drop(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &TxnState,
+    slot: usize,
+    schema: SqlName,
+    name: SqlName,
+) -> Result<(), SqlError> {
+    storage.prepare_index_definition_enforcers(
+        slot,
+        txn.txid,
+        crate::storage::IndexBindingOperation::Drop,
+    )?;
     let temporary = storage
         .index_table_slot_to(slot, txn.txid)
         .is_some_and(|table| {
             storage.table_def(table, txn.txid).persistence
                 == crate::storage::RelationPersistence::Temporary
         });
-    let dropped = storage
-        .drop_index(schema.as_str(), name.as_str(), txn.txid)?
-        .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "index does not exist"))?;
-    if let Some(table) = storage.index_table_slot_to(dropped, txn.txid)
-        && let Err(error) = storage.prepare_index_enforcers(
-            table,
-            txn.txid,
-            crate::storage::BindingChange::IndexDrop {
-                created_at: index.created_at,
-            },
-        )
-    {
-        storage.rollback_index_drop(dropped, txn.txid);
-        return Err(error);
-    }
     if !temporary {
         let lsn = storage.bump_lsn();
-        if let Err(error) = wal.stage_reserved(
+        wal.stage_reserved(
             txn.txid,
             lsn,
             &WalOp::DropIndex {
                 schema: schema.as_str(),
                 name: name.as_str(),
             },
-        ) {
-            storage.rollback_index_drop(dropped, txn.txid);
-            return Err(error);
-        }
-    }
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::IndexDropped(dropped as u32)) {
-        storage.rollback_index_drop(dropped, txn.txid);
-        return Err(error);
+        )?;
     }
     Ok(())
 }

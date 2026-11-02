@@ -11033,7 +11033,12 @@ impl Checkpointer {
                     format_args!("dsst {slot} 0 0 0 - - -"),
                 )?;
             }
+            // A private replacement has no committed value generation. Row
+            // roots and prepared WAL retain recovery without this accelerator.
             for binding in 0..storage.value_binding_count(slot) {
+                if !storage.value_binding_is_committed(slot, binding) {
+                    continue;
+                }
                 let (columns, n_columns) = storage.value_binding_columns(slot, binding);
                 let index_created_at = storage.value_binding_created_at(slot, binding);
                 let include_mask = storage.value_binding_include_mask(slot, binding);

@@ -267,6 +267,9 @@ mod tests {
         config.max_tables = 2;
         config.row_overlay_slots = 2;
         config.txn_rows = 2;
+        config.definition_image_slots = 4;
+        config.table_metadata_bytes = 64 << 10;
+        config.table_metadata_leases = 128;
         config.max_catalog_versions_per_object = 1;
         config.catalog_history_bytes = 4096;
         config.max_spill_generations_per_table = 1;

@@ -858,9 +858,9 @@ mod tests {
             ))
             .unwrap();
         crate::mem::guard::forbid_alloc(|| {
-            let committed = storage
-                .create_index(index("committed_key", "binding_source", 0, 1), 0)
-                .unwrap();
+            let mut definition = index("committed_key", "binding_source", 0, 1);
+            definition.collations = [Collation::None; MAX_INDEX_COLS];
+            let committed = storage.create_index(definition, 0).unwrap();
             storage.commit_index_create(committed).unwrap();
             storage.refresh_enforcers(table).unwrap();
             assert_eq!(storage.value_binding_count(table), 1);
@@ -893,6 +893,7 @@ mod tests {
 
             let mut redundant = index("private_key", "binding_renamed", 1, 0);
             redundant.schema = destination;
+            redundant.collations = [Collation::None; MAX_INDEX_COLS];
             redundant.n_include_cols = 0;
             let private = storage.create_index(redundant, 7).unwrap();
             storage

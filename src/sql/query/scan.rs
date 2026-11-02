@@ -3938,6 +3938,11 @@ fn compare_ordered_index_keys(
     Ok(core::cmp::Ordering::Equal)
 }
 
+struct RowDecodeBuffers<'values> {
+    values: &'values mut [Datum<'values>],
+    offsets: &'values [usize],
+}
+
 /// One assembled source row: per table, decoded values (empty slice =
 /// LEFT-join null row; None = not yet joined).
 #[derive(Clone, Copy)]
@@ -3946,7 +3951,8 @@ pub(crate) enum JoinRowValues<'s, 'v> {
         bound: &'s [Option<BoundRow<'v>>],
         order: &'s [usize],
         count: usize,
-        buffers: &'s [[Datum<'v>; MAX_COLUMNS]],
+        buffers: &'s [Datum<'v>],
+        buffer_offsets: &'s [usize],
     },
     Flat {
         values: &'s [Datum<'v>],
@@ -3992,6 +3998,7 @@ impl<'s, 'v> JoinRow<'s, 'v, '_> {
                 order,
                 count,
                 buffers,
+                buffer_offsets,
             } => {
                 let position = order[..count].iter().position(|source| *source == table)?;
                 match bound[table] {
@@ -4001,7 +4008,8 @@ impl<'s, 'v> JoinRow<'s, 'v, '_> {
                         } else {
                             self.scope.defs.get(table).expect("resolved").n_columns
                         };
-                        Some(&buffers[position][..width])
+                        let start = buffer_offsets[position];
+                        Some(&buffers[start..start + width])
                     }
                     Some(BoundRow::Values(values)) => Some(values),
                     None => Some(&[]),
@@ -5605,14 +5613,15 @@ fn scan_source_mode<'a>(
         bound_rowids: &'s [Option<u64>],
         order: &'s [usize],
         count: usize,
-        buffers: &'s mut [[Datum<'v>; MAX_COLUMNS]],
+        buffers: &'s mut RowDecodeBuffers<'v>,
         arena: &'v Arena,
     ) -> Result<JoinRow<'s, 'v, 'd>, SqlError> {
         // Split buffers so each table borrows a distinct buffer. `order` maps the
         // execution position to the scope-table index.
-        let mut rest: &mut [[Datum<'v>; MAX_COLUMNS]] = buffers;
-        for &t in order.iter().take(count) {
-            let (buffer, tail) = rest.split_first_mut().expect("enough buffers");
+        let mut rest = &mut *buffers.values;
+        for (position, &t) in order.iter().take(count).enumerate() {
+            let width = buffers.offsets[position + 1] - buffers.offsets[position];
+            let (buffer, tail) = rest.split_at_mut(width);
             rest = tail;
             let def = scope.defs.get(t).expect("resolved");
             match bound[t] {
@@ -5647,7 +5656,8 @@ fn scan_source_mode<'a>(
                 bound,
                 order,
                 count,
-                buffers,
+                buffers: buffers.values,
+                buffer_offsets: buffers.offsets,
             },
             rowids: &bound_rowids[..scope.n],
         })
@@ -5692,7 +5702,7 @@ fn scan_source_mode<'a>(
         outer: Option<&dyn ColumnLookup<'a>>,
         order: &[usize],
         plan: HashJoinPlan<'a>,
-        decode_buffers: &mut [[Datum<'a>; MAX_COLUMNS]],
+        decode_buffers: &mut RowDecodeBuffers<'a>,
         recycle_rows: bool,
         pax_demand: PaxReadDemand,
         f: &mut dyn FnMut(&JoinRow<'_, 'a, '_>) -> Result<bool, SqlError>,
@@ -6256,7 +6266,7 @@ fn scan_source_mode<'a>(
         count: usize,
         on: Option<&Expr<'a>>,
         pushdown: &[&Expr<'a>],
-        decode_buffers: &mut [[Datum<'a>; MAX_COLUMNS]],
+        decode_buffers: &mut RowDecodeBuffers<'a>,
         arena: &'a Arena,
         params: &[Datum<'a>],
         hooks: &EvalHooks<'_, 'a>,
@@ -6334,7 +6344,7 @@ fn scan_source_mode<'a>(
         security_plans: &[Option<RowSecurityPlan<'a>>],
         pushdown: &[&[&'a Expr<'a>]],
         order: &[usize],
-        decode_buffers: &mut [[Datum<'a>; MAX_COLUMNS]],
+        decode_buffers: &mut RowDecodeBuffers<'a>,
         on: Option<&'a Expr<'a>>,
     ) -> Result<bool, SqlError> {
         if !sample_includes(sample_plans[order[depth]], rowid)? {
@@ -6428,7 +6438,7 @@ fn scan_source_mode<'a>(
         order: &[usize],
         parameterized: &[Option<IndexAccessPlan<'a>>],
         indexed: Option<&IndexedCandidates<'a>>,
-        decode_buffers: &mut [[Datum<'a>; MAX_COLUMNS]],
+        decode_buffers: &mut RowDecodeBuffers<'a>,
         recycle_rows: bool,
         retain_match: Option<&core::cell::Cell<bool>>,
         pax_demand: PaxReadDemand,
@@ -7263,9 +7273,21 @@ fn scan_source_mode<'a>(
     let bound_rowids = arena
         .alloc_slice_with(scope.n, |_| None)
         .map_err(|_| arena_full())?;
-    let decode_buffers = arena
-        .alloc_slice_with(scope.n.max(1), |_| [Datum::Null; MAX_COLUMNS])
+    let buffer_offsets = arena
+        .alloc_slice_with(scope.n + 1, |_| 0usize)
         .map_err(|_| arena_full())?;
+    for (position, &table) in order.iter().enumerate() {
+        buffer_offsets[position + 1] = buffer_offsets[position]
+            .checked_add(scope.defs.get(table).expect("resolved").columns.len())
+            .ok_or_else(arena_full)?;
+    }
+    let values = arena
+        .alloc_slice_with(buffer_offsets[scope.n], |_| Datum::Null)
+        .map_err(|_| arena_full())?;
+    let decode_buffers = &mut RowDecodeBuffers {
+        values,
+        offsets: buffer_offsets,
+    };
     // A row-security predicate is a security barrier ahead of every user ON
     // and WHERE expression. The nested plan owns that ordering explicitly;
     // the hash plan is selected only when no protected source participates.

@@ -25380,11 +25380,16 @@ impl Storage {
         schema == INTERNAL_LARGE_OBJECT_SCHEMA && name == INTERNAL_LARGE_OBJECT_TABLE
     }
 
-    pub(crate) fn wal_table_slot(&self, schema: &str, name: &str) -> Option<usize> {
+    pub(crate) fn wal_table_slot(
+        &self,
+        schema: &str,
+        name: &str,
+        transaction: u32,
+    ) -> Option<usize> {
         if self.is_large_object_page_relation(schema, name) {
             Some(self.large_object_page_table())
         } else {
-            self.find_table(schema, name)
+            self.find_visible(schema, name, transaction)
         }
     }
 
@@ -37372,6 +37377,11 @@ impl Storage {
 
     pub(crate) fn value_binding_is_committed(&self, table_index: usize, binding: usize) -> bool {
         let enforcer = self.tables[table_index].enforcer(binding).expect("binding");
+        // A committed index identity can still belong to a private rewritten
+        // shape. Maintenance must not decode committed rows with that shape.
+        if enforcer.evaluation_txid != 0 {
+            return false;
+        }
         if let Some(created_at) = enforcer.index_created_at {
             let table = &self.tables[table_index];
             return self.index_catalog().iter().any(|index| {
@@ -37802,6 +37812,37 @@ impl Storage {
     }
 
     /// Completes the binding root only after the selected shape's rows exist.
+    pub(crate) fn prepare_table_commit_enforcers(
+        &self,
+        change: TableDefinitionChange,
+    ) -> Result<(), SqlError> {
+        let table = self.tables.get(change.table()).ok_or_else(|| {
+            sql_err!(
+                sqlstate::SERIALIZATION_FAILURE,
+                "table binding source no longer exists"
+            )
+        })?;
+        let target = {
+            let state = table.definition.read();
+            if !table_publication::DefinitionSource::Pending(change).matches(self, &state) {
+                return Err(sql_err!(
+                    sqlstate::SERIALIZATION_FAILURE,
+                    "table binding change no longer belongs to its transaction"
+                ));
+            }
+            TableDefinitionTarget {
+                source: change.source,
+                transaction: change.transaction,
+                committed_revision: state.committed_revision,
+                pending_revision: self
+                    .pending_table_defs
+                    .selected_revision(&state, change.transaction),
+            }
+        };
+        self.prepare_table_definition_enforcers(target)
+    }
+
+    /// Row input retains the exact definition that prepared its values.
     pub(crate) fn prepare_table_definition_enforcers(
         &self,
         target: TableDefinitionTarget,
@@ -38910,6 +38951,7 @@ impl Storage {
         };
     }
 
+    #[track_caller]
     pub fn table_def(&self, index: usize, txid: u32) -> TableDefinitionRead<'_> {
         TableDefinitionRead::visible(
             &self.tables[index].definition,
@@ -55850,7 +55892,7 @@ mod tests {
             return Ok(None);
         }
         let result = (|| {
-            storage.prepare_table_definition_enforcers(change.row_target())?;
+            storage.prepare_table_commit_enforcers(change)?;
             storage.prepare_definition_publication(
                 change.transaction,
                 [change].into_iter(),

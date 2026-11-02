@@ -6,13 +6,17 @@ fn rewritten_rows_keep_complete_index_caches_after_later_updates_and_prepared_re
         crate::config::TransactionMode::Mvcc,
         crate::config::TransactionMode::Locking,
     ] {
-        for (prepared, cold, checkpoint) in [
-            (false, false, false),
-            (true, false, false),
-            (true, true, false),
-            (true, true, true),
+        for (prepared, cold, checkpoint, commit) in [
+            (false, false, false, true),
+            (true, false, false, true),
+            (true, true, false, true),
+            (true, true, true, true),
+            (true, false, false, false),
+            (true, true, false, false),
+            (true, true, true, false),
         ] {
-            let name = format!("metadata-rewrite-cache-{mode:?}-{prepared}-{cold}-{checkpoint}");
+            let name =
+                format!("metadata-rewrite-cache-{mode:?}-{prepared}-{cold}-{checkpoint}-{commit}");
             let mut config = test_config(&name);
             config.transaction_mode = mode;
             config.max_tables = 1;
@@ -44,6 +48,14 @@ fn rewritten_rows_keep_complete_index_caches_after_later_updates_and_prepared_re
             );
             if prepared {
                 session.success(&mut engine, "PREPARE TRANSACTION 'rewrite-cache'", !cold);
+                let table = engine
+                    .storage
+                    .find_table("public", "rewritten_cache")
+                    .unwrap();
+                assert!(engine.storage.value_binding_count(table) != 0);
+                for binding in 0..engine.storage.value_binding_count(table) {
+                    assert!(!engine.storage.value_binding_is_committed(table, binding));
+                }
             } else {
                 session.success(&mut engine, "COMMIT", true);
             }
@@ -57,15 +69,33 @@ fn rewritten_rows_keep_complete_index_caches_after_later_updates_and_prepared_re
                 let mut cold_budget = test_engine_budget(&config, 1 << 29);
                 let mut recovered = Engine::new(&config, &mut cold_budget).unwrap();
                 let mut resolver = ConfiguredTransactionSession::new(&config, &mut cold_budget);
-                resolver.success(&mut recovered, "COMMIT PREPARED 'rewrite-cache'", false);
-                assert_rewritten_cache(&mut recovered, &mut resolver, false);
+                resolver.success(
+                    &mut recovered,
+                    if commit {
+                        "COMMIT PREPARED 'rewrite-cache'"
+                    } else {
+                        "ROLLBACK PREPARED 'rewrite-cache'"
+                    },
+                    false,
+                );
+                assert_rewritten_cache(&mut recovered, &mut resolver, false, commit);
+                assert!(recovered.checkpoint().unwrap());
+                assert_rewritten_cache(&mut recovered, &mut resolver, false, commit);
                 drop((resolver, recovered));
                 crate::object_store::sim::drop_namespace(&config.object_store_bucket);
             } else {
                 if prepared {
-                    session.success(&mut engine, "COMMIT PREPARED 'rewrite-cache'", true);
+                    session.success(
+                        &mut engine,
+                        if commit {
+                            "COMMIT PREPARED 'rewrite-cache'"
+                        } else {
+                            "ROLLBACK PREPARED 'rewrite-cache'"
+                        },
+                        true,
+                    );
                 }
-                assert_rewritten_cache(&mut engine, &mut session, true);
+                assert_rewritten_cache(&mut engine, &mut session, true, commit);
             }
         }
     }
@@ -75,20 +105,33 @@ fn assert_rewritten_cache(
     engine: &mut Engine,
     session: &mut ConfiguredTransactionSession,
     forbid_alloc: bool,
+    commit: bool,
 ) {
     assert_eq!(
         data_rows(&session.success(
             engine,
-            "SELECT id,amount FROM rewritten_cache WHERE id=11",
-            forbid_alloc,
+            if commit {
+                "SELECT id,amount,pg_typeof(amount) FROM rewritten_cache WHERE id=11"
+            } else {
+                "SELECT id,amount,pg_typeof(amount) FROM rewritten_cache WHERE id=1"
+            },
+            forbid_alloc
         )),
-        ["11|10"],
+        [if commit {
+            "11|10|bigint"
+        } else {
+            "1|10|integer"
+        }],
     );
     assert!(
         data_rows(&session.success(
             engine,
-            "SELECT id FROM rewritten_cache WHERE id=1",
-            forbid_alloc,
+            if commit {
+                "SELECT id FROM rewritten_cache WHERE id=1"
+            } else {
+                "SELECT id FROM rewritten_cache WHERE id=11"
+            },
+            forbid_alloc
         ))
         .is_empty()
     );
@@ -97,9 +140,12 @@ fn assert_rewritten_cache(
         .find_table("public", "rewritten_cache")
         .unwrap();
     assert!(engine.storage.value_cache_complete(table, &[0]));
+    for binding in 0..engine.storage.value_binding_count(table) {
+        assert!(engine.storage.value_binding_is_committed(table, binding));
+    }
     engine.storage.set_commit_snapshot(u64::MAX);
     crate::mem::guard::forbid_alloc(|| {
-        for (id, expected) in [(1, 0), (11, 1)] {
+        for (id, expected) in [(1, usize::from(!commit)), (11, usize::from(commit))] {
             let hash =
                 crate::sql::eval::hash_key_catalog(&engine.storage, 0, &[Datum::Int4(id)], &[0])
                     .unwrap();
@@ -383,7 +429,8 @@ fn prepared_resolution_installs_admitted_metadata_with_no_free_lease() {
         config.row_overlay_slots = 16;
         config.max_value_indexes = 4;
         config.value_index_rows = 16;
-        config.table_metadata_bytes = 64 << 10;
+        // Admission retains committed/private/undo roots beside a complete replacement.
+        config.table_metadata_bytes = 128 << 10;
         config.table_metadata_leases = 256;
         crate::object_store::sim::drop_namespace(&config.object_store_bucket);
         let mut budget = test_engine_budget(&config, 1 << 29);
@@ -561,7 +608,7 @@ fn commit_admission_rewinds_generated_wal_after_repeated_cold_row_waits() {
     ));
     server.hold_response.store(true, Ordering::Release);
     let requests_before = server.requests.load(Ordering::Acquire);
-    let original = engine.wal.stage_stats(session.transaction.txid);
+    assert_eq!(engine.wal.stage_stats(session.transaction.txid), (0, 0));
     // Exercise restartable admission directly: the frontend commit wrapper
     // keeps effectful deferred SQL inside its synchronous read scope.
     for attempt in 0..3 {
@@ -574,11 +621,29 @@ fn commit_admission_rewinds_generated_wal_after_repeated_cold_row_waits() {
         })
         .unwrap_err();
         assert_eq!(error.sqlstate, sqlstate::INTERNAL_IO_WAIT);
-        assert_eq!(
-            engine.wal.stage_stats(session.transaction.txid).0,
-            original.0 + 1,
-            "exactly one TRUNCATE is staged before the cold UPDATE image"
-        );
+        let staged = engine.wal.staged_bytes_for_tests(session.transaction.txid);
+        let mut offset = 0;
+        let mut scopes = 0;
+        let mut truncates = 0;
+        while offset < staged.len() {
+            let payload_len =
+                u32::from_le_bytes(staged[offset + 4..offset + 8].try_into().unwrap()) as usize;
+            let end = offset + crate::wal::HEADER_LEN + payload_len;
+            match crate::wal::decode_record(&staged[offset + 16..end]).unwrap() {
+                crate::wal::WalOp::DatabaseScope { oid } => {
+                    assert_eq!(oid, crate::storage::DatabaseOid::POSTGRES.get());
+                    scopes += 1;
+                }
+                crate::wal::WalOp::Truncate { table_count, .. } => {
+                    assert_eq!(table_count, 1);
+                    truncates += 1;
+                }
+                _ => panic!("unexpected WAL before the cold UPDATE image"),
+            }
+            offset = end;
+        }
+        assert_eq!((scopes, truncates), (1, 1));
+        assert_eq!(engine.wal.stage_stats(session.transaction.txid).0, 2);
         assert!(session.transaction.staged_commit().is_none());
         if attempt == 0 {
             let deadline = Instant::now() + Duration::from_secs(2);

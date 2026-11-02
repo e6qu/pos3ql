@@ -5493,8 +5493,7 @@ impl Engine {
                     }) {
                         continue;
                     }
-                    self.storage
-                        .prepare_table_definition_enforcers(change.row_target())?;
+                    self.storage.prepare_table_commit_enforcers(change)?;
                 }
                 DdlUndo::IndexCreated(slot) => self.storage.prepare_index_definition_enforcers(
                     slot as usize,
@@ -21529,6 +21528,8 @@ fn replay_transaction_batches(
                         "prepared transaction WAL has an invalid database"
                     )
                 })?;
+                // The typed WAL owner remains an identity after its role is
+                // dropped; a replacement account must never inherit it.
                 storage.observe_role_oid(owner);
                 let metadata = two_phase::PreparedTransactionMetadata {
                     gid,
@@ -22197,7 +22198,7 @@ fn replay_transaction_batches(
                             ..
                         } => {
                             let Some(table_slot) =
-                                storage.find_visible(schema, table, transaction_id)
+                                storage.wal_table_slot(schema, table, transaction_id)
                             else {
                                 continue;
                             };
@@ -22223,7 +22224,7 @@ fn replay_transaction_batches(
                             ..
                         } => {
                             let Some(table_slot) =
-                                storage.find_visible(schema, table, transaction_id)
+                                storage.wal_table_slot(schema, table, transaction_id)
                             else {
                                 continue;
                             };
@@ -22296,15 +22297,6 @@ fn replay_transaction_batches(
                     return Err(sql_err!(
                         sqlstate::DATA_EXCEPTION,
                         "prepared transaction ends during a table rewrite"
-                    ));
-                }
-                if storage
-                    .role_slot_by_oid(owner.get(), transaction_id)
-                    .is_none()
-                {
-                    return Err(sql_err!(
-                        sqlstate::DATA_EXCEPTION,
-                        "prepared transaction owner is not present in the role catalog"
                     ));
                 }
                 storage.set_lsn(*lsn);
@@ -23114,7 +23106,7 @@ fn apply_wal_op(
             column,
             last,
         } => {
-            let Some(index) = storage.wal_table_slot(schema, table) else {
+            let Some(index) = storage.wal_table_slot(schema, table, 0) else {
                 return Err(SqlError {
                     sqlstate: SqlState::known(sqlstate::UNDEFINED_TABLE),
                     message: stack_format!(
@@ -23137,7 +23129,7 @@ fn apply_wal_op(
             table,
             statistics,
         } => {
-            let Some(index) = storage.wal_table_slot(schema, table) else {
+            let Some(index) = storage.wal_table_slot(schema, table, 0) else {
                 return Err(sql_err!(
                     sqlstate::UNDEFINED_TABLE,
                     "journal analyzes unknown table \"{}\"",
@@ -23250,7 +23242,7 @@ fn apply_wal_op(
             row,
             ..
         } => {
-            let Some(index) = storage.wal_table_slot(schema, table) else {
+            let Some(index) = storage.wal_table_slot(schema, table, 0) else {
                 return Err(SqlError {
                     sqlstate: SqlState::known(sqlstate::UNDEFINED_TABLE),
                     message: stack_format!(192, "journal writes to unknown table \"{}\"", table),
@@ -23266,7 +23258,7 @@ fn apply_wal_op(
             rowid,
             ..
         } => {
-            let Some(index) = storage.wal_table_slot(schema, table) else {
+            let Some(index) = storage.wal_table_slot(schema, table, 0) else {
                 return Err(SqlError {
                     sqlstate: SqlState::known(sqlstate::UNDEFINED_TABLE),
                     message: stack_format!(192, "journal deletes from unknown table \"{}\"", table),

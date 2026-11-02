@@ -33,6 +33,9 @@ fn cold_prepared_object_and_foreign_catalogs_install_or_roll_back_private_images
         config.max_user_mappings = 1;
         config.work_arena_bytes = 4 << 20;
         crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        // Keep the allocating simulator on its own server thread while the
+        // engine's real HTTP client remains inside allocation checks.
+        let server = object_reads::HttpObjectServer::start(&mut config);
         let mut budget = test_engine_budget(&config, 1 << 29);
         let mut engine = Engine::new(&config, &mut budget).unwrap();
         let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
@@ -130,6 +133,7 @@ fn cold_prepared_object_and_foreign_catalogs_install_or_roll_back_private_images
         }
         assert!(recovered.fatal_commit_failure().is_none());
         drop((resolver, recovered));
+        drop(server);
         crate::object_store::sim::drop_namespace(&config.object_store_bucket);
         std::fs::remove_dir_all(package).unwrap();
     }

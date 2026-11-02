@@ -688,6 +688,8 @@ mod tests {
         config.max_catalog_versions_per_object = 1;
         config.query_workspace_slots = 1;
         config.definition_image_slots = 4;
+        config.table_metadata_bytes = 64 << 10;
+        config.table_metadata_leases = 128;
         let mut budget = test_budget(&config);
         let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let table = storage

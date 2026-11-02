@@ -2495,6 +2495,12 @@ impl Wal {
             .map_or(0, |index| self.stages[index].buffer.mark())
     }
 
+    #[cfg(test)]
+    pub(crate) fn staged_bytes_for_tests(&self, transaction_id: u32) -> &[u8] {
+        self.stage_index(transaction_id)
+            .map_or(&[], |index| self.stages[index].buffer.readable())
+    }
+
     /// Current record/byte totals in one transaction's private stage.
     /// EXPLAIN WAL snapshots this before and after execution; publication
     /// still owns the same bytes and does not depend on the telemetry.

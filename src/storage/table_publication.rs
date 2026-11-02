@@ -1675,6 +1675,14 @@ mod tests {
                 storage.table_def(child, 9).fkeys()[0].parent.as_str(),
                 "publication_renamed"
             );
+            assert_eq!(
+                storage
+                    .prepare_table_definition_enforcers(first.row_target())
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::SERIALIZATION_FAILURE,
+                "already prepared row input must retain its original committed revision"
+            );
             assert_eq!(publish_change(&storage, first).unwrap(), Some(false));
             assert!(storage.pending_table_def(child).is_none());
             assert_eq!(

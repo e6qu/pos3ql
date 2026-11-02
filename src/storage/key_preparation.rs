@@ -93,7 +93,7 @@ impl ValueKeyPreparation {
         indexes
             .iter()
             .find(|index| {
-                index.ddl_state != CatalogDdlState::Absent
+                index.visible_to(self.target.transaction())
                     && index.created_at == created_at
                     && index.database == definition.identity.database
             })
@@ -1232,6 +1232,55 @@ mod tests {
                     .unwrap()
                     .sqlstate,
                 sqlstate::SERIALIZATION_FAILURE
+            );
+        });
+    }
+
+    #[test]
+    fn key_preparation_selects_the_visible_replacement_of_a_retained_index_identity() {
+        let (mut storage, table) = fixture(4);
+        crate::mem::guard::forbid_alloc(|| {
+            let mut definition = IndexDef {
+                schema: SqlName::parse("public").unwrap(),
+                name: SqlName::parse("selected_expression").unwrap(),
+                table: SqlName::parse("key_orders").unwrap(),
+                n_cols: 1,
+                collations: [Collation::None; MAX_INDEX_COLS],
+                ..IndexDef::EMPTY
+            };
+            definition.expressions[0] = Some(index_expression_stackstr("amount + 1").unwrap());
+            let original = storage.create_index(definition, 0).unwrap();
+            storage.commit_index_create(original).unwrap();
+            let mut replacement = storage.index_visible_to(original, 8).unwrap();
+            let identity = replacement.created_at;
+            let owner = ValueKeyPreparation::capture(&storage, table, 8).unwrap();
+            let reader = ValueKeyPreparation::capture(&storage, table, 9).unwrap();
+            storage
+                .drop_index("public", "selected_expression", 8)
+                .unwrap();
+            replacement.expressions[0] = Some(index_expression_stackstr("amount + 2").unwrap());
+            let new_slot = storage.create_index(replacement, 8).unwrap();
+            assert_ne!(original, new_slot);
+            assert_eq!(storage.index(new_slot).created_at, identity);
+            assert_eq!(
+                owner.index(&storage, identity).unwrap().expressions[0]
+                    .unwrap()
+                    .as_str(),
+                "amount + 2"
+            );
+            assert_eq!(
+                reader.index(&storage, identity).unwrap().expressions[0]
+                    .unwrap()
+                    .as_str(),
+                "amount + 1"
+            );
+            storage.rollback_index_create(new_slot);
+            storage.rollback_index_drop(original, 8);
+            assert_eq!(
+                owner.index(&storage, identity).unwrap().expressions[0]
+                    .unwrap()
+                    .as_str(),
+                "amount + 1"
             );
         });
     }

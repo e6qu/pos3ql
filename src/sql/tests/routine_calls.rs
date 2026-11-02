@@ -488,8 +488,17 @@ fn sorted_and_paged_projection_effects(external: bool) {
         ["t|t|t|t|t|t|-1|1", "NULL", "t|t", "f|t|-1", "f|-1"],
         "external={external}",
     );
+    let mut comparison_types = Vec::new();
+    let mut remaining = array_comparisons.as_slice();
+    while !remaining.is_empty() {
+        let length = i32::from_be_bytes(remaining[1..5].try_into().unwrap()) as usize;
+        if remaining[0] == b'T' {
+            comparison_types.extend(row_description_type_oids(&remaining[..1 + length]));
+        }
+        remaining = &remaining[1 + length..];
+    }
     assert_eq!(
-        row_description_type_oids(&array_comparisons),
+        comparison_types,
         [
             16, 16, 16, 16, 16, 16, 23, 23, 16, 16, 16, 16, 16, 23, 16, 23
         ],

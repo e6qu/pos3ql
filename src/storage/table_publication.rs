@@ -113,6 +113,9 @@ pub(super) struct PreparedDefinitionTransaction {
     table_changes: SharedSlice<TableDefinitionChange>,
     type_changes: SharedSlice<TypeCommitChange>,
     tables: MutableSlice<PreparedTablePublication>,
+    metadata_generations: SharedSlice<(usize, u64)>,
+    generation_tables: SharedSlice<usize>,
+    definitions_finished: bool,
 }
 
 impl PreparedDefinitionTransaction {
@@ -158,6 +161,84 @@ fn rewrite_definition(
 }
 
 impl DefinitionPublication {
+    pub(super) fn metadata_generations(&self, transaction: u32) -> SharedSlice<(usize, u64)> {
+        let registry = self
+            .prepared
+            .lock()
+            .expect("definition publication registry poisoned");
+        registry
+            .iter()
+            .find(|plan| plan.transaction == transaction)
+            .map_or(SharedSlice::EMPTY, |plan| plan.metadata_generations.clone())
+    }
+
+    pub(super) fn retain_generation_tables(
+        &self,
+        storage: &Storage,
+        transaction: u32,
+        tables: SharedSlice<usize>,
+    ) -> Result<(), SqlError> {
+        let mut registry = self
+            .prepared
+            .lock()
+            .expect("definition publication registry poisoned");
+        if let Some(plan) = registry
+            .iter_mut()
+            .find(|plan| plan.transaction == transaction)
+        {
+            plan.generation_tables = tables;
+        } else if !tables.is_empty() {
+            registry
+                .push(PreparedDefinitionTransaction {
+                    transaction,
+                    revision: None,
+                    table_changes: SharedSlice::EMPTY,
+                    type_changes: SharedSlice::EMPTY,
+                    tables: storage
+                        .metadata_pool
+                        .lease(0)
+                        .expect("empty definition plan needs no capacity"),
+                    metadata_generations: SharedSlice::EMPTY,
+                    generation_tables: tables,
+                    definitions_finished: true,
+                })
+                .map_err(|_| {
+                    sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "definition publication owners exhausted"
+                    )
+                })?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn generation_tables(&self, transaction: u32) -> SharedSlice<usize> {
+        self.prepared
+            .lock()
+            .expect("definition publication registry poisoned")
+            .iter()
+            .find(|plan| plan.transaction == transaction)
+            .map_or(SharedSlice::EMPTY, |plan| plan.generation_tables.clone())
+    }
+
+    pub(super) fn release_generation_tables(&self, transaction: u32) -> SharedSlice<usize> {
+        let mut registry = self
+            .prepared
+            .lock()
+            .expect("definition publication registry poisoned");
+        let Some(index) = registry
+            .iter()
+            .position(|plan| plan.transaction == transaction)
+        else {
+            return SharedSlice::EMPTY;
+        };
+        let tables = core::mem::replace(&mut registry[index].generation_tables, SharedSlice::EMPTY);
+        if registry[index].definitions_finished {
+            registry.swap_remove(index);
+        }
+        tables
+    }
+
     fn prepare_transaction(
         &self,
         storage: &Storage,
@@ -406,12 +487,6 @@ impl DefinitionPublication {
                         owner.definition.committed().name.as_str(),
                     ));
                 }
-                owner.publication.generation.checked_add(1).ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "table publication generation exhausted"
-                    )
-                })?;
                 let identity = owner.definition.identity;
                 let source = storage.catalog_object_identity(
                     CatalogObjectSlot::Table(slot),
@@ -469,6 +544,26 @@ impl DefinitionPublication {
                     })
                     .expect("target reservation covers all owned tables");
             }
+            let mut generation_counts = storage
+                .metadata_pool
+                .lease(targets.len())
+                .map_err(metadata_error)?;
+            for target in targets.iter() {
+                if target.primary.is_some()
+                    || (!target.retiring
+                        && target
+                            .replacements
+                            .as_ref()
+                            .is_some_and(PreparedDefinitionReplacements::changed))
+                {
+                    let CatalogObjectSlot::Table(table) = target.source.slot() else {
+                        unreachable!()
+                    };
+                    generation_counts
+                        .push_reserved((table, 1))
+                        .expect("generation count reservation covers targets");
+                }
+            }
             types.claim_definition_publication(storage, transaction, type_changes.clone())?;
             for owner in owners.slots.iter_mut().flatten() {
                 owner
@@ -483,6 +578,9 @@ impl DefinitionPublication {
                     table_changes: captured_tables.freeze(),
                     type_changes: captured_types.freeze(),
                     tables: targets,
+                    metadata_generations: generation_counts.freeze(),
+                    generation_tables: SharedSlice::EMPTY,
+                    definitions_finished: false,
                 })
                 .expect("publication owner slot was reserved before metadata preparation");
             return Ok(());
@@ -504,6 +602,9 @@ impl DefinitionPublication {
         else {
             return Ok(());
         };
+        if registry[index].definitions_finished {
+            return Ok(());
+        }
         scratch.reset();
         let mut slots = scratch
             .alloc_owned_slice_with(storage.tables.len(), |_| None)
@@ -565,7 +666,7 @@ impl DefinitionPublication {
                     )?;
                 }
             }
-            let mut plan = registry.swap_remove(index);
+            let plan = &mut registry[index];
             for target in plan.tables.iter_mut() {
                 let CatalogObjectSlot::Table(slot) = target.source.slot() else {
                     unreachable!()
@@ -585,18 +686,20 @@ impl DefinitionPublication {
                             .expect("table replacements retain a staged source revision"),
                     )
                 {
-                    owner.publication.generation += 1;
+                    owner.publication.publish_reserved_generation(transaction);
                     owner.publication.dirty = true;
                     owner.definition.publish_names();
                 }
                 owner.definition.release_publication(transaction);
             }
             types.release_definition_publication(transaction);
+            plan.definitions_finished = true;
             return Ok(());
         }
     }
 
     fn rollback_transaction(&self, storage: &Storage, transaction: u32) {
+        storage.release_commit_generations(transaction);
         let _scratch = self
             .scratch
             .lock()
@@ -885,12 +988,15 @@ impl DefinitionPublication {
             // changes before all counters and owners have been admitted.
             if transaction.is_none() {
                 for owner in owners.slots.iter().flatten() {
-                    owner.publication.generation.checked_add(1).ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                            "table publication generation exhausted"
-                        )
-                    })?;
+                    owner
+                        .publication
+                        .preview_unreserved_generation()
+                        .map_err(|_| {
+                            sql_err!(
+                                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                "table publication generation exhausted"
+                            )
+                        })?;
                 }
             }
             let selected = &owners.slots[table].as_ref().unwrap().definition;
@@ -1075,7 +1181,14 @@ impl DefinitionPublication {
                         revision,
                     );
                 }
-                owner.publication.generation += 1;
+                if let Some(transaction) = transaction {
+                    owner.publication.publish_reserved_generation(transaction);
+                } else {
+                    owner.publication.generation = owner
+                        .publication
+                        .preview_unreserved_generation()
+                        .expect("immediate publication preflight retains all owners");
+                }
                 owner.publication.dirty = true;
             }
             if let Some(transaction) = transaction {
@@ -1221,12 +1334,21 @@ mod tests {
             [change].into_iter(),
             core::iter::empty(),
         )?;
+        if let Err(error) = storage.prepare_commit_generations(
+            change.transaction,
+            core::iter::empty(),
+            core::iter::empty(),
+        ) {
+            storage.rollback_definition_publication(change.transaction);
+            return Err(error);
+        }
         let result = storage.commit_table_def(change);
         if matches!(result, Ok(Some(_))) {
             storage.finish_definition_publication(change.transaction)?;
         } else {
             storage.rollback_definition_publication(change.transaction);
         }
+        storage.release_commit_generations(change.transaction);
         storage.release_object_locks(change.transaction);
         storage.release_row_locks(change.transaction);
         result
@@ -1278,6 +1400,9 @@ mod tests {
             storage
                 .prepare_definition_publication(7, [change].into_iter(), core::iter::empty())
                 .unwrap();
+            storage
+                .prepare_commit_generations(7, core::iter::empty(), core::iter::empty())
+                .unwrap();
             let held = fill_metadata(&storage);
             assert_eq!(storage.commit_table_def(change).unwrap(), Some(false));
             storage.finish_definition_publication(7).unwrap();
@@ -1296,7 +1421,7 @@ mod tests {
 
     #[test]
     fn dependent_publication_composes_two_sources_into_one_target_generation() {
-        let (storage, parent, child, other) = fixture();
+        let (mut storage, parent, child, other) = fixture();
         {
             let revision = storage.reserve_table_definition_revision().unwrap();
             let mut owner = storage.tables[child].definition_mut(revision);
@@ -1317,6 +1442,9 @@ mod tests {
         crate::mem::guard::forbid_alloc(|| {
             storage
                 .prepare_definition_publication(7, [first, second].into_iter(), core::iter::empty())
+                .unwrap();
+            storage
+                .prepare_commit_generations(7, core::iter::empty(), core::iter::empty())
                 .unwrap();
             let held = fill_metadata(&storage);
             storage.commit_table_def(first).unwrap();
@@ -1417,6 +1545,9 @@ mod tests {
                 storage.table_def(child, 0).fkeys()[0].parent.as_str(),
                 "publication_parent"
             );
+            storage
+                .prepare_commit_generations(7, core::iter::empty(), core::iter::empty())
+                .unwrap();
             storage.commit_table_def(change).unwrap();
             storage.finish_definition_publication(7).unwrap();
             storage.release_object_locks(7);

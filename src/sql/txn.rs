@@ -244,6 +244,8 @@ struct CommitAdmission {
     clock: super::datetime::StatementClock,
     deadline: i64,
     prepared_locks_staged: bool,
+    prepared_resolution_staged: bool,
+    wal_prefix: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -1267,7 +1269,11 @@ impl TxnState {
 
     /// SQL effects are complete, but admission may still wait before WAL is
     /// committed. Unlike a staged commit, this phase remains cancellable.
-    pub(crate) fn begin_commit_admission(&mut self, target: CommitTarget) {
+    pub(crate) fn begin_commit_admission(
+        &mut self,
+        target: CommitTarget,
+        wal_prefix: usize,
+    ) -> usize {
         assert!(self.is_active() && self.staged_commit.is_none());
         if let Some(admission) = &self.commit_admission {
             assert_eq!(
@@ -1280,8 +1286,13 @@ impl TxnState {
                 clock: super::datetime::statement_clock(),
                 deadline: super::query::statement_deadline(),
                 prepared_locks_staged: false,
+                prepared_resolution_staged: false,
+                wal_prefix,
             });
         }
+        self.commit_admission
+            .expect("admission is initialized")
+            .wal_prefix
     }
 
     pub(crate) fn commit_admission(&self) -> Option<CommitTarget> {
@@ -1295,13 +1306,34 @@ impl TxnState {
             .prepared_locks_staged
     }
 
-    pub(super) fn mark_prepared_locks_staged(&mut self) {
+    pub(super) fn mark_prepared_locks_staged(&mut self, wal_prefix: usize) {
         let admission = self
             .commit_admission
             .as_mut()
             .expect("prepared lock image requires admission");
         assert!(matches!(admission.target, CommitTarget::Prepare { .. }));
         admission.prepared_locks_staged = true;
+        admission.wal_prefix = wal_prefix;
+    }
+
+    pub(super) fn prepared_resolution_staged(&self) -> bool {
+        self.commit_admission
+            .as_ref()
+            .expect("prepared resolution requires admission")
+            .prepared_resolution_staged
+    }
+
+    pub(super) fn mark_prepared_resolution_staged(&mut self, wal_prefix: usize) {
+        let admission = self
+            .commit_admission
+            .as_mut()
+            .expect("prepared resolution requires admission");
+        assert!(matches!(
+            admission.target,
+            CommitTarget::CommitPrepared { .. } | CommitTarget::RollbackPrepared { .. }
+        ));
+        admission.prepared_resolution_staged = true;
+        admission.wal_prefix = wal_prefix;
     }
 
     pub(crate) fn stage_commit(&mut self, lsn: u64, target: CommitTarget, barrier: CommitBarrier) {
@@ -1670,6 +1702,7 @@ impl TxnState {
         tables: &[usize],
         cascade: bool,
         restart_identity: bool,
+        command_id: u32,
     ) -> Result<(), SqlError> {
         if self.truncates.len() == self.truncates.capacity()
             || tables.len() > self.truncate_table_capacity()
@@ -1687,7 +1720,7 @@ impl TxnState {
         }
         self.truncates
             .push(TruncateEvent {
-                command_id: self.command_id(),
+                command_id,
                 table_offset,
                 table_count: tables.len(),
                 cascade,
@@ -2547,6 +2580,22 @@ impl TxnState {
                 DdlUndo::DomainAltered(undo) => TypeCommitChange::Definition(undo.target()),
                 DdlUndo::EnumAltered(undo) => TypeCommitChange::Definition(undo.target()),
                 DdlUndo::CompositeAltered(undo) => TypeCommitChange::Definition(undo.target()),
+                _ => return None,
+            })
+        })
+    }
+
+    pub(crate) fn index_generation_changes(
+        &self,
+    ) -> impl Iterator<Item = crate::storage::IndexGenerationChange> + Clone {
+        self.ddl().iter().filter_map(|undo| {
+            use crate::storage::IndexGenerationChange;
+            Some(match undo {
+                DdlUndo::IndexCreated(slot) => IndexGenerationChange::Created(*slot as usize),
+                DdlUndo::IndexDropped(slot) => IndexGenerationChange::Dropped(*slot as usize),
+                DdlUndo::IndexRenamed { slot, .. } => {
+                    IndexGenerationChange::Renamed(*slot as usize)
+                }
                 _ => return None,
             })
         })

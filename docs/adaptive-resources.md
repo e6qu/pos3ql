@@ -21,8 +21,9 @@ reserved memory must remain unchanged.
   instance-wide `row_history_slots`; locking mode reserves no committed history.
 - Foreground retained row IDs and DML buffers use one `row_work_bytes` pool,
   bounded by `row_work_leases` owners. Reader table definitions use the explicit
-  `definition_image_slots` pool. These replace hidden row/table/worker sizing;
-  separate catalog and definition-history metadata still needs accounting.
+  `definition_image_slots` identity pool. Physical images share schema pins;
+  synthetic images own only their actual visible/hidden columns. Statistics
+  and other catalog families retain separate reservations.
   Exact read captures reserve their known count. Active write buffers grow
   geometrically, clamped to the pool maximum; unused active capacity still costs
   bytes. Each extent rounds to 64 bytes (at most 63 alignment-padding bytes).
@@ -33,6 +34,15 @@ reserved memory must remain unchanged.
   Checkpoint and relocation buffers retain independent guaranteed progress
   capacity, sized from the resident objects they can visit. They do not borrow
   foreground space needed by a report that may outlive maintenance.
+
+- Actual table columns, constraints, pending edit mappings and index bindings
+  share `table_metadata_bytes` backing (64 MiB in the starter configuration),
+  with `table_metadata_leases` limiting occupied ranges (8,192). Retained schemas
+  share ownership without another payload copy. Replacement data and old versions
+  stay charged together until their owners release them. Pool descriptors,
+  per-table headers, statistics and serial state still add startup cost.
+  Metadata, binding roots and row keys are reserved before durability; commit
+  does not build replacements afterward.
 
 - The [RAM block cache](https://github.com/e6qu/pos3ql/blob/b36e100a1d48221d6a06a15ecb68981dc699d26f/src/store/cache.rs) and
   [disk block cache](https://github.com/e6qu/pos3ql/blob/b36e100a1d48221d6a06a15ecb68981dc699d26f/src/store/disk.rs) already share fixed slots across
@@ -57,8 +67,8 @@ the runner matrix records equal-capacity evidence separately.
 
 ## Keep capacity fixed; change who can use it
 
-Allocate shared backing pools, their indexes and controller state at startup.
-A lease is temporary ownership of a portion of that reserved space. Tables,
+Keep shared backing pools and their indexes fixed at startup. Future controller
+state must fit the same rule. A lease is temporary ownership of a portion of that reserved space. Tables,
 queries and maintenance acquire and release leases without growing the heap.
 Keep small table identities separate from expensive resident row capacity.
 

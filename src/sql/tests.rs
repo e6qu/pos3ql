@@ -11,6 +11,7 @@ mod client_catalog;
 mod cursor_execution;
 mod key_preparation;
 mod object_reads;
+mod prepared_object_capacity;
 mod query_execution;
 mod routine_calls;
 mod row_history;
@@ -1016,9 +1017,10 @@ fn statement_row_copy_chunks_reject_a_definition_changed_after_copy_begin() {
             .storage
             .find_visible("public", "statement_copy_source", transaction.txid)
             .unwrap();
-        let (target, mut definition) = engine
+        let (target, definition) = engine
             .storage
             .select_table_definition(table, transaction.txid);
+        let mut definition = crate::storage::TableDefBuilder::from_definition(&definition);
         definition.columns[0].name = crate::storage::SqlName::parse("renamed_after_begin").unwrap();
         let mut mapping = [None; crate::storage::MAX_COLUMNS];
         mapping[0] = Some(definition.columns[0].name);
@@ -73969,7 +73971,8 @@ fn typed_table_membership_rejects_a_reused_source_lifetime() {
         .storage
         .find_visible("public", "saved_typed_rows", 0)
         .unwrap();
-    let mut saved = *engine.storage.table_def(slot, 0);
+    let mut saved =
+        crate::storage::TableDefBuilder::from_definition(&engine.storage.table_def(slot, 0));
     let source_slot = saved.type_membership.composite_slot().unwrap();
     for statement in [
         "DROP TYPE retired_typed_source CASCADE",
@@ -81572,7 +81575,7 @@ fn one_protocol_flush_publishes_many_commits_as_one_immutable_batch() {
     engine.commit_wal().unwrap();
     for session in [&mut first, &mut second, &mut third] {
         engine
-            .finish_staged_transaction(&mut session.transaction, &session.guc)
+            .finish_pending_transaction(&mut session.transaction, &session.guc)
             .unwrap();
     }
 
@@ -81640,7 +81643,7 @@ fn one_protocol_flush_publishes_many_commits_as_one_immutable_batch() {
     stage_without_publication(&mut engine, &mut first, "INSERT INTO batched VALUES (4)");
     engine.commit_wal().unwrap();
     engine
-        .finish_staged_transaction(&mut first.transaction, &first.guc)
+        .finish_pending_transaction(&mut first.transaction, &first.guc)
         .unwrap();
     assert!(engine.checkpoint().unwrap());
     let mut batches = 0;
@@ -83483,7 +83486,7 @@ fn ambiguous_commit_batch_put_is_idempotently_adopted() {
     // the durable bytes and adopt the same batch and root without duplication.
     engine.commit_wal().unwrap();
     engine
-        .finish_staged_transaction(&mut session.transaction, &session.guc)
+        .finish_pending_transaction(&mut session.transaction, &session.guc)
         .unwrap();
     assert_eq!(engine.wal.pending_batch_bytes(), 0);
     namespace.borrow_mut().faults.ambiguous_put_per_mille = 0;
@@ -85225,7 +85228,7 @@ fn named_backup_recovers_to_retained_lsn_and_timestamp_boundaries_body() {
     engine.commit_wal().unwrap();
     for session in [&mut target, &mut later] {
         engine
-            .finish_staged_transaction(&mut session.transaction, &session.guc)
+            .finish_pending_transaction(&mut session.transaction, &session.guc)
             .unwrap();
     }
     assert!(engine.checkpoint().unwrap());
@@ -94992,7 +94995,7 @@ fn cleanup_download_overlap_wal_retry_precedes_cleanup_and_preserves_pending_pre
         namespace.borrow_mut().faults.fail_from_op = None;
         engine.commit_wal().unwrap();
         engine
-            .finish_staged_transaction(&mut session.transaction, &session.guc)
+            .finish_pending_transaction(&mut session.transaction, &session.guc)
             .unwrap();
         assert!(!engine.durable_retry_pending());
         prepare_sliced_cleanup(&mut engine);
@@ -96863,7 +96866,7 @@ fn parallel_commit_partition_detach_keeps_phase_receipts_before_reader_waits() {
         engine.commit_wal().unwrap();
         if extended {
             crate::mem::guard::forbid_alloc(|| {
-                engine.finish_staged_transaction(&mut detacher.transaction, &detacher.guc)
+                engine.finish_pending_transaction(&mut detacher.transaction, &detacher.guc)
             })
             .unwrap();
         } else {

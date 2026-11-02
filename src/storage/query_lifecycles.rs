@@ -1823,7 +1823,7 @@ impl Storage {
             }
         }
         owners.catalog.views[slot].pending_definition = undo.prior;
-        let restored = owners.catalog.views[slot];
+        let restored = owners.catalog.views[slot].clone();
         self.stage_view_comments(
             owners.comments.as_mut().expect("view edits own comments"),
             (pending.schema, pending.name),

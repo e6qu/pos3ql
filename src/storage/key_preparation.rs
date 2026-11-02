@@ -189,7 +189,7 @@ impl ValueBindingRead {
         storage: &Storage,
         arena: &Arena,
         values: &[Datum],
-        visit: impl FnOnce(Option<&[Datum]>, &[Datum], &Enforcer) -> Result<R, SqlError>,
+        visit: impl FnOnce(Option<&[Datum]>, &[Datum], &EnforcerSnapshot) -> Result<R, SqlError>,
     ) -> Result<R, SqlError> {
         if values.len() != self.n_columns {
             return Err(sql_err!(
@@ -204,9 +204,13 @@ impl ValueBindingRead {
                 &self.enforcer,
                 self.enforcer.evaluation_txid,
                 values,
-                visit,
+                |key, values, _| visit(key, values, &self.enforcer),
             ),
-            None => Storage::with_plain_value_binding_values(&self.enforcer, values, visit),
+            None => Storage::with_plain_value_binding_values(
+                &self.enforcer,
+                values,
+                |key, values, _| visit(key, values, &self.enforcer),
+            ),
         }
     }
 }
@@ -548,6 +552,9 @@ mod tests {
         storage
             .prepare_commit_row_keys(8, core::iter::once((table, 1)))
             .unwrap();
+        storage
+            .prepare_commit_generations(8, core::iter::once((table, 1)), core::iter::empty())
+            .unwrap();
         let selected_bindings = storage.tables[table].enforcers();
         let mut occupied = Vec::new();
         while let Ok(lease) = storage.metadata_pool.lease::<u8>(64) {
@@ -655,7 +662,7 @@ mod tests {
             };
             index.columns[0] = 1;
             let slot = storage.create_index(index, 0).unwrap();
-            storage.commit_index_create(slot);
+            storage.commit_index_create(slot).unwrap();
             let error = storage
                 .build_enforcers_visible(table, None, EnforcerRows::Rebuild, None)
                 .unwrap_err();
@@ -677,7 +684,7 @@ mod tests {
                 storage.drop_index("public", "amount_index", 8).unwrap(),
                 Some(slot)
             );
-            storage.commit_index_drop(slot);
+            storage.commit_index_drop(slot).unwrap();
             storage
                 .build_enforcers_visible(table, None, EnforcerRows::Rebuild, None)
                 .unwrap();
@@ -700,7 +707,7 @@ mod tests {
             };
             index.expressions[0] = Some(index_expression_stackstr("id / (amount - 11)").unwrap());
             let slot = storage.create_index(index, 0).unwrap();
-            storage.commit_index_create(slot);
+            storage.commit_index_create(slot).unwrap();
             assert_eq!(
                 storage
                     .build_enforcers_visible(table, None, EnforcerRows::Rebuild, None)
@@ -718,7 +725,7 @@ mod tests {
                 storage.drop_index("public", "bad_expression", 8).unwrap(),
                 Some(slot)
             );
-            storage.commit_index_drop(slot);
+            storage.commit_index_drop(slot).unwrap();
             storage
                 .build_enforcers_visible(table, None, EnforcerRows::Rebuild, None)
                 .unwrap();
@@ -960,6 +967,9 @@ mod tests {
                 .unwrap()
                 .unwrap();
             storage
+                .prepare_commit_generations(8, core::iter::once((table, 1)), core::iter::empty())
+                .unwrap();
+            storage
                 .build_enforcers_visible(table, None, EnforcerRows::Rebuild, None)
                 .unwrap();
             let before = storage.tables[table].generation();
@@ -973,6 +983,7 @@ mod tests {
             assert_eq!(row.pending_last().unwrap().txid, 8);
             assert!(row.history.is_empty());
             drop(row);
+            storage.release_commit_generations(8);
             storage.commit_row(table, 1, 8, 9).unwrap();
             assert_eq!(key_rows(&storage, table, 1), 0);
             assert_eq!(key_rows(&storage, table, 2), 1);
@@ -1001,7 +1012,7 @@ mod tests {
                     },
                 )
                 .unwrap();
-            storage.commit_index_create(slot);
+            storage.commit_index_create(slot).unwrap();
             pending(&storage, table, 1, 8, 2);
             storage.commit_row(table, 1, 8, 9).unwrap();
             let before = storage.tables[table].enforcers();
@@ -1048,7 +1059,7 @@ mod tests {
                     },
                 )
                 .unwrap();
-            storage.commit_index_create(slot);
+            storage.commit_index_create(slot).unwrap();
             let selected = storage.tables[table].enforcers();
             let held = [
                 storage.value_indexes.acquire().unwrap(),
@@ -1070,7 +1081,7 @@ mod tests {
                     },
                 )
                 .unwrap();
-            storage.commit_index_drop(slot);
+            storage.commit_index_drop(slot).unwrap();
             storage.finish_bindings(table, 8);
             let current = storage.tables[table].enforcers();
             assert_eq!(storage.tables[table].enforcer_count(), 1);
@@ -1104,6 +1115,9 @@ mod tests {
                 .prepare_committed_row(table, 1, 8, false, selected)
                 .unwrap()
                 .unwrap();
+            storage
+                .prepare_commit_generations(8, core::iter::once((table, 1)), core::iter::empty())
+                .unwrap();
             pending(&storage, table, 2, 10, 3);
             storage.commit_row(table, 2, 10, 9).unwrap();
             storage.publish_prepared_row(10, prepared).unwrap();
@@ -1124,6 +1138,9 @@ mod tests {
             let prepared = first
                 .prepare_committed_row(table, 1, 8, true, selected)
                 .unwrap()
+                .unwrap();
+            first
+                .prepare_commit_generations(8, core::iter::once((table, 1)), core::iter::empty())
                 .unwrap();
             let generation = second.tables[other].generation();
             assert_eq!(
@@ -1183,7 +1200,7 @@ mod tests {
                 ..IndexDef::EMPTY
             };
             let slot = storage.create_index(index, 0).unwrap();
-            storage.commit_index_create(slot);
+            storage.commit_index_create(slot).unwrap();
             let created_at = storage.index(slot).created_at;
             let selection = ValueKeyPreparation::capture(&storage, table, 0).unwrap();
             assert!(selection.index(&storage, created_at).is_ok());

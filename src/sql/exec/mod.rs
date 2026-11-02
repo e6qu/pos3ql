@@ -21358,7 +21358,7 @@ impl PlpgsqlExecHost<'_> {
                     result => result?,
                 }
                 engine.commit_wal()?;
-                engine.finish_staged_transaction(txn, guc)?;
+                engine.finish_pending_transaction(txn, guc)?;
                 cursors.on_commit();
                 next
             }
@@ -44803,7 +44803,7 @@ fn apply_column_drop_dependencies(
             table,
             column,
             column_name,
-            table_definition,
+            table_definition: table_definition.clone(),
         },
         cascade,
         arena,
@@ -55061,7 +55061,7 @@ pub fn apply_replication_truncate(
             }
         }
     }
-    txn.record_truncate(tables, cascade, restart_identity)?;
+    txn.record_truncate(tables, cascade, restart_identity, txn.command_id())?;
     for &table in tables {
         storage.record_relation_transaction_truncate(txn.txid, table)?;
     }
@@ -60143,7 +60143,7 @@ pub(crate) fn instead_of_view_dml<'a>(
         let mut description = [ColDesc::new("", 0, 0); MAX_PROJ];
         let count = match super::query::describe_catalog_items_as(
             returning.items,
-            Some(&def),
+            Some(crate::storage::RelationDefinition::from_definition(&def)),
             alias,
             storage,
             txn.txid,
@@ -64190,7 +64190,8 @@ pub(crate) fn truncate(
             return sql_fail(error);
         }
     }
-    if let Err(error) = txn.record_truncate(&list[..n], cascade, restart_identity) {
+    if let Err(error) = txn.record_truncate(&list[..n], cascade, restart_identity, txn.command_id())
+    {
         return sql_fail(error);
     }
     for &table_index in &list[..n] {
@@ -64723,7 +64724,7 @@ fn drop_dependent_foreign_keys(
         let current = if table_slot == target_table {
             *target
         } else {
-            live_definition
+            TableDefBuilder::from_definition(&live_definition)
         };
         let depends = |foreign_key: &crate::storage::ForeignKey| {
             foreign_key.parent_schema == target_schema
@@ -69881,7 +69882,7 @@ fn alter_table_relation(
     sql_ok()
 }
 
-fn stage_inbound_foreign_key_moves<
+pub(super) fn stage_inbound_foreign_key_moves<
     Definition0: crate::storage::DefinitionBacking,
     Definition1: crate::storage::DefinitionBacking,
 >(

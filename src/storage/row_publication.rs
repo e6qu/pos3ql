@@ -1783,7 +1783,7 @@ mod tests {
                 match retirement {
                     0 => storage.commit_drop(table),
                     1 => storage.rollback_create(table),
-                    _ => storage.drop_table(table),
+                    _ => storage.drop_table(table).unwrap(),
                 }
                 let error = storage.publish_pending_write(retired).err().unwrap();
                 assert_eq!(error.sqlstate, sqlstate::SERIALIZATION_FAILURE);
@@ -2204,7 +2204,7 @@ mod tests {
         let stale = storage
             .prepare_pending_write(table, 1, 7, 1, Some(location), true)
             .unwrap();
-        storage.drop_table(table);
+        storage.drop_table(table).unwrap();
         let replacement = storage
             .create_table(make_def("replacement", &[("id", ColType::Int4, false)]))
             .unwrap();

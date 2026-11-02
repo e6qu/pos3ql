@@ -89,9 +89,12 @@ table_metadata_bytes = 64MiB
 table_metadata_leases = 8192
 ```
 
-These settings budget resident row metadata, foreground row workspace and copies
-of table definitions for the whole instance. A busy table can use available
-shared capacity; creating empty tables does not give each its own row allowance.
+These explicit settings bound resident rows, foreground row workspace, retained
+schema identities and actual table/index metadata for the whole instance.
+`table_metadata_bytes` reserves metadata backing; `table_metadata_leases` bounds
+its occupied ranges. Readers share immutable schema owners. A busy table can use
+available capacity; empty tables receive no private maximum-width schema or row
+allowance.
 Large objects retain their separate `large_object_pages` reservation. The
 [architecture](docs/architecture.md#memory-and-physical-size) explains the
 remaining per-table costs and the limits of this work.

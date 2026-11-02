@@ -260,7 +260,7 @@ pub struct Config {
     pub table_metadata_bytes: usize,
     /// Concurrent owned ranges in the table metadata pool.
     pub table_metadata_leases: usize,
-    /// Wide table-definition images shared by active readers.
+    /// Shared identities for retained table schemas and synthetic query columns.
     pub definition_image_slots: usize,
     /// Entries retained by each in-RAM value-index acceleration cache before it
     /// becomes incomplete and probes fall through to authoritative row SSTs.
@@ -2082,6 +2082,7 @@ mod tests {
             "row_overlay_slots",
             "row_work_leases",
             "definition_image_slots",
+            "table_metadata_leases",
         ] {
             for value in [0, usize::MAX] {
                 let mut config = base.clone();
@@ -2089,6 +2090,7 @@ mod tests {
                     "row_overlay_slots" => config.row_overlay_slots = value,
                     "row_work_leases" => config.row_work_leases = value,
                     "definition_image_slots" => config.definition_image_slots = value,
+                    "table_metadata_leases" => config.table_metadata_leases = value,
                     _ => unreachable!(),
                 }
                 assert!(
@@ -2100,16 +2102,22 @@ mod tests {
                 );
             }
         }
-        for bytes in [0, 65, usize::MAX & !63] {
-            let mut config = base.clone();
-            config.row_work_bytes = bytes;
-            assert!(
-                config
-                    .validate_runtime_resources()
-                    .unwrap_err()
-                    .message
-                    .contains("row_work_bytes")
-            );
+        for name in ["row_work_bytes", "table_metadata_bytes"] {
+            for bytes in [0, 65, usize::MAX & !63] {
+                let mut config = base.clone();
+                match name {
+                    "row_work_bytes" => config.row_work_bytes = bytes,
+                    "table_metadata_bytes" => config.table_metadata_bytes = bytes,
+                    _ => unreachable!(),
+                }
+                assert!(
+                    config
+                        .validate_runtime_resources()
+                        .unwrap_err()
+                        .message
+                        .contains(name)
+                );
+            }
         }
         let text = format!(
             "transaction_mode = mvcc\ncatalog_history_bytes = 16MiB\nrow_history_slots = 65536\nrow_overlay_slots = 1\nrow_work_bytes = {}\nrow_work_leases = 1\ndefinition_image_slots = 1\ntable_metadata_bytes = 64MiB\ntable_metadata_leases = 8192\n",
@@ -2146,6 +2154,8 @@ mod tests {
             assert_eq!(config.row_work_bytes, 3 * MIB);
             assert_eq!(config.row_work_leases, 19);
             assert_eq!(config.definition_image_slots, 23);
+            assert_eq!(config.table_metadata_bytes, 64 * MIB);
+            assert_eq!(config.table_metadata_leases, 8192);
         }
         assert!(
             Config::parse(&format!(
@@ -2167,6 +2177,8 @@ mod tests {
             ("row_work_bytes", "3MiB"),
             ("row_work_leases", "19"),
             ("definition_image_slots", "23"),
+            ("table_metadata_bytes", "64MiB"),
+            ("table_metadata_leases", "8192"),
         ] {
             let missing = capacities.replace(&format!("{name} = {value}\n"), "");
             assert!(

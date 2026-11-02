@@ -424,8 +424,9 @@ mod tests {
             storage.create_schema(destination).unwrap();
             let revision = storage.reserve_table_definition_revision().unwrap();
             {
-                let original = *storage.table_def(table, 0);
-                let mut dependent = storage.tables[other].definition_mut(revision);
+                let original = storage.table_def(table, 0).clone();
+                let mut dependent =
+                    TableDefBuilder::from_definition(&storage.tables[other].definition());
                 dependent.n_fkeys = 1;
                 dependent.fkeys[0] = crate::storage::ForeignKey {
                     identity: None,
@@ -435,6 +436,8 @@ mod tests {
                     n_parent_cols: 1,
                     ..crate::storage::ForeignKey::EMPTY
                 };
+                let dependent = dependent.freeze(&storage.metadata_pool).unwrap();
+                *storage.tables[other].definition_mut(revision) = dependent;
             }
             crate::mem::guard::forbid_alloc(|| {
                 let (target, selected_definition) = storage.select_table_definition(table, 8);

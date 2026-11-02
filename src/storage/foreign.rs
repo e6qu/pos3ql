@@ -192,7 +192,7 @@ pub(crate) enum ForeignDataValidator {
     Postgres,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ForeignDataWrapperDefinition {
     pub name: SqlName,
     pub handler: ForeignDataHandler,
@@ -209,7 +209,7 @@ impl ForeignDataWrapperDefinition {
     };
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ForeignServerDefinition {
     pub name: SqlName,
     pub wrapper: u16,
@@ -234,7 +234,7 @@ pub(crate) enum ForeignMappingUser {
     Role(u16),
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct UserMappingDefinition {
     pub server: u16,
     pub user: ForeignMappingUser,
@@ -249,7 +249,7 @@ impl UserMappingDefinition {
     };
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ForeignColumnOption {
     pub column: u16,
     pub option: ForeignOption,
@@ -262,7 +262,7 @@ impl ForeignColumnOption {
     };
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ForeignColumnOptions {
     entries: [ForeignColumnOption; MAX_FOREIGN_COLUMN_OPTIONS],
     count: u8,
@@ -333,7 +333,7 @@ impl ForeignColumnOptions {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ForeignTableDefinition {
     pub table: u16,
     pub server: u16,
@@ -398,6 +398,26 @@ impl<D: Copy> ForeignCatalogEntry<D> {
         .flatten()
         .find(|owner| *owner != txid)
     }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum PreparedForeignChange<D: Copy> {
+    Unchanged,
+    Created,
+    Dropped,
+    Changed {
+        // Outer None means unchanged; inner None means no prior private image.
+        definition: Option<Option<PendingForeignDefinition<D>>>,
+        ownership: Option<Option<PendingOwnership>>,
+    },
+}
+
+pub(crate) struct PreparedForeignImage<D: Copy> {
+    pub database: DatabaseOid,
+    pub created_at: u64,
+    pub owner: Option<u16>,
+    pub definition: Option<D>,
+    pub transaction: u32,
 }
 
 pub(crate) struct ForeignCatalog {
@@ -939,6 +959,124 @@ impl ForeignCatalog {
             }
         }
         Ok(())
+    }
+
+    fn stage_prepared_entry<D: Copy + PartialEq>(
+        entries: &mut FixedVec<ForeignCatalogEntry<D>>,
+        slot: usize,
+        image: PreparedForeignImage<D>,
+    ) -> Result<PreparedForeignChange<D>, SqlError> {
+        CatalogIdentity::require(image.created_at)?;
+        if image.definition.is_some()
+            && entries.iter().enumerate().any(|(other, entry)| {
+                other != slot
+                    && entry.database == image.database
+                    && entry.ddl_state != CatalogDdlState::Absent
+                    && entry.created_at == image.created_at
+            })
+        {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "prepared foreign catalog creation identity is duplicated"
+            ));
+        }
+        let entry = entries.get_mut(slot).ok_or_else(|| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "prepared foreign catalog slot is out of range"
+            )
+        })?;
+        if entry.ddl_state == CatalogDdlState::Absent {
+            let Some(definition) = image.definition else {
+                return Ok(PreparedForeignChange::Unchanged);
+            };
+            *entry = ForeignCatalogEntry {
+                database: image.database,
+                created_at: image.created_at,
+                definition,
+                pending: None,
+                ownership: image.owner.map_or(Ownership::BOOTSTRAP, |owner| Ownership {
+                    owner,
+                    pending: None,
+                }),
+                ddl_state: CatalogDdlState::PendingCreate {
+                    txid: image.transaction,
+                },
+            };
+            return Ok(PreparedForeignChange::Created);
+        }
+        if entry.database != image.database
+            || entry.created_at != image.created_at
+            || entry.pending_owner_other_than(image.transaction).is_some()
+        {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "prepared foreign catalog image selects another lifetime or owner"
+            ));
+        }
+        let Some(definition) = image.definition else {
+            entry.ddl_state = entry.ddl_state.drop_by(image.transaction);
+            return Ok(PreparedForeignChange::Dropped);
+        };
+        let prior_definition = (entry.definition_for(image.transaction) != definition).then(|| {
+            let prior = entry.pending;
+            entry.pending = Some(PendingForeignDefinition {
+                txid: image.transaction,
+                definition,
+            });
+            prior
+        });
+        let prior_ownership = image
+            .owner
+            .filter(|owner| *owner != entry.ownership.owner_to(image.transaction))
+            .map(|owner| {
+                let prior = entry.ownership.pending;
+                entry.ownership.pending = Some(PendingOwnership {
+                    txid: image.transaction,
+                    owner,
+                });
+                prior
+            });
+        if prior_definition.is_none() && prior_ownership.is_none() {
+            Ok(PreparedForeignChange::Unchanged)
+        } else {
+            Ok(PreparedForeignChange::Changed {
+                definition: prior_definition,
+                ownership: prior_ownership,
+            })
+        }
+    }
+
+    pub(crate) fn stage_prepared_wrapper(
+        &mut self,
+        slot: usize,
+        image: PreparedForeignImage<ForeignDataWrapperDefinition>,
+    ) -> Result<PreparedForeignChange<ForeignDataWrapperDefinition>, SqlError> {
+        Self::stage_prepared_entry(&mut self.wrappers, slot, image)
+    }
+
+    pub(crate) fn stage_prepared_server(
+        &mut self,
+        slot: usize,
+        image: PreparedForeignImage<ForeignServerDefinition>,
+    ) -> Result<PreparedForeignChange<ForeignServerDefinition>, SqlError> {
+        Self::stage_prepared_entry(&mut self.servers, slot, image)
+    }
+
+    pub(crate) fn stage_prepared_mapping(
+        &mut self,
+        slot: usize,
+        image: PreparedForeignImage<UserMappingDefinition>,
+    ) -> Result<PreparedForeignChange<UserMappingDefinition>, SqlError> {
+        Self::stage_prepared_entry(&mut self.mappings, slot, image)
+    }
+
+    pub(crate) fn stage_prepared_table(
+        &mut self,
+        slot: usize,
+        image: PreparedForeignImage<ForeignTableDefinition>,
+    ) -> Result<PreparedForeignChange<ForeignTableDefinition>, SqlError> {
+        Self::stage_prepared_entry(&mut self.tables, slot, image)
     }
 
     pub(crate) fn replay_set_wrapper(

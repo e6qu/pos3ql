@@ -370,6 +370,13 @@ mod tests {
             assert!(AttributeSlot::decode([2, 8, 0, 1, b'z', b'p', 0, 0]).is_none());
         });
     }
+}
+
+#[cfg(test)]
+mod ownership_tests {
+    use super::*;
+    use crate::sql::types::ColType;
+    use crate::storage::TableDefBuilder;
 
     #[test]
     fn shared_table_definition_copies_actual_fields_and_pins_them_through_clone() {

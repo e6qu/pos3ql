@@ -16,7 +16,7 @@ static NEXT_IMAGE_POOL: AtomicU64 = AtomicU64::new(1);
 
 /// Borrowed columns for query schemas; hidden fields may follow the visible prefix.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct RelationDefinition<'a> {
+pub struct RelationDefinition<'a> {
     pub(crate) schema: super::SqlName,
     pub(crate) name: super::SqlName,
     pub(crate) n_columns: usize,
@@ -24,7 +24,7 @@ pub(crate) struct RelationDefinition<'a> {
 }
 
 impl<'a> RelationDefinition<'a> {
-    pub(crate) fn from_definition<B: super::DefinitionBacking>(
+    pub fn from_definition<B: super::DefinitionBacking>(
         definition: &'a super::TableDefinition<B>,
     ) -> Self {
         Self {
@@ -35,11 +35,11 @@ impl<'a> RelationDefinition<'a> {
         }
     }
 
-    pub(crate) fn columns(&self) -> &'a [super::ColumnMeta] {
+    pub fn columns(&self) -> &'a [super::ColumnMeta] {
         &self.columns[..self.n_columns]
     }
 
-    pub(crate) fn column_index(&self, name: &str) -> Option<usize> {
+    pub fn column_index(&self, name: &str) -> Option<usize> {
         self.columns()
             .iter()
             .position(|column| column.name.as_str() == name)

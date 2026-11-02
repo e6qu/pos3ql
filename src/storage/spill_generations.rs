@@ -3807,7 +3807,7 @@ mod tests {
             drop(scan);
             drop(scope);
             storage.set_spill_list(table, &[roots[2]]);
-            storage.drop_table(table);
+            storage.drop_table(table).unwrap();
             lease
         });
         drop(storage);
@@ -5392,7 +5392,7 @@ mod tests {
             assert_eq!(values, [crate::sql::types::Datum::Int4(17)]);
             let registry = Arc::clone(&storage.spill_roots);
             storage.set_spill_list(table, &[roots[2]]);
-            storage.drop_table(table);
+            storage.drop_table(table).unwrap();
             let mut definition = make_def("retirement", &[("id", ColType::Text, true)]);
             definition.persistence = RelationPersistence::Temporary;
             let replacement = storage.create_table(definition).unwrap();
@@ -5516,7 +5516,7 @@ mod tests {
             if reading {
                 crate::mem::guard::forbid_alloc(|| {
                     storage.set_spill_list(table, &[roots[2]]);
-                    storage.drop_table(table);
+                    storage.drop_table(table).unwrap();
                     let mut definition = make_def("overlap", &[("id", ColType::Text, true)]);
                     definition.persistence = RelationPersistence::Temporary;
                     let replacement = storage.create_table(definition).unwrap();
@@ -5822,7 +5822,7 @@ mod tests {
             let registry = lease
                 .with_snapshot(|snapshot| Ok(Arc::clone(snapshot.registry.as_ref().unwrap())))
                 .unwrap();
-            storage.drop_table(table);
+            storage.drop_table(table).unwrap();
             storage
                 .create_table(make_def("retiring_query", &[("id", ColType::Text, true)]))
                 .unwrap();
@@ -6034,7 +6034,7 @@ mod tests {
                 storage.table(table).spill_generations().handle(0).unwrap(),
                 replacement
             );
-            storage.drop_table(table);
+            storage.drop_table(table).unwrap();
             assert_eq!(
                 snapshot.validate(&storage, table).unwrap_err().sqlstate,
                 sqlstate::SERIALIZATION_FAILURE

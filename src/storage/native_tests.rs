@@ -1581,7 +1581,7 @@ fn catalog_creation_missing_actor_preserves_catalogs_and_identifiers() {
             },
             7,
         ));
-        assert_missing_creation_actor(storage.create_large_object(None, 7));
+        assert_missing_creation_actor(storage.create_large_object(CatalogCreation::New, None, 7));
         assert_missing_creation_actor(table_creation::allocate(
             &storage,
             make_def("unowned_table", &[("id", ColType::Int4, false)]),
@@ -1593,7 +1593,9 @@ fn catalog_creation_missing_actor_preserves_catalogs_and_identifiers() {
         assert!(storage.find_table("public", "unowned_table").is_none());
     });
     drop(actor);
-    let (_, oid) = storage.create_large_object(None, 7).unwrap();
+    let (_, oid) = storage
+        .create_large_object(CatalogCreation::New, None, 7)
+        .unwrap();
     assert_eq!(Some(oid), next_oid);
     assert_eq!(storage.catalog_sequence.current(), sequence + 1);
 }
@@ -2504,7 +2506,7 @@ fn index_catalog_is_synchronized_and_startup_bounded() {
             WORKERS
         );
         for slot in 0..WORKERS {
-            storage.commit_index_create(slot);
+            storage.commit_index_create(slot).unwrap();
         }
         assert_eq!(storage.checkpoint_indexes().count(), WORKERS);
         assert_eq!(storage.live_indexes().count(), WORKERS);
@@ -2565,9 +2567,9 @@ fn index_slot_retirement_clears_complete_images() {
             maintenance.unsummarized_ranges[0] = 1;
             drop(maintenance);
             if committed {
-                storage.commit_index_create(slot);
+                storage.commit_index_create(slot).unwrap();
                 storage.drop_index("public", "pending_name", 17).unwrap();
-                storage.commit_index_drop(slot);
+                storage.commit_index_drop(slot).unwrap();
             } else {
                 storage.rollback_index_create(slot);
             }
@@ -2607,7 +2609,7 @@ fn index_rename_checks_only_its_database() {
     let foreign = storage
         .create_index(test_index_definition("remote_index"), 18)
         .unwrap();
-    storage.commit_index_create(foreign);
+    storage.commit_index_create(foreign).unwrap();
     storage.index_catalog()[foreign].database = DatabaseOid::TEMPLATE1;
     storage
         .apply_comment(
@@ -2653,7 +2655,7 @@ fn index_rename_checks_only_its_database() {
             sqlstate::INTERNAL_LOCK_WAIT
         );
         storage.release_row_locks(19);
-        storage.commit_index_rename(slot, 17);
+        storage.commit_index_rename(slot, 17).unwrap();
         assert!(
             storage
                 .comment_text(CommentClass::Relation, "public", "remote_pending", 0, 0)
@@ -9282,7 +9284,7 @@ fn create_find_drop_reuse() {
         s.create_table(def).unwrap_err().sqlstate,
         sqlstate::DUPLICATE_TABLE
     );
-    s.drop_table(index);
+    s.drop_table(index).unwrap();
     assert_eq!(s.find_table("public", "t1"), None);
     // Slot is reusable; capacity is enforced.
     for i in 0..4u32 {
@@ -9311,7 +9313,7 @@ fn published_generation_cleanup_keeps_newer_table_writes_dirty() {
     let _ = storage.tables[slot]
         .rows
         .insert(1, RowState::committed_only_at(RowLoc::test(0, 4), 42));
-    storage.table_mut(slot).mark_dirty();
+    storage.table_mut(slot).mark_dirty().unwrap();
     storage.finish_row_cleanup(
         RowCleanupTask::SavedMarkers {
             through_lsn: 42,
@@ -9728,7 +9730,7 @@ fn table_retirement_waits_for_its_definition_without_reserving_unrelated_tables(
                 storage.commit_drop(second);
                 storage.commit_create(third);
                 storage.rollback_create(third);
-                storage.drop_table(replay);
+                storage.drop_table(replay).unwrap();
             });
             sent.send(()).unwrap();
         });

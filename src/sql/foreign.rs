@@ -840,7 +840,7 @@ fn endpoint(
     ),
     SqlError,
 > {
-    let table = *storage.table_def(table_slot, txid);
+    let table = storage.table_def(table_slot, txid).clone();
     let foreign = storage
         .foreign_table(table_slot as u16, txid)
         .ok_or_else(|| sql_err!(sqlstate::FDW_ERROR, "foreign table has no server binding"))?

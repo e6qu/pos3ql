@@ -89,7 +89,8 @@ def main():
             "rss_metrics": rss_metric_contract(platform.system()),
             "hash_chunk_bytes": HASH_CHUNK_BYTES,
             "table_counts": [1, 8, 32, 128],
-            "workloads": ["empty", "hot", "even", "moving"],
+            "workloads": ["empty", "hot", "even", "moving", "wide", "replacement"],
+            "schema_columns": {"narrow": 2, "wide": 64},
             "row_overlay_slots": 8192,
             "row_work_bytes": 8 * 1024**2,
             "row_work_leases": 128,
@@ -150,7 +151,8 @@ def main():
                         raise RuntimeError(f"{label}: incomplete session component evidence")
                     draws.append({"mode": mode, "max_tables": tables, "workload": workload, "components": components})
         fixed_components = ["engine:row_overlay_slots", "engine:row work pool", "engine:row work free ranges",
-                            "engine:table definition image owner", "engine:table definition image occupancy", "engine:table definition images"]
+                            "engine:table definition image owner", "engine:table definition image occupancy", "engine:table definition images",
+                            "engine:table metadata pool", "engine:table metadata free ranges"]
         for component in fixed_components:
             if any(component not in draw["components"] for draw in draws):
                 raise RuntimeError(f"missing fixed-pool evidence: {component}")
@@ -168,6 +170,10 @@ def main():
                   "Each sample owns a new process and the same global pool limits. Active samples",
                   "create all configured tables, verify row counts and sums, and forbid heap",
                   "allocation during SQL execution. Moving demand uses TRUNCATE before refilling.", "",
+                  "Wide samples create 64-column tables; ordinary populated samples use two columns.",
+                  "Replacement samples add columns, roll back a schema savepoint and replace a unique index,",
+                  "then verify the original row counts and sums. Retained-reader pressure is covered by",
+                  "ownership/capacity regressions; this single-session matrix does not measure it.", "",
                   "Session reservation is a full configured connection ceiling; session draws report",
                   "the direct embedded client's actual buffers. These are local-only debug samples,",
                   "not a production memory minimum or an object-store throughput qualification.", "",

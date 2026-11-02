@@ -19,7 +19,7 @@ work, rather than a history of completed changes.
 
 SQL uses one CPU worker. Several storage requests can be in flight, and cached
 work can run while an eligible query waits for storage. Multiple CPU workers,
-complete shared catalog publication and representative deployment measurements
+further catalog/resource reductions and representative deployment measurements
 remain in the plan.
 
 ## Transactions and durable success
@@ -45,11 +45,25 @@ order's earlier status after another transaction changes it. In locking mode,
 a conflicting writer waits for the reader's relation lock. Work against an
 unrelated table can continue during that wait.
 
-A commit reserves journal positions, uploads its durable data, then installs
-its complete transaction before releasing locks and success responses. New
+Before durability, commit admission reserves replacement definitions, index
+bindings and row keys, then captures journal positions. It uploads durable data
+and installs the complete transaction before releasing locks and success responses. New
 statements cannot select a half-installed order-and-invoice update. Existing
 readers retain their selected data. Prepared commit and rollback decisions
 retain both the transaction and prepared-slot ownership through completion.
+
+If admission waits, it keeps the completed command and buffered output. For
+example, a default that issued an order number and a trigger that wrote an audit
+row do not run again when the wait ends. Admission can be cancelled before
+publication. Share locks protect affected tables while ordinary readers and
+unrelated work continue; prepared transactions save those locks only after
+admission has acquired them.
+
+Saved transactions retain private catalog changes after a restart. For example,
+a domain created before `PREPARE TRANSACTION 'import'` stays hidden from other
+connections until `COMMIT PREPARED 'import'`; rolling it back removes the private
+domain. Resolution reserves metadata before recording a durable commit decision,
+then publishes the reconstructed changes without allocating catalog replay.
 
 A lost final reply leaves the client uncertain whether the commit happened.
 Check application state before retrying an operation that could charge twice.
@@ -365,8 +379,11 @@ were removed.
 Schema, table and type edits retain their original object and revision through
 waits and rollback. They update bound columns, indexes, comments, foreign keys,
 owned sequences and saved queries together within their implemented publication
-boundary. A stale edit cannot modify a replacement in the same slot. Waiting
-releases earlier owners rather than holding unrelated tables.
+boundary. A stale edit cannot modify a replacement in the same slot. Table
+columns, constraints and index bindings use shared fixed metadata capacity;
+retained readers keep their original immutable owners. Waiting releases short
+catalog owners, keeps the needed SQL relation locks, and leaves unrelated tables
+available.
 
 Renames preserve object identity; drop and recreate reserve fresh identities
 for relations, row/array types, named types, enum members, indexes, CHECK,
@@ -507,10 +524,11 @@ repeated references and require the applicable ownership role. Their full
 result shapes and definitions follow the pinned PostgreSQL 18.6
 [information schema](https://github.com/postgres/postgres/blob/REL_18_6/src/backend/catalog/information_schema.sql).
 
-Catalog descriptions retain only their actual column metadata in statement
-memory; full execution definitions use the existing fixed schema-image pool.
-Joining several small catalogs does not reserve a full wide table and all its
-constraint arrays for each description. Pool exhaustion is still a named error.
+Catalog, CTE, table-function and trigger descriptions retain actual column
+metadata and borrowed descriptors. Physical readers share stored schema owners;
+synthetic execution images use a separate typed column payload, including hidden
+fields. Joining small catalogs does not reserve maximum-width tables and their
+constraint arrays. Pool exhaustion remains a named error.
 
 Catalog type properties describe PostgreSQL's interface, independently of the
 object-store layout. Hidden `tableoid` must be named explicitly. Index vectors

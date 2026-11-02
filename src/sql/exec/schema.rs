@@ -118,7 +118,8 @@ pub(crate) fn rename(
         {
             continue;
         }
-        let (target, mut definition) = storage.select_table_definition(slot, txn.txid);
+        let (target, selected) = storage.select_table_definition(slot, txn.txid);
+        let mut definition = crate::storage::TableDefBuilder::from_definition(&selected);
         if source.rewrite_table(name, &mut definition, arena)? {
             let mut mapping = [None; MAX_COLUMNS];
             for (entry, column) in mapping.iter_mut().zip(definition.columns()) {

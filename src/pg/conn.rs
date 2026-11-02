@@ -9329,11 +9329,13 @@ mod tests {
                     conn.txn.commit_admission().is_some() && conn.txn.staged_commit().is_none()
                 );
                 let sequence = engine
-                    .storage
+                    .publication_storage_for_tests()
                     .sequence_slot("public", "protocol_admission_calls", conn.txn.txid)
                     .unwrap();
                 assert_eq!(
-                    engine.storage.sequence_value_for(sequence, conn.txn.txid),
+                    engine
+                        .publication_storage_for_tests()
+                        .sequence_value_for(sequence, conn.txn.txid),
                     (2, true)
                 );
                 let prefix = conn.send.readable().to_vec();
@@ -9346,7 +9348,9 @@ mod tests {
                 assert!(conn.parked);
                 assert_eq!(conn.send.readable(), prefix);
                 assert_eq!(
-                    engine.storage.sequence_value_for(sequence, conn.txn.txid),
+                    engine
+                        .publication_storage_for_tests()
+                        .sequence_value_for(sequence, conn.txn.txid),
                     (2, true)
                 );
                 if outcome == "cancel" {
@@ -9380,12 +9384,17 @@ mod tests {
                 );
                 assert_eq!(
                     engine
-                        .storage
+                        .publication_storage_for_tests()
                         .find_table("public", "protocol_admission_renamed")
                         .is_some(),
                     outcome == "resume"
                 );
-                assert_eq!(engine.storage.sequence_value_for(sequence, 0), (2, true));
+                assert_eq!(
+                    engine
+                        .publication_storage_for_tests()
+                        .sequence_value_for(sequence, 0),
+                    (2, true)
+                );
                 if blocker.txn.is_active() {
                     request(&mut blocker, &mut engine, "ROLLBACK");
                 }

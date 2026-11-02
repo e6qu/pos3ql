@@ -2359,8 +2359,8 @@ mod tests {
             assert_eq!(committed.star_columns(), 1);
             assert_eq!(pending.output_name(ResolvedColumn::Table(0, 1)), "c1");
             assert!(!core::ptr::eq(
-                pending.defs.get(0).unwrap(),
-                committed.defs.get(0).unwrap()
+                pending.defs.get(0).unwrap().columns().as_ptr(),
+                committed.defs.get(0).unwrap().columns().as_ptr()
             ));
         });
     }

@@ -47,6 +47,13 @@ pub mod numeric;
 mod param_types;
 pub mod parser;
 pub mod prep;
+mod prepared_foreign_replay;
+mod prepared_object_replay;
+mod prepared_query_replay;
+mod prepared_replay;
+mod prepared_replay_rows;
+mod prepared_subscription_replay;
+mod prepared_type_replay;
 pub mod query;
 pub mod range;
 pub mod regex;
@@ -5531,7 +5538,8 @@ impl Engine {
         if !txn.is_active() {
             return Ok(());
         }
-        txn.begin_commit_admission(target);
+        let mark = txn.begin_commit_admission(target, self.wal.stage_mark(txn.txid));
+        self.wal.truncate_stage(txn.txid, mark);
         // The retained admission keeps the completed command's clock on waits.
         datetime::end_transaction();
         if txn.has_deferred_triggers() {
@@ -5637,6 +5645,20 @@ impl Engine {
             }
             return Err(error);
         }
+        if let Err(error) = self.storage.prepare_commit_generations(
+            txn.txid,
+            txn.touched()
+                .iter()
+                .map(|&(table, rowid, _)| (table as usize, rowid)),
+            txn.index_generation_changes(),
+        ) {
+            if error.sqlstate != sqlstate::INTERNAL_IO_WAIT
+                && error.sqlstate != sqlstate::INTERNAL_LOCK_WAIT
+            {
+                self.rollback_txn(txn, guc);
+            }
+            return Err(error);
+        }
         if let Err(error) = self.stage_prepared_lock_image(txn, target) {
             if error.sqlstate != sqlstate::INTERNAL_IO_WAIT
                 && error.sqlstate != sqlstate::INTERNAL_LOCK_WAIT
@@ -5662,16 +5684,18 @@ impl Engine {
         } else {
             crate::storage::CatalogPublication::Uninterrupted
         };
-        match catalog_snapshot::capture_transaction(
-            &self.storage,
-            txn,
-            catalog_publication,
-            &self.work,
-        ) {
-            Ok(history) => txn.catalog_history = history,
-            Err(error) => {
-                self.rollback_txn(txn, guc);
-                return Err(error);
+        if txn.catalog_history.is_none() {
+            match catalog_snapshot::capture_transaction(
+                &self.storage,
+                txn,
+                catalog_publication,
+                &self.work,
+            ) {
+                Ok(history) => txn.catalog_history = history,
+                Err(error) => {
+                    self.rollback_txn(txn, guc);
+                    return Err(error);
+                }
             }
         }
         for event_index in 0..txn.truncates().len() {
@@ -6794,6 +6818,10 @@ impl Engine {
             eval::funcs::system::set_current_database(name.as_str());
         }
         let result = match txn.commit_admission() {
+            Some(
+                target @ (txn::CommitTarget::CommitPrepared { .. }
+                | txn::CommitTarget::RollbackPrepared { .. }),
+            ) => self.finish_prepared_resolution_admission(txn, guc, target),
             Some(target) => self.finish_txn(txn, guc, target),
             None => self.complete_staged_commit(txn, guc),
         };
@@ -7116,7 +7144,7 @@ impl Engine {
                         .finish_table_drop(*undo, crate::storage::CatalogDdlDecision::Commit)
                         .is_some()
                     {
-                        self.storage.commit_indexes_for(undo.slot(), txn.txid);
+                        self.storage.commit_indexes_for(undo.slot(), txn.txid)?;
                     }
                 }
                 DdlUndo::TableAltered(_) => {}
@@ -7394,7 +7422,7 @@ impl Engine {
                 DdlUndo::EnumAltered(prior) => self.storage.commit_enum_alter(prior.target())?,
                 DdlUndo::IndexCreated(slot) => {
                     let slot = *slot as usize;
-                    self.storage.commit_index_create(slot);
+                    self.storage.publish_index_create(slot, txn.txid)?;
                     self.storage.commit_object_owner(
                         crate::storage::AccessObject {
                             class: crate::storage::AccessClass::Index,
@@ -7413,7 +7441,7 @@ impl Engine {
                 DdlUndo::IndexDropped(slot) => {
                     let slot = *slot as usize;
                     let table = self.storage.index_table_slot(slot);
-                    self.storage.commit_index_drop(slot);
+                    self.storage.publish_index_drop(slot, txn.txid)?;
                     if let Some(table) = table
                         && !self.commit_index_tables.contains(&table)
                     {
@@ -7422,9 +7450,9 @@ impl Engine {
                             .expect("commit index scratch matches transaction DDL capacity");
                     }
                 }
-                DdlUndo::IndexRenamed { slot, .. } => {
-                    self.storage.commit_index_rename(*slot as usize, txn.txid)
-                }
+                DdlUndo::IndexRenamed { slot, .. } => self
+                    .storage
+                    .publish_index_rename(*slot as usize, txn.txid)?,
                 DdlUndo::IndexAltered { slot, .. } => self
                     .storage
                     .commit_index_definition(*slot as usize, txn.txid),
@@ -7552,6 +7580,7 @@ impl Engine {
         // rows and definitions. Failure requires recovery, never row rollback.
         let notify_result = self.flush_committed_notifications(txn);
         let temporary_result = self.storage.apply_temporary_on_commit();
+        self.storage.release_commit_generations(txn.txid);
         if let Some(guc) = guc {
             guc.commit_transaction();
         }
@@ -7973,7 +8002,7 @@ impl Engine {
                 encoded: self.prepared_transactions.slot(slot).locks.readable(),
             },
         )?;
-        txn.mark_prepared_locks_staged();
+        txn.mark_prepared_locks_staged(self.wal.stage_mark(txn.txid));
         Ok(())
     }
 
@@ -8001,7 +8030,7 @@ impl Engine {
                     "prepared resolution changed admitted identity"
                 ));
             }
-            return self.finish_txn(txn, guc, target);
+            return self.finish_prepared_resolution_admission(txn, guc, target);
         }
         if let Some(staged) = txn.staged_commit() {
             let staged_gid = match staged.target {
@@ -8066,32 +8095,88 @@ impl Engine {
                 "statement is waiting for prepared transaction publication"
             ));
         }
-        if commit {
-            let prepared = &self.prepared_transactions.slot(slot).transaction;
-            self.storage.validate_row_history_publication(
-                prepared.txid,
-                prepared
-                    .touched()
-                    .iter()
-                    .map(|&(table, rowid, _)| (table as usize, rowid)),
-            )?;
-        }
-        let lsn = self.storage.bump_lsn();
-        let operation = if commit {
-            WalOp::CommitPrepared { gid: gid.as_str() }
+        let target = if commit {
+            txn::CommitTarget::CommitPrepared { slot, gid }
         } else {
-            WalOp::RollbackPrepared { gid: gid.as_str() }
+            txn::CommitTarget::RollbackPrepared { slot, gid }
         };
-        self.wal.stage_reserved(txn.txid, lsn, &operation)?;
-        self.finish_txn(
-            txn,
-            guc,
-            if commit {
-                txn::CommitTarget::CommitPrepared { slot, gid }
+        txn.begin_commit_admission(target, self.wal.stage_mark(txn.txid));
+        self.prepared_transactions.claim_resolution(slot, txn.txid);
+        self.finish_prepared_resolution_admission(txn, guc, target)
+    }
+
+    fn finish_prepared_resolution_admission(
+        &mut self,
+        txn: &mut TxnState,
+        guc: &GucState,
+        target: txn::CommitTarget,
+    ) -> Result<(), SqlError> {
+        let (slot, gid, commit) = match target {
+            txn::CommitTarget::CommitPrepared { slot, gid } => (slot, gid, true),
+            txn::CommitTarget::RollbackPrepared { slot, gid } => (slot, gid, false),
+            _ => {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "prepared resolution has an invalid target"
+                ));
+            }
+        };
+        if commit {
+            core::mem::swap(
+                txn,
+                &mut self.prepared_transactions.slot_mut(slot).transaction,
+            );
+            let prepared_transaction = txn.txid;
+            let preparation = (|| {
+                self.prepare_transaction_bindings(txn)?;
+                self.storage.prepare_commit_row_keys(
+                    txn.txid,
+                    txn.touched()
+                        .iter()
+                        .map(|&(table, rowid, _)| (table as usize, rowid)),
+                )?;
+                self.storage.prepare_definition_publication(
+                    txn.txid,
+                    txn.table_definition_changes(),
+                    txn.type_commit_changes(),
+                )?;
+                self.storage.prepare_commit_generations(
+                    txn.txid,
+                    txn.touched()
+                        .iter()
+                        .map(|&(table, rowid, _)| (table as usize, rowid)),
+                    txn.index_generation_changes(),
+                )?;
+                self.storage.validate_row_history_publication(
+                    txn.txid,
+                    txn.touched()
+                        .iter()
+                        .map(|&(table, rowid, _)| (table as usize, rowid)),
+                )
+            })();
+            core::mem::swap(
+                txn,
+                &mut self.prepared_transactions.slot_mut(slot).transaction,
+            );
+            if let Err(error) = preparation {
+                self.storage
+                    .rollback_definition_publication(prepared_transaction);
+                self.storage
+                    .release_commit_generations(prepared_transaction);
+                return Err(error);
+            }
+        }
+        if !txn.prepared_resolution_staged() {
+            let operation = if commit {
+                WalOp::CommitPrepared { gid: gid.as_str() }
             } else {
-                txn::CommitTarget::RollbackPrepared { slot, gid }
-            },
-        )
+                WalOp::RollbackPrepared { gid: gid.as_str() }
+            };
+            self.wal
+                .stage_reserved(txn.txid, self.storage.bump_lsn(), &operation)?;
+            txn.mark_prepared_resolution_staged(self.wal.stage_mark(txn.txid));
+        }
+        self.finish_txn(txn, guc, target)
     }
 
     fn complete_prepared_resolution(
@@ -8101,7 +8186,6 @@ impl Engine {
         txn: &mut TxnState,
         resolution_lsn: u64,
     ) -> Result<(), SqlError> {
-        let recovered = self.prepared_transactions.slot(slot).recovered;
         // The resolution record is durable before the detached transaction is
         // released. Recovery therefore reaches the same outcome if the process
         // stops anywhere in the in-memory promotion below.
@@ -8109,24 +8193,7 @@ impl Engine {
             txn,
             &mut self.prepared_transactions.slot_mut(slot).transaction,
         );
-        let result = if commit && recovered {
-            for &(table, rowid, _) in txn.touched() {
-                self.storage
-                    .retain_prepared_row_history(table as usize, rowid, txn.txid)?;
-            }
-            self.rollback_transaction_state(txn, true);
-            self.prepared_transactions
-                .slot(slot)
-                .visit_records(|_, raw| {
-                    let operation = crate::wal::decode_record(raw).ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::DATA_EXCEPTION,
-                            "prepared transaction WAL is corrupt"
-                        )
-                    })?;
-                    apply_wal_op(&mut self.storage, resolution_lsn, operation, &self.work)
-                })
-        } else if commit {
+        let result = if commit {
             self.storage
                 .end_transaction_snapshots(txn.txid, crate::storage::SnapshotCleanup::Schedule);
             self.promote_transaction_state(txn, resolution_lsn, None)
@@ -8191,6 +8258,20 @@ impl Engine {
         self.storage.rollback_definition_publication(txn.txid);
         if let Some(txn::CommitTarget::Prepare { slot, .. }) = txn.commit_admission() {
             self.prepared_transactions.release(slot);
+        }
+        if let Some(
+            txn::CommitTarget::CommitPrepared { slot, .. }
+            | txn::CommitTarget::RollbackPrepared { slot, .. },
+        ) = txn.commit_admission()
+        {
+            let prepared_transaction = self.prepared_transactions.slot(slot).transaction.txid;
+            self.storage
+                .rollback_definition_publication(prepared_transaction);
+            self.storage
+                .release_commit_generations(prepared_transaction);
+            self.prepared_transactions
+                .release_resolution(slot, txn.txid);
+            self.storage.wake_transaction_waiters(txn.txid);
         }
         foreign::abort_session(&self.storage, txn.txid);
         rollback_transaction_overlays(&mut self.storage, txn);
@@ -22170,7 +22251,19 @@ fn replay_transaction_batches(
                                 transaction_id,
                             )?;
                         }
-                        _ => {}
+                        operation => {
+                            arena.reset();
+                            let result = prepared_replay::stage_catalog_record(
+                                storage,
+                                &mut prepared.slot_mut(slot).transaction,
+                                operation,
+                                *record_lsn,
+                                apply_floor,
+                                arena,
+                            );
+                            arena.reset();
+                            result?;
+                        }
                     }
                 }
                 if table_rewrite.is_some() {
@@ -22179,7 +22272,6 @@ fn replay_transaction_batches(
                         "prepared transaction ends during a table rewrite"
                     ));
                 }
-                prepared.slot_mut(slot).recovered = true;
                 storage.set_lsn(*lsn);
             }
             WalOp::Commit {
@@ -23094,7 +23186,7 @@ fn apply_wal_op(
             let index = storage.table_replay_slot(identity, schema, name, 0)?;
             storage.commit_drop(index);
             storage.drop_indexes_for(index, 0);
-            storage.commit_indexes_for(index, 0);
+            storage.commit_indexes_for(index, 0)?;
         }
         WalOp::Upsert {
             schema,
@@ -23800,7 +23892,7 @@ fn apply_wal_op(
                 )
             })?;
             storage.rename_index(slot, crate::storage::SqlName::parse(new_name)?, 0)?;
-            storage.commit_index_rename(slot, 0);
+            storage.commit_index_rename(slot, 0)?;
         }
         WalOp::CreateMatview {
             identity,
@@ -24262,7 +24354,7 @@ fn apply_wal_op(
                 },
                 0,
             )?;
-            storage.commit_index_create(slot);
+            storage.commit_index_create(slot)?;
         }
         WalOp::BrinMaintenance {
             index_created_at,
@@ -24457,7 +24549,7 @@ fn apply_wal_op(
         }
         WalOp::DropIndex { schema, name } => {
             if let Some(slot) = storage.drop_index(schema, name, 0)? {
-                storage.commit_index_drop(slot);
+                storage.commit_index_drop(slot)?;
             }
         }
         WalOp::CreateSchema { identity, name } => {

@@ -29,7 +29,6 @@ pub(crate) struct PreparedTransactionSlot {
     /// same bytes to rebuild a prepared transaction or resolve it later.
     pub records: FixedBuf,
     pub locks: FixedBuf,
-    pub recovered: bool,
 }
 
 pub(crate) struct PreparedTransactions {
@@ -103,7 +102,6 @@ impl PreparedTransactions {
                     "prepared transaction locks",
                     config.wal_buffer_bytes,
                 )?,
-                recovered: false,
             });
         }
         Ok(Self { slots })
@@ -143,7 +141,6 @@ impl PreparedTransactions {
         slot.metadata = Some(metadata);
         slot.records.clear();
         slot.locks.clear();
-        slot.recovered = false;
         Ok(Some(index))
     }
 
@@ -223,13 +220,28 @@ impl PreparedTransactions {
         });
     }
 
+    pub(crate) fn release_resolution(&mut self, index: usize, transaction: u32) {
+        let Some(PreparedTransactionImage::Prepared { metadata, resolver }) =
+            self.slots[index].metadata
+        else {
+            panic!("resolution release requires a prepared transaction");
+        };
+        assert!(
+            resolver.is_none_or(|owner| owner == transaction),
+            "one prepared resolver owns its admission"
+        );
+        self.slots[index].metadata = Some(PreparedTransactionImage::Prepared {
+            metadata,
+            resolver: None,
+        });
+    }
+
     pub(crate) fn release(&mut self, index: usize) {
         let slot = &mut self.slots[index];
         slot.metadata = None;
         slot.transaction.clear();
         slot.records.clear();
         slot.locks.clear();
-        slot.recovered = false;
     }
 }
 

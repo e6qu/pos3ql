@@ -17,6 +17,10 @@ mod default_acls;
 mod partition_triggers;
 pub(crate) use partition_triggers::{PartitionTriggerImage, PartitionTriggerState};
 mod parameter_acls;
+mod prepared_catalog;
+#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
+mod prepared_catalog_tests;
+mod prepared_foreign;
 use parameter_acls::ParameterAclGrantIdentity;
 use parameter_acls::ParameterAclRows;
 pub(crate) use parameter_acls::{
@@ -56,7 +60,8 @@ pub(crate) use constraint_identities::{
 mod column_maps;
 pub(crate) use column_maps::{RelationColumnMap, RelationRowDecoder};
 mod definition_images;
-pub(crate) use definition_images::{DefinitionImageId, RelationDefinition};
+pub(crate) use definition_images::DefinitionImageId;
+pub(crate) use definition_images::RelationDefinition;
 mod definition_pool;
 mod index_bindings;
 mod key_preparation;
@@ -74,6 +79,10 @@ mod domain_validation;
 mod relation_identities;
 pub(crate) use relation_identities::{MAX_RELATION_GENERATION, RelationIdentity};
 mod definition_dependencies;
+mod publication_generations;
+pub(crate) use publication_generations::IndexGenerationChange;
+mod prepared_queries;
+mod prepared_types;
 mod table_creation;
 mod table_definitions;
 mod table_edits;
@@ -105,6 +114,7 @@ pub(crate) use type_references::StorageSetupError;
 pub(crate) use type_references::TypeReference;
 pub(crate) mod foreign;
 mod partition_rows;
+mod prepared_objects;
 pub(crate) use partition_rows::{PartitionKeyRow, PartitionRow};
 mod heap_relocation;
 mod row_heap;
@@ -1935,21 +1945,21 @@ impl ForeignKey {
     }
 }
 
-pub(crate) trait DefinitionBacking: Clone + core::fmt::Debug {
+pub trait DefinitionBacking: Clone + core::fmt::Debug {
     type Slice<T: Copy + core::fmt::Debug + 'static, const N: usize>: AsRef<[T]>
         + Clone
         + core::fmt::Debug;
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct InlineDefinition;
+pub struct InlineDefinition;
 
 impl DefinitionBacking for InlineDefinition {
     type Slice<T: Copy + core::fmt::Debug + 'static, const N: usize> = [T; N];
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct StoredDefinition;
+pub struct StoredDefinition;
 
 impl DefinitionBacking for StoredDefinition {
     type Slice<T: Copy + core::fmt::Debug + 'static, const N: usize> =
@@ -1957,7 +1967,7 @@ impl DefinitionBacking for StoredDefinition {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct BorrowedDefinition<'a>(core::marker::PhantomData<&'a ()>);
+pub struct BorrowedDefinition<'a>(core::marker::PhantomData<&'a ()>);
 
 impl<'a> DefinitionBacking for BorrowedDefinition<'a> {
     type Slice<T: Copy + core::fmt::Debug + 'static, const N: usize> = &'a [T];
@@ -1968,7 +1978,7 @@ pub(crate) type TableDefBuilder = TableDefinition<InlineDefinition>;
 pub(crate) type TableDefView<'a> = TableDefinition<BorrowedDefinition<'a>>;
 
 #[derive(Debug, Clone)]
-pub(crate) struct TableDefinition<B: DefinitionBacking> {
+pub struct TableDefinition<B: DefinitionBacking> {
     /// The schema the table lives in ("public" unless created qualified or
     /// under a search_path naming another schema).
     pub schema: SqlName,
@@ -3081,6 +3091,8 @@ pub(crate) enum ValueIndexInstallation {
 struct TablePublication {
     dirty: bool,
     generation: u64,
+    reserved_generations: u64,
+    generation_reservations: Option<MutableSlice<publication_generations::GenerationReservation>>,
     /// Last committed replacement of row encodings, independent of row updates.
     rewrite_generation: u64,
     row_layout: row_layout::RowLayout,
@@ -4600,13 +4612,11 @@ impl Table {
         self.publication().enforcers.clone()
     }
 
-    pub fn mark_dirty(&self) {
+    pub fn mark_dirty(&self) -> Result<(), SqlError> {
         let mut publication = self.publication();
-        publication.generation = publication
-            .generation
-            .checked_add(1)
-            .expect("table publication generation exhausted");
+        publication.generation = publication.preview_unreserved_generation()?;
         publication.dirty = true;
+        Ok(())
     }
 
     /// Whether `txid` sees this table exist: its own pending CREATE/DROP,
@@ -18484,8 +18494,9 @@ impl Storage {
                 continue;
             }
             self.drop_indexes_for(slot, 0);
-            self.commit_indexes_for(slot, 0);
             self.commit_drop(slot);
+            self.commit_indexes_for(slot, 0)
+                .expect("retired table indexes do not consume generation capacity");
         }
         for slot in 0..self.sequence_count() {
             let sequence = self.sequence(slot);
@@ -18542,7 +18553,12 @@ impl Storage {
                         .statistics
                         .set_image(TableStatistics::EMPTY, None, true);
                     self.set_spill_list(slot, &[]);
-                    self.refresh_enforcers(slot)?;
+                    let publication = self.tables[slot].publication();
+                    for enforcer in publication.enforcers.iter().flatten() {
+                        enforcer.cache.index().clear();
+                    }
+                    drop(publication);
+                    self.mark_value_bindings_rebuild_at(slot, self.lsn());
                 }
                 OnCommitAction::Drop => {
                     let table = {
@@ -18550,7 +18566,8 @@ impl Storage {
                         definition.name
                     };
                     self.drop_indexes_for(slot, 0);
-                    self.commit_indexes_for(slot, 0);
+                    self.commit_drop(slot);
+                    self.commit_indexes_for(slot, 0)?;
                     for sequence in 0..self.sequence_count() {
                         let definition = self.sequence(sequence);
                         if definition.ddl_state == CatalogDdlState::Present
@@ -18565,7 +18582,6 @@ impl Storage {
                             ));
                         }
                     }
-                    self.commit_drop(slot);
                 }
             }
         }
@@ -18581,13 +18597,16 @@ impl Storage {
             {
                 continue;
             }
+            self.tables[slot]
+                .publication()
+                .preview_unreserved_generation()?;
             self.clear_table_rows(slot);
             self.install_table_serial_values(slot, [0; MAX_COLUMNS]);
             self.tables[slot]
                 .statistics
                 .set_image(TableStatistics::EMPTY, None, true);
             self.set_spill_list(slot, &[]);
-            self.tables[slot].mark_dirty();
+            self.tables[slot].mark_dirty()?;
             self.refresh_enforcers(slot)?;
             self.mark_value_bindings_dirty(slot);
         }
@@ -20365,6 +20384,8 @@ impl Storage {
                     publication: Mutex::new(TablePublication {
                         dirty: false,
                         generation: 1,
+                        reserved_generations: 0,
+                        generation_reservations: None,
                         rewrite_generation: 0,
                         row_layout: row_layout::RowLayout::initial(),
                         enforcers: SharedSlice::EMPTY,
@@ -22876,7 +22897,7 @@ impl Storage {
             {
                 let mut catalog = self.view_rule_catalog();
                 for source_slot in 0..catalog.views.len() {
-                    let source_definition = catalog.views[source_slot];
+                    let source_definition = catalog.views[source_slot].clone();
                     if source_definition.database != source
                         || source_definition.ddl_state != CatalogDdlState::Present
                         || source_definition.persistence == RelationPersistence::Temporary
@@ -25140,6 +25161,7 @@ impl Storage {
 
     pub(crate) fn create_large_object(
         &mut self,
+        creation: CatalogCreation,
         requested: Option<LargeObjectOid>,
         txid: u32,
     ) -> Result<(usize, LargeObjectOid), SqlError> {
@@ -25194,11 +25216,11 @@ impl Storage {
                     )
                 })?
         };
+        let created_at = creation.resolve(&self.catalog_sequence)?;
         self.clear_object_acl_entries(AccessObject {
             class: AccessClass::LargeObject,
             slot: slot as u16,
         });
-        let created_at = self.catalog_sequence.next()?;
         self.large_objects
             .lock()
             .expect("large object catalog lock poisoned")
@@ -25214,6 +25236,7 @@ impl Storage {
                 CatalogDdlState::PendingCreate { txid }
             },
         };
+        self.catalog_sequence.observe(created_at);
         Ok((slot, oid))
     }
 
@@ -25319,7 +25342,11 @@ impl Storage {
         created_at: u64,
         allocated: bool,
     ) -> Result<usize, SqlError> {
-        let (slot, _) = self.create_large_object(Some(oid), 0)?;
+        let (slot, _) = self.create_large_object(
+            CatalogCreation::Restore(CatalogIdentity::require(created_at)?),
+            Some(oid),
+            0,
+        )?;
         {
             let mut catalog = self
                 .large_objects
@@ -29089,11 +29116,14 @@ impl Storage {
             .enumerate()
             .any(|(other, entry)| {
                 other != slot
-                    && entry.live
+                    && (entry.live || entry.pending.is_some())
                     && ((entry.role as usize == role
                         && entry.member as usize == member
                         && entry.grantor as usize == grantor)
-                        || entry.created_at == identity.created_at())
+                        || entry
+                            .pending
+                            .map_or(entry.created_at, |pending| pending.created_at)
+                            == identity.created_at())
             })
         {
             return Err(sql_err!(
@@ -29104,7 +29134,7 @@ impl Storage {
         let occupied = catalog.memberships[slot];
         if occupied.pending.is_some()
             || (occupied.live
-                && (occupied.created_at != identity.created_at()
+                && (occupied.created_at > identity.created_at()
                     || occupied.role as usize != role
                     || occupied.member as usize != member
                     || occupied.grantor as usize != grantor))
@@ -30692,6 +30722,7 @@ impl Storage {
                 },
             )?;
             if replacement.changed() {
+                table.publication().preview_unreserved_generation()?;
                 table_renames
                     .push_reserved((table_slot, source, replacement))
                     .map_err(|error| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "{}", error))?;
@@ -30773,7 +30804,7 @@ impl Storage {
                 revision,
             );
             drop(state);
-            table.mark_dirty();
+            table.mark_dirty()?;
         }
 
         {
@@ -34800,7 +34831,7 @@ impl Storage {
     pub fn partition_target(
         &self,
         table: usize,
-        definition: &TableDef,
+        definition: &TableDefinition<impl DefinitionBacking>,
         values: &[crate::sql::types::Datum],
         txid: u32,
     ) -> Result<usize, SqlError> {
@@ -34835,7 +34866,7 @@ impl Storage {
     pub(crate) fn validate_partition_target(
         &self,
         leaf: usize,
-        definition: &TableDef,
+        definition: &TableDefinition<impl DefinitionBacking>,
         values: &[crate::sql::types::Datum],
         txid: u32,
     ) -> Result<(), SqlError> {
@@ -35288,6 +35319,9 @@ impl Storage {
         image: Option<RowLoc>,
         commit_lsn: u64,
     ) -> Result<(), SqlError> {
+        self.tables[table_index]
+            .publication()
+            .preview_unreserved_generation()?;
         let generation = self.tables[table_index].generation();
         let mut state = match self.tables[table_index].rows.get(&rowid) {
             Some(state) => state,
@@ -35313,7 +35347,7 @@ impl Storage {
         {
             if self.remove_row_state(table_index, rowid).is_some() {
                 self.mark_value_bindings_changed_at(table_index, commit_lsn);
-                self.tables[table_index].mark_dirty();
+                self.tables[table_index].mark_dirty()?;
             }
             return Ok(());
         }
@@ -35331,7 +35365,7 @@ impl Storage {
         })?;
         self.mark_value_bindings_changed_at(table_index, commit_lsn);
         let table = &mut self.tables[table_index];
-        table.mark_dirty();
+        table.mark_dirty()?;
         Ok(())
     }
 
@@ -35445,7 +35479,26 @@ impl Storage {
         else {
             return Ok(());
         };
-        self.publish_prepared_row(commit_lsn, prepared)
+        let prior_generations = {
+            let mut publication = self.tables[table_index].publication();
+            let prior = publication.generation_reservation(txid);
+            let reserved = prior.checked_add(1).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "table publication generation count exhausted"
+                )
+            })?;
+            publication.reserve_generations(&self.metadata_pool, txid, reserved)?;
+            prior
+        };
+        let result = self.publish_prepared_row(commit_lsn, prepared);
+        if result.is_err() {
+            self.tables[table_index]
+                .publication()
+                .reserve_generations(&self.metadata_pool, txid, prior_generations)
+                .expect("canceling a test publication only releases reserved capacity");
+        }
+        result
     }
 
     fn prepare_committed_row(
@@ -35647,12 +35700,7 @@ impl Storage {
         prepared_keys.validate_definition(self, &definition)?;
         prepared_keys.validate_bindings(&publication)?;
         let n_enforcers = publication.enforcers.len();
-        let generation = publication.generation.checked_add(1).ok_or_else(|| {
-            sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "table publication generation exhausted"
-            )
-        })?;
+        let generation = publication.preview_reserved_generation(txid)?;
         let state = rows.get_mut(&rowid).ok_or_else(|| {
             sql_err!(
                 sqlstate::SERIALIZATION_FAILURE,
@@ -35742,8 +35790,8 @@ impl Storage {
         {
             rows.remove(&rowid);
         }
-        publication.generation = generation;
-        publication.dirty = true;
+        let installed = publication.publish_reserved_generation(txid);
+        debug_assert_eq!(installed, generation);
         Ok(())
     }
 
@@ -35854,7 +35902,7 @@ impl Storage {
         binding: usize,
         rowid: u64,
         home: impl Into<RowByteRead>,
-        visit: impl FnOnce(Option<&[Datum]>, &[Datum], &Enforcer) -> Result<R, SqlError>,
+        visit: impl FnOnce(Option<&[Datum]>, &[Datum], &EnforcerSnapshot) -> Result<R, SqlError>,
     ) -> Result<R, SqlError> {
         let selection = key_preparation::ValueBindingRead::capture(self, table_index, binding)?;
         let schema = selection.schema();
@@ -35882,7 +35930,7 @@ impl Storage {
         table_index: usize,
         binding: usize,
         values: &[Datum],
-        visit: impl FnOnce(Option<&[Datum]>, &[Datum], &Enforcer) -> Result<R, SqlError>,
+        visit: impl FnOnce(Option<&[Datum]>, &[Datum], &EnforcerSnapshot) -> Result<R, SqlError>,
     ) -> Result<R, SqlError> {
         let selection = key_preparation::ValueBindingRead::capture(self, table_index, binding)?;
         selection.with_values(self, arena, values, visit)
@@ -37398,7 +37446,7 @@ impl Storage {
         &self,
         key: Option<&[Datum]>,
         values: &[Datum],
-        enforcer: &Enforcer,
+        enforcer: &EnforcerSnapshot,
         output: &mut [u8],
     ) -> Result<Option<(usize, usize, u64)>, SqlError> {
         let Some(key) = key else { return Ok(None) };
@@ -39134,7 +39182,8 @@ impl Storage {
         &self,
         index: usize,
         selected: table_definitions::TableIdentity,
-    ) -> Option<MutexGuard<'_, ()>> {
+        generation: publication_generations::RetirementGeneration,
+    ) -> Result<Option<MutexGuard<'_, ()>>, SqlError> {
         loop {
             let lifecycle = self.tables[index].lifecycle();
             let mut state = self.tables[index].definition.write();
@@ -39144,9 +39193,18 @@ impl Storage {
                 || state.identity.existence != selected.existence
                 || state.identity.existence == CatalogDdlState::Absent
             {
-                return None;
+                return Ok(None);
             }
             let attempt: Result<_, row_ownership::LockWait<'_>> = (|| {
+                let publication = match generation {
+                    publication_generations::RetirementGeneration::Preserve => None,
+                    publication_generations::RetirementGeneration::Advance => {
+                        Some(row_ownership::try_mutex(
+                            &self.tables[index].publication,
+                            "table publication lock poisoned",
+                        )?)
+                    }
+                };
                 let types =
                     row_ownership::try_mutex(&self.type_catalog, "type catalog lock poisoned")?;
                 let comments =
@@ -39157,21 +39215,26 @@ impl Storage {
                     &self.extension_catalog,
                     "extension catalog lock poisoned",
                 )?;
-                Ok((types, comments, permissions, extensions))
+                Ok((types, comments, permissions, extensions, publication))
             })();
-            let (types, mut comments, mut permissions, mut extensions) = match attempt {
-                Ok(owners) => owners,
-                Err(wait) => {
-                    drop(state);
-                    drop(lifecycle);
-                    #[cfg(test)]
-                    self.definition_publication
-                        .waits
-                        .fetch_add(1, core::sync::atomic::Ordering::Release);
-                    wait.wait();
-                    continue;
-                }
-            };
+            let (types, mut comments, mut permissions, mut extensions, mut publication) =
+                match attempt {
+                    Ok(owners) => owners,
+                    Err(wait) => {
+                        drop(state);
+                        drop(lifecycle);
+                        #[cfg(test)]
+                        self.definition_publication
+                            .waits
+                            .fetch_add(1, core::sync::atomic::Ordering::Release);
+                        wait.wait();
+                        continue;
+                    }
+                };
+            let next_generation = publication
+                .as_ref()
+                .map(|owner| owner.preview_unreserved_generation())
+                .transpose()?;
             let source = self.catalog_object_identity(
                 catalog_sources::CatalogObjectSlot::Table(index),
                 selected.database,
@@ -39207,28 +39270,40 @@ impl Storage {
             Self::clear_object_acl_entries_locked(&mut permissions, object);
             Self::clear_extension_dependencies_for_object_locked(&mut extensions, object);
             state.identity.existence = CatalogDdlState::Absent;
+            if let Some(next) = next_generation {
+                let owner = publication
+                    .as_mut()
+                    .expect("advancing retirement owns publication");
+                owner.generation = next;
+                owner.dirty = true;
+            }
             drop(state);
             drop(types);
             drop(comments);
             drop(permissions);
             drop(extensions);
-            return Some(lifecycle);
+            return Ok(Some(lifecycle));
         }
     }
 
     /// Committed drop (journal replay): rows are retained until checkpoint.
-    pub fn drop_table(&self, index: usize) {
+    pub fn drop_table(&self, index: usize) -> Result<(), SqlError> {
         let selected = self.tables[index].definition.read().identity;
-        let Some(_lifecycle) = self.retire_table_names(index, selected) else {
-            return;
+        let Some(_lifecycle) = self.retire_table_names(
+            index,
+            selected,
+            publication_generations::RetirementGeneration::Advance,
+        )?
+        else {
+            return Ok(());
         };
         self.release_enforcers(index);
         self.clear_pending_table_defs(index);
         self.clear_pending_table_statistics(index);
-        self.tables[index].mark_dirty();
         self.commit_triggers_for_table(index);
         self.commit_policies_for_table(index);
         self.commit_extended_statistics_for_table(index);
+        Ok(())
     }
 
     /// Promotes an uncommitted CREATE to the committed image.
@@ -39247,7 +39322,14 @@ impl Storage {
                 | CatalogDdlState::Present
                 | CatalogDdlState::PendingDrop { .. }
         ));
-        let Some(_lifecycle) = self.retire_table_names(index, selected) else {
+        let Some(_lifecycle) = self
+            .retire_table_names(
+                index,
+                selected,
+                publication_generations::RetirementGeneration::Preserve,
+            )
+            .expect("committed retirement does not consume generation capacity")
+        else {
             return;
         };
         self.retire_table_data(index);
@@ -42238,6 +42320,7 @@ impl Storage {
             txid,
             type_identities::TypeCreationAdmission::Fresh,
             false,
+            None,
         )
     }
 
@@ -42257,6 +42340,7 @@ impl Storage {
             0,
             type_identities::TypeCreationAdmission::restored(created_at)?,
             true,
+            None,
         )
         .map(TypeDdlUndo::slot)
     }
@@ -42275,10 +42359,12 @@ impl Storage {
             0,
             type_identities::TypeCreationAdmission::restored(created_at)?,
             false,
+            None,
         )
         .map(TypeDdlUndo::slot)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn create_domain_with_binding(
         &self,
         schema: SqlName,
@@ -42287,6 +42373,7 @@ impl Storage {
         txid: u32,
         creation: type_identities::TypeCreationAdmission,
         defer_manifest_binding: bool,
+        requested_slot: Option<usize>,
     ) -> Result<TypeDdlUndo, SqlError> {
         constraint_names::domain(name, &mut spec)?;
         self.require_schema_create(schema.as_str(), txid)?;
@@ -42298,7 +42385,8 @@ impl Storage {
         }
         self.require_named_type_name(&catalog, schema, name, txid, None)?;
         let Some(new) = catalog.domains.iter().enumerate().position(|(slot, d)| {
-            d.ddl_state == CatalogDdlState::Absent
+            requested_slot.is_none_or(|requested| requested == slot)
+                && d.ddl_state == CatalogDdlState::Absent
                 && catalog
                     .definition_publication_owner(NamedTypeSlot::Domain(slot))
                     .is_none()
@@ -43050,7 +43138,14 @@ impl Storage {
             (slot, version)
         } else {
             let slot = self
-                .create_enum_with_creation(schema, name, EnumSpec { members: &[] }, 0, creation)?
+                .create_enum_with_creation(
+                    schema,
+                    name,
+                    EnumSpec { members: &[] },
+                    0,
+                    creation,
+                    None,
+                )?
                 .slot();
             let version = self
                 .type_catalog
@@ -43092,6 +43187,7 @@ impl Storage {
             spec,
             txid,
             type_identities::TypeCreationAdmission::Fresh,
+            None,
         )
     }
 
@@ -43102,6 +43198,7 @@ impl Storage {
         spec: EnumSpec<'_>,
         txid: u32,
         creation: type_identities::TypeCreationAdmission,
+        requested_slot: Option<usize>,
     ) -> Result<TypeDdlUndo, SqlError> {
         self.require_schema_create(schema.as_str(), txid)?;
         let ownership = self.initial_ownership(txid)?;
@@ -43109,7 +43206,8 @@ impl Storage {
         let (mut permissions, mut catalog) = self.type_creation_catalogs();
         self.require_named_type_name(&catalog, schema, name, txid, None)?;
         let Some(new) = catalog.enums.iter().enumerate().position(|(slot, e)| {
-            e.ddl_state == CatalogDdlState::Absent
+            requested_slot.is_none_or(|requested| requested == slot)
+                && e.ddl_state == CatalogDdlState::Absent
                 && catalog
                     .definition_publication_owner(NamedTypeSlot::Enum(slot))
                     .is_none()
@@ -43123,12 +43221,20 @@ impl Storage {
                 catalog.enums.len()
             ));
         };
-        let image = EnumImageReservation::write(
-            &self.enum_member_images,
-            spec.members,
-            &self.catalog_sequence,
-            None,
-        )?;
+        let image = match creation {
+            type_identities::TypeCreationAdmission::Fresh => EnumImageReservation::write(
+                &self.enum_member_images,
+                spec.members,
+                &self.catalog_sequence,
+                None,
+            )?,
+            type_identities::TypeCreationAdmission::Restored(_) => EnumImageReservation::restore(
+                &self.enum_member_images,
+                spec.members,
+                None,
+                created_at,
+            )?,
+        };
         let member_count = image.count();
         catalog
             .identities
@@ -43178,6 +43284,18 @@ impl Storage {
         members: &[EnumMember],
         txid: u32,
     ) -> Result<EnumAlterUndo, SqlError> {
+        self.stage_enum_definition(target, schema, name, members, txid, false)
+    }
+
+    fn stage_enum_definition(
+        &self,
+        target: TypeEditTarget,
+        schema: SqlName,
+        name: SqlName,
+        members: &[EnumMember],
+        txid: u32,
+        restored: bool,
+    ) -> Result<EnumAlterUndo, SqlError> {
         let slot = target.slot(NamedTypeKind::Enum)?;
         let mut catalog = self
             .type_catalog
@@ -43223,23 +43341,43 @@ impl Storage {
             catalog.pending_enum_members[previous as usize].depth + 1
         });
         let version = catalog.versions.next()?;
-        let image = EnumImageReservation::write(
-            &self.enum_member_images,
-            members,
-            &self.catalog_sequence,
-            Some((
-                prior.map_or(
-                    catalog.enums[slot]
-                        .member_image
-                        .expect("live enum owns members"),
-                    |pending| pending.image,
-                ),
-                prior.map_or(catalog.enums[slot].member_count as usize, |pending| {
-                    pending.member_count as usize
-                }),
-            )),
-        )?;
+        let previous = Some((
+            prior.map_or(
+                catalog.enums[slot]
+                    .member_image
+                    .expect("live enum owns members"),
+                |pending| pending.image,
+            ),
+            prior.map_or(catalog.enums[slot].member_count as usize, |pending| {
+                pending.member_count as usize
+            }),
+        ));
+        let image = if restored {
+            EnumImageReservation::restore(
+                &self.enum_member_images,
+                members,
+                previous,
+                catalog.enums[slot].created_at,
+            )?
+        } else {
+            EnumImageReservation::write(
+                &self.enum_member_images,
+                members,
+                &self.catalog_sequence,
+                previous,
+            )?
+        };
         let member_count = image.count();
+        if restored {
+            for member in members {
+                self.catalog_sequence.observe(
+                    member
+                        .identity
+                        .expect("validated restored enum member")
+                        .created_at(),
+                );
+            }
+        }
         let image = image.publish();
         catalog.pending_enum_members[member_slot] = PendingEnumMemberSlot {
             image: Some(image),
@@ -43793,6 +43931,7 @@ impl Storage {
             txid,
             type_identities::TypeCreationAdmission::Fresh,
             false,
+            None,
         )
     }
 
@@ -43810,10 +43949,12 @@ impl Storage {
             0,
             type_identities::TypeCreationAdmission::restored(created_at)?,
             true,
+            None,
         )
         .map(TypeDdlUndo::slot)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn create_composite_with_binding(
         &self,
         schema: SqlName,
@@ -43822,6 +43963,7 @@ impl Storage {
         txid: u32,
         creation: type_identities::TypeCreationAdmission,
         defer_manifest_binding: bool,
+        requested_slot: Option<usize>,
     ) -> Result<TypeDdlUndo, SqlError> {
         self.require_schema_create(schema.as_str(), txid)?;
         let ownership = self.initial_ownership(txid)?;
@@ -43837,7 +43979,8 @@ impl Storage {
             .iter()
             .enumerate()
             .position(|(slot, definition)| {
-                definition.ddl_state == CatalogDdlState::Absent
+                requested_slot.is_none_or(|requested| requested == slot)
+                    && definition.ddl_state == CatalogDdlState::Absent
                     && catalog
                         .definition_publication_owner(NamedTypeSlot::Composite(slot))
                         .is_none()
@@ -48069,15 +48212,39 @@ impl Storage {
         Ok(prior)
     }
 
-    pub(crate) fn commit_index_rename(&mut self, slot: usize, txid: u32) {
+    pub(crate) fn commit_index_rename(&mut self, slot: usize, txid: u32) -> Result<(), SqlError> {
+        self.install_index_rename(slot, txid, None)
+    }
+
+    pub(crate) fn publish_index_rename(&mut self, slot: usize, txid: u32) -> Result<(), SqlError> {
+        self.install_index_rename(slot, txid, Some(txid))
+    }
+
+    fn install_index_rename(
+        &mut self,
+        slot: usize,
+        txid: u32,
+        admitted: Option<u32>,
+    ) -> Result<(), SqlError> {
+        if !self
+            .index(slot)
+            .pending_name
+            .is_some_and(|pending| pending.txid == txid)
+        {
+            return Ok(());
+        }
+        let table = self.index_table_slot(slot);
+        if let Some(table) = table {
+            self.preview_index_generation(table, admitted)?;
+        }
         let (database, schema, old_name, new_name) = {
             let mut catalog = self.index_catalog();
             let index = &mut catalog[slot];
             let Some(pending) = index.pending_name else {
-                return;
+                return Ok(());
             };
             if pending.txid != txid {
-                return;
+                return Ok(());
             }
             let old_name = index.name;
             index.name = pending.name;
@@ -48105,9 +48272,10 @@ impl Storage {
                 }
             }
         }
-        if let Some(table) = self.index_table_slot(slot) {
-            self.tables[table].mark_dirty();
+        if let Some(table) = table {
+            self.publish_index_generation(table, admitted)?;
         }
+        Ok(())
     }
 
     pub(crate) fn rollback_index_rename(&mut self, slot: usize, prior: Option<PendingIndexName>) {
@@ -48697,7 +48865,7 @@ impl Storage {
 
     /// Promotes this transaction's pending index drops on a table (cascaded
     /// from its DROP TABLE) into the committed catalog.
-    pub fn commit_indexes_for(&mut self, table: usize, txid: u32) {
+    pub fn commit_indexes_for(&mut self, table: usize, txid: u32) -> Result<(), SqlError> {
         let identity = self.tables[table].identity();
         let source = self.catalog_object_identity(
             catalog_sources::CatalogObjectSlot::Table(table),
@@ -48712,9 +48880,10 @@ impl Storage {
                     .is_some_and(|binding| binding.source == source)
                 && index.ddl_state.pending_drop_txid() == Some(txid)
             {
-                self.commit_index_drop(slot);
+                self.commit_index_drop(slot)?;
             }
         }
+        Ok(())
     }
 
     /// Discards this transaction's pending index drops on a table (a rolled
@@ -48774,8 +48943,22 @@ impl Storage {
     }
 
     /// Promotes an uncommitted CREATE INDEX into the committed catalog.
-    pub fn commit_index_create(&mut self, slot: usize) {
-        if let Some(table) = self.index_table_slot(slot) {
+    pub fn commit_index_create(&mut self, slot: usize) -> Result<(), SqlError> {
+        self.install_index_create(slot, None)
+    }
+
+    pub(crate) fn publish_index_create(
+        &mut self,
+        slot: usize,
+        transaction: u32,
+    ) -> Result<(), SqlError> {
+        self.install_index_create(slot, Some(transaction))
+    }
+
+    fn install_index_create(&mut self, slot: usize, admitted: Option<u32>) -> Result<(), SqlError> {
+        let table = self.index_table_slot(slot);
+        if let Some(table) = table {
+            self.preview_index_generation(table, admitted)?;
             self.tables[table]
                 .statistics
                 .mark_index_created(self.tables[table].identity().created_at);
@@ -48784,15 +48967,31 @@ impl Storage {
             let mut catalog = self.index_catalog();
             catalog[slot].ddl_state = catalog[slot].ddl_state.commit_create();
         }
-        if let Some(table) = self.index_table_slot(slot) {
-            self.tables[table].mark_dirty();
+        if let Some(table) = table {
+            self.publish_index_generation(table, admitted)?;
         }
+        Ok(())
     }
 
     /// Promotes an uncommitted DROP INDEX into the committed catalog.
-    pub fn commit_index_drop(&mut self, slot: usize) {
+    pub fn commit_index_drop(&mut self, slot: usize) -> Result<(), SqlError> {
+        self.install_index_drop(slot, None)
+    }
+
+    pub(crate) fn publish_index_drop(
+        &mut self,
+        slot: usize,
+        transaction: u32,
+    ) -> Result<(), SqlError> {
+        self.install_index_drop(slot, Some(transaction))
+    }
+
+    fn install_index_drop(&mut self, slot: usize, admitted: Option<u32>) -> Result<(), SqlError> {
         let index = self.index(slot);
         let table = self.index_table_slot(slot);
+        if let Some(table) = table {
+            self.preview_index_generation(table, admitted)?;
+        }
         self.drop_object_comments(
             CommentClass::Relation,
             index.schema.as_str(),
@@ -48804,8 +49003,9 @@ impl Storage {
         });
         self.retire_index(slot, false);
         if let Some(table) = table {
-            self.tables[table].mark_dirty();
+            self.publish_index_generation(table, admitted)?;
         }
+        Ok(())
     }
 
     fn retire_index(&self, slot: usize, rollback_create: bool) {
@@ -49782,6 +49982,9 @@ impl Storage {
             return Ok(None);
         };
         let removed = definition.fkeys[at];
+        self.tables[index]
+            .publication()
+            .preview_unreserved_generation()?;
         let count = definition.n_fkeys - 1;
         let mut replacement = self
             .metadata_pool
@@ -49799,7 +50002,7 @@ impl Storage {
         definition.fkeys = replacement.freeze();
         definition.n_fkeys = count;
         drop(definition);
-        self.tables[index].mark_dirty();
+        self.tables[index].mark_dirty()?;
         Ok(Some(removed))
     }
 

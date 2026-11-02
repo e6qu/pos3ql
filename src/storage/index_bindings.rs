@@ -464,11 +464,11 @@ mod tests {
         let slot = storage
             .create_index(index("binding_index", "binding_source", 0, 1), 7)
             .unwrap();
-        storage.commit_index_create(slot);
+        storage.commit_index_create(slot).unwrap();
         let mut occupied = index("binding_index", "binding_target", 0, 1);
         occupied.schema = target_schema;
         let occupied_slot = storage.create_index(occupied, 8).unwrap();
-        storage.commit_index_create(occupied_slot);
+        storage.commit_index_create(occupied_slot).unwrap();
         storage
             .apply_comment(
                 CommentClass::Relation,
@@ -504,7 +504,7 @@ mod tests {
                     .unwrap(),
                 Some(occupied_slot)
             );
-            storage.commit_index_drop(occupied_slot);
+            storage.commit_index_drop(occupied_slot).unwrap();
             let change = storage
                 .write_table_def(
                     storage.select_table_definition(table, 7).0,
@@ -604,7 +604,7 @@ mod tests {
             let slot = storage
                 .create_index(index("binding_index", "binding_source", 0, 1), 7)
                 .unwrap();
-            storage.commit_index_create(slot);
+            storage.commit_index_create(slot).unwrap();
             let captured = storage.index(slot);
             assert!(other.project_index_binding(captured, 0).is_none());
             let selected_indexes = storage.indexes_for("public", "binding_source", 0);
@@ -829,7 +829,7 @@ mod tests {
                 }
             }
             for (slot, expected) in [(before, (1, 0)), (during, (2, 0))] {
-                storage.commit_index_create(slot);
+                storage.commit_index_create(slot).unwrap();
                 let committed = storage.index_visible_to(slot, 8).unwrap();
                 assert_eq!(
                     (committed.columns[0], committed.include_columns[0]),

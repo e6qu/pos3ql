@@ -2059,13 +2059,13 @@ pub(super) fn preserve_projection_type_identities(
 /// Describes a derived table without retaining a maximum-width arena image.
 /// FROM-less LATERAL projections use the preceding tables' column types.
 pub(crate) fn describe_derived_definition<'a>(
-    storage: &'a Storage,
-    sub: &'a Select<'a>,
-    exposed: &'a str,
-    col_alias: Option<&'a [&'a str]>,
+    storage: &Storage,
+    sub: &Select<'_>,
+    exposed: &str,
+    col_alias: Option<&[&str]>,
     txid: u32,
     arena: &'a Arena,
-    outer: Option<&QueryScope<'a>>,
+    outer: Option<&QueryScope<'_>>,
 ) -> Result<RelationDefinition<'a>, SqlError> {
     let outer_schema = outer.map(super::ScopeSchema);
     let outer_columns = outer_schema

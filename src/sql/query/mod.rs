@@ -9603,12 +9603,20 @@ pub fn describe_catalog_items<'q>(
     arena: &'q Arena,
     out: &mut [ColDesc<'q>],
 ) -> Result<usize, SqlError> {
-    describe_catalog_items_as(items, definition, None, storage, txid, arena, out)
+    describe_catalog_items_as(
+        items,
+        definition.map(crate::storage::RelationDefinition::from_definition),
+        None,
+        storage,
+        txid,
+        arena,
+        out,
+    )
 }
 
 pub fn describe_catalog_items_as<'q>(
     items: &[SelectItem<'q>],
-    definition: Option<&'q TableDef>,
+    definition: Option<crate::storage::RelationDefinition<'q>>,
     alias: Option<&str>,
     storage: &'q Storage,
     txid: u32,
@@ -9630,7 +9638,7 @@ pub fn describe_catalog_items_as<'q>(
             super::exec::infer_type_res(
                 expression,
                 &super::exec::CatalogCols {
-                    definition: definition.map(crate::storage::RelationDefinition::from_definition),
+                    definition,
                     alias,
                     output_aliases: &[],
                     storage,

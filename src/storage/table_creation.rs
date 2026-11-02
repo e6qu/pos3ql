@@ -130,7 +130,7 @@ pub(super) fn allocate(
             }
         };
         let table = &storage.tables[slot];
-        let mut state = table.definition.write();
+        let state = table.definition.write();
         let source = match super::row_ownership::try_mutex(
             &storage.type_catalog,
             "type catalog lock poisoned",
@@ -206,6 +206,21 @@ pub(super) fn allocate(
         storage.reset_implicit_index_statistics(slot);
         storage.clear_table_rows(slot);
         let mut state = table.definition.write();
+        let mut publication = match super::row_ownership::try_mutex(
+            &table.publication,
+            "table publication lock poisoned",
+        ) {
+            Ok(publication) => publication,
+            Err(wait) => {
+                drop(state);
+                drop(source);
+                drop(lifecycle);
+                drop(names);
+                wait.wait();
+                continue;
+            }
+        };
+        let generation = publication.preview_unreserved_generation()?;
         state.install(
             definition,
             table_definitions::TableIdentity {
@@ -219,10 +234,12 @@ pub(super) fn allocate(
                 },
             },
         );
-        table.publication().row_layout = super::row_layout::RowLayout::initial();
+        publication.row_layout = super::row_layout::RowLayout::initial();
+        publication.generation = generation;
+        publication.dirty = true;
+        drop(publication);
         drop(state);
         drop(source);
-        table.mark_dirty();
         table
             .statistics
             .set_image(TableStatistics::EMPTY, Some(false), true);

@@ -317,6 +317,69 @@ impl EnumImageReservation {
         })
     }
 
+    /// Restore recorded label identities without exposing a committed catalog image.
+    pub(super) fn restore(
+        images: &Arc<Mutex<EnumMemberImages>>,
+        members: &[EnumMember],
+        previous: Option<(u32, usize)>,
+        created_at: u64,
+    ) -> Result<Self, SqlError> {
+        let mut state = images.lock().expect("enum member-image lock poisoned");
+        let count = state.validate_count(members.len())?;
+        let mut last_creation = created_at;
+        for member in members {
+            let creation = member
+                .identity
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::DATA_EXCEPTION,
+                        "stored enum member has no creation identity"
+                    )
+                })?
+                .created_at();
+            if creation <= last_creation {
+                return Err(sql_err!(
+                    sqlstate::DATA_EXCEPTION,
+                    "stored enum member identities are not increasing"
+                ));
+            }
+            last_creation = creation;
+        }
+        if let Some((source, old_count)) = previous {
+            if old_count > members.len()
+                || old_count > state.width
+                || state
+                    .slots
+                    .get(source as usize)
+                    .is_none_or(|slot| !slot.owned && slot.readers == 0)
+                || state
+                    .image_members(source, old_count)
+                    .iter()
+                    .zip(members)
+                    .any(|(old, new)| old.identity != new.identity)
+            {
+                return Err(sql_err!(
+                    sqlstate::DATA_EXCEPTION,
+                    "stored enum member identities changed an existing prefix"
+                ));
+            }
+        }
+        let image = state.reserve()?;
+        let start = image as usize * state.width;
+        state.members.as_mut_slice()[start..start + members.len()].copy_from_slice(members);
+        if let Err(error) =
+            validate_members(&mut state.members.as_mut_slice()[start..start + members.len()])
+        {
+            state.release(image);
+            return Err(error);
+        }
+        Ok(Self {
+            images: Arc::clone(images),
+            image: Some(image),
+            count,
+        })
+    }
+
     pub(super) fn copy(
         images: &Arc<Mutex<EnumMemberImages>>,
         source: u32,

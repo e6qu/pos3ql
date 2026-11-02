@@ -141,7 +141,7 @@ pub(crate) struct MutableSlice<T> {
 
 /// References returned by Deref borrow this owner. Clone retains the initialized
 /// allocation, including non-Copy values, without reserving bytes or descriptors.
-pub(crate) struct SharedSlice<T> {
+pub struct SharedSlice<T> {
     pool: Option<Arc<LeasePool>>,
     reservation: Option<Reservation>,
     len: usize,

@@ -559,7 +559,6 @@ impl super::Storage {
             .type_catalog
             .lock()
             .expect("type catalog lock poisoned");
-        let mut has_identity_moves = false;
         for change in changes.clone() {
             let (source, owner) = match change {
                 TypeCommitChange::Definition(target) => (target.source, target.transaction),
@@ -585,7 +584,6 @@ impl super::Storage {
             }
             let valid = match change {
                 TypeCommitChange::Definition(target) => {
-                    has_identity_moves |= target.identity_move(&catalog).is_some();
                     let current = catalog.type_definition_version(source.slot(), transaction);
                     let pending = match source.slot() {
                         NamedTypeSlot::Domain(slot) => catalog.domains[slot]
@@ -634,11 +632,6 @@ impl super::Storage {
             }
         }
         drop(catalog);
-        if has_identity_moves {
-            super::type_reference_moves::DefinitionPublication::validate_generations(
-                self, changes,
-            )?;
-        }
         Ok(())
     }
 

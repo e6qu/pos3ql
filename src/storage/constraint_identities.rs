@@ -452,7 +452,8 @@ mod tests {
             let slot = storage
                 .create_table(checked_table("constraint_owner"))
                 .unwrap();
-            let original = *storage.table_def(slot, 0);
+            let original =
+                crate::storage::TableDefBuilder::from_definition(&storage.table_def(slot, 0));
             let before = storage.catalog_identity_sequence();
             let position = CatalogPosition::new(1, before + 10).unwrap();
             for rejected_kind in 0..3 {
@@ -517,7 +518,11 @@ mod tests {
             let original = storage.table_def(first, 0).checks[0].identity;
             let duplicate = storage.table_def(second, 0).checks[0].identity;
             let revision = storage.reserve_table_definition_revision().unwrap();
-            storage.tables[first].definition_mut(revision).checks[0].identity = duplicate;
+            let mut definition =
+                crate::storage::TableDefBuilder::from_definition(&storage.table_def(first, 0));
+            definition.checks[0].identity = duplicate;
+            let replacement = definition.freeze(&storage.metadata_pool).unwrap();
+            *storage.tables[first].definition_mut(revision) = replacement;
             let before = storage.catalog_identity_sequence();
             assert_eq!(
                 storage
@@ -528,7 +533,9 @@ mod tests {
             );
             assert_eq!(storage.catalog_identity_sequence(), before);
             assert_eq!(storage.table_def(first, 0).checks[0].identity, duplicate);
-            storage.tables[first].definition_mut(revision).checks[0].identity = original;
+            definition.checks[0].identity = original;
+            let replacement = definition.freeze(&storage.metadata_pool).unwrap();
+            *storage.tables[first].definition_mut(revision) = replacement;
             storage
                 .validate_restored_constraint_identities(before)
                 .unwrap();

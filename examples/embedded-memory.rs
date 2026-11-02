@@ -152,7 +152,7 @@ fn measure() -> Result<(), Box<dyn std::error::Error>> {
             .enumerate()
             .any(|(index, flag)| arguments[index * 2] != *flag)
     {
-        return Err("usage: embedded-memory --tables N --row-overlay-slots N --row-work-bytes N --row-work-leases N --definition-image-slots N --mode mvcc|locking --row-history-slots N --workload empty|hot|even|moving --rows N --data-dir NEW_DIRECTORY --budget-limit-bytes N --table-metadata-bytes N --table-metadata-leases N".into());
+        return Err("usage: embedded-memory --tables N --row-overlay-slots N --row-work-bytes N --row-work-leases N --definition-image-slots N --mode mvcc|locking --row-history-slots N --workload empty|hot|even|moving|wide|replacement --rows N --data-dir NEW_DIRECTORY --budget-limit-bytes N --table-metadata-bytes N --table-metadata-leases N".into());
     }
     let mut config = Config::default_dev();
     config.max_tables = arguments[1].parse()?;
@@ -180,11 +180,13 @@ fn measure() -> Result<(), Box<dyn std::error::Error>> {
     }
     let workload = arguments[15].as_str();
     let rows: usize = arguments[17].parse()?;
-    if !matches!(workload, "empty" | "hot" | "even" | "moving")
-        || (workload == "empty") != (rows == 0)
+    if !matches!(
+        workload,
+        "empty" | "hot" | "even" | "moving" | "wide" | "replacement"
+    ) || (workload == "empty") != (rows == 0)
         || rows > config.row_overlay_slots
     {
-        return Err("choose empty with zero rows, or hot/even/moving with positive rows fitting the global overlay".into());
+        return Err("choose empty with zero rows, or hot/even/moving/wide/replacement with positive rows fitting the global overlay".into());
     }
     config.catalog_history_bytes = if config.transaction_mode == TransactionMode::Mvcc {
         1 << 20
@@ -234,10 +236,16 @@ fn measure() -> Result<(), Box<dyn std::error::Error>> {
     let workload_started = std::time::Instant::now();
     if workload != "empty" {
         let mut session = Session::new(&config, &mut session_budget)?;
+        let mut columns = String::from("id integer, payload text");
+        if workload == "wide" {
+            for column in 2..64 {
+                columns.push_str(&format!(", field_{column} integer"));
+            }
+        }
         for table in 0..config.max_tables {
             session.execute(
                 &mut engine,
-                &format!("CREATE TABLE measured_{table}(id integer, payload text)"),
+                &format!("CREATE TABLE measured_{table}({columns})"),
                 None,
             )?;
         }
@@ -250,7 +258,7 @@ fn measure() -> Result<(), Box<dyn std::error::Error>> {
                         count: usize|
          -> Result<(), Box<dyn std::error::Error>> {
             if count != 0 {
-                session.execute(engine, &format!("INSERT INTO measured_{table} SELECT g,repeat('x',64) FROM generate_series({first},{}) g", first + count - 1), None)?;
+                session.execute(engine, &format!("INSERT INTO measured_{table}(id,payload) SELECT g,repeat('x',64) FROM generate_series({first},{}) g", first + count - 1), None)?;
             }
             Ok(())
         };
@@ -285,6 +293,20 @@ fn measure() -> Result<(), Box<dyn std::error::Error>> {
                     prior = target;
                 }
             }
+        }
+        if workload == "replacement" {
+            session.execute(
+                &mut engine,
+                "CREATE UNIQUE INDEX measured_id ON measured_0(id)",
+                None,
+            )?;
+            session.execute(&mut engine, "BEGIN; ALTER TABLE measured_0 ADD COLUMN note text; SAVEPOINT original; ALTER TABLE measured_0 ADD COLUMN discarded integer; ROLLBACK TO original; COMMIT", None)?;
+            session.execute(&mut engine, "DROP INDEX measured_id", None)?;
+            session.execute(
+                &mut engine,
+                "CREATE UNIQUE INDEX measured_id ON measured_0(id)",
+                None,
+            )?;
         }
         for (table, (&count, &sum)) in counts.iter().zip(&sums).enumerate() {
             session.execute(

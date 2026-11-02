@@ -9319,7 +9319,9 @@ impl Checkpointer {
                             ))
                         })?;
                     // Checkpoint load reconstructs committed state.
-                    storage.commit_index_create(slot);
+                    storage
+                        .commit_index_create(slot)
+                        .map_err(CheckpointSetupError::Replay)?;
                     if has_brin_maintenance {
                         storage
                             .restore_brin_maintenance(

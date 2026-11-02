@@ -306,49 +306,6 @@ impl DefinitionPublication {
         }
     }
 
-    pub(super) fn validate_generations(
-        storage: &Storage,
-        changes: impl Iterator<Item = super::TypeCommitChange> + Clone,
-    ) -> Result<(), crate::sql::eval::SqlError> {
-        for table in storage.tables.iter() {
-            loop {
-                let attempt: Result<_, LockWait<'_>> = (|| {
-                    let state = table.definition.try_read_for_batch()?;
-                    let publication =
-                        try_mutex(&table.publication, "table publication lock poisoned")?;
-                    let types = try_mutex(&storage.type_catalog, "type catalog lock poisoned")?;
-                    let count = changes
-                        .clone()
-                        .filter_map(|change| match change {
-                            super::TypeCommitChange::Definition(target) => {
-                                target.identity_move(&types)
-                            }
-                            super::TypeCommitChange::Lifecycle(_) => None,
-                        })
-                        .filter(|movement| {
-                            movement.applies_to(state.identity)
-                                && storage
-                                    .pending_table_defs
-                                    .references_type(&state, *movement)
-                        })
-                        .count();
-                    Ok(publication.generation.checked_add(count as u64).is_some())
-                })();
-                match attempt {
-                    Err(wait) => wait.wait(),
-                    Ok(true) => break,
-                    Ok(false) => {
-                        return Err(crate::sql_err!(
-                            crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                            "type change exhausts a dependent table publication generation"
-                        ));
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
     fn scratch_bytes(config: &Config) -> usize {
         super::table_slot_capacity(config)
             .saturating_mul(size_of::<Option<TableOwner<'static>>>())
@@ -524,12 +481,15 @@ impl DefinitionPublication {
                     // Preflight every fallible counter before changing any
                     // source, pending version or dependent definition.
                     for owner in owners.slots.iter().flatten() {
-                        owner.publication.generation.checked_add(1).ok_or_else(|| {
-                            crate::sql_err!(
-                                crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                                "type change exhausts a dependent table publication generation"
-                            )
-                        })?;
+                        owner
+                            .publication
+                            .preview_unreserved_generation()
+                            .map_err(|_| {
+                                crate::sql_err!(
+                                    crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                    "type change exhausts a dependent table publication generation"
+                                )
+                            })?;
                     }
                     let revision = match source {
                         TypePublicationSource::Pending(target) => target.dependent_table_revision(),
@@ -591,7 +551,10 @@ impl DefinitionPublication {
                                 .expect("dependent replacement is applied once"),
                             revision,
                         );
-                        owner.publication.generation += 1;
+                        owner.publication.generation = owner
+                            .publication
+                            .preview_unreserved_generation()
+                            .expect("immediate type publication retains its preflight owners");
                         owner.publication.dirty = true;
                     }
                     movement.rewrite_catalog(&mut types);
@@ -820,6 +783,14 @@ mod tests {
             core::iter::empty(),
             [super::super::TypeCommitChange::Definition(target)].into_iter(),
         )?;
+        if let Err(error) = storage.prepare_commit_generations(
+            target.transaction(),
+            core::iter::empty(),
+            core::iter::empty(),
+        ) {
+            storage.rollback_definition_publication(target.transaction());
+            return Err(error);
+        }
         let result = match kind {
             TypeReferenceKind::Domain => storage.commit_domain_alter(target),
             TypeReferenceKind::Enum => storage.commit_enum_alter(target),
@@ -830,6 +801,7 @@ mod tests {
             return Err(error);
         }
         let result = storage.finish_definition_publication(target.transaction());
+        storage.release_commit_generations(target.transaction());
         storage.release_object_locks(target.transaction());
         storage.release_row_locks(target.transaction());
         result
@@ -1317,13 +1289,21 @@ mod tests {
                     .validate_type_commit(7, [TypeCommitChange::Definition(target)].into_iter())
                     .unwrap();
                 storage.tables[related].publication().generation = u64::MAX;
+                storage
+                    .prepare_definition_publication(
+                        7,
+                        core::iter::empty(),
+                        [TypeCommitChange::Definition(target)].into_iter(),
+                    )
+                    .unwrap();
                 assert_eq!(
                     storage
-                        .validate_type_commit(7, [TypeCommitChange::Definition(target)].into_iter())
+                        .prepare_commit_generations(7, core::iter::empty(), core::iter::empty())
                         .unwrap_err()
                         .sqlstate,
                     crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED
                 );
+                storage.rollback_definition_publication(7);
                 let error = commit_move(&storage, kind, target).unwrap_err();
                 assert_eq!(
                     error.sqlstate,
@@ -3294,7 +3274,7 @@ mod tests {
             }
             let foreign = storage.create_table(definition).unwrap();
             storage.select_database(DatabaseOid::POSTGRES).unwrap();
-            storage.drop_table(retired);
+            storage.drop_table(retired).unwrap();
             let retired_view = storage.table_def(retired, 0);
             let foreign_view = storage.table_def(foreign, 0);
             let (send, receive) = mpsc::sync_channel(1);

@@ -870,14 +870,14 @@ fn transaction_publication_queued_failure_preserves_later_durable_work_for_recov
         );
         assert_eq!(
             engine
-                .finish_staged_transaction(&mut writer.transaction, &writer.guc)
+                .finish_pending_transaction(&mut writer.transaction, &writer.guc)
                 .unwrap_err()
                 .sqlstate,
             "08007"
         );
         assert_eq!(
             engine
-                .finish_staged_transaction(&mut later.transaction, &later.guc)
+                .finish_pending_transaction(&mut later.transaction, &later.guc)
                 .unwrap_err()
                 .sqlstate,
             "08007"

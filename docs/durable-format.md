@@ -542,6 +542,20 @@ or class owner edit must not restore an old input or result name during replay.
 The field inventory is shared with database-scoped type moves. Existing record
 grammars are unchanged.
 
+### Reconstructing saved transactions
+
+Startup restores prepared row and catalog records into private transaction
+changes with their recorded identities. Types, indexes, views, rules, triggers,
+policies and other declarations remain invisible to other transactions until
+resolution. The reconstruction records normal undo, so rollback releases the
+same owners without publishing temporary committed objects.
+
+`COMMIT PREPARED` reserves definition replacements, index bindings and row keys
+before its decision becomes durable. Installation consumes those owners through
+the normal transaction boundary; it does not run allocating catalog replay after
+the decision. Saved locks are captured after admission. Record framing and object
+identity checks still apply to every reconstructed operation.
+
 ### Prepared transaction locks
 
 Each entry starts with a kind byte: 0 for a stored table, 1 for a row, 2 for an

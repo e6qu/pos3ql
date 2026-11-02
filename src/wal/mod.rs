@@ -765,10 +765,25 @@ impl<'a> Iterator for WalPolicyRoleIter<'a> {
 
 impl ExactSizeIterator for WalPolicyRoleIter<'_> {}
 
-pub(crate) fn apply_enum_payload(
-    storage: &mut crate::storage::Storage,
-    payload: &[u8],
-) -> Result<(), SqlError> {
+pub(crate) struct DecodedEnum<'a> {
+    pub(crate) slot: u16,
+    pub(crate) created_at: u64,
+    pub(crate) schema: crate::storage::SqlName,
+    pub(crate) name: crate::storage::SqlName,
+    pub(crate) count: usize,
+    members_payload: &'a [u8],
+}
+
+fn enum_payload_name<'a>(payload: &'a [u8], at: &mut usize) -> Result<&'a str, SqlError> {
+    let invalid = || sql_err!(sqlstate::DATA_EXCEPTION, "invalid enum journal payload");
+    let length = usize::from(*payload.get(*at).ok_or_else(invalid)?);
+    *at += 1;
+    let bytes = payload.get(*at..*at + length).ok_or_else(invalid)?;
+    *at += length;
+    core::str::from_utf8(bytes).map_err(|_| invalid())
+}
+
+pub(crate) fn decode_enum_payload(payload: &[u8]) -> Result<DecodedEnum<'_>, SqlError> {
     let invalid = || {
         sql_err!(
             sqlstate::DATA_EXCEPTION,
@@ -787,38 +802,12 @@ pub(crate) fn apply_enum_payload(
             .and_then(|bytes| bytes.try_into().ok())
             .ok_or_else(invalid)?,
     );
-    if usize::from(slot) >= storage.enum_count() || created_at == 0 {
-        return Err(invalid());
-    }
-    let existing = storage.enum_for(usize::from(slot), 0);
-    if existing.visible_to(0)
-        && (existing.database != storage.current_database_oid()
-            || existing.created_at != created_at)
-    {
+    if crate::storage::TypeCreation::parse(created_at).is_none() {
         return Err(invalid());
     }
     let mut at = 10usize;
-    let take_name = |at: &mut usize| -> Result<&str, SqlError> {
-        let length =
-            usize::from(*payload.get(*at).ok_or_else(|| {
-                sql_err!(sqlstate::INTERNAL_ERROR, "invalid enum journal payload")
-            })?);
-        *at += 1;
-        let bytes = payload
-            .get(*at..*at + length)
-            .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "invalid enum journal payload"))?;
-        *at += length;
-        core::str::from_utf8(bytes)
-            .map_err(|_| sql_err!(sqlstate::INTERNAL_ERROR, "invalid enum journal payload"))
-    };
-    let name = crate::storage::SqlName::parse(take_name(&mut at)?)?;
-    let schema = crate::storage::SqlName::parse(take_name(&mut at)?)?;
-    if storage
-        .enum_slot(schema.as_str(), name.as_str(), 0)
-        .is_some_and(|existing| existing != usize::from(slot))
-    {
-        return Err(invalid());
-    }
+    let name = crate::storage::SqlName::parse(enum_payload_name(payload, &mut at)?)?;
+    let schema = crate::storage::SqlName::parse(enum_payload_name(payload, &mut at)?)?;
     let count = u32::from_le_bytes(
         payload
             .get(at..at + 4)
@@ -826,57 +815,109 @@ pub(crate) fn apply_enum_payload(
             .ok_or_else(invalid)?,
     ) as usize;
     at += 4;
-    let mut members = storage.enum_replay_members(count)?;
-    for member in members.iter_mut() {
-        let label = crate::storage::SqlName::parse(take_name(&mut at)?)?;
-        let sort = f64::from_le_bytes(
-            payload
-                .get(at..at + 8)
-                .and_then(|bytes| bytes.try_into().ok())
-                .ok_or_else(|| {
-                    sql_err!(sqlstate::INTERNAL_ERROR, "invalid enum journal payload")
-                })?,
-        );
-        at += 8;
-        let legacy_label = match *payload.get(at).ok_or_else(invalid)? {
-            0 => {
-                at += 1;
-                None
-            }
-            1 => {
-                at += 1;
-                Some(crate::storage::SqlName::parse(take_name(&mut at)?)?)
-            }
-            _ => return Err(invalid()),
-        };
-        let identity = u32::from_le_bytes(
-            payload
-                .get(at..at + 4)
-                .and_then(|bytes| bytes.try_into().ok())
-                .ok_or_else(invalid)?,
-        );
-        at += 4;
-        let identity =
-            crate::storage::EnumLabelIdentity::parse(u64::from(identity)).ok_or_else(invalid)?;
-        *member = crate::storage::EnumMember {
-            identity: Some(identity),
-            label,
-            legacy_label,
-            sort,
-        };
+    Ok(DecodedEnum {
+        slot,
+        created_at,
+        schema,
+        name,
+        count,
+        members_payload: &payload[at..],
+    })
+}
+
+impl DecodedEnum<'_> {
+    pub(crate) fn read_members(
+        &self,
+        members: &mut [crate::storage::EnumMember],
+    ) -> Result<(), SqlError> {
+        let invalid = || sql_err!(sqlstate::DATA_EXCEPTION, "invalid enum journal payload");
+        if members.len() != self.count {
+            return Err(invalid());
+        }
+        let payload = self.members_payload;
+        let mut at = 0usize;
+        for member in members.iter_mut() {
+            let label = crate::storage::SqlName::parse(enum_payload_name(payload, &mut at)?)?;
+            let sort = f64::from_le_bytes(
+                payload
+                    .get(at..at + 8)
+                    .and_then(|bytes| bytes.try_into().ok())
+                    .ok_or_else(|| {
+                        sql_err!(sqlstate::INTERNAL_ERROR, "invalid enum journal payload")
+                    })?,
+            );
+            at += 8;
+            let legacy_label = match *payload.get(at).ok_or_else(invalid)? {
+                0 => {
+                    at += 1;
+                    None
+                }
+                1 => {
+                    at += 1;
+                    Some(crate::storage::SqlName::parse(enum_payload_name(
+                        payload, &mut at,
+                    )?)?)
+                }
+                _ => return Err(invalid()),
+            };
+            let identity = u32::from_le_bytes(
+                payload
+                    .get(at..at + 4)
+                    .and_then(|bytes| bytes.try_into().ok())
+                    .ok_or_else(invalid)?,
+            );
+            at += 4;
+            let identity = crate::storage::EnumLabelIdentity::parse(u64::from(identity))
+                .ok_or_else(invalid)?;
+            *member = crate::storage::EnumMember {
+                identity: Some(identity),
+                label,
+                legacy_label,
+                sort,
+            };
+        }
+        if at != payload.len() {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "invalid enum journal payload"
+            ));
+        }
+        Ok(())
     }
-    if at != payload.len() {
+}
+
+pub(crate) fn apply_enum_payload(
+    storage: &mut crate::storage::Storage,
+    payload: &[u8],
+) -> Result<(), SqlError> {
+    let definition = decode_enum_payload(payload)?;
+    let slot = usize::from(definition.slot);
+    if slot >= storage.enum_count()
+        || storage.enum_for(slot, 0).visible_to(0)
+            && (storage.enum_for(slot, 0).database != storage.current_database_oid()
+                || storage.enum_for(slot, 0).created_at != definition.created_at)
+        || storage
+            .enum_slot(definition.schema.as_str(), definition.name.as_str(), 0)
+            .is_some_and(|existing| existing != slot)
+    {
         return Err(sql_err!(
-            sqlstate::INTERNAL_ERROR,
-            "invalid enum journal payload"
+            sqlstate::DATA_EXCEPTION,
+            "invalid enum journal source identity"
         ));
     }
+    let mut members = storage.enum_replay_members(definition.count)?;
+    definition.read_members(&mut members)?;
     drop(members);
-    let allocated = storage.finish_enum_replay(schema, name, count, created_at)?;
+    let allocated = storage.finish_enum_replay(
+        definition.schema,
+        definition.name,
+        definition.count,
+        definition.created_at,
+    )?;
     storage.restore_type_identity(
         crate::storage::NamedTypeSlot::Enum(allocated),
-        crate::storage::NamedTypeSlot::Enum(usize::from(slot)),
-        created_at,
+        crate::storage::NamedTypeSlot::Enum(slot),
+        definition.created_at,
     )?;
     Ok(())
 }

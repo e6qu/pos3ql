@@ -12257,6 +12257,57 @@ pub(crate) fn index_identity_by_oid(
     found
 }
 
+pub(crate) struct IndexMaintenanceTarget {
+    pub table: usize,
+    pub oid: i32,
+    pub explicit_slot: Option<usize>,
+}
+
+/// Includes the implicit constraint indexes exposed by the relation catalog.
+pub(crate) fn index_maintenance_target(
+    storage: &Storage,
+    txid: u32,
+    schema: Option<&str>,
+    name: &str,
+) -> Result<Option<IndexMaintenanceTarget>, SqlError> {
+    let Some(oid) = relation_oid_for_name(storage, txid, schema, name) else {
+        return Ok(None);
+    };
+    let mut found = None;
+    visit_indexes(storage, txid, None, |index| {
+        if index.oid == oid {
+            found = Some((
+                index.table_slot,
+                index.name,
+                index.explicit_definition.is_some(),
+            ));
+        }
+    });
+    let Some((table, name, explicit)) = found else {
+        return Ok(None);
+    };
+    let explicit_slot = if explicit {
+        let schema = storage.table_def(table, txid).schema;
+        Some(
+            storage
+                .index_slot(schema.as_str(), name.as_str(), txid)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::SERIALIZATION_FAILURE,
+                        "selected index changed before maintenance"
+                    )
+                })?,
+        )
+    } else {
+        None
+    };
+    Ok(Some(IndexMaintenanceTarget {
+        table,
+        oid,
+        explicit_slot,
+    }))
+}
+
 fn stack_str_64(s: &str) -> StackStr<64> {
     let mut out = StackStr::<64>::new();
     let _ = core::fmt::Write::write_str(&mut out, s);

@@ -258,7 +258,8 @@ pub(super) fn allocate(
             let definition = table.definition();
             definition.name
         };
-        if let Err(error) = storage.refresh_enforcers_visible(slot, None) {
+        if let Err(error) = storage.rebuild_value_caches(slot, super::ValueCacheRebuild::Committed)
+        {
             storage.rollback_create_locked(slot);
             let mut state = table.definition.write();
             let mut identity = state.identity;

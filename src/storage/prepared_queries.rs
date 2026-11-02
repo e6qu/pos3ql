@@ -488,3 +488,89 @@ impl Storage {
         Ok(slot)
     }
 }
+
+#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
+mod tests {
+    use super::*;
+    use crate::storage::tests::{make_def, test_budget, test_config};
+    use crate::storage::{
+        ColType, ColumnSet, DependencyClass, MAX_COLUMNS, ResolvedRelation,
+        StoredDependencyIdentity, StoredQueryDependency, TableDefBuilder,
+    };
+
+    #[test]
+    fn stored_relation_sources_reject_serialized_slots_and_unselected_definitions() {
+        let config = test_config();
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
+        let table = storage
+            .create_table(make_def("bound_items", &[("id", ColType::Int4, false)]))
+            .unwrap();
+        let mut dependency = StoredQueryDependency {
+            class: DependencyClass::Table,
+            slot: u16::MAX,
+            identity: StoredDependencyIdentity::Name,
+            referenced_columns: ColumnSet::EMPTY,
+            schema: SqlName::parse("public").unwrap(),
+            name: SqlName::parse("bound_items").unwrap(),
+            referenced_schema: SqlName::EMPTY,
+            referenced_name: SqlName::parse("bound_items").unwrap(),
+        };
+        crate::mem::guard::forbid_alloc(|| {
+            let error = storage
+                .resolve_stored_query_relation(&dependency, 0)
+                .err()
+                .unwrap();
+            assert_eq!(error.sqlstate, sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE);
+            assert!(error.message.as_str().contains("unresolved"));
+            dependency.slot = table as u16;
+            assert!(
+                matches!(storage.resolve_stored_query_relation(&dependency, 0).unwrap(), ResolvedRelation::Table(slot) if slot == table)
+            );
+            let (target, selected) = storage.select_table_definition(table, 7);
+            let mut replacement = TableDefBuilder::from_definition(&selected);
+            replacement.name = SqlName::parse("private_items").unwrap();
+            let mut mapping = [None; MAX_COLUMNS];
+            mapping[0] = Some(replacement.columns[0].name);
+            let change = storage
+                .write_table_def(target, replacement, &mapping, false)
+                .unwrap();
+            assert!(
+                storage
+                    .resolve_stored_query_relation(&dependency, 0)
+                    .is_ok()
+            );
+            assert!(
+                storage
+                    .resolve_stored_query_relation(&dependency, 7)
+                    .is_err()
+            );
+            let pending = StoredQueryDependency {
+                name: replacement.name,
+                ..dependency
+            };
+            assert!(storage.resolve_stored_query_relation(&pending, 7).is_ok());
+            assert!(storage.resolve_stored_query_relation(&pending, 0).is_err());
+            storage.rollback_table_def(change);
+            assert!(
+                storage
+                    .resolve_stored_query_relation(&dependency, 7)
+                    .is_ok()
+            );
+            assert!(storage.resolve_stored_query_relation(&pending, 7).is_err());
+            storage.commit_drop(table);
+            let reused = storage
+                .create_table(make_def(
+                    "replacement_items",
+                    &[("id", ColType::Int4, false)],
+                ))
+                .unwrap();
+            assert_eq!(table, reused);
+            assert!(
+                storage
+                    .resolve_stored_query_relation(&dependency, 0)
+                    .is_err()
+            );
+        });
+    }
+}

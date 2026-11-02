@@ -6228,14 +6228,37 @@ fn cluster_metadata_preparing_transactions_stay_private_until_finalized() {
         assert_eq!(prepared.catalog_entries().count(), 1);
         assert_eq!(prepared.catalog_entries().next().unwrap().1.first_lsn, 1);
         assert_eq!(prepared.catalog_entries().next().unwrap().1.prepared_lsn, 2);
+        prepared
+            .slot_mut(slot)
+            .transaction
+            .restore_prepared_identity(metadata.transaction_id);
+        prepared.slot_mut(slot).transaction.clear();
+        assert_eq!(
+            prepared.slot(slot).transaction.txid,
+            metadata.transaction_id
+        );
         prepared.release(slot);
+        assert_eq!(prepared.slot(slot).transaction.txid, 0);
+        assert!(!prepared.slot(slot).transaction.is_active());
+        assert!(prepared.slot(slot).records.is_empty());
+        assert!(prepared.slot(slot).locks.is_empty());
         assert_eq!(prepared.catalog_entries().count(), 0);
         let recovered = two_phase::PreparedTransactionMetadata {
+            transaction_id: 11,
             first_lsn: 3,
             prepared_lsn: 4,
             ..metadata
         };
-        prepared.reserve(recovered).unwrap().unwrap();
+        let reused = prepared.reserve(recovered).unwrap().unwrap();
+        assert_eq!(reused, slot);
+        prepared
+            .slot_mut(reused)
+            .transaction
+            .restore_prepared_identity(recovered.transaction_id);
+        assert_eq!(
+            prepared.slot(reused).transaction.txid,
+            recovered.transaction_id
+        );
         assert_eq!(prepared.catalog_entries().count(), 1);
         for (first_lsn, prepared_lsn) in [(0, 1), (2, 0), (2, 1)] {
             let invalid = two_phase::PreparedTransactionMetadata {
@@ -6251,6 +6274,9 @@ fn cluster_metadata_preparing_transactions_stay_private_until_finalized() {
             );
             assert_eq!(prepared.catalog_entries().next().unwrap().1, recovered);
         }
+        prepared.slot_mut(reused).transaction.clear();
+        prepared.release(reused);
+        assert_eq!(prepared.slot(reused).transaction.txid, 0);
     });
 }
 
@@ -70608,6 +70634,139 @@ fn reindex_rebuilds_named_index_and_table_cache() {
 }
 
 #[test]
+fn reindex_keeps_committed_cache_ownership_and_private_shape_undo() {
+    let (mut engine, mut budget) = test_engine();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE reindex_owners(id integer PRIMARY KEY, value text); \
+         INSERT INTO reindex_owners VALUES(1,'one'),(2,'two')",
+    );
+    assert!(error_sqlstates(&setup).is_empty());
+    let table = engine
+        .storage
+        .find_table("public", "reindex_owners")
+        .unwrap();
+    let pending_rows = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; UPDATE reindex_owners SET id=9 WHERE id=1; \
+         REINDEX TABLE reindex_owners; SELECT id FROM reindex_owners ORDER BY id",
+    );
+    assert!(error_sqlstates(&pending_rows).is_empty());
+    assert_eq!(data_rows(&pending_rows), ["2", "9"]);
+    assert!(engine.storage.value_binding_is_committed(table, 0));
+    let rollback = run_with(
+        &mut engine,
+        &mut budget,
+        "ROLLBACK; SELECT id FROM reindex_owners WHERE id=1; \
+         SELECT id FROM reindex_owners WHERE id=9",
+    );
+    assert!(error_sqlstates(&rollback).is_empty());
+    assert_eq!(data_rows(&rollback), ["1"]);
+    assert!(engine.storage.value_binding_is_committed(table, 0));
+    let pending_shape = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; ALTER TABLE reindex_owners RENAME COLUMN value TO renamed; \
+         REINDEX TABLE reindex_owners; SELECT renamed FROM reindex_owners WHERE id=1",
+    );
+    assert!(error_sqlstates(&pending_shape).is_empty());
+    assert_eq!(data_rows(&pending_shape), ["one"]);
+    assert!(!engine.storage.value_binding_is_committed(table, 0));
+    let rollback = run_with(
+        &mut engine,
+        &mut budget,
+        "ROLLBACK; SELECT value FROM reindex_owners WHERE id=1",
+    );
+    assert!(error_sqlstates(&rollback).is_empty());
+    assert_eq!(data_rows(&rollback), ["one"]);
+    assert!(engine.storage.value_binding_is_committed(table, 0));
+}
+
+#[test]
+fn reindex_validates_own_deferred_keys_only_for_selected_indexes() {
+    let (mut engine, mut budget) = test_engine();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE reindex_deferred(id integer UNIQUE DEFERRABLE INITIALLY DEFERRED, payload integer); \
+         CREATE INDEX reindex_payload ON reindex_deferred(payload); \
+         CREATE UNIQUE INDEX reindex_payload_unique ON reindex_deferred(payload)",
+    );
+    assert!(error_sqlstates(&setup).is_empty());
+    let named = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; INSERT INTO reindex_deferred VALUES(1,10),(1,20); \
+         REINDEX INDEX reindex_payload; SELECT payload FROM reindex_deferred ORDER BY payload",
+    );
+    assert!(error_sqlstates(&named).is_empty());
+    assert_eq!(data_rows(&named), ["10", "20"]);
+    assert!(error_sqlstates(&run_with(&mut engine, &mut budget, "ROLLBACK")).is_empty());
+    let other_unique = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; INSERT INTO reindex_deferred VALUES(1,10),(1,20); \
+         REINDEX INDEX reindex_payload_unique; SELECT payload FROM reindex_deferred ORDER BY payload",
+    );
+    assert!(error_sqlstates(&other_unique).is_empty());
+    assert_eq!(data_rows(&other_unique), ["10", "20"]);
+    assert!(error_sqlstates(&run_with(&mut engine, &mut budget, "ROLLBACK")).is_empty());
+    for target in [
+        "REINDEX TABLE reindex_deferred",
+        "REINDEX INDEX reindex_deferred_id_key",
+    ] {
+        assert!(
+            error_sqlstates(&run_with(
+                &mut engine,
+                &mut budget,
+                "BEGIN; INSERT INTO reindex_deferred VALUES(1,10),(1,20)",
+            ))
+            .is_empty()
+        );
+        let all = run_with(&mut engine, &mut budget, target);
+        assert_eq!(error_sqlstates(&all), ["23505"]);
+        assert!(error_sqlstates(&run_with(&mut engine, &mut budget, "ROLLBACK")).is_empty());
+    }
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*) FROM reindex_deferred"
+        )),
+        ["0"]
+    );
+    assert!(
+        error_sqlstates(&run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE TABLE reindex_excluded(r int4range, CONSTRAINT reindex_excluded_key \
+         EXCLUDE USING gist(r WITH &&) DEFERRABLE INITIALLY DEFERRED)",
+        ))
+        .is_empty()
+    );
+    for target in [
+        "REINDEX TABLE reindex_excluded",
+        "REINDEX INDEX reindex_excluded_key",
+    ] {
+        assert!(
+            error_sqlstates(&run_with(
+                &mut engine,
+                &mut budget,
+                "BEGIN; INSERT INTO reindex_excluded VALUES('[1,4)'),('[3,6)')",
+            ))
+            .is_empty()
+        );
+        assert_eq!(
+            error_sqlstates(&run_with(&mut engine, &mut budget, target)),
+            ["23P01"]
+        );
+        assert!(error_sqlstates(&run_with(&mut engine, &mut budget, "ROLLBACK")).is_empty());
+    }
+}
+
+#[test]
 fn reindex_preserves_indexed_access_after_checkpoint_and_cold_restart() {
     let mut config = test_config("reindex-recovery");
     config.object_store_on = true;
@@ -92015,6 +92174,7 @@ fn retained_dml_descriptions_use_small_statement_buffers_after_cold_recovery() {
     config.wal_upload_sync = false;
     config.object_store_bucket = format!("retained-description-cold-{}", std::process::id());
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let server = object_reads::HttpObjectServer::start(&mut config);
     let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
@@ -92089,6 +92249,7 @@ fn retained_dml_descriptions_use_small_statement_buffers_after_cold_recovery() {
     );
     drop(session);
     drop(engine);
+    drop(server);
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
@@ -98565,6 +98726,7 @@ fn parallel_physical_explicit_reindex_does_not_read_the_retired_corrupt_roster()
         .is_empty()
     );
     assert!(engine.storage.value_binding_requires_rebuild(table, 0));
+    assert!(engine.storage.value_binding_is_committed(table, 0));
     assert!(
         engine.checkpoint().unwrap(),
         "repair must read table data, never the broken old roster"

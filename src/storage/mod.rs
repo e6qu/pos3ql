@@ -4255,6 +4255,12 @@ pub(crate) enum IndexBindingOperation {
     Drop,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum ValueCacheRebuild {
+    Committed,
+    Existing { transaction: u32 },
+}
+
 struct BindingVersion {
     change: BindingChange,
     transaction: u32,
@@ -19789,6 +19795,51 @@ impl Storage {
         }
     }
 
+    pub(crate) fn resolve_stored_query_relation(
+        &self,
+        dependency: &StoredQueryDependency,
+        transaction: u32,
+    ) -> Result<ResolvedRelation, SqlError> {
+        let invalid = || {
+            sql_err!(
+                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                "stored relation binding is unresolved, replaced or no longer visible"
+            )
+        };
+        let slot = usize::from(dependency.slot);
+        match dependency.class {
+            DependencyClass::Table => {
+                let table = self.tables.get(slot).ok_or_else(invalid)?;
+                let definition = TableDefinitionRead::visible(
+                    &table.definition,
+                    &self.pending_table_defs,
+                    transaction,
+                );
+                if definition.identity().database != current_database()
+                    || !definition.identity().existence.visible_to(transaction)
+                    || definition.schema != dependency.schema
+                    || definition.name != dependency.name
+                {
+                    return Err(invalid());
+                }
+                Ok(ResolvedRelation::Table(slot))
+            }
+            DependencyClass::View => {
+                let catalog = self.view_rule_catalog();
+                if !catalog.views.get(slot).is_some_and(|view| {
+                    view.database == current_database()
+                        && view.visible_to(transaction)
+                        && view.schema_for(transaction) == dependency.schema
+                        && view.name_for(transaction) == dependency.name
+                }) {
+                    return Err(invalid());
+                }
+                Ok(ResolvedRelation::View(slot))
+            }
+            _ => Err(invalid()),
+        }
+    }
+
     pub fn rebind_stored_query_dependencies(
         &self,
         serialized: StoredQueryDependencies,
@@ -19905,7 +19956,7 @@ impl Storage {
                 .stored_query_dependencies
                 .lock()
                 .expect("stored-query dependency catalog lock poisoned");
-            let count = catalog.counts[image];
+            let count = catalog.image_count(image);
             snapshot[..usize::from(count)].copy_from_slice(catalog.image(
                 image,
                 count,
@@ -19933,8 +19984,11 @@ impl Storage {
         Ok(())
     }
 
-    pub fn rebind_all_stored_query_dependencies(&mut self) -> Result<(), SqlError> {
-        self.rebind_all_stored_query_dependencies_to(0, None)
+    pub fn rebind_all_stored_query_dependencies(
+        &mut self,
+        transaction: u32,
+    ) -> Result<(), SqlError> {
+        self.rebind_all_stored_query_dependencies_to(transaction, None)
     }
 
     fn rebind_all_stored_query_dependencies_to(
@@ -19943,42 +19997,84 @@ impl Storage {
         template_source: Option<DatabaseOid>,
     ) -> Result<(), SqlError> {
         for slot in 0..self.rule_count() {
-            if self.rule(slot).database == current_database() && self.rule(slot).visible_to(txid) {
+            let rule = self.rule(slot);
+            let pending = rule.pending.filter(|pending| pending.txid == txid);
+            if rule.database == current_database()
+                && rule.visible_to(txid)
+                && (txid == 0
+                    || pending.is_some()
+                    || rule.ddl_state == (CatalogDdlState::PendingCreate { txid }))
+            {
                 let owner = StoredQueryDependencyOwner::Rule(slot as u16);
-                self.rebind_stored_query_dependency_image(
-                    self.committed_dependency_image(owner),
-                    txid,
-                    template_source,
-                )?;
+                let image = pending.map_or_else(
+                    || self.committed_dependency_image(owner),
+                    |pending| {
+                        self.stored_query_dependency_pending_base + pending.dependency_slot as usize
+                    },
+                );
+                self.rebind_stored_query_dependency_image(image, txid, template_source)?;
             }
         }
         for slot in 0..self.matview_count() {
             let definition = self.matview(slot);
-            if definition.database == current_database() && definition.visible_to(txid) {
-                let image = self.matview_dependency_image(slot);
+            let pending = definition
+                .pending_query
+                .filter(|pending| pending.transaction == txid);
+            if definition.database == current_database()
+                && definition.visible_to(txid)
+                && (txid == 0
+                    || pending.is_some()
+                    || definition.ddl_state == (CatalogDdlState::PendingCreate { txid }))
+            {
+                let image = pending.map_or_else(
+                    || self.matview_dependency_image(slot),
+                    |pending| {
+                        self.stored_query_dependency_pending_base + pending.dependency_slot as usize
+                    },
+                );
                 self.rebind_stored_query_dependency_image(image, txid, template_source)?;
             }
         }
         for slot in 0..self.policy_count() {
             let policy = self.policy(slot);
-            if policy.database == current_database() && policy.visible_to(txid) {
+            let pending = policy
+                .pending_definition
+                .filter(|pending| pending.txid == txid);
+            if policy.database == current_database()
+                && policy.visible_to(txid)
+                && (txid == 0
+                    || pending.is_some()
+                    || policy.ddl_state == (CatalogDdlState::PendingCreate { txid }))
+            {
                 let owner = StoredQueryDependencyOwner::Policy(slot as u16);
-                self.rebind_stored_query_dependency_image(
-                    self.committed_dependency_image(owner),
-                    txid,
-                    template_source,
-                )?;
+                let image = pending.map_or_else(
+                    || self.committed_dependency_image(owner),
+                    |pending| {
+                        self.stored_query_dependency_pending_base + pending.dependency_slot as usize
+                    },
+                );
+                self.rebind_stored_query_dependency_image(image, txid, template_source)?;
             }
         }
         for slot in 0..self.routine_count() {
             let routine = self.routine(slot);
-            if routine.database == current_database() && routine.visible_to(txid) {
+            let pending = routine
+                .pending_definition
+                .filter(|pending| pending.txid == txid);
+            if routine.database == current_database()
+                && routine.visible_to(txid)
+                && (txid == 0
+                    || pending.is_some()
+                    || routine.ddl_state == (CatalogDdlState::PendingCreate { txid }))
+            {
                 let owner = StoredQueryDependencyOwner::Routine(slot as u16);
-                self.rebind_stored_query_dependency_image(
-                    self.committed_dependency_image(owner),
-                    txid,
-                    template_source,
-                )?;
+                let image = pending.map_or_else(
+                    || self.committed_dependency_image(owner),
+                    |pending| {
+                        self.stored_query_dependency_pending_base + pending.dependency_slot as usize
+                    },
+                );
+                self.rebind_stored_query_dependency_image(image, txid, template_source)?;
             }
         }
         Ok(())
@@ -38033,12 +38129,10 @@ impl Storage {
     /// change outside the per-row [`Self::commit_row`] maintenance (ALTER, a
     /// committed CREATE, CREATE/DROP INDEX, cold-start replay).
     pub fn refresh_enforcers(&mut self, table_index: usize) -> Result<(), SqlError> {
-        self.refresh_enforcers_visible(table_index, None)
+        self.rebuild_value_caches(table_index, ValueCacheRebuild::Committed)
     }
 
-    /// Builds the cache shape visible to the owner of a pending CREATE INDEX
-    /// before its WAL record becomes durable. Pool exhaustion is therefore a
-    /// pre-commit DDL error, never a committed index followed by an error.
+    /// Admits the pending index's cache before its WAL becomes durable.
     pub(crate) fn prepare_index_enforcers(
         &mut self,
         table_index: usize,
@@ -38059,11 +38153,28 @@ impl Storage {
         Ok(())
     }
 
-    pub(crate) fn refresh_enforcers_visible(
+    /// Explicit maintenance preserves the selected cache root's ownership.
+    pub(crate) fn rebuild_value_caches(
         &self,
         table_index: usize,
-        txid: Option<u32>,
+        context: ValueCacheRebuild,
     ) -> Result<(), SqlError> {
+        // Maintenance replaces an existing cache, not its owning SQL shape.
+        // A committed cache must keep reading committed rows even when the
+        // caller has private row updates; pending shapes retain their undo.
+        let txid = match context {
+            ValueCacheRebuild::Existing { transaction } => {
+                let owner = self.tables[table_index].publication().enforcer_transaction;
+                if owner != 0 && owner != transaction {
+                    return Err(sql_err!(
+                        sqlstate::SERIALIZATION_FAILURE,
+                        "index bindings are owned by another transaction"
+                    ));
+                }
+                (owner != 0).then_some(owner)
+            }
+            ValueCacheRebuild::Committed => None,
+        };
         self.build_enforcers_visible(
             table_index,
             txid,
@@ -38100,6 +38211,15 @@ impl Storage {
                     row_ownership::try_mutex(&self.index_catalog, "index catalog lock poisoned")?,
                 ))
             });
+            if change.is_none()
+                && publication.enforcer_transaction != txid.unwrap_or(0)
+                && !matches!(rows, key_preparation::EnforcerRows::RebuildRecovered)
+            {
+                return Err(sql_err!(
+                    sqlstate::SERIALIZATION_FAILURE,
+                    "index binding context changed before maintenance"
+                ));
+            }
             let has_constraints = definition
                 .committed()
                 .columns()
@@ -38147,6 +38267,15 @@ impl Storage {
                 ))
             });
             selection.validate_definition(self, &definition)?;
+            if change.is_none()
+                && publication.enforcer_transaction != txid.unwrap_or(0)
+                && !recovering
+            {
+                return Err(sql_err!(
+                    sqlstate::SERIALIZATION_FAILURE,
+                    "index binding context changed before maintenance"
+                ));
+            }
             let count = publication.enforcers.len();
             let mut metadata = self
                 .metadata_pool

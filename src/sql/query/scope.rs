@@ -702,15 +702,35 @@ impl<'d> QueryScope<'d> {
         });
         let def_reference = match cached {
             Some(definition) => definition,
-            None => materialized_definition(
-                storage,
-                txid,
-                exposed,
-                &names[..ncols],
-                m.column_types,
-                m.column_collations,
-                arena,
-            )?,
+            None => match m.definition {
+                Some(definition) => {
+                    if definition.n_columns != ncols {
+                        return Err(sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "materialized relation visible width changed"
+                        ));
+                    }
+                    let columns = arena
+                        .alloc_slice_copy(definition.columns)
+                        .map_err(|_| arena_full())?;
+                    for (column, name) in columns.iter_mut().zip(&names[..ncols]) {
+                        column.name = SqlName::parse(name)?;
+                    }
+                    RelationDefinition {
+                        columns,
+                        ..definition
+                    }
+                }
+                None => materialized_definition(
+                    storage,
+                    txid,
+                    exposed,
+                    &names[..ncols],
+                    m.column_types,
+                    m.column_collations,
+                    arena,
+                )?,
+            },
         };
         self.names[self.n] = exposed;
         self.defs.set_arena(self.n, def_reference);
@@ -2018,7 +2038,7 @@ impl<'d> QueryScope<'d> {
     }
 
     pub(super) fn row_width(&self, table: usize) -> usize {
-        self.defs.get(table).expect("resolved").n_columns + self.hidden_columns[table]
+        self.defs.get(table).expect("resolved").columns.len()
     }
 
     fn scope_column_index(&self, table: usize, name: &str) -> Option<usize> {
@@ -2308,6 +2328,64 @@ mod tests {
             );
             drop(execution);
             assert_eq!(name, "c1");
+        });
+    }
+
+    #[test]
+    fn materialized_aliases_preserve_private_physical_columns_without_exposing_names() {
+        let mut config = config();
+        config.definition_image_slots = 2;
+        config.table_metadata_bytes = 64 << 10;
+        config.table_metadata_leases = 128;
+        let mut budget = Budget::new(Storage::extra_budget_bytes(&config) + config.memtable_bytes);
+        let storage = Storage::new(&config, &mut budget, 0).unwrap();
+        let mut arena_budget = Budget::new(16 << 10);
+        let arena =
+            Arena::new(&mut arena_budget, "private physical CTE columns", 16 << 10).unwrap();
+        let parsed =
+            crate::sql::parser::parse_query("SELECT renamed FROM source AS alias(renamed)", &arena)
+                .unwrap();
+        let columns = [
+            ColumnMeta {
+                name: SqlName::parse("visible").unwrap(),
+                ctype: ColType::Int4,
+                ..ColumnMeta::EMPTY
+            },
+            ColumnMeta {
+                name: SqlName::parse("internal").unwrap(),
+                ctype: ColType::Int8,
+                ..ColumnMeta::EMPTY
+            },
+        ];
+        let relation = MaterializedCte {
+            column_names: &["visible"],
+            column_types: &[(crate::sql::types::oid::INT4, 4, -1)],
+            column_collations: &[crate::sql::ast::Collation::None],
+            definition: Some(RelationDefinition {
+                schema: SqlName::EMPTY,
+                name: SqlName::parse("source").unwrap(),
+                n_columns: 1,
+                columns: &columns,
+            }),
+            source: crate::sql::ast::MaterializedCteSource::Inline(&[]),
+        };
+        let from = FromClause {
+            base: TableRef {
+                cte: Some(&relation),
+                ..parsed.from.as_ref().unwrap().base
+            },
+            joins: &[],
+        };
+        crate::mem::guard::forbid_alloc(|| {
+            let scope = QueryScope::resolve_schema(&storage, &from, 0, &arena, None).unwrap();
+            let selected = scope.defs.get(0).unwrap();
+            assert_eq!(selected.n_columns, 1);
+            assert_eq!(selected.columns.len(), 2);
+            assert_eq!(scope.row_width(0), 2);
+            assert_eq!(selected.columns()[0].name.as_str(), "renamed");
+            assert_eq!(selected.columns[1].name.as_str(), "internal");
+            assert_eq!(selected.column_index("internal"), None);
+            assert_eq!(scope.star_columns(), 1);
         });
     }
 

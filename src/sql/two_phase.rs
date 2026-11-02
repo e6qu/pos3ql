@@ -138,6 +138,14 @@ impl PreparedTransactions {
             return Ok(None);
         };
         let slot = &mut self.slots[index];
+        assert_eq!(
+            slot.transaction.txid, 0,
+            "a reusable prepared slot has no transaction identity"
+        );
+        assert!(
+            !slot.transaction.is_active(),
+            "a reusable prepared slot is idle"
+        );
         slot.metadata = Some(metadata);
         slot.records.clear();
         slot.locks.clear();
@@ -238,10 +246,23 @@ impl PreparedTransactions {
 
     pub(crate) fn release(&mut self, index: usize) {
         let slot = &mut self.slots[index];
-        slot.metadata = None;
+        assert!(
+            !slot.transaction.is_active()
+                && slot.transaction.touched().is_empty()
+                && slot.transaction.ddl().is_empty()
+                && slot.transaction.statistics_undo().is_empty()
+                && slot.transaction.catalog_history.is_none()
+                && slot.transaction.staged_commit().is_none()
+                && slot.transaction.commit_admission().is_none(),
+            "prepared transaction owners must be resolved before releasing their slot"
+        );
         slot.transaction.clear();
+        // Frontend state may retain its last XID while idle. A detached slot
+        // instead becomes a fresh identity owner for the next PREPARE.
+        slot.transaction.txid = 0;
         slot.records.clear();
         slot.locks.clear();
+        slot.metadata = None;
     }
 }
 

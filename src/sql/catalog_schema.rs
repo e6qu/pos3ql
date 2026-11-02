@@ -1705,10 +1705,20 @@ mod tests {
                 let before = arena.used();
                 let table =
                     super::super::synthesize_definition(Some("pg_catalog"), name, &arena).unwrap();
-                assert_eq!(
-                    table.def.columns.len(),
-                    definition.columns.len() + hidden_columns(name, false).len(),
-                );
+                let explicit_tableoid = definition.relation.is_some();
+                let visible = definition
+                    .columns
+                    .iter()
+                    .filter(|(column, _)| !explicit_tableoid || *column != "tableoid")
+                    .count();
+                let hidden = usize::from(explicit_tableoid)
+                    + hidden_columns(name, false)
+                        .iter()
+                        .filter(|(column, _)| !explicit_tableoid || *column != "tableoid")
+                        .count();
+                assert_eq!(table.def.n_columns, visible, "{name}");
+                assert_eq!(table.hidden_columns, hidden, "{name}");
+                assert_eq!(table.def.columns.len(), visible + hidden, "{name}",);
                 let used = arena.used();
                 let payload = core::mem::size_of_val(table.def.columns);
                 let alignment = core::mem::align_of::<crate::storage::ColumnMeta>();

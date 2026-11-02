@@ -180,7 +180,11 @@ than allocating or rebuilding metadata after durability.
 
 After a restart, saved transactions reconstruct their private row and catalog
 changes from the journal, including types, indexes and stored queries. Other
-transactions still see the committed definitions. `COMMIT PREPARED` completes
+transactions still see the committed definitions. Once all startup catalogs
+exist, stored-query references are bound separately for committed definitions
+and each saved transaction's selected private definitions, in its own database.
+For example, a saved schema rename keeps the original function usable until
+commit, then its body reads the renamed table. `COMMIT PREPARED` completes
 admission before making its decision durable, then installs these reserved
 changes through normal publication. It does not replay allocating catalog
 operations after confirming the decision. `ROLLBACK PREPARED` uses the same
@@ -217,9 +221,17 @@ being treated as the earlier row.
 A checkpoint writes captured committed versions and publishes a complete
 manifest, the inventory of saved objects and definitions. Later commits remain
 in the journal. Finishing an older checkpoint cannot clear newer writes or
-ANALYZE results. Merges combine saved generations, retaining the versions needed
-by readers. Object deletion respects current roots, retained readers and backups.
+ANALYZE results. Index output is eligible only when both its catalog identity
+and its row-decoding context are committed; a committed index name alone cannot
+make a private rewritten table shape safe to save. Merges combine saved
+generations, retaining the versions needed by readers. Object deletion respects
+current roots, retained readers and backups.
 There is no need for an operating-system cron entry to drive this internal work.
+
+`REINDEX` rebuilds from rows using the selected table shape and the existing
+cache's transaction ownership. It does not turn a committed cache into a private
+one or replace another transaction's cache. Rebuilding from rows also avoids
+depending on the damaged saved index that the command is repairing.
 
 Application jobs, migration scheduling and backup schedules are operator work.
 There is no built-in SQL job scheduler or PostgreSQL background-worker ABI.
@@ -277,8 +289,12 @@ include their owning pool and generation, so a stale or foreign identifier canno
 select another schema. CTEs, table functions
 and trigger descriptions use borrowed column descriptors and actual statement
 memory. They do not put owning schema leases or maximum-width definitions in
-arenas that do not run destructors. Checkpoint and relocation reserves remain
-separate so foreground work cannot consume their progress capacity.
+arenas that do not run destructors. Joined-row decoding also reserves only the
+actual physical fields of each source. Recursive queries retain their internal
+`SEARCH` ordering and `CYCLE` tracking fields in that physical shape while
+exposing only the SQL-visible column prefix where required. Hiding a field
+does not remove the scratch space needed to decode it. Checkpoint and relocation
+reserves remain separate so foreground work cannot consume their progress capacity.
 
 MVCC row history uses the explicit shared `row_history_slots` capacity across all tables and large
 objects; `max_row_versions_per_row` remains a separate per-row bound. Locking

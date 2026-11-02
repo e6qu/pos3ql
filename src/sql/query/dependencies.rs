@@ -77,24 +77,9 @@ impl<'a> CollectionContext<'a> {
                     && dependency.referenced_name.as_str() == name
             })
         }) {
-            let slot = usize::from(dependency.slot);
-            return match dependency.class {
-                DependencyClass::Table
-                    if slot < storage.table_count()
-                        && storage.table_slot_visible_to(slot, txid) =>
-                {
-                    Ok(Some(ResolvedRelation::Table(slot)))
-                }
-                DependencyClass::View
-                    if slot < storage.view_count() && storage.view_slot_visible_to(slot, txid) =>
-                {
-                    Ok(Some(ResolvedRelation::View(slot)))
-                }
-                _ => Err(sql_err!(
-                    sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
-                    "stored relation binding is no longer visible"
-                )),
-            };
+            return storage
+                .resolve_stored_query_relation(dependency, txid)
+                .map(Some);
         }
         Ok(storage.resolve_relation_under(self.path, schema, name, txid))
     }

@@ -50133,7 +50133,15 @@ fn prepare_index_creation(
             "new index is not visible to its creator"
         )
     })?;
-    let statistics = validate_index_rows(storage, table, txn.txid, index.unique, arena)?;
+    let statistics = validate_index_rows(
+        storage,
+        table,
+        txn.txid,
+        IndexRowValidation::Create {
+            unique: index.unique,
+        },
+        arena,
+    )?;
     storage.prepare_index_definition_enforcers(
         slot,
         txn.txid,
@@ -50195,11 +50203,17 @@ fn journal_index_creation(
 
 /// Validate current committed rows and earlier own changes through retained
 /// byte sources. No row, parsed expression, or arena reference escapes.
+#[derive(Clone, Copy)]
+enum IndexRowValidation {
+    Create { unique: bool },
+    Reindex { selected: Option<i32> },
+}
+
 fn validate_index_rows(
     storage: &Storage,
     table_index: usize,
     txid: u32,
-    unique: bool,
+    validation: IndexRowValidation,
     arena: &Arena,
 ) -> Result<crate::storage::TableStatistics, SqlError> {
     let mark = arena.mark();
@@ -50211,8 +50225,8 @@ fn validate_index_rows(
             let row_mark = arena.mark();
             let result = (|| {
                 check_index_tuple_sizes(storage, &definition, values, txid, arena)?;
-                if unique {
-                    check_unique_indexes(
+                match validation {
+                    IndexRowValidation::Create { unique: true } => check_unique_indexes(
                         storage,
                         table_index,
                         &definition,
@@ -50221,7 +50235,22 @@ fn validate_index_rows(
                         Some(rowid),
                         txid,
                         arena,
-                    )?;
+                        constraints::UniqueIndexCheck::Cache,
+                    )?,
+                    IndexRowValidation::Create { unique: false } => {}
+                    IndexRowValidation::Reindex { selected } => {
+                        constraints::check_reindex_constraints(
+                            storage,
+                            table_index,
+                            &definition,
+                            &schema[..definition.n_columns],
+                            values,
+                            rowid,
+                            txid,
+                            arena,
+                            selected,
+                        )?
+                    }
                 }
                 Ok(())
             })();
@@ -52391,6 +52420,7 @@ pub fn reindex(
     };
     let mut table_count = 0usize;
     let mut selected_index = None;
+    let mut selected_index_oid = None;
     match target {
         crate::sql::ast::ReindexTarget::Table => match resolve_dml_table(
             storage,
@@ -52402,43 +52432,25 @@ pub fn reindex(
         },
         crate::sql::ast::ReindexTarget::Index => {
             let name = name.expect("INDEX target has a parsed name");
-            let index = match name.schema {
-                Some(schema) => storage.index_definition(schema, name.name, txn.txid),
-                None => storage
-                    .path()
-                    .entries()
-                    .iter()
-                    .find_map(|entry| match entry {
-                        crate::storage::PathEntry::Schema(slot) => storage.index_definition(
-                            storage
-                                .schema_def_for(*slot as usize, txn.txid)
-                                .name
-                                .as_str(),
-                            name.name,
-                            txn.txid,
-                        ),
-                        crate::storage::PathEntry::Catalog => None,
-                    }),
+            let selected = match crate::sql::catalog::index_maintenance_target(
+                storage,
+                txn.txid,
+                name.schema,
+                name.name,
+            ) {
+                Ok(selected) => selected,
+                Err(error) => return sql_fail(error),
             };
-            let Some(index) = index else {
+            let Some(selected) = selected else {
                 return sql_fail(sql_err!(
                     sqlstate::UNDEFINED_OBJECT,
                     "index \"{}\" does not exist",
                     name.name
                 ));
             };
-            let Some(table) =
-                storage.find_visible(index.schema.as_str(), index.table.as_str(), txn.txid)
-            else {
-                return sql_fail(sql_err!(
-                    sqlstate::INTERNAL_ERROR,
-                    "index \"{}\" has no table",
-                    index.name.as_str()
-                ));
-            };
-            tables[0] = table;
-            selected_index =
-                storage.index_slot(index.schema.as_str(), index.name.as_str(), txn.txid);
+            tables[0] = selected.table;
+            selected_index_oid = Some(selected.oid);
+            selected_index = selected.explicit_slot;
         }
         crate::sql::ast::ReindexTarget::Schema => {
             let name = name.expect("SCHEMA target has a parsed name");
@@ -52515,6 +52527,24 @@ pub fn reindex(
     ) {
         table_count = 1;
     }
+    if options.tablespace.is_some()
+        && if selected_index_oid.is_some() {
+            selected_index.is_none()
+        } else {
+            tables[..table_count].iter().any(|&table| {
+                storage
+                    .table_def(table, txn.txid)
+                    .implicit_index_identities()
+                    .next()
+                    .is_some()
+            })
+        }
+    {
+        return sql_fail(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "REINDEX TABLESPACE for an implicit constraint index is not supported"
+        ));
+    }
     for &table in &tables[..table_count] {
         if let Err(error) = require_table_privilege(
             storage,
@@ -52538,8 +52568,24 @@ pub fn reindex(
         }
     }
     for &table in &tables[..table_count] {
+        if let Err(error) = validate_index_rows(
+            storage,
+            table,
+            txn.txid,
+            IndexRowValidation::Reindex {
+                selected: selected_index_oid,
+            },
+            arena,
+        ) {
+            return sql_fail(error);
+        }
         storage.mark_value_bindings_dirty(table);
-        if let Err(error) = storage.refresh_enforcers_visible(table, Some(txn.txid)) {
+        if let Err(error) = storage.rebuild_value_caches(
+            table,
+            crate::storage::ValueCacheRebuild::Existing {
+                transaction: txn.txid,
+            },
+        ) {
             return sql_fail(error);
         }
     }
@@ -52548,7 +52594,7 @@ pub fn reindex(
             continue;
         };
         if index.method != crate::sql::ast::IndexAccessMethod::Brin
-            || selected_index.is_some_and(|selected| selected != index_slot)
+            || (selected_index_oid.is_some() && selected_index != Some(index_slot))
             || storage
                 .index_table_slot_to(index_slot, txn.txid)
                 .is_none_or(|table| !tables[..table_count].contains(&table))
@@ -52569,13 +52615,13 @@ pub fn reindex(
             let Some(index) = storage.index_visible_to(index_slot, txn.txid) else {
                 continue;
             };
-            if selected_index.is_some_and(|selected| selected != index_slot) {
+            if selected_index_oid.is_some() && selected_index != Some(index_slot) {
                 continue;
             }
             let Some(table) = storage.index_table_slot_to(index_slot, txn.txid) else {
                 continue;
             };
-            if selected_index.is_none() && !tables[..table_count].contains(&table) {
+            if selected_index_oid.is_none() && !tables[..table_count].contains(&table) {
                 continue;
             }
             let mut definition = index.mutable_for(txn.txid);
@@ -52642,7 +52688,12 @@ fn set_clustered_index(
         definition.clustered = clustered;
         stage_index_definition(storage, wal, txn, index_slot, definition)?;
     }
-    storage.refresh_enforcers_visible(table, Some(txn.txid))
+    storage.rebuild_value_caches(
+        table,
+        crate::storage::ValueCacheRebuild::Existing {
+            transaction: txn.txid,
+        },
+    )
 }
 
 /// Records the ordered-index CLUSTER choice in the same typed definition that

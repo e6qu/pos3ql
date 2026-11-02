@@ -7278,7 +7278,7 @@ fn scan_source_mode<'a>(
         .map_err(|_| arena_full())?;
     for (position, &table) in order.iter().enumerate() {
         buffer_offsets[position + 1] = buffer_offsets[position]
-            .checked_add(scope.defs.get(table).expect("resolved").columns.len())
+            .checked_add(scope.row_width(table))
             .ok_or_else(arena_full)?;
     }
     let values = arena

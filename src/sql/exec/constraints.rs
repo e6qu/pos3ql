@@ -747,9 +747,36 @@ fn enforce_key_uniqueness(
     columns: &[u16],
     nulls_not_distinct: bool,
     name: &ConstraintName,
+    source: UniqueKeySource,
 ) -> Result<(), SqlError> {
     if !nulls_not_distinct && columns.iter().any(|&c| values[c as usize].is_null()) {
         return Ok(());
+    }
+    if matches!(source, UniqueKeySource::Rows) {
+        committed_scan_uniqueness(
+            storage,
+            table_index,
+            schema,
+            columns,
+            nulls_not_distinct,
+            values,
+            self_rowid,
+            txid,
+            def,
+            name,
+        )?;
+        return pending_scan_uniqueness(
+            storage,
+            table_index,
+            schema,
+            columns,
+            nulls_not_distinct,
+            values,
+            self_rowid,
+            txid,
+            def,
+            name,
+        );
     }
     if storage.has_pending_table_def(table_index, txid) {
         if !storage.pending_table_rows_rewritten(table_index, txid) {
@@ -872,6 +899,12 @@ fn enforce_key_uniqueness(
         def,
         name,
     )
+}
+
+#[derive(Clone, Copy)]
+enum UniqueKeySource {
+    Cache,
+    Rows,
 }
 
 /// The committed-image check when a key has no value-cache binding: a full
@@ -1135,6 +1168,7 @@ pub fn check_unique(
             &[i as u16],
             false,
             &name,
+            UniqueKeySource::Cache,
         )?;
     }
     Ok(())
@@ -1162,6 +1196,7 @@ pub fn check_all_unique(
         self_rowid,
         txid,
         arena,
+        UniqueIndexCheck::Cache,
     )
 }
 
@@ -1374,13 +1409,119 @@ fn check_index_tuple_sizes_inner(
     Ok(())
 }
 
-/// Enforces every UNIQUE index on the table: a candidate row conflicts if some
-/// other visible row has an equal key under that index's NULL-equality rule
-/// (23505; a conflicting uncommitted row from another transaction waits).
-/// Named indexes share the same bounded acceleration cache as table
-/// constraints. CREATE INDEX validates against authoritative rows before its
-/// pending cache binding is prepared, and subsequent writes may use that
-/// binding while the creating transaction remains open.
+#[derive(Clone, Copy)]
+pub enum UniqueIndexCheck {
+    Cache,
+    Rebuild { selected: Option<i32> },
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn check_reindex_constraints(
+    storage: &Storage,
+    table_index: usize,
+    def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
+    schema: &[ColType],
+    values: &[Datum],
+    rowid: u64,
+    txid: u32,
+    arena: &Arena,
+    selected: Option<i32>,
+) -> Result<(), SqlError> {
+    for (column, metadata) in def.columns().iter().enumerate() {
+        if !metadata.unique
+            || selected.is_some_and(|oid| {
+                def.column_index_identity(column)
+                    .is_none_or(|identity| identity.oid() != oid)
+            })
+        {
+            continue;
+        }
+        let name = if metadata.primary {
+            ConstraintName::PrimaryFlag
+        } else {
+            ConstraintName::UniqueFlag(metadata.name.as_str())
+        };
+        enforce_key_uniqueness(
+            storage,
+            table_index,
+            def,
+            schema,
+            values,
+            Some(rowid),
+            txid,
+            &[column as u16],
+            false,
+            &name,
+            UniqueKeySource::Rows,
+        )?;
+    }
+    for key in def.uniques() {
+        if selected.is_some_and(|oid| {
+            key.index_identity
+                .is_none_or(|identity| identity.oid() != oid)
+        }) {
+            continue;
+        }
+        enforce_key_uniqueness(
+            storage,
+            table_index,
+            def,
+            schema,
+            values,
+            Some(rowid),
+            txid,
+            key.columns(),
+            key.kind.nulls_not_distinct(),
+            &ConstraintName::Named(key.name.as_str()),
+            UniqueKeySource::Rows,
+        )?;
+    }
+    for exclusion in def.exclusions() {
+        if selected.is_some_and(|oid| {
+            exclusion
+                .index_identity
+                .is_none_or(|identity| identity.oid() != oid)
+        }) {
+            continue;
+        }
+        let predicate = exclusion
+            .predicate
+            .map(|source| {
+                let source = arena
+                    .alloc_str(source.as_str())
+                    .map_err(|_| crate::sql::eval::arena_full())?;
+                crate::sql::parser::parse_expr(source, arena)
+            })
+            .transpose()?;
+        enforce_exclusion_constraint(
+            storage,
+            table_index,
+            def,
+            schema,
+            values,
+            Some(rowid),
+            txid,
+            exclusion,
+            predicate,
+            arena,
+            Some(storage.validation_read()),
+        )?;
+    }
+    check_unique_indexes(
+        storage,
+        table_index,
+        def,
+        schema,
+        values,
+        Some(rowid),
+        txid,
+        arena,
+        UniqueIndexCheck::Rebuild { selected },
+    )
+}
+
+/// Normal writes may probe the derived cache. Explicit rebuilding validates
+/// only its selected indexes against authoritative rows, including own writes.
 #[allow(clippy::too_many_arguments)]
 pub fn check_unique_indexes(
     storage: &Storage,
@@ -1391,8 +1532,13 @@ pub fn check_unique_indexes(
     self_rowid: Option<u64>,
     txid: u32,
     arena: &Arena,
+    check: UniqueIndexCheck,
 ) -> Result<(), SqlError> {
     for index in storage.unique_indexes_for(def.schema.as_str(), def.name.as_str(), txid) {
+        if matches!(check, UniqueIndexCheck::Rebuild { selected: Some(oid) } if oid != crate::sql::catalog::explicit_index_oid(&index))
+        {
+            continue;
+        }
         let icols = &index.columns[..index.n_cols];
         let index_name = index.name_for(txid);
         let name = ConstraintName::Named(index_name.as_str());
@@ -1416,7 +1562,8 @@ pub fn check_unique_indexes(
                 .any(|(position, column)| {
                     index.collations[position] != def.columns()[*column as usize].collation
                 });
-        if custom
+        if matches!(check, UniqueIndexCheck::Rebuild { .. })
+            || custom
             || custom_collation
             || index.expressions[..index.n_cols]
                 .iter()
@@ -1451,6 +1598,7 @@ pub fn check_unique_indexes(
                 &classes[..index.n_cols],
                 index.nulls_not_distinct,
                 &name,
+                UniqueKeySource::Cache,
                 predicate,
                 arena,
             )?;
@@ -1882,6 +2030,7 @@ fn check_or_defer_unique_keys(
             key.columns(),
             key.kind.nulls_not_distinct(),
             &ConstraintName::Named(key.name.as_str()),
+            UniqueKeySource::Cache,
         )?;
     }
     Ok(())
@@ -2189,6 +2338,7 @@ pub(crate) fn validate_constraint_obligation(
                     key.columns(),
                     key.kind.nulls_not_distinct(),
                     &ConstraintName::Named(key.name.as_str()),
+                    UniqueKeySource::Cache,
                 )?;
             } else if let Some(foreign_key) = foreign_key {
                 if foreign_key.validation.enforced()

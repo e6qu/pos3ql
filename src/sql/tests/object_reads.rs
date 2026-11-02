@@ -182,6 +182,11 @@ impl HttpObjectServer {
                                 .unwrap();
                             let first: usize = first.parse().unwrap();
                             let last: usize = last.parse().unwrap();
+                            if first >= data.len() || last < first {
+                                write!(stream, "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", data.len()).unwrap();
+                                continue;
+                            }
+                            let last = last.min(data.len() - 1);
                             let selected = &data[first..=last];
                             write!(stream, "HTTP/1.1 206 Partial Content\r\nETag: {}\r\nContent-Length: {}\r\nContent-Range: bytes {first}-{last}/{}\r\nConnection: close\r\n\r\n", metadata.etag.as_str(), selected.len(), data.len()).unwrap();
                             stream.write_all(selected).unwrap();
@@ -348,6 +353,20 @@ fn http_object_fixture_preserves_missing_keys_conditions_ranges_and_listing() {
     .unwrap();
     assert_eq!(metadata.etag, first);
     assert_eq!(client.body_bytes(), b"lph");
+    let metadata = crate::mem::guard::forbid_alloc(|| {
+        client.get("fixture/a &<", Some(ByteRange::new(1, 1024).unwrap()))
+    })
+    .unwrap();
+    assert_eq!(metadata.etag, first);
+    assert_eq!(client.body_bytes(), b"lpha");
+    let range_error = crate::mem::guard::forbid_alloc(|| {
+        client.get("fixture/a &<", Some(ByteRange::new(5, 1).unwrap()))
+    })
+    .unwrap_err();
+    assert!(matches!(
+        range_error,
+        crate::object_store::Error::Status { code: 416, .. }
+    ));
     let replaced = crate::mem::guard::forbid_alloc(|| {
         client.put("fixture/a &<", b"updated", Precondition::IfMatch(&first))
     })

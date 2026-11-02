@@ -76,10 +76,14 @@ owns the current limits and admission behavior.
 Complete the current CI and equal-capacity evidence before accepting this
 integration. Cover narrow/wide schemas, retained readers, overlapping replacements,
 savepoints, private catalog reconstruction after prepared recovery, cancellation
-and waits that preserve completed SQL effects. Exercise prepared resolution with
-no spare metadata after admission and preserve old definitions on rollback. For example, if adding an `orders.note` column cannot reserve metadata,
-`orders` must keep its previous usable definition; waiting to commit must not run
-an audit trigger again.
+and waits that preserve completed SQL effects. Keep joined and recursive input
+decoding proportional to the complete physical shape, including hidden fields;
+a successful small-arena regression does not establish an embedded minimum.
+Exercise prepared resolution with no spare metadata after admission, binding
+private stored queries only after their startup catalogs exist. Preserve old
+definitions on rollback. For example, if adding an `orders.note` column cannot
+reserve metadata, `orders` must keep its previous usable definition; waiting to
+commit must not run an audit trigger again.
 
 Reduce the remaining per-table statistics, serial-state and other catalog
 reservations using measured component costs. Empty tables still have a cost;

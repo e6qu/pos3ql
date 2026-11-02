@@ -3860,7 +3860,11 @@ impl Engine {
             storage.rebind_domain_base_types()?;
             storage.rebind_user_type_declarations()?;
             storage.rebind_routine_types()?;
-            storage.rebind_all_stored_query_dependencies()?;
+            storage.rebind_all_stored_query_dependencies(0)?;
+        }
+        for (_, metadata) in prepared_transactions.entries() {
+            storage.select_database_for_recovery(metadata.database)?;
+            storage.rebind_all_stored_query_dependencies(metadata.transaction_id)?;
         }
         storage.select_database(crate::storage::DatabaseOid::POSTGRES)?;
         wal.select_database(crate::storage::DatabaseOid::POSTGRES);

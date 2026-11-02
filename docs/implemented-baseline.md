@@ -178,9 +178,17 @@ cost boundaries; an explicit sequence call can change their evaluation timing.
 `NULLIF` uses the selected equality operator and its input conversions.
 For example, `pg_typeof(NULLIF(1, 2.2))` returns `numeric`. Enum labels are
 validated through the catalog, and null operands skip the comparison.
+Conversions from `real` and `double precision` to `numeric` use PostgreSQL's
+six and fifteen significant digits, including NaN and infinities. For example,
+`1.2345678::real::numeric` returns `1.23457`.
 SQL JSON constructors use registered enum-to-JSON conversions, including inside
 arrays and records. Arrays and records retain their structural representation
 instead of invoking a cast registered for the whole container.
+
+`array_eq`, `array_ne`, `array_lt`, `array_le`, `array_gt`, `array_ge` and
+`btarraycmp` use the array comparison rules of the SQL operators. They accept
+arrays wrapped in domains (types with extra checks), preserving dimensions and
+lower bounds. Input types and enum labels are checked before null handling.
 
 Statements, transaction snapshots, scans and point reads have separate startup
 reservations. Their [exact capacities](postgresql-18-compatibility.md#capacity-boundaries)

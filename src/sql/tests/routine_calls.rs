@@ -464,6 +464,83 @@ fn sorted_and_paged_projection_effects(external: bool) {
         ["XX000"],
         "external={external}",
     );
+    let array_comparisons = session.success(
+        &mut engine,
+        "SELECT array_eq(ARRAY[1,NULL],ARRAY[1,NULL]),array_ne(ARRAY[1],ARRAY[2]), \
+                array_lt(ARRAY[1],ARRAY[2]),array_le(ARRAY[1],ARRAY[1]), \
+                array_gt(ARRAY[2],ARRAY[1]),array_ge(ARRAY[1],ARRAY[1]), \
+                btarraycmp(ARRAY[1],ARRAY[2]),btarraycmp(ARRAY[1,2],ARRAY[1]); \
+         SELECT array_eq(NULL::integer[],ARRAY[1]); \
+         SELECT array_eq('{1}',ARRAY[1]),array_eq(ARRAY['x']::projection_mood[],'{x}'); \
+         SELECT array_eq('[0:1]={1,2}'::integer[],ARRAY[1,2]), \
+                array_lt('[0:1]={1,2}'::integer[],ARRAY[1,2]), \
+                btarraycmp('[0:1]={1,2}'::integer[],ARRAY[1,2]); \
+         SELECT array_eq('[1:2][1:1][1:3]={{{1,2,3}},{{4,5,6}}}'::integer[], \
+                         '[1:2][1:3][1:1]={{{1},{2},{3}},{{4},{5},{6}}}'::integer[]), \
+                btarraycmp('[1:2][1:1][1:3]={{{1,2,3}},{{4,5,6}}}'::integer[], \
+                           '[1:2][1:3][1:1]={{{1},{2},{3}},{{4},{5},{6}}}'::integer[])",
+        true,
+    );
+    assert_eq!(
+        data_rows(&array_comparisons),
+        ["t|t|t|t|t|t|-1|1", "NULL", "t|t", "f|t|-1", "f|-1"],
+        "external={external}",
+    );
+    assert_eq!(
+        row_description_type_oids(&array_comparisons),
+        [
+            16, 16, 16, 16, 16, 16, 23, 23, 16, 16, 16, 16, 16, 23, 16, 23
+        ],
+    );
+    for (query, state) in [
+        ("SELECT array_eq(NULL,NULL)", "42804"),
+        ("SELECT array_eq(NULL::integer[],NULL::text[])", "42883"),
+        (
+            "SELECT array_eq(ARRAY[1]::integer[],ARRAY[1]::bigint[])",
+            "42883",
+        ),
+        (
+            "SELECT array_eq(NULL::projection_mood[],'{missing}')",
+            "22P02",
+        ),
+    ] {
+        assert_eq!(
+            error_sqlstates(&session.execute(&mut engine, query, true)),
+            [state],
+            "external={external}: {query}"
+        );
+    }
+    session.success(
+        &mut engine,
+        "CREATE DOMAIN projection_array AS integer[]; \
+         CREATE FUNCTION projection_array_value(integer,integer) RETURNS projection_array \
+           VOLATILE LANGUAGE plpgsql AS $$ DECLARE value projection_array; BEGIN \
+             PERFORM nextval('public.projection_equality_calls'); value:=ARRAY[$1,$2]; RETURN value; END $$; \
+         CREATE FUNCTION projection_array_equals(projection_array,projection_array) RETURNS boolean \
+           LANGUAGE plpgsql AS $$ BEGIN RETURN pg_catalog.array_eq($1,$2); END $$; \
+         CREATE OPERATOR public.= (FUNCTION=projection_array_equals, \
+           LEFTARG=projection_array,RIGHTARG=projection_array)",
+        true,
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT array_eq(ARRAY[1]::projection_array,ARRAY[1]), \
+                    array_eq(NULL::projection_array,NULL::integer[]); \
+             ALTER SEQUENCE projection_equality_calls RESTART WITH 1; \
+             SELECT CASE projection_array_value(1,2) \
+               WHEN ARRAY[2,4]::projection_array THEN 'wrong' \
+               WHEN ARRAY[2,5]::projection_array THEN 'still wrong' \
+               WHEN ARRAY[1,2]::projection_array THEN 'right' END; \
+             SELECT currval('projection_equality_calls'); \
+             ALTER SEQUENCE projection_equality_calls RESTART WITH 1; \
+             SELECT NULLIF(projection_array_value(1,2),ARRAY[2,3]::projection_array); \
+             SELECT currval('projection_equality_calls')",
+            true,
+        )),
+        ["t|NULL", "right", "1", "{1,2}", "1"],
+        "external={external}",
+    );
     if let Some(server) = server.as_ref() {
         assert!(
             server.uploads.load(std::sync::atomic::Ordering::Relaxed) > initial_uploads.unwrap(),

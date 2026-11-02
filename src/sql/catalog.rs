@@ -196,6 +196,15 @@ macro_rules! intrinsic {
 }
 
 const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
+    // PostgreSQL 18.6 pg_proc.dat: both operands share the anyarray type.
+    // https://github.com/postgres/postgres/blob/REL_18_6/src/include/catalog/pg_proc.dat
+    intrinsic!(744, "array_eq", 16, "2277 2277", 2, "i"),
+    intrinsic!(390, "array_ne", 16, "2277 2277", 2, "i"),
+    intrinsic!(391, "array_lt", 16, "2277 2277", 2, "i"),
+    intrinsic!(393, "array_le", 16, "2277 2277", 2, "i"),
+    intrinsic!(392, "array_gt", 16, "2277 2277", 2, "i"),
+    intrinsic!(396, "array_ge", 16, "2277 2277", 2, "i"),
+    intrinsic!(382, "btarraycmp", 23, "2277 2277", 2, "i"),
     // PostgreSQL 18.6 scalar hash identities and signatures.
     // https://github.com/postgres/postgres/blob/REL_18_6/src/include/catalog/pg_proc.dat
     intrinsic!(449, "hashint2", 23, "21", 1, "i"),

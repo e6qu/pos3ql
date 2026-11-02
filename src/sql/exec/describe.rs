@@ -4187,6 +4187,25 @@ pub fn infer_type_res(
     {
         return result;
     }
+    if let Expr::Call {
+        name,
+        args,
+        star,
+        variadic,
+        argument_names,
+        ..
+    } = expression
+        && let Some(result) = crate::sql::eval::funcs::array::describe_comparison(
+            name,
+            args,
+            *star,
+            *variadic,
+            argument_names,
+            columns,
+        )
+    {
+        return result;
+    }
     if let Expr::Call { name, args, .. } = expression
         && let Some(result) = crate::sql::engine_intrinsic_result_type(name, args.len())
     {

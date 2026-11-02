@@ -5483,6 +5483,7 @@ fn call<'a>(
         return result;
     }
     if argument_names.is_empty()
+        && !variadic
         && let Some(result) = funcs::array::dispatch(name, args, star, arena, params, row, hooks)
     {
         return result;

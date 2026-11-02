@@ -1,6 +1,7 @@
 //! Array scalar built-ins.
 //!
-//! Covers size and bounds (`array_length`/`cardinality`/`array_upper`/
+//! Covers comparison (`array_eq`/`array_ne`/`array_lt`/`array_le`/`array_gt`/
+//! `array_ge`/`btarraycmp`), size and bounds (`array_length`/`cardinality`/`array_upper`/
 //! `array_lower`, `array_ndims`/`array_dims`), search (`array_position`/
 //! `array_positions`), mutation (`array_append`/`array_prepend`, `array_cat`,
 //! `array_remove`/`array_replace`, `trim_array`), and conversions
@@ -17,6 +18,120 @@ use super::super::{
     ColumnLookup, EvalHooks, SqlError, arena_full, arity_err, cast_to, compare_datums, eval_full,
     load_array, sqlstate, text_arg, text_view, type_mismatch, unify_arr_elem,
 };
+
+#[derive(Clone, Copy)]
+enum ComparisonFunction {
+    Equal,
+    NotEqual,
+    Less,
+    LessEqual,
+    Greater,
+    GreaterEqual,
+    Compare,
+}
+
+impl ComparisonFunction {
+    fn named(name: &str) -> Option<Self> {
+        Some(match name {
+            "array_eq" => Self::Equal,
+            "array_ne" => Self::NotEqual,
+            "array_lt" => Self::Less,
+            "array_le" => Self::LessEqual,
+            "array_gt" => Self::Greater,
+            "array_ge" => Self::GreaterEqual,
+            "btarraycmp" => Self::Compare,
+            _ => return None,
+        })
+    }
+
+    fn result_type(self) -> ColType {
+        match self {
+            Self::Compare => ColType::Int4,
+            _ => ColType::Bool,
+        }
+    }
+
+    fn result(self, order: core::cmp::Ordering) -> Datum<'static> {
+        match self {
+            Self::Equal => Datum::Bool(order.is_eq()),
+            Self::NotEqual => Datum::Bool(!order.is_eq()),
+            Self::Less => Datum::Bool(order.is_lt()),
+            Self::LessEqual => Datum::Bool(!order.is_gt()),
+            Self::Greater => Datum::Bool(order.is_gt()),
+            Self::GreaterEqual => Datum::Bool(!order.is_lt()),
+            Self::Compare => Datum::Int4(match order {
+                core::cmp::Ordering::Less => -1,
+                core::cmp::Ordering::Equal => 0,
+                core::cmp::Ordering::Greater => 1,
+            }),
+        }
+    }
+}
+
+fn comparison_array_type(
+    name: &str,
+    arguments: [i32; 2],
+    domain_base: impl Fn(i32) -> Option<ColType>,
+) -> Result<ColType, SqlError> {
+    let mut selected = None;
+    for oid in arguments {
+        if oid == crate::sql::types::oid::UNKNOWN {
+            continue;
+        }
+        let Some(ctype @ ColType::Array(_)) = domain_base(oid).or_else(|| ColType::from_oid(oid))
+        else {
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_FUNCTION,
+                "function {} does not exist for input types {} and {}",
+                name,
+                arguments[0],
+                arguments[1]
+            ));
+        };
+        if selected.is_some_and(|prior| prior != ctype) {
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_FUNCTION,
+                "function {} does not exist for input types {} and {}",
+                name,
+                arguments[0],
+                arguments[1]
+            ));
+        }
+        selected = Some(ctype);
+    }
+    selected.ok_or_else(|| {
+        sql_err!(
+            sqlstate::DATATYPE_MISMATCH,
+            "could not determine polymorphic type because input has type unknown"
+        )
+    })
+}
+
+pub(crate) fn describe_comparison(
+    name: &str,
+    args: &[&Expr<'_>],
+    star: bool,
+    variadic: bool,
+    argument_names: &[Option<&str>],
+    columns: &dyn crate::sql::exec::ColTypeResolver,
+) -> Option<Result<(i32, i16), SqlError>> {
+    let function = ComparisonFunction::named(name)?;
+    Some((|| {
+        if star || variadic || !argument_names.is_empty() || args.len() != 2 {
+            return Err(arity_err(name, args.len()));
+        }
+        comparison_array_type(
+            name,
+            [
+                crate::sql::exec::infer_routine_argument_oid(args[0], columns)?,
+                crate::sql::exec::infer_routine_argument_oid(args[1], columns)?,
+            ],
+            |oid| columns.domain_base_type(oid),
+        )?;
+        let result = function.result_type();
+        Ok((result.oid(), result.typlen()))
+    })())
+}
 
 #[allow(clippy::too_many_arguments)]
 fn vector_bounds<'a>(
@@ -62,26 +177,28 @@ pub(crate) fn dispatch<'a>(
     row: &impl ColumnLookup<'a>,
     hooks: &EvalHooks<'_, 'a>,
 ) -> Option<Result<Datum<'a>, SqlError>> {
-    if !matches!(
-        name,
-        "array_length"
-            | "cardinality"
-            | "array_upper"
-            | "array_lower"
-            | "array_position"
-            | "array_positions"
-            | "array_append"
-            | "array_prepend"
-            | "array_cat"
-            | "array_remove"
-            | "array_replace"
-            | "trim_array"
-            | "array_ndims"
-            | "array_dims"
-            | "array_to_string"
-            | "array_fill"
-            | "string_to_array"
-    ) {
+    if ComparisonFunction::named(name).is_none()
+        && !matches!(
+            name,
+            "array_length"
+                | "cardinality"
+                | "array_upper"
+                | "array_lower"
+                | "array_position"
+                | "array_positions"
+                | "array_append"
+                | "array_prepend"
+                | "array_cat"
+                | "array_remove"
+                | "array_replace"
+                | "trim_array"
+                | "array_ndims"
+                | "array_dims"
+                | "array_to_string"
+                | "array_fill"
+                | "string_to_array"
+        )
+    {
         return None;
     }
     let arity = |n: usize| -> Result<(), SqlError> {
@@ -98,6 +215,83 @@ pub(crate) fn dispatch<'a>(
     };
     Some((|| -> Result<Datum<'a>, SqlError> {
         match name {
+            name if ComparisonFunction::named(name).is_some() => {
+                arity(2)?;
+                let input_oids = [
+                    super::super::expression_type_identity(args[0], row, hooks)?
+                        .routine_argument_oid(),
+                    super::super::expression_type_identity(args[1], row, hooks)?
+                        .routine_argument_oid(),
+                ];
+                let target = comparison_array_type(name, input_oids, |oid| {
+                    hooks
+                        .catalog
+                        .and_then(|catalog| catalog.domain_base_type(oid))
+                })?;
+                let mut values = [Datum::Null; 2];
+                for (index, value) in values.iter_mut().enumerate() {
+                    *value = eval_full(args[index], arena, params, row, hooks)?;
+                    if input_oids[index] == crate::sql::types::oid::UNKNOWN {
+                        if !value.is_null()
+                            && matches!(target, ColType::Array(element) if element.is_named())
+                        {
+                            let catalog = hooks.catalog.ok_or_else(|| {
+                                sql_err!(
+                                    sqlstate::INTERNAL_ERROR,
+                                    "array input type catalog is unavailable"
+                                )
+                            })?;
+                            let name =
+                                catalog.type_name(target.oid(), arena)?.ok_or_else(|| {
+                                    sql_err!(
+                                        sqlstate::UNDEFINED_OBJECT,
+                                        "array input type no longer exists"
+                                    )
+                                })?;
+                            *value =
+                                catalog
+                                    .cast_user_type(name, *value, arena)?
+                                    .ok_or_else(|| {
+                                        sql_err!(
+                                            sqlstate::UNDEFINED_OBJECT,
+                                            "array input type no longer exists"
+                                        )
+                                    })?;
+                        } else {
+                            *value = cast_to(*value, target, arena)?;
+                        }
+                    }
+                }
+                if values.iter().any(Datum::is_null) {
+                    return Ok(Datum::Null);
+                }
+                let (Datum::Array { element: left, .. }, Datum::Array { element: right, .. }) =
+                    (values[0], values[1])
+                else {
+                    return Err(type_mismatch(
+                        "array comparison requires arrays",
+                        &values[0],
+                    ));
+                };
+                if left != right {
+                    return Err(arity_err(name, args.len()));
+                }
+                let collation = super::super::resolve_comparison_collation(
+                    args[0],
+                    args[1],
+                    row,
+                    hooks.catalog,
+                )?;
+                let order = super::super::compare_datums_with_catalog(
+                    collation,
+                    hooks.catalog,
+                    &values[0],
+                    &values[1],
+                )?;
+                Ok(ComparisonFunction::named(name)
+                    .expect("matched comparator")
+                    .result(order))
+            }
             "array_length" | "cardinality" | "array_upper" | "array_lower" => {
                 arity(if name == "cardinality" { 1 } else { 2 })?;
                 let a = eval_full(args[0], arena, params, row, hooks)?;

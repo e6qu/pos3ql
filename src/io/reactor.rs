@@ -164,7 +164,11 @@ impl Reactor {
 
     /// Bytes `new` will draw from the budget for a given event capacity.
     pub const fn budget_bytes(max_events: usize) -> usize {
-        max_events * (size_of::<libc::kevent>() + size_of::<Event>() + size_of::<Registration>())
+        max_events.saturating_mul(
+            size_of::<libc::kevent>()
+                .saturating_add(size_of::<Event>())
+                .saturating_add(size_of::<Registration>()),
+        )
     }
 
     /// Like [`Self::wait`], but returns only the count; events are fetched

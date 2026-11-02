@@ -573,8 +573,8 @@ mod tests {
             config.max_tables = 1;
             config.max_catalog_versions_per_object = 1;
             config.query_workspace_slots = 1;
-            let capacity =
-                table_slot_capacity(&config) * (config.max_catalog_versions_per_object + 1);
+            config.definition_image_slots = 2;
+            let capacity = config.definition_image_slots;
             let mut budget = test_budget(&config);
             let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
             let mut definition = make_def(
@@ -599,7 +599,8 @@ mod tests {
                 assert_eq!(
                     exhausted
                         .definition(&storage, table, 0)
-                        .unwrap_err()
+                        .err()
+                        .expect("all definition images are held by readers")
                         .sqlstate,
                     sqlstate::PROGRAM_LIMIT_EXCEEDED
                 );

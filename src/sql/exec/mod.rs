@@ -12301,20 +12301,35 @@ pub(crate) fn drop_schema(
         *n_objects += 1;
         Ok(())
     };
-    let definitions = storage.table_definition_images();
-    for t in 0..storage.table_count() {
+    #[derive(Clone, Copy)]
+    struct TableDropSelection {
+        source: crate::storage::TableDefinitionTarget,
+        mode: Option<crate::sql::ast::TableLockMode>,
+    }
+    let table_locks =
+        match arena.alloc_slice_with(storage.table_count(), |_| None::<TableDropSelection>) {
+            Ok(locks) => locks,
+            Err(_) => return sql_fail(arena_full()),
+        };
+    for (t, selected) in table_locks.iter_mut().enumerate() {
         if !storage.table_slot_visible_to(t, txn.txid) {
             continue;
         }
-        let def = match definitions.definition(storage, t, txn.txid) {
-            Ok(definition) => definition,
-            Err(error) => return sql_fail(error),
+        let (source, schema, name) = {
+            let definitions = storage.table_definition_images();
+            let (source, definition) = match definitions.selection(storage, t, txn.txid) {
+                Ok(selection) => selection,
+                Err(error) => return sql_fail(error),
+            };
+            (source, definition.schema, definition.name)
         };
-        if !in_listed(storage, def.schema.as_str()) {
+        // Keep the original identity/revision for lock validation, releasing
+        // the wide image before the next table or any catalog callback.
+        *selected = Some(TableDropSelection { source, mode: None });
+        if !in_listed(storage, schema.as_str()) {
             continue;
         }
-        let def = *def;
-        let object = match storage.matview_slot(def.schema.as_str(), def.name.as_str(), txn.txid) {
+        let object = match storage.matview_slot(schema.as_str(), name.as_str(), txn.txid) {
             Some(catalog) => SchemaObject::Matview { table: t, catalog },
             None => SchemaObject::Table(t),
         };
@@ -13301,37 +13316,47 @@ pub(crate) fn drop_schema(
             storage.schema_def_for(first, txn.txid).name.as_str()
         ));
     }
-    let table_locks = match arena.alloc_slice_with(storage.table_count(), |_| None) {
-        Ok(locks) => locks,
-        Err(_) => return sql_fail(arena_full()),
-    };
     let view_locks = match arena.alloc_slice_with(storage.view_count(), |_| false) {
         Ok(locks) => locks,
         Err(_) => return sql_fail(arena_full()),
     };
     for object in objects[..n_objects].iter().flatten() {
-        match object {
+        let requested = match object {
             SchemaObject::Table(table)
             | SchemaObject::Matview { table, .. }
             | SchemaObject::InboundFk { table, .. } => {
-                table_locks[*table] = Some(crate::sql::ast::TableLockMode::AccessExclusive);
+                Some((*table, crate::sql::ast::TableLockMode::AccessExclusive))
             }
-            SchemaObject::View(view) => view_locks[*view] = true,
+            SchemaObject::View(view) => {
+                view_locks[*view] = true;
+                None
+            }
             SchemaObject::Policy { slot, .. } => {
                 let table = usize::from(storage.policy(*slot).table);
-                if table_locks[table].is_none() {
-                    table_locks[table] = Some(crate::sql::ast::TableLockMode::ShareRowExclusive);
-                }
+                Some((table, crate::sql::ast::TableLockMode::ShareRowExclusive))
             }
-            _ => {}
+            _ => None,
+        };
+        if let Some((table, mode)) = requested {
+            let Some(selection) = table_locks[table].as_mut() else {
+                return sql_fail(sql_err!(
+                    sqlstate::SERIALIZATION_FAILURE,
+                    "schema drop selected a table without its original definition source"
+                ));
+            };
+            if selection.mode.is_none() || mode == crate::sql::ast::TableLockMode::AccessExclusive {
+                selection.mode = Some(mode);
+            }
         }
     }
     // Resolve all waits before cascade notices, journal writes or catalog edits.
-    for (table, mode) in table_locks.iter().copied().enumerate() {
-        let Some(mode) = mode else { continue };
-        let (source, _) = match definitions.selection(storage, table, txn.txid) {
-            Ok(selection) => selection,
-            Err(error) => return sql_fail(error),
+    for (table, selection) in table_locks.iter().copied().enumerate() {
+        let Some(TableDropSelection {
+            source,
+            mode: Some(mode),
+        }) = selection
+        else {
+            continue;
         };
         if let Err(error) = storage
             .lock_table(txn.txid, table, mode, false)
@@ -60097,7 +60122,11 @@ pub(crate) fn instead_of_view_dml<'a>(
                     arena,
                     params,
                     None,
-                    None,
+                    Some(&crate::sql::sequence::SeqEval::new(
+                        storage,
+                        seq_session,
+                        txn.txid,
+                    )),
                     &mut |values| {
                         let bytes = encode_projected_pub(values, arena)?;
                         rows.push(bytes).map_err(|error| {
@@ -60169,6 +60198,14 @@ pub(crate) fn instead_of_view_dml<'a>(
                             "INSERT has more expressions than target columns"
                         ));
                     }
+                    let sequences =
+                        crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
+                    let catalog = super::query::storage_catalog(storage, arena, txn.txid);
+                    let hooks = EvalHooks {
+                        catalog: Some(&catalog),
+                        sequences: Some(&sequences),
+                        ..NO_HOOKS
+                    };
                     for (index, expression) in row.iter().enumerate() {
                         let column = if insert.columns.is_empty() {
                             index
@@ -60178,11 +60215,10 @@ pub(crate) fn instead_of_view_dml<'a>(
                                 None => return sql_fail(undefined_column(insert.columns[index])),
                             }
                         };
-                        let value =
-                            match eval_full(expression, arena, params, &NoColumns, &NO_HOOKS) {
-                                Ok(value) => value,
-                                Err(error) => return sql_fail(error),
-                            };
+                        let value = match eval_full(expression, arena, params, &NoColumns, &hooks) {
+                            Ok(value) => value,
+                            Err(error) => return sql_fail(error),
+                        };
                         values[column] =
                             match coerce(value, &def.columns[column], storage, txn.txid, arena) {
                                 Ok(value) => value,
@@ -60220,7 +60256,10 @@ pub(crate) fn instead_of_view_dml<'a>(
                 view_slot,
                 &def,
                 arena,
-                params,
+                TriggerQueryExecution {
+                    params,
+                    seq_session,
+                },
                 scratch.pool(),
             ) {
                 Ok(rows) => rows,
@@ -60284,6 +60323,14 @@ pub(crate) fn instead_of_view_dml<'a>(
                         continue;
                     }
                 } else {
+                    let sequences =
+                        crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
+                    let catalog = super::query::storage_catalog(storage, arena, txn.txid);
+                    let hooks = EvalHooks {
+                        catalog: Some(&catalog),
+                        sequences: Some(&sequences),
+                        ..NO_HOOKS
+                    };
                     if let Some(predicate) = update.where_clause {
                         match row_matches_values(
                             storage,
@@ -60294,7 +60341,7 @@ pub(crate) fn instead_of_view_dml<'a>(
                             Some(predicate),
                             arena,
                             params,
-                            &NO_HOOKS,
+                            &hooks,
                             None,
                             None,
                         ) {
@@ -60307,8 +60354,7 @@ pub(crate) fn instead_of_view_dml<'a>(
                         let Some(column) = def.column_index(name) else {
                             return sql_fail(undefined_column(name));
                         };
-                        let value = match eval_full(expression, arena, params, &context, &NO_HOOKS)
-                        {
+                        let value = match eval_full(expression, arena, params, &context, &hooks) {
                             Ok(value) => value,
                             Err(error) => return sql_fail(error),
                         };
@@ -60373,7 +60419,10 @@ pub(crate) fn instead_of_view_dml<'a>(
                 view_slot,
                 &def,
                 arena,
-                params,
+                TriggerQueryExecution {
+                    params,
+                    seq_session,
+                },
                 scratch.pool(),
             ) {
                 Ok(rows) => rows,
@@ -60410,6 +60459,14 @@ pub(crate) fn instead_of_view_dml<'a>(
                         Err(error) => return sql_fail(error),
                     }
                 } else if let Some(predicate) = delete.where_clause {
+                    let sequences =
+                        crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
+                    let catalog = super::query::storage_catalog(storage, arena, txn.txid);
+                    let hooks = EvalHooks {
+                        catalog: Some(&catalog),
+                        sequences: Some(&sequences),
+                        ..NO_HOOKS
+                    };
                     match row_matches_values(
                         storage,
                         txn.txid,
@@ -60419,7 +60476,7 @@ pub(crate) fn instead_of_view_dml<'a>(
                         Some(predicate),
                         arena,
                         params,
-                        &NO_HOOKS,
+                        &hooks,
                         None,
                         None,
                     ) {
@@ -60496,7 +60553,7 @@ fn materialize_view_rows<'a>(
     view_slot: usize,
     def: &TableDef,
     arena: &'a Arena,
-    params: &[Datum<'a>],
+    execution: TriggerQueryExecution<'_, '_, 'a>,
     pool: &std::sync::Arc<RowWorkPool>,
 ) -> Result<RowWorkLease<&'a [u8]>, SqlError> {
     let user = crate::sql::eval::funcs::system::session_user_owned();
@@ -60521,9 +60578,13 @@ fn materialize_view_rows<'a>(
         txid,
         select,
         arena,
-        params,
+        execution.params,
         None,
-        None,
+        Some(&crate::sql::sequence::SeqEval::new(
+            storage,
+            execution.seq_session,
+            txid,
+        )),
         &mut |values| {
             if values.len() != def.n_columns {
                 return Err(sql_err!(

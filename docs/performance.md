@@ -325,7 +325,33 @@ and `definition_image_slots` for 1/8/32/128 configured tables in both transactio
 modes. Empty, one-hot-table, evenly distributed and moving-demand cases have
 separate samples. The output retains the exact commands, revision, compiler,
 binary digest, named budget draws and raw JSON measurements, with checksums.
-No new measurements have been published for this change yet.
+Digests read files in bounded 1 MiB chunks. The script runs the helper's focused
+metric tests before building and sampling it.
+
+RSS metric version 2 identifies every source explicitly in samples,
+`environment.json` and the report. On Linux, `startup_peak_rss_bytes` and
+`final_peak_rss_bytes` use `VmHWM` from `/proc/self/status`, which belongs to the
+current program's address space. Separate `startup_current_rss_bytes` and
+`final_current_rss_bytes` record `VmRSS`. The helper reads an 8 KiB fixed buffer
+and rejects missing fields, invalid units, overflow or oversized status output;
+it does not substitute another counter. Linux's `kB` values are converted to
+bytes by multiplying by 1,024. These are kernel RSS accounting snapshots, not
+exact allocator byte counts.
+
+`startup_getrusage_maxrss_bytes` and `final_getrusage_maxrss_bytes` are separate
+diagnostics. On Linux, [exec preserves the previous address space's peak](https://github.com/torvalds/linux/blob/v7.0/fs/exec.c#L838)
+for `getrusage`, whereas [the proc counters use the current address space](https://github.com/torvalds/linux/blob/v7.0/fs/proc/task_mmu.c#L34).
+A launcher using `vfork` or `CLONE_VM` can therefore impose its earlier peak on
+the child's `getrusage` result, even after freeing that memory. The
+bounded diagnostic in `tools/tests/test_measure_embedded_capacity.py`
+compares a 32 MiB allocate/free launch with ordinary fork/exec, independently of
+engine measurements. Earlier unlabelled `getrusage` peaks must not be treated as
+engine-only memory or compared as this new metric. Their named startup budget
+components remain valid.
+
+On macOS, the primary source remains `getrusage` in bytes, explicitly labelled
+`darwin_getrusage_ru_maxrss`; current RSS is `null`. The CI matrix runs on Linux.
+Fresh version-2 samples are required before making a new resident-memory claim.
 
 Compare the named shared pools at equal settings. Total memory can still rise
 with table identities, catalog/history structures, connection metadata and

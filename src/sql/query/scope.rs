@@ -2084,7 +2084,8 @@ mod tests {
 
     #[test]
     fn query_definition_ownership_wide_aliases_share_one_image_and_keep_names() {
-        let config = config();
+        let mut config = config();
+        config.definition_image_slots = 3;
         let mut budget = Budget::new(Storage::extra_budget_bytes(&config) + config.memtable_bytes);
         let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let table = storage
@@ -2093,8 +2094,7 @@ mod tests {
                 crate::storage::MAX_RELATION_COLUMNS,
             ))
             .unwrap();
-        let capacity = crate::storage::table_slot_capacity(&config)
-            * (config.max_catalog_versions_per_object + 1);
+        let capacity = config.definition_image_slots;
         let mut owners = Vec::with_capacity(capacity - 1);
         let mut arena_budget = Budget::new(1 << 17);
         let arena = Arena::new(&mut arena_budget, "query definition names", 1 << 17).unwrap();
@@ -2172,13 +2172,13 @@ mod tests {
 
     #[test]
     fn query_definition_ownership_failed_resolution_releases_capacity() {
-        let config = config();
+        let mut config = config();
+        config.definition_image_slots = 3;
         let mut budget = Budget::new(Storage::extra_budget_bytes(&config) + config.memtable_bytes);
         let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let table = storage.create_table(definition("first", 1)).unwrap();
         storage.create_table(definition("second", 1)).unwrap();
-        let capacity = crate::storage::table_slot_capacity(&config)
-            * (config.max_catalog_versions_per_object + 1);
+        let capacity = config.definition_image_slots;
         let mut owners = Vec::with_capacity(capacity - 1);
         let mut arena_budget = Budget::new(1 << 17);
         let arena = Arena::new(&mut arena_budget, "query resolution", 1 << 17).unwrap();

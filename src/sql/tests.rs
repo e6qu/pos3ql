@@ -5705,6 +5705,7 @@ fn live_definition_ownership_checkpoint_exhaustion_retries_and_recovers() {
     let mut config = test_config("definition-checkpoint-exhaustion");
     config.max_tables = 1;
     config.max_catalog_versions_per_object = 1;
+    config.definition_image_slots = 4;
     config.object_store_on = true;
     config.object_store_sim = true;
     config.wal_upload = true;
@@ -5723,9 +5724,7 @@ fn live_definition_ownership_checkpoint_exhaustion_retries_and_recovers() {
         .storage
         .find_table("public", "definition_checkpoint")
         .unwrap();
-    let capacity = crate::storage::table_slot_capacity(&config)
-        * (config.max_catalog_versions_per_object + 1)
-        * config.query_workspace_slots;
+    let capacity = config.definition_image_slots;
     let mut owners = Vec::with_capacity(capacity);
     for _ in 0..capacity {
         let definitions = engine.storage.table_definition_images();
@@ -6070,6 +6069,7 @@ fn table_definition_images_nested_trigger_exhaustion_rolls_back_and_retries() {
     let mut config = test_config("definition-image-exhaustion");
     config.max_tables = 2;
     config.max_catalog_versions_per_object = 1;
+    config.definition_image_slots = 6;
     let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 27));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     for statement in [
@@ -6089,9 +6089,7 @@ fn table_definition_images_nested_trigger_exhaustion_rolls_back_and_retries() {
         .storage
         .find_visible("public", "image_target", 0)
         .unwrap();
-    let capacity = crate::storage::table_slot_capacity(&config)
-        * (config.max_catalog_versions_per_object + 1)
-        * config.query_workspace_slots;
+    let capacity = config.definition_image_slots;
     let mut owners = Vec::with_capacity(capacity - 1);
     for _ in 1..capacity {
         let definitions = engine.storage.table_definition_images();
@@ -18166,11 +18164,14 @@ fn statement_arena_scales_event_graphs_ddl_and_sequence_effects_through_cold_rec
     use core::fmt::Write;
 
     const TABLES_PER_SCHEMA: usize = 260;
+    const VISIBLE_TABLES: usize = TABLES_PER_SCHEMA * 2 + 1;
     const DROPPED_OBJECTS: usize = 1 + TABLES_PER_SCHEMA * 3;
 
     let mut config = test_config("arena-backed-execution-effects");
     config.max_catalog_versions_per_object = 1;
-    config.max_tables = TABLES_PER_SCHEMA * 2 + 1;
+    config.max_tables = VISIBLE_TABLES;
+    // A wide cascade reuses scan images while the audit nests target/SRF images.
+    config.definition_image_slots = 4;
     config.max_ddl_per_transaction = 1_024;
     config.txn_rows = 2_048;
     config.row_overlay_slots = 8;
@@ -18330,7 +18331,8 @@ fn configured_transaction_capacity_covers_bulk_analyze_undo_and_exhaustion() {
     const TABLES: usize = 129;
     let mut config = test_config("bulk-analyze-transaction-capacity");
     config.max_tables = TABLES;
-    config.row_overlay_slots = 8;
+    // All two-row relations remain resident throughout the ANALYZE undo checks.
+    config.row_overlay_slots = 2 * TABLES;
     config.value_index_rows = 8;
     config.max_analyze_per_transaction = 2 * (TABLES + 1);
     config.wal_bytes = 8 << 20;
@@ -18786,7 +18788,8 @@ fn configured_transaction_capacity_covers_truncate_fanout_and_prepared_cold_reco
     config.max_value_indexes = TABLES;
     config.max_prepared_transactions = 2;
     config.subscription_relation_capacity = TABLES;
-    config.row_overlay_slots = 4;
+    // The fanout retains one row per relation before truncate and refill.
+    config.row_overlay_slots = TABLES;
     config.value_index_rows = 4;
     config.txn_rows = 1024;
     config.memtable_bytes = 8 << 20;
@@ -41815,17 +41818,20 @@ fn sql_standard_routine_bodies_keep_creation_time_catalog_identity() {
 fn configured_stored_query_dependency_pool_crosses_old_inline_limit_and_recovers_cold() {
     use core::fmt::Write as _;
 
-    const DEPENDENCIES: usize = 70;
+    const TABLE_DEPENDENCIES: usize = 64;
+    const ROUTINE_DEPENDENCIES: usize = 6;
+    const DEPENDENCIES: usize = TABLE_DEPENDENCIES + ROUTINE_DEPENDENCIES;
 
     let mut config = test_config("stored-query-dependency-pool");
     config.max_connections = 1;
-    config.max_tables = 64;
+    config.max_tables = TABLE_DEPENDENCIES;
     config.max_routines = 8;
     config.max_rules = 4;
     config.max_policies = 2;
     config.max_ddl_per_transaction = 96;
     config.max_stored_query_dependencies_per_object = DEPENDENCIES;
-    config.row_overlay_slots = 8;
+    // One inserted row per dependency table remains resident until the checkpoint.
+    config.row_overlay_slots = TABLE_DEPENDENCIES;
     config.txn_rows = 128;
     config.wal_bytes = 8 << 20;
     config.wal_buffer_bytes = 2 << 20;
@@ -41840,9 +41846,9 @@ fn configured_stored_query_dependency_pool_crosses_old_inline_limit_and_recovers
 
     let mut budget = test_engine_budget(&config, 2 << 30);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
-    for first in (0..64).step_by(16) {
+    for first in (0..TABLE_DEPENDENCIES).step_by(16) {
         let mut tables = String::new();
-        for dependency in first..(first + 16).min(64) {
+        for dependency in first..(first + 16).min(TABLE_DEPENDENCIES) {
             writeln!(
                 tables,
                 "CREATE TABLE pooled_dependency_{dependency}(value integer); \
@@ -41858,7 +41864,7 @@ fn configured_stored_query_dependency_pool_crosses_old_inline_limit_and_recovers
         );
     }
     let mut setup = String::new();
-    for dependency in 0..6 {
+    for dependency in 0..ROUTINE_DEPENDENCIES {
         writeln!(
             setup,
             "CREATE FUNCTION pooled_dependency_helper_{dependency}() RETURNS integer \
@@ -41872,7 +41878,7 @@ fn configured_stored_query_dependency_pool_crosses_old_inline_limit_and_recovers
          pooled_dependency_helper_2() + pooled_dependency_helper_3() + \
          pooled_dependency_helper_4() + pooled_dependency_helper_5() FROM ",
     );
-    for dependency in 0..64 {
+    for dependency in 0..TABLE_DEPENDENCIES {
         if dependency != 0 {
             main_definition.push_str(", ");
         }
@@ -41931,7 +41937,7 @@ fn configured_stored_query_dependency_pool_crosses_old_inline_limit_and_recovers
          pooled_dependency_helper_4() + pooled_dependency_helper_5() + \
          pooled_dependency_helper_6() FROM ",
     );
-    for dependency in 0..64 {
+    for dependency in 0..TABLE_DEPENDENCIES {
         if dependency != 0 {
             replacement.push_str(", ");
         }
@@ -52268,7 +52274,8 @@ fn analyze_reclaims_each_target_capture_within_the_fixed_work_arena() {
     let mut config = test_config("analysis-target-recycling");
     config.work_arena_bytes = 12 << 10;
     config.max_tables = 4;
-    config.row_overlay_slots = 512;
+    // Three resident relations each retain 256 rows during per-target ANALYZE.
+    config.row_overlay_slots = 3 * 256;
     config.value_index_rows = 512;
     let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -65380,7 +65387,6 @@ fn geometric_navigation_prunes_cold_objects_across_every_builtin_spatial_class()
     config.wal_buffer_bytes = 2 << 20;
     config.wal_bytes = 32 << 20;
     config.memtable_bytes = 32 << 20;
-    config.row_overlay_slots = 4096;
     config.txn_rows = 8192;
     config.value_index_rows = 8192;
     config.max_tables = 16;
@@ -65408,6 +65414,8 @@ fn geometric_navigation_prunes_cold_objects_across_every_builtin_spatial_class()
             "poly_ops",
         ),
     ];
+    // Every spatial fixture stays resident until their common checkpoint.
+    config.row_overlay_slots = classes.len() * 3_000;
     let mut budget = test_engine_budget(&config, 1 << 30);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
@@ -90475,7 +90483,8 @@ fn cte_ctas_sequence_effects_survive_row_scratch_rewinds() {
 fn remaining_inline_widths_are_allocation_free_and_survive_cold_recovery() {
     let mut config = test_config("remaining-inline-widths");
     config.max_schemas = 32;
-    config.row_overlay_slots = 2_048;
+    // The included fixture retains 1,100 split rows and one path-target row.
+    config.row_overlay_slots = 1_100 + 1 + 1_200;
     config.txn_rows = 2_048;
     config.memtable_bytes = 16 << 20;
     config.wal_bytes = 16 << 20;

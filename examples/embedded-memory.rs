@@ -223,7 +223,7 @@ fn measure() -> Result<(), Box<dyn std::error::Error>> {
     let started = std::time::Instant::now();
     let mut engine = Engine::new(&config, &mut budget)?;
     let startup_microseconds = started.elapsed().as_micros();
-    let startup_peak_rss_bytes = peak_rss_bytes()?;
+    let startup_memory = memory_usage()?;
     let mut session_budget = Budget::new(session_reserved);
     session_budget
         .observe_draws(|component, bytes| eprintln!("budget-draw\tsession\t{bytes}\t{component}"));
@@ -291,9 +291,24 @@ fn measure() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     let workload_microseconds = workload_started.elapsed().as_micros();
-    let final_peak_rss_bytes = peak_rss_bytes()?;
+    let final_memory = memory_usage()?;
+    let current_source = startup_memory
+        .current_source
+        .map_or("null".to_string(), |source| format!("\"{source}\""));
+    let startup_current = startup_memory
+        .current_bytes
+        .map_or("null".to_string(), |bytes| bytes.to_string());
+    let final_current = final_memory
+        .current_bytes
+        .map_or("null".to_string(), |bytes| bytes.to_string());
     println!(
-        "{{\"os\":\"{}\",\"arch\":\"{}\",\"mode\":\"{}\",\"workload\":\"{}\",\"rows\":{},\"max_tables\":{},\"row_overlay_slots\":{},\"row_work_bytes\":{},\"row_work_leases\":{},\"definition_image_slots\":{},\"max_connections\":1,\"query_workspace_slots\":1,\"max_prepared_transactions\":0,\"max_subscriptions\":1,\"max_ddl_per_transaction\":16,\"max_catalog_versions_per_object\":2,\"memtable_bytes\":{},\"work_arena_bytes\":{},\"sql_arena_bytes\":{},\"catalog_history_bytes\":{},\"row_history_slots\":{},\"max_row_versions_per_row\":{},\"large_object_pages\":{},\"startup_stack_bytes\":{},\"planned_engine_bytes\":{},\"drawn_engine_bytes\":{},\"planned_session_ceiling_bytes\":{},\"drawn_session_bytes\":{},\"startup_peak_rss_bytes\":{},\"final_peak_rss_bytes\":{},\"startup_microseconds\":{},\"workload_microseconds\":{}}}",
+        "{{\"rss_metric_version\":2,\"rss_unit\":\"bytes\",\"rss_peak_source\":\"{}\",\"rss_current_source\":{},\"getrusage_maxrss_source\":\"getrusage_rusage_self_ru_maxrss\",\"startup_current_rss_bytes\":{},\"final_current_rss_bytes\":{},\"startup_getrusage_maxrss_bytes\":{},\"final_getrusage_maxrss_bytes\":{},\"os\":\"{}\",\"arch\":\"{}\",\"mode\":\"{}\",\"workload\":\"{}\",\"rows\":{},\"max_tables\":{},\"row_overlay_slots\":{},\"row_work_bytes\":{},\"row_work_leases\":{},\"definition_image_slots\":{},\"max_connections\":1,\"query_workspace_slots\":1,\"max_prepared_transactions\":0,\"max_subscriptions\":1,\"max_ddl_per_transaction\":16,\"max_catalog_versions_per_object\":2,\"memtable_bytes\":{},\"work_arena_bytes\":{},\"sql_arena_bytes\":{},\"catalog_history_bytes\":{},\"row_history_slots\":{},\"max_row_versions_per_row\":{},\"large_object_pages\":{},\"startup_stack_bytes\":{},\"planned_engine_bytes\":{},\"drawn_engine_bytes\":{},\"planned_session_ceiling_bytes\":{},\"drawn_session_bytes\":{},\"startup_peak_rss_bytes\":{},\"final_peak_rss_bytes\":{},\"startup_microseconds\":{},\"workload_microseconds\":{}}}",
+        startup_memory.peak_source,
+        current_source,
+        startup_current,
+        final_current,
+        startup_memory.getrusage_peak_bytes,
+        final_memory.getrusage_peak_bytes,
         std::env::consts::OS,
         std::env::consts::ARCH,
         arguments[11],
@@ -316,25 +331,189 @@ fn measure() -> Result<(), Box<dyn std::error::Error>> {
         budget.used(),
         session_reserved,
         session_budget.used(),
-        startup_peak_rss_bytes,
-        final_peak_rss_bytes,
+        startup_memory.peak_bytes,
+        final_memory.peak_bytes,
         startup_microseconds,
         workload_microseconds
     );
     Ok(())
 }
 
-fn peak_rss_bytes() -> Result<u64, std::io::Error> {
+struct MemoryUsage {
+    peak_bytes: u64,
+    current_bytes: Option<u64>,
+    getrusage_peak_bytes: u64,
+    peak_source: &'static str,
+    current_source: Option<&'static str>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ProcMemoryStatus {
+    peak_bytes: u64,
+    current_bytes: u64,
+}
+
+fn parse_proc_memory_status(input: &[u8]) -> Result<ProcMemoryStatus, &'static str> {
+    let mut peak = None;
+    let mut current = None;
+    for line in input.split(|byte| *byte == b'\n') {
+        let (destination, raw) = if let Some(value) = line.strip_prefix(b"VmHWM:") {
+            (&mut peak, value)
+        } else if let Some(value) = line.strip_prefix(b"VmRSS:") {
+            (&mut current, value)
+        } else {
+            continue;
+        };
+        if destination.is_some() {
+            return Err("duplicate VmHWM or VmRSS in /proc/self/status");
+        }
+        let text =
+            core::str::from_utf8(raw).map_err(|_| "invalid RSS bytes in /proc/self/status")?;
+        let mut fields = text.split_ascii_whitespace();
+        let digits = fields
+            .next()
+            .ok_or("missing RSS count in /proc/self/status")?;
+        if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err("invalid RSS count in /proc/self/status");
+        }
+        let count = digits
+            .parse::<u64>()
+            .map_err(|_| "RSS count overflow in /proc/self/status")?;
+        if fields.next() != Some("kB") || fields.next().is_some() {
+            return Err("RSS unit must be kB in /proc/self/status");
+        }
+        *destination = Some(
+            count
+                .checked_mul(1024)
+                .ok_or("RSS byte overflow in /proc/self/status")?,
+        );
+    }
+    Ok(ProcMemoryStatus {
+        peak_bytes: peak.ok_or("missing VmHWM in /proc/self/status")?,
+        current_bytes: current.ok_or("missing VmRSS in /proc/self/status")?,
+    })
+}
+
+fn read_proc_memory_status() -> Result<ProcMemoryStatus, std::io::Error> {
+    use std::io::Read;
+    let mut file = std::fs::File::open("/proc/self/status")?;
+    let mut bytes = [0u8; 8192];
+    let mut used = 0;
+    loop {
+        let read = match file.read(&mut bytes[used..]) {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            result => result?,
+        };
+        if read == 0 {
+            break;
+        }
+        used += read;
+        if used == bytes.len() {
+            let mut extra = [0u8; 1];
+            let extra_read = loop {
+                match file.read(&mut extra) {
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    result => break result?,
+                }
+            };
+            if extra_read != 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "/proc/self/status exceeds the 8192-byte measurement buffer",
+                ));
+            }
+            break;
+        }
+    }
+    parse_proc_memory_status(&bytes[..used])
+        .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidData, message))
+}
+
+fn memory_usage() -> Result<MemoryUsage, std::io::Error> {
+    if !cfg!(any(target_os = "linux", target_os = "macos")) {
+        return Err(std::io::Error::from(std::io::ErrorKind::Unsupported));
+    }
     let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
     // SAFETY: getrusage initializes the complete output on success.
     if unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } != 0 {
         return Err(std::io::Error::last_os_error());
     }
     // SAFETY: the successful call initialized usage.
-    let peak = unsafe { usage.assume_init() }.ru_maxrss as u64;
-    Ok(if cfg!(target_os = "macos") {
-        peak
+    let peak = u64::try_from(unsafe { usage.assume_init() }.ru_maxrss)
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidData))?;
+    if cfg!(target_os = "linux") {
+        // Linux exec preserves pre-exec high water in getrusage. VmHWM belongs
+        // to the current address space, so launcher memory cannot set its floor.
+        let current = read_proc_memory_status()?;
+        Ok(MemoryUsage {
+            peak_bytes: current.peak_bytes,
+            current_bytes: Some(current.current_bytes),
+            getrusage_peak_bytes: peak
+                .checked_mul(1024)
+                .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidData))?,
+            peak_source: "linux_proc_status_vmhwm",
+            current_source: Some("linux_proc_status_vmrss"),
+        })
     } else {
-        peak * 1024
-    })
+        Ok(MemoryUsage {
+            peak_bytes: peak,
+            current_bytes: None,
+            getrusage_peak_bytes: peak,
+            peak_source: "darwin_getrusage_ru_maxrss",
+            current_source: None,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn proc_memory_fields_have_explicit_binary_kilobyte_units() {
+        pos3ql::mem::guard::forbid_alloc(|| {
+            assert_eq!(
+                parse_proc_memory_status(b"Name:\tmeasurement\nVmHWM:\t1024 kB\nVmRSS: 512 kB\n")
+                    .unwrap(),
+                ProcMemoryStatus {
+                    peak_bytes: 1_048_576,
+                    current_bytes: 524_288
+                }
+            );
+        });
+    }
+
+    #[test]
+    fn proc_memory_fields_reject_missing_malformed_or_overflowed_values() {
+        for input in [
+            &b"VmHWM: 1 kB\n"[..],
+            &b"VmRSS: 1 kB\n"[..],
+            &b"VmHWM: 1 bytes\nVmRSS: 1 kB\n"[..],
+            &b"VmHWM: 1 kB\nVmRSS: 1 KB\n"[..],
+            &b"VmHWM: -1 kB\nVmRSS: 1 kB\n"[..],
+            &b"VmHWM: +1 kB\nVmRSS: 1 kB\n"[..],
+            &b"VmHWM: 1 kB extra\nVmRSS: 1 kB\n"[..],
+            &b"VmHWM: 18446744073709551616 kB\nVmRSS: 1 kB\n"[..],
+            &b"VmHWM: 18446744073709551615 kB\nVmRSS: 1 kB\n"[..],
+            &b"VmHWM: 1 kB\nVmHWM: 2 kB\nVmRSS: 1 kB\n"[..],
+            &b"VmHWM: 1 kB\nVmRSS: 1 kB\nVmRSS: 2 kB\n"[..],
+        ] {
+            pos3ql::mem::guard::forbid_alloc(|| assert!(parse_proc_memory_status(input).is_err()));
+        }
+    }
+
+    #[test]
+    fn memory_snapshot_identifies_the_platform_metric() {
+        let usage = memory_usage().unwrap();
+        if cfg!(target_os = "linux") {
+            assert_eq!(usage.peak_source, "linux_proc_status_vmhwm");
+            assert_eq!(usage.current_source, Some("linux_proc_status_vmrss"));
+            assert!(usage.current_bytes.unwrap() > 0);
+        } else {
+            assert_eq!(usage.peak_source, "darwin_getrusage_ru_maxrss");
+            assert_eq!(usage.current_bytes, None);
+            assert_eq!(usage.current_source, None);
+        }
+        assert!(usage.peak_bytes > 0);
+    }
 }

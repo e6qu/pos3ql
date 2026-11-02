@@ -3703,15 +3703,14 @@ fn table_definition_images_keep_their_pool_alive_after_storage_drops() {
 
 #[test]
 fn table_definition_images_exhaustion_preserves_readers_and_releases_capacity() {
-    let config = test_config();
+    let mut config = test_config();
+    config.definition_image_slots = 4;
     let mut budget = test_budget(&config);
     let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
     let table = storage
         .create_table(make_def("bounded", &[("id", ColType::Int8, true)]))
         .unwrap();
-    let capacity = table_slot_capacity(&config)
-        * (config.max_catalog_versions_per_object + 1)
-        * config.query_workspace_slots;
+    let capacity = config.definition_image_slots;
     let mut owners = Vec::with_capacity(capacity);
     crate::mem::guard::forbid_alloc(|| {
         let retained_owner = storage.table_definition_images();
@@ -3725,7 +3724,8 @@ fn table_definition_images_exhaustion_preserves_readers_and_releases_capacity() 
         assert_eq!(
             exhausted
                 .definition(&storage, table, 0)
-                .unwrap_err()
+                .err()
+                .expect("all definition images are held by readers")
                 .sqlstate,
             sqlstate::PROGRAM_LIMIT_EXCEEDED
         );

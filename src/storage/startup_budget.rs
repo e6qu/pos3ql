@@ -104,6 +104,33 @@ fn component_counts_and_cross_products_saturate_before_composition() {
     config = tests::test_config();
     config.max_routines = usize::MAX;
     assert_eq!(stored_query_dependency_budget_bytes(&config), usize::MAX);
+    for resource in ["subscription_relation_capacity", "subscription_arena_bytes"] {
+        config = tests::test_config();
+        match resource {
+            "subscription_relation_capacity" => config.subscription_relation_capacity = usize::MAX,
+            "subscription_arena_bytes" => config.subscription_arena_bytes = usize::MAX,
+            _ => unreachable!(),
+        }
+        crate::mem::guard::forbid_alloc(|| {
+            assert_eq!(
+                crate::pg::subscription_apply::RelationMap::budget_bytes(usize::MAX),
+                usize::MAX
+            );
+            assert_eq!(
+                crate::pg::subscription_apply::SubscriptionApply::budget_bytes(&config),
+                usize::MAX
+            );
+            assert_eq!(
+                config
+                    .memory_plan(
+                        crate::server::Server::budget_bytes(&config),
+                        crate::sql::Engine::extra_budget_bytes(&config)
+                    )
+                    .total(),
+                usize::MAX
+            );
+        });
+    }
 }
 
 #[test]

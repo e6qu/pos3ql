@@ -206,7 +206,7 @@ impl QueryDispatchQueue {
     }
 
     const fn budget_bytes(capacity: usize) -> usize {
-        capacity * core::mem::size_of::<Option<QueryDispatch>>()
+        capacity.saturating_mul(core::mem::size_of::<Option<QueryDispatch>>())
     }
 
     fn push(&mut self, dispatch: QueryDispatch) {
@@ -271,8 +271,9 @@ impl QueryWorkspaceLeases {
     }
 
     const fn budget_bytes(workspace_count: usize, connection_count: usize) -> usize {
-        workspace_count * core::mem::size_of::<Option<usize>>()
-            + connection_count * core::mem::size_of::<usize>()
+        workspace_count
+            .saturating_mul(core::mem::size_of::<Option<usize>>())
+            .saturating_add(connection_count.saturating_mul(core::mem::size_of::<usize>()))
     }
 
     fn acquire(&mut self, owner: usize) -> Option<QueryWorkspaceId> {
@@ -797,46 +798,65 @@ impl Server {
         };
         let block_reads = Self::block_read_slots(config);
         let background_io = Self::background_io_slots(config);
-        Reactor::budget_bytes(
-            connections
-                + 2
-                + block_reads
-                + background_io
-                + 2 * config.max_subscriptions
-                + usize::from(operations_connections != 0)
-                + operations_connections
-                + Self::writer_probe_slots(config),
-        ) + 128
-            + connections * (core::mem::size_of::<Slot>() + core::mem::size_of::<u32>())
-            + QueryWorkspaceLeases::budget_bytes(config.query_workspace_slots, connections)
-            + QueryDispatchQueue::budget_bytes(config.query_workspace_slots)
-            + operations_connections
-                * (core::mem::size_of::<OperationsSlot>()
-                    + core::mem::size_of::<u32>()
-                    + OPERATIONS_REQUEST_BYTES
-                    + OPERATIONS_RESPONSE_BYTES)
-            + (block_reads + background_io) * core::mem::size_of::<Option<i32>>()
-            + Self::extra_budget_bytes(config)
+        let events = connections
+            .saturating_add(2)
+            .saturating_add(block_reads)
+            .saturating_add(background_io)
+            .saturating_add(config.max_subscriptions.saturating_mul(2))
+            .saturating_add(usize::from(operations_connections != 0))
+            .saturating_add(operations_connections)
+            .saturating_add(Self::writer_probe_slots(config));
+        [
+            Reactor::budget_bytes(events),
+            128,
+            connections.saturating_mul(
+                core::mem::size_of::<Slot>().saturating_add(core::mem::size_of::<u32>()),
+            ),
+            QueryWorkspaceLeases::budget_bytes(config.query_workspace_slots, connections),
+            QueryDispatchQueue::budget_bytes(config.query_workspace_slots),
+            operations_connections.saturating_mul(
+                core::mem::size_of::<OperationsSlot>()
+                    .saturating_add(core::mem::size_of::<u32>())
+                    .saturating_add(OPERATIONS_REQUEST_BYTES)
+                    .saturating_add(OPERATIONS_RESPONSE_BYTES),
+            ),
+            block_reads
+                .saturating_add(background_io)
+                .saturating_mul(core::mem::size_of::<Option<i32>>()),
+            Self::extra_budget_bytes(config),
+        ]
+        .into_iter()
+        .fold(0usize, usize::saturating_add)
     }
 
     /// TLS-pool capacity for the complete fixed outbound subscription worker
     /// set.  The workers are allocated at startup even when their catalog
     /// entries are disabled, so enabling one cannot grow runtime memory.
     pub fn extra_tls_pool_bytes(config: &Config) -> usize {
-        config.max_subscriptions * 2 * crate::object_store::tls::CLIENT_SESSION_BYTES
+        config
+            .max_subscriptions
+            .saturating_mul(2)
+            .saturating_mul(crate::object_store::tls::CLIENT_SESSION_BYTES)
     }
 
     pub fn extra_budget_bytes(config: &Config) -> usize {
-        config.max_subscriptions * core::mem::size_of::<SubscriptionWorker>()
-            + config.max_subscriptions
-                * (2 * crate::pg::replication_client::ReplicationClient::budget_bytes(
-                    crate::storage::MAX_SUBSCRIPTION_PUBLICATIONS,
-                    config.subscription_receive_bytes,
-                    config.subscription_send_bytes,
-                ) + crate::pg::subscription_apply::SubscriptionApply::budget_bytes(config)
-                    + config.subscription_relation_capacity
-                        * core::mem::size_of::<SubscriptionBootstrapTable>()
-                    + config.copy_line_bytes)
+        let worker_bytes = crate::pg::replication_client::ReplicationClient::budget_bytes(
+            crate::storage::MAX_SUBSCRIPTION_PUBLICATIONS,
+            config.subscription_receive_bytes,
+            config.subscription_send_bytes,
+        )
+        .saturating_mul(2)
+        .saturating_add(crate::pg::subscription_apply::SubscriptionApply::budget_bytes(config))
+        .saturating_add(
+            config
+                .subscription_relation_capacity
+                .saturating_mul(core::mem::size_of::<SubscriptionBootstrapTable>()),
+        )
+        .saturating_add(config.copy_line_bytes);
+        config
+            .max_subscriptions
+            .saturating_mul(core::mem::size_of::<SubscriptionWorker>())
+            .saturating_add(config.max_subscriptions.saturating_mul(worker_bytes))
     }
 
     pub fn new(config: &Config, budget: &mut Budget) -> Result<Self, ServerSetupError> {
@@ -4044,6 +4064,57 @@ mod tests {
         Server, SubscriptionBinding, SubscriptionBootstrapStage, SubscriptionBootstrapWork,
         bind_listener, parse_operations_request,
     };
+
+    #[test]
+    fn extreme_server_resource_budgets_propagate_exhaustion_without_allocation() {
+        for resource in 0..10 {
+            let mut config = crate::config::Config::default_dev();
+            match resource {
+                0 => config.subscription_relation_capacity = usize::MAX,
+                1 => config.subscription_arena_bytes = usize::MAX,
+                2 => config.subscription_receive_bytes = usize::MAX,
+                3 => config.subscription_send_bytes = usize::MAX,
+                4 => config.max_subscriptions = usize::MAX,
+                5 => config.copy_line_bytes = usize::MAX,
+                6 => config.query_workspace_slots = usize::MAX,
+                7 => {
+                    config.operations_listen_addr = "127.0.0.1:0".to_string();
+                    config.operations_max_connections = usize::MAX;
+                }
+                8 => {
+                    config.object_store_on = true;
+                    config.object_store_get_slots = usize::MAX;
+                }
+                9 => {
+                    config.object_store_on = true;
+                    config.object_store_put_slots = usize::MAX;
+                }
+                _ => unreachable!(),
+            }
+            crate::mem::guard::forbid_alloc(|| {
+                assert_eq!(
+                    Server::budget_bytes(&config),
+                    usize::MAX,
+                    "server resource {resource}"
+                );
+                if resource < 6 {
+                    assert_eq!(Server::extra_budget_bytes(&config), usize::MAX);
+                }
+                if resource == 4 {
+                    assert_eq!(Server::extra_tls_pool_bytes(&config), usize::MAX);
+                }
+                assert_eq!(crate::io::Reactor::budget_bytes(usize::MAX), usize::MAX);
+                assert_eq!(
+                    crate::pg::replication_client::ReplicationClient::budget_bytes(
+                        usize::MAX,
+                        0,
+                        0
+                    ),
+                    usize::MAX
+                );
+            });
+        }
+    }
 
     #[test]
     fn cleanup_download_overlap_storage_failure_survives_local_work_and_skipped_turns() {

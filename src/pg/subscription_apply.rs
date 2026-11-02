@@ -73,7 +73,7 @@ pub struct RelationMap {
 
 impl RelationMap {
     pub const fn budget_bytes(capacity: usize) -> usize {
-        capacity * core::mem::size_of::<RelationEntry>()
+        capacity.saturating_mul(core::mem::size_of::<RelationEntry>())
     }
 
     pub fn new(budget: &mut Budget, capacity: usize) -> Result<Self, BudgetError> {
@@ -297,12 +297,16 @@ pub struct SubscriptionApply {
 impl SubscriptionApply {
     pub const fn budget_bytes(config: &crate::config::Config) -> usize {
         RelationMap::budget_bytes(config.subscription_relation_capacity)
-            + TxnState::budget_bytes_with_config(config)
-            + GucState::extra_savepoint_budget_bytes(config.max_savepoints_per_transaction)
-            + config.subscription_arena_bytes
-            + TRIGGER_RESPONSE_BYTES
-            + crate::sql::exec::CopyTransitionRows::budget_bytes(config)
-            + crate::sql::guc::SeqSession::extra_budget_bytes(config.max_sequences)
+            .saturating_add(TxnState::budget_bytes_with_config(config))
+            .saturating_add(GucState::extra_savepoint_budget_bytes(
+                config.max_savepoints_per_transaction,
+            ))
+            .saturating_add(config.subscription_arena_bytes)
+            .saturating_add(TRIGGER_RESPONSE_BYTES)
+            .saturating_add(crate::sql::exec::CopyTransitionRows::budget_bytes(config))
+            .saturating_add(crate::sql::guc::SeqSession::extra_budget_bytes(
+                config.max_sequences,
+            ))
     }
 
     pub(crate) fn new(

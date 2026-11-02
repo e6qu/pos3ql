@@ -268,6 +268,12 @@ fn global_overlay_pressure_starts_the_first_immutable_generation() {
     assert!(engine.wal.used_bytes() * 100 < engine.wal.capacity_bytes() * 50);
     assert!(engine.checkpoint_work_pending());
     for _ in 0..256 {
+        engine
+            .advance_wal_publication(
+                std::time::Instant::now(),
+                crate::sql::CommitProgressMode::Reactor,
+            )
+            .unwrap();
         let beat = engine.checkpoint_beat();
         assert!(
             !beat.failed(),

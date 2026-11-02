@@ -842,71 +842,110 @@ mod tests {
 
     #[test]
     fn nonblocking_snapshot_cleanup_releases_owners_and_rechecks_readers_on_retry() {
-        let (storage, table, _) = fixture();
-        let reader = storage.retain_statement_snapshot(99, |lsn| lsn).unwrap();
-        crate::mem::guard::forbid_alloc(|| {
-            let image = storage.heap.append_row_image(&[Datum::Int4(20)]).unwrap();
-            storage
-                .write_pending_image(
-                    storage.select_table_definition(table, 8).0,
-                    1,
-                    1,
-                    Some(image),
-                    crate::storage::RowWriteStatistics::Untracked,
-                )
+        for started in [false, true] {
+            let (mut storage, table, other) = fixture();
+            // Visit an unrelated owned cell before the row whose history must
+            // survive version-owner contention and a reader arriving on retry.
+            let state = storage.tables[table].rows.remove(&1).unwrap();
+            let location = storage.heap.append_row(&[Datum::Int4(2)]).unwrap();
+            storage.tables[other]
+                .rows
+                .insert(1, RowState::committed_only_at(location, 7))
                 .unwrap();
-            storage.commit_row(table, 1, 8, 9).unwrap();
-            storage.observe_lsn(9);
-            storage.advance_visible_lsn(9).unwrap();
-            drop(reader);
-        });
-        let versions = storage.row_versions.test_write().unwrap();
-        let finished = AtomicBool::new(false);
-        let progressed = std::thread::scope(|scope| {
-            let worker = scope.spawn(|| {
-                crate::mem::guard::forbid_alloc(|| finish_blocked_pass(&storage));
-                finished.store(true, Ordering::Release);
-            });
-            let progressed = crate::mem::guard::forbid_alloc(|| {
-                let deadline = Instant::now() + Duration::from_secs(5);
-                while !finished.load(Ordering::Acquire) && Instant::now() < deadline {
-                    std::thread::yield_now();
+            storage.tables[table].rows.insert(1, state).unwrap();
+            let reader = storage.retain_statement_snapshot(99, |lsn| lsn).unwrap();
+            crate::mem::guard::forbid_alloc(|| {
+                let image = storage.heap.append_row_image(&[Datum::Int4(20)]).unwrap();
+                storage
+                    .write_pending_image(
+                        storage.select_table_definition(table, 8).0,
+                        1,
+                        1,
+                        Some(image),
+                        crate::storage::RowWriteStatistics::Untracked,
+                    )
+                    .unwrap();
+                storage.commit_row(table, 1, 8, 9).unwrap();
+                storage.observe_lsn(9);
+                storage.advance_visible_lsn(9).unwrap();
+                drop(reader);
+                if started {
+                    assert_eq!(
+                        storage.advance_history_cleanup(NonZeroUsize::new(1).unwrap()),
+                        HistoryReclamation::Advanced
+                    );
+                    let workspace = storage.snapshot_reclamation.workspace.lock().unwrap();
+                    let cursor = workspace.cursor.unwrap();
+                    assert!(cursor.pressure_started);
+                    assert_eq!(cursor.slot, 1);
+                    assert!(!workspace.retry);
                 }
-                finished.load(Ordering::Acquire)
+                assert_eq!(storage.tables[table].rows.get(&1).unwrap().history.len(), 1);
             });
-            // Check guards only after the worker returned, without waiting on them.
-            let registry_released = storage.snapshots.try_lock().is_ok();
-            let generations_released = storage.tables[table]
-                .spill_generations
-                .try_read_for_batch()
-                .is_ok();
-            let rows_released = storage.tables[table].rows.test_write().is_ok();
-            drop(versions);
-            worker.join().unwrap();
-            assert!(registry_released && generations_released && rows_released);
-            progressed
-        });
-        assert!(
-            progressed,
-            "opportunistic cleanup waited for row-version ownership"
-        );
-        crate::mem::guard::forbid_alloc(|| {
-            assert!(storage.snapshot_reclamation.workspace.lock().unwrap().retry);
-            assert_eq!(storage.tables[table].rows.get(&1).unwrap().history.len(), 1);
-            storage.register_snapshot(100, 7).unwrap();
-            finish_history_work(&storage);
-            assert!(!storage.snapshot_reclamation.workspace.lock().unwrap().retry);
-            assert_eq!(storage.tables[table].rows.get(&1).unwrap().history.len(), 1);
-            storage.release_snapshot(100);
+            let versions = storage.row_versions.test_write().unwrap();
+            let finished = AtomicBool::new(false);
+            let progressed = std::thread::scope(|scope| {
+                let worker = scope.spawn(|| {
+                    crate::mem::guard::forbid_alloc(|| finish_blocked_pass(&storage));
+                    finished.store(true, Ordering::Release);
+                });
+                let progressed = crate::mem::guard::forbid_alloc(|| {
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    while !finished.load(Ordering::Acquire) && Instant::now() < deadline {
+                        std::thread::yield_now();
+                    }
+                    finished.load(Ordering::Acquire)
+                });
+                // Check guards after the worker returns, without waiting on them.
+                let registry_released = storage.snapshots.try_lock().is_ok();
+                let generations_released = storage.tables[table]
+                    .spill_generations
+                    .try_read_for_batch()
+                    .is_ok();
+                let rows_released = storage.tables[table].rows.test_write().is_ok();
+                drop(versions);
+                worker.join().unwrap();
+                assert!(registry_released && generations_released && rows_released);
+                progressed
+            });
             assert!(
-                storage.tables[table]
-                    .rows
-                    .get(&1)
-                    .unwrap()
-                    .history
-                    .is_empty()
+                progressed,
+                "opportunistic cleanup waited for row-version ownership"
             );
-        });
+            crate::mem::guard::forbid_alloc(|| {
+                {
+                    let workspace = storage.snapshot_reclamation.workspace.lock().unwrap();
+                    assert_eq!(workspace.retry, started);
+                    if started {
+                        assert!(
+                            workspace.cursor.is_none(),
+                            "a skipped row schedules another complete pass"
+                        );
+                    } else {
+                        let cursor = workspace
+                            .cursor
+                            .expect("blocked startup retains its pending pass");
+                        assert!(!cursor.pressure_started);
+                        assert_eq!(cursor.slot, 0);
+                    }
+                }
+                assert!(storage.history_cleanup_pending());
+                assert_eq!(storage.tables[table].rows.get(&1).unwrap().history.len(), 1);
+                storage.register_snapshot(100, 7).unwrap();
+                finish_history_work(&storage);
+                assert!(!storage.snapshot_reclamation.workspace.lock().unwrap().retry);
+                assert_eq!(storage.tables[table].rows.get(&1).unwrap().history.len(), 1);
+                storage.release_snapshot(100);
+                assert!(
+                    storage.tables[table]
+                        .rows
+                        .get(&1)
+                        .unwrap()
+                        .history
+                        .is_empty()
+                );
+            });
+        }
     }
 
     #[test]

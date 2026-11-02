@@ -1,10 +1,11 @@
 //! Guarded relation metadata shares stable startup-allocated row cells.
 
+use crate::mem::mutex::Mutex;
 use core::cell::UnsafeCell;
 use core::hash::{Hash, Hasher};
 use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use super::RowState;
 use crate::mem::budget::{Budget, BudgetError};
@@ -1414,7 +1415,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(miri))]
     fn shared_row_tables_read_and_write_without_other_table_or_stripe_ownership() {
         let (pool, left, mut right) = shared(4);
         let left_bucket = pool.bucket(left.owner_id(), 1);
@@ -1429,7 +1429,7 @@ mod tests {
         let done = std::sync::atomic::AtomicBool::new(false);
         std::thread::scope(|scope| {
             let done = &done;
-            scope.spawn(move || {
+            let writer = scope.spawn(move || {
                 crate::mem::guard::forbid_alloc(|| {
                     for round in 0..256 {
                         assert_eq!(right.get(&right_key).unwrap().committed_lsn, 7 + round);
@@ -1438,17 +1438,30 @@ mod tests {
                 });
                 done.store(true, Ordering::Release);
             });
-            let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            while !done.load(Ordering::Acquire) && std::time::Instant::now() < until {
-                std::thread::yield_now();
+            #[cfg(miri)]
+            {
+                // The interpreter diagnoses blocked-thread cycles; wait for
+                // completion while both unrelated exclusion guards stay held.
+                writer.join().unwrap();
+                assert!(done.load(Ordering::Acquire));
+                drop(stripe_owner);
+                drop(left_owner);
             }
-            let independent = done.load(Ordering::Acquire);
-            drop(stripe_owner);
-            drop(left_owner);
-            assert!(
-                independent,
-                "another table or stripe serialized independent reads"
-            );
+            #[cfg(not(miri))]
+            {
+                let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while !done.load(Ordering::Acquire) && std::time::Instant::now() < until {
+                    std::thread::yield_now();
+                }
+                let independent = done.load(Ordering::Acquire);
+                drop(stripe_owner);
+                drop(left_owner);
+                writer.join().unwrap();
+                assert!(
+                    independent,
+                    "another table or stripe serialized independent reads"
+                );
+            }
         });
     }
 }

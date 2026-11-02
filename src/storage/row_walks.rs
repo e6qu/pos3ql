@@ -1173,7 +1173,7 @@ mod tests {
                 error
                     .message
                     .as_str()
-                    .contains("checkpoint retained row identities")
+                    .contains("checkpoint retained row identity capacity exhausted (1)")
             );
             assert!(cursor.resident_rowids.is_empty());
             assert!(!cursor.resident_initialized);

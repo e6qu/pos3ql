@@ -120,24 +120,15 @@ fn view_write_staging_uses_actual_rows_with_large_pool_and_small_work_arena() {
     let mut budget = test_engine_budget(&config, 1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
-    session.success(&mut engine,
-        "CREATE TABLE shared_view_base(id integer PRIMARY KEY, amount integer); \
-         CREATE SEQUENCE shared_view_calls; \
-         CREATE VIEW shared_view AS SELECT id, amount FROM shared_view_base; \
-         CREATE FUNCTION shared_view_write() RETURNS trigger LANGUAGE plpgsql AS $$ \
-           BEGIN \
-             IF TG_OP = 'INSERT' THEN INSERT INTO shared_view_base VALUES(NEW.id, NEW.amount); RETURN NEW; END IF; \
-             IF TG_OP = 'UPDATE' THEN UPDATE shared_view_base SET amount = NEW.amount WHERE id = OLD.id; RETURN NEW; END IF; \
-             DELETE FROM shared_view_base WHERE id = OLD.id; RETURN OLD; \
-           END $$; \
-         CREATE TRIGGER shared_view_write INSTEAD OF INSERT OR UPDATE OR DELETE ON shared_view \
-           FOR EACH ROW EXECUTE FUNCTION shared_view_write()", true);
-    assert_eq!(data_rows(&session.success(&mut engine,
-        "INSERT INTO shared_view SELECT nextval('shared_view_calls')::integer, 10 RETURNING id, amount; \
-         UPDATE shared_view SET amount = amount + nextval('shared_view_calls')::integer WHERE id = 1 RETURNING id, amount; \
-         DELETE FROM shared_view WHERE id = nextval('shared_view_calls') - 2 RETURNING id; \
-         SELECT currval('shared_view_calls'), count(*) FROM shared_view_base", true)),
-        ["1|10", "1|12", "1", "3|0"]);
+    let output = session.success(
+        &mut engine,
+        include_str!("../../../tests/external/differential_exact/58_volatile_view_writes.sql"),
+        true,
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["1|10", "1|12", "1", "3|0", "4|40", "4|41", "48", "6|48"]
+    );
     assert_idle(&engine, config.row_work_bytes);
 }
 
@@ -156,7 +147,7 @@ fn subscription_workers_share_foreground_admission_without_reserving_payload() {
          CREATE TABLE shared_worker_effect(id integer, amount integer); \
          INSERT INTO shared_worker_effect VALUES(1,0); \
          CREATE FUNCTION shared_worker_write() RETURNS trigger LANGUAGE plpgsql AS $$ \
-           BEGIN UPDATE shared_worker_effect SET amount = amount + 1 WHERE id = NEW.id; RETURN NEW; END $$; \
+           BEGIN UPDATE public.shared_worker_effect SET amount = amount + 1 WHERE id = NEW.id; RETURN NEW; END $$; \
          CREATE TRIGGER shared_worker_write BEFORE INSERT ON shared_worker_source \
            FOR EACH ROW EXECUTE FUNCTION shared_worker_write(); \
          ALTER TABLE shared_worker_source ENABLE REPLICA TRIGGER shared_worker_write; \

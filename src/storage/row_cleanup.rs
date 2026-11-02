@@ -538,9 +538,12 @@ mod tests {
     use crate::sql::types::{ColType, Datum};
     use crate::storage::tests::{make_def, test_budget, test_config};
 
-    fn fixture(persistence: RelationPersistence, table_rows: usize) -> (Storage, usize, usize) {
+    fn fixture(
+        persistence: RelationPersistence,
+        row_overlay_slots: usize,
+    ) -> (Storage, usize, usize) {
         let mut config = test_config();
-        config.row_overlay_slots = table_rows;
+        config.row_overlay_slots = row_overlay_slots;
         let mut budget = test_budget(&config);
         let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let mut definition = make_def("cleanup_owned", &[("id", ColType::Int4, false)]);
@@ -1105,7 +1108,13 @@ mod tests {
 
     #[test]
     fn row_lock_owners_shared_cleanup_preserves_retained_bytes_and_later_writes() {
-        let (mut storage, first, second) = fixture(RelationPersistence::Permanent, 2);
+        const SOURCE_ROWS: usize = 2;
+        const LATER_WRITER_ROWS: usize = 1;
+        // Both source rows and the later write must fit before cleanup runs.
+        let (mut storage, first, second) = fixture(
+            RelationPersistence::Permanent,
+            SOURCE_ROWS + LATER_WRITER_ROWS,
+        );
         let location = storage.heap.append_row(&[Datum::Int4(40)]).unwrap();
         storage.tables[first]
             .rows
@@ -1140,6 +1149,9 @@ mod tests {
         });
         let old = selected(&storage, first, 7);
         let current = selected(&storage, first, u64::MAX);
+        assert_eq!(storage.row_overlay.usage().live, SOURCE_ROWS);
+        assert_eq!(storage.row_overlay.usage().free, LATER_WRITER_ROWS);
+        assert!(storage.row_overlay.usage().pressured());
         let definition = storage.tables[first].definition();
         std::thread::scope(|scope| {
             let shared = &storage;
@@ -1165,6 +1177,7 @@ mod tests {
             });
             crate::mem::guard::forbid_alloc(|| {
                 update(&storage, second, 1, 50, 12, 13);
+                assert!(storage.row_overlay.usage().pressured());
                 assert_value(&storage, first, old, 10);
                 assert_value(&storage, first, current, 30);
             });

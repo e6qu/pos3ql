@@ -196,6 +196,7 @@ jobs:
           tools/tests/test_benchmark.py
           tools/tests/test_benchmark_environment.py
           tools/tests/test_benchmark_matrix_report.py
+          tools/tests/test_measure_embedded_capacity.py
           tools/tests/test_benchmark_postgresql.py
           tools/tests/test_benchmark_report.py
           tools/tests/test_run_performance.py

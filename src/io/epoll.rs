@@ -79,7 +79,11 @@ impl Reactor {
     }
 
     pub const fn budget_bytes(max_events: usize) -> usize {
-        max_events * (size_of::<libc::epoll_event>() + size_of::<Event>() + size_of::<Interest>())
+        max_events.saturating_mul(
+            size_of::<libc::epoll_event>()
+                .saturating_add(size_of::<Event>())
+                .saturating_add(size_of::<Interest>()),
+        )
     }
 
     pub fn register_read(&mut self, fd: RawFd, token: u64) -> std::io::Result<()> {

@@ -256,6 +256,7 @@ fn sorted_and_paged_projection_effects(external: bool) {
         "greatest(100/z,f,n)",
         "least(100/z,f,n,id)",
         "coalesce(100/z,id)",
+        "coalesce(100/z+f*2-f/3+f*4,n)",
         "nullif(100/z,id)",
         "(current_date-current_date)+100/z",
         "json_object('n':100/z)",
@@ -274,7 +275,7 @@ fn sorted_and_paged_projection_effects(external: bool) {
     }
     for expression in [
         "greatest(100/z+f*2-f/3+f*4-f/5,n,id)",
-        "coalesce(100/z+f*2-f/3+f*4,n)",
+        "coalesce(100/z+f*2-f/3+f*4-f/5,n)",
         "json_object('n':100/z+f*2-f/3+f*2-f/3+f*2-f/3+f*2-f/3+f*2-f/3)",
         "xmlparse(document('<n>'||(100/z+f*2-f/3+f*4-f/5)::text||'</n>'))",
         "row(100/z+f*2-f/3+f*4-f/5)::text",

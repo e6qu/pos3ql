@@ -29,7 +29,6 @@ pub use pattern::{like_match, regex_split_count_pub, regex_split_piece_at_pub, r
 pub(crate) use pattern::{regex_substring, similar_to_posix, sql_regex_substring};
 
 pub(crate) use operators::arithmetic;
-pub(crate) use operators::coerce_unknown as coerce_unknown_pub;
 pub(crate) use operators::{binary, coerce_unknown, membership_eq};
 pub use operators::{
     compare_datums, compare_datums_collated, compare_datums_with_catalog, hash_key,

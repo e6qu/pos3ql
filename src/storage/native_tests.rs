@@ -3839,7 +3839,7 @@ fn catalog_object_pools_follow_their_independent_startup_capacities() {
     config.max_default_acl_entries = 24;
     config.max_parameter_acl_entries = 25;
     config.max_indexes = 6;
-    config.set_extended_statistics_capacity(31);
+    config.max_extended_statistics = 31;
     config.max_brin_unsummarized_ranges_per_index = 70;
     config.max_views = 3;
     config.max_materialized_views = 4;
@@ -5735,6 +5735,7 @@ fn routine_candidate_lookup_preserves_visibility_identity_and_guard_release() {
                 "renamed",
                 &[],
                 &[],
+                false,
                 7,
                 RoutineCallKind::Scalar
             ),
@@ -6143,7 +6144,7 @@ fn extended_statistics_catalog_is_synchronized_and_startup_bounded() {
     const WORKERS: usize = 4;
     let mut config = test_config();
     config.max_connections = WORKERS as u32;
-    config.set_extended_statistics_capacity(WORKERS);
+    config.max_extended_statistics = WORKERS;
     let mut budget = test_budget(&config);
     let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
     let table = storage

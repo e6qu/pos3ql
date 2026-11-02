@@ -285,8 +285,8 @@ def test_role_startup_defaults_database_and_options():
     malformed.sendall(startup_payload(0, parameters=(("options", "-x ignored"),)))
     kind, payload = read_message(malformed)
     check(
-        "startup options: unsupported option is rejected rather than ignored",
-        kind == b"E" and b"C22023" in payload,
+        "startup options: unsupported option reports PostgreSQL syntax error",
+        kind == b"E" and b"C42601" in payload,
         (kind, payload),
     )
     malformed.close()

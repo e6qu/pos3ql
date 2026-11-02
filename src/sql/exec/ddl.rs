@@ -625,6 +625,10 @@ fn validate_check_refs(
         }
         Expr::Unary { operand, .. }
         | Expr::Cast { operand, .. }
+        | Expr::BoundDefault {
+            expression: operand,
+            ..
+        }
         | Expr::Collate { operand, .. }
         | Expr::IsNull { operand, .. } => validate_check_refs(operand, def, cols)?,
         Expr::Binary { left, right, .. } => {

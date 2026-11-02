@@ -1777,7 +1777,7 @@ fn catalog_lifetime_config(name: &str, mode: crate::config::TransactionMode) -> 
     config.max_user_mappings = 2;
     config.max_publications = 2;
     config.max_subscriptions = 2;
-    config.set_extended_statistics_capacity(2);
+    config.max_extended_statistics = 2;
     config.extension_control_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/external/extensions")
         .to_str()
@@ -3056,7 +3056,7 @@ fn catalog_lifetime_template_copies_preserve_local_identifiers_and_statistics() 
             config.max_foreign_servers = 4;
             config.max_user_mappings = 4;
             config.max_publications = 4;
-            config.set_extended_statistics_capacity(4);
+            config.max_extended_statistics = 4;
             config.object_store_on = true;
             config.object_store_sim = true;
             config.wal_upload = true;
@@ -17432,6 +17432,7 @@ fn test_config(name: &str) -> Config {
     config.temporary_spill_bytes = 0;
     config.max_connections = 8;
     config.max_tables = 8;
+    config.max_extended_statistics = 64;
     config.max_composites = 8;
     config.max_views = 8;
     config.max_materialized_views = 8;
@@ -48232,7 +48233,7 @@ fn routine_acl_checkpoint_recovery_uses_overload_safe_identity() {
              GRANT EXECUTE ON FUNCTION checkpoint_overload() TO checkpoint_reader;
              CREATE TABLE checkpoint_procedure_log (value integer);
              INSERT INTO checkpoint_procedure_log VALUES (4), (5);
-             CREATE FUNCTION checkpoint_pairs() RETURNS TABLE (position integer, value integer) LANGUAGE SQL
+             CREATE FUNCTION checkpoint_pairs() RETURNS TABLE (\"position\" integer, value integer) LANGUAGE SQL
                AS 'SELECT value - 3, value FROM checkpoint_procedure_log ORDER BY value';
              CREATE PROCEDURE checkpoint_log(value integer) LANGUAGE SQL AS 'INSERT INTO checkpoint_procedure_log VALUES ($1)';",
         );
@@ -48267,7 +48268,7 @@ fn routine_acl_checkpoint_recovery_uses_overload_safe_identity() {
             "1|4",
             "2|5",
             "6|9",
-            "CREATE OR REPLACE FUNCTION public.checkpoint_pairs() RETURNS TABLE (position integer, value integer) LANGUAGE sql AS 'SELECT value - 3, value FROM checkpoint_procedure_log ORDER BY value'",
+            "CREATE OR REPLACE FUNCTION public.checkpoint_pairs() RETURNS TABLE (\"position\" integer, value integer) LANGUAGE sql AS 'SELECT value - 3, value FROM checkpoint_procedure_log ORDER BY value'",
         ]
     );
 }
@@ -64769,7 +64770,7 @@ fn configured_statistics_and_brin_ranges_cross_old_per_object_bounds() {
     config.max_indexes = 1;
     config.max_routines = 1;
     config.max_triggers = TRIGGERS;
-    config.set_extended_statistics_capacity(STATISTICS);
+    config.max_extended_statistics = STATISTICS;
     config.max_brin_unsummarized_ranges_per_index = RANGES;
     config.wal_buffer_bytes = 4 << 20;
     config.checkpoint_manifest_bytes = 4 << 20;
@@ -67492,18 +67493,10 @@ fn routine_setting_values_and_reset_values_share_one_bounded_definition() {
         },
     ];
     crate::mem::guard::forbid_alloc(|| {
-        assert_eq!(
-            guc.canonical_routine_setting("standard_conforming_strings", "on")
-                .unwrap()
-                .as_str(),
-            "on"
-        );
-        assert_eq!(
-            guc.canonical_routine_setting("xmloption", "document")
-                .unwrap()
-                .as_str(),
-            "document"
-        );
+        guc.validate_setting_value("standard_conforming_strings", Some("on"))
+            .unwrap();
+        guc.validate_setting_value("xmloption", Some("document"))
+            .unwrap();
         let scope = guc.enter_routine_configs(&configurations).unwrap();
         assert_eq!(guc.get_owned("xmloption").unwrap().as_str(), "document");
         assert_eq!(guc.reset_owned("xmloption").unwrap().as_str(), "content");

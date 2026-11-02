@@ -59,6 +59,10 @@ pub(crate) fn duplicate_expression<'a>(
     match &mut copied {
         Expr::Unary { operand, .. }
         | Expr::Cast { operand, .. }
+        | Expr::BoundDefault {
+            expression: operand,
+            ..
+        }
         | Expr::Collate { operand, .. }
         | Expr::IsNull { operand, .. }
         | Expr::Field { base: operand, .. }

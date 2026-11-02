@@ -3759,6 +3759,7 @@ fn table_func_routine<'a, C: ColumnLookup<'a>>(
             name,
             tref.func_argument_names,
             &argument_type_oids[..args.len()],
+            tref.func_variadic,
             txid,
         )
     };

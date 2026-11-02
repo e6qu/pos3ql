@@ -1523,13 +1523,19 @@ impl<'a> Parser<'a> {
                     return Ok(Stmt::SetCatalog(self.str_literal("catalog name")?));
                 }
                 if self.eat_ident("schema")? {
-                    let start = self.peek_at;
-                    let _ = self.str_literal("schema name")?;
+                    if !matches!(self.peeked, Tok::Str(_)) {
+                        return Err(self.unexpected("schema name string"));
+                    }
+                    let RoutineConfigValue::Value(value) =
+                        self.configuration_value_list("search_path", false)?
+                    else {
+                        unreachable!("schema syntax requires a string")
+                    };
                     return Ok(Stmt::Set {
                         name: "search_path",
-                        value: self.text[start..self.peek_at].trim(),
+                        value,
                         local,
-                        syntax: SettingSyntax::Generic,
+                        syntax: SettingSyntax::DecodedValue,
                     });
                 }
                 if self.eat_ident("names")? {
@@ -1538,15 +1544,17 @@ impl<'a> Parser<'a> {
                     let value = if reset {
                         "DEFAULT"
                     } else {
-                        let start = self.peek_at;
-                        let _ = self.str_literal("encoding name")?;
-                        self.text[start..self.peek_at].trim()
+                        self.str_literal("encoding name")?
                     };
                     return Ok(Stmt::Set {
                         name: "client_encoding",
                         value,
                         local,
-                        syntax: SettingSyntax::Generic,
+                        syntax: if reset {
+                            SettingSyntax::Default
+                        } else {
+                            SettingSyntax::DecodedValue
+                        },
                     });
                 }
                 if self.eat_ident("xml")? {
@@ -1561,14 +1569,14 @@ impl<'a> Parser<'a> {
                         name: "xmloption",
                         value,
                         local,
-                        syntax: SettingSyntax::Generic,
+                        syntax: SettingSyntax::DecodedValue,
                     });
                 }
                 let (name, syntax) = if self.eat_ident("time")? {
                     self.expect_ident("zone")?;
                     ("timezone", SettingSyntax::TimeZone)
                 } else {
-                    let n = self.any_ident("configuration parameter")?;
+                    let n = self.configuration_parameter_name()?;
                     if self.eat_ident("from")? {
                         self.expect_ident("current")?;
                         return Ok(Stmt::Set {
@@ -1581,7 +1589,7 @@ impl<'a> Parser<'a> {
                     if !self.eat_op("=")? {
                         self.expect_ident("to")?;
                     }
-                    (n, SettingSyntax::Generic)
+                    (n, SettingSyntax::DecodedValue)
                 };
                 if syntax == SettingSyntax::TimeZone && self.eat_ident("interval")? {
                     let precision = if self.peeked == Tok::Op("(") {
@@ -1620,10 +1628,32 @@ impl<'a> Parser<'a> {
                         syntax: SettingSyntax::TimeZoneInterval(type_mod),
                     });
                 }
-                let value = if syntax == SettingSyntax::TimeZone {
-                    self.time_zone_setting_value()?
+                let (value, syntax) = if syntax == SettingSyntax::TimeZone {
+                    if self.eat_ident("default")? || self.eat_ident("local")? {
+                        ("DEFAULT", SettingSyntax::Default)
+                    } else if let Tok::Str(value) | Tok::QuotedIdent(value) = self.peeked {
+                        self.advance()?;
+                        (value, SettingSyntax::DecodedValue)
+                    } else {
+                        (self.time_zone_setting_value()?, syntax)
+                    }
                 } else {
-                    self.configuration_value_list()?
+                    let numeric_timezone = name.eq_ignore_ascii_case("timezone")
+                        && matches!(self.peeked, Tok::Num(_) | Tok::Op("+") | Tok::Op("-"));
+                    match self.configuration_value_list(name, true)? {
+                        RoutineConfigValue::Default => ("DEFAULT", SettingSyntax::Default),
+                        RoutineConfigValue::Value(value) => (
+                            value,
+                            if numeric_timezone {
+                                SettingSyntax::TimeZone
+                            } else {
+                                SettingSyntax::DecodedValue
+                            },
+                        ),
+                        RoutineConfigValue::Current => {
+                            unreachable!("FROM CURRENT is separate syntax")
+                        }
+                    }
                 };
                 Ok(Stmt::Set {
                     name,
@@ -1657,9 +1687,7 @@ impl<'a> Parser<'a> {
                     self.expect_ident("level")?;
                     Ok(Stmt::Reset(Some("transaction_isolation")))
                 } else {
-                    Ok(Stmt::Reset(Some(
-                        self.any_ident("configuration parameter")?,
-                    )))
+                    Ok(Stmt::Reset(Some(self.configuration_parameter_name()?)))
                 }
             }
             Tok::Ident("show") => {
@@ -1792,9 +1820,6 @@ impl<'a> Parser<'a> {
         if !self.eat_op(")")? {
             loop {
                 let this_variadic = self.eat_ident("variadic")?;
-                if this_variadic && saw_named {
-                    return Err(self.err_here("VARIADIC argument cannot use named notation"));
-                }
                 let first = self.expression(0)?;
                 let (argument, argument_name) = if self.eat_op("=>")? {
                     let argument_name = match first {
@@ -3036,26 +3061,21 @@ impl<'a> Parser<'a> {
         // immediately after the (possibly schema-qualified) name.
         let mut func_argument_names: &'a [Option<&'a str>] = &[];
         let mut func_variadic = false;
-        let mut func_args = if table.eq_ignore_ascii_case("json_table")
-            && self.peeked == Tok::Op("(")
-        {
-            Some(self.json_table_arguments()?)
-        } else if table.eq_ignore_ascii_case("xmltable") && self.peeked == Tok::Op("(") {
-            Some(self.xml_table_arguments()?)
-        } else if self.peeked == Tok::Op("(") {
-            self.advance()?;
-            let mut args = ArenaList::new(self.arena);
-            let mut names = ArenaList::new(self.arena);
-            let mut saw_named = false;
-            if self.peeked != Tok::Op(")") {
-                loop {
-                    let this_variadic = self.eat_ident("variadic")?;
-                    if this_variadic && saw_named {
-                        return Err(self.err_here("VARIADIC argument cannot use named notation"));
-                    }
-                    let first = self.expression(0)?;
-                    let (argument, argument_name) =
-                        if self.eat_op("=>")? {
+        let mut func_args =
+            if table.eq_ignore_ascii_case("json_table") && self.peeked == Tok::Op("(") {
+                Some(self.json_table_arguments()?)
+            } else if table.eq_ignore_ascii_case("xmltable") && self.peeked == Tok::Op("(") {
+                Some(self.xml_table_arguments()?)
+            } else if self.peeked == Tok::Op("(") {
+                self.advance()?;
+                let mut args = ArenaList::new(self.arena);
+                let mut names = ArenaList::new(self.arena);
+                let mut saw_named = false;
+                if self.peeked != Tok::Op(")") {
+                    loop {
+                        let this_variadic = self.eat_ident("variadic")?;
+                        let first = self.expression(0)?;
+                        let (argument, argument_name) = if self.eat_op("=>")? {
                             let argument_name = match first {
                                 Expr::Column {
                                     qualifier: None,
@@ -3076,28 +3096,28 @@ impl<'a> Parser<'a> {
                             }
                             (first, None)
                         };
-                    self.push(&mut args, argument)?;
-                    self.push(&mut names, argument_name)?;
-                    if this_variadic {
-                        func_variadic = true;
-                        if self.peeked != Tok::Op(")") {
-                            return Err(self.err_here("VARIADIC argument must be last"));
+                        self.push(&mut args, argument)?;
+                        self.push(&mut names, argument_name)?;
+                        if this_variadic {
+                            func_variadic = true;
+                            if self.peeked != Tok::Op(")") {
+                                return Err(self.err_here("VARIADIC argument must be last"));
+                            }
+                            break;
                         }
-                        break;
-                    }
-                    if !self.eat_op(",")? {
-                        break;
+                        if !self.eat_op(",")? {
+                            break;
+                        }
                     }
                 }
-            }
-            self.expect_op(")")?;
-            if saw_named {
-                func_argument_names = names.as_slice();
-            }
-            Some(args.as_slice())
-        } else {
-            None
-        };
+                self.expect_op(")")?;
+                if saw_named {
+                    func_argument_names = names.as_slice();
+                }
+                Some(args.as_slice())
+            } else {
+                None
+            };
         if func_args.is_some() && inheritance == RelationInheritance::Only {
             return Err(self.err_here("ONLY requires a relation, not a function call"));
         }
@@ -4678,12 +4698,31 @@ impl<'a> Parser<'a> {
     }
 
     fn configuration_parameter_name(&mut self) -> Result<&'a str, ParseError> {
-        let start = self.peek_at;
-        let _ = self.any_ident("configuration parameter")?;
-        while self.eat_op(".")? {
-            let _ = self.any_ident("configuration parameter component")?;
+        let first = self.col_ident("configuration parameter")?;
+        if !self.eat_op(".")? {
+            return Ok(first);
         }
-        Ok(self.text[start..self.peek_at].trim())
+        let mut bytes = ArenaList::new(self.arena);
+        for byte in first.as_bytes() {
+            bytes
+                .push(*byte)
+                .map_err(|_| self.arena_full("configuration name exceeds SQL arena"))?;
+        }
+        loop {
+            bytes
+                .push(b'.')
+                .map_err(|_| self.arena_full("configuration name exceeds SQL arena"))?;
+            let component = self.col_ident("configuration parameter component")?;
+            for byte in component.as_bytes() {
+                bytes
+                    .push(*byte)
+                    .map_err(|_| self.arena_full("configuration name exceeds SQL arena"))?;
+            }
+            if !self.eat_op(".")? {
+                break;
+            }
+        }
+        Ok(core::str::from_utf8(bytes.as_slice()).expect("decoded configuration name is UTF-8"))
     }
 
     fn routine_privilege_target(
@@ -5113,19 +5152,18 @@ impl<'a> Parser<'a> {
         }
         if self.eat_ident("system")? {
             if self.eat_ident("set")? {
-                let name = self.any_ident("configuration parameter")?;
-                let _ = self.eat_op("=")?;
-                let start = self.peek_at;
-                while !matches!(self.peeked, Tok::Op(";") | Tok::Eof) {
-                    self.advance()?;
+                let name = self.configuration_parameter_name()?;
+                if !self.eat_op("=")? {
+                    self.expect_ident("to")?;
                 }
-                let value = self.text[start..self.peek_at].trim();
-                if value.is_empty() {
-                    return Err(self.err_here("configuration value is required"));
-                }
+                let value = match self.configuration_value_list(name, true)? {
+                    RoutineConfigValue::Value(value) => Some(value),
+                    RoutineConfigValue::Default => None,
+                    RoutineConfigValue::Current => unreachable!("ALTER SYSTEM has no FROM CURRENT"),
+                };
                 return Ok(Stmt::AlterSystem {
                     name: Some(name),
-                    value: Some(value),
+                    value,
                 });
             }
             self.expect_ident("reset")?;
@@ -8286,23 +8324,88 @@ impl<'a> Parser<'a> {
         Ok(parsed)
     }
 
-    fn configuration_value_list(&mut self) -> Result<&'a str, ParseError> {
-        let start = self.peek_at;
+    fn configuration_value_list(
+        &mut self,
+        name: &str,
+        allow_list: bool,
+    ) -> Result<RoutineConfigValue<'a>, ParseError> {
+        if self.eat_ident("default")? {
+            return Ok(RoutineConfigValue::Default);
+        }
+        let mut bytes = ArenaList::new(self.arena);
+        let mut count = 0;
         loop {
-            if (self.eat_op("+")? || self.eat_op("-")?) && !matches!(self.peeked, Tok::Num(_)) {
+            let negative = self.eat_op("-")?;
+            let positive = !negative && self.eat_op("+")?;
+            if (positive || negative) && !matches!(self.peeked, Tok::Num(_)) {
                 return Err(self.unexpected("expected a numeric configuration value"));
             }
-            match self.peeked {
-                Tok::Ident(_) | Tok::QuotedIdent(_) | Tok::Str(_) | Tok::Num(_) => {
-                    self.advance()?;
-                }
+            let (value, identifier) = match self.peeked {
+                Tok::Ident(value) | Tok::QuotedIdent(value) => (value, true),
+                Tok::Str(value) | Tok::Num(value) => (value, false),
                 _ => return Err(self.unexpected("expected a configuration value")),
+            };
+            let path = name.eq_ignore_ascii_case("search_path");
+            if path && identifier && value.len() > 63 {
+                return Err(ParseError {
+                    at: self.peek_at,
+                    message: stack_format!(96, "search_path identifier is longer than 63 bytes"),
+                    sqlstate: sqlstate::NAME_TOO_LONG,
+                });
             }
+            if count != 0 {
+                for byte in b", " {
+                    bytes
+                        .push(*byte)
+                        .map_err(|_| self.arena_full("configuration value exceeds SQL arena"))?;
+                }
+            }
+            let quoted = path && super::eval::ident_needs_quotes(value);
+            if quoted {
+                bytes
+                    .push(b'"')
+                    .map_err(|_| self.arena_full("configuration value exceeds SQL arena"))?;
+            }
+            if negative {
+                bytes
+                    .push(b'-')
+                    .map_err(|_| self.arena_full("configuration value exceeds SQL arena"))?;
+            }
+            for byte in value.as_bytes() {
+                bytes
+                    .push(*byte)
+                    .map_err(|_| self.arena_full("configuration value exceeds SQL arena"))?;
+                if quoted && *byte == b'"' {
+                    bytes
+                        .push(b'"')
+                        .map_err(|_| self.arena_full("configuration value exceeds SQL arena"))?;
+                }
+            }
+            if quoted {
+                bytes
+                    .push(b'"')
+                    .map_err(|_| self.arena_full("configuration value exceeds SQL arena"))?;
+            }
+            count += 1;
+            self.advance()?;
             if !self.eat_op(",")? {
                 break;
             }
+            if !allow_list {
+                return Err(self.unexpected("expected one configuration value"));
+            }
+            if !name.eq_ignore_ascii_case("search_path") && !name.eq_ignore_ascii_case("datestyle")
+            {
+                return Err(ParseError {
+                    at: self.peek_at,
+                    message: stack_format!(96, "parameter \"{}\" requires a single value", name),
+                    sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                });
+            }
         }
-        Ok(self.text[start..self.peek_at].trim())
+        Ok(RoutineConfigValue::Value(
+            core::str::from_utf8(bytes.as_slice()).expect("decoded configuration value is UTF-8"),
+        ))
     }
 
     fn time_zone_setting_value(&mut self) -> Result<&'a str, ParseError> {
@@ -11132,12 +11235,71 @@ mod tests {
     }
 
     #[test]
-    fn routine_parameter_names_obey_postgresql_column_identifier_grammar() {
+    fn named_variadic_arguments_keep_their_names_in_every_call_form() {
+        with_parser(
+            "SELECT f(marker=>7,VARIADIC \"Members\"=>ARRAY[]::integer[]); \
+             SELECT * FROM f(marker=>7,VARIADIC \"Members\"=>ARRAY[]::integer[]); \
+             CALL p(marker=>7,VARIADIC \"Members\"=>ARRAY[]::integer[])",
+            |parser| {
+                let Stmt::Select(select) = parser.next_stmt().unwrap().unwrap() else {
+                    panic!("scalar call")
+                };
+                let SelectItem::Expr {
+                    expression:
+                        Expr::Call {
+                            argument_names,
+                            variadic,
+                            ..
+                        },
+                    ..
+                } = select.items[0]
+                else {
+                    panic!("scalar function expression")
+                };
+                assert!(*variadic);
+                assert_eq!(*argument_names, [Some("marker"), Some("Members")]);
+                let Stmt::Select(select) = parser.next_stmt().unwrap().unwrap() else {
+                    panic!("table call")
+                };
+                let table = &select.from.unwrap().base;
+                assert!(table.func_variadic);
+                assert_eq!(table.func_argument_names, [Some("marker"), Some("Members")]);
+                let Stmt::Call {
+                    argument_names,
+                    variadic,
+                    ..
+                } = parser.next_stmt().unwrap().unwrap()
+                else {
+                    panic!("procedure call")
+                };
+                assert!(variadic);
+                assert_eq!(argument_names, [Some("marker"), Some("Members")]);
+            },
+        );
+        for sql in [
+            "SELECT f(marker=>7,VARIADIC ARRAY[]::integer[])",
+            "SELECT * FROM f(marker=>7,VARIADIC ARRAY[]::integer[])",
+            "CALL p(marker=>7,VARIADIC ARRAY[]::integer[])",
+            "SELECT f(VARIADIC members=>ARRAY[]::integer[],marker=>7)",
+            "SELECT * FROM f(VARIADIC members=>ARRAY[]::integer[],marker=>7)",
+            "CALL p(VARIADIC members=>ARRAY[]::integer[],marker=>7)",
+        ] {
+            with_parser(sql, |parser| {
+                assert!(parser.next_stmt().is_err(), "accepted {sql}");
+            });
+        }
+    }
+
+    #[test]
+    fn routine_parameter_names_obey_postgresql_type_function_identifier_grammar() {
         for sql in [
             "CREATE FUNCTION f(values integer) RETURNS integer LANGUAGE SQL AS 'SELECT 1'",
             "CREATE PROCEDURE p(VARIADIC values integer[]) LANGUAGE SQL AS 'SELECT 1'",
             "ALTER FUNCTION f(values integer) RENAME TO g",
             "DROP PROCEDURE p(values integer)",
+            "CREATE FUNCTION f() RETURNS TABLE (position integer) LANGUAGE SQL AS 'SELECT 1'",
+            "CREATE FUNCTION f() RETURNS TABLE (values integer) LANGUAGE SQL AS 'SELECT 1'",
+            "CREATE FUNCTION f() RETURNS TABLE (select integer) LANGUAGE SQL AS 'SELECT 1'",
         ] {
             with_parser(sql, |parser| {
                 assert!(parser.next_stmt().is_err(), "accepted {sql}")
@@ -11147,6 +11309,9 @@ mod tests {
             "CREATE FUNCTION f(\"values\" integer) RETURNS integer LANGUAGE SQL AS 'SELECT 1'",
             "CREATE FUNCTION f(begin integer, set text) RETURNS integer LANGUAGE SQL AS 'SELECT 1'",
             "CREATE FUNCTION f(left integer) RETURNS integer LANGUAGE SQL AS 'SELECT 1'",
+            "CREATE FUNCTION f() RETURNS TABLE (\"position\" integer) LANGUAGE SQL AS 'SELECT 1'",
+            "CREATE FUNCTION f() RETURNS TABLE (left integer) LANGUAGE SQL AS 'SELECT 1'",
+            "CREATE FUNCTION f() RETURNS TABLE (begin integer, set text) LANGUAGE SQL AS 'SELECT 1, NULL'",
         ] {
             with_parser(sql, |parser| {
                 assert!(parser.next_stmt().unwrap().is_some(), "rejected {sql}")

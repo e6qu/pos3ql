@@ -15,7 +15,7 @@ use super::ast::{TransactionCharacteristics, TransactionIsolation};
 use super::datetime::{DateFormat, DateStyle, FieldOrder, IntervalStyle};
 use super::eval::SqlError;
 
-/// Maximum canonical byte length of a session search path. The resolver's
+/// Maximum stored byte length of a session search path. The resolver's
 /// entry bound is derived from this value, so a byte-valid path cannot overrun
 /// a narrower effective-path array.
 pub const SEARCH_PATH_BYTES: usize = 128;
@@ -269,9 +269,7 @@ pub fn set_active_config(
         // for exactly the dynamic extent of execute_stmt and its Drop guard
         // clears it on every exit. GucState mutation is behind RefCell.
         let guc = unsafe { &*pointer };
-        if let Some(characteristics) =
-            guc.current_transaction_setting(name, value.unwrap_or("DEFAULT"))
-        {
+        if let Some(characteristics) = guc.current_transaction_value(name, value) {
             let characteristics = characteristics?;
             let txn_pointer = ACTIVE_TXN.with(Cell::get);
             if txn_pointer.is_null() {
@@ -1081,6 +1079,7 @@ fn merge_session_changes(target: &mut GucValues, before: &GucValues, after: &Guc
     changed!(event_triggers);
     changed!(bytea_escape);
     changed!(check_function_bodies);
+    changed!(xml_document);
     changed!(default_transaction_isolation);
     changed!(default_transaction_read_only);
     changed!(default_transaction_deferrable);
@@ -1483,11 +1482,13 @@ impl GucState {
     }
 
     pub fn statement_timeout_ms(&self) -> u64 {
-        parse_timeout_ms(self.store.borrow().current.statement_timeout.as_str()).unwrap_or(0)
+        parse_timeout_ms(self.store.borrow().current.statement_timeout.as_str())
+            .expect("stored statement_timeout is validated")
     }
 
     pub fn lock_timeout_ms(&self) -> u64 {
-        parse_timeout_ms(self.store.borrow().current.lock_timeout.as_str()).unwrap_or(0)
+        parse_timeout_ms(self.store.borrow().current.lock_timeout.as_str())
+            .expect("stored lock_timeout is validated")
     }
 
     pub(crate) fn event_triggers(&self) -> bool {
@@ -1512,43 +1513,49 @@ impl GucState {
         characteristics: TransactionCharacteristics,
     ) -> Result<(), SqlError> {
         if let Some(isolation) = characteristics.isolation {
-            self.set("default_transaction_isolation", isolation.as_str(), false)?;
+            self.assign(
+                "default_transaction_isolation",
+                Some(isolation.as_str()),
+                false,
+            )?;
         }
         if let Some(read_only) = characteristics.read_only {
-            self.set(
+            self.assign(
                 "default_transaction_read_only",
-                if read_only { "on" } else { "off" },
+                Some(if read_only { "on" } else { "off" }),
                 false,
             )?;
         }
         if let Some(deferrable) = characteristics.deferrable {
-            self.set(
+            self.assign(
                 "default_transaction_deferrable",
-                if deferrable { "on" } else { "off" },
+                Some(if deferrable { "on" } else { "off" }),
                 false,
             )?;
         }
         Ok(())
     }
 
-    pub(crate) fn current_transaction_setting(
+    pub(crate) fn current_transaction_value(
         &self,
         name: &str,
-        raw: &str,
+        value: Option<&str>,
     ) -> Option<Result<TransactionCharacteristics, SqlError>> {
-        let value = unquote(raw);
+        if !name.eq_ignore_ascii_case("transaction_isolation")
+            && !name.eq_ignore_ascii_case("transaction_read_only")
+            && !name.eq_ignore_ascii_case("transaction_deferrable")
+        {
+            return None;
+        }
         let mut characteristics = TransactionCharacteristics::EMPTY;
-        let cannot_reset = || {
-            sql_err!(
+        let Some(value) = value else {
+            return Some(Err(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
                 "parameter \"{}\" cannot be reset",
                 name
-            )
+            )));
         };
         if name.eq_ignore_ascii_case("transaction_isolation") {
-            if value.eq_ignore_ascii_case("default") {
-                return Some(Err(cannot_reset()));
-            }
             let isolation = match parse_transaction_isolation(value) {
                 Some(isolation) => isolation,
                 None => {
@@ -1561,21 +1568,15 @@ impl GucState {
             };
             characteristics.isolation = Some(isolation);
         } else if name.eq_ignore_ascii_case("transaction_read_only") {
-            if value.eq_ignore_ascii_case("default") {
-                return Some(Err(cannot_reset()));
-            }
             let read_only = match parse_on_off(value) {
                 Some(read_only) => read_only,
-                None => return Some(Err(unsupported_value("transaction_read_only", value))),
+                None => return Some(Err(invalid_setting_value("transaction_read_only", value))),
             };
             characteristics.read_only = Some(read_only);
         } else if name.eq_ignore_ascii_case("transaction_deferrable") {
-            if value.eq_ignore_ascii_case("default") {
-                return Some(Err(cannot_reset()));
-            }
             let deferrable = match parse_on_off(value) {
                 Some(deferrable) => deferrable,
-                None => return Some(Err(unsupported_value("transaction_deferrable", value))),
+                None => return Some(Err(invalid_setting_value("transaction_deferrable", value))),
             };
             characteristics.deferrable = Some(deferrable);
         } else {
@@ -1606,12 +1607,11 @@ impl GucState {
 
     pub(crate) fn set_from_current(&self, name: &str, local: bool) -> Result<(), SqlError> {
         if name.eq_ignore_ascii_case("seed") {
-            return self.set("seed", "unavailable", local);
+            return self.assign("seed", Some("unavailable"), local);
         }
+        self.capture_setting_value(name)?;
         let mut state = self.store.borrow_mut();
         let values = state.current;
-        let mut validation = values;
-        reset_setting(&mut validation, &values, name)?;
         finish_setting_change(&mut state, values, guc_bit(name), local, false);
         Ok(())
     }
@@ -1632,19 +1632,14 @@ impl GucState {
         }
     }
 
-    /// Applies `SET name = raw`. `raw` is the raw source text of the value
-    /// (surrounding single quotes and whitespace are stripped here). Returns an
-    /// error for an unknown parameter, a read-only parameter, or a value the
-    /// engine cannot honor.
-    pub fn set(&self, name: &str, raw: &str, local: bool) -> Result<(), SqlError> {
+    fn assign(&self, name: &str, value: Option<&str>, local: bool) -> Result<(), SqlError> {
         if name.eq_ignore_ascii_case("seed") {
-            let value = unquote(raw);
-            if value.eq_ignore_ascii_case("default") {
+            let Some(value) = value else {
                 return Err(sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
                     "parameter \"seed\" cannot be reset"
                 ));
-            }
+            };
             let seed = value.parse::<f64>().map_err(|_| {
                 sql_err!(
                     sqlstate::INVALID_PARAMETER_VALUE,
@@ -1656,40 +1651,26 @@ impl GucState {
         }
         let mut state = self.store.borrow_mut();
         let mut values = state.current;
-        change_setting(&mut values, &state.defaults, name, raw)?;
+        change_setting(&mut values, &state.defaults, name, value)?;
         super::txn::validate_isolation_mode(
             self.transaction_mode,
             values.default_transaction_isolation,
         )?;
         let bit = guc_bit(name);
-        let resetting = unquote(raw).eq_ignore_ascii_case("default");
+        let resetting = value.is_none();
         finish_setting_change(&mut state, values, bit, local, resetting);
         Ok(())
     }
 
     pub(crate) fn set_time_zone_sql(&self, raw: &str, local: bool) -> Result<(), SqlError> {
-        let value = unquote(raw);
+        let value = raw.trim();
         if value.eq_ignore_ascii_case("local") || value.eq_ignore_ascii_case("default") {
-            return self.set("timezone", "DEFAULT", local);
+            return self.assign("timezone", None, local);
         }
-        let text = raw.trim();
-        let numeric = text.strip_prefix(['+', '-']).unwrap_or(text);
-        if numeric.is_empty()
-            || !numeric
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || byte == b'.')
-            || numeric.bytes().filter(|byte| *byte == b'.').count() > 1
-        {
-            return self.set("timezone", raw, local);
+        if let Some(seconds) = time_zone_numeric_offset(value)? {
+            return self.set_time_zone_offset(seconds, local);
         }
-        let hours = text
-            .parse::<f64>()
-            .map_err(|_| unsupported_value("TimeZone", value))?;
-        let seconds = hours * 3600.0;
-        if !seconds.is_finite() || seconds.fract() != 0.0 {
-            return Err(unsupported_value("TimeZone", value));
-        }
-        self.set_time_zone_offset(seconds as i32, local)
+        self.assign("timezone", Some(value), local)
     }
 
     pub(crate) fn set_time_zone_interval(
@@ -1697,32 +1678,21 @@ impl GucState {
         interval: super::types::Interval,
         local: bool,
     ) -> Result<(), SqlError> {
-        if interval.months != 0 {
-            return Err(unsupported_value("TimeZone", "interval containing months"));
+        if interval.months != 0 || interval.days != 0 {
+            return Err(invalid_setting_value(
+                "TimeZone",
+                "interval containing months or days",
+            ));
         }
-        let micros = i64::from(interval.days)
-            .checked_mul(86_400_000_000)
-            .and_then(|days| days.checked_add(interval.micros))
-            .ok_or_else(|| unsupported_value("TimeZone", "interval"))?;
-        if micros % 1_000_000 != 0 {
-            return Err(unsupported_value("TimeZone", "fractional-second interval"));
-        }
-        let seconds = i32::try_from(micros / 1_000_000)
-            .map_err(|_| unsupported_value("TimeZone", "interval"))?;
+        let seconds = i32::try_from(interval.micros / 1_000_000)
+            .map_err(|_| invalid_setting_value("TimeZone", "interval"))?;
         self.set_time_zone_offset(seconds, local)
     }
 
     fn set_time_zone_offset(&self, seconds_east: i32, local: bool) -> Result<(), SqlError> {
-        if !(-57_599..=57_599).contains(&seconds_east) {
-            return Err(unsupported_value("TimeZone", "UTC offset"));
-        }
-        let east = super::datetime::iso_offset_string(seconds_east);
-        let west = super::datetime::iso_offset_string(-seconds_east);
-        let display = crate::stack_format!(32, "<{}>{}", east.as_str(), west.as_str());
         let mut state = self.store.borrow_mut();
         let mut values = state.current;
-        store(&mut values.timezone, display.as_str())?;
-        values.parsed_timezone = super::timezone::Timezone::fixed(seconds_east, "", false);
+        apply_time_zone_offset(&mut values, seconds_east)?;
         finish_setting_change(&mut state, values, GUC_TIMEZONE, local, false);
         Ok(())
     }
@@ -1730,7 +1700,7 @@ impl GucState {
     pub(crate) fn set_cluster_default(&self, name: &str, raw: &str) -> Result<(), SqlError> {
         let mut state = self.store.borrow_mut();
         let mut cluster = state.cluster_defaults;
-        change_setting(&mut cluster, &GucValues::new(), name, raw)?;
+        change_setting(&mut cluster, &GucValues::new(), name, Some(raw))?;
         state.cluster_defaults = cluster;
         state.cluster_overrides |= guc_bit(name);
         Self::recompute_cluster_defaults(&mut state);
@@ -1751,7 +1721,7 @@ impl GucState {
     ) -> Result<(), SqlError> {
         let mut state = self.store.borrow_mut();
         let mut values = state.defaults;
-        change_setting(&mut values, &state.defaults, name, raw)?;
+        change_setting(&mut values, &state.defaults, name, Some(raw))?;
         let bit = guc_bit(name);
         state.connection_overrides |= bit;
         state.database_overrides &= !bit;
@@ -1833,7 +1803,7 @@ impl GucState {
     }
 
     pub fn reset(&self, name: &str) -> Result<(), SqlError> {
-        self.set(name, "DEFAULT", false)
+        self.assign(name, None, false)
     }
 
     pub fn reset_all(&self) {
@@ -1942,7 +1912,7 @@ impl GucState {
         value: Option<&str>,
         local: bool,
     ) -> Result<StackStr<256>, SqlError> {
-        self.set(name, value.unwrap_or("DEFAULT"), local)?;
+        self.assign(name, value, local)?;
         self.get_owned(name).ok_or_else(|| {
             sql_err!(
                 sqlstate::UNDEFINED_OBJECT,
@@ -1952,28 +1922,35 @@ impl GucState {
         })
     }
 
-    pub(crate) fn canonical_routine_setting(
-        &self,
-        name: &str,
-        raw: &str,
-    ) -> Result<StackStr<256>, SqlError> {
-        let prior = {
-            let mut state = self.store.borrow_mut();
-            let prior = state.current;
-            let mut values = state.current;
-            change_setting(&mut values, &state.defaults, name, raw)?;
-            state.current = values;
-            prior
-        };
+    pub(crate) fn capture_setting_value(&self, name: &str) -> Result<StackStr<256>, SqlError> {
         let value = self.get_owned(name).ok_or_else(|| {
             sql_err!(
                 sqlstate::UNDEFINED_OBJECT,
                 "unrecognized configuration parameter \"{}\"",
                 name
             )
-        });
-        self.store.borrow_mut().current = prior;
-        value
+        })?;
+        self.validate_setting_value(name, Some(value.as_str()))?;
+        Ok(value)
+    }
+
+    pub(crate) fn validate_system_reset(&self, name: &str) -> Result<(), SqlError> {
+        match read_only_parameter_context(name) {
+            Some(ReadOnlyParameterContext::Startup) => Ok(()),
+            Some(ReadOnlyParameterContext::Internal) | None => {
+                self.validate_setting_value(name, None)
+            }
+        }
+    }
+
+    pub(crate) fn validate_setting_value(
+        &self,
+        name: &str,
+        value: Option<&str>,
+    ) -> Result<(), SqlError> {
+        let state = self.store.borrow();
+        let mut values = state.current;
+        change_setting(&mut values, &state.defaults, name, value)
     }
 
     pub(crate) fn enter_routine_configs(
@@ -1989,7 +1966,7 @@ impl GucState {
                 &mut current,
                 &state.defaults,
                 config.name.as_str(),
-                config.value.as_str(),
+                Some(config.value.as_str()),
             )?;
         }
         state.current = current;
@@ -2045,12 +2022,11 @@ fn change_setting(
     values: &mut GucValues,
     defaults: &GucValues,
     name: &str,
-    raw: &str,
+    value: Option<&str>,
 ) -> Result<(), SqlError> {
-    if unquote(raw).eq_ignore_ascii_case("default") {
-        reset_setting(values, defaults, name)
-    } else {
-        apply_setting(values, name, raw)
+    match value {
+        Some(value) => apply_setting(values, defaults, name, value),
+        None => reset_setting(values, defaults, name),
     }
 }
 
@@ -2088,6 +2064,8 @@ fn reset_setting(values: &mut GucValues, defaults: &GucValues, name: &str) -> Re
         values.bytea_escape = defaults.bytea_escape;
     } else if name.eq_ignore_ascii_case("check_function_bodies") {
         values.check_function_bodies = defaults.check_function_bodies;
+    } else if name.eq_ignore_ascii_case("xmloption") {
+        values.xml_document = defaults.xml_document;
     } else if name.eq_ignore_ascii_case("intervalstyle") {
         values.intervalstyle = defaults.intervalstyle;
     } else if name.eq_ignore_ascii_case("default_transaction_isolation") {
@@ -2103,7 +2081,6 @@ fn reset_setting(values: &mut GucValues, defaults: &GucValues, name: &str) -> Re
     } else if name.eq_ignore_ascii_case("synchronize_seqscans") {
         // Storage scans are deterministic and never synchronize their starts.
     } else if name.eq_ignore_ascii_case("standard_conforming_strings")
-        || name.eq_ignore_ascii_case("xmloption")
         || name.eq_ignore_ascii_case("default_table_access_method")
         || name.eq_ignore_ascii_case("idle_in_transaction_session_timeout")
         || name.eq_ignore_ascii_case("transaction_timeout")
@@ -2125,39 +2102,35 @@ fn reset_setting(values: &mut GucValues, defaults: &GucValues, name: &str) -> Re
     Ok(())
 }
 
-fn apply_setting(values: &mut GucValues, name: &str, raw: &str) -> Result<(), SqlError> {
-    let v = unquote(raw);
-    let is_default = v.eq_ignore_ascii_case("default");
-
+fn apply_setting(
+    values: &mut GucValues,
+    defaults: &GucValues,
+    name: &str,
+    v: &str,
+) -> Result<(), SqlError> {
     if name.eq_ignore_ascii_case("datestyle") {
-        // DateStyle is cumulative: each SET updates only the components it
-        // names, keeping the rest.
-        let (fmt, ord) = if is_default {
-            (DateFormat::Iso, Order3::Mdy)
-        } else {
-            let cur = parse_full(values.datestyle.as_str());
-            apply_datestyle(cur, v).ok_or_else(|| unsupported_value("DateStyle", v))?
-        };
+        let current = parse_full(values.datestyle.as_str());
+        let reset = parse_full(defaults.datestyle.as_str());
+        let (format, order) = apply_datestyle(current, reset, v)?;
         return store(
             &mut values.datestyle,
-            canonical_datestyle(fmt, ord).as_str(),
+            canonical_datestyle(format, order).as_str(),
         );
     }
     if name.eq_ignore_ascii_case("timezone") {
+        if let Some(seconds) = time_zone_numeric_offset(v)? {
+            return apply_time_zone_offset(values, seconds);
+        }
         // UTC, fixed numeric offsets, Etc/GMT±N, and named IANA zones (with
         // DST) are honored; an unknown zone is rejected loudly.
-        let timezone = if is_default {
-            super::timezone::Timezone::utc()
-        } else {
-            parse_timezone(v).ok_or_else(|| {
-                sql_err!(
-                    crate::sql::eval::sqlstate::INVALID_PARAMETER_VALUE,
-                    "invalid value for parameter \"TimeZone\": \"{}\"",
-                    v
-                )
-            })?
-        };
-        store(&mut values.timezone, if is_default { "UTC" } else { v })?;
+        let timezone = parse_timezone(v).ok_or_else(|| {
+            sql_err!(
+                crate::sql::eval::sqlstate::INVALID_PARAMETER_VALUE,
+                "invalid value for parameter \"TimeZone\": \"{}\"",
+                v
+            )
+        })?;
+        store(&mut values.timezone, v)?;
         values.parsed_timezone = timezone;
         return Ok(());
     }
@@ -2165,7 +2138,7 @@ fn apply_setting(values: &mut GucValues, name: &str, raw: &str) -> Result<(), Sq
         // UTF8 is native; SQL_ASCII is byte-pass-through (no conversion), so
         // both are served without transcoding. Any other encoding would
         // require a conversion we do not implement.
-        if is_default || is_utf8(v) {
+        if is_utf8(v) {
             return store(&mut values.client_encoding, "UTF8");
         }
         if v.eq_ignore_ascii_case("sql_ascii") {
@@ -2178,7 +2151,7 @@ fn apply_setting(values: &mut GucValues, name: &str, raw: &str) -> Result<(), Sq
         ));
     }
     if name.eq_ignore_ascii_case("standard_conforming_strings") {
-        if is_default || v.eq_ignore_ascii_case("on") {
+        if parse_on_off(v).ok_or_else(|| invalid_setting_value(name, v))? {
             return Ok(());
         }
         return Err(sql_err!(
@@ -2187,40 +2160,31 @@ fn apply_setting(values: &mut GucValues, name: &str, raw: &str) -> Result<(), Sq
         ));
     }
     if name.eq_ignore_ascii_case("check_function_bodies") {
-        values.check_function_bodies = if is_default {
-            true
-        } else {
-            parse_on_off(v).ok_or_else(|| unsupported_value("check_function_bodies", v))?
-        };
+        values.check_function_bodies =
+            parse_on_off(v).ok_or_else(|| invalid_setting_value("check_function_bodies", v))?;
         return Ok(());
     }
     if name.eq_ignore_ascii_case("xmloption") {
-        values.xml_document = if is_default || v.eq_ignore_ascii_case("content") {
+        values.xml_document = if v.eq_ignore_ascii_case("content") {
             false
         } else if v.eq_ignore_ascii_case("document") {
             true
         } else {
-            return Err(unsupported_value("xmloption", v));
+            return Err(invalid_setting_value("xmloption", v));
         };
         return Ok(());
     }
     if name.eq_ignore_ascii_case("default_tablespace") {
-        return store(
-            &mut values.default_tablespace,
-            if is_default { "" } else { v },
-        );
+        return store(&mut values.default_tablespace, v);
     }
     if name.eq_ignore_ascii_case("default_text_search_config") {
         if v.is_empty() {
-            return Err(unsupported_value("default_text_search_config", v));
+            return Err(invalid_setting_value("default_text_search_config", v));
         }
-        return store(
-            &mut values.default_text_search_config,
-            if is_default { "pg_catalog.english" } else { v },
-        );
+        return store(&mut values.default_text_search_config, v);
     }
     if name.eq_ignore_ascii_case("default_table_access_method") {
-        if is_default || v.eq_ignore_ascii_case("heap") {
+        if v == "heap" {
             return Ok(());
         }
         return Err(sql_err!(
@@ -2230,24 +2194,17 @@ fn apply_setting(values: &mut GucValues, name: &str, raw: &str) -> Result<(), Sq
         ));
     }
     if name.eq_ignore_ascii_case("intervalstyle") {
-        values.intervalstyle = if is_default {
-            IntervalStyle::Postgres
-        } else {
-            IntervalStyle::parse(v).ok_or_else(|| {
-                sql_err!(
-                    sqlstate::INVALID_PARAMETER_VALUE,
-                    "invalid value for parameter \"IntervalStyle\": \"{}\"",
-                    v
-                )
-            })?
-        };
+        values.intervalstyle = IntervalStyle::parse(v).ok_or_else(|| {
+            sql_err!(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "invalid value for parameter \"IntervalStyle\": \"{}\"",
+                v
+            )
+        })?;
         return Ok(());
     }
     if name.eq_ignore_ascii_case("lc_monetary") {
-        let canonical = if is_default
-            || v.eq_ignore_ascii_case("C.UTF-8")
-            || v.eq_ignore_ascii_case("C.utf8")
-        {
+        let canonical = if v.eq_ignore_ascii_case("C.UTF-8") || v.eq_ignore_ascii_case("C.utf8") {
             "C.UTF-8"
         } else if v.eq_ignore_ascii_case("C") || v.eq_ignore_ascii_case("POSIX") {
             "C"
@@ -2263,7 +2220,7 @@ fn apply_setting(values: &mut GucValues, name: &str, raw: &str) -> Result<(), Sq
         return store(&mut values.lc_monetary, canonical);
     }
     if name.eq_ignore_ascii_case("synchronize_seqscans") {
-        if is_default || v.eq_ignore_ascii_case("off") {
+        if !parse_on_off(v).ok_or_else(|| invalid_setting_value(name, v))? {
             return Ok(());
         }
         return Err(sql_err!(
@@ -2274,51 +2231,34 @@ fn apply_setting(values: &mut GucValues, name: &str, raw: &str) -> Result<(), Sq
     if name.eq_ignore_ascii_case("client_min_messages") {
         // Filters which NOTICE/WARNING messages reach the client. The
         // default is `notice`; an unrecognized level errors like PostgreSQL.
-        values.client_min_messages = if is_default {
-            MessageLevel::Notice
-        } else {
-            MessageLevel::parse(v).ok_or_else(|| {
-                sql_err!(
-                    sqlstate::INVALID_PARAMETER_VALUE,
-                    "invalid value for parameter \"client_min_messages\": \"{}\"",
-                    v
-                )
-            })?
-        };
+        values.client_min_messages = MessageLevel::parse(v).ok_or_else(|| {
+            sql_err!(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "invalid value for parameter \"client_min_messages\": \"{}\"",
+                v
+            )
+        })?;
         return Ok(());
     }
     if name.eq_ignore_ascii_case("application_name") {
-        return store(
-            &mut values.application_name,
-            if is_default { "" } else { v },
-        );
+        values.application_name = sanitize_application_name(v)?;
+        return Ok(());
     }
     if name.eq_ignore_ascii_case("search_path") {
-        if is_default {
-            return store(&mut values.search_path, "\"$user\", public");
-        }
-        let mut canonical = StackStr::<128>::new();
-        // The raw text, not the pre-unquoted value: quoting decides how
-        // elements split, and a single-quoted string is one element
-        // however many commas it holds.
-        canonicalize_search_path(raw, &mut canonical)?;
-        return store(&mut values.search_path, canonical.as_str());
+        validate_search_path(v)?;
+        return store(&mut values.search_path, v);
     }
     if name.eq_ignore_ascii_case("extra_float_digits") {
         // Floats already render at their shortest exact round-trip form —
         // the extra_float_digits >= 0 behavior — so the value is validated
         // to PostgreSQL's range and retained for SHOW.
-        let n: i32 = if is_default {
-            1
-        } else {
-            v.parse().map_err(|_| {
-                sql_err!(
-                    sqlstate::INVALID_PARAMETER_VALUE,
-                    "invalid value for parameter \"extra_float_digits\": \"{}\"",
-                    v
-                )
-            })?
-        };
+        let n: i32 = v.parse().map_err(|_| {
+            sql_err!(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "invalid value for parameter \"extra_float_digits\": \"{}\"",
+                v
+            )
+        })?;
         if !(-15..=3).contains(&n) {
             return Err(sql_err!(
                 sqlstate::INVALID_PARAMETER_VALUE,
@@ -2331,9 +2271,6 @@ fn apply_setting(values: &mut GucValues, name: &str, raw: &str) -> Result<(), Sq
         return Ok(());
     }
     if name.eq_ignore_ascii_case("lock_timeout") {
-        if is_default {
-            return store(&mut values.lock_timeout, "0");
-        }
         if parse_timeout_ms(v).is_none() {
             return Err(sql_err!(
                 sqlstate::INVALID_PARAMETER_VALUE,
@@ -2345,9 +2282,7 @@ fn apply_setting(values: &mut GucValues, name: &str, raw: &str) -> Result<(), Sq
     }
     if name.eq_ignore_ascii_case("statement_timeout") {
         // Enforced at scan boundaries during execution.
-        if is_default {
-            return store(&mut values.statement_timeout, "0");
-        }
+
         if parse_timeout_ms(v).is_none() {
             return Err(sql_err!(
                 sqlstate::INVALID_PARAMETER_VALUE,
@@ -2362,7 +2297,7 @@ fn apply_setting(values: &mut GucValues, name: &str, raw: &str) -> Result<(), Sq
     {
         // These timeout mechanisms do not run yet, so only the disabled value
         // is honored; a non-zero value would be a silent no-operator.
-        if is_default || v == "0" {
+        if parse_timeout_ms(v).ok_or_else(|| invalid_setting_value(name, v))? == 0 {
             return Ok(());
         }
         return Err(sql_err!(
@@ -2372,7 +2307,7 @@ fn apply_setting(values: &mut GucValues, name: &str, raw: &str) -> Result<(), Sq
         ));
     }
     if name.eq_ignore_ascii_case("bytea_output") {
-        if is_default || v.eq_ignore_ascii_case("hex") {
+        if v.eq_ignore_ascii_case("hex") {
             values.bytea_escape = false;
             return Ok(());
         }
@@ -2387,53 +2322,36 @@ fn apply_setting(values: &mut GucValues, name: &str, raw: &str) -> Result<(), Sq
         ));
     }
     if name.eq_ignore_ascii_case("row_security") {
-        let on = if is_default {
-            true
-        } else {
-            parse_on_off(v).ok_or_else(|| unsupported_value("row_security", v))?
-        };
+        let on = parse_on_off(v).ok_or_else(|| invalid_setting_value("row_security", v))?;
         return store(&mut values.row_security, if on { "on" } else { "off" });
     }
     if name.eq_ignore_ascii_case("event_triggers") {
-        values.event_triggers = if is_default {
-            true
-        } else {
-            parse_on_off(v).ok_or_else(|| unsupported_value("event_triggers", v))?
-        };
+        values.event_triggers =
+            parse_on_off(v).ok_or_else(|| invalid_setting_value("event_triggers", v))?;
         return Ok(());
     }
     if name.eq_ignore_ascii_case("default_transaction_isolation") {
-        values.default_transaction_isolation = if is_default {
-            TransactionIsolation::ReadCommitted
-        } else {
-            parse_transaction_isolation(v).ok_or_else(|| {
-                sql_err!(
-                    sqlstate::INVALID_PARAMETER_VALUE,
-                    "invalid value for parameter \"default_transaction_isolation\": \"{}\"",
-                    v
-                )
-            })?
-        };
+        values.default_transaction_isolation = parse_transaction_isolation(v).ok_or_else(|| {
+            sql_err!(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "invalid value for parameter \"default_transaction_isolation\": \"{}\"",
+                v
+            )
+        })?;
         return Ok(());
     }
     if name.eq_ignore_ascii_case("default_transaction_read_only") {
-        values.default_transaction_read_only = if is_default {
-            false
-        } else {
-            parse_on_off(v).ok_or_else(|| unsupported_value("default_transaction_read_only", v))?
-        };
+        values.default_transaction_read_only = parse_on_off(v)
+            .ok_or_else(|| invalid_setting_value("default_transaction_read_only", v))?;
         return Ok(());
     }
     if name.eq_ignore_ascii_case("default_transaction_deferrable") {
-        values.default_transaction_deferrable = if is_default {
-            false
-        } else {
-            parse_on_off(v).ok_or_else(|| unsupported_value("default_transaction_deferrable", v))?
-        };
+        values.default_transaction_deferrable = parse_on_off(v)
+            .ok_or_else(|| invalid_setting_value("default_transaction_deferrable", v))?;
         return Ok(());
     }
     if name.eq_ignore_ascii_case("password_encryption") {
-        values.password_encryption = if is_default || v.eq_ignore_ascii_case("scram-sha-256") {
+        values.password_encryption = if v.eq_ignore_ascii_case("scram-sha-256") {
             PasswordEncryption::ScramSha256
         } else if v.eq_ignore_ascii_case("md5") {
             PasswordEncryption::Md5
@@ -2447,14 +2365,14 @@ fn apply_setting(values: &mut GucValues, name: &str, raw: &str) -> Result<(), Sq
         return Ok(());
     }
     if name.eq_ignore_ascii_case("track_functions") {
-        values.track_functions = if is_default || v.eq_ignore_ascii_case("none") {
+        values.track_functions = if v.eq_ignore_ascii_case("none") {
             TrackFunctions::None
         } else if v.eq_ignore_ascii_case("pl") {
             TrackFunctions::Pl
         } else if v.eq_ignore_ascii_case("all") {
             TrackFunctions::All
         } else {
-            return Err(unsupported_value("track_functions", v));
+            return Err(invalid_setting_value("track_functions", v));
         };
         return Ok(());
     }
@@ -2502,7 +2420,11 @@ impl GucState {
             min_message_level: values.client_min_messages,
             bytea_escape: values.bytea_escape,
             xml_document: values.xml_document,
-            extra_float_digits: values.extra_float_digits.as_str().parse().unwrap_or(1),
+            extra_float_digits: values
+                .extra_float_digits
+                .as_str()
+                .parse()
+                .expect("stored extra_float_digits is validated"),
         }
     }
 }
@@ -2608,18 +2530,19 @@ fn owned_setting(values: &GucValues, name: &str) -> Option<StackStr<256>> {
 
 /// Parses a PostgreSQL boolean GUC value (on/off/true/false/1/0), allocation-free.
 fn parse_on_off(v: &str) -> Option<bool> {
-    if ["on", "true", "yes", "1"]
-        .iter()
-        .any(|s| v.eq_ignore_ascii_case(s))
-    {
-        Some(true)
-    } else if ["off", "false", "no", "0"]
-        .iter()
-        .any(|s| v.eq_ignore_ascii_case(s))
-    {
-        Some(false)
-    } else {
-        None
+    if v.is_empty() {
+        return None;
+    }
+    let matches = |word: &str| {
+        word.get(..v.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(v))
+    };
+    let on = ["on", "true", "yes", "1"].into_iter().any(matches);
+    let off = ["off", "false", "no", "0"].into_iter().any(matches);
+    match (on, off) {
+        (true, false) => Some(true),
+        (false, true) => Some(false),
+        _ => None,
     }
 }
 
@@ -2639,9 +2562,9 @@ pub(crate) fn parse_transaction_isolation(v: &str) -> Option<TransactionIsolatio
 
 /// Parses a `statement_timeout` value into milliseconds: a bare integer is
 /// milliseconds, or a `ms`/`s`/`min`/`h`/`d` unit suffix scales it (matching
-/// PostgreSQL). Returns None for a malformed value.
+/// PostgreSQL). Returns None for malformed values or values above i32::MAX.
 fn parse_timeout_ms(v: &str) -> Option<u64> {
-    let t = v.trim().trim_matches('\'').trim();
+    let t = v.trim();
     let (num_part, mult) = if let Some(n) = t.strip_suffix("ms") {
         (n, 1u64)
     } else if let Some(n) = t.strip_suffix("min") {
@@ -2660,6 +2583,33 @@ fn parse_timeout_ms(v: &str) -> Option<u64> {
         .parse::<u64>()
         .ok()
         .and_then(|n| n.checked_mul(mult))
+        .filter(|milliseconds| *milliseconds <= i32::MAX as u64)
+}
+
+// PostgreSQL escapes each non-printable UTF-8 byte, preserving ASCII backslashes.
+// https://github.com/postgres/postgres/blob/REL_18_6/src/common/string.c#L81
+fn sanitize_application_name(value: &str) -> Result<StackStr<64>, SqlError> {
+    let mut clean = StackStr::new();
+    for byte in value.bytes() {
+        if byte == 0 {
+            return Err(sql_err!(
+                sqlstate::CHARACTER_NOT_IN_REPERTOIRE,
+                "invalid byte sequence for encoding \"UTF8\": 0x00"
+            ));
+        }
+        if (b' '..=b'~').contains(&byte) {
+            let _ = clean.write_char(char::from(byte));
+        } else {
+            let _ = write!(clean, "\\x{byte:02x}");
+        }
+    }
+    if clean.is_truncated() {
+        return Err(sql_err!(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "application_name exceeds 64 bytes after escaping"
+        ));
+    }
+    Ok(clean)
 }
 
 fn store<const N: usize>(dst: &mut StackStr<N>, v: &str) -> Result<(), SqlError> {
@@ -2674,17 +2624,6 @@ fn store<const N: usize>(dst: &mut StackStr<N>, v: &str) -> Result<(), SqlError>
     Ok(())
 }
 
-/// Strips one layer of surrounding single quotes (and doubled `''` escapes)
-/// and trims whitespace, turning raw source text into the value.
-fn unquote(raw: &str) -> &str {
-    let t = raw.trim();
-    if t.len() >= 2 && t.starts_with('\'') && t.ends_with('\'') {
-        &t[1..t.len() - 1]
-    } else {
-        t
-    }
-}
-
 /// Field order as PostgreSQL tracks it (YMD is preserved for SHOW even though
 /// output renders it like MDY).
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2696,51 +2635,115 @@ enum Order3 {
 
 /// Parses a stored canonical DateStyle string (always well-formed).
 fn parse_full(s: &str) -> (DateFormat, Order3) {
-    apply_datestyle((DateFormat::Iso, Order3::Mdy), s).unwrap_or((DateFormat::Iso, Order3::Mdy))
+    let (style, order) = s
+        .split_once(", ")
+        .expect("stored DateStyle has both canonical components");
+    let style = match style {
+        "ISO" => DateFormat::Iso,
+        "SQL" => DateFormat::Sql,
+        "Postgres" => DateFormat::Postgres,
+        "German" => DateFormat::German,
+        _ => panic!("stored DateStyle has a validated output style"),
+    };
+    let order = match order {
+        "MDY" => Order3::Mdy,
+        "DMY" => Order3::Dmy,
+        "YMD" => Order3::Ymd,
+        _ => panic!("stored DateStyle has a validated field order"),
+    };
+    (style, order)
 }
 
-/// Applies a `SET datestyle` value cumulatively onto `current`, returning the
-/// new (format, order) or None if a token is unrecognized. Selecting German
-/// without naming an order sets DMY, as PostgreSQL does.
-fn apply_datestyle(current: (DateFormat, Order3), v: &str) -> Option<(DateFormat, Order3)> {
-    let (mut fmt, mut ord) = current;
-    let (mut mentioned_order, mut mentioned_german) = (false, false);
-    let mut mentioned_any = false;
-    for tok in v.split([',', ' ']) {
-        let t = tok.trim();
-        if t.is_empty() {
+/// PostgreSQL's check_datestyle applies DEFAULT only to components not yet
+/// explicitly selected. German implies DMY at its own position in the list;
+/// DEFAULT after German can therefore replace that implied order.
+fn apply_datestyle(
+    current: (DateFormat, Order3),
+    reset: (DateFormat, Order3),
+    value: &str,
+) -> Result<(DateFormat, Order3), SqlError> {
+    use core::fmt::Write as _;
+    let (mut format, mut order) = current;
+    let (mut have_style, mut have_order) = (false, false);
+    let mut conflict = false;
+    for component in search_path_components(value) {
+        let component = component.map_err(|_| invalid_setting_value("DateStyle", value))?;
+        let component = component.trim_matches(search_path_space);
+        let mut token = StackStr::<63>::new();
+        if let Some(quoted) = component.strip_prefix('"') {
+            let inner = quoted
+                .strip_suffix('"')
+                .expect("validated identifier has paired quotes");
+            let mut characters = inner.chars().peekable();
+            while let Some(character) = characters.next() {
+                let _ = token.write_char(character);
+                if token.is_truncated() {
+                    break;
+                }
+                if character == '"' {
+                    characters.next();
+                }
+            }
+        } else {
+            let _ = token.write_str(component);
+        }
+        let token = token.as_str();
+        let starts = |prefix: &str| {
+            token
+                .get(..prefix.len())
+                .is_some_and(|part| part.eq_ignore_ascii_case(prefix))
+        };
+        let selected_style = if token.eq_ignore_ascii_case("iso") {
+            Some(DateFormat::Iso)
+        } else if token.eq_ignore_ascii_case("sql") {
+            Some(DateFormat::Sql)
+        } else if starts("postgres") {
+            Some(DateFormat::Postgres)
+        } else if token.eq_ignore_ascii_case("german") {
+            Some(DateFormat::German)
+        } else {
+            None
+        };
+        if let Some(selected) = selected_style {
+            conflict |= have_style && format != selected;
+            format = selected;
+            have_style = true;
+            if selected == DateFormat::German && !have_order {
+                order = Order3::Dmy;
+            }
             continue;
         }
-        mentioned_any = true;
-        if t.eq_ignore_ascii_case("iso") {
-            fmt = DateFormat::Iso;
-        } else if t.eq_ignore_ascii_case("postgres") {
-            fmt = DateFormat::Postgres;
-        } else if t.eq_ignore_ascii_case("sql") {
-            fmt = DateFormat::Sql;
-        } else if t.eq_ignore_ascii_case("german") {
-            fmt = DateFormat::German;
-            mentioned_german = true;
-        } else if t.eq_ignore_ascii_case("mdy") {
-            ord = Order3::Mdy;
-            mentioned_order = true;
-        } else if t.eq_ignore_ascii_case("dmy") {
-            ord = Order3::Dmy;
-            mentioned_order = true;
-        } else if t.eq_ignore_ascii_case("ymd") {
-            ord = Order3::Ymd;
-            mentioned_order = true;
+        let selected_order = if token.eq_ignore_ascii_case("ymd") {
+            Some(Order3::Ymd)
+        } else if token.eq_ignore_ascii_case("dmy") || starts("euro") {
+            Some(Order3::Dmy)
+        } else if token.eq_ignore_ascii_case("mdy")
+            || token.eq_ignore_ascii_case("us")
+            || starts("noneuro")
+        {
+            Some(Order3::Mdy)
         } else {
-            return None;
+            None
+        };
+        if let Some(selected) = selected_order {
+            conflict |= have_order && order != selected;
+            order = selected;
+            have_order = true;
+        } else if token.eq_ignore_ascii_case("default") {
+            if !have_style {
+                format = reset.0;
+            }
+            if !have_order {
+                order = reset.1;
+            }
+        } else {
+            return Err(invalid_setting_value("DateStyle", value));
         }
     }
-    if !mentioned_any {
-        return None;
+    if conflict {
+        return Err(invalid_setting_value("DateStyle", value));
     }
-    if mentioned_german && !mentioned_order {
-        ord = Order3::Dmy;
-    }
-    Some((fmt, ord))
+    Ok((format, order))
 }
 
 fn canonical_datestyle(fmt: DateFormat, ord: Order3) -> StackStr<24> {
@@ -2760,6 +2763,30 @@ fn canonical_datestyle(fmt: DateFormat, ord: Order3) -> StackStr<24> {
     s
 }
 
+/// Catalog settings use PostgreSQL's canonical parameter spelling.
+pub(crate) fn canonical_setting_name(name: &str) -> Result<crate::storage::SqlName, SqlError> {
+    let validated = crate::storage::SqlName::parse(name)?;
+    let special = if name.eq_ignore_ascii_case("datestyle") {
+        Some("DateStyle")
+    } else if name.eq_ignore_ascii_case("timezone") {
+        Some("TimeZone")
+    } else if name.eq_ignore_ascii_case("intervalstyle") {
+        Some("IntervalStyle")
+    } else {
+        None
+    };
+    if let Some(special) = special {
+        return crate::storage::SqlName::parse(special);
+    }
+    let mut normalized = StackStr::<63>::new();
+    for character in validated.as_str().chars() {
+        normalized
+            .write_char(character.to_ascii_lowercase())
+            .expect("ASCII case folding preserves the validated name length");
+    }
+    crate::storage::SqlName::parse(normalized.as_str())
+}
+
 fn is_utc(v: &str) -> bool {
     v.eq_ignore_ascii_case("utc")
         || v.eq_ignore_ascii_case("gmt")
@@ -2767,10 +2794,76 @@ fn is_utc(v: &str) -> bool {
         || v.eq_ignore_ascii_case("universal")
 }
 
-/// Parses a session TimeZone as an installed zone or fixed offset. Datetime
-/// input recognizes abbreviations separately. Matches
-/// PostgreSQL's inverted sign conventions: `Etc/GMT+5` is UTC-5 and a bare
-/// `+05:30` is UTC-5:30.
+// PostgreSQL localtime.c accepts offsets through 167:59:59.
+const TIME_ZONE_MAX_OFFSET_SECONDS: i32 = 167 * 3600 + 59 * 60 + 59;
+
+// Decimal GUC values denote hours east of UTC, including quoted strings.
+// Canonical POSIX names are parsed separately from numeric input.
+// Bare colon-separated offsets instead follow the timezone parser's POSIX sign.
+fn time_zone_numeric_offset(value: &str) -> Result<Option<i32>, SqlError> {
+    let text = value.trim();
+    if let Some((east, west)) = text.strip_prefix('<').and_then(|text| text.split_once('>')) {
+        if let Some(seconds) = parse_hms(east, 167)
+            && super::datetime::iso_offset_string(seconds).as_str() == east
+            && (if seconds == 0 {
+                west == "-00"
+            } else {
+                super::datetime::iso_offset_string(-seconds).as_str() == west
+            })
+        {
+            // PostgreSQL rejects second-bearing named zones as leap-second
+            // zones, although its direct numeric-offset path accepts them.
+            if seconds % 60 != 0 {
+                return Err(invalid_setting_value("TimeZone", value));
+            }
+            return Ok(Some(seconds));
+        }
+        return Ok(None);
+    }
+    let Ok(hours) = text.parse::<f64>() else {
+        return Ok(None);
+    };
+    if hours.is_nan() {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "NaN time zone offsets are not supported"
+        ));
+    }
+    // PostgreSQL converts hours to whole seconds by truncating toward zero.
+    let seconds = (hours * 3600.0).trunc();
+    if !seconds.is_finite()
+        || !(-f64::from(TIME_ZONE_MAX_OFFSET_SECONDS)..=f64::from(TIME_ZONE_MAX_OFFSET_SECONDS))
+            .contains(&seconds)
+    {
+        return Err(invalid_setting_value("TimeZone", value));
+    }
+    Ok(Some(seconds as i32))
+}
+
+fn apply_time_zone_offset(values: &mut GucValues, seconds_east: i32) -> Result<(), SqlError> {
+    if !(-TIME_ZONE_MAX_OFFSET_SECONDS..=TIME_ZONE_MAX_OFFSET_SECONDS).contains(&seconds_east) {
+        return Err(invalid_setting_value("TimeZone", "UTC offset"));
+    }
+    let east = super::datetime::iso_offset_string(seconds_east);
+    let west = super::datetime::iso_offset_string(-seconds_east);
+    let display = crate::stack_format!(
+        32,
+        "<{}>{}",
+        east.as_str(),
+        if seconds_east == 0 {
+            "-00"
+        } else {
+            west.as_str()
+        }
+    );
+    store(&mut values.timezone, display.as_str())?;
+    values.parsed_timezone = super::timezone::Timezone::fixed(seconds_east, "", false);
+    Ok(())
+}
+
+/// Parses timezone names and POSIX offsets; datetime input also recognizes
+/// abbreviations separately. GUC decimal hours are handled before this parser.
+/// `Etc/GMT+5` is UTC-5 and `+05:30` is UTC-5:30.
 pub fn parse_timezone(v: &str) -> Option<super::timezone::Timezone> {
     use super::timezone::Timezone;
     let t = v.trim();
@@ -2800,7 +2893,7 @@ pub fn parse_timezone(v: &str) -> Option<super::timezone::Timezone> {
         if rest.is_empty() {
             return Some(Timezone::utc());
         }
-        let offset = -parse_hms(rest)?;
+        let offset = -parse_hms(rest, 24)?;
         return Some(Timezone::fixed(
             offset,
             super::datetime::iso_offset_string(offset).as_str(),
@@ -2809,13 +2902,13 @@ pub fn parse_timezone(v: &str) -> Option<super::timezone::Timezone> {
     }
     // Bare numeric offset: POSIX inverted sign, no abbreviation shown.
     if t.starts_with('+') || t.starts_with('-') {
-        return Some(Timezone::fixed(-parse_hms(t)?, "", false));
+        return Some(Timezone::fixed(-parse_hms(t, 24)?, "", false));
     }
     None
 }
 
 /// Parses `±HH[:MM[:SS]]` to signed seconds (sign as written, not inverted).
-fn parse_hms(s: &str) -> Option<i32> {
+fn parse_hms(s: &str, max_hours: i32) -> Option<i32> {
     let (sign, rest) = match s.strip_prefix('-') {
         Some(r) => (-1, r),
         None => (1, s.strip_prefix('+').unwrap_or(s)),
@@ -2831,7 +2924,7 @@ fn parse_hms(s: &str) -> Option<i32> {
         None => 0,
     };
     if parts.next().is_some()
-        || !(0..=24).contains(&hh)
+        || !(0..=max_hours).contains(&hh)
         || !(0..60).contains(&mm)
         || !(0..60).contains(&ss)
     {
@@ -2846,118 +2939,105 @@ fn is_utf8(v: &str) -> bool {
         || v.eq_ignore_ascii_case("unicode")
 }
 
-/// Renders a `SET search_path` value the way PostgreSQL stores it for SHOW:
-/// elements comma-space separated, bare identifiers case-folded to lower, and
-/// an element quoted on output when it needs quoting (`"$user"`, mixed case,
-/// spaces). Elements split on commas *outside* quotes: a single-quoted
-/// string is one element however many commas it contains.
-fn canonicalize_search_path(
-    v: &str,
-    out: &mut StackStr<SEARCH_PATH_BYTES>,
-) -> Result<(), SqlError> {
-    use core::fmt::Write as _;
-    let mut first = true;
-    let mut rest = v.trim();
-    while !rest.is_empty() {
-        // Take one element: up to a comma not inside '...' or "...".
-        let mut depth_single = false;
-        let mut depth_double = false;
-        let mut split = rest.len();
-        for (i, c) in rest.char_indices() {
-            match c {
-                '\'' if !depth_double => depth_single = !depth_single,
-                '"' if !depth_single => depth_double = !depth_double,
-                ',' if !depth_single && !depth_double => {
-                    split = i;
-                    break;
-                }
-                _ => {}
-            }
+pub(crate) fn search_path_space(character: char) -> bool {
+    matches!(character, ' ' | '\t' | '\n' | '\r' | '\x0b' | '\x0c')
+}
+
+/// Splits the decoded GUC value, preserving its spelling for SHOW and saved
+/// settings. Quoting and separators follow PostgreSQL SplitIdentifierString.
+pub(crate) fn search_path_components(value: &str) -> impl Iterator<Item = Result<&str, SqlError>> {
+    let mut remaining = Some(value);
+    let mut after_comma = false;
+    core::iter::from_fn(move || {
+        let raw = remaining.take()?;
+        let bytes = raw.as_bytes();
+        let mut at = 0;
+        while at < bytes.len() && search_path_space(char::from(bytes[at])) {
+            at += 1;
         }
-        let element = rest[..split].trim();
-        rest = rest.get(split + 1..).unwrap_or("").trim_start();
-        if element.is_empty() {
-            continue;
-        }
-        let mut name = StackStr::<64>::new();
-        if element.starts_with('"') {
-            let raw = element
-                .strip_prefix('"')
-                .and_then(|raw| raw.strip_suffix('"'))
-                .ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::INVALID_PARAMETER_VALUE,
-                        "invalid quoted search_path identifier"
-                    )
-                })?;
-            let mut chars = raw.chars().peekable();
-            while let Some(c) = chars.next() {
-                let _ = write!(name, "{c}");
-                if c == '"' {
-                    chars.next();
-                }
-            }
-        } else if element.starts_with('\'') {
-            let raw = element
-                .strip_prefix('\'')
-                .and_then(|raw| raw.strip_suffix('\''))
-                .ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::INVALID_PARAMETER_VALUE,
-                        "invalid quoted search_path identifier"
-                    )
-                })?;
-            let mut chars = raw.chars().peekable();
-            while let Some(c) = chars.next() {
-                let _ = write!(name, "{c}");
-                if c == '\'' {
-                    chars.next();
-                }
-            }
-        } else {
-            for c in element.chars() {
-                let _ = write!(name, "{}", c.to_ascii_lowercase());
-            }
-        }
-        let plain = name
-            .as_str()
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
-            && name
-                .as_str()
-                .bytes()
-                .next()
-                .is_some_and(|b| b.is_ascii_lowercase() || b == b'_');
-        if !first {
-            let _ = write!(out, ", ");
-        }
-        first = false;
-        if plain {
-            let _ = write!(out, "{}", name.as_str());
-        } else {
-            let _ = write!(out, "\"");
-            for c in name.as_str().chars() {
-                if c == '"' {
-                    let _ = write!(out, "\"\"");
-                } else {
-                    let _ = write!(out, "{c}");
-                }
-            }
-            let _ = write!(out, "\"");
-        }
-        if out.is_truncated() {
-            return Err(sql_err!(
+        let invalid = || {
+            sql_err!(
                 sqlstate::INVALID_PARAMETER_VALUE,
-                "search_path is too long (limit {} bytes)",
-                SEARCH_PATH_BYTES
-            ));
+                "invalid value for parameter \"search_path\": \"{}\"; list syntax is invalid",
+                value
+            )
+        };
+        if at == bytes.len() {
+            return after_comma.then(|| Err(invalid()));
         }
+        if bytes[at] == b'"' {
+            at += 1;
+            loop {
+                if at == bytes.len() || bytes[at] == 0 {
+                    return Some(Err(invalid()));
+                }
+                if bytes[at] == b'"' {
+                    at += 1;
+                    if bytes.get(at) != Some(&b'"') {
+                        break;
+                    }
+                }
+                at += 1;
+            }
+        } else {
+            let start = at;
+            while at < bytes.len() && bytes[at] != b',' && !search_path_space(char::from(bytes[at]))
+            {
+                if bytes[at] == 0 {
+                    return Some(Err(invalid()));
+                }
+                at += 1;
+            }
+            if at == start {
+                return Some(Err(invalid()));
+            }
+        }
+        while at < bytes.len() && search_path_space(char::from(bytes[at])) {
+            at += 1;
+        }
+        if at < bytes.len() {
+            if bytes[at] != b',' {
+                return Some(Err(invalid()));
+            }
+            remaining = Some(&raw[at + 1..]);
+            after_comma = true;
+        }
+        Some(Ok(&raw[..at]))
+    })
+}
+
+pub(crate) fn validate_search_path(value: &str) -> Result<(), SqlError> {
+    if value.len() > SEARCH_PATH_BYTES {
+        return Err(sql_err!(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "search_path is too long (limit {} bytes)",
+            SEARCH_PATH_BYTES
+        ));
+    }
+    for component in search_path_components(value) {
+        component?;
     }
     Ok(())
 }
 
-fn is_read_only(name: &str) -> bool {
-    const READ_ONLY: &[&str] = &[
+#[derive(Clone, Copy)]
+enum ReadOnlyParameterContext {
+    Startup,
+    Internal,
+}
+
+fn read_only_parameter_context(name: &str) -> Option<ReadOnlyParameterContext> {
+    if [
+        "max_connections",
+        "max_locks_per_transaction",
+        "max_prepared_transactions",
+    ]
+    .iter()
+    .any(|parameter| name.eq_ignore_ascii_case(parameter))
+    {
+        return Some(ReadOnlyParameterContext::Startup);
+    }
+    if [
         "server_version",
         "server_version_num",
         "server_encoding",
@@ -2965,17 +3045,23 @@ fn is_read_only(name: &str) -> bool {
         "integer_datetimes",
         "data_directory_mode",
         "in_hot_standby",
-        "max_connections",
-        "max_locks_per_transaction",
-        "max_prepared_transactions",
-    ];
-    READ_ONLY.iter().any(|r| name.eq_ignore_ascii_case(r))
+    ]
+    .iter()
+    .any(|parameter| name.eq_ignore_ascii_case(parameter))
+    {
+        return Some(ReadOnlyParameterContext::Internal);
+    }
+    None
 }
 
-fn unsupported_value(param: &str, v: &str) -> SqlError {
+fn is_read_only(name: &str) -> bool {
+    read_only_parameter_context(name).is_some()
+}
+
+fn invalid_setting_value(param: &str, v: &str) -> SqlError {
     sql_err!(
-        sqlstate::FEATURE_NOT_SUPPORTED,
-        "{} \"{}\" is not supported (only the default is implemented)",
+        sqlstate::INVALID_PARAMETER_VALUE,
+        "invalid value for parameter \"{}\": \"{}\"",
         param,
         v
     )

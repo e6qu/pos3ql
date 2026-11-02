@@ -1538,11 +1538,13 @@ where
                 operand: left,
                 type_name: left_name,
                 type_mod: left_mod,
+                ..
             },
             Expr::Cast {
                 operand: right,
                 type_name: right_name,
                 type_mod: right_mod,
+                ..
             },
         ) => {
             left_mod == right_mod
@@ -1579,6 +1581,7 @@ where
             Expr::Call {
                 name: left_name,
                 bound_oid: left_bound_oid,
+                bound_strict: left_bound_strict,
                 args: left_args,
                 argument_names: left_argument_names,
                 variadic: left_variadic,
@@ -1591,6 +1594,7 @@ where
             Expr::Call {
                 name: right_name,
                 bound_oid: right_bound_oid,
+                bound_strict: right_bound_strict,
                 args: right_args,
                 argument_names: right_argument_names,
                 variadic: right_variadic,
@@ -1603,6 +1607,7 @@ where
         ) => {
             left_name.eq_ignore_ascii_case(right_name)
                 && left_bound_oid == right_bound_oid
+                && left_bound_strict == right_bound_strict
                 && left_argument_names == right_argument_names
                 && left_variadic == right_variadic
                 && left_star == right_star
@@ -2689,6 +2694,10 @@ fn dml_index_operand_is_invariant(expression: &Expr<'_>) -> bool {
         Expr::Unary { operand, .. }
         | Expr::IsNull { operand, .. }
         | Expr::Cast { operand, .. }
+        | Expr::BoundDefault {
+            expression: operand,
+            ..
+        }
         | Expr::Collate { operand, .. } => dml_index_operand_is_invariant(operand),
         Expr::Binary { left, right, .. } => {
             dml_index_operand_is_invariant(left) && dml_index_operand_is_invariant(right)
@@ -4413,6 +4422,7 @@ fn external_lateral_function_run<'a, C: ColumnLookup<'a>>(
     let call = arena
         .alloc(Expr::Call {
             bound_oid: None,
+            bound_strict: None,
             name: tref.table,
             args: arguments,
             argument_names: tref.func_argument_names,

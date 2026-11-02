@@ -797,8 +797,13 @@ impl ColTypeResolver for CatalogCols<'_> {
             self.storage
                 .function_for_call_syntax_oids(name, arguments, variadic, self.txid)
         } else {
-            self.storage
-                .function_for_named_call_oids(name, argument_names, arguments, self.txid)
+            self.storage.function_for_named_call_oids(
+                name,
+                argument_names,
+                arguments,
+                variadic,
+                self.txid,
+            )
         };
         let result = routine
             .and_then(|routine| routine.function_result_contract())
@@ -879,6 +884,7 @@ impl ColTypeResolver for CatalogCols<'_> {
                 name,
                 argument_names,
                 arguments,
+                variadic,
                 self.txid,
             )?
         };
@@ -1452,7 +1458,11 @@ fn name_of<'a>(expression: &Expr<'a>) -> Option<&'a str> {
             }
             _ => cast_target_name(type_name),
         },
-        Expr::Collate { operand, .. } => name_of(operand),
+        Expr::BoundDefault {
+            expression: operand,
+            ..
+        }
+        | Expr::Collate { operand, .. } => name_of(operand),
         // A desugared CASE (`IS TRUE`, `IS DISTINCT FROM`) is anonymous, as
         // PostgreSQL labels those `?column?`; a real CASE forwards to its ELSE.
         Expr::Case {
@@ -1483,7 +1493,12 @@ fn cast_source_name<'a>(expression: &Expr<'a>) -> Option<&'a str> {
         | Expr::Call { .. }
         | Expr::Array(_)
         | Expr::ArraySubquery(_) => name_of(expression),
-        Expr::Cast { operand, .. } | Expr::Collate { operand, .. } => cast_source_name(operand),
+        Expr::Cast { operand, .. }
+        | Expr::BoundDefault {
+            expression: operand,
+            ..
+        }
+        | Expr::Collate { operand, .. } => cast_source_name(operand),
         _ => None,
     }
 }
@@ -2722,7 +2737,7 @@ pub(crate) fn resolved_set_call(
     } else if argument_names.is_empty() {
         storage.function_for_call_syntax_oids(name, arguments, *variadic, txid)
     } else {
-        storage.function_for_named_call_oids(name, argument_names, arguments, txid)
+        storage.function_for_named_call_oids(name, argument_names, arguments, *variadic, txid)
     };
     Ok(routine.is_some_and(|routine| routine.kind.is_set_returning()))
 }
@@ -4072,13 +4087,6 @@ pub fn infer_type_res(
     columns: &dyn ColTypeResolver,
 ) -> Result<(i32, i16), SqlError> {
     let of = |t: ColType| (t.oid(), t.typlen());
-    if let Expr::Call {
-        name, args, star, ..
-    } = expression
-        && let Some(result) = crate::sql::eval::funcs::hashing::describe(name, args, *star, columns)
-    {
-        return result;
-    }
     if let Expr::Call { name, args, .. } = expression
         && let Some((Some("pg_catalog"), symbol)) = crate::sql::ast::catalog_operator_call(name)
         && let [left, right] = *args
@@ -4093,12 +4101,33 @@ pub fn infer_type_res(
     if let Some(result) = routine_result_metadata(expression, columns) {
         return Ok((result.type_oid, result.ctype.typlen()));
     }
+    // Resolve stored targets with their original qualification first. The
+    // remaining builtin descriptions use the runtime dispatcher's spelling.
+    let mut builtin = *expression;
+    if let Expr::Call { name, .. } = &mut builtin {
+        let written = *name;
+        *name = written.strip_prefix("pg_catalog.").unwrap_or(written);
+    }
+    let expression = &builtin;
+    if let Expr::Call {
+        name, args, star, ..
+    } = expression
+        && let Some(result) = crate::sql::eval::funcs::hashing::describe(name, args, *star, columns)
+    {
+        return result;
+    }
     if let Expr::Call { name, args, .. } = expression
         && let Some(result) = crate::sql::engine_intrinsic_result_type(name, args.len())
     {
         return Ok(result);
     }
     Ok(match expression {
+        Expr::BoundDefault { type_oid, .. } => (
+            *type_oid,
+            coltype_of_oid(*type_oid)
+                .or_else(|| columns.domain_base_type(*type_oid))
+                .map_or(-1, ColType::typlen),
+        ),
         Expr::RecursiveState { ctype, .. } => of(*ctype),
         Expr::Null | Expr::Str(_) => (oid::UNKNOWN, -2),
         Expr::Param(index) => bound_parameter_type_oid(*index)

@@ -155,6 +155,7 @@ impl Storage {
         name: super::SqlName,
         definition: super::ViewDefinition,
     ) -> Result<(), SqlError> {
+        super::validate_stored_search_path(&definition.query.creation_path)?;
         let slot = identity.slot();
         let rule_slot = identity.return_rule_slot();
         if self.find_schema_visible(schema.as_str(), 0).is_none() {
@@ -1400,6 +1401,7 @@ impl Storage {
         definition: super::ViewDefinition,
         transaction: u32,
     ) -> Result<ViewAlterUndo, SqlError> {
+        super::validate_stored_search_path(&definition.query.creation_path)?;
         let slot = self.validate_view_edit(&owners.catalog, target, transaction)?;
         let current = owners.catalog.views[slot];
         let rule_slot = usize::from(current.return_rule);
@@ -1859,6 +1861,78 @@ mod tests {
                 transaction,
             )
             .unwrap()
+    }
+
+    #[test]
+    fn stored_creation_paths_are_rejected_before_catalog_publication() {
+        let mut storage = fixture(3);
+        let backing = storage
+            .create_table(crate::storage::TableDef {
+                schema: name("public"),
+                name: name("saved_backing"),
+                ..crate::storage::TableDef::empty()
+            })
+            .unwrap();
+        let sequence = storage.catalog_sequence.current();
+        let oversized = "a".repeat(crate::sql::guc::SEARCH_PATH_BYTES + 1);
+        let oversized_utf8 = "é".repeat(crate::sql::guc::SEARCH_PATH_BYTES / 2 + 1);
+        crate::mem::guard::forbid_alloc(|| {
+            for path in [
+                "public,",
+                "\"unterminated",
+                "public public",
+                oversized.as_str(),
+                oversized_utf8.as_str(),
+            ] {
+                let definition = || {
+                    let mut definition = test_view_definition(StoredQueryDependencies::EMPTY);
+                    definition.query.creation_path = crate::util::StackStr::from_str(path);
+                    definition
+                };
+                assert_eq!(
+                    storage
+                        .create_view(
+                            name("public"),
+                            name("rejected_view"),
+                            definition(),
+                            false,
+                            0
+                        )
+                        .unwrap_err()
+                        .sqlstate,
+                    sqlstate::DATA_EXCEPTION
+                );
+                assert_eq!(
+                    storage
+                        .replay_view(
+                            ViewCatalogIdentity::new(0, 1, 0, 2).unwrap(),
+                            name("public"),
+                            name("rejected_view"),
+                            definition()
+                        )
+                        .unwrap_err()
+                        .sqlstate,
+                    sqlstate::DATA_EXCEPTION
+                );
+                assert_eq!(
+                    storage
+                        .create_matview(
+                            super::super::CatalogAllocation::New,
+                            backing,
+                            definition().query,
+                            false,
+                            0
+                        )
+                        .unwrap_err()
+                        .sqlstate,
+                    sqlstate::DATA_EXCEPTION
+                );
+                assert_eq!(storage.live_views().count(), 0);
+                assert_eq!(storage.live_matviews().count(), 0);
+                assert_eq!(storage.rule(0).ddl_state, CatalogDdlState::Absent);
+                assert_eq!(storage.catalog_sequence.current(), sequence);
+            }
+        });
     }
 
     #[test]

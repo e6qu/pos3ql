@@ -528,7 +528,8 @@ pub enum TransactionTarget {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingSyntax {
-    Generic,
+    DecodedValue,
+    Default,
     FromCurrent,
     TimeZone,
     TimeZoneInterval(i32),
@@ -1088,8 +1089,8 @@ pub enum Stmt<'a> {
         target: ClusterTarget<'a>,
         verbose: bool,
     },
-    /// SET [LOCAL] name {=|TO} value. `value` is the raw source text of the
-    /// value (quotes included); the session GUC store validates and applies it.
+    /// SET values retain decoded SQL strings separately from DEFAULT and the
+    /// numeric/interval TIME ZONE forms. The GUC store validates the value.
     Set {
         name: &'a str,
         value: &'a str,
@@ -4300,6 +4301,7 @@ pub struct RoutineConfigClause<'a> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RoutineConfigValue<'a> {
+    Default,
     Value(&'a str),
     Current,
 }
@@ -5536,6 +5538,14 @@ pub enum ParameterSource {
     PlpgsqlCursor,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CastBinding {
+    /// Resolve a user-defined cast before attempting the builtin conversion.
+    Resolve,
+    /// The query selected the builtin conversion; do not resolve it again.
+    Builtin,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Expr<'a> {
     Null,
@@ -5579,6 +5589,13 @@ pub enum Expr<'a> {
         type_name: &'a str,
         /// Encoded atttypmod for `::numeric(p,s)` / `::varchar(n)`, or -1.
         type_mod: i32,
+        binding: CastBinding,
+    },
+    /// A planned routine default keeps its declared input type without an
+    /// extra conversion. Routine input preparation performs its one coercion.
+    BoundDefault {
+        expression: &'a Expr<'a>,
+        type_oid: i32,
     },
     /// An explicit collation that remains part of expression identity until
     /// the comparison, ordering, or key path consumes it.
@@ -5597,6 +5614,8 @@ pub enum Expr<'a> {
         name: &'a str,
         /// Captured catalog identity for a stored call; SQL text carries names only.
         bound_oid: Option<i32>,
+        /// Null-input behavior selected while preparing this query.
+        bound_strict: Option<bool>,
         args: &'a [&'a Expr<'a>],
         /// Empty for positional calls; otherwise parallel to `args` and
         /// populated only for named notation parsed after positional inputs.
@@ -5904,6 +5923,10 @@ impl Expr<'_> {
             }
             Expr::Unary { operand, .. }
             | Expr::Cast { operand, .. }
+            | Expr::BoundDefault {
+                expression: operand,
+                ..
+            }
             | Expr::Collate { operand, .. }
             | Expr::IsNull { operand, .. } => operand.is_constant(),
             Expr::Binary { left, right, .. } => left.is_constant() && right.is_constant(),
@@ -5974,6 +5997,10 @@ impl Expr<'_> {
             | Expr::DefaultMarker => false,
             Expr::Unary { operand, .. }
             | Expr::Cast { operand, .. }
+            | Expr::BoundDefault {
+                expression: operand,
+                ..
+            }
             | Expr::Collate { operand, .. }
             | Expr::IsNull { operand, .. }
             | Expr::Field { base: operand, .. }
@@ -6052,6 +6079,10 @@ impl Expr<'_> {
             | Expr::DefaultMarker => false,
             Expr::Unary { operand, .. }
             | Expr::Cast { operand, .. }
+            | Expr::BoundDefault {
+                expression: operand,
+                ..
+            }
             | Expr::Collate { operand, .. }
             | Expr::IsNull { operand, .. }
             | Expr::Field { base: operand, .. }
@@ -6141,6 +6172,10 @@ impl Expr<'_> {
             | Expr::ArraySubquery(_) => None,
             Expr::Unary { operand, .. }
             | Expr::Cast { operand, .. }
+            | Expr::BoundDefault {
+                expression: operand,
+                ..
+            }
             | Expr::Collate { operand, .. }
             | Expr::IsNull { operand, .. }
             | Expr::Field { base: operand, .. }
@@ -6215,6 +6250,10 @@ impl Expr<'_> {
             | Expr::ArraySubquery(_) => {}
             Expr::Unary { operand, .. }
             | Expr::Cast { operand, .. }
+            | Expr::BoundDefault {
+                expression: operand,
+                ..
+            }
             | Expr::Collate { operand, .. }
             | Expr::IsNull { operand, .. }
             | Expr::Field { base: operand, .. }
@@ -6302,6 +6341,10 @@ impl Expr<'_> {
             | Expr::ArraySubquery(_) => {}
             Expr::Unary { operand, .. }
             | Expr::Cast { operand, .. }
+            | Expr::BoundDefault {
+                expression: operand,
+                ..
+            }
             | Expr::Collate { operand, .. }
             | Expr::IsNull { operand, .. }
             | Expr::Field { base: operand, .. }

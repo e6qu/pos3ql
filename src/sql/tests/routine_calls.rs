@@ -1,6 +1,327 @@
 use super::*;
 
 #[test]
+fn query_positions_do_not_repeat_completed_projection_effects() {
+    let config = test_config("retained-query-positions");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    // Independent cases commit retired definitions within the eight routine slots.
+    let sql =
+        include_str!("../../../tests/external/differential_exact/55_retained_query_positions.sql");
+    let output = session.success(&mut engine, sql, true);
+    assert_eq!(
+        data_rows(&output),
+        [
+            &["0", "1|1", "2|2", "3|3", "3", "1", "2", "3"][..],
+            &["0", "20", "20", "20", "3", "0|3", "20|3"],
+            &["0", "3|99", "3", "0|3", "99|3"],
+            &["0", "1|7|2|8|3", "3", "7|2", "8|1"],
+            &["query_second,public|12", "12", "22", "12", "22"],
+            &["query_second,pg_catalog,public|2|2", "shadow"],
+            &["2|2", "777"],
+            &["0|101", "109", "101", "109"],
+            &[
+                "0", "2", "0", "7", "9", "11", "15", "0", "0", "2", "7", "9", "11", "15"
+            ],
+            &["0|7", "NULL", "7", "0|NULL", "7", "7"],
+            &["0|7", "NULL", "7", "0|NULL", "7", "7"],
+            &["9", "7", "9", "11"],
+            &["2|2", "9"],
+        ]
+        .concat()
+    );
+    let mut remaining = output.as_slice();
+    let mut descriptions = 0;
+    let mut completions = 0;
+    while !remaining.is_empty() {
+        let length = i32::from_be_bytes(remaining[1..5].try_into().unwrap()) as usize;
+        descriptions += usize::from(remaining[0] == b'T');
+        completions += usize::from(remaining[0] == b'C');
+        remaining = &remaining[length + 1..];
+    }
+    assert_eq!(descriptions, 53);
+    assert_eq!(completions, 137);
+}
+
+#[test]
+fn named_routine_arguments_preserve_quoted_identifier_case() {
+    let config = test_config("quoted-routine-arguments");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE TABLE quoted_argument_source(value integer); \
+         INSERT INTO quoted_argument_source VALUES(2); \
+         CREATE FUNCTION quoted_argument_input(\"Value\" integer) RETURNS integer \
+         LANGUAGE sql VOLATILE AS $$SELECT $1$$; \
+         CREATE FUNCTION folded_argument_input(VALUE integer) RETURNS integer \
+         LANGUAGE sql VOLATILE AS $$SELECT $1$$; \
+         CREATE PROCEDURE quoted_argument_output(OUT \"Result\" integer,\"Value\" integer, \
+         VARIADIC \"Members\" integer[]) LANGUAGE sql AS $$SELECT $1+cardinality($2)$$",
+        true,
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT quoted_argument_input(\"Value\"=>value), \
+             folded_argument_input(VALUE=>value) FROM quoted_argument_source; \
+             CALL quoted_argument_output(\"Result\"=>NULL,\"Value\"=>9, \
+             VARIADIC \"Members\"=>ARRAY[]::integer[])",
+            true,
+        )),
+        ["2|2", "9"]
+    );
+    for sql in [
+        "SELECT quoted_argument_input(value=>value) FROM quoted_argument_source",
+        "SELECT quoted_argument_input(\"value\"=>value) FROM quoted_argument_source",
+        "CALL quoted_argument_output(\"result\"=>NULL,\"Value\"=>9, \
+         VARIADIC \"Members\"=>ARRAY[]::integer[])",
+        "CALL quoted_argument_output(\"Result\"=>NULL,value=>9, \
+         VARIADIC \"Members\"=>ARRAY[]::integer[])",
+        "CALL quoted_argument_output(\"Result\"=>NULL,\"Value\"=>9, \
+         VARIADIC members=>ARRAY[]::integer[])",
+    ] {
+        assert_eq!(
+            error_sqlstates(&session.execute(&mut engine, sql, true)),
+            ["42883"],
+            "{sql}"
+        );
+    }
+    let actual = [
+        types::oid::UNKNOWN,
+        types::oid::INT4,
+        ColType::Array(types::ArrElem::Int4).oid(),
+    ];
+    let expected = engine
+        .storage
+        .procedure_call_parameter_oids(
+            "quoted_argument_output",
+            &[Some("Result"), Some("Value"), Some("Members")],
+            true,
+            &actual,
+            0,
+        )
+        .expect("quoted argument identities resolve protocol types");
+    assert_eq!(
+        &expected[..actual.len()],
+        &[types::oid::INT4, types::oid::INT4, actual[2]]
+    );
+    assert!(
+        engine
+            .storage
+            .procedure_call_parameter_oids(
+                "quoted_argument_output",
+                &[Some("result"), Some("Value"), Some("Members")],
+                true,
+                &actual,
+                0,
+            )
+            .is_none()
+    );
+}
+
+#[test]
+fn retained_variadic_calls_require_explicit_empty_arrays_or_declared_defaults() {
+    let config = test_config("retained-variadic-arity");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE TABLE retained_variadic_source(value integer); \
+         INSERT INTO retained_variadic_source VALUES(1); \
+         CREATE FUNCTION retained_variadic_required(VARIADIC members integer[]) \
+         RETURNS integer LANGUAGE sql VOLATILE AS $$SELECT cardinality($1)$$; \
+         CREATE FUNCTION retained_variadic_named_default(marker integer DEFAULT 7, \
+         VARIADIC members integer[] DEFAULT ARRAY[]::integer[]) RETURNS integer \
+         LANGUAGE sql VOLATILE AS $$SELECT $1+cardinality($2)$$",
+        true,
+    );
+    assert_eq!(
+        error_sqlstates(&session.execute(
+            &mut engine,
+            "SELECT retained_variadic_required() FROM retained_variadic_source",
+            true,
+        )),
+        ["42883"]
+    );
+    assert_eq!(
+        error_sqlstates(&session.execute(
+            &mut engine,
+            "SELECT retained_variadic_named_default(marker=>9) FROM retained_variadic_source",
+            true,
+        )),
+        ["42883"]
+    );
+    assert_eq!(
+        error_sqlstates(&session.execute(
+            &mut engine,
+            "CREATE FUNCTION retained_variadic_invalid(marker integer DEFAULT 7, \
+             VARIADIC members integer[]) RETURNS integer LANGUAGE sql \
+             AS $$SELECT $1+cardinality($2)$$",
+            true,
+        )),
+        ["42P13"]
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT retained_variadic_required(VARIADIC ARRAY[]::integer[]) \
+             FROM retained_variadic_source",
+            true,
+        )),
+        ["0"]
+    );
+}
+
+#[test]
+fn variadic_procedures_preserve_output_positions_and_named_array_syntax() {
+    let config = test_config("variadic-procedure-mapping");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE PROCEDURE variadic_output(OUT result integer,marker integer DEFAULT 7, \
+         VARIADIC members integer[] DEFAULT ARRAY[]::integer[]) LANGUAGE sql \
+         AS $$SELECT $1+cardinality($2)$$",
+        true,
+    );
+    for sql in [
+        "CALL variadic_output(result=>NULL)",
+        "CALL variadic_output(result=>NULL,marker=>9)",
+        "CALL variadic_output(result=>NULL,marker=>9,members=>ARRAY[]::integer[])",
+    ] {
+        assert_eq!(
+            error_sqlstates(&session.execute(&mut engine, sql, true)),
+            ["42883"],
+            "{sql}"
+        );
+    }
+    for sql in [
+        "CREATE PROCEDURE invalid_variadic_output(VARIADIC members integer[], \
+         OUT result integer) LANGUAGE sql AS $$SELECT cardinality($1)$$",
+        "CREATE PROCEDURE invalid_variadic_default_output(marker integer DEFAULT 7, \
+         VARIADIC members integer[] DEFAULT ARRAY[]::integer[],OUT result integer) \
+         LANGUAGE sql AS $$SELECT $1+cardinality($2)$$",
+    ] {
+        assert_eq!(
+            error_sqlstates(&session.execute(&mut engine, sql, true)),
+            ["42P13"],
+            "{sql}"
+        );
+    }
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "CALL variadic_output(result=>NULL,marker=>9,VARIADIC members=>ARRAY[]::integer[]); \
+             CALL variadic_output(NULL); \
+             CALL variadic_output(NULL,9,VARIADIC ARRAY[]::integer[]); \
+             CALL variadic_output(NULL,9,4,5)",
+            true,
+        )),
+        ["9", "7", "9", "11"]
+    );
+}
+
+#[test]
+fn retained_query_errors_rollback_completed_writes_and_session_changes() {
+    let config = test_config("retained-query-rollback");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE TABLE query_rollback_source(value integer); \
+         INSERT INTO query_rollback_source VALUES(1); \
+         CREATE TABLE query_rollback_audit(value integer); \
+         CREATE SEQUENCE query_rollback_numbers; \
+         CREATE FUNCTION query_rollback_write(value integer) RETURNS integer \
+         LANGUAGE sql VOLATILE AS \
+         $$INSERT INTO query_rollback_audit VALUES($1); SELECT $1$$; \
+         SELECT set_config('application_name','0',false)",
+        true,
+    );
+    session.success(&mut engine, "BEGIN", true);
+    let output = session.execute(
+        &mut engine,
+        "SELECT nextval('query_rollback_numbers'), \
+         set_config('application_name','changed',false), \
+         query_rollback_write(value), 1/(value-1) FROM query_rollback_source",
+        true,
+    );
+    assert_eq!(error_sqlstates(&output), ["22012"]);
+    session.success(&mut engine, "ROLLBACK", true);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT current_setting('application_name'); \
+             SELECT count(*) FROM query_rollback_audit; \
+             SELECT last_value,is_called FROM query_rollback_numbers; \
+             SELECT query_rollback_write(value) FROM query_rollback_source; \
+             SELECT value FROM query_rollback_audit",
+            true,
+        )),
+        ["0", "0", "1|t", "1", "1"]
+    );
+}
+
+#[test]
+fn retained_query_call_state_is_reused_between_rows() {
+    const ROWS: usize = 1024;
+    let config = test_config("retained-query-bounded-rows");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let statement_bytes = crate::storage::RowCursor::position_bytes(ROWS, 0).unwrap() + (128 << 10);
+    let mut session =
+        ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, statement_bytes);
+    session.success(
+        &mut engine,
+        "CREATE TABLE query_bounded_source(value integer); \
+         CREATE TABLE query_bounded_audit(value integer); \
+         CREATE FUNCTION query_bounded_write(value integer) RETURNS integer \
+         LANGUAGE sql VOLATILE AS \
+         $$INSERT INTO query_bounded_audit VALUES($1); SELECT $1$$",
+        true,
+    );
+    for value in 1..=ROWS {
+        session.success(
+            &mut engine,
+            &format!("INSERT INTO query_bounded_source VALUES({value})"),
+            true,
+        );
+    }
+    session.success(
+        &mut engine,
+        "SELECT set_config('application_name','0',false)",
+        true,
+    );
+    let output = session.success(
+        &mut engine,
+        "SELECT set_config('application_name', \
+         (current_setting('application_name')::integer+1)::text,false), \
+         query_bounded_write(value) FROM query_bounded_source",
+        true,
+    );
+    let rows = data_rows(&output);
+    assert_eq!(rows.len(), ROWS);
+    for (index, row) in rows.iter().enumerate() {
+        assert_eq!(row.split('|').next().unwrap(), (index + 1).to_string());
+    }
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT current_setting('application_name'); \
+             SELECT count(*),count(DISTINCT value),sum(value) FROM query_bounded_audit",
+            true,
+        )),
+        ["1024", "1024|1024|524800"]
+    );
+}
+
+#[test]
 fn intrinsic_handoffs_retain_completed_builtin_inputs() {
     let config = test_config("retained-intrinsic-inputs");
     let mut budget = test_engine_budget(&config, 1 << 29);
@@ -713,4 +1034,931 @@ fn record_call_expansion_preserves_scalar_effects_and_shared_set_producers() {
             ),
         }
     }
+}
+
+#[test]
+fn retained_query_handoffs_count_one_scan_and_each_source_row_once() {
+    let config = test_config("retained-query-scan-counts");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE TABLE query_scan_source(value integer); \
+         INSERT INTO query_scan_source VALUES(1),(2),(3); \
+         CREATE TABLE query_scan_audit(value integer); \
+         CREATE FUNCTION query_scan_write(value integer) RETURNS integer \
+         LANGUAGE sql VOLATILE AS \
+         $$INSERT INTO query_scan_audit VALUES($1); SELECT $1$$",
+        true,
+    );
+    session.success(&mut engine, "BEGIN", true);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT query_scan_write(value) FROM query_scan_source; \
+             SELECT seq_scan,seq_tup_read FROM pg_stat_xact_user_tables \
+             WHERE relid='query_scan_source'::regclass",
+            true,
+        )),
+        ["1", "2", "3", "1|3"]
+    );
+    session.success(&mut engine, "ROLLBACK", true);
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "SELECT count(*) FROM query_scan_audit", true,)),
+        ["0"]
+    );
+}
+
+#[test]
+fn qualified_builtin_types_survive_mutable_function_handoffs() {
+    let config = test_config("qualified-builtin-handoff-types");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE TABLE qualified_builtin_source(value integer); \
+         INSERT INTO qualified_builtin_source VALUES(2); \
+         CREATE TABLE qualified_builtin_audit(value integer); \
+         CREATE FUNCTION qualified_builtin_write(value integer) RETURNS integer \
+         LANGUAGE sql VOLATILE AS \
+         $$INSERT INTO qualified_builtin_audit VALUES($1); SELECT $1$$",
+        true,
+    );
+    for prefix in ["", "pg_catalog."] {
+        let sql = format!(
+            "SELECT {prefix}abs(-7.5)+1.0, \
+             {prefix}ln({prefix}abs(-7.5)+1.0), \
+             {prefix}hashfloat8extended(0::float8,23)+1, \
+             {prefix}hashtext(NULL::text), \
+             {prefix}hashtextextended(NULL::text,0), \
+             qualified_builtin_write(value) FROM qualified_builtin_source"
+        );
+        let output = session.success(&mut engine, &sql, true);
+        assert_eq!(
+            row_description_type_oids(&output),
+            [1700, 1700, 20, 23, 20, 23]
+        );
+        let rows = data_rows(&output);
+        assert_eq!(rows.len(), 1);
+        let values = rows[0].split('|').collect::<Vec<_>>();
+        assert_eq!(values[0], "8.5");
+        assert!((values[1].parse::<f64>().unwrap() - 8.5f64.ln()).abs() < 1e-12);
+        assert_eq!(&values[2..], &["24", "NULL", "NULL", "2"]);
+    }
+    session.success(
+        &mut engine,
+        "CREATE SCHEMA qualified_builtin_user; \
+         CREATE FUNCTION qualified_builtin_user.abs(value numeric) RETURNS text \
+         LANGUAGE sql IMMUTABLE AS $$SELECT 'custom'::text$$; \
+         CREATE FUNCTION qualified_builtin_user.hashtextextended(value text,seed bigint) \
+         RETURNS numeric LANGUAGE sql IMMUTABLE AS $$SELECT 123.5$$",
+        true,
+    );
+    let output = session.success(
+        &mut engine,
+        "SELECT qualified_builtin_user.abs(-7.5), \
+         qualified_builtin_user.hashtextextended('label',0)+1.0, \
+         qualified_builtin_write(value) FROM qualified_builtin_source",
+        true,
+    );
+    assert_eq!(row_description_type_oids(&output), [25, 1700, 23]);
+    assert_eq!(data_rows(&output), ["custom|124.5|2"]);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT count(*) FROM qualified_builtin_audit",
+            true,
+        )),
+        ["3"]
+    );
+}
+
+#[test]
+fn decoded_guc_values_keep_their_spelling_and_resolve_search_path_names() {
+    let config = test_config("decoded-guc-values");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    let sql = include_str!(
+        "../../../tests/external/differential_exact/56_search_path_value_assignment.sql"
+    );
+    assert_eq!(
+        data_rows(&session.success(&mut engine, sql, true)),
+        [
+            "GUC_RAW,public",
+            "GUC_RAW,public|7",
+            "  \"Guc Space\" , public  ",
+            "8",
+            "\x0bpublic\x0b",
+            "public",
+            "public\x0b,\x0bpg_catalog",
+            "public",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "\"ééééééééééééééééééééééééééééééééa\"",
+            "\"éééééééééééééééééééééééééééééééééééééééééééééééééé\"",
+            "guc_raw, public",
+            "\"guc_raw,public\"",
+            "'public'",
+            "  abc  ",
+            "'abc'",
+            "DEFAULT",
+            "DEFAULT",
+            "DEFAULT",
+            "\"$user\", public",
+            "GUC_RAW,public",
+            "public",
+            "GUC_RAW,public|public",
+            "GUC_RAW,public",
+            "  \"Guc Space\" , public  ",
+            "GUC_RAW,public",
+            "public",
+        ]
+    );
+    session.success(
+        &mut engine,
+        "SELECT set_config('search_path','GUC_RAW,public',false)",
+        true,
+    );
+    for value in [
+        "foo bar",
+        "public\x0bpg_catalog",
+        "public,\x0b",
+        "public,,pg_catalog",
+        "public,",
+        "\"unclosed",
+        "\"public\"tail",
+    ] {
+        assert_eq!(
+            error_sqlstates(&session.execute(
+                &mut engine,
+                &format!("SELECT set_config('search_path','{value}',false)"),
+                true
+            )),
+            ["22023"]
+        );
+        assert_eq!(
+            data_rows(&session.success(&mut engine, "SELECT current_setting('search_path')", true)),
+            ["GUC_RAW,public"]
+        );
+    }
+}
+
+#[test]
+fn sql_setting_strings_are_decoded_once_before_guc_assignment() {
+    let config = test_config("decoded-sql-setting-values");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    let sql =
+        include_str!("../../../tests/external/differential_exact/57_decoded_sql_settings.sql");
+    assert_eq!(
+        data_rows(&session.success(&mut engine, sql, true)),
+        [
+            "a'b",
+            "dollar'quote",
+            "doubled'quote",
+            "a\\x09b",
+            "DEFAULT",
+            "1",
+            "\"Case\tName\", public",
+            "\"quote'name\", \"dollar,name\", \"Mixed Case\"",
+            "ISO, DMY",
+            "function'value|outside",
+            "changed'value|outside",
+            "outside|t",
+            "outside|t",
+            "DEFAULT",
+            "application_name=role'value",
+            "application_name=database'value",
+            "UTC",
+            "<+02>-02",
+            "<+02>-02",
+            "<+02>-02",
+            "<-02>+02",
+            "<+02:30>-02:30",
+            "9000",
+            "+02:00",
+            "-7200",
+            "<+02:30>-02:30|TimeZone=2.5",
+            "<+00:00:01>-00:00:01|TimeZone=0.0005",
+            "TimeZone=0.0005|t|DateStyle=sql, dmy",
+            "TimeZone=0.0005",
+            "DateStyle=sql, dmy",
+        ]
+    );
+    for sql in [
+        "SET application_name TO one,two",
+        "SET nonexistent_parameter TO one,two",
+        "SET server_version TO one,two",
+        "SET TIME ZONE 'DEFAULT'",
+        "SET TIME ZONE 'LOCAL'",
+        "SET TIME ZONE $$DEFAULT$$",
+    ] {
+        assert_eq!(
+            error_sqlstates(&session.execute(&mut engine, sql, true)),
+            ["22023"],
+            "{sql}"
+        );
+    }
+    for sql in [
+        "ALTER ROLE postgres SET nonexistent_parameter FROM CURRENT",
+        "ALTER DATABASE postgres SET nonexistent_parameter FROM CURRENT",
+    ] {
+        assert_eq!(
+            error_sqlstates(&session.execute(&mut engine, sql, true)),
+            ["42704"],
+            "{sql}"
+        );
+    }
+
+    for sql in [
+        "ALTER ROLE postgres RESET nonexistent_parameter",
+        "ALTER DATABASE postgres RESET nonexistent_parameter",
+        "ALTER ROLE postgres RESET server_version",
+        "ALTER DATABASE postgres RESET server_version",
+        "ALTER ROLE postgres SET nonexistent_parameter TO DEFAULT",
+        "ALTER DATABASE postgres SET nonexistent_parameter TO DEFAULT",
+        "ALTER ROLE postgres SET server_version TO DEFAULT",
+        "ALTER DATABASE postgres SET server_version TO DEFAULT",
+    ] {
+        session.success(&mut engine, sql, true);
+    }
+    session.success(&mut engine, "CREATE FUNCTION public.current_timezone_source() RETURNS integer LANGUAGE sql AS 'SELECT 1'; SELECT set_config('timezone','0.0005',false)", true);
+    for sql in [
+        "CREATE FUNCTION public.invalid_captured_timezone() RETURNS integer LANGUAGE sql SET timezone FROM CURRENT AS 'SELECT 1'",
+        "ALTER FUNCTION public.current_timezone_source() SET timezone FROM CURRENT",
+        "ALTER ROLE postgres SET timezone FROM CURRENT",
+        "ALTER DATABASE postgres SET timezone FROM CURRENT",
+        "SET timezone FROM CURRENT",
+    ] {
+        assert_eq!(
+            error_sqlstates(&session.execute(&mut engine, sql, true)),
+            ["22023"],
+            "{sql}"
+        );
+        assert_eq!(
+            data_rows(&session.success(&mut engine, "SELECT current_setting('timezone')", true)),
+            ["<+00:00:01>-00:00:01"]
+        );
+    }
+    session.success(&mut engine, "RESET timezone; ALTER FUNCTION public.current_timezone_source() SET application_name TO 'saved-function'; ALTER ROLE postgres SET application_name TO 'saved-role'; ALTER DATABASE postgres SET application_name TO 'saved-database'", true);
+    session.success(
+        &mut engine,
+        "ALTER SYSTEM SET application_name TO 'saved-system'",
+        true,
+    );
+    for (sql, expected) in [
+        (
+            "ALTER ROLE postgres RESET nonexistent_parameter",
+            Some("42704"),
+        ),
+        (
+            "ALTER DATABASE postgres RESET nonexistent_parameter",
+            Some("42704"),
+        ),
+        ("ALTER ROLE postgres RESET max_connections", Some("55P02")),
+        (
+            "ALTER DATABASE postgres RESET max_connections",
+            Some("55P02"),
+        ),
+        ("ALTER SYSTEM RESET max_connections", None),
+        (
+            "ALTER ROLE postgres SET nonexistent_parameter TO DEFAULT",
+            Some("42704"),
+        ),
+        (
+            "ALTER DATABASE postgres SET nonexistent_parameter TO DEFAULT",
+            Some("42704"),
+        ),
+        (
+            "ALTER ROLE postgres SET server_version TO DEFAULT",
+            Some("55P02"),
+        ),
+        (
+            "ALTER DATABASE postgres SET server_version TO DEFAULT",
+            Some("55P02"),
+        ),
+        ("ALTER SYSTEM SET max_connections TO DEFAULT", None),
+        (
+            "ALTER FUNCTION public.current_timezone_source() RESET nonexistent_parameter",
+            Some("42704"),
+        ),
+        ("ALTER SYSTEM RESET nonexistent_parameter", Some("42704")),
+        ("ALTER ROLE postgres RESET server_version", Some("55P02")),
+        (
+            "ALTER DATABASE postgres RESET server_version",
+            Some("55P02"),
+        ),
+        (
+            "ALTER FUNCTION public.current_timezone_source() RESET server_version",
+            Some("55P02"),
+        ),
+        ("ALTER SYSTEM RESET server_version", Some("55P02")),
+    ] {
+        if let Some(expected) = expected {
+            assert_eq!(
+                error_sqlstates(&session.execute(&mut engine, sql, true)),
+                [expected],
+                "{sql}"
+            );
+        } else {
+            session.success(&mut engine, sql, true);
+        }
+        assert_eq!(data_rows(&session.success(&mut engine, "SELECT proconfig[1] FROM pg_proc WHERE proname='current_timezone_source'; SELECT setconfig[1] FROM pg_db_role_setting WHERE setrole='postgres'::regrole AND setdatabase=0; SELECT setconfig[1] FROM pg_db_role_setting WHERE setrole=0 AND setdatabase=(SELECT oid FROM pg_database WHERE datname='postgres')", true)), ["application_name=saved-function", "application_name=saved-role", "application_name=saved-database"]);
+        assert!(
+            engine
+                .storage
+                .system_settings()
+                .any(|(_, setting)| setting.live
+                    && setting.name.as_str() == "application_name"
+                    && setting.value.as_str() == "saved-system")
+        );
+    }
+    session.success(&mut engine, "ALTER SYSTEM RESET application_name", true);
+    session.success(&mut engine, "ALTER ROLE postgres RESET application_name; ALTER DATABASE postgres RESET application_name; DROP FUNCTION public.current_timezone_source()", true);
+}
+
+#[test]
+fn search_path_sql_capacity_errors_preserve_the_selected_value() {
+    let config = test_config("search-path-sql-capacity");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    for (name, expected) in [
+        ("a".repeat(63), "a".repeat(63)),
+        (
+            format!("{}a", "é".repeat(31)),
+            format!("\"{}a\"", "é".repeat(31)),
+        ),
+    ] {
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                &format!("SET search_path TO {name}; SHOW search_path"),
+                true,
+            )),
+            [expected]
+        );
+    }
+    session.success(
+        &mut engine,
+        "SELECT set_config('search_path','GUC_RAW,public',false)",
+        true,
+    );
+    for name in [
+        "a".repeat(64),
+        "a".repeat(65),
+        "é".repeat(32),
+        format!("{}a", "é".repeat(32)),
+    ] {
+        for sql in [
+            format!("SET search_path TO {name}"),
+            format!("SET search_path TO \"{name}\""),
+        ] {
+            assert_eq!(
+                error_sqlstates(&session.execute(&mut engine, &sql, true)),
+                ["42622"]
+            );
+            assert_eq!(
+                data_rows(&session.success(&mut engine, "SHOW search_path", true)),
+                ["GUC_RAW,public"]
+            );
+        }
+    }
+    for value in ["a".repeat(129), "é".repeat(64), "é".repeat(65)] {
+        assert_eq!(
+            error_sqlstates(&session.execute(
+                &mut engine,
+                &format!("SET search_path TO '{value}'"),
+                true,
+            )),
+            ["22023"]
+        );
+        assert_eq!(
+            data_rows(&session.success(&mut engine, "SHOW search_path", true)),
+            ["GUC_RAW,public"]
+        );
+    }
+}
+
+#[test]
+fn saved_guc_values_preserve_raw_spelling_without_runtime_allocations() {
+    let guc = GucState::new();
+    let raw = "  \"Mixed Case\" , public  ";
+    let configs = [crate::storage::RoutineConfig {
+        name: crate::storage::SqlName::parse("search_path").unwrap(),
+        value: crate::util::StackStr::from_str(raw),
+    }];
+    crate::mem::guard::forbid_alloc(|| {
+        guc.set_connection_default(
+            "search_path",
+            "GUC_RAW,public",
+            guc::ConnectionDefaultSource::Role,
+        )
+        .unwrap();
+        assert_eq!(
+            guc.get_owned("search_path").unwrap().as_str(),
+            "GUC_RAW,public"
+        );
+        guc.begin_transaction();
+        guc.set_config("search_path", Some("public"), false)
+            .unwrap();
+        guc.commit_transaction();
+        guc.begin_transaction();
+        guc.set_config("search_path", None, false).unwrap();
+        guc.commit_transaction();
+        assert_eq!(
+            guc.get_owned("search_path").unwrap().as_str(),
+            "GUC_RAW,public"
+        );
+        {
+            let _scope = guc.enter_routine_configs(&configs).unwrap();
+            assert_eq!(guc.get_owned("search_path").unwrap().as_str(), raw);
+        }
+        assert_eq!(
+            guc.get_owned("search_path").unwrap().as_str(),
+            "GUC_RAW,public"
+        );
+        guc.begin_transaction();
+        guc.set_config("search_path", Some(raw), true).unwrap();
+        guc.commit_transaction();
+        assert_eq!(
+            guc.get_owned("search_path").unwrap().as_str(),
+            "GUC_RAW,public"
+        );
+    });
+}
+
+#[test]
+fn reset_xmloption_restores_the_connection_default_without_allocating() {
+    let guc = GucState::new();
+    let configs = [crate::storage::RoutineConfig {
+        name: crate::storage::SqlName::parse("application_name").unwrap(),
+        value: crate::util::StackStr::from_str("scoped"),
+    }];
+    crate::mem::guard::forbid_alloc(|| {
+        guc.set_connection_default("xmloption", "document", guc::ConnectionDefaultSource::Role)
+            .unwrap();
+        guc.begin_transaction();
+        guc.set_config("xmloption", Some("content"), false).unwrap();
+        guc.commit_transaction();
+        assert_eq!(guc.get_owned("xmloption").unwrap().as_str(), "content");
+        guc.begin_transaction();
+        guc.reset("xmloption").unwrap();
+        guc.commit_transaction();
+        assert_eq!(guc.get_owned("xmloption").unwrap().as_str(), "document");
+        assert!(guc.render().xml_document);
+        guc.begin_transaction();
+        {
+            let _scope = guc.enter_routine_configs(&configs).unwrap();
+            guc.set_config("xmloption", Some("content"), false).unwrap();
+        }
+        assert_eq!(guc.get_owned("xmloption").unwrap().as_str(), "content");
+        guc.commit_transaction();
+        assert!(!guc.render().xml_document);
+    });
+}
+
+#[test]
+fn bound_builtin_casts_keep_indexed_point_reads() {
+    let config = test_config("retained-query-indexed-casts");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE TABLE query_indexed_casts(id integer PRIMARY KEY,payload integer); \
+         INSERT INTO query_indexed_casts \
+         SELECT value,value*10 FROM generate_series(1,1024) AS source(value)",
+        true,
+    );
+    session.success(&mut engine, "BEGIN", true);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT payload::text,-payload,payload+1 FROM query_indexed_casts WHERE id=511; \
+             SELECT seq_scan,seq_tup_read,idx_scan,idx_tup_fetch \
+             FROM pg_stat_xact_user_tables WHERE relname='query_indexed_casts'",
+            true,
+        )),
+        ["5110|-5110|5111", "0|0|1|1"]
+    );
+    session.success(&mut engine, "ROLLBACK", true);
+}
+#[test]
+fn application_names_escape_non_printable_bytes_without_allocating() {
+    let guc = GucState::new();
+    let exactly_full = "é".repeat(8);
+    let full_expected = "\\xc3\\xa9".repeat(8);
+    let overflowing = "é".repeat(9);
+    crate::mem::guard::forbid_alloc(|| {
+        for (value, expected) in [
+            (" plain !~\\ ", " plain !~\\ "),
+            ("a\tb", "a\\x09b"),
+            (
+                "\x01\t\n\x0b\x0c\r\x1b\x1f\x7f",
+                "\\x01\\x09\\x0a\\x0b\\x0c\\x0d\\x1b\\x1f\\x7f",
+            ),
+            ("é中🦀", "\\xc3\\xa9\\xe4\\xb8\\xad\\xf0\\x9f\\xa6\\x80"),
+            ("\\x09", "\\x09"),
+        ] {
+            assert_eq!(
+                guc.set_config("application_name", Some(value), false)
+                    .unwrap()
+                    .as_str(),
+                expected
+            );
+            assert_eq!(
+                guc.get_owned("application_name").unwrap().as_str(),
+                expected
+            );
+        }
+        assert_eq!(
+            guc.set_config("application_name", Some(&exactly_full), false)
+                .unwrap()
+                .as_str(),
+            full_expected
+        );
+        assert_eq!(
+            guc.set_config("application_name", Some(&overflowing), false)
+                .unwrap_err()
+                .sqlstate,
+            "22023"
+        );
+        assert_eq!(
+            guc.get_owned("application_name").unwrap().as_str(),
+            full_expected
+        );
+        assert_eq!(
+            guc.set_config("application_name", Some("zero\0byte"), false)
+                .unwrap_err()
+                .sqlstate,
+            "22021"
+        );
+        assert_eq!(
+            guc.get_owned("application_name").unwrap().as_str(),
+            full_expected
+        );
+    });
+}
+#[test]
+fn datestyle_assignments_preserve_reset_defaults_and_reject_conflicts_atomically() {
+    let guc = GucState::new();
+    guc.set_connection_default(
+        "DateStyle",
+        "SQL, YMD",
+        guc::ConnectionDefaultSource::Database,
+    )
+    .unwrap();
+    crate::mem::guard::forbid_alloc(|| {
+        guc.begin_transaction();
+        for (value, expected) in [
+            ("", "German, DMY"),
+            (" \t\n\u{b}", "German, DMY"),
+            ("DEFAULT", "SQL, YMD"),
+            ("DEFAULT,ISO", "ISO, YMD"),
+            ("ISO,DEFAULT", "ISO, YMD"),
+            ("DEFAULT,German", "German, DMY"),
+            ("German,DEFAULT", "German, YMD"),
+            ("MDY,DEFAULT,German", "German, MDY"),
+            ("German,DEFAULT,MDY", "German, MDY"),
+            ("ISO,ISO", "ISO, DMY"),
+            ("\"ISO\", \"DMY\"", "ISO, DMY"),
+            ("PostgreSQL", "Postgres, DMY"),
+            ("European", "German, DMY"),
+            ("US", "German, MDY"),
+            ("NonEuro", "German, MDY"),
+            ("German,MDY,German", "German, MDY"),
+            ("DEFAULT,DEFAULT", "SQL, YMD"),
+        ] {
+            guc.set_config("DateStyle", Some("German,DMY"), false)
+                .unwrap();
+            assert_eq!(
+                guc.set_config("DateStyle", Some(value), false)
+                    .unwrap()
+                    .as_str(),
+                expected,
+                "{value:?}"
+            );
+        }
+        guc.set_config("DateStyle", Some("DEFAULT"), false).unwrap();
+        assert_eq!(guc.get_owned("DateStyle").unwrap().as_str(), "SQL, YMD");
+        guc.set_config("DateStyle", Some("German,MDY"), false)
+            .unwrap();
+        for value in [
+            "ISO,SQL",
+            "DMY,MDY",
+            "ISO SQL",
+            "ISO,",
+            "ISO,,MDY",
+            "\"ISO,DMY\"",
+            "\"ISO\"suffix",
+            "\"ISO",
+            "\"IS\"\"O\"",
+            "'DEFAULT'",
+            "German,Euro,US",
+            "ISO,SQL,DEFAULT",
+            "SQL,DEFAULT,ISO",
+        ] {
+            assert_eq!(
+                guc.set_config("DateStyle", Some(value), false)
+                    .unwrap_err()
+                    .sqlstate,
+                "22023",
+                "{value:?}"
+            );
+            assert_eq!(guc.get_owned("DateStyle").unwrap().as_str(), "German, MDY");
+        }
+        assert_eq!(
+            guc.set_config("DateStyle", None, false).unwrap().as_str(),
+            "SQL, YMD"
+        );
+        guc.commit_transaction();
+    });
+}
+
+#[test]
+fn datestyle_sql_values_apply_cumulative_components_and_quoted_defaults() {
+    let config = test_config("decoded-datestyle-components");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SET DateStyle TO SQL,YMD; SELECT current_setting('DateStyle'); \
+         SET DateStyle TO German; SELECT current_setting('DateStyle'); \
+         SELECT set_config('DateStyle','German,DEFAULT',false); \
+         SET DateStyle TO 'DEFAULT'; SELECT current_setting('DateStyle'); \
+         SELECT set_config('DateStyle','\"SQL\",\"DMY\"',false); \
+         SELECT set_config('DateStyle','',false)",
+            true
+        )),
+        [
+            "SQL, YMD",
+            "German, DMY",
+            "German, MDY",
+            "ISO, MDY",
+            "SQL, DMY",
+            "SQL, DMY"
+        ]
+    );
+    for sql in [
+        "SET DateStyle TO ISO,SQL",
+        "SELECT set_config('DateStyle','DMY,MDY',false)",
+    ] {
+        assert_eq!(
+            error_sqlstates(&session.execute(&mut engine, sql, true)),
+            ["22023"]
+        );
+        assert_eq!(
+            data_rows(&session.success(&mut engine, "SELECT current_setting('DateStyle')", true)),
+            ["SQL, DMY"]
+        );
+    }
+}
+
+#[test]
+fn invalid_setting_values_use_parameter_errors_without_changing_values() {
+    let guc = GucState::new();
+    crate::mem::guard::forbid_alloc(|| {
+        for (name, invalid) in [
+            ("check_function_bodies", "not_a_value"),
+            ("row_security", "not_a_value"),
+            ("event_triggers", "not_a_value"),
+            ("default_transaction_read_only", "not_a_value"),
+            ("default_transaction_deferrable", "not_a_value"),
+            ("xmloption", "not_a_value"),
+            ("track_functions", "not_a_value"),
+            ("default_text_search_config", ""),
+            ("standard_conforming_strings", "not_a_value"),
+            ("synchronize_seqscans", "not_a_value"),
+            ("idle_in_transaction_session_timeout", "not_a_value"),
+            ("transaction_timeout", "not_a_value"),
+            ("lock_timeout", "'0'"),
+            ("statement_timeout", "2147483648"),
+        ] {
+            let prior = guc.get_owned(name).unwrap();
+            assert_eq!(
+                guc.set_config(name, Some(invalid), false)
+                    .unwrap_err()
+                    .sqlstate,
+                "22023",
+                "{name}"
+            );
+            assert_eq!(guc.get_owned(name).unwrap().as_str(), prior.as_str());
+        }
+        for name in ["transaction_read_only", "transaction_deferrable"] {
+            assert_eq!(
+                guc.current_transaction_value(name, Some("not_a_value"))
+                    .unwrap()
+                    .unwrap_err()
+                    .sqlstate,
+                "22023"
+            );
+        }
+    });
+}
+
+#[test]
+fn rendered_routine_definitions_preserve_quoted_names_and_saved_setting_input() {
+    let config = test_config("quoted-routine-definition");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        r#"
+        CREATE SCHEMA "Quoted App";
+        CREATE FUNCTION "Quoted App"."Quoted Routine"("input label" integer)
+        RETURNS TABLE ("output label" integer) LANGUAGE sql
+        SET timezone TO '0.0005'
+        AS $$SELECT $1 + EXTRACT(timezone FROM current_timestamp)::integer$$;
+    "#,
+        true,
+    );
+    let definitions = data_rows(&session.success(
+        &mut engine,
+        r#"SELECT pg_get_functiondef('"Quoted App"."Quoted Routine"(integer)'::regprocedure)"#,
+        true,
+    ));
+    assert_eq!(definitions.len(), 1);
+    let definition = &definitions[0];
+    for quoted in [
+        r#""Quoted App"."Quoted Routine""#,
+        r#""input label""#,
+        r#""output label""#,
+        r#"SET "TimeZone" TO '0.0005'"#,
+    ] {
+        assert!(definition.contains(quoted), "{definition}");
+    }
+    session.success(
+        &mut engine,
+        r#"DROP FUNCTION "Quoted App"."Quoted Routine"(integer)"#,
+        true,
+    );
+    session.success(&mut engine, definition, true);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            r#"SELECT * FROM "Quoted App"."Quoted Routine"(7)"#,
+            true
+        )),
+        ["8"]
+    );
+}
+
+#[test]
+fn fixed_settings_parse_values_before_checking_supported_behavior() {
+    let guc = GucState::new();
+    crate::mem::guard::forbid_alloc(|| {
+        for value in ["on", "t", "tr", "tru", "true", "y", "yes", "1"] {
+            assert_eq!(
+                guc.set_config("standard_conforming_strings", Some(value), false)
+                    .unwrap()
+                    .as_str(),
+                "on"
+            );
+        }
+        for value in ["off", "of", "f", "false", "n", "no", "0"] {
+            assert_eq!(
+                guc.set_config("synchronize_seqscans", Some(value), false)
+                    .unwrap()
+                    .as_str(),
+                "off"
+            );
+        }
+        for name in ["idle_in_transaction_session_timeout", "transaction_timeout"] {
+            assert_eq!(
+                guc.set_config(name, Some("0ms"), false).unwrap().as_str(),
+                "0"
+            );
+            assert_eq!(
+                guc.set_config(name, Some("1ms"), false)
+                    .unwrap_err()
+                    .sqlstate,
+                "0A000"
+            );
+        }
+        for name in ["standard_conforming_strings", "synchronize_seqscans"] {
+            assert_eq!(
+                guc.set_config(name, Some("o"), false).unwrap_err().sqlstate,
+                "22023"
+            );
+        }
+        for (name, value) in [
+            ("standard_conforming_strings", "off"),
+            ("synchronize_seqscans", "on"),
+            ("default_table_access_method", "HEAP"),
+        ] {
+            assert_eq!(
+                guc.set_config(name, Some(value), false)
+                    .unwrap_err()
+                    .sqlstate,
+                "0A000"
+            );
+        }
+    });
+}
+
+#[test]
+fn timezone_numeric_offsets_and_intervals_use_postgresql_bounds() {
+    let guc = GucState::new();
+    crate::mem::guard::forbid_alloc(|| {
+        for (value, expected) in [
+            ("16", "<+16>-16"),
+            ("24", "<+24>-24"),
+            ("1e1", "<+10>-10"),
+            ("0.0001", "<+00>-00"),
+            ("-0.0005", "<-00:00:01>+00:00:01"),
+            ("167.999999", "<+167:59:59>-167:59:59"),
+            ("<+02:30>-02:30", "<+02:30>-02:30"),
+            ("<+00>-00", "<+00>-00"),
+        ] {
+            guc.set_config("timezone", Some(value), false).unwrap();
+            assert_eq!(
+                guc.get_owned("timezone").unwrap().as_str(),
+                expected,
+                "{value}"
+            );
+        }
+        for value in [
+            "168",
+            "-168",
+            "1000",
+            "Infinity",
+            "<+167:59:59>-167:59:59",
+            "<-167:59:59>+167:59:59",
+        ] {
+            let prior = guc.get_owned("timezone").unwrap();
+            assert_eq!(
+                guc.set_config("timezone", Some(value), false)
+                    .unwrap_err()
+                    .sqlstate,
+                "22023",
+                "{value}"
+            );
+            assert_eq!(guc.get_owned("timezone").unwrap().as_str(), prior.as_str());
+        }
+        let prior = guc.get_owned("timezone").unwrap();
+        assert_eq!(
+            guc.set_config("timezone", Some("NaN"), false)
+                .unwrap_err()
+                .sqlstate,
+            "0A000"
+        );
+        assert_eq!(guc.get_owned("timezone").unwrap().as_str(), prior.as_str());
+        for (micros, expected) in [
+            (500_000, "<+00>-00"),
+            (1_500_000, "<+00:00:01>-00:00:01"),
+            (-1_500_000, "<-00:00:01>+00:00:01"),
+            (604_799_000_000, "<+167:59:59>-167:59:59"),
+            (-604_799_000_000, "<-167:59:59>+167:59:59"),
+        ] {
+            guc.set_time_zone_interval(
+                super::super::types::Interval {
+                    months: 0,
+                    days: 0,
+                    micros,
+                },
+                false,
+            )
+            .unwrap();
+            assert_eq!(guc.get_owned("timezone").unwrap().as_str(), expected);
+        }
+        for interval in [
+            super::super::types::Interval {
+                months: 1,
+                days: 0,
+                micros: 0,
+            },
+            super::super::types::Interval {
+                months: 0,
+                days: 1,
+                micros: 0,
+            },
+            super::super::types::Interval {
+                months: 0,
+                days: 0,
+                micros: 604_800_000_000,
+            },
+            super::super::types::Interval {
+                months: 0,
+                days: 0,
+                micros: -604_800_000_000,
+            },
+        ] {
+            let prior = guc.get_owned("timezone").unwrap();
+            assert_eq!(
+                guc.set_time_zone_interval(interval, false)
+                    .unwrap_err()
+                    .sqlstate,
+                "22023"
+            );
+            assert_eq!(guc.get_owned("timezone").unwrap().as_str(), prior.as_str());
+        }
+    });
 }

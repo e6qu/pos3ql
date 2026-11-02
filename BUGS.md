@@ -15,23 +15,5 @@ Unfinished features and their acceptance criteria belong in [PLAN.md](PLAN.md).
 Current guarantees belong in the [behavior guide](docs/implemented-baseline.md)
 and its [owning technical guides](docs/README.md).
 
-Successful-call regressions must compare successful values. Matching errors on
-both servers do not establish support; keep SQL and binary-client checks aligned.
-Argument resumption checks must also compare non-sequence effects, changed
-session settings, selected defaults and replacement timing with PostgreSQL.
-Record expansion checks must also compare argument effects and declared field
-types, including independent calls and shared set-returning producers.
-Keep small-arena index checks in the full gate: repeated nonsuspending builtin
-expressions must not accumulate routine input records. Compare anonymous-record
-casts with PostgreSQL before using a named type to persist function results.
-Named row function regressions cover SELECT values and FROM columns, including
-null rows, combined producers, lateral inputs and empty-cache recovery.
-Input-retention cases include engine-owned statistics, logical replication and
-large-object builtins; their arguments must not repeat around an engine handoff.
-Routine result conversions must use structural decoding for named and anonymous
-records, including mutable table functions and restored declarations.
-Use the shared structural value copy for SQL and PL/pgSQL results and detached
-trigger rows; test named fields in conflict-update triggers as well as functions.
-
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

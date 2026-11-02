@@ -931,15 +931,15 @@ pub(crate) struct RoutineInvocationState<'a> {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct RoutineInvocationContext<'a> {
-    invocations: &'a RoutineInvocationState<'a>,
-    statement_arena: &'a Arena,
+pub(crate) struct RoutineInvocationContext<'scope, 'arena> {
+    invocations: &'scope RoutineInvocationState<'arena>,
+    statement_arena: &'arena Arena,
 }
 
-impl<'a> RoutineInvocationContext<'a> {
+impl<'scope, 'arena> RoutineInvocationContext<'scope, 'arena> {
     pub(crate) const fn new(
-        invocations: &'a RoutineInvocationState<'a>,
-        statement_arena: &'a Arena,
+        invocations: &'scope RoutineInvocationState<'arena>,
+        statement_arena: &'arena Arena,
     ) -> Self {
         Self {
             invocations,
@@ -964,7 +964,7 @@ impl Drop for RoutineInvocationScope {
 }
 
 pub(crate) fn enter_routine_invocation_scope(
-    context: Option<RoutineInvocationContext<'_>>,
+    context: Option<RoutineInvocationContext<'_, '_>>,
 ) -> RoutineInvocationScope {
     let current = match context {
         Some(context) => Some((
@@ -3439,6 +3439,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                 name,
                 argument_names,
                 argument_type_oids,
+                variadic,
                 self.txid,
             )
         }) else {
@@ -3463,6 +3464,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             oid,
             argument_mapping,
             variadic,
+            bound_strict: None,
         }))
     }
 
@@ -3582,12 +3584,13 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         evaluate: &mut dyn FnMut(&'a Expr<'a>) -> Result<Datum<'a>, SqlError>,
         arena: &'a Arena,
     ) -> Result<Datum<'a>, SqlError> {
-        let (oid, mapping, variadic) = match target {
+        let (oid, mapping, variadic, bound_strict) = match target {
             super::eval::RoutineCallTarget::Stored {
                 oid,
                 argument_mapping,
                 variadic,
-            } => (oid, argument_mapping, variadic),
+                bound_strict,
+            } => (oid, argument_mapping, variadic, bound_strict),
             super::eval::RoutineCallTarget::Operator { schema, name } => {
                 let values = arena
                     .alloc_slice_with(arguments.len(), |_| Datum::Null)
@@ -3617,6 +3620,9 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                 )
             })?;
         let mut declared = self.storage.routine_for(slot, self.txid);
+        if let Some(strict) = bound_strict {
+            declared.attributes.strict = strict;
+        }
         let Some(completed) = self.prepare_routine_inputs(
             slot,
             &mut declared,
@@ -3825,6 +3831,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                 name,
                 argument_names,
                 argument_type_oids,
+                variadic,
                 self.txid,
             )
         };
@@ -6680,10 +6687,15 @@ fn rewrite_grouped_expr<'a>(
             left: rewrite(left)?,
             right: rewrite(right)?,
         }),
-        Expr::Cast { operand, type_name, type_mod } => alloc(Expr::Cast {
+        Expr::Cast { operand, type_name, type_mod, binding } => alloc(Expr::Cast {
             operand: rewrite(operand)?,
             type_name,
             type_mod: *type_mod,
+            binding: *binding,
+        }),
+        Expr::BoundDefault { expression, type_oid } => alloc(Expr::BoundDefault {
+            expression: rewrite(expression)?,
+            type_oid: *type_oid,
         }),
         Expr::Collate { operand, collation } => alloc(Expr::Collate {
             operand: rewrite(operand)?,
@@ -6748,6 +6760,7 @@ fn rewrite_grouped_expr<'a>(
             order_by,
             over,
             filter,
+            bound_strict,
         } => {
             let mut rewritten = ArenaList::new(arena);
             for a in args.iter() {
@@ -6797,6 +6810,7 @@ fn rewrite_grouped_expr<'a>(
             alloc(Expr::Call {
                 name,
                 bound_oid: *bound_oid,
+                bound_strict: *bound_strict,
                 args,
                 argument_names,
                 variadic: *variadic,
@@ -10760,8 +10774,13 @@ impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_> {
             self.storage
                 .function_for_call_syntax_oids(name, arguments, variadic, self.txid)
         } else {
-            self.storage
-                .function_for_named_call_oids(name, argument_names, arguments, self.txid)
+            self.storage.function_for_named_call_oids(
+                name,
+                argument_names,
+                arguments,
+                variadic,
+                self.txid,
+            )
         };
         let result = routine
             .and_then(|routine| routine.function_result_contract())
@@ -10830,6 +10849,7 @@ impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_> {
                 name,
                 argument_names,
                 arguments,
+                variadic,
                 self.txid,
             )?
         };

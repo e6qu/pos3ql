@@ -179,6 +179,7 @@ impl Storage {
         dependencies: RoutineDependencies<'_>,
         transaction: u32,
     ) -> Result<RoutineChange, SqlError> {
+        super::validate_stored_search_path(&definition.creation_path)?;
         let mut owners = self.catalog_dependency_owners(
             &self.routines,
             type_contracts::CatalogPublicationInput::RoutineContract,
@@ -669,6 +670,7 @@ impl Storage {
             creation_path,
             dependencies,
         } = spec;
+        super::validate_stored_search_path(&creation_path)?;
         if config_count > configs.len()
             || configs[..config_count]
                 .iter()

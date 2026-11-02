@@ -1412,8 +1412,13 @@ impl ColTypeResolver for DependencyTypes<'_, '_, '_> {
             self.storage
                 .function_for_call_syntax_oids(name, arguments, variadic, self.txid)?
         } else {
-            self.storage
-                .function_for_named_call_oids(name, argument_names, arguments, self.txid)?
+            self.storage.function_for_named_call_oids(
+                name,
+                argument_names,
+                arguments,
+                variadic,
+                self.txid,
+            )?
         };
         let ctype = routine.function_result_contract()?.ctype;
         Some(StaticTypeMeta {
@@ -1459,6 +1464,7 @@ impl ColTypeResolver for DependencyTypes<'_, '_, '_> {
                 name,
                 argument_names,
                 arguments,
+                variadic,
                 self.txid,
             )?
         };
@@ -1803,7 +1809,13 @@ fn record_routine_call(
     let resolved = if argument_names.is_empty() {
         storage.routine_slot_for_function_call_syntax_oids(name, argument_oids, variadic, txid)
     } else {
-        storage.routine_slot_for_named_function_call_oids(name, argument_names, argument_oids, txid)
+        storage.routine_slot_for_named_function_call_oids(
+            name,
+            argument_names,
+            argument_oids,
+            variadic,
+            txid,
+        )
     };
     let Some(slot) = resolved else {
         return Ok(());
@@ -2525,7 +2537,12 @@ fn collect_expression<'a>(
         )
     };
     match expression {
-        Expr::Cast { operand, .. } | Expr::Collate { operand, .. } => child(operand),
+        Expr::Cast { operand, .. }
+        | Expr::BoundDefault {
+            expression: operand,
+            ..
+        }
+        | Expr::Collate { operand, .. } => child(operand),
         Expr::Unary { operand, .. }
         | Expr::IsNull { operand, .. }
         | Expr::Field { base: operand, .. } => child(operand),
@@ -2758,7 +2775,12 @@ fn collect_type(
 fn regclass_literal<'a>(expression: &'a Expr<'a>) -> Option<&'a str> {
     match expression {
         Expr::Str(value) => Some(value),
-        Expr::Cast { operand, .. } | Expr::Collate { operand, .. } => regclass_literal(operand),
+        Expr::Cast { operand, .. }
+        | Expr::BoundDefault {
+            expression: operand,
+            ..
+        }
+        | Expr::Collate { operand, .. } => regclass_literal(operand),
         _ => None,
     }
 }

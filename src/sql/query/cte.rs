@@ -582,6 +582,7 @@ fn coerce_rule_transition<'a>(
             operand: expression,
             type_name: target.type_name,
             type_mod: target.type_mod,
+            binding: crate::sql::ast::CastBinding::Resolve,
         })
         .map(|expression| &*expression)
         .map_err(|_| arena_full())?;
@@ -2199,6 +2200,10 @@ fn expr_references(e: &Expr, name: &str) -> usize {
         } => expr_references(operand, name) + select_references(select, name),
         Expr::Unary { operand, .. }
         | Expr::Cast { operand, .. }
+        | Expr::BoundDefault {
+            expression: operand,
+            ..
+        }
         | Expr::Collate { operand, .. }
         | Expr::IsNull { operand, .. } => expr_references(operand, name),
         Expr::Binary { left, right, .. } => {
@@ -2346,6 +2351,10 @@ fn expr_mentions_column(expression: &Expr<'_>, qualifier: &str, name: &str) -> b
         } => child(operand) || select_mentions_column(select, qualifier, name),
         Expr::Unary { operand, .. }
         | Expr::Cast { operand, .. }
+        | Expr::BoundDefault {
+            expression: operand,
+            ..
+        }
         | Expr::Collate { operand, .. }
         | Expr::IsNull { operand, .. }
         | Expr::Field { base: operand, .. } => child(operand),
@@ -4926,6 +4935,10 @@ fn expr_has_subquery(e: &Expr) -> bool {
         | Expr::ArraySubquery(_) => true,
         Expr::Unary { operand, .. }
         | Expr::Cast { operand, .. }
+        | Expr::BoundDefault {
+            expression: operand,
+            ..
+        }
         | Expr::Collate { operand, .. }
         | Expr::IsNull { operand, .. } => expr_has_subquery(operand),
         Expr::Binary { left, right, .. } => expr_has_subquery(left) || expr_has_subquery(right),
@@ -5239,7 +5252,12 @@ fn text_search_configuration_argument<'a>(
     fn literal<'a>(expression: &'a Expr<'a>) -> Option<&'a str> {
         match expression {
             Expr::Str(value) => Some(value),
-            Expr::Cast { operand, .. } | Expr::Collate { operand, .. } => literal(operand),
+            Expr::Cast { operand, .. }
+            | Expr::BoundDefault {
+                expression: operand,
+                ..
+            }
+            | Expr::Collate { operand, .. } => literal(operand),
             _ => None,
         }
     }
@@ -5298,6 +5316,7 @@ fn rewrite_stored_text_search_arguments<'a>(
             operand,
             type_name: "regconfig",
             type_mod: -1,
+            binding: crate::sql::ast::CastBinding::Resolve,
         })
         .map_err(|_| arena_full())?;
     let rewritten = arena.alloc_slice_copy(args).map_err(|_| arena_full())?;
@@ -5343,6 +5362,7 @@ fn rewrite_stored_sequence_arguments<'a>(
             operand,
             type_name: "regclass",
             type_mod: -1,
+            binding: crate::sql::ast::CastBinding::Resolve,
         })
         .map_err(|_| arena_full())?;
     let rewritten = arena.alloc_slice_copy(args).map_err(|_| arena_full())?;
@@ -5500,14 +5520,23 @@ fn subst_expr<'a>(
             operand,
             type_name,
             type_mod,
+            binding,
         } => {
             let operand = subst_expr(operand, context, arena)?;
             Expr::Cast {
                 operand: rewrite_stored_regcollation_operand(operand, type_name, context, arena)?,
                 type_name: rewrite_stored_type_name(type_name, context, arena)?,
                 type_mod: *type_mod,
+                binding: *binding,
             }
         }
+        Expr::BoundDefault {
+            expression,
+            type_oid,
+        } => Expr::BoundDefault {
+            expression: subst_expr(expression, context, arena)?,
+            type_oid: *type_oid,
+        },
         Expr::Collate { operand, collation } => Expr::Collate {
             operand: subst_expr(operand, context, arena)?,
             collation: rewrite_stored_collation(*collation, context)?,
@@ -5526,6 +5555,7 @@ fn subst_expr<'a>(
             order_by,
             over,
             filter,
+            bound_strict,
             ..
         } => {
             let name = rewrite_stored_operator_name(name, args, context, arena)?;
@@ -5576,6 +5606,7 @@ fn subst_expr<'a>(
             Expr::Call {
                 name,
                 bound_oid,
+                bound_strict: *bound_strict,
                 args,
                 argument_names,
                 variadic: *variadic,

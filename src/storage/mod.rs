@@ -4071,7 +4071,7 @@ fn pending_table_statistics_capacity(config: &Config) -> usize {
 
 fn pending_extended_statistics_capacity(config: &Config) -> usize {
     config
-        .extended_statistics_capacity()
+        .max_extended_statistics
         .saturating_mul(config.max_catalog_versions_per_object)
         .min(
             catalog_transaction_capacity(config).saturating_mul(config.max_analyze_per_transaction),
@@ -4952,6 +4952,25 @@ pub(crate) struct StoredQueryDefinition {
     pub sql: StackStr<VIEW_SQL_MAX>,
     pub creation_path: StackStr<128>,
     pub dependencies: StoredQueryDependencies,
+}
+
+/// Stored SQL must cross the same path boundary as a session assignment before
+/// publication. In particular, a fixed string's truncated prefix is not a path.
+pub(crate) fn validate_stored_search_path(path: &StackStr<128>) -> Result<(), SqlError> {
+    if path.is_truncated() {
+        return Err(sql_err!(
+            sqlstate::DATA_EXCEPTION,
+            "stored creation search path exceeds {} bytes",
+            crate::sql::guc::SEARCH_PATH_BYTES
+        ));
+    }
+    crate::sql::guc::validate_search_path(path.as_str()).map_err(|error| {
+        sql_err!(
+            sqlstate::DATA_EXCEPTION,
+            "invalid stored creation search path: {}",
+            error.message
+        )
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -9130,24 +9149,36 @@ impl RoutineDef {
         argument_count: usize,
         explicit_variadic: bool,
     ) -> Option<[u8; MAX_ROUTINE_ARGUMENTS]> {
-        let parameter_for_input = |index| {
-            parameters
-                .iter()
-                .filter(|parameter| parameter.mode.is_input())
-                .nth(index)
-        };
-        let variadic_index = parameters
+        let inputs = parameters
             .iter()
-            .filter(|parameter| parameter.mode.is_input())
+            .filter(|parameter| parameter.mode.is_input());
+        if inputs.clone().count() != input_count {
+            return None;
+        }
+        Self::map_parameter_positions(inputs, argument_names, argument_count, explicit_variadic)
+    }
+
+    fn map_parameter_positions<'parameter>(
+        parameters: impl Iterator<Item = &'parameter RoutineParameterDef> + Clone,
+        argument_names: &[Option<&str>],
+        argument_count: usize,
+        explicit_variadic: bool,
+    ) -> Option<[u8; MAX_ROUTINE_ARGUMENTS]> {
+        let input_count = parameters.clone().count();
+        let parameter_for_input = |index| parameters.clone().nth(index);
+        let variadic_index = parameters
+            .clone()
             .enumerate()
-            .find_map(|(input_index, parameter)| {
-                matches!(parameter.mode, RoutineParameterMode::Variadic { .. })
-                    .then_some(input_index)
+            .find_map(|(index, parameter)| {
+                matches!(parameter.mode, RoutineParameterMode::Variadic { .. }).then_some(index)
             });
         if argument_count > MAX_ROUTINE_ARGUMENTS
             || (argument_count > input_count && variadic_index.is_none())
             || (!argument_names.is_empty() && argument_names.len() != argument_count)
-            || explicit_variadic && !argument_names.is_empty()
+            || explicit_variadic && variadic_index.is_none()
+            || (!explicit_variadic
+                && variadic_index.is_some()
+                && argument_names.iter().any(Option::is_some))
         {
             return None;
         }
@@ -9163,7 +9194,7 @@ impl RoutineDef {
                 None => call_index,
                 Some(name) => (0..input_count).find(|&input_index| {
                     parameter_for_input(input_index)
-                        .is_some_and(|parameter| parameter.name.as_str().eq_ignore_ascii_case(name))
+                        .is_some_and(|parameter| parameter.name.as_str() == name)
                 })?,
             };
             let expanded_variadic =
@@ -9173,6 +9204,14 @@ impl RoutineDef {
             }
             occupied[input_index] = true;
             *mapped_input = u8::try_from(input_index).ok()?;
+        }
+        if explicit_variadic
+            && variadic_index
+                != argument_count
+                    .checked_sub(1)
+                    .map(|index| usize::from(mapping[index]))
+        {
+            return None;
         }
         for (input_index, occupied) in occupied.iter().enumerate().take(input_count) {
             if !occupied && !parameter_for_input(input_index)?.mode.has_default() {
@@ -9189,15 +9228,17 @@ impl RoutineDef {
         &self,
         argument_names: &[Option<&str>],
         argument_count: usize,
+        explicit_variadic: bool,
     ) -> Option<[u8; MAX_ROUTINE_ARGUMENTS]> {
-        if !matches!(self.kind, RoutineKind::Procedure)
-            || argument_count > self.parameter_count
-            || (!argument_names.is_empty() && argument_names.len() != argument_count)
-        {
+        if !matches!(self.kind, RoutineKind::Procedure) {
             return None;
         }
-        let mut mapping = [u8::MAX; MAX_ROUTINE_ARGUMENTS];
-        let mut occupied = [false; MAX_ROUTINE_ARGUMENTS];
+        let mut mapping = Self::map_parameter_positions(
+            self.parameters().iter(),
+            argument_names,
+            argument_count,
+            explicit_variadic,
+        )?;
         let mut input_of_parameter = [u8::MAX; MAX_ROUTINE_ARGUMENTS];
         let mut input_index = 0usize;
         for (parameter_index, parameter) in self.parameters().iter().enumerate() {
@@ -9206,27 +9247,8 @@ impl RoutineDef {
                 input_index += 1;
             }
         }
-        for (call_index, mapped_input) in mapping.iter_mut().enumerate().take(argument_count) {
-            let parameter_index = match argument_names.get(call_index).copied().flatten() {
-                None => call_index,
-                Some(name) => self
-                    .parameters()
-                    .iter()
-                    .position(|parameter| parameter.name.as_str().eq_ignore_ascii_case(name))?,
-            };
-            if occupied[parameter_index] {
-                return None;
-            }
-            occupied[parameter_index] = true;
-            *mapped_input = input_of_parameter[parameter_index];
-        }
-        for (parameter_index, occupied) in occupied.iter().enumerate().take(self.parameter_count) {
-            if !occupied {
-                let parameter = self.parameters[parameter_index];
-                if !parameter.mode.is_input() || !parameter.mode.has_default() {
-                    return None;
-                }
-            }
+        for position in mapping.iter_mut().take(argument_count) {
+            *position = input_of_parameter[usize::from(*position)];
         }
         Some(mapping)
     }
@@ -16048,32 +16070,6 @@ fn rename_routine_parameters_schema(
     }
 }
 
-fn schema_path_components(remaining: &str) -> impl Iterator<Item = &str> {
-    let mut remaining = Some(remaining);
-    core::iter::from_fn(move || {
-        let current = remaining.take()?;
-        let mut quoted = false;
-        let mut end = current.len();
-        for (at, character) in current.char_indices() {
-            match character {
-                '"' => quoted = !quoted,
-                ',' if !quoted => {
-                    end = at;
-                    break;
-                }
-                _ => {}
-            }
-        }
-        let component = &current[..end];
-        remaining = if end == current.len() {
-            None
-        } else {
-            Some(&current[end + 1..])
-        };
-        Some(component)
-    })
-}
-
 fn quoted_identifier_matches(source: &str, name: &str) -> bool {
     let mut source = source.chars().peekable();
     let mut name = name.chars();
@@ -16114,11 +16110,18 @@ pub(crate) fn rename_schema_path(
 
     let original = *path;
     let mut rewritten = StackStr::<128>::new();
-    for (index, component) in schema_path_components(original.as_str()).enumerate() {
+    for (index, component) in crate::sql::guc::search_path_components(original.as_str()).enumerate()
+    {
+        let component = component.map_err(|_| {
+            sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "stored search path has invalid list syntax"
+            )
+        })?;
         if index != 0 {
             let _ = rewritten.write_char(',');
         }
-        let name = component.trim();
+        let name = component.trim_matches(crate::sql::guc::search_path_space);
         let matches = if let Some(inner) = name.strip_prefix('"') {
             let inner = inner.strip_suffix('"').ok_or_else(|| {
                 sql_err!(
@@ -16128,11 +16131,18 @@ pub(crate) fn rename_schema_path(
             })?;
             quoted_identifier_matches(inner, old.as_str())
         } else {
-            name == old.as_str()
+            name.bytes()
+                .map(|byte| byte.to_ascii_lowercase())
+                .eq(old.as_str().bytes())
         };
         if matches {
-            let start = component.len() - component.trim_start().len();
-            let end = component.trim_end().len();
+            let start = component.len()
+                - component
+                    .trim_start_matches(crate::sql::guc::search_path_space)
+                    .len();
+            let end = component
+                .trim_end_matches(crate::sql::guc::search_path_space)
+                .len();
             let _ = rewritten.write_str(&component[..start]);
             write_schema_identifier(&mut rewritten, new);
             let _ = rewritten.write_str(&component[end..]);
@@ -19707,7 +19717,7 @@ impl Storage {
                 * (size_of::<TriggerDef>() + config.max_tables * size_of::<PartitionTriggerState>())
             + config.max_policies * size_of::<PolicyDef>()
             + policy_role_budget_bytes(config)
-            + config.extended_statistics_capacity() * size_of::<ExtendedStatisticsDef>()
+            + config.max_extended_statistics * size_of::<ExtendedStatisticsDef>()
             + config.max_publications * size_of::<PublicationDef>()
             + config.max_materialized_views * size_of::<MatviewDef>()
             + config.max_indexes * (size_of::<IndexDef>() + size_of::<BrinMaintenanceState>())
@@ -20165,7 +20175,7 @@ impl Storage {
                 .push(PUBLIC_ROLE)
                 .expect("sized to policy role images");
         }
-        let extended_statistics_capacity = config.extended_statistics_capacity();
+        let extended_statistics_capacity = config.max_extended_statistics;
         let mut extended_statistics =
             FixedVec::new(budget, "extended_statistics", extended_statistics_capacity)?;
         for _ in 0..extended_statistics_capacity {
@@ -31367,36 +31377,40 @@ impl Storage {
         let mut entries = [PathEntry::Catalog; MAX_PATH_ENTRIES];
         let mut n = 0;
         let mut explicit_catalog = false;
-        let mut name_buf = [0u8; 63];
-        // Elements split on commas outside double quotes (the stored form is
-        // canonical: only double-quoted elements may embed commas).
-        for element in schema_path_components(raw).map(str::trim) {
+        for element in crate::sql::guc::search_path_components(raw) {
+            let element = element
+                .expect("search path crossed its validated GUC boundary")
+                .trim_matches(crate::sql::guc::search_path_space);
             if element.is_empty() {
                 continue;
             }
             // Unquote a `"quoted name"` element ("" is an embedded quote).
-            let name: &str = if element.starts_with('"') {
+            let mut decoded = StackStr::<63>::new();
+            if element.starts_with('"') {
                 let inner = element
                     .strip_prefix('"')
                     .and_then(|inner| inner.strip_suffix('"'))
                     .expect("validated search-path identifier has paired quotes");
-                let mut len = 0;
-                let mut bytes = inner.bytes().peekable();
-                while let Some(b) = bytes.next() {
-                    if len == name_buf.len() {
+                let mut characters = inner.chars().peekable();
+                while let Some(character) = characters.next() {
+                    let _ = core::fmt::Write::write_char(&mut decoded, character);
+                    if decoded.is_truncated() {
                         break;
                     }
-                    name_buf[len] = b;
-                    len += 1;
-                    if b == b'"' {
-                        // "" collapses to one quote.
-                        bytes.next();
+                    if character == '"' {
+                        characters.next();
                     }
                 }
-                core::str::from_utf8(&name_buf[..len]).unwrap_or(inner)
             } else {
-                element
-            };
+                for character in element.chars() {
+                    let _ =
+                        core::fmt::Write::write_char(&mut decoded, character.to_ascii_lowercase());
+                    if decoded.is_truncated() {
+                        break;
+                    }
+                }
+            }
+            let name = decoded.as_str();
             let name = if name == "$user" { user } else { name };
             if name == "pg_catalog" {
                 if !explicit_catalog {
@@ -42865,6 +42879,7 @@ impl Storage {
         or_replace: bool,
         txid: u32,
     ) -> Result<ViewPublication, SqlError> {
+        validate_stored_search_path(&definition.query.creation_path)?;
         self.require_schema_create(schema.as_str(), txid)?;
         if self.find_table(schema.as_str(), name.as_str()).is_some() {
             return Err(sql_err!(
@@ -43329,6 +43344,7 @@ impl Storage {
         name: &str,
         argument_names: &[Option<&str>],
         argument_type_oids: &[i32],
+        explicit_variadic: bool,
         txid: u32,
     ) -> Option<usize> {
         if argument_type_oids.len() > MAX_ROUTINE_ARGUMENTS
@@ -43342,6 +43358,7 @@ impl Storage {
                 routine_name,
                 argument_names,
                 argument_type_oids,
+                explicit_variadic,
                 txid,
                 RoutineCallKind::Scalar,
             )
@@ -43365,6 +43382,7 @@ impl Storage {
         name: &str,
         argument_names: &[Option<&str>],
         argument_type_oids: &[i32],
+        explicit_variadic: bool,
         txid: u32,
     ) -> Option<usize> {
         if argument_type_oids.len() > MAX_ROUTINE_ARGUMENTS
@@ -43378,6 +43396,7 @@ impl Storage {
                 routine_name,
                 argument_names,
                 argument_type_oids,
+                explicit_variadic,
                 txid,
                 RoutineCallKind::Function,
             )
@@ -43548,17 +43567,22 @@ impl Storage {
         name: &str,
         argument_names: &[Option<&str>],
         argument_type_oids: &[i32],
+        explicit_variadic: bool,
         txid: u32,
     ) -> Option<RoutineDef> {
         let slot = self.routine_slot_for_named_function_call_oids(
             name,
             argument_names,
             argument_type_oids,
+            explicit_variadic,
             txid,
         )?;
         let routine = self.routine_for(slot, txid);
-        let mapping =
-            routine.call_input_mapping(argument_names, argument_type_oids.len(), false)?;
+        let mapping = routine.call_input_mapping(
+            argument_names,
+            argument_type_oids.len(),
+            explicit_variadic,
+        )?;
         let mut completed = [crate::sql::types::oid::UNKNOWN; MAX_ROUTINE_ARGUMENTS];
         for (input_index, argument) in routine.arguments().iter().enumerate() {
             completed[input_index] = self.routine_argument_oid(argument, txid)?;
@@ -43906,6 +43930,7 @@ impl Storage {
         name: &str,
         argument_names: &[Option<&str>],
         argument_type_oids: &[i32],
+        explicit_variadic: bool,
         txid: u32,
     ) -> Option<usize> {
         let resolve = |schema: &str, routine_name: &str| {
@@ -43914,6 +43939,7 @@ impl Storage {
                 routine_name,
                 argument_names,
                 argument_type_oids,
+                explicit_variadic,
                 txid,
                 RoutineCallKind::Procedure,
             )
@@ -43937,6 +43963,7 @@ impl Storage {
         name: &str,
         argument_names: &[Option<&str>],
         argument_count: usize,
+        explicit_variadic: bool,
         txid: u32,
     ) -> Option<usize> {
         let resolve = |schema: &str, routine_name: &str| {
@@ -43947,7 +43974,7 @@ impl Storage {
                     && definition.schema_for(txid).as_str() == schema
                     && definition.name_for(txid).as_str() == routine_name
                     && definition
-                        .procedure_call_mapping(argument_names, argument_count)
+                        .procedure_call_mapping(argument_names, argument_count, explicit_variadic)
                         .is_some())
                 .then_some(slot)
             });
@@ -44005,9 +44032,11 @@ impl Storage {
                     .iter()
                     .any(|parameter| parameter.mode.is_output());
                 let input_mapping = if output_call {
-                    let Some(mapping) =
-                        routine.procedure_call_mapping(argument_names, actual_oids.len())
-                    else {
+                    let Some(mapping) = routine.procedure_call_mapping(
+                        argument_names,
+                        actual_oids.len(),
+                        explicit_variadic,
+                    ) else {
                         continue;
                     };
                     mapping
@@ -44040,11 +44069,10 @@ impl Storage {
                         if output_call && input_mapping[call_index] == u8::MAX {
                             let parameter_index =
                                 match argument_names.get(call_index).copied().flatten() {
-                                    Some(name) => {
-                                        routine.parameters().iter().position(|parameter| {
-                                            parameter.name.as_str().eq_ignore_ascii_case(name)
-                                        })?
-                                    }
+                                    Some(name) => routine
+                                        .parameters()
+                                        .iter()
+                                        .position(|parameter| parameter.name.as_str() == name)?,
                                     None => call_index,
                                 };
                             let parameter = *routine.parameters().get(parameter_index)?;
@@ -44304,18 +44332,27 @@ impl Storage {
         }
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "named routine lookup keeps variadic syntax explicit"
+    )]
     fn routine_slot_in_named_oids(
         &self,
         schema: &str,
         name: &str,
         argument_names: &[Option<&str>],
         argument_type_oids: &[i32],
+        explicit_variadic: bool,
         txid: u32,
         call_kind: RoutineCallKind,
     ) -> Option<usize> {
-        self.routine_slot_in_candidates(argument_names, argument_type_oids, false, txid, || {
-            self.routine_candidates(schema, name, txid, call_kind)
-        })
+        self.routine_slot_in_candidates(
+            argument_names,
+            argument_type_oids,
+            explicit_variadic,
+            txid,
+            || self.routine_candidates(schema, name, txid, call_kind),
+        )
     }
 
     fn routine_slot_in_candidates<F, I>(
@@ -51813,6 +51850,7 @@ impl Storage {
         or_replace: bool,
         txid: u32,
     ) -> Result<RulePublication, SqlError> {
+        validate_stored_search_path(&definition.creation_path)?;
         let target = self.query_rule_target(definition.target, txid)?;
         let mut owners = self.catalog_dependency_owners(
             &self.view_rule_catalog,
@@ -52197,6 +52235,7 @@ impl Storage {
         definition: RuleDefinition,
         dependencies: StoredQueryDependencies,
     ) -> Result<(), SqlError> {
+        validate_stored_search_path(&definition.creation_path)?;
         CatalogIdentity::require(created_at)?;
         if slot >= self.rule_count() {
             return Err(sql_err!(
@@ -54140,6 +54179,7 @@ mod tests {
         c.memtable_bytes = 1 << 16;
         c.max_connections = 2;
         c.max_tables = 4;
+        c.max_extended_statistics = 32;
         c.table_rows = 128;
         c.txn_rows = 128;
         c.value_index_rows = 512;

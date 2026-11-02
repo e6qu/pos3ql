@@ -988,6 +988,7 @@ pub(super) fn postpone_cost(e: &Expr, scope: &QueryScope, arena: &Arena) -> u32 
         } => postpone_cost(operand, scope, arena),
         Unary { operand, .. } => postpone_cost(operand, scope, arena) + 2,
         IsNull { operand, .. } => postpone_cost(operand, scope, arena),
+        BoundDefault { expression, .. } => postpone_cost(expression, scope, arena),
         Cast { operand, .. } => postpone_cost(operand, scope, arena) + 2,
         Collate { operand, .. } => postpone_cost(operand, scope, arena),
         Binary {

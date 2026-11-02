@@ -298,6 +298,10 @@ impl ParameterInference<'_> {
                     assign(operand, type_oid, oids);
                 }
             }
+            Expr::BoundDefault {
+                expression,
+                type_oid,
+            } => assign(expression, *type_oid, oids),
             Expr::Binary { left, right, .. } => {
                 if let Some(type_oid) = infer(right) {
                     assign(left, type_oid, oids);

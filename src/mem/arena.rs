@@ -40,6 +40,7 @@ struct BorrowedRegion {
 #[derive(Clone, Copy)]
 struct InternedAllocation {
     value_type: core::any::TypeId,
+    length: usize,
     value: *const u8,
     end: usize,
     previous: Option<core::ptr::NonNull<InternedAllocation>>,
@@ -251,6 +252,7 @@ impl Arena {
             value,
             identity: InternedAllocation {
                 value_type: core::any::TypeId::of::<T>(),
+                length: 1,
                 value: core::ptr::null(),
                 end: 0,
                 previous: self.interned.get(),
@@ -261,6 +263,54 @@ impl Arena {
         self.interned
             .set(Some(core::ptr::NonNull::from(&mut allocated.identity)));
         Ok(&allocated.value)
+    }
+
+    /// Shares actual-length immutable slices within the same rewind boundary.
+    pub(crate) fn alloc_interned_slice<T: Copy + PartialEq + Send + Sync + 'static>(
+        &self,
+        values: &[T],
+    ) -> Result<&[T], ArenaFull> {
+        if values.is_empty() {
+            return Ok(&[]);
+        }
+        let mut cursor = self.interned.get();
+        while let Some(previous) = cursor {
+            // Cache entries remain initialized until rewind removes their links.
+            let previous = unsafe { previous.as_ref() };
+            if previous.value_type == core::any::TypeId::of::<[T]>()
+                && previous.length == values.len()
+            {
+                let prior = unsafe {
+                    core::slice::from_raw_parts(previous.value.cast::<T>(), previous.length)
+                };
+                if prior == values {
+                    return Ok(prior);
+                }
+            }
+            cursor = previous.previous;
+        }
+        let elements = Layout::array::<T>(values.len()).map_err(|_| self.full(usize::MAX))?;
+        let (layout, elements_offset) = Layout::new::<InternedAllocation>()
+            .extend(elements)
+            .map_err(|_| self.full(usize::MAX))?;
+        let allocation = self.alloc_raw(layout.pad_to_align())?;
+        let identity = allocation.cast::<InternedAllocation>();
+        let elements = unsafe { allocation.add(elements_offset).cast::<T>() };
+        // One disjoint checked allocation contains both the typed elements and
+        // their cache identity. Publish the link only after both are initialized.
+        unsafe {
+            core::ptr::copy_nonoverlapping(values.as_ptr(), elements, values.len());
+            identity.write(InternedAllocation {
+                value_type: core::any::TypeId::of::<[T]>(),
+                length: values.len(),
+                value: elements.cast(),
+                end: self.offset.get(),
+                previous: self.interned.get(),
+            });
+            self.interned
+                .set(Some(core::ptr::NonNull::new_unchecked(identity)));
+            Ok(core::slice::from_raw_parts(elements, values.len()))
+        }
     }
 
     pub(crate) fn alloc_atomic_usize(
@@ -1297,6 +1347,45 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn interned_slices_are_actual_length_typed_and_rewind_with_their_values() {
+        let mut budget = Budget::new(1024);
+        let arena = Arena::new(&mut budget, "actual schema columns", 1024).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let first = arena.alloc_interned_slice(&[1u32, 2]).unwrap();
+            let initial_used = arena.used();
+            assert!(core::ptr::eq(
+                first,
+                arena.alloc_interned_slice(&[1u32, 2]).unwrap()
+            ));
+            assert_eq!(arena.used(), initial_used);
+            let short = arena.alloc_interned_slice(&[1u32]).unwrap();
+            assert_eq!(short, &[1]);
+            assert!(!core::ptr::eq(first.as_ptr(), short.as_ptr()));
+            let scalar = arena.alloc_interned(1u32, PartialEq::eq).unwrap();
+            assert!(!core::ptr::eq(short.as_ptr(), scalar));
+            let mark = arena.mark();
+            assert_eq!(
+                arena.alloc_interned_slice(&[9u32, 10, 11]).unwrap(),
+                &[9, 10, 11]
+            );
+            // No reference to the discarded suffix is used after this point.
+            unsafe { arena.rewind_to(mark) };
+            let reused = arena.alloc_slice_copy(&[55u32, 56, 57, 58]).unwrap();
+            assert_eq!(
+                arena.alloc_interned_slice(&[9u32, 10, 11]).unwrap(),
+                &[9, 10, 11]
+            );
+            assert_eq!(reused, &[55, 56, 57, 58]);
+            assert!(core::ptr::eq(
+                first,
+                arena.alloc_interned_slice(&[1u32, 2]).unwrap()
+            ));
+            assert!(arena.alloc_interned_slice(&[0u32; 512]).is_err());
+            assert_eq!(arena.alloc_interned_slice(&[1u32, 2]).unwrap(), &[1, 2]);
+        });
+    }
 
     #[test]
     fn catalog_snapshot_schema_cache_is_typed_bounded_and_survives_failed_allocations() {

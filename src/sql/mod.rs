@@ -279,7 +279,12 @@ impl From<crate::storage::StorageSetupError> for EngineSetupError {
             crate::storage::StorageSetupError::Configuration(error) => {
                 Self::ResourceConfiguration(error)
             }
-            crate::storage::StorageSetupError::RowWork(error) => Self::Storage(sql_err!(
+            crate::storage::StorageSetupError::LeasePool(error) => Self::Storage(sql_err!(
+                crate::sql::eval::sqlstate::INVALID_PARAMETER_VALUE,
+                "{}",
+                error
+            )),
+            crate::storage::StorageSetupError::ValueIndex(error) => Self::Storage(sql_err!(
                 crate::sql::eval::sqlstate::INVALID_PARAMETER_VALUE,
                 "{}",
                 error
@@ -356,7 +361,7 @@ impl DmlWorkspaces {
     fn new(
         config: &Config,
         budget: &mut Budget,
-        row_work: &std::sync::Arc<crate::mem::lease_pool::RowWorkPool>,
+        row_work: &std::sync::Arc<crate::mem::lease_pool::LeasePool>,
     ) -> Result<Self, BudgetError> {
         let mut slots =
             FixedVec::new(budget, "query_dml_workspaces", config.query_workspace_slots)?;
@@ -2496,7 +2501,7 @@ fn publication_row_matches(
         let result = (|| {
             let expression = parser::parse_expr(filter, arena)?;
             let row = exec::RowCtx {
-                def: &definition,
+                def: crate::storage::RelationDefinition::from_definition(&definition),
                 values,
                 alias: None,
             };
@@ -2553,7 +2558,7 @@ impl Engine {
         let _ = self.replace_read_owner(Some(self.execution_identity().read_owner()));
     }
 
-    pub(crate) fn row_work_pool(&self) -> &std::sync::Arc<crate::mem::lease_pool::RowWorkPool> {
+    pub(crate) fn row_work_pool(&self) -> &std::sync::Arc<crate::mem::lease_pool::LeasePool> {
         &self.storage.row_work
     }
 
@@ -5570,6 +5575,15 @@ impl Engine {
             self.rollback_txn(txn, guc);
             return Err(error);
         }
+        if let Err(error) = self.storage.prepare_commit_row_keys(
+            txn.txid,
+            txn.touched()
+                .iter()
+                .map(|&(table, rowid, _)| (table as usize, rowid)),
+        ) {
+            self.rollback_txn(txn, guc);
+            return Err(error);
+        }
         if let Err(error) = self.storage.validate_row_history_publication(
             txn.txid,
             txn.touched()
@@ -7010,10 +7024,10 @@ impl Engine {
                 .any(|&(altered, rewrote_rows)| altered == table && rewrote_rows)
             {
                 self.storage
-                    .commit_rewritten_row(table, rowid, txn.txid, commit_lsn)?;
+                    .publish_row(table, rowid, txn.txid, commit_lsn, true)?;
             } else {
                 self.storage
-                    .commit_row(table, rowid, txn.txid, commit_lsn)?;
+                    .publish_row(table, rowid, txn.txid, commit_lsn, false)?;
             }
             #[cfg(test)]
             self.observe_publication(commit::PublicationPoint::RowInstalled { table, rowid })?;
@@ -7447,30 +7461,21 @@ impl Engine {
         for &advance in txn.subscription_advances() {
             self.storage.apply_subscription_advance(advance, commit_lsn);
         }
-        let mut index_result = Ok(());
         for &(table, rewrote_rows) in self.commit_altered_tables.iter() {
             self.storage.finish_table_def_commit(table, rewrote_rows);
-            if self.storage.table(table).live()
-                && let Err(error) = self.storage.finish_table_enforcers(table, rewrote_rows)
-            {
-                index_result = Err(error);
-                break;
+            if self.storage.table(table).live() {
+                self.storage.finish_bindings(table, txn.txid);
             }
         }
-        if index_result.is_ok() {
-            for &table in self.commit_index_tables.iter() {
-                if self
-                    .commit_altered_tables
-                    .iter()
-                    .any(|&(altered, _)| altered == table)
-                {
-                    continue;
-                }
-                if let Err(error) = self.storage.finish_index_enforcers(table) {
-                    index_result = Err(error);
-                    break;
-                }
+        for &table in self.commit_index_tables.iter() {
+            if self
+                .commit_altered_tables
+                .iter()
+                .any(|&(altered, _)| altered == table)
+            {
+                continue;
             }
+            self.storage.finish_bindings(table, txn.txid);
         }
         for slot in 0..self.storage.table_count() {
             self.storage.commit_table_statistics(slot, txn.txid);
@@ -7488,7 +7493,7 @@ impl Engine {
         self.storage.clear_temporary_transaction(txn.txid);
         self.storage.finish_cumulative_transaction(txn.txid, true);
         txn.clear();
-        let result = notify_result.and(index_result).and(temporary_result);
+        let result = notify_result.and(temporary_result);
         #[cfg(test)]
         let result =
             result.and_then(|()| self.observe_publication(commit::PublicationPoint::DataInstalled));
@@ -20807,14 +20812,7 @@ fn rollback_catalog_change(storage: &mut Storage, undo: DdlUndo, txid: u32) {
             storage.rollback_enum_alter(prior);
         }
         DdlUndo::IndexCreated(slot) => {
-            let slot = slot as usize;
-            let table = storage.index_table_slot(slot);
-            storage.rollback_index_create(slot);
-            if let Some(table) = table {
-                storage
-                    .refresh_enforcers(table)
-                    .expect("rolling back CREATE INDEX restores its cache binding");
-            }
+            storage.rollback_index_create(slot as usize);
         }
         DdlUndo::IndexDropped(slot) => {
             storage.rollback_index_drop(slot as usize, txid);

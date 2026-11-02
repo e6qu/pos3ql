@@ -44,6 +44,8 @@ def main():
     parser.add_argument("--row-work-bytes", type=int, required=True)
     parser.add_argument("--row-work-leases", type=int, required=True)
     parser.add_argument("--definition-image-slots", type=int, required=True)
+    parser.add_argument("--table-metadata-bytes", type=int, required=True)
+    parser.add_argument("--table-metadata-leases", type=int, required=True)
     parser.add_argument("--operations", type=int, required=True)
     parser.add_argument("--clients", type=int, required=True)
     parser.add_argument("--catalog-relations", type=int, required=True)
@@ -78,10 +80,11 @@ def main():
     parser.add_argument("--checkpoint-profile", type=int, choices=(0, 1), default=0)
     parser.add_argument("--checkpoint-duration-seconds", type=float, default=0.0)
     args = parser.parse_args()
-    if min(args.row_overlay_slots, args.row_work_bytes, args.row_work_leases, args.definition_image_slots) <= 0:
-        parser.error("shared row capacities must be positive")
-    if args.row_work_bytes % 64 != 0:
-        parser.error("row-work-bytes must be a multiple of 64")
+    if min(args.row_overlay_slots, args.row_work_bytes, args.row_work_leases, args.definition_image_slots,
+           args.table_metadata_bytes, args.table_metadata_leases) <= 0:
+        parser.error("shared capacities must be positive")
+    if args.row_work_bytes % 64 != 0 or args.table_metadata_bytes % 64 != 0:
+        parser.error("row-work-bytes and table-metadata-bytes must be multiples of 64")
     if not math.isfinite(args.checkpoint_duration_seconds) or args.checkpoint_duration_seconds < 0:
         parser.error("checkpoint duration must be nonnegative and finite")
     if not math.isfinite(args.object_latency_ms) or args.object_latency_ms < 0:
@@ -127,6 +130,8 @@ def main():
             "row_work_bytes": args.row_work_bytes,
             "row_work_leases": args.row_work_leases,
             "definition_image_slots": args.definition_image_slots,
+            "table_metadata_bytes": args.table_metadata_bytes,
+            "table_metadata_leases": args.table_metadata_leases,
             "operations_per_client": args.operations,
             "clients": args.clients,
             "catalog_relations": args.catalog_relations,

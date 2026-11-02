@@ -2275,7 +2275,7 @@ pub(crate) fn index_access_plan<'a>(
         scope.slots[0],
         txid,
         &[Some(predicate)],
-        scope.defs.get(0).expect("physical table has definition"),
+        scope.defs.stored(0).expect("physical table has definition"),
         &mut resolve_column,
         &operand_is_invariant,
         false,
@@ -2396,7 +2396,10 @@ pub(crate) fn parameterized_index_access_plan<'a>(
         scope.slots[table],
         txid,
         &[where_clause, on],
-        scope.defs.get(table).expect("resolved"),
+        scope
+            .defs
+            .stored(table)
+            .expect("physical table has definition"),
         &mut resolve_column,
         &operand_is_bound,
         false,
@@ -2459,7 +2462,10 @@ pub(crate) fn parameterized_index_access_plan<'a>(
         }
     }
     let slot = scope.slots[table];
-    let definition = scope.defs.get(table).expect("resolved");
+    let definition = scope
+        .defs
+        .stored(table)
+        .expect("physical table has definition");
     let expected_rows = plan.expected_rows(storage, slot, definition, txid);
     let resident_exact = !matches!(
         plan.method,
@@ -2615,7 +2621,7 @@ pub(crate) fn ordered_index_access_plan<'a>(
             selected = Some((score, plan));
         }
     }
-    let definition = scope.defs.get(0).expect("physical table has definition");
+    let definition = scope.defs.stored(0).expect("physical table has definition");
     if let Some(access) = special_index_access_plan(
         storage,
         slot,
@@ -2774,7 +2780,11 @@ pub(crate) fn dml_index_access_plan<'a>(
             return None;
         };
         if qualifier.is_some_and(|qualifier| {
-            !crate::sql::eval::qualifier_answers_target(definition, alias, qualifier)
+            !crate::sql::eval::qualifier_answers_target(
+                crate::storage::RelationDefinition::from_definition(definition),
+                alias,
+                qualifier,
+            )
         }) {
             return None;
         }
@@ -2824,7 +2834,7 @@ fn indexed_candidates<'a>(
         return Ok(None);
     };
     let slot = scope.slots[0];
-    let definition = scope.defs.get(0).expect("physical table has definition");
+    let definition = scope.defs.stored(0).expect("physical table has definition");
     indexed_candidates_for_plan(
         storage, 0, slot, definition, txid, plan, None, None, arena, params, &NoColumns, hooks,
     )
@@ -2842,7 +2852,7 @@ pub(super) fn ordered_indexed_candidates<'a>(
     hooks: &EvalHooks<'_, 'a>,
 ) -> Result<Option<IndexedCandidates<'a>>, SqlError> {
     let slot = scope.slots[0];
-    let definition = scope.defs.get(0).expect("physical table has definition");
+    let definition = scope.defs.stored(0).expect("physical table has definition");
     let rank_window = rank_window.filter(|_| {
         storage.current_role_slot(txid).is_some_and(|current_role| {
             let role = scope.authorization_roles[0].map_or(current_role, usize::from);
@@ -6710,7 +6720,10 @@ fn scan_source_mode<'a>(
                     storage,
                     order[depth],
                     slot,
-                    scope.defs.get(order[depth]).expect("resolved"),
+                    scope
+                        .defs
+                        .stored(order[depth])
+                        .expect("physical table has definition"),
                     txid,
                     plan,
                     None,

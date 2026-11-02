@@ -15,7 +15,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub(crate) enum StorageSetupError {
     Budget(BudgetError),
     Configuration(crate::config::ConfigError),
-    RowWork(crate::mem::lease_pool::RowWorkSetupError),
+    LeasePool(crate::mem::lease_pool::LeaseSetupError),
+    ValueIndex(crate::mem::value_index::ValueIndexSetupError),
     CatalogIdentitySpaceExhausted,
 }
 
@@ -31,11 +32,20 @@ impl From<crate::config::ConfigError> for StorageSetupError {
     }
 }
 
-impl From<crate::mem::lease_pool::RowWorkSetupError> for StorageSetupError {
-    fn from(error: crate::mem::lease_pool::RowWorkSetupError) -> Self {
+impl From<crate::mem::lease_pool::LeaseSetupError> for StorageSetupError {
+    fn from(error: crate::mem::lease_pool::LeaseSetupError) -> Self {
         match error {
-            crate::mem::lease_pool::RowWorkSetupError::Budget(error) => Self::Budget(error),
-            error => Self::RowWork(error),
+            crate::mem::lease_pool::LeaseSetupError::Budget(error) => Self::Budget(error),
+            error => Self::LeasePool(error),
+        }
+    }
+}
+
+impl From<crate::mem::value_index::ValueIndexSetupError> for StorageSetupError {
+    fn from(error: crate::mem::value_index::ValueIndexSetupError) -> Self {
+        match error {
+            crate::mem::value_index::ValueIndexSetupError::Budget(error) => Self::Budget(error),
+            error => Self::ValueIndex(error),
         }
     }
 }
@@ -45,7 +55,8 @@ impl std::fmt::Display for StorageSetupError {
         match self {
             Self::Budget(error) => write!(formatter, "{error}"),
             Self::Configuration(error) => write!(formatter, "{error}"),
-            Self::RowWork(error) => write!(formatter, "{error}"),
+            Self::LeasePool(error) => write!(formatter, "{error}"),
+            Self::ValueIndex(error) => write!(formatter, "{error}"),
             Self::CatalogIdentitySpaceExhausted => {
                 formatter.write_str("catalog reference identity space exhausted")
             }
@@ -58,7 +69,8 @@ impl std::error::Error for StorageSetupError {
         match self {
             Self::Budget(error) => Some(error),
             Self::Configuration(error) => Some(error),
-            Self::RowWork(error) => Some(error),
+            Self::LeasePool(error) => Some(error),
+            Self::ValueIndex(error) => Some(error),
             Self::CatalogIdentitySpaceExhausted => None,
         }
     }

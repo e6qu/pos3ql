@@ -33,6 +33,8 @@ class BenchmarkEnvironmentTests(unittest.TestCase):
             "--row-work-bytes", "8388608",
             "--row-work-leases", "128",
             "--definition-image-slots", "256",
+            "--table-metadata-bytes", "67108864",
+            "--table-metadata-leases", "8192",
             "--operations",
             "20",
             "--clients",

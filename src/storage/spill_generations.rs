@@ -2703,9 +2703,13 @@ mod tests {
         let table = storage.create_table(definition).unwrap();
         {
             let mut publication = storage.tables[table].publication();
-            let enforcer = publication.enforcers[0].as_mut().unwrap();
-            enforcer.durable = Some(handle);
-            enforcer.cache.write().mark_incomplete();
+            publication.enforcer_state[0].durable = Some(handle);
+            publication.enforcers[0]
+                .as_ref()
+                .unwrap()
+                .cache
+                .write()
+                .mark_incomplete();
         }
         IndexFixture {
             storage,
@@ -2835,10 +2839,7 @@ mod tests {
                     .unwrap()
             );
             drop(scope);
-            storage.tables[*table].publication().enforcers[0]
-                .as_mut()
-                .unwrap()
-                .durable = None;
+            storage.tables[*table].publication().enforcer_state[0].durable = None;
             storage.spill_roots.copy_index_roots(&mut roots).unwrap();
             assert_eq!(roots, [handle.roster]);
             let scope = owner.enter_files(storage).unwrap();
@@ -2937,35 +2938,21 @@ mod tests {
         crate::mem::guard::forbid_alloc(|| {
             storage.set_commit_snapshot(7);
             assert!(storage.value_indexes_match_snapshot(*table));
-            storage.tables[*table].publication().enforcers[0]
-                .as_mut()
-                .unwrap()
-                .durable_dirty_lsn = 9;
+            storage.tables[*table].publication().enforcer_state[0].durable_dirty_lsn = 9;
             assert!(!storage.value_indexes_match_snapshot(*table));
             // Publication clears dirtiness; its former rebuild reservation is
             // no longer a newer committed change to the saved generation.
-            storage.tables[*table].publication().enforcers[0]
-                .as_mut()
-                .unwrap()
-                .durable_dirty = false;
+            storage.tables[*table].publication().enforcer_state[0].durable_dirty = false;
             assert!(storage.value_indexes_match_snapshot(*table));
-            storage.tables[*table].publication().enforcers[0]
-                .as_mut()
-                .unwrap()
-                .durable_dirty = true;
+            storage.tables[*table].publication().enforcer_state[0].durable_dirty = true;
             storage.set_commit_snapshot(9);
             assert!(storage.value_indexes_match_snapshot(*table));
-            storage.tables[*table].publication().enforcers[0]
-                .as_mut()
-                .unwrap()
-                .durable_dirty = false;
-            storage.tables[*table].publication().enforcers[0]
-                .as_mut()
-                .unwrap()
-                .durable = Some(ValueIndexHandle {
-                published_lsn: 11,
-                ..*handle
-            });
+            storage.tables[*table].publication().enforcer_state[0].durable_dirty = false;
+            storage.tables[*table].publication().enforcer_state[0].durable =
+                Some(ValueIndexHandle {
+                    published_lsn: 11,
+                    ..*handle
+                });
             assert!(!storage.value_indexes_match_snapshot(*table));
             storage.set_commit_snapshot(11);
             assert!(storage.value_indexes_match_snapshot(*table));

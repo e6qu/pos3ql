@@ -33,7 +33,7 @@ use crate::storage::{
     CheckpointRowCursor, ColumnDefault, ColumnMeta, MAX_COLUMNS, MAX_RELATION_COLUMNS,
     MaintenanceMode, MaintenanceStep, OwnedDatum, PartitionBound, PartitionBoundValue,
     PartitionDef, PartitionStrategy, RowCleanup, RowCleanupTarget, RowCleanupTask, RowHome,
-    SerializedStoredQueryDependency, SqlName, Storage, TableDef, TransactionIdentityRecord,
+    SerializedStoredQueryDependency, SqlName, Storage, TableDefBuilder, TransactionIdentityRecord,
 };
 use crate::store::{
     BlockId, BlockStore, BlockType, BlockWriter, MAX_ASSEMBLED, MAX_INLINE_ROW, OwnedObjectStore,
@@ -4163,7 +4163,7 @@ impl Checkpointer {
         let mut pending_def: Option<(
             usize,
             u64,
-            TableDef,
+            TableDefBuilder,
             usize,
             [i64; crate::storage::MAX_COLUMNS],
         )> = None;
@@ -4357,7 +4357,7 @@ impl Checkpointer {
                         return Err(CheckpointSetupError::Corrupt("invalid table fillfactor"));
                     }
                     let name = rest_of(line, 12 + inheritance_count)?;
-                    let def = TableDef {
+                    let def = TableDefBuilder {
                         // The current format omits `tsch` for the public schema.
                         schema: sql_name("public")?,
                         name: sql_name(name)?,
@@ -4365,7 +4365,9 @@ impl Checkpointer {
                         n_columns: n_cols,
                         attributes: crate::storage::column_attributes::ColumnAttributes {
                             count: u16::MAX,
-                            ..crate::storage::column_attributes::ColumnAttributes::EMPTY
+                            ..crate::storage::column_attributes::ColumnAttributes::<
+                                crate::storage::InlineDefinition,
+                            >::EMPTY
                         },
                         has_toast,
                         has_rules,
@@ -4377,7 +4379,7 @@ impl Checkpointer {
                         storage_options: crate::storage::TableStorageOptions {
                             fillfactor: (fillfactor != 0).then_some(fillfactor),
                         },
-                        ..TableDef::empty()
+                        ..TableDefBuilder::empty()
                     };
                     pending_def = Some((
                         mindex,
@@ -4405,7 +4407,7 @@ impl Checkpointer {
                         }
                         def.attributes = ColumnAttributes {
                             count,
-                            ..ColumnAttributes::EMPTY
+                            ..ColumnAttributes::<crate::storage::InlineDefinition>::EMPTY
                         };
                     } else {
                         if def.attributes.count == u16::MAX
@@ -17819,7 +17821,7 @@ fn finish_pending(
     pending: &mut Option<(
         usize,
         u64,
-        TableDef,
+        TableDefBuilder,
         usize,
         [i64; crate::storage::MAX_COLUMNS],
     )>,
@@ -17840,7 +17842,8 @@ fn finish_pending(
                 || definition.schema != expected.schema
                 || definition.name != expected.name
                 || definition.n_columns != expected.n_columns
-                || definition.not_null_names != expected.not_null_names
+                || &definition.not_null_names[..definition.n_columns]
+                    != expected.not_null_names.as_ref()
                 || definition.has_toast != expected.has_toast
                 || definition
                     .columns()
@@ -19806,11 +19809,11 @@ mod stored_dependency_tests {
         )
         .unwrap();
         storage.attach_spill(reader);
-        let mut definition = TableDef {
+        let mut definition = TableDefBuilder {
             schema: SqlName::parse("public").unwrap(),
             name: SqlName::parse("saved_index").unwrap(),
             n_columns: 1,
-            ..TableDef::empty()
+            ..TableDefBuilder::empty()
         };
         definition.columns[0] = ColumnMeta {
             name: SqlName::parse("id").unwrap(),
@@ -19835,11 +19838,11 @@ mod stored_dependency_tests {
         for writing in [false, true] {
             let (mut checkpoint, mut storage, _, config) =
                 index_gc_fixture(&format!("table-source-wait-{writing}"), 64);
-            let mut definition = TableDef {
+            let mut definition = TableDefBuilder {
                 schema: SqlName::parse("public").unwrap(),
                 name: SqlName::parse("orders").unwrap(),
                 n_columns: 2,
-                ..TableDef::empty()
+                ..TableDefBuilder::empty()
             };
             definition.columns[0] = ColumnMeta {
                 name: SqlName::parse("id").unwrap(),
@@ -22024,7 +22027,7 @@ mod stored_dependency_tests {
                     let mut budget = Budget::new(bytes);
                     let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
                     let mut checkpointer = Checkpointer::new(&config, &mut budget).unwrap();
-                    let mut definition = TableDef::empty();
+                    let mut definition = TableDefBuilder::empty();
                     definition.schema = SqlName::parse("public").unwrap();
                     definition.name = SqlName::parse("schema_manifest_table").unwrap();
                     storage.create_table(definition).unwrap();

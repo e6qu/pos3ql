@@ -492,7 +492,7 @@ fn collect_statement(
     context: CollectionContext<'_>,
 ) -> Result<(), SqlError> {
     let path = context.path;
-    let no_excluded: Option<(usize, &crate::storage::TableDef)> = None;
+    let no_excluded: Option<(usize, crate::storage::RelationDefinition<'_>)> = None;
     macro_rules! collect_expr {
         ($expression:expr, $scope:expr, $excluded:expr) => {{
             collect_expression(
@@ -824,7 +824,7 @@ fn collect_dml_routine_calls<'a>(
     storage: &Storage,
     txid: u32,
     scope: Option<&super::QueryScope<'a>>,
-    excluded: Option<&crate::storage::TableDef>,
+    excluded: Option<crate::storage::RelationDefinition<'_>>,
     dependencies: &mut StoredQueryDependencies,
     context: CollectionContext<'a>,
     arena: &Arena,
@@ -851,10 +851,10 @@ fn collect_dml_routine_calls_with_output<'a>(
     storage: &Storage,
     txid: u32,
     scope: Option<&super::QueryScope<'a>>,
-    excluded: Option<&crate::storage::TableDef>,
+    excluded: Option<crate::storage::RelationDefinition<'_>>,
     dependencies: &mut StoredQueryDependencies,
     context: CollectionContext<'a>,
-    returning_output: Option<(&crate::storage::TableDef, [&'a str; 2])>,
+    returning_output: Option<(crate::storage::RelationDefinition<'_>, [&'a str; 2])>,
     arena: &Arena,
 ) -> Result<(), SqlError> {
     let resolver = DependencyTypes {
@@ -923,7 +923,7 @@ fn collect_dml_routine_calls_with_output<'a>(
 fn collect_returning_expression<'a>(
     expression: &Expr<'a>,
     returning: crate::sql::ast::Returning<'a>,
-    target: &crate::storage::TableDef,
+    target: crate::storage::RelationDefinition<'_>,
     target_qualifier: &str,
     storage: &Storage,
     txid: u32,
@@ -980,7 +980,7 @@ fn collect_returning_expression<'a>(
 fn record_dml_column_references(
     expression: &Expr<'_>,
     scope: &super::QueryScope<'_>,
-    excluded: Option<(usize, &crate::storage::TableDef)>,
+    excluded: Option<(usize, crate::storage::RelationDefinition<'_>)>,
     dependencies: &mut StoredQueryDependencies,
     context: CollectionContext<'_>,
 ) -> Result<(), SqlError> {
@@ -1288,11 +1288,14 @@ fn collect_select<'a>(
 
 struct DependencyTypes<'scope, 'definition, 'storage> {
     scope: Option<&'scope super::QueryScope<'definition>>,
-    excluded: Option<&'storage crate::storage::TableDef>,
+    excluded: Option<crate::storage::RelationDefinition<'storage>>,
     transition: Option<&'scope dyn ColTypeResolver>,
     storage: &'storage Storage,
     txid: u32,
-    returning_output: Option<(&'storage crate::storage::TableDef, [&'definition str; 2])>,
+    returning_output: Option<(
+        crate::storage::RelationDefinition<'storage>,
+        [&'definition str; 2],
+    )>,
     arena: &'storage Arena,
 }
 

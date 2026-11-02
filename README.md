@@ -85,6 +85,8 @@ row_overlay_slots = 8192
 row_work_bytes = 8MiB
 row_work_leases = 128
 definition_image_slots = 256
+table_metadata_bytes = 64MiB
+table_metadata_leases = 8192
 ```
 
 These settings budget resident row metadata, foreground row workspace and copies

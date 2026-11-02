@@ -12,8 +12,8 @@ use crate::mem::budget::{Budget, BudgetError};
 use crate::sql::eval::{SqlError, sqlstate};
 use crate::sql_err;
 
-/// Only column metadata is needed to describe a synthetic relation.
-#[derive(Clone, Copy)]
+/// Borrowed columns for query schemas; hidden fields may follow the visible prefix.
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct RelationDefinition<'a> {
     pub(crate) schema: super::SqlName,
     pub(crate) name: super::SqlName,
@@ -21,8 +21,19 @@ pub(crate) struct RelationDefinition<'a> {
     pub(crate) columns: &'a [super::ColumnMeta],
 }
 
-impl RelationDefinition<'_> {
-    pub(crate) fn columns(&self) -> &[super::ColumnMeta] {
+impl<'a> RelationDefinition<'a> {
+    pub(crate) fn from_definition<B: super::DefinitionBacking>(
+        definition: &'a super::TableDefinition<B>,
+    ) -> Self {
+        Self {
+            schema: definition.schema,
+            name: definition.name,
+            n_columns: definition.n_columns,
+            columns: &definition.columns.as_ref()[..definition.n_columns],
+        }
+    }
+
+    pub(crate) fn columns(&self) -> &'a [super::ColumnMeta] {
         &self.columns[..self.n_columns]
     }
 
@@ -30,6 +41,16 @@ impl RelationDefinition<'_> {
         self.columns()
             .iter()
             .position(|column| column.name.as_str() == name)
+    }
+
+    pub(crate) fn schema(
+        &self,
+        output: &mut [crate::sql::types::ColType; super::MAX_COLUMNS],
+    ) -> usize {
+        for (index, column) in self.columns().iter().enumerate() {
+            output[index] = column.ctype;
+        }
+        self.n_columns
     }
 }
 
@@ -69,6 +90,30 @@ pub(super) struct TableDefinitionImagePool {
     cells: Box<[ImageCell]>,
     occupied: Box<[AtomicBool]>,
     allocation: Mutex<()>,
+    metadata: Arc<crate::mem::lease_pool::LeasePool>,
+}
+
+struct ImageReservation<'a> {
+    pool: &'a TableDefinitionImagePool,
+    index: usize,
+    installed: bool,
+}
+
+impl ImageReservation<'_> {
+    fn install(mut self, image: Image) -> usize {
+        // This reservation exclusively owns the occupied, unpublished cell.
+        unsafe { (*self.pool.cells[self.index].image.get()).write(image) };
+        self.installed = true;
+        self.index
+    }
+}
+
+impl Drop for ImageReservation<'_> {
+    fn drop(&mut self) {
+        if !self.installed {
+            self.pool.occupied[self.index].store(false, Ordering::Release);
+        }
+    }
 }
 
 impl TableDefinitionImagePool {
@@ -86,7 +131,11 @@ impl TableDefinitionImagePool {
             .saturating_add(Self::shared_bytes())
     }
 
-    pub(super) fn new(config: &Config, budget: &mut Budget) -> Result<Arc<Self>, BudgetError> {
+    pub(super) fn new(
+        config: &Config,
+        budget: &mut Budget,
+        metadata: &Arc<crate::mem::lease_pool::LeasePool>,
+    ) -> Result<Arc<Self>, BudgetError> {
         let capacity = Self::capacity(config);
         budget.draw(Self::shared_bytes(), "table definition image owner")?;
         budget.draw_array(
@@ -111,7 +160,32 @@ impl TableDefinitionImagePool {
             cells,
             occupied,
             allocation: Mutex::new(()),
+            metadata: Arc::clone(metadata),
         }))
+    }
+
+    fn reserve(&self) -> Result<ImageReservation<'_>, SqlError> {
+        let _allocation = self
+            .allocation
+            .lock()
+            .expect("table definition image lock poisoned");
+        let index = self
+            .occupied
+            .iter()
+            .position(|flag| !flag.load(Ordering::Acquire))
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "table definition image pool is exhausted (capacity {})",
+                    self.cells.len()
+                )
+            })?;
+        self.occupied[index].store(true, Ordering::Release);
+        Ok(ImageReservation {
+            pool: self,
+            index,
+            installed: false,
+        })
     }
 }
 
@@ -185,39 +259,23 @@ impl TableDefinitionImages {
             }
             slot = image.next;
         }
-        let _allocation = self
+        let reservation = self.pool.reserve()?;
+        let columns = self
             .pool
-            .allocation
-            .lock()
-            .expect("table definition image lock poisoned");
-        let index = self
-            .pool
-            .occupied
-            .iter()
-            .position(|flag| !flag.load(Ordering::Acquire))
-            .ok_or_else(|| {
-                sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "table definition image pool is exhausted (capacity {})",
-                    self.pool.cells.len()
-                )
-            })?;
-        static EMPTY_RELATION: TableDef = TableDef::empty();
-        let target = self.pool.cells[index].image.get().cast::<Image>();
-        // SAFETY: the allocation lock exclusively owns this unoccupied cell.
-        // Copy the static definition directly into its destination, avoiding a wide stack
-        // image. Every field is initialized before occupancy becomes visible.
-        unsafe {
-            core::ptr::addr_of_mut!((*target).next).write(self.head.get());
-            core::ptr::addr_of_mut!((*target).source).write(ImageSource::Relation { width });
-            let destination = core::ptr::addr_of_mut!((*target).definition);
-            core::ptr::copy_nonoverlapping(&EMPTY_RELATION, destination, 1);
-            (*destination).schema = relation.schema;
-            (*destination).name = relation.name;
-            (*destination).n_columns = relation.n_columns;
-            (&mut (*destination).columns)[..width].copy_from_slice(relation.columns);
-        }
-        self.pool.occupied[index].store(true, Ordering::Release);
+            .metadata
+            .copy_slice(relation.columns)
+            .map_err(|error| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "{}", error))?;
+        let index = reservation.install(Image {
+            next: self.head.get(),
+            source: ImageSource::Relation { width },
+            definition: TableDef {
+                schema: relation.schema,
+                name: relation.name,
+                n_columns: relation.n_columns,
+                columns,
+                ..TableDef::empty()
+            },
+        });
         self.head.set(Some(index));
         Ok(DefinitionImageId(index))
     }
@@ -328,44 +386,21 @@ impl TableDefinitionImages {
             }
             slot = image.next;
         }
-        let _allocation = self
-            .pool
-            .allocation
-            .lock()
-            .expect("table definition image lock poisoned");
-        let Some(index) = self
-            .pool
-            .occupied
-            .iter()
-            .position(|flag| !flag.load(Ordering::Acquire))
-        else {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "table definition image pool is exhausted (capacity {})",
-                self.pool.cells.len()
-            ));
-        };
-        let cell = &self.pool.cells[index];
-        let target = cell.image.get().cast::<Image>();
+        let reservation = self.pool.reserve()?;
+        // The image allocator lock is released before waiting for the source.
         let definition = storage.table_def(table, transaction);
         let identity = definition.identity();
-        // SAFETY: the allocation lock gives this writer exclusive ownership
-        // of the free cell. Acquire observes the previous owner's release.
-        // Copy directly into the reserved slot instead of a wide stack image.
-        unsafe {
-            core::ptr::addr_of_mut!((*target).next).write(self.head.get());
-            core::ptr::addr_of_mut!((*target).source).write(ImageSource::Table(TableSource {
+        let index = reservation.install(Image {
+            next: self.head.get(),
+            source: ImageSource::Table(TableSource {
                 table,
                 transaction,
                 identity,
                 target: storage.table_definition_target(table, transaction, &definition),
-            }));
-            core::ptr::copy_nonoverlapping(
-                &*definition,
-                core::ptr::addr_of_mut!((*target).definition),
-                1,
-            );
-        }
+            }),
+            definition: (*definition).clone(),
+        });
+        let target = self.pool.cells[index].image.get().cast::<Image>();
         self.pool.occupied[index].store(true, Ordering::Release);
         self.head.set(Some(index));
         // SAFETY: every field is initialized and this owner now retains the
@@ -382,6 +417,8 @@ impl Drop for TableDefinitionImages {
             // SAFETY: Drop has exclusive access to the owner, so all returned
             // references are finished before its cells become reusable.
             slot = unsafe { (*cell.image.get()).assume_init_ref().next };
+            // Release schema pins before this cell can be reserved again.
+            unsafe { (*cell.image.get()).assume_init_drop() };
             self.pool.occupied[index].store(false, Ordering::Release);
         }
     }

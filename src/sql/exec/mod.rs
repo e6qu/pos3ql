@@ -6,7 +6,7 @@
 
 use super::txn::{TxnMode, TxnState};
 use crate::mem::arena::{Arena, ArenaList};
-use crate::mem::lease_pool::{RowWorkLease, RowWorkPool};
+use crate::mem::lease_pool::{LeasePool, MutableSlice};
 use crate::mem::mutex::Mutex;
 use crate::pg::respond::Responder;
 use crate::pg::wire::WireFull;
@@ -89,7 +89,7 @@ impl PhysicalRow {
     }
 }
 
-pub(crate) type DmlScratch = RowWorkLease<PhysicalRow>;
+pub(crate) type DmlScratch = MutableSlice<PhysicalRow>;
 
 #[derive(Clone, Copy)]
 struct DmlRowImage<'arena> {
@@ -411,7 +411,7 @@ pub(crate) fn finish_replication_row(
 /// arena bytes) is independent of the borrow of the value slice itself, so
 /// looked-up datums may outlive the decode buffer.
 pub struct RowCtx<'s, 'v, 'd> {
-    pub def: &'d TableDef,
+    pub def: crate::storage::RelationDefinition<'d>,
     pub values: &'s [Datum<'v>],
     pub alias: Option<&'d str>,
 }
@@ -604,7 +604,7 @@ impl<'v> ColumnLookup<'v> for ReturningLookup<'_, 'v> {
             return self.image_column(image, name);
         }
         let context = RowCtx {
-            def: self.definition,
+            def: crate::storage::RelationDefinition::from_definition(self.definition),
             values: self.current,
             alias: self.target_alias,
         };
@@ -620,7 +620,7 @@ impl<'v> ColumnLookup<'v> for ReturningLookup<'_, 'v> {
             return self.image_fields(image, arena).map(Some);
         }
         let context = RowCtx {
-            def: self.definition,
+            def: crate::storage::RelationDefinition::from_definition(self.definition),
             values: self.current,
             alias: self.target_alias,
         };
@@ -635,7 +635,7 @@ impl<'v> ColumnLookup<'v> for ReturningLookup<'_, 'v> {
                 .map(|i| self.definition.columns()[i].ctype);
         }
         RowCtx {
-            def: self.definition,
+            def: crate::storage::RelationDefinition::from_definition(self.definition),
             values: self.current,
             alias: self.target_alias,
         }
@@ -651,7 +651,7 @@ impl<'v> ColumnLookup<'v> for ReturningLookup<'_, 'v> {
                 .unwrap_or(crate::sql::ast::Collation::None);
         }
         RowCtx {
-            def: self.definition,
+            def: crate::storage::RelationDefinition::from_definition(self.definition),
             values: self.current,
             alias: self.target_alias,
         }
@@ -670,7 +670,7 @@ impl<'v> ColumnLookup<'v> for ReturningLookup<'_, 'v> {
                 .and_then(|i| self.definition.columns()[i].user_type);
         }
         RowCtx {
-            def: self.definition,
+            def: crate::storage::RelationDefinition::from_definition(self.definition),
             values: self.current,
             alias: self.target_alias,
         }
@@ -1093,7 +1093,7 @@ fn create_table_kind(
                     lsn,
                     &WalOp::CreateTable {
                         identity: storage.table_position(slot),
-                        definition: &storage.table_def(slot, txn.txid),
+                        definition: (&*storage.table_def(slot, txn.txid)).into(),
                     },
                 )
             };
@@ -5029,7 +5029,10 @@ where
                 .lookup(qualifier, name);
         } else {
             if let Some(q) = qualifier
-                && !crate::sql::eval::qualifier_answers_single(&self.def, q)
+                && !crate::sql::eval::qualifier_answers_single(
+                    crate::storage::RelationDefinition::from_definition(&self.def),
+                    q,
+                )
             {
                 return Err(sql_err!(
                     sqlstate::UNDEFINED_TABLE,
@@ -5310,7 +5313,7 @@ where
         }
         if let Some(plan) = row_security_using {
             let policy_row = RowCtx {
-                def: logical_definition,
+                def: crate::storage::RelationDefinition::from_definition(logical_definition),
                 values: logical_existing,
                 alias: None,
             };
@@ -5440,7 +5443,7 @@ where
             arena,
         )?;
         let policy_row = RowCtx {
-            def: logical_definition,
+            def: crate::storage::RelationDefinition::from_definition(logical_definition),
             values: logical_new,
             alias: None,
         };
@@ -39944,7 +39947,7 @@ pub fn create_table_as(
                     lsn,
                     &WalOp::CreateTable {
                         identity: storage.table_position(slot),
-                        definition: &storage.table_def(slot, txn.txid),
+                        definition: (&*storage.table_def(slot, txn.txid)).into(),
                     },
                 )
             };
@@ -41057,7 +41060,7 @@ fn rewrite_sequence_default_references(
             lsn,
             &WalOp::CreateTable {
                 identity: storage.table_position(table_slot),
-                definition: &storage.table_def(table_slot, txn.txid),
+                definition: (&*storage.table_def(table_slot, txn.txid)).into(),
             },
         )?;
     }
@@ -47394,7 +47397,7 @@ fn rewrite_composite_dependent_tables(
                 lsn,
                 &WalOp::CreateTable {
                     identity: storage.table_position(table_slot),
-                    definition: &storage.table_def(table_slot, txn.txid),
+                    definition: (&*storage.table_def(table_slot, txn.txid)).into(),
                 },
             )?;
         }
@@ -50068,7 +50071,13 @@ fn finish_index_creation(
         }
     };
     let result = (|| {
-        storage.prepare_index_enforcers(table, txn.txid)?;
+        storage.prepare_index_enforcers(
+            table,
+            txn.txid,
+            crate::storage::BindingChange::IndexCreate {
+                created_at: index.created_at,
+            },
+        )?;
         storage.write_relation_counts(table, statistics, true)?;
         if storage.table_def(table, txn.txid).persistence
             != crate::storage::RelationPersistence::Temporary
@@ -50107,19 +50116,8 @@ fn finish_index_creation(
         }
         txn.record_ddl(super::txn::DdlUndo::IndexCreated(slot as u32))
     })();
-    if let Err(error) = &result {
+    if result.is_err() {
         storage.rollback_index_create(slot);
-        if let Err(restore) = storage.prepare_index_enforcers(table, txn.txid) {
-            return Err(SqlError {
-                sqlstate: restore.sqlstate,
-                message: stack_format!(
-                    192,
-                    "index creation failed ({}); cache restoration failed: {}",
-                    error.sqlstate,
-                    restore.message.as_str()
-                ),
-            });
-        }
     }
     result
 }
@@ -50905,7 +50903,7 @@ fn stage_table_definition(
             lsn,
             &WalOp::CreateTable {
                 identity: storage.table_position(table),
-                definition: &next,
+                definition: (&next).into(),
             },
         )?;
     }
@@ -52069,20 +52067,23 @@ fn stage_index_drop(
             storage.table_def(table, txn.txid).persistence
                 == crate::storage::RelationPersistence::Temporary
         });
+    let dropped = storage
+        .drop_index(schema.as_str(), name.as_str(), txn.txid)?
+        .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "index does not exist"))?;
     if !temporary {
         let lsn = storage.bump_lsn();
-        wal.stage_reserved(
+        if let Err(error) = wal.stage_reserved(
             txn.txid,
             lsn,
             &WalOp::DropIndex {
                 schema: schema.as_str(),
                 name: name.as_str(),
             },
-        )?;
+        ) {
+            storage.rollback_index_drop(dropped, txn.txid);
+            return Err(error);
+        }
     }
-    let dropped = storage
-        .drop_index(schema.as_str(), name.as_str(), txn.txid)?
-        .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "index does not exist"))?;
     if let Err(error) = txn.record_ddl(super::txn::DdlUndo::IndexDropped(dropped as u32)) {
         storage.rollback_index_drop(dropped, txn.txid);
         return Err(error);
@@ -52451,7 +52452,7 @@ pub fn reindex(
     }
     for &table in &tables[..table_count] {
         storage.mark_value_bindings_dirty(table);
-        if let Err(error) = storage.refresh_enforcers(table) {
+        if let Err(error) = storage.refresh_enforcers_visible(table, Some(txn.txid)) {
             return sql_fail(error);
         }
     }
@@ -52554,7 +52555,7 @@ fn set_clustered_index(
         definition.clustered = clustered;
         stage_index_definition(storage, wal, txn, index_slot, definition)?;
     }
-    storage.refresh_enforcers(table)
+    storage.refresh_enforcers_visible(table, Some(txn.txid))
 }
 
 /// Records the ordered-index CLUSTER choice in the same typed definition that
@@ -52789,7 +52790,7 @@ impl CopyFilter {
         }
         validate_copy_predicate(predicate, def)?;
         let row = RowCtx {
-            def,
+            def: crate::storage::RelationDefinition::from_definition(def),
             values: &[],
             alias: None,
         };
@@ -52837,7 +52838,7 @@ impl CopyFilter {
         }
         let predicate = crate::sql::parser::parse_expr(self.source.as_str(), arena)?;
         let row = RowCtx {
-            def,
+            def: crate::storage::RelationDefinition::from_definition(def),
             values,
             alias: None,
         };
@@ -52867,7 +52868,11 @@ impl CopyFilter {
 fn validate_copy_predicate(expression: &Expr, def: &TableDef) -> Result<(), SqlError> {
     let column = |qualifier: Option<&str>, name: &str| -> Result<(), SqlError> {
         if let Some(qualifier) = qualifier
-            && !crate::sql::eval::qualifier_answers_target(def, None, qualifier)
+            && !crate::sql::eval::qualifier_answers_target(
+                crate::storage::RelationDefinition::from_definition(def),
+                None,
+                qualifier,
+            )
         {
             return Err(sql_err!(
                 sqlstate::UNDEFINED_TABLE,
@@ -53935,7 +53940,7 @@ fn finish_copy_row<'a>(
                     arena,
                 )?;
                 let row = RowCtx {
-                    def: definition,
+                    def: crate::storage::RelationDefinition::from_definition(definition),
                     values: logical_values,
                     alias: None,
                 };
@@ -55936,7 +55941,7 @@ fn emit_copy_out_row<'a>(
     super::query::check_timeout()?;
     if let Some(plan) = security {
         let row = RowCtx {
-            def: definition,
+            def: crate::storage::RelationDefinition::from_definition(definition),
             values: &values[..definition.n_columns],
             alias: None,
         };
@@ -56662,7 +56667,7 @@ fn compute_generated<'a>(
     let mut snapshot = [Datum::Null; MAX_COLUMNS];
     snapshot[..def.n_columns].copy_from_slice(&values[..def.n_columns]);
     let context = RowCtx {
-        def,
+        def: crate::storage::RelationDefinition::from_definition(def),
         values: &snapshot[..def.n_columns],
         alias: None,
     };
@@ -56912,7 +56917,7 @@ struct MergeLookup<'d, 'v> {
     target_def: &'d TableDef,
     target_alias: &'d str,
     target: &'v [Datum<'v>],
-    source_def: &'d TableDef,
+    source_def: &'d crate::storage::RelationDefinition<'d>,
     source_alias: &'d str,
     /// A target-only candidate deliberately has no source namespace. This is
     /// PostgreSQL-visible: referring to the source there is a missing
@@ -57094,7 +57099,7 @@ fn eval_merge_expression<'a, R: ColumnLookup<'a>>(
 fn merge_source_demand(
     expression: &Expr,
     source_alias: &str,
-    source: &crate::storage::TableDef,
+    source: &crate::storage::RelationDefinition<'_>,
     columns: &mut u64,
 ) -> bool {
     match expression {
@@ -57140,7 +57145,7 @@ fn merge_source_demand(
 fn merge_source_columns(
     statement: &crate::sql::ast::Merge,
     source_alias: &str,
-    source: &crate::storage::TableDef,
+    source: &crate::storage::RelationDefinition<'_>,
 ) -> Option<u64> {
     if source_alias.is_empty() {
         return None;
@@ -57976,7 +57981,7 @@ pub(crate) fn merge<'a>(
                 rowenc::decode(bytes, target_schema, &mut values)?;
                 if let Some(plan) = select_security {
                     let context = RowCtx {
-                        def,
+                        def: crate::storage::RelationDefinition::from_definition(def),
                         values: &values[..def.n_columns],
                         alias: None,
                     };
@@ -58170,7 +58175,7 @@ pub(crate) fn merge<'a>(
             layout.project(&vals, &mut logical);
             if let Some(plan) = select_security {
                 let context = RowCtx {
-                    def,
+                    def: crate::storage::RelationDefinition::from_definition(def),
                     values: &logical[..def.n_columns],
                     alias: None,
                 };
@@ -58328,7 +58333,7 @@ pub(crate) fn merge<'a>(
                 };
                 if let Some(plan) = action_security {
                     let policy_row = RowCtx {
-                        def,
+                        def: crate::storage::RelationDefinition::from_definition(def),
                         values: target_vals[j],
                         alias: None,
                     };
@@ -58751,7 +58756,7 @@ pub(crate) fn merge<'a>(
                         new_layout.project(&persisted, &mut new_values);
                         if let Some(plan) = update_check {
                             let policy_row = RowCtx {
-                                def,
+                                def: crate::storage::RelationDefinition::from_definition(def),
                                 values: &new_values[..def.n_columns],
                                 alias: None,
                             };
@@ -59015,7 +59020,7 @@ pub(crate) fn merge<'a>(
         if !matched {
             // First satisfied WHEN NOT MATCHED clause (source columns only).
             let source_ctx = RowCtx {
-                def: source_def,
+                def: *source_def,
                 values: sv,
                 alias: None,
             };
@@ -59371,7 +59376,7 @@ fn merge_insert<'a>(
                     arena,
                 )?;
                 let policy_row = RowCtx {
-                    def: logical_definition,
+                    def: crate::storage::RelationDefinition::from_definition(logical_definition),
                     values: logical_values,
                     alias: None,
                 };
@@ -59592,7 +59597,7 @@ where
                     Err(error) => return Ok(Err(error)),
                 };
                 let context = RowCtx {
-                    def: logical_definition,
+                    def: crate::storage::RelationDefinition::from_definition(logical_definition),
                     values: logical_values,
                     alias: None,
                 };
@@ -60254,7 +60259,7 @@ pub(crate) fn instead_of_view_dml<'a>(
                     return sql_fail(error);
                 }
                 let context = RowCtx {
-                    def: &def,
+                    def: crate::storage::RelationDefinition::from_definition(&def),
                     values: &old[..def.n_columns],
                     alias: update.alias,
                 };
@@ -60421,7 +60426,7 @@ pub(crate) fn instead_of_view_dml<'a>(
                     return sql_fail(error);
                 }
                 let context = RowCtx {
-                    def: &def,
+                    def: crate::storage::RelationDefinition::from_definition(&def),
                     values: &old[..def.n_columns],
                     alias: delete.alias,
                 };
@@ -60547,8 +60552,8 @@ fn materialize_view_rows<'a>(
     selection: ViewRowSelection<'_, 'a>,
     arena: &'a Arena,
     execution: TriggerQueryExecution<'_, '_, 'a>,
-    pool: &std::sync::Arc<RowWorkPool>,
-) -> Result<(RowWorkLease<&'a [u8]>, Option<&'a Expr<'a>>), SqlError> {
+    pool: &std::sync::Arc<LeasePool>,
+) -> Result<(MutableSlice<&'a [u8]>, Option<&'a Expr<'a>>), SqlError> {
     let user = crate::sql::eval::funcs::system::session_user_owned();
     let query = storage.snapshot_view_query(view_slot, txid, arena)?;
     let path = storage.compute_path(query.creation_path.as_str(), user.as_str(), txid);
@@ -60562,7 +60567,7 @@ fn materialize_view_rows<'a>(
     let (select, predicate) = super::query::filter_view_rows(
         select,
         selection.predicate,
-        selection.definition,
+        crate::storage::RelationDefinition::from_definition(selection.definition),
         selection.alias,
         storage.view(view_slot).security_barrier_for(txid),
         storage,
@@ -61613,7 +61618,13 @@ fn emit_projected(
             }
             SelectItem::TableWildcard(q) => {
                 let image = context.image(q);
-                if image.is_none() && !crate::sql::eval::qualifier_answers_target(def, alias, q) {
+                if image.is_none()
+                    && !crate::sql::eval::qualifier_answers_target(
+                        crate::storage::RelationDefinition::from_definition(def),
+                        alias,
+                        q,
+                    )
+                {
                     return Ok(Err(sql_err!(
                         sqlstate::UNDEFINED_TABLE,
                         "missing FROM-clause entry for table \"{}\"",
@@ -61695,7 +61706,7 @@ fn emit_merge_returning<'a>(
     target_def: &TableDef,
     target_alias: &str,
     target: &[Datum<'a>],
-    source_def: &TableDef,
+    source_def: &crate::storage::RelationDefinition<'_>,
     source_alias: &str,
     source: Option<&[Datum<'a>]>,
     returning: crate::sql::ast::Returning<'a>,
@@ -61960,7 +61971,11 @@ fn returning_dml_target_columns(
             SelectItem::Wildcard => all_columns_mask(definition),
             SelectItem::TableWildcard(qualifier) => {
                 if output_aliases.contains(qualifier)
-                    || crate::sql::eval::qualifier_answers_target(definition, alias, qualifier)
+                    || crate::sql::eval::qualifier_answers_target(
+                        crate::storage::RelationDefinition::from_definition(definition),
+                        alias,
+                        qualifier,
+                    )
                 {
                     all_columns_mask(definition)
                 } else {
@@ -62433,7 +62448,7 @@ pub(crate) fn update<'a>(
             row_layout.project(&physical_old, &mut values);
             let mut logical_new = values;
             let context = RowCtx {
-                def,
+                def: crate::storage::RelationDefinition::from_definition(def),
                 values: &values[..def.n_columns],
                 alias: statement.alias,
             };
@@ -62765,7 +62780,7 @@ pub(crate) fn update<'a>(
             new_layout.project(&persisted, new_values);
             if let Some(plan) = row_security_check {
                 let context = RowCtx {
-                    def,
+                    def: crate::storage::RelationDefinition::from_definition(def),
                     values: &new_values[..def.n_columns],
                     alias: None,
                 };
@@ -64577,7 +64592,7 @@ fn rename_attached_index_constraint(
         lsn,
         &WalOp::CreateTable {
             identity: storage.table_position(table_index),
-            definition: &altered,
+            definition: (&altered).into(),
         },
     )?;
     txn.write_table_definition(storage, edit_target, altered, &mapping, false)?;
@@ -64659,7 +64674,7 @@ fn drop_dependent_foreign_keys(
             lsn,
             &WalOp::CreateTable {
                 identity: storage.table_position(table_slot),
-                definition: &altered,
+                definition: (&altered).into(),
             },
         )?;
         txn.write_table_definition(storage, edit_target, altered, &mapping, false)?;
@@ -64893,12 +64908,12 @@ fn rewritten_exclusion_name(
     for (index, exclusion) in new_def.exclusions().iter().enumerate() {
         if let Some(predicate) = expressions[crate::storage::MAX_CHECKS + index] {
             let left = RowCtx {
-                def: new_def,
+                def: crate::storage::RelationDefinition::from_definition(new_def),
                 values: a,
                 alias: None,
             };
             let right = RowCtx {
-                def: new_def,
+                def: crate::storage::RelationDefinition::from_definition(new_def),
                 values: b,
                 alias: None,
             };
@@ -65884,7 +65899,7 @@ fn alter_table_inheritance(
         lsn,
         &WalOp::CreateTable {
             identity: storage.table_position(child),
-            definition: &updated,
+            definition: (&updated).into(),
         },
     ) {
         return sql_fail(error);
@@ -66318,7 +66333,7 @@ fn alter_partition_attachment(
         lsn,
         &WalOp::CreateTable {
             identity: storage.table_position(child),
-            definition: &new_def,
+            definition: (&new_def).into(),
         },
     ) {
         return sql_fail(error);
@@ -66378,7 +66393,7 @@ fn alter_partition_attachment(
                     lsn,
                     &WalOp::CreateTable {
                         identity: storage.table_position(descendant),
-                        definition: &dependent,
+                        definition: (&dependent).into(),
                     },
                 ) {
                     return sql_fail(error);
@@ -67476,7 +67491,7 @@ fn alter_table_relation(
                 lsn,
                 &WalOp::CreateTable {
                     identity: storage.table_position(table_index),
-                    definition: &new_def,
+                    definition: (&new_def).into(),
                 },
             ) {
                 return sql_fail(error);
@@ -68959,7 +68974,9 @@ fn alter_table_relation(
                             let cast_source = match using {
                                 Some(expr) => {
                                     let ctx = RowCtx {
-                                        def: &def,
+                                        def: crate::storage::RelationDefinition::from_definition(
+                                            &def,
+                                        ),
                                         values: &old_values[..def.n_columns],
                                         alias: None,
                                     };
@@ -69192,7 +69209,7 @@ fn alter_table_relation(
             lsn,
             &WalOp::CreateTable {
                 identity: storage.table_position(table_index),
-                definition: &new_def,
+                definition: (&new_def).into(),
             },
         ) {
             return sql_fail(e);
@@ -69694,7 +69711,7 @@ fn alter_table_relation(
                         lsn,
                         &WalOp::CreateTable {
                             identity: storage.table_position(descendant),
-                            definition: &dependent,
+                            definition: (&dependent).into(),
                         },
                     ) {
                         return sql_fail(error);
@@ -70083,7 +70100,7 @@ fn alter_table_replica_identity(
             lsn,
             &WalOp::CreateTable {
                 identity: storage.table_position(table_index),
-                definition: &next,
+                definition: (&next).into(),
             },
         ) {
             return sql_fail(error);
@@ -70393,7 +70410,7 @@ fn row_matches_values<'a>(
     transition: Option<&dyn ColumnLookup<'a>>,
 ) -> Result<bool, SqlError> {
     let context = RowCtx {
-        def,
+        def: crate::storage::RelationDefinition::from_definition(def),
         values: &values[..def.n_columns],
         alias,
     };
@@ -70677,7 +70694,7 @@ fn collect_join_matches<'a>(
                 let mut values = [Datum::Null; MAX_COLUMNS];
                 rowenc::decode(row, schema, &mut values)?;
                 let context = RowCtx {
-                    def,
+                    def: crate::storage::RelationDefinition::from_definition(def),
                     values: &values[..def.n_columns],
                     alias,
                 };
@@ -70744,7 +70761,7 @@ fn collect_join_matches<'a>(
                         let mut tv = [Datum::Null; MAX_COLUMNS];
                         layout.project(&physical, &mut tv);
                         let context = RowCtx {
-                            def,
+                            def: crate::storage::RelationDefinition::from_definition(def),
                             values: &tv[..def.n_columns],
                             alias,
                         };
@@ -70841,7 +70858,7 @@ fn collect_join_matches_with_transition<'a>(
                 let mut values = [Datum::Null; MAX_COLUMNS];
                 rowenc::decode(row, schema, &mut values)?;
                 let context = RowCtx {
-                    def,
+                    def: crate::storage::RelationDefinition::from_definition(def),
                     values: &values[..def.n_columns],
                     alias,
                 };
@@ -70910,7 +70927,7 @@ fn collect_join_matches_with_transition<'a>(
                         let mut values = [Datum::Null; MAX_COLUMNS];
                         layout.project(&physical, &mut values);
                         let context = RowCtx {
-                            def,
+                            def: crate::storage::RelationDefinition::from_definition(def),
                             values: &values[..def.n_columns],
                             alias,
                         };
@@ -72819,7 +72836,7 @@ fn enforce_view_check<'a>(
         return Ok(());
     };
     let row = RowCtx {
-        def: definition,
+        def: crate::storage::RelationDefinition::from_definition(definition),
         values,
         alias: None,
     };

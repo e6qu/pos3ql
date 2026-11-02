@@ -242,7 +242,11 @@ fn describe_items_with_output_aliases<'q>(
             SelectItem::TableWildcard(q) => {
                 let matches = output_aliases.contains(q)
                     || def.is_some_and(|d| {
-                        crate::sql::eval::qualifier_answers_target(d, table_alias, q)
+                        crate::sql::eval::qualifier_answers_target(
+                            crate::storage::RelationDefinition::from_definition(d),
+                            table_alias,
+                            q,
+                        )
                     });
                 if !matches {
                     return Err(sql_err!(
@@ -263,7 +267,8 @@ fn describe_items_with_output_aliases<'q>(
                 let resolver: &dyn ColTypeResolver = match storage {
                     Some(storage) => {
                         catalog_resolver = CatalogCols {
-                            definition: def,
+                            definition: def
+                                .map(crate::storage::RelationDefinition::from_definition),
                             alias: table_alias,
                             output_aliases,
                             storage,
@@ -274,7 +279,9 @@ fn describe_items_with_output_aliases<'q>(
                     }
                     None => match def {
                         Some(definition) => &AliasedDefCols {
-                            definition,
+                            definition: crate::storage::RelationDefinition::from_definition(
+                                definition,
+                            ),
                             alias: table_alias,
                             output_aliases,
                         },
@@ -317,7 +324,9 @@ fn describe_items_with_output_aliases<'q>(
                         Some(definition) => described_expression_collation(
                             expression,
                             &AliasedDefCols {
-                                definition,
+                                definition: crate::storage::RelationDefinition::from_definition(
+                                    definition,
+                                ),
                                 alias: table_alias,
                                 output_aliases,
                             },
@@ -489,7 +498,7 @@ pub(crate) fn describe_returning_items<'q, 'storage: 'q>(
                     {
                         scope = Some(super::super::query::QueryScope::for_returning(
                             storage,
-                            definition,
+                            crate::storage::RelationDefinition::from_definition(definition),
                             target_alias,
                             &output_aliases,
                             txid,
@@ -519,7 +528,7 @@ pub(crate) fn describe_returning_items<'q, 'storage: 'q>(
 }
 
 pub(crate) struct CatalogCols<'a> {
-    pub(crate) definition: Option<&'a TableDef>,
+    pub(crate) definition: Option<crate::storage::RelationDefinition<'a>>,
     pub(crate) alias: Option<&'a str>,
     pub(crate) output_aliases: &'a [&'a str],
     pub(crate) storage: &'a crate::storage::Storage,
@@ -985,7 +994,8 @@ fn describe_record_star<'q>(
             let resolver: &dyn ColTypeResolver = match (def, storage) {
                 (definition, Some(storage)) => {
                     catalog_resolver = CatalogCols {
-                        definition,
+                        definition: definition
+                            .map(crate::storage::RelationDefinition::from_definition),
                         alias: table_alias,
                         output_aliases,
                         storage,
@@ -996,7 +1006,7 @@ fn describe_record_star<'q>(
                 }
                 (Some(definition), None) => {
                     aliased_resolver = AliasedDefCols {
-                        definition,
+                        definition: crate::storage::RelationDefinition::from_definition(definition),
                         alias: table_alias,
                         output_aliases,
                     };
@@ -1077,7 +1087,7 @@ fn describe_record_star<'q>(
         }
         Expr::Call { .. } if storage.is_some() => {
             let resolver = CatalogCols {
-                definition: def,
+                definition: def.map(crate::storage::RelationDefinition::from_definition),
                 alias: table_alias,
                 output_aliases,
                 storage: storage.expect("matched"),
@@ -1123,7 +1133,11 @@ fn describe_record_star<'q>(
             name: table,
         } if output_aliases.contains(table)
             || def.is_some_and(|d| {
-                crate::sql::eval::qualifier_answers_target(d, table_alias, table)
+                crate::sql::eval::qualifier_answers_target(
+                    crate::storage::RelationDefinition::from_definition(d),
+                    table_alias,
+                    table,
+                )
             }) =>
         {
             for c in def.expect("matched").columns() {
@@ -1168,7 +1182,7 @@ fn describe_record_star<'q>(
 
             let resolver: &dyn ColTypeResolver = match def {
                 Some(definition) => &AliasedDefCols {
-                    definition,
+                    definition: crate::storage::RelationDefinition::from_definition(definition),
                     alias: table_alias,
                     output_aliases,
                 },
@@ -1266,7 +1280,7 @@ fn describe_record_star<'q>(
         _ => {
             let resolver: &dyn ColTypeResolver = match def {
                 Some(definition) => &AliasedDefCols {
-                    definition,
+                    definition: crate::storage::RelationDefinition::from_definition(definition),
                     alias: table_alias,
                     output_aliases,
                 },
@@ -3393,7 +3407,10 @@ pub struct DefCols<'d>(pub &'d TableDef);
 impl ColTypeResolver for DefCols<'_> {
     fn resolve(&self, q: Option<&str>, name: &str) -> Result<ColType, SqlError> {
         if let Some(q) = q
-            && !crate::sql::eval::qualifier_answers_single(self.0, q)
+            && !crate::sql::eval::qualifier_answers_single(
+                crate::storage::RelationDefinition::from_definition(self.0),
+                q,
+            )
         {
             return Err(sql_err!(
                 sqlstate::UNDEFINED_TABLE,
@@ -3463,7 +3480,7 @@ impl<'a> ColumnLookup<'a> for DefCols<'_> {
 
 /// A single DML target's columns, with its optional PostgreSQL correlation name.
 pub(crate) struct AliasedDefCols<'d, 'a> {
-    pub definition: &'d TableDef,
+    pub definition: crate::storage::RelationDefinition<'d>,
     pub alias: Option<&'a str>,
     pub output_aliases: &'a [&'a str],
 }
@@ -3650,7 +3667,7 @@ pub(crate) fn infer_type_catalog(
     infer_type_res(
         expression,
         &CatalogCols {
-            definition,
+            definition: definition.map(crate::storage::RelationDefinition::from_definition),
             alias: None,
             output_aliases: &[],
             storage,

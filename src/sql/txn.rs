@@ -2443,7 +2443,7 @@ impl TxnState {
         &mut self,
         storage: &crate::storage::Storage,
         target: crate::storage::TableDefinitionTarget,
-        definition: crate::storage::TableDef,
+        definition: crate::storage::TableDefBuilder,
         column_mapping: &[Option<crate::storage::SqlName>; crate::storage::MAX_COLUMNS],
         rewrites_rows: bool,
     ) -> Result<crate::storage::TableDefinitionTarget, SqlError> {

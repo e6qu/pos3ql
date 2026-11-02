@@ -14,11 +14,12 @@ use crate::sql::eval::SqlError;
 use crate::sql::types::{BtreeOperatorClass, ColType};
 use crate::sql_err;
 use crate::storage::{
-    CheckConstraint, ColumnDefault, ColumnMeta, ColumnSet, ColumnStatistics, DependencyClass,
-    ExtendedStatisticsData, ExtendedStatisticsMcv, FkAction, ForeignKey, MAX_COLUMNS,
-    MAX_INDEX_COLS, MAX_RELATION_COLUMNS, OwnedDatum, PartitionBound, PartitionBoundValue,
-    PartitionDef, PartitionStrategy, RoleAttributes, SerializedStoredQueryDependency, SqlName,
-    StoredDependencyIdentity, StoredQueryDependencies, TableDef, TableStatistics, UniqueKey,
+    CheckConstraint, ColumnDefault, ColumnMeta, ColumnSet, ColumnStatistics, DefinitionBacking,
+    DependencyClass, ExtendedStatisticsData, ExtendedStatisticsMcv, FkAction, ForeignKey,
+    MAX_COLUMNS, MAX_INDEX_COLS, MAX_RELATION_COLUMNS, OwnedDatum, PartitionBound,
+    PartitionBoundValue, PartitionDef, PartitionStrategy, RoleAttributes,
+    SerializedStoredQueryDependency, SqlName, StoredDependencyIdentity, StoredQueryDependencies,
+    TableDef, TableDefBuilder, TableDefinition, TableStatistics, UniqueKey,
 };
 use crate::util::StackStr;
 
@@ -263,7 +264,7 @@ fn access_class_has_oid(class: u8) -> bool {
         || class == crate::storage::AccessClass::LargeObject as u8
 }
 
-fn table_needs_typed_journal(def: &TableDef) -> bool {
+fn table_needs_typed_journal<B: DefinitionBacking>(def: &TableDefinition<B>) -> bool {
     def.columns().iter().any(|column| {
         column
             .default
@@ -880,6 +881,316 @@ pub(crate) fn apply_enum_payload(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum TableDefinitionSource<'a> {
+    Stored(&'a TableDef),
+    Builder(&'a TableDefBuilder),
+}
+
+impl<'a> From<&'a TableDef> for TableDefinitionSource<'a> {
+    fn from(definition: &'a TableDef) -> Self {
+        Self::Stored(definition)
+    }
+}
+impl<'a> From<&'a TableDefBuilder> for TableDefinitionSource<'a> {
+    fn from(definition: &'a TableDefBuilder) -> Self {
+        Self::Builder(definition)
+    }
+}
+impl TableDefinitionSource<'_> {
+    fn validate(self) -> Result<(), SqlError> {
+        match self {
+            Self::Stored(definition) => validate_table_definition(definition),
+            Self::Builder(definition) => validate_table_definition(definition),
+        }
+    }
+    fn needs_typed_journal(self) -> bool {
+        match self {
+            Self::Stored(definition) => table_needs_typed_journal(definition),
+            Self::Builder(definition) => table_needs_typed_journal(definition),
+        }
+    }
+    fn payload_len(self) -> usize {
+        match self {
+            Self::Stored(definition) => table_payload_len(definition),
+            Self::Builder(definition) => table_payload_len(definition),
+        }
+    }
+    fn append_payload(
+        self,
+        buffer: &mut FixedBuf,
+        identity: crate::storage::CatalogPosition,
+    ) -> bool {
+        match self {
+            Self::Stored(definition) => append_table_payload(buffer, identity, definition),
+            Self::Builder(definition) => append_table_payload(buffer, identity, definition),
+        }
+    }
+}
+
+fn validate_table_definition<B: DefinitionBacking>(
+    definition: &TableDefinition<B>,
+) -> Result<(), SqlError> {
+    crate::storage::Storage::validate_not_null_names(definition)?;
+    if !definition.attributes.validate(definition.n_columns) {
+        return Err(sql_err!(
+            sqlstate::DATA_EXCEPTION,
+            "invalid column attribute layout before journaling"
+        ));
+    }
+    Ok(())
+}
+
+fn table_payload_len<B: DefinitionBacking>(def: &TableDefinition<B>) -> usize {
+    let mut n = 10 + 1 + 1 + def.name.as_str().len() + 2 + 4 + 2;
+    n += def.attributes.encoded_len();
+    n += match def.access_method {
+        crate::storage::TableAccessMethod::Heap => 1,
+        crate::storage::TableAccessMethod::Catalog(_) => 5,
+    };
+    for (column, c) in def.columns().iter().enumerate() {
+        let default_value = c.default.constant().copied();
+        n += 1 + c.name.as_str().len() + 4 + 4 + encoded_default_len(&default_value);
+        n += 1 + def.not_null_names.as_ref()[column].map_or(0, |name| name.as_str().len());
+        // Non-constant DEFAULT text: 2-byte length prefix + bytes.
+        n += 2 + c
+            .default
+            .expression()
+            .map(|e| e.as_str().len())
+            .unwrap_or(0);
+        // auto_increment_step (i64).
+        n += 8;
+        n += 2; // attstattarget
+        n += 9; // attoptions presence byte plus two float4 bit patterns
+        n += 2; // attstorage + attcompression
+        // User-defined column: name, then a format marker and schema.
+        if let Some(identity) = c.user_type {
+            n += 1 + identity.storage_name().as_str().len();
+            n += 2 + identity.schema.as_str().len();
+        }
+    }
+    // uniques
+    n += 1;
+    for uk in def.uniques() {
+        n += 1 + uk.name.as_str().len() + 3 + uk.n_cols * 2;
+    }
+    // checks
+    n += 1;
+    for check in def.checks() {
+        n += 1 + check.name.as_str().len() + 3 + check.expression.as_str().len();
+    }
+    // foreign keys
+    n += 1;
+    for fk in def.fkeys() {
+        n += 1
+            + fk.name.as_str().len()
+            + 1
+            + fk.n_cols * 2
+            + 1
+            + fk.parent.as_str().len()
+            + 1
+            + fk.n_parent_cols * 2
+            + 4;
+    }
+    // exclusion constraints
+    n += 1;
+    for exclusion in def.exclusions() {
+        n += 1
+            + exclusion.name.as_str().len()
+            + 2
+            + exclusion.n_cols * 3
+            + 2
+            + exclusion
+                .predicate
+                .as_ref()
+                .map_or(0, |predicate| predicate.as_str().len());
+    }
+    n += 1 + def.schema.as_str().len();
+    for fk in def.fkeys() {
+        n += 1 + fk.parent_schema.as_str().len();
+    }
+    n += def.n_columns * crate::sql::ast::Collation::None.code().to_le_bytes().len();
+    n += encoded_partition_len(def.partition);
+    n += 1 + def.inheritance.parents_ref().len() * 2;
+    n += match def.type_membership {
+        crate::storage::TableTypeMembership::None => 1,
+        crate::storage::TableTypeMembership::Composite(reference) => {
+            2 + reference.storage_key().len()
+        }
+    };
+    n += 1;
+    n += 3;
+    n += def.implicit_index_identities().count() * 8;
+    n += def.constraint_identities().count() * crate::storage::ConstraintIdentity::ENCODED_BYTES;
+    n
+}
+
+fn append_table_payload<B: DefinitionBacking>(
+    buffer: &mut FixedBuf,
+    identity: crate::storage::CatalogPosition,
+    def: &TableDefinition<B>,
+) -> bool {
+    let mut ok = crate::storage::Storage::validate_not_null_names(def).is_ok()
+        && def.attributes.validate(def.n_columns)
+        && buffer.append(&[TABLE_DEF_PAYLOAD_VERSION])
+        && buffer.append(&identity.encode())
+        && name_bytes(buffer, def.name.as_str());
+    ok &= buffer.append(&(def.n_columns as u16).to_le_bytes());
+    ok &= buffer.append(&[
+        u8::from(def.has_toast),
+        match def.kind {
+            crate::storage::TableKind::Local => 0,
+            crate::storage::TableKind::Foreign => 1,
+        },
+        def.persistence.code(),
+        match def.on_commit {
+            crate::storage::OnCommitAction::PreserveRows => 0,
+            crate::storage::OnCommitAction::DeleteRows => 1,
+            crate::storage::OnCommitAction::Drop => 2,
+        },
+    ]);
+    ok &= buffer.append(&def.tablespace.to_le_bytes());
+    ok &= match def.access_method {
+        crate::storage::TableAccessMethod::Heap => buffer.append(&[0]),
+        crate::storage::TableAccessMethod::Catalog(oid) => {
+            buffer.append(&[1]) && buffer.append(&oid.get().to_le_bytes())
+        }
+    };
+    ok &= def.attributes.append(buffer);
+    for (column, c) in def.columns().iter().enumerate() {
+        ok &= name_bytes(buffer, c.name.as_str());
+        // Bit 7 (the last free per-column flag bit) marks a domain-typed
+        // column, whose domain name is appended after the fixed fields.
+        let flags = u8::from(c.not_null.is_required())
+            | (u8::from(c.unique) << 1)
+            | (u8::from(c.primary) << 2)
+            | (u8::from(c.auto_increment) << 3)
+            | (u8::from(c.default.is_generated()) << 4)
+            | (u8::from(c.is_identity) << 5)
+            | (u8::from(c.identity_always) << 6)
+            | (u8::from(c.user_type.is_some()) << 7);
+        ok &= buffer.append(&[c.ctype.code(), flags]);
+        ok &= buffer.append(&[c.not_null.code()]);
+        ok &= buffer.append(&[u8::from(c.not_null_inheritable)]);
+        ok &= name_bytes(
+            buffer,
+            def.not_null_names.as_ref()[column]
+                .as_ref()
+                .map_or("", |name| name.as_str()),
+        );
+        ok &= buffer.append(&c.type_mod.to_le_bytes());
+        let default_value = c.default.constant().copied();
+        ok &= append_default(buffer, &default_value);
+        let de = c.default.expression().map_or("", |e| e.as_str());
+        ok &= buffer.append(&(de.len() as u16).to_le_bytes());
+        ok &= buffer.append(de.as_bytes());
+        ok &= buffer.append(&c.auto_increment_step.to_le_bytes());
+        ok &= buffer.append(&c.statistics_target.to_le_bytes());
+        let (option_flags, n_distinct, n_distinct_inherited) = c.statistics_options.encoded();
+        ok &= buffer.append(&[option_flags]);
+        ok &= buffer.append(&n_distinct.to_le_bytes());
+        ok &= buffer.append(&n_distinct_inherited.to_le_bytes());
+        ok &= buffer.append(&[c.storage.code(), c.compression.code()]);
+        if let Some(identity) = c.user_type {
+            ok &= name_bytes(buffer, identity.storage_name().as_str());
+            ok &= buffer.append(&[u8::MAX]);
+            ok &= name_bytes(buffer, identity.schema.as_str());
+        }
+    }
+    // Multi-column UNIQUE/PRIMARY KEY constraints.
+    ok &= buffer.append(&[def.n_uniques as u8]);
+    for uk in def.uniques() {
+        ok &= name_bytes(buffer, uk.name.as_str());
+        ok &= buffer.append(&[uk.kind.code(), uk.n_cols as u8, uk.timing.code()]);
+        for &c in uk.columns() {
+            ok &= buffer.append(&c.to_le_bytes());
+        }
+    }
+    // CHECK constraints.
+    ok &= buffer.append(&[def.n_checks as u8]);
+    for check in def.checks() {
+        ok &= name_bytes(buffer, check.name.as_str());
+        let e = check.expression.as_str();
+        ok &= buffer.append(&[check.validation.code()]);
+        ok &= buffer.append(&(e.len() as u16).to_le_bytes());
+        ok &= buffer.append(e.as_bytes());
+    }
+    // FOREIGN KEY constraints.
+    ok &= buffer.append(&[def.n_fkeys as u8]);
+    for fk in def.fkeys() {
+        ok &= name_bytes(buffer, fk.name.as_str());
+        ok &= buffer.append(&[fk.n_cols as u8]);
+        for &c in fk.columns() {
+            ok &= buffer.append(&c.to_le_bytes());
+        }
+        ok &= name_bytes(buffer, fk.parent.as_str());
+        ok &= buffer.append(&[fk.n_parent_cols as u8]);
+        for &c in fk.parent_cols() {
+            ok &= buffer.append(&c.to_le_bytes());
+        }
+        ok &= buffer.append(&[
+            fk.on_delete.code(),
+            fk.on_update.code(),
+            fk.timing.code(),
+            fk.validation.code(),
+        ]);
+    }
+    ok &= buffer.append(&[def.n_exclusions as u8]);
+    for exclusion in def.exclusions() {
+        ok &= name_bytes(buffer, exclusion.name.as_str());
+        ok &= buffer.append(&[exclusion.n_cols as u8, exclusion.timing.code()]);
+        for position in 0..exclusion.n_cols {
+            ok &= buffer.append(&exclusion.columns[position].to_le_bytes());
+            ok &= buffer.append(&[exclusion.operators[position].code()]);
+        }
+        let predicate = exclusion.predicate.as_ref().map(|value| value.as_str());
+        ok &=
+            buffer.append(&(predicate.map_or(u16::MAX, |value| value.len() as u16)).to_le_bytes());
+        if let Some(predicate) = predicate {
+            ok &= buffer.append(predicate.as_bytes());
+        }
+    }
+    ok &= name_bytes(buffer, def.schema.as_str());
+    for fk in def.fkeys() {
+        ok &= name_bytes(buffer, fk.parent_schema.as_str());
+    }
+    for column in def.columns() {
+        ok &= buffer.append(&column.collation.code().to_le_bytes());
+    }
+    ok &= append_partition(buffer, def.partition);
+    ok &= buffer.append(&[def.inheritance.parents_ref().len() as u8]);
+    for parent in def.inheritance.parents_ref() {
+        ok &= buffer.append(&parent.to_le_bytes());
+    }
+    match def.type_membership {
+        crate::storage::TableTypeMembership::None => ok &= buffer.append(&[0]),
+        crate::storage::TableTypeMembership::Composite(reference) => {
+            ok &= buffer.append(&[1]) && name_bytes(buffer, reference.storage_key().as_str());
+        }
+    }
+    ok &= buffer.append(&[def.storage_options.fillfactor.unwrap_or(0)]);
+    ok &= buffer.append(&[
+        u8::from(def.row_level_security.enabled),
+        u8::from(def.row_level_security.forced),
+        def.replica_identity.code(),
+    ]);
+    for identity in def.implicit_index_identities() {
+        ok &= identity.is_some()
+            && buffer.append(
+                &identity
+                    .map_or(0, |identity| identity.created_at())
+                    .to_le_bytes(),
+            );
+    }
+    for identity in def.constraint_identities() {
+        let Some(identity) = identity else {
+            return false;
+        };
+        ok &= buffer.append(&identity.to_le_bytes());
+    }
+    ok
+}
+
 #[derive(Debug)]
 #[expect(
     clippy::large_enum_variant,
@@ -922,11 +1233,11 @@ pub(crate) enum WalOp<'a> {
     },
     RestoreForeignTable(&'a [u8]),
     /// A table definition staged by the SQL executor. Borrowing keeps the WAL
-    /// operation discriminant small even when configured inline schema bounds
-    /// make `TableDef` large.
+    /// operation payload small even when configured inline schema bounds
+    /// make `TableDefBuilder` large.
     CreateTable {
         identity: crate::storage::CatalogPosition,
-        definition: &'a TableDef,
+        definition: TableDefinitionSource<'a>,
     },
     /// A validated table-definition payload read from WAL. Replay materializes
     /// it into its bounded stack scratch only at the table-application choke
@@ -936,7 +1247,7 @@ pub(crate) enum WalOp<'a> {
     /// Begins ALTER TABLE's in-place definition/row rewrite. The immediately
     /// following CreateTable record supplies the final definition; this marker
     /// carries the old identity and composed column ordinals without inflating
-    /// every WAL operation by another inline TableDef.
+    /// every WAL operation by another inline TableDefBuilder.
     BeginTableRewrite {
         previous_schema: &'a str,
         previous_name: &'a str,
@@ -1872,13 +2183,7 @@ impl From<BudgetError> for WalSetupError {
 
 fn append_record(buffer: &mut FixedBuf, lsn: u64, operation: &WalOp) -> Result<(), SqlError> {
     if let WalOp::CreateTable { definition, .. } = operation {
-        crate::storage::Storage::validate_not_null_names(definition)?;
-        if !definition.attributes.validate(definition.n_columns) {
-            return Err(sql_err!(
-                sqlstate::DATA_EXCEPTION,
-                "invalid column attribute layout before journaling"
-            ));
-        }
+        definition.validate()?;
     }
     let payload_len = encoded_payload_len(operation);
     let total = HEADER_LEN + payload_len;
@@ -2645,7 +2950,7 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::SetUserMapping { .. } => KIND_SET_USER_MAPPING,
         WalOp::SetForeignTable { .. } | WalOp::RestoreForeignTable(_) => KIND_SET_FOREIGN_TABLE,
         WalOp::CreateTable { definition, .. } => {
-            if table_needs_typed_journal(definition) {
+            if definition.needs_typed_journal() {
                 KIND_CREATE_TYPED
             } else {
                 KIND_CREATE
@@ -2976,92 +3281,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             })
         }
         WalOp::RestoreTable(payload) | WalOp::RestoreTypedTable(payload) => payload.len(),
-        WalOp::CreateTable {
-            definition: def, ..
-        } => {
-            let mut n = 10 + 1 + 1 + def.name.as_str().len() + 2 + 4 + 2;
-            n += def.attributes.encoded_len();
-            n += match def.access_method {
-                crate::storage::TableAccessMethod::Heap => 1,
-                crate::storage::TableAccessMethod::Catalog(_) => 5,
-            };
-            for (column, c) in def.columns().iter().enumerate() {
-                let default_value = c.default.constant().copied();
-                n += 1 + c.name.as_str().len() + 4 + 4 + encoded_default_len(&default_value);
-                n += 1 + def.not_null_names[column].map_or(0, |name| name.as_str().len());
-                // Non-constant DEFAULT text: 2-byte length prefix + bytes.
-                n += 2 + c
-                    .default
-                    .expression()
-                    .map(|e| e.as_str().len())
-                    .unwrap_or(0);
-                // auto_increment_step (i64).
-                n += 8;
-                n += 2; // attstattarget
-                n += 9; // attoptions presence byte plus two float4 bit patterns
-                n += 2; // attstorage + attcompression
-                // User-defined column: name, then a format marker and schema.
-                if let Some(identity) = c.user_type {
-                    n += 1 + identity.storage_name().as_str().len();
-                    n += 2 + identity.schema.as_str().len();
-                }
-            }
-            // uniques
-            n += 1;
-            for uk in def.uniques() {
-                n += 1 + uk.name.as_str().len() + 3 + uk.n_cols * 2;
-            }
-            // checks
-            n += 1;
-            for check in def.checks() {
-                n += 1 + check.name.as_str().len() + 3 + check.expression.as_str().len();
-            }
-            // foreign keys
-            n += 1;
-            for fk in def.fkeys() {
-                n += 1
-                    + fk.name.as_str().len()
-                    + 1
-                    + fk.n_cols * 2
-                    + 1
-                    + fk.parent.as_str().len()
-                    + 1
-                    + fk.n_parent_cols * 2
-                    + 4;
-            }
-            // exclusion constraints
-            n += 1;
-            for exclusion in def.exclusions() {
-                n += 1
-                    + exclusion.name.as_str().len()
-                    + 2
-                    + exclusion.n_cols * 3
-                    + 2
-                    + exclusion
-                        .predicate
-                        .as_ref()
-                        .map_or(0, |predicate| predicate.as_str().len());
-            }
-            n += 1 + def.schema.as_str().len();
-            for fk in def.fkeys() {
-                n += 1 + fk.parent_schema.as_str().len();
-            }
-            n += def.n_columns * crate::sql::ast::Collation::None.code().to_le_bytes().len();
-            n += encoded_partition_len(def.partition);
-            n += 1 + def.inheritance.parents_ref().len() * 2;
-            n += match def.type_membership {
-                crate::storage::TableTypeMembership::None => 1,
-                crate::storage::TableTypeMembership::Composite(reference) => {
-                    2 + reference.storage_key().len()
-                }
-            };
-            n += 1;
-            n += 3;
-            n += def.implicit_index_identities().count() * 8;
-            n += def.constraint_identities().count()
-                * crate::storage::ConstraintIdentity::ENCODED_BYTES;
-            n
-        }
+        WalOp::CreateTable { definition, .. } => definition.payload_len(),
         WalOp::BeginTableRewrite {
             previous_schema,
             previous_name,
@@ -4700,171 +4920,8 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
         WalOp::RestoreTable(payload) | WalOp::RestoreTypedTable(payload) => buffer.append(payload),
         WalOp::CreateTable {
             identity,
-            definition: def,
-        } => {
-            let mut ok = crate::storage::Storage::validate_not_null_names(def).is_ok()
-                && def.attributes.validate(def.n_columns)
-                && buffer.append(&[TABLE_DEF_PAYLOAD_VERSION])
-                && buffer.append(&identity.encode())
-                && name_bytes(buffer, def.name.as_str());
-            ok &= buffer.append(&(def.n_columns as u16).to_le_bytes());
-            ok &= buffer.append(&[
-                u8::from(def.has_toast),
-                match def.kind {
-                    crate::storage::TableKind::Local => 0,
-                    crate::storage::TableKind::Foreign => 1,
-                },
-                def.persistence.code(),
-                match def.on_commit {
-                    crate::storage::OnCommitAction::PreserveRows => 0,
-                    crate::storage::OnCommitAction::DeleteRows => 1,
-                    crate::storage::OnCommitAction::Drop => 2,
-                },
-            ]);
-            ok &= buffer.append(&def.tablespace.to_le_bytes());
-            ok &= match def.access_method {
-                crate::storage::TableAccessMethod::Heap => buffer.append(&[0]),
-                crate::storage::TableAccessMethod::Catalog(oid) => {
-                    buffer.append(&[1]) && buffer.append(&oid.get().to_le_bytes())
-                }
-            };
-            ok &= def.attributes.append(buffer);
-            for (column, c) in def.columns().iter().enumerate() {
-                ok &= name_bytes(buffer, c.name.as_str());
-                // Bit 7 (the last free per-column flag bit) marks a domain-typed
-                // column, whose domain name is appended after the fixed fields.
-                let flags = u8::from(c.not_null.is_required())
-                    | (u8::from(c.unique) << 1)
-                    | (u8::from(c.primary) << 2)
-                    | (u8::from(c.auto_increment) << 3)
-                    | (u8::from(c.default.is_generated()) << 4)
-                    | (u8::from(c.is_identity) << 5)
-                    | (u8::from(c.identity_always) << 6)
-                    | (u8::from(c.user_type.is_some()) << 7);
-                ok &= buffer.append(&[c.ctype.code(), flags]);
-                ok &= buffer.append(&[c.not_null.code()]);
-                ok &= buffer.append(&[u8::from(c.not_null_inheritable)]);
-                ok &= name_bytes(
-                    buffer,
-                    def.not_null_names[column]
-                        .as_ref()
-                        .map_or("", |name| name.as_str()),
-                );
-                ok &= buffer.append(&c.type_mod.to_le_bytes());
-                let default_value = c.default.constant().copied();
-                ok &= append_default(buffer, &default_value);
-                let de = c.default.expression().map_or("", |e| e.as_str());
-                ok &= buffer.append(&(de.len() as u16).to_le_bytes());
-                ok &= buffer.append(de.as_bytes());
-                ok &= buffer.append(&c.auto_increment_step.to_le_bytes());
-                ok &= buffer.append(&c.statistics_target.to_le_bytes());
-                let (option_flags, n_distinct, n_distinct_inherited) =
-                    c.statistics_options.encoded();
-                ok &= buffer.append(&[option_flags]);
-                ok &= buffer.append(&n_distinct.to_le_bytes());
-                ok &= buffer.append(&n_distinct_inherited.to_le_bytes());
-                ok &= buffer.append(&[c.storage.code(), c.compression.code()]);
-                if let Some(identity) = c.user_type {
-                    ok &= name_bytes(buffer, identity.storage_name().as_str());
-                    ok &= buffer.append(&[u8::MAX]);
-                    ok &= name_bytes(buffer, identity.schema.as_str());
-                }
-            }
-            // Multi-column UNIQUE/PRIMARY KEY constraints.
-            ok &= buffer.append(&[def.n_uniques as u8]);
-            for uk in def.uniques() {
-                ok &= name_bytes(buffer, uk.name.as_str());
-                ok &= buffer.append(&[uk.kind.code(), uk.n_cols as u8, uk.timing.code()]);
-                for &c in uk.columns() {
-                    ok &= buffer.append(&c.to_le_bytes());
-                }
-            }
-            // CHECK constraints.
-            ok &= buffer.append(&[def.n_checks as u8]);
-            for check in def.checks() {
-                ok &= name_bytes(buffer, check.name.as_str());
-                let e = check.expression.as_str();
-                ok &= buffer.append(&[check.validation.code()]);
-                ok &= buffer.append(&(e.len() as u16).to_le_bytes());
-                ok &= buffer.append(e.as_bytes());
-            }
-            // FOREIGN KEY constraints.
-            ok &= buffer.append(&[def.n_fkeys as u8]);
-            for fk in def.fkeys() {
-                ok &= name_bytes(buffer, fk.name.as_str());
-                ok &= buffer.append(&[fk.n_cols as u8]);
-                for &c in fk.columns() {
-                    ok &= buffer.append(&c.to_le_bytes());
-                }
-                ok &= name_bytes(buffer, fk.parent.as_str());
-                ok &= buffer.append(&[fk.n_parent_cols as u8]);
-                for &c in fk.parent_cols() {
-                    ok &= buffer.append(&c.to_le_bytes());
-                }
-                ok &= buffer.append(&[
-                    fk.on_delete.code(),
-                    fk.on_update.code(),
-                    fk.timing.code(),
-                    fk.validation.code(),
-                ]);
-            }
-            ok &= buffer.append(&[def.n_exclusions as u8]);
-            for exclusion in def.exclusions() {
-                ok &= name_bytes(buffer, exclusion.name.as_str());
-                ok &= buffer.append(&[exclusion.n_cols as u8, exclusion.timing.code()]);
-                for position in 0..exclusion.n_cols {
-                    ok &= buffer.append(&exclusion.columns[position].to_le_bytes());
-                    ok &= buffer.append(&[exclusion.operators[position].code()]);
-                }
-                let predicate = exclusion.predicate.as_ref().map(|value| value.as_str());
-                ok &= buffer.append(
-                    &(predicate.map_or(u16::MAX, |value| value.len() as u16)).to_le_bytes(),
-                );
-                if let Some(predicate) = predicate {
-                    ok &= buffer.append(predicate.as_bytes());
-                }
-            }
-            ok &= name_bytes(buffer, def.schema.as_str());
-            for fk in def.fkeys() {
-                ok &= name_bytes(buffer, fk.parent_schema.as_str());
-            }
-            for column in def.columns() {
-                ok &= buffer.append(&column.collation.code().to_le_bytes());
-            }
-            ok &= append_partition(buffer, def.partition);
-            ok &= buffer.append(&[def.inheritance.parents_ref().len() as u8]);
-            for parent in def.inheritance.parents_ref() {
-                ok &= buffer.append(&parent.to_le_bytes());
-            }
-            match def.type_membership {
-                crate::storage::TableTypeMembership::None => ok &= buffer.append(&[0]),
-                crate::storage::TableTypeMembership::Composite(reference) => {
-                    ok &=
-                        buffer.append(&[1]) && name_bytes(buffer, reference.storage_key().as_str());
-                }
-            }
-            ok &= buffer.append(&[def.storage_options.fillfactor.unwrap_or(0)]);
-            ok &= buffer.append(&[
-                u8::from(def.row_level_security.enabled),
-                u8::from(def.row_level_security.forced),
-                def.replica_identity.code(),
-            ]);
-            for identity in def.implicit_index_identities() {
-                ok &= identity.is_some()
-                    && buffer.append(
-                        &identity
-                            .map_or(0, |identity| identity.created_at())
-                            .to_le_bytes(),
-                    );
-            }
-            for identity in def.constraint_identities() {
-                let Some(identity) = identity else {
-                    return false;
-                };
-                ok &= buffer.append(&identity.to_le_bytes());
-            }
-            ok
-        }
+            definition,
+        } => definition.append_payload(buffer, *identity),
         WalOp::BeginTableRewrite {
             previous_schema,
             previous_name,
@@ -7414,7 +7471,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
 
 pub(crate) fn decode_table_payload(
     payload: &[u8],
-) -> Option<(crate::storage::CatalogPosition, TableDef)> {
+) -> Option<(crate::storage::CatalogPosition, TableDefBuilder)> {
     let mut definition = None;
     decode_op_inner(
         KIND_CREATE,
@@ -7548,7 +7605,7 @@ pub(crate) fn decode_operator_class_payload(
 }
 
 struct WalDecodeOutput<'output, 'payload> {
-    table: Option<&'output mut Option<(crate::storage::CatalogPosition, TableDef)>>,
+    table: Option<&'output mut Option<(crate::storage::CatalogPosition, TableDefBuilder)>>,
     domain: Option<&'output mut crate::storage::DomainDef>,
     routine: Option<
         &'output mut Option<(
@@ -7862,12 +7919,13 @@ fn decode_op_inner<'a>(
                 }
                 _ => return None,
             };
-            let attributes =
-                crate::storage::column_attributes::ColumnAttributes::decode(payload, &mut at)?;
+            let attributes = crate::storage::column_attributes::ColumnAttributes::<
+                crate::storage::InlineDefinition,
+            >::decode(payload, &mut at)?;
             if !attributes.validate(n_cols) {
                 return None;
             }
-            let mut def = TableDef {
+            let mut def = TableDefBuilder {
                 name: SqlName::parse(name).ok()?,
                 columns: [ColumnMeta::EMPTY; MAX_COLUMNS],
                 n_columns: n_cols,
@@ -7878,7 +7936,7 @@ fn decode_op_inner<'a>(
                 on_commit,
                 tablespace,
                 access_method,
-                ..TableDef::empty()
+                ..TableDefBuilder::empty()
             };
             for i in 0..n_cols {
                 let col_name = take_name(&mut at)?;
@@ -13706,10 +13764,10 @@ mod tests {
     #[test]
     fn operation_does_not_embed_wide_schema_definitions() {
         assert!(
-            core::mem::size_of::<WalOp<'static>>() < core::mem::size_of::<TableDef>(),
-            "WalOp {} must remain smaller than TableDef {}",
+            core::mem::size_of::<WalOp<'static>>() < core::mem::size_of::<TableDefBuilder>(),
+            "WalOp {} must remain smaller than TableDefBuilder {}",
             core::mem::size_of::<WalOp<'static>>(),
-            core::mem::size_of::<TableDef>()
+            core::mem::size_of::<TableDefBuilder>()
         );
         assert!(
             core::mem::size_of::<WalOp<'static>>()
@@ -14032,7 +14090,7 @@ mod tests {
                 KIND_CREATE_TYPED,
                 WalOp::CreateTable {
                     identity: crate::storage::CatalogPosition::new(0, 1).unwrap(),
-                    definition: &table,
+                    definition: (&table).into(),
                 },
             ),
             (KIND_CREATE_DOMAIN_TYPED, WalOp::CreateDomain(0, &domain)),
@@ -14697,12 +14755,12 @@ mod tests {
         dir.to_str().unwrap().to_string()
     }
 
-    fn sample_def() -> TableDef {
-        let mut def = TableDef {
+    fn sample_def() -> TableDefBuilder {
+        let mut def = TableDefBuilder {
             name: SqlName::parse("t").unwrap(),
             columns: [ColumnMeta::EMPTY; MAX_COLUMNS],
             n_columns: 2,
-            ..TableDef::empty()
+            ..TableDefBuilder::empty()
         };
         def.columns[0] = ColumnMeta {
             name: SqlName::parse("id").unwrap(),
@@ -14794,6 +14852,68 @@ mod tests {
         def
     }
 
+    #[test]
+    fn stored_and_builder_table_backings_encode_identical_payloads_without_workspace() {
+        let definition = sample_def();
+        let attributes = usize::from(definition.attributes.count);
+        let bytes = [
+            core::mem::size_of_val(definition.columns()),
+            core::mem::size_of_val(&definition.not_null_names[..definition.n_columns]),
+            core::mem::size_of_val(&definition.not_null_identities[..attributes]),
+            core::mem::size_of_val(&definition.inline_index_identities[..attributes]),
+            core::mem::size_of_val(definition.uniques()),
+            core::mem::size_of_val(definition.checks()),
+            core::mem::size_of_val(definition.fkeys()),
+            core::mem::size_of_val(definition.exclusions()),
+            core::mem::size_of_val(&definition.attributes.slots[..attributes]),
+        ]
+        .into_iter()
+        .map(|bytes| bytes.next_multiple_of(64))
+        .sum();
+        let payload_bytes = table_payload_len(&definition);
+        let mut budget = Budget::new(
+            crate::mem::lease_pool::LeasePool::budget_bytes(bytes, 9) + 2 * payload_bytes,
+        );
+        let pool = crate::mem::lease_pool::LeasePool::new(
+            &mut budget,
+            crate::mem::lease_pool::Purpose::TABLE_METADATA,
+            bytes,
+            9,
+        )
+        .unwrap();
+        let mut from_builder =
+            FixedBuf::new(&mut budget, "builder table payload", payload_bytes).unwrap();
+        let mut from_stored =
+            FixedBuf::new(&mut budget, "stored table payload", payload_bytes).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let stored = definition.freeze(&pool).unwrap();
+            assert!(pool.lease::<u8>(1).is_err());
+            let identity = crate::storage::CatalogPosition::new(0, 50).unwrap();
+            let builder = WalOp::CreateTable {
+                identity,
+                definition: (&definition).into(),
+            };
+            let stored = WalOp::CreateTable {
+                identity,
+                definition: (&stored).into(),
+            };
+            assert_eq!(encoded_payload_len(&builder), payload_bytes);
+            assert_eq!(encoded_payload_len(&stored), payload_bytes);
+            assert!(append_payload(&mut from_builder, &builder));
+            assert!(append_payload(&mut from_stored, &stored));
+            assert_eq!(from_builder.readable(), from_stored.readable());
+            let (position, decoded) = decode_table_payload(from_stored.readable()).unwrap();
+            assert_eq!(position, identity);
+            assert_eq!(decoded.columns(), definition.columns());
+            assert_eq!(
+                decoded.constraint_identities().count(),
+                definition.constraint_identities().count()
+            );
+        });
+        assert!(pool.lease::<u8>(bytes).is_ok());
+        assert_eq!(budget.remaining(), 0);
+    }
+
     fn collect_replay(wal: &mut Wal) -> Vec<String> {
         collect_replay_from(wal, 0)
     }
@@ -14836,7 +14956,7 @@ mod tests {
             &mut payload,
             &WalOp::CreateTable {
                 identity: crate::storage::CatalogPosition::new(0, 50).unwrap(),
-                definition: &definition,
+                definition: (&definition).into(),
             }
         ));
         let bytes = payload.readable();
@@ -14864,7 +14984,7 @@ mod tests {
             &mut payload,
             &WalOp::CreateTable {
                 identity: crate::storage::CatalogPosition::new(0, 50).unwrap(),
-                definition: &definition,
+                definition: (&definition).into(),
             }
         ));
         let length = payload.len();
@@ -14911,7 +15031,7 @@ mod tests {
                     &mut payload,
                     &WalOp::CreateTable {
                         identity: crate::storage::CatalogPosition::new(0, 1).unwrap(),
-                        definition: &definition,
+                        definition: (&definition).into(),
                     }
                 ));
                 let (_, restored) = decode_table_payload(payload.readable()).unwrap();
@@ -14939,7 +15059,7 @@ mod tests {
                     1,
                     &WalOp::CreateTable {
                         identity: crate::storage::CatalogPosition::new(0, 1).unwrap(),
-                        definition: &definition,
+                        definition: (&definition).into(),
                     }
                 )
                 .unwrap_err()
@@ -14959,7 +15079,7 @@ mod tests {
             &mut payload,
             &WalOp::CreateTable {
                 identity: crate::storage::CatalogPosition::new(0, 1).unwrap(),
-                definition: &definition
+                definition: (&definition).into()
             }
         ));
         let truncated_len = payload.len() - definition.n_columns;
@@ -14994,14 +15114,14 @@ mod tests {
                     &mut payload,
                     &WalOp::CreateTable {
                         identity: crate::storage::CatalogPosition::new(0, 1).unwrap(),
-                        definition: &definition
+                        definition: (&definition).into()
                     }
                 ));
                 assert_eq!(
                     payload.len(),
                     encoded_payload_len(&WalOp::CreateTable {
                         identity: crate::storage::CatalogPosition::new(0, 1).unwrap(),
-                        definition: &definition,
+                        definition: (&definition).into(),
                     })
                 );
                 let (_, restored) = decode_table_payload(payload.readable()).unwrap();
@@ -15053,7 +15173,7 @@ mod tests {
             &mut payload,
             &WalOp::CreateTable {
                 identity: crate::storage::CatalogPosition::new(0, 1).unwrap(),
-                definition: &definition
+                definition: (&definition).into()
             }
         ));
         let (_, restored) = decode_table_payload(payload.readable())
@@ -15769,7 +15889,7 @@ mod tests {
                 1,
                 &WalOp::CreateTable {
                     identity: crate::storage::CatalogPosition::new(0, 1).unwrap(),
-                    definition: &sample_def(),
+                    definition: (&sample_def()).into(),
                 },
             )
             .unwrap();

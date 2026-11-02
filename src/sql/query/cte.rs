@@ -1300,7 +1300,7 @@ fn expand_dml_ctes_with_relations<'a>(
 pub(crate) fn filter_view_rows<'a>(
     select: &'a Select<'a>,
     predicate: Option<&'a Expr<'a>>,
-    definition: &crate::storage::TableDef,
+    definition: crate::storage::RelationDefinition<'_>,
     alias: Option<&str>,
     security_barrier: crate::storage::ViewSecurityBarrier,
     storage: &Storage,
@@ -1530,7 +1530,7 @@ pub(crate) fn filter_view_rows<'a>(
 fn filter_set_view_rows<'a>(
     body: &'a SetTree<'a>,
     predicate: Option<&'a Expr<'a>>,
-    definition: &crate::storage::TableDef,
+    definition: crate::storage::RelationDefinition<'_>,
     alias: Option<&str>,
     security_barrier: crate::storage::ViewSecurityBarrier,
     storage: &Storage,
@@ -1590,7 +1590,7 @@ fn filter_set_view_rows<'a>(
 fn filter_set_view_conjunct<'a>(
     body: &'a SetTree<'a>,
     predicate: &'a Expr<'a>,
-    definition: &crate::storage::TableDef,
+    definition: crate::storage::RelationDefinition<'_>,
     alias: Option<&str>,
     security_barrier: crate::storage::ViewSecurityBarrier,
     storage: &Storage,

@@ -2,7 +2,7 @@
 
 use core::num::NonZeroU32;
 
-use super::{Storage, TableDef};
+use super::Storage;
 use crate::sql::eval::{SqlError, sqlstate};
 use crate::sql_err;
 
@@ -33,27 +33,22 @@ impl RelationIdentity {
     }
 }
 
-impl TableDef {
+impl<B: super::DefinitionBacking> super::TableDefinition<B> {
     pub(crate) fn column_index_identity(&self, column: usize) -> Option<RelationIdentity> {
         let attribute = usize::from(self.attributes.number(column)? - 1);
-        self.inline_index_identities[attribute]
-    }
-
-    pub(crate) fn take_column_index_identity(&mut self, column: usize) -> Option<RelationIdentity> {
-        let attribute = usize::from(self.attributes.number(column)? - 1);
-        self.inline_index_identities[attribute].take()
+        self.inline_index_identities.as_ref()[attribute]
     }
 
     pub(crate) fn implicit_index_identities(
         &self,
     ) -> impl Iterator<Item = Option<RelationIdentity>> + '_ {
-        self.inline_index_identities[..usize::from(self.attributes.count)]
+        self.inline_index_identities.as_ref()[..usize::from(self.attributes.count)]
             .iter()
-            .zip(&self.attributes.slots)
+            .zip(self.attributes.slots.as_ref())
             .filter_map(|(identity, slot)| match *slot {
                 super::column_attributes::AttributeSlot::Live(column)
-                    if self.columns[usize::from(column)].primary
-                        || self.columns[usize::from(column)].unique =>
+                    if self.columns.as_ref()[usize::from(column)].primary
+                        || self.columns.as_ref()[usize::from(column)].unique =>
                 {
                     Some(*identity)
                 }
@@ -61,6 +56,27 @@ impl TableDef {
             })
             .chain(self.uniques().iter().map(|key| key.index_identity))
             .chain(self.exclusions().iter().map(|key| key.index_identity))
+    }
+
+    pub(crate) fn implicit_index_oid(&self, position: usize) -> i32 {
+        self.columns()
+            .iter()
+            .enumerate()
+            .filter(|(_, column)| column.primary || column.unique)
+            .map(|(column, _)| self.column_index_identity(column))
+            .chain(self.uniques().iter().map(|key| key.index_identity))
+            .chain(self.exclusions().iter().map(|key| key.index_identity))
+            .nth(position)
+            .flatten()
+            .expect("admitted implicit index has a durable identity")
+            .oid()
+    }
+}
+
+impl super::TableDefBuilder {
+    pub(crate) fn take_column_index_identity(&mut self, column: usize) -> Option<RelationIdentity> {
+        let attribute = usize::from(self.attributes.number(column)? - 1);
+        self.inline_index_identities[attribute].take()
     }
 
     pub(crate) fn implicit_index_identities_mut(
@@ -90,27 +106,12 @@ impl TableDef {
                     .map(|key| &mut key.index_identity),
             )
     }
-
-    /// Event positions follow live columns; the durable array follows attribute numbers.
-    pub(crate) fn implicit_index_oid(&self, position: usize) -> i32 {
-        self.columns()
-            .iter()
-            .enumerate()
-            .filter(|(_, column)| column.primary || column.unique)
-            .map(|(column, _)| self.column_index_identity(column))
-            .chain(self.uniques().iter().map(|key| key.index_identity))
-            .chain(self.exclusions().iter().map(|key| key.index_identity))
-            .nth(position)
-            .flatten()
-            .expect("admitted implicit index has a durable identity")
-            .oid()
-    }
 }
 
 impl Storage {
     pub(crate) fn reserve_table_catalog_identities(
         &self,
-        definition: &mut TableDef,
+        definition: &mut super::TableDefBuilder,
     ) -> Result<(), SqlError> {
         self.reserve_constraint_identities(definition)?;
         for (identity, slot) in definition
@@ -143,9 +144,9 @@ impl Storage {
         Ok(())
     }
 
-    pub(super) fn validate_table_catalog_identities(
+    pub(super) fn validate_table_catalog_identities<B: super::DefinitionBacking>(
         &self,
-        definition: &TableDef,
+        definition: &super::TableDefinition<B>,
         owner_birth: u64,
     ) -> Result<(), SqlError> {
         super::validate_constraint_lifetimes(definition.constraint_identities(), owner_birth)?;

@@ -13,8 +13,35 @@
 
 use crate::mem::mutex::Mutex;
 use core::fmt;
+use std::alloc::Layout;
 
 use super::budget::{Budget, BudgetError};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ValueIndexSetupError {
+    Budget(BudgetError),
+    CapacityOverflow { setting: &'static str },
+}
+
+impl From<BudgetError> for ValueIndexSetupError {
+    fn from(error: BudgetError) -> Self {
+        Self::Budget(error)
+    }
+}
+
+impl fmt::Display for ValueIndexSetupError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Budget(error) => error.fmt(formatter),
+            Self::CapacityOverflow { setting } => write!(
+                formatter,
+                "{setting} exceeds the supported value index memory layout"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ValueIndexSetupError {}
 
 pub struct ValueIndex {
     what: &'static str,
@@ -59,23 +86,29 @@ impl ValueIndex {
 
     /// Bytes `new` will draw from the budget for a given capacity.
     pub fn budget_bytes(capacity: usize) -> usize {
-        Self::slot_count(capacity) * size_of::<Option<(u64, u64)>>()
+        Self::slot_count(capacity)
+            .map(|count| count * size_of::<Option<(u64, u64)>>())
+            .unwrap_or(usize::MAX)
     }
 
-    fn slot_count(capacity: usize) -> usize {
-        capacity
+    fn slot_count(capacity: usize) -> Option<usize> {
+        let count = capacity
             .checked_mul(2)
             .and_then(|n| n.checked_next_power_of_two())
-            .unwrap_or_else(|| panic!("value index capacity {capacity} is unrepresentable"))
-            .max(8)
+            .map(|count| count.max(8))?;
+        Layout::array::<Option<(u64, u64)>>(count).ok()?;
+        Some(count)
     }
 
     pub fn new(
         budget: &mut Budget,
         what: &'static str,
         capacity: usize,
-    ) -> Result<Self, BudgetError> {
-        let slot_count = Self::slot_count(capacity);
+    ) -> Result<Self, ValueIndexSetupError> {
+        let slot_count =
+            Self::slot_count(capacity).ok_or(ValueIndexSetupError::CapacityOverflow {
+                setting: "value_index_rows",
+            })?;
         budget.draw_array(slot_count, size_of::<Option<(u64, u64)>>(), what)?;
         let mut slots = Vec::new();
         slots.resize_with(slot_count, || None);
@@ -248,14 +281,38 @@ impl ValueIndexPool {
     }
 
     pub fn budget_bytes(capacity: usize, rows: usize) -> usize {
-        size_of::<Self>()
-            + capacity
-                * (size_of::<std::sync::Arc<std::sync::RwLock<ValueIndex>>>()
-                    + Self::owner_bytes()
-                    + ValueIndex::budget_bytes(rows))
+        Self::checked_budget_bytes(capacity, rows).unwrap_or(usize::MAX)
     }
 
-    pub fn new(budget: &mut Budget, capacity: usize, rows: usize) -> Result<Self, BudgetError> {
+    pub(crate) fn checked_budget_bytes(
+        capacity: usize,
+        rows: usize,
+    ) -> Result<usize, ValueIndexSetupError> {
+        let index_slots =
+            ValueIndex::slot_count(rows).ok_or(ValueIndexSetupError::CapacityOverflow {
+                setting: "value_index_rows",
+            })?;
+        let overflow = || ValueIndexSetupError::CapacityOverflow {
+            setting: "max_value_indexes",
+        };
+        Layout::array::<std::sync::Arc<std::sync::RwLock<ValueIndex>>>(capacity)
+            .map_err(|_| overflow())?;
+        let per_index = size_of::<std::sync::Arc<std::sync::RwLock<ValueIndex>>>()
+            .checked_add(Self::owner_bytes())
+            .and_then(|bytes| bytes.checked_add(index_slots * size_of::<Option<(u64, u64)>>()))
+            .ok_or_else(overflow)?;
+        capacity
+            .checked_mul(per_index)
+            .and_then(|bytes| bytes.checked_add(size_of::<Self>()))
+            .ok_or_else(overflow)
+    }
+
+    pub fn new(
+        budget: &mut Budget,
+        capacity: usize,
+        rows: usize,
+    ) -> Result<Self, ValueIndexSetupError> {
+        Self::checked_budget_bytes(capacity, rows)?;
         budget.draw(size_of::<Self>(), "value index allocation controls")?;
         budget.draw_array(
             capacity,
@@ -448,13 +505,73 @@ mod tests {
             Ok(_) => panic!("undersized cache controls accepted"),
             Err(error) => error,
         };
-        assert_eq!(error.what, "value index allocation controls");
+        assert!(matches!(
+            error,
+            ValueIndexSetupError::Budget(error)
+                if error.what == "value index allocation controls"
+        ));
         let mut short = Budget::new(ValueIndexPool::budget_bytes(2, 8) - 1);
         let error = match ValueIndexPool::new(&mut short, 2, 8) {
             Ok(_) => panic!("undersized cache payload accepted"),
             Err(error) => error,
         };
-        assert_eq!(error.what, "value_index");
+        assert!(matches!(
+            error,
+            ValueIndexSetupError::Budget(error) if error.what == "value_index"
+        ));
+    }
+
+    #[test]
+    fn unrepresentable_value_index_dimensions_fail_before_startup_draws() {
+        let mut budget = Budget::new(usize::MAX);
+        crate::mem::guard::forbid_alloc(|| {
+            for rows in [
+                usize::MAX,
+                (isize::MAX as usize) / size_of::<Option<(u64, u64)>>() / 2 + 1,
+            ] {
+                assert_eq!(ValueIndex::budget_bytes(rows), usize::MAX);
+                assert_eq!(ValueIndexPool::budget_bytes(1, rows), usize::MAX);
+                let Err(error) = ValueIndex::new(&mut budget, "boundary", rows) else {
+                    panic!("unrepresentable value index accepted");
+                };
+                assert_eq!(
+                    error,
+                    ValueIndexSetupError::CapacityOverflow {
+                        setting: "value_index_rows"
+                    }
+                );
+                let Err(error) = ValueIndexPool::new(&mut budget, 1, rows) else {
+                    panic!("unrepresentable value index pool accepted");
+                };
+                assert_eq!(
+                    error,
+                    ValueIndexSetupError::CapacityOverflow {
+                        setting: "value_index_rows"
+                    }
+                );
+                assert_eq!(budget.used(), 0);
+            }
+            let per_index =
+                ValueIndexPool::checked_budget_bytes(1, 8).unwrap() - size_of::<ValueIndexPool>();
+            for count in [
+                usize::MAX,
+                (isize::MAX as usize) / size_of::<std::sync::Arc<std::sync::RwLock<ValueIndex>>>()
+                    + 1,
+                usize::MAX / per_index + 1,
+            ] {
+                assert_eq!(ValueIndexPool::budget_bytes(count, 8), usize::MAX);
+                let Err(error) = ValueIndexPool::new(&mut budget, count, 8) else {
+                    panic!("unrepresentable value index owners accepted");
+                };
+                assert_eq!(
+                    error,
+                    ValueIndexSetupError::CapacityOverflow {
+                        setting: "max_value_indexes"
+                    }
+                );
+                assert_eq!(budget.used(), 0);
+            }
+        });
     }
 
     #[test]

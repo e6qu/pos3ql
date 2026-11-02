@@ -73,7 +73,17 @@ and definition-history reservations; sharing these pools does not make every
 empty table free. Next, store a table's actual columns and index bindings in
 shared startup capacity, so a one-column table does not reserve the metadata
 for a maximum-width table. Preserve object identities, unfinished schema edits,
-retained readers, rollback and cold recovery. Establish whether cache files need
+retained readers, rollback and cold recovery. Reserve complete replacement
+definitions and index bindings before a change can become durable, including
+changes to dependent tables. Readers retain their original definitions without
+another allocation; old and replacement data both count against the fixed
+capacity until their owners release them. Preserve the original column numbers
+after columns are dropped.
+
+For example, if `ALTER TABLE orders ADD COLUMN note text` cannot reserve its
+replacement metadata, return a named capacity error and leave `orders` usable
+with its previous definition. Test the same rule through savepoints, prepared
+transactions and recovery. Establish whether cache files need
 guaranteed physical disk reservation, then implement and verify it rather than
 equating file length with reserved disk space.
 
@@ -92,7 +102,9 @@ The [resource design](docs/adaptive-resources.md) records candidate policies and
 code evidence; proposed controls are not current settings.
 
 Keep the 1/8/32/128-table comparisons at equal explicit global capacity in both
-transaction modes. Identify memory counters and their units; separate named
+transaction modes, including narrow/wide schemas, retained readers and the
+temporary overlap during schema/index replacement. Identify memory counters
+and their units; separate named
 startup reservations, resident pages, stack and TLS costs. Old unlabelled RSS
 peaks are not comparable to the corrected current-program measurements described
 in the [performance guide](docs/performance.md). Keep controller state within

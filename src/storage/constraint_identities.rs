@@ -2,9 +2,7 @@
 
 use core::num::NonZeroU32;
 
-use super::{
-    CheckConstraint, DetachedPartitionBound, DomainDef, DomainSpec, ForeignKey, Storage, TableDef,
-};
+use super::{CheckConstraint, DetachedPartitionBound, DomainDef, DomainSpec, ForeignKey, Storage};
 use crate::sql::eval::{SqlError, sqlstate};
 use crate::sql_err;
 
@@ -109,10 +107,10 @@ impl DetachedPartitionBound {
     }
 }
 
-impl TableDef {
+impl<B: super::DefinitionBacking> super::TableDefinition<B> {
     pub(crate) fn not_null_constraint_oid(&self, column: usize) -> i32 {
         let attribute = usize::from(self.attribute_number(column) - 1);
-        self.not_null_identities[attribute]
+        self.not_null_identities.as_ref()[attribute]
             .expect("admitted NOT NULL has a creation identity")
             .oid()
     }
@@ -126,11 +124,14 @@ impl TableDef {
             .chain(self.fkeys().iter().map(|key| key.identity))
             .chain(
                 self.not_null_identities
+                    .as_ref()
                     .iter()
-                    .zip(&self.attributes.slots)
+                    .zip(self.attributes.slots.as_ref())
                     .filter_map(|(identity, slot)| match *slot {
                         super::column_attributes::AttributeSlot::Live(column)
-                            if self.columns[usize::from(column)].not_null.is_required() =>
+                            if self.columns.as_ref()[usize::from(column)]
+                                .not_null
+                                .is_required() =>
                         {
                             Some(*identity)
                         }
@@ -144,7 +145,9 @@ impl TableDef {
                     .map(|check| check.identity),
             )
     }
+}
 
+impl super::TableDefBuilder {
     pub(crate) fn constraint_identities_mut(
         &mut self,
     ) -> impl Iterator<Item = &mut Option<ConstraintIdentity>> {
@@ -270,7 +273,7 @@ pub(crate) fn validate_constraint_lifetimes(
 impl Storage {
     pub(super) fn reserve_constraint_identities(
         &self,
-        definition: &mut TableDef,
+        definition: &mut super::TableDefBuilder,
     ) -> Result<(), SqlError> {
         for (identity, slot) in definition
             .not_null_identities
@@ -431,7 +434,7 @@ mod tests {
     use crate::storage::tests::{make_def, test_budget, test_config};
     use crate::storage::{CatalogPosition, SqlName, TableCreation};
 
-    fn checked_table(name: &str) -> TableDef {
+    fn checked_table(name: &str) -> super::super::TableDefBuilder {
         let mut definition = make_def(name, &[("id", ColType::Int4, true)]);
         definition.n_checks = 1;
         definition.checks[0].name = SqlName::parse("positive").unwrap();

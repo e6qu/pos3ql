@@ -9630,7 +9630,7 @@ pub fn describe_catalog_items_as<'q>(
             super::exec::infer_type_res(
                 expression,
                 &super::exec::CatalogCols {
-                    definition,
+                    definition: definition.map(crate::storage::RelationDefinition::from_definition),
                     alias,
                     output_aliases: &[],
                     storage,

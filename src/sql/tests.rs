@@ -6322,12 +6322,13 @@ fn query_workspaces_are_startup_bounded_and_isolated() {
         crate::storage::DatabaseOid::POSTGRES
     );
 
-    let mut shared_budget = Budget::new(crate::mem::lease_pool::RowWorkPool::budget_bytes(
+    let mut shared_budget = Budget::new(crate::mem::lease_pool::LeasePool::budget_bytes(
         config.row_work_bytes,
         config.row_work_leases,
     ));
-    let shared = crate::mem::lease_pool::RowWorkPool::new(
+    let shared = crate::mem::lease_pool::LeasePool::new(
         &mut shared_budget,
+        crate::mem::lease_pool::Purpose::ROW_WORK,
         config.row_work_bytes,
         config.row_work_leases,
     )
@@ -64127,13 +64128,22 @@ fn index_creation_cache_failure_releases_partial_bindings_and_preserves_prior_in
         let slot = engine.storage.create_index(second, txid).unwrap();
         let error = engine
             .storage
-            .prepare_index_enforcers(table, txid)
+            .prepare_index_enforcers(
+                table,
+                txid,
+                crate::storage::BindingChange::IndexCreate {
+                    created_at: engine
+                        .storage
+                        .index_visible_to(slot, txid)
+                        .unwrap()
+                        .created_at,
+                },
+            )
             .unwrap_err();
         assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
         assert_eq!(engine.storage.table(table).enforcer_count(), 1);
         assert!(engine.storage.value_cache_complete(table, &[0]));
         engine.storage.rollback_index_create(slot);
-        engine.storage.prepare_index_enforcers(table, txid).unwrap();
         assert_eq!(engine.storage.table(table).enforcer_count(), 1);
         assert!(engine.storage.value_cache_complete(table, &[0]));
     });
@@ -92095,7 +92105,13 @@ fn alter_rewrite_sources_release_failed_capture_and_allow_fixed_capacity_retry()
         .unwrap();
     let arena = Arena::new(&mut budget, "alter capture retry", 2 << 20).unwrap();
     let tiny = Arena::new(&mut budget, "alter tiny arena", 1).unwrap();
-    let short_pool = crate::mem::lease_pool::RowWorkPool::new(&mut budget, 64, 1).unwrap();
+    let short_pool = crate::mem::lease_pool::LeasePool::new(
+        &mut budget,
+        crate::mem::lease_pool::Purpose::ROW_WORK,
+        64,
+        1,
+    )
+    .unwrap();
     let mut short = short_pool.lease(0).unwrap();
     let mut complete = engine.row_work_pool().lease(0).unwrap();
     crate::mem::guard::forbid_alloc(|| {

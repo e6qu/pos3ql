@@ -94,6 +94,8 @@ def main():
             "row_work_bytes": 8 * 1024**2,
             "row_work_leases": 128,
             "definition_image_slots": 256,
+            "table_metadata_bytes": 64 * 1024**2,
+            "table_metadata_leases": 8192,
             "active_rows": 512,
             "local_only": True,
         }
@@ -120,6 +122,8 @@ def main():
                                  "--row-history-slots", str(history), "--workload", workload,
                                  "--rows", "0" if workload == "empty" else "512",
                                  "--data-dir", data, "--budget-limit-bytes", str(args.budget_limit_bytes)]
+                    arguments.extend(["--table-metadata-bytes", str(environment["table_metadata_bytes"]),
+                                      "--table-metadata-leases", str(environment["table_metadata_leases"])])
                     try:
                         with (output / f"{label}.stdout").open("w") as stdout, (output / f"{label}.budget.log").open("w") as stderr:
                             command(arguments, stdout=stdout, stderr=stderr)

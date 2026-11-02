@@ -1162,7 +1162,7 @@ fn value_cache_owners_failed_candidate_releases_capacity_and_publishes_no_prefix
         assert!(error.message.as_str().contains("max_value_indexes"));
         {
             let publication = storage.tables[table].publication();
-            assert_eq!(publication.n_enforcers, 1);
+            assert_eq!(publication.enforcers.len(), 1);
             assert_eq!(
                 publication.enforcers[0].as_ref().unwrap().cache.slot(),
                 selected.cache.slot()
@@ -1176,9 +1176,16 @@ fn value_cache_owners_failed_candidate_releases_capacity_and_publishes_no_prefix
         selected.cache.read().probe(41, |row| original = row);
         assert_eq!(original, 99);
         drop(selected);
-        storage.prepare_index_enforcers(table, 0).unwrap();
+        storage
+            .build_enforcers_visible(
+                table,
+                None,
+                key_preparation::EnforcerRows::ReusePrepared,
+                None,
+            )
+            .unwrap();
         let publication = storage.tables[table].publication();
-        assert_eq!(publication.n_enforcers, 2);
+        assert_eq!(publication.enforcers.len(), 2);
         assert!(publication.enforcers[..2].iter().all(Option::is_some));
     });
 }

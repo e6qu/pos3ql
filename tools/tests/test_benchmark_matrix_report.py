@@ -39,6 +39,8 @@ class BenchmarkMatrixReportTest(unittest.TestCase):
                 "row_work_bytes": 8388608,
                 "row_work_leases": 128,
                 "definition_image_slots": 256,
+                "table_metadata_bytes": 67108864,
+                "table_metadata_leases": 8192,
                 "operations_per_client": 10,
                 "clients": 2,
                 "catalog_relations": 128 if mode == "full" else 0,

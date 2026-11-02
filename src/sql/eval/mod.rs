@@ -841,7 +841,7 @@ impl<'a, T: ColumnLookup<'a> + ?Sized> ColumnLookup<'a> for &T {
 
 /// Whether a qualifier answers to one concrete table: its bare name, or the
 /// composed `schema.table` a three-part reference resolves through.
-pub fn qualifier_answers_single(def: &crate::storage::TableDef, q: &str) -> bool {
+pub fn qualifier_answers_single(def: crate::storage::RelationDefinition<'_>, q: &str) -> bool {
     match q.split_once('.') {
         None => q == def.name.as_str(),
         Some((schema, table)) => schema == def.schema.as_str() && table == def.name.as_str(),
@@ -851,7 +851,7 @@ pub fn qualifier_answers_single(def: &crate::storage::TableDef, q: &str) -> bool
 /// A DML correlation name replaces its target relation name everywhere that
 /// statement can name the target.
 pub fn qualifier_answers_target(
-    def: &crate::storage::TableDef,
+    def: crate::storage::RelationDefinition<'_>,
     alias: Option<&str>,
     q: &str,
 ) -> bool {

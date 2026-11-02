@@ -2,8 +2,8 @@
 
 use super::{
     AccessClass, AccessObject, CatalogDdlState, DependencyClass, Ownership,
-    RelationCumulativeStatistics, SqlError, Storage, TableDef, TableSerialState, TableStatistics,
-    current_database, table_definitions,
+    RelationCumulativeStatistics, SqlError, Storage, TableDef, TableDefBuilder, TableSerialState,
+    TableStatistics, current_database, table_definitions,
 };
 use crate::sql::eval::sqlstate;
 use crate::sql_err;
@@ -18,7 +18,7 @@ pub(crate) enum TableCreation {
 /// name, lifecycle and definition owners before retrying the name reservation.
 pub(super) fn allocate(
     storage: &Storage,
-    mut def: TableDef,
+    mut def: TableDefBuilder,
     allocation: super::CatalogAllocation,
     creation: TableCreation,
 ) -> Result<usize, SqlError> {
@@ -129,17 +129,6 @@ pub(super) fn allocate(
                 (position.slot(), lifecycle)
             }
         };
-        // A reused slot must not keep the dropped table's value indexes.
-        storage.release_enforcers(slot);
-        storage.clear_pending_table_defs(slot);
-        storage.clear_pending_table_statistics(slot);
-        storage.clear_object_acl_entries(AccessObject {
-            class: AccessClass::Table,
-            slot: slot as u16,
-        });
-        storage.cumulative_statistics().relations[slot] = RelationCumulativeStatistics::EMPTY;
-        storage.reset_implicit_index_statistics(slot);
-        storage.clear_table_rows(slot);
         let table = &storage.tables[slot];
         let mut state = table.definition.write();
         let source = match super::row_ownership::try_mutex(
@@ -202,8 +191,22 @@ pub(super) fn allocate(
         if matches!(allocation, super::CatalogAllocation::Restore(_)) {
             storage.catalog_sequence.observe(created_at);
         }
+        let definition = def.freeze(&storage.metadata_pool)?;
+        drop(state);
+        // A reused slot must not keep the dropped table's value indexes.
+        storage.release_enforcers(slot);
+        storage.clear_pending_table_defs(slot);
+        storage.clear_pending_table_statistics(slot);
+        storage.clear_object_acl_entries(AccessObject {
+            class: AccessClass::Table,
+            slot: slot as u16,
+        });
+        storage.cumulative_statistics().relations[slot] = RelationCumulativeStatistics::EMPTY;
+        storage.reset_implicit_index_statistics(slot);
+        storage.clear_table_rows(slot);
+        let mut state = table.definition.write();
         state.install(
-            def,
+            definition,
             table_definitions::TableIdentity {
                 database: current_database(),
                 ownership,

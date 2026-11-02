@@ -14,7 +14,8 @@ use crate::sql::eval::{ColumnLookup, SequenceAccess, SqlError, sqlstate};
 use crate::sql::types::{ColType, Datum};
 use crate::sql_err;
 use crate::storage::{
-    ColumnMeta, MAX_COLUMNS, SqlName, Storage, TableDef, TableDefinitionImages, UserTypeName,
+    ColumnMeta, MAX_COLUMNS, RelationDefinition, SqlName, Storage, TableDef, TableDefinitionImages,
+    UserTypeName,
 };
 use crate::util::StackStr;
 
@@ -184,7 +185,7 @@ pub(crate) fn materialized_definition<'a>(
     column_types: &[(i32, i16, i32)],
     column_collations: &[crate::sql::ast::Collation],
     arena: &'a Arena,
-) -> Result<&'a TableDef, SqlError> {
+) -> Result<RelationDefinition<'a>, SqlError> {
     debug_assert_eq!(column_names.len(), column_types.len());
     debug_assert_eq!(column_names.len(), column_collations.len());
     let mut columns = [ColumnMeta::EMPTY; MAX_COLUMNS];
@@ -209,33 +210,35 @@ pub(crate) fn materialized_definition<'a>(
         };
     }
     retain_query_definition(
-        TableDef {
+        RelationDefinition {
+            schema: SqlName::EMPTY,
             name: SqlName::parse(name)?,
-            columns,
+            columns: &columns[..column_names.len()],
             n_columns: column_names.len(),
-            ..TableDef::empty()
         },
         arena,
     )
 }
 
-pub(super) fn retain_query_definition(
-    definition: TableDef,
-    arena: &Arena,
-) -> Result<&TableDef, SqlError> {
-    arena
-        .alloc_interned(definition, |left, right| {
-            // Query output definitions have empty non-column metadata.
-            left.name == right.name
-                && left.n_columns == right.n_columns
-                && left.columns() == right.columns()
-        })
-        .map_err(|_| arena_full())
+pub(super) fn retain_query_definition<'a>(
+    definition: RelationDefinition<'_>,
+    arena: &'a Arena,
+) -> Result<RelationDefinition<'a>, SqlError> {
+    let columns = arena
+        .alloc_interned_slice(definition.columns)
+        .map_err(|_| arena_full())?;
+    Ok(RelationDefinition {
+        columns,
+        ..definition
+    })
 }
 
 #[derive(Clone, Copy)]
 enum ScopeDefinition<'a> {
-    Arena(&'a TableDef),
+    Synthetic {
+        definition: RelationDefinition<'a>,
+        table: Option<usize>,
+    },
     Relation {
         image: crate::storage::DefinitionImageId,
         names: &'a [&'a str],
@@ -254,19 +257,39 @@ pub(crate) struct QueryDefinitions<'a> {
 }
 
 impl<'a> QueryDefinitions<'a> {
-    pub(crate) fn get(&self, index: usize) -> Option<&TableDef> {
+    pub(crate) fn get(&self, index: usize) -> Option<RelationDefinition<'_>> {
         match self.sources.get(index).copied().flatten()? {
-            ScopeDefinition::Arena(definition) => Some(definition),
-            ScopeDefinition::Relation { image, .. } => Some(
-                self.images
+            ScopeDefinition::Synthetic { definition, .. } => Some(definition),
+            ScopeDefinition::Relation { image, .. } => {
+                let definition = self
+                    .images
                     .retained_relation(image)
-                    .expect("scope retains its catalog definition"),
-            ),
-            ScopeDefinition::Retained { table, .. } => Some(
+                    .expect("scope retains its catalog definition");
+                Some(RelationDefinition {
+                    schema: definition.schema,
+                    name: definition.name,
+                    n_columns: definition.n_columns,
+                    columns: &definition.columns,
+                })
+            }
+            ScopeDefinition::Retained { table, .. } => Some(RelationDefinition::from_definition(
                 self.images
                     .retained_definition(table, self.transaction)
                     .expect("scope retains its registered definition"),
-            ),
+            )),
+        }
+    }
+
+    pub(crate) fn stored(&self, index: usize) -> Option<&TableDef> {
+        match self.sources.get(index).copied().flatten()? {
+            ScopeDefinition::Synthetic {
+                table: Some(table), ..
+            }
+            | ScopeDefinition::Retained { table, .. } => {
+                self.images.retained_definition(table, self.transaction)
+            }
+            ScopeDefinition::Relation { image, .. } => self.images.retained_relation(image),
+            ScopeDefinition::Synthetic { table: None, .. } => None,
         }
     }
 
@@ -274,39 +297,29 @@ impl<'a> QueryDefinitions<'a> {
         self.images.definition(storage, table, self.transaction)
     }
 
-    fn set_arena(&mut self, index: usize, definition: &'a TableDef) {
-        self.sources[index] = Some(ScopeDefinition::Arena(definition));
+    fn set_arena(&mut self, index: usize, definition: RelationDefinition<'a>) {
+        self.sources[index] = Some(ScopeDefinition::Synthetic {
+            definition,
+            table: None,
+        });
     }
 
     fn set_relation(
         &mut self,
         index: usize,
-        definition: &TableDef,
+        definition: RelationDefinition<'_>,
         arena: &'a Arena,
     ) -> Result<(), SqlError> {
-        // The owner pins the full image in its startup pool. Only actual
-        // output columns and escaped names consume statement-arena bytes.
-        let columns = arena
-            .alloc_slice_copy(definition.columns())
-            .map_err(|_| arena_full())?;
-        let names = arena
-            .alloc_slice_with(columns.len(), |column| columns[column].name.as_str())
-            .map_err(|_| arena_full())?;
-        let image = self
-            .images
-            .retain_relation(&crate::storage::RelationDefinition {
-                schema: definition.schema,
-                name: definition.name,
-                n_columns: definition.n_columns,
-                columns,
-            })?;
-        self.sources[index] = Some(ScopeDefinition::Relation { image, names });
+        let definition = retain_query_definition(definition, arena)?;
+        self.set_arena(index, definition);
         Ok(())
     }
 
     pub(crate) fn column_name(&self, index: usize, column: usize) -> &'a str {
         match self.sources[index].expect("source is resolved") {
-            ScopeDefinition::Arena(definition) => definition.columns[column].name.as_str(),
+            ScopeDefinition::Synthetic { definition, .. } => {
+                definition.columns[column].name.as_str()
+            }
             ScopeDefinition::Retained { names, .. } | ScopeDefinition::Relation { names, .. } => {
                 names[column]
             }
@@ -446,7 +459,7 @@ impl<'d> QueryScope<'d> {
     /// as separate, ambiguous sources of unqualified columns.
     pub(crate) fn for_returning(
         storage: &'d Storage,
-        definition: &TableDef,
+        definition: RelationDefinition<'_>,
         alias: Option<&'d str>,
         output_aliases: &[&'d str],
         txid: u32,
@@ -482,7 +495,11 @@ impl<'d> QueryScope<'d> {
                 joins: &[],
             })
             .map_err(|_| arena_full())?;
-        let mut scope = Self::resolve_schema(storage, from, txid, arena, None)?;
+        let mut scope = Self::empty(storage, txid, arena, from)?;
+        scope.names[0] = alias.unwrap_or(table);
+        scope.defs.set_relation(0, definition, arena)?;
+        scope.slots[0] = usize::MAX;
+        scope.n = 1;
         scope.returning_aliases = arena
             .alloc_slice_copy(output_aliases)
             .map_err(|_| arena_full())?;
@@ -797,7 +814,7 @@ impl<'d> QueryScope<'d> {
             arena,
             tref.lateral.then_some(&*self),
         )?;
-        self.defs.set_relation(self.n, &definition, arena)?;
+        self.defs.set_arena(self.n, definition);
         if tref.lateral {
             self.names[self.n] = exposed;
             self.derived[self.n] = Some(&[]);
@@ -994,7 +1011,7 @@ impl<'d> QueryScope<'d> {
             tref.lateral.then_some(&*self),
         )?;
         self.names[self.n] = exposed;
-        self.defs.set_relation(self.n, &definition, arena)?;
+        self.defs.set_arena(self.n, definition);
         // No rows: this scope is never scanned, only described. An empty row
         // set keeps a stray scan safe rather than reading a physical slot.
         self.derived[self.n] = Some(&[]);
@@ -1127,14 +1144,9 @@ impl<'d> QueryScope<'d> {
         }
         let default_names = ["last_value", "log_cnt", "is_called"];
         let types = [ColType::Int8, ColType::Int8, ColType::Bool];
-        let mut definition = TableDef {
-            schema: sequence.schema,
-            name: sequence.name,
-            n_columns: default_names.len(),
-            ..TableDef::empty()
-        };
+        let mut columns = [ColumnMeta::EMPTY; 3];
         for index in 0..3 {
-            definition.columns[index] = ColumnMeta {
+            columns[index] = ColumnMeta {
                 name: SqlName::parse(
                     tref.col_alias
                         .and_then(|aliases| aliases.get(index).copied())
@@ -1144,7 +1156,16 @@ impl<'d> QueryScope<'d> {
                 ..ColumnMeta::EMPTY
             };
         }
-        self.defs.set_relation(self.n, &definition, arena)?;
+        self.defs.set_relation(
+            self.n,
+            RelationDefinition {
+                schema: sequence.schema,
+                name: sequence.name,
+                n_columns: columns.len(),
+                columns: &columns,
+            },
+            arena,
+        )?;
         let rows: &'a [&'a [u8]] = if materialize {
             let role = storage.current_role_slot(txid).ok_or_else(|| {
                 sql_err!(
@@ -1351,15 +1372,20 @@ impl<'d> QueryScope<'d> {
                     aliases.len()
                 ));
             }
-            let mut renamed = *stored_def;
-            for (column, alias) in renamed.columns.iter_mut().zip(aliases) {
+            let columns = arena
+                .alloc_slice_copy(stored_def.columns())
+                .map_err(|_| arena_full())?;
+            for (column, alias) in columns.iter_mut().zip(aliases) {
                 column.name = SqlName::parse(alias)?;
             }
-            Some(&*arena.alloc(renamed).map_err(|_| arena_full())?)
+            Some(RelationDefinition {
+                columns,
+                ..RelationDefinition::from_definition(stored_def)
+            })
         } else {
             None
         };
-        let def = renamed.unwrap_or(stored_def);
+        let def = renamed.unwrap_or_else(|| RelationDefinition::from_definition(stored_def));
         // Two same-named entries coexist only when both are *unaliased base
         // tables of different schemas* (their references then need the
         // three-part spelling); any other duplicate — aliases, the same
@@ -1384,7 +1410,10 @@ impl<'d> QueryScope<'d> {
         }
         self.names[self.n] = exposed;
         let source = match renamed {
-            Some(definition) => ScopeDefinition::Arena(definition),
+            Some(definition) => ScopeDefinition::Synthetic {
+                definition,
+                table: Some(slot),
+            },
             None => {
                 let reused = self.defs.sources[..self.n]
                     .iter()
@@ -2026,12 +2055,12 @@ mod tests {
         config
     }
 
-    fn definition(name: &str, width: usize) -> TableDef {
-        let mut definition = TableDef {
+    fn definition(name: &str, width: usize) -> crate::storage::TableDefBuilder {
+        let mut definition = crate::storage::TableDefBuilder {
             schema: SqlName::parse("public").unwrap(),
             name: SqlName::parse(name).unwrap(),
             n_columns: width,
-            ..TableDef::empty()
+            ..crate::storage::TableDefBuilder::empty()
         };
         for (index, column) in definition.columns[..width].iter_mut().enumerate() {
             *column = ColumnMeta {
@@ -2200,8 +2229,8 @@ mod tests {
                 QueryScope::resolve_schema(&storage, query.from.as_ref().unwrap(), 0, &arena, None)
                     .unwrap();
             assert!(core::ptr::eq(
-                scope.defs.get(0).unwrap(),
-                scope.defs.get(1).unwrap()
+                scope.defs.stored(0).unwrap(),
+                scope.defs.stored(1).unwrap()
             ));
             assert_eq!(
                 scope.defs.get(0).unwrap().n_columns,
@@ -2232,7 +2261,7 @@ mod tests {
         storage.create_table(definition("source", 2)).unwrap();
         let mut arena_budget = Budget::new(256 << 10);
         let arena = Arena::new(&mut arena_budget, "nested schema columns", 256 << 10).unwrap();
-        assert!(core::mem::size_of::<TableDef>() > arena.capacity());
+        assert!(core::mem::size_of::<crate::storage::TableDefBuilder>() > arena.capacity());
         let query = crate::sql::parser::parse_query(
             "SELECT output.c0 FROM (SELECT * FROM \
              (SELECT c0,c1 FROM source) AS inner_output) AS output",

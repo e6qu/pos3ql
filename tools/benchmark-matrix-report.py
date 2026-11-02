@@ -48,6 +48,8 @@ SUITE_IDENTITY_FIELDS = (
     "row_work_bytes",
     "row_work_leases",
     "definition_image_slots",
+    "table_metadata_bytes",
+    "table_metadata_leases",
     "operations_per_client",
     "clients",
     "catalog_relations",

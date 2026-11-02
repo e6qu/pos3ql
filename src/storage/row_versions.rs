@@ -292,6 +292,7 @@ pub(super) fn push_pending_version(
                 used: true,
                 previous,
                 change,
+                prepared_keys: None,
             };
             slot
         }
@@ -302,6 +303,7 @@ pub(super) fn push_pending_version(
                 used: true,
                 previous,
                 change,
+                prepared_keys: None,
             })
             .map_err(|_| {
                 sql_err!(
@@ -327,12 +329,15 @@ pub(super) fn pop_pending_version(
         &mut state.pending_row_versions.free,
     );
     let slot = versions.tail?;
-    let entry = pool[slot];
+    let entry = &mut pool[slot];
     debug_assert!(entry.used);
-    pool[slot].used = false;
-    pool[slot].previous = *free;
+    let previous = entry.previous;
+    let change = entry.change;
+    entry.prepared_keys = None;
+    entry.used = false;
+    entry.previous = *free;
     *free = Some(slot);
-    versions.tail = entry.previous;
+    versions.tail = previous;
     versions.len -= 1;
     if versions.is_none()
         && let PendingHistory::Reserved(reservation) =
@@ -340,7 +345,7 @@ pub(super) fn pop_pending_version(
     {
         release_reserved_history(&mut state.committed_row_versions, reservation);
     }
-    Some(entry.change)
+    Some(change)
 }
 
 pub(super) fn clear_pending_versions(state: &mut RowVersionState, versions: &mut PendingVersions) {
@@ -357,12 +362,14 @@ pub(super) fn release_pending_chain(state: &mut RowVersionState, versions: Pendi
     );
     let mut slot = versions.tail;
     while let Some(index) = slot {
-        let entry = pool[index];
+        let entry = &mut pool[index];
         debug_assert!(entry.used);
-        pool[index].used = false;
-        pool[index].previous = *free;
+        let previous = entry.previous;
+        entry.prepared_keys = None;
+        entry.used = false;
+        entry.previous = *free;
         *free = Some(index);
-        slot = entry.previous;
+        slot = previous;
     }
 }
 

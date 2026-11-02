@@ -297,6 +297,8 @@ row_overlay_slots = $TABLE_CAPACITY
 row_work_bytes = 8MiB
 row_work_leases = 128
 definition_image_slots = 256
+table_metadata_bytes = 64MiB
+table_metadata_leases = 8192
 value_index_rows = $TABLE_CAPACITY
 max_value_indexes = 24
 max_large_objects = 16
@@ -632,6 +634,7 @@ python3 "$ROOT/tools/benchmark-environment.py" \
   --mode "$MODE" --rows "$ROWS" --table-capacity "$TABLE_CAPACITY" \
   --row-overlay-slots "$TABLE_CAPACITY" --row-work-bytes 8388608 \
   --row-work-leases 128 --definition-image-slots 256 \
+  --table-metadata-bytes 67108864 --table-metadata-leases 8192 \
   --operations "$OPERATIONS" --clients "$CLIENTS" \
   --catalog-relations "$CATALOG_RELATIONS" \
   --replicas "$REPLICA_SETTING" --object-latency-ms "$LATENCY_MS" \

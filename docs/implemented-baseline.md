@@ -156,6 +156,17 @@ uses its captured values and files. A new read can select the replacement.
 These storage protections do not yet establish every later catalog lookup's
 coherence; the remaining cases are explicit in the plan.
 
+Sorting postpones volatile output expressions until the result order is known.
+For example, `SELECT id, nextval('order_numbers') FROM orders ORDER BY id LIMIT 1`
+issues one number. Adding `OFFSET 1` issues two: PostgreSQL also evaluates the
+skipped row. If the generated number is itself the sort key, every candidate
+needs a number before sorting, and output reuses those values. Sorting can use
+the configured memory or temporary-disk path without changing these effects.
+With `FETCH FIRST ... WITH TIES`, finding the end of the tied group also
+evaluates the first following row, even though that row is not returned.
+A sorted nested query with `LIMIT 0` validates names and types without consuming
+sequence values from its input.
+
 Statements, transaction snapshots, scans and point reads have separate startup
 reservations. Their [exact capacities](postgresql-18-compatibility.md#capacity-boundaries)
 are independent of total durable row count. Completion, cancellation, errors

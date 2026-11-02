@@ -711,6 +711,17 @@ impl PaxReadDemand {
         }
     }
 
+    pub(super) fn references_column(&self, table: usize, column: usize, n_columns: usize) -> bool {
+        match &self.0 {
+            PaxReadMode::Selected(columns)
+            | PaxReadMode::FullRow {
+                reason: PaxFullRowReason::WideColumn,
+                columns,
+            } => columns.referenced[table].contains(column),
+            PaxReadMode::FullRow { .. } => column < n_columns,
+        }
+    }
+
     /// SQL-visible columns proven to be referenced by this scan. Physical
     /// decoding may still require a full row when one lies beyond the compact
     /// PAX mask.

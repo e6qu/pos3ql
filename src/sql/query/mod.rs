@@ -42,9 +42,7 @@ pub(crate) use setops::set_query_into_rows;
 
 mod materialize;
 pub(crate) use materialize::ScopeSchema;
-use materialize::{
-    external_materialized_into, finalize_projected_row, materialized_rows, materialized_select,
-};
+use materialize::{external_materialized_into, materialized_rows, materialized_select};
 
 mod scan;
 pub(crate) use plan::plan_time_bool;
@@ -625,7 +623,7 @@ use aggregate::{AggState, fold_aggregates};
 mod srf;
 pub(crate) use srf::{
     describe_derived_definition, expression_has_project_set, is_srf_name as is_builtin_set_routine,
-    synth_derived_def, synth_derived_def_outer, table_func_rows_outer,
+    table_func_rows_outer,
 };
 use srf::{find_srf, has_project_set, prepare_project_set, table_func_def, table_func_def_outer};
 
@@ -5988,7 +5986,7 @@ fn resolve_position_target<'a>(
     }
     let column_ref = |qualifier: Option<&str>, name: &str| {
         let qualifier = qualifier
-            .map(|name| arena.alloc_str(name).map(|name| &*name))
+            .map(|name| arena.alloc_str(name))
             .transpose()
             .map_err(|_| arena_full())?;
         let name = arena.alloc_str(name).map_err(|_| arena_full())?;
@@ -6880,19 +6878,35 @@ fn check_select_types<'a>(
     storage: &Storage,
     txid: u32,
     arena: &'a Arena,
+    outer: Option<&dyn ColumnLookup<'a>>,
 ) -> Result<(), SqlError> {
-    let columns = CatalogScopeCols {
+    let catalog_columns = CatalogScopeCols {
         scope,
         outer_scope: None,
         storage,
         txid,
         arena,
     };
+    let schema = ScopeSchema(scope);
+    let row = Chained {
+        inner: &schema,
+        outer,
+    };
+    let catalog = storage_catalog(storage, arena, txid);
+    let runtime_columns = super::eval::RuntimeColumnTypes {
+        row: &row,
+        catalog: Some(&catalog),
+    };
+    let columns: &dyn crate::sql::exec::ColTypeResolver = if outer.is_some() {
+        &runtime_columns
+    } else {
+        &catalog_columns
+    };
     let check = |e: &Expr| -> Result<(), SqlError> {
         if user_type_expression_description(e, "", storage, txid).is_some() {
             Ok(())
         } else {
-            super::exec::infer_type_res(e, &columns).map(|_| ())
+            super::exec::infer_type_res(e, columns).map(|_| ())
         }
     };
     // SELECT-list items first: PostgreSQL analyzes types before it folds
@@ -6905,7 +6919,7 @@ fn check_select_types<'a>(
     }
     if let Some(w) = statement.where_clause {
         check(w)?;
-        let (oid, _) = super::exec::infer_type_res(w, &columns)?;
+        let (oid, _) = super::exec::infer_type_res(w, columns)?;
         let catalog = storage_catalog(storage, arena, txid);
         let boolean = oid == super::types::oid::BOOL
             || oid == super::types::oid::UNKNOWN
@@ -7367,7 +7381,7 @@ pub(crate) fn select_query_resumable<'a, 'statement>(
         merge_action: None,
     };
 
-    if let Err(error) = check_select_types(statement, &scope, storage, txid, arena) {
+    if let Err(error) = check_select_types(statement, &scope, storage, txid, arena, None) {
         return sql_fail(error);
     }
 
@@ -8777,6 +8791,24 @@ fn select_into_rows_mode<'a>(
         return Ok(());
     };
 
+    let offset = super::exec::eval_offset_pub(statement.offset, arena, params, &bound_hooks)?;
+    let limit = super::exec::eval_limit_pub(statement.limit, arena, params, &bound_hooks)?;
+    if limit == 0 {
+        // Plan the schema without materializing derived inputs or evaluating
+        // subqueries/projections that Limit will never request.
+        let scope = QueryScope::resolve_schema(storage, from, txid, arena, outer)?;
+        check_select_types(statement, &scope, storage, txid, arena, outer)?;
+        check_key_types(statement, &scope, arena)?;
+        materialize::prepare_materialization(storage, txid, statement, &scope, &[], outer, arena)?;
+        scan::validate_materialized_view_reads(
+            storage,
+            &scope,
+            statement.where_clause,
+            arena,
+            txid,
+        )?;
+        return Ok(());
+    }
     collect_table_sample_expressions(from, &mut sub_exprs[1 + statement.items.len()..]);
     let scope = QueryScope::resolve_exec_outer(
         storage,
@@ -8840,9 +8872,6 @@ fn select_into_rows_mode<'a>(
             );
         }
         if storage.spill_attached() {
-            let offset =
-                super::exec::eval_offset_pub(statement.offset, arena, params, &bound_hooks)?;
-            let limit = super::exec::eval_limit_pub(statement.limit, arena, params, &bound_hooks)?;
             external_window_into(
                 storage,
                 txid,
@@ -8908,8 +8937,6 @@ fn select_into_rows_mode<'a>(
                 }
             }
         }
-        let offset = super::exec::eval_offset_pub(statement.offset, arena, params, &bound_hooks)?;
-        let limit = super::exec::eval_limit_pub(statement.limit, arena, params, &bound_hooks)?;
         let start = (offset as usize).min(count);
         let n = ((count - start) as u64).min(limit) as usize;
         for &i in &order[start..start + n] {
@@ -8918,17 +8945,10 @@ fn select_into_rows_mode<'a>(
         return Ok(());
     }
 
-    // DISTINCT / ORDER BY / LIMIT / OFFSET need the whole set materialized
-    // (so top-N and dedup are correct), then paged.
-    if statement.distinct
-        || !statement.order_by.is_empty()
-        || statement.limit.is_some()
-        || statement.offset.is_some()
-    {
+    // Sorting, deduplication and row locks need a materialized source. Plain
+    // LIMIT/OFFSET use the streaming path so later rows are never evaluated.
+    if statement.distinct || !statement.order_by.is_empty() || !statement.locking.is_empty() {
         if storage.spill_attached() {
-            let offset =
-                super::exec::eval_offset_pub(statement.offset, arena, params, &bound_hooks)?;
-            let limit = super::exec::eval_limit_pub(statement.limit, arena, params, &bound_hooks)?;
             external_materialized_into(
                 storage,
                 &scope,
@@ -8950,9 +8970,7 @@ fn select_into_rows_mode<'a>(
             )?;
             return Ok(());
         }
-        let offset = super::exec::eval_offset_pub(statement.offset, arena, params, &bound_hooks)?;
-        let limit = super::exec::eval_limit_pub(statement.limit, arena, params, &bound_hooks)?;
-        let (rows, width, deferred, _identities_at) = materialized_rows(
+        let (rows, width, deferred, identities_at) = materialized_rows(
             storage,
             &scope,
             from,
@@ -8970,32 +8988,29 @@ fn select_into_rows_mode<'a>(
                 && statement.locking.is_empty())
             .then_some(offset.saturating_add(limit).min(usize::MAX as u64) as usize),
         )?;
-        // OFFSET rows flow through PostgreSQL's projection before Limit
-        // discards them, so deferred items are evaluated for them too (their
-        // errors surface); only rows past the offset are emitted.
-        let window = offset.saturating_add(limit).min(usize::MAX as u64) as usize;
-        for (index, row) in rows.iter().take(window).enumerate() {
-            let mut out = [Datum::Null; MAX_PROJ];
-            finalize_projected_row(
-                row,
-                width,
-                deferred.as_ref(),
-                statement,
-                &scope,
-                arena,
-                params,
-                &hooks,
-                &mut out,
-            )?;
-            if (index as u64) >= offset {
-                emit(&out[..width])?;
-            }
-        }
+        materialize::materialized_rows_into(
+            storage,
+            &scope,
+            txid,
+            statement,
+            rows,
+            width,
+            deferred.as_ref(),
+            identities_at,
+            arena,
+            params,
+            &hooks,
+            outer,
+            limit,
+            offset,
+            &mut |values| {
+                emit(values)?;
+                Ok(true)
+            },
+        )?;
         return Ok(());
     }
     let where_in_scan = correlated_scan_conjuncts(statement.where_clause, where_correlated, arena)?;
-    let offset = super::exec::eval_offset_pub(statement.offset, arena, params, &bound_hooks)?;
-    let limit = super::exec::eval_limit_pub(statement.limit, arena, params, &bound_hooks)?;
     let stop_after = offset.saturating_add(limit);
     if stop_after == 0 {
         return Ok(());

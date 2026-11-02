@@ -1,6 +1,198 @@
 use super::*;
 
 #[test]
+fn sorted_and_paged_projection_effects_follow_postgresql_row_order() {
+    for external in [false, true] {
+        let mut config = test_config(if external {
+            "projection-window-external"
+        } else {
+            "projection-window-ram"
+        });
+        config.object_store_on = external;
+        config.object_store_sim = external;
+        config.object_store_bucket = format!("projection-window-{}-{external}", std::process::id());
+        config.work_arena_bytes = 256 << 10;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        assert_eq!(engine.storage.spill_attached(), external);
+        let mut session =
+            ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, 256 << 10);
+        session.success(&mut engine,
+            "CREATE TABLE projection_inputs(id integer,payload text); \
+             CREATE TABLE projection_outer(id integer); INSERT INTO projection_outer VALUES(10); \
+             CREATE SEQUENCE projection_calls; \
+             CREATE FUNCTION projection_default(value bigint DEFAULT nextval('public.projection_calls')) \
+             RETURNS bigint IMMUTABLE LANGUAGE sql SET search_path TO pg_catalog AS $$ SELECT value $$", true);
+        for id in [2, 1, 3] {
+            session.success(
+                &mut engine,
+                &format!("INSERT INTO projection_inputs VALUES({id},repeat('p',65536))"),
+                true,
+            );
+        }
+        for (query, expected) in [
+            (
+                "SELECT id,nextval('projection_calls') AS marker FROM projection_inputs ORDER BY id LIMIT 1",
+                &["1|1", "1"][..],
+            ),
+            (
+                "SELECT id,nextval('projection_calls') AS marker FROM projection_inputs ORDER BY id",
+                &["1|1", "2|2", "3|3", "3"][..],
+            ),
+            (
+                "SELECT * FROM (SELECT id,nextval('projection_calls') AS marker FROM projection_inputs LIMIT 1) AS selected",
+                &["2|1", "1"][..],
+            ),
+            (
+                "SELECT id,nextval('projection_calls') AS marker FROM projection_inputs ORDER BY id OFFSET 1 LIMIT 1",
+                &["2|2", "2"][..],
+            ),
+            (
+                "SELECT * FROM (SELECT id,nextval('projection_calls') AS marker FROM projection_inputs OFFSET 1 LIMIT 1) AS selected",
+                &["1|2", "2"][..],
+            ),
+            (
+                "SELECT id,nextval('projection_calls') AS marker FROM projection_inputs ORDER BY marker LIMIT 1",
+                &["2|1", "3"][..],
+            ),
+            (
+                "SELECT id,nextval('projection_calls') AS marker FROM projection_inputs ORDER BY nextval('projection_calls') OFFSET 1 LIMIT 1",
+                &["1|2", "3"][..],
+            ),
+            (
+                "SELECT id,projection_default() AS marker FROM projection_inputs ORDER BY id LIMIT 1",
+                &["1|1", "1"][..],
+            ),
+            (
+                "SELECT * FROM (SELECT id,projection_default() AS marker FROM projection_inputs ORDER BY id LIMIT 1) AS selected",
+                &["1|1", "1"][..],
+            ),
+            (
+                "SELECT source.id,selected.marker FROM projection_outer AS source CROSS JOIN LATERAL (SELECT source.id+nextval('projection_calls') AS marker FROM projection_inputs ORDER BY id LIMIT 1) AS selected",
+                &["10|11", "1"][..],
+            ),
+        ] {
+            let command = format!(
+                "ALTER SEQUENCE projection_calls RESTART WITH 1; {query}; SELECT currval('projection_calls')"
+            );
+            let output = session.success(&mut engine, &command, true);
+            assert_eq!(data_rows(&output), expected, "external={external}: {query}");
+        }
+        let ties = session.success(&mut engine,
+            "CREATE TABLE projection_ties(id integer); INSERT INTO projection_ties VALUES(2),(1),(1); \
+             ALTER SEQUENCE projection_calls RESTART WITH 1; \
+             SELECT * FROM (SELECT id,nextval('projection_calls') AS marker FROM projection_ties \
+                 ORDER BY id FETCH FIRST 1 ROW WITH TIES) AS selected; \
+             SELECT currval('projection_calls')", true);
+        assert_eq!(data_rows(&ties), ["1|1", "1|2", "3"], "external={external}");
+        let offset_ties = session.success(
+            &mut engine,
+            "ALTER SEQUENCE projection_calls RESTART WITH 1; \
+             SELECT * FROM (SELECT id,nextval('projection_calls') AS marker FROM projection_ties \
+                 ORDER BY id OFFSET 1 FETCH FIRST 1 ROW WITH TIES) AS selected; \
+             SELECT currval('projection_calls')",
+            true,
+        );
+        assert_eq!(data_rows(&offset_ties), ["1|2", "3"], "external={external}");
+        let zero_limit = session.success(
+            &mut engine,
+            "ALTER SEQUENCE projection_calls RESTART WITH 1; \
+             SELECT * FROM (SELECT id,nextval('projection_calls') AS marker FROM projection_inputs \
+                 ORDER BY nextval('projection_calls') LIMIT 0) AS selected; \
+             SELECT nextval('projection_calls')",
+            true,
+        );
+        assert_eq!(data_rows(&zero_limit), ["1"], "external={external}");
+        let nested_zero_limit = session.success(
+            &mut engine,
+            "ALTER SEQUENCE projection_calls RESTART WITH 1; \
+             SELECT * FROM (SELECT * FROM (SELECT nextval('projection_calls') AS marker \
+                 FROM projection_inputs) AS source ORDER BY 1 LIMIT 0) AS selected; \
+             SELECT nextval('projection_calls')",
+            true,
+        );
+        assert_eq!(data_rows(&nested_zero_limit), ["1"], "external={external}");
+        session.success(
+            &mut engine,
+            "CREATE TABLE projection_locks(row_id integer PRIMARY KEY,order_key integer); \
+             INSERT INTO projection_locks VALUES(1,1),(2,1),(3,2); \
+             ALTER SEQUENCE projection_calls RESTART WITH 1; BEGIN",
+            true,
+        );
+        let locked = session.success(&mut engine,
+            "SELECT order_key,marker FROM (SELECT row_id,order_key,nextval('projection_calls') AS marker \
+                 FROM projection_locks ORDER BY order_key FETCH FIRST 1 ROW WITH TIES FOR UPDATE) AS selected; \
+             SELECT currval('projection_calls')", true);
+        assert_eq!(
+            data_rows(&locked),
+            ["1|1", "1|2", "3"],
+            "external={external}"
+        );
+        let mut other =
+            ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+        assert_eq!(
+            error_sqlstates(&other.execute(
+                &mut engine,
+                "SELECT row_id FROM projection_locks WHERE row_id=3 FOR UPDATE NOWAIT",
+                true
+            )),
+            ["55P03"]
+        );
+        session.success(&mut engine, "ROLLBACK", true);
+        assert_eq!(
+            data_rows(&other.success(
+                &mut engine,
+                "SELECT row_id FROM projection_locks WHERE row_id=3 FOR UPDATE NOWAIT",
+                true
+            )),
+            ["3"]
+        );
+        session.success(
+            &mut engine,
+            "ALTER SEQUENCE projection_calls RESTART WITH 1; BEGIN; \
+             SELECT row_id FROM projection_locks WHERE row_id=3 FOR UPDATE",
+            true,
+        );
+        let waiting_query = "SELECT order_key,marker FROM (SELECT row_id,order_key,nextval('projection_calls') AS marker \
+            FROM projection_locks ORDER BY order_key FETCH FIRST 1 ROW WITH TIES FOR UPDATE) AS selected";
+        let blocked = other.execute(&mut engine, waiting_query, true);
+        assert!(
+            blocked.is_empty(),
+            "nested lock wait emitted a partial result: external={external}"
+        );
+        session.success(&mut engine, "ROLLBACK", true);
+        let status = crate::mem::guard::forbid_alloc(|| {
+            engine.execute_simple_from(
+                waiting_query,
+                0,
+                &other.arena,
+                &mut other.transaction,
+                &mut other.pool,
+                &mut other.cursors,
+                &mut other.guc,
+                &mut Responder::new(&mut other.send),
+                2,
+                false,
+            )
+        })
+        .unwrap();
+        assert_eq!(status, ExecutionStatus::Complete);
+        assert_eq!(
+            data_rows(other.send.readable()),
+            ["1|1", "1|2"],
+            "external={external}"
+        );
+        assert_eq!(
+            data_rows(&other.success(&mut engine, "SELECT currval('projection_calls')", true)),
+            ["3"]
+        );
+        if external {
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        }
+    }
+}
+
+#[test]
 fn query_positions_do_not_repeat_completed_projection_effects() {
     let config = test_config("retained-query-positions");
     let mut budget = test_engine_budget(&config, 1 << 29);

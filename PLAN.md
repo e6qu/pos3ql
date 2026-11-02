@@ -42,6 +42,9 @@ projection positions through mutable function handoffs, using the existing
 physical reader and startup arenas. Temporary call state belongs to active rows.
 Calls retain selected identities, original defaults and null handling; explicit
 variadic arrays remain distinct from expanded arguments.
+Keep sequence effects aligned with PostgreSQL through sorting, skipped rows
+and tied groups, including nested queries and disk-backed sorts. A zero-row
+limit must validate the query without evaluating its input.
 
 Extend those positions through function bodies and object-store waits, complex
 plans, named/custom casts, SQL cursors and results already sent to the client.

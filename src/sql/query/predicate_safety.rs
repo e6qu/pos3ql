@@ -7,11 +7,17 @@ use crate::sql::types::ColType;
 use crate::sql_err;
 use crate::storage::{RoutineVolatility, Storage};
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum AnalysisStage {
+    ViewPushdown,
+    RuntimeProjection,
+}
+
 #[derive(Clone, Copy)]
 pub(super) struct ExpressionProperties {
     pub(super) volatile: bool,
     pub(super) leaks_columns: bool,
-    columns: bool,
+    pub(super) columns: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -139,6 +145,7 @@ pub(super) fn expression_properties(
     columns: &dyn ColTypeResolver,
     storage: &Storage,
     txid: u32,
+    stage: AnalysisStage,
 ) -> Result<ExpressionProperties, SqlError> {
     let mut result = ExpressionProperties {
         volatile: false,
@@ -146,7 +153,7 @@ pub(super) fn expression_properties(
         columns: false,
     };
     super::walk_children(expression, &mut |child| {
-        let child = expression_properties(child, columns, storage, txid)?;
+        let child = expression_properties(child, columns, storage, txid, stage)?;
         result.volatile |= child.volatile;
         result.leaks_columns |= child.leaks_columns;
         result.columns |= child.columns;
@@ -262,6 +269,18 @@ pub(super) fn expression_properties(
                                     "selected routine input mapping is unavailable"
                                 )
                             })?;
+                        if stage == AnalysisStage::RuntimeProjection
+                            && (0..routine.argument_count).any(|input| {
+                                !mapping[..args.len()].contains(&(input as u8))
+                                    && routine
+                                        .parameter_for_input(input)
+                                        .is_some_and(|parameter| parameter.mode.default().is_some())
+                            })
+                        {
+                            // Defaults can execute after planning; do not run
+                            // an omitted input before sorting and limiting.
+                            result.volatile = true;
+                        }
                         for (position, argument) in args.iter().enumerate() {
                             let input = usize::from(mapping[position]);
                             let parameter = routine
@@ -301,8 +320,8 @@ pub(super) fn expression_properties(
                             result.leaks_columns |=
                                 !conversion.leakproof && contains_columns(argument)?;
                         }
-                        // PostgreSQL decides view pushdown before inserting omitted
-                        // defaults. Explicit argument effects remain child nodes.
+                        // View pushdown precedes omitted-default insertion.
+                        // Explicit argument effects are always child nodes.
                         ProcedureProperties {
                             volatile: routine.attributes.volatility == RoutineVolatility::Volatile,
                             leakproof: routine.attributes.leakproof,
@@ -320,14 +339,26 @@ pub(super) fn expression_properties(
             binding,
             type_mod,
         } => {
-            let source = type_of(operand)?;
-            Some(
-                columns
-                    .named_type_oid(type_name)
-                    .map_or(ProcedureProperties::UNKNOWN, |target| {
-                        cast_properties(storage, txid, source, target, *binding, *type_mod)
-                    }),
-            )
+            let target = columns.named_type_oid(type_name);
+            // ARRAY constructors receive their element type from an explicit
+            // array cast, including nested empty constructors and domains.
+            let source = if let Expr::Array(items) = operand
+                && let Some(ColType::Array(element)) = target.and_then(|target| {
+                    crate::sql::eval::constructor_type_from_oid(target, &|oid| {
+                        columns.domain_base_type(oid)
+                    })
+                }) {
+                crate::sql::eval::array_constructor_type(items, Some(element), &type_of, &|oid| {
+                    columns.domain_base_type(oid)
+                })?
+                .element
+                .array_oid()
+            } else {
+                type_of(operand)?
+            };
+            Some(target.map_or(ProcedureProperties::UNKNOWN, |target| {
+                cast_properties(storage, txid, source, target, *binding, *type_mod)
+            }))
         }
         Expr::Like {
             operand,

@@ -20,8 +20,7 @@ use crate::util::StackStr;
 
 use super::{
     Chained, arena_full, collect_aggs, collect_windows, common_using_type, select_into_rows,
-    synth_derived_def, synth_derived_def_outer, table_func_def, table_func_def_outer,
-    table_func_rows_outer,
+    table_func_def, table_func_def_outer, table_func_rows_outer,
 };
 
 fn catalog_scan(
@@ -277,6 +276,32 @@ impl<'a> QueryDefinitions<'a> {
 
     fn set_arena(&mut self, index: usize, definition: &'a TableDef) {
         self.sources[index] = Some(ScopeDefinition::Arena(definition));
+    }
+
+    fn set_relation(
+        &mut self,
+        index: usize,
+        definition: &TableDef,
+        arena: &'a Arena,
+    ) -> Result<(), SqlError> {
+        // The owner pins the full image in its startup pool. Only actual
+        // output columns and escaped names consume statement-arena bytes.
+        let columns = arena
+            .alloc_slice_copy(definition.columns())
+            .map_err(|_| arena_full())?;
+        let names = arena
+            .alloc_slice_with(columns.len(), |column| columns[column].name.as_str())
+            .map_err(|_| arena_full())?;
+        let image = self
+            .images
+            .retain_relation(&crate::storage::RelationDefinition {
+                schema: definition.schema,
+                name: definition.name,
+                n_columns: definition.n_columns,
+                columns,
+            })?;
+        self.sources[index] = Some(ScopeDefinition::Relation { image, names });
+        Ok(())
     }
 
     pub(crate) fn column_name(&self, index: usize, column: usize) -> &'a str {
@@ -782,18 +807,18 @@ impl<'d> QueryScope<'d> {
         // (a body may project an outer column); a plain derived table is typed
         // on its own. Its rows are materialized per outer row by the scan, so
         // register an empty placeholder here rather than running it now.
+        let definition = super::srf::describe_derived_definition(
+            storage,
+            sub,
+            exposed,
+            tref.col_alias,
+            txid,
+            arena,
+            tref.lateral.then_some(&*self),
+        )?;
+        self.defs.set_relation(self.n, &definition, arena)?;
         if tref.lateral {
-            let def_reference = synth_derived_def_outer(
-                storage,
-                sub,
-                exposed,
-                tref.col_alias,
-                txid,
-                arena,
-                Some(self),
-            )?;
             self.names[self.n] = exposed;
-            self.defs.set_arena(self.n, def_reference);
             self.derived[self.n] = Some(&[]);
             self.lateral[self.n] = true;
             self.slots[self.n] = usize::MAX;
@@ -801,7 +826,6 @@ impl<'d> QueryScope<'d> {
             self.n += 1;
             return Ok(());
         }
-        let def_reference = synth_derived_def(storage, sub, exposed, tref.col_alias, txid, arena)?;
         let rows: &'a [&'a [u8]];
         let external_run;
         if storage.spill_attached() {
@@ -877,7 +901,6 @@ impl<'d> QueryScope<'d> {
             external_run = None;
         }
         self.names[self.n] = exposed;
-        self.defs.set_arena(self.n, def_reference);
         self.derived[self.n] = Some(rows);
         self.external_runs[self.n] = external_run;
         self.slots[self.n] = usize::MAX;
@@ -980,21 +1003,17 @@ impl<'d> QueryScope<'d> {
                 exposed
             ));
         }
-        let def_reference = if tref.lateral {
-            synth_derived_def_outer(
-                storage,
-                sub,
-                exposed,
-                tref.col_alias,
-                txid,
-                arena,
-                Some(self),
-            )?
-        } else {
-            synth_derived_def(storage, sub, exposed, tref.col_alias, txid, arena)?
-        };
+        let definition = super::srf::describe_derived_definition(
+            storage,
+            sub,
+            exposed,
+            tref.col_alias,
+            txid,
+            arena,
+            tref.lateral.then_some(&*self),
+        )?;
         self.names[self.n] = exposed;
-        self.defs.set_arena(self.n, def_reference);
+        self.defs.set_relation(self.n, &definition, arena)?;
         // No rows: this scope is never scanned, only described. An empty row
         // set keeps a stray scan safe rather than reading a physical slot.
         self.derived[self.n] = Some(&[]);
@@ -2133,6 +2152,53 @@ mod tests {
             let reused = storage.table_definition_images();
             reused.definition(&storage, table, 0).unwrap();
             assert_eq!(escaped, "c1599");
+        });
+    }
+
+    #[test]
+    fn query_definition_ownership_nested_schema_uses_actual_column_arena_bytes() {
+        let mut config = config();
+        config.definition_image_slots = 4;
+        let mut budget = Budget::new(Storage::extra_budget_bytes(&config) + config.memtable_bytes);
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
+        storage.create_table(definition("source", 2)).unwrap();
+        let mut arena_budget = Budget::new(256 << 10);
+        let arena = Arena::new(&mut arena_budget, "nested schema columns", 256 << 10).unwrap();
+        assert!(core::mem::size_of::<TableDef>() > arena.capacity());
+        let query = crate::sql::parser::parse_query(
+            "SELECT output.c0 FROM (SELECT * FROM \
+             (SELECT c0,c1 FROM source) AS inner_output) AS output",
+            &arena,
+        )
+        .unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let scope =
+                QueryScope::resolve_schema(&storage, query.from.as_ref().unwrap(), 0, &arena, None)
+                    .unwrap();
+            let definition = scope.defs.get(0).unwrap();
+            assert_eq!(definition.n_columns, 2);
+            assert_eq!(definition.columns()[0].ctype, ColType::Int8);
+            assert_eq!(definition.columns()[1].ctype, ColType::Int8);
+            let name = scope.output_name(ResolvedColumn::Table(0, 1));
+            assert_eq!(name, "c1");
+            drop(scope);
+            let execution = QueryScope::resolve_exec(
+                &storage,
+                query.from.as_ref().unwrap(),
+                None,
+                0,
+                &arena,
+                crate::sql::eval::NO_PARAMS,
+                None,
+            )
+            .unwrap();
+            assert_eq!(execution.total_columns(), 2);
+            assert_eq!(
+                execution.defs.get(0).unwrap().columns()[0].ctype,
+                ColType::Int8
+            );
+            drop(execution);
+            assert_eq!(name, "c1");
         });
     }
 

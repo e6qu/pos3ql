@@ -1406,6 +1406,7 @@ pub(crate) fn filter_view_rows<'a>(
             source_columns,
             storage,
             txid,
+            super::predicate_safety::AnalysisStage::ViewPushdown,
         )?
         .volatile
             && !expression_contains_function(expression, &set_returning)
@@ -1810,6 +1811,7 @@ fn split_view_predicate<'a>(
         safety.columns,
         context.storage,
         context.txid,
+        super::predicate_safety::AnalysisStage::ViewPushdown,
     )?;
     if (safety.unsafe_volatile && properties.volatile)
         || (safety.security_barrier && properties.leaks_columns)

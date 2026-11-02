@@ -1117,10 +1117,12 @@ mod tests {
 
     #[test]
     fn shared_type_move_rejects_a_new_definition_or_owner_after_waiting() {
+        use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
         for kind in KINDS {
             for commit_update in [false, true] {
                 let (storage, related, _, movement) = fixture(kind);
+                let storage = Arc::new(storage);
                 let database = storage.current_database_oid();
                 let source = TypePublicationSource::committed(
                     &storage.type_catalog.lock().unwrap(),
@@ -1128,71 +1130,92 @@ mod tests {
                 )
                 .unwrap();
                 let selected = storage.table_def(related, 0);
-                let installed = AtomicBool::new(false);
-                std::thread::scope(|scope| {
-                    let writer = scope.spawn(|| {
+                let (finished, received) = mpsc::sync_channel(1);
+                let writer = {
+                    let storage = Arc::clone(&storage);
+                    std::thread::spawn(move || {
                         crate::sql::set_execution_database_oid(database);
-                        crate::mem::guard::forbid_alloc(|| {
+                        let installed = AtomicBool::new(false);
+                        let result = crate::mem::guard::forbid_alloc(|| {
                             storage.publish_type_move(movement, source, |_catalog, _members| {
                                 installed.store(true, Ordering::Release);
                             })
-                        })
-                    });
-                    let waiting = wait_until_contended(&storage);
-                    let update = stage_move(
-                        &storage,
-                        kind,
-                        movement.identity.slot().index(),
-                        movement.prior,
-                        7,
+                        });
+                        let _ = finished.send((result, installed.load(Ordering::Acquire)));
+                    })
+                };
+                let waiting = wait_until_contended(&storage);
+                let update = stage_move(
+                    &storage,
+                    kind,
+                    movement.identity.slot().index(),
+                    movement.prior,
+                    7,
+                );
+                if !commit_update {
+                    let captured = TypePublicationSource::committed(
+                        &storage.type_catalog.lock().unwrap(),
+                        movement.identity.slot(),
                     );
-                    let changed = commit_update.then(|| {
-                        crate::mem::guard::forbid_alloc(|| {
-                            commit_move(&storage, kind, update.target())
-                        })
-                    });
-                    if !commit_update {
-                        let captured = TypePublicationSource::committed(
-                            &storage.type_catalog.lock().unwrap(),
-                            movement.identity.slot(),
-                        );
-                        assert!(
-                            matches!(captured, Err(error) if error.sqlstate == sqlstate::SERIALIZATION_FAILURE)
-                        );
-                    }
-                    drop(selected);
-                    let result = writer.join().unwrap();
-                    if let Some(changed) = changed {
-                        changed.unwrap();
-                    } else {
-                        update.rollback(&storage);
-                    }
                     assert!(
-                        waiting,
-                        "type publication did not wait for the selected table"
+                        matches!(captured, Err(error) if error.sqlstate == sqlstate::SERIALIZATION_FAILURE)
                     );
-                    assert_eq!(
-                        result.unwrap_err().sqlstate,
-                        sqlstate::SERIALIZATION_FAILURE
-                    );
-                    assert!(!installed.load(Ordering::Acquire));
-                    assert_identity(&storage, related, 0, movement.prior);
-                    assert_eq!(
-                        source_identity(&storage.type_catalog.lock().unwrap(), movement),
-                        movement.prior
-                    );
-                    let next = stage_move(
-                        &storage,
-                        kind,
-                        movement.identity.slot().index(),
-                        movement.current,
-                        8,
-                    );
-                    crate::mem::guard::forbid_alloc(|| {
-                        commit_move(&storage, kind, next.target()).unwrap()
+                }
+                // Admission now reserves dependent table replacements, so
+                // the competing commit must not retain this read guard.
+                drop(selected);
+                let changed = commit_update.then(|| {
+                    let storage = Arc::clone(&storage);
+                    let target = update.target();
+                    let (finished, received) = mpsc::sync_channel(1);
+                    let worker = std::thread::spawn(move || {
+                        crate::sql::set_execution_database_oid(database);
+                        let result =
+                            crate::mem::guard::forbid_alloc(|| commit_move(&storage, kind, target));
+                        let _ = finished.send(result);
                     });
-                    assert_identity(&storage, related, 0, movement.current);
+                    (worker, received)
                 });
+                // Owned worker threads let a timeout report the stalled
+                // operation instead of blocking again in a scoped join.
+                let (result, installed) = received
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("stale type publication did not complete after reader release");
+                writer.join().unwrap();
+                if let Some((worker, received)) = changed {
+                    received
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("competing type commit did not complete after reader release")
+                        .unwrap();
+                    worker.join().unwrap();
+                } else {
+                    update.rollback(&storage);
+                }
+                assert!(
+                    waiting,
+                    "type publication did not wait for the selected table"
+                );
+                assert_eq!(
+                    result.unwrap_err().sqlstate,
+                    sqlstate::SERIALIZATION_FAILURE
+                );
+                assert!(!installed);
+                assert_identity(&storage, related, 0, movement.prior);
+                assert_eq!(
+                    source_identity(&storage.type_catalog.lock().unwrap(), movement),
+                    movement.prior
+                );
+                let next = stage_move(
+                    &storage,
+                    kind,
+                    movement.identity.slot().index(),
+                    movement.current,
+                    8,
+                );
+                crate::mem::guard::forbid_alloc(|| {
+                    commit_move(&storage, kind, next.target()).unwrap()
+                });
+                assert_identity(&storage, related, 0, movement.current);
             }
         }
     }

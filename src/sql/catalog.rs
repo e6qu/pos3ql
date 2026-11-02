@@ -45,6 +45,8 @@ mod privileges;
 #[path = "catalog_routines.rs"]
 mod routines;
 
+#[path = "catalog_builtin_properties.rs"]
+mod builtin_properties;
 #[path = "catalog_type_io.rs"]
 mod type_io;
 
@@ -3772,6 +3774,334 @@ pub(crate) fn intrinsic_routine_has_name(name: &str) -> bool {
     INTRINSIC_ROUTINES
         .iter()
         .any(|routine| routine_name_matches(name, "pg_catalog", routine.name))
+}
+
+/// Catalog properties describe execution order, not routine acceptance.
+/// The tuple is (volatile, leakproof); stable routines are nonvolatile.
+pub(crate) fn builtin_routine_properties(
+    name: &str,
+    bound_oid: Option<i32>,
+    arguments: &[i32],
+) -> Option<(bool, bool)> {
+    if let Some(oid) = bound_oid {
+        return builtin_procedure_properties(oid);
+    }
+    let mut names = [SqlName::EMPTY; 2];
+    let mut count = 0;
+    super::identifiers::for_each_qualified_identifier(
+        name,
+        super::identifiers::IdentifierGrammar::Sql,
+        true,
+        |identifier| {
+            if count < names.len() {
+                names[count] = identifier.sql_name()?;
+            }
+            count += 1;
+            Ok(())
+        },
+    )
+    .ok()?;
+    if count == 0 || count > names.len() || (count == 2 && names[0].as_str() != "pg_catalog") {
+        return None;
+    }
+    let name = names[count - 1].as_str();
+    let first = builtin_properties::ROUTINES.partition_point(|routine| routine.name < name);
+    let mut family = None;
+    let mut mixed_family = false;
+    let mut best = None;
+    let mut best_score = None;
+    let mut ambiguous = false;
+    for routine in &builtin_properties::ROUTINES[first..] {
+        if routine.name != name {
+            break;
+        }
+        let properties = (
+            routine.volatile,
+            builtin_procedure_is_leakproof(routine.oid),
+        );
+        mixed_family |= family.is_some_and(|prior| prior != properties);
+        family = Some(properties);
+        if routine.argument_count != arguments.len() {
+            continue;
+        }
+        let mut score = 0;
+        let mut properties = properties;
+        let compatible = routine
+            .arguments
+            .split_ascii_whitespace()
+            .zip(arguments)
+            .all(|(expected, actual)| {
+                let expected = expected.parse::<i32>().expect("registered argument OID");
+                let Some((rank, volatile, leakproof)) =
+                    builtin_argument_properties(*actual, expected)
+                else {
+                    return false;
+                };
+                score += rank;
+                properties.0 |= volatile;
+                properties.1 &= leakproof;
+                true
+            });
+        if !compatible {
+            continue;
+        }
+        if best_score.is_none_or(|prior| score > prior) {
+            best_score = Some(score);
+            best = Some(properties);
+            ambiguous = false;
+        } else if best_score == Some(score) && best != Some(properties) {
+            ambiguous = true;
+        }
+    }
+    if best.is_some() {
+        return if ambiguous { None } else { best };
+    }
+    // COUNT(*) has no expression arguments although its catalog row has one.
+    // A uniform family also covers polymorphic/defaulted argument notation.
+    if mixed_family { None } else { family }
+}
+
+pub(crate) fn builtin_operator_properties(
+    name: &str,
+    left: Option<i32>,
+    right: Option<i32>,
+) -> Option<(bool, bool)> {
+    let name = name.strip_prefix("pg_catalog.").unwrap_or(name);
+    let mut best = None;
+    let mut best_score = None;
+    let mut ambiguous = false;
+    for &(candidate, expected_left, expected_right, procedure) in builtin_properties::OPERATORS {
+        if candidate != name {
+            continue;
+        }
+        let Some((left_rank, left_volatile, left_leakproof)) =
+            builtin_argument_properties(left.unwrap_or(0), expected_left)
+        else {
+            continue;
+        };
+        let Some((right_rank, right_volatile, right_leakproof)) =
+            builtin_argument_properties(right.unwrap_or(0), expected_right)
+        else {
+            continue;
+        };
+        let Some((volatile, leakproof)) = builtin_procedure_properties(procedure) else {
+            continue;
+        };
+        let properties = (
+            volatile || left_volatile || right_volatile,
+            leakproof && left_leakproof && right_leakproof,
+        );
+        let score = left_rank + right_rank;
+        if best_score.is_none_or(|prior| score > prior) {
+            best_score = Some(score);
+            best = Some(properties);
+            ambiguous = false;
+        } else if best_score == Some(score) && best != Some(properties) {
+            ambiguous = true;
+        }
+    }
+    if ambiguous { None } else { best }
+}
+
+pub(crate) fn builtin_cast_properties(source: i32, target: i32) -> Option<(bool, bool)> {
+    if source == super::types::oid::UNKNOWN {
+        let &(_, input, _) = builtin_properties::TYPE_IO
+            .iter()
+            .find(|entry| entry.0 == target)?;
+        return builtin_procedure_properties(input);
+    }
+    if let Some(cast) = builtin_properties::CASTS
+        .iter()
+        .find(|cast| cast.source == source && cast.target == target)
+    {
+        return match cast.method {
+            b'b' => Some((false, true)),
+            b'f' => builtin_procedure_properties(cast.procedure),
+            b'i' => builtin_inout_cast_properties(source, target),
+            _ => unreachable!("PostgreSQL cast method"),
+        };
+    }
+    if source == target {
+        return Some((false, true));
+    }
+    // Explicit casts involving the string category can use type I/O without
+    // a pg_cast row (PostgreSQL parse_coerce.c:find_coercion_pathway).
+    if [source, target].into_iter().any(|oid| {
+        ColType::from_oid(oid).is_some_and(|ctype| super::types::type_category(ctype) == "S")
+    }) {
+        return builtin_inout_cast_properties(source, target);
+    }
+    None
+}
+
+pub(crate) fn builtin_inout_cast_properties(source: i32, target: i32) -> Option<(bool, bool)> {
+    let &(_, input, _) = builtin_properties::TYPE_IO
+        .iter()
+        .find(|entry| entry.0 == target)?;
+    let input = builtin_procedure_properties(input)?;
+    if source == super::types::oid::UNKNOWN {
+        return Some(input);
+    }
+    let &(_, _, output) = builtin_properties::TYPE_IO
+        .iter()
+        .find(|entry| entry.0 == source)?;
+    let output = builtin_procedure_properties(output)?;
+    Some((input.0 || output.0, input.1 && output.1))
+}
+
+fn builtin_procedure_is_leakproof(oid: i32) -> bool {
+    builtin_properties::LEAKPROOF_PROCEDURES
+        .binary_search(&oid)
+        .is_ok()
+}
+
+fn builtin_procedure_properties(oid: i32) -> Option<(bool, bool)> {
+    let index = builtin_properties::ROUTINE_OIDS
+        .binary_search_by_key(&oid, |entry| entry.0)
+        .ok()?;
+    let routine = &builtin_properties::ROUTINES[builtin_properties::ROUTINE_OIDS[index].1];
+    Some((routine.volatile, builtin_procedure_is_leakproof(oid)))
+}
+
+fn builtin_argument_properties(actual: i32, expected: i32) -> Option<(usize, bool, bool)> {
+    use super::types::oid;
+    if actual == expected {
+        return Some((3, false, true));
+    }
+    if actual == 0 || expected == 0 {
+        return None;
+    }
+    if actual == oid::UNKNOWN {
+        return Some((0, false, true));
+    }
+    let polymorphic = match expected {
+        oid::ANYELEMENT | oid::ANYCOMPATIBLE => true,
+        oid::ANYARRAY | oid::ANYCOMPATIBLEARRAY => {
+            ColType::from_oid(actual).is_some_and(|ctype| matches!(ctype, ColType::Array(_)))
+        }
+        oid::ANYNONARRAY | oid::ANYCOMPATIBLENONARRAY => {
+            ColType::from_oid(actual).is_some_and(|ctype| !matches!(ctype, ColType::Array(_)))
+        }
+        oid::ANYENUM => {
+            ColType::from_oid(actual).is_some_and(|ctype| matches!(ctype, ColType::Enum(_)))
+        }
+        oid::ANYRANGE | oid::ANYCOMPATIBLERANGE => {
+            ColType::from_oid(actual).is_some_and(|ctype| matches!(ctype, ColType::Range(_)))
+        }
+        oid::ANYMULTIRANGE | oid::ANYCOMPATIBLEMULTIRANGE => {
+            ColType::from_oid(actual).is_some_and(|ctype| matches!(ctype, ColType::Multirange(_)))
+        }
+        _ => false,
+    };
+    if polymorphic {
+        return Some((0, false, true));
+    }
+    let cast = builtin_properties::CASTS
+        .iter()
+        .find(|cast| cast.source == actual && cast.target == expected && cast.context == b'i')?;
+    let (volatile, leakproof) = builtin_cast_properties(cast.source, cast.target)?;
+    Some((1, volatile, leakproof))
+}
+
+#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
+mod builtin_property_tests {
+    use super::*;
+
+    #[test]
+    fn pg18_builtin_properties_distinguish_operators_casts_and_io() {
+        use super::super::types::oid;
+        crate::mem::guard::forbid_alloc(|| {
+            assert_eq!(
+                builtin_routine_properties("nextval", None, &[oid::REGCLASS]),
+                Some((true, false))
+            );
+            assert_eq!(
+                builtin_routine_properties("irrelevant_bound_spelling", Some(1574), &[]),
+                Some((true, false))
+            );
+            assert_eq!(
+                builtin_routine_properties("count", None, &[]),
+                Some((false, false))
+            );
+            assert_eq!(
+                builtin_routine_properties("public.nextval", None, &[oid::REGCLASS]),
+                None
+            );
+            assert_eq!(
+                builtin_routine_properties("nextval", Some(i32::MAX), &[oid::REGCLASS]),
+                None
+            );
+            assert_eq!(
+                builtin_operator_properties("=", Some(oid::INT4), Some(oid::INT4)),
+                Some((false, true))
+            );
+            assert_eq!(
+                builtin_operator_properties("=", Some(oid::INT4), Some(oid::UNKNOWN)),
+                Some((false, true))
+            );
+            assert_eq!(
+                builtin_operator_properties("+", Some(oid::INT4), Some(oid::INT4)),
+                Some((false, false))
+            );
+            assert_eq!(
+                builtin_cast_properties(oid::INT4, oid::INT8),
+                Some((false, true))
+            );
+            assert_eq!(
+                builtin_cast_properties(oid::TEXT, oid::VARCHAR),
+                Some((false, true))
+            );
+            assert_eq!(
+                builtin_cast_properties(oid::INT4, oid::TEXT),
+                Some((false, false))
+            );
+            assert_eq!(
+                builtin_cast_properties(oid::NUMERIC, oid::NUMERIC),
+                Some((false, false))
+            );
+            assert_eq!(
+                builtin_cast_properties(oid::UNKNOWN, oid::INT4),
+                Some((false, false))
+            );
+            assert_eq!(
+                builtin_inout_cast_properties(oid::INT4, oid::INT8),
+                Some((false, false))
+            );
+            assert_eq!(builtin_cast_properties(i32::MAX, oid::INT4), None);
+        });
+    }
+
+    #[test]
+    fn pg18_property_inventory_is_complete_ordered_and_references_known_procedures() {
+        crate::mem::guard::forbid_alloc(|| {
+            assert_eq!(builtin_properties::LEAKPROOF_PROCEDURES.len(), 345);
+            assert_eq!(builtin_properties::CASTS.len(), 235);
+            assert_eq!(builtin_properties::OPERATORS.len(), 799);
+            assert_eq!(builtin_properties::TYPE_IO.len(), 473);
+            assert!(
+                builtin_properties::LEAKPROOF_PROCEDURES
+                    .windows(2)
+                    .all(|pair| pair[0] < pair[1])
+            );
+            assert_eq!(builtin_properties::ROUTINES.len(), 3402);
+            assert!(
+                builtin_properties::ROUTINE_OIDS
+                    .windows(2)
+                    .all(|pair| pair[0].0 < pair[1].0)
+            );
+            assert!(
+                builtin_properties::ROUTINES
+                    .windows(2)
+                    .all(|pair| pair[0].name <= pair[1].name)
+            );
+            for &(_, _, _, procedure) in builtin_properties::OPERATORS {
+                assert!(builtin_procedure_properties(procedure).is_some());
+            }
+            for cast in builtin_properties::CASTS {
+                assert!(builtin_cast_properties(cast.source, cast.target).is_some());
+            }
+        });
+    }
 }
 
 /// Foldability follows the registered catalog contract. Exact inputs win over
@@ -26795,10 +27125,7 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 text(intrinsic_routine_source(*routine), arena)?,
                 Datum::Null,
                 Datum::Bool(intrinsic_routine_is_strict(*routine)),
-                Datum::Bool(matches!(
-                    routine.oid,
-                    69 | 1265 | 1292 | 2790 | 2791 | 2792 | 2793 | 2794 | 6342 | 6343
-                )),
+                Datum::Bool(builtin_procedure_is_leakproof(routine.oid)),
                 Datum::Null,
                 Datum::Float8(if routine.oid == 6120 { 10.0 } else { 1.0 }),
                 Datum::Float8(match routine.oid {

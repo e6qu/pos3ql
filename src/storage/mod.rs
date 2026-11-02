@@ -37901,7 +37901,7 @@ impl Storage {
             .map(TableDefinitionRevision::catalog)
     }
 
-    fn table_definition_target(
+    pub(crate) fn table_definition_target(
         &self,
         index: usize,
         transaction: u32,

@@ -3353,6 +3353,7 @@ impl Engine {
             &targets[..count],
             cascade,
             restart_identity,
+            arena,
         )
     }
 

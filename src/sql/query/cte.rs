@@ -1294,6 +1294,531 @@ fn expand_dml_ctes_with_relations<'a>(
     )
 }
 
+/// Places view-write restrictions before projection when PostgreSQL permits
+/// it, retaining restrictions on volatile output values for the computed row.
+#[expect(clippy::too_many_arguments, reason = "view predicate binding context")]
+pub(crate) fn filter_view_rows<'a>(
+    select: &'a Select<'a>,
+    predicate: Option<&'a Expr<'a>>,
+    definition: &crate::storage::TableDef,
+    alias: Option<&str>,
+    security_barrier: crate::storage::ViewSecurityBarrier,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<(&'a Select<'a>, Option<&'a Expr<'a>>), SqlError> {
+    if predicate.is_none()
+        || select.limit.is_some()
+        || select.offset.is_some()
+        || !select.grouping_sets.is_empty()
+    {
+        return Ok((select, predicate));
+    }
+    if let Some(body) = select.set_body {
+        let (body, residual) = filter_set_view_rows(
+            body,
+            predicate,
+            definition,
+            alias,
+            security_barrier,
+            storage,
+            txid,
+            arena,
+        )?;
+        return Ok((
+            &*arena
+                .alloc(Select {
+                    set_body: Some(body),
+                    ..*select
+                })
+                .map_err(|_| arena_full())?,
+            residual,
+        ));
+    }
+    let scope = select
+        .from
+        .as_ref()
+        .map(|from| super::QueryScope::resolve_schema(storage, from, txid, arena, None))
+        .transpose()?;
+    let mut projections: ArenaList<'a, &'a Expr<'a>> = ArenaList::new(arena);
+    let mut names: ArenaList<'a, &'a str> = ArenaList::new(arena);
+    for (index, column) in definition.columns[..definition.n_columns]
+        .iter()
+        .enumerate()
+    {
+        let position = arena
+            .alloc(Expr::Int((index + 1) as i64))
+            .map_err(|_| arena_full())?;
+        projections
+            .push(super::resolve_position_target(
+                position,
+                select.items,
+                scope.as_ref(),
+                arena,
+                "view output",
+            )?)
+            .map_err(|_| arena_full())?;
+        names
+            .push(
+                arena
+                    .alloc_str(column.name.as_str())
+                    .map_err(|_| arena_full())?,
+            )
+            .map_err(|_| arena_full())?;
+    }
+    let projected = projections.as_slice();
+    let source_columns = scope.as_ref().map(|scope| super::CatalogScopeCols {
+        scope,
+        outer_scope: None,
+        storage,
+        txid,
+        arena,
+    });
+    let empty_columns = crate::sql::exec::CatalogCols {
+        definition: None,
+        alias: None,
+        output_aliases: &[],
+        storage,
+        txid,
+        arena,
+    };
+    let source_columns: &dyn crate::sql::exec::ColTypeResolver = source_columns.as_ref().map_or(
+        &empty_columns as &dyn crate::sql::exec::ColTypeResolver,
+        |columns| columns,
+    );
+    let set_returning = |name: &str, arity| {
+        super::is_builtin_set_routine(name) || storage.has_set_routine_candidate(name, arity, txid)
+    };
+    let windows = projected
+        .iter()
+        .any(|expression| super::expr_has_window(expression));
+    let target_sets = projected
+        .iter()
+        .any(|expression| expression_contains_function(expression, &set_returning));
+    let unsafe_volatile =
+        select.distinct || !select.distinct_on.is_empty() || windows || target_sets;
+    let safe_columns = arena
+        .alloc_slice_with(definition.n_columns, |_| false)
+        .map_err(|_| arena_full())?;
+    for (index, expression) in projected.iter().enumerate() {
+        safe_columns[index] = !super::predicate_safety::expression_properties(
+            expression,
+            source_columns,
+            storage,
+            txid,
+        )?
+        .volatile
+            && !expression_contains_function(expression, &set_returning)
+            && !super::expr_has_window(expression);
+        if !select.distinct_on.is_empty() {
+            let mut in_distinct = false;
+            for distinct in select.distinct_on {
+                in_distinct |= *super::resolve_position_target(
+                    distinct,
+                    select.items,
+                    scope.as_ref(),
+                    arena,
+                    "DISTINCT ON",
+                )? == **expression;
+            }
+            safe_columns[index] &= in_distinct;
+        }
+        if windows {
+            for output in projected {
+                safe_columns[index] &= window_partitions_contain(output, expression);
+            }
+        }
+    }
+    let from = arena
+        .alloc_str(alias.unwrap_or(definition.name.as_str()))
+        .map_err(|_| arena_full())?;
+    let from_schema = arena
+        .alloc_str(definition.schema.as_str())
+        .map_err(|_| arena_full())?;
+    let qualifier = ViewQualifier {
+        from,
+        from_schema: alias.is_none().then_some(from_schema),
+        to: "",
+        to_schema: "",
+        exposed_columns: names.as_slice(),
+        base_columns: &[],
+        projected_columns: Some(projected),
+    };
+    let context = Subst {
+        ctes: &[],
+        materialized: &[],
+        storage,
+        txid,
+        depth: 0,
+        path: None,
+        dependencies: None,
+        authorization_role: None,
+        qualifier: Some(qualifier),
+        rule_transition: None,
+        recursive_state: None,
+        execution: None,
+    };
+    let outer_columns = crate::sql::exec::CatalogCols {
+        definition: Some(definition),
+        alias,
+        output_aliases: &[],
+        storage,
+        txid,
+        arena,
+    };
+    let (pushed, residual) = split_view_predicate(
+        predicate,
+        context,
+        ViewPredicateSafety {
+            safe_columns: &safe_columns[..definition.n_columns],
+            unsafe_volatile,
+            security_barrier: security_barrier == crate::storage::ViewSecurityBarrier::Enabled,
+            columns: &outer_columns,
+        },
+        arena,
+    )?;
+    let mut rewritten = *select;
+    let grouped = !select.group_by.is_empty()
+        || select.having.is_some()
+        || projected.iter().any(|expression| {
+            super::expr_has_aggregate(expression)
+                || expression_contains_function(expression, &|name, arity| {
+                    storage.has_aggregate_candidate(name, arity, txid)
+                })
+        });
+    if grouped {
+        rewritten.having = and_where(select.having, pushed, arena)?;
+    } else {
+        rewritten.where_clause = and_where(select.where_clause, pushed, arena)?;
+    }
+    if let Some(mut from) = rewritten.from
+        && from.joins.is_empty()
+        && let Some(body) = from.base.subquery
+        && let Some(definition) = scope.as_ref().and_then(|scope| scope.defs.get(0))
+    {
+        let barrier = from
+            .base
+            .view_access
+            .map_or(crate::storage::ViewSecurityBarrier::Default, |slot| {
+                storage.view(slot as usize).security_barrier_for(txid)
+            });
+        let (body, remaining) = filter_view_rows(
+            body,
+            rewritten.where_clause,
+            definition,
+            Some(from.base.alias.unwrap_or(from.base.table)),
+            barrier,
+            storage,
+            txid,
+            arena,
+        )?;
+        from.base.subquery = Some(body);
+        rewritten.from = Some(from);
+        rewritten.where_clause = remaining;
+    }
+    Ok((
+        &*arena.alloc(rewritten).map_err(|_| arena_full())?,
+        residual,
+    ))
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "set-operation view predicate binding context"
+)]
+fn filter_set_view_rows<'a>(
+    body: &'a SetTree<'a>,
+    predicate: Option<&'a Expr<'a>>,
+    definition: &crate::storage::TableDef,
+    alias: Option<&str>,
+    security_barrier: crate::storage::ViewSecurityBarrier,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<(&'a SetTree<'a>, Option<&'a Expr<'a>>), SqlError> {
+    let Some(predicate) = predicate else {
+        return Ok((body, None));
+    };
+    if let Expr::Binary {
+        operator: super::super::ast::BinaryOp::And,
+        left,
+        right,
+    } = predicate
+    {
+        let (body, left_keep) = filter_set_view_rows(
+            body,
+            Some(left),
+            definition,
+            alias,
+            security_barrier,
+            storage,
+            txid,
+            arena,
+        )?;
+        let (body, right_keep) = filter_set_view_rows(
+            body,
+            Some(right),
+            definition,
+            alias,
+            security_barrier,
+            storage,
+            txid,
+            arena,
+        )?;
+        return Ok((body, and_where(left_keep, right_keep, arena)?));
+    }
+    match filter_set_view_conjunct(
+        body,
+        predicate,
+        definition,
+        alias,
+        security_barrier,
+        storage,
+        txid,
+        arena,
+    )? {
+        Some(filtered) => Ok((filtered, None)),
+        None => Ok((body, Some(predicate))),
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "set-operation view predicate binding context"
+)]
+fn filter_set_view_conjunct<'a>(
+    body: &'a SetTree<'a>,
+    predicate: &'a Expr<'a>,
+    definition: &crate::storage::TableDef,
+    alias: Option<&str>,
+    security_barrier: crate::storage::ViewSecurityBarrier,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<Option<&'a SetTree<'a>>, SqlError> {
+    let rewritten = match body {
+        SetTree::Select(select) => {
+            let columns = arena
+                .alloc_slice_with(definition.n_columns, |_| ColDesc::new("", 0, 0))
+                .map_err(|_| arena_full())?;
+            let count = super::describe_select(select, storage, txid, arena, columns)?;
+            if count != definition.n_columns {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "view set-operation row shape changed"
+                ));
+            }
+            let mut names: ArenaList<'a, &'a str> = ArenaList::new(arena);
+            let matching_types = arena
+                .alloc_slice_with(count, |_| false)
+                .map_err(|_| arena_full())?;
+            for (index, column) in columns[..count].iter().enumerate() {
+                names
+                    .push(
+                        arena
+                            .alloc_str(definition.columns[index].name.as_str())
+                            .map_err(|_| arena_full())?,
+                    )
+                    .map_err(|_| arena_full())?;
+                matching_types[index] = column.type_oid
+                    == storage
+                        .declared_column_type(&definition.columns[index], txid)?
+                        .catalog_oid();
+            }
+            let from = alias.unwrap_or(definition.name.as_str());
+            let qualifier = ViewQualifier {
+                from,
+                from_schema: alias.is_none().then_some(definition.schema.as_str()),
+                to: "",
+                to_schema: "",
+                exposed_columns: names.as_slice(),
+                base_columns: &[],
+                projected_columns: None,
+            };
+            if !view_predicate_columns_safe(predicate, qualifier, &matching_types[..count]) {
+                return Ok(None);
+            }
+            let (select, remaining) = filter_view_rows(
+                select,
+                Some(predicate),
+                definition,
+                alias,
+                security_barrier,
+                storage,
+                txid,
+                arena,
+            )?;
+            if remaining.is_some() {
+                return Ok(None);
+            }
+            SetTree::Select(select)
+        }
+        SetTree::Op {
+            operator: SetOp::Except,
+            ..
+        } => return Ok(None),
+        SetTree::Op {
+            operator,
+            all,
+            left,
+            right,
+        } => {
+            let Some(left) = filter_set_view_conjunct(
+                left,
+                predicate,
+                definition,
+                alias,
+                security_barrier,
+                storage,
+                txid,
+                arena,
+            )?
+            else {
+                return Ok(None);
+            };
+            let Some(right) = filter_set_view_conjunct(
+                right,
+                predicate,
+                definition,
+                alias,
+                security_barrier,
+                storage,
+                txid,
+                arena,
+            )?
+            else {
+                return Ok(None);
+            };
+            SetTree::Op {
+                operator: *operator,
+                all: *all,
+                left,
+                right,
+            }
+        }
+    };
+    Ok(Some(&*arena.alloc(rewritten).map_err(|_| arena_full())?))
+}
+
+fn window_partitions_contain(expression: &Expr<'_>, column: &Expr<'_>) -> bool {
+    if let Expr::Call {
+        over: Some(window), ..
+    } = expression
+        && !window
+            .partition_by
+            .iter()
+            .any(|partition| **partition == *column)
+    {
+        return false;
+    }
+    let mut safe = true;
+    super::walk_children(expression, &mut |child| {
+        safe &= window_partitions_contain(child, column);
+        Ok(())
+    })
+    .expect("expression visitor cannot fail");
+    safe
+}
+
+fn view_predicate_columns_safe(
+    expression: &Expr<'_>,
+    qualifier: ViewQualifier<'_>,
+    safe_columns: &[bool],
+) -> bool {
+    let column = match expression {
+        Expr::Column {
+            qualifier: written,
+            name,
+        } => {
+            if written.is_some_and(|written| written != qualifier.from) {
+                return false;
+            }
+            Some(*name)
+        }
+        Expr::SchemaColumn {
+            schema,
+            table,
+            name,
+        } => {
+            if *table != qualifier.from || Some(*schema) != qualifier.from_schema {
+                return false;
+            }
+            Some(*name)
+        }
+        Expr::WholeRow(_) => return false,
+        _ => None,
+    };
+    if let Some(column) = column {
+        return qualifier
+            .exposed_columns
+            .iter()
+            .position(|known| *known == column)
+            .is_some_and(|index| safe_columns[index]);
+    }
+    let mut safe = true;
+    super::walk_children(expression, &mut |child| {
+        safe &= view_predicate_columns_safe(child, qualifier, safe_columns);
+        Ok(())
+    })
+    .expect("expression visitor cannot fail");
+    safe
+}
+
+#[derive(Clone, Copy)]
+struct ViewPredicateSafety<'a> {
+    safe_columns: &'a [bool],
+    unsafe_volatile: bool,
+    security_barrier: bool,
+    columns: &'a dyn crate::sql::exec::ColTypeResolver,
+}
+
+fn split_view_predicate<'a>(
+    predicate: Option<&'a Expr<'a>>,
+    context: Subst<'_, 'a, '_, '_>,
+    safety: ViewPredicateSafety<'_>,
+    arena: &'a Arena,
+) -> Result<(Option<&'a Expr<'a>>, Option<&'a Expr<'a>>), SqlError> {
+    let Some(predicate) = predicate else {
+        return Ok((None, None));
+    };
+    if let Expr::Binary {
+        operator: super::super::ast::BinaryOp::And,
+        left,
+        right,
+    } = predicate
+    {
+        let (left_push, left_keep) = split_view_predicate(Some(left), context, safety, arena)?;
+        let (right_push, right_keep) = split_view_predicate(Some(right), context, safety, arena)?;
+        return Ok((
+            and_where(left_push, right_push, arena)?,
+            and_where(left_keep, right_keep, arena)?,
+        ));
+    }
+    if expr_has_subquery(predicate)
+        || super::expr_has_aggregate(predicate)
+        || super::expr_has_window(predicate)
+        || !view_predicate_columns_safe(
+            predicate,
+            context.qualifier.expect("view predicate qualifier"),
+            safety.safe_columns,
+        )
+    {
+        return Ok((None, Some(predicate)));
+    }
+    let properties = super::predicate_safety::expression_properties(
+        predicate,
+        safety.columns,
+        context.storage,
+        context.txid,
+    )?;
+    if (safety.unsafe_volatile && properties.volatile)
+        || (safety.security_barrier && properties.leaks_columns)
+    {
+        return Ok((None, Some(predicate)));
+    }
+    Ok((Some(subst_expr(predicate, context, arena)?), None))
+}
+
 /// Rebinds a data-modifying statement from an auto-updatable view to its base
 /// relation without losing qualified target references or the view's exposed
 /// RETURNING shape.
@@ -1320,10 +1845,12 @@ pub fn rewrite_view_dml<'a>(
         authorization_role: None,
         qualifier: Some(ViewQualifier {
             from: view_name,
+            from_schema: None,
             to: base_name,
             to_schema: base_schema,
             exposed_columns,
             base_columns,
+            projected_columns: None,
         }),
         rule_transition: None,
         recursive_state: None,
@@ -1947,10 +2474,12 @@ struct ExecutionSubst<'e, 'a> {
 #[derive(Clone, Copy)]
 struct ViewQualifier<'a> {
     from: &'a str,
+    from_schema: Option<&'a str>,
     to: &'a str,
     to_schema: &'a str,
     exposed_columns: &'a [&'a str],
     base_columns: &'a [&'a str],
+    projected_columns: Option<&'a [&'a Expr<'a>]>,
 }
 
 #[derive(Clone, Copy)]
@@ -5471,6 +6000,31 @@ fn subst_expr<'a>(
     context: Subst<'_, 'a, '_, '_>,
     arena: &'a Arena,
 ) -> Result<&'a Expr<'a>, SqlError> {
+    if let Some(rewrite) = context.qualifier
+        && let Some(projected) = rewrite.projected_columns
+    {
+        let name = match e {
+            Expr::Column { qualifier, name }
+                if qualifier.is_none_or(|written| written == rewrite.from) =>
+            {
+                Some(*name)
+            }
+            Expr::SchemaColumn {
+                schema,
+                table,
+                name,
+            } if *table == rewrite.from && Some(*schema) == rewrite.from_schema => Some(*name),
+            _ => None,
+        };
+        if let Some(name) = name
+            && let Some(index) = rewrite
+                .exposed_columns
+                .iter()
+                .position(|known| *known == name)
+        {
+            return Ok(projected[index]);
+        }
+    }
     if context.qualifier.is_none()
         && context.rule_transition.is_none()
         && context.recursive_state.is_none()

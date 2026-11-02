@@ -17737,31 +17737,60 @@ fn instead_of_view_trigger_survives_checkpoint_recovery() {
 }
 
 #[test]
-fn view_trigger_is_a_drop_dependency_and_cascades_transactionally() {
-    let (mut engine, mut budget) = test_engine();
-    run_with(
-        &mut engine,
-        &mut budget,
-        "CREATE TABLE drop_view_trigger_base (id integer); \
-         CREATE VIEW drop_view_trigger_target AS SELECT id FROM drop_view_trigger_base; \
-         CREATE FUNCTION drop_view_trigger_function() RETURNS trigger LANGUAGE plpgsql AS \
-           'BEGIN RETURN NEW; END'; \
-         CREATE TRIGGER drop_view_trigger INSTEAD OF INSERT ON drop_view_trigger_target \
-           FOR EACH ROW EXECUTE FUNCTION drop_view_trigger_function();",
-    );
-    let restricted = run_with(
-        &mut engine,
-        &mut budget,
-        "DROP VIEW drop_view_trigger_target",
-    );
-    assert!(String::from_utf8_lossy(&restricted).contains("2BP01"));
-    let dropped = run_with(
-        &mut engine,
-        &mut budget,
-        "DROP VIEW drop_view_trigger_target CASCADE; \
-         SELECT count(*) FROM pg_trigger WHERE tgname = 'drop_view_trigger'",
-    );
-    assert_eq!(data_rows(&dropped), ["0"]);
+fn view_owned_triggers_drop_automatically_and_restore_on_rollback() {
+    let config = test_config("view-owned-trigger-drop");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 27));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    let script =
+        include_str!("../../tests/external/differential_exact/59_view_owned_trigger_drop.sql");
+    for (request, sql) in script.split("-- next request").enumerate() {
+        if request == 1 {
+            let output = session.execute(&mut engine, sql, true);
+            assert_eq!(error_sqlstates(&output), ["2BP01"]);
+            assert!(
+                String::from_utf8_lossy(&output).contains(
+                    "cannot drop view owned_view_parent because other objects depend on it"
+                )
+            );
+            continue;
+        }
+        if request == 4 {
+            let mut limited_config = config.clone();
+            limited_config.max_ddl_per_transaction = 1;
+            let mut limited = ConfiguredTransactionSession::new(&limited_config, &mut budget)
+                .with_connection_id(2);
+            limited.success(
+                &mut engine,
+                "BEGIN; COMMENT ON VIEW owned_view_parent IS 'undo admission'",
+                true,
+            );
+            let output = limited.execute(&mut engine, "DROP VIEW owned_view_parent", true);
+            assert_eq!(error_sqlstates(&output), ["54000"]);
+            let view = engine
+                .storage
+                .view_slot("public", "owned_view_parent", limited.transaction.txid)
+                .unwrap();
+            assert_eq!(
+                engine
+                    .storage
+                    .triggers_for_view(view, limited.transaction.txid)
+                    .count(),
+                1
+            );
+            limited.success(&mut engine, "ROLLBACK", true);
+            assert_eq!(data_rows(&session.success(&mut engine, "INSERT INTO owned_view_parent VALUES(8) RETURNING id; SELECT id FROM owned_view_base ORDER BY id", true)), ["8", "5", "7", "8"]);
+        }
+        let output = session.success(&mut engine, sql, true);
+        let expected: &[&str] = match request {
+            0 => &[],
+            2 => &["1", "2", "5", "5"],
+            3 => &["0", "1", "7", "5", "7"],
+            4 => &["0"],
+            _ => panic!("unexpected view ownership fixture request"),
+        };
+        assert_eq!(data_rows(&output), expected);
+    }
 }
 
 #[test]
@@ -18779,6 +18808,45 @@ fn configured_transaction_capacity_covers_deferred_exhaustion_and_reuse() {
 }
 
 #[test]
+fn truncate_fanout_releases_definition_images_before_statement_triggers() {
+    let mut config = test_config("truncate-scoped-trigger-definitions");
+    config.definition_image_slots = 2;
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 27));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE TABLE scoped_truncate_parent(id integer PRIMARY KEY); \
+         CREATE TABLE scoped_truncate_child(id integer REFERENCES scoped_truncate_parent(id)); \
+         CREATE TABLE scoped_truncate_audit(timing text); \
+         INSERT INTO scoped_truncate_parent VALUES(1); \
+         INSERT INTO scoped_truncate_child VALUES(1); \
+         CREATE FUNCTION scoped_truncate_log() RETURNS trigger LANGUAGE plpgsql AS $$ \
+           BEGIN INSERT INTO scoped_truncate_audit VALUES(TG_WHEN); RETURN NULL; END $$; \
+         CREATE TRIGGER scoped_truncate_before BEFORE TRUNCATE ON scoped_truncate_parent \
+           FOR EACH STATEMENT EXECUTE FUNCTION scoped_truncate_log(); \
+         CREATE TRIGGER scoped_truncate_after AFTER TRUNCATE ON scoped_truncate_parent \
+           FOR EACH STATEMENT EXECUTE FUNCTION scoped_truncate_log()",
+        true,
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "BEGIN; SAVEPOINT before_truncate; TRUNCATE scoped_truncate_parent CASCADE; \
+             SELECT timing FROM scoped_truncate_audit ORDER BY timing; \
+             SELECT count(*) FROM scoped_truncate_parent; \
+             SELECT count(*) FROM scoped_truncate_child; \
+             ROLLBACK TO before_truncate; \
+             SELECT count(*) FROM scoped_truncate_parent; \
+             SELECT count(*) FROM scoped_truncate_child; \
+             SELECT count(*) FROM scoped_truncate_audit; COMMIT",
+            true,
+        )),
+        ["AFTER", "BEFORE", "0", "0", "1", "1", "0"]
+    );
+}
+
+#[test]
 fn configured_transaction_capacity_covers_truncate_fanout_and_prepared_cold_recovery() {
     const TABLES: usize = 300;
     let mut config = test_config("truncate-fanout-prepared-cold-recovery");
@@ -18787,6 +18855,9 @@ fn configured_transaction_capacity_covers_truncate_fanout_and_prepared_cold_reco
     config.max_indexes = TABLES;
     config.max_value_indexes = TABLES;
     config.max_prepared_transactions = 2;
+    // The closure retains compact source targets; full definitions are scoped
+    // to one relation instead of consuming one image per affected table.
+    config.definition_image_slots = 2;
     config.subscription_relation_capacity = TABLES;
     // The fanout retains one row per relation before truncate and refill.
     config.row_overlay_slots = TABLES;

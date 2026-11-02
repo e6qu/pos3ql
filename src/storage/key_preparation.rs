@@ -596,14 +596,10 @@ mod tests {
                     readers.push(reader);
                 }
                 let exhausted = storage.table_definition_images();
-                assert_eq!(
-                    exhausted
-                        .definition(&storage, table, 0)
-                        .err()
-                        .expect("all definition images are held by readers")
-                        .sqlstate,
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED
-                );
+                let Err(error) = exhausted.definition(&storage, table, 0) else {
+                    panic!("all definition images are held by readers");
+                };
+                assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
                 pending(&storage, table, 1, 8, 2);
                 storage.commit_row(table, 1, 8, 7).unwrap();
                 if indexed {

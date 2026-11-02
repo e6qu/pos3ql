@@ -72,7 +72,9 @@ pub use scope::{MergedColumn, QueryScope, ResolvedColumn};
 mod cte;
 pub(crate) use cte::captured_type_oid;
 mod dependencies;
+pub(super) mod predicate_safety;
 use cte::expand_set_tree_exec;
+pub(crate) use cte::filter_view_rows;
 pub(crate) use cte::{
     RuleTransitionType, attach_rule_source, expand_set_tree, expand_stored_query,
     expand_stored_query_exec, expand_stored_rule_action_exec, expand_stored_rule_expression_exec,
@@ -5965,7 +5967,7 @@ pub(super) fn resolve_sort_key<'a>(
 fn resolve_position_target<'a>(
     expression: &'a Expr<'a>,
     items: &'a [SelectItem<'a>],
-    scope: Option<&QueryScope<'a>>,
+    scope: Option<&QueryScope<'_>>,
     arena: &'a Arena,
     clause: &str,
 ) -> Result<&'a Expr<'a>, SqlError> {
@@ -5984,7 +5986,12 @@ fn resolve_position_target<'a>(
     if index < 1 {
         return Err(position_error());
     }
-    let column_ref = |qualifier: Option<&'a str>, name: &'a str| {
+    let column_ref = |qualifier: Option<&str>, name: &str| {
+        let qualifier = qualifier
+            .map(|name| arena.alloc_str(name).map(|name| &*name))
+            .transpose()
+            .map_err(|_| arena_full())?;
+        let name = arena.alloc_str(name).map_err(|_| arena_full())?;
         Ok(&*arena
             .alloc(Expr::Column { qualifier, name })
             .map_err(|_| arena_full())?)

@@ -3721,14 +3721,10 @@ fn table_definition_images_exhaustion_preserves_readers_and_releases_capacity() 
             owners.push(owner);
         }
         let exhausted = storage.table_definition_images();
-        assert_eq!(
-            exhausted
-                .definition(&storage, table, 0)
-                .err()
-                .expect("all definition images are held by readers")
-                .sqlstate,
-            sqlstate::PROGRAM_LIMIT_EXCEEDED
-        );
+        let Err(error) = exhausted.definition(&storage, table, 0) else {
+            panic!("all definition images are held by readers");
+        };
+        assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
         assert_eq!(retained.name.as_str(), "bounded");
         drop(owners.pop().unwrap());
         exhausted.definition(&storage, table, 0).unwrap();

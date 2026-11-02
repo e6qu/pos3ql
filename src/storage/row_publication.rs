@@ -845,7 +845,11 @@ mod tests {
                             .unwrap();
                         let change = rename_definition(&storage, table, 7, "renamed");
                         if committed {
-                            assert_eq!(storage.commit_table_def(change).unwrap(), Some(false));
+                            assert_eq!(
+                                crate::storage::tests::publish_table_definition(&storage, change)
+                                    .unwrap(),
+                                Some(false)
+                            );
                         }
                         let error = storage.publish_pending_write(prepared).err().unwrap();
                         assert_eq!(error.sqlstate, sqlstate::SERIALIZATION_FAILURE);

@@ -253,6 +253,10 @@ index-binding collections. Its starter value is 64 MiB;
 `table_metadata_leases` starts at 8,192 concurrently occupied ranges. File
 configurations must name both settings. Bytes must be a positive multiple of 64;
 allocator controls and per-table headers are additional startup reservations.
+Prepared value-index keys also use one range per distinct row alongside schema
+and binding ranges. Thus 8,192 leases is not an 8,192-row transaction limit:
+bulk changes need room for their keys and the other live metadata. Exhaustion
+fails before the journal becomes durable and rolls the changes back.
 Each range rounds to 64 bytes. Fragmentation, retained old versions and the
 overlap with replacement data can exhaust bytes or descriptors independently.
 The named `54000` diagnostic identifies the metadata pool and requested, free

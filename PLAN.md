@@ -237,7 +237,7 @@ Reject unsupported behavior and stored formats explicitly. Earlier pos3ql
 versions are not compatibility targets.
 Keep native Linux amd64, Linux arm64 and macOS arm64 builds, lint and boundary
 regressions passing; use the platform's declared C types at libc boundaries.
-Run shared formatting and Rust type checks before admitting build and test matrices.
+Run shared formatting, Rust type checks and lint before admitting build and test matrices.
 Keep native SQL fixtures in native gates and interpreter ownership cases beside
 their runtime modules, so interpreter startup does not compile irrelevant fixtures.
 Shared fixture helpers remain available to ownership cases; native storage tests

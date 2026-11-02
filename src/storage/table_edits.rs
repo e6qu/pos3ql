@@ -377,12 +377,11 @@ impl<'storage> TableDefinitionEdit<'storage> {
         drop(_source);
         drop(comments);
         drop(self);
-        if !rewrites_rows {
-            if let Err(error) = storage.prepare_table_enforcers(table, transaction, revision, false)
-            {
-                storage.rollback_table_def(change);
-                return Err(error);
-            }
+        if !rewrites_rows
+            && let Err(error) = storage.prepare_table_enforcers(table, transaction, revision, false)
+        {
+            storage.rollback_table_def(change);
+            return Err(error);
         }
         Ok(change)
     }
@@ -1221,7 +1220,10 @@ mod tests {
             let crate::sql::txn::DdlUndo::TableAltered(change) = transaction.ddl()[0] else {
                 panic!("table definition change was not registered");
             };
-            assert_eq!(storage.commit_table_def(change).unwrap(), Some(false));
+            assert_eq!(
+                crate::storage::tests::publish_table_definition(&storage, change).unwrap(),
+                Some(false)
+            );
             assert_eq!(storage.table_def(table, 0).name.as_str(), "kept_change");
         });
     }

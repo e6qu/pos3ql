@@ -1704,7 +1704,15 @@ mod tests {
             crate::mem::guard::forbid_alloc(|| {
                 let table =
                     super::super::synthesize_definition(Some("pg_catalog"), name, &arena).unwrap();
-                assert!(arena.used() < core::mem::size_of::<crate::storage::TableDef>() / 4);
+                assert_eq!(
+                    table.def.columns.len(),
+                    definition.columns.len() + hidden_columns(name, false).len(),
+                );
+                let used = arena.used();
+                let repeated =
+                    super::super::synthesize_definition(Some("pg_catalog"), name, &arena).unwrap();
+                assert!(core::ptr::eq(table.def.columns, repeated.def.columns));
+                assert_eq!(arena.used(), used);
                 assert!(table.rows.is_empty());
                 if definition.relation.is_some() {
                     assert_eq!(table.hidden_columns, 1);

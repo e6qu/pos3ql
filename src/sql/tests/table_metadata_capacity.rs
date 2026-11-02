@@ -532,11 +532,45 @@ fn commit_admission_rewinds_generated_wal_after_repeated_cold_row_waits() {
         "BEGIN; TRUNCATE cold_commit_empty; UPDATE cold_commit_rows SET id=2",
         true,
     );
+    // UPDATE may retain its source block in the spill reader's decode scratch.
+    // A fresh fixture reader gives the WAL builder a genuinely cold old image.
+    let mut commit_read_budget = Budget::new(crate::storage::SpillReader::budget_bytes(
+        true,
+        config.max_spill_generations_per_table,
+    ));
+    let reader = crate::storage::SpillReader::new(
+        &mut commit_read_budget,
+        config.max_spill_generations_per_table,
+        Some(Arc::clone(&blocks)),
+        engine
+            .temporary_spiller
+            .as_ref()
+            .map(TemporarySpiller::block_store),
+    )
+    .unwrap();
+    engine.storage.attach_spill(reader);
+    let rowid = session.transaction.touched()[0].1;
+    assert!(matches!(
+        engine
+            .storage
+            .row_state(table, rowid)
+            .unwrap()
+            .unwrap()
+            .committed,
+        Some(crate::storage::RowHome::Spilled { .. })
+    ));
     server.hold_response.store(true, Ordering::Release);
+    let requests_before = server.requests.load(Ordering::Acquire);
     let original = engine.wal.stage_stats(session.transaction.txid);
-    for _ in 0..3 {
+    // Exercise restartable admission directly: the frontend commit wrapper
+    // keeps effectful deferred SQL inside its synchronous read scope.
+    for attempt in 0..3 {
         let error = crate::mem::guard::forbid_alloc(|| {
-            engine.commit_txn(&mut session.transaction, &session.guc)
+            engine.finish_txn(
+                &mut session.transaction,
+                &session.guc,
+                crate::sql::txn::CommitTarget::Ordinary,
+            )
         })
         .unwrap_err();
         assert_eq!(error.sqlstate, sqlstate::INTERNAL_IO_WAIT);
@@ -546,13 +580,26 @@ fn commit_admission_rewinds_generated_wal_after_repeated_cold_row_waits() {
             "exactly one TRUNCATE is staged before the cold UPDATE image"
         );
         assert!(session.transaction.staged_commit().is_none());
+        if attempt == 0 {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while server.requests.load(Ordering::Acquire) == requests_before {
+                let _ = engine.advance_pending_block_read(0).unwrap();
+                assert!(Instant::now() < deadline, "cold old-row GET was not issued");
+                std::thread::yield_now();
+            }
+        }
     }
+    assert!(server.requests.load(Ordering::Acquire) > requests_before);
     server.hold_response.store(false, Ordering::Release);
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
         let _ = engine.advance_pending_block_read(0).unwrap();
         match crate::mem::guard::forbid_alloc(|| {
-            engine.commit_txn(&mut session.transaction, &session.guc)
+            engine.finish_txn(
+                &mut session.transaction,
+                &session.guc,
+                crate::sql::txn::CommitTarget::Ordinary,
+            )
         }) {
             Ok(()) => break,
             Err(error) if error.sqlstate == sqlstate::INTERNAL_IO_WAIT => {
@@ -571,6 +618,26 @@ fn commit_admission_rewinds_generated_wal_after_repeated_cold_row_waits() {
         data_rows(&session.success(&mut engine, "SELECT id FROM cold_commit_rows", true)),
         ["2"]
     );
+    let mut truncates = 0;
+    let mut updates = 0;
+    // Inspect the complete journal after the final engine operation.
+    engine
+        .wal
+        .replay(0, |_, record| {
+            match crate::wal::decode_record(record).unwrap() {
+                crate::wal::WalOp::Truncate { .. } => truncates += 1,
+                crate::wal::WalOp::Upsert {
+                    table: "cold_commit_rows",
+                    is_update: true,
+                    old_row: Some(_),
+                    ..
+                } => updates += 1,
+                _ => {}
+            }
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!((truncates, updates), (1, 1));
     drop((session, engine, blocks));
     drop(server);
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);

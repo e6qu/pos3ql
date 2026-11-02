@@ -585,7 +585,7 @@ impl<T> MutableSlice<T> {
             // Only the initialized prefix owns values. Destructors can use the
             // pool recursively; this range remains occupied until they finish.
             unsafe {
-                core::ptr::drop_in_place(core::slice::from_raw_parts_mut(
+                core::ptr::drop_in_place(core::ptr::slice_from_raw_parts_mut(
                     self.pool.pointer::<T>(reservation.range),
                     len,
                 ));
@@ -725,7 +725,7 @@ impl<T> Drop for SharedSlice<T> {
         std::sync::atomic::fence(Ordering::Acquire);
         let _reclaim = Reclaim { pool, reservation };
         unsafe {
-            core::ptr::drop_in_place(core::slice::from_raw_parts_mut(
+            core::ptr::drop_in_place(core::ptr::slice_from_raw_parts_mut(
                 pool.pointer::<T>(reservation.range),
                 self.len,
             ));

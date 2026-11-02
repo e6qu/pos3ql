@@ -2182,10 +2182,23 @@ mod tests {
                     false,
                 )
                 .unwrap();
+            storage
+                .prepare_definition_publication(
+                    7,
+                    [published_change].into_iter(),
+                    core::iter::empty(),
+                )
+                .unwrap();
+            storage
+                .prepare_commit_generations(7, core::iter::empty(), core::iter::empty())
+                .unwrap();
             assert_eq!(
                 storage.commit_table_def(published_change).unwrap(),
                 Some(false)
             );
+            storage.finish_definition_publication(7).unwrap();
+            storage.release_commit_generations(7);
+            storage.release_object_locks(7);
             storage.commit_drop(table);
             assert_eq!(
                 storage.create_table(definition("replacement", 1)).unwrap(),

@@ -52,7 +52,8 @@ impl Storage {
                 view.database == current_database()
                     && view.ddl_state != CatalogDdlState::Absent
                     && (view.created_at == identity.created_at()
-                        || view.schema_for(transaction) == schema
+                        || view.ddl_state.pending_drop_txid() != Some(transaction)
+                            && view.schema_for(transaction) == schema
                             && view.name_for(transaction) == name)
             })
             || owners.catalog.rules.iter().any(|rule| {
@@ -174,7 +175,8 @@ impl Storage {
                         && rule.database == current_database()
                         && rule.ddl_state != CatalogDdlState::Absent
                         && (rule.created_at == created_at
-                            || rule.definition_for(transaction).target == definition.target
+                            || rule.ddl_state.pending_drop_txid() != Some(transaction)
+                                && rule.definition_for(transaction).target == definition.target
                                 && rule.definition_for(transaction).name == definition.name)
                 })
         {
@@ -287,7 +289,8 @@ impl Storage {
                 trigger.database == current_database()
                     && trigger.ddl_state != CatalogDdlState::Absent
                     && (trigger.created_at == created_at
-                        || trigger.target == spec.target
+                        || trigger.ddl_state.pending_drop_txid() != Some(transaction)
+                            && trigger.target == spec.target
                             && trigger.name_to(transaction) == spec.name)
             })
         {
@@ -446,7 +449,9 @@ impl Storage {
                 policy.database == current_database()
                     && policy.ddl_state != CatalogDdlState::Absent
                     && (policy.created_at == created_at
-                        || policy.table == table && policy.name == spec.name)
+                        || policy.ddl_state.pending_drop_txid() != Some(transaction)
+                            && policy.table == table
+                            && policy.name == spec.name)
             })
         {
             return Err(sql_err!(

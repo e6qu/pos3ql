@@ -1453,10 +1453,10 @@ mod tests {
                         for epoch in 1..=100 {
                             let width = (worker + 1) * 100 + epoch;
                             versions
-                                .stage(table, pending(width, transaction, &pool), 2)
+                                .stage(table, pending(width, transaction, pool), 2)
                                 .unwrap();
                             versions
-                                .stage(table, pending(width + 1, transaction, &pool), 2)
+                                .stage(table, pending(width + 1, transaction, pool), 2)
                                 .unwrap();
                             assert_eq!(
                                 TableDefinitionRead::visible(table, versions, transaction)

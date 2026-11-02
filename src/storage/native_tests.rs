@@ -3635,7 +3635,7 @@ fn table_definition_images_survive_publication_rollback_and_slot_reuse() {
             )
             .unwrap();
         assert_eq!(
-            storage.commit_table_def(second_change).unwrap(),
+            crate::storage::tests::publish_table_definition(&storage, second_change).unwrap(),
             Some(false)
         );
         assert_eq!(original.name.as_str(), "original");
@@ -5023,7 +5023,10 @@ fn relation_identity_statistics_retire_without_growth_or_cross_database_reset() 
         let change = storage
             .write_table_def(target, next, &mapping, false)
             .unwrap();
-        assert_eq!(storage.commit_table_def(change).unwrap(), Some(false));
+        assert_eq!(
+            crate::storage::tests::publish_table_definition(&storage, change).unwrap(),
+            Some(false)
+        );
         assert_eq!(storage.cumulative_statistics().indexes.len(), capacity - 1);
         assert_eq!(
             storage
@@ -5043,7 +5046,7 @@ fn relation_identity_statistics_retire_without_growth_or_cross_database_reset() 
         let change = storage
             .write_table_def(target, next, &mapping, false)
             .unwrap();
-        storage.commit_table_def(change).unwrap();
+        crate::storage::tests::publish_table_definition(&storage, change).unwrap();
         let replacement = storage
             .table_def(table, 0)
             .column_index_identity(0)
@@ -5102,7 +5105,7 @@ fn relation_identity_statistics_retire_without_growth_or_cross_database_reset() 
         let change = storage
             .write_table_def(target, next, &mapping, false)
             .unwrap();
-        storage.commit_table_def(change).unwrap();
+        crate::storage::tests::publish_table_definition(&storage, change).unwrap();
         assert_eq!(storage.cumulative_statistics().indexes.len(), capacity - 1);
         assert_eq!(
             storage

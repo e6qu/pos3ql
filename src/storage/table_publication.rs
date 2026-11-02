@@ -35,7 +35,7 @@ impl DefinitionSource<'_> {
         }
     }
 
-    fn matches(self, storage: &Storage, state: &DefinitionState) -> bool {
+    pub(super) fn matches(self, storage: &Storage, state: &DefinitionState) -> bool {
         let identity = state.identity;
         self.identity().matches(
             storage,
@@ -1268,7 +1268,9 @@ impl Storage {
 mod tests {
     use super::*;
     use crate::sql::types::{ColType, Datum};
-    use crate::storage::tests::{make_def, test_budget, test_config};
+    use crate::storage::tests::{
+        make_def, publish_table_definition as publish_change, test_budget, test_config,
+    };
     use crate::storage::{ForeignKey, comment_stackstr};
     use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
@@ -1317,41 +1319,6 @@ mod tests {
         storage
             .write_table_def(target, definition, &mapping(), false)
             .unwrap()
-    }
-
-    fn publish_change(
-        storage: &Storage,
-        change: TableDefinitionChange,
-    ) -> Result<Option<bool>, SqlError> {
-        let Some(table) = storage.tables.get(change.table()) else {
-            return Ok(None);
-        };
-        if !DefinitionSource::Pending(change).matches(storage, &table.definition.read()) {
-            return Ok(None);
-        }
-        storage.prepare_definition_publication(
-            change.transaction,
-            [change].into_iter(),
-            core::iter::empty(),
-        )?;
-        if let Err(error) = storage.prepare_commit_generations(
-            change.transaction,
-            core::iter::empty(),
-            core::iter::empty(),
-        ) {
-            storage.rollback_definition_publication(change.transaction);
-            return Err(error);
-        }
-        let result = storage.commit_table_def(change);
-        if matches!(result, Ok(Some(_))) {
-            storage.finish_definition_publication(change.transaction)?;
-        } else {
-            storage.rollback_definition_publication(change.transaction);
-        }
-        storage.release_commit_generations(change.transaction);
-        storage.release_object_locks(change.transaction);
-        storage.release_row_locks(change.transaction);
-        result
     }
 
     fn fill_metadata(storage: &Storage) -> [Option<MutableSlice<u8>>; 128] {

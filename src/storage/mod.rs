@@ -37726,16 +37726,15 @@ impl Storage {
                 .reserve_exact(capacity)
                 .map_err(|error| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "{}", error))?;
         }
-        if candidate.transaction == 0 {
-            if let Err(error) = self.tables[table]
+        if candidate.transaction == 0
+            && let Err(error) = self.tables[table]
                 .statistics
                 .set_index_hint(created_at, true, true)
-            {
-                if publication.binding_versions.is_empty() {
-                    publication.binding_versions.clear();
-                }
-                return Err(error);
+        {
+            if publication.binding_versions.is_empty() {
+                publication.binding_versions.clear();
             }
+            return Err(error);
         }
         let bindings = core::mem::replace(&mut publication.enforcers, candidate.bindings.freeze());
         let state = core::mem::replace(&mut publication.enforcer_state, candidate.state);
@@ -38178,9 +38177,6 @@ impl Storage {
             dependency_mask: ColumnSet::EMPTY,
         };
         let table_definition = selection.definition();
-        let table_schema = table_definition.schema;
-        let table_name = table_definition.name;
-        let table_database = selection.database();
         let wanted_capacity = table_definition
             .columns()
             .iter()
@@ -38191,9 +38187,7 @@ impl Storage {
                 self.matching_indexes(|index| {
                     txid.map_or(index.ddl_state == CatalogDdlState::Present, |owner| {
                         index.visible_to(owner)
-                    }) && index.database == table_database
-                        && index.schema == table_schema
-                        && index.table == table_name
+                    }) && selection.matches_index_source(index)
                         && !index.mutable_for(txid.unwrap_or(0)).kind.is_partitioned()
                 })
                 .count(),
@@ -38251,14 +38245,12 @@ impl Storage {
             .matching_indexes(|index| {
                 txid.map_or(index.ddl_state == CatalogDdlState::Present, |owner| {
                     index.visible_to(owner)
-                }) && index.database == table_database
-                    && index.schema == table_schema
-                    && index.table == table_name
+                }) && selection.matches_index_source(index)
                     && !index.mutable_for(txid.unwrap_or(0)).kind.is_partitioned()
             })
             .map(|(_, index)| index)
         {
-            selection.index(self, index.created_at)?;
+            let index = selection.index(self, index.created_at)?;
             let uses_catalog_comparison = index.resolved_operator_classes[..index.n_cols]
                 .iter()
                 .any(|class| matches!(class, Some(IndexOperatorClass::Catalog(_))));
@@ -42669,9 +42661,20 @@ impl Storage {
                 continue;
             }
             let mut definition = TableDefBuilder::from_definition(&self.tables[table].definition());
+            if !definition.requires_type_catalog() {
+                continue;
+            }
             self.bind_user_type_columns_to(&mut definition, txid)?;
             let definition = definition.freeze(&self.metadata_pool)?;
-            *self.tables[table].definition_mut(revision) = definition;
+            let mut state = self.tables[table].definition.write();
+            // Startup restores local type references without changing the SQL shape
+            // retained by reconstructed prepared-transaction targets.
+            let revision = if txid == 0 {
+                state.committed_revision
+            } else {
+                revision
+            };
+            *state.edit_committed(revision) = definition;
         }
         for composite in 0..self.composite_count() {
             let definition = self.composite_for(composite, txid);
@@ -42840,6 +42843,24 @@ impl Storage {
     }
 
     pub(crate) fn commit_domain_alter(&self, target: TypeEditTarget) -> Result<(), SqlError> {
+        self.publish_domain_alter(
+            target,
+            type_reference_moves::TypePublicationSource::Pending(target),
+        )
+    }
+
+    pub(crate) fn replay_domain_alter(&self, target: TypeEditTarget) -> Result<(), SqlError> {
+        self.publish_domain_alter(
+            target,
+            type_reference_moves::TypePublicationSource::journal(target)?,
+        )
+    }
+
+    fn publish_domain_alter(
+        &self,
+        target: TypeEditTarget,
+        source: type_reference_moves::TypePublicationSource,
+    ) -> Result<(), SqlError> {
         let slot = target
             .slot(NamedTypeKind::Domain)
             .expect("domain publication identifies its source kind");
@@ -42878,15 +42899,11 @@ impl Storage {
                 UserTypeName::declaration(definition.schema, definition.name),
             )
         };
-        self.publish_type_move(
-            movement,
-            type_reference_moves::TypePublicationSource::Pending(target),
-            |catalog, _members| {
-                let version = catalog.type_definition_version(NamedTypeSlot::Domain(slot), txid);
-                catalog.versions.set(NamedTypeSlot::Domain(slot), version);
-                catalog.domains[slot] = catalog.domains[slot].definition_for(txid);
-            },
-        )
+        self.publish_type_move(movement, source, |catalog, _members| {
+            let version = catalog.type_definition_version(NamedTypeSlot::Domain(slot), txid);
+            catalog.versions.set(NamedTypeSlot::Domain(slot), version);
+            catalog.domains[slot] = catalog.domains[slot].definition_for(txid);
+        })
     }
 
     pub(crate) fn rollback_domain_alter(&self, undo: DomainAlterUndo) {
@@ -43905,6 +43922,24 @@ impl Storage {
     }
 
     pub(crate) fn commit_composite_alter(&self, target: TypeEditTarget) -> Result<(), SqlError> {
+        self.publish_composite_alter(
+            target,
+            type_reference_moves::TypePublicationSource::Pending(target),
+        )
+    }
+
+    pub(crate) fn replay_composite_alter(&self, target: TypeEditTarget) -> Result<(), SqlError> {
+        self.publish_composite_alter(
+            target,
+            type_reference_moves::TypePublicationSource::journal(target)?,
+        )
+    }
+
+    fn publish_composite_alter(
+        &self,
+        target: TypeEditTarget,
+        source: type_reference_moves::TypePublicationSource,
+    ) -> Result<(), SqlError> {
         let slot = target
             .slot(NamedTypeKind::Composite)
             .expect("composite publication identifies its source kind");
@@ -43939,13 +43974,9 @@ impl Storage {
                 UserTypeName::declaration(pending.schema, pending.name),
             )
         };
-        self.publish_type_move(
-            movement,
-            type_reference_moves::TypePublicationSource::Pending(target),
-            |catalog, _members| {
-                Self::install_composite_alter_locked(catalog, slot, txid);
-            },
-        )
+        self.publish_type_move(movement, source, |catalog, _members| {
+            Self::install_composite_alter_locked(catalog, slot, txid);
+        })
     }
 
     fn install_composite_alter_locked(catalog: &mut TypeCatalog, slot: usize, txid: u32) {
@@ -55804,6 +55835,46 @@ mod tests {
 
     pub(super) fn test_budget(config: &Config) -> Budget {
         Budget::new(config.memtable_bytes + Storage::extra_budget_bytes(config) + (1 << 20))
+    }
+
+    pub(super) fn publish_table_definition(
+        storage: &Storage,
+        change: TableDefinitionChange,
+    ) -> Result<Option<bool>, SqlError> {
+        let Some(table) = storage.tables.get(change.table()) else {
+            return Ok(None);
+        };
+        if !table_publication::DefinitionSource::Pending(change)
+            .matches(storage, &table.definition.read())
+        {
+            return Ok(None);
+        }
+        let result = (|| {
+            storage.prepare_table_definition_enforcers(change.row_target())?;
+            storage.prepare_definition_publication(
+                change.transaction,
+                [change].into_iter(),
+                core::iter::empty(),
+            )?;
+            storage.prepare_commit_generations(
+                change.transaction,
+                core::iter::empty(),
+                core::iter::empty(),
+            )?;
+            let result = storage.commit_table_def(change)?;
+            if result.is_some() {
+                storage.finish_definition_publication(change.transaction)?;
+                storage.finish_bindings(change.table(), change.transaction);
+            }
+            Ok(result)
+        })();
+        if !matches!(result, Ok(Some(_))) {
+            storage.rollback_definition_publication(change.transaction);
+        }
+        storage.release_commit_generations(change.transaction);
+        storage.release_object_locks(change.transaction);
+        storage.release_row_locks(change.transaction);
+        result
     }
 
     pub(super) fn test_view_definition(dependencies: StoredQueryDependencies) -> ViewDefinition {

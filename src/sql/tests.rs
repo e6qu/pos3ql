@@ -26429,7 +26429,9 @@ fn catalog_creation_prepared_type_owner_locks_survive_disposable_disk_recovery()
                 std::fs::remove_dir_all(&config.data_dir).unwrap();
                 let mut recovered_budget =
                     test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+                let ambient = crate::sql::eval::funcs::system::current_identity();
                 let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+                assert_eq!(crate::sql::eval::funcs::system::current_identity(), ambient);
                 let owner = recovered.storage.find_role("prepared_type_owner").unwrap();
                 let target =
                     crate::storage::ObjectLockTarget::Role(recovered.storage.role(owner).oid());
@@ -66767,6 +66769,8 @@ fn ranked_knn_navigation_bounds_cold_object_reads_for_gist_and_spgist() {
     config.value_index_rows = 16384;
     config.max_indexes = 8;
     config.max_value_indexes = 8;
+    // One implicit transaction admits 8192 row-hash owners plus catalog/control leases.
+    config.table_metadata_leases = 2 * 4096 + 128;
     config.object_store_bucket = format!("ranked-knn-navigation-{}", std::process::id());
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
@@ -66790,6 +66794,16 @@ fn ranked_knn_navigation_bounds_cold_object_reads_for_gist_and_spgist() {
          ANALYZE ranked_gist;
          ANALYZE ranked_spgist",
         false,
+    );
+    assert!(
+        engine
+            .storage
+            .metadata_pool_for_tests()
+            .lease::<u8>(usize::MAX)
+            .unwrap_err()
+            .available_leases
+            >= 2 * 4096,
+        "committed row-hash owners must release their metadata leases"
     );
     assert!(
         !String::from_utf8_lossy(&setup).contains("ERROR"),
@@ -71821,7 +71835,7 @@ fn database_configuration_and_tablespace_lifecycle_is_typed_and_transactional() 
                 STRATEGY WAL_LOG LOCALE_PROVIDER libc
                 LC_COLLATE 'C' LC_CTYPE 'C'
                 TABLESPACE object_archive ALLOW_CONNECTIONS true
-                CONNECTION_LIMIT 4 IS_TEMPLATE false",
+                CONNECTION LIMIT = 4 IS_TEMPLATE false",
     ] {
         let output = run_with(&mut engine, &mut budget, sql);
         assert!(
@@ -71833,7 +71847,8 @@ fn database_configuration_and_tablespace_lifecycle_is_typed_and_transactional() 
     let output = run_with(
         &mut engine,
         &mut budget,
-        "ALTER DATABASE application WITH ALLOW_CONNECTIONS false CONNECTION_LIMIT 2;
+        "ALTER DATABASE application WITH ALLOW_CONNECTIONS false CONNECTION LIMIT 3;
+         ALTER DATABASE application CONNECTION LIMIT 2;
          CREATE ROLE database_reader;
          GRANT CONNECT, CREATE ON DATABASE application TO database_reader WITH GRANT OPTION;
          ALTER DATABASE application SET application_name TO 'database-default';
@@ -91944,7 +91959,6 @@ fn retained_dml_descriptions_use_small_statement_buffers_after_cold_recovery() {
     drop(engine);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
     config.work_arena_bytes = 64 << 10;
-    assert!(size_of::<crate::storage::TableDef>() > config.work_arena_bytes);
     let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let mut session =
@@ -91958,30 +91972,33 @@ fn retained_dml_descriptions_use_small_statement_buffers_after_cold_recovery() {
         data_rows(&session.success(&mut engine, "SELECT id, amount FROM described_cold", true)),
         ["1|11"]
     );
-    // Reading the captured rows needs a separate full-width relation schema.
-    // Its named failure must roll back the update and release description owners.
-    let rejected = session.execute(&mut engine,
+    let projected = session.success(&mut engine,
         "WITH changed AS (UPDATE described_cold SET amount = amount + 1 RETURNING id, amount) SELECT id, amount FROM changed", true);
+    assert_eq!(data_rows(&projected), ["1|12"]);
+    assert_eq!(row_description_names(&projected), ["id", "amount"]);
+    // A result larger than the fixed arena must undo the update and release its owners.
+    let rejected = session.execute(&mut engine,
+        "WITH changed AS (UPDATE described_cold SET amount = amount + 1 RETURNING id, amount) SELECT id, amount, repeat('x',(65536 + amount - amount)::integer) FROM changed", true);
     let error = String::from_utf8_lossy(&rejected);
     assert!(
-        error.contains("54000") && error.contains("statement arena"),
+        error.contains("54000") && error.contains("SQL arena"),
         "{error}"
     );
     assert_eq!(
         data_rows(&session.success(&mut engine, "SELECT id, amount FROM described_cold", true)),
-        ["1|11"]
+        ["1|12"]
     );
     session.success(&mut engine, narrow, true);
     assert_eq!(
         data_rows(&session.success(&mut engine, "SELECT id, amount FROM described_cold", true)),
-        ["1|12"]
+        ["1|13"]
     );
     session.success(&mut engine, "BEGIN", true);
     session.success(&mut engine, narrow, true);
     session.success(&mut engine, "ROLLBACK", true);
     assert_eq!(
         data_rows(&session.success(&mut engine, "SELECT id, amount FROM described_cold", true)),
-        ["1|12"]
+        ["1|13"]
     );
     assert!(engine.checkpoint().unwrap());
     drop(session);
@@ -91993,7 +92010,7 @@ fn retained_dml_descriptions_use_small_statement_buffers_after_cold_recovery() {
         ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, 64 << 10);
     assert_eq!(
         data_rows(&session.success(&mut engine, "SELECT id, amount FROM described_cold", true)),
-        ["1|12"]
+        ["1|13"]
     );
     drop(session);
     drop(engine);

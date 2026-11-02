@@ -23,6 +23,7 @@ use crate::sql::eval::{SqlError, sqlstate};
 #[derive(Clone, Copy)]
 pub(super) enum TypePublicationSource {
     Pending(TypeEditTarget),
+    Journal(TypeEditTarget),
     Committed {
         identity: TypeIdentity,
         revision: u64,
@@ -30,6 +31,16 @@ pub(super) enum TypePublicationSource {
 }
 
 impl TypePublicationSource {
+    pub(super) fn journal(target: TypeEditTarget) -> Result<Self, SqlError> {
+        if target.transaction() != 0 {
+            return Err(crate::sql_err!(
+                sqlstate::SERIALIZATION_FAILURE,
+                "journal type publication requires an exclusive recovery edit"
+            ));
+        }
+        Ok(Self::Journal(target))
+    }
+
     pub(super) fn committed(
         catalog: &TypeCatalog,
         source: NamedTypeSlot,
@@ -61,13 +72,22 @@ impl TypePublicationSource {
         movement: TypeReferenceMove,
     ) -> Result<bool, SqlError> {
         match self {
-            Self::Pending(target) => Ok(target.identity_move(catalog).is_some_and(|current| {
-                current.identity == movement.identity
-                    && current.prior.schema == movement.prior.schema
-                    && current.prior.name == movement.prior.name
-                    && current.current.schema == movement.current.schema
-                    && current.current.name == movement.current.name
-            })),
+            Self::Pending(target) | Self::Journal(target) => {
+                let matches = target.identity_move(catalog).is_some_and(|current| {
+                    current.identity == movement.identity
+                        && current.prior.schema == movement.prior.schema
+                        && current.prior.name == movement.prior.name
+                        && current.current.schema == movement.current.schema
+                        && current.current.name == movement.current.name
+                });
+                if !matches && matches!(self, Self::Journal(_)) {
+                    return Err(crate::sql_err!(
+                        sqlstate::SERIALIZATION_FAILURE,
+                        "journal type publication source changed before installation"
+                    ));
+                }
+                Ok(matches)
+            }
             Self::Committed { identity, revision } => {
                 if identity.database() != super::current_database()
                     || !catalog.contains_type_source(identity)
@@ -419,7 +439,10 @@ impl DefinitionPublication {
                 pause_after_release: Some(&self.release_pause),
             };
             let attempt: Result<_, LockWait<'_>> = (|| {
-                if matches!(source, TypePublicationSource::Committed { .. }) {
+                if matches!(
+                    source,
+                    TypePublicationSource::Committed { .. } | TypePublicationSource::Journal(_)
+                ) {
                     Self::acquire_tables(storage, movement, &mut owners)?;
                 }
                 #[cfg(test)]
@@ -443,7 +466,10 @@ impl DefinitionPublication {
             let attempt: Result<_, LockWait<'_>> = (|| {
                 // Dependent creation and edits bind while owning this catalog.
                 // Catch submissions that arrived after the first table scan.
-                if matches!(source, TypePublicationSource::Committed { .. }) {
+                if matches!(
+                    source,
+                    TypePublicationSource::Committed { .. } | TypePublicationSource::Journal(_)
+                ) {
                     Self::acquire_tables(storage, movement, &mut owners)?;
                 }
                 let members = try_mutex(
@@ -492,48 +518,53 @@ impl DefinitionPublication {
                             })?;
                     }
                     let revision = match source {
-                        TypePublicationSource::Pending(target) => target.dependent_table_revision(),
+                        TypePublicationSource::Pending(target)
+                        | TypePublicationSource::Journal(target) => {
+                            target.dependent_table_revision()
+                        }
                         TypePublicationSource::Committed { .. } => {
                             storage.reserve_table_definition_revision()?
                         }
                     };
-                    let mut replacements =
-                        if matches!(source, TypePublicationSource::Committed { .. }) {
-                            let mut prepared = storage
-                                .metadata_pool
-                                .lease(owners.slots.iter().flatten().count())
-                                .map_err(|error| {
-                                    crate::sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "{}", error)
-                                })?;
-                            for (slot, owner) in owners.slots.iter().enumerate() {
-                                let Some(owner) = owner else { continue };
-                                let identity = owner.definition.identity;
-                                let source = storage.catalog_object_identity(
-                                    super::catalog_sources::CatalogObjectSlot::Table(slot),
-                                    identity.database,
-                                    identity.created_at,
-                                );
-                                let plan = storage.pending_table_defs.prepare_replacements_locked(
-                                    &owner.definition,
-                                    source,
-                                    &storage.metadata_pool,
-                                    |original| {
-                                        let mut replacement =
-                                            TableDefBuilder::from_definition(original);
-                                        movement
-                                            .rewrite_definition(&mut replacement)
-                                            .then(|| replacement.freeze(&storage.metadata_pool))
-                                            .transpose()
-                                    },
-                                )?;
-                                prepared
-                                    .push_reserved((slot, source, Some(plan)))
-                                    .expect("immediate type publication reserves every dependent");
-                            }
-                            Some(prepared)
-                        } else {
-                            None
-                        };
+                    let mut replacements = if matches!(
+                        source,
+                        TypePublicationSource::Committed { .. } | TypePublicationSource::Journal(_)
+                    ) {
+                        let mut prepared = storage
+                            .metadata_pool
+                            .lease(owners.slots.iter().flatten().count())
+                            .map_err(|error| {
+                                crate::sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "{}", error)
+                            })?;
+                        for (slot, owner) in owners.slots.iter().enumerate() {
+                            let Some(owner) = owner else { continue };
+                            let identity = owner.definition.identity;
+                            let source = storage.catalog_object_identity(
+                                super::catalog_sources::CatalogObjectSlot::Table(slot),
+                                identity.database,
+                                identity.created_at,
+                            );
+                            let plan = storage.pending_table_defs.prepare_replacements_locked(
+                                &owner.definition,
+                                source,
+                                &storage.metadata_pool,
+                                |original| {
+                                    let mut replacement =
+                                        TableDefBuilder::from_definition(original);
+                                    movement
+                                        .rewrite_definition(&mut replacement)
+                                        .then(|| replacement.freeze(&storage.metadata_pool))
+                                        .transpose()
+                                },
+                            )?;
+                            prepared
+                                .push_reserved((slot, source, Some(plan)))
+                                .expect("immediate type publication reserves every dependent");
+                        }
+                        Some(prepared)
+                    } else {
+                        None
+                    };
                     install_source(&mut types, &mut members);
                     for (slot, owner) in owners.slots.iter_mut().enumerate() {
                         let Some(owner) = owner else { continue };
@@ -812,6 +843,80 @@ mod tests {
     impl Drop for ResumeScan<'_> {
         fn drop(&mut self) {
             self.0.store(3, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    #[test]
+    fn journal_type_moves_require_explicit_recovery_and_preflight_dependent_capacity() {
+        for kind in [TypeReferenceKind::Domain, TypeReferenceKind::Composite] {
+            let (storage, related, _, movement) = fixture(kind);
+            let retained = (*storage.table_def(related, 0)).clone();
+            let replay = |target| match kind {
+                TypeReferenceKind::Domain => storage.replay_domain_alter(target),
+                TypeReferenceKind::Composite => storage.replay_composite_alter(target),
+                TypeReferenceKind::Enum => {
+                    unreachable!("this path replays domain and composite records")
+                }
+            };
+            crate::mem::guard::forbid_alloc(|| {
+                let ordinary = stage_move(
+                    &storage,
+                    kind,
+                    movement.identity.slot().index(),
+                    movement.current,
+                    7,
+                );
+                assert_eq!(
+                    replay(ordinary.target()).unwrap_err().sqlstate,
+                    sqlstate::SERIALIZATION_FAILURE
+                );
+                ordinary.rollback(&storage);
+                let journal = stage_move(
+                    &storage,
+                    kind,
+                    movement.identity.slot().index(),
+                    movement.current,
+                    0,
+                );
+                let target = journal.target();
+                let unadmitted = match kind {
+                    TypeReferenceKind::Domain => storage.commit_domain_alter(target),
+                    TypeReferenceKind::Composite => storage.commit_composite_alter(target),
+                    TypeReferenceKind::Enum => {
+                        unreachable!("this path replays domain and composite records")
+                    }
+                };
+                assert_eq!(
+                    unadmitted.unwrap_err().sqlstate,
+                    sqlstate::SERIALIZATION_FAILURE
+                );
+                let generation = storage.tables[related].publication().generation;
+                storage.tables[related].publication().generation = u64::MAX;
+                assert_eq!(
+                    replay(target).unwrap_err().sqlstate,
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED
+                );
+                assert!(
+                    storage.table_def(related, 0).columns()[0]
+                        .user_type
+                        .unwrap()
+                        .is_named(movement.prior.schema, movement.prior.name)
+                );
+                storage.tables[related].publication().generation = generation;
+                replay(target).unwrap();
+                assert!(
+                    storage.table_def(related, 0).columns()[0]
+                        .user_type
+                        .unwrap()
+                        .is_named(movement.current.schema, movement.current.name)
+                );
+                assert!(
+                    retained.columns()[0]
+                        .user_type
+                        .unwrap()
+                        .is_named(movement.prior.schema, movement.prior.name)
+                );
+            });
         }
     }
 

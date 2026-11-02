@@ -345,8 +345,8 @@ impl EnumImageReservation {
             }
             last_creation = creation;
         }
-        if let Some((source, old_count)) = previous {
-            if old_count > members.len()
+        if let Some((source, old_count)) = previous
+            && (old_count > members.len()
                 || old_count > state.width
                 || state
                     .slots
@@ -356,13 +356,12 @@ impl EnumImageReservation {
                     .image_members(source, old_count)
                     .iter()
                     .zip(members)
-                    .any(|(old, new)| old.identity != new.identity)
-            {
-                return Err(sql_err!(
-                    sqlstate::DATA_EXCEPTION,
-                    "stored enum member identities changed an existing prefix"
-                ));
-            }
+                    .any(|(old, new)| old.identity != new.identity))
+        {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "stored enum member identities changed an existing prefix"
+            ));
         }
         let image = state.reserve()?;
         let start = image as usize * state.width;
@@ -1180,9 +1179,21 @@ mod tests {
             assert_eq!(storage.enum_for(slot, 77).name, after.name);
         });
         crate::mem::guard::forbid_alloc(|| {
+            let target = storage.prepare_enum_edit(slot, 77).unwrap().1;
             storage
-                .commit_enum_alter(storage.prepare_enum_edit(slot, 77).unwrap().1)
+                .prepare_definition_publication(
+                    77,
+                    core::iter::empty(),
+                    [super::super::TypeCommitChange::Definition(target)].into_iter(),
+                )
                 .unwrap();
+            storage
+                .prepare_commit_generations(77, core::iter::empty(), core::iter::empty())
+                .unwrap();
+            storage.commit_enum_alter(target).unwrap();
+            storage.finish_definition_publication(77).unwrap();
+            storage.release_commit_generations(77);
+            storage.release_object_locks(77);
             assert_eq!(storage.enum_for(slot, 0).name, after.name);
             assert!(
                 storage.table_def(table, 0).columns()[0]

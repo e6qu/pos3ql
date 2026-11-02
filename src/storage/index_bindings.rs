@@ -817,7 +817,8 @@ mod tests {
                 );
                 if commit {
                     assert_eq!(
-                        storage.commit_table_def(second_change).unwrap(),
+                        crate::storage::tests::publish_table_definition(&storage, second_change)
+                            .unwrap(),
                         Some(false)
                     );
                 } else {
@@ -837,6 +838,80 @@ mod tests {
                 );
                 assert_eq!(committed.table_binding.unwrap().revision, 0);
             }
+        });
+    }
+
+    #[test]
+    fn prepared_bindings_project_committed_indexes_through_table_moves_and_reordering() {
+        let config = test_config();
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
+        let destination = SqlName::parse("binding_destination").unwrap();
+        storage.create_schema(destination).unwrap();
+        let table = storage
+            .create_table(make_def(
+                "binding_source",
+                &[
+                    ("key", ColType::Int4, false),
+                    ("payload", ColType::Int4, false),
+                ],
+            ))
+            .unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let committed = storage
+                .create_index(index("committed_key", "binding_source", 0, 1), 0)
+                .unwrap();
+            storage.commit_index_create(committed).unwrap();
+            storage.refresh_enforcers(table).unwrap();
+            assert_eq!(storage.value_binding_count(table), 1);
+            assert_eq!(storage.value_binding_columns(table, 0).0[0], 0);
+            assert!(storage.value_binding_include_mask(table, 0).contains(1));
+
+            let mut replacement = make_def(
+                "binding_renamed",
+                &[
+                    ("payload", ColType::Int4, false),
+                    ("key", ColType::Int4, false),
+                ],
+            );
+            replacement.schema = destination;
+            let mut mapping = [None; MAX_COLUMNS];
+            mapping[0] = Some(SqlName::parse("key").unwrap());
+            mapping[1] = Some(SqlName::parse("payload").unwrap());
+            let change = storage
+                .write_table_def(
+                    storage.select_table_definition(table, 7).0,
+                    replacement,
+                    &mapping,
+                    false,
+                )
+                .unwrap();
+            assert_eq!(storage.value_binding_count(table), 1);
+            assert_eq!(storage.value_binding_columns(table, 0).0[0], 1);
+            assert!(storage.value_binding_include_mask(table, 0).contains(0));
+            assert!(!storage.value_binding_include_mask(table, 0).contains(1));
+
+            let mut redundant = index("private_key", "binding_renamed", 1, 0);
+            redundant.schema = destination;
+            redundant.n_include_cols = 0;
+            let private = storage.create_index(redundant, 7).unwrap();
+            storage
+                .prepare_index_definition_enforcers(
+                    private,
+                    7,
+                    super::super::IndexBindingOperation::Create,
+                )
+                .unwrap();
+            assert_eq!(storage.value_binding_count(table), 1);
+            assert_eq!(storage.value_binding_columns(table, 0).0[0], 1);
+            assert!(storage.value_binding_include_mask(table, 0).contains(0));
+
+            storage.rollback_index_create(private);
+            storage.rollback_table_def(change);
+            assert_eq!(storage.value_binding_count(table), 1);
+            assert_eq!(storage.value_binding_columns(table, 0).0[0], 0);
+            assert!(storage.value_binding_include_mask(table, 0).contains(1));
+            assert!(!storage.value_binding_include_mask(table, 0).contains(0));
         });
     }
 }

@@ -54,11 +54,10 @@ impl ValueKeyPreparation {
             .expect("key preparation owns its selected definition")
     }
 
-    pub(super) fn database(&self) -> DatabaseOid {
-        self.definitions
-            .retained_identity(self.target.table(), self.target.transaction())
-            .expect("key preparation owns its selected identity")
-            .database
+    pub(super) fn matches_index_source(&self, index: &IndexDef) -> bool {
+        index
+            .table_binding
+            .is_some_and(|binding| binding.source == self.target.source)
     }
 
     pub(super) fn validate_definition(
@@ -593,6 +592,7 @@ mod tests {
             table: SqlName::parse("key_orders").unwrap(),
             name: SqlName::parse("first_amount_index").unwrap(),
             n_cols: 1,
+            collations: [Collation::None; MAX_INDEX_COLS],
             ..IndexDef::EMPTY
         };
         index.columns[0] = 1;
@@ -1176,7 +1176,17 @@ mod tests {
             let change = storage
                 .write_table_def(target, definition, &mapping, true)
                 .unwrap();
-            assert_eq!(storage.commit_table_def(change).unwrap(), Some(true));
+            let rewritten = storage
+                .heap
+                .append_row(&[Datum::Int8(1), Datum::Int4(11)])
+                .unwrap();
+            storage
+                .write_pending(table, 1, 8, 1, Some(rewritten))
+                .unwrap();
+            assert_eq!(
+                crate::storage::tests::publish_table_definition(&storage, change).unwrap(),
+                Some(true)
+            );
             let mut output = [0; 128];
             let error = storage
                 .encode_value_binding_entry(table, 0, 1, selected, &mut output)
@@ -1213,7 +1223,7 @@ mod tests {
             let change = storage
                 .write_table_def(target, definition, &mapping, false)
                 .unwrap();
-            storage.commit_table_def(change).unwrap();
+            crate::storage::tests::publish_table_definition(&storage, change).unwrap();
             assert_eq!(selection.definition().name.as_str(), "key_orders");
             assert_eq!(
                 selection

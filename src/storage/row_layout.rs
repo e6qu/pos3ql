@@ -137,7 +137,10 @@ mod tests {
                 }
                 assert_eq!(histories(&storage, table), 129);
                 let rewrite = change(&storage, table, ColType::Int8, true);
-                assert_eq!(storage.commit_table_def(rewrite).unwrap(), Some(true));
+                assert_eq!(
+                    crate::storage::tests::publish_table_definition(&storage, rewrite).unwrap(),
+                    Some(true)
+                );
                 storage.finish_table_def_commit(table, true);
                 assert_eq!(
                     histories(&storage, table),
@@ -242,7 +245,10 @@ mod tests {
             storage.rollback_table_def(rewrite);
             assert_eq!(storage.table(table).publication().row_layout, original);
             let metadata = change(&storage, table, ColType::Int4, false);
-            assert_eq!(storage.commit_table_def(metadata).unwrap(), Some(false));
+            assert_eq!(
+                crate::storage::tests::publish_table_definition(&storage, metadata).unwrap(),
+                Some(false)
+            );
             storage.finish_table_def_commit(table, false);
             assert!(
                 storage
@@ -271,11 +277,13 @@ mod tests {
             let rewrite = change(&storage, table, ColType::Int8, true);
             let original = storage.select_table_definition(table, 0).0;
             storage.tables[table].publication().generation = u64::MAX;
-            let error = storage.commit_table_def(rewrite).err().unwrap();
+            let error = crate::storage::tests::publish_table_definition(&storage, rewrite)
+                .err()
+                .unwrap();
             assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
             assert_eq!(
                 error.message.as_str(),
-                "table publication generation exhausted"
+                "table publication generations exhausted"
             );
             assert_eq!(storage.table_def(table, 0).columns[0].ctype, ColType::Int4);
             assert!(storage.tables[table].publication().row_layout.accepts(0));
@@ -360,7 +368,10 @@ mod tests {
                 .unwrap();
             let snapshot = original.snapshot();
             let rewrite = change(&storage, table, ColType::Int8, true);
-            assert_eq!(storage.commit_table_def(rewrite).unwrap(), Some(true));
+            assert_eq!(
+                crate::storage::tests::publish_table_definition(&storage, rewrite).unwrap(),
+                Some(true)
+            );
             storage.finish_table_def_commit(table, true);
             storage.commit_drop(table);
             let replacement = storage
@@ -454,7 +465,9 @@ mod tests {
                     .unwrap();
                 let exhausted = if dependent_exhausted { other } else { table };
                 storage.tables[exhausted].publication().generation = u64::MAX;
-                let error = storage.commit_table_def(change).err().unwrap();
+                let error = crate::storage::tests::publish_table_definition(&storage, change)
+                    .err()
+                    .unwrap();
                 assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
                 let committed = storage.table_def(table, 0);
                 assert_eq!(
@@ -508,14 +521,20 @@ mod tests {
                 .unwrap();
             let updated = source.retain(1, &compatible).unwrap();
             let metadata = change(&storage, table, ColType::Int4, false);
-            assert_eq!(storage.commit_table_def(metadata).unwrap(), Some(false));
+            assert_eq!(
+                crate::storage::tests::publish_table_definition(&storage, metadata).unwrap(),
+                Some(false)
+            );
             assert!(source.retain(1, &compatible).is_ok());
             let rewrite = change(&storage, table, ColType::Int8, true);
             let location = storage.heap.append_row(&[Datum::Int8(13)]).unwrap();
             storage
                 .write_pending(table, 1, 8, 1, Some(location))
                 .unwrap();
-            assert_eq!(storage.commit_table_def(rewrite).unwrap(), Some(true));
+            assert_eq!(
+                crate::storage::tests::publish_table_definition(&storage, rewrite).unwrap(),
+                Some(true)
+            );
             storage.commit_rewritten_row(table, 1, 8, 11).unwrap();
             storage.finish_table_def_commit(table, true);
             let replacement = storage

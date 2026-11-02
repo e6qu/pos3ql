@@ -21481,6 +21481,9 @@ fn replay_transaction_batches(
     apply_floor: u64,
     arena: &mut Arena,
 ) -> Result<(), SqlError> {
+    // Replay follows recorded ownership images, not the previous frontend's identity.
+    let _recovery_user =
+        eval::funcs::system::enter_current_user(crate::storage::SessionIdentity::bootstrap());
     let mut batch: Vec<(u64, &[u8])> = Vec::new();
     for (lsn, record) in recovered {
         let operator = crate::wal::decode_record(record).ok_or_else(|| {
@@ -22060,20 +22063,26 @@ fn replay_transaction_batches(
                             table,
                             statistics,
                         } => {
-                            if *record_lsn > apply_floor {
-                                let table_slot = storage
-                                    .find_visible(schema, table, transaction_id)
-                                    .ok_or_else(|| {
-                                        sql_err!(
-                                            sqlstate::UNDEFINED_TABLE,
-                                            "prepared ANALYZE references an unknown table"
-                                        )
-                                    })?;
-                                storage.write_relation_counts(
-                                    table_slot,
-                                    statistics.materialize()?,
-                                    false,
-                                )?;
+                            let table_slot = storage
+                                .find_visible(schema, table, transaction_id)
+                                .ok_or_else(|| {
+                                    sql_err!(
+                                        sqlstate::UNDEFINED_TABLE,
+                                        "prepared ANALYZE references an unknown table"
+                                    )
+                                })?;
+                            if storage.restore_prepared_table_statistics(
+                                table_slot,
+                                transaction_id,
+                                statistics.materialize()?,
+                                *record_lsn > apply_floor,
+                            )? && let Err(error) = prepared
+                                .slot_mut(slot)
+                                .transaction
+                                .record_statistics(table_slot as u32)
+                            {
+                                storage.rollback_table_statistics(table_slot, transaction_id);
+                                return Err(error);
                             }
                         }
                         WalOp::PreparedCatalogRow { relation, row } => {
@@ -22152,7 +22161,7 @@ fn replay_transaction_batches(
                                         "invalid prepared parameter ACL name"
                                     )
                                 })?;
-                            let prior = storage.reserve_prepared_parameter_acl(
+                            let prior = storage.stage_prepared_parameter_acl(
                                 parameter,
                                 expected,
                                 image,
@@ -22287,6 +22296,15 @@ fn replay_transaction_batches(
                     return Err(sql_err!(
                         sqlstate::DATA_EXCEPTION,
                         "prepared transaction ends during a table rewrite"
+                    ));
+                }
+                if storage
+                    .role_slot_by_oid(owner.get(), transaction_id)
+                    .is_none()
+                {
+                    return Err(sql_err!(
+                        sqlstate::DATA_EXCEPTION,
+                        "prepared transaction owner is not present in the role catalog"
                     ));
                 }
                 storage.set_lsn(*lsn);
@@ -22495,7 +22513,7 @@ fn apply_composite_wal_definition(
         definition.fields = spec.fields;
         definition.n_fields = spec.n_fields;
         let prior = storage.stage_composite_alter(edit_target, definition, 0)?;
-        storage.commit_composite_alter(prior.target())?;
+        storage.replay_composite_alter(prior.target())?;
     } else {
         storage.create_composite_at(slot, def.schema, def.name, spec, def.created_at)?;
         storage.restore_type_identity(
@@ -24106,7 +24124,7 @@ fn apply_wal_op(
                 }
                 let (_, edit_target) = storage.prepare_domain_edit(slot, 0)?;
                 let prior = storage.stage_domain_alter(edit_target, spec, 0)?;
-                storage.commit_domain_alter(prior.target())?;
+                storage.replay_domain_alter(prior.target())?;
             } else {
                 let allocated = storage.create_domain_from_journal(
                     def.schema,
@@ -24280,7 +24298,7 @@ fn apply_wal_op(
             definition.schema = crate::storage::SqlName::parse(new_schema)?;
             definition.name = crate::storage::SqlName::parse(new_name)?;
             let prior = storage.stage_composite_alter(edit_target, definition, 0)?;
-            storage.commit_composite_alter(prior.target())?;
+            storage.replay_composite_alter(prior.target())?;
         }
         WalOp::AlterDomainIdentity {
             schema,
@@ -24302,7 +24320,7 @@ fn apply_wal_op(
                 crate::storage::SqlName::parse(new_name)?,
                 0,
             )?;
-            storage.commit_domain_alter(prior.target())?;
+            storage.replay_domain_alter(prior.target())?;
         }
         WalOp::Comment {
             class,

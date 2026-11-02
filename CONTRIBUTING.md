@@ -81,8 +81,8 @@ Linux amd64, Linux arm64 and macOS arm64. See `Cargo.toml`, `examples/dev.conf`,
 Each build or test workflow first calls the shared Rust source checks.
 A formatting failure keeps its test matrix from starting and retains a
 `formatting-<revision>` artifact containing the correction. Apply that patch
-before pushing again. After formatting, `cargo check --all-targets` checks that
-the Rust code compiles, with warnings treated as failures. Build and test
+before pushing again. After formatting, `cargo clippy --all-targets` checks that
+the Rust code compiles and passes lint, with warnings treated as failures. Build and test
 matrices start only after both checks pass, so one compiler error does not
 launch dozens of copies of the same failing build.
 

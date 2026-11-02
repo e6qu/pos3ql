@@ -189,6 +189,8 @@ instead of invoking a cast registered for the whole container.
 `btarraycmp` use the array comparison rules of the SQL operators. They accept
 arrays wrapped in domains (types with extra checks), preserving dimensions and
 lower bounds. Input types and enum labels are checked before null handling.
+Within arrays, null elements compare equal to each other and follow non-null
+elements. For example, `ARRAY[NULL::integer] > ARRAY[1]` returns `true`.
 
 Statements, transaction snapshots, scans and point reads have separate startup
 reservations. Their [exact capacities](postgresql-18-compatibility.md#capacity-boundaries)

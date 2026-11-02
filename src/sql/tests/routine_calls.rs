@@ -494,6 +494,28 @@ fn sorted_and_paged_projection_effects(external: bool) {
             16, 16, 16, 16, 16, 16, 23, 23, 16, 16, 16, 16, 16, 23, 16, 23
         ],
     );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT array_gt(ARRAY[NULL::integer],ARRAY[1]), \
+                    array_lt(ARRAY[1],ARRAY[NULL::integer]), \
+                    btarraycmp(ARRAY[NULL::integer],ARRAY[NULL::integer]), \
+                    ARRAY[NULL::integer]=ARRAY[NULL::integer], \
+                    ARRAY[NULL::integer]>ARRAY[1],ARRAY[1]<ARRAY[NULL::integer]; \
+             SELECT ARRAY[1,2,3,4,5,6]<'{{1,2,3},{4,5,6}}'::integer[], \
+                    array_lt(ARRAY[1,2,3,4,5,6],'{{1,2,3},{4,5,6}}'::integer[]), \
+                    btarraycmp(ARRAY[1,2,3,4,5,6],'{{1,2,3},{4,5,6}}'::integer[]), \
+                    '[1:2][1:1][1:3]={{{1,2,3}},{{4,5,6}}}'::integer[] \
+                        <'[0:1][1:3][1:1]={{{1},{2},{3}},{{4},{5},{6}}}'::integer[], \
+                    array_lt('[1:2][1:1][1:3]={{{1,2,3}},{{4,5,6}}}'::integer[], \
+                             '[0:1][1:3][1:1]={{{1},{2},{3}},{{4},{5},{6}}}'::integer[]), \
+                    btarraycmp('[1:2][1:1][1:3]={{{1,2,3}},{{4,5,6}}}'::integer[], \
+                               '[0:1][1:3][1:1]={{{1},{2},{3}},{{4},{5},{6}}}'::integer[])",
+            true,
+        )),
+        ["t|t|0|t|t|t", "t|t|-1|t|t|-1"],
+        "external={external}",
+    );
     for (query, state) in [
         ("SELECT array_eq(NULL,NULL)", "42804"),
         ("SELECT array_eq(NULL::integer[],NULL::text[])", "42883"),

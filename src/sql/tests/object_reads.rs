@@ -144,7 +144,12 @@ impl HttpObjectServer {
                                 write!(stream, "HTTP/1.1 200 OK\r\nETag: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", tag.as_str()).unwrap();
                             }
                             Err(crate::object_store::Error::Status { code: 412, .. }) => {
-                                stream.write_all(b"HTTP/1.1 412 Precondition Failed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                                reply_object_error(
+                                    &mut stream,
+                                    412,
+                                    "PreconditionFailed",
+                                    "precondition failed",
+                                );
                             }
                             Err(error) => panic!("fixture object upload failed: {error}"),
                         }
@@ -157,7 +162,7 @@ impl HttpObjectServer {
                         let metadata = match backing.get(key, None) {
                             Ok(metadata) => metadata,
                             Err(error) if error.is_not_found() => {
-                                stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                                reply_object_error(&mut stream, 404, "NoSuchKey", "object missing");
                                 continue;
                             }
                             Err(error) => panic!("fixture object read failed: {error}"),
@@ -230,6 +235,17 @@ fn decode_http_component(input: &str) -> String {
     String::from_utf8(output).expect("fixture URI must be UTF-8")
 }
 
+fn reply_object_error(stream: &mut TcpStream, status: u16, code: &str, message: &str) {
+    let reason = match status {
+        404 => "Not Found",
+        412 => "Precondition Failed",
+        _ => panic!("unsupported fixture error status: {status}"),
+    };
+    let body = format!("<Error><Code>{code}</Code><Message>{message}</Message></Error>");
+    write!(stream, "HTTP/1.1 {status} {reason}\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
+    stream.write_all(body.as_bytes()).unwrap();
+}
+
 fn reply_object_list(
     backing: &mut crate::object_store::Client,
     stream: &mut TcpStream,
@@ -286,6 +302,96 @@ fn reply_object_list(
     )
     .unwrap();
     stream.write_all(body.as_bytes()).unwrap();
+}
+
+#[test]
+fn http_object_fixture_preserves_missing_keys_conditions_ranges_and_listing() {
+    use crate::object_store::{ByteRange, Client, EntityTag, Precondition};
+
+    let mut config = test_config("http-object-contract");
+    config.object_store_on = true;
+    config.object_store_bucket = format!("http-object-contract-{}", std::process::id());
+    config.object_store_prefix = "contract/root/".to_owned();
+    let server = HttpObjectServer::start(&mut config);
+    let mut budget = Budget::new(Client::budget_bytes(&config));
+    let mut client = Client::new(&config, &mut budget).unwrap();
+    let missing =
+        crate::mem::guard::forbid_alloc(|| client.get("restore-pending", None)).unwrap_err();
+    assert!(missing.is_not_found(), "{missing}");
+    assert_eq!(
+        crate::mem::guard::forbid_alloc(|| client.list("commits/", |_| {})).unwrap(),
+        0
+    );
+
+    let first = crate::mem::guard::forbid_alloc(|| {
+        client.put("fixture/a &<", b"alpha", Precondition::IfNoneMatchAny)
+    })
+    .unwrap();
+    let exists = crate::mem::guard::forbid_alloc(|| {
+        client.put("fixture/a &<", b"replacement", Precondition::IfNoneMatchAny)
+    })
+    .unwrap_err();
+    assert!(exists.is_precondition_failed(), "{exists}");
+    let stale = EntityTag::parse("\"stale\"").unwrap();
+    let conflict = crate::mem::guard::forbid_alloc(|| {
+        client.put(
+            "fixture/a &<",
+            b"replacement",
+            Precondition::IfMatch(&stale),
+        )
+    })
+    .unwrap_err();
+    assert!(conflict.is_precondition_failed(), "{conflict}");
+    let metadata = crate::mem::guard::forbid_alloc(|| {
+        client.get("fixture/a &<", Some(ByteRange::new(1, 3).unwrap()))
+    })
+    .unwrap();
+    assert_eq!(metadata.etag, first);
+    assert_eq!(client.body_bytes(), b"lph");
+    let replaced = crate::mem::guard::forbid_alloc(|| {
+        client.put("fixture/a &<", b"updated", Precondition::IfMatch(&first))
+    })
+    .unwrap();
+    assert_ne!(replaced, first);
+    let metadata = crate::mem::guard::forbid_alloc(|| client.get("fixture/a &<", None)).unwrap();
+    assert_eq!(metadata.etag, replaced);
+    assert_eq!(client.body_bytes(), b"updated");
+    crate::mem::guard::forbid_alloc(|| {
+        client.put("fixture/b", b"second", Precondition::IfNoneMatchAny)
+    })
+    .unwrap();
+
+    let mut keys = [crate::util::StackStr::<256>::new(); 2];
+    let mut count = 0usize;
+    let listed = crate::mem::guard::forbid_alloc(|| {
+        client.list_batch("fixture/", "", 1, |key| {
+            keys[count] = crate::util::StackStr::from_str(key);
+            count += 1;
+        })
+    })
+    .unwrap();
+    assert_eq!(listed, 1);
+    assert_eq!(keys[0].as_str(), "fixture/a &<");
+    count = 0;
+    let listed = crate::mem::guard::forbid_alloc(|| {
+        client.list_batch("fixture/", "fixture/a &<", 1, |key| {
+            keys[count] = crate::util::StackStr::from_str(key);
+            count += 1;
+        })
+    })
+    .unwrap();
+    assert_eq!(listed, 1);
+    assert_eq!(keys[0].as_str(), "fixture/b");
+    crate::mem::guard::forbid_alloc(|| client.delete("fixture/a &<")).unwrap();
+    let missing = crate::mem::guard::forbid_alloc(|| client.get("fixture/a &<", None)).unwrap_err();
+    assert!(missing.is_not_found(), "{missing}");
+    crate::mem::guard::forbid_alloc(|| client.delete("fixture/a &<")).unwrap();
+    let mut engine_budget = test_engine_budget(&config, 1 << 29);
+    let engine = Engine::new(&config, &mut engine_budget).unwrap();
+    assert!(engine.storage.spill_attached());
+    drop(engine);
+    drop((client, server));
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 }
 
 pub(super) fn advance(engine: &mut Engine) {

@@ -60,10 +60,12 @@ jobs:
         if: ${{ matrix.check == 'build and test' }}
         run: cargo build --all-targets --locked --target "$NATIVE_TARGET"
 
-      - name: Function call contracts
+      - name: Function and HTTP fixture contracts
         if: ${{ matrix.check == 'build and test' }}
         run: >-
-          python3 tools/test_command.py cargo test --lib --locked --target "$NATIVE_TARGET" -- routine_calls:: --test-threads=1
+          python3 tools/test_command.py cargo test --lib --locked --target "$NATIVE_TARGET" --
+          routine_calls:: object_reads::http_object_fixture_preserves_missing_keys_conditions_ranges_and_listing
+          --test-threads=1
 
       - name: Native SQL, catalog and socket boundaries
         if: ${{ matrix.check == 'build and test' }}

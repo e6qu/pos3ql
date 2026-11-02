@@ -919,6 +919,16 @@ fn pax_column_demand_bounded(
                         return false;
                     }
                 }
+                Err(error)
+                    if error.sqlstate == sqlstate::UNDEFINED_COLUMN
+                        && qualifier.is_none()
+                        && (scope.table_index(name).is_ok()
+                            || scope.using_alias(name).is_some()) =>
+                {
+                    // A bare local relation name reads its complete row, just
+                    // like WholeRow; it is not an unresolved outer column.
+                    return false;
+                }
                 // An unresolved name can be an enclosing correlated column.
                 // The select walker records it against the enclosing physical
                 // scope while this inner scan needs no local span for it.
@@ -3943,6 +3953,28 @@ pub struct JoinRow<'s, 'v, 'd> {
 }
 
 impl<'s, 'v> JoinRow<'s, 'v, '_> {
+    /// None means the source has not joined yet. A present zero-column row
+    /// remains distinct from an outer join's absent source.
+    pub(crate) fn table_present(&self, table: usize) -> Option<bool> {
+        if table >= self.scope.n {
+            return None;
+        }
+        match self.values {
+            JoinRowValues::Bound {
+                bound,
+                order,
+                count,
+                ..
+            } => {
+                if !order[..count].contains(&table) {
+                    return None;
+                }
+                Some(bound.get(table)?.is_some())
+            }
+            JoinRowValues::Flat { offsets, .. } => offsets.get(table).map(|_| true),
+        }
+    }
+
     pub(crate) fn table_values(&self, table: usize) -> Option<&'s [Datum<'v>]> {
         match self.values {
             JoinRowValues::Bound {
@@ -4071,9 +4103,8 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
             return Ok(true);
         }
         let t = self.scope.table_index(table)?;
-        match self.table_values(t) {
-            Some([]) => Ok(false), // outer-join null row
-            Some(_) => Ok(true),
+        match self.table_present(t) {
+            Some(present) => Ok(present),
             None => Err(sql_err!(
                 sqlstate::INVALID_COLUMN_REFERENCE,
                 "whole-row reference to \"{}\" before its table is joined",
@@ -4107,17 +4138,12 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
         }
         let t = self.scope.table_index(table)?;
         let def = self.scope.defs.get(t).expect("resolved");
-        let vals = match self.table_values(t) {
-            Some([]) => return Ok(None), // outer-join null row
-            Some(vals) => vals,
-            None => {
-                return Err(sql_err!(
-                    sqlstate::INVALID_COLUMN_REFERENCE,
-                    "whole-row reference to \"{}\" before its table is joined",
-                    table
-                ));
-            }
-        };
+        if !self.whole_row_present(table)? {
+            return Ok(None);
+        }
+        let vals = self
+            .table_values(t)
+            .expect("present source has bound values");
         // Copy field names into the arena so the record does not borrow the
         // catalog (its lifetime is unrelated to the row's `'v`).
         let cols = def.columns();

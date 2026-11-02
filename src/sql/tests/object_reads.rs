@@ -3,7 +3,290 @@
 use super::*;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+};
 use std::time::{Duration, Instant};
+
+/// Real HTTP clients run under the allocation guard; provider state lives on
+/// the server thread, matching an external object-store service.
+pub(super) struct HttpObjectServer {
+    stop: Arc<AtomicBool>,
+    pub(super) requests: Arc<AtomicUsize>,
+    pub(super) uploads: Arc<AtomicUsize>,
+    pub(super) hold_response: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl HttpObjectServer {
+    pub(super) fn start(config: &mut Config) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        config.object_store_sim = false;
+        config.object_store_endpoint = listener.local_addr().unwrap().to_string();
+        config.object_store_access_key = "test-access".to_string();
+        config.object_store_secret_key = "test-secret".to_string();
+        let prefix = format!("/{}/", config.object_store_bucket);
+        let mut fixture_config = config.clone();
+        fixture_config.object_store_sim = true;
+        // HTTP paths already contain the configured object prefix.
+        fixture_config.object_store_prefix.clear();
+        let stop = Arc::new(AtomicBool::new(false));
+        let requests = Arc::new(AtomicUsize::new(0));
+        let uploads = Arc::new(AtomicUsize::new(0));
+        let hold_response = Arc::new(AtomicBool::new(false));
+        let server_stop = Arc::clone(&stop);
+        let server_requests = Arc::clone(&requests);
+        let server_uploads = Arc::clone(&uploads);
+        let server_hold_response = Arc::clone(&hold_response);
+        let server = std::thread::spawn(move || {
+            let mut fixture_budget =
+                Budget::new(crate::object_store::Client::budget_bytes(&fixture_config));
+            let mut backing =
+                crate::object_store::Client::new(&fixture_config, &mut fixture_budget).unwrap();
+            while !server_stop.load(Ordering::Acquire) {
+                let mut stream = match listener.accept() {
+                    Ok((stream, _)) => stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(1));
+                        continue;
+                    }
+                    Err(error) => panic!("accept object read: {error}"),
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut request = [0u8; 8192];
+                let mut received = 0;
+                let header_end = loop {
+                    if let Some(at) = request[..received]
+                        .windows(4)
+                        .position(|bytes| bytes == b"\r\n\r\n")
+                    {
+                        break at + 4;
+                    }
+                    assert!(
+                        received < request.len(),
+                        "fixture request headers are too large"
+                    );
+                    let n = stream.read(&mut request[received..]).unwrap();
+                    assert_ne!(n, 0, "request ended before its headers");
+                    received += n;
+                };
+                let headers = std::str::from_utf8(&request[..header_end]).unwrap();
+                let mut words = headers.lines().next().unwrap().split_whitespace();
+                let method = words.next().unwrap();
+                let target = words.next().unwrap();
+                let (path, query) = target
+                    .split_once('?')
+                    .map_or((target, None), |(path, query)| (path, Some(query)));
+                let key = path.strip_prefix(&prefix);
+                let mut content_length = None;
+                let mut range = None;
+                let mut if_none_match = None;
+                let mut if_match = None;
+                for line in headers.lines().skip(1).filter(|line| !line.is_empty()) {
+                    let (name, value) = line.split_once(':').expect("HTTP header field");
+                    let value = value.trim();
+                    if name.eq_ignore_ascii_case("Content-Length") {
+                        content_length = Some(value.parse::<usize>().unwrap());
+                    } else if name.eq_ignore_ascii_case("Range") {
+                        range = Some(value);
+                    } else if name.eq_ignore_ascii_case("If-None-Match") {
+                        if_none_match = Some(value);
+                    } else if name.eq_ignore_ascii_case("If-Match") {
+                        if_match = Some(crate::object_store::EntityTag::parse(value).unwrap());
+                    }
+                }
+                let length = match content_length {
+                    Some(length) => length,
+                    None => {
+                        assert_ne!(method, "PUT", "PUT requires Content-Length");
+                        0
+                    }
+                };
+                assert!(
+                    length <= backing.response_capacity(),
+                    "fixture request body is too large"
+                );
+                let mut body = vec![0u8; length];
+                let buffered = received - header_end;
+                assert!(
+                    buffered <= length,
+                    "unexpected bytes after the request body"
+                );
+                body[..buffered].copy_from_slice(&request[header_end..received]);
+                stream.read_exact(&mut body[buffered..]).unwrap();
+                if let Some(query) = query {
+                    assert_eq!(method, "GET");
+                    assert_eq!(path, prefix.trim_end_matches('/'));
+                    reply_object_list(&mut backing, &mut stream, query);
+                    continue;
+                }
+                let key = decode_http_component(key.expect("fixture object path"));
+                let key = key.as_str();
+                match method {
+                    "PUT" => {
+                        let condition = match (if_none_match, if_match.as_ref()) {
+                            (Some("*"), None) => crate::object_store::Precondition::IfNoneMatchAny,
+                            (None, Some(tag)) => crate::object_store::Precondition::IfMatch(tag),
+                            (None, None) => crate::object_store::Precondition::None,
+                            _ => panic!("unsupported conditional request"),
+                        };
+                        match backing.put(key, &body, condition) {
+                            Ok(tag) => {
+                                server_uploads.fetch_add(1, Ordering::Relaxed);
+                                write!(stream, "HTTP/1.1 200 OK\r\nETag: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", tag.as_str()).unwrap();
+                            }
+                            Err(crate::object_store::Error::Status { code: 412, .. }) => {
+                                stream.write_all(b"HTTP/1.1 412 Precondition Failed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                            }
+                            Err(error) => panic!("fixture object upload failed: {error}"),
+                        }
+                    }
+                    "DELETE" => {
+                        backing.delete(key).unwrap();
+                        stream.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                    }
+                    "GET" => {
+                        let metadata = match backing.get(key, None) {
+                            Ok(metadata) => metadata,
+                            Err(error) if error.is_not_found() => {
+                                stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                                continue;
+                            }
+                            Err(error) => panic!("fixture object read failed: {error}"),
+                        };
+                        let data = backing.body_bytes();
+                        server_requests.fetch_add(1, Ordering::Relaxed);
+                        while server_hold_response.load(Ordering::Acquire)
+                            && !server_stop.load(Ordering::Acquire)
+                        {
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        if let Some(range) = range {
+                            let (first, last) = range
+                                .strip_prefix("bytes=")
+                                .unwrap()
+                                .split_once('-')
+                                .unwrap();
+                            let first: usize = first.parse().unwrap();
+                            let last: usize = last.parse().unwrap();
+                            let selected = &data[first..=last];
+                            write!(stream, "HTTP/1.1 206 Partial Content\r\nETag: {}\r\nContent-Length: {}\r\nContent-Range: bytes {first}-{last}/{}\r\nConnection: close\r\n\r\n", metadata.etag.as_str(), selected.len(), data.len()).unwrap();
+                            stream.write_all(selected).unwrap();
+                        } else {
+                            write!(stream, "HTTP/1.1 200 OK\r\nETag: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", metadata.etag.as_str(), data.len()).unwrap();
+                            stream.write_all(data).unwrap();
+                        }
+                    }
+                    _ => panic!("unsupported fixture method: {method}"),
+                }
+            }
+        });
+        Self {
+            stop,
+            requests,
+            uploads,
+            hold_response,
+            thread: Some(server),
+        }
+    }
+}
+
+impl Drop for HttpObjectServer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let result = thread.join();
+            if !std::thread::panicking() {
+                result.expect("HTTP object fixture thread failed");
+            }
+        }
+    }
+}
+
+fn decode_http_component(input: &str) -> String {
+    let mut output = Vec::with_capacity(input.len());
+    let mut bytes = input.bytes();
+    while let Some(byte) = bytes.next() {
+        output.push(if byte == b'%' {
+            let high = char::from(bytes.next().expect("URI escape high digit"))
+                .to_digit(16)
+                .expect("URI hex digit");
+            let low = char::from(bytes.next().expect("URI escape low digit"))
+                .to_digit(16)
+                .expect("URI hex digit");
+            ((high << 4) | low) as u8
+        } else {
+            byte
+        });
+    }
+    String::from_utf8(output).expect("fixture URI must be UTF-8")
+}
+
+fn reply_object_list(
+    backing: &mut crate::object_store::Client,
+    stream: &mut TcpStream,
+    query: &str,
+) {
+    let mut prefix = None;
+    let mut after = String::new();
+    let mut limit = 1000usize;
+    for pair in query.split('&') {
+        let (name, value) = pair.split_once('=').expect("fixture list query field");
+        let value = decode_http_component(value);
+        match name {
+            "encoding-type" => assert_eq!(value, "url"),
+            "list-type" => assert_eq!(value, "2"),
+            "prefix" => {
+                assert!(prefix.is_none());
+                prefix = Some(value);
+            }
+            "start-after" => after = value,
+            "continuation-token" => after = decode_http_component(&value),
+            "max-keys" => limit = value.parse().expect("fixture list maximum keys"),
+            _ => panic!("unsupported fixture list field: {name}"),
+        }
+    }
+    assert!((1..=1000).contains(&limit));
+    let prefix = prefix.expect("fixture list prefix");
+    let mut keys = Vec::new();
+    backing
+        .list_batch(&prefix, &after, limit + 1, |key| keys.push(key.to_owned()))
+        .unwrap();
+    let truncated = keys.len() > limit;
+    keys.truncate(limit);
+    let mut body = format!(
+        "<ListBucketResult><EncodingType>url</EncodingType><IsTruncated>{truncated}</IsTruncated>"
+    );
+    let mut last = String::new();
+    for key in &keys {
+        last.clear();
+        crate::object_store::signature_v4::uri_encode(&mut last, key, false).unwrap();
+        body.push_str("<Contents><Key>");
+        body.push_str(&last);
+        body.push_str("</Key></Contents>");
+    }
+    if truncated {
+        body.push_str("<NextContinuationToken>");
+        body.push_str(&last);
+        body.push_str("</NextContinuationToken>");
+    }
+    body.push_str("</ListBucketResult>");
+    write!(
+        stream,
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )
+    .unwrap();
+    stream.write_all(body.as_bytes()).unwrap();
+}
 
 pub(super) fn advance(engine: &mut Engine) {
     // Simulated upload completions update fixture inventories outside the runtime guard.

@@ -166,6 +166,9 @@ With `FETCH FIRST ... WITH TIES`, finding the end of the tied group also
 evaluates the first following row, even though that row is not returned.
 A sorted nested query with `LIMIT 0` validates names and types without consuming
 sequence values from its input.
+Sorting also preserves whether each joined row existed. For example,
+`row_to_json(profile)` distinguishes a missing profile from a present record
+whose fields are all null; delaying an output expression keeps that distinction.
 
 Statements, transaction snapshots, scans and point reads have separate startup
 reservations. Their [exact capacities](postgresql-18-compatibility.md#capacity-boundaries)

@@ -98993,10 +98993,8 @@ fn parallel_checkpoint_failures_reach_waiters_and_do_not_poison_new_or_cancelled
 #[test]
 fn atomic_block_reads_function_and_sequence_effects_survive_cold_http_reads_once() {
     use crate::store::BlockStore;
-    use std::io::{Read, Write};
-    use std::net::TcpListener;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::Ordering;
     use std::time::Duration;
 
     for extended in [false, true] {
@@ -99064,155 +99062,10 @@ fn atomic_block_reads_function_and_sequence_effects_survive_cold_http_reads_once
             RowCleanupTarget::Table(table),
         );
 
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
-        config.object_store_sim = false;
-        config.object_store_endpoint = listener.local_addr().unwrap().to_string();
-        config.object_store_access_key = "test-access".to_string();
-        config.object_store_secret_key = "test-secret".to_string();
-        let prefix = format!("/{}/", config.object_store_bucket);
-        let mut fixture_config = config.clone();
-        fixture_config.object_store_sim = true;
-        // HTTP paths already contain the configured object prefix.
-        fixture_config.object_store_prefix.clear();
-        let stop = Arc::new(AtomicBool::new(false));
-        let requests = Arc::new(AtomicUsize::new(0));
-        let uploads = Arc::new(AtomicUsize::new(0));
-        let hold_response = Arc::new(AtomicBool::new(false));
-        let server_stop = Arc::clone(&stop);
-        let server_requests = Arc::clone(&requests);
-        let server_uploads = Arc::clone(&uploads);
-        let server_hold_response = Arc::clone(&hold_response);
-        let server = std::thread::spawn(move || {
-            let mut fixture_budget =
-                Budget::new(crate::object_store::Client::budget_bytes(&fixture_config));
-            let mut backing =
-                crate::object_store::Client::new(&fixture_config, &mut fixture_budget).unwrap();
-            while !server_stop.load(Ordering::Acquire) {
-                let mut stream = match listener.accept() {
-                    Ok((stream, _)) => stream,
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(Duration::from_millis(1));
-                        continue;
-                    }
-                    Err(error) => panic!("accept object read: {error}"),
-                };
-                stream.set_nonblocking(false).unwrap();
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(2)))
-                    .unwrap();
-                stream
-                    .set_write_timeout(Some(Duration::from_secs(2)))
-                    .unwrap();
-                let mut request = [0u8; 8192];
-                let mut received = 0;
-                let header_end = loop {
-                    if let Some(at) = request[..received]
-                        .windows(4)
-                        .position(|bytes| bytes == b"\r\n\r\n")
-                    {
-                        break at + 4;
-                    }
-                    assert!(
-                        received < request.len(),
-                        "fixture request headers are too large"
-                    );
-                    let n = stream.read(&mut request[received..]).unwrap();
-                    assert_ne!(n, 0, "request ended before its headers");
-                    received += n;
-                };
-                let headers = std::str::from_utf8(&request[..header_end]).unwrap();
-                let mut words = headers.lines().next().unwrap().split_whitespace();
-                let method = words.next().unwrap();
-                let key = words.next().unwrap().strip_prefix(&prefix).unwrap();
-                let mut content_length = None;
-                let mut range = None;
-                let mut if_none_match = None;
-                let mut if_match = None;
-                for line in headers.lines().skip(1).filter(|line| !line.is_empty()) {
-                    let (name, value) = line.split_once(':').expect("HTTP header field");
-                    let value = value.trim();
-                    if name.eq_ignore_ascii_case("Content-Length") {
-                        content_length = Some(value.parse::<usize>().unwrap());
-                    } else if name.eq_ignore_ascii_case("Range") {
-                        range = Some(value);
-                    } else if name.eq_ignore_ascii_case("If-None-Match") {
-                        if_none_match = Some(value);
-                    } else if name.eq_ignore_ascii_case("If-Match") {
-                        if_match = Some(crate::object_store::EntityTag::parse(value).unwrap());
-                    }
-                }
-                let length = match content_length {
-                    Some(length) => length,
-                    None => {
-                        assert_ne!(method, "PUT", "PUT requires Content-Length");
-                        0
-                    }
-                };
-                assert!(
-                    length <= backing.response_capacity(),
-                    "fixture request body is too large"
-                );
-                let mut body = vec![0u8; length];
-                let buffered = received - header_end;
-                assert!(
-                    buffered <= length,
-                    "unexpected bytes after the request body"
-                );
-                body[..buffered].copy_from_slice(&request[header_end..received]);
-                stream.read_exact(&mut body[buffered..]).unwrap();
-                match method {
-                    "PUT" => {
-                        let condition = match (if_none_match, if_match.as_ref()) {
-                            (Some("*"), None) => crate::object_store::Precondition::IfNoneMatchAny,
-                            (None, Some(tag)) => crate::object_store::Precondition::IfMatch(tag),
-                            (None, None) => crate::object_store::Precondition::None,
-                            _ => panic!("unsupported conditional request"),
-                        };
-                        match backing.put(key, &body, condition) {
-                            Ok(tag) => {
-                                server_uploads.fetch_add(1, Ordering::Relaxed);
-                                write!(stream, "HTTP/1.1 200 OK\r\nETag: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", tag.as_str()).unwrap();
-                            }
-                            Err(crate::object_store::Error::Status { code: 412, .. }) => {
-                                stream.write_all(b"HTTP/1.1 412 Precondition Failed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
-                            }
-                            Err(error) => panic!("fixture object upload failed: {error}"),
-                        }
-                    }
-                    "DELETE" => {
-                        backing.delete(key).unwrap();
-                        stream.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
-                    }
-                    "GET" => {
-                        let metadata = backing.get(key, None).unwrap();
-                        let data = backing.body_bytes();
-                        server_requests.fetch_add(1, Ordering::Relaxed);
-                        while server_hold_response.load(Ordering::Acquire)
-                            && !server_stop.load(Ordering::Acquire)
-                        {
-                            std::thread::sleep(Duration::from_millis(1));
-                        }
-                        if let Some(range) = range {
-                            let (first, last) = range
-                                .strip_prefix("bytes=")
-                                .unwrap()
-                                .split_once('-')
-                                .unwrap();
-                            let first: usize = first.parse().unwrap();
-                            let last: usize = last.parse().unwrap();
-                            let selected = &data[first..=last];
-                            write!(stream, "HTTP/1.1 206 Partial Content\r\nETag: {}\r\nContent-Length: {}\r\nContent-Range: bytes {first}-{last}/{}\r\nConnection: close\r\n\r\n", metadata.etag.as_str(), selected.len(), data.len()).unwrap();
-                            stream.write_all(selected).unwrap();
-                        } else {
-                            write!(stream, "HTTP/1.1 200 OK\r\nETag: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", metadata.etag.as_str(), data.len()).unwrap();
-                            stream.write_all(data).unwrap();
-                        }
-                    }
-                    _ => panic!("unsupported fixture method: {method}"),
-                }
-            }
-        });
+        let server = object_reads::HttpObjectServer::start(&mut config);
+        let requests = &server.requests;
+        let uploads = &server.uploads;
+        let hold_response = &server.hold_response;
         let mut io_budget = Budget::new(
             Checkpointer::budget_bytes(&config)
                 + crate::storage::SpillReader::budget_bytes(
@@ -99406,8 +99259,7 @@ fn atomic_block_reads_function_and_sequence_effects_survive_cold_http_reads_once
                 .is_ok()
         );
         drop((session, engine, blocks));
-        stop.store(true, Ordering::Release);
-        server.join().unwrap();
+        drop(server);
         crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     }
 }

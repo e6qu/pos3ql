@@ -117,6 +117,8 @@ fn view_write_staging_uses_actual_rows_with_large_pool_and_small_work_arena() {
     config.row_work_bytes = 8 << 20;
     config.row_work_leases = 32;
     config.work_arena_bytes = 256 << 10;
+    // One request retains all nine view identities until its implicit commit.
+    config.max_views = 9;
     let mut budget = test_engine_budget(&config, 1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let mut session = ConfiguredTransactionSession::new(&config, &mut budget);

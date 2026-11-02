@@ -210,6 +210,9 @@ pub(super) fn expression_properties(
                 Some(type_of(operand)?),
             )?)
         }
+        // ROW is a structural constructor, not a procedure lookup. Its
+        // effects are exactly those of its already-classified child nodes.
+        Expr::Call { name, .. } if name.eq_ignore_ascii_case("row") => None,
         Expr::Call {
             name,
             bound_oid,

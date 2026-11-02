@@ -12,9 +12,15 @@ fn sorted_and_paged_projection_effects_follow_postgresql_row_order() {
         config.object_store_sim = external;
         config.object_store_bucket = format!("projection-window-{}-{external}", std::process::id());
         config.work_arena_bytes = 256 << 10;
+        config.block_cache_bytes = 0;
+        config.disk_cache_bytes = 0;
+        let server = external.then(|| object_reads::HttpObjectServer::start(&mut config));
         let mut budget = test_engine_budget(&config, 1 << 29);
         let mut engine = Engine::new(&config, &mut budget).unwrap();
         assert_eq!(engine.storage.spill_attached(), external);
+        let initial_uploads = server
+            .as_ref()
+            .map(|server| server.uploads.load(std::sync::atomic::Ordering::Relaxed));
         let mut session =
             ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, 256 << 10);
         session.success(&mut engine,
@@ -186,6 +192,61 @@ fn sorted_and_paged_projection_effects_follow_postgresql_row_order() {
             data_rows(&other.success(&mut engine, "SELECT currval('projection_calls')", true)),
             ["3"]
         );
+        session.success(&mut engine,
+            "CREATE TABLE projection_left(id integer); INSERT INTO projection_left VALUES(1),(2); \
+             CREATE TABLE projection_right(id integer,payload text); INSERT INTO projection_right VALUES(NULL,NULL); \
+             CREATE TABLE projection_empty(); INSERT INTO projection_empty DEFAULT VALUES", true);
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "SELECT right_row::text FROM projection_empty AS right_row",
+                true
+            )),
+            ["()"]
+        );
+        for (query, expected) in [
+            (
+                "SELECT left_row::text||nextval('projection_calls')::text \
+              FROM projection_left AS left_row ORDER BY left_row.id",
+                &["(1)1", "(2)2", "2"][..],
+            ),
+            (
+                "SELECT COALESCE(right_row::text,'missing')||nextval('projection_calls')::text \
+              FROM projection_left AS left_row LEFT JOIN projection_right AS right_row ON left_row.id=1 \
+              ORDER BY left_row.id",
+                &["(,)1", "missing2", "2"][..],
+            ),
+            (
+                "SELECT COALESCE(right_row::text,'missing')||nextval('projection_calls')::text \
+              FROM projection_left AS left_row LEFT JOIN projection_empty AS right_row ON left_row.id=1 \
+              ORDER BY left_row.id",
+                &["()1", "missing2", "2"][..],
+            ),
+            (
+                "SELECT ROW(merged.*,nextval('projection_calls'))::text FROM projection_left AS left_row \
+              LEFT JOIN projection_right AS right_row USING(id) AS merged ORDER BY left_row.id",
+                &["(1,1)", "(2,2)", "2"][..],
+            ),
+        ] {
+            let command = format!(
+                "ALTER SEQUENCE projection_calls RESTART WITH 1; {query}; SELECT currval('projection_calls')"
+            );
+            let output = session.success(&mut engine, &command, true);
+            assert_eq!(data_rows(&output), expected, "external={external}: {query}");
+        }
+        if let Some(server) = server.as_ref() {
+            assert!(
+                server.uploads.load(std::sync::atomic::Ordering::Relaxed)
+                    > initial_uploads.unwrap(),
+                "sort must upload through the HTTP provider"
+            );
+            assert!(
+                server.requests.load(std::sync::atomic::Ordering::Relaxed) > 0,
+                "sort must read through the HTTP provider"
+            );
+        }
+        drop((session, other, engine));
+        drop(server);
         if external {
             crate::object_store::sim::drop_namespace(&config.object_store_bucket);
         }

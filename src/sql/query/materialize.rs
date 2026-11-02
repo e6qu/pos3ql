@@ -5,8 +5,8 @@
 //! their rows are projected into the statement arena as self-describing byte
 //! strings and sorted or deduplicated there. ORDER BY keys ride along as hidden
 //! columns after the visible ones, which is how an arbitrary key expression can
-//! order a result; an expensive select-list expression can also be postponed
-//! past the sort, so it is evaluated only for the rows that survive a LIMIT.
+//! order a result. Volatile or expensive output can be evaluated after sorting,
+//! in the order and row window requested by LIMIT and OFFSET.
 
 use crate::mem::arena::{Arena, ArenaList};
 use crate::pg::respond::Responder;
@@ -68,8 +68,18 @@ impl<'a> ColumnLookup<'a> for EncodedRawRow<'_, '_, 'a> {
     }
 
     fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
-        let entry = self.scope.find_column(qualifier, name).ok()?;
-        Some(self.scope.output_type(entry))
+        match self.scope.find_column(qualifier, name) {
+            Ok(entry) => Some(self.scope.output_type(entry)),
+            Err(error)
+                if error.sqlstate == sqlstate::UNDEFINED_COLUMN
+                    && qualifier.is_none()
+                    && (self.scope.using_alias(name).is_some()
+                        || self.scope.table_index(name).is_ok()) =>
+            {
+                Some(self.scope.func_scalar_type(name).unwrap_or(ColType::Record))
+            }
+            Err(_) => None,
+        }
     }
 
     fn collation(&self, qualifier: Option<&str>, name: &str) -> Collation {
@@ -107,6 +117,59 @@ impl<'a> ColumnLookup<'a> for EncodedRawRow<'_, '_, 'a> {
 
     fn whole_row_is_scalar(&self, table: &str) -> bool {
         self.scope.func_scalar_type(table).is_some()
+    }
+
+    fn whole_row_present(&self, table: &str) -> Result<bool, SqlError> {
+        if self.scope.using_alias(table).is_some() {
+            return Ok(true);
+        }
+        let source = self.scope.table_index(table)?;
+        let value = crate::sql::exec::decode_projected_col_record(
+            self.bytes,
+            self.raw_at + self.scope.total_columns() + source,
+            self.arena,
+        )?;
+        match value {
+            Datum::Bool(present) => Ok(present),
+            _ => Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "saved projection source-presence flag is not boolean"
+            )),
+        }
+    }
+
+    fn whole_row_fields(
+        &self,
+        table: &str,
+        arena: &'a Arena,
+    ) -> Result<Option<&'a [crate::sql::types::RecordField<'a>]>, SqlError> {
+        if !self.whole_row_present(table)? {
+            return Ok(None);
+        }
+        self.whole_row_expansion_fields(table, arena).map(Some)
+    }
+
+    fn whole_row_expansion_fields(
+        &self,
+        table: &str,
+        arena: &'a Arena,
+    ) -> Result<&'a [crate::sql::types::RecordField<'a>], SqlError> {
+        let width = self.scope.qualified_star_columns(table)?;
+        let fields = arena
+            .alloc_slice_with(width, |_| crate::sql::types::RecordField {
+                name: "",
+                type_oid: 0,
+                value: Datum::Null,
+            })
+            .map_err(|_| arena_full())?;
+        for (index, field) in fields.iter_mut().enumerate() {
+            let entry = self.scope.qualified_star_entry(table, index)?;
+            let name = self.scope.output_name(entry);
+            field.name = arena.alloc_str(name).map_err(|_| arena_full())?;
+            field.type_oid = self.scope.output_type(entry).oid();
+            field.value = self.lookup(Some(table), name)?;
+        }
+        Ok(fields)
     }
 }
 
@@ -259,6 +322,14 @@ fn materialized_value_at<'a>(
             .unwrap_or(Datum::Null);
     }
     let mut raw_index = index - width - n_keys;
+    let source_columns = scope.total_columns();
+    if raw_index >= source_columns {
+        let table = raw_index - source_columns;
+        let present = row
+            .table_present(table)
+            .expect("materialized source is joined");
+        return Datum::Bool(present);
+    }
     for table in 0..scope.n {
         let column_count = scope.defs.get(table).expect("resolved").n_columns;
         if raw_index < column_count {
@@ -295,8 +366,17 @@ impl<'a> ColumnLookup<'a> for ScopeSchema<'_, '_> {
         ))
     }
     fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
-        let entry = self.0.find_column(qualifier, name).ok()?;
-        Some(self.0.output_type(entry))
+        match self.0.find_column(qualifier, name) {
+            Ok(entry) => Some(self.0.output_type(entry)),
+            Err(error)
+                if error.sqlstate == sqlstate::UNDEFINED_COLUMN
+                    && qualifier.is_none()
+                    && (self.0.using_alias(name).is_some() || self.0.table_index(name).is_ok()) =>
+            {
+                Some(self.0.func_scalar_type(name).unwrap_or(ColType::Record))
+            }
+            Err(_) => None,
+        }
     }
     fn collation(&self, qualifier: Option<&str>, name: &str) -> Collation {
         self.0
@@ -332,9 +412,8 @@ impl<'a> ColumnLookup<'a> for ScopeSchema<'_, '_> {
     }
 }
 
-/// Which projection items a sorted or paged query defers until after the
-/// sort: `postponed` flags the deferred items, and the raw source columns are
-/// appended to each encoded row starting at `raw_at`.
+/// `postponed` marks output deferred until after sorting. Encoded rows append
+/// raw source columns and source-presence flags starting at `raw_at`.
 pub(crate) struct PostponedProjection {
     postponed: [bool; MAX_PROJ],
     raw_at: usize,
@@ -659,7 +738,12 @@ pub(super) fn prepare_materialization<'a>(
     } else {
         None
     };
-    let n_raw = if raw_needed { scope.total_columns() } else { 0 };
+    // Presence is independent of field NULLs, including zero-column rows.
+    let n_raw = if raw_needed {
+        scope.total_columns() + scope.n
+    } else {
+        0
+    };
     let n_identities = if statement.locking.is_empty() {
         0
     } else {

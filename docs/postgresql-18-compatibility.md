@@ -118,6 +118,12 @@ ordering. Expression results are recomputed from fetched rows rather than
 projected directly from an index expression tuple. Native PostgreSQL index page
 layouts and custom native callbacks are not implemented.
 
+Moving indexes to a tablespace during `REINDEX` requires explicitly created
+indexes. For example, `REINDEX (TABLESPACE archive) INDEX orders_pkey` returns
+`0A000` if a primary-key constraint created `orders_pkey`. Table, schema and
+database targets also reject that option if they include constraint-generated
+indexes. Rejection happens before changing any selected index.
+
 ### Partition column order
 
 An attached table can store matching columns in a different order. SQL

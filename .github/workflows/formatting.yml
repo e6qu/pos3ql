@@ -6,7 +6,7 @@ on:
 jobs:
   check:
     name: Rust formatting
-    runs-on: ubuntu-24.04-arm
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
       contents: read
@@ -33,7 +33,7 @@ jobs:
   compile:
     name: Rust type checks
     needs: check
-    runs-on: ubuntu-24.04-arm
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
       contents: read

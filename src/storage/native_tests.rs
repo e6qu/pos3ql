@@ -8805,7 +8805,9 @@ fn stored_query_dependency_catalog_is_synchronized_and_startup_bounded() {
                     .push(StoredQueryDependency {
                         class: DependencyClass::Table,
                         slot: worker as u16,
-                        identity: StoredDependencyIdentity::Name,
+                        identity: StoredDependencyIdentity::Table(
+                            RelationReference::from_storage(worker as u64 + 1).unwrap(),
+                        ),
                         referenced_columns: ColumnSet::EMPTY,
                         schema: marker,
                         name: marker,

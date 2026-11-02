@@ -499,7 +499,7 @@ mod tests {
     };
 
     #[test]
-    fn stored_relation_sources_reject_serialized_slots_and_unselected_definitions() {
+    fn stored_relation_sources_follow_renames_and_reject_unbound_or_reused_lifetimes() {
         let config = test_config();
         let mut budget = test_budget(&config);
         let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
@@ -509,7 +509,9 @@ mod tests {
         let mut dependency = StoredQueryDependency {
             class: DependencyClass::Table,
             slot: u16::MAX,
-            identity: StoredDependencyIdentity::Name,
+            identity: storage
+                .capture_stored_query_relation(ResolvedRelation::Table(table), 0)
+                .unwrap(),
             referenced_columns: ColumnSet::EMPTY,
             schema: SqlName::parse("public").unwrap(),
             name: SqlName::parse("bound_items").unwrap(),
@@ -543,27 +545,40 @@ mod tests {
             assert!(
                 storage
                     .resolve_stored_query_relation(&dependency, 7)
-                    .is_err()
+                    .is_ok()
             );
             let pending = StoredQueryDependency {
                 name: replacement.name,
                 ..dependency
             };
             assert!(storage.resolve_stored_query_relation(&pending, 7).is_ok());
-            assert!(storage.resolve_stored_query_relation(&pending, 0).is_err());
+            assert!(storage.resolve_stored_query_relation(&pending, 0).is_ok());
+            let unresolved = StoredQueryDependency {
+                identity: StoredDependencyIdentity::Table(
+                    super::super::RelationReference::from_storage(
+                        storage.table(table).created_at(),
+                    )
+                    .unwrap(),
+                ),
+                ..dependency
+            };
+            assert!(
+                storage
+                    .resolve_stored_query_relation(&unresolved, 7)
+                    .is_err()
+            );
+            let rebound = storage.rebind_stored_query_relation(unresolved, 7).unwrap();
+            assert!(storage.resolve_stored_query_relation(&rebound, 7).is_ok());
             storage.rollback_table_def(change);
             assert!(
                 storage
                     .resolve_stored_query_relation(&dependency, 7)
                     .is_ok()
             );
-            assert!(storage.resolve_stored_query_relation(&pending, 7).is_err());
+            assert!(storage.resolve_stored_query_relation(&pending, 7).is_ok());
             storage.commit_drop(table);
             let reused = storage
-                .create_table(make_def(
-                    "replacement_items",
-                    &[("id", ColType::Int4, false)],
-                ))
+                .create_table(make_def("bound_items", &[("id", ColType::Int4, false)]))
                 .unwrap();
             assert_eq!(table, reused);
             assert!(
@@ -571,6 +586,55 @@ mod tests {
                     .resolve_stored_query_relation(&dependency, 0)
                     .is_err()
             );
+            assert!(storage.rebind_stored_query_relation(unresolved, 0).is_err());
+        });
+    }
+
+    #[test]
+    fn stored_relation_sources_reject_another_storage_with_the_same_birth_and_name() {
+        let mut config = test_config();
+        config.max_tables = 1;
+        config.table_metadata_bytes = 64 << 10;
+        config.table_metadata_leases = 128;
+        let mut first_budget = test_budget(&config);
+        let mut first = Storage::new(&config, &mut first_budget, 0).unwrap();
+        let first_slot = first
+            .create_table(make_def("same_items", &[("id", ColType::Int4, false)]))
+            .unwrap();
+        let identity = first
+            .capture_stored_query_relation(ResolvedRelation::Table(first_slot), 0)
+            .unwrap();
+        let dependency = StoredQueryDependency {
+            class: DependencyClass::Table,
+            slot: first_slot as u16,
+            identity,
+            referenced_columns: ColumnSet::EMPTY,
+            schema: SqlName::parse("public").unwrap(),
+            name: SqlName::parse("same_items").unwrap(),
+            referenced_schema: SqlName::EMPTY,
+            referenced_name: SqlName::parse("same_items").unwrap(),
+        };
+        let mut second_budget = test_budget(&config);
+        let mut second = Storage::new(&config, &mut second_budget, 0).unwrap();
+        let second_slot = second
+            .create_table(make_def("same_items", &[("id", ColType::Int4, false)]))
+            .unwrap();
+        assert_eq!(first_slot, second_slot);
+        assert_eq!(
+            first.table(first_slot).created_at(),
+            second.table(second_slot).created_at()
+        );
+        crate::mem::guard::forbid_alloc(|| {
+            assert!(first.resolve_stored_query_relation(&dependency, 0).is_ok());
+            assert_eq!(
+                second
+                    .resolve_stored_query_relation(&dependency, 0)
+                    .err()
+                    .unwrap()
+                    .sqlstate,
+                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE
+            );
+            assert!(second.rebind_stored_query_relation(dependency, 0).is_err());
         });
     }
 }

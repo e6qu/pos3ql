@@ -33,6 +33,8 @@ pub(crate) use database_clone_positions::{
 };
 mod matview_lifecycles;
 mod query_lifecycles;
+mod query_relation_sources;
+pub(crate) use query_relation_sources::RelationReference;
 mod routine_lifecycles;
 mod schema_names;
 pub(crate) use matview_lifecycles::MatviewDdlUndo;
@@ -4699,6 +4701,8 @@ impl DependencyClass {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StoredDependencyIdentity {
     Name,
+    Table(RelationReference),
+    View(RelationReference),
     RoutineOid(i32),
     OperatorOid(i32),
     Collation(crate::sql::ast::CatalogCollation),
@@ -4713,6 +4717,15 @@ impl StoredDependencyIdentity {
             return source.storage_key();
         }
         let mut key = StackStr::new();
+        if let Self::Table(source) | Self::View(source) = self {
+            let kind = if matches!(self, Self::Table(_)) {
+                't'
+            } else {
+                'v'
+            };
+            write!(key, "{kind}:{}", source.created_at()).expect("bounded relation identity");
+            return key;
+        }
         if let Self::Collation(selected) = self {
             write!(key, "c{}", Collation::Catalog(selected).code())
                 .expect("bounded collation identity");
@@ -4723,7 +4736,7 @@ impl StoredDependencyIdentity {
             Self::RoutineOid(oid)
             | Self::OperatorOid(oid)
             | Self::TextSearchConfigurationOid(oid) => oid,
-            Self::Type(_) | Self::Collation(_) => unreachable!(),
+            Self::Type(_) | Self::Collation(_) | Self::Table(_) | Self::View(_) => unreachable!(),
         };
         write!(key, "{oid}").expect("bounded dependency identity");
         key
@@ -4731,6 +4744,8 @@ impl StoredDependencyIdentity {
 
     pub(crate) fn valid_for(self, class: DependencyClass) -> bool {
         match self {
+            Self::Table(_) => class == DependencyClass::Table,
+            Self::View(_) => class == DependencyClass::View,
             Self::Type(source) => matches!(
                 (class, source.slot()),
                 (DependencyClass::Domain, NamedTypeSlot::Domain(_))
@@ -4739,7 +4754,9 @@ impl StoredDependencyIdentity {
             ),
             Self::Name => !matches!(
                 class,
-                DependencyClass::Routine
+                DependencyClass::Table
+                    | DependencyClass::View
+                    | DependencyClass::Routine
                     | DependencyClass::Operator
                     | DependencyClass::Domain
                     | DependencyClass::Enum
@@ -4766,7 +4783,20 @@ impl StoredDependencyIdentity {
     }
 
     pub(crate) fn from_storage(class: DependencyClass, encoded: &str) -> Option<Self> {
-        let identity = if class == DependencyClass::Collation {
+        let identity = if matches!(class, DependencyClass::Table | DependencyClass::View) {
+            let prefix = if class == DependencyClass::Table {
+                "t:"
+            } else {
+                "v:"
+            };
+            let source =
+                RelationReference::from_storage(encoded.strip_prefix(prefix)?.parse().ok()?)?;
+            if class == DependencyClass::Table {
+                Self::Table(source)
+            } else {
+                Self::View(source)
+            }
+        } else if class == DependencyClass::Collation {
             match Collation::from_code(encoded.strip_prefix('c')?.parse().ok()?)? {
                 Collation::Catalog(selected) => Self::Collation(selected),
                 _ => return None,
@@ -19801,51 +19831,6 @@ impl Storage {
         }
     }
 
-    pub(crate) fn resolve_stored_query_relation(
-        &self,
-        dependency: &StoredQueryDependency,
-        transaction: u32,
-    ) -> Result<ResolvedRelation, SqlError> {
-        let invalid = || {
-            sql_err!(
-                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
-                "stored relation binding is unresolved, replaced or no longer visible"
-            )
-        };
-        let slot = usize::from(dependency.slot);
-        match dependency.class {
-            DependencyClass::Table => {
-                let table = self.tables.get(slot).ok_or_else(invalid)?;
-                let definition = TableDefinitionRead::visible(
-                    &table.definition,
-                    &self.pending_table_defs,
-                    transaction,
-                );
-                if definition.identity().database != current_database()
-                    || !definition.identity().existence.visible_to(transaction)
-                    || definition.schema != dependency.schema
-                    || definition.name != dependency.name
-                {
-                    return Err(invalid());
-                }
-                Ok(ResolvedRelation::Table(slot))
-            }
-            DependencyClass::View => {
-                let catalog = self.view_rule_catalog();
-                if !catalog.views.get(slot).is_some_and(|view| {
-                    view.database == current_database()
-                        && view.visible_to(transaction)
-                        && view.schema_for(transaction) == dependency.schema
-                        && view.name_for(transaction) == dependency.name
-                }) {
-                    return Err(invalid());
-                }
-                Ok(ResolvedRelation::View(slot))
-            }
-            _ => Err(invalid()),
-        }
-    }
-
     pub fn rebind_stored_query_dependencies(
         &self,
         serialized: StoredQueryDependencies,
@@ -19866,6 +19851,12 @@ impl Storage {
     ) -> Result<StoredQueryDependency, SqlError> {
         if matches!(
             dependency.class,
+            DependencyClass::Table | DependencyClass::View
+        ) {
+            return self.rebind_stored_query_relation(dependency, txid);
+        }
+        if matches!(
+            dependency.class,
             DependencyClass::Domain | DependencyClass::Enum | DependencyClass::Composite
         ) {
             self.type_catalog
@@ -19877,13 +19868,9 @@ impl Storage {
         let schema = dependency.schema.as_str();
         let name = dependency.name.as_str();
         let slot = match dependency.class {
-            DependencyClass::Table => self.find_visible(schema, name, txid),
-            DependencyClass::View => self.view_rule_catalog().views.iter().position(|view| {
-                view.database == current_database()
-                    && view.visible_to(txid)
-                    && view.schema_for(txid).as_str() == schema
-                    && view.name_for(txid).as_str() == name
-            }),
+            DependencyClass::Table | DependencyClass::View => {
+                unreachable!("relation source handled above")
+            }
             DependencyClass::Domain | DependencyClass::Enum | DependencyClass::Composite => {
                 unreachable!("type source handled above")
             }
@@ -19891,6 +19878,8 @@ impl Storage {
             DependencyClass::Routine => match dependency.identity {
                 StoredDependencyIdentity::RoutineOid(oid) => self.routine_slot_by_oid(oid, txid),
                 StoredDependencyIdentity::Name
+                | StoredDependencyIdentity::Table(_)
+                | StoredDependencyIdentity::View(_)
                 | StoredDependencyIdentity::OperatorOid(_)
                 | StoredDependencyIdentity::Type(_)
                 | StoredDependencyIdentity::Collation(_)
@@ -19899,6 +19888,8 @@ impl Storage {
             DependencyClass::Operator => match dependency.identity {
                 StoredDependencyIdentity::OperatorOid(oid) => self.operator_slot_by_oid(oid, txid),
                 StoredDependencyIdentity::Name
+                | StoredDependencyIdentity::Table(_)
+                | StoredDependencyIdentity::View(_)
                 | StoredDependencyIdentity::RoutineOid(_)
                 | StoredDependencyIdentity::Type(_)
                 | StoredDependencyIdentity::Collation(_)
@@ -19973,6 +19964,7 @@ impl Storage {
         let dependencies = &mut snapshot[..usize::from(count)];
         for dependency in dependencies.iter_mut() {
             if let Some(source) = template_source {
+                self.clone_stored_query_relation(dependency, source)?;
                 self.type_catalog
                     .lock()
                     .expect("type catalog lock poisoned")
@@ -39665,8 +39657,20 @@ impl Storage {
         self.view_rule_catalog().views[slot].clone()
     }
 
+    pub(crate) fn view_relation_name(&self, oid: i32, txid: u32) -> Option<(SqlName, SqlName)> {
+        let catalog = self.view_rule_catalog();
+        catalog.views.iter().find_map(|view| {
+            (view.database == current_database()
+                && view.visible_to(txid)
+                && RelationIdentity::parse(view.created_at)
+                    .is_some_and(|identity| identity.oid() == oid))
+            .then(|| (view.schema_for(txid), view.name_for(txid)))
+        })
+    }
+
     pub(crate) fn view_slot_visible_to(&self, slot: usize, txid: u32) -> bool {
-        let view = self.view(slot);
+        let catalog = self.view_rule_catalog();
+        let view = &catalog.views[slot];
         view.database == current_database() && view.visible_to(txid)
     }
 
@@ -44032,6 +44036,33 @@ impl Storage {
                 unreachable!("the shared named-type namespace admitted a duplicate")
             }
         }
+    }
+
+    pub(crate) fn composite_relation_identity(&self, slot: usize) -> RelationIdentity {
+        let catalog = self
+            .type_catalog
+            .lock()
+            .expect("type catalog lock poisoned");
+        RelationIdentity::parse(catalog.composites[slot].created_at)
+            .expect("admitted composite relation has a durable identity")
+    }
+
+    pub(crate) fn composite_relation_name(
+        &self,
+        oid: i32,
+        txid: u32,
+    ) -> Option<(SqlName, SqlName)> {
+        let catalog = self
+            .type_catalog
+            .lock()
+            .expect("type catalog lock poisoned");
+        catalog.composites.iter().find_map(|definition| {
+            (definition.database == current_database()
+                && definition.visible_to(txid)
+                && RelationIdentity::parse(definition.created_at)
+                    .is_some_and(|identity| identity.oid() == oid))
+            .then(|| definition.names_for(txid))
+        })
     }
 
     pub fn composite(&self, slot: usize) -> CompositeDef {

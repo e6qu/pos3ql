@@ -22505,7 +22505,8 @@ mod stored_dependency_tests {
         dependencies
             .serialized_push(SerializedStoredQueryDependency {
                 class: DependencyClass::Table,
-                identity: StoredDependencyIdentity::Name,
+                identity: StoredDependencyIdentity::from_storage(DependencyClass::Table, "t:31")
+                    .unwrap(),
                 schema: SqlName::parse("moved").unwrap(),
                 name: SqlName::parse("current_name").unwrap(),
                 referenced_schema: SqlName::parse("").unwrap(),
@@ -22533,6 +22534,10 @@ mod stored_dependency_tests {
             dependencies
         );
         for (class, key) in [
+            (DependencyClass::Table, "t:41"),
+            (DependencyClass::View, "v:42"),
+            (DependencyClass::Table, "t:9999999"),
+            (DependencyClass::View, "v:9999999"),
             (DependencyClass::Domain, "d:1:41"),
             (DependencyClass::Enum, "e:2:42"),
             (DependencyClass::Composite, "c:3:43"),
@@ -22553,6 +22558,44 @@ mod stored_dependency_tests {
             assert_eq!(
                 parse_stored_query_dependencies(&mut encoded.split(' ')).unwrap(),
                 dependencies
+            );
+        }
+    }
+
+    #[test]
+    fn manifest_relation_dependencies_reject_missing_or_wrong_lifetimes() {
+        for (class, key) in [
+            (DependencyClass::Table, "0"),
+            (DependencyClass::View, "0"),
+            (DependencyClass::Table, "t:0"),
+            (DependencyClass::View, "v:0"),
+            (DependencyClass::Table, "v:31"),
+            (DependencyClass::View, "t:31"),
+            (DependencyClass::Table, "t:10000000"),
+            (DependencyClass::View, "v:18446744073709551616"),
+            (DependencyClass::Table, "t:-1"),
+            (DependencyClass::View, "v:"),
+            (DependencyClass::Table, "t:1:31"),
+        ] {
+            let valid_key = if class == DependencyClass::Table {
+                "t:31"
+            } else {
+                "v:31"
+            };
+            let valid = format!(
+                "1 {} {valid_key} 7075626c6963 6974656d73  6974656d73 {}",
+                class as u8,
+                crate::storage::ColumnSet::EMPTY
+            );
+            assert!(parse_stored_query_dependencies(&mut valid.split(' ')).is_ok());
+            let input = format!(
+                "1 {} {key} 7075626c6963 6974656d73  6974656d73 {}",
+                class as u8,
+                crate::storage::ColumnSet::EMPTY
+            );
+            assert!(
+                parse_stored_query_dependencies(&mut input.split(' ')).is_err(),
+                "{class:?} {key}"
             );
         }
     }

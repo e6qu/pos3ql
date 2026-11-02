@@ -433,23 +433,29 @@ fn record_routine_target(
     dependencies: &mut StoredQueryDependencies,
 ) -> Result<(), SqlError> {
     let resolved = storage.resolve_relation_under(path, name.schema, name.name, txid);
-    let Some((class, slot, schema, catalog_name)) = (match resolved {
+    let Some((class, slot, schema, catalog_name, identity)) = (match resolved {
         Some(ResolvedRelation::Table(slot)) => {
+            let identity =
+                storage.capture_stored_query_relation(ResolvedRelation::Table(slot), txid)?;
             let definition = storage.table_def(slot, txid);
             Some((
                 DependencyClass::Table,
                 slot,
                 definition.schema,
                 definition.name,
+                identity,
             ))
         }
         Some(ResolvedRelation::View(slot)) => {
+            let identity =
+                storage.capture_stored_query_relation(ResolvedRelation::View(slot), txid)?;
             let definition = storage.view(slot);
             Some((
                 DependencyClass::View,
                 slot,
                 definition.schema,
                 definition.name,
+                identity,
             ))
         }
         Some(ResolvedRelation::Catalog) | None => None,
@@ -459,7 +465,7 @@ fn record_routine_target(
     dependencies.push(StoredQueryDependency {
         class,
         slot: slot as u16,
-        identity: StoredDependencyIdentity::Name,
+        identity,
         referenced_columns: crate::storage::ColumnSet::EMPTY,
         schema,
         name: catalog_name,
@@ -2370,11 +2376,13 @@ fn collect_table_ref<'a>(
     {
         match context.resolve_relation(storage, txid, table.schema, table.table)? {
             Some(ResolvedRelation::Table(slot)) => {
+                let identity =
+                    storage.capture_stored_query_relation(ResolvedRelation::Table(slot), txid)?;
                 let definition = storage.table_def(slot, txid);
                 dependencies.push(StoredQueryDependency {
                     class: DependencyClass::Table,
                     slot: slot as u16,
-                    identity: StoredDependencyIdentity::Name,
+                    identity,
                     referenced_columns: crate::storage::ColumnSet::EMPTY,
                     schema: definition.schema,
                     name: definition.name,
@@ -2383,11 +2391,13 @@ fn collect_table_ref<'a>(
                 })?;
             }
             Some(ResolvedRelation::View(slot)) => {
+                let identity =
+                    storage.capture_stored_query_relation(ResolvedRelation::View(slot), txid)?;
                 let view = storage.view(slot);
                 dependencies.push(StoredQueryDependency {
                     class: DependencyClass::View,
                     slot: slot as u16,
-                    identity: StoredDependencyIdentity::Name,
+                    identity,
                     referenced_columns: crate::storage::ColumnSet::EMPTY,
                     schema: view.schema_for(txid),
                     name: view.name_for(txid),

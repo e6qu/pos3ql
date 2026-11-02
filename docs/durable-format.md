@@ -299,9 +299,16 @@ composite kind 143, and view kinds 144/145 for wide column sets and 16-bit
 counts. Readers retain the preceding publication, trigger, routine, composite,
 and view kinds; trigger payloads require the current ten-byte position prefix. Stored-query dependencies use marker `0xfd`, a length-prefixed
 identity and the complete column set. Type identities use `d:<slot>:<creation>`,
-`e:<slot>:<creation>` or `c:<slot>:<creation>`; other identities retain their
-decimal object identifiers or zero for name-based objects. Earlier dependency
-grammars are rejected. Table statistics use the
+`e:<slot>:<creation>` or `c:<slot>:<creation>`. Table and view identities use
+`t:<creation>` and `v:<creation>` with checked creation numbers from 1 through
+9,999,999; their runtime catalog slots are not durable. Startup finds that
+creation in the owning database, then binds a qualified runtime source. The
+recorded current names and original SQL spelling remain separate from the
+source lifetime, so a rename cannot redirect a query to a replacement object.
+Zero/name-only table or view keys, the wrong relation kind and invalid creation
+numbers are rejected. Other identities retain their decimal object identifiers
+or zero for the remaining name-based objects. Earlier dependency grammars are
+rejected. Table statistics use the
 v4 marker 252 for 16-bit counts and ordinals while retaining v3 marker 254.
 The current manifest text represents sparse column sets and streams wide
 composite fields into the configured manifest buffer.

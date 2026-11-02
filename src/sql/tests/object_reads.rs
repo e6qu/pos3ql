@@ -360,7 +360,7 @@ fn http_object_fixture_preserves_missing_keys_conditions_ranges_and_listing() {
     assert_eq!(metadata.etag, first);
     assert_eq!(client.body_bytes(), b"lpha");
     let range_error = crate::mem::guard::forbid_alloc(|| {
-        client.get("fixture/a &<", Some(ByteRange::new(5, 1).unwrap()))
+        client.get("fixture/a &<", Some(ByteRange::new(5, 5).unwrap()))
     })
     .unwrap_err();
     assert!(matches!(

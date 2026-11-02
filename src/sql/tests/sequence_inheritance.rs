@@ -2,13 +2,17 @@ use super::*;
 
 #[test]
 fn like_identity_copies_generator_options_and_serial_defaults_share_the_source() {
-    let (mut engine, mut budget) = test_engine();
-    let identity = run_with(
+    let config = test_config("like-sequence-ownership");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes((1 << 27) + (1 << 20)));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session =
+        ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, 32 << 20);
+    let identity = session.execute(
         &mut engine,
-        &mut budget,
         "CREATE TABLE like_identity_source(id integer GENERATED ALWAYS AS IDENTITY \
            (START WITH 11 INCREMENT BY 3 CACHE 2 CYCLE MAXVALUE 100)); \
          INSERT INTO like_identity_source DEFAULT VALUES RETURNING id",
+        false,
     );
     assert!(error_sqlstates(&identity).is_empty());
     assert_eq!(data_rows(&identity), ["11"]);
@@ -23,9 +27,8 @@ fn like_identity_copies_generator_options_and_serial_defaults_share_the_source()
         "{}",
         String::from_utf8_lossy(&copied)
     );
-    let identity = run_with(
+    let identity = session.execute(
         &mut engine,
-        &mut budget,
         "CREATE TABLE like_identity_plain(LIKE like_identity_source INCLUDING DEFAULTS); \
          INSERT INTO like_identity_copy DEFAULT VALUES RETURNING id; \
          INSERT INTO like_identity_source DEFAULT VALUES RETURNING id; \
@@ -36,6 +39,7 @@ fn like_identity_copies_generator_options_and_serial_defaults_share_the_source()
          SELECT pg_get_serial_sequence('like_identity_source','id'), \
                 pg_get_serial_sequence('like_identity_copy','id'), \
                 pg_get_serial_sequence('like_identity_plain','id')",
+        false,
     );
     assert!(
         error_sqlstates(&identity).is_empty(),
@@ -54,43 +58,40 @@ fn like_identity_copies_generator_options_and_serial_defaults_share_the_source()
         ]
     );
     assert_eq!(
-        error_sqlstates(&run_with(
+        error_sqlstates(&session.execute(
             &mut engine,
-            &mut budget,
-            "INSERT INTO like_identity_plain DEFAULT VALUES"
+            "INSERT INTO like_identity_plain DEFAULT VALUES",
+            false
         )),
         ["23502"]
     );
     assert!(
-        error_sqlstates(&run_with(
+        error_sqlstates(&session.execute(
             &mut engine,
-            &mut budget,
-            "CREATE TABLE like_identity_child() INHERITS(like_identity_source)"
+            "CREATE TABLE like_identity_child() INHERITS(like_identity_source)",
+            false
         ))
         .is_empty()
     );
     assert_eq!(
-        error_sqlstates(&run_with(
+        error_sqlstates(&session.execute(
             &mut engine,
-            &mut budget,
-            "INSERT INTO like_identity_child DEFAULT VALUES"
+            "INSERT INTO like_identity_child DEFAULT VALUES",
+            false
         )),
         ["23502"]
     );
     assert_eq!(
-        data_rows(&run_with(
+        data_rows(&session.execute(
             &mut engine,
-            &mut budget,
             "INSERT INTO like_identity_child(id) VALUES(101) RETURNING id; \
          SELECT attidentity::text FROM pg_attribute WHERE attrelid='like_identity_child'::regclass \
-           AND attname='id'; DROP TABLE like_identity_child"
+           AND attname='id'; DROP TABLE like_identity_child",
+            false
         )),
         ["101", ""]
     );
-    let serial = run_with(
-        &mut engine,
-        &mut budget,
-        "CREATE TABLE like_serial_source(id serial); \
+    let serial = session.execute(&mut engine, "CREATE TABLE like_serial_source(id serial); \
          CREATE TABLE like_serial_defaults(LIKE like_serial_source INCLUDING DEFAULTS); \
          CREATE TABLE like_serial_all(LIKE like_serial_source INCLUDING ALL); \
          CREATE TABLE like_serial_identity(LIKE like_serial_source INCLUDING IDENTITY); \
@@ -111,8 +112,7 @@ fn like_identity_copies_generator_options_and_serial_defaults_share_the_source()
              AND dependency.refobjsubid=1 AND relation.relname IN \
              ('like_identity_source','like_identity_copy','like_serial_source', \
               'like_serial_defaults','like_serial_all','like_serial_identity','like_serial_child') \
-           ORDER BY relation.relname",
-    );
+           ORDER BY relation.relname", false);
     assert!(
         error_sqlstates(&serial).is_empty(),
         "{}",
@@ -132,10 +132,10 @@ fn like_identity_copies_generator_options_and_serial_defaults_share_the_source()
         ]
     );
     assert_eq!(
-        error_sqlstates(&run_with(
+        error_sqlstates(&session.execute(
             &mut engine,
-            &mut budget,
-            "INSERT INTO like_serial_identity DEFAULT VALUES"
+            "INSERT INTO like_serial_identity DEFAULT VALUES",
+            false
         )),
         ["23502"]
     );
@@ -386,12 +386,12 @@ fn partition_identity_modes_follow_the_root_through_rollback_and_cold_recovery()
         let mut config = test_config(&format!("partition-identity-mode-{mode:?}"));
         config.transaction_mode = mode;
         config.object_store_on = true;
-        config.object_store_sim = true;
         config.wal_upload = false;
         config.wal_upload_sync = false;
         config.object_store_bucket =
             format!("partition-identity-mode-{mode:?}-{}", std::process::id());
         crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        let server = object_reads::HttpObjectServer::start(&mut config);
         let mut budget = test_engine_budget(&config, 1 << 29);
         let mut engine = Engine::new(&config, &mut budget).unwrap();
         let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
@@ -523,6 +523,7 @@ fn partition_identity_modes_follow_the_root_through_rollback_and_cold_recovery()
         drop(session);
         drop(engine);
         std::fs::remove_dir_all(&config.data_dir).unwrap();
+        drop(server);
         crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     }
 }

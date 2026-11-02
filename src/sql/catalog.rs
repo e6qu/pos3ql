@@ -10199,7 +10199,7 @@ pub(crate) fn table_row_type_oid(storage: &Storage, slot: usize, array: bool) ->
 }
 
 pub(crate) fn view_row_type_oid(storage: &Storage, slot: usize, array: bool) -> i32 {
-    crate::storage::RelationIdentity::parse(storage.view(slot).created_at)
+    crate::storage::RelationIdentity::parse(storage.view_catalog_identity(slot).created_at())
         .expect("admitted view has a durable relation identity")
         .companion_oid(if array {
             FIRST_VIEW_COMPOSITE_ARRAY_TYPE_OID
@@ -11424,7 +11424,7 @@ pub(crate) fn sequence_state_by_oid(storage: &Storage, oid: i32, txid: u32) -> O
 
 /// A view replacement preserves identity; drop and create reserve a new one.
 pub(crate) fn view_oid(storage: &Storage, slot: usize) -> i32 {
-    crate::storage::RelationIdentity::parse(storage.view(slot).created_at)
+    crate::storage::RelationIdentity::parse(storage.view_catalog_identity(slot).created_at())
         .expect("admitted relation has a durable identity")
         .oid()
 }
@@ -11608,9 +11608,7 @@ pub(crate) fn extended_statistics_expressions_by_oid<'a>(
 }
 
 pub(crate) fn named_composite_relation_oid(storage: &Storage, slot: usize) -> i32 {
-    crate::storage::RelationIdentity::parse(storage.composite(slot).created_at)
-        .expect("admitted relation has a durable identity")
-        .oid()
+    storage.composite_relation_identity(slot).oid()
 }
 
 fn composite_type_oid(storage: &Storage, schema: &str, name: &str, txid: u32) -> Option<i32> {
@@ -12346,14 +12344,11 @@ pub fn relname_text<'a>(
         let sequence = storage.sequence_for(slot, txid);
         return reference(sequence.schema.as_str(), sequence.name.as_str());
     }
-    if let Some(slot) = view_slot_by_oid(storage, txid, oid) {
-        let view = storage.view(slot);
-        return reference(view.schema_for(txid).as_str(), view.name_for(txid).as_str());
+    if let Some((schema, name)) = storage.view_relation_name(oid, txid) {
+        return reference(schema.as_str(), name.as_str());
     }
-    for (slot, composite) in storage.composites_with_slots_visible_to(txid) {
-        if named_composite_relation_oid(storage, slot) == oid {
-            return reference(composite.schema.as_str(), composite.name.as_str());
-        }
+    if let Some((schema, name)) = storage.composite_relation_name(oid, txid) {
+        return reference(schema.as_str(), name.as_str());
     }
     // Other relation families were resolved above. Index names are copied
     // directly, without constructing catalog rows.
@@ -12569,9 +12564,7 @@ pub fn relation_oid_is_visible(storage: &Storage, txid: u32, oid: i32) -> bool {
         })
         || (0..storage.view_count())
             .any(|slot| storage.view_slot_visible_to(slot, txid) && view_oid(storage, slot) == oid)
-        || storage
-            .composites_with_slots_visible_to(txid)
-            .any(|(slot, _)| named_composite_relation_oid(storage, slot) == oid)
+        || storage.composite_relation_name(oid, txid).is_some()
 }
 
 pub(crate) fn relation_oid_visibility(storage: &Storage, txid: u32, oid: i32) -> Option<bool> {
@@ -12597,24 +12590,11 @@ pub(crate) fn relation_oid_visibility(storage: &Storage, txid: u32, oid: i32) ->
             );
         }
     }
-    for slot in 0..storage.view_count() {
-        if storage.view_slot_visible_to(slot, txid) && view_oid(storage, slot) == oid {
-            return Some(
-                relation_oid_for_name(
-                    storage,
-                    txid,
-                    None,
-                    storage.view(slot).name_for(txid).as_str(),
-                ) == Some(oid),
-            );
-        }
+    if let Some((_, name)) = storage.view_relation_name(oid, txid) {
+        return Some(relation_oid_for_name(storage, txid, None, name.as_str()) == Some(oid));
     }
-    for (slot, composite) in storage.composites_with_slots_visible_to(txid) {
-        if named_composite_relation_oid(storage, slot) == oid {
-            return Some(
-                relation_oid_for_name(storage, txid, None, composite.name.as_str()) == Some(oid),
-            );
-        }
+    if let Some((_, name)) = storage.composite_relation_name(oid, txid) {
+        return Some(relation_oid_for_name(storage, txid, None, name.as_str()) == Some(oid));
     }
     None
 }
@@ -22295,6 +22275,8 @@ fn pg_depend<'a>(
             match dependency.identity {
                 crate::storage::StoredDependencyIdentity::RoutineOid(oid) => oid,
                 crate::storage::StoredDependencyIdentity::Name
+                | crate::storage::StoredDependencyIdentity::Table(_)
+                | crate::storage::StoredDependencyIdentity::View(_)
                 | crate::storage::StoredDependencyIdentity::OperatorOid(_)
                 | crate::storage::StoredDependencyIdentity::Type(_)
                 | crate::storage::StoredDependencyIdentity::Collation(_)
@@ -22308,6 +22290,8 @@ fn pg_depend<'a>(
             match dependency.identity {
                 crate::storage::StoredDependencyIdentity::OperatorOid(oid) => oid,
                 crate::storage::StoredDependencyIdentity::Name
+                | crate::storage::StoredDependencyIdentity::Table(_)
+                | crate::storage::StoredDependencyIdentity::View(_)
                 | crate::storage::StoredDependencyIdentity::RoutineOid(_)
                 | crate::storage::StoredDependencyIdentity::Type(_)
                 | crate::storage::StoredDependencyIdentity::Collation(_)

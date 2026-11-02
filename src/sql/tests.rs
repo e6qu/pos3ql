@@ -7,6 +7,7 @@
 use super::*;
 use crate::mem::mutex::Mutex;
 
+mod catalog_identity_lookup;
 mod client_catalog;
 mod cursor_execution;
 mod foreign_parent_admission;
@@ -20,6 +21,7 @@ mod row_layout;
 mod sequence_inheritance;
 mod shared_row_capacity;
 mod shared_row_work;
+mod stored_relation_sources;
 mod table_metadata_capacity;
 mod table_publication;
 mod transaction_publication;
@@ -70636,52 +70638,57 @@ fn reindex_rebuilds_named_index_and_table_cache() {
 
 #[test]
 fn reindex_keeps_committed_cache_ownership_and_private_shape_undo() {
-    let (mut engine, mut budget) = test_engine();
-    let setup = run_with(
+    let config = test_config("reindex-cache-ownership");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    let setup = session.success(
         &mut engine,
-        &mut budget,
         "CREATE TABLE reindex_owners(id integer PRIMARY KEY, value text); \
          INSERT INTO reindex_owners VALUES(1,'one'),(2,'two')",
+        true,
     );
     assert!(error_sqlstates(&setup).is_empty());
     let table = engine
         .storage
         .find_table("public", "reindex_owners")
         .unwrap();
-    let pending_rows = run_with(
+    let pending_rows = session.success(
         &mut engine,
-        &mut budget,
         "BEGIN; UPDATE reindex_owners SET id=9 WHERE id=1; \
          REINDEX TABLE reindex_owners; SELECT id FROM reindex_owners ORDER BY id",
+        true,
     );
     assert!(error_sqlstates(&pending_rows).is_empty());
     assert_eq!(data_rows(&pending_rows), ["2", "9"]);
     assert!(engine.storage.value_binding_is_committed(table, 0));
-    let rollback = run_with(
+    let rollback = session.success(
         &mut engine,
-        &mut budget,
         "ROLLBACK; SELECT id FROM reindex_owners WHERE id=1; \
          SELECT id FROM reindex_owners WHERE id=9",
+        true,
     );
     assert!(error_sqlstates(&rollback).is_empty());
     assert_eq!(data_rows(&rollback), ["1"]);
     assert!(engine.storage.value_binding_is_committed(table, 0));
-    let pending_shape = run_with(
+    let pending_shape = session.success(
         &mut engine,
-        &mut budget,
         "BEGIN; ALTER TABLE reindex_owners RENAME COLUMN value TO renamed; \
-         REINDEX TABLE reindex_owners; SELECT renamed FROM reindex_owners WHERE id=1",
+         ALTER TABLE reindex_owners ALTER COLUMN id TYPE bigint; \
+         REINDEX TABLE reindex_owners; \
+         SELECT renamed, pg_typeof(id)::text FROM reindex_owners WHERE id=1",
+        true,
     );
     assert!(error_sqlstates(&pending_shape).is_empty());
-    assert_eq!(data_rows(&pending_shape), ["one"]);
+    assert_eq!(data_rows(&pending_shape), ["one|bigint"]);
     assert!(!engine.storage.value_binding_is_committed(table, 0));
-    let rollback = run_with(
+    let rollback = session.success(
         &mut engine,
-        &mut budget,
-        "ROLLBACK; SELECT value FROM reindex_owners WHERE id=1",
+        "ROLLBACK; SELECT value, pg_typeof(id)::text FROM reindex_owners WHERE id=1",
+        true,
     );
     assert!(error_sqlstates(&rollback).is_empty());
-    assert_eq!(data_rows(&rollback), ["one"]);
+    assert_eq!(data_rows(&rollback), ["one|integer"]);
     assert!(engine.storage.value_binding_is_committed(table, 0));
 }
 
@@ -70715,19 +70722,16 @@ fn reindex_validates_own_deferred_keys_only_for_selected_indexes() {
     assert_eq!(data_rows(&other_unique), ["10", "20"]);
     assert!(error_sqlstates(&run_with(&mut engine, &mut budget, "ROLLBACK")).is_empty());
     for target in [
-        "REINDEX TABLE reindex_deferred",
-        "REINDEX INDEX reindex_deferred_id_key",
+        "BEGIN; INSERT INTO reindex_deferred VALUES(1,10),(1,20); REINDEX TABLE reindex_deferred",
+        "BEGIN; INSERT INTO reindex_deferred VALUES(1,10),(1,20); REINDEX INDEX reindex_deferred_id_key",
     ] {
-        assert!(
-            error_sqlstates(&run_with(
-                &mut engine,
-                &mut budget,
-                "BEGIN; INSERT INTO reindex_deferred VALUES(1,10),(1,20)",
-            ))
-            .is_empty()
-        );
         let all = run_with(&mut engine, &mut budget, target);
-        assert_eq!(error_sqlstates(&all), ["23505"]);
+        assert_eq!(
+            error_sqlstates(&all),
+            ["23505"],
+            "{target}: {}",
+            String::from_utf8_lossy(&all)
+        );
         assert!(error_sqlstates(&run_with(&mut engine, &mut budget, "ROLLBACK")).is_empty());
     }
     assert_eq!(
@@ -70748,20 +70752,15 @@ fn reindex_validates_own_deferred_keys_only_for_selected_indexes() {
         .is_empty()
     );
     for target in [
-        "REINDEX TABLE reindex_excluded",
-        "REINDEX INDEX reindex_excluded_key",
+        "BEGIN; INSERT INTO reindex_excluded VALUES('[1,4)'),('[3,6)'); REINDEX TABLE reindex_excluded",
+        "BEGIN; INSERT INTO reindex_excluded VALUES('[1,4)'),('[3,6)'); REINDEX INDEX reindex_excluded_key",
     ] {
-        assert!(
-            error_sqlstates(&run_with(
-                &mut engine,
-                &mut budget,
-                "BEGIN; INSERT INTO reindex_excluded VALUES('[1,4)'),('[3,6)')",
-            ))
-            .is_empty()
-        );
+        let output = run_with(&mut engine, &mut budget, target);
         assert_eq!(
-            error_sqlstates(&run_with(&mut engine, &mut budget, target)),
-            ["23P01"]
+            error_sqlstates(&output),
+            ["23P01"],
+            "{target}: {}",
+            String::from_utf8_lossy(&output)
         );
         assert!(error_sqlstates(&run_with(&mut engine, &mut budget, "ROLLBACK")).is_empty());
     }
@@ -75348,7 +75347,11 @@ fn database_template_catalogs_diverge_and_survive_object_cold_recovery() {
         &mut budget,
         "ALTER TABLE template_app.items RENAME TO cloned_items",
     );
-    assert!(!String::from_utf8_lossy(&output).contains("ERROR"));
+    assert!(
+        error_sqlstates(&output).is_empty(),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
     assert_eq!(
         engine.storage.table_def(cloned_table, 0).name.as_str(),
         "cloned_items"

@@ -137,8 +137,8 @@ impl MatviewPopulationUndo {
 impl Storage {
     pub(crate) fn view_catalog_identity(&self, slot: usize) -> ViewCatalogIdentity {
         let catalog = self.view_rule_catalog();
-        let view = catalog.views[slot].clone();
-        let rule = catalog.rules[usize::from(view.return_rule)];
+        let view = &catalog.views[slot];
+        let rule = &catalog.rules[usize::from(view.return_rule)];
         ViewCatalogIdentity::new(
             slot as u16,
             view.created_at,

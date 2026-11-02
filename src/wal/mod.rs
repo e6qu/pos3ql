@@ -13743,7 +13743,8 @@ mod tests {
         dependencies
             .serialized_push(SerializedStoredQueryDependency {
                 class: DependencyClass::Table,
-                identity: StoredDependencyIdentity::Name,
+                identity: StoredDependencyIdentity::from_storage(DependencyClass::Table, "t:31")
+                    .unwrap(),
                 schema: SqlName::parse("public").unwrap(),
                 name: SqlName::parse("items").unwrap(),
                 referenced_schema: SqlName::parse("").unwrap(),
@@ -13778,6 +13779,10 @@ mod tests {
             WalStoredQueryDependencies::Captured(dependencies.view()).encoded_len()
         );
         for (class, key) in [
+            (DependencyClass::Table, "t:41"),
+            (DependencyClass::View, "v:42"),
+            (DependencyClass::Table, "t:9999999"),
+            (DependencyClass::View, "v:9999999"),
             (DependencyClass::Domain, "d:1:41"),
             (DependencyClass::Enum, "e:2:42"),
             (DependencyClass::Composite, "c:3:43"),
@@ -13808,6 +13813,52 @@ mod tests {
             wrong_kind[4] = b'x';
             assert!(!validate_stored_query_dependencies(&wrong_kind));
             assert!(StoredDependencyIdentity::from_storage(class, "0").is_none());
+        }
+    }
+
+    #[test]
+    fn stored_relation_dependency_wal_rejects_missing_or_wrong_lifetimes() {
+        let mut budget = crate::mem::budget::Budget::new(1024);
+        let mut payload =
+            FixedBuf::new(&mut budget, "relation dependency validation", 1024).unwrap();
+        for (class, key) in [
+            (DependencyClass::Table, "0"),
+            (DependencyClass::View, "0"),
+            (DependencyClass::Table, "t:0"),
+            (DependencyClass::View, "v:0"),
+            (DependencyClass::Table, "v:31"),
+            (DependencyClass::View, "t:31"),
+            (DependencyClass::Table, "t:10000000"),
+            (DependencyClass::View, "v:18446744073709551616"),
+            (DependencyClass::Table, "t:-1"),
+            (DependencyClass::View, "v:"),
+            (DependencyClass::Table, "t:1:31"),
+        ] {
+            let encode = |payload: &mut FixedBuf, key: &str| {
+                payload.clear();
+                assert!(payload.append(&[0xfd, 1, class as u8]));
+                assert!(append_stored_dependency_name(payload, key));
+                assert!(append_column_set(payload, ColumnSet::EMPTY));
+                for name in ["public", "items", "", "items"] {
+                    assert!(append_stored_dependency_name(payload, name));
+                }
+            };
+            encode(
+                &mut payload,
+                if class == DependencyClass::Table {
+                    "t:31"
+                } else {
+                    "v:31"
+                },
+            );
+            assert!(validate_stored_query_dependencies(payload.readable()));
+            encode(&mut payload, key);
+            assert!(
+                !validate_stored_query_dependencies(payload.readable()),
+                "{class:?} {key}"
+            );
+            assert!(decode_stored_query_dependencies(payload.readable()).is_none());
+            assert!(StoredDependencyIdentity::from_storage(class, key).is_none());
         }
     }
 

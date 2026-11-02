@@ -18626,7 +18626,14 @@ fn load_subscription(storage: &mut Storage, line: &str) -> Result<(), Checkpoint
                 error.message.as_str()
             ))
         })?;
-    storage.restore_subscription_owner(slot, owner);
+    storage
+        .restore_subscription_owner(slot, owner, 0)
+        .map_err(|error| {
+            CheckpointSetupError::ObjectStore(format!(
+                "manifest subscription owner rejected: {}",
+                error.message.as_str()
+            ))
+        })?;
     storage.commit_subscription_create(slot);
     storage
         .restore_subscription_stream_identity(slot, created_at, definition_generation)

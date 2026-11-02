@@ -1693,7 +1693,7 @@ impl<'d> QueryScope<'d> {
         &self,
         storage: &Storage,
         arena: &Arena,
-        expression: &Expr<'d>,
+        expression: &Expr<'_>,
     ) -> Result<crate::sql::ast::Collation, SqlError> {
         let catalog = super::storage_catalog(storage, arena, self.txid);
         crate::sql::eval::resolved_expression_collation(
@@ -1707,7 +1707,7 @@ impl<'d> QueryScope<'d> {
         &self,
         storage: &Storage,
         arena: &Arena,
-        expression: &Expr<'d>,
+        expression: &Expr<'_>,
     ) -> Result<
         (
             crate::sql::ast::Collation,

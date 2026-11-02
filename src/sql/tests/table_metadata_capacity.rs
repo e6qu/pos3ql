@@ -437,7 +437,7 @@ fn prepared_resolution_installs_admitted_metadata_with_no_free_lease() {
         let mut held: [Option<crate::mem::lease_pool::MutableSlice<u8>>; 256] =
             core::array::from_fn(|_| None);
         let mut count = 0;
-        while let Ok(lease) = engine.storage.metadata_pool.lease::<u8>(64) {
+        while let Ok(lease) = engine.storage.metadata_pool_for_tests().lease::<u8>(64) {
             held[count] = Some(lease);
             count += 1;
         }

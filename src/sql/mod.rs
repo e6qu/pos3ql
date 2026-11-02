@@ -21554,13 +21554,30 @@ fn replay_transaction_batches(
                     prepared.slot_mut(slot).push_record(*record_lsn, raw)?;
                 }
                 let mut table_rewrite = None;
+                let mut foreign_restored = false;
                 for (record_lsn, raw) in &batch[..batch.len() - 1] {
-                    match crate::wal::decode_record(raw).ok_or_else(|| {
+                    let operation = crate::wal::decode_record(raw).ok_or_else(|| {
                         sql_err!(
                             sqlstate::DATA_EXCEPTION,
                             "prepared transaction WAL is corrupt"
                         )
-                    })? {
+                    })?;
+                    if prepared_foreign_replay::is_foreign_record(&operation) {
+                        if !foreign_restored {
+                            arena.reset();
+                            let result = prepared_foreign_replay::stage_batch(
+                                storage,
+                                &mut prepared.slot_mut(slot).transaction,
+                                &batch[..batch.len() - 1],
+                                arena,
+                            );
+                            arena.reset();
+                            result?;
+                            foreign_restored = true;
+                        }
+                        continue;
+                    }
+                    match operation {
                         WalOp::CreateSchema { identity, name } => {
                             let selected = storage.restore_schema(
                                 identity,
@@ -22334,26 +22351,18 @@ fn replay_transaction_batches(
                         TransactionIdentityRelease::Immediate,
                     );
                     if commit && *lsn > apply_floor {
-                        prepared.slot(slot).visit_records(|_, raw| {
-                            let operation = crate::wal::decode_record(raw).ok_or_else(|| {
-                                sql_err!(
-                                    sqlstate::DATA_EXCEPTION,
-                                    "prepared transaction WAL is corrupt"
-                                )
-                            })?;
-                            apply_wal_op(storage, *lsn, operation, arena)
+                        let mut records = Vec::new();
+                        prepared.slot(slot).visit_records(|position, raw| {
+                            records.push((position, raw));
+                            Ok(())
                         })?;
+                        apply_committed_batch(storage, &records, Some(*lsn), arena)?;
                     }
                     prepared.release(slot);
                     storage.set_lsn(*lsn);
                 } else {
                     if *lsn > apply_floor {
-                        for (record_lsn, raw) in &batch {
-                            let operation = crate::wal::decode_record(raw).ok_or_else(|| {
-                                sql_err!(sqlstate::DATA_EXCEPTION, "transaction WAL is corrupt")
-                            })?;
-                            apply_wal_op(storage, *record_lsn, operation, arena)?;
-                        }
+                        apply_committed_batch(storage, &batch, None, arena)?;
                     }
                 }
             }
@@ -22366,6 +22375,34 @@ fn replay_transaction_batches(
             sqlstate::DATA_EXCEPTION,
             "recovery input ends inside a transaction"
         ));
+    }
+    Ok(())
+}
+
+fn apply_committed_batch(
+    storage: &mut Storage,
+    batch: &[(u64, &[u8])],
+    resolved_at: Option<u64>,
+    arena: &mut Arena,
+) -> Result<(), SqlError> {
+    let mut foreign_restored = false;
+    for (position, record) in batch {
+        let operation = crate::wal::decode_record(record)
+            .ok_or_else(|| sql_err!(sqlstate::DATA_EXCEPTION, "transaction WAL is corrupt"))?;
+        let position = resolved_at.unwrap_or(*position);
+        if prepared_foreign_replay::is_foreign_record(&operation) {
+            if !foreign_restored {
+                arena.reset();
+                let result =
+                    prepared_foreign_replay::restore_committed_batch(storage, batch, arena);
+                arena.reset();
+                result?;
+                foreign_restored = true;
+            }
+            storage.set_lsn(position);
+        } else {
+            apply_wal_op(storage, position, operation, arena)?;
+        }
     }
     Ok(())
 }
@@ -23638,7 +23675,7 @@ fn apply_wal_op(
                 0,
             )?;
             storage.restore_subscription_stream_identity(slot, created_at, 1)?;
-            storage.restore_subscription_owner(slot, owner);
+            storage.restore_subscription_owner(slot, owner, 0)?;
             storage.commit_subscription_create(slot);
         }
         WalOp::DropSubscription { name } => {
@@ -23865,7 +23902,7 @@ fn apply_wal_op(
                     name
                 )
             })?;
-            storage.restore_subscription_owner(slot, owner);
+            storage.restore_subscription_owner(slot, owner, 0)?;
         }
         WalOp::RenameSubscription { name, new_name } => {
             let (slot, _) = storage.subscription(name, 0).ok_or_else(|| {

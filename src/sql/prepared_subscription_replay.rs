@@ -53,7 +53,7 @@ pub(super) fn stage_subscription_record(
             let result = storage
                 .restore_subscription_stream_identity(slot, *created_at, 1)
                 .and_then(|()| {
-                    storage.restore_subscription_owner(slot, *owner);
+                    storage.restore_subscription_owner(slot, *owner, txid)?;
                     transaction.record_ddl(DdlUndo::SubscriptionCreated(slot as u32))
                 });
             if result.is_err() {

@@ -222,7 +222,7 @@ fn retained_bound(expression: &Expr<'_>, catalog: &dyn super::super::eval::Catal
 
 fn validate_statement_casts(
     expression: &Expr<'_>,
-    columns: &CatalogScopeCols<'_, '_, '_>,
+    columns: &CatalogScopeCols<'_, '_, '_, '_>,
     safe: &mut bool,
 ) -> Result<(), SqlError> {
     if let Expr::Cast {
@@ -268,7 +268,7 @@ impl Drop for DefaultPath<'_> {
 fn bind_expression<'a>(
     expression: &'a Expr<'a>,
     arena: &'a Arena,
-    columns: Option<&CatalogScopeCols<'_, 'a, '_>>,
+    columns: Option<&CatalogScopeCols<'_, 'a, '_, '_>>,
     defaults: Option<&DefaultExpansion<'_>>,
 ) -> Result<&'a Expr<'a>, SqlError> {
     let full = |error: crate::mem::arena::ArenaFull| {
@@ -524,7 +524,7 @@ fn bind_defaults<'a>(
     arguments: &'a [&'a Expr<'a>],
     mapping: &[u8; crate::storage::MAX_ROUTINE_ARGUMENTS],
     variadic: bool,
-    columns: &CatalogScopeCols<'_, 'a, '_>,
+    columns: &CatalogScopeCols<'_, 'a, '_, '_>,
     arena: &'a Arena,
     parent: Option<&DefaultExpansion<'_>>,
 ) -> Result<(&'a [&'a Expr<'a>], bool, bool), SqlError> {

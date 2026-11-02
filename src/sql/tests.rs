@@ -9,6 +9,7 @@ use crate::mem::mutex::Mutex;
 
 mod client_catalog;
 mod cursor_execution;
+mod foreign_parent_admission;
 mod key_preparation;
 mod object_reads;
 mod prepared_object_capacity;

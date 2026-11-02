@@ -11,6 +11,7 @@ pub(crate) use catalog_history::{
     CatalogRowImage, HistoricalCatalogRow,
 };
 mod catalog_identities;
+mod catalog_keys;
 mod catalog_sources;
 pub(crate) use catalog_identities::{CatalogCreation, CatalogIdentity};
 mod default_acls;
@@ -13404,6 +13405,14 @@ pub struct RoleDef {
 }
 
 impl RoleDef {
+    fn name_blocker(&self, name: SqlName, transaction: u32) -> Option<u32> {
+        self.pending
+            .filter(|pending| {
+                pending.txid != transaction && (self.name == name || pending.name == name)
+            })
+            .map(|pending| pending.txid)
+    }
+
     pub(crate) fn oid(&self) -> RoleOid {
         self.lifetime
             .expect("a selected role has a durable identity")
@@ -18555,7 +18564,7 @@ impl Storage {
                     self.set_spill_list(slot, &[]);
                     let publication = self.tables[slot].publication();
                     for enforcer in publication.enforcers.iter().flatten() {
-                        enforcer.cache.index().clear();
+                        enforcer.cache.write().clear();
                     }
                     drop(publication);
                     self.mark_value_bindings_rebuild_at(slot, self.lsn());
@@ -18722,6 +18731,22 @@ impl Storage {
 
     fn foreign_catalog(&self) -> MutexGuard<'_, foreign::ForeignCatalog> {
         self.foreign.lock().expect("foreign catalog lock poisoned")
+    }
+
+    fn foreign_catalog_with_parent(
+        &self,
+        class: foreign::ForeignObjectClass,
+        parent: usize,
+        transaction: u32,
+    ) -> Result<MutexGuard<'_, foreign::ForeignCatalog>, SqlError> {
+        let catalog = self.foreign_catalog();
+        if let Some(owner) =
+            catalog.parent_reference_owner(class, parent, current_database(), transaction)?
+        {
+            drop(catalog);
+            return Err(self.catalog_ddl_wait_error(transaction, owner, "foreign catalog parent"));
+        }
+        Ok(catalog)
     }
 
     pub(crate) fn foreign_wrapper(
@@ -19166,16 +19191,17 @@ impl Storage {
         txid: u32,
     ) -> Result<usize, SqlError> {
         let ownership = self.initial_ownership(txid)?;
+        let mut catalog = self.foreign_catalog_with_parent(
+            foreign::ForeignObjectClass::Wrapper,
+            usize::from(definition.wrapper),
+            txid,
+        )?;
         let created_at = self
             .catalog_sequence
             .next_bounded(MAX_CATALOG_CREATION, "catalog object")?;
-        let slot = self.foreign_catalog().create_server(
-            current_database(),
-            created_at,
-            definition,
-            ownership,
-            txid,
-        )?;
+        let slot =
+            catalog.create_server(current_database(), created_at, definition, ownership, txid)?;
+        drop(catalog);
         self.clear_object_acl_entries(AccessObject {
             class: AccessClass::ForeignServer,
             slot: slot as u16,
@@ -19191,11 +19217,15 @@ impl Storage {
         if let foreign::ForeignMappingUser::Role(role) = definition.user {
             self.role_reference_ready(usize::from(role), txid)?;
         }
+        let mut catalog = self.foreign_catalog_with_parent(
+            foreign::ForeignObjectClass::Server,
+            usize::from(definition.server),
+            txid,
+        )?;
         let created_at = self
             .catalog_sequence
             .next_bounded(MAX_CATALOG_CREATION, "catalog object")?;
-        self.foreign_catalog()
-            .create_mapping(current_database(), created_at, definition, txid)
+        catalog.create_mapping(current_database(), created_at, definition, txid)
     }
 
     pub(crate) fn create_foreign_table_binding(
@@ -19204,16 +19234,15 @@ impl Storage {
         txid: u32,
     ) -> Result<usize, SqlError> {
         let ownership = self.initial_ownership(txid)?;
+        let mut catalog = self.foreign_catalog_with_parent(
+            foreign::ForeignObjectClass::Server,
+            usize::from(definition.server),
+            txid,
+        )?;
         let created_at = self
             .catalog_sequence
             .next_bounded(MAX_CATALOG_CREATION, "catalog object")?;
-        self.foreign_catalog().create_table(
-            current_database(),
-            created_at,
-            definition,
-            ownership,
-            txid,
-        )
+        catalog.create_table(current_database(), created_at, definition, ownership, txid)
     }
 
     pub(crate) fn alter_foreign_wrapper(
@@ -19235,7 +19264,12 @@ impl Storage {
         txid: u32,
     ) -> Result<Option<foreign::PendingForeignDefinition<foreign::ForeignServerDefinition>>, SqlError>
     {
-        self.foreign_catalog().alter_server(slot, definition, txid)
+        self.foreign_catalog_with_parent(
+            foreign::ForeignObjectClass::Wrapper,
+            usize::from(definition.wrapper),
+            txid,
+        )?
+        .alter_server(slot, definition, txid)
     }
 
     pub(crate) fn alter_foreign_user_mapping(
@@ -19248,7 +19282,12 @@ impl Storage {
         if let foreign::ForeignMappingUser::Role(role) = definition.user {
             self.role_reference_ready(usize::from(role), txid)?;
         }
-        self.foreign_catalog().alter_mapping(slot, definition, txid)
+        self.foreign_catalog_with_parent(
+            foreign::ForeignObjectClass::Server,
+            usize::from(definition.server),
+            txid,
+        )?
+        .alter_mapping(slot, definition, txid)
     }
 
     pub(crate) fn alter_foreign_table_binding(
@@ -19258,7 +19297,12 @@ impl Storage {
         txid: u32,
     ) -> Result<Option<foreign::PendingForeignDefinition<foreign::ForeignTableDefinition>>, SqlError>
     {
-        self.foreign_catalog().alter_table(slot, definition, txid)
+        self.foreign_catalog_with_parent(
+            foreign::ForeignObjectClass::Server,
+            usize::from(definition.server),
+            txid,
+        )?
+        .alter_table(slot, definition, txid)
     }
 
     pub(crate) fn foreign_catalog_commit_create(
@@ -25172,6 +25216,18 @@ impl Storage {
                 .large_objects
                 .lock()
                 .expect("large object catalog lock poisoned");
+            if let CatalogCreation::Restore(identity) = creation
+                && catalog.definitions.iter().any(|object| {
+                    object.database == database
+                        && object.ddl_state != CatalogDdlState::Absent
+                        && object.created_at == identity.created_at()
+                })
+            {
+                return Err(sql_err!(
+                    sqlstate::DATA_EXCEPTION,
+                    "large object creation identity is duplicated"
+                ));
+            }
             let (oid, allocated) = match requested {
                 Some(oid) => {
                     if catalog.definitions.iter().any(|object| {
@@ -28541,20 +28597,13 @@ impl Storage {
                 name.as_str()
             ));
         }
-        if let Some(owner) = catalog.roles.iter().find_map(|role| {
-            (role.name == name)
-                .then_some(role.pending)
-                .flatten()
-                .filter(|pending| pending.txid != txid)
-                .map(|pending| pending.txid)
-        }) {
+        if let Some(owner) = catalog
+            .roles
+            .iter()
+            .find_map(|role| role.name_blocker(name, txid))
+        {
             drop(catalog);
-            self.wait_for_transaction(txid, owner)?;
-            return Err(sql_err!(
-                sqlstate::INTERNAL_LOCK_WAIT,
-                "statement is waiting for concurrent DDL on role \"{}\"",
-                name.as_str()
-            ));
+            return Err(self.catalog_ddl_wait_error(txid, owner, name.as_str()));
         }
         let Some(slot) = catalog
             .roles
@@ -28638,6 +28687,14 @@ impl Storage {
                 "role \"{}\" already exists",
                 name.as_str()
             ));
+        }
+        if let Some(owner) = catalog.roles.iter().enumerate().find_map(|(other, role)| {
+            (other != slot)
+                .then(|| role.name_blocker(name, txid))
+                .flatten()
+        }) {
+            drop(catalog);
+            return Err(self.catalog_ddl_wait_error(txid, owner, name.as_str()));
         }
         if let Some(pending) = catalog.roles[slot].pending
             && pending.txid != txid
@@ -34940,7 +34997,7 @@ impl Storage {
         parent: usize,
         child: usize,
         bound: PartitionBound,
-        definition: &TableDef,
+        definition: &TableDefinition<impl DefinitionBacking>,
         values: &[crate::sql::types::Datum],
         txid: u32,
     ) -> Result<bool, SqlError> {
@@ -34958,7 +35015,7 @@ impl Storage {
         parent: usize,
         child: usize,
         bound: PartitionBound,
-        row: PartitionRow<'_, '_, StoredDefinition>,
+        row: PartitionRow<'_, '_, impl DefinitionBacking>,
         txid: u32,
     ) -> Result<bool, SqlError> {
         let keys = {
@@ -38913,6 +38970,11 @@ impl Storage {
         TableDefinitionImages::new(&self.table_definition_images)
     }
 
+    #[cfg(all(test, not(miri)))]
+    pub(crate) fn metadata_pool_for_tests(&self) -> &Arc<crate::mem::lease_pool::LeasePool> {
+        &self.metadata_pool
+    }
+
     pub fn has_pending_table_def(&self, index: usize, txid: u32) -> bool {
         self.tables[index].pending_definition_transaction() == Some(txid)
     }
@@ -40403,7 +40465,13 @@ impl Storage {
         Ok(())
     }
 
-    pub(crate) fn restore_subscription_owner(&mut self, slot: usize, owner: u16) {
+    pub(crate) fn restore_subscription_owner(
+        &mut self,
+        slot: usize,
+        owner: u16,
+        reference_transaction: u32,
+    ) -> Result<(), SqlError> {
+        self.role_reference_ready(usize::from(owner), reference_transaction)?;
         self.subscription_catalog
             .lock()
             .expect("subscription catalog lock poisoned")
@@ -40412,6 +40480,7 @@ impl Storage {
             owner,
             pending: None,
         };
+        Ok(())
     }
 
     pub(crate) fn set_subscription_owner(
@@ -43341,7 +43410,7 @@ impl Storage {
             catalog.pending_enum_members[previous as usize].depth + 1
         });
         let version = catalog.versions.next()?;
-        let previous = Some((
+        let previous_image = Some((
             prior.map_or(
                 catalog.enums[slot]
                     .member_image
@@ -43356,7 +43425,7 @@ impl Storage {
             EnumImageReservation::restore(
                 &self.enum_member_images,
                 members,
-                previous,
+                previous_image,
                 catalog.enums[slot].created_at,
             )?
         } else {
@@ -43364,7 +43433,7 @@ impl Storage {
                 &self.enum_member_images,
                 members,
                 &self.catalog_sequence,
-                previous,
+                previous_image,
             )?
         };
         let member_count = image.count();
@@ -51374,18 +51443,24 @@ impl Storage {
     }
 
     fn validate_cast_definition(&self, definition: CastDef, txid: u32) -> Result<(), SqlError> {
-        if self
-            .routine_type_oid(definition.source.ctype, definition.source.user_type, txid)
-            .is_none()
-            || self
-                .routine_type_oid(definition.target.ctype, definition.target.user_type, txid)
-                .is_none()
-        {
+        if definition.source == definition.target {
             return Err(sql_err!(
-                sqlstate::UNDEFINED_OBJECT,
-                "cast source or target type does not exist"
+                sqlstate::DUPLICATE_OBJECT,
+                "source data type and target data type are the same"
             ));
         }
+        let missing = || {
+            sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "cast source or target type does not exist"
+            )
+        };
+        let source_oid = self
+            .routine_type_oid(definition.source.ctype, definition.source.user_type, txid)
+            .ok_or_else(missing)?;
+        let target_oid = self
+            .routine_type_oid(definition.target.ctype, definition.target.user_type, txid)
+            .ok_or_else(missing)?;
         match definition.method {
             CastMethod::Binary
                 if !self.routine_results_binary_coercible(
@@ -51435,7 +51510,11 @@ impl Storage {
                 Ok(())
             }
             CastMethod::Binary | CastMethod::InOut => Ok(()),
+        }?;
+        if Self::builtin_cast_exists(source_oid, target_oid) {
+            return Err(sql_err!(sqlstate::DUPLICATE_OBJECT, "cast already exists"));
         }
+        Ok(())
     }
 
     pub(crate) fn routine_results_binary_coercible(
@@ -51595,12 +51674,6 @@ impl Storage {
     ) -> Result<usize, SqlError> {
         let source = self.bind_routine_result(source, txid)?;
         let target = self.bind_routine_result(target, txid)?;
-        if source == target {
-            return Err(sql_err!(
-                sqlstate::DUPLICATE_OBJECT,
-                "source data type and target data type are the same"
-            ));
-        }
         self.validate_cast_definition(
             CastDef {
                 database: current_database(),
@@ -51613,15 +51686,6 @@ impl Storage {
             },
             txid,
         )?;
-        let source_oid = self
-            .routine_type_oid(source.ctype, source.user_type, txid)
-            .expect("validated cast source type");
-        let target_oid = self
-            .routine_type_oid(target.ctype, target.user_type, txid)
-            .expect("validated cast target type");
-        if Self::builtin_cast_exists(source_oid, target_oid) {
-            return Err(sql_err!(sqlstate::DUPLICATE_OBJECT, "cast already exists"));
-        }
         let mut definition = CastDef {
             database: current_database(),
             created_at: 0,
@@ -51692,6 +51756,16 @@ impl Storage {
         let mut owners = self.catalog_type_owners(&self.casts);
         owners.bind_definition(&mut definition, 0)?;
         let casts = &mut owners.catalog;
+        if casts.iter().any(|candidate| {
+            candidate.database == current_database()
+                && candidate.ddl_state != CatalogDdlState::Absent
+                && candidate.created_at == identity.created_at()
+        }) {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "stored cast creation identity is duplicated"
+            ));
+        }
         if casts.iter().any(|candidate| {
             candidate.database == current_database()
                 && candidate.visible_to(0)
@@ -52073,6 +52147,12 @@ impl Storage {
                 definition.name.as_str()
             ));
         }
+        if let Some(owner) = catalog.collations.iter().find_map(|candidate| {
+            candidate.pending_key_owner(txid, |selected| selected.shares_catalog_key(definition))
+        }) {
+            drop(catalog);
+            return Err(self.catalog_ddl_wait_error(txid, owner, definition.name.as_str()));
+        }
         let slot = catalog
             .collations
             .iter()
@@ -52137,6 +52217,12 @@ impl Storage {
                 definition.destination.name()
             ));
         }
+        if let Some(owner) = catalog.conversions.iter().find_map(|candidate| {
+            candidate.pending_key_owner(txid, |selected| selected.shares_catalog_key(definition))
+        }) {
+            drop(catalog);
+            return Err(self.catalog_ddl_wait_error(txid, owner, definition.name.as_str()));
+        }
         let slot = catalog
             .conversions
             .iter()
@@ -52191,6 +52277,12 @@ impl Storage {
                 definition.kind().noun(),
                 definition.name().as_str()
             ));
+        }
+        if let Some(owner) = catalog.text_search_objects.iter().find_map(|candidate| {
+            candidate.pending_key_owner(txid, |selected| selected.shares_catalog_key(definition))
+        }) {
+            drop(catalog);
+            return Err(self.catalog_ddl_wait_error(txid, owner, definition.name().as_str()));
         }
         let slot = catalog
             .text_search_objects
@@ -52254,13 +52346,28 @@ impl Storage {
                 definition.kind().noun()
             ));
         }
+        if let Some(owner) =
+            catalog
+                .text_search_objects
+                .iter()
+                .enumerate()
+                .find_map(|(other, candidate)| {
+                    (other != slot)
+                        .then(|| {
+                            candidate.pending_key_owner(txid, |selected| {
+                                selected.shares_catalog_key(definition)
+                            })
+                        })
+                        .flatten()
+                })
+        {
+            drop(catalog);
+            return Err(self.catalog_ddl_wait_error(txid, owner, definition.name().as_str()));
+        }
         let prior = catalog.text_search_objects[slot].pending;
-        if prior.is_some_and(|pending| pending.txid != txid) {
-            return Err(sql_err!(
-                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
-                "{} is being altered by another transaction",
-                definition.kind().noun()
-            ));
+        if let Some(owner) = catalog.text_search_objects[slot].pending_key_owner(txid, |_| true) {
+            drop(catalog);
+            return Err(self.catalog_ddl_wait_error(txid, owner, definition.name().as_str()));
         }
         catalog.text_search_objects[slot].pending =
             Some(PendingTextSearchDefinition { txid, definition });
@@ -52519,12 +52626,27 @@ impl Storage {
                 "collation already exists"
             ));
         }
+        if let Some(owner) = catalog
+            .collations
+            .iter()
+            .enumerate()
+            .find_map(|(other, candidate)| {
+                (other != slot)
+                    .then(|| {
+                        candidate.pending_key_owner(txid, |selected| {
+                            selected.shares_catalog_key(definition)
+                        })
+                    })
+                    .flatten()
+            })
+        {
+            drop(catalog);
+            return Err(self.catalog_ddl_wait_error(txid, owner, definition.name.as_str()));
+        }
         let prior = catalog.collations[slot].pending;
-        if prior.is_some_and(|pending| pending.txid != txid) {
-            return Err(sql_err!(
-                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
-                "collation is being altered by another transaction"
-            ));
+        if let Some(owner) = catalog.collations[slot].pending_key_owner(txid, |_| true) {
+            drop(catalog);
+            return Err(self.catalog_ddl_wait_error(txid, owner, definition.name.as_str()));
         }
         catalog.collations[slot].pending = Some(PendingCollationDefinition { txid, definition });
         drop(catalog);
@@ -52568,12 +52690,49 @@ impl Storage {
                 "conversion already exists"
             ));
         }
-        let prior = catalog.conversions[slot].pending;
-        if prior.is_some_and(|pending| pending.txid != txid) {
+        if definition.default
+            && catalog
+                .conversions
+                .iter()
+                .enumerate()
+                .any(|(other, entry)| {
+                    let candidate = entry.definition_for(txid);
+                    other != slot
+                        && entry.database == current_database()
+                        && entry.visible_to(txid)
+                        && candidate.default
+                        && candidate.schema == definition.schema
+                        && candidate.source == definition.source
+                        && candidate.destination == definition.destination
+                })
+        {
             return Err(sql_err!(
-                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
-                "conversion is being altered by another transaction"
+                sqlstate::DUPLICATE_OBJECT,
+                "default conversion already exists"
             ));
+        }
+        if let Some(owner) =
+            catalog
+                .conversions
+                .iter()
+                .enumerate()
+                .find_map(|(other, candidate)| {
+                    (other != slot)
+                        .then(|| {
+                            candidate.pending_key_owner(txid, |selected| {
+                                selected.shares_catalog_key(definition)
+                            })
+                        })
+                        .flatten()
+                })
+        {
+            drop(catalog);
+            return Err(self.catalog_ddl_wait_error(txid, owner, definition.name.as_str()));
+        }
+        let prior = catalog.conversions[slot].pending;
+        if let Some(owner) = catalog.conversions[slot].pending_key_owner(txid, |_| true) {
+            drop(catalog);
+            return Err(self.catalog_ddl_wait_error(txid, owner, definition.name.as_str()));
         }
         catalog.conversions[slot].pending = Some(PendingConversionDefinition { txid, definition });
         drop(catalog);
@@ -53668,36 +53827,24 @@ impl Storage {
             .event_triggers
             .lock()
             .expect("event trigger catalog lock poisoned");
-        let same_name = |candidate: &EventTriggerDef| {
+        if event_triggers.iter().any(|candidate| {
             candidate.database == current_database()
-                && (candidate.definition.name == definition.name
-                    || candidate
-                        .pending
-                        .is_some_and(|pending| pending.definition.name == definition.name))
-        };
-        if let Some(blocker) = event_triggers.iter().find_map(|candidate| {
-            same_name(candidate)
-                .then(|| {
-                    candidate
-                        .pending
-                        .map(|pending| pending.txid)
-                        .or_else(|| candidate.ddl_state.pending_txid())
-                })
-                .flatten()
-                .filter(|owner| *owner != txid)
+                && candidate.visible_to(txid)
+                && candidate
+                    .definition_for(txid)
+                    .shares_catalog_key(definition)
         }) {
-            drop(event_triggers);
-            return Err(self.catalog_ddl_wait_error(txid, blocker, definition.name.as_str()));
-        }
-        if event_triggers
-            .iter()
-            .any(|candidate| same_name(candidate) && candidate.visible_to(txid))
-        {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_OBJECT,
                 "event trigger \"{}\" already exists",
                 definition.name.as_str()
             ));
+        }
+        if let Some(owner) = event_triggers.iter().find_map(|candidate| {
+            candidate.pending_key_owner(txid, |selected| selected.shares_catalog_key(definition))
+        }) {
+            drop(event_triggers);
+            return Err(self.catalog_ddl_wait_error(txid, owner, definition.name.as_str()));
         }
         let slot = event_triggers
             .iter()
@@ -53739,29 +53886,6 @@ impl Storage {
             .map(|pending| pending.txid)
             .or_else(|| event_triggers[slot].ddl_state.pending_txid())
             .filter(|owner| *owner != txid);
-        let name_blocker = event_triggers
-            .iter()
-            .enumerate()
-            .find_map(|(other, candidate)| {
-                (other != slot
-                    && candidate.database == current_database()
-                    && (candidate.definition.name == definition.name
-                        || candidate
-                            .pending
-                            .is_some_and(|pending| pending.definition.name == definition.name)))
-                .then(|| {
-                    candidate
-                        .pending
-                        .map(|pending| pending.txid)
-                        .or_else(|| candidate.ddl_state.pending_txid())
-                })
-                .flatten()
-                .filter(|owner| *owner != txid)
-            });
-        if let Some(blocker) = target_blocker.or(name_blocker) {
-            drop(event_triggers);
-            return Err(self.catalog_ddl_wait_error(txid, blocker, definition.name.as_str()));
-        }
         if event_triggers.iter().enumerate().any(|(other, candidate)| {
             other != slot
                 && candidate.database == current_database()
@@ -53773,6 +53897,22 @@ impl Storage {
                 "event trigger \"{}\" already exists",
                 definition.name.as_str()
             ));
+        }
+        let name_blocker = event_triggers
+            .iter()
+            .enumerate()
+            .find_map(|(other, candidate)| {
+                (other != slot)
+                    .then(|| {
+                        candidate.pending_key_owner(txid, |selected| {
+                            selected.shares_catalog_key(definition)
+                        })
+                    })
+                    .flatten()
+            });
+        if let Some(blocker) = target_blocker.or(name_blocker) {
+            drop(event_triggers);
+            return Err(self.catalog_ddl_wait_error(txid, blocker, definition.name.as_str()));
         }
         let prior = event_triggers[slot].pending;
         event_triggers[slot].pending = Some(PendingEventTriggerDefinition { txid, definition });
@@ -54318,9 +54458,6 @@ impl Storage {
         definition = self.bind_catalog_definition(definition, txid)?;
         self.require_schema_create(definition.schema.as_str(), txid)?;
         self.validate_operator_definition(definition, txid, None)?;
-        let created_at = self
-            .catalog_sequence
-            .next_bounded(MAX_CATALOG_CREATION, "catalog object")?;
         let mut owners = self.catalog_type_owners(&self.operator_catalog);
         owners.bind_definition(&mut definition, txid)?;
         let catalog = &mut owners.catalog;
@@ -54336,6 +54473,12 @@ impl Storage {
                 "operator already exists with the same argument types"
             ));
         }
+        if let Some(owner) = catalog.operators.iter().find_map(|candidate| {
+            candidate.pending_key_owner(txid, |selected| selected.shares_catalog_key(definition))
+        }) {
+            drop(owners);
+            return Err(self.catalog_ddl_wait_error(txid, owner, definition.name.as_str()));
+        }
         let Some(slot) = catalog
             .operators
             .iter()
@@ -54347,6 +54490,9 @@ impl Storage {
                 catalog.operators.len()
             ));
         };
+        let created_at = self
+            .catalog_sequence
+            .next_bounded(MAX_CATALOG_CREATION, "catalog object")?;
         catalog.operators[slot] = OperatorDef {
             database: current_database(),
             created_at,
@@ -54459,10 +54605,45 @@ impl Storage {
                 "operator changed before publication"
             ));
         }
-        let prior = catalog.operators[slot].pending;
-        if let Some(pending) = prior.filter(|pending| pending.txid != txid) {
+        if catalog
+            .operators
+            .iter()
+            .enumerate()
+            .any(|(other, candidate)| {
+                other != slot
+                    && candidate.database == current_database()
+                    && candidate.visible_to(txid)
+                    && candidate
+                        .definition_for(txid)
+                        .shares_catalog_key(definition)
+            })
+        {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_FUNCTION,
+                "operator already exists with the same argument types"
+            ));
+        }
+        if let Some(owner) = catalog
+            .operators
+            .iter()
+            .enumerate()
+            .find_map(|(other, candidate)| {
+                (other != slot)
+                    .then(|| {
+                        candidate.pending_key_owner(txid, |selected| {
+                            selected.shares_catalog_key(definition)
+                        })
+                    })
+                    .flatten()
+            })
+        {
             drop(owners);
-            return Err(self.catalog_ddl_wait_error(txid, pending.txid, definition.name.as_str()));
+            return Err(self.catalog_ddl_wait_error(txid, owner, definition.name.as_str()));
+        }
+        let prior = catalog.operators[slot].pending;
+        if let Some(owner) = catalog.operators[slot].pending_key_owner(txid, |_| true) {
+            drop(owners);
+            return Err(self.catalog_ddl_wait_error(txid, owner, definition.name.as_str()));
         }
         catalog.operators[slot].pending = Some(PendingOperatorDefinition { txid, definition });
         Ok(prior)
@@ -54753,6 +54934,12 @@ impl Storage {
                 definition.name.as_str()
             ));
         }
+        if let Some(owner) = catalog.families.iter().find_map(|candidate| {
+            candidate.pending_key_owner(txid, |selected| selected.shares_catalog_key(definition))
+        }) {
+            drop(owners);
+            return Err(self.catalog_ddl_wait_error(txid, owner, definition.name.as_str()));
+        }
         let Some(slot) = catalog
             .families
             .iter()
@@ -54869,10 +55056,45 @@ impl Storage {
                 "operator family changed before publication"
             ));
         }
-        let prior = catalog.families[slot].pending;
-        if let Some(pending) = prior.filter(|pending| pending.txid != txid) {
+        if catalog
+            .families
+            .iter()
+            .enumerate()
+            .any(|(other, candidate)| {
+                other != slot
+                    && candidate.database == current_database()
+                    && candidate.visible_to(txid)
+                    && candidate
+                        .definition_for(txid)
+                        .shares_catalog_key(definition)
+            })
+        {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_OBJECT,
+                "operator family already exists"
+            ));
+        }
+        if let Some(owner) = catalog
+            .families
+            .iter()
+            .enumerate()
+            .find_map(|(other, candidate)| {
+                (other != slot)
+                    .then(|| {
+                        candidate.pending_key_owner(txid, |selected| {
+                            selected.shares_catalog_key(definition)
+                        })
+                    })
+                    .flatten()
+            })
+        {
             drop(owners);
-            return Err(self.catalog_ddl_wait_error(txid, pending.txid, definition.name.as_str()));
+            return Err(self.catalog_ddl_wait_error(txid, owner, definition.name.as_str()));
+        }
+        let prior = catalog.families[slot].pending;
+        if let Some(owner) = catalog.families[slot].pending_key_owner(txid, |_| true) {
+            drop(owners);
+            return Err(self.catalog_ddl_wait_error(txid, owner, definition.name.as_str()));
         }
         catalog.families[slot].pending = Some(PendingOperatorFamilyDefinition { txid, definition });
         Ok(prior)
@@ -55279,6 +55501,12 @@ impl Storage {
                 definition.name.as_str()
             ));
         }
+        if let Some(owner) = catalog.classes.iter().find_map(|candidate| {
+            candidate.pending_key_owner(txid, |selected| selected.shares_catalog_key(definition))
+        }) {
+            drop(owners);
+            return Err(self.catalog_ddl_wait_error(txid, owner, definition.name.as_str()));
+        }
         let Some(slot) = catalog
             .classes
             .iter()
@@ -55330,6 +55558,22 @@ impl Storage {
                 && candidate.ddl_state == CatalogDdlState::Present
                 && candidate.created_at == created_at
         });
+        if definition.default
+            && (crate::sql::types::BtreeOperatorClass::for_type(definition.input.ctype).is_some()
+                || catalog.classes.iter().enumerate().any(|(slot, candidate)| {
+                    let selected = candidate.definition_for(0);
+                    Some(slot) != existing
+                        && candidate.database == current_database()
+                        && candidate.ddl_state != CatalogDdlState::Absent
+                        && selected.default
+                        && selected.input == definition.input
+                }))
+        {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "stored default operator class is duplicated"
+            ));
+        }
         if catalog.classes.iter().enumerate().any(|(slot, candidate)| {
             candidate.database == current_database()
                 && candidate.visible_to(0)
@@ -55392,10 +55636,47 @@ impl Storage {
                 "operator class changed before publication"
             ));
         }
-        let prior = catalog.classes[slot].pending;
-        if let Some(pending) = prior.filter(|pending| pending.txid != txid) {
+        if definition.default
+            && crate::sql::types::BtreeOperatorClass::for_type(definition.input.ctype).is_some()
+            || catalog
+                .classes
+                .iter()
+                .enumerate()
+                .any(|(other, candidate)| {
+                    other != slot
+                        && candidate.database == current_database()
+                        && candidate.visible_to(txid)
+                        && candidate
+                            .definition_for(txid)
+                            .shares_catalog_key(definition)
+                })
+        {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_OBJECT,
+                "operator class already exists with the same name or default input type"
+            ));
+        }
+        if let Some(owner) = catalog
+            .classes
+            .iter()
+            .enumerate()
+            .find_map(|(other, candidate)| {
+                (other != slot)
+                    .then(|| {
+                        candidate.pending_key_owner(txid, |selected| {
+                            selected.shares_catalog_key(definition)
+                        })
+                    })
+                    .flatten()
+            })
+        {
             drop(owners);
-            return Err(self.catalog_ddl_wait_error(txid, pending.txid, definition.name.as_str()));
+            return Err(self.catalog_ddl_wait_error(txid, owner, definition.name.as_str()));
+        }
+        let prior = catalog.classes[slot].pending;
+        if let Some(owner) = catalog.classes[slot].pending_key_owner(txid, |_| true) {
+            drop(owners);
+            return Err(self.catalog_ddl_wait_error(txid, owner, definition.name.as_str()));
         }
         catalog.classes[slot].pending = Some(PendingOperatorClassDefinition { txid, definition });
         Ok(prior)

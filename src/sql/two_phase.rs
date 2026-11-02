@@ -273,9 +273,9 @@ impl PreparedTransactionSlot {
             .map(|bytes| u64::from_le_bytes(bytes.try_into().unwrap()))
     }
 
-    pub(crate) fn visit_records(
-        &self,
-        mut visit: impl FnMut(u64, &[u8]) -> Result<(), SqlError>,
+    pub(crate) fn visit_records<'records>(
+        &'records self,
+        mut visit: impl FnMut(u64, &'records [u8]) -> Result<(), SqlError>,
     ) -> Result<(), SqlError> {
         let bytes = self.records.readable();
         let mut at = 0usize;

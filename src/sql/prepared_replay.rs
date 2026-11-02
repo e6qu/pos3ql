@@ -28,9 +28,6 @@ pub(super) fn stage_catalog_record(
     if super::prepared_query_replay::stage_query_record(storage, transaction, &operation, arena)? {
         return Ok(());
     }
-    if super::prepared_foreign_replay::stage_foreign_record(storage, transaction, &operation)? {
-        return Ok(());
-    }
     if super::prepared_object_replay::stage_object_record(storage, transaction, &operation)? {
         return Ok(());
     }

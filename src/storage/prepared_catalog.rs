@@ -224,8 +224,9 @@ impl Storage {
             || entries.iter().any(|candidate| {
                 candidate.database == current_database()
                     && candidate.ddl_state != CatalogDdlState::Absent
-                    && candidate.source == definition.source
-                    && candidate.target == definition.target
+                    && (candidate.created_at == identity.created_at()
+                        || (candidate.source == definition.source
+                            && candidate.target == definition.target))
             })
         {
             return Err(sql_err!(
@@ -308,6 +309,27 @@ impl Storage {
         self.validate_operator_class_definition(definition, transaction)?;
         let mut owners = self.catalog_type_owners(&self.operator_catalog);
         owners.bind_definition(&mut definition, transaction)?;
+        if definition.default
+            && (crate::sql::types::BtreeOperatorClass::for_type(definition.input.ctype).is_some()
+                || owners
+                    .catalog
+                    .classes
+                    .iter()
+                    .enumerate()
+                    .any(|(slot, candidate)| {
+                        let selected = candidate.definition_for(transaction);
+                        slot != identity.slot()
+                            && candidate.database == current_database()
+                            && candidate.ddl_state != CatalogDdlState::Absent
+                            && selected.default
+                            && selected.input == definition.input
+                    }))
+        {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "prepared default operator class is duplicated"
+            ));
+        }
         Ok(restore_definition!(
             self,
             &mut owners.catalog.classes,
@@ -529,8 +551,9 @@ impl Storage {
                 .is_some_and(|pending| pending.txid != transaction)
             || catalog.roles.iter().enumerate().any(|(other, role)| {
                 other != slot
-                    && role.visible_to(transaction)
-                    && (role.lifetime == Some(oid) || role.name_to(transaction) == name)
+                    && (((role.live || role.pending.is_some()) && role.lifetime == Some(oid))
+                        || role.name_blocker(name, transaction).is_some()
+                        || role.visible_to(transaction) && role.name_to(transaction) == name)
             })
         {
             return Err(sql_err!(
@@ -540,6 +563,9 @@ impl Storage {
         }
         let selected = &mut catalog.roles[slot];
         let prior = selected.pending;
+        if !selected.live && prior.is_none() {
+            selected.name = name;
+        }
         selected.lifetime = Some(oid);
         selected.pending = Some(PendingRole {
             txid: transaction,

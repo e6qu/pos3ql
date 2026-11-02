@@ -1414,7 +1414,7 @@ pub fn check_unique_indexes(
                 .iter()
                 .enumerate()
                 .any(|(position, column)| {
-                    index.collations[position] != def.columns[*column as usize].collation
+                    index.collations[position] != def.columns()[*column as usize].collation
                 });
         if custom
             || custom_collation

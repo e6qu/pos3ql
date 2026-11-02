@@ -29,3 +29,25 @@ jobs:
           name: formatting-${{ github.sha }}
           path: ${{ runner.temp }}/formatting.patch
           if-no-files-found: ignore
+
+  compile:
+    name: Rust type checks
+    needs: check
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache Rust dependencies
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-source-check-dependencies-${{ hashFiles('Cargo.lock') }}
+      - name: Check all Rust targets before test matrices
+        env:
+          RUSTFLAGS: -Dwarnings
+        run: cargo check --locked --all-targets --jobs 1

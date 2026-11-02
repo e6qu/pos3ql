@@ -170,6 +170,18 @@ Sorting also preserves whether each joined row existed. For example,
 `row_to_json(profile)` distinguishes a missing profile from a present record
 whose fields are all null; delaying an output expression keeps that distinction.
 
+`LIMIT` bounds returned rows. Expressions evaluated before sorting can still
+fail on later input rows. SQL constructs such as `GREATEST`, `COALESCE`, JSON
+constructors and XML constructors follow PostgreSQL's expression effects and
+cost boundaries; an explicit sequence call can change their evaluation timing.
+
+`NULLIF` uses the selected equality operator and its input conversions.
+For example, `pg_typeof(NULLIF(1, 2.2))` returns `numeric`. Enum labels are
+validated through the catalog, and null operands skip the comparison.
+SQL JSON constructors use registered enum-to-JSON conversions, including inside
+arrays and records. Arrays and records retain their structural representation
+instead of invoking a cast registered for the whole container.
+
 Statements, transaction snapshots, scans and point reads have separate startup
 reservations. Their [exact capacities](postgresql-18-compatibility.md#capacity-boundaries)
 are independent of total durable row count. Completion, cancellation, errors

@@ -138,6 +138,84 @@ fn operator_properties(
     ))
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum SqlConstructor {
+    JsonArray,
+    JsonObject,
+    Other,
+}
+
+pub(super) fn sql_constructor(name: &str) -> Option<SqlConstructor> {
+    use SqlConstructor::*;
+    Some(match name {
+        "__xmlparse_document"
+        | "__xmlparse_content"
+        | "__xmlserialize"
+        | "__xmlexists"
+        | "__xmlelement"
+        | "__xmlforest"
+        | "__xmlpi"
+        | "__xmlroot"
+        | "__is_json_scalar"
+        | "__is_json_array"
+        | "__is_json_object"
+        | "__is_json_value"
+        | "__is_json_scalar_unique"
+        | "__is_json_array_unique"
+        | "__is_json_object_unique"
+        | "__is_json_value_unique"
+        | "__json"
+        | "__json_unique"
+        | "__json_format"
+        | "__json_serialize_text"
+        | "__json_serialize_bytea"
+        | "__jsonb_subscript_set"
+        | "__json_exists_true"
+        | "__json_exists_unknown"
+        | "__json_exists_error"
+        | "__json_exists_false"
+        | "__json_query_json"
+        | "__json_query_jsonb"
+        | "__json_query_text"
+        | "__json_query_bytea"
+        | "__json_value" => Other,
+        "__json_array_absent_json"
+        | "__json_array_absent_jsonb"
+        | "__json_array_absent_text"
+        | "__json_array_absent_bytea"
+        | "__json_array_null_json"
+        | "__json_array_null_jsonb"
+        | "__json_array_null_text"
+        | "__json_array_null_bytea" => JsonArray,
+        "__json_object_json"
+        | "__json_object_jsonb"
+        | "__json_object_text"
+        | "__json_object_bytea"
+        | "__json_object_unique_json"
+        | "__json_object_unique_jsonb"
+        | "__json_object_unique_text"
+        | "__json_object_unique_bytea" => JsonObject,
+        _ => return None,
+    })
+}
+
+fn sql_value_expression(name: &str) -> bool {
+    matches!(
+        name,
+        "current_date"
+            | "current_timestamp"
+            | "current_time"
+            | "localtimestamp"
+            | "localtime"
+            | "current_user"
+            | "current_role"
+            | "session_user"
+            | "user"
+            | "current_catalog"
+            | "current_schema"
+    )
+}
+
 /// A non-leakproof function matters at a barrier only when its arguments can
 /// expose a row column. A volatile constant call can still move independently.
 pub(super) fn expression_properties(
@@ -212,7 +290,109 @@ pub(super) fn expression_properties(
         }
         // ROW is a structural constructor, not a procedure lookup. Its
         // effects are exactly those of its already-classified child nodes.
-        Expr::Call { name, .. } if name.eq_ignore_ascii_case("row") => None,
+        Expr::Call {
+            name,
+            bound_oid: None,
+            ..
+        } if *name == "row" => None,
+        Expr::Call {
+            name,
+            bound_oid: None,
+            args,
+            argument_names,
+            star: false,
+            variadic: false,
+            ..
+        } if argument_names.is_empty()
+            && sql_value_expression(name)
+            && !storage.has_function_routine_candidate(name, args.len(), txid) =>
+        {
+            // SQL value expressions read transaction or session state; their
+            // explicit precision expression was classified with the children.
+            Some(ProcedureProperties::BINARY)
+        }
+        Expr::Call {
+            name,
+            bound_oid: None,
+            args,
+            argument_names,
+            star: false,
+            variadic: false,
+            ..
+        } if argument_names.is_empty()
+            && matches!(*name, "coalesce" | "greatest" | "least" | "nullif") =>
+        {
+            let name = *name;
+            if args.is_empty() || name == "nullif" && args.len() != 2 {
+                return Err(crate::sql::eval::arity_err(name, args.len()));
+            }
+            if name == "nullif" {
+                // NULLIF is a selected equality operation; its implementation
+                // and argument coercions can execute catalog-defined code.
+                Some(operator_properties(
+                    storage,
+                    txid,
+                    None,
+                    "=",
+                    Some(type_of(args[0])?),
+                    Some(type_of(args[1])?),
+                )?)
+            } else {
+                let target = type_of(expression)?;
+                for argument in *args {
+                    let source = type_of(argument)?;
+                    // Identical declarations need no conversion, including
+                    // domains retained by all arms of a common-type node.
+                    if source != target {
+                        let conversion = cast_properties(
+                            storage,
+                            txid,
+                            source,
+                            target,
+                            CastBinding::Resolve,
+                            -1,
+                        );
+                        result.volatile |= conversion.volatile;
+                        result.leaks_columns |=
+                            !conversion.leakproof && contains_columns(argument)?;
+                    }
+                }
+                if name == "coalesce" {
+                    None
+                } else {
+                    // MinMax uses the common type's comparison, independently
+                    // of a search-path overload of the SQL function spelling.
+                    Some(operator_properties(
+                        storage,
+                        txid,
+                        Some("pg_catalog"),
+                        if name == "greatest" { ">" } else { "<" },
+                        Some(target),
+                        Some(target),
+                    )?)
+                }
+            }
+        }
+        Expr::Call {
+            name,
+            bound_oid: None,
+            args,
+            argument_names,
+            star: false,
+            variadic: false,
+            ..
+        } if argument_names.is_empty()
+            && sql_constructor(name).is_some()
+            && !storage.has_function_routine_candidate(name, args.len(), txid) =>
+        {
+            // PostgreSQL's volatile-expression walk sees explicit children,
+            // but not constructor-internal casts or output functions. Those
+            // still execute at the original projection phase (PG 18.6).
+            Some(ProcedureProperties {
+                volatile: false,
+                leakproof: false,
+            })
+        }
         Expr::Call {
             name,
             bound_oid,

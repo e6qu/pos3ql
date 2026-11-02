@@ -1023,7 +1023,12 @@ pub(super) fn postpone_cost(e: &Expr, scope: &QueryScope, arena: &Arena) -> u32 
         | Match {
             operand, pattern, ..
         } => postpone_cost(operand, scope, arena) + postpone_cost(pattern, scope, arena) + 2,
-        Call { name, args, .. } => {
+        Call {
+            name,
+            bound_oid,
+            args,
+            ..
+        } => {
             // GREATEST/LEAST/COALESCE unify their arguments' types, and
             // PostgreSQL charges one operator for each argument it has to cast
             // (a constant is pre-cast at plan time, as in the CASE arm below).
@@ -1033,11 +1038,22 @@ pub(super) fn postpone_cost(e: &Expr, scope: &QueryScope, arena: &Arena) -> u32 
             let unifying = name.eq_ignore_ascii_case("greatest")
                 || name.eq_ignore_ascii_case("least")
                 || name.eq_ignore_ascii_case("coalesce");
-            let node = if name.eq_ignore_ascii_case("coalesce") {
-                0
-            } else {
-                2
-            };
+            let json_constructor = bound_oid.is_none()
+                && matches!(
+                    super::predicate_safety::sql_constructor(name),
+                    Some(
+                        super::predicate_safety::SqlConstructor::JsonArray
+                            | super::predicate_safety::SqlConstructor::JsonObject
+                    )
+                );
+            // PostgreSQL charges ROW and JSON constructors for children only.
+            let row_constructor = bound_oid.is_none() && *name == "row";
+            let node =
+                if name.eq_ignore_ascii_case("coalesce") || json_constructor || row_constructor {
+                    0
+                } else {
+                    2
+                };
             let mut c = args
                 .iter()
                 .map(|a| postpone_cost(a, scope, arena))

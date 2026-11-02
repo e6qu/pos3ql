@@ -664,6 +664,33 @@ impl crate::sql::exec::ColTypeResolver for RuntimeColumnTypes<'_, '_> {
             .and_then(|catalog| catalog.domain_base_type(type_oid))
     }
 
+    fn operator_first_argument_type(
+        &self,
+        name: &str,
+        left: i32,
+        right: i32,
+    ) -> Result<Option<crate::sql::exec::StaticTypeMeta>, SqlError> {
+        let Some(catalog) = self.catalog else {
+            return Ok(None);
+        };
+        let Some(type_oid) = catalog.operator_first_argument_type(name, left, right)? else {
+            return Ok(None);
+        };
+        let Some(ctype) = constructor_type_from_oid(type_oid, &|oid| self.domain_base_type(oid))
+        else {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "operator input type identity is unavailable"
+            ));
+        };
+        Ok(Some(crate::sql::exec::StaticTypeMeta {
+            type_oid,
+            ctype,
+            type_mod: -1,
+            collation: crate::sql::ast::Collation::Default,
+        }))
+    }
+
     fn named_type_oid(&self, type_name: &str) -> Option<i32> {
         self.catalog
             .and_then(|catalog| catalog.user_type_oid(type_name))
@@ -1327,8 +1354,8 @@ pub trait CatalogAccess {
         ))
     }
     /// Executes a support function already bound to a durable catalog object.
-    /// Aggregate definitions use this boundary so a later rename cannot turn
-    /// a validated dependency into an unresolved text lookup.
+    /// Aggregate and JSON conversion definitions use this boundary so a later
+    /// rename cannot turn a validated dependency into an unresolved text lookup.
     fn call_routine_oid<'a>(
         &self,
         _oid: i32,
@@ -1338,6 +1365,15 @@ pub trait CatalogAccess {
     ) -> Result<Option<Datum<'a>>, SqlError> {
         Ok(None)
     }
+    /// JSON's Other category may use a function cast after array/composite
+    /// categorization; source_type_oid retains the peeled declaration.
+    fn json_serialization_cast(
+        &self,
+        _type_oid: i32,
+    ) -> Result<Option<JsonSerializationCast>, SqlError> {
+        Ok(None)
+    }
+
     /// Registered casts expose whether planning may evaluate them.
     fn cast_evaluation(
         &self,
@@ -1363,18 +1399,25 @@ pub trait CatalogAccess {
     fn has_operator_candidate(&self, _name: &str) -> bool {
         false
     }
+    fn operator_first_argument_type(
+        &self,
+        _name: &str,
+        _left: i32,
+        _right: i32,
+    ) -> Result<Option<i32>, SqlError> {
+        Ok(None)
+    }
     /// Executes a search-path-resolved user-defined binary operator. `None`
     /// means the catalog has no matching definition and builtin resolution
     /// continues.
     fn call_operator<'a>(
         &self,
         _name: &str,
-        _left: Datum<'a>,
-        _right: Datum<'a>,
-        _left_oid: i32,
-        _right_oid: i32,
+        _arguments: [Datum<'a>; 2],
+        _argument_type_oids: [i32; 2],
+        _nulls: OperatorNulls,
         _arena: &'a Arena,
-    ) -> Result<Option<Datum<'a>>, SqlError> {
+    ) -> Result<Option<OperatorEvaluation<'a>>, SqlError> {
         Ok(None)
     }
     /// The declared result identity of a catalog routine. This is separate
@@ -1853,6 +1896,12 @@ pub trait CatalogAccess {
 pub enum ExpressionEvaluation {
     Immutable,
     Runtime,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JsonSerializationCast {
+    pub source_type_oid: i32,
+    pub function_oid: i32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2378,11 +2427,23 @@ pub(crate) fn escape_char(d: Datum<'_>) -> Result<Option<char>, SqlError> {
     }
 }
 
+pub struct OperatorEvaluation<'a> {
+    pub value: Datum<'a>,
+    pub first_argument: Datum<'a>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum OperatorNulls {
+    RoutineStrictness,
+    ReturnNull,
+}
+
 struct BinaryExpression<'expression, 'a> {
     operator: BinaryOp,
     left: &'expression Expr<'a>,
     right: &'expression Expr<'a>,
     search_catalog: bool,
+    nulls: OperatorNulls,
 }
 
 fn validate_enum_operator_types<'a>(
@@ -2424,27 +2485,56 @@ fn eval_binary_expression<'a>(
     row: &impl ColumnLookup<'a>,
     hooks: &EvalHooks<'_, 'a>,
 ) -> Result<Datum<'a>, SqlError> {
-    let BinaryExpression {
-        operator,
-        left,
-        right,
-        search_catalog,
-    } = expression;
-    let comparison = operators::Comparison::from_binary(operator);
-    let comparison_collation = if comparison.is_some() {
+    let comparison_collation = if operators::Comparison::from_binary(expression.operator).is_some()
+    {
         Some(resolve_comparison_collation(
-            left,
-            right,
+            expression.left,
+            expression.right,
             row,
             hooks.catalog,
         )?)
     } else {
         None
     };
-    let mut l =
-        materialize_named_composite(eval_full(left, arena, params, row, hooks)?, hooks, arena)?;
-    let mut r =
-        materialize_named_composite(eval_full(right, arena, params, row, hooks)?, hooks, arena)?;
+    let left = materialize_named_composite(
+        eval_full(expression.left, arena, params, row, hooks)?,
+        hooks,
+        arena,
+    )?;
+    let right = materialize_named_composite(
+        eval_full(expression.right, arena, params, row, hooks)?,
+        hooks,
+        arena,
+    )?;
+    Ok(eval_binary_values(
+        expression,
+        left,
+        right,
+        comparison_collation,
+        arena,
+        row,
+        hooks,
+    )?
+    .value)
+}
+
+fn eval_binary_values<'a>(
+    expression: BinaryExpression<'_, 'a>,
+    mut l: Datum<'a>,
+    mut r: Datum<'a>,
+    comparison_collation: Option<super::ast::Collation>,
+    arena: &'a Arena,
+    row: &impl ColumnLookup<'a>,
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<OperatorEvaluation<'a>, SqlError> {
+    let BinaryExpression {
+        operator,
+        left,
+        right,
+        search_catalog,
+        nulls,
+    } = expression;
+    let comparison = operators::Comparison::from_binary(operator);
     if search_catalog
         && let Some(catalog) = hooks.catalog
         && let Some(name) = operator.operator_name()
@@ -2452,17 +2542,59 @@ fn eval_binary_expression<'a>(
     {
         let left_oid = expression_type_identity(left, row, hooks)?.routine_argument_oid();
         let right_oid = expression_type_identity(right, row, hooks)?.routine_argument_oid();
-        if let Some(value) = catalog.call_operator(name, l, r, left_oid, right_oid, arena)? {
+        if let Some(value) =
+            catalog.call_operator(name, [l, r], [left_oid, right_oid], nulls, arena)?
+        {
             return Ok(value);
         }
     }
     if comparison_collation.is_some() {
         validate_enum_operator_types(operator, left, right, row, hooks, arena)?;
     }
+    if nulls == OperatorNulls::ReturnNull {
+        let base_type = |expression| -> Result<i32, SqlError> {
+            let oid = expression_type_identity(expression, row, hooks)?.routine_argument_oid();
+            Ok(hooks
+                .catalog
+                .and_then(|catalog| catalog.domain_base_type(oid))
+                .map_or(oid, ColType::oid))
+        };
+        let left_oid = base_type(left)?;
+        let right_oid = base_type(right)?;
+        let (expected_left, expected_right) =
+            super::catalog::builtin_nullif_input_oids(left_oid, right_oid)?;
+        if left_oid != expected_left {
+            let target = ColType::from_oid(expected_left).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "operator input type identity is unavailable"
+                )
+            })?;
+            l = match target {
+                ColType::Enum(Some(creation)) => coerce_enum_value(creation, l, hooks, arena)?,
+                _ => cast_to(l, target, arena)?,
+            };
+        }
+        if right_oid != expected_right {
+            let target = ColType::from_oid(expected_right).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "operator input type identity is unavailable"
+                )
+            })?;
+            r = match target {
+                ColType::Enum(Some(creation)) => coerce_enum_value(creation, r, hooks, arena)?,
+                _ => cast_to(r, target, arena)?,
+            };
+        }
+    }
     if operator == BinaryOp::Concat
         && let Some(value) = array_null_concat(l, r, left, right, row, arena)?
     {
-        return Ok(value);
+        return Ok(OperatorEvaluation {
+            value,
+            first_argument: l,
+        });
     }
     if (l.is_null() || r.is_null())
         && let Some(name) = operator.operator_name()
@@ -2473,7 +2605,10 @@ fn eval_binary_expression<'a>(
         // overload before applying strictness, so typed text is not accepted
         // as geometry and valid nullable columns cannot dispatch as text.
         if funcs::geometry::operator_result(name, &[left_oid, right_oid]).is_some() {
-            return Ok(Datum::Null);
+            return Ok(OperatorEvaluation {
+                value: Datum::Null,
+                first_argument: l,
+            });
         }
     }
     let left_unknown = is_unknown_literal(left);
@@ -2499,7 +2634,7 @@ fn eval_binary_expression<'a>(
             )
         )
     {
-        return compare_text_collated(
+        let value = compare_text_collated(
             comparison,
             l,
             r,
@@ -2507,9 +2642,16 @@ fn eval_binary_expression<'a>(
             right_unknown,
             collation,
             hooks.catalog,
-        );
+        )?;
+        return Ok(OperatorEvaluation {
+            value,
+            first_argument: l,
+        });
     }
-    binary(operator, l, r, left_unknown, right_unknown, arena)
+    Ok(OperatorEvaluation {
+        value: binary(operator, l, r, left_unknown, right_unknown, arena)?,
+        first_argument: l,
+    })
 }
 
 fn materialize_acl_value<'a>(
@@ -3018,6 +3160,7 @@ fn eval_full_inner<'a>(
                 left,
                 right,
                 search_catalog: true,
+                nulls: OperatorNulls::RoutineStrictness,
             },
             arena,
             params,
@@ -3337,6 +3480,7 @@ fn eval_full_inner<'a>(
                         left: args[0],
                         right: args[1],
                         search_catalog: false,
+                        nulls: OperatorNulls::RoutineStrictness,
                     },
                     arena,
                     params,
@@ -8506,9 +8650,40 @@ pub(crate) fn type_name_of_pub(d: &Datum) -> &'static str {
     type_name_of(d)
 }
 
-/// When an enum value is compared with an unknown text literal, resolves the
-/// literal to a member of the enum's type (catalog-aware). PostgreSQL reports a
-/// non-member as 22P02. Non-enum pairs and already-typed operands pass through.
+/// Resolves textual input against the selected enum's durable identity.
+fn coerce_enum_value<'a>(
+    slot: crate::storage::TypeCreation,
+    value: Datum<'a>,
+    hooks: &EvalHooks<'_, 'a>,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    let label = match value {
+        Datum::Text(s) => s,
+        Datum::Bpchar(s) => s.trim_end_matches(' '),
+        _ => return Ok(value),
+    };
+    let catalog = hooks.catalog.ok_or_else(|| {
+        sql_err!(
+            sqlstate::INVALID_TEXT_REPRESENTATION,
+            "invalid input value for enum: \"{}\"",
+            label
+        )
+    })?;
+    let Some(sort) = catalog.enum_label_sort(slot, label)? else {
+        return Err(sql_err!(
+            sqlstate::INVALID_TEXT_REPRESENTATION,
+            "invalid input value for enum: \"{}\"",
+            label
+        ));
+    };
+    Ok(Datum::Enum {
+        slot,
+        member: catalog.enum_member_identity(slot, label)?,
+        sort,
+        label: arena.alloc_str(label).map_err(|_| arena_full())?,
+    })
+}
+
 fn coerce_enum_literal<'a>(
     l: Datum<'a>,
     r: Datum<'a>,
@@ -8517,37 +8692,13 @@ fn coerce_enum_literal<'a>(
     hooks: &EvalHooks<'_, 'a>,
     arena: &'a Arena,
 ) -> Result<(Datum<'a>, Datum<'a>), SqlError> {
-    let resolve =
-        |slot: crate::storage::TypeCreation, text: Datum<'a>| -> Result<Datum<'a>, SqlError> {
-            let label = match text {
-                Datum::Text(s) => s,
-                Datum::Bpchar(s) => s.trim_end_matches(' '),
-                _ => return Ok(text),
-            };
-            let cat = hooks.catalog.ok_or_else(|| {
-                sql_err!(
-                    sqlstate::INVALID_TEXT_REPRESENTATION,
-                    "invalid input value for enum: \"{}\"",
-                    label
-                )
-            })?;
-            let Some(sort) = cat.enum_label_sort(slot, label)? else {
-                return Err(sql_err!(
-                    sqlstate::INVALID_TEXT_REPRESENTATION,
-                    "invalid input value for enum: \"{}\"",
-                    label
-                ));
-            };
-            Ok(Datum::Enum {
-                slot,
-                member: cat.enum_member_identity(slot, label)?,
-                sort,
-                label: arena.alloc_str(label).map_err(|_| arena_full())?,
-            })
-        };
     match (l, r) {
-        (Datum::Enum { slot, .. }, _) if r_unknown => Ok((l, resolve(slot, r)?)),
-        (_, Datum::Enum { slot, .. }) if l_unknown => Ok((resolve(slot, l)?, r)),
+        (Datum::Enum { slot, .. }, _) if r_unknown => {
+            Ok((l, coerce_enum_value(slot, r, hooks, arena)?))
+        }
+        (_, Datum::Enum { slot, .. }) if l_unknown => {
+            Ok((coerce_enum_value(slot, l, hooks, arena)?, r))
+        }
         _ => Ok((l, r)),
     }
 }

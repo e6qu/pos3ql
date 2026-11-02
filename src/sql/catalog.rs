@@ -3903,6 +3903,102 @@ pub(crate) fn builtin_operator_properties(
     if ambiguous { None } else { best }
 }
 
+/// NULLIF retains the first argument after equality overload coercion.
+/// Match exact inputs before PostgreSQL's same-category preferred types.
+pub(crate) fn builtin_nullif_input_oids(left: i32, right: i32) -> Result<(i32, i32), SqlError> {
+    use super::types::oid;
+    let (left, right) = match (left, right) {
+        (oid::UNKNOWN, oid::UNKNOWN) => (oid::TEXT, oid::TEXT),
+        (oid::UNKNOWN, right) => (right, right),
+        (left, oid::UNKNOWN) => (left, left),
+        pair => pair,
+    };
+    let preferred = |actual, expected| {
+        matches!(
+            expected,
+            oid::BOOL
+                | oid::TEXT
+                | oid::OID
+                | oid::FLOAT8
+                | oid::INET
+                | oid::TIMESTAMPTZ
+                | oid::INTERVAL
+                | oid::VARBIT
+        ) && ColType::from_oid(actual)
+            .zip(ColType::from_oid(expected))
+            .is_some_and(|(actual, expected)| {
+                super::types::type_category(actual) == super::types::type_category(expected)
+            })
+    };
+    let concrete = |actual, expected| {
+        if matches!(
+            expected,
+            oid::ANYELEMENT
+                | oid::ANYCOMPATIBLE
+                | oid::ANYARRAY
+                | oid::ANYCOMPATIBLEARRAY
+                | oid::ANYNONARRAY
+                | oid::ANYCOMPATIBLENONARRAY
+                | oid::ANYENUM
+                | oid::ANYRANGE
+                | oid::ANYCOMPATIBLERANGE
+                | oid::ANYMULTIRANGE
+                | oid::ANYCOMPATIBLEMULTIRANGE
+                | oid::RECORD
+        ) {
+            actual
+        } else {
+            expected
+        }
+    };
+    let compatible = |actual, expected| {
+        builtin_argument_properties(actual, expected).is_some()
+            || expected == oid::RECORD
+                && matches!(ColType::from_oid(actual), Some(ColType::Composite(_)))
+    };
+    let mut best = None;
+    let mut best_score = None;
+    let mut ambiguous = false;
+    for &(name, expected_left, expected_right, _) in builtin_properties::OPERATORS {
+        if name != "=" || !compatible(left, expected_left) || !compatible(right, expected_right) {
+            continue;
+        }
+        let score = (
+            usize::from(left == expected_left) + usize::from(right == expected_right),
+            usize::from(preferred(left, expected_left))
+                + usize::from(preferred(right, expected_right)),
+        );
+        let signature = (
+            concrete(left, expected_left),
+            concrete(right, expected_right),
+        );
+        if best_score.is_none_or(|prior| score > prior) {
+            best = Some(signature);
+            best_score = Some(score);
+            ambiguous = false;
+        } else if best_score == Some(score) && best != Some(signature) {
+            ambiguous = true;
+        }
+    }
+    if ambiguous {
+        Err(sql_err!(
+            sqlstate::AMBIGUOUS_FUNCTION,
+            "operator is not unique for NULLIF input types {} and {}",
+            left,
+            right
+        ))
+    } else {
+        best.ok_or_else(|| {
+            sql_err!(
+                sqlstate::UNDEFINED_FUNCTION,
+                "operator does not exist for NULLIF input types {} and {}",
+                left,
+                right
+            )
+        })
+    }
+}
+
 pub(crate) fn builtin_cast_properties(source: i32, target: i32) -> Option<(bool, bool)> {
     if source == super::types::oid::UNKNOWN {
         let &(_, input, _) = builtin_properties::TYPE_IO

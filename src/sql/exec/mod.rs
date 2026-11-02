@@ -697,8 +697,9 @@ pub(super) use schema::rename as stage_schema_rename;
 
 mod describe;
 pub(crate) use describe::{
-    CatalogCols, builtin_binary_type, catalog_composite_field, catalog_routine_record_field,
-    expand_record_call_items, numeric_log_type, resolved_set_call, visit_catalog_composite_fields,
+    CatalogCols, builtin_binary_type, catalog_composite_field,
+    catalog_operator_first_argument_type, catalog_routine_record_field, expand_record_call_items,
+    numeric_log_type, resolved_set_call, visit_catalog_composite_fields,
     visit_catalog_rowtype_fields,
 };
 pub use describe::{

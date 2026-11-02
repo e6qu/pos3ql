@@ -2208,8 +2208,9 @@ impl StorageCatalog<'_, '_, '_, '_> {
         name: &str,
         arguments: &[Datum<'a>],
         argument_type_oids: &[i32],
+        nulls: super::eval::OperatorNulls,
         arena: &'a Arena,
-    ) -> Result<Option<Datum<'a>>, SqlError> {
+    ) -> Result<Option<super::eval::OperatorEvaluation<'a>>, SqlError> {
         if arguments.len() != argument_type_oids.len() || !(1..=2).contains(&arguments.len()) {
             return Err(sql_err!(
                 sqlstate::INTERNAL_ERROR,
@@ -2263,7 +2264,12 @@ impl StorageCatalog<'_, '_, '_, '_> {
                 arena,
             )
         {
-            return result.map(Some);
+            return result.map(|value| {
+                Some(super::eval::OperatorEvaluation {
+                    value,
+                    first_argument: builtin_arguments[0],
+                })
+            });
         }
         let (left_oid, right_oid) = if argument_type_oids.len() == 1 {
             (None, Some(argument_type_oids[0]))
@@ -2331,6 +2337,14 @@ impl StorageCatalog<'_, '_, '_, '_> {
                 )
             })?;
         self.storage.require_routine_execute(function, self.txid)?;
+        if nulls == super::eval::OperatorNulls::ReturnNull
+            && coerced[..expected_count].iter().any(Datum::is_null)
+        {
+            return Ok(Some(super::eval::OperatorEvaluation {
+                value: Datum::Null,
+                first_argument: coerced[0],
+            }));
+        }
         self.execute_routine(
             function,
             &self.storage.routine_for(function, self.txid),
@@ -2343,7 +2357,12 @@ impl StorageCatalog<'_, '_, '_, '_> {
                 "operator function produced no scalar result"
             )
         })
-        .map(Some)
+        .map(|value| {
+            Some(super::eval::OperatorEvaluation {
+                value,
+                first_argument: coerced[0],
+            })
+        })
     }
 
     fn execute_routine<'a>(
@@ -3599,7 +3618,15 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                     *value = evaluate(expression)?;
                 }
                 return self
-                    .execute_catalog_operator(schema, name, values, argument_type_oids, arena)?
+                    .execute_catalog_operator(
+                        schema,
+                        name,
+                        values,
+                        argument_type_oids,
+                        super::eval::OperatorNulls::RoutineStrictness,
+                        arena,
+                    )?
+                    .map(|evaluation| evaluation.value)
                     .ok_or_else(|| {
                         sql_err!(
                             sqlstate::UNDEFINED_FUNCTION,
@@ -3659,7 +3686,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         let Some(slot) = self.storage.routine_slot_by_oid(oid, self.txid) else {
             return Err(sql_err!(
                 sqlstate::UNDEFINED_FUNCTION,
-                "aggregate support function with OID {} does not exist",
+                "bound support function with OID {} does not exist",
                 oid
             ));
         };
@@ -3668,7 +3695,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         {
             return Err(sql_err!(
                 sqlstate::INTERNAL_ERROR,
-                "aggregate support function argument contract changed"
+                "bound support function argument contract changed"
             ));
         }
         let routine = self
@@ -3677,7 +3704,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             .ok_or_else(|| {
                 sql_err!(
                     sqlstate::INTERNAL_ERROR,
-                    "aggregate support function polymorphic contract does not match its arguments"
+                    "bound support function polymorphic contract does not match its arguments"
                 )
             })?;
         self.execute_routine(slot, &routine, arguments, arena)
@@ -3727,6 +3754,61 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         }))
     }
 
+    fn json_serialization_cast(
+        &self,
+        type_oid: i32,
+    ) -> Result<Option<super::eval::JsonSerializationCast>, SqlError> {
+        let mut source = type_oid;
+        while matches!(
+            crate::storage::NamedTypeKind::from_oid(source),
+            Some((crate::storage::NamedTypeKind::Domain, _, false))
+        ) {
+            source = self
+                .storage
+                .domain_base_type_for_oid(source, self.txid)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "JSON source domain is unavailable"
+                    )
+                })?
+                .oid();
+        }
+        // PostgreSQL json_categorize_type checks user casts only for Other
+        // types, after domains and the builtin/array/composite categories.
+        if source < 16_384 {
+            return Ok(None);
+        }
+        let physical = self
+            .storage
+            .routine_result_for_oid(source, self.txid)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "JSON source type is unavailable"
+                )
+            })?
+            .ctype;
+        if matches!(physical, ColType::Array(_) | ColType::Composite(_)) {
+            return Ok(None);
+        }
+        let Some((_, cast)) =
+            self.storage
+                .cast_for_oids(source, super::types::oid::JSON, self.txid)
+        else {
+            return Ok(None);
+        };
+        match cast.method {
+            crate::storage::CastMethod::Function(function_oid) => {
+                Ok(Some(super::eval::JsonSerializationCast {
+                    source_type_oid: source,
+                    function_oid,
+                }))
+            }
+            crate::storage::CastMethod::Binary | crate::storage::CastMethod::InOut => Ok(None),
+        }
+    }
+
     fn cast_defined<'a>(
         &self,
         source_oid: i32,
@@ -3738,16 +3820,31 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         self.execute_defined_cast(source_oid, target_oid, value, context, arena)
     }
 
+    fn operator_first_argument_type(
+        &self,
+        name: &str,
+        left: i32,
+        right: i32,
+    ) -> Result<Option<i32>, SqlError> {
+        super::exec::catalog_operator_first_argument_type(
+            self.storage,
+            self.txid,
+            name,
+            left,
+            right,
+        )
+        .map(|meta| meta.map(|meta| meta.type_oid))
+    }
+
     fn call_operator<'a>(
         &self,
         name: &str,
-        left: Datum<'a>,
-        right: Datum<'a>,
-        left_oid: i32,
-        right_oid: i32,
+        arguments: [Datum<'a>; 2],
+        argument_type_oids: [i32; 2],
+        nulls: super::eval::OperatorNulls,
         arena: &'a Arena,
-    ) -> Result<Option<Datum<'a>>, SqlError> {
-        self.execute_catalog_operator(None, name, &[left, right], &[left_oid, right_oid], arena)
+    ) -> Result<Option<super::eval::OperatorEvaluation<'a>>, SqlError> {
+        self.execute_catalog_operator(None, name, &arguments, &argument_type_oids, nulls, arena)
     }
 
     fn subquery_type(
@@ -10604,6 +10701,21 @@ pub(crate) struct CatalogScopeCols<'scope, 'definition, 'storage> {
 }
 
 impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_> {
+    fn operator_first_argument_type(
+        &self,
+        name: &str,
+        left: i32,
+        right: i32,
+    ) -> Result<Option<super::exec::StaticTypeMeta>, SqlError> {
+        super::exec::catalog_operator_first_argument_type(
+            self.storage,
+            self.txid,
+            name,
+            left,
+            right,
+        )
+    }
+
     fn subquery_type(&self, expression: &Expr<'_>) -> Result<Option<(i32, i16)>, SqlError> {
         let schema = ScopeSchema(self.scope);
         let outer_schema = self.outer_scope.map(ScopeSchema);

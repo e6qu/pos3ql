@@ -20,6 +20,142 @@ use super::super::{
     json_to_text, json_tree_arg, sqlstate, text_view, type_mismatch,
 };
 
+struct SqlJsonWriter<'catalog, 'arena> {
+    catalog: Option<&'catalog dyn super::super::CatalogAccess>,
+    arena: &'arena crate::mem::arena::Arena,
+}
+
+impl<'a> SqlJsonWriter<'_, 'a> {
+    fn write(&self, value: Datum<'a>, type_oid: i32, out: &mut dyn Write) -> Result<(), SqlError> {
+        match value {
+            Datum::Null => out.write_str("null").map_err(|_| arena_full()),
+            Datum::Array { element, raw } => {
+                let shape = crate::sql::array::shape(raw).ok_or_else(|| {
+                    sql_err!(sqlstate::DATA_EXCEPTION, "invalid JSON source array")
+                })?;
+                let mut values = crate::sql::array::elements(raw, element);
+                if shape.dimension_count() == 0 {
+                    return out.write_str("[]").map_err(|_| arena_full());
+                }
+                self.array(&mut values, &shape, 0, element.element_oid(), out)?;
+                if values.next().is_some() {
+                    return Err(sql_err!(
+                        sqlstate::DATA_EXCEPTION,
+                        "JSON source array shape changed"
+                    ));
+                }
+                Ok(())
+            }
+            Datum::CompositeText {
+                slot,
+                physical_fields,
+                text,
+            } => {
+                let catalog = self.catalog.ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "JSON composite catalog access is unavailable"
+                    )
+                })?;
+                self.write(
+                    catalog.materialize_composite(slot, physical_fields, text, self.arena)?,
+                    type_oid,
+                    out,
+                )
+            }
+            Datum::Composite { fields, .. } | Datum::Record(fields) => {
+                out.write_char('{').map_err(|_| arena_full())?;
+                for (index, field) in fields.iter().enumerate() {
+                    if index != 0 {
+                        out.write_char(',').map_err(|_| arena_full())?;
+                    }
+                    json::write_json_raw_string(field.name, out).map_err(|_| arena_full())?;
+                    out.write_char(':').map_err(|_| arena_full())?;
+                    self.write(field.value, field.type_oid, out)?;
+                }
+                out.write_char('}').map_err(|_| arena_full())
+            }
+            value => {
+                if let Some(catalog) = self.catalog
+                    && let Some(cast) = catalog.json_serialization_cast(type_oid)?
+                {
+                    let converted = catalog
+                        .call_routine_oid(
+                            cast.function_oid,
+                            &[value],
+                            &[cast.source_type_oid],
+                            self.arena,
+                        )?
+                        .ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::UNDEFINED_FUNCTION,
+                                "JSON conversion function is unavailable"
+                            )
+                        })?;
+                    return match converted {
+                        Datum::Json { text, jsonb: false } => {
+                            out.write_str(text).map_err(|_| arena_full())
+                        }
+                        _ => Err(sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "JSON conversion function did not return a non-null json value"
+                        )),
+                    };
+                }
+                json::write_datum_json(&value, false, out).map_err(|_| arena_full())
+            }
+        }
+    }
+
+    fn array(
+        &self,
+        values: &mut crate::sql::array::Elements<'a>,
+        shape: &crate::sql::array::Shape,
+        dimension: usize,
+        element_oid: i32,
+        out: &mut dyn Write,
+    ) -> Result<(), SqlError> {
+        let width = shape.dimension(dimension).ok_or_else(|| {
+            sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "JSON source array dimension is unavailable"
+            )
+        })?;
+        out.write_char('[').map_err(|_| arena_full())?;
+        for index in 0..width {
+            if index != 0 {
+                out.write_char(',').map_err(|_| arena_full())?;
+            }
+            if dimension + 1 < shape.dimension_count() {
+                self.array(values, shape, dimension + 1, element_oid, out)?;
+            } else {
+                let value = values.next().ok_or_else(|| {
+                    sql_err!(sqlstate::DATA_EXCEPTION, "JSON source array shape changed")
+                })?;
+                self.write(value, element_oid, out)?;
+            }
+        }
+        out.write_char(']').map_err(|_| arena_full())
+    }
+}
+
+fn write_sql_json_argument<'a>(
+    expression: &Expr<'a>,
+    value: Datum<'a>,
+    arena: &'a crate::mem::arena::Arena,
+    row: &impl ColumnLookup<'a>,
+    hooks: &EvalHooks<'_, 'a>,
+    out: &mut dyn Write,
+) -> Result<(), SqlError> {
+    let type_oid =
+        super::super::expression_type_identity(expression, row, hooks)?.routine_argument_oid();
+    SqlJsonWriter {
+        catalog: hooks.catalog,
+        arena,
+    }
+    .write(value, type_oid, out)
+}
+
 /// Validates the common `jsonb_path_*` arguments and executes the path.  A
 /// `None` result represents SQL NULL from any strict argument.
 pub(crate) fn path_query_outcome<'a>(
@@ -1232,8 +1368,7 @@ pub(crate) fn dispatch<'a>(
                     if value.is_null() {
                         buffer.write_str("null").map_err(|_| arena_full())?;
                     } else {
-                        json::write_datum_json(&value, false, &mut buffer)
-                            .map_err(|_| arena_full())?;
+                        write_sql_json_argument(argument, value, arena, row, hooks, &mut buffer)?;
                     }
                     emitted += 1;
                 }
@@ -1287,8 +1422,7 @@ pub(crate) fn dispatch<'a>(
                     if value.is_null() {
                         buffer.write_str("null").map_err(|_| arena_full())?;
                     } else {
-                        json::write_datum_json(&value, false, &mut buffer)
-                            .map_err(|_| arena_full())?;
+                        write_sql_json_argument(pair[1], value, arena, row, hooks, &mut buffer)?;
                     }
                     emitted += 1;
                 }

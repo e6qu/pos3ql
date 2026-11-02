@@ -257,8 +257,8 @@ but initialize only dense occupancy locks. Wide payload pages are touched when
 a definition is staged; its matching read/write guard protects initialization,
 retirement and reuse. Reserving unused slots does not initialize every payload.
 
-The [embedded memory helper](../examples/embedded-memory.rs) and
-[runner script](../tools/measure-embedded-capacity.py) measure 1, 8, 32 and 128
+The [embedded memory helper](https://github.com/e6qu/pos3ql/blob/b3aa3099993c351e09a0eb73fd6c1de67228007d/examples/embedded-memory.rs) and
+[runner script](https://github.com/e6qu/pos3ql/blob/b3aa3099993c351e09a0eb73fd6c1de67228007d/tools/measure-embedded-capacity.py) measure 1, 8, 32 and 128
 configured tables with the same explicit shared capacities in each transaction
 mode. They retain named startup draws, configured reservation, peak resident
 memory, stack size and startup time. Populated workloads are reported separately

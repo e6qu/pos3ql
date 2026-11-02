@@ -6324,8 +6324,19 @@ fn query_workspaces_are_startup_bounded_and_isolated() {
         crate::storage::DatabaseOid::POSTGRES
     );
 
+    let mut shared_budget = Budget::new(crate::mem::lease_pool::RowWorkPool::budget_bytes(
+        config.row_work_bytes,
+        config.row_work_leases,
+    ));
+    let shared = crate::mem::lease_pool::RowWorkPool::new(
+        &mut shared_budget,
+        config.row_work_bytes,
+        config.row_work_leases,
+    )
+    .unwrap();
+    assert_eq!(shared_budget.remaining(), 0);
     let mut budget = Budget::new(config.query_workspace_slots * dml_workspace_bytes);
-    let mut dml_workspaces = DmlWorkspaces::new(&config, &mut budget).unwrap();
+    let mut dml_workspaces = DmlWorkspaces::new(&config, &mut budget, &shared).unwrap();
     assert_eq!(budget.remaining(), 0);
 
     workspaces.select(QueryWorkspaceId::from_index(0));
@@ -6336,7 +6347,10 @@ fn query_workspaces_are_startup_bounded_and_isolated() {
         })
         .unwrap();
     assert_eq!(dml_workspaces.len(), 1);
-    assert_eq!(dml_workspaces.capacity(), config.row_overlay_slots);
+    assert_eq!(
+        dml_workspaces.max_entries(),
+        shared.max_entries::<exec::PhysicalRow>()
+    );
 
     workspaces.select(QueryWorkspaceId::from_index(1));
     assert!(dml_workspaces.is_empty());

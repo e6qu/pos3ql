@@ -378,9 +378,7 @@ impl<T: Copy> RowWorkLease<T> {
     pub(crate) fn len(&self) -> usize {
         self.len
     }
-    pub(crate) fn is_empty(&self) -> bool {
-        self.len == 0
-    }
+    #[cfg(test)]
     pub(crate) fn capacity(&self) -> usize {
         self.capacity
     }
@@ -395,11 +393,11 @@ impl<T: Copy> RowWorkLease<T> {
         let bytes = entries
             .checked_mul(size_of::<T>())
             .ok_or_else(|| self.pool.error(usize::MAX))?;
-        if let Some(reservation) = &mut self.reservation {
-            if self.pool.extend(reservation, bytes) {
-                self.capacity = entries;
-                return Ok(());
-            }
+        if let Some(reservation) = &mut self.reservation
+            && self.pool.extend(reservation, bytes)
+        {
+            self.capacity = entries;
+            return Ok(());
         }
         // Both ranges and both descriptors are charged until the copy is
         // complete. Failure leaves the previous initialized prefix untouched.
@@ -442,36 +440,6 @@ impl<T: Copy> RowWorkLease<T> {
         }
         self.len += 1;
         Ok(())
-    }
-
-    pub(crate) fn pop(&mut self) -> Option<T> {
-        if self.len == 0 {
-            return None;
-        }
-        self.len -= 1;
-        let reservation = self.reservation.expect("initialized row work lease");
-        let value = unsafe {
-            self.pool
-                .pointer::<T>(reservation.range)
-                .add(self.len)
-                .read()
-        };
-        if self.len == 0 {
-            self.clear();
-        }
-        Some(value)
-    }
-
-    pub(crate) fn truncate(&mut self, len: usize) {
-        assert!(
-            len <= self.len,
-            "row work lease truncate exceeds initialized prefix"
-        );
-        if len == 0 {
-            self.clear();
-        } else {
-            self.len = len;
-        }
     }
 
     /// Returning idle capacity lets another reader or writer use these bytes.
@@ -551,9 +519,7 @@ mod tests {
             ids.as_mut_slice().sort_unstable();
             assert_eq!(ids.as_slice(), &[7, 12]);
             assert_eq!(words.as_slice(), &[u128::MAX, 81]);
-            assert_eq!(words.pop(), Some(81));
-            assert_eq!(words.as_slice(), &[u128::MAX]);
-            words.truncate(0);
+            words.clear();
             assert_eq!(words.capacity(), 0);
             words.push(81).unwrap();
             assert_eq!(ids.max_entries(), 32);
@@ -692,8 +658,8 @@ mod tests {
                     together.wait();
                 });
             };
-            let left = scope.spawn(|| worker(71));
-            let right = scope.spawn(|| worker(93));
+            let left = scope.spawn(move || worker(71));
+            let right = scope.spawn(move || worker(93));
             left.join().unwrap();
             right.join().unwrap();
         });

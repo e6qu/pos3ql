@@ -45,41 +45,52 @@ pub(crate) enum RowCleanupTarget {
     Table(usize),
 }
 
-#[derive(Clone, Copy, Debug)]
-struct RowCleanupPosition {
-    table: usize,
-    slot: usize,
-    selected: Option<bool>,
-    owner_cursor: Option<RowOwnerCursor>,
-    cell: Option<RowCellPosition>,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CleanupPoolPosition {
+    Ordinary(usize),
+    LargeObjects(usize),
 }
 
-/// A pass owns positions, never table or allocator guards between turns.
+#[derive(Clone, Copy, Debug)]
+enum RowCleanupPosition {
+    AllTables {
+        position: CleanupPoolPosition,
+        retry: Option<CleanupPoolPosition>,
+        selected: [Option<bool>; 2],
+    },
+    Owner {
+        table: usize,
+        cursor: Option<RowOwnerCursor>,
+        selected: Option<bool>,
+    },
+    Complete,
+}
+
+/// A pass owns one kind of position, never owner guards between turns.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct RowCleanup {
     task: RowCleanupTask,
-    target: RowCleanupTarget,
     position: RowCleanupPosition,
-    retry: Option<RowCleanupPosition>,
     changed: bool,
 }
 
 impl RowCleanup {
     pub(crate) fn new(task: RowCleanupTask, target: RowCleanupTarget) -> Self {
+        let position = match target {
+            RowCleanupTarget::AllTables => RowCleanupPosition::AllTables {
+                position: CleanupPoolPosition::Ordinary(0),
+                retry: None,
+                selected: [None; 2],
+            },
+            RowCleanupTarget::Table(table) => RowCleanupPosition::Owner {
+                table,
+                cursor: None,
+                selected: None,
+            },
+        };
         Self {
             task,
-            target,
-            position: RowCleanupPosition {
-                table: match target {
-                    RowCleanupTarget::AllTables => 0,
-                    RowCleanupTarget::Table(table) => table,
-                },
-                slot: 0,
-                selected: None,
-                owner_cursor: None,
-                cell: None,
-            },
-            retry: None,
+            position,
             changed: false,
         }
     }
@@ -87,19 +98,26 @@ impl RowCleanup {
     pub(crate) fn changed(&self) -> bool {
         self.changed
     }
-
     pub(crate) fn task(&self) -> RowCleanupTask {
         self.task
     }
 }
 
+/// A batch validates its first shared cell after acquiring its table owner,
+/// or advances that owner's bounded list cursor. These states cannot overlap.
+enum RowCleanupWalk {
+    Shared {
+        next: usize,
+        first: Option<RowCellPosition>,
+    },
+    Owner(Option<RowOwnerCursor>),
+}
+
 struct CleanedSlots {
-    next: usize,
     visited: usize,
     complete: bool,
     selected: bool,
     changed: bool,
-    owner_cursor: Option<RowOwnerCursor>,
 }
 
 impl Storage {
@@ -115,85 +133,128 @@ impl Storage {
         work: core::num::NonZeroUsize,
         mode: MaintenanceMode,
     ) -> MaintenanceStep {
-        let ordinary = matches!(cleanup.target, RowCleanupTarget::AllTables);
-        let large_objects = self.tables.len() - 1;
-        let done = match cleanup.target {
-            RowCleanupTarget::AllTables => self.tables.len(),
-            RowCleanupTarget::Table(table) => table + 1,
-        };
+        let pressure_only = matches!(
+            cleanup.task,
+            RowCleanupTask::HeapRows(HeapCleanup::PressuredDurable)
+                | RowCleanupTask::SavedEntries(EntryCleanup::Pressured)
+        );
         let mut remaining = work.get();
-        while remaining != 0 && cleanup.position.table < done {
-            let mut position = cleanup.position;
-            let shared = ordinary && position.table == 0;
-            if shared {
-                if position.slot >= self.row_overlay.scan_end() {
-                    cleanup.position = RowCleanupPosition {
-                        table: large_objects,
-                        slot: 0,
-                        selected: None,
-                        owner_cursor: None,
-                        cell: None,
+        while remaining != 0 {
+            match &mut cleanup.position {
+                RowCleanupPosition::AllTables {
+                    position,
+                    retry,
+                    selected,
+                } => {
+                    let (pool, selection, slot) = match *position {
+                        CleanupPoolPosition::Ordinary(slot) => (&self.row_overlay, 0, slot),
+                        CleanupPoolPosition::LargeObjects(slot) => {
+                            (self.tables.last().unwrap().rows.pool(), 1, slot)
+                        }
                     };
-                    remaining -= 1;
-                    continue;
+                    if slot >= pool.scan_end() {
+                        match *position {
+                            CleanupPoolPosition::Ordinary(_) => {
+                                *position = CleanupPoolPosition::LargeObjects(0);
+                                remaining -= 1;
+                                continue;
+                            }
+                            CleanupPoolPosition::LargeObjects(_) => {
+                                if let Some(again) = retry.take() {
+                                    *position = again;
+                                    return MaintenanceStep::WaitingForOwner;
+                                }
+                                cleanup.position = RowCleanupPosition::Complete;
+                                return MaintenanceStep::Complete;
+                            }
+                        }
+                    }
+                    let selected = *selected[selection]
+                        .get_or_insert_with(|| !pressure_only || pool.usage().pressured());
+                    let Some(cell) = pool.position_at(slot) else {
+                        *position = match *position {
+                            CleanupPoolPosition::Ordinary(_) => {
+                                CleanupPoolPosition::Ordinary(slot + 1)
+                            }
+                            CleanupPoolPosition::LargeObjects(_) => {
+                                CleanupPoolPosition::LargeObjects(slot + 1)
+                            }
+                        };
+                        remaining -= 1;
+                        continue;
+                    };
+                    let table = if selection == 0 {
+                        cell.owner().index()
+                    } else {
+                        self.tables.len() - 1
+                    };
+                    let mut walk = RowCleanupWalk::Shared {
+                        next: slot,
+                        first: Some(cell),
+                    };
+                    match self.clean_row_slots(
+                        cleanup.task,
+                        table,
+                        &mut walk,
+                        Some(selected),
+                        core::num::NonZeroUsize::new(remaining).unwrap(),
+                        mode,
+                    ) {
+                        Some(batch) => {
+                            remaining -= batch.visited.max(1);
+                            cleanup.changed |= batch.changed;
+                            let RowCleanupWalk::Shared { next, .. } = walk else {
+                                unreachable!()
+                            };
+                            *position = if selection == 0 {
+                                CleanupPoolPosition::Ordinary(next)
+                            } else {
+                                CleanupPoolPosition::LargeObjects(next)
+                            };
+                        }
+                        None => {
+                            retry.get_or_insert(*position);
+                            remaining -= 1;
+                            *position = if selection == 0 {
+                                CleanupPoolPosition::Ordinary(slot + 1)
+                            } else {
+                                CleanupPoolPosition::LargeObjects(slot + 1)
+                            };
+                        }
+                    }
                 }
-                let pressure_only = matches!(
-                    cleanup.task,
-                    RowCleanupTask::HeapRows(HeapCleanup::PressuredDurable)
-                        | RowCleanupTask::SavedEntries(EntryCleanup::Pressured)
-                );
-                let selected = *cleanup.position.selected.get_or_insert_with(|| {
-                    let usage = self.row_overlay.usage();
-                    !pressure_only || usage.pressured()
-                });
-                position.selected = Some(selected);
-                let Some(cell) = self.row_overlay.position_at(position.slot) else {
-                    cleanup.position.slot += 1;
-                    remaining -= 1;
-                    continue;
-                };
-                position.table = cell.owner().index();
-                position.cell = Some(cell);
-            }
-            match self.clean_row_slots(
-                cleanup.task,
-                position,
-                core::num::NonZeroUsize::new(remaining).unwrap(),
-                mode,
-            ) {
-                Some(batch) => {
+                RowCleanupPosition::Owner {
+                    table,
+                    cursor,
+                    selected,
+                } => {
+                    let mut walk = RowCleanupWalk::Owner(*cursor);
+                    let Some(batch) = self.clean_row_slots(
+                        cleanup.task,
+                        *table,
+                        &mut walk,
+                        *selected,
+                        core::num::NonZeroUsize::new(remaining).unwrap(),
+                        mode,
+                    ) else {
+                        return MaintenanceStep::WaitingForOwner;
+                    };
                     remaining -= batch.visited.max(1);
                     cleanup.changed |= batch.changed;
-                    if shared {
-                        cleanup.position.slot = batch.next;
-                    } else if batch.complete {
-                        cleanup.position.table = done;
-                    } else {
-                        cleanup.position.slot = batch.next;
-                        cleanup.position.selected = Some(batch.selected);
-                        cleanup.position.owner_cursor = batch.owner_cursor;
+                    if batch.complete {
+                        cleanup.position = RowCleanupPosition::Complete;
+                        return MaintenanceStep::Complete;
                     }
+                    let RowCleanupWalk::Owner(next) = walk else {
+                        unreachable!()
+                    };
+                    *cursor = next;
+                    *selected = Some(batch.selected);
                 }
-                None => {
-                    cleanup.retry.get_or_insert(cleanup.position);
-                    remaining -= 1;
-                    if shared {
-                        cleanup.position.slot += 1;
-                    } else {
-                        cleanup.position.table = done;
-                    }
-                }
+                RowCleanupPosition::Complete => return MaintenanceStep::Complete,
             }
         }
-        if cleanup.position.table != done {
-            return MaintenanceStep::Advanced;
-        }
-        if let Some(retry) = cleanup.retry.take() {
-            cleanup.position = retry;
-            MaintenanceStep::WaitingForOwner
-        } else {
-            MaintenanceStep::Complete
-        }
+        MaintenanceStep::Advanced
     }
 
     /// The caller has released publication/version owners before reclamation.
@@ -246,11 +307,13 @@ impl Storage {
     fn clean_row_slots(
         &self,
         task: RowCleanupTask,
-        position: RowCleanupPosition,
+        table: usize,
+        walk: &mut RowCleanupWalk,
+        selection: Option<bool>,
         work: core::num::NonZeroUsize,
         mode: MaintenanceMode,
     ) -> Option<CleanedSlots> {
-        let table = &self.tables[position.table];
+        let table = &self.tables[table];
         let attempt = || {
             let snapshots = matches!(task, RowCleanupTask::SnapshotHistory)
                 .then(|| try_mutex(&self.snapshots, "snapshot state lock poisoned"))
@@ -303,62 +366,64 @@ impl Storage {
             RowCleanupTask::HeapRows(HeapCleanup::PressuredDurable)
                 | RowCleanupTask::SavedEntries(EntryCleanup::Pressured)
         );
-        let selected = position.selected.unwrap_or_else(|| {
-            let usage = rows.pool_usage();
-            !pressure_only || usage.pressured()
-        });
-        let shared = position.cell.is_some();
-        let mut owner_cursor = position.owner_cursor.unwrap_or_else(|| rows.owner_cursor());
-        let mut next = position.slot;
+        let selected = selection.unwrap_or_else(|| !pressure_only || rows.pool_usage().pressured());
+        let shared = matches!(walk, RowCleanupWalk::Shared { .. });
+        if let RowCleanupWalk::Owner(cursor) = walk {
+            cursor.get_or_insert_with(|| rows.owner_cursor());
+        }
         let mut visited = 0;
         let mut complete = false;
         let mut changed = false;
         if !shared && (!eligible || !selected || rows.is_empty()) {
             return Some(CleanedSlots {
-                next,
                 visited,
                 complete: true,
                 selected,
                 changed,
-                owner_cursor: Some(owner_cursor),
             });
         }
         while visited < work.get() {
-            let cell = if shared {
-                if next >= self.row_overlay.scan_end() {
-                    complete = true;
-                    break;
-                }
-                let captured = if next == position.slot {
-                    position.cell
-                } else {
-                    self.row_overlay.position_at(next)
-                };
-                if captured.is_some_and(|cell| cell.owner() != rows.owner_id()) {
-                    if next == position.slot {
-                        next += 1;
-                        visited += 1;
-                    }
-                    break;
-                }
-                next += 1;
-                visited += 1;
-                captured
-            } else {
-                match rows.step_owner_cursor(&mut owner_cursor) {
-                    RowOwnerStep::Position(cell) => {
-                        visited += 1;
-                        next += 1;
-                        Some(cell)
-                    }
-                    RowOwnerStep::Skipped => {
-                        visited += 1;
-                        next += 1;
-                        continue;
-                    }
-                    RowOwnerStep::Complete => {
+            let cell = match walk {
+                RowCleanupWalk::Shared { next, first } => {
+                    let pool = table.rows.pool();
+                    if *next >= pool.scan_end() {
                         complete = true;
                         break;
+                    }
+                    let initial = first.is_some();
+                    let captured = match first.take() {
+                        Some(cell) => Some(cell),
+                        None => pool.position_at(*next),
+                    };
+                    if captured.is_some_and(|cell| cell.owner() != rows.owner_id()) {
+                        if initial {
+                            *next += 1;
+                            visited += 1;
+                        }
+                        break;
+                    }
+                    *next += 1;
+                    visited += 1;
+                    captured
+                }
+                RowCleanupWalk::Owner(cursor) => {
+                    match rows.step_owner_cursor(
+                        cursor
+                            .as_mut()
+                            .expect("owner cursor initialized under its table guard"),
+                    ) {
+                        RowOwnerStep::Position(cell) => {
+                            visited += 1;
+                            Some(cell)
+                        }
+                        RowOwnerStep::Skipped => {
+                            visited += 1;
+                            continue;
+                        }
+                        RowOwnerStep::Complete => {
+                            complete = true;
+                            break;
+                        }
                     }
                 }
             };
@@ -440,16 +505,14 @@ impl Storage {
                 }
             }
         }
-        if !shared {
-            complete |= owner_cursor.is_finished();
+        if let RowCleanupWalk::Owner(Some(cursor)) = walk {
+            complete |= cursor.is_finished();
         }
         Some(CleanedSlots {
-            next,
             visited,
             complete,
             selected,
             changed,
-            owner_cursor: (!shared).then_some(owner_cursor),
         })
     }
 
@@ -652,6 +715,39 @@ mod tests {
     ];
 
     #[test]
+    fn bounded_row_cleanup_control_stores_only_one_cursor_kind() {
+        assert!(
+            size_of::<RowCleanup>() <= 128,
+            "cleanup control grew to {} bytes",
+            size_of::<RowCleanup>()
+        );
+        assert!(size_of::<Option<RowCleanup>>() <= 128);
+        crate::mem::guard::forbid_alloc(|| {
+            let task = RowCleanupTask::SavedEntries(EntryCleanup::Pressured);
+            let all = RowCleanup::new(task, RowCleanupTarget::AllTables);
+            assert!(matches!(
+                all.position,
+                RowCleanupPosition::AllTables {
+                    position: CleanupPoolPosition::Ordinary(0),
+                    retry: None,
+                    selected: [None, None],
+                }
+            ));
+            let owner = RowCleanup::new(task, RowCleanupTarget::Table(3));
+            assert!(matches!(
+                owner.position,
+                RowCleanupPosition::Owner {
+                    table: 3,
+                    cursor: None,
+                    selected: None,
+                }
+            ));
+            assert!(!all.changed());
+            assert!(!owner.changed());
+        });
+    }
+
+    #[test]
     fn bounded_row_cleanup_limits_every_walk_and_keeps_pressure_selection() {
         const ROWS: usize = 129;
         for task in BOUNDED_TASKS {
@@ -720,8 +816,13 @@ mod tests {
                 assert!(waited, "{task:?}");
                 assert_eq!(remaining_rows(&storage, second, task), 0, "{task:?}");
                 assert_eq!(held.len(), 3);
-                assert_eq!(cleanup.position.table, first);
-                assert_eq!(cleanup.position.slot, 0);
+                assert!(matches!(
+                    cleanup.position,
+                    RowCleanupPosition::AllTables {
+                        position: CleanupPoolPosition::Ordinary(0),
+                        ..
+                    }
+                ));
             });
             drop(held);
             crate::mem::guard::forbid_alloc(|| {

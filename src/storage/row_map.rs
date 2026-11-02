@@ -43,10 +43,6 @@ impl RowCellPosition {
     pub(crate) fn owner(self) -> RowOwnerId {
         self.owner
     }
-
-    pub(crate) fn index(self) -> usize {
-        self.cell.index as usize
-    }
 }
 
 /// Bounded owner-list walk. New insertions belong to the next pass.
@@ -196,7 +192,7 @@ impl RowOverlayPool {
             .collect::<Vec<_>>()
             .into_boxed_slice();
         let identity = NEXT_POOL_ID
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                 value.checked_add(1)
             })
             .expect("row overlay pool identities exhausted");
@@ -266,7 +262,7 @@ impl RowOverlayPool {
     fn register_owner(&self) -> RowOwnerId {
         let local = self
             .next_owner
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                 value.checked_add(1)
             })
             .expect("row overlay owner identities exhausted");

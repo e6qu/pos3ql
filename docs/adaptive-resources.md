@@ -16,7 +16,7 @@ reserved memory must remain unchanged.
 - `row_overlay_slots` budgets ordinary-table resident row metadata across the
   whole instance. Empty tables share that capacity instead of receiving private
   row allowances. `large_object_pages` remains a separate reserve.
-- [Row bytes](../src/storage/row_heap.rs) already share two `memtable_bytes`
+- [Row bytes](https://github.com/e6qu/pos3ql/blob/b3aa3099993c351e09a0eb73fd6c1de67228007d/src/storage/row_heap.rs) already share two `memtable_bytes`
   buffers for active data and relocation. Committed MVCC history uses the
   instance-wide `row_history_slots`; locking mode reserves no committed history.
 - Foreground retained row IDs and DML buffers use one `row_work_bytes` pool,

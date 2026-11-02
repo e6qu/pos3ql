@@ -58,7 +58,7 @@ impl std::error::Error for PoolExhausted {}
 
 fn allocate_pool_identity(counter: &AtomicUsize, budget: &Budget) -> Result<usize, BudgetError> {
     counter
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
             value.checked_add(1)
         })
         .map_err(|_| BudgetError {

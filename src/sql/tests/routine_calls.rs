@@ -19,6 +19,8 @@ fn sorted_and_paged_projection_effects(external: bool) {
     config.object_store_on = external;
     config.object_store_sim = external;
     config.object_store_bucket = format!("projection-window-{}-{external}", std::process::id());
+    // All nine fixture relations coexist; statement work remains 256 KiB.
+    config.max_tables = 9;
     config.work_arena_bytes = 256 << 10;
     config.block_cache_bytes = 0;
     config.disk_cache_bytes = 0;

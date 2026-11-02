@@ -111,8 +111,8 @@ in the [performance guide](docs/performance.md). Keep controller state within
 startup budgets and prove capacity conservation, no runtime heap growth and safe
 release after errors.
 Preserve the [historical embedded measurements](https://github.com/e6qu/pos3ql/blob/4054a6d3c79e916728f8e84d84139eae6d86b501/benchmarks/baselines/2026-10-30-embedded-lazy-definitions/README.md);
-repeat with independent statistics capacity and populated workloads before
-claiming a current embedded minimum.
+compare future measurements at identical explicit capacities. Add populated
+multi-session and pinned-reader measurements before claiming an embedded minimum.
 
 ### Adapt batching, admission and future layout to the workload
 

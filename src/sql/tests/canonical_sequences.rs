@@ -355,11 +355,12 @@ fn sequence_advances_from_another_transaction_survive_cold_commit_retries() {
     config.block_cache_bytes = 0;
     config.disk_cache_bytes = 0;
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let server = object_reads::HttpObjectServer::start(&mut config);
     let mut budget = test_engine_budget(&config, 1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
-    session.success(&mut engine, "CREATE TABLE cold_commit_rows(id integer); CREATE TABLE cold_commit_empty(id integer); CREATE SEQUENCE publication_counter CACHE 1; INSERT INTO cold_commit_rows VALUES(1)", false);
-    assert!(engine.checkpoint().unwrap());
+    session.success(&mut engine, "CREATE TABLE cold_commit_rows(id integer); CREATE TABLE cold_commit_empty(id integer); CREATE SEQUENCE publication_counter CACHE 1; INSERT INTO cold_commit_rows VALUES(1)", true);
+    assert!(crate::mem::guard::forbid_alloc(|| engine.checkpoint()).unwrap());
     let table = engine
         .storage
         .find_table("public", "cold_commit_rows")
@@ -372,28 +373,9 @@ fn sequence_advances_from_another_transaction_survive_cold_commit_retries() {
         RowCleanupTask::SavedEntries(EntryCleanup::AllSaved),
         RowCleanupTarget::Table(table),
     );
-    let server = object_reads::HttpObjectServer::start(&mut config);
-    let mut io_budget = Budget::new(
-        Checkpointer::budget_bytes(&config)
-            + crate::storage::SpillReader::budget_bytes(
-                true,
-                config.max_spill_generations_per_table,
-            ),
-    );
-    let checkpoint = Checkpointer::new(&config, &mut io_budget).unwrap();
-    let blocks = checkpoint.block_stack();
-    let reader = crate::storage::SpillReader::new(
-        &mut io_budget,
-        config.max_spill_generations_per_table,
-        Some(Arc::clone(&blocks)),
-        engine
-            .temporary_spiller
-            .as_ref()
-            .map(TemporarySpiller::block_store),
-    )
-    .unwrap();
-    engine.storage.attach_spill(reader);
-    engine.ckpt = Some(checkpoint);
+    // Keep the writer authority acquired by Engine::new for both checkpoints.
+    // Only the row decoder is replaced below to make commit admission cold.
+    let blocks = engine.ckpt.as_ref().unwrap().block_stack();
     engine.enable_async_block_reads();
     session.success(
         &mut engine,

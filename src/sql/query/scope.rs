@@ -496,18 +496,6 @@ impl<'d> QueryScope<'d> {
         from: &FromClause<'d>,
     ) -> Result<Self, SqlError> {
         let table_count = from.joins.len() + 1;
-        let merged_capacity = from
-            .joins
-            .iter()
-            .map(|join| {
-                if join.natural {
-                    MAX_COLUMNS
-                } else {
-                    join.using.map_or(0, |using| using.columns.len())
-                }
-            })
-            .sum::<usize>();
-        let has_merges = merged_capacity != 0;
         let names = arena
             .alloc_slice_with(table_count, |_| "")
             .map_err(|_| arena_full())?;
@@ -539,21 +527,14 @@ impl<'d> QueryScope<'d> {
             .alloc_slice_with(table_count, |_| false)
             .map_err(|_| arena_full())?;
         let merged = arena
-            .alloc_slice_with(merged_capacity.max(1), |_| MergedColumn {
+            .alloc_slice_with(0, |_| MergedColumn {
                 name: "",
                 parts: &[],
                 ctype: ColType::Bool,
             })
             .map_err(|_| arena_full())?;
         let output = arena
-            .alloc_slice_with(
-                if has_merges {
-                    table_count.saturating_mul(MAX_COLUMNS)
-                } else {
-                    1
-                },
-                |_| ResolvedColumn::Table(0, 0),
-            )
+            .alloc_slice_with(0, |_| ResolvedColumn::Table(0, 0))
             .map_err(|_| arena_full())?;
         let join_on = arena
             .alloc_slice_with(from.joins.len().max(1), |_| None)
@@ -1456,9 +1437,30 @@ impl<'d> QueryScope<'d> {
         if !from.joins.iter().any(|j| j.natural || j.using.is_some()) {
             return Ok(());
         }
+        // Definitions are now available: a merged join needs capacity for its
+        // actual columns, not the maximum relation width for every source.
+        let merged_capacity = from
+            .joins
+            .iter()
+            .enumerate()
+            .map(|(index, join)| {
+                if join.natural {
+                    self.defs.get(index + 1).expect("resolved").n_columns
+                } else {
+                    join.using.map_or(0, |using| using.columns.len())
+                }
+            })
+            .sum();
+        self.merged = scratch_arena
+            .alloc_slice_with(merged_capacity, |_| MergedColumn {
+                name: "",
+                parts: &[],
+                ctype: ColType::Bool,
+            })
+            .map_err(|_| arena_full())?;
         // The left join tree's output columns, updated join by join.
         let out = scratch_arena
-            .alloc_slice_with(self.output.len(), |_| ResolvedColumn::Table(0, 0))
+            .alloc_slice_with(self.total_columns(), |_| ResolvedColumn::Table(0, 0))
             .map_err(|_| arena_full())?;
         let mut n_out = 0usize;
         for c in 0..self.defs.get(0).expect("resolved").n_columns {
@@ -1624,7 +1626,7 @@ impl<'d> QueryScope<'d> {
             }
             self.join_on[join_index] = predicate;
         }
-        self.output[..n_out].copy_from_slice(&out[..n_out]);
+        self.output = out;
         self.n_output = n_out;
         Ok(())
     }
@@ -2200,6 +2202,39 @@ mod tests {
             drop(execution);
             assert_eq!(name, "c1");
         });
+    }
+
+    #[test]
+    fn query_definition_ownership_merged_joins_size_buffers_from_actual_columns() {
+        let mut config = config();
+        config.definition_image_slots = 2;
+        let mut budget = Budget::new(Storage::extra_budget_bytes(&config) + config.memtable_bytes);
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
+        storage.create_table(definition("left_source", 1)).unwrap();
+        storage.create_table(definition("right_source", 1)).unwrap();
+        for sql in [
+            "SELECT merged.* FROM left_source JOIN right_source USING(c0) AS merged",
+            "SELECT * FROM left_source NATURAL JOIN right_source",
+        ] {
+            let mut arena_budget = Budget::new(16 << 10);
+            let arena = Arena::new(&mut arena_budget, "actual merged columns", 16 << 10).unwrap();
+            let query = crate::sql::parser::parse_query(sql, &arena).unwrap();
+            crate::mem::guard::forbid_alloc(|| {
+                let scope = QueryScope::resolve_schema(
+                    &storage,
+                    query.from.as_ref().unwrap(),
+                    0,
+                    &arena,
+                    None,
+                )
+                .unwrap();
+                assert_eq!(scope.output.len(), 2);
+                assert_eq!(scope.merged.len(), 1);
+                assert_eq!(scope.star_columns(), 1);
+                assert_eq!(scope.output_name(scope.star_entry(0)), "c0");
+                assert_eq!(scope.output_type(scope.star_entry(0)), ColType::Int8);
+            });
+        }
     }
 
     #[test]

@@ -151,7 +151,7 @@ fn describe_items_with_output_aliases<'q>(
                 let Some(def) = def else {
                     return Err(sql_err!(
                         sqlstate::SYNTAX_ERROR,
-                        "SELECT * requires a FROM clause"
+                        "SELECT * with no tables specified is not valid"
                     ));
                 };
                 for c in def.columns() {

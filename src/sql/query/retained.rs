@@ -23,6 +23,10 @@ enum RetainedRow<'a> {
     Singleton,
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "physical cursors retain their existing inline control storage; singleton sources need no additional arena owner"
+)]
 enum RetainedSource {
     Physical(RowCursor),
     Singleton { available: bool },

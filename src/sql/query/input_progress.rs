@@ -340,6 +340,10 @@ struct InputFrame<'a> {
 }
 
 #[derive(Clone, Copy)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "temporary input frames stay on the stack; boxing would allocate during evaluation"
+)]
 enum AttemptFrame<'statement, 'query> {
     // retain is the only constructor: saved values are encoded statement bytes.
     Saved(&'statement InputFrame<'statement>),

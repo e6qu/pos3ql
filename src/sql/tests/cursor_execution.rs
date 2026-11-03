@@ -1,6 +1,49 @@
 use super::*;
 
 #[test]
+fn singleton_cursor_wildcards_require_relations_and_preserve_zero_column_rows() {
+    let config = test_config("singleton-cursor-wildcards");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    for (query, expected) in [
+        ("SELECT *", sqlstate::SYNTAX_ERROR),
+        ("SELECT * LIMIT 0", sqlstate::SYNTAX_ERROR),
+        ("SELECT *,1/0 LIMIT 0", sqlstate::SYNTAX_ERROR),
+        ("SELECT true+1,*", sqlstate::UNDEFINED_FUNCTION),
+        ("SELECT *,true+1", sqlstate::SYNTAX_ERROR),
+        ("SELECT missing.*", sqlstate::UNDEFINED_TABLE),
+        ("SELECT missing.* LIMIT 0", sqlstate::UNDEFINED_TABLE),
+    ] {
+        assert_eq!(
+            error_sqlstates(&session.execute(&mut engine, query, true)),
+            [expected],
+            "{query}"
+        );
+        assert_eq!(
+            error_sqlstates(&session.execute(
+                &mut engine,
+                &format!("BEGIN; DECLARE invalid_singleton CURSOR FOR {query}"),
+                true
+            )),
+            [expected],
+            "DECLARE {query}"
+        );
+        session.success(&mut engine, "ROLLBACK", true);
+    }
+    session.success(&mut engine,
+        "CREATE TABLE zero_column_cursor_source(); INSERT INTO zero_column_cursor_source DEFAULT VALUES", true);
+    for projection in ["*", "source.*"] {
+        session.success(&mut engine,
+            &format!("BEGIN; DECLARE valid_empty_columns CURSOR FOR SELECT {projection} FROM zero_column_cursor_source source"), true);
+        let output = session.success(&mut engine, "FETCH NEXT FROM valid_empty_columns", true);
+        assert_eq!(command_tags(&output), ["FETCH 1"]);
+        assert_eq!(data_rows(&output), [""]);
+        session.success(&mut engine, "CLOSE valid_empty_columns; COMMIT", true);
+    }
+}
+
+#[test]
 fn singleton_cursors_defer_function_defaults_and_effects_until_fetch() {
     let config = test_config("singleton-cursor-functions");
     let mut budget = test_engine_budget(&config, 1 << 29);

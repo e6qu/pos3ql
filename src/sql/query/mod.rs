@@ -8096,6 +8096,20 @@ fn rewrite_grouped_expr<'a>(
     }
 }
 
+fn validate_projection_source(
+    item: &SelectItem<'_>,
+    scope: &QueryScope<'_>,
+) -> Result<(), SqlError> {
+    match item {
+        SelectItem::Wildcard if scope.n == 0 => Err(sql_err!(
+            sqlstate::SYNTAX_ERROR,
+            "SELECT * with no tables specified is not valid"
+        )),
+        SelectItem::TableWildcard(qualifier) => scope.qualified_star_columns(qualifier).map(|_| ()),
+        _ => Ok(()),
+    }
+}
+
 /// Check SELECT types before folding constants or requesting any input rows.
 fn check_select_types<'a>(
     statement: &'a Select<'a>,
@@ -8138,6 +8152,7 @@ fn check_select_types<'a>(
     // constants, so an invalid aggregate/operator (e.g. `min(boolean)`)
     // errors ahead of a constant division elsewhere in the query.
     for item in statement.items {
+        validate_projection_source(item, scope)?;
         if let SelectItem::Expr { expression, .. } = item {
             check(expression)?;
         }
@@ -9149,6 +9164,12 @@ pub(crate) fn constant_select_resumable<'a, 'statement>(
     statement_arena: Option<&'statement Arena>,
     responder: &mut Responder,
 ) -> Outcome {
+    let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
+    let n = match describe_catalog_items(statement.items, None, storage, txid, arena, &mut columns)
+    {
+        Ok(count) => count,
+        Err(error) => return sql_fail(error),
+    };
     let statement = match expand_select_record_calls(statement, storage, txid, arena, None) {
         Ok(statement) => statement,
         Err(error) => return sql_fail(error),
@@ -9209,13 +9230,6 @@ pub(crate) fn constant_select_resumable<'a, 'statement>(
         Ok(s) => s,
         Err(e) => return sql_fail(e),
     };
-    let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
-    let n = match describe_catalog_items(statement.items, None, storage, txid, arena, &mut columns)
-    {
-        Ok(n) => n,
-        Err(e) => return sql_fail(e),
-    };
-
     let mut sub_exprs: [Option<&Expr>; 1 + MAX_PROJ] = [None; 1 + MAX_PROJ];
     sub_exprs[0] = statement.where_clause;
     for (i, item) in statement.items.iter().enumerate() {
@@ -10828,6 +10842,7 @@ pub fn describe_scope_items<'q>(
 ) -> Result<usize, SqlError> {
     let mut n = 0;
     for item in items {
+        validate_projection_source(item, scope)?;
         match item {
             SelectItem::TableWildcard(q) => {
                 for index in 0..scope.qualified_star_columns(q)? {

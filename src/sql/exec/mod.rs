@@ -7541,12 +7541,7 @@ pub(super) fn alter_owner_target(
             }
             None => None,
         },
-        AlterOwnerKind::MaterializedView => {
-            match materialized_view_access_object(storage, name, txid) {
-                Ok(object) => object,
-                Err(error) => return Err(error),
-            }
-        }
+        AlterOwnerKind::MaterializedView => materialized_view_access_object(storage, name, txid)?,
         AlterOwnerKind::Sequence => match resolve_sequence(storage, name, txid) {
             Ok(Some(slot)) => Some(AccessObject {
                 class: AccessClass::Sequence,

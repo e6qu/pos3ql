@@ -14359,9 +14359,10 @@ pub fn rule_def_text<'a>(
     storage: &Storage,
     txid: u32,
     oid: i32,
+    pretty: bool,
     arena: &'a Arena,
 ) -> Result<Option<&'a str>, SqlError> {
-    rewrite::rule_definition(storage, txid, oid, arena)
+    rewrite::rule_definition(storage, txid, oid, pretty, arena)
 }
 
 /// The bytes occupied by a relation's visible encoded row images. Plain views
@@ -14911,6 +14912,16 @@ pub fn user_type_name_text<'a>(
     oid: i32,
     arena: &'a Arena,
 ) -> Result<Option<&'a str>, SqlError> {
+    user_type_name_fixed(storage, txid, oid)?
+        .map(|rendered| alloc_rendered(&rendered, "formatted type name is too long", arena))
+        .transpose()
+}
+
+pub(crate) fn user_type_name_fixed(
+    storage: &Storage,
+    txid: u32,
+    oid: i32,
+) -> Result<Option<StackStr<260>>, SqlError> {
     let Some((_, _, array)) = crate::storage::NamedTypeKind::from_oid(oid) else {
         return Ok(None);
     };
@@ -14933,11 +14944,13 @@ pub fn user_type_name_text<'a>(
     if array {
         let _ = rendered.write_str("[]");
     }
-    Ok(Some(alloc_rendered(
-        &rendered,
-        "formatted type name is too long",
-        arena,
-    )?))
+    if rendered.is_truncated() {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "formatted type name is too long"
+        ));
+    }
+    Ok(Some(rendered))
 }
 
 /// The comment text `txid` sees on the object with this OID (and column

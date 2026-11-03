@@ -533,6 +533,8 @@ fn sequence_advances_from_another_transaction_survive_cold_commit_retries() {
         })
         .unwrap();
     assert_eq!((truncates, updates, sequence_advances), (1, 1, 1));
+    // Embedded command completion releases unused read-ahead before maintenance.
+    assert!(!engine.block_reads_pending());
     assert!(crate::mem::guard::forbid_alloc(|| engine.checkpoint()).unwrap());
     drop((session, publisher, engine, blocks));
     std::fs::remove_dir_all(&config.data_dir).unwrap();

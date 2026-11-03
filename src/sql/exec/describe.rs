@@ -645,6 +645,16 @@ pub(crate) fn visit_catalog_rowtype_fields(
 }
 
 impl ColTypeResolver for CatalogCols<'_> {
+    fn type_name_fixed(
+        &self,
+        type_oid: i32,
+    ) -> Result<Option<crate::util::StackStr<260>>, SqlError> {
+        Ok(
+            crate::sql::catalog::user_type_name_fixed(self.storage, self.txid, type_oid)?
+                .or_else(|| builtin_type_name_fixed(type_oid)),
+        )
+    }
+
     fn subquery_type(&self, expression: &Expr<'_>) -> Result<Option<(i32, i16)>, SqlError> {
         let scope = self
             .definition
@@ -1823,7 +1833,89 @@ pub(crate) fn catalog_operator_first_argument_type(
     }))
 }
 
+pub(crate) fn builtin_type_name_fixed(type_oid: i32) -> Option<crate::util::StackStr<260>> {
+    if crate::storage::NamedTypeKind::from_oid(type_oid).is_some() {
+        return None;
+    }
+    let name = if type_oid == oid::UNKNOWN {
+        "unknown"
+    } else {
+        ColType::from_oid(type_oid)?.name()
+    };
+    Some(crate::util::StackStr::from_str(name))
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum FunctionLookupFailure {
+    Missing,
+    Ambiguous,
+}
+
+pub(crate) fn function_lookup_error(
+    name: &str,
+    argument_oids: &[i32],
+    argument_names: &[Option<&str>],
+    failure: FunctionLookupFailure,
+    columns: &dyn ColTypeResolver,
+) -> SqlError {
+    let format = || -> Result<crate::util::StackStr<192>, SqlError> {
+        use core::fmt::Write;
+        if argument_names.len() > argument_oids.len() {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "function diagnostic argument mapping changed"
+            ));
+        }
+        let mut message = crate::util::StackStr::<192>::new();
+        let _ = write!(message, "function {}(", name);
+        for (index, type_oid) in argument_oids.iter().copied().enumerate() {
+            if index != 0 {
+                let _ = message.write_str(", ");
+            }
+            if let Some(Some(name)) = argument_names.get(index) {
+                let _ = write!(message, "{} => ", name);
+            }
+            let type_name = columns.type_name_fixed(type_oid)?.ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "function argument type with OID {} is unavailable",
+                    type_oid
+                )
+            })?;
+            let _ = message.write_str(type_name.as_str());
+        }
+        let _ = message.write_str(match failure {
+            FunctionLookupFailure::Missing => ") does not exist",
+            FunctionLookupFailure::Ambiguous => ") is not unique",
+        });
+        if message.is_truncated() {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "function diagnostic exceeds SQL error message capacity (192 bytes)"
+            ));
+        }
+        Ok(message)
+    };
+    match format() {
+        Ok(message) => SqlError {
+            message,
+            sqlstate: crate::sql::eval::SqlState::known(match failure {
+                FunctionLookupFailure::Missing => sqlstate::UNDEFINED_FUNCTION,
+                FunctionLookupFailure::Ambiguous => sqlstate::AMBIGUOUS_FUNCTION,
+            }),
+        },
+        Err(error) => error,
+    }
+}
+
 pub trait ColTypeResolver {
+    fn type_name_fixed(
+        &self,
+        type_oid: i32,
+    ) -> Result<Option<crate::util::StackStr<260>>, SqlError> {
+        Ok(builtin_type_name_fixed(type_oid))
+    }
+
     fn operator_first_argument_type(
         &self,
         _name: &str,
@@ -2011,7 +2103,7 @@ pub trait ColTypeResolver {
 /// degrading `$n` to `unknown`.
 #[derive(Clone, Copy)]
 struct RoutineParameterTypes {
-    types: [Option<(i32, i16)>; MAX_ROUTINE_ARGUMENTS],
+    types: [Option<StaticTypeMeta>; MAX_ROUTINE_ARGUMENTS],
 }
 
 #[derive(Clone, Copy)]
@@ -2114,7 +2206,16 @@ pub(crate) fn enter_routine_parameter_types(
                 })?,
             None => argument.ctype.oid(),
         };
-        current.types[slot] = Some((type_oid, argument.ctype.typlen()));
+        current.types[slot] = Some(StaticTypeMeta {
+            ctype: argument.ctype,
+            type_oid,
+            type_mod: -1,
+            collation: if argument.ctype.is_collatable() {
+                crate::sql::ast::Collation::Default
+            } else {
+                crate::sql::ast::Collation::None
+            },
+        });
     }
     let prior = ROUTINE_PARAMETER_TYPES.with(|slot| slot.replace(current));
     Ok(RoutineParameterScope(
@@ -2131,6 +2232,10 @@ impl Drop for RoutineParameterScope {
 }
 
 fn routine_parameter_type(index: u32) -> Option<(i32, i16)> {
+    routine_parameter_metadata(index).map(|metadata| (metadata.type_oid, metadata.ctype.typlen()))
+}
+
+fn routine_parameter_metadata(index: u32) -> Option<StaticTypeMeta> {
     index.checked_sub(1).and_then(|index| {
         ROUTINE_PARAMETER_TYPES
             .with(|types| types.get().types.get(index as usize).copied().flatten())
@@ -2912,7 +3017,7 @@ fn selected_call(
         return Ok(None);
     }
     let mut arguments = [oid::UNKNOWN; MAX_ROUTINE_ARGUMENTS];
-    let count = if *star { 0 } else { args.len() };
+    let mut count = if *star { 0 } else { args.len() };
     if count > arguments.len() {
         return Err(sql_err!(
             sqlstate::TOO_MANY_ARGUMENTS,
@@ -2951,17 +3056,22 @@ fn selected_call(
             *variadic,
             &arguments[..complete],
         );
+        count = complete;
     }
     match selection {
-        Some(crate::storage::RoutineCallSelection::Absent) => Err(sql_err!(
-            sqlstate::UNDEFINED_FUNCTION,
-            "function {}(...) does not exist",
-            name
+        Some(crate::storage::RoutineCallSelection::Absent) => Err(function_lookup_error(
+            name,
+            &arguments[..count],
+            argument_names,
+            FunctionLookupFailure::Missing,
+            columns,
         )),
-        Some(crate::storage::RoutineCallSelection::Ambiguous) => Err(sql_err!(
-            sqlstate::AMBIGUOUS_FUNCTION,
-            "function {}(...) is not unique",
-            name
+        Some(crate::storage::RoutineCallSelection::Ambiguous) => Err(function_lookup_error(
+            name,
+            &arguments[..count],
+            argument_names,
+            FunctionLookupFailure::Ambiguous,
+            columns,
         )),
         Some(crate::storage::RoutineCallSelection::WrongKind { .. }) => Err(sql_err!(
             sqlstate::WRONG_OBJECT_TYPE,
@@ -3129,10 +3239,12 @@ pub(crate) fn resolved_set_call(
             Ok(crate::sql::catalog::builtin_callable_by_oid(oid)
                 .is_some_and(|signature| signature.returns_set))
         }
-        crate::storage::RoutineCallSelection::Ambiguous => Err(sql_err!(
-            sqlstate::AMBIGUOUS_FUNCTION,
-            "function {}(...) is not unique",
-            name
+        crate::storage::RoutineCallSelection::Ambiguous => Err(function_lookup_error(
+            name,
+            &arguments[..args.len()],
+            argument_names,
+            FunctionLookupFailure::Ambiguous,
+            columns,
         )),
         crate::storage::RoutineCallSelection::WrongKind { .. } => Err(sql_err!(
             sqlstate::WRONG_OBJECT_TYPE,
@@ -3144,10 +3256,12 @@ pub(crate) fn resolved_set_call(
                 || crate::sql::query::is_builtin_set_routine(name)
                 || storage.has_set_routine_candidate(name, args.len(), txid)
             {
-                Err(sql_err!(
-                    sqlstate::UNDEFINED_FUNCTION,
-                    "function {}(...) does not exist",
-                    name
+                Err(function_lookup_error(
+                    name,
+                    &arguments[..args.len()],
+                    argument_names,
+                    FunctionLookupFailure::Missing,
+                    columns,
                 ))
             } else {
                 Ok(false)
@@ -3262,6 +3376,36 @@ fn record_shape_metadata_dyn(
     columns: &dyn ColTypeResolver,
     visit: &mut dyn FnMut(&str, StaticTypeMeta),
 ) -> Result<Option<usize>, SqlError> {
+    let parameter = match base {
+        Expr::Param(index)
+            if matches!(PARAMETER_CONTEXT.with(Cell::get), ParameterContext::Routine) =>
+        {
+            routine_parameter_metadata(*index)
+        }
+        Expr::RoutineParam {
+            qualifier,
+            name,
+            index,
+            source: crate::sql::ast::ParameterSource::SqlRoutine,
+        } => match columns.resolve(*qualifier, name) {
+            Ok(_) => None,
+            Err(error)
+                if error.sqlstate == sqlstate::UNDEFINED_COLUMN
+                    || error.sqlstate == sqlstate::UNDEFINED_TABLE =>
+            {
+                routine_parameter_metadata(*index)
+            }
+            Err(error) => return Err(error),
+        },
+        _ => None,
+    };
+    if let Some(StaticTypeMeta {
+        ctype: ColType::Composite(slot),
+        ..
+    }) = parameter
+    {
+        return Ok(columns.visit_composite_fields(slot, visit));
+    }
     match base {
         Expr::Call {
             kind: crate::sql::ast::CallKind::SqlSyntax,
@@ -3808,6 +3952,10 @@ impl ColTypeResolver for DefCols<'_> {
 }
 
 impl<'a> ColumnLookup<'a> for DefCols<'_> {
+    fn whole_row_type(&self, table: &str) -> Option<ColType> {
+        ColTypeResolver::is_whole_row(self, table).then_some(ColType::Record)
+    }
+
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
         self.resolve(qualifier, name)?;
         Ok(Datum::Null)
@@ -3891,6 +4039,10 @@ impl ColTypeResolver for AliasedDefCols<'_, '_> {
 }
 
 impl<'a> ColumnLookup<'a> for AliasedDefCols<'_, '_> {
+    fn whole_row_type(&self, table: &str) -> Option<ColType> {
+        ColTypeResolver::is_whole_row(self, table).then_some(ColType::Record)
+    }
+
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
         self.resolve(qualifier, name)?;
         Ok(Datum::Null)
@@ -4568,14 +4720,31 @@ pub fn infer_type_res(
             "selected routine result type is unavailable"
         ));
     }
-    if let Expr::Call { name, .. } = expression
+    if let Expr::Call {
+        name,
+        args,
+        argument_names,
+        ..
+    } = expression
         && name.rsplit('.').next() == Some("_pg_expandarray")
         && crate::sql::query::builtin_set_routine_name(name).is_none()
     {
-        return Err(sql_err!(
-            sqlstate::UNDEFINED_FUNCTION,
-            "function {}(...) does not exist",
-            name
+        let mut arguments = [oid::UNKNOWN; MAX_ROUTINE_ARGUMENTS];
+        if args.len() > arguments.len() {
+            return Err(sql_err!(
+                sqlstate::TOO_MANY_ARGUMENTS,
+                "function has too many arguments"
+            ));
+        }
+        for (output, argument) in arguments.iter_mut().zip(*args) {
+            *output = infer_routine_argument_oid(argument, columns)?;
+        }
+        return Err(function_lookup_error(
+            name,
+            &arguments[..args.len()],
+            argument_names,
+            FunctionLookupFailure::Missing,
+            columns,
         ));
     }
     // Resolve stored targets with their original qualification first. The
@@ -5286,7 +5455,7 @@ pub fn infer_type_res(
             "macaddr8_in" | "macaddr8" | "macaddr8_set7bit" | "macaddr8_not" | "macaddr8_and"
             | "macaddr8_or" => of(ColType::Macaddr8),
             "array_dims" => of(ColType::Text),
-            "current_schemas" => of(ColType::Array(crate::sql::types::ArrElem::Text)),
+            "current_schemas" => of(ColType::Array(crate::sql::types::ArrElem::Name)),
             "array_to_json" => of(ColType::Json),
             "json_populate_record"
             | "jsonb_populate_record"
@@ -5848,22 +6017,37 @@ pub fn infer_type_res(
                     .unwrap_or(crate::sql::types::ArrElem::Int4);
                 of(ColType::Array(elem))
             }
-            // Ordered-set aggregates: percentile_cont yields double precision
-            // (numeric for a numeric input); percentile_disc/mode yield the
-            // WITHIN GROUP input type.
+            // Continuous percentiles select float8 or interval; discrete
+            // percentiles preserve the ordering input's type.
             "percentile_cont" | "percentile_disc" | "mode" => {
                 let input = order_by
                     .first()
-                    .map(|o| infer_type_res(o.expression, columns))
+                    .map(|order| infer_type_res(order.expression, columns))
                     .transpose()?
-                    .map(|t| t.0);
-                match *name {
-                    "percentile_cont" if input == Some(oid::NUMERIC) => of(ColType::Numeric),
-                    "percentile_cont" => of(ColType::Float8),
-                    _ => match input.and_then(coltype_of_oid) {
-                        Some(t) => of(t),
-                        None => (oid::UNKNOWN, -2),
-                    },
+                    .and_then(|(oid, _)| coltype_of_oid(oid));
+                let result = if *name == "percentile_cont" {
+                    Some(if input == Some(ColType::Interval) {
+                        ColType::Interval
+                    } else {
+                        ColType::Float8
+                    })
+                } else {
+                    input
+                };
+                let array_fraction = args
+                    .first()
+                    .map(|fraction| infer_type_res(fraction, columns))
+                    .transpose()?
+                    .and_then(|(oid, _)| coltype_of_oid(oid))
+                    .is_some_and(|ctype| matches!(ctype, ColType::Array(_)));
+                match result {
+                    Some(result) if array_fraction => {
+                        crate::sql::types::ArrElem::from_coltype(result)
+                            .map(|element| of(ColType::Array(element)))
+                            .unwrap_or((oid::UNKNOWN, -2))
+                    }
+                    Some(result) => of(result),
+                    None => (oid::UNKNOWN, -2),
                 }
             }
             "extract" => of(ColType::Numeric),

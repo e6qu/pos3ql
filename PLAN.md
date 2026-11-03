@@ -177,8 +177,8 @@ A waiting schema edit must never attach itself to a new object that reused a nam
   ownership, failed-fetch cleanup and scan statistics. Fetching, skipping and
   moving rows must keep their distinct PostgreSQL effects. Sequence values
   already issued remain owned by the command across retries and rollback.
-  Finishing or saving a result must release its input owners across all wire
-  command paths, including COPY and extended-protocol Sync.
+  Finishing or saving a result must release its input owners across embedded
+  calls and wire command paths, including COPY and extended-protocol Sync.
 
 Follow PostgreSQL's distinction between listing an old catalog row and resolving
 an object for current use. After `orders` becomes `sales`, an older report can

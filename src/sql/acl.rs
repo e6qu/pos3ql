@@ -493,7 +493,20 @@ pub struct Exploded {
     pub grantable: bool,
 }
 
+pub(crate) fn validate_array_shape(raw: &[u8]) -> Result<(), SqlError> {
+    let shape = crate::sql::array::shape(raw)
+        .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "ACL array shape is invalid"))?;
+    if shape.dimension_count() != 1 {
+        return Err(sql_err!(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "ACL arrays must be one-dimensional"
+        ));
+    }
+    Ok(())
+}
+
 pub fn explode_count(raw: &[u8]) -> Result<usize, SqlError> {
+    validate_array_shape(raw)?;
     let mut count = 0usize;
     for value in crate::sql::array::elements(raw, crate::sql::types::ArrElem::AclItem) {
         let privileges = match value {
@@ -522,6 +535,7 @@ pub fn explode_at(
     catalog: &dyn crate::sql::eval::CatalogAccess,
     arena: &Arena,
 ) -> Result<Option<Exploded>, SqlError> {
+    validate_array_shape(raw)?;
     let mut current = 0usize;
     for value in crate::sql::array::elements(raw, crate::sql::types::ArrElem::AclItem) {
         let (grantor, grantee, privileges, grant_options) = match value {

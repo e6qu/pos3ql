@@ -17,7 +17,8 @@ use crate::sql_err;
 use crate::stack_format;
 
 use super::super::{
-    ColumnLookup, EvalHooks, SqlError, arena_full, eval_full, sqlstate, text_arg, type_mismatch,
+    ColumnLookup, EvalHooks, SqlError, arena_full, cast_to, eval_full, sqlstate, text_arg,
+    type_mismatch,
 };
 
 /// A catalog OID accepted by identity predicates.  Keeping conversion at the
@@ -676,13 +677,17 @@ pub(crate) enum CatalogPredicateKind {
 
 fn strict_catalog_arguments<'a>(
     args: &[&Expr<'a>],
+    catalog: Option<&dyn super::super::CatalogAccess>,
     mut evaluate: impl FnMut(usize, &Expr<'a>) -> Result<Datum<'a>, SqlError>,
 ) -> Result<Option<[Datum<'a>; 3]>, SqlError> {
     assert!(args.len() <= 3, "catalog call arity was validated");
     let mut values = [Datum::Null; 3];
+    let mut constants = [false; 3];
     let mut constant_null = false;
     for (position, expression) in args.iter().enumerate() {
-        if expression.is_constant() {
+        constants[position] = super::super::constant_evaluation(expression, catalog)?
+            != Some(super::super::ExpressionEvaluation::Runtime);
+        if constants[position] {
             values[position] = evaluate(position, expression)?;
             constant_null |= values[position].is_null();
         }
@@ -691,45 +696,53 @@ fn strict_catalog_arguments<'a>(
         return Ok(None);
     }
     for (position, expression) in args.iter().enumerate() {
-        if !expression.is_constant() {
+        if !constants[position] {
             values[position] = evaluate(position, expression)?;
         }
     }
     Ok((!values[..args.len()].iter().any(Datum::is_null)).then_some(values))
 }
 
+/// Indirectly dispatched catalog predicates also belong to typed overload
+/// selection. Keep this registry shared with the callable-inventory check.
+pub(crate) const CATALOG_PREDICATES: &[(&str, CatalogPredicateKind)] = &[
+    ("has_table_privilege", CatalogPredicateKind::Privilege),
+    ("has_column_privilege", CatalogPredicateKind::Privilege),
+    ("has_any_column_privilege", CatalogPredicateKind::Privilege),
+    ("has_sequence_privilege", CatalogPredicateKind::Privilege),
+    ("has_schema_privilege", CatalogPredicateKind::Privilege),
+    ("has_type_privilege", CatalogPredicateKind::Privilege),
+    ("has_language_privilege", CatalogPredicateKind::Privilege),
+    ("has_function_privilege", CatalogPredicateKind::Privilege),
+    ("has_database_privilege", CatalogPredicateKind::Privilege),
+    ("has_tablespace_privilege", CatalogPredicateKind::Privilege),
+    (
+        "has_foreign_data_wrapper_privilege",
+        CatalogPredicateKind::Privilege,
+    ),
+    ("has_server_privilege", CatalogPredicateKind::Privilege),
+    ("has_largeobject_privilege", CatalogPredicateKind::Privilege),
+    ("has_parameter_privilege", CatalogPredicateKind::Privilege),
+    ("pg_table_is_visible", CatalogPredicateKind::Object),
+    ("pg_type_is_visible", CatalogPredicateKind::Object),
+    ("pg_function_is_visible", CatalogPredicateKind::Object),
+    ("pg_collation_is_visible", CatalogPredicateKind::Object),
+    ("pg_operator_is_visible", CatalogPredicateKind::Object),
+    ("pg_opclass_is_visible", CatalogPredicateKind::Object),
+    ("pg_opfamily_is_visible", CatalogPredicateKind::Object),
+    ("pg_conversion_is_visible", CatalogPredicateKind::Object),
+    ("pg_statistics_obj_is_visible", CatalogPredicateKind::Object),
+    ("pg_ts_dict_is_visible", CatalogPredicateKind::Object),
+    ("pg_ts_config_is_visible", CatalogPredicateKind::Object),
+    ("pg_relation_is_publishable", CatalogPredicateKind::Object),
+];
+
 /// Execution and result descriptions share these accepted Boolean families.
 pub(crate) fn catalog_predicate_kind(name: &str) -> Option<CatalogPredicateKind> {
     let name = name.strip_prefix("pg_catalog.").unwrap_or(name);
-    match name {
-        "has_table_privilege"
-        | "has_column_privilege"
-        | "has_any_column_privilege"
-        | "has_sequence_privilege"
-        | "has_schema_privilege"
-        | "has_type_privilege"
-        | "has_language_privilege"
-        | "has_function_privilege"
-        | "has_database_privilege"
-        | "has_tablespace_privilege"
-        | "has_foreign_data_wrapper_privilege"
-        | "has_server_privilege"
-        | "has_largeobject_privilege"
-        | "has_parameter_privilege" => Some(CatalogPredicateKind::Privilege),
-        "pg_table_is_visible"
-        | "pg_type_is_visible"
-        | "pg_function_is_visible"
-        | "pg_collation_is_visible"
-        | "pg_operator_is_visible"
-        | "pg_opclass_is_visible"
-        | "pg_opfamily_is_visible"
-        | "pg_conversion_is_visible"
-        | "pg_statistics_obj_is_visible"
-        | "pg_ts_dict_is_visible"
-        | "pg_ts_config_is_visible"
-        | "pg_relation_is_publishable" => Some(CatalogPredicateKind::Object),
-        _ => None,
-    }
+    CATALOG_PREDICATES
+        .iter()
+        .find_map(|(candidate, kind)| (*candidate == name).then_some(*kind))
 }
 
 /// Handles the system/introspection family. Returns `None` if `name` is not one
@@ -1501,15 +1514,21 @@ pub(crate) fn dispatch<'a>(
                         .map_err(|_| arena_full())?,
                 ))
             }
-            // `current_schemas(bool)` returns the search-path schemas as a text[];
+            // `current_schemas(bool)` returns the search-path schemas as name[];
             // with `true` it includes pg_catalog at its (implicit or explicit)
             // position.
             "current_schemas" => {
                 arity(1)?;
-                let include_implicit = matches!(
-                    eval_full(args[0], arena, params, row, hooks)?,
-                    Datum::Bool(true)
-                );
+                let flag = eval_full(args[0], arena, params, row, hooks)?;
+                let include_implicit = match flag {
+                    Datum::Bool(value) => value,
+                    Datum::Text(_) => match cast_to(flag, ColType::Bool, arena)? {
+                        Datum::Bool(value) => value,
+                        _ => unreachable!("boolean cast returns its declared type"),
+                    },
+                    Datum::Null => return Ok(Datum::Null),
+                    other => return Err(type_mismatch(name, &other)),
+                };
                 let schemas = session_schemas();
                 let mut elems = [Datum::Null; crate::storage::MAX_PATH_ENTRIES];
                 let mut n = 0;
@@ -1530,7 +1549,7 @@ pub(crate) fn dispatch<'a>(
                     n += 1;
                 }
                 Ok(Datum::Array {
-                    element: ArrElem::Text,
+                    element: ArrElem::Name,
                     raw: array::build(&elems[..n], arena)?,
                 })
             }
@@ -1897,7 +1916,7 @@ pub(crate) fn dispatch<'a>(
                     return Ok(Datum::Null);
                 };
                 let Some(values) =
-                    strict_catalog_arguments(args, |position, expression| {
+                    strict_catalog_arguments(args, hooks.catalog, |position, expression| {
                         let value = eval_full(expression, arena, params, row, hooks)?;
                         match position {
                             0 => Ok(CatalogOid::parse(value)?
@@ -2139,7 +2158,7 @@ pub(crate) fn dispatch<'a>(
                     ));
                 }
                 let Some(values) =
-                    strict_catalog_arguments(args, |position, expression| {
+                    strict_catalog_arguments(args, hooks.catalog, |position, expression| {
                         let value = eval_full(expression, arena, params, row, hooks)?;
                         match position {
                             0 => Ok(value),
@@ -2198,15 +2217,47 @@ pub(crate) fn dispatch<'a>(
                         "function pg_get_ruledef(...) does not exist"
                     ));
                 }
-                let Some(cat) = hooks.catalog else {
+                let Some(values) =
+                    strict_catalog_arguments(args, hooks.catalog, |position, expression| {
+                        let value = eval_full(expression, arena, params, row, hooks)?;
+                        if position == 0 {
+                            match CatalogOid::parse(value)? {
+                                Some(oid) => Ok(Datum::Oid(oid.0 as u32)),
+                                None if value.is_null() => Ok(Datum::Null),
+                                None => Err(type_mismatch("rule identity must be oid", &value)),
+                            }
+                        } else {
+                            super::super::cast_to(value, ColType::Bool, arena)
+                        }
+                    })?
+                else {
                     return Ok(Datum::Null);
                 };
-                let oid = match CatalogOid::parse(eval_full(args[0], arena, params, row, hooks)?)? {
-                    Some(oid) => oid.0,
-                    None => return Ok(Datum::Null),
+                let Datum::Oid(oid) = values[0] else {
+                    return Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "rule identity lost its OID input type"
+                    ));
                 };
+                let pretty = if args.len() == 2 {
+                    let Datum::Bool(pretty) = values[1] else {
+                        return Err(sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "rule formatting flag lost its boolean input type"
+                        ));
+                    };
+                    pretty
+                } else {
+                    false
+                };
+                let cat = hooks.catalog.ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "rule definition lookup requires catalog access"
+                    )
+                })?;
                 Ok(cat
-                    .rule_def(oid, arena)?
+                    .rule_def(oid as i32, pretty, arena)?
                     .map(Datum::Text)
                     .unwrap_or(Datum::Null))
             }

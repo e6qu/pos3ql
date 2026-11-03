@@ -501,6 +501,13 @@ unrelated tables remain usable. Replacement keeps enable mode and comments;
 `_RETURN` cannot be renamed. View rule/trigger mode changes and materialized-view
 mode changes retain PostgreSQL's explicit relation-kind errors.
 
+`pg_get_ruledef` reads its identifier and formatting flag once. Unconditional
+`DO NOTHING` rules support both PostgreSQL formatting modes. Other rules return
+their saved SQL when the flag is omitted or false; requesting pretty formatting
+for a condition or action returns `0A000`. For example,
+`pg_get_ruledef(rule_oid, false)` reconstructs a rule without requesting that
+unsupported formatting. A missing rule returns NULL in either mode.
+
 ## Catalog listings and current lookups
 
 MVCC catalog listings use their statement or transaction's selected rows.

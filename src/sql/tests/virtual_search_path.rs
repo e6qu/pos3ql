@@ -218,7 +218,7 @@ fn unsupported_virtual_relation_oids_never_bind_a_later_user_relation() {
     session.success(
         &mut engine,
         "CREATE SCHEMA path_user; CREATE TABLE path_user.tables(id integer); \
-         CREATE INDEX path_user.columns ON path_user.tables(id); \
+         CREATE INDEX columns ON path_user.tables(id); \
          SET search_path=information_schema,path_user,public",
         true,
     );

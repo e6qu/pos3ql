@@ -417,6 +417,11 @@ pub trait ColumnLookup<'a> {
     fn whole_row_is_scalar(&self, _table: &str) -> bool {
         false
     }
+
+    /// Declared whole-row identity, without looking up or constructing values.
+    fn whole_row_type(&self, _table: &str) -> Option<ColType> {
+        None
+    }
 }
 
 /// Static type identity retained until a context decides how PostgreSQL
@@ -490,7 +495,12 @@ pub(crate) fn expression_type_identity<'a>(
             });
     }
     if let Expr::Field { base, field } = expression
-        && let Expr::Call { name, args, .. } = &**base
+        && let Expr::Call {
+            kind: super::ast::CallKind::SqlSyntax,
+            name,
+            args,
+            ..
+        } = &**base
         && name.eq_ignore_ascii_case("row")
         && let Some(position) = crate::sql::exec::RECORD_FIELD_NAMES
             .iter()
@@ -642,6 +652,14 @@ pub(crate) struct RuntimeColumnTypes<'row, 'datum> {
 }
 
 impl crate::sql::exec::ColTypeResolver for RuntimeColumnTypes<'_, '_> {
+    fn type_name_fixed(&self, type_oid: i32) -> Result<Option<StackStr<260>>, SqlError> {
+        let named = match self.catalog {
+            Some(catalog) => catalog.type_name_fixed(type_oid)?,
+            None => None,
+        };
+        Ok(named.or_else(|| super::exec::builtin_type_name_fixed(type_oid)))
+    }
+
     fn column_meta(
         &self,
         qualifier: Option<&str>,
@@ -665,13 +683,31 @@ impl crate::sql::exec::ColTypeResolver for RuntimeColumnTypes<'_, '_> {
         qualifier: Option<&str>,
         name: &str,
     ) -> Result<super::types::ColType, SqlError> {
-        self.row.col_type(qualifier, name).ok_or_else(|| {
-            sql_err!(
-                sqlstate::UNDEFINED_COLUMN,
-                "column \"{}\" does not exist",
-                name
-            )
-        })
+        self.row
+            .col_type(qualifier, name)
+            .or_else(|| {
+                qualifier
+                    .is_none()
+                    .then(|| self.row.whole_row_type(name))
+                    .flatten()
+            })
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_COLUMN,
+                    "column \"{}\" does not exist",
+                    name
+                )
+            })
+    }
+
+    fn is_whole_row(&self, name: &str) -> bool {
+        self.row.whole_row_type(name).is_some()
+    }
+
+    fn whole_row_scalar_type(&self, name: &str) -> Option<ColType> {
+        self.row
+            .whole_row_type(name)
+            .filter(|ctype| *ctype != ColType::Record)
     }
 
     fn domain_base_type(&self, type_oid: i32) -> Option<ColType> {
@@ -872,6 +908,10 @@ impl<'a, T: ColumnLookup<'a> + ?Sized> ColumnLookup<'a> for &T {
         (**self).whole_row_is_scalar(table)
     }
 
+    fn whole_row_type(&self, table: &str) -> Option<ColType> {
+        (**self).whole_row_type(table)
+    }
+
     fn column_identity(&self, qualifier: Option<&str>, name: &str) -> Option<(u32, u32)> {
         (**self).column_identity(qualifier, name)
     }
@@ -1031,6 +1071,9 @@ pub(crate) fn sql_syntax_call_name(name: &str) -> bool {
             | "nullif"
             | "row"
             | "grouping"
+            | "json_scalar"
+            | "xmlconcat"
+            | "merge_action"
             | "current_date"
             | "current_timestamp"
             | "current_time"
@@ -1960,6 +2003,11 @@ pub trait CatalogAccess {
         oid: u32,
         arena: &'a Arena,
     ) -> Result<Option<&'a str>, SqlError>;
+    /// SQL spelling of a user-defined type OID without statement allocation.
+    fn type_name_fixed(&self, _oid: i32) -> Result<Option<StackStr<260>>, SqlError> {
+        Ok(None)
+    }
+
     /// SQL spelling of a user-defined type OID for `format_type`.
     fn type_name<'a>(&self, _oid: i32, _arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
         Ok(None)
@@ -1968,7 +2016,12 @@ pub trait CatalogAccess {
     fn view_def<'a>(&self, _oid: i32, _arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
         Ok(None)
     }
-    fn rule_def<'a>(&self, _oid: i32, _arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
+    fn rule_def<'a>(
+        &self,
+        _oid: i32,
+        _pretty: bool,
+        _arena: &'a Arena,
+    ) -> Result<Option<&'a str>, SqlError> {
         Ok(None)
     }
     /// Bytes occupied by the relation's stored row images. Relations without
@@ -3004,6 +3057,32 @@ pub fn eval_full<'a>(
     hooks: &EvalHooks<'_, 'a>,
 ) -> Result<Datum<'a>, SqlError> {
     let evaluate = || {
+        // Grouped/window results belong to the original plan node. Consume
+        // them before a scalar continuation can rebind or execute that call.
+        if let Expr::Call { over, .. } = expression {
+            let selected = over
+                .as_ref()
+                .and(hooks.windows)
+                .and_then(|(nodes, values)| {
+                    nodes.iter().zip(values).find_map(|(node, value)| {
+                        core::ptr::eq(*node, expression as *const _).then_some(*value)
+                    })
+                })
+                .or_else(|| {
+                    hooks.aggs.and_then(|(nodes, values)| {
+                        nodes.iter().zip(values).find_map(|(node, value)| {
+                            core::ptr::eq(*node, expression as *const _).then_some(*value)
+                        })
+                    })
+                });
+            if let Some(value) = selected {
+                return materialize_enum_values(
+                    materialize_acl_value(value, hooks, arena)?,
+                    hooks.catalog,
+                    arena,
+                );
+            }
+        }
         let position = super::query::input_progress::enter_expression(expression)?;
         let bound;
         let expression = if let (
@@ -3678,23 +3757,6 @@ fn eval_full_inner<'a>(
                     row,
                     hooks,
                 );
-            }
-            // A window-function call resolves to this row's precomputed value.
-            if over.is_some()
-                && let Some((nodes, values)) = hooks.windows
-            {
-                for (node, v) in nodes.iter().zip(values) {
-                    if core::ptr::eq(*node, expression as *const _) {
-                        return Ok(*v);
-                    }
-                }
-            }
-            if let Some((nodes, values)) = hooks.aggs {
-                for (node, v) in nodes.iter().zip(values) {
-                    if core::ptr::eq(*node, expression as *const _) {
-                        return Ok(*v);
-                    }
-                }
             }
             if distinct {
                 return Err(sql_err!(
@@ -4372,7 +4434,12 @@ fn eval_full_inner<'a>(
             // A direct ROW(...) resolves its f1..fn — unless the selected
             // field is a bare unknown literal, which PostgreSQL cannot
             // coerce (XX000). A typed sibling of an unknown field is fine.
-            if let Expr::Call { name, args, .. } = base
+            if let Expr::Call {
+                kind: super::ast::CallKind::SqlSyntax,
+                name,
+                args,
+                ..
+            } = base
                 && name.eq_ignore_ascii_case("row")
                 && let Some(position) = crate::sql::exec::RECORD_FIELD_NAMES
                     .iter()
@@ -4398,8 +4465,9 @@ fn eval_full_inner<'a>(
                 }
             }
             let anonymous_source = match base {
-                Expr::Call { name, .. } => {
-                    !(name.eq_ignore_ascii_case("row")
+                Expr::Call { kind, name, .. } => {
+                    !((*kind == super::ast::CallKind::SqlSyntax
+                        && name.eq_ignore_ascii_case("row"))
                         || name.eq_ignore_ascii_case("json_each")
                         || name.eq_ignore_ascii_case("jsonb_each")
                         || name.eq_ignore_ascii_case("json_each_text")
@@ -5440,66 +5508,30 @@ pub(crate) fn array_constructor_type<'a>(
 pub(crate) fn undefined_function<'a, T>(
     name: &str,
     args: &[&Expr<'a>],
-    arena: &'a Arena,
     row: &impl ColumnLookup<'a>,
     hooks: &EvalHooks<'_, 'a>,
 ) -> Result<T, SqlError> {
-    use core::fmt::Write as _;
-    let mut message = StackStr::<192>::new();
-    let _ = write!(message, "function {}(", name);
     let columns = RuntimeColumnTypes {
         row,
         catalog: hooks.catalog,
     };
-    for (i, argument) in args.iter().enumerate() {
-        if i > 0 {
-            let _ = message.write_str(", ");
-        }
-        let type_oid = super::exec::infer_routine_argument_oid(argument, &columns)?;
-        let named = if type_oid == super::types::oid::UNKNOWN {
-            "unknown"
-        } else if crate::storage::NamedTypeKind::from_oid(type_oid).is_some() {
-            hooks
-                .catalog
-                .ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::INTERNAL_ERROR,
-                        "function argument type catalog is unavailable"
-                    )
-                })?
-                .type_name(type_oid, arena)?
-                .ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::INTERNAL_ERROR,
-                        "function argument type with OID {} is unavailable",
-                        type_oid
-                    )
-                })?
-        } else {
-            ColType::from_oid(type_oid)
-                .map(ColType::name)
-                .ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::INTERNAL_ERROR,
-                        "function argument type with OID {} is unavailable",
-                        type_oid
-                    )
-                })?
-        };
-        let _ = message.write_str(named);
-    }
-    let _ = message.write_str(") does not exist");
-    // Fixed strings record truncation instead of returning a formatting error.
-    if message.is_truncated() {
+    let mut types = [super::types::oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
+    if args.len() > types.len() {
         return Err(sql_err!(
-            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "function diagnostic exceeds SQL error message capacity (192 bytes)"
+            sqlstate::TOO_MANY_ARGUMENTS,
+            "function has too many arguments"
         ));
     }
-    Err(SqlError {
-        sqlstate: SqlState::known(sqlstate::UNDEFINED_FUNCTION),
-        message,
-    })
+    for (output, argument) in types.iter_mut().zip(args) {
+        *output = super::exec::infer_routine_argument_oid(argument, &columns)?;
+    }
+    Err(super::exec::function_lookup_error(
+        name,
+        &types[..args.len()],
+        &[],
+        super::exec::FunctionLookupFailure::Missing,
+        &columns,
+    ))
 }
 
 /// Normalize only a catalog-selected builtin. Written arguments stay as AST
@@ -5678,8 +5710,8 @@ pub(crate) fn builtin_operator_function<'a>(
         let convert = |expression, target: ColType| {
             let value = eval_full(expression, arena, params, row, hooks)?;
             let source = expression_type_identity(expression, row, hooks)?.routine_argument_oid();
-            if source == target.oid() {
-                Ok(value)
+            let value = if source == target.oid() {
+                value
             } else if let Some(catalog) = hooks.catalog
                 && let Some(value) = catalog.cast_defined(
                     source,
@@ -5689,9 +5721,24 @@ pub(crate) fn builtin_operator_function<'a>(
                     arena,
                 )?
             {
-                Ok(value)
+                value
             } else {
-                cast_to(value, target, arena)
+                cast_to(value, target, arena)?
+            };
+            match (target, value) {
+                (ColType::AclItem, Datum::Text(text)) => {
+                    let catalog = hooks.catalog.ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::FEATURE_NOT_SUPPORTED,
+                            "aclitem role catalog access is unavailable"
+                        )
+                    })?;
+                    crate::sql::acl::from_text(text, catalog, arena).map(Datum::AclItem)
+                }
+                (ColType::Array(ArrElem::AclItem), value) => {
+                    materialize_acl_value(value, hooks, arena)
+                }
+                (_, value) => Ok(value),
             }
         };
         let mut values = [Datum::Null; 2];
@@ -5853,19 +5900,19 @@ fn call<'a>(
             )
         )
     {
-        return undefined_function(written_name, args, arena, row, hooks);
+        return undefined_function(written_name, args, row, hooks);
     }
     if kind == super::ast::CallKind::Routine
         && builtin.is_none()
         && sql_syntax_call_name(written_name)
         && super::catalog::builtin_callable_schema(written_name).is_none()
     {
-        return undefined_function(written_name, args, arena, row, hooks);
+        return undefined_function(written_name, args, row, hooks);
     }
     if (written_name == "_pg_expandarray" || written_name == "pg_catalog._pg_expandarray")
         && super::query::builtin_set_routine_name(written_name).is_none()
     {
-        return undefined_function(written_name, args, arena, row, hooks);
+        return undefined_function(written_name, args, row, hooks);
     }
     let name = if let Some((oid, _)) = builtin {
         super::catalog::builtin_callable_by_oid(oid)
@@ -6045,10 +6092,11 @@ fn call<'a>(
     }
     if !star
         && builtin.is_none()
-        && kind == super::ast::CallKind::Routine
         && let Some(catalog) = hooks.catalog
-        && (catalog.has_routine_candidate(written_name, args.len())
-            || crate::sql::ast::catalog_operator_call(written_name).is_some())
+        && ((kind == super::ast::CallKind::Routine
+            && catalog.has_routine_candidate(written_name, args.len()))
+            || (kind == super::ast::CallKind::SqlSyntax
+                && crate::sql::ast::catalog_operator_call(written_name).is_some()))
     {
         let argument_type_oids = arena
             .alloc_slice_with(args.len(), |_| crate::sql::types::oid::UNKNOWN)
@@ -6079,7 +6127,7 @@ fn call<'a>(
             argument_type_oids,
         )? {
             if matches!(target, RoutineCallTarget::Builtin { .. }) {
-                return undefined_function(written_name, args, arena, row, hooks);
+                return undefined_function(written_name, args, row, hooks);
             }
             return catalog.call_routine(
                 target,
@@ -6874,7 +6922,7 @@ fn call<'a>(
                 .map_err(|_| arena_full())?;
             Ok(Datum::Record(fields))
         }
-        _ => undefined_function(written_name, args, arena, row, hooks),
+        _ => undefined_function(written_name, args, row, hooks),
     }
 }
 
@@ -9711,5 +9759,55 @@ mod tests {
         for invalid in ["", "2201", "220123", "22p02", "22-02"] {
             assert!(SqlState::parse(invalid).is_none(), "{invalid}");
         }
+    }
+
+    #[test]
+    fn whole_row_argument_types_do_not_read_values() {
+        struct SchemaOnly;
+        impl<'a> ColumnLookup<'a> for SchemaOnly {
+            fn lookup(&self, _: Option<&str>, _: &str) -> Result<Datum<'a>, SqlError> {
+                panic!("type inference must not read a row");
+            }
+
+            fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
+                (qualifier == Some("rt") && name == "a").then_some(ColType::Int4)
+            }
+
+            fn whole_row_type(&self, table: &str) -> Option<ColType> {
+                (table == "rt").then_some(ColType::Record)
+            }
+        }
+        let base = Expr::Column {
+            qualifier: None,
+            name: "rt",
+        };
+        let field = Expr::Field {
+            base: &base,
+            field: "a",
+        };
+        crate::mem::guard::forbid_alloc(|| {
+            assert_eq!(
+                crate::sql::exec::infer_type_res(
+                    &field,
+                    &RuntimeColumnTypes {
+                        row: &SchemaOnly,
+                        catalog: None
+                    }
+                )
+                .unwrap(),
+                (super::types::oid::INT4, 4)
+            );
+            assert_eq!(
+                crate::sql::exec::infer_type_res(
+                    &base,
+                    &RuntimeColumnTypes {
+                        row: &SchemaOnly,
+                        catalog: None
+                    }
+                )
+                .unwrap(),
+                (super::types::oid::RECORD, -1)
+            );
+        });
     }
 }

@@ -21527,6 +21527,50 @@ fn logical_replication_slot_survives_wal_and_checkpoint_recovery_body() {
 }
 
 #[test]
+fn selected_acl_operator_functions_resolve_both_operand_identities() {
+    let config = test_config("selected-acl-operator-functions");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    let output = session.success(
+        &mut engine,
+        "CREATE ROLE acl_callable_reader; CREATE ROLE acl_callable_grantor; \
+         SELECT aclcontains(ARRAY['acl_callable_reader=rw/acl_callable_grantor'::aclitem], \
+                            'acl_callable_reader=r/acl_callable_grantor'), \
+                pg_catalog.aclcontains(ARRAY['acl_callable_reader=rw/acl_callable_grantor'::aclitem], \
+                                       'acl_callable_reader=r/acl_callable_grantor'::aclitem), \
+                aclcontains(ARRAY['acl_callable_reader=r/acl_callable_grantor'::aclitem], \
+                            'acl_callable_reader=w/acl_callable_grantor'), \
+                aclcontains(ARRAY['acl_callable_reader=rw/acl_callable_grantor'::aclitem], \
+                            'acl_callable_reader=r*/acl_callable_grantor'), \
+                aclcontains(NULL::aclitem[], 'acl_callable_reader=r/acl_callable_grantor')",
+        true,
+    );
+    assert_eq!(row_description_type_oids(&output), [16; 5]);
+    assert_eq!(data_rows(&output), ["t|t|f|f|NULL"]);
+    for sql in [
+        "SELECT aclcontains(ARRAY[]::aclitem[], 'acl_callable_reader=r/acl_callable_grantor')",
+        "SELECT ARRAY[]::aclitem[] @> 'acl_callable_reader=r/acl_callable_grantor'::aclitem",
+        "SELECT * FROM aclexplode(ARRAY[]::aclitem[])",
+        "SELECT aclcontains(ARRAY[['acl_callable_reader=r/acl_callable_grantor'::aclitem]], \
+                            'acl_callable_reader=r/acl_callable_grantor')",
+    ] {
+        let output = session.execute(&mut engine, sql, true);
+        assert_eq!(error_sqlstates(&output), ["22023"], "{sql}");
+        assert!(String::from_utf8_lossy(&output).contains("ACL arrays must be one-dimensional"));
+    }
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT aclcontains('[0:0]={acl_callable_reader=rw/acl_callable_grantor}'::aclitem[], \
+                            'acl_callable_reader=r/acl_callable_grantor')",
+            true
+        )),
+        ["t"]
+    );
+}
+
+#[test]
 fn aclitem_and_pg_lsn_are_first_class_postgresql_18_types() {
     let (mut engine, mut budget) = test_engine();
     let output = run_with(
@@ -58256,13 +58300,13 @@ fn geometric_constructors_and_inspectors_match_postgresql_forms() {
     let response = run_with(
         &mut engine,
         &mut budget,
-        "SELECT point(1, 2)::text, x(point(1, 2)), y(point(1, 2)), \
+        "SELECT point(1, 2)::text, (point(1, 2))[0], (point(1, 2))[1], \
                 lseg(point(1, 2), point(3, 4))::text, \
                 box(point(1, 2), point(3, 4))::text, \
                 line(point(1, 2), point(3, 4))::text, \
                 circle(point(1, 2), 3)::text, center(box(point(1, 2), point(3, 4)))::text, \
                 length(lseg(point(1, 2), point(4, 6))), radius(circle(point(1, 2), 3)), \
-                pclose('[(1,2),(3,4)]'::path)::text, polygon('[(1,2),(3,4),(5,6)]'::path)::text, \
+                pclose('[(1,2),(3,4)]'::path)::text, polygon('((1,2),(3,4),(5,6))'::path)::text, \
                 area('((0,0),(4,0),(0,3))'::path), area('[(0,0),(4,0),(0,3)]'::path) IS NULL",
     );
     assert_eq!(
@@ -58271,6 +58315,35 @@ fn geometric_constructors_and_inspectors_match_postgresql_forms() {
             "(1,2)|1|2|[(1,2),(3,4)]|(3,4),(1,2)|{1,-1,1}|<(1,2),3>|(2,3)|5|3|((1,2),(3,4))|((1,2),(3,4),(5,6))|6|t"
         ]
     );
+}
+
+#[test]
+fn geometric_path_conversion_and_point_fields_match_postgresql() {
+    let config = test_config("geometry-postgresql-boundaries");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT (point(1,2))[0], (point(1,2))[1], \
+                polygon('((1,2),(3,4),(5,6))'::path)::text",
+            true
+        )),
+        ["1|2|((1,2),(3,4),(5,6))"]
+    );
+    for (sql, state) in [
+        ("SELECT x(point(1,2))", "42883"),
+        ("SELECT y(point(1,2))", "42883"),
+        ("SELECT polygon('[(1,2),(3,4),(5,6)]'::path)", "22023"),
+        ("SELECT ('[(1,2),(3,4),(5,6)]'::path)::polygon", "22023"),
+    ] {
+        assert_eq!(
+            error_sqlstates(&session.execute(&mut engine, sql, true)),
+            [state],
+            "{sql}"
+        );
+    }
 }
 
 #[test]
@@ -59516,11 +59589,17 @@ fn describe_preserves_builtin_function_result_types() {
         [
             crate::sql::types::oid::JSONB,
             crate::sql::types::oid::JSON,
-            crate::sql::types::ColType::Array(crate::sql::types::ArrElem::Text).oid(),
+            crate::sql::types::ColType::Array(crate::sql::types::ArrElem::Name).oid(),
             crate::sql::types::oid::INT4,
             crate::sql::types::oid::INT8,
         ]
     );
+    let schemas = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT current_schemas(NULL) IS NULL, current_schemas('true')=current_schemas(true)",
+    );
+    assert_eq!(data_rows(&schemas), ["t|t"]);
     let typeof_output = run_with(&mut engine, &mut budget, "SELECT pg_typeof(7)");
     assert_eq!(data_rows(&typeof_output), ["integer"], "{typeof_output:?}");
     assert_eq!(
@@ -63436,7 +63515,15 @@ fn subquery_wildcard_multi_column_errors() {
 #[test]
 fn scalar_functions() {
     let (mut e, mut b) = test_engine();
-    let r = |e: &mut Engine, b: &mut Budget, sql: &str| data_rows(&run_with(e, b, sql));
+    let r = |e: &mut Engine, b: &mut Budget, sql: &str| {
+        let output = run_with(e, b, sql);
+        assert!(
+            error_sqlstates(&output).is_empty(),
+            "{sql}: {}",
+            String::from_utf8_lossy(&output)
+        );
+        data_rows(&output)
+    };
     assert_eq!(r(&mut e, &mut b, "SELECT trim('  hi  ')"), ["hi"]);
     assert_eq!(r(&mut e, &mut b, "SELECT ltrim('xxhi', 'x')"), ["hi"]);
     assert_eq!(r(&mut e, &mut b, "SELECT rtrim('hixx', 'x')"), ["hi"]);
@@ -76046,7 +76133,7 @@ fn publication_table_function_supports_postgresql_subscriber_introspection() {
     );
     assert_eq!(
         data_rows(&catalog_contract),
-        ["6119|2249|t|25|1|u", "6120|2205|f|0|10|u"]
+        ["6119|2249|t|25|1|s", "6120|2205|f|0|10|s"]
     );
     let replication_tool_setting = run_with(
         &mut engine,
@@ -87936,8 +88023,8 @@ fn postgresql_18_temporal_boundaries() {
         ("SELECT ln(numeric '-Infinity')", "2201E"),
         ("SELECT numeric 'Infinity'/0", "22012"),
         ("SELECT power(0::numeric,numeric '-Infinity')", "2201F"),
-        ("SELECT interval 'infinity' * 0", "22015"),
-        ("SELECT interval 'infinity' / 'Infinity'::float8", "22015"),
+        ("SELECT interval 'infinity' * 0", "22008"),
+        ("SELECT interval 'infinity' / 'Infinity'::float8", "22008"),
         (
             "SELECT timestamp 'infinity' + interval '-infinity'",
             "22008",

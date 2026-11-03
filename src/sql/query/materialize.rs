@@ -119,6 +119,15 @@ impl<'a> ColumnLookup<'a> for EncodedRawRow<'_, '_, 'a> {
         self.scope.func_scalar_type(table).is_some()
     }
 
+    fn whole_row_type(&self, table: &str) -> Option<ColType> {
+        self.scope.qualified_star_columns(table).ok()?;
+        Some(
+            self.scope
+                .func_scalar_type(table)
+                .unwrap_or(ColType::Record),
+        )
+    }
+
     fn whole_row_present(&self, table: &str) -> Result<bool, SqlError> {
         if self.scope.using_alias(table).is_some() {
             return Ok(true);
@@ -409,6 +418,11 @@ impl<'a> ColumnLookup<'a> for ScopeSchema<'_, '_> {
     }
     fn whole_row_is_scalar(&self, table: &str) -> bool {
         self.0.func_scalar_type(table).is_some()
+    }
+
+    fn whole_row_type(&self, table: &str) -> Option<ColType> {
+        self.0.qualified_star_columns(table).ok()?;
+        Some(self.0.func_scalar_type(table).unwrap_or(ColType::Record))
     }
 }
 

@@ -915,6 +915,15 @@ struct SubqueryCollationLookup<'scope, 'definition, 'outer, 'row> {
 }
 
 impl<'a> ColumnLookup<'a> for SubqueryCollationLookup<'_, 'a, '_, 'a> {
+    fn whole_row_type(&self, table: &str) -> Option<ColType> {
+        self.scope
+            .and_then(|scope| {
+                scope.qualified_star_columns(table).ok()?;
+                Some(scope.func_scalar_type(table).unwrap_or(ColType::Record))
+            })
+            .or_else(|| self.outer.and_then(|outer| outer.whole_row_type(table)))
+    }
+
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
         if self
             .scope
@@ -2361,6 +2370,10 @@ pub(super) struct SubqueryColumns<'scope, 'definition, 'outer, 'row, 'catalog> {
 }
 
 impl crate::sql::exec::ColTypeResolver for SubqueryColumns<'_, '_, '_, '_, '_> {
+    fn type_name_fixed(&self, oid: i32) -> Result<Option<crate::util::StackStr<260>>, SqlError> {
+        self.catalog.type_name_fixed(oid)
+    }
+
     fn routine_call_selection(
         &self,
         name: &str,

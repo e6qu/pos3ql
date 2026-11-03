@@ -3475,10 +3475,15 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                 }));
             }
             crate::storage::RoutineCallSelection::Ambiguous => {
-                return Err(sql_err!(
-                    sqlstate::AMBIGUOUS_FUNCTION,
-                    "function {}(...) is not unique",
-                    name
+                return Err(super::exec::function_lookup_error(
+                    name,
+                    argument_type_oids,
+                    argument_names,
+                    super::exec::FunctionLookupFailure::Ambiguous,
+                    &super::eval::RuntimeColumnTypes {
+                        row: &super::eval::NoColumns,
+                        catalog: Some(self),
+                    },
                 ));
             }
             crate::storage::RoutineCallSelection::WrongKind { .. } => {
@@ -3489,10 +3494,15 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                 ));
             }
             crate::storage::RoutineCallSelection::Absent => {
-                return Err(sql_err!(
-                    sqlstate::UNDEFINED_FUNCTION,
-                    "function {}(...) does not exist",
-                    name
+                return Err(super::exec::function_lookup_error(
+                    name,
+                    argument_type_oids,
+                    argument_names,
+                    super::exec::FunctionLookupFailure::Missing,
+                    &super::eval::RuntimeColumnTypes {
+                        row: &super::eval::NoColumns,
+                        catalog: Some(self),
+                    },
                 ));
             }
         };
@@ -5005,12 +5015,21 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         super::catalog::user_type_name_text(self.storage, self.txid, oid, arena)
     }
 
+    fn type_name_fixed(&self, oid: i32) -> Result<Option<crate::util::StackStr<260>>, SqlError> {
+        super::catalog::user_type_name_fixed(self.storage, self.txid, oid)
+    }
+
     fn view_def<'a>(&self, oid: i32, arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
         super::catalog::view_def_text(self.storage, self.txid, oid, arena)
     }
 
-    fn rule_def<'a>(&self, oid: i32, arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
-        super::catalog::rule_def_text(self.storage, self.txid, oid, arena)
+    fn rule_def<'a>(
+        &self,
+        oid: i32,
+        pretty: bool,
+        arena: &'a Arena,
+    ) -> Result<Option<&'a str>, SqlError> {
+        super::catalog::rule_def_text(self.storage, self.txid, oid, pretty, arena)
     }
 
     fn relation_size(&self, oid: i32) -> Result<Option<i64>, SqlError> {
@@ -5746,8 +5765,16 @@ pub(super) fn fromless_aggregate_hooks<'a, R: ColumnLookup<'a>>(
     let states = arena
         .alloc_slice_with(agg_nodes.len(), |_| AggState::default())
         .map_err(|_| arena_full())?;
+    let columns = super::exec::CatalogCols {
+        definition: None,
+        alias: None,
+        output_aliases: &[],
+        storage,
+        txid,
+        arena,
+    };
     for (i, (_, node)) in agg_nodes.iter().enumerate() {
-        states[i].init(node, storage, txid, &super::exec::NoCols, arena)?;
+        states[i].init(node, storage, txid, &columns, arena)?;
     }
     if pass {
         for (i, (_, node)) in agg_nodes.iter().enumerate() {
@@ -5758,6 +5785,7 @@ pub(super) fn fromless_aggregate_hooks<'a, R: ColumnLookup<'a>>(
         .alloc_slice_with(agg_nodes.len(), |_| Datum::Null)
         .map_err(|_| arena_full())?;
     for (i, state) in states[..agg_nodes.len()].iter_mut().enumerate() {
+        state.initialize_direct_inputs(agg_nodes[i].1, arena, params, row, hooks)?;
         values[i] = state.finish(arena, hooks.catalog)?;
     }
     let ptrs: &[*const Expr] = arena
@@ -6720,6 +6748,7 @@ pub(super) fn selected_aggregate_call(
     for (index, argument) in args.iter().enumerate() {
         argument_oids[index] = super::exec::infer_routine_argument_oid(argument, columns)?;
     }
+    let mut diagnostic_count = args.len();
     let mut selected = if let Some(oid) = bound_oid {
         storage.routine_slot_by_oid(*oid, txid).map_or_else(
             || {
@@ -6773,6 +6802,7 @@ pub(super) fn selected_aggregate_call(
             txid,
             RoutineCallKind::Function,
         );
+        diagnostic_count = count;
     }
     let aggregate = match selected {
         RoutineCallSelection::Stored(slot) => {
@@ -6817,10 +6847,12 @@ pub(super) fn selected_aggregate_call(
             }
             Ok(signature.kind == b'a')
         }
-        RoutineCallSelection::Ambiguous => Err(sql_err!(
-            sqlstate::AMBIGUOUS_FUNCTION,
-            "function {}(...) is not unique",
-            name
+        RoutineCallSelection::Ambiguous => Err(super::exec::function_lookup_error(
+            name,
+            &argument_oids[..diagnostic_count],
+            argument_names,
+            super::exec::FunctionLookupFailure::Ambiguous,
+            columns,
         )),
         RoutineCallSelection::WrongKind { .. } => Err(sql_err!(
             sqlstate::WRONG_OBJECT_TYPE,
@@ -6832,10 +6864,12 @@ pub(super) fn selected_aggregate_call(
                 || super::catalog::builtin_callable_schema(name.rsplit('.').next().unwrap_or(name))
                     .is_some()
             {
-                return Err(sql_err!(
-                    sqlstate::UNDEFINED_FUNCTION,
-                    "function {}(...) does not exist",
-                    name
+                return Err(super::exec::function_lookup_error(
+                    name,
+                    &argument_oids[..diagnostic_count],
+                    argument_names,
+                    super::exec::FunctionLookupFailure::Missing,
+                    columns,
                 ));
             }
             Ok(false)
@@ -10291,6 +10325,9 @@ pub fn describe_catalog_items_as<'q>(
             }
         }
     }
+    for description in &mut out[..count] {
+        *description = super::exec::wire_column_description(*description, storage, txid)?;
+    }
     Ok(count)
 }
 
@@ -10721,7 +10758,15 @@ fn user_type_expression_description<'q>(
             };
             match selection {
                 crate::storage::RoutineCallSelection::Stored(slot) => {
-                    let result = storage.routine_for(slot, txid).function_result_contract()?;
+                    let oid = crate::storage::routine_oid(&storage.routine_for(slot, txid));
+                    let routine = storage.function_for_captured_call(
+                        oid,
+                        argument_names,
+                        &argument_type_oids[..args.len()],
+                        *variadic,
+                        txid,
+                    )?;
+                    let result = routine.function_result_contract()?;
                     return Some(ColDesc::new(
                         name,
                         storage.routine_type_oid(result.ctype, result.user_type, txid)?,
@@ -11341,6 +11386,13 @@ pub(crate) struct CatalogScopeCols<'scope, 'definition, 'outer_definition, 'stor
 }
 
 impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_, '_> {
+    fn type_name_fixed(&self, oid: i32) -> Result<Option<crate::util::StackStr<260>>, SqlError> {
+        Ok(
+            super::catalog::user_type_name_fixed(self.storage, self.txid, oid)?
+                .or_else(|| super::exec::builtin_type_name_fixed(oid)),
+        )
+    }
+
     fn operator_first_argument_type(
         &self,
         name: &str,

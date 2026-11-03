@@ -618,9 +618,19 @@ pub(super) fn groups_for_mask<'a>(
         let agg_vals: &mut [Datum] = arena
             .alloc_slice_with(n_aggs, |_| Datum::Null)
             .map_err(|_| arena_full())?;
+        let direct_hooks = EvalHooks {
+            group: Some((statement.group_by, &key_vals[..n_keys], mask)),
+            ..*hooks
+        };
         for (i, (_, node)) in agg_nodes.iter().enumerate() {
             let state = &mut states[g * n_aggs.max(1) + i];
-            state.initialize_custom_direct(node, arena, params, &ScopeSchema(scope), hooks)?;
+            state.initialize_direct_inputs(
+                node,
+                arena,
+                params,
+                &ScopeSchema(scope),
+                &direct_hooks,
+            )?;
             agg_vals[i] = state.finish(arena, hooks.catalog)?;
         }
         let merged_subs;

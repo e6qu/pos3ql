@@ -413,6 +413,10 @@ impl<'a> ColumnLookup<'a> for OuterColumnTypes<'_, '_> {
     fn whole_row_is_scalar(&self, table: &str) -> bool {
         self.0.whole_row_is_scalar(table)
     }
+
+    fn whole_row_type(&self, table: &str) -> Option<ColType> {
+        self.0.whole_row_type(table)
+    }
 }
 
 impl<'a> ColumnLookup<'a> for ScopeTypes<'_, '_> {
@@ -452,6 +456,11 @@ impl<'a> ColumnLookup<'a> for ScopeTypes<'_, '_> {
 
     fn whole_row_is_scalar(&self, table: &str) -> bool {
         self.0.func_scalar_type(table).is_some()
+    }
+
+    fn whole_row_type(&self, table: &str) -> Option<ColType> {
+        self.0.qualified_star_columns(table).ok()?;
+        Some(self.0.func_scalar_type(table).unwrap_or(ColType::Record))
     }
 }
 

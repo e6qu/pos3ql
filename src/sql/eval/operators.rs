@@ -137,6 +137,7 @@ fn acl_contains(left: Datum<'_>, right: Datum<'_>) -> Result<Datum<'static>, Sql
     else {
         return Err(type_mismatch("aclcontains", &left));
     };
+    crate::sql::acl::validate_array_shape(raw)?;
     let right_item = match right {
         Datum::AclItem(item) => Some(item),
         Datum::Text(_) => None,
@@ -1548,7 +1549,7 @@ pub(crate) fn arithmetic<'a>(
             if left_sign != 0 || right_sign != 0 {
                 if left_sign != 0 && right_sign != 0 && left_sign != right_sign {
                     return Err(sql_err!(
-                        sqlstate::INTERVAL_FIELD_OVERFLOW,
+                        sqlstate::DATETIME_FIELD_OVERFLOW,
                         "interval out of range"
                     ));
                 }
@@ -1570,13 +1571,13 @@ pub(crate) fn arithmetic<'a>(
             };
             return Ok(Datum::Interval(Interval {
                 months: combine_i32(a.months, b.months).ok_or_else(|| {
-                    sql_err!(sqlstate::INTERVAL_FIELD_OVERFLOW, "interval out of range")
+                    sql_err!(sqlstate::DATETIME_FIELD_OVERFLOW, "interval out of range")
                 })?,
                 days: combine_i32(a.days, b.days).ok_or_else(|| {
-                    sql_err!(sqlstate::INTERVAL_FIELD_OVERFLOW, "interval out of range")
+                    sql_err!(sqlstate::DATETIME_FIELD_OVERFLOW, "interval out of range")
                 })?,
                 micros: combine_i64(a.micros, b.micros).ok_or_else(|| {
-                    sql_err!(sqlstate::INTERVAL_FIELD_OVERFLOW, "interval out of range")
+                    sql_err!(sqlstate::DATETIME_FIELD_OVERFLOW, "interval out of range")
                 })?,
             }));
         }

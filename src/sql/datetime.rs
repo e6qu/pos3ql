@@ -1921,7 +1921,7 @@ pub fn interval_scale(
     factor: f64,
     div: bool,
 ) -> Result<super::types::Interval, SqlError> {
-    let out_of_range = || sql_err!(sqlstate::INTERVAL_FIELD_OVERFLOW, "interval out of range");
+    let out_of_range = || sql_err!(sqlstate::DATETIME_FIELD_OVERFLOW, "interval out of range");
     if factor.is_nan() {
         return Err(out_of_range());
     }

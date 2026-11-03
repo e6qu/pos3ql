@@ -1,6 +1,281 @@
 use super::*;
 
 #[test]
+fn rule_definition_flags_preserve_formats_nulls_and_argument_effects() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config("rule-definition-input-binding");
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        session.success(&mut engine,
+            "CREATE TABLE rule_format_source(id integer); CREATE TABLE rule_format_sink(id integer); \
+             CREATE RULE diag_nothing AS ON INSERT TO rule_format_source DO NOTHING; \
+             CREATE RULE diag_instead AS ON DELETE TO rule_format_source DO INSTEAD NOTHING; \
+             CREATE RULE diag_action AS ON UPDATE TO rule_format_source DO ALSO INSERT INTO rule_format_sink VALUES(NEW.id); \
+             CREATE SEQUENCE rule_argument_effects", true);
+        let plain =
+            "CREATE RULE diag_nothing AS\n    ON INSERT TO public.rule_format_source DO NOTHING;";
+        let pretty = "CREATE RULE diag_nothing AS\n    ON INSERT TO rule_format_source DO NOTHING;";
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "SELECT pg_get_ruledef(oid),pg_get_ruledef(oid,false),pg_get_ruledef(oid,true) \
+               FROM pg_rewrite WHERE rulename='diag_nothing'",
+                true
+            )),
+            [format!("{plain}|{plain}|{pretty}")]
+        );
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "SELECT pg_get_ruledef(oid,true) FROM pg_rewrite WHERE rulename='diag_instead'",
+                true
+            )),
+            [
+                "CREATE RULE diag_instead AS\n    ON DELETE TO rule_format_source DO INSTEAD NOTHING;"
+            ]
+        );
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "SET search_path=pg_catalog; \
+             SELECT pg_get_ruledef(oid,true) FROM pg_rewrite WHERE rulename='diag_nothing'; \
+             SET search_path=public,pg_catalog",
+                true
+            )),
+            [plain]
+        );
+        assert_eq!(data_rows(&session.success(&mut engine,
+            "SELECT pg_get_ruledef(NULL::oid,nextval('rule_argument_effects')>0) IS NULL; \
+             SELECT nextval('rule_argument_effects'); \
+             ALTER SEQUENCE rule_argument_effects RESTART WITH 1; \
+             SELECT pg_get_ruledef(nextval('rule_argument_effects')::oid,NULL) IS NULL; \
+             SELECT nextval('rule_argument_effects'); \
+             ALTER SEQUENCE rule_argument_effects RESTART WITH 1; \
+             SELECT pg_get_ruledef(CASE WHEN nextval('rule_argument_effects')=1 THEN NULL::oid ELSE 0::oid END, \
+                                   nextval('rule_argument_effects')>0) IS NULL; \
+             SELECT nextval('rule_argument_effects'); \
+             SELECT pg_get_ruledef(0::oid) IS NULL,pg_get_ruledef(0::oid,false) IS NULL,pg_get_ruledef(0::oid,true) IS NULL", true)),
+            ["t", "1", "t", "1", "t", "3", "t|t|t"]);
+        let bad_flag = session.execute(&mut engine, "SELECT pg_get_ruledef(NULL::oid,'bad')", true);
+        assert_eq!(error_sqlstates(&bad_flag), ["22P02"]);
+        session.success(
+            &mut engine,
+            "ALTER SEQUENCE rule_argument_effects RESTART WITH 1",
+            true,
+        );
+        let unsupported = session.execute(
+            &mut engine,
+            "SELECT pg_get_ruledef(oid,nextval('rule_argument_effects')=1) \
+               FROM pg_rewrite WHERE rulename='diag_action'",
+            true,
+        );
+        assert_eq!(error_sqlstates(&unsupported), ["0A000"]);
+        assert!(
+            String::from_utf8_lossy(&unsupported).contains(
+                "pretty formatting of rewrite rule conditions or actions is not supported"
+            )
+        );
+        assert_eq!(data_rows(&session.success(&mut engine,
+            "SELECT nextval('rule_argument_effects'); \
+             SELECT pg_get_ruledef(oid,false) LIKE '%rule_format_sink%' FROM pg_rewrite WHERE rulename='diag_action'", true)),
+            ["2", "t"]);
+    }
+}
+
+#[test]
+fn routine_lookup_diagnostics_keep_static_types_without_argument_effects() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config("routine-lookup-diagnostic-types");
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        session.success(
+            &mut engine,
+            "CREATE SEQUENCE diagnostic_effects; CREATE SCHEMA \"Hidden Schema\"; \
+             CREATE TYPE \"Hidden Schema\".\"Odd Type\" AS ENUM('a'); \
+             CREATE DOMAIN \"Hidden Schema\".\"Odd Domain\" AS integer; \
+             CREATE TYPE \"Hidden Schema\".\"Odd Row\" AS(value integer); \
+             CREATE TYPE public.\"select\" AS ENUM('a'); \
+             CREATE FUNCTION diag_amb(value smallint) RETURNS integer LANGUAGE sql AS 'SELECT 1'; \
+             CREATE FUNCTION diag_amb(value bigint) RETURNS integer LANGUAGE sql AS 'SELECT 1'; \
+             CREATE TABLE diagnostic_inputs(value \"Hidden Schema\".\"Odd Type\"[]); \
+             INSERT INTO diagnostic_inputs VALUES(NULL)",
+            true,
+        );
+        assert_eq!(data_rows(&session.success(&mut engine,
+            "SELECT enum_first(NULL::\"Hidden Schema\".\"Odd Type\"), \
+                    enum_last(NULL::\"Hidden Schema\".\"Odd Type\"), \
+                    enum_range(NULL::\"Hidden Schema\".\"Odd Type\"), \
+                    enum_range(NULL::\"Hidden Schema\".\"Odd Type\",NULL::\"Hidden Schema\".\"Odd Type\")", true)),
+            ["a|a|{a}|{a}"]);
+        for (sql, state, message) in [
+            (
+                "SELECT diag_missing(1)",
+                "42883",
+                "function diag_missing(integer) does not exist",
+            ),
+            (
+                "SELECT diag_missing('untyped')",
+                "42883",
+                "function diag_missing(unknown) does not exist",
+            ),
+            (
+                "SELECT diag_missing(x=>nextval('diagnostic_effects'))",
+                "42883",
+                "function diag_missing(x => bigint) does not exist",
+            ),
+            (
+                "SELECT * FROM diag_missing(nextval('diagnostic_effects'))",
+                "42883",
+                "function diag_missing(bigint) does not exist",
+            ),
+            (
+                "SELECT \"Hidden Schema\".\"No Such Fn\"(1)",
+                "42883",
+                "function Hidden Schema.No Such Fn(integer) does not exist",
+            ),
+            (
+                "SELECT diag_missing(nextval('diagnostic_effects'),NULL::\"Hidden Schema\".\"Odd Type\"[])",
+                "42883",
+                "function diag_missing(bigint, \"Hidden Schema\".\"Odd Type\"[]) does not exist",
+            ),
+            (
+                "SELECT diag_missing(NULL::\"select\"[])",
+                "42883",
+                "function diag_missing(\"select\"[]) does not exist",
+            ),
+            (
+                "SELECT diag_missing(NULL::\"Hidden Schema\".\"Odd Domain\"[])",
+                "42883",
+                "function diag_missing(\"Hidden Schema\".\"Odd Domain\"[]) does not exist",
+            ),
+            (
+                "SELECT diag_missing(NULL::\"Hidden Schema\".\"Odd Row\"[])",
+                "42883",
+                "function diag_missing(\"Hidden Schema\".\"Odd Row\"[]) does not exist",
+            ),
+            (
+                "SELECT diag_missing(value) FROM diagnostic_inputs",
+                "42883",
+                "function diag_missing(\"Hidden Schema\".\"Odd Type\"[]) does not exist",
+            ),
+            (
+                "SELECT diag_missing(source.value) FROM (SELECT value FROM diagnostic_inputs) source",
+                "42883",
+                "function diag_missing(\"Hidden Schema\".\"Odd Type\"[]) does not exist",
+            ),
+            (
+                "SELECT diag_amb(NULL)",
+                "42725",
+                "function diag_amb(unknown) is not unique",
+            ),
+            (
+                "SELECT * FROM diag_amb(NULL)",
+                "42725",
+                "function diag_amb(unknown) is not unique",
+            ),
+        ] {
+            let output = session.execute(&mut engine, sql, true);
+            assert_eq!(
+                error_sqlstates(&output),
+                [state],
+                "{sql}: {}",
+                String::from_utf8_lossy(&output)
+            );
+            let expected_field = format!("M{message}\0");
+            assert!(
+                output
+                    .windows(expected_field.len())
+                    .any(|field| field == expected_field.as_bytes()),
+                "{sql}: {}",
+                String::from_utf8_lossy(&output)
+            );
+        }
+        let arguments = std::iter::repeat_n("nextval('diagnostic_effects')", 24)
+            .collect::<Vec<_>>()
+            .join(",");
+        let output = session.execute(
+            &mut engine,
+            &format!("SELECT diag_missing({arguments})"),
+            true,
+        );
+        assert_eq!(error_sqlstates(&output), ["54000"]);
+        assert!(
+            String::from_utf8_lossy(&output)
+                .contains("function diagnostic exceeds SQL error message capacity (192 bytes)")
+        );
+        assert_eq!(
+            data_rows(&session.success(&mut engine, "SELECT nextval('diagnostic_effects')", true)),
+            ["1"]
+        );
+    }
+}
+
+#[test]
+fn indirect_catalog_predicates_have_exact_typed_callable_contracts() {
+    let config = test_config("indirect-catalog-predicate-contracts");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    crate::mem::guard::forbid_alloc(|| {
+        let mut rule_definitions = 0;
+        for declaration in crate::sql::catalog::builtin_callable_signatures("pg_get_ruledef") {
+            rule_definitions += 1;
+            assert_eq!(declaration.result_oid, crate::sql::types::oid::TEXT);
+            assert!(matches!(engine.storage.select_routine_call(
+                "pg_catalog.pg_get_ruledef", &[], declaration.arguments, false, 0,
+                crate::storage::RoutineCallKind::Function,
+            ), crate::storage::RoutineCallSelection::Builtin { oid, .. } if oid == declaration.oid));
+        }
+        assert_eq!(rule_definitions, 2);
+        for (name, _) in crate::sql::eval::funcs::system::CATALOG_PREDICATES {
+            let mut count = 0;
+            for declaration in crate::sql::catalog::builtin_callable_signatures(name) {
+                count += 1;
+                assert_eq!(declaration.schema, "pg_catalog");
+                assert_eq!(declaration.result_oid, crate::sql::types::oid::BOOL);
+                assert_eq!(declaration.kind, b'f');
+                assert!(!declaration.returns_set);
+                let qualified = crate::stack_format!(128, "pg_catalog.{}", name);
+                assert!(!qualified.is_truncated());
+                for written in [*name, qualified.as_str()] {
+                    assert!(
+                        matches!(engine.storage.select_routine_call(
+                        written, &[], declaration.arguments, false, 0,
+                        crate::storage::RoutineCallKind::Function,
+                    ), crate::storage::RoutineCallSelection::Builtin { oid, .. } if oid == declaration.oid),
+                        "{} OID {}",
+                        written,
+                        declaration.oid
+                    );
+                }
+            }
+            assert!(count > 0, "missing callable family {}", name);
+        }
+    });
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    let output = session.success(
+        &mut engine,
+        "SELECT has_language_privilege('sql','USAGE'), \
+                pg_catalog.has_language_privilege('sql','USAGE'), \
+                has_language_privilege(current_user,'sql','USAGE'), \
+                has_language_privilege(14::oid,'USAGE'), \
+                has_function_privilege('pg_catalog.lower(text)','EXECUTE')",
+        true,
+    );
+    assert_eq!(row_description_type_oids(&output), [16; 5]);
+    assert_eq!(data_rows(&output), ["t|t|t|t|t"]);
+}
+
+#[test]
 fn selected_builtin_arguments_preserve_defaults_names_and_once_only_effects() {
     for mode in [
         crate::config::TransactionMode::Mvcc,

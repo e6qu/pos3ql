@@ -4125,6 +4125,15 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
         self.scope.func_scalar_type(table).is_some()
     }
 
+    fn whole_row_type(&self, table: &str) -> Option<crate::sql::types::ColType> {
+        self.scope.qualified_star_columns(table).ok()?;
+        Some(
+            self.scope
+                .func_scalar_type(table)
+                .unwrap_or(crate::sql::types::ColType::Record),
+        )
+    }
+
     fn whole_row_present(&self, table: &str) -> Result<bool, SqlError> {
         if self.scope.using_alias(table).is_some() {
             return Ok(true);
@@ -4333,6 +4342,12 @@ impl<'a> ColumnLookup<'a> for Chained<'_, 'a> {
     fn whole_row_is_scalar(&self, table: &str) -> bool {
         self.inner.whole_row_is_scalar(table)
             || self.outer.is_some_and(|o| o.whole_row_is_scalar(table))
+    }
+
+    fn whole_row_type(&self, table: &str) -> Option<crate::sql::types::ColType> {
+        self.inner
+            .whole_row_type(table)
+            .or_else(|| self.outer.and_then(|outer| outer.whole_row_type(table)))
     }
 }
 

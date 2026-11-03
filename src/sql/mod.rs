@@ -10880,14 +10880,27 @@ impl Engine {
         // provide the response barrier. Preserve the same acknowledgement
         // contract here; network connections use `execute_simple_from` and
         // publish once per readable batch instead.
+        let read_owner = ExecutionIdentity::new(conn_id, execution_database_oid()).read_owner();
         if let Err(error) = self.retry_pending_wal_upload() {
+            self.cancel_read_owner(read_owner);
             responder.error(error.sqlstate, error.message.as_str())?;
             return Ok(ExecutionStatus::Complete);
         }
         let output_mark = responder.buffer.mark();
         let result = self.execute_simple_from(
             text, 0, arena, txn, sqlprep, cursors, guc, responder, conn_id, false,
-        )?;
+        );
+        let retains_reads = matches!(
+            &result,
+            Ok(ExecutionStatus::Blocked {
+                wait: StatementWait::ObjectIo,
+                ..
+            })
+        ) && txn.staged_commit().is_none();
+        if !retains_reads {
+            self.cancel_read_owner(read_owner);
+        }
+        let result = result?;
         if let Err(error) = self.commit_wal() {
             responder.buffer.truncate_to(output_mark);
             responder.error(error.sqlstate, error.message.as_str())?;

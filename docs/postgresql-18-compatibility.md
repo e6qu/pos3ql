@@ -81,6 +81,14 @@ such as `nextval('order_numbers'::text)`, request lookup when the call runs.
 If a missing-function diagnostic cannot fit the fixed 192-byte SQL error
 message, it returns `54000` naming that capacity before running any arguments.
 
+Permission-entry arrays (`aclitem[]`) must have one dimension. For example,
+`aclexplode(ARRAY[]::aclitem[])` fails with `22023`:
+`ACL arrays must be one-dimensional`; NULL arrays produce no rows.
+
+Use `(point(1,2))[0]` and `(point(1,2))[1]` for point coordinates.
+Converting an open path to a polygon fails with `22023`:
+`open path cannot be converted to polygon`.
+
 Catalog column references retain their schema, including in nested queries.
 For example, this form works when an application spells out every name:
 

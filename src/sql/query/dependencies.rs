@@ -1293,6 +1293,13 @@ struct DependencyTypes<'scope, 'definition, 'storage> {
 }
 
 impl ColTypeResolver for DependencyTypes<'_, '_, '_> {
+    fn type_name_fixed(&self, oid: i32) -> Result<Option<crate::util::StackStr<260>>, SqlError> {
+        Ok(
+            crate::sql::catalog::user_type_name_fixed(self.storage, self.txid, oid)?
+                .or_else(|| crate::sql::exec::builtin_type_name_fixed(oid)),
+        )
+    }
+
     fn resolve(&self, qualifier: Option<&str>, name: &str) -> Result<ColType, SqlError> {
         if let Some((definition, aliases)) = self.returning_output
             && qualifier.is_some_and(|qualifier| aliases.contains(&qualifier))

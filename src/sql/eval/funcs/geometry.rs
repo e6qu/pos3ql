@@ -996,7 +996,14 @@ pub(crate) fn dispatch<'a>(
                         kind: GeometryKind::Path,
                         text,
                     } => {
-                        let (values, count, _) = points_parts(GeometryKind::Path, text, arena)?;
+                        let (values, count, closed) =
+                            points_parts(GeometryKind::Path, text, arena)?;
+                        if !closed {
+                            return Err(sql_err!(
+                                sqlstate::INVALID_PARAMETER_VALUE,
+                                "open path cannot be converted to polygon"
+                            ));
+                        }
                         geometry::render(GeometryKind::Polygon, &values[..count], true, arena).map(
                             |text| Datum::Geometry {
                                 kind: GeometryKind::Polygon,

@@ -7437,20 +7437,19 @@ fn polymorphic_element_oid(kind: PolymorphicType, actual_oid: i32) -> Option<i32
     use crate::sql::types::{ColType, oid};
     let actual = ColType::from_oid(actual_oid);
     match kind {
-        PolymorphicType::Element | PolymorphicType::Compatible => (!matches!(
-            actual,
-            Some(ColType::Void | ColType::Internal | ColType::Record)
-        ) && actual_oid != oid::UNKNOWN)
-            .then_some(actual_oid),
-        PolymorphicType::NonArray | PolymorphicType::CompatibleNonArray => (!matches!(
-            actual,
-            Some(ColType::Array(_) | ColType::Int2Vector | ColType::OidVector)
-        ) && !matches!(
-            actual,
-            Some(ColType::Void | ColType::Internal | ColType::Record)
-        ) && actual_oid
-            != oid::UNKNOWN)
-            .then_some(actual_oid),
+        PolymorphicType::Element | PolymorphicType::Compatible => {
+            (!matches!(actual, Some(ColType::Void | ColType::Internal))
+                && actual_oid != oid::UNKNOWN)
+                .then_some(actual_oid)
+        }
+        PolymorphicType::NonArray | PolymorphicType::CompatibleNonArray => {
+            (!matches!(
+                actual,
+                Some(ColType::Array(_) | ColType::Int2Vector | ColType::OidVector)
+            ) && !matches!(actual, Some(ColType::Void | ColType::Internal))
+                && actual_oid != oid::UNKNOWN)
+                .then_some(actual_oid)
+        }
         PolymorphicType::Array | PolymorphicType::CompatibleArray => {
             if let Some((NamedTypeKind::Domain, creation, true)) =
                 NamedTypeKind::from_oid(actual_oid)
@@ -9557,53 +9556,17 @@ impl RoutineDef {
             .find_map(|(index, parameter)| {
                 matches!(parameter.mode, RoutineParameterMode::Variadic { .. }).then_some(index)
             });
-        if argument_count > MAX_ROUTINE_ARGUMENTS
-            || (argument_count > input_count && variadic_index.is_none())
-            || (!argument_names.is_empty() && argument_names.len() != argument_count)
-            || explicit_variadic && variadic_index.is_none()
-            || (!explicit_variadic
-                && variadic_index.is_some()
-                && argument_names.iter().any(Option::is_some))
-        {
-            return None;
-        }
-        let mut mapping = [u8::MAX; MAX_ROUTINE_ARGUMENTS];
-        let mut occupied = [false; MAX_ROUTINE_ARGUMENTS];
-        for (call_index, mapped_input) in mapping.iter_mut().enumerate().take(argument_count) {
-            let input_index = match argument_names.get(call_index).copied().flatten() {
-                None if !explicit_variadic
-                    && variadic_index.is_some_and(|variadic| call_index >= variadic) =>
-                {
-                    variadic_index?
-                }
-                None => call_index,
-                Some(name) => (0..input_count).find(|&input_index| {
-                    parameter_for_input(input_index)
-                        .is_some_and(|parameter| parameter.name.as_str() == name)
-                })?,
-            };
-            let expanded_variadic =
-                !explicit_variadic && variadic_index == Some(input_index) && occupied[input_index];
-            if input_index >= input_count || occupied[input_index] && !expanded_variadic {
-                return None;
-            }
-            occupied[input_index] = true;
-            *mapped_input = u8::try_from(input_index).ok()?;
-        }
-        if explicit_variadic
-            && variadic_index
-                != argument_count
-                    .checked_sub(1)
-                    .map(|index| usize::from(mapping[index]))
-        {
-            return None;
-        }
-        for (input_index, occupied) in occupied.iter().enumerate().take(input_count) {
-            if !occupied && !parameter_for_input(input_index)?.mode.has_default() {
-                return None;
-            }
-        }
-        Some(mapping)
+        routine_resolution::map_parameter_positions(
+            input_count,
+            variadic_index,
+            |index| {
+                parameter_for_input(index)
+                    .map(|parameter| (parameter.name.as_str(), parameter.mode.has_default()))
+            },
+            argument_names,
+            argument_count,
+            explicit_variadic,
+        )
     }
 
     /// CALL syntax includes OUT placeholders even though overload identity and

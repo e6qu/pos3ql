@@ -1106,10 +1106,15 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
                 None
             }
             crate::storage::RoutineCallSelection::Ambiguous => {
-                return Err(sql_err!(
-                    sqlstate::AMBIGUOUS_FUNCTION,
-                    "function {}(...) is not unique",
-                    name
+                return Err(crate::sql::exec::function_lookup_error(
+                    name,
+                    &input_oids[..args.len()],
+                    argument_names,
+                    crate::sql::exec::FunctionLookupFailure::Ambiguous,
+                    &crate::sql::eval::RuntimeColumnTypes {
+                        row,
+                        catalog: hooks.catalog,
+                    },
                 ));
             }
             crate::storage::RoutineCallSelection::WrongKind { .. } => {
@@ -1119,7 +1124,18 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
                     name
                 ));
             }
-            _ => return crate::sql::eval::undefined_function(name, args, arena, row, hooks),
+            _ => {
+                return Err(crate::sql::exec::function_lookup_error(
+                    name,
+                    &input_oids[..args.len()],
+                    argument_names,
+                    crate::sql::exec::FunctionLookupFailure::Missing,
+                    &crate::sql::eval::RuntimeColumnTypes {
+                        row,
+                        catalog: hooks.catalog,
+                    },
+                ));
+            }
         };
         if selected.is_none() {
             let oid = builtin_oid.expect("builtin project-set target was selected");
@@ -1537,7 +1553,7 @@ pub(super) fn with_bound_srf_inputs<'a, R: ColumnLookup<'a>, T>(
             ));
         }
         if !srf_arity(name).is_some_and(|arity| arity.accepts(args.len())) {
-            return crate::sql::eval::undefined_function(name, args, arena, row, hooks);
+            return crate::sql::eval::undefined_function(name, args, row, hooks);
         }
         let mut input_oids =
             [crate::sql::types::oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
@@ -1562,10 +1578,15 @@ pub(super) fn with_bound_srf_inputs<'a, R: ColumnLookup<'a>, T>(
                 oid
             }
             crate::storage::RoutineCallSelection::Ambiguous => {
-                return Err(sql_err!(
-                    sqlstate::AMBIGUOUS_FUNCTION,
-                    "function {}(...) is not unique",
-                    name
+                return Err(crate::sql::exec::function_lookup_error(
+                    name,
+                    &input_oids[..args.len()],
+                    argument_names,
+                    crate::sql::exec::FunctionLookupFailure::Ambiguous,
+                    &crate::sql::eval::RuntimeColumnTypes {
+                        row,
+                        catalog: hooks.catalog,
+                    },
                 ));
             }
             crate::storage::RoutineCallSelection::WrongKind { .. } => {
@@ -1581,7 +1602,18 @@ pub(super) fn with_bound_srf_inputs<'a, R: ColumnLookup<'a>, T>(
                     "stored set-returning routine reached builtin input binding"
                 ));
             }
-            _ => return crate::sql::eval::undefined_function(name, args, arena, row, hooks),
+            _ => {
+                return Err(crate::sql::exec::function_lookup_error(
+                    name,
+                    &input_oids[..args.len()],
+                    argument_names,
+                    crate::sql::exec::FunctionLookupFailure::Missing,
+                    &crate::sql::eval::RuntimeColumnTypes {
+                        row,
+                        catalog: Some(catalog),
+                    },
+                ));
+            }
         };
         let arguments = crate::sql::eval::bind_builtin_arguments(
             selected_oid,
@@ -1689,7 +1721,7 @@ fn srf_count_positional<'a, R: ColumnLookup<'a>>(
     hooks: &EvalHooks<'_, 'a>,
 ) -> Result<usize, SqlError> {
     let Some(name) = builtin_set_routine_name(name) else {
-        return crate::sql::eval::undefined_function(name, args, arena, row, hooks);
+        return crate::sql::eval::undefined_function(name, args, row, hooks);
     };
     if is_event_trigger_introspection(name) {
         require_no_arguments(name, args)?;
@@ -4042,6 +4074,27 @@ pub(super) fn select_table_func_routine<'a, C: ColumnLookup<'a>>(
             crate::storage::RoutineCallKind::Function,
         )
     };
+    let failure = match selection {
+        crate::storage::RoutineCallSelection::Absent => {
+            Some(crate::sql::exec::FunctionLookupFailure::Missing)
+        }
+        crate::storage::RoutineCallSelection::Ambiguous => {
+            Some(crate::sql::exec::FunctionLookupFailure::Ambiguous)
+        }
+        _ => None,
+    };
+    if let Some(failure) = failure {
+        return Err(crate::sql::exec::function_lookup_error(
+            name,
+            &argument_type_oids[..args.len()],
+            tref.func_argument_names,
+            failure,
+            &crate::sql::eval::RuntimeColumnTypes {
+                row: columns,
+                catalog: Some(&catalog),
+            },
+        ));
+    }
     Ok((selection, argument_type_oids))
 }
 

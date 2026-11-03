@@ -11992,4 +11992,84 @@ mod tests {
             });
         }
     }
+
+    #[test]
+    fn sql_constructor_and_temporal_calls_keep_their_syntax_identity() {
+        for (sql, expected) in [
+            (
+                "SELECT json_scalar(1)",
+                crate::sql::ast::CallKind::SqlSyntax,
+            ),
+            (
+                "SELECT xmlconcat('<a/>'::xml)",
+                crate::sql::ast::CallKind::SqlSyntax,
+            ),
+            (
+                "SELECT merge_action()",
+                crate::sql::ast::CallKind::SqlSyntax,
+            ),
+            (
+                "SELECT current_time(0)",
+                crate::sql::ast::CallKind::SqlSyntax,
+            ),
+            ("SELECT localtime(3)", crate::sql::ast::CallKind::SqlSyntax),
+            (
+                "SELECT current_timestamp(0)",
+                crate::sql::ast::CallKind::SqlSyntax,
+            ),
+            (
+                "SELECT localtimestamp(0)",
+                crate::sql::ast::CallKind::SqlSyntax,
+            ),
+            (
+                "SELECT \"json_scalar\"(1)",
+                crate::sql::ast::CallKind::Routine,
+            ),
+            (
+                "SELECT pg_catalog.xmlconcat('<a/>'::xml)",
+                crate::sql::ast::CallKind::Routine,
+            ),
+            (
+                "SELECT \"merge_action\"()",
+                crate::sql::ast::CallKind::Routine,
+            ),
+            (
+                "SELECT pg_catalog.current_time(0)",
+                crate::sql::ast::CallKind::Routine,
+            ),
+        ] {
+            with_parser(sql, |parser| {
+                let Stmt::Select(select) = parser.next_stmt().unwrap().unwrap() else {
+                    panic!("expected SELECT");
+                };
+                let [
+                    SelectItem::Expr {
+                        expression: Expr::Call { kind, .. },
+                        ..
+                    },
+                ] = select.items
+                else {
+                    panic!("expected call");
+                };
+                assert_eq!(*kind, expected, "{sql}");
+            });
+        }
+        for sql in [
+            "SELECT json_scalar()",
+            "SELECT xmlconcat()",
+            "SELECT merge_action(1)",
+            "SELECT current_time(1+1)",
+            "SELECT localtime(NULL)",
+            "SELECT json_scalar(DISTINCT 1)",
+            "SELECT xmlconcat('<a/>'::xml) OVER ()",
+        ] {
+            with_parser(sql, |parser| {
+                assert_eq!(
+                    parser.next_stmt().unwrap_err().sqlstate,
+                    sqlstate::SYNTAX_ERROR,
+                    "{sql}"
+                );
+            });
+        }
+    }
 }

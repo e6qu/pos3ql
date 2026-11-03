@@ -19,6 +19,69 @@ struct Candidate {
     is_procedure: bool,
 }
 
+pub(super) fn map_parameter_positions<'parameter>(
+    formal_count: usize,
+    variadic_index: Option<usize>,
+    parameter: impl Fn(usize) -> Option<(&'parameter str, bool)>,
+    names: &[Option<&str>],
+    count: usize,
+    explicit_variadic: bool,
+) -> Option<[u8; MAX_ROUTINE_ARGUMENTS]> {
+    if count > MAX_ROUTINE_ARGUMENTS || (!names.is_empty() && names.len() != count) {
+        return None;
+    }
+    let variadic = variadic_index;
+    if formal_count > MAX_ROUTINE_ARGUMENTS
+        || !explicit_variadic && variadic.is_some() && names.iter().any(Option::is_some)
+    {
+        return None;
+    }
+    if explicit_variadic && variadic.is_none() {
+        return None;
+    }
+    let mut mapping = [u8::MAX; MAX_ROUTINE_ARGUMENTS];
+    let mut supplied = [false; MAX_ROUTINE_ARGUMENTS];
+    let mut named = false;
+    for (actual, target) in mapping.iter_mut().take(count).enumerate() {
+        let name = names.get(actual).copied().flatten();
+        let input = if let Some(name) = name {
+            named = true;
+            let input = (0..formal_count)
+                .find(|index| parameter(*index).is_some_and(|(formal, _)| formal == name))?;
+            if variadic == Some(input) && !explicit_variadic {
+                return None;
+            }
+            input
+        } else {
+            if named {
+                return None;
+            }
+            if actual < formal_count {
+                actual
+            } else if !explicit_variadic {
+                variadic?
+            } else {
+                return None;
+            }
+        };
+        let expanded_tail = !explicit_variadic && !named && variadic == Some(input);
+        if supplied[input] && !expanded_tail {
+            return None;
+        }
+        supplied[input] = true;
+        *target = input as u8;
+    }
+    if explicit_variadic && (count == 0 || Some(usize::from(mapping[count - 1])) != variadic) {
+        return None;
+    }
+    for (input, supplied) in supplied.iter().enumerate().take(formal_count) {
+        if !supplied && !parameter(input)?.1 {
+            return None;
+        }
+    }
+    Some(mapping)
+}
+
 impl Candidate {
     fn stored(
         storage: &Storage,
@@ -152,54 +215,14 @@ impl Candidate {
         count: usize,
         explicit_variadic: bool,
     ) -> Option<[u8; MAX_ROUTINE_ARGUMENTS]> {
-        if count > MAX_ROUTINE_ARGUMENTS || (!names.is_empty() && names.len() != count) {
-            return None;
-        }
-        let variadic = self.variadic_index();
-        if explicit_variadic && variadic.is_none() {
-            return None;
-        }
-        let mut mapping = [0; MAX_ROUTINE_ARGUMENTS];
-        let mut supplied = [false; MAX_ROUTINE_ARGUMENTS];
-        let mut named = false;
-        for (actual, target) in mapping.iter_mut().take(count).enumerate() {
-            let name = names.get(actual).copied().flatten();
-            let input = if let Some(name) = name {
-                named = true;
-                let input =
-                    (0..self.argument_count()).find(|index| self.parameter_name(*index) == name)?;
-                if variadic == Some(input) && !explicit_variadic {
-                    return None;
-                }
-                input
-            } else {
-                if named {
-                    return None;
-                }
-                if actual < self.argument_count() {
-                    actual
-                } else if !explicit_variadic {
-                    variadic?
-                } else {
-                    return None;
-                }
-            };
-            let expanded_tail = !explicit_variadic && !named && variadic == Some(input);
-            if supplied[input] && !expanded_tail {
-                return None;
-            }
-            supplied[input] = true;
-            *target = input as u8;
-        }
-        if explicit_variadic && (count == 0 || Some(usize::from(mapping[count - 1])) != variadic) {
-            return None;
-        }
-        for (input, supplied) in supplied.iter().enumerate().take(self.argument_count()) {
-            if !supplied && !self.has_default(input) {
-                return None;
-            }
-        }
-        Some(mapping)
+        map_parameter_positions(
+            self.argument_count(),
+            self.variadic_index(),
+            |index| Some((self.parameter_name(index), self.has_default(index))),
+            names,
+            count,
+            explicit_variadic,
+        )
     }
 
     fn accepts(

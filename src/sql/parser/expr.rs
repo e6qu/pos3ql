@@ -999,6 +999,23 @@ impl<'a> Parser<'a> {
                 if self.peeked == Tok::Op("(") && self.typed_literal_with_modifier_ahead(name)? {
                     return self.modified_typed_literal(name);
                 }
+                if self.peeked == Tok::Op("(")
+                    && matches!(
+                        name,
+                        "current_timestamp" | "current_time" | "localtimestamp" | "localtime"
+                    )
+                {
+                    self.advance()?;
+                    let Tok::Num(text) = self.peeked else {
+                        return Err(self.unexpected("expected temporal precision"));
+                    };
+                    let precision = parse_uint(text)
+                        .ok_or_else(|| self.err_here("expected temporal precision"))?;
+                    self.advance()?;
+                    self.expect_op(")")?;
+                    let precision = self.arena_expr(Expr::Int(precision))?;
+                    return self.plain_call(name, &[precision]);
+                }
                 if self.peeked == Tok::Op("(") {
                     return self.call(name, true);
                 }
@@ -1133,24 +1150,12 @@ impl<'a> Parser<'a> {
                         | "current_catalog"
                         | "current_schema"
                 ) {
-                    let mut args: &[&'a Expr<'a>] = &[];
-                    if self.peeked == Tok::Op("(")
-                        && matches!(
-                            name,
-                            "current_timestamp" | "current_time" | "localtimestamp" | "localtime"
-                        )
-                    {
-                        self.advance()?;
-                        let precision = self.expression(0)?;
-                        self.expect_op(")")?;
-                        args = self.arena_slice(&[precision])?;
-                    }
                     return self.arena_expr(Expr::Call {
                         kind: CallKind::SqlSyntax,
                         bound_oid: None,
                         bound_strict: None,
                         name,
-                        args,
+                        args: &[],
                         argument_names: &[],
                         variadic: false,
                         star: false,
@@ -1989,7 +1994,15 @@ impl<'a> Parser<'a> {
         let kind = if syntax
             && matches!(
                 name,
-                "coalesce" | "greatest" | "least" | "nullif" | "row" | "grouping"
+                "coalesce"
+                    | "greatest"
+                    | "least"
+                    | "nullif"
+                    | "row"
+                    | "grouping"
+                    | "json_scalar"
+                    | "xmlconcat"
+                    | "merge_action"
             ) {
             CallKind::SqlSyntax
         } else {
@@ -2240,8 +2253,13 @@ impl<'a> Parser<'a> {
             {
                 return Err(self.err_here("SQL expression does not accept function-call modifiers"));
             }
-            if (matches!(name, "coalesce" | "greatest" | "least" | "grouping") && args.is_empty())
+            if (matches!(
+                name,
+                "coalesce" | "greatest" | "least" | "grouping" | "xmlconcat"
+            ) && args.is_empty())
                 || (name == "nullif" && args.len() != 2)
+                || (name == "json_scalar" && args.len() != 1)
+                || (name == "merge_action" && !args.is_empty())
             {
                 return Err(self.err_here("invalid SQL expression argument count"));
             }

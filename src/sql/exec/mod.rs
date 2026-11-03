@@ -447,6 +447,11 @@ struct ViewCheckContext<'storage, 'arena, 'params, 'sequence> {
 }
 
 impl<'v> ColumnLookup<'v> for RowCtx<'_, 'v, '_> {
+    fn whole_row_type(&self, table: &str) -> Option<ColType> {
+        crate::sql::eval::qualifier_answers_target(self.def, self.alias, table)
+            .then_some(ColType::Record)
+    }
+
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'v>, SqlError> {
         if let Some(q) = qualifier
             && !crate::sql::eval::qualifier_answers_target(self.def, self.alias, q)
@@ -600,6 +605,16 @@ impl<'v> ReturningLookup<'_, 'v> {
 }
 
 impl<'v> ColumnLookup<'v> for ReturningLookup<'_, 'v> {
+    fn whole_row_type(&self, table: &str) -> Option<ColType> {
+        (self.image(table).is_some()
+            || crate::sql::eval::qualifier_answers_target(
+                self.definition,
+                self.target_alias,
+                table,
+            ))
+        .then_some(ColType::Record)
+    }
+
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'v>, SqlError> {
         if let Some(qualifier) = qualifier
             && let Some(image) = self.image(qualifier)
@@ -700,10 +715,10 @@ pub(super) use schema::rename as stage_schema_rename;
 
 mod describe;
 pub(crate) use describe::{
-    CatalogCols, builtin_binary_type, builtin_call, builtin_record_srf_call,
-    catalog_builtin_call_result_metadata, catalog_composite_field,
+    CatalogCols, FunctionLookupFailure, builtin_binary_type, builtin_call, builtin_record_srf_call,
+    builtin_type_name_fixed, catalog_builtin_call_result_metadata, catalog_composite_field,
     catalog_operator_first_argument_type, catalog_routine_record_field, expand_record_call_items,
-    numeric_log_type, resolved_set_call, visit_catalog_composite_fields,
+    function_lookup_error, numeric_log_type, resolved_set_call, visit_catalog_composite_fields,
     visit_catalog_rowtype_fields,
 };
 pub use describe::{
@@ -17100,6 +17115,11 @@ impl<'d, 's, 'stored, 'value> ColumnLookup<'value> for TriggerTransition<'d, 's,
 where
     'stored: 'value,
 {
+    fn whole_row_type(&self, table: &str) -> Option<ColType> {
+        (table.eq_ignore_ascii_case("old") || table.eq_ignore_ascii_case("new"))
+            .then_some(ColType::Record)
+    }
+
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'value>, SqlError> {
         let Some(qualifier) = qualifier else {
             return Err(sql_err!(
@@ -38392,6 +38412,10 @@ impl<'value> ColumnLookup<'value> for RuleConditionColumns<'_> {
 }
 
 impl ColTypeResolver for RuleConditionColumns<'_> {
+    fn type_name_fixed(&self, oid: i32) -> Result<Option<StackStr<260>>, SqlError> {
+        self.catalog.type_name_fixed(oid)
+    }
+
     fn routine_call_selection(
         &self,
         name: &str,

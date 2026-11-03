@@ -1,0 +1,91 @@
+{
+  "revision": "00a17039fb153dad8d40b8bed5bc53e9c8629b18",
+  "checkout": "0e2f5d8fcb7ff808b6d3193d5a155cbc6da9dc1e",
+  "parents": [
+    "ddada9b0f91000ff493da9948f7dfd745d48a370",
+    "00a17039fb153dad8d40b8bed5bc53e9c8629b18"
+  ],
+  "tree": "86b9c0539855d1e2ca70ed3351c8eb9cb78161f4",
+  "artifact": 13257235290,
+  "zip_sha256": "4dc99f1606fd860f4175ec7e80dcf6d1318efe84dea0e3c960969bcd2218d50f",
+  "verified_sources": [
+    "tests/external/routine-input-oracle.sql",
+    "tests/external/routine-input-oracle.py",
+    "tests/external/differential/205_planner_checked_inputs.sql",
+    "tests/external/differential/206_runtime_input_collations.sql",
+    "tests/external/differential/207_plpgsql_input_instances.sql",
+    "tests/external/differential/208_routine_parameter_collations.sql",
+    "tests/external/differential/213_cast_type_modifiers.sql",
+    "tests/external/differential/214_owner_role_inheritance.sql",
+    "tests/external/differential/215_relation_input_granularity.sql",
+    "tests/external/differential/216_support_function_plan_dependencies.sql",
+    "tests/external/differential/217_analyze_plan_invalidations.sql"
+  ],
+  "version": "postgres (PostgreSQL) 18.6 (Debian 18.6-1.pgdg13+2)",
+  "run": 41685422665,
+  "artifact_url": "https://github.com/e6qu/pos3ql/actions/runs/41685422665/artifacts/13257235290",
+  "inputs": [
+    {
+      "path": "tests/external/routine-input-oracle.sql",
+      "sha256": "0231e65b17050288153aa281bd19aa375bc53766324eee09b85efa159dbf8acf",
+      "retained_path": "routine-input-oracle.sql"
+    },
+    {
+      "path": "tests/external/routine-input-oracle.py",
+      "sha256": "8ee89540b427084b6f5858a0c1c6de42288523fab4f7dacebe54fe6287bbaf0b",
+      "retained_path": "routine-input-oracle.py"
+    },
+    {
+      "path": "tests/external/differential/205_planner_checked_inputs.sql",
+      "sha256": "168f96b9de864444d3efcf6606c631df0bf1a97d005b50fa2073dcf941741e55",
+      "retained_path": "tests/external/differential/205_planner_checked_inputs.sql"
+    },
+    {
+      "path": "tests/external/differential/206_runtime_input_collations.sql",
+      "sha256": "2d5e3f5c66bd50475e3570b803e089ef91ffb28ad3a887097089109f01d8ca42",
+      "retained_path": "tests/external/differential/206_runtime_input_collations.sql"
+    },
+    {
+      "path": "tests/external/differential/207_plpgsql_input_instances.sql",
+      "sha256": "e177fd8ee538c027768ab0b37e7d3a5222537a37769d2a520d6026af2da4c27e",
+      "retained_path": "tests/external/differential/207_plpgsql_input_instances.sql"
+    },
+    {
+      "path": "tests/external/differential/208_routine_parameter_collations.sql",
+      "sha256": "b903aff00968acddaa4815009a1836ee74c4630016800d904c5588402ae11b79",
+      "retained_path": "tests/external/differential/208_routine_parameter_collations.sql"
+    },
+    {
+      "path": "tests/external/differential/213_cast_type_modifiers.sql",
+      "sha256": "c5875908c7604cc5048b7ca87365efd57264bdc91b41ee27299d642d6548d420",
+      "retained_path": "tests/external/differential/213_cast_type_modifiers.sql"
+    },
+    {
+      "path": "tests/external/differential/214_owner_role_inheritance.sql",
+      "sha256": "2b10429fe48333f14752a7674d4a65c8b307ed54dcf3c0f68b9c0481125de355",
+      "retained_path": "tests/external/differential/214_owner_role_inheritance.sql"
+    },
+    {
+      "path": "tests/external/differential/215_relation_input_granularity.sql",
+      "sha256": "544a129681e71e9c8f301dba5ad2b73efa4b78254bc2584250f4e104b6ebf086",
+      "retained_path": "tests/external/differential/215_relation_input_granularity.sql"
+    },
+    {
+      "path": "tests/external/differential/216_support_function_plan_dependencies.sql",
+      "sha256": "9c04672ec8e39eddc4a3d811aef675720239cec83c35ab3701f7889609802372",
+      "retained_path": "tests/external/differential/216_support_function_plan_dependencies.sql"
+    },
+    {
+      "path": "tests/external/differential/217_analyze_plan_invalidations.sql",
+      "sha256": "cdcae55ce37dfaa716cb6ede9b95a2cfb6478486a2dba25ce5ef17a88d84828f",
+      "retained_path": "tests/external/differential/217_analyze_plan_invalidations.sql"
+    }
+  ],
+  "snapshots": {
+    "tests/external/routine-input-oracle.sql": "routine-input-oracle.sql",
+    "tests/external/routine-input-oracle.py": "routine-input-oracle.py",
+    ".github/workflows/routine-input-oracle.yml": "workflow.yml"
+  },
+  "container_image": "mirror.gcr.io/library/postgres:18@sha256:885953109528ad3dfc90362b1a6f50a78620b5315be19f187753d267e484dc5b",
+  "image_id": "sha256:885953109528ad3dfc90362b1a6f50a78620b5315be19f187753d267e484dc5b"
+}

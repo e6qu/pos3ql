@@ -247,8 +247,8 @@ fn runtime_input_retries_keep_their_receipts_across_namespace_changes() {
 }
 
 // PostgreSQL 18.6 two-session oracle SQL/Python SHA256:
-// 3df4b20befdb50122161465bd83cc7a870e63ccc78bd6b9cb8e8c0bafc444e38,
-// c68084448f63edc5dc2d636ec2b7c06264088b554138411ad526332c0379c5b4.
+// 0231e65b17050288153aa281bd19aa375bc53766324eee09b85efa159dbf8acf,
+// 8ee89540b427084b6f5858a0c1c6de42288523fab4f7dacebe54fe6287bbaf0b.
 #[test]
 fn namespace_plan_invalidations_follow_local_commit_and_rollback_boundaries() {
     for mode in [

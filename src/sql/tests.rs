@@ -86353,13 +86353,13 @@ fn transaction_wal_isolated_across_checkpoint_interleaving_and_cold_recovery_bod
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let mut connection_a = TxnState::new(&mut budget, 256).unwrap();
     let mut connection_b = TxnState::new(&mut budget, 256).unwrap();
-    let mut guc_a = GucState::new();
-    let mut guc_b = GucState::new();
+    let guc_a = GucState::new();
+    let guc_b = GucState::new();
     run_session_transaction(
         &mut engine,
         &mut budget,
         &mut connection_b,
-        &mut guc_b,
+        &guc_b,
         "CREATE TABLE checkpoint_base (id int PRIMARY KEY); \
          INSERT INTO checkpoint_base VALUES (1)",
     );
@@ -86369,7 +86369,7 @@ fn transaction_wal_isolated_across_checkpoint_interleaving_and_cold_recovery_bod
         &mut engine,
         &mut budget,
         &mut connection_a,
-        &mut guc_a,
+        &guc_a,
         "BEGIN; \
          CREATE TABLE rolled_back_catalog (id int); \
          CREATE UNIQUE INDEX rolled_back_index ON checkpoint_base(id)",
@@ -86381,7 +86381,7 @@ fn transaction_wal_isolated_across_checkpoint_interleaving_and_cold_recovery_bod
         &mut engine,
         &mut budget,
         &mut connection_b,
-        &mut guc_b,
+        &guc_b,
         "CREATE TABLE committed_while_a_open (id int PRIMARY KEY); \
          INSERT INTO committed_while_a_open VALUES (2)",
     );
@@ -86389,7 +86389,7 @@ fn transaction_wal_isolated_across_checkpoint_interleaving_and_cold_recovery_bod
         &mut engine,
         &mut budget,
         &mut connection_a,
-        &mut guc_a,
+        &guc_a,
         "ROLLBACK",
     );
 
@@ -86397,7 +86397,7 @@ fn transaction_wal_isolated_across_checkpoint_interleaving_and_cold_recovery_bod
         &mut engine,
         &mut budget,
         &mut connection_a,
-        &mut guc_a,
+        &guc_a,
         "BEGIN; \
          CREATE TABLE late_commit (id int PRIMARY KEY); \
          INSERT INTO late_commit VALUES (3); \
@@ -86417,7 +86417,7 @@ fn transaction_wal_isolated_across_checkpoint_interleaving_and_cold_recovery_bod
         &mut engine,
         &mut budget,
         &mut connection_b,
-        &mut guc_b,
+        &guc_b,
         "CREATE TABLE middle_commit (id int PRIMARY KEY); \
          INSERT INTO middle_commit VALUES (5)",
     );
@@ -86425,7 +86425,7 @@ fn transaction_wal_isolated_across_checkpoint_interleaving_and_cold_recovery_bod
         &mut engine,
         &mut budget,
         &mut connection_a,
-        &mut guc_a,
+        &guc_a,
         "COMMIT",
     );
     drop(engine);

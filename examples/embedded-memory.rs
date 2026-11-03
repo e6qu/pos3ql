@@ -62,7 +62,7 @@ impl Session {
                 &mut self.transaction,
                 &mut self.prepared,
                 &mut self.cursors,
-                &mut self.guc,
+                &self.guc,
                 &mut Responder::new(&mut self.send),
                 1,
             )

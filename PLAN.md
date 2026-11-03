@@ -86,7 +86,9 @@ Keep completed inputs while rolling back and safely replaying the unfinished
 input within its original deadline. Cancellation must release unfinished
 metadata so a fresh statement can select a different schema and track its
 subsequent changes. Demonstrate the complete behavior in CI
-before closing this acceptance item.
+before closing this acceptance item. The original PostgreSQL probe inputs, raw
+results and verified provenance are retained under
+`tests/external/reference/2026-11-03-input-plans/`.
 Data-change trigger statements that need checked domain-array input currently
 raise `0A000` before running the constraint; event triggers have an engine-owned
 execution context. Finish a retained trigger continuation that preserves prior
